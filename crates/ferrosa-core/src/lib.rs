@@ -16,12 +16,17 @@
 //! - [`types`] — Shared domain types
 
 pub mod auth;
+pub mod compression;
 pub mod config;
 pub mod dispatch;
 pub mod embedding;
+pub mod entity;
+pub mod feedback;
+pub mod fold;
 pub mod memo;
 pub mod metrics;
 pub mod plan;
 pub mod storage;
+pub mod temporal;
 pub mod transport;
 pub mod types;

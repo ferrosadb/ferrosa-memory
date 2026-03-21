@@ -13,7 +13,10 @@
 
 use uuid::Uuid;
 
-use crate::types::{MemoEntry, PlanNode, PlanStatus, TenantContext};
+use crate::types::{
+    EntityEntry, FeedbackOutcome, FoldEntry, FoldStatus, FoldSummary, MemoEntry, PlanNode,
+    PlanStatus, TemporalEvent, TenantContext,
+};
 
 /// Core storage operations for the memory system.
 ///
@@ -64,6 +67,103 @@ pub trait Storage: Send + Sync {
         status: PlanStatus,
         outcome_summary: Option<&str>,
     ) -> anyhow::Result<()>;
+
+    // --- Fold operations (Sprint 2) ---
+
+    /// Create a new active fold.
+    async fn fold_put(&self, ctx: &TenantContext, entry: &FoldEntry) -> anyhow::Result<()>;
+
+    /// Get a fold by ID.
+    async fn fold_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        fold_id: Uuid,
+    ) -> anyhow::Result<Option<FoldEntry>>;
+
+    /// Append text to a fold's raw_trajectory.
+    async fn fold_append(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        fold_id: Uuid,
+        text: &str,
+    ) -> anyhow::Result<()>;
+
+    /// Update fold status, summary, embedding, and compression info.
+    async fn fold_complete(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        fold_id: Uuid,
+        summary: &str,
+        embedding: Vec<f32>,
+        compression_ratio: f64,
+    ) -> anyhow::Result<()>;
+
+    /// Retrieve fold summaries by embedding similarity (ANN search).
+    async fn fold_search(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        query_embedding: &[f32],
+        k: usize,
+        include_raw: bool,
+    ) -> anyhow::Result<Vec<FoldSummary>>;
+
+    // --- Entity operations (Sprint 3) ---
+
+    /// Store a new entity.
+    async fn entity_put(&self, ctx: &TenantContext, entry: &EntityEntry) -> anyhow::Result<()>;
+
+    /// Find entity by phonetic match on name.
+    async fn entity_find_phonetic(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        name: &str,
+    ) -> anyhow::Result<Option<EntityEntry>>;
+
+    /// Search entities by embedding similarity.
+    async fn entity_search_ann(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        query_embedding: &[f32],
+        k: usize,
+    ) -> anyhow::Result<Vec<EntityEntry>>;
+
+    /// Count entities in a session (for rate limiting).
+    async fn entity_count(&self, ctx: &TenantContext, session_id: Uuid) -> anyhow::Result<usize>;
+
+    // --- Temporal event operations (Sprint 3) ---
+
+    /// Store a temporal event.
+    async fn temporal_put(&self, ctx: &TenantContext, event: &TemporalEvent) -> anyhow::Result<()>;
+
+    /// Get the current (valid_until IS NULL) fact for an entity.
+    async fn temporal_get_current(
+        &self,
+        ctx: &TenantContext,
+        entity_id: Uuid,
+    ) -> anyhow::Result<Option<TemporalEvent>>;
+
+    /// Invalidate a temporal event (set valid_until).
+    async fn temporal_invalidate(
+        &self,
+        ctx: &TenantContext,
+        entity_id: Uuid,
+        event_id: Uuid,
+    ) -> anyhow::Result<()>;
+
+    // --- Feedback operations (Sprint 3) ---
+
+    /// Record a feedback outcome.
+    async fn feedback_put(
+        &self,
+        ctx: &TenantContext,
+        outcome: &FeedbackOutcome,
+    ) -> anyhow::Result<()>;
 }
 
 /// In-memory mock storage for unit tests.
@@ -78,6 +178,10 @@ pub mod mock {
     pub struct MockStorage {
         pub memos: Mutex<Vec<MemoEntry>>,
         pub plans: Mutex<Vec<PlanNode>>,
+        pub folds: Mutex<Vec<FoldEntry>>,
+        pub entities: Mutex<Vec<EntityEntry>>,
+        pub temporal_events: Mutex<Vec<TemporalEvent>>,
+        pub feedback: Mutex<Vec<FeedbackOutcome>>,
     }
 
     impl MockStorage {
@@ -165,6 +269,199 @@ pub mod mock {
                     p.completed_at = Some(chrono::Utc::now());
                 }
             }
+            Ok(())
+        }
+
+        // --- Fold operations ---
+
+        async fn fold_put(&self, _ctx: &TenantContext, entry: &FoldEntry) -> anyhow::Result<()> {
+            self.folds.lock().await.push(entry.clone());
+            Ok(())
+        }
+
+        async fn fold_get(
+            &self,
+            _ctx: &TenantContext,
+            session_id: Uuid,
+            fold_id: Uuid,
+        ) -> anyhow::Result<Option<FoldEntry>> {
+            let folds = self.folds.lock().await;
+            Ok(folds
+                .iter()
+                .find(|f| f.session_id == session_id && f.fold_id == fold_id)
+                .cloned())
+        }
+
+        async fn fold_append(
+            &self,
+            _ctx: &TenantContext,
+            session_id: Uuid,
+            fold_id: Uuid,
+            text: &str,
+        ) -> anyhow::Result<()> {
+            let mut folds = self.folds.lock().await;
+            if let Some(f) = folds
+                .iter_mut()
+                .find(|f| f.session_id == session_id && f.fold_id == fold_id)
+            {
+                f.raw_trajectory.push('\n');
+                f.raw_trajectory.push_str(text);
+                f.token_count = f.raw_trajectory.split_whitespace().count() as i32;
+            }
+            Ok(())
+        }
+
+        async fn fold_complete(
+            &self,
+            _ctx: &TenantContext,
+            session_id: Uuid,
+            fold_id: Uuid,
+            summary: &str,
+            embedding: Vec<f32>,
+            compression_ratio: f64,
+        ) -> anyhow::Result<()> {
+            let mut folds = self.folds.lock().await;
+            if let Some(f) = folds
+                .iter_mut()
+                .find(|f| f.session_id == session_id && f.fold_id == fold_id)
+            {
+                f.status = FoldStatus::Folded;
+                f.fold_summary = Some(summary.to_string());
+                f.fold_embedding = Some(embedding);
+                f.compression_ratio = Some(compression_ratio);
+                f.folded_at = Some(chrono::Utc::now());
+            }
+            Ok(())
+        }
+
+        async fn fold_search(
+            &self,
+            _ctx: &TenantContext,
+            session_id: Uuid,
+            _query_embedding: &[f32],
+            k: usize,
+            include_raw: bool,
+        ) -> anyhow::Result<Vec<FoldSummary>> {
+            let folds = self.folds.lock().await;
+            Ok(folds
+                .iter()
+                .filter(|f| f.session_id == session_id && f.fold_summary.is_some())
+                .take(k)
+                .map(|f| FoldSummary {
+                    fold_id: f.fold_id,
+                    depth: f.depth,
+                    fold_summary: f.fold_summary.clone().unwrap_or_default(),
+                    token_count: f.token_count,
+                    similarity: Some(0.9), // mock similarity
+                    raw_trajectory: if include_raw {
+                        Some(f.raw_trajectory.clone())
+                    } else {
+                        None
+                    },
+                })
+                .collect())
+        }
+
+        // --- Entity operations ---
+
+        async fn entity_put(
+            &self,
+            _ctx: &TenantContext,
+            entry: &EntityEntry,
+        ) -> anyhow::Result<()> {
+            self.entities.lock().await.push(entry.clone());
+            Ok(())
+        }
+
+        async fn entity_find_phonetic(
+            &self,
+            _ctx: &TenantContext,
+            session_id: Uuid,
+            name: &str,
+        ) -> anyhow::Result<Option<EntityEntry>> {
+            let entities = self.entities.lock().await;
+            let lower = name.to_lowercase();
+            Ok(entities
+                .iter()
+                .find(|e| e.session_id == session_id && e.entity_name.to_lowercase() == lower)
+                .cloned())
+        }
+
+        async fn entity_search_ann(
+            &self,
+            _ctx: &TenantContext,
+            session_id: Uuid,
+            _query_embedding: &[f32],
+            k: usize,
+        ) -> anyhow::Result<Vec<EntityEntry>> {
+            let entities = self.entities.lock().await;
+            Ok(entities
+                .iter()
+                .filter(|e| e.session_id == session_id)
+                .take(k)
+                .cloned()
+                .collect())
+        }
+
+        async fn entity_count(
+            &self,
+            _ctx: &TenantContext,
+            session_id: Uuid,
+        ) -> anyhow::Result<usize> {
+            let entities = self.entities.lock().await;
+            Ok(entities
+                .iter()
+                .filter(|e| e.session_id == session_id)
+                .count())
+        }
+
+        // --- Temporal operations ---
+
+        async fn temporal_put(
+            &self,
+            _ctx: &TenantContext,
+            event: &TemporalEvent,
+        ) -> anyhow::Result<()> {
+            self.temporal_events.lock().await.push(event.clone());
+            Ok(())
+        }
+
+        async fn temporal_get_current(
+            &self,
+            _ctx: &TenantContext,
+            entity_id: Uuid,
+        ) -> anyhow::Result<Option<TemporalEvent>> {
+            let events = self.temporal_events.lock().await;
+            Ok(events
+                .iter()
+                .rfind(|e| e.entity_id == entity_id && e.valid_until.is_none())
+                .cloned())
+        }
+
+        async fn temporal_invalidate(
+            &self,
+            _ctx: &TenantContext,
+            entity_id: Uuid,
+            event_id: Uuid,
+        ) -> anyhow::Result<()> {
+            let mut events = self.temporal_events.lock().await;
+            if let Some(e) = events
+                .iter_mut()
+                .find(|e| e.entity_id == entity_id && e.event_id == event_id)
+            {
+                e.valid_until = Some(chrono::Utc::now());
+            }
+            Ok(())
+        }
+
+        // --- Feedback operations ---
+
+        async fn feedback_put(
+            &self,
+            _ctx: &TenantContext,
+            outcome: &FeedbackOutcome,
+        ) -> anyhow::Result<()> {
+            self.feedback.lock().await.push(outcome.clone());
             Ok(())
         }
     }

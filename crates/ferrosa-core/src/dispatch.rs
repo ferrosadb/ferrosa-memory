@@ -100,6 +100,113 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "required": ["session_id", "depth", "subtask_id", "status"]
             }),
         },
+        // --- Fold tools (Sprint 2) ---
+        ToolDef {
+            name: "start_fold".into(),
+            description: "Create a new active trajectory fold".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "format": "uuid" },
+                    "depth": { "type": "integer" },
+                    "parent_fold_id": { "type": "string", "format": "uuid" },
+                    "initial_context": { "type": "string" }
+                },
+                "required": ["session_id", "depth", "initial_context"]
+            }),
+        },
+        ToolDef {
+            name: "append_to_fold".into(),
+            description: "Append a REPL turn to an active fold".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "fold_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string", "format": "uuid" },
+                    "repl_turn": { "type": "string" }
+                },
+                "required": ["fold_id", "session_id", "repl_turn"]
+            }),
+        },
+        ToolDef {
+            name: "complete_fold".into(),
+            description: "Seal a fold with summary and embedding".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "fold_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string", "format": "uuid" },
+                    "summary": { "type": "string" },
+                    "embedding": { "type": "array", "items": { "type": "number" } }
+                },
+                "required": ["fold_id", "session_id", "summary", "embedding"]
+            }),
+        },
+        ToolDef {
+            name: "retrieve_fold_context".into(),
+            description: "Search fold summaries by embedding similarity".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "format": "uuid" },
+                    "query_embedding": { "type": "array", "items": { "type": "number" } },
+                    "k": { "type": "integer" },
+                    "include_raw": { "type": "boolean" }
+                },
+                "required": ["session_id", "query_embedding"]
+            }),
+        },
+        // --- Entity tools (Sprint 3) ---
+        ToolDef {
+            name: "upsert_entity".into(),
+            description: "Track a named entity with phonetic deduplication".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "format": "uuid" },
+                    "entity_name": { "type": "string" },
+                    "entity_type": { "type": "string", "enum": ["person", "place", "event", "concept", "org"] },
+                    "context_snippet": { "type": "string" },
+                    "embedding": { "type": "array", "items": { "type": "number" } },
+                    "source_fold_id": { "type": "string", "format": "uuid" },
+                    "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+                },
+                "required": ["session_id", "entity_name", "entity_type", "context_snippet"]
+            }),
+        },
+        ToolDef {
+            name: "retrieve_entities".into(),
+            description: "Retrieve entities by phonetic, ANN, or both strategies".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "format": "uuid" },
+                    "query": { "type": "string" },
+                    "embedding": { "type": "array", "items": { "type": "number" } },
+                    "strategy": { "type": "string", "enum": ["ann", "phonetic", "both"] },
+                    "k": { "type": "integer" }
+                },
+                "required": ["session_id", "query"]
+            }),
+        },
+        // --- Feedback tool (Sprint 3) ---
+        ToolDef {
+            name: "record_outcome".into(),
+            description: "Record a retrieval strategy outcome for learning".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "format": "uuid" },
+                    "query_id": { "type": "string", "format": "uuid" },
+                    "program_type": { "type": "string", "enum": ["hnsw_ann", "phonetic", "cypher_hop", "btree_range", "memo_hit"] },
+                    "task_complexity": { "type": "string", "enum": ["simple", "linear", "quadratic"] },
+                    "succeeded": { "type": "boolean" },
+                    "latency_ms": { "type": "integer" },
+                    "token_cost": { "type": "integer" }
+                },
+                "required": ["session_id", "query_id", "program_type", "task_complexity", "succeeded", "latency_ms", "token_cost"]
+            }),
+        },
     ]
 }
 
@@ -161,6 +268,13 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "write_plan_node" => handle_write_plan(args, storage, ctx).await,
         "get_plan_context" => handle_get_plan(args, storage, ctx).await,
         "update_plan_node" => handle_update_plan(args, storage, ctx).await,
+        "start_fold" => handle_start_fold(args, storage, ctx).await,
+        "append_to_fold" => handle_append_fold(args, storage, ctx).await,
+        "complete_fold" => handle_complete_fold(args, storage, ctx).await,
+        "retrieve_fold_context" => handle_retrieve_fold(args, storage, ctx).await,
+        "upsert_entity" => handle_upsert_entity(args, storage, ctx).await,
+        "retrieve_entities" => handle_retrieve_entities(args, storage, ctx).await,
+        "record_outcome" => handle_record_outcome(args, storage, ctx).await,
         _ => Err((METHOD_NOT_FOUND, format!("unknown tool: {name}"))),
     }
 }
@@ -296,7 +410,225 @@ async fn handle_update_plan<S: crate::storage::Storage>(
     Ok(serde_json::json!({ "updated": updated }))
 }
 
+// --- Fold handlers ---
+
+async fn handle_start_fold<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = require_uuid(&args, "session_id")?;
+    let depth = require_i32(&args, "depth")?;
+    let parent_fold_id = optional_uuid(&args, "parent_fold_id")?;
+    let initial_context = require_str(&args, "initial_context")?;
+
+    let fold_id = crate::fold::start_fold(
+        storage,
+        ctx,
+        session_id,
+        depth,
+        parent_fold_id,
+        initial_context,
+    )
+    .await
+    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    Ok(serde_json::json!({ "fold_id": fold_id.to_string() }))
+}
+
+async fn handle_append_fold<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = require_uuid(&args, "session_id")?;
+    let fold_id = require_uuid(&args, "fold_id")?;
+    let repl_turn = require_str(&args, "repl_turn")?;
+
+    let (appended, token_count) =
+        crate::fold::append_to_fold(storage, ctx, session_id, fold_id, repl_turn)
+            .await
+            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    Ok(serde_json::json!({ "appended": appended, "token_count": token_count }))
+}
+
+async fn handle_complete_fold<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = require_uuid(&args, "session_id")?;
+    let fold_id = require_uuid(&args, "fold_id")?;
+    let summary = require_str(&args, "summary")?;
+    let embedding = require_f32_array(&args, "embedding")?;
+
+    let (folded, compression_ratio) =
+        crate::fold::complete_fold(storage, ctx, session_id, fold_id, summary, embedding)
+            .await
+            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    Ok(serde_json::json!({ "folded": folded, "compression_ratio": compression_ratio }))
+}
+
+async fn handle_retrieve_fold<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = require_uuid(&args, "session_id")?;
+    let query_embedding = require_f32_array(&args, "query_embedding")?;
+    let k = args.get("k").and_then(|v| v.as_u64()).map(|v| v as usize);
+    let include_raw = args
+        .get("include_raw")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let folds = crate::fold::retrieve_fold_context(
+        storage,
+        ctx,
+        session_id,
+        &query_embedding,
+        k,
+        include_raw,
+    )
+    .await
+    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    serde_json::to_value(&folds).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
+// --- Entity handlers ---
+
+async fn handle_upsert_entity<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = require_uuid(&args, "session_id")?;
+    let entity_name = require_str(&args, "entity_name")?;
+    let entity_type = require_str(&args, "entity_type")?;
+    let context_snippet = require_str(&args, "context_snippet")?;
+    let embedding = optional_f32_array(&args, "embedding")?;
+    let source_fold_id = optional_uuid(&args, "source_fold_id")?;
+    let confidence = args.get("confidence").and_then(|v| v.as_f64());
+
+    let result = crate::entity::upsert_entity(
+        storage,
+        ctx,
+        session_id,
+        entity_name,
+        entity_type,
+        context_snippet,
+        embedding,
+        source_fold_id,
+        confidence,
+    )
+    .await
+    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
+async fn handle_retrieve_entities<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = require_uuid(&args, "session_id")?;
+    let query = require_str(&args, "query")?;
+    let embedding = optional_f32_array(&args, "embedding")?;
+    let strategy = args
+        .get("strategy")
+        .and_then(|v| v.as_str())
+        .unwrap_or("both");
+    let k = args.get("k").and_then(|v| v.as_u64()).map(|v| v as usize);
+
+    let entities = crate::entity::retrieve_entities(
+        storage,
+        ctx,
+        session_id,
+        query,
+        embedding.as_deref(),
+        strategy,
+        k,
+    )
+    .await
+    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    serde_json::to_value(&entities).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
+// --- Feedback handler ---
+
+async fn handle_record_outcome<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = require_uuid(&args, "session_id")?;
+    let query_id = require_uuid(&args, "query_id")?;
+    let program_type = require_str(&args, "program_type")?;
+    let task_complexity = require_str(&args, "task_complexity")?;
+    let succeeded = args
+        .get("succeeded")
+        .and_then(|v| v.as_bool())
+        .ok_or((INVALID_PARAMS, "missing required bool: succeeded".into()))?;
+    let latency_ms = require_i32(&args, "latency_ms")?;
+    let token_cost = require_i32(&args, "token_cost")?;
+
+    let recorded = crate::feedback::record_outcome(
+        storage,
+        ctx,
+        session_id,
+        query_id,
+        program_type,
+        task_complexity,
+        succeeded,
+        latency_ms,
+        token_cost,
+    )
+    .await
+    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    Ok(serde_json::json!({ "recorded": recorded }))
+}
+
 // --- Parameter extraction helpers ---
+
+fn optional_uuid(args: &Value, field: &str) -> Result<Option<uuid::Uuid>, (i32, String)> {
+    match args.get(field).and_then(|v| v.as_str()) {
+        Some(s) => uuid::Uuid::parse_str(s)
+            .map(Some)
+            .map_err(|e| (INVALID_PARAMS, format!("invalid uuid {field}: {e}"))),
+        None => Ok(None),
+    }
+}
+
+fn require_f32_array(args: &Value, field: &str) -> Result<Vec<f32>, (i32, String)> {
+    args.get(field)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|n| n.as_f64().map(|f| f as f32))
+                .collect()
+        })
+        .ok_or((INVALID_PARAMS, format!("missing required array: {field}")))
+}
+
+fn optional_f32_array(args: &Value, field: &str) -> Result<Option<Vec<f32>>, (i32, String)> {
+    match args.get(field) {
+        Some(v) if v.is_array() => Ok(Some(
+            v.as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|n| n.as_f64().map(|f| f as f32))
+                .collect(),
+        )),
+        Some(_) => Err((INVALID_PARAMS, format!("{field} must be an array"))),
+        None => Ok(None),
+    }
+}
 
 fn require_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, (i32, String)> {
     args.get(field)
@@ -349,7 +681,7 @@ mod tests {
             .await
             .unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 12);
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"check_memo_cache"));
