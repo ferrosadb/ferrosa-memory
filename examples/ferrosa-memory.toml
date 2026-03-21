@@ -7,7 +7,7 @@ transport = "stdio"          # "stdio" for Claude Code, "http" for remote
 # log_level = "info"
 
 [ferrosa]
-contact_points = ["localhost:9042", "localhost:9043", "localhost:9044"]
+contact_points = ["localhost:19042", "localhost:19043", "localhost:19044"]
 keyspace = "agent_memory"
 # replication_factor = 3
 # consistency = "LOCAL_QUORUM"
@@ -27,10 +27,10 @@ model = "nomic-embed-text"
 dimensions = 768
 
 [graph]
-bolt_uri = "bolt://localhost:7687"
+bolt_uri = "bolt://localhost:17687"
 username = "neo4j"
 password = "neo4j"
-http_url = "http://localhost:7474"
+http_url = "http://localhost:17474"
 
 [security]
 # audit_log_enabled = true

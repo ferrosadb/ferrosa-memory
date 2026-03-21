@@ -8,12 +8,12 @@
 #   cqlsh localhost 9042 -f ddl/002_folds_entities.cql
 #
 # Ports:
-#   9042-9044  CQL (node1-3)
-#   7687-7689  Bolt/Cypher (node1-3)
-#   7474-7476  Graph HTTP (node1-3)
-#   9090-9092  Web console (node1-3)
-#   9000-9001  RustFS S3 + console
-#   11434      Ollama API
+#   19042-19044  CQL (node1-3)
+#   17687-17689  Bolt/Cypher (node1-3)
+#   17474-17476  Graph HTTP (node1-3)
+#   19090-19092  Web console (node1-3)
+#   19000-19001  RustFS S3 + console
+#   11434        Ollama API
 
 services:
   # --- S3-compatible object storage ---
@@ -32,8 +32,8 @@ services:
       volume-permissions:
         condition: service_completed_successfully
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "19000:9000"
+      - "19001:9001"
     environment:
       RUSTFS_VOLUMES: /data/rustfs0
       RUSTFS_ADDRESS: "0.0.0.0:9000"
@@ -66,14 +66,15 @@ services:
   node1:
     build:
       context: ../ferrosa
+    image: ferrosa-node1
     depends_on:
       rustfs-init:
         condition: service_completed_successfully
     ports:
-      - "9042:9042"    # CQL
-      - "7474:7474"    # Graph HTTP
-      - "7687:7687"    # Bolt
-      - "9090:9090"    # Web console
+      - "19042:9042"    # CQL
+      - "17474:7474"    # Graph HTTP
+      - "17687:7687"    # Bolt
+      - "19090:9090"    # Web console
     environment:
       FERROSA_DATA_DIR: /var/lib/ferrosa
       FERROSA_AUTH_DISABLED: "true"
@@ -99,14 +100,15 @@ services:
   node2:
     build:
       context: ../ferrosa
+    image: ferrosa-node1
     depends_on:
       rustfs-init:
         condition: service_completed_successfully
     ports:
-      - "9043:9042"    # CQL
-      - "7475:7474"    # Graph HTTP
-      - "7688:7687"    # Bolt
-      - "9091:9090"    # Web console
+      - "19043:9042"    # CQL
+      - "17475:7474"    # Graph HTTP
+      - "17688:7687"    # Bolt
+      - "19091:9090"    # Web console
     environment:
       FERROSA_DATA_DIR: /var/lib/ferrosa
       FERROSA_AUTH_DISABLED: "true"
@@ -132,14 +134,15 @@ services:
   node3:
     build:
       context: ../ferrosa
+    image: ferrosa-node1
     depends_on:
       rustfs-init:
         condition: service_completed_successfully
     ports:
-      - "9044:9042"    # CQL
-      - "7476:7474"    # Graph HTTP
-      - "7689:7687"    # Bolt
-      - "9092:9090"    # Web console
+      - "19044:9042"    # CQL
+      - "17476:7474"    # Graph HTTP
+      - "17689:7687"    # Bolt
+      - "19092:9090"    # Web console
     environment:
       FERROSA_DATA_DIR: /var/lib/ferrosa
       FERROSA_AUTH_DISABLED: "true"
