@@ -31,6 +31,31 @@ pub struct Config {
     pub security: SecurityConfig,
     #[serde(default)]
     pub routing: RoutingConfig,
+    #[serde(default)]
+    pub graph: GraphDbConfig,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GraphDbConfig {
+    #[serde(default = "default_bolt_uri")]
+    pub bolt_uri: String,
+    #[serde(default = "default_graph_user")]
+    pub username: String,
+    #[serde(default = "default_graph_pass")]
+    pub password: String,
+    #[serde(default = "default_http_graph_url")]
+    pub http_url: String,
+}
+
+impl Default for GraphDbConfig {
+    fn default() -> Self {
+        Self {
+            bolt_uri: default_bolt_uri(),
+            username: default_graph_user(),
+            password: default_graph_pass(),
+            http_url: default_http_graph_url(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -214,6 +239,18 @@ fn default_guideline_version() -> String {
 }
 fn default_cron() -> String {
     "0 2 * * *".into()
+}
+fn default_bolt_uri() -> String {
+    "bolt://localhost:7687".into()
+}
+fn default_graph_user() -> String {
+    "neo4j".into()
+}
+fn default_graph_pass() -> String {
+    "neo4j".into()
+}
+fn default_http_graph_url() -> String {
+    "http://localhost:7474".into()
 }
 
 /// Resolve the config file path. Checks, in order:

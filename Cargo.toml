@@ -41,3 +41,9 @@ anyhow = "1"
 
 # Config
 dirs = "6"
+
+# CQL driver (Ferrosa/Cassandra)
+cdrs-tokio = { version = "9", features = ["derive"] }
+
+# Cypher driver (Ferrosa graph / Neo4j)
+neo4rs = "0.8"

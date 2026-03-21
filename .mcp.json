@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ferrosa-memory": {
+      "command": "/home/bkearns/src/ferrosa-memory/target/release/ferrosa-memory-mcp",
+      "args": [],
+      "env": {
+        "RUST_LOG": "info"
+      },
+      "type": "stdio"
+    }
+  }
+}

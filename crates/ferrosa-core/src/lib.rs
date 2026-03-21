@@ -18,11 +18,13 @@
 pub mod auth;
 pub mod compression;
 pub mod config;
+pub mod cql_storage;
 pub mod dispatch;
 pub mod embedding;
 pub mod entity;
 pub mod feedback;
 pub mod fold;
+pub mod graph;
 pub mod http;
 pub mod memo;
 pub mod metrics;
