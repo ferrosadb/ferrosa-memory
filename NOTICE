@@ -1,0 +1,24 @@
+Ferrosa Memory
+Copyright 2026 Ferrosa, Inc.
+
+This product includes software developed at Ferrosa, Inc.
+(https://ferrosadb.com/).
+
+================================================================================
+Third-party attributions
+================================================================================
+
+Ferrosa Memory builds on top of Ferrosa (https://github.com/ferrosadb/ferrosa)
+and exposes its query interfaces over the Model Context Protocol (MCP).
+
+  - Ferrosa (Apache License 2.0) — see https://github.com/ferrosadb/ferrosa
+    for upstream attributions.
+
+  - Model Context Protocol (https://modelcontextprotocol.io/) — open
+    specification by Anthropic for LLM-tool interoperability.
+
+  - Tokio (https://tokio.rs/) — async runtime, dual-licensed under MIT and
+    Apache License 2.0.
+
+The full set of third-party Rust dependencies, with their licenses, is
+enumerated in THIRD_PARTY_LICENSES.md (generated via cargo-about).
