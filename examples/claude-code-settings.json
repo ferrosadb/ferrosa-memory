@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "ferrosa-memory": {
+      "command": "/path/to/ferrosa-memory-mcp",
+      "env": {
+        "FERROSA_MEMORY_CONFIG": "/path/to/ferrosa-memory.toml",
+        "RUST_LOG": "info"
+      }
+    }
+  }
+}
