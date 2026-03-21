@@ -217,7 +217,11 @@ fn positional_weight(index: usize, total: usize) -> f64 {
         return 1.0;
     }
     let pos = index as f64 / total as f64;
-    if !(0.1..=0.9).contains(&pos) { 1.5 } else { 1.0 }
+    if !(0.1..=0.9).contains(&pos) {
+        1.5
+    } else {
+        1.0
+    }
 }
 
 /// Check if a token is structural (connective, punctuation, or very short).
