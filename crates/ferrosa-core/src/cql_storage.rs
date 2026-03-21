@@ -76,9 +76,14 @@ impl CqlStorage {
             builder.build().await?
         };
 
-        let session = TcpSessionBuilder::new(RoundRobinLoadBalancingStrategy::new(), node_config)
-            .build()
-            .await?;
+        let session = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            TcpSessionBuilder::new(RoundRobinLoadBalancingStrategy::new(), node_config).build(),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("CQL session build timed out (10s) — is Ferrosa running?")
+        })??;
 
         let session = Arc::new(session);
         let ks = &config.keyspace;
