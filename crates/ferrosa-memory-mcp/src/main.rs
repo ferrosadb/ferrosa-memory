@@ -312,16 +312,17 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Connect graph client (non-fatal if it fails)
+    // Connect graph client via HTTP (non-fatal if it fails)
     match ferrosa_core::graph::GraphClient::connect(&ferrosa_core::graph::GraphConfig {
-        bolt_uri: config.graph.bolt_uri.clone(),
+        http_url: config.graph.http_url.clone(),
         username: config.graph.username.clone(),
         password: config.graph.password.clone(),
+        keyspace: config.ferrosa.keyspace.clone(),
     })
     .await
     {
-        Ok(_graph) => tracing::info!("connected to Ferrosa graph (Bolt)"),
-        Err(e) => tracing::warn!("Bolt connection failed ({e}), graph features disabled"),
+        Ok(_graph) => tracing::info!("connected to Ferrosa graph (HTTP)"),
+        Err(e) => tracing::warn!("graph connection failed ({e}), graph traversals disabled"),
     };
 
     match config.server.transport.as_str() {

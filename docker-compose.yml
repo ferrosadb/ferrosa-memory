@@ -21,7 +21,7 @@ services:
   volume-permissions:
     image: alpine
     volumes:
-      - rustfs-data:/data
+      - ~/data/ferrosa-memory/rustfs:/data
     command: >
       sh -c "chown -R 10001:10001 /data && echo 'permissions fixed'"
     restart: "no"
@@ -42,7 +42,7 @@ services:
       RUSTFS_ACCESS_KEY: rustfsadmin
       RUSTFS_SECRET_KEY: rustfsadmin  # pragma: allowlist secret
     volumes:
-      - rustfs-data:/data
+      - ~/data/ferrosa-memory/rustfs:/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
       interval: 5s
@@ -64,9 +64,7 @@ services:
   # --- 3-node Ferrosa cluster (CQL + Graph + Bolt) ---
 
   node1:
-    build:
-      context: ../ferrosa
-    image: ferrosa-node1
+    image: ferrosa-memory-node
     depends_on:
       rustfs-init:
         condition: service_completed_successfully
@@ -89,7 +87,7 @@ services:
       FERROSA_S3_ACCESS_KEY_ID: rustfsadmin
       FERROSA_S3_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
     volumes:
-      - node1-data:/var/lib/ferrosa
+      - ~/data/ferrosa-memory/node1:/var/lib/ferrosa
     healthcheck:
       test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9042' || exit 1"]
       interval: 5s
@@ -98,9 +96,7 @@ services:
       start_period: 15s
 
   node2:
-    build:
-      context: ../ferrosa
-    image: ferrosa-node1
+    image: ferrosa-memory-node
     depends_on:
       rustfs-init:
         condition: service_completed_successfully
@@ -123,7 +119,7 @@ services:
       FERROSA_S3_ACCESS_KEY_ID: rustfsadmin
       FERROSA_S3_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
     volumes:
-      - node2-data:/var/lib/ferrosa
+      - ~/data/ferrosa-memory/node2:/var/lib/ferrosa
     healthcheck:
       test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9042' || exit 1"]
       interval: 5s
@@ -132,9 +128,7 @@ services:
       start_period: 15s
 
   node3:
-    build:
-      context: ../ferrosa
-    image: ferrosa-node1
+    image: ferrosa-memory-node
     depends_on:
       rustfs-init:
         condition: service_completed_successfully
@@ -157,7 +151,7 @@ services:
       FERROSA_S3_ACCESS_KEY_ID: rustfsadmin
       FERROSA_S3_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
     volumes:
-      - node3-data:/var/lib/ferrosa
+      - ~/data/ferrosa-memory/node3:/var/lib/ferrosa
     healthcheck:
       test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9042' || exit 1"]
       interval: 5s
@@ -188,8 +182,4 @@ services:
       start_period: 10s
 
 volumes:
-  rustfs-data:
-  node1-data:
-  node2-data:
-  node3-data:
   ollama-data:

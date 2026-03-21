@@ -45,5 +45,5 @@ dirs = "6"
 # CQL driver (Ferrosa/Cassandra)
 cdrs-tokio = { version = "9", features = ["derive"] }
 
-# Cypher driver (Ferrosa graph / Neo4j)
-neo4rs = "0.8"
+# neo4rs removed — Ferrosa's Bolt is v5, neo4rs 0.8 only supports v4
+# Graph queries go through Ferrosa's HTTP /graph/query endpoint via reqwest

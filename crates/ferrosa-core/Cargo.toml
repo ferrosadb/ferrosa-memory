@@ -21,4 +21,3 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 dirs = { workspace = true }
 cdrs-tokio = { workspace = true }
-neo4rs = { workspace = true }

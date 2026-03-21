@@ -1,7 +1,12 @@
-//! Cypher graph client using neo4rs (Bolt protocol).
+//! Graph client for Ferrosa's HTTP Cypher endpoint.
 //!
-//! Connects to Ferrosa's graph layer on port 7687 (Bolt) for managing
-//! fold hierarchy edges, entity relationship edges, and temporal supersession.
+//! Ferrosa's graph model is property-graph-on-CQL: vertices are CQL rows in
+//! tables annotated with `graph.type=vertex`, edges are CQL rows in tables
+//! annotated with `graph.type=edge`. The graph adjacency index is maintained
+//! automatically.
+//!
+//! **Writes** go through CQL (via `CqlStorage`) — INSERT into vertex/edge tables.
+//! **Reads/traversals** go through the graph HTTP API — MATCH queries via Cypher.
 //!
 //! ## Edge types
 //!
@@ -9,131 +14,108 @@
 //! - `CO_OCCURS_WITH` — entity <-> entity (same fold)
 //! - `MENTIONED_IN` — entity -> fold
 //! - `SUPERSEDES` — new temporal fact -> old fact
-//!
-//! ## Ferrosa endpoints
-//!
-//! - Bolt: port 7687 (used by neo4rs)
-//! - HTTP: port 7474 (available for REST queries)
 
-use neo4rs::{Graph, query};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Graph client wrapping a neo4rs connection pool.
+/// Graph client wrapping an HTTP connection to Ferrosa's graph endpoint.
 pub struct GraphClient {
-    graph: Graph,
+    client: reqwest::Client,
+    base_url: String,
+    auth_header: String,
+    keyspace: String,
 }
 
 /// Configuration for the graph connection.
 pub struct GraphConfig {
-    pub bolt_uri: String,
+    pub http_url: String,
     pub username: String,
     pub password: String,
+    pub keyspace: String,
 }
 
 impl Default for GraphConfig {
     fn default() -> Self {
         Self {
-            bolt_uri: "bolt://localhost:7687".into(),
-            username: "neo4j".into(),
-            password: "neo4j".into(),
+            http_url: "http://localhost:17474".into(),
+            username: "cassandra".into(),
+            password: "cassandra".into(),
+            keyspace: "agent_memory".into(),
         }
     }
 }
 
+#[derive(Serialize)]
+struct CypherRequest<'a> {
+    query: &'a str,
+    keyspace: &'a str,
+}
+
+#[derive(Deserialize, Debug)]
+struct CypherResponse {
+    #[serde(default)]
+    _columns: Vec<String>,
+    #[serde(default)]
+    rows: Vec<Vec<serde_json::Value>>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
 impl GraphClient {
-    /// Connect to Ferrosa's graph layer via Bolt protocol.
+    /// Connect to Ferrosa's graph HTTP endpoint.
     pub async fn connect(config: &GraphConfig) -> anyhow::Result<Self> {
-        let graph = Graph::new(&config.bolt_uri, &config.username, &config.password).await?;
-        tracing::info!(uri = %config.bolt_uri, "graph client connected via Bolt");
-        Ok(Self { graph })
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+
+        let auth = base64_encode(&format!("{}:{}", config.username, config.password));
+        let auth_header = format!("Basic {auth}");
+
+        // Health check
+        let resp = client
+            .get(format!("{}/graph/health", config.http_url))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("graph health check failed: {}", resp.status());
+        }
+
+        tracing::info!(url = %config.http_url, "graph client connected via HTTP");
+
+        Ok(Self {
+            client,
+            base_url: config.http_url.clone(),
+            auth_header,
+            keyspace: config.keyspace.clone(),
+        })
     }
 
-    /// Create a FOLDED_INTO edge from child fold to parent fold.
-    pub async fn create_fold_edge(
-        &self,
-        child_fold_id: Uuid,
-        parent_fold_id: Uuid,
-        session_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.graph
-            .run(
-                query(
-                    "MERGE (child:Fold {fold_id: $child_id, session_id: $session_id}) \
-                     MERGE (parent:Fold {fold_id: $parent_id, session_id: $session_id}) \
-                     MERGE (child)-[:FOLDED_INTO]->(parent)",
-                )
-                .param("child_id", child_fold_id.to_string())
-                .param("parent_id", parent_fold_id.to_string())
-                .param("session_id", session_id.to_string()),
-            )
-            .await?;
-        Ok(())
-    }
+    /// Execute a Cypher MATCH query against the graph endpoint.
+    async fn query(&self, cypher: &str) -> anyhow::Result<CypherResponse> {
+        let req = CypherRequest {
+            query: cypher,
+            keyspace: &self.keyspace,
+        };
 
-    /// Create a MENTIONED_IN edge from entity to fold.
-    pub async fn create_mentioned_in_edge(
-        &self,
-        entity_id: Uuid,
-        fold_id: Uuid,
-        session_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.graph
-            .run(
-                query(
-                    "MERGE (e:Entity {entity_id: $entity_id, session_id: $session_id}) \
-                     MERGE (f:Fold {fold_id: $fold_id, session_id: $session_id}) \
-                     MERGE (e)-[:MENTIONED_IN]->(f)",
-                )
-                .param("entity_id", entity_id.to_string())
-                .param("fold_id", fold_id.to_string())
-                .param("session_id", session_id.to_string()),
-            )
+        let resp = self
+            .client
+            .post(format!("{}/graph/query", self.base_url))
+            .header("Authorization", &self.auth_header)
+            .header("Content-Type", "application/json")
+            .json(&req)
+            .send()
             .await?;
-        Ok(())
-    }
 
-    /// Create a CO_OCCURS_WITH edge between two entities.
-    pub async fn create_co_occurrence_edge(
-        &self,
-        entity_a: Uuid,
-        entity_b: Uuid,
-        session_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.graph
-            .run(
-                query(
-                    "MERGE (a:Entity {entity_id: $a_id, session_id: $session_id}) \
-                     MERGE (b:Entity {entity_id: $b_id, session_id: $session_id}) \
-                     MERGE (a)-[:CO_OCCURS_WITH]-(b)",
-                )
-                .param("a_id", entity_a.to_string())
-                .param("b_id", entity_b.to_string())
-                .param("session_id", session_id.to_string()),
-            )
-            .await?;
-        Ok(())
-    }
+        let body = resp.text().await?;
+        let parsed: CypherResponse = serde_json::from_str(&body)
+            .map_err(|e| anyhow::anyhow!("graph response parse error: {e}, body: {body}"))?;
 
-    /// Create a SUPERSEDES edge from new temporal fact to old fact.
-    pub async fn create_supersedes_edge(
-        &self,
-        new_event_id: Uuid,
-        old_event_id: Uuid,
-        entity_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.graph
-            .run(
-                query(
-                    "MERGE (new_f:Fact {event_id: $new_id, entity_id: $entity_id}) \
-                     MERGE (old_f:Fact {event_id: $old_id, entity_id: $entity_id}) \
-                     MERGE (new_f)-[:SUPERSEDES]->(old_f)",
-                )
-                .param("new_id", new_event_id.to_string())
-                .param("old_id", old_event_id.to_string())
-                .param("entity_id", entity_id.to_string()),
-            )
-            .await?;
-        Ok(())
+        if let Some(err) = &parsed.error {
+            anyhow::bail!("graph query error: {err}");
+        }
+
+        Ok(parsed)
     }
 
     /// Traverse the fold hierarchy: get all ancestors of a fold.
@@ -143,28 +125,13 @@ impl GraphClient {
         session_id: Uuid,
         max_depth: usize,
     ) -> anyhow::Result<Vec<String>> {
-        let mut result = self
-            .graph
-            .execute(
-                query(
-                    "MATCH (start:Fold {fold_id: $fold_id, session_id: $session_id}) \
-                     MATCH path = (start)-[:FOLDED_INTO*1..]->(ancestor) \
-                     WHERE length(path) <= $max_depth \
-                     RETURN ancestor.fold_id AS ancestor_id",
-                )
-                .param("fold_id", fold_id.to_string())
-                .param("session_id", session_id.to_string())
-                .param("max_depth", max_depth as i64),
-            )
-            .await?;
-
-        let mut ancestors = Vec::new();
-        while let Some(row) = result.next().await? {
-            if let Ok(id) = row.get::<String>("ancestor_id") {
-                ancestors.push(id);
-            }
-        }
-        Ok(ancestors)
+        let cypher = format!(
+            "MATCH (start:Fold {{fold_id: '{fold_id}', session_id: '{session_id}'}})\
+             -[:FOLDED_INTO*1..{max_depth}]->(ancestor) \
+             RETURN ancestor.fold_id AS ancestor_id"
+        );
+        let resp = self.query(&cypher).await?;
+        Ok(extract_string_column(&resp))
     }
 
     /// Find entities related to a given entity within N hops.
@@ -174,56 +141,100 @@ impl GraphClient {
         session_id: Uuid,
         max_hops: usize,
     ) -> anyhow::Result<Vec<String>> {
-        let mut result = self
-            .graph
-            .execute(
-                query(
-                    "MATCH (start:Entity {entity_id: $entity_id, session_id: $session_id}) \
-                     MATCH path = (start)-[:CO_OCCURS_WITH*1..]-(related) \
-                     WHERE length(path) <= $max_hops AND related <> start \
-                     RETURN DISTINCT related.entity_id AS related_id",
-                )
-                .param("entity_id", entity_id.to_string())
-                .param("session_id", session_id.to_string())
-                .param("max_hops", max_hops as i64),
-            )
-            .await?;
-
-        let mut related = Vec::new();
-        while let Some(row) = result.next().await? {
-            if let Ok(id) = row.get::<String>("related_id") {
-                related.push(id);
-            }
-        }
-        Ok(related)
+        let cypher = format!(
+            "MATCH (start:Entity {{entity_id: '{entity_id}', session_id: '{session_id}'}})\
+             -[:CO_OCCURS_WITH*1..{max_hops}]-(related) \
+             WHERE related <> start \
+             RETURN DISTINCT related.entity_id AS related_id"
+        );
+        let resp = self.query(&cypher).await?;
+        Ok(extract_string_column(&resp))
     }
 
-    /// Get the temporal supersession chain for an entity.
+    /// Get entities mentioned in a specific fold.
+    pub async fn get_entities_in_fold(
+        &self,
+        fold_id: Uuid,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<String>> {
+        let cypher = format!(
+            "MATCH (e:Entity)-[:MENTIONED_IN]->(f:Fold {{fold_id: '{fold_id}', session_id: '{session_id}'}}) \
+             RETURN e.entity_id AS entity_id"
+        );
+        let resp = self.query(&cypher).await?;
+        Ok(extract_string_column(&resp))
+    }
+
+    /// Get the temporal supersession chain for a fact.
     pub async fn get_supersession_chain(
         &self,
         event_id: Uuid,
         entity_id: Uuid,
     ) -> anyhow::Result<Vec<String>> {
-        let mut result = self
-            .graph
-            .execute(
-                query(
-                    "MATCH (start:Fact {event_id: $event_id, entity_id: $entity_id}) \
-                     MATCH path = (start)-[:SUPERSEDES*1..]->(older) \
-                     RETURN older.event_id AS event_id \
-                     ORDER BY length(path)",
-                )
-                .param("event_id", event_id.to_string())
-                .param("entity_id", entity_id.to_string()),
-            )
-            .await?;
+        let cypher = format!(
+            "MATCH (start:Fact {{event_id: '{event_id}', entity_id: '{entity_id}'}})\
+             -[:SUPERSEDES*1..]->(older) \
+             RETURN older.event_id AS event_id"
+        );
+        let resp = self.query(&cypher).await?;
+        Ok(extract_string_column(&resp))
+    }
+}
 
-        let mut chain = Vec::new();
-        while let Some(row) = result.next().await? {
-            if let Ok(id) = row.get::<String>("event_id") {
-                chain.push(id);
-            }
+/// Extract first column as strings from a Cypher response.
+fn extract_string_column(resp: &CypherResponse) -> Vec<String> {
+    resp.rows
+        .iter()
+        .filter_map(|row| row.first().and_then(|v| v.as_str().map(String::from)))
+        .collect()
+}
+
+fn base64_encode(input: &str) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len() * 4 / 3 + 4);
+    for chunk in input.as_bytes().chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
         }
-        Ok(chain)
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_encode_works() {
+        assert_eq!(
+            base64_encode("cassandra:cassandra"),
+            "Y2Fzc2FuZHJhOmNhc3NhbmRyYQ=="
+        );
+    }
+
+    #[test]
+    fn extract_string_column_from_response() {
+        let resp = CypherResponse {
+            _columns: vec!["id".into()],
+            rows: vec![
+                vec![serde_json::json!("abc")],
+                vec![serde_json::json!("def")],
+            ],
+            error: None,
+        };
+        assert_eq!(extract_string_column(&resp), vec!["abc", "def"]);
     }
 }
