@@ -1,9 +1,9 @@
 # Ferrosa Memory MCP Server
 ## Product Specification v0.1
 
-**Status:** Pre-implementation draft  
-**Authors:** Ben  
-**Last updated:** 2026-03-21  
+**Status:** Pre-implementation draft
+**Authors:** Ben
+**Last updated:** 2026-03-21
 **Repository:** TBD (ferrosa-memory-mcp)
 
 ---
