@@ -44,3 +44,4 @@ pub mod storage;
 pub mod temporal;
 pub mod transport;
 pub mod types;
+pub mod vector;
