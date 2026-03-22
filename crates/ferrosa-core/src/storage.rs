@@ -14,8 +14,8 @@
 use uuid::Uuid;
 
 use crate::types::{
-    EntityEntry, FeedbackOutcome, FoldEntry, FoldStatus, FoldSummary, MemoEntry, MemoryState,
-    PlanNode, PlanStatus, TemporalEvent, TenantContext,
+    EntityEntry, FeedbackOutcome, FoldEntry, FoldSummary, MemoEntry, MemoryState, PlanNode,
+    PlanStatus, TemporalEvent, TenantContext,
 };
 
 /// Core storage operations for the memory system.
@@ -228,6 +228,31 @@ pub trait Storage: Send + Sync {
         old_event_id: Uuid,
         entity_id: Uuid,
     ) -> anyhow::Result<()>;
+
+    // --- Intention operations ---
+
+    /// Store a new intention.
+    async fn intention_put(
+        &self,
+        ctx: &TenantContext,
+        intention: &crate::intention::Intention,
+    ) -> anyhow::Result<()>;
+
+    /// List all intentions for a tenant.
+    async fn intention_list(
+        &self,
+        ctx: &TenantContext,
+    ) -> anyhow::Result<Vec<crate::intention::Intention>>;
+
+    /// Update an intention's status and optional timestamps.
+    async fn intention_update_status(
+        &self,
+        ctx: &TenantContext,
+        id: Uuid,
+        status: &str,
+        triggered_at: Option<chrono::DateTime<chrono::Utc>>,
+        completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> anyhow::Result<()>;
 }
 
 /// In-memory mock storage for unit tests.
@@ -236,6 +261,7 @@ pub trait Storage: Send + Sync {
 #[cfg(any(test, feature = "mock-storage"))]
 pub mod mock {
     use super::*;
+    use crate::types::FoldStatus;
     use tokio::sync::Mutex;
 
     #[derive(Default)]
@@ -246,6 +272,7 @@ pub mod mock {
         pub entities: Mutex<Vec<EntityEntry>>,
         pub temporal_events: Mutex<Vec<TemporalEvent>>,
         pub feedback: Mutex<Vec<FeedbackOutcome>>,
+        pub intentions: Mutex<Vec<crate::intention::Intention>>,
     }
 
     impl MockStorage {
@@ -649,6 +676,42 @@ pub mod mock {
             _old: Uuid,
             _entity: Uuid,
         ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        // --- Intention operations ---
+
+        async fn intention_put(
+            &self,
+            _ctx: &TenantContext,
+            intention: &crate::intention::Intention,
+        ) -> anyhow::Result<()> {
+            self.intentions.lock().await.push(intention.clone());
+            Ok(())
+        }
+
+        async fn intention_list(
+            &self,
+            _ctx: &TenantContext,
+        ) -> anyhow::Result<Vec<crate::intention::Intention>> {
+            Ok(self.intentions.lock().await.clone())
+        }
+
+        async fn intention_update_status(
+            &self,
+            _ctx: &TenantContext,
+            id: Uuid,
+            status: &str,
+            triggered_at: Option<chrono::DateTime<chrono::Utc>>,
+            completed_at: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> anyhow::Result<()> {
+            let mut intentions = self.intentions.lock().await;
+            if let Some(i) = intentions.iter_mut().find(|i| i.id == id) {
+                i.status = serde_json::from_str(&format!("\"{status}\""))
+                    .unwrap_or(crate::intention::IntentionStatus::Pending);
+                i.triggered_at = triggered_at;
+                i.completed_at = completed_at;
+            }
             Ok(())
         }
     }

@@ -75,13 +75,13 @@ impl IntentionStore {
         }
     }
 
-    /// Set a new intention.
+    /// Set a new intention. Returns the created Intention for persistence.
     pub fn set(
         &mut self,
         description: &str,
         trigger: IntentionTrigger,
         priority: Priority,
-    ) -> Uuid {
+    ) -> Intention {
         let id = Uuid::new_v4();
         let intention = Intention {
             id,
@@ -94,8 +94,13 @@ impl IntentionStore {
             completed_at: None,
         };
         tracing::info!(%id, description, "intention set");
-        self.intentions.push(intention);
-        id
+        self.intentions.push(intention.clone());
+        intention
+    }
+
+    /// Load intentions from storage (for session restart recovery).
+    pub fn load(&mut self, intentions: Vec<Intention>) {
+        self.intentions = intentions;
     }
 
     /// Check which intentions are triggered by the current context.
@@ -212,7 +217,7 @@ mod tests {
     #[test]
     fn complete_intention() {
         let mut store = IntentionStore::new();
-        let id = store.set(
+        let intention = store.set(
             "Add tests",
             IntentionTrigger::Topic {
                 keywords: vec!["test".into()],
@@ -221,7 +226,7 @@ mod tests {
         );
 
         store.check("running tests");
-        assert!(store.complete(id));
+        assert!(store.complete(intention.id));
 
         let pending = store.pending();
         assert!(pending.is_empty());

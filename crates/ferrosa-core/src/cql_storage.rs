@@ -63,6 +63,10 @@ struct PreparedStatements {
     edge_supersedes: PreparedQuery,
     // Feedback
     feedback_put: PreparedQuery,
+    // Intentions
+    intention_put: PreparedQuery,
+    intention_list: PreparedQuery,
+    intention_update_status: PreparedQuery,
 }
 
 /// CQL storage backend.
@@ -265,11 +269,33 @@ impl CqlStorage {
                      VALUES (?, ?, ?, ?, ?)"
                 ))
                 .await?,
+            // Intentions
+            intention_put: session
+                .prepare(format!(
+                    "INSERT INTO {ks}.intentions \
+                     (tenant_id, intention_id, description, trigger_json, priority, \
+                      status, created_at, triggered_at, completed_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                ))
+                .await?,
+            intention_list: session
+                .prepare(format!(
+                    "SELECT intention_id, description, trigger_json, priority, status, \
+                     created_at, triggered_at, completed_at \
+                     FROM {ks}.intentions WHERE tenant_id = ?"
+                ))
+                .await?,
+            intention_update_status: session
+                .prepare(format!(
+                    "UPDATE {ks}.intentions SET status = ?, triggered_at = ?, completed_at = ? \
+                     WHERE tenant_id = ? AND intention_id = ?"
+                ))
+                .await?,
         };
 
         tracing::info!(
             keyspace = ks,
-            statements = 24,
+            statements = 27,
             "CQL storage connected, all statements prepared"
         );
 
@@ -1150,6 +1176,108 @@ impl Storage for CqlStorage {
             )
             .await?;
         tracing::debug!(%new_event_id, %old_event_id, "SUPERSEDES edge created");
+        Ok(())
+    }
+
+    // --- Intention operations ---
+
+    async fn intention_put(
+        &self,
+        ctx: &TenantContext,
+        intention: &crate::intention::Intention,
+    ) -> anyhow::Result<()> {
+        let trigger_json = serde_json::to_string(&intention.trigger)?;
+        let priority_str = serde_json::to_string(&intention.priority)?
+            .trim_matches('"')
+            .to_string();
+        let status_str = serde_json::to_string(&intention.status)?
+            .trim_matches('"')
+            .to_string();
+
+        self.session
+            .exec_with_values(
+                &self.stmts.intention_put,
+                query_values!(
+                    ctx.tenant_id,
+                    intention.id,
+                    intention.description.clone(),
+                    trigger_json,
+                    priority_str,
+                    status_str,
+                    intention.created_at.naive_utc(),
+                    intention.triggered_at.map(|t| t.naive_utc()),
+                    intention.completed_at.map(|t| t.naive_utc())
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn intention_list(
+        &self,
+        ctx: &TenantContext,
+    ) -> anyhow::Result<Vec<crate::intention::Intention>> {
+        let rows = self
+            .query_rows(&self.stmts.intention_list, query_values!(ctx.tenant_id))
+            .await?;
+
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            let trigger_json: String = row.r_by_name("trigger_json")?;
+            let trigger: crate::intention::IntentionTrigger = serde_json::from_str(&trigger_json)?;
+
+            let priority_str: String = row.r_by_name("priority")?;
+            let priority: crate::intention::Priority =
+                serde_json::from_str(&format!("\"{priority_str}\""))
+                    .unwrap_or(crate::intention::Priority::Normal);
+
+            let status_str: String = row.r_by_name("status")?;
+            let status: crate::intention::IntentionStatus =
+                serde_json::from_str(&format!("\"{status_str}\""))
+                    .unwrap_or(crate::intention::IntentionStatus::Pending);
+
+            let created: chrono::NaiveDateTime = row.r_by_name("created_at")?;
+
+            results.push(crate::intention::Intention {
+                id: row.r_by_name("intention_id")?,
+                description: row.r_by_name("description")?,
+                trigger,
+                priority,
+                status,
+                created_at: created.and_utc(),
+                triggered_at: row
+                    .r_by_name::<chrono::NaiveDateTime>("triggered_at")
+                    .ok()
+                    .map(|t| t.and_utc()),
+                completed_at: row
+                    .r_by_name::<chrono::NaiveDateTime>("completed_at")
+                    .ok()
+                    .map(|t| t.and_utc()),
+            });
+        }
+        Ok(results)
+    }
+
+    async fn intention_update_status(
+        &self,
+        ctx: &TenantContext,
+        id: Uuid,
+        status: &str,
+        triggered_at: Option<chrono::DateTime<chrono::Utc>>,
+        completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> anyhow::Result<()> {
+        self.session
+            .exec_with_values(
+                &self.stmts.intention_update_status,
+                query_values!(
+                    status.to_string(),
+                    triggered_at.map(|t| t.naive_utc()),
+                    completed_at.map(|t| t.naive_utc()),
+                    ctx.tenant_id,
+                    id
+                ),
+            )
+            .await?;
         Ok(())
     }
 }

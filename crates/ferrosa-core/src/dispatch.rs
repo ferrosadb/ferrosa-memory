@@ -509,11 +509,11 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "record_outcome" => handle_record_outcome(args, storage, ctx).await,
         "delete_session" => handle_delete_session(args, storage, ctx).await,
         "smart_ingest" => handle_smart_ingest(args, storage, ctx).await,
-        "set_intention" => handle_set_intention(args, session).await,
-        "check_intentions" => handle_check_intentions(args, session).await,
-        "complete_intention" => handle_complete_intention(args, session).await,
+        "set_intention" => handle_set_intention(args, storage, ctx, session).await,
+        "check_intentions" => handle_check_intentions(args, storage, ctx, session).await,
+        "complete_intention" => handle_complete_intention(args, storage, ctx, session).await,
         "list_intentions" => handle_list_intentions(session).await,
-        "snooze_intention" => handle_snooze_intention(args, session).await,
+        "snooze_intention" => handle_snooze_intention(args, storage, ctx, session).await,
         "write_temporal_fact" => handle_write_temporal_fact(args, storage, ctx).await,
         "get_temporal_chain" => handle_get_temporal_chain(args, storage, ctx).await,
         "explore_connections" => handle_explore_connections(args, session).await,
@@ -937,7 +937,12 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
 
 // --- Intention handlers ---
 
-async fn handle_set_intention(args: Value, session: &SessionState) -> Result<Value, (i32, String)> {
+async fn handle_set_intention<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
     let description = require_str(&args, "description")?;
     let trigger_json = args
         .get("trigger")
@@ -954,12 +959,21 @@ async fn handle_set_intention(args: Value, session: &SessionState) -> Result<Val
         .unwrap_or(crate::intention::Priority::Normal);
 
     let mut store = session.intentions.lock().await;
-    let id = store.set(description, trigger, priority);
+    let intention = store.set(description, trigger, priority);
+    let id = intention.id;
+
+    // Persist to storage (best-effort -- in-memory is primary)
+    if let Err(e) = storage.intention_put(ctx, &intention).await {
+        tracing::warn!(error = %e, "failed to persist intention to storage");
+    }
+
     Ok(serde_json::json!({ "intention_id": id.to_string() }))
 }
 
-async fn handle_check_intentions(
+async fn handle_check_intentions<S: crate::storage::Storage>(
     args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
     let context = require_str(&args, "context")?;
@@ -969,16 +983,42 @@ async fn handle_check_intentions(
         .iter()
         .map(|i| serde_json::to_value(i).unwrap_or(Value::Null))
         .collect();
+
+    // Persist status changes for triggered intentions
+    for intention in &triggered {
+        let status_str = serde_json::to_string(&intention.status)
+            .unwrap_or_else(|_| "\"triggered\"".into())
+            .trim_matches('"')
+            .to_string();
+        if let Err(e) = storage
+            .intention_update_status(ctx, intention.id, &status_str, intention.triggered_at, None)
+            .await
+        {
+            tracing::warn!(id = %intention.id, error = %e, "failed to persist intention trigger");
+        }
+    }
+
     Ok(serde_json::json!({ "triggered": triggered_json }))
 }
 
-async fn handle_complete_intention(
+async fn handle_complete_intention<S: crate::storage::Storage>(
     args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
     let id = require_uuid(&args, "intention_id")?;
     let mut store = session.intentions.lock().await;
     let completed = store.complete(id);
+
+    if completed
+        && let Err(e) = storage
+            .intention_update_status(ctx, id, "completed", None, Some(chrono::Utc::now()))
+            .await
+    {
+        tracing::warn!(%id, error = %e, "failed to persist intention completion");
+    }
+
     Ok(serde_json::json!({ "completed": completed }))
 }
 
@@ -992,13 +1032,24 @@ async fn handle_list_intentions(session: &SessionState) -> Result<Value, (i32, S
     Ok(serde_json::json!({ "intentions": json }))
 }
 
-async fn handle_snooze_intention(
+async fn handle_snooze_intention<S: crate::storage::Storage>(
     args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
     let id = require_uuid(&args, "intention_id")?;
     let mut store = session.intentions.lock().await;
     let snoozed = store.snooze(id);
+
+    if snoozed
+        && let Err(e) = storage
+            .intention_update_status(ctx, id, "pending", None, None)
+            .await
+    {
+        tracing::warn!(%id, error = %e, "failed to persist intention snooze");
+    }
+
     Ok(serde_json::json!({ "snoozed": snoozed }))
 }
 
@@ -1666,5 +1717,129 @@ mod tests {
         assert_eq!(result["fold_count"], 0);
         assert_eq!(result["memo_count"], 0);
         assert_eq!(result["intention_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn intention_persists_to_storage() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+
+        // Set an intention — should persist to mock storage
+        let params = serde_json::json!({
+            "name": "set_intention",
+            "arguments": {
+                "description": "Check SQL injection patterns",
+                "trigger": { "type": "Topic", "keywords": ["sql", "injection"] },
+                "priority": "high"
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let intention_id = result["intention_id"].as_str().unwrap().to_string();
+
+        // Verify it was persisted to storage
+        let stored = store.intentions.lock().await;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id.to_string(), intention_id);
+        assert_eq!(stored[0].description, "Check SQL injection patterns");
+        drop(stored);
+
+        // Read back from storage trait
+        use crate::storage::Storage as _;
+        let loaded = store.intention_list(&ctx).await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id.to_string(), intention_id);
+    }
+
+    #[tokio::test]
+    async fn intention_complete_persists_status() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+
+        // Set an intention
+        let params = serde_json::json!({
+            "name": "set_intention",
+            "arguments": {
+                "description": "Review auth module",
+                "trigger": { "type": "Topic", "keywords": ["auth"] },
+                "priority": "normal"
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let intention_id = result["intention_id"].as_str().unwrap().to_string();
+
+        // Trigger it
+        let params = serde_json::json!({
+            "name": "check_intentions",
+            "arguments": { "context": "working on auth middleware" }
+        });
+        dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+
+        // Verify triggered status was persisted
+        let stored = store.intentions.lock().await;
+        assert_eq!(
+            stored[0].status,
+            crate::intention::IntentionStatus::Triggered
+        );
+        drop(stored);
+
+        // Complete it
+        let params = serde_json::json!({
+            "name": "complete_intention",
+            "arguments": { "intention_id": intention_id }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        assert_eq!(result["completed"], true);
+
+        // Verify completed status was persisted
+        let stored = store.intentions.lock().await;
+        assert_eq!(
+            stored[0].status,
+            crate::intention::IntentionStatus::Completed
+        );
+        assert!(stored[0].completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn intention_load_from_storage() {
+        use crate::intention::*;
+        use crate::storage::Storage as _;
+
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+
+        // Simulate pre-existing intentions in storage (from previous session)
+        let intention = Intention {
+            id: Uuid::new_v4(),
+            description: "Previously stored intention".into(),
+            trigger: IntentionTrigger::Topic {
+                keywords: vec!["rust".into()],
+            },
+            priority: Priority::High,
+            status: IntentionStatus::Pending,
+            created_at: chrono::Utc::now(),
+            triggered_at: None,
+            completed_at: None,
+        };
+        store.intention_put(&ctx, &intention).await.unwrap();
+
+        // Load from storage into IntentionStore
+        let loaded = store.intention_list(&ctx).await.unwrap();
+        let mut intention_store = IntentionStore::new();
+        intention_store.load(loaded);
+
+        // Verify the loaded intention triggers correctly
+        let triggered = intention_store.check("writing rust code");
+        assert_eq!(triggered.len(), 1);
+        assert_eq!(triggered[0].description, "Previously stored intention");
     }
 }

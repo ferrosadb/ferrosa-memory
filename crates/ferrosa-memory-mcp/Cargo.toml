@@ -11,4 +11,5 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+chrono = { workspace = true }
 anyhow = { workspace = true }

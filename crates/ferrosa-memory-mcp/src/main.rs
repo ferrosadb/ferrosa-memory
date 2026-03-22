@@ -378,6 +378,47 @@ impl Storage for StorageBackend {
             Self::Mock(s) => s.edge_supersedes(ctx, new_id, old_id, entity).await,
         }
     }
+
+    async fn intention_put(
+        &self,
+        ctx: &TenantContext,
+        intention: &ferrosa_core::intention::Intention,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Cql(s) => s.intention_put(ctx, intention).await,
+            Self::Mock(s) => s.intention_put(ctx, intention).await,
+        }
+    }
+
+    async fn intention_list(
+        &self,
+        ctx: &TenantContext,
+    ) -> anyhow::Result<Vec<ferrosa_core::intention::Intention>> {
+        match self {
+            Self::Cql(s) => s.intention_list(ctx).await,
+            Self::Mock(s) => s.intention_list(ctx).await,
+        }
+    }
+
+    async fn intention_update_status(
+        &self,
+        ctx: &TenantContext,
+        id: uuid::Uuid,
+        status: &str,
+        triggered_at: Option<chrono::DateTime<chrono::Utc>>,
+        completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Cql(s) => {
+                s.intention_update_status(ctx, id, status, triggered_at, completed_at)
+                    .await
+            }
+            Self::Mock(s) => {
+                s.intention_update_status(ctx, id, status, triggered_at, completed_at)
+                    .await
+            }
+        }
+    }
 }
 
 #[tokio::main]

@@ -443,6 +443,7 @@ name = "ferrosa-memory-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "ferrosa-core",
  "serde",
  "serde_json",
