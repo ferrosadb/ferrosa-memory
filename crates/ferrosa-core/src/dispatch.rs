@@ -219,6 +219,22 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "required": ["session_id"]
             }),
         },
+        // --- Cognitive memory tools ---
+        ToolDef {
+            name: "smart_ingest".into(),
+            description: "Intelligently ingests content by comparing against existing memories. Uses prediction error gating to decide: CREATE (novel), UPDATE (similar topic), SUPERSEDE (contradicts existing), or SKIP (redundant).\n\nCALL WHEN: You learn something new that should be remembered — facts, decisions, patterns, preferences. This is the primary write path for building the knowledge graph.\nDO NOT CALL: For ephemeral conversation or task-specific state. Use plan tools for task state.\nRETURNS: The action taken and affected entity_id(s).\nCost: ~15ms (includes similarity search).".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "format": "uuid" },
+                    "content": { "type": "string", "maxLength": 8192, "description": "The content to ingest" },
+                    "entity_type": { "type": "string", "enum": ["person", "place", "event", "concept", "org", "decision", "pattern", "preference"] },
+                    "embedding": { "type": "array", "items": { "type": "number" }, "description": "Optional embedding vector" },
+                    "source_fold_id": { "type": "string", "format": "uuid", "description": "Fold that produced this content" }
+                },
+                "required": ["session_id", "content", "entity_type"]
+            }),
+        },
     ]
 }
 
@@ -290,6 +306,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "retrieve_entities" => handle_retrieve_entities(args, storage, ctx).await,
         "record_outcome" => handle_record_outcome(args, storage, ctx).await,
         "delete_session" => handle_delete_session(args, storage, ctx).await,
+        "smart_ingest" => handle_smart_ingest(args, storage, ctx).await,
         _ => Err((METHOD_NOT_FOUND, format!("unknown tool: {name}"))),
     };
     let elapsed = start.elapsed();
@@ -641,6 +658,36 @@ async fn handle_delete_session<S: crate::storage::Storage>(
     serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
 }
 
+// --- Cognitive memory handler ---
+
+async fn handle_smart_ingest<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = require_uuid(&args, "session_id")?;
+    let content = require_str(&args, "content")?;
+    let entity_type = require_str(&args, "entity_type")?;
+    let embedding = optional_f32_array(&args, "embedding")?;
+    let source_fold_id = optional_uuid(&args, "source_fold_id")?;
+
+    let config = crate::smart_ingest::IngestConfig::default();
+    let decision = crate::smart_ingest::smart_ingest(
+        storage,
+        ctx,
+        session_id,
+        content,
+        entity_type,
+        embedding.as_deref(),
+        source_fold_id,
+        &config,
+    )
+    .await
+    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    serde_json::to_value(decision).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
 // --- Parameter extraction helpers ---
 
 fn optional_uuid(args: &Value, field: &str) -> Result<Option<uuid::Uuid>, (i32, String)> {
@@ -728,7 +775,7 @@ mod tests {
             .await
             .unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools.len(), 14);
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"check_memo_cache"));
@@ -841,5 +888,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["nodes"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn smart_ingest_creates_on_new_content() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let sid = Uuid::new_v4();
+
+        let params = serde_json::json!({
+            "name": "smart_ingest",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "content": "Ferrosa uses LSM-tree storage with S3 tiering",
+                "entity_type": "concept"
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx).await.unwrap();
+        assert_eq!(result["action"], "Created");
+        assert!(result["entity_id"].is_string());
     }
 }

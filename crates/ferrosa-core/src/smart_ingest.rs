@@ -60,6 +60,7 @@ impl Default for IngestConfig {
 ///
 /// Uses entity search to find similar existing memories, then applies
 /// prediction error gating based on similarity thresholds.
+#[allow(clippy::too_many_arguments)] // source_fold_id is per-call provenance, not config
 pub async fn smart_ingest(
     storage: &(impl Storage + ?Sized),
     ctx: &TenantContext,
@@ -67,6 +68,7 @@ pub async fn smart_ingest(
     content: &str,
     entity_type: &str,
     embedding: Option<&[f32]>,
+    source_fold_id: Option<Uuid>,
     config: &IngestConfig,
 ) -> anyhow::Result<IngestDecision> {
     // Search for similar existing entities
@@ -101,7 +103,7 @@ pub async fn smart_ingest(
                 .collect::<Vec<_>>()
                 .join(" "),
             entity_type: entity_type.to_string(),
-            source_fold_id: None,
+            source_fold_id,
             context_snippet: content.to_string(),
             entity_embedding: embedding.map(|e| e.to_vec()),
             confidence: 1.0,
@@ -159,7 +161,7 @@ pub async fn smart_ingest(
                 .collect::<Vec<_>>()
                 .join(" "),
             entity_type: entity_type.to_string(),
-            source_fold_id: None,
+            source_fold_id,
             context_snippet: content.to_string(),
             entity_embedding: embedding.map(|e| e.to_vec()),
             confidence: 1.0,
@@ -195,7 +197,7 @@ pub async fn smart_ingest(
             .collect::<Vec<_>>()
             .join(" "),
         entity_type: entity_type.to_string(),
-        source_fold_id: None,
+        source_fold_id,
         context_snippet: content.to_string(),
         entity_embedding: embedding.map(|e| e.to_vec()),
         confidence: 1.0,
@@ -260,6 +262,7 @@ mod tests {
             Uuid::new_v4(),
             "Ferrosa is a Rust-native Cassandra-compatible database",
             "concept",
+            None,
             None,
             &IngestConfig::default(),
         )
