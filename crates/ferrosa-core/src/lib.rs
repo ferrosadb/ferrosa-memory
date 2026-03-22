@@ -32,6 +32,7 @@ pub mod feedback;
 pub mod fold;
 pub mod graph;
 pub mod http;
+pub mod intention;
 pub mod memo;
 pub mod metrics;
 pub mod plan;
@@ -40,6 +41,7 @@ pub mod router;
 #[cfg(test)]
 mod security_tests;
 pub mod session;
+pub mod smart_ingest;
 pub mod storage;
 pub mod temporal;
 pub mod transport;
