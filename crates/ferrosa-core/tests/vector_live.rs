@@ -67,15 +67,12 @@ async fn vector_blob_workaround_roundtrip() {
     let rows = envelope.response_body().unwrap().into_rows().unwrap();
     assert_eq!(rows.len(), 1);
 
-    // Read as Blob (cdrs-tokio's blob type), then convert to Vec<u8>
-    let raw: Blob = rows[0]
-        .r_by_name::<Blob>("embedding")
-        .expect("read vector as blob");
-    let raw: Vec<u8> = raw.into_vec();
+    // Read vector using ByIndex — column 0 is embedding (only column selected)
+    use cdrs_tokio::types::ByIndex;
+    let raw: Blob = rows[0].r_by_index(0).expect("read vector by index as blob");
+    let decoded = vector::decode_vector(&raw.into_vec());
 
-    let decoded = vector::decode_vector(&raw);
     eprintln!("Decoded: {:?}", decoded);
-
     assert_eq!(decoded.len(), 4);
     for (a, b) in embedding.iter().zip(decoded.iter()) {
         assert!((a - b).abs() < 1e-6, "mismatch: {} vs {}", a, b);

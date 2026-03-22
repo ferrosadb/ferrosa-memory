@@ -118,7 +118,7 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 [[package]]
 name = "cassandra-protocol"
 version = "4.0.0"
-source = "git+https://github.com/bkearns/cdrs-tokio.git?branch=feature%2Fvector-type#4754ef5266923116654d03bbd50f47785ae017b7"
+source = "git+https://github.com/bkearns/cdrs-tokio.git?branch=feature%2Fvector-type#502498c0035b3a559f652083c4e0e38d55711942"
 dependencies = [
  "arc-swap",
  "bitflags",
@@ -151,7 +151,7 @@ dependencies = [
 [[package]]
 name = "cdrs-tokio"
 version = "9.0.0"
-source = "git+https://github.com/bkearns/cdrs-tokio.git?branch=feature%2Fvector-type#4754ef5266923116654d03bbd50f47785ae017b7"
+source = "git+https://github.com/bkearns/cdrs-tokio.git?branch=feature%2Fvector-type#502498c0035b3a559f652083c4e0e38d55711942"
 dependencies = [
  "arc-swap",
  "atomic",
@@ -174,7 +174,7 @@ dependencies = [
 [[package]]
 name = "cdrs-tokio-helpers-derive"
 version = "5.0.3"
-source = "git+https://github.com/bkearns/cdrs-tokio.git?branch=feature%2Fvector-type#4754ef5266923116654d03bbd50f47785ae017b7"
+source = "git+https://github.com/bkearns/cdrs-tokio.git?branch=feature%2Fvector-type#502498c0035b3a559f652083c4e0e38d55711942"
 dependencies = [
  "itertools",
  "proc-macro2",
