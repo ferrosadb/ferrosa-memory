@@ -486,6 +486,19 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!("graph connection failed ({e}), graph traversals disabled"),
     };
 
+    // Start visualization server if enabled
+    let shared_event_bus = Arc::new(ferrosa_core::viz::EventBus::new());
+    if config.viz.enabled {
+        let viz_bus = Arc::clone(&shared_event_bus);
+        let viz_port = config.viz.port;
+        tokio::spawn(async move {
+            if let Err(e) = http::serve_viz(viz_port, viz_bus).await {
+                tracing::warn!("viz server error: {e}");
+            }
+        });
+        tracing::info!("viz dashboard at http://localhost:{}/viz", config.viz.port);
+    }
+
     match config.server.transport.as_str() {
         "stdio" => {
             let ctx = Arc::new(auth::authenticate_stdio(tenant_id));
@@ -493,7 +506,10 @@ async fn main() -> anyhow::Result<()> {
 
             let storage_ref = Arc::clone(&storage);
             let ctx_ref = Arc::clone(&ctx);
-            let session = Arc::new(dispatch::SessionState::default());
+            let session = Arc::new(dispatch::SessionState {
+                event_bus: Arc::clone(&shared_event_bus),
+                ..dispatch::SessionState::default()
+            });
             let session_ref = Arc::clone(&session);
 
             let handler: transport::Handler = Box::new(move |method: &str, params| {

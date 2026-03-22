@@ -21,6 +21,7 @@ use crate::transport::{INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND};
 pub struct SessionState {
     pub intentions: Arc<Mutex<crate::intention::IntentionStore>>,
     pub graph: Option<Arc<crate::graph::GraphClient>>,
+    pub event_bus: Arc<crate::viz::EventBus>,
 }
 
 impl Default for SessionState {
@@ -28,6 +29,7 @@ impl Default for SessionState {
         Self {
             intentions: Arc::new(Mutex::new(crate::intention::IntentionStore::new())),
             graph: None,
+            event_bus: Arc::new(crate::viz::EventBus::new()),
         }
     }
 }
@@ -502,26 +504,26 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "update_plan_node" => handle_update_plan(args, storage, ctx).await,
         "start_fold" => handle_start_fold(args, storage, ctx).await,
         "append_to_fold" => handle_append_fold(args, storage, ctx).await,
-        "complete_fold" => handle_complete_fold(args, storage, ctx).await,
+        "complete_fold" => handle_complete_fold(args, storage, ctx, session).await,
         "retrieve_fold_context" => handle_retrieve_fold(args, storage, ctx).await,
-        "upsert_entity" => handle_upsert_entity(args, storage, ctx).await,
+        "upsert_entity" => handle_upsert_entity(args, storage, ctx, session).await,
         "retrieve_entities" => handle_retrieve_entities(args, storage, ctx).await,
         "record_outcome" => handle_record_outcome(args, storage, ctx).await,
         "delete_session" => handle_delete_session(args, storage, ctx).await,
-        "smart_ingest" => handle_smart_ingest(args, storage, ctx).await,
+        "smart_ingest" => handle_smart_ingest(args, storage, ctx, session).await,
         "set_intention" => handle_set_intention(args, storage, ctx, session).await,
         "check_intentions" => handle_check_intentions(args, storage, ctx, session).await,
         "complete_intention" => handle_complete_intention(args, storage, ctx, session).await,
         "list_intentions" => handle_list_intentions(session).await,
         "snooze_intention" => handle_snooze_intention(args, storage, ctx, session).await,
-        "write_temporal_fact" => handle_write_temporal_fact(args, storage, ctx).await,
+        "write_temporal_fact" => handle_write_temporal_fact(args, storage, ctx, session).await,
         "get_temporal_chain" => handle_get_temporal_chain(args, storage, ctx).await,
         "explore_connections" => handle_explore_connections(args, session).await,
         "hybrid_search" => handle_hybrid_search(args, storage, ctx).await,
-        "run_consolidation" => handle_run_consolidation(args, storage, ctx).await,
+        "run_consolidation" => handle_run_consolidation(args, storage, ctx, session).await,
         "get_stats" => handle_get_stats(args, storage, ctx, session).await,
-        "promote_memory" => handle_promote_memory(args, storage, ctx).await,
-        "demote_memory" => handle_demote_memory(args, storage, ctx).await,
+        "promote_memory" => handle_promote_memory(args, storage, ctx, session).await,
+        "demote_memory" => handle_demote_memory(args, storage, ctx, session).await,
         _ => Err((METHOD_NOT_FOUND, format!("unknown tool: {name}"))),
     };
     let elapsed = start.elapsed();
@@ -720,6 +722,7 @@ async fn handle_complete_fold<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
     ctx: &crate::types::TenantContext,
+    session: &SessionState,
 ) -> Result<Value, (i32, String)> {
     let session_id = require_uuid(&args, "session_id")?;
     let fold_id = require_uuid(&args, "fold_id")?;
@@ -730,6 +733,13 @@ async fn handle_complete_fold<S: crate::storage::Storage>(
         crate::fold::complete_fold(storage, ctx, session_id, fold_id, summary, embedding)
             .await
             .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    // Emit viz event for fold completion
+    session.event_bus.emit(crate::viz::VizEvent::FoldCompleted {
+        fold_id: fold_id.to_string(),
+        summary: summary.to_string(),
+        entity_count: 0, // entity count not tracked at fold level
+    });
 
     Ok(serde_json::json!({ "folded": folded, "compression_ratio": compression_ratio }))
 }
@@ -767,6 +777,7 @@ async fn handle_upsert_entity<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
     ctx: &crate::types::TenantContext,
+    session: &SessionState,
 ) -> Result<Value, (i32, String)> {
     let session_id = require_uuid(&args, "session_id")?;
     let entity_name = require_str(&args, "entity_name")?;
@@ -790,7 +801,35 @@ async fn handle_upsert_entity<S: crate::storage::Storage>(
     .await
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
-    serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+    let result_json = serde_json::to_value(&result).map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    // Emit viz event for entity upsert
+    let entity_id = result_json
+        .get("entity_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let is_new = result_json
+        .get("is_new")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let action = if is_new { "created" } else { "updated" };
+
+    session.event_bus.emit(crate::viz::VizEvent::EntityChanged {
+        node: crate::viz::VizNode {
+            id: entity_id,
+            label: entity_name.to_string(),
+            node_type: "entity".into(),
+            entity_type: entity_type.to_string(),
+            state: "active".into(),
+            confidence: confidence.unwrap_or(1.0),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            context: context_snippet.to_string(),
+        },
+        action: action.into(),
+    });
+
+    Ok(result_json)
 }
 
 async fn handle_retrieve_entities<S: crate::storage::Storage>(
@@ -828,6 +867,7 @@ async fn handle_promote_memory<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
     ctx: &crate::types::TenantContext,
+    session: &SessionState,
 ) -> Result<Value, (i32, String)> {
     let session_id = require_uuid(&args, "session_id")?;
     let entity_id = require_uuid(&args, "entity_id")?;
@@ -836,6 +876,11 @@ async fn handle_promote_memory<S: crate::storage::Storage>(
         .await
         .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
+    session.event_bus.emit(crate::viz::VizEvent::StateChanged {
+        entity_id: entity_id.to_string(),
+        new_state: new_state.to_string(),
+    });
+
     Ok(serde_json::json!({ "new_state": new_state.to_string() }))
 }
 
@@ -843,6 +888,7 @@ async fn handle_demote_memory<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
     ctx: &crate::types::TenantContext,
+    session: &SessionState,
 ) -> Result<Value, (i32, String)> {
     let session_id = require_uuid(&args, "session_id")?;
     let entity_id = require_uuid(&args, "entity_id")?;
@@ -850,6 +896,11 @@ async fn handle_demote_memory<S: crate::storage::Storage>(
     let new_state = crate::entity::demote_memory(storage, ctx, session_id, entity_id)
         .await
         .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    session.event_bus.emit(crate::viz::VizEvent::StateChanged {
+        entity_id: entity_id.to_string(),
+        new_state: new_state.to_string(),
+    });
 
     Ok(serde_json::json!({ "new_state": new_state.to_string() }))
 }
@@ -911,6 +962,7 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
     ctx: &crate::types::TenantContext,
+    session: &SessionState,
 ) -> Result<Value, (i32, String)> {
     let session_id = require_uuid(&args, "session_id")?;
     let content = require_str(&args, "content")?;
@@ -932,7 +984,38 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
     .await
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
-    serde_json::to_value(decision).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+    // Emit viz event based on ingest decision
+    let decision_json =
+        serde_json::to_value(&decision).map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    let action = decision_json
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let entity_id = decision_json
+        .get("entity_id")
+        .or_else(|| decision_json.get("new_entity_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if !entity_id.is_empty() {
+        session.event_bus.emit(crate::viz::VizEvent::EntityChanged {
+            node: crate::viz::VizNode {
+                id: entity_id,
+                label: content.chars().take(64).collect(),
+                node_type: "entity".into(),
+                entity_type: entity_type.to_string(),
+                state: "active".into(),
+                confidence: 1.0,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                context: content.chars().take(256).collect(),
+            },
+            action,
+        });
+    }
+
+    Ok(decision_json)
 }
 
 // --- Intention handlers ---
@@ -1059,6 +1142,7 @@ async fn handle_write_temporal_fact<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
     ctx: &crate::types::TenantContext,
+    session: &SessionState,
 ) -> Result<Value, (i32, String)> {
     let session_id = require_uuid(&args, "session_id")?;
     let entity_id = require_uuid(&args, "entity_id")?;
@@ -1073,6 +1157,13 @@ async fn handle_write_temporal_fact<S: crate::storage::Storage>(
     )
     .await
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    // Emit viz event for temporal fact
+    session.event_bus.emit(crate::viz::VizEvent::FactUpdated {
+        entity_id: entity_id.to_string(),
+        fact_text: fact_text.to_string(),
+        superseded: None,
+    });
 
     Ok(serde_json::json!({ "event_id": event_id.to_string() }))
 }
@@ -1203,12 +1294,24 @@ async fn handle_run_consolidation<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
     ctx: &crate::types::TenantContext,
+    session: &SessionState,
 ) -> Result<Value, (i32, String)> {
     let session_id = require_uuid(&args, "session_id")?;
 
     let result = crate::dream::run_consolidation(storage, ctx, session_id)
         .await
         .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    // Emit viz events for each connection created during consolidation
+    for _ in 0..result.connections_created {
+        session.event_bus.emit(crate::viz::VizEvent::EdgeCreated {
+            edge: crate::viz::VizEdge {
+                source: session_id.to_string(),
+                target: session_id.to_string(),
+                edge_type: "CO_OCCURS".into(),
+            },
+        });
+    }
 
     serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
 }

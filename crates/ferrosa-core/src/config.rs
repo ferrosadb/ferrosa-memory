@@ -33,6 +33,8 @@ pub struct Config {
     pub routing: RoutingConfig,
     #[serde(default)]
     pub graph: GraphDbConfig,
+    #[serde(default)]
+    pub viz: VizConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +56,24 @@ impl Default for GraphDbConfig {
             username: default_graph_user(),
             password: default_graph_pass(),
             http_url: default_http_graph_url(),
+        }
+    }
+}
+
+/// Visualization dashboard configuration.
+#[derive(Debug, Deserialize, Clone)]
+pub struct VizConfig {
+    #[serde(default = "default_viz_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_viz_port")]
+    pub port: u16,
+}
+
+impl Default for VizConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_viz_enabled(),
+            port: default_viz_port(),
         }
     }
 }
@@ -246,6 +266,12 @@ fn default_guideline_version() -> String {
 }
 fn default_cron() -> String {
     "0 2 * * *".into()
+}
+fn default_viz_enabled() -> bool {
+    true
+}
+fn default_viz_port() -> u16 {
+    8766
 }
 fn default_bolt_uri() -> String {
     "bolt://localhost:7687".into()

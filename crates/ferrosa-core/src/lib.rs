@@ -49,3 +49,4 @@ pub mod temporal;
 pub mod transport;
 pub mod types;
 pub mod vector;
+pub mod viz;

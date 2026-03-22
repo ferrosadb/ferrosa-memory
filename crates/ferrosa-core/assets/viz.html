@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Ferrosa Memory</title>
+<style>
+  :root {
+    --bg-primary: #0a0a0f;
+    --bg-secondary: #111118;
+    --text-primary: #e8e8ed;
+    --text-secondary: #9494a3;
+    --accent: #e2725b;
+    --border: #1e1e2a;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg-primary); color: var(--text-primary); font-family: Inter, system-ui, sans-serif; }
+  #status { padding: 1rem; color: var(--accent); }
+  #log { padding: 1rem; font-family: 'JetBrains Mono', monospace; font-size: 0.875rem; color: var(--text-secondary); max-height: calc(100vh - 4rem); overflow-y: auto; }
+  #log div { padding: 0.25rem 0; border-bottom: 1px solid var(--border); }
+</style>
+</head>
+<body>
+<div id="status">Connecting...</div>
+<div id="log"></div>
+<script>
+const ws = new WebSocket(`ws://${location.host}/viz/ws`);
+ws.onopen = () => { document.getElementById('status').textContent = 'Connected \u2014 waiting for events'; };
+ws.onmessage = (e) => {
+  const event = JSON.parse(e.data);
+  const div = document.createElement('div');
+  div.textContent = `[${event.type}] ${JSON.stringify(event).slice(0, 200)}`;
+  document.getElementById('log').prepend(div);
+};
+ws.onclose = () => { document.getElementById('status').textContent = 'Disconnected'; };
+ws.onerror = () => { document.getElementById('status').textContent = 'Connection error'; };
+</script>
+</body>
+</html>
