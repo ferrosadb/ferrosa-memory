@@ -67,3 +67,27 @@ async fn cdrs_prepare_statement() {
     }
     prepared.expect("prepare failed");
 }
+
+#[tokio::test]
+#[ignore]
+async fn prepare_vector_column() {
+    let node_config = NodeTcpConfigBuilder::new()
+        .with_contact_point("127.0.0.1:19042".into())
+        .with_authenticator_provider(Arc::new(NoneAuthenticatorProvider))
+        .build()
+        .await
+        .expect("node config");
+    let session = TcpSessionBuilder::new(RoundRobinLoadBalancingStrategy::new(), node_config)
+        .build()
+        .await
+        .expect("session");
+
+    eprintln!("PREPARE vector INSERT...");
+    match session
+        .prepare("INSERT INTO agent_memory.test_vector_blob (id, embedding) VALUES (?, ?)")
+        .await
+    {
+        Ok(_) => eprintln!("  OK"),
+        Err(e) => panic!("PREPARE vector INSERT failed: {e}"),
+    }
+}

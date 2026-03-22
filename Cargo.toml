@@ -42,8 +42,9 @@ anyhow = "1"
 # Config
 dirs = "6"
 
-# CQL driver (Ferrosa/Cassandra)
-cdrs-tokio = { version = "9", features = ["derive"] }
+# CQL driver (Ferrosa/Cassandra) — using fork with VECTOR type support
+# PR: https://github.com/krojew/cdrs-tokio/pull/221
+cdrs-tokio = { git = "https://github.com/bkearns/cdrs-tokio.git", branch = "feature/vector-type", features = ["derive"] }
 
 # neo4rs removed — Ferrosa's Bolt is v5, neo4rs 0.8 only supports v4
 # Graph queries go through Ferrosa's HTTP /graph/query endpoint via reqwest
