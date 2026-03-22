@@ -19,6 +19,7 @@
 //!
 //! Shared library for the Ferrosa Memory MCP system.
 
+pub mod audit;
 pub mod auth;
 pub mod compression;
 pub mod config;

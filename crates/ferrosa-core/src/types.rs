@@ -153,3 +153,15 @@ pub struct FeedbackOutcome {
     pub token_cost: i32,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
+
+/// An audit log entry recording a write operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEntry {
+    pub tenant_id: Uuid,
+    pub audit_id: Uuid,
+    pub operation: String,
+    pub target_table: String,
+    pub target_id: String,
+    pub session_id: Uuid,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
