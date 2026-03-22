@@ -32,6 +32,7 @@ pub mod feedback;
 pub mod fold;
 pub mod graph;
 pub mod http;
+pub mod hybrid_search;
 pub mod intention;
 pub mod memo;
 pub mod metrics;

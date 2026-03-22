@@ -20,12 +20,14 @@ use crate::transport::{INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND};
 /// Per-session mutable state (not persisted in CQL).
 pub struct SessionState {
     pub intentions: Arc<Mutex<crate::intention::IntentionStore>>,
+    pub graph: Option<Arc<crate::graph::GraphClient>>,
 }
 
 impl Default for SessionState {
     fn default() -> Self {
         Self {
             intentions: Arc::new(Mutex::new(crate::intention::IntentionStore::new())),
+            graph: None,
         }
     }
 }
@@ -344,6 +346,46 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "required": ["session_id", "entity_id"]
             }),
         },
+        // --- Graph traversal tool ---
+        ToolDef {
+            name: "explore_connections".into(),
+            description: "Traverses the knowledge graph. Supports 4 traversal types:\n- fold_ancestors: walk the fold hierarchy upward from a fold\n- related_entities: find entities connected within N hops\n- entities_in_fold: list all entities mentioned in a fold\n- supersession_chain: follow temporal supersession links from a fact\n\nCALL WHEN: You need to understand relationships between entities or folds, or trace how facts evolved over time.\nRequires a graph connection to be configured.\nCost: ~10-50ms depending on traversal depth.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "traversal": {
+                        "type": "string",
+                        "enum": ["fold_ancestors", "related_entities", "entities_in_fold", "supersession_chain"],
+                        "description": "The type of graph traversal to perform"
+                    },
+                    "entity_id": { "type": "string", "format": "uuid", "description": "Entity or event ID (required for related_entities, supersession_chain)" },
+                    "fold_id": { "type": "string", "format": "uuid", "description": "Fold ID (required for fold_ancestors, entities_in_fold)" },
+                    "session_id": { "type": "string", "format": "uuid", "description": "Session ID (required for fold_ancestors, related_entities, entities_in_fold)" },
+                    "max_depth": { "type": "integer", "minimum": 1, "maximum": 5, "description": "Maximum traversal depth (default: 2)" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum results to return (default: 10)" }
+                },
+                "required": ["traversal"]
+            }),
+        },
+        // --- Hybrid search ---
+        ToolDef {
+            name: "hybrid_search".into(),
+            description: "Multi-strategy search combining phonetic entity lookup, ANN entity search, and ANN fold search with Reciprocal Rank Fusion.\n\nCALL WHEN: You need maximum recall across all memory types — entities and folds. Prefer this over separate retrieve_entities + retrieve_fold_context when you want a single ranked result set.\nProvide embedding for ANN strategies; without it only phonetic matching runs.\nCost: ~15ms (runs up to 3 strategies in sequence).".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "format": "uuid" },
+                    "query": { "type": "string", "maxLength": 4096, "description": "Search query text (used for phonetic matching)" },
+                    "embedding": {
+                        "type": "array",
+                        "items": { "type": "number" },
+                        "description": "Optional embedding vector for ANN search strategies"
+                    },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Max results to return (default: 10)" }
+                },
+                "required": ["session_id", "query"]
+            }),
+        },
     ]
 }
 
@@ -425,6 +467,8 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "snooze_intention" => handle_snooze_intention(args, session).await,
         "write_temporal_fact" => handle_write_temporal_fact(args, storage, ctx).await,
         "get_temporal_chain" => handle_get_temporal_chain(args, storage, ctx).await,
+        "explore_connections" => handle_explore_connections(args, session).await,
+        "hybrid_search" => handle_hybrid_search(args, storage, ctx).await,
         _ => Err((METHOD_NOT_FOUND, format!("unknown tool: {name}"))),
     };
     let elapsed = start.elapsed();
@@ -915,6 +959,108 @@ async fn handle_get_temporal_chain<S: crate::storage::Storage>(
     }
 }
 
+// --- Graph traversal handler ---
+
+async fn handle_explore_connections(
+    args: Value,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let graph = session
+        .graph
+        .as_ref()
+        .ok_or((INTERNAL_ERROR, "graph client not configured".into()))?;
+
+    let traversal = require_str(&args, "traversal")?;
+    let max_depth = args.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(2) as usize;
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+
+    let results = match traversal {
+        "fold_ancestors" => {
+            let fold_id = require_uuid(&args, "fold_id")?;
+            let session_id = require_uuid(&args, "session_id")?;
+            graph
+                .get_fold_ancestors(fold_id, session_id, max_depth)
+                .await
+                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+        }
+        "related_entities" => {
+            let entity_id = require_uuid(&args, "entity_id")?;
+            let session_id = require_uuid(&args, "session_id")?;
+            let mut r = graph
+                .find_related_entities(entity_id, session_id, max_depth)
+                .await
+                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+            r.truncate(limit);
+            r
+        }
+        "entities_in_fold" => {
+            let fold_id = require_uuid(&args, "fold_id")?;
+            let session_id = require_uuid(&args, "session_id")?;
+            let mut r = graph
+                .get_entities_in_fold(fold_id, session_id)
+                .await
+                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+            r.truncate(limit);
+            r
+        }
+        "supersession_chain" => {
+            let entity_id = require_uuid(&args, "entity_id")?;
+            let event_id = entity_id; // event_id is passed via entity_id field
+            // For supersession_chain, we need both event_id and entity_id.
+            // The tool schema uses entity_id for the event, and fold_id is repurposed
+            // as the actual entity_id context. But the graph method signature is
+            // (event_id, entity_id). We pass entity_id as event_id since the Cypher
+            // query uses it as the starting fact node.
+            let fact_entity_id = optional_uuid(&args, "fold_id")?.unwrap_or(event_id);
+            graph
+                .get_supersession_chain(event_id, fact_entity_id)
+                .await
+                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+        }
+        _ => {
+            return Err((
+                INVALID_PARAMS,
+                format!("unknown traversal type: {traversal}"),
+            ));
+        }
+    };
+
+    Ok(serde_json::json!({
+        "traversal": traversal,
+        "results": results,
+        "count": results.len()
+    }))
+}
+
+// --- Hybrid search handler ---
+
+async fn handle_hybrid_search<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = require_uuid(&args, "session_id")?;
+    let query = require_str(&args, "query")?;
+    let embedding = optional_f32_array(&args, "embedding")?;
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+
+    let results = crate::hybrid_search::hybrid_search(
+        storage,
+        ctx,
+        session_id,
+        query,
+        embedding.as_deref(),
+        limit,
+    )
+    .await
+    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    Ok(serde_json::json!({
+        "results": results,
+        "count": results.len()
+    }))
+}
+
 // --- Parameter extraction helpers ---
 
 fn optional_uuid(args: &Value, field: &str) -> Result<Option<uuid::Uuid>, (i32, String)> {
@@ -1004,7 +1150,7 @@ mod tests {
             .await
             .unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 21);
+        assert_eq!(tools.len(), 23);
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"check_memo_cache"));
@@ -1017,6 +1163,7 @@ mod tests {
         assert!(names.contains(&"complete_intention"));
         assert!(names.contains(&"list_intentions"));
         assert!(names.contains(&"snooze_intention"));
+        assert!(names.contains(&"hybrid_search"));
     }
 
     #[tokio::test]
@@ -1242,5 +1389,133 @@ mod tests {
             .await
             .unwrap();
         assert!(result["fact"].is_null());
+    }
+
+    #[tokio::test]
+    async fn explore_connections_requires_graph() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default(); // graph is None
+        let params = serde_json::json!({
+            "name": "explore_connections",
+            "arguments": {
+                "traversal": "related_entities",
+                "entity_id": Uuid::new_v4().to_string()
+            }
+        });
+        let err = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, INTERNAL_ERROR);
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_phonetic_only() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+
+        // Seed an entity
+        let entity = crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "Alice".into(),
+            entity_type: "person".into(),
+            source_fold_id: None,
+            context_snippet: "Alice is the project lead".into(),
+            entity_embedding: None,
+            confidence: 0.9,
+            created_at: chrono::Utc::now(),
+        };
+        store.entities.lock().await.push(entity.clone());
+
+        // Search without embedding — only phonetic strategy runs
+        let params = serde_json::json!({
+            "name": "hybrid_search",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "query": "Alice",
+                "limit": 5
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        assert!(result["count"].as_u64().unwrap() >= 1);
+        let results = result["results"].as_array().unwrap();
+        assert_eq!(results[0]["source"], "entity_phonetic");
+        assert_eq!(results[0]["result_type"], "entity");
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_with_embedding() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+
+        // Seed an entity
+        let entity = crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "Bob".into(),
+            entity_type: "person".into(),
+            source_fold_id: None,
+            context_snippet: "Bob is the CTO".into(),
+            entity_embedding: Some(vec![0.1, 0.2, 0.3]),
+            confidence: 0.95,
+            created_at: chrono::Utc::now(),
+        };
+        store.entities.lock().await.push(entity);
+
+        // Seed a completed fold
+        let fold = crate::types::FoldEntry {
+            session_id: sid,
+            fold_id: Uuid::new_v4(),
+            tenant_id: ctx.tenant_id,
+            depth: 0,
+            parent_fold_id: None,
+            raw_trajectory: "discussed architecture".into(),
+            fold_summary: Some("Architecture discussion summary".into()),
+            fold_embedding: Some(vec![0.1, 0.2, 0.3]),
+            token_count: 100,
+            compression_ratio: Some(0.5),
+            status: crate::types::FoldStatus::Folded,
+            created_at: chrono::Utc::now(),
+            folded_at: Some(chrono::Utc::now()),
+        };
+        store.folds.lock().await.push(fold);
+
+        // Search with embedding — all 3 strategies can run
+        let params = serde_json::json!({
+            "name": "hybrid_search",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "query": "Bob",
+                "embedding": [0.1, 0.2, 0.3],
+                "limit": 10
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        // Should have results from multiple strategies
+        let count = result["count"].as_u64().unwrap();
+        assert!(count >= 2, "expected at least 2 results, got {count}");
+
+        // Bob entity should appear (boosted by phonetic + ann fusion)
+        let results = result["results"].as_array().unwrap();
+        let sources: Vec<&str> = results
+            .iter()
+            .map(|r| r["source"].as_str().unwrap())
+            .collect();
+        assert!(
+            sources.contains(&"entity_phonetic") || sources.contains(&"entity_ann"),
+            "expected entity results"
+        );
+        assert!(sources.contains(&"fold_ann"), "expected fold results");
     }
 }
