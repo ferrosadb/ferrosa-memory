@@ -111,6 +111,34 @@ pub struct FoldSummary {
 
 // --- Entity types (Sprint 3) ---
 
+/// Memory lifecycle state inspired by vestige's cognitive memory model.
+///
+/// Memories transition through states based on usage:
+/// - Active: frequently accessed, returned in searches
+/// - Dormant: still available but lower priority
+/// - Silent: not returned in normal searches, available on explicit request
+/// - Unavailable: logically deleted, retained for audit trail only
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryState {
+    #[default]
+    Active,
+    Dormant,
+    Silent,
+    Unavailable,
+}
+
+impl std::fmt::Display for MemoryState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Active => write!(f, "active"),
+            Self::Dormant => write!(f, "dormant"),
+            Self::Silent => write!(f, "silent"),
+            Self::Unavailable => write!(f, "unavailable"),
+        }
+    }
+}
+
 /// A named entity discovered during trajectory traversal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityEntry {
@@ -123,6 +151,8 @@ pub struct EntityEntry {
     pub context_snippet: String,
     pub entity_embedding: Option<Vec<f32>>,
     pub confidence: f64,
+    #[serde(default)]
+    pub state: MemoryState,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 

@@ -107,6 +107,7 @@ mod tests {
             context_snippet: format!("context for {name}"),
             entity_embedding: None,
             confidence: 0.9,
+            state: Default::default(),
             created_at: chrono::Utc::now(),
         }
     }

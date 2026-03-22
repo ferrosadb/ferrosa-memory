@@ -14,8 +14,8 @@
 use uuid::Uuid;
 
 use crate::types::{
-    EntityEntry, FeedbackOutcome, FoldEntry, FoldStatus, FoldSummary, MemoEntry, PlanNode,
-    PlanStatus, TemporalEvent, TenantContext,
+    EntityEntry, FeedbackOutcome, FoldEntry, FoldStatus, FoldSummary, MemoEntry, MemoryState,
+    PlanNode, PlanStatus, TemporalEvent, TenantContext,
 };
 
 /// Core storage operations for the memory system.
@@ -136,12 +136,26 @@ pub trait Storage: Send + Sync {
     /// Count entities in a session (for rate limiting).
     async fn entity_count(&self, ctx: &TenantContext, session_id: Uuid) -> anyhow::Result<usize>;
 
+    /// Count folds in a session.
+    async fn fold_count(&self, ctx: &TenantContext, session_id: Uuid) -> anyhow::Result<usize>;
+
+    /// Count memo cache entries for the tenant.
+    async fn memo_count(&self, ctx: &TenantContext) -> anyhow::Result<usize>;
+
     /// List all entities for a session (for consolidation).
     async fn entity_list_session(
         &self,
         ctx: &TenantContext,
         session_id: Uuid,
     ) -> anyhow::Result<Vec<EntityEntry>>;
+
+    /// Update an entity's memory state (promote/demote lifecycle).
+    async fn entity_update_state(
+        &self,
+        ctx: &TenantContext,
+        entity_id: Uuid,
+        state: MemoryState,
+    ) -> anyhow::Result<()>;
 
     // --- Temporal event operations (Sprint 3) ---
 
@@ -465,6 +479,20 @@ pub mod mock {
                 .count())
         }
 
+        async fn fold_count(
+            &self,
+            _ctx: &TenantContext,
+            session_id: Uuid,
+        ) -> anyhow::Result<usize> {
+            let folds = self.folds.lock().await;
+            Ok(folds.iter().filter(|f| f.session_id == session_id).count())
+        }
+
+        async fn memo_count(&self, _ctx: &TenantContext) -> anyhow::Result<usize> {
+            let memos = self.memos.lock().await;
+            Ok(memos.len())
+        }
+
         async fn entity_list_session(
             &self,
             _ctx: &TenantContext,
@@ -476,6 +504,21 @@ pub mod mock {
                 .filter(|e| e.session_id == session_id)
                 .cloned()
                 .collect())
+        }
+
+        async fn entity_update_state(
+            &self,
+            _ctx: &TenantContext,
+            entity_id: Uuid,
+            state: MemoryState,
+        ) -> anyhow::Result<()> {
+            let mut entities = self.entities.lock().await;
+            if let Some(e) = entities.iter_mut().find(|e| e.entity_id == entity_id) {
+                e.state = state;
+                Ok(())
+            } else {
+                anyhow::bail!("entity not found: {entity_id}")
+            }
         }
 
         // --- Temporal operations ---

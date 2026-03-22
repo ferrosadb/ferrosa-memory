@@ -18,7 +18,7 @@
 use uuid::Uuid;
 
 use crate::storage::Storage;
-use crate::types::{EntityEntry, TenantContext};
+use crate::types::{EntityEntry, MemoryState, TenantContext};
 
 /// Maximum entities per session (configurable via config, hardcoded default).
 const DEFAULT_MAX_ENTITIES_PER_SESSION: usize = 1000;
@@ -98,6 +98,7 @@ pub async fn upsert_entity(
         context_snippet: context_snippet.to_string(),
         entity_embedding: embedding,
         confidence,
+        state: crate::types::MemoryState::default(),
         created_at: chrono::Utc::now(),
     };
 
@@ -168,6 +169,82 @@ pub async fn retrieve_entities(
         }
         other => anyhow::bail!("unknown retrieval strategy: {other}"),
     }
+}
+
+/// Promote an entity's memory state one level up.
+///
+/// Transition: dormant -> active, silent -> dormant, unavailable -> silent.
+/// Active stays active (already at highest state).
+pub async fn promote_memory(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    session_id: Uuid,
+    entity_id: Uuid,
+) -> anyhow::Result<MemoryState> {
+    let entities = storage.entity_list_session(ctx, session_id).await?;
+    let entity = entities
+        .iter()
+        .find(|e| e.entity_id == entity_id)
+        .ok_or_else(|| anyhow::anyhow!("entity not found: {entity_id}"))?;
+
+    let new_state = match entity.state {
+        MemoryState::Active => MemoryState::Active,
+        MemoryState::Dormant => MemoryState::Active,
+        MemoryState::Silent => MemoryState::Dormant,
+        MemoryState::Unavailable => MemoryState::Silent,
+    };
+
+    if new_state != entity.state {
+        storage
+            .entity_update_state(ctx, entity_id, new_state.clone())
+            .await?;
+        tracing::info!(
+            %entity_id,
+            old_state = %entity.state,
+            new_state = %new_state,
+            "memory promoted"
+        );
+    }
+
+    Ok(new_state)
+}
+
+/// Demote an entity's memory state one level down.
+///
+/// Transition: active -> dormant, dormant -> silent, silent -> unavailable.
+/// Unavailable stays unavailable (already at lowest state).
+pub async fn demote_memory(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    session_id: Uuid,
+    entity_id: Uuid,
+) -> anyhow::Result<MemoryState> {
+    let entities = storage.entity_list_session(ctx, session_id).await?;
+    let entity = entities
+        .iter()
+        .find(|e| e.entity_id == entity_id)
+        .ok_or_else(|| anyhow::anyhow!("entity not found: {entity_id}"))?;
+
+    let new_state = match entity.state {
+        MemoryState::Active => MemoryState::Dormant,
+        MemoryState::Dormant => MemoryState::Silent,
+        MemoryState::Silent => MemoryState::Unavailable,
+        MemoryState::Unavailable => MemoryState::Unavailable,
+    };
+
+    if new_state != entity.state {
+        storage
+            .entity_update_state(ctx, entity_id, new_state.clone())
+            .await?;
+        tracing::info!(
+            %entity_id,
+            old_state = %entity.state,
+            new_state = %new_state,
+            "memory demoted"
+        );
+    }
+
+    Ok(new_state)
 }
 
 #[cfg(test)]
@@ -314,5 +391,91 @@ mod tests {
             .unwrap();
         // Should have exactly 1 (deduplicated)
         assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn promote_from_dormant_to_active() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let sid = Uuid::new_v4();
+
+        // Create entity
+        let result = upsert_entity(
+            &store, &ctx, sid, "Alice", "person", "ctx", None, None, None,
+        )
+        .await
+        .unwrap();
+        let entity_id = result.entity_id;
+
+        // Demote to dormant first
+        let state = demote_memory(&store, &ctx, sid, entity_id).await.unwrap();
+        assert_eq!(state, MemoryState::Dormant);
+
+        // Promote back to active
+        let state = promote_memory(&store, &ctx, sid, entity_id).await.unwrap();
+        assert_eq!(state, MemoryState::Active);
+    }
+
+    #[tokio::test]
+    async fn demote_from_active_to_dormant() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let sid = Uuid::new_v4();
+
+        // Create entity (default state = Active)
+        let result = upsert_entity(&store, &ctx, sid, "Bob", "person", "ctx", None, None, None)
+            .await
+            .unwrap();
+        let entity_id = result.entity_id;
+
+        // Demote active -> dormant
+        let state = demote_memory(&store, &ctx, sid, entity_id).await.unwrap();
+        assert_eq!(state, MemoryState::Dormant);
+
+        // Demote dormant -> silent
+        let state = demote_memory(&store, &ctx, sid, entity_id).await.unwrap();
+        assert_eq!(state, MemoryState::Silent);
+
+        // Demote silent -> unavailable
+        let state = demote_memory(&store, &ctx, sid, entity_id).await.unwrap();
+        assert_eq!(state, MemoryState::Unavailable);
+
+        // Demote unavailable stays unavailable
+        let state = demote_memory(&store, &ctx, sid, entity_id).await.unwrap();
+        assert_eq!(state, MemoryState::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn promote_active_stays_active() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let sid = Uuid::new_v4();
+
+        let result = upsert_entity(
+            &store, &ctx, sid, "Carol", "person", "ctx", None, None, None,
+        )
+        .await
+        .unwrap();
+
+        let state = promote_memory(&store, &ctx, sid, result.entity_id)
+            .await
+            .unwrap();
+        assert_eq!(state, MemoryState::Active);
+    }
+
+    #[tokio::test]
+    async fn promote_demote_not_found() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let sid = Uuid::new_v4();
+        let bogus_id = Uuid::new_v4();
+
+        let err = promote_memory(&store, &ctx, sid, bogus_id).await;
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("not found"));
+
+        let err = demote_memory(&store, &ctx, sid, bogus_id).await;
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("not found"));
     }
 }

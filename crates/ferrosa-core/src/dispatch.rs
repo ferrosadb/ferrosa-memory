@@ -398,6 +398,43 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "required": ["session_id"]
             }),
         },
+        // --- Stats tool ---
+        ToolDef {
+            name: "get_stats".into(),
+            description: "Returns memory system statistics for the session: entity count, fold count, memo count, and intention count.\n\nCALL WHEN: For health monitoring, debugging, or when the user asks about memory usage.\nCost: ~5ms (runs 3 count queries).".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "format": "uuid" }
+                },
+                "required": ["session_id"]
+            }),
+        },
+        // --- Memory state management ---
+        ToolDef {
+            name: "promote_memory".into(),
+            description: "Promotes an entity's memory state one level: dormant->active, silent->dormant, unavailable->silent. Active stays active.\n\nCALL WHEN: A dormant or silent memory becomes relevant again — e.g., an entity is referenced in new context after a period of inactivity.\nRETURNS: The new memory state after promotion.\nCost: ~5ms.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "format": "uuid" },
+                    "entity_id": { "type": "string", "format": "uuid" }
+                },
+                "required": ["session_id", "entity_id"]
+            }),
+        },
+        ToolDef {
+            name: "demote_memory".into(),
+            description: "Demotes an entity's memory state one level: active->dormant, dormant->silent, silent->unavailable. Unavailable stays unavailable.\n\nCALL WHEN: A memory is no longer relevant to the current context, or during periodic decay sweeps. Demoted memories are still retrievable but with lower priority.\nRETURNS: The new memory state after demotion.\nCost: ~5ms.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "format": "uuid" },
+                    "entity_id": { "type": "string", "format": "uuid" }
+                },
+                "required": ["session_id", "entity_id"]
+            }),
+        },
     ]
 }
 
@@ -482,6 +519,9 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "explore_connections" => handle_explore_connections(args, session).await,
         "hybrid_search" => handle_hybrid_search(args, storage, ctx).await,
         "run_consolidation" => handle_run_consolidation(args, storage, ctx).await,
+        "get_stats" => handle_get_stats(args, storage, ctx, session).await,
+        "promote_memory" => handle_promote_memory(args, storage, ctx).await,
+        "demote_memory" => handle_demote_memory(args, storage, ctx).await,
         _ => Err((METHOD_NOT_FOUND, format!("unknown tool: {name}"))),
     };
     let elapsed = start.elapsed();
@@ -780,6 +820,38 @@ async fn handle_retrieve_entities<S: crate::storage::Storage>(
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
     serde_json::to_value(&entities).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
+// --- Memory state handlers ---
+
+async fn handle_promote_memory<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = require_uuid(&args, "session_id")?;
+    let entity_id = require_uuid(&args, "entity_id")?;
+
+    let new_state = crate::entity::promote_memory(storage, ctx, session_id, entity_id)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    Ok(serde_json::json!({ "new_state": new_state.to_string() }))
+}
+
+async fn handle_demote_memory<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = require_uuid(&args, "session_id")?;
+    let entity_id = require_uuid(&args, "entity_id")?;
+
+    let new_state = crate::entity::demote_memory(storage, ctx, session_id, entity_id)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    Ok(serde_json::json!({ "new_state": new_state.to_string() }))
 }
 
 // --- Feedback handler ---
@@ -1090,6 +1162,28 @@ async fn handle_run_consolidation<S: crate::storage::Storage>(
     serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
 }
 
+// --- Stats handler ---
+
+async fn handle_get_stats<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let session_id = require_uuid(&args, "session_id")?;
+    let entity_count = storage.entity_count(ctx, session_id).await.unwrap_or(0);
+    let fold_count = storage.fold_count(ctx, session_id).await.unwrap_or(0);
+    let memo_count = storage.memo_count(ctx).await.unwrap_or(0);
+    let intention_count = session.intentions.lock().await.list().len();
+
+    Ok(serde_json::json!({
+        "entity_count": entity_count,
+        "fold_count": fold_count,
+        "memo_count": memo_count,
+        "intention_count": intention_count
+    }))
+}
+
 // --- Parameter extraction helpers ---
 
 fn optional_uuid(args: &Value, field: &str) -> Result<Option<uuid::Uuid>, (i32, String)> {
@@ -1179,7 +1273,7 @@ mod tests {
             .await
             .unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 24);
+        assert_eq!(tools.len(), 27);
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"check_memo_cache"));
@@ -1193,6 +1287,8 @@ mod tests {
         assert!(names.contains(&"list_intentions"));
         assert!(names.contains(&"snooze_intention"));
         assert!(names.contains(&"hybrid_search"));
+        assert!(names.contains(&"promote_memory"));
+        assert!(names.contains(&"demote_memory"));
     }
 
     #[tokio::test]
@@ -1456,6 +1552,7 @@ mod tests {
             context_snippet: "Alice is the project lead".into(),
             entity_embedding: None,
             confidence: 0.9,
+            state: Default::default(),
             created_at: chrono::Utc::now(),
         };
         store.entities.lock().await.push(entity.clone());
@@ -1496,6 +1593,7 @@ mod tests {
             context_snippet: "Bob is the CTO".into(),
             entity_embedding: Some(vec![0.1, 0.2, 0.3]),
             confidence: 0.95,
+            state: Default::default(),
             created_at: chrono::Utc::now(),
         };
         store.entities.lock().await.push(entity);
@@ -1546,5 +1644,27 @@ mod tests {
             "expected entity results"
         );
         assert!(sources.contains(&"fold_ann"), "expected fold results");
+    }
+
+    #[tokio::test]
+    async fn get_stats_returns_zeroes_for_empty_session() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+
+        let params = serde_json::json!({
+            "name": "get_stats",
+            "arguments": {
+                "session_id": sid.to_string()
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        assert_eq!(result["entity_count"], 0);
+        assert_eq!(result["fold_count"], 0);
+        assert_eq!(result["memo_count"], 0);
+        assert_eq!(result["intention_count"], 0);
     }
 }

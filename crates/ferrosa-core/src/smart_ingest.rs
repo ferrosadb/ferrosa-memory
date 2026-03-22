@@ -107,6 +107,7 @@ pub async fn smart_ingest(
             context_snippet: content.to_string(),
             entity_embedding: embedding.map(|e| e.to_vec()),
             confidence: 1.0,
+            state: crate::types::MemoryState::default(),
             created_at: chrono::Utc::now(),
         };
         storage.entity_put(ctx, &entry).await?;
@@ -165,6 +166,7 @@ pub async fn smart_ingest(
             context_snippet: content.to_string(),
             entity_embedding: embedding.map(|e| e.to_vec()),
             confidence: 1.0,
+            state: crate::types::MemoryState::default(),
             created_at: chrono::Utc::now(),
         };
         storage.entity_put(ctx, &entry).await?;
@@ -201,6 +203,7 @@ pub async fn smart_ingest(
         context_snippet: content.to_string(),
         entity_embedding: embedding.map(|e| e.to_vec()),
         confidence: 1.0,
+        state: crate::types::MemoryState::default(),
         created_at: chrono::Utc::now(),
     };
     storage.entity_put(ctx, &entry).await?;

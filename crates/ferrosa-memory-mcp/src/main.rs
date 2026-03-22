@@ -234,6 +234,36 @@ impl Storage for StorageBackend {
         }
     }
 
+    async fn fold_count(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+    ) -> anyhow::Result<usize> {
+        match self {
+            Self::Cql(s) => s.fold_count(ctx, session_id).await,
+            Self::Mock(s) => s.fold_count(ctx, session_id).await,
+        }
+    }
+
+    async fn memo_count(&self, ctx: &TenantContext) -> anyhow::Result<usize> {
+        match self {
+            Self::Cql(s) => s.memo_count(ctx).await,
+            Self::Mock(s) => s.memo_count(ctx).await,
+        }
+    }
+
+    async fn entity_update_state(
+        &self,
+        ctx: &TenantContext,
+        entity_id: uuid::Uuid,
+        state: MemoryState,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Cql(s) => s.entity_update_state(ctx, entity_id, state).await,
+            Self::Mock(s) => s.entity_update_state(ctx, entity_id, state).await,
+        }
+    }
+
     async fn entity_list_session(
         &self,
         ctx: &TenantContext,

@@ -48,6 +48,10 @@ struct PreparedStatements {
     entity_put: PreparedQuery,
     entity_count: PreparedQuery,
     entity_list_session: PreparedQuery,
+    entity_update_state: PreparedQuery,
+    // Count queries for stats
+    fold_count: PreparedQuery,
+    memo_count: PreparedQuery,
     // Temporal
     temporal_put: PreparedQuery,
     temporal_get_current: PreparedQuery,
@@ -184,8 +188,24 @@ impl CqlStorage {
             entity_list_session: session
                 .prepare(format!(
                     "SELECT entity_id, entity_name, entity_type, source_fold_id, \
-                     context_snippet, confidence, created_at \
+                     context_snippet, confidence, state, created_at \
                      FROM {ks}.entity_store WHERE tenant_id = ? AND session_id = ?"
+                ))
+                .await?,
+            entity_update_state: session
+                .prepare(format!(
+                    "UPDATE {ks}.entity_store SET state = ? \
+                     WHERE tenant_id = ? AND session_id = ? AND entity_id = ?"
+                ))
+                .await?,
+            fold_count: session
+                .prepare(format!(
+                    "SELECT fold_id FROM {ks}.trajectory_folds WHERE tenant_id = ? AND session_id = ?"
+                ))
+                .await?,
+            memo_count: session
+                .prepare(format!(
+                    "SELECT content_hash FROM {ks}.memo_cache WHERE tenant_id = ?"
                 ))
                 .await?,
             temporal_put: session
@@ -249,7 +269,7 @@ impl CqlStorage {
 
         tracing::info!(
             keyspace = ks,
-            statements = 22,
+            statements = 24,
             "CQL storage connected, all statements prepared"
         );
 
@@ -694,7 +714,7 @@ impl Storage for CqlStorage {
         // Fallback: exact case-insensitive match via ALLOW FILTERING
         let query = format!(
             "SELECT entity_id, entity_name, entity_type, source_fold_id, \
-             context_snippet, confidence, created_at \
+             context_snippet, confidence, state, created_at \
              FROM {}.entity_store WHERE tenant_id = ? AND session_id = ? ALLOW FILTERING",
             self.keyspace
         );
@@ -709,6 +729,11 @@ impl Storage for CqlStorage {
             let entity_name: String = row.r_by_name("entity_name")?;
             if entity_name.to_lowercase() == lower {
                 let created: chrono::NaiveDateTime = row.r_by_name("created_at")?;
+                let state = row
+                    .r_by_name::<String>("state")
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
+                    .unwrap_or_default();
                 return Ok(Some(EntityEntry {
                     tenant_id: ctx.tenant_id,
                     entity_id: row.r_by_name("entity_id")?,
@@ -719,6 +744,7 @@ impl Storage for CqlStorage {
                     context_snippet: row.r_by_name("context_snippet")?,
                     entity_embedding: None,
                     confidence: f64::from(row.r_by_name::<f32>("confidence")?),
+                    state,
                     created_at: created.and_utc(),
                 }));
             }
@@ -737,7 +763,7 @@ impl Storage for CqlStorage {
             cdrs_tokio::types::blob::Blob::new(crate::vector::encode_vector(query_embedding));
         let query = format!(
             "SELECT entity_id, entity_name, entity_type, source_fold_id, \
-             context_snippet, confidence, created_at \
+             context_snippet, confidence, state, created_at \
              FROM {}.entity_store WHERE tenant_id = ? AND session_id = ? \
              ORDER BY entity_embedding ANN OF ? LIMIT ?",
             self.keyspace
@@ -760,6 +786,11 @@ impl Storage for CqlStorage {
         let mut results = Vec::new();
         for row in rows {
             let created: chrono::NaiveDateTime = row.r_by_name("created_at")?;
+            let state = row
+                .r_by_name::<String>("state")
+                .ok()
+                .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
+                .unwrap_or_default();
             results.push(EntityEntry {
                 tenant_id: ctx.tenant_id,
                 entity_id: row.r_by_name("entity_id")?,
@@ -770,6 +801,7 @@ impl Storage for CqlStorage {
                 context_snippet: row.r_by_name("context_snippet")?,
                 entity_embedding: None, // Don't return embedding bytes in search results
                 confidence: f64::from(row.r_by_name::<f32>("confidence")?),
+                state,
                 created_at: created.and_utc(),
             });
         }
@@ -784,6 +816,23 @@ impl Storage for CqlStorage {
                 &self.stmts.entity_count,
                 query_values!(ctx.tenant_id, session_id),
             )
+            .await?;
+        Ok(rows.len())
+    }
+
+    async fn fold_count(&self, ctx: &TenantContext, session_id: Uuid) -> anyhow::Result<usize> {
+        let rows = self
+            .query_rows(
+                &self.stmts.fold_count,
+                query_values!(ctx.tenant_id, session_id),
+            )
+            .await?;
+        Ok(rows.len())
+    }
+
+    async fn memo_count(&self, ctx: &TenantContext) -> anyhow::Result<usize> {
+        let rows = self
+            .query_rows(&self.stmts.memo_count, query_values!(ctx.tenant_id))
             .await?;
         Ok(rows.len())
     }
@@ -803,6 +852,11 @@ impl Storage for CqlStorage {
         let mut results = Vec::with_capacity(rows.len());
         for row in rows {
             let created: chrono::NaiveDateTime = row.r_by_name("created_at")?;
+            let state = row
+                .r_by_name::<String>("state")
+                .ok()
+                .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
+                .unwrap_or_default();
             results.push(EntityEntry {
                 tenant_id: ctx.tenant_id,
                 entity_id: row.r_by_name("entity_id")?,
@@ -813,10 +867,44 @@ impl Storage for CqlStorage {
                 context_snippet: row.r_by_name("context_snippet")?,
                 entity_embedding: None,
                 confidence: f64::from(row.r_by_name::<f32>("confidence")?),
+                state,
                 created_at: created.and_utc(),
             });
         }
         Ok(results)
+    }
+
+    async fn entity_update_state(
+        &self,
+        ctx: &TenantContext,
+        entity_id: Uuid,
+        state: MemoryState,
+    ) -> anyhow::Result<()> {
+        let state_str = state.to_string();
+        // We need session_id for the partition key. Look up from entity_id via ALLOW FILTERING.
+        // In a real deployment, the caller should provide session_id. For now, use a scan.
+        let query = format!(
+            "SELECT session_id FROM {}.entity_store WHERE tenant_id = ? AND entity_id = ? ALLOW FILTERING",
+            self.keyspace
+        );
+        let envelope = self
+            .session
+            .query_with_values(query, query_values!(ctx.tenant_id, entity_id))
+            .await?;
+        let rows = envelope.response_body()?.into_rows().unwrap_or_default();
+        let row = rows
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("entity not found: {entity_id}"))?;
+        let session_id: Uuid = row.r_by_name("session_id")?;
+
+        self.session
+            .exec_with_values(
+                &self.stmts.entity_update_state,
+                query_values!(state_str, ctx.tenant_id, session_id, entity_id),
+            )
+            .await?;
+        Ok(())
     }
 
     // --- Temporal operations ---
