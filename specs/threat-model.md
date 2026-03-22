@@ -1,5 +1,8 @@
 # STRIDE Threat Model — ferrosa-memory-mcp
 
+> Last updated: 2026-03-21
+> Status: Updated — graph path changed to HTTP, TLS enforcement status noted
+
 ## Scope
 
 Full system: MCP clients -> ferrosa-memory-mcp -> Ferrosa DB. Includes stdio and HTTP+SSE transports, all 12 MCP tools, 6 CQL tables, graph layer, embedding endpoint, and nightly batch job.
@@ -63,7 +66,8 @@ graph TB
 | ID | Boundary | Crosses | Trust Level |
 |----|----------|---------|-------------|
 | TB0 | External clients -> MCP server | Network (HTTP) or process pipes (stdio) | Untrusted |
-| TB1 | MCP server -> Ferrosa DB | CQL wire protocol (TCP) | Authenticated, same-network |
+| TB1 | MCP server -> Ferrosa DB (CQL) | CQL wire protocol (TCP) | Authenticated, same-network |
+| TB1b | MCP server -> Ferrosa DB (Graph) | HTTP POST to `/graph/query` | Authenticated (HTTP Basic), same-network |
 | TB2 | MCP server -> Ollama | HTTP (local network) | Semi-trusted (no auth) |
 | TB3 | Batch job -> Ferrosa DB | CQL wire protocol (TCP) | Authenticated, separate credentials |
 
@@ -86,7 +90,7 @@ graph TB
 | T2 | Poisoned memo cache entries returning wrong results | memo_tools | **High** (L:3 x I:4 = 12) | Content hash verification on read. TTL-based expiry limits poison window. Audit log on all writes. |
 | T3 | Tampered fold summaries misleading future retrieval | fold_tools | **High** (L:2 x I:5 = 10) | Fold summaries written only by authenticated sessions. Compression is lossless-reversible for verification. `FOLDED_INTO` graph edges provide provenance chain. |
 | T4 | CQL injection via tool parameters | cql_client | **High** (L:2 x I:5 = 10) | ALL queries use prepared statements with parameterized bindings. No string interpolation into CQL. |
-| T5 | Cypher injection via entity names or queries | graph_client | **High** (L:2 x I:5 = 10) | Parameterized Cypher queries only. Entity names passed as parameters, never interpolated. |
+| T5 | Cypher injection via entity names or queries | graph_client (HTTP) | **High** (L:2 x I:5 = 10) | Parameterized Cypher queries via HTTP POST. Entity names passed as parameters, never interpolated into query strings. Graph client uses HTTP Basic auth on same-network endpoint (TB1b). |
 | T6 | Tampering with compressed data on S3 | storage (TB2) | **Medium** (L:1 x I:4 = 4) | S3 server-side encryption. Integrity check on decompression (store checksum alongside compressed data). |
 
 ### R — Repudiation
@@ -152,14 +156,14 @@ quadrantChart
 
 ## Critical Threats (Must mitigate before v1.0)
 
-1. **S2 — Tenant ID spoofing:** Architectural invariant — `tenant_id` never from client input
-2. **T1 — Memory poisoning (MemoryGraft):** Confidence gating + anomaly detection + audit log
-3. **T4/T5 — CQL/Cypher injection:** Prepared statements only, zero string interpolation
-4. **I1 — Cross-tenant leakage:** Partition key design + auth-scoped queries
+1. **S2 — Tenant ID spoofing:** Architectural invariant — `tenant_id` never from client input. **Status: MITIGATED** — `TenantContext` required param in all handlers, type-system enforced.
+1. **T1 — Memory poisoning (MemoryGraft):** Confidence gating + anomaly detection + audit log. **Status: PARTIAL** — confidence gating (>=0.7) implemented, rate limiting (1000/session) implemented. Anomaly detection and audit log NOT yet implemented.
+1. **T4/T5 — CQL/Cypher injection:** Prepared statements only, zero string interpolation. **Status: MITIGATED** — all 17 CQL prepared statements parameterized. Graph queries use HTTP POST with serialized parameters.
+1. **I1 — Cross-tenant leakage:** Partition key design + auth-scoped queries. **Status: MITIGATED** — every CQL query includes `tenant_id` from auth context.
 
 ## High Threats (Mitigate in Phase 1-2)
 
-5. **S1 — Client impersonation:** TLS + HTTP Basic auth
-6. **T2 — Memo cache poisoning:** Content hash verification + TTL
-7. **D3 — Cypher DoS:** Query timeout + depth limit
-8. **I2 — Raw trajectory exposure:** Compress fast, archive fast
+5. **S1 — Client impersonation:** TLS + HTTP Basic auth. **Status: PARTIAL** — HTTP Basic auth implemented, but `require_tls: false` currently hardcoded in main.rs. TLS enforcement needed before production HTTP deployment.
+1. **T2 — Memo cache poisoning:** Content hash verification + TTL. **Status: MITIGATED** — SHA-256 content hash, model version isolation, TTL support.
+1. **D3 — Cypher DoS:** Query timeout + depth limit. **Status: PARTIAL** — depth limit in traversal queries, but no explicit query timeout configured on HTTP client.
+1. **I2 — Raw trajectory exposure:** Compress fast, archive fast. **Status: PARTIAL** — compression engine working, but background compression job and S3 lifecycle not yet wired.

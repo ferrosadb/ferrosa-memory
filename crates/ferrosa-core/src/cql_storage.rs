@@ -172,7 +172,7 @@ impl CqlStorage {
                 .await?,
             entity_count: session
                 .prepare(format!(
-                    "SELECT COUNT(*) FROM {ks}.entity_store WHERE tenant_id = ? AND session_id = ?"
+                    "SELECT entity_id FROM {ks}.entity_store WHERE tenant_id = ? AND session_id = ?"
                 ))
                 .await?,
             temporal_put: session
@@ -668,19 +668,15 @@ impl Storage for CqlStorage {
     }
 
     async fn entity_count(&self, ctx: &TenantContext, session_id: Uuid) -> anyhow::Result<usize> {
+        // Client-side count: SELECT entity_id returns rows, count them.
+        // Workaround for Ferrosa returning COUNT(*) column as "system.count".
         let rows = self
             .query_rows(
                 &self.stmts.entity_count,
                 query_values!(ctx.tenant_id, session_id),
             )
             .await?;
-
-        if let Some(row) = rows.into_iter().next() {
-            let count: i64 = row.r_by_name("count")?;
-            Ok(count as usize)
-        } else {
-            Ok(0)
-        }
+        Ok(rows.len())
     }
 
     // --- Temporal operations ---

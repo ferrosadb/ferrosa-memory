@@ -1,5 +1,8 @@
 # Failure Mode and Effects Analysis — ferrosa-memory-mcp
 
+> Last updated: 2026-03-21
+> Status: Updated — added F31 (vector column gap), F32 (graph edge write gap)
+
 ## Scoring Criteria
 
 | Score | Severity (S) | Occurrence (O) | Detection (D) |
@@ -148,3 +151,26 @@
 | TC22 | F24 | Start HTTP server; attempt connection without TLS; verify rejection | Integration |
 | TC23 | F22 | Write two facts for same entity without supersession; run validation; verify detection | Integration |
 | TC24 | F27 | Compress then decompress 100 sample trajectories; verify exact round-trip equality | Unit (property-based) |
+
+### Component: cql_storage — Vector Column Support (NEW, 2026-03-21)
+
+| ID | Failure Mode | Effect | S | O | D | RPN | Recommended Action |
+|----|-------------|--------|---|---|---|-----|-------------------|
+| F31 | cdrs-tokio v9 lacks `vector<float,768>` type support | All embeddings stored as NULL in CQL. ANN queries (`ORDER BY embedding ANN OF ?`) non-functional. `fold_search` falls back to LIMIT-based retrieval. `entity_search_ann` returns empty. Semantic search completely broken. | 9 | 10 | 2 | **180** | Options: (1) Implement custom `vector` type serialization for cdrs-tokio (PR upstream or local fork), (2) Switch to scylla-rust-driver if it supports Ferrosa's vector type, (3) Use raw CQL bytes for vector columns. This is the #1 blocker for production semantic search. |
+| F32 | Graph edge creation not implemented in write paths | `FOLDED_INTO`, `SUPERSEDES`, `MENTIONED_IN`, `CO_OCCURS_WITH` edges never created. Graph traversals return empty. Fold hierarchy, entity relationships, and temporal chains not queryable via Cypher. | 7 | 10 | 2 | **140** | Implement edge creation INSERTs in fold_tools (complete_fold), entity_tools (upsert_entity), and temporal (write_temporal_fact). Edges are CQL INSERTs into graph-annotated tables, not Cypher mutations. |
+
+### Updated RPN entries (append to summary)
+
+| RPN | ID | Failure Mode | Component |
+|-----|----|-------------|-----------|
+| **180** | F31 | Vector column type not supported by cdrs-tokio | cql_storage |
+| **140** | F32 | Graph edge creation not implemented | fold/entity/temporal tools |
+
+### New Test Cases
+
+| Test ID | For FMEA | Test Description | Type |
+|---------|----------|------------------|------|
+| TC25 | F31 | Store entity with embedding via CQL; read back; verify embedding is not NULL | Integration |
+| TC26 | F31 | Execute `ORDER BY entity_embedding ANN OF ?` query; verify results ordered by similarity | Integration |
+| TC27 | F32 | Complete a fold with parent_fold_id; verify `FOLDED_INTO` edge exists in graph | Integration |
+| TC28 | F32 | Upsert two co-occurring entities; verify `CO_OCCURS_WITH` edge exists | Integration |

@@ -1,5 +1,8 @@
 # Design Structure Matrix — ferrosa-memory-mcp
 
+> Last updated: 2026-03-21
+> Status: Updated — M11 (graph_client) no longer depends on M10 (cql_client)
+
 ## Module Inventory
 
 14 modules identified from component architecture:
@@ -37,11 +40,13 @@ M7  .   .   .   .   .   .   .   .   .   X   X   X   X   X
 M8  .   .   .   .   .   .   .   .   .   X   X   .   X   X
 M9  .   .   .   .   .   .   .   .   .   X   .   .   .   X
 M10 .   .   .   .   .   .   .   .   .   .   .   .   .   X
-M11 .   .   .   .   .   .   .   .   .   X   .   .   .   X
+M11 .   .   .   .   .   .   .   .   .   .   .   .   .   .
 M12 .   .   .   .   .   .   .   .   .   .   .   .   .   .
 M13 .   .   .   .   .   .   .   .   .   .   .   .   .   .
 M14 .   .   .   .   .   .   .   .   .   .   .   .   .   .
 ```
+
+**Change (2026-03-21):** M11 (graph_client) no longer depends on M10 (cql_client) or M14 (metrics). After refactoring from neo4rs Bolt to HTTP Cypher (commit de901d1), graph_client is now a leaf module using only `reqwest` and `serde_json`. Graph writes still go through CQL (via tool handlers -> cql_client), but graph reads are independent HTTP calls.
 
 ## Dependency Graph
 
@@ -68,7 +73,7 @@ graph TD
     M6 --> M14
 
     M7 --> M10
-    M7 --> M11[graph_client]
+    M7 --> M11[graph_client<br/>HTTP Cypher]
     M7 --> M12
     M7 --> M13
     M7 --> M14
@@ -82,12 +87,11 @@ graph TD
     M9 --> M14
 
     M10 --> M14
-    M11 --> M10
-    M11 --> M14
 
     style M10 fill:#ff9999
     style M14 fill:#ffcc99
     style M2 fill:#ff9999
+    style M11 fill:#ccffcc
 ```
 
 ## Analysis
@@ -96,11 +100,11 @@ graph TD
 
 | Module | Fan-In | Assessment |
 |--------|--------|------------|
-| cql_client (M10) | 8 | **High** — every tool module + graph_client + router |
-| metrics (M14) | 9 | **High** — every module except transport, dispatch, auth, compression, embedding |
+| cql_client (M10) | 7 | **High** — every tool module + router (graph_client removed) |
+| metrics (M14) | 8 | **High** — every module except transport, dispatch, auth, compression, embedding, graph |
 | embedding_client (M13) | 3 | Normal |
 | compression (M12) | 2 | Normal |
-| graph_client (M11) | 2 | Normal |
+| graph_client (M11) | 2 | Normal (fold_tools, entity_tools only) |
 | auth (M3) | 1 | Normal |
 | tool_router (M4) | 1 | Normal |
 | All tool modules (M5-M9) | 1 each | Normal (only dispatch calls them) |
@@ -117,8 +121,8 @@ graph TD
 ### Dependency Cycles
 
 **None detected.** The dependency graph is a strict DAG:
-- Leaf modules (no dependencies): `transport` (M1), `auth` (M3), `compression` (M12), `embedding_client` (M13), `metrics` (M14)
-- Infrastructure layer: `cql_client` -> `metrics`, `graph_client` -> `cql_client` + `metrics`
+- Leaf modules (no dependencies): `transport` (M1), `auth` (M3), `compression` (M12), `embedding_client` (M13), `metrics` (M14), `graph_client` (M11)
+- Infrastructure layer: `cql_client` -> `metrics`
 - Tool layer: all tool modules -> infrastructure layer
 - Dispatch layer: `tool_dispatch` -> `auth` + `tool_router` + tool modules
 - Transport layer: `transport` -> `tool_dispatch`
@@ -129,15 +133,15 @@ Propagation cost estimates how much of the system is affected by a change in one
 
 | Module | Direct deps | Transitive reach | Propagation % |
 |--------|------------|-------------------|---------------|
-| cql_client (M10) | 8 dependents | 12/14 modules | **86%** |
-| metrics (M14) | 9 dependents | 13/14 modules | **93%** |
+| cql_client (M10) | 7 dependents | 11/14 modules | **79%** |
+| metrics (M14) | 8 dependents | 12/14 modules | **86%** |
 | compression (M12) | 2 dependents | 4/14 modules | 29% |
 | embedding_client (M13) | 3 dependents | 5/14 modules | 36% |
 | graph_client (M11) | 2 dependents | 4/14 modules | 29% |
 
-**System propagation cost: 39%** (average across all modules)
+**System propagation cost: 37%** (average across all modules)
 
-This is good for a project of this size. The high propagation for `cql_client` and `metrics` is expected and manageable through stable interfaces (trait abstractions).
+This is good for a project of this size. The decoupling of `graph_client` from `cql_client` (HTTP refactor, 2026-03-21) reduced `cql_client` propagation from 86% to 79%. The high propagation for `cql_client` and `metrics` is expected and manageable through stable interfaces (trait abstractions).
 
 ### Structural Concerns
 

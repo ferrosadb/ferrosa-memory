@@ -1,5 +1,8 @@
 # Component Architecture
 
+> Last updated: 2026-03-21
+> Status: Updated — graph_client refactored to HTTP Cypher (de901d1)
+
 ## Module Map
 
 ```mermaid
@@ -25,8 +28,8 @@ graph TB
     end
 
     subgraph "Storage"
-        CQL[cql_client]
-        GRAPH[graph_client]
+        CQL[cql_client<br/>cdrs-tokio CQL]
+        GRAPH[graph_client<br/>HTTP Cypher]
     end
 
     subgraph "Observability"
@@ -57,6 +60,8 @@ graph TB
     GRAPH --> METRICS
     ROUTER --> METRICS
 ```
+
+**Note:** `graph_client` (M11) no longer depends on `cql_client` (M10). Graph writes go through CQL (vertex/edge table INSERTs via `CqlStorage`), but graph reads/traversals go directly through the HTTP Cypher endpoint via `reqwest`.
 
 ## Components
 
@@ -229,20 +234,24 @@ graph TB
 
 ---
 
-### 11. `graph_client` — Cypher Graph Client
+### 11. `graph_client` — HTTP Cypher Client
 
-**Responsibility:** Executes Cypher queries against Ferrosa's graph layer for multi-hop traversals and edge management.
+**Responsibility:** Executes Cypher MATCH queries against Ferrosa's HTTP graph endpoint for multi-hop traversals.
+
+**Implementation note (updated 2026-03-21):** Switched from neo4rs (Bolt v4) to HTTP POST against `/graph/query` in commit de901d1. Ferrosa's Bolt endpoint is v5, which neo4rs 0.8 does not support. Graph writes (vertex/edge creation) go through CQL INSERTs into graph-annotated tables via `CqlStorage`, not through this client.
 
 **Interface:**
-- `create_vertex(label, properties) -> Result<()>`
-- `create_edge(from, to, edge_type, properties) -> Result<()>`
-- `traverse(cypher_query) -> Result<Vec<Row>>`
+- `connect(config) -> Result<GraphClient>` — HTTP connection with Basic auth
+- `get_fold_ancestors(fold_id) -> Result<Vec<Uuid>>` — `FOLDED_INTO` traversal
+- `find_related_entities(entity_id, hops) -> Result<Vec<Value>>` — `CO_OCCURS_WITH` N-hop
+- `get_entities_in_fold(fold_id) -> Result<Vec<Value>>` — `MENTIONED_IN` lookup
+- `get_supersession_chain(event_id) -> Result<Vec<Value>>` — `SUPERSEDES` chain
 
-**Edge types managed:** `FOLDED_INTO`, `CO_OCCURS_WITH`, `MENTIONED_IN`, `SUPERSEDES`
+**Edge types queried:** `FOLDED_INTO`, `CO_OCCURS_WITH`, `MENTIONED_IN`, `SUPERSEDES`
 
-**Dependencies:** `cql_client` (Cypher may route through CQL in Ferrosa), `metrics`
+**Dependencies:** `reqwest` (HTTP), `serde_json` — no dependency on `cql_client` or `metrics`
 
-**Size estimate:** ~80 lines
+**Size estimate:** ~170 lines (actual)
 
 ---
 

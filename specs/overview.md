@@ -55,10 +55,24 @@ Authentication: HTTP Basic (same credentials as CQL) in HTTP mode; stdio inherit
 
 - **Language:** Rust (Tokio async runtime)
 - **MCP protocol:** JSON-RPC over stdio or HTTP+SSE
-- **CQL driver:** `cdrs-tokio` or `scylla-rust-driver` (depending on Ferrosa wire compatibility)
+- **CQL driver:** `cdrs-tokio` v9 (selected over `scylla-rust-driver` — see risk register)
+- **Graph client:** HTTP POST to Ferrosa's `/graph/query` endpoint via `reqwest` (neo4rs Bolt v4 incompatible with Ferrosa Bolt v5)
 - **Compression:** Rust-native implementation (no Python — LLMLingua algorithm ported to Rust)
 - **Embedding:** HTTP call to Ollama endpoint (nomic-embed-text, 768 dimensions)
 - **Serialization:** `serde` + `serde_json`
+
+## Workspace Structure
+
+```
+ferrosa-memory/
+├── crates/
+│   ├── ferrosa-core/          # Shared library: storage traits, tool handlers, config
+│   ├── ferrosa-memory-mcp/    # MCP server binary (stdio + HTTP)
+│   └── ferrosa-memory-batch/  # Nightly batch job binary
+├── ddl/                       # CQL schema files (001_keyspace, 002_folds_entities)
+├── docker-compose.yml         # Dev cluster (3-node Ferrosa + RustFS + Ollama)
+└── specs/                     # Architecture documentation
+```
 
 ## Keyspace
 
