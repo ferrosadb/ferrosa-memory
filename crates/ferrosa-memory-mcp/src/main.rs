@@ -278,13 +278,24 @@ impl Storage for StorageBackend {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let debug = std::env::args().any(|a| a == "--debug");
+
+    let default_filter = if debug {
+        "debug,cdrs_tokio=debug,hyper=info,reqwest=info"
+    } else {
+        "ferrosa_core=warn,ferrosa_memory_mcp=warn"
+    };
+
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)),
         )
+        .with_writer(std::io::stderr)
         .init();
 
-    tracing::info!("ferrosa-memory-mcp starting");
+    if debug {
+        tracing::info!("ferrosa-memory-mcp starting (debug mode)");
+    }
 
     let config = match ferrosa_core::config::load_config() {
         Ok(c) => c,

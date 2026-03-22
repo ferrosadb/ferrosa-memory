@@ -54,6 +54,7 @@ pub async fn write_temporal_fact(
     };
 
     storage.temporal_put(ctx, &event).await?;
+    tracing::info!(%event_id, %entity_id, supersedes = ?supersedes_id, "temporal fact written");
     Ok(event_id)
 }
 

@@ -50,21 +50,26 @@ pub async fn check_memo_cache(
     model_version: &str,
 ) -> anyhow::Result<MemoCheckResult> {
     let hash = content_hash(prompt, context_slice);
+    tracing::debug!(hash = %hash, model_version, "check_memo_cache");
 
     match storage.memo_get(ctx, &hash, model_version).await? {
         Some(entry) => {
             storage.memo_touch(ctx, &hash, model_version).await?;
+            tracing::info!(hash = %hash, hit_count = entry.hit_count + 1, "memo cache HIT");
             Ok(MemoCheckResult {
                 hit: true,
                 result: Some(entry.result),
                 hit_count: Some(entry.hit_count + 1),
             })
         }
-        None => Ok(MemoCheckResult {
-            hit: false,
-            result: None,
-            hit_count: None,
-        }),
+        None => {
+            tracing::debug!(hash = %hash, "memo cache MISS");
+            Ok(MemoCheckResult {
+                hit: false,
+                result: None,
+                hit_count: None,
+            })
+        }
     }
 }
 
@@ -105,6 +110,12 @@ pub async fn store_memo_result(
     };
 
     storage.memo_put(ctx, &entry).await?;
+    tracing::info!(
+        hash = %hash,
+        model_version = params.model_version,
+        result_len = params.result.len(),
+        "memo stored"
+    );
 
     Ok(MemoStoreResult {
         stored: true,

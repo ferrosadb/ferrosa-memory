@@ -51,6 +51,7 @@ pub async fn write_plan_node(
     };
 
     storage.plan_put(ctx, &node).await?;
+    tracing::info!(subtask_id, depth, "plan node written");
     Ok(true)
 }
 

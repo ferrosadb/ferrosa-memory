@@ -51,15 +51,26 @@ pub async fn upsert_entity(
     confidence: Option<f64>,
 ) -> anyhow::Result<UpsertEntityResult> {
     let confidence = confidence.unwrap_or(1.0);
+    tracing::debug!(entity_name, entity_type, confidence, "upsert_entity");
 
     // Confidence gating (FMEA F19)
     if confidence < DEFAULT_CONFIDENCE_GATE {
+        tracing::warn!(
+            confidence,
+            gate = DEFAULT_CONFIDENCE_GATE,
+            "entity rejected: low confidence"
+        );
         anyhow::bail!("confidence {confidence} below gate {DEFAULT_CONFIDENCE_GATE}");
     }
 
     // Rate limit: check entity count (FMEA F20)
     let count = storage.entity_count(ctx, session_id).await?;
     if count >= DEFAULT_MAX_ENTITIES_PER_SESSION {
+        tracing::warn!(
+            count,
+            limit = DEFAULT_MAX_ENTITIES_PER_SESSION,
+            "entity rejected: rate limit"
+        );
         anyhow::bail!("entity count {count} exceeds limit {DEFAULT_MAX_ENTITIES_PER_SESSION}");
     }
 
@@ -68,6 +79,7 @@ pub async fn upsert_entity(
         .entity_find_phonetic(ctx, session_id, entity_name)
         .await?
     {
+        tracing::info!(entity_name, entity_id = %existing.entity_id, "entity deduplicated (phonetic match)");
         return Ok(UpsertEntityResult {
             entity_id: existing.entity_id,
             is_new: false,
@@ -90,6 +102,7 @@ pub async fn upsert_entity(
     };
 
     storage.entity_put(ctx, &entry).await?;
+    tracing::info!(entity_name, entity_type, %entity_id, "entity created");
 
     Ok(UpsertEntityResult {
         entity_id,

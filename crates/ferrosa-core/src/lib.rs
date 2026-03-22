@@ -15,6 +15,10 @@
 //! - [`plan`] — Plan state tool handlers
 //! - [`types`] — Shared domain types
 
+//! # ferrosa-core
+//!
+//! Shared library for the Ferrosa Memory MCP system.
+
 pub mod auth;
 pub mod compression;
 pub mod config;

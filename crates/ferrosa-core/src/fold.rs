@@ -47,6 +47,7 @@ pub async fn start_fold(
     };
 
     storage.fold_put(ctx, &entry).await?;
+    tracing::info!(%fold_id, depth, "fold started");
     Ok(fold_id)
 }
 
@@ -116,6 +117,7 @@ pub async fn complete_fold(
         )
         .await?;
 
+    tracing::info!(%fold_id, compression_ratio, "fold completed");
     Ok((true, compression_ratio))
 }
 

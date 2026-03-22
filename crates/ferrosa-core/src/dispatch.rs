@@ -262,7 +262,9 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         .cloned()
         .unwrap_or(Value::Object(serde_json::Map::new()));
 
-    match name {
+    tracing::debug!(tool = name, "dispatching tool call");
+    let start = std::time::Instant::now();
+    let result = match name {
         "check_memo_cache" => handle_check_memo(args, storage, ctx).await,
         "store_memo_result" => handle_store_memo(args, storage, ctx).await,
         "write_plan_node" => handle_write_plan(args, storage, ctx).await,
@@ -276,7 +278,23 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "retrieve_entities" => handle_retrieve_entities(args, storage, ctx).await,
         "record_outcome" => handle_record_outcome(args, storage, ctx).await,
         _ => Err((METHOD_NOT_FOUND, format!("unknown tool: {name}"))),
+    };
+    let elapsed = start.elapsed();
+    match &result {
+        Ok(_) => tracing::debug!(
+            tool = name,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "tool call OK"
+        ),
+        Err((code, msg)) => tracing::warn!(
+            tool = name,
+            code,
+            msg,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "tool call FAILED"
+        ),
     }
+    result
 }
 
 // --- Tool handlers ---

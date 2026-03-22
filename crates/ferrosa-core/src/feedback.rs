@@ -34,6 +34,13 @@ pub async fn record_outcome(
     };
 
     storage.feedback_put(ctx, &outcome).await?;
+    tracing::info!(
+        program_type,
+        task_complexity,
+        succeeded,
+        latency_ms,
+        "feedback recorded"
+    );
     Ok(true)
 }
 
