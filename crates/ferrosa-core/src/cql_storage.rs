@@ -110,8 +110,8 @@ impl CqlStorage {
             memo_put: session
                 .prepare(format!(
                     "INSERT INTO {ks}.memo_cache \
-                     (content_hash, model_version, tenant_id, result, created_at, last_hit_at, hit_count, expires_at) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                     (content_hash, model_version, tenant_id, result, result_embedding, created_at, last_hit_at, hit_count, expires_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 ))
                 .await?,
             plan_put: session
@@ -163,7 +163,7 @@ impl CqlStorage {
             fold_complete: session
                 .prepare(format!(
                     "UPDATE {ks}.trajectory_folds \
-                     SET status = ?, fold_summary = ?, compression_ratio = ?, folded_at = ? \
+                     SET status = ?, fold_summary = ?, fold_embedding = ?, compression_ratio = ?, folded_at = ? \
                      WHERE session_id = ? AND tenant_id = ? AND fold_id = ?"
                 ))
                 .await?,
@@ -171,8 +171,8 @@ impl CqlStorage {
                 .prepare(format!(
                     "INSERT INTO {ks}.entity_store \
                      (tenant_id, entity_id, session_id, entity_name, entity_type, \
-                      source_fold_id, context_snippet, confidence, created_at) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                      source_fold_id, context_snippet, entity_embedding, confidence, created_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 ))
                 .await?,
             entity_count: session
@@ -347,6 +347,9 @@ impl Storage for CqlStorage {
                     entry.model_version.clone(),
                     ctx.tenant_id,
                     entry.result.clone(),
+                    entry.result_embedding.as_ref().map(|e| {
+                        cdrs_tokio::types::blob::Blob::new(crate::vector::encode_vector(e))
+                    }),
                     now,
                     now,  // last_hit_at = created_at initially
                     0i64, // hit_count
@@ -565,16 +568,18 @@ impl Storage for CqlStorage {
         session_id: Uuid,
         fold_id: Uuid,
         summary: &str,
-        _embedding: Vec<f32>,
+        embedding: Vec<f32>,
         compression_ratio: f64,
     ) -> anyhow::Result<()> {
-        // TODO: write embedding to fold_embedding vector column
+        let embedding_blob =
+            cdrs_tokio::types::blob::Blob::new(crate::vector::encode_vector(&embedding));
         self.session
             .exec_with_values(
                 &self.stmts.fold_complete,
                 query_values!(
                     "folded".to_string(),
                     summary.to_string(),
+                    embedding_blob,
                     compression_ratio,
                     chrono::Utc::now().naive_utc(),
                     session_id,
@@ -590,21 +595,41 @@ impl Storage for CqlStorage {
         &self,
         ctx: &TenantContext,
         session_id: Uuid,
-        _query_embedding: &[f32],
+        query_embedding: &[f32],
         k: usize,
         include_raw: bool,
     ) -> anyhow::Result<Vec<FoldSummary>> {
-        // TODO: ANN query using ORDER BY fold_embedding ANN OF ?
-        // For now, fall back to retrieving all folded entries and returning top-k
+        // ANN query using ORDER BY fold_embedding ANN OF ?
+        // Falls back to LIMIT-based if ANN query fails (no HNSW index)
+        let query_blob =
+            cdrs_tokio::types::blob::Blob::new(crate::vector::encode_vector(query_embedding));
         let query = format!(
             "SELECT fold_id, depth, fold_summary, token_count, raw_trajectory \
-             FROM {}.trajectory_folds WHERE session_id = ? AND tenant_id = ? LIMIT ?",
+             FROM {}.trajectory_folds WHERE session_id = ? AND tenant_id = ? \
+             ORDER BY fold_embedding ANN OF ? LIMIT ?",
             self.keyspace
         );
-        let envelope = self
+        let envelope = match self
             .session
-            .query_with_values(query, query_values!(session_id, ctx.tenant_id, k as i32))
-            .await?;
+            .query_with_values(
+                query,
+                query_values!(session_id, ctx.tenant_id, query_blob, k as i32),
+            )
+            .await
+        {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e, "ANN query failed, falling back to LIMIT");
+                let fallback = format!(
+                    "SELECT fold_id, depth, fold_summary, token_count, raw_trajectory \
+                     FROM {}.trajectory_folds WHERE session_id = ? AND tenant_id = ? LIMIT ?",
+                    self.keyspace
+                );
+                self.session
+                    .query_with_values(fallback, query_values!(session_id, ctx.tenant_id, k as i32))
+                    .await?
+            }
+        };
 
         let rows = envelope.response_body()?.into_rows().unwrap_or_default();
         let mut results = Vec::new();
@@ -641,6 +666,9 @@ impl Storage for CqlStorage {
                     entry.entity_type.clone(),
                     entry.source_fold_id,
                     entry.context_snippet.clone(),
+                    entry.entity_embedding.as_ref().map(|e| {
+                        cdrs_tokio::types::blob::Blob::new(crate::vector::encode_vector(e))
+                    }),
                     entry.confidence as f32,
                     chrono::Utc::now().naive_utc()
                 ),
@@ -693,13 +721,52 @@ impl Storage for CqlStorage {
 
     async fn entity_search_ann(
         &self,
-        _ctx: &TenantContext,
-        _session_id: Uuid,
-        _query_embedding: &[f32],
-        _k: usize,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        query_embedding: &[f32],
+        k: usize,
     ) -> anyhow::Result<Vec<EntityEntry>> {
-        // TODO: ANN query using ORDER BY entity_embedding ANN OF ?
-        Ok(Vec::new())
+        let query_blob =
+            cdrs_tokio::types::blob::Blob::new(crate::vector::encode_vector(query_embedding));
+        let query = format!(
+            "SELECT entity_id, entity_name, entity_type, source_fold_id, \
+             context_snippet, confidence, created_at \
+             FROM {}.entity_store WHERE tenant_id = ? AND session_id = ? \
+             ORDER BY entity_embedding ANN OF ? LIMIT ?",
+            self.keyspace
+        );
+        let envelope = match self
+            .session
+            .query_with_values(
+                query,
+                query_values!(ctx.tenant_id, session_id, query_blob, k as i32),
+            )
+            .await
+        {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e, "entity ANN query failed");
+                return Ok(Vec::new());
+            }
+        };
+        let rows = envelope.response_body()?.into_rows().unwrap_or_default();
+        let mut results = Vec::new();
+        for row in rows {
+            let created: chrono::NaiveDateTime = row.r_by_name("created_at")?;
+            results.push(EntityEntry {
+                tenant_id: ctx.tenant_id,
+                entity_id: row.r_by_name("entity_id")?,
+                session_id,
+                entity_name: row.r_by_name("entity_name")?,
+                entity_type: row.r_by_name("entity_type")?,
+                source_fold_id: row.r_by_name::<Uuid>("source_fold_id").ok(),
+                context_snippet: row.r_by_name("context_snippet")?,
+                entity_embedding: None, // Don't return embedding bytes in search results
+                confidence: f64::from(row.r_by_name::<f32>("confidence")?),
+                created_at: created.and_utc(),
+            });
+        }
+        Ok(results)
     }
 
     async fn entity_count(&self, ctx: &TenantContext, session_id: Uuid) -> anyhow::Result<usize> {
