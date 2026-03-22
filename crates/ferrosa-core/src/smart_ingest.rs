@@ -215,6 +215,119 @@ pub async fn smart_ingest(
     Ok(IngestDecision::Created { entity_id })
 }
 
+/// Extract candidate entities from text using simple heuristics.
+/// Returns (name, entity_type) pairs.
+///
+/// Finds capitalized multi-word phrases (2+ capital-letter words) which are
+/// likely named entities (people, places, orgs, technical concepts). Also
+/// captures standalone capitalized words that are not common English words.
+pub fn extract_entity_candidates(text: &str) -> Vec<(String, String)> {
+    let mut candidates = Vec::new();
+
+    // Find capitalized multi-word phrases (words starting with uppercase)
+    // These are likely named entities (people, places, orgs, concepts)
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut i = 0;
+    while i < words.len() {
+        let word = words[i];
+        // Skip common sentence starters and short words
+        if word.len() > 1
+            && word.chars().next().is_some_and(|c| c.is_uppercase())
+            && !is_common_word(word)
+            // skip sentence starters (i > 0)
+            && i > 0
+        {
+            // Collect consecutive capitalized words
+            let start = i;
+            while i < words.len()
+                && words[i].chars().next().is_some_and(|c| c.is_uppercase())
+                && words[i].len() > 1
+            {
+                i += 1;
+            }
+            if i > start {
+                let phrase: String = words[start..i].join(" ");
+                // Clean trailing punctuation
+                let clean = phrase.trim_end_matches(|c: char| c.is_ascii_punctuation());
+                if clean.len() > 1 {
+                    candidates.push((clean.to_string(), "concept".to_string()));
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    candidates.dedup_by(|a, b| a.0 == b.0);
+    candidates
+}
+
+fn is_common_word(word: &str) -> bool {
+    matches!(
+        word,
+        "The"
+            | "This"
+            | "That"
+            | "These"
+            | "Those"
+            | "When"
+            | "Where"
+            | "Which"
+            | "What"
+            | "How"
+            | "For"
+            | "With"
+            | "From"
+            | "Into"
+            | "After"
+            | "Before"
+            | "During"
+            | "Between"
+            | "Through"
+            | "About"
+            | "Each"
+            | "Every"
+            | "Also"
+            | "Both"
+            | "Either"
+            | "Neither"
+            | "Some"
+            | "Any"
+            | "All"
+            | "Most"
+            | "Other"
+            | "Another"
+            | "Such"
+            | "Only"
+            | "Very"
+            | "Just"
+            | "But"
+            | "And"
+            | "Not"
+            | "Yet"
+            | "Still"
+            | "Already"
+            | "However"
+            | "Therefore"
+            | "Thus"
+            | "Hence"
+            | "Since"
+            | "Because"
+            | "Although"
+            | "While"
+            | "Until"
+            | "Unless"
+            | "Once"
+            | "Here"
+            | "There"
+            | "Then"
+            | "Now"
+            | "If"
+            | "Or"
+            | "So"
+    )
+}
+
 /// Simple text similarity using word overlap (Jaccard coefficient).
 /// For production, this should use embedding cosine similarity.
 fn compute_text_similarity(a: &str, b: &str) -> f64 {
@@ -273,5 +386,70 @@ mod tests {
         .unwrap();
 
         assert!(matches!(result, IngestDecision::Created { .. }));
+    }
+
+    #[test]
+    fn extract_entities_from_technical_text() {
+        // First word is skipped by the sentence-starter heuristic (i > 0),
+        // so prefix with a lowercase word to push entities past position 0.
+        let text = "uses Ferrosa with LSM-tree storage and S3 tiering";
+        let candidates = extract_entity_candidates(text);
+        let names: Vec<&str> = candidates.iter().map(|c| c.0.as_str()).collect();
+        assert!(names.contains(&"Ferrosa"), "should extract Ferrosa");
+        assert!(names.contains(&"LSM-tree"), "should extract LSM-tree");
+        assert!(names.contains(&"S3"), "should extract S3");
+    }
+
+    #[test]
+    fn extract_entities_filters_common_words() {
+        let text = "However the system Also provides Some features";
+        let candidates = extract_entity_candidates(text);
+        let names: Vec<&str> = candidates.iter().map(|c| c.0.as_str()).collect();
+        assert!(
+            !names.iter().any(|n| *n == "However"),
+            "should filter However"
+        );
+        assert!(!names.iter().any(|n| *n == "Also"), "should filter Also");
+        assert!(!names.iter().any(|n| *n == "Some"), "should filter Some");
+    }
+
+    #[test]
+    fn extract_entities_skips_sentence_starters() {
+        let text = "Cassandra is great. Redis is fast.";
+        let candidates = extract_entity_candidates(text);
+        let names: Vec<&str> = candidates.iter().map(|c| c.0.as_str()).collect();
+        // "Cassandra" is at i=0, so it is skipped as a sentence starter
+        assert!(
+            !names.contains(&"Cassandra"),
+            "should skip sentence-starting word"
+        );
+        // "Redis" is at i > 0 and capitalized, so it should be captured
+        assert!(
+            names.contains(&"Redis"),
+            "should extract mid-sentence entity"
+        );
+    }
+
+    #[test]
+    fn extract_entities_multi_word_phrase() {
+        let text = "uses Apache Kafka for streaming";
+        let candidates = extract_entity_candidates(text);
+        let names: Vec<&str> = candidates.iter().map(|c| c.0.as_str()).collect();
+        assert!(
+            names.contains(&"Apache Kafka"),
+            "should extract multi-word phrase, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn extract_entities_empty_text() {
+        let candidates = extract_entity_candidates("");
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn extract_entities_all_lowercase() {
+        let candidates = extract_entity_candidates("everything is lowercase here");
+        assert!(candidates.is_empty());
     }
 }

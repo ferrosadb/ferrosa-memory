@@ -126,6 +126,22 @@ pub async fn complete_fold(
         tracing::warn!(%fold_id, %parent_id, error = %e, "failed to create FOLDED_INTO edge");
     }
 
+    // Auto-extract entities from the fold summary
+    let candidates = crate::smart_ingest::extract_entity_candidates(summary);
+    for (name, entity_type) in candidates {
+        let _ = crate::smart_ingest::smart_ingest(
+            storage,
+            ctx,
+            session_id,
+            &name,
+            &entity_type,
+            None,
+            Some(fold_id),
+            &crate::smart_ingest::IngestConfig::default(),
+        )
+        .await;
+    }
+
     tracing::info!(%fold_id, compression_ratio, "fold completed");
     Ok((true, compression_ratio))
 }
@@ -288,5 +304,40 @@ mod tests {
         let fold = store.fold_get(&ctx, sid, child).await.unwrap().unwrap();
         assert_eq!(fold.parent_fold_id, Some(parent));
         assert_eq!(fold.depth, 1);
+    }
+
+    #[tokio::test]
+    async fn complete_fold_extracts_entities_from_summary() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let sid = Uuid::new_v4();
+
+        let fold_id = start_fold(&store, &ctx, sid, 0, None, "working on storage layer")
+            .await
+            .unwrap();
+
+        // Summary contains capitalized entity names mid-sentence
+        let summary = "implemented Ferrosa storage using Apache Kafka for streaming";
+        let embedding = vec![0.1; 768];
+        let (folded, _ratio) = complete_fold(&store, &ctx, sid, fold_id, summary, embedding)
+            .await
+            .unwrap();
+        assert!(folded);
+
+        // Verify entities were created in storage
+        let entities = store.entities.lock().await;
+        let entity_names: Vec<&str> = entities.iter().map(|e| e.entity_name.as_str()).collect();
+        assert!(
+            entity_names.iter().any(|n| n.contains("Ferrosa")),
+            "should have created Ferrosa entity, got: {entity_names:?}"
+        );
+        assert!(
+            entity_names.iter().any(|n| n.contains("Apache Kafka")),
+            "should have created Apache Kafka entity, got: {entity_names:?}"
+        );
+        // All entities should have the fold_id as source
+        for entity in entities.iter() {
+            assert_eq!(entity.source_fold_id, Some(fold_id));
+        }
     }
 }
