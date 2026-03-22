@@ -317,6 +317,33 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "required": ["intention_id"]
             }),
         },
+        // --- Temporal fact tools ---
+        ToolDef {
+            name: "write_temporal_fact".into(),
+            description: "Records a timestamped fact about an entity. Auto-supersedes the previous current fact for the same entity.\n\nCALL WHEN: You learn a new fact about an entity that may change over time (e.g., role, location, status). The old fact is preserved with a valid_until timestamp.\nDO NOT CALL: For static attributes unlikely to change. Use upsert_entity for those.\nReturns: event_id of the new fact.\nCost: ~5ms.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "format": "uuid" },
+                    "entity_id": { "type": "string", "format": "uuid" },
+                    "fact_text": { "type": "string", "maxLength": 4096, "description": "The fact to record" },
+                    "confidence": { "type": "number", "minimum": 0, "maximum": 1, "description": "Confidence score (default: 1.0)" }
+                },
+                "required": ["session_id", "entity_id", "fact_text"]
+            }),
+        },
+        ToolDef {
+            name: "get_temporal_chain".into(),
+            description: "Returns the current (most recent valid) fact for an entity.\n\nCALL WHEN: You need to check the latest known fact about an entity before writing a new one, or to answer a question about current state.\nReturns: The current fact object, or {\"fact\": null} if no facts exist.\nCost: ~2ms.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "format": "uuid" },
+                    "entity_id": { "type": "string", "format": "uuid" }
+                },
+                "required": ["session_id", "entity_id"]
+            }),
+        },
     ]
 }
 
@@ -396,6 +423,8 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "complete_intention" => handle_complete_intention(args, session).await,
         "list_intentions" => handle_list_intentions(session).await,
         "snooze_intention" => handle_snooze_intention(args, session).await,
+        "write_temporal_fact" => handle_write_temporal_fact(args, storage, ctx).await,
+        "get_temporal_chain" => handle_get_temporal_chain(args, storage, ctx).await,
         _ => Err((METHOD_NOT_FOUND, format!("unknown tool: {name}"))),
     };
     let elapsed = start.elapsed();
@@ -844,6 +873,48 @@ async fn handle_snooze_intention(
     Ok(serde_json::json!({ "snoozed": snoozed }))
 }
 
+// --- Temporal fact handlers ---
+
+async fn handle_write_temporal_fact<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = require_uuid(&args, "session_id")?;
+    let entity_id = require_uuid(&args, "entity_id")?;
+    let fact_text = require_str(&args, "fact_text")?;
+    let confidence = args
+        .get("confidence")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0);
+
+    let event_id = crate::temporal::write_temporal_fact(
+        storage, ctx, entity_id, fact_text, session_id, confidence,
+    )
+    .await
+    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    Ok(serde_json::json!({ "event_id": event_id.to_string() }))
+}
+
+async fn handle_get_temporal_chain<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let _session_id = require_uuid(&args, "session_id")?;
+    let entity_id = require_uuid(&args, "entity_id")?;
+
+    let fact = crate::temporal::get_current_fact(storage, ctx, entity_id)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    match fact {
+        Some(event) => serde_json::to_value(&event).map_err(|e| (INTERNAL_ERROR, e.to_string())),
+        None => Ok(serde_json::json!({ "fact": null })),
+    }
+}
+
 // --- Parameter extraction helpers ---
 
 fn optional_uuid(args: &Value, field: &str) -> Result<Option<uuid::Uuid>, (i32, String)> {
@@ -933,7 +1004,7 @@ mod tests {
             .await
             .unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 19);
+        assert_eq!(tools.len(), 21);
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"check_memo_cache"));
@@ -1119,5 +1190,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["triggered"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn temporal_fact_round_trip() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+        let entity_id = Uuid::new_v4();
+
+        // Write a temporal fact
+        let params = serde_json::json!({
+            "name": "write_temporal_fact",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "entity_id": entity_id.to_string(),
+                "fact_text": "Alice is VP of Engineering",
+                "confidence": 0.95
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        assert!(result["event_id"].is_string());
+
+        // Get the current fact
+        let params = serde_json::json!({
+            "name": "get_temporal_chain",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "entity_id": entity_id.to_string()
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        assert_eq!(result["fact_text"], "Alice is VP of Engineering");
+        assert_eq!(result["confidence"], 0.95);
+
+        // Get for unknown entity returns null fact
+        let unknown = Uuid::new_v4();
+        let params = serde_json::json!({
+            "name": "get_temporal_chain",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "entity_id": unknown.to_string()
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        assert!(result["fact"].is_null());
     }
 }
