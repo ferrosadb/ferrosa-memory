@@ -28,74 +28,74 @@ pub fn tool_definitions() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "check_memo_cache".into(),
-            description: "Check if a sub-call result is cached".into(),
+            description: "Looks up a prior sub-call result by content hash. Returns cached result if found, or miss signal if not.\n\nCALL WHEN: Before every sub-LLM invocation within a long-horizon task. This is the first step in the usage loop.\nDO NOT CALL: For top-level queries or tasks where you are not making sub-calls. Do not call more than once per sub-call.\nON HIT: Use the cached result directly. Do not invoke the sub-LLM. Call record_outcome with program_type='memo_hit'.\nON MISS: Proceed with the sub-call. After it completes, call store_memo_result.\nCost: ~1ms. Zero token cost.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "prompt": { "type": "string", "description": "The prompt text" },
-                    "context_slice": { "type": "string", "description": "Context slice for cache key" },
-                    "model_version": { "type": "string", "description": "Model version string" }
+                    "prompt": { "type": "string", "maxLength": 4096, "description": "The prompt text" },
+                    "context_slice": { "type": "string", "maxLength": 131072, "description": "Context slice for cache key" },
+                    "model_version": { "type": "string", "maxLength": 64, "description": "Model version string" }
                 },
                 "required": ["prompt", "context_slice", "model_version"]
             }),
         },
         ToolDef {
             name: "store_memo_result".into(),
-            description: "Store a sub-call result in the memo cache".into(),
+            description: "Stores a completed sub-call result for future reuse.\n\nCALL WHEN: Immediately after any sub-call completes on a task where the same chunk might be processed again.\nDO NOT CALL: For top-level responses or ephemeral computations. Do not call if check_memo_cache returned a hit.\nCost: ~5ms write.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "prompt": { "type": "string" },
-                    "context_slice": { "type": "string" },
-                    "model_version": { "type": "string" },
-                    "result": { "type": "string", "description": "The sub-call result to cache" },
+                    "prompt": { "type": "string", "maxLength": 4096 },
+                    "context_slice": { "type": "string", "maxLength": 131072 },
+                    "model_version": { "type": "string", "maxLength": 64 },
+                    "result": { "type": "string", "maxLength": 131072, "description": "The sub-call result to cache" },
                     "embedding": {
                         "type": "array", "items": { "type": "number" },
                         "description": "Optional embedding vector"
                     },
-                    "ttl_days": { "type": "integer", "description": "TTL in days (default: 7)" }
+                    "ttl_days": { "type": "integer", "minimum": 1, "maximum": 365, "description": "TTL in days (default: 7)" }
                 },
                 "required": ["prompt", "context_slice", "model_version", "result"]
             }),
         },
         ToolDef {
             name: "write_plan_node".into(),
-            description: "Write a new node in the plan hierarchy".into(),
+            description: "Records a sub-task node in the hierarchical plan tree. Enables structured re-injection of parent plan context on recursive return.\n\nCALL WHEN: At the start of each sub-task, before execution. Always call when decomposing a complex task into sub-tasks. Depth=0 is the root goal.\nDO NOT CALL: For single-step tasks with no decomposition.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string", "format": "uuid" },
-                    "depth": { "type": "integer" },
-                    "subtask_id": { "type": "string" },
-                    "parent_subtask": { "type": "string" },
-                    "goal_text": { "type": "string" }
+                    "depth": { "type": "integer", "minimum": 0, "maximum": 100 },
+                    "subtask_id": { "type": "string", "maxLength": 256 },
+                    "parent_subtask": { "type": "string", "maxLength": 256 },
+                    "goal_text": { "type": "string", "maxLength": 4096 }
                 },
                 "required": ["session_id", "depth", "subtask_id", "goal_text"]
             }),
         },
         ToolDef {
             name: "get_plan_context".into(),
-            description: "Retrieve the plan tree for a session".into(),
+            description: "Returns the full plan tree for the current session as compact JSON. Use to re-inject parent context when returning from recursive sub-tasks.\n\nCALL WHEN: At the start of each sub-task execution and on return from a sub-task call.\nInclude the returned plan tree in your prompt preamble with 'Current task hierarchy:' to prevent goal drift.\nCost: ~2ms.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string", "format": "uuid" },
-                    "max_depth": { "type": "integer" }
+                    "max_depth": { "type": "integer", "minimum": 0, "maximum": 100 }
                 },
                 "required": ["session_id"]
             }),
         },
         ToolDef {
             name: "update_plan_node".into(),
-            description: "Update a plan node's status".into(),
+            description: "Marks a plan node complete or failed and records an outcome summary.\n\nCALL WHEN: When a sub-task finishes (success or failure). Always provide outcome_summary — this is what parent nodes will see.\nWrite outcome_summary describing what was found, not the process used.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string", "format": "uuid" },
-                    "depth": { "type": "integer" },
-                    "subtask_id": { "type": "string" },
+                    "depth": { "type": "integer", "minimum": 0, "maximum": 100 },
+                    "subtask_id": { "type": "string", "maxLength": 256 },
                     "status": { "type": "string", "enum": ["pending", "active", "complete", "failed"] },
-                    "outcome_summary": { "type": "string" }
+                    "outcome_summary": { "type": "string", "maxLength": 4096 }
                 },
                 "required": ["session_id", "depth", "subtask_id", "status"]
             }),
@@ -103,40 +103,40 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         // --- Fold tools (Sprint 2) ---
         ToolDef {
             name: "start_fold".into(),
-            description: "Create a new active trajectory fold".into(),
+            description: "Opens a new trajectory fold for a sub-task. Returns fold_id to append REPL turns as the sub-task executes.\n\nCALL WHEN: Starting any sub-task that involves multiple steps and whose results you want retrievable later. Always call write_plan_node first.\nA fold is the durable equivalent of a REPL scope.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string", "format": "uuid" },
-                    "depth": { "type": "integer" },
+                    "depth": { "type": "integer", "minimum": 0, "maximum": 100 },
                     "parent_fold_id": { "type": "string", "format": "uuid" },
-                    "initial_context": { "type": "string" }
+                    "initial_context": { "type": "string", "maxLength": 131072 }
                 },
                 "required": ["session_id", "depth", "initial_context"]
             }),
         },
         ToolDef {
             name: "append_to_fold".into(),
-            description: "Append a REPL turn to an active fold".into(),
+            description: "Appends a REPL turn to an active fold. Returns current token_count.\n\nCALL WHEN: After each step within an active fold.\nMONITOR token_count: If it exceeds ~80000, open a nested fold for the next phase.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "fold_id": { "type": "string", "format": "uuid" },
                     "session_id": { "type": "string", "format": "uuid" },
-                    "repl_turn": { "type": "string" }
+                    "repl_turn": { "type": "string", "maxLength": 131072 }
                 },
                 "required": ["fold_id", "session_id", "repl_turn"]
             }),
         },
         ToolDef {
             name: "complete_fold".into(),
-            description: "Seal a fold with summary and embedding".into(),
+            description: "Seals a fold with summary and embedding. Creates FOLDED_INTO graph edge to parent. Queues trajectory for compression.\n\nCALL WHEN: When a sub-task is fully complete. Always call before returning from a recursive level.\nWrite summary as dense NL capsule: key findings, state changes, answers. Summarize outcomes, not process.\nCost: ~10ms.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "fold_id": { "type": "string", "format": "uuid" },
                     "session_id": { "type": "string", "format": "uuid" },
-                    "summary": { "type": "string" },
+                    "summary": { "type": "string", "maxLength": 131072 },
                     "embedding": { "type": "array", "items": { "type": "number" } }
                 },
                 "required": ["fold_id", "session_id", "summary", "embedding"]
@@ -144,13 +144,13 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "retrieve_fold_context".into(),
-            description: "Search fold summaries by embedding similarity".into(),
+            description: "ANN vector search over prior fold summaries. Returns k most semantically similar fold summaries.\n\nCALL WHEN: Starting a new task where prior work might be relevant. Also call when stuck — prior folds often contain relevant evidence.\nRETRIEVAL LOOP: If results partially answer but leave gaps, call again with a more specific query targeting the gap. 2-3 rounds is normal.\nCost: ~10ms (HNSW). include_raw adds ~200-2000ms.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string", "format": "uuid" },
                     "query_embedding": { "type": "array", "items": { "type": "number" } },
-                    "k": { "type": "integer" },
+                    "k": { "type": "integer", "minimum": 1, "maximum": 100 },
                     "include_raw": { "type": "boolean" }
                 },
                 "required": ["session_id", "query_embedding"]
@@ -159,14 +159,14 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         // --- Entity tools (Sprint 3) ---
         ToolDef {
             name: "upsert_entity".into(),
-            description: "Track a named entity with phonetic deduplication".into(),
+            description: "Writes a discovered named entity to the entity store. Deduplicates via phonetic matching.\n\nCALL WHEN: Any time you identify a named entity (person, place, org, event, concept) from content. Always link to source_fold_id.\nCheck is_new in response: if false, entity already exists — use the returned entity_id to attach new facts.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string", "format": "uuid" },
-                    "entity_name": { "type": "string" },
+                    "entity_name": { "type": "string", "maxLength": 512 },
                     "entity_type": { "type": "string", "enum": ["person", "place", "event", "concept", "org"] },
-                    "context_snippet": { "type": "string" },
+                    "context_snippet": { "type": "string", "maxLength": 4096 },
                     "embedding": { "type": "array", "items": { "type": "number" } },
                     "source_fold_id": { "type": "string", "format": "uuid" },
                     "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
@@ -176,15 +176,15 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "retrieve_entities".into(),
-            description: "Retrieve entities by phonetic, ANN, or both strategies".into(),
+            description: "Retrieves named entities by name (phonetic fuzzy match), semantic similarity (ANN), or both.\n\nCALL WHEN: Need to find entities related to current query. Use strategy='phonetic' for known names with possible variants. Use strategy='ann' for semantic search. Use strategy='both' for maximum recall.\nCost: phonetic ~5ms, ann ~10ms, both ~15ms.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string", "format": "uuid" },
-                    "query": { "type": "string" },
+                    "query": { "type": "string", "maxLength": 4096 },
                     "embedding": { "type": "array", "items": { "type": "number" } },
                     "strategy": { "type": "string", "enum": ["ann", "phonetic", "both"] },
-                    "k": { "type": "integer" }
+                    "k": { "type": "integer", "minimum": 1, "maximum": 100 }
                 },
                 "required": ["session_id", "query"]
             }),
@@ -192,7 +192,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         // --- Feedback tool (Sprint 3) ---
         ToolDef {
             name: "record_outcome".into(),
-            description: "Record a retrieval strategy outcome for learning".into(),
+            description: "Records the result of a retrieval operation for offline routing improvement.\n\nCALL WHEN: After every retrieval operation (retrieve_fold_context, retrieve_entities, check_memo_cache). Provide program_type, task_complexity, succeeded, latency_ms, token_cost.\nThis is write-only (~1ms). No effect on current task but improves routing for future sessions.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -201,8 +201,8 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     "program_type": { "type": "string", "enum": ["hnsw_ann", "phonetic", "cypher_hop", "btree_range", "memo_hit"] },
                     "task_complexity": { "type": "string", "enum": ["simple", "linear", "quadratic"] },
                     "succeeded": { "type": "boolean" },
-                    "latency_ms": { "type": "integer" },
-                    "token_cost": { "type": "integer" }
+                    "latency_ms": { "type": "integer", "minimum": 0 },
+                    "token_cost": { "type": "integer", "minimum": 0 }
                 },
                 "required": ["session_id", "query_id", "program_type", "task_complexity", "succeeded", "latency_ms", "token_cost"]
             }),
@@ -210,7 +210,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         // --- Session lifecycle ---
         ToolDef {
             name: "delete_session".into(),
-            description: "Delete all memory objects for a session (right-to-deletion)".into(),
+            description: "Deletes all memory objects for a session across all tables (right-to-deletion).\n\nCALL WHEN: User explicitly requests data deletion, or session cleanup is needed.\nDO NOT CALL: During normal operation. This is destructive and irreversible.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
