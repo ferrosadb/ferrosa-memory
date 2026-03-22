@@ -51,6 +51,11 @@ struct PreparedStatements {
     temporal_put: PreparedQuery,
     temporal_get_current: PreparedQuery,
     temporal_invalidate: PreparedQuery,
+    // Edges
+    edge_folded_into: PreparedQuery,
+    edge_mentioned_in: PreparedQuery,
+    edge_co_occurs: PreparedQuery,
+    edge_supersedes: PreparedQuery,
     // Feedback
     feedback_put: PreparedQuery,
 }
@@ -203,11 +208,41 @@ impl CqlStorage {
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 ))
                 .await?,
+            // Edges
+            edge_folded_into: session
+                .prepare(format!(
+                    "INSERT INTO {ks}.folded_into \
+                     (source_fold_id, target_fold_id, session_id, tenant_id, created_at) \
+                     VALUES (?, ?, ?, ?, ?)"
+                ))
+                .await?,
+            edge_mentioned_in: session
+                .prepare(format!(
+                    "INSERT INTO {ks}.mentioned_in \
+                     (entity_id, fold_id, session_id, tenant_id, created_at) \
+                     VALUES (?, ?, ?, ?, ?)"
+                ))
+                .await?,
+            edge_co_occurs: session
+                .prepare(format!(
+                    "INSERT INTO {ks}.co_occurs_with \
+                     (entity_a, entity_b, session_id, tenant_id, created_at) \
+                     VALUES (?, ?, ?, ?, ?)"
+                ))
+                .await?,
+            edge_supersedes: session
+                .prepare(format!(
+                    "INSERT INTO {ks}.supersedes \
+                     (new_event_id, old_event_id, entity_id, tenant_id, created_at) \
+                     VALUES (?, ?, ?, ?, ?)"
+                ))
+                .await?,
         };
 
         tracing::info!(
             keyspace = ks,
-            statements = 17,
+            statements = 21,
+            statements = 21,
             "CQL storage connected, all statements prepared"
         );
 
@@ -788,6 +823,100 @@ impl Storage for CqlStorage {
                 ),
             )
             .await?;
+        Ok(())
+    }
+
+    // --- Edge operations ---
+
+    async fn edge_folded_into(
+        &self,
+        ctx: &TenantContext,
+        source_fold_id: Uuid,
+        target_fold_id: Uuid,
+        session_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.session
+            .exec_with_values(
+                &self.stmts.edge_folded_into,
+                query_values!(
+                    source_fold_id,
+                    target_fold_id,
+                    session_id,
+                    ctx.tenant_id,
+                    chrono::Utc::now().naive_utc()
+                ),
+            )
+            .await?;
+        tracing::debug!(%source_fold_id, %target_fold_id, "FOLDED_INTO edge created");
+        Ok(())
+    }
+
+    async fn edge_mentioned_in(
+        &self,
+        ctx: &TenantContext,
+        entity_id: Uuid,
+        fold_id: Uuid,
+        session_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.session
+            .exec_with_values(
+                &self.stmts.edge_mentioned_in,
+                query_values!(
+                    entity_id,
+                    fold_id,
+                    session_id,
+                    ctx.tenant_id,
+                    chrono::Utc::now().naive_utc()
+                ),
+            )
+            .await?;
+        tracing::debug!(%entity_id, %fold_id, "MENTIONED_IN edge created");
+        Ok(())
+    }
+
+    async fn edge_co_occurs(
+        &self,
+        ctx: &TenantContext,
+        entity_a: Uuid,
+        entity_b: Uuid,
+        session_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.session
+            .exec_with_values(
+                &self.stmts.edge_co_occurs,
+                query_values!(
+                    entity_a,
+                    entity_b,
+                    session_id,
+                    ctx.tenant_id,
+                    chrono::Utc::now().naive_utc()
+                ),
+            )
+            .await?;
+        tracing::debug!(%entity_a, %entity_b, "CO_OCCURS_WITH edge created");
+        Ok(())
+    }
+
+    async fn edge_supersedes(
+        &self,
+        ctx: &TenantContext,
+        new_event_id: Uuid,
+        old_event_id: Uuid,
+        entity_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.session
+            .exec_with_values(
+                &self.stmts.edge_supersedes,
+                query_values!(
+                    new_event_id,
+                    old_event_id,
+                    entity_id,
+                    ctx.tenant_id,
+                    chrono::Utc::now().naive_utc()
+                ),
+            )
+            .await?;
+        tracing::debug!(%new_event_id, %old_event_id, "SUPERSEDES edge created");
         Ok(())
     }
 }

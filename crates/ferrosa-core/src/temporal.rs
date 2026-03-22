@@ -54,6 +54,16 @@ pub async fn write_temporal_fact(
     };
 
     storage.temporal_put(ctx, &event).await?;
+
+    // Create SUPERSEDES edge if this fact replaces an older one
+    if let Some(old_id) = supersedes_id
+        && let Err(e) = storage
+            .edge_supersedes(ctx, event_id, old_id, entity_id)
+            .await
+    {
+        tracing::warn!(%event_id, %old_id, error = %e, "failed to create SUPERSEDES edge");
+    }
+
     tracing::info!(%event_id, %entity_id, supersedes = ?supersedes_id, "temporal fact written");
     Ok(event_id)
 }

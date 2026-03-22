@@ -66,6 +66,8 @@ pub struct ServerConfig {
     pub http_port: u16,
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    #[serde(default)]
+    pub require_tls: bool,
 }
 
 impl Default for ServerConfig {
@@ -74,6 +76,7 @@ impl Default for ServerConfig {
             transport: default_transport(),
             http_port: default_http_port(),
             log_level: default_log_level(),
+            require_tls: false,
         }
     }
 }

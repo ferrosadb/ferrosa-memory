@@ -274,6 +274,58 @@ impl Storage for StorageBackend {
             Self::Mock(s) => s.feedback_put(ctx, outcome).await,
         }
     }
+
+    async fn edge_folded_into(
+        &self,
+        ctx: &TenantContext,
+        source: uuid::Uuid,
+        target: uuid::Uuid,
+        session: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Cql(s) => s.edge_folded_into(ctx, source, target, session).await,
+            Self::Mock(s) => s.edge_folded_into(ctx, source, target, session).await,
+        }
+    }
+
+    async fn edge_mentioned_in(
+        &self,
+        ctx: &TenantContext,
+        entity: uuid::Uuid,
+        fold: uuid::Uuid,
+        session: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Cql(s) => s.edge_mentioned_in(ctx, entity, fold, session).await,
+            Self::Mock(s) => s.edge_mentioned_in(ctx, entity, fold, session).await,
+        }
+    }
+
+    async fn edge_co_occurs(
+        &self,
+        ctx: &TenantContext,
+        a: uuid::Uuid,
+        b: uuid::Uuid,
+        session: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Cql(s) => s.edge_co_occurs(ctx, a, b, session).await,
+            Self::Mock(s) => s.edge_co_occurs(ctx, a, b, session).await,
+        }
+    }
+
+    async fn edge_supersedes(
+        &self,
+        ctx: &TenantContext,
+        new_id: uuid::Uuid,
+        old_id: uuid::Uuid,
+        entity: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Cql(s) => s.edge_supersedes(ctx, new_id, old_id, entity).await,
+            Self::Mock(s) => s.edge_supersedes(ctx, new_id, old_id, entity).await,
+        }
+    }
 }
 
 #[tokio::main]
@@ -364,7 +416,7 @@ async fn main() -> anyhow::Result<()> {
             http::serve_http(
                 http::HttpConfig {
                     port: config.server.http_port,
-                    require_tls: false,
+                    require_tls: config.server.require_tls,
                 },
                 storage,
                 metrics,

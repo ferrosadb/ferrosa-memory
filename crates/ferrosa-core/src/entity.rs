@@ -102,6 +102,16 @@ pub async fn upsert_entity(
     };
 
     storage.entity_put(ctx, &entry).await?;
+
+    // Create MENTIONED_IN edge if entity was found in a fold
+    if let Some(fold_id) = source_fold_id
+        && let Err(e) = storage
+            .edge_mentioned_in(ctx, entity_id, fold_id, session_id)
+            .await
+    {
+        tracing::warn!(%entity_id, %fold_id, error = %e, "failed to create MENTIONED_IN edge");
+    }
+
     tracing::info!(entity_name, entity_type, %entity_id, "entity created");
 
     Ok(UpsertEntityResult {

@@ -164,6 +164,44 @@ pub trait Storage: Send + Sync {
         ctx: &TenantContext,
         outcome: &FeedbackOutcome,
     ) -> anyhow::Result<()>;
+
+    // --- Graph edge operations ---
+
+    /// Create a FOLDED_INTO edge (child fold -> parent fold).
+    async fn edge_folded_into(
+        &self,
+        ctx: &TenantContext,
+        source_fold_id: Uuid,
+        target_fold_id: Uuid,
+        session_id: Uuid,
+    ) -> anyhow::Result<()>;
+
+    /// Create a MENTIONED_IN edge (entity -> fold).
+    async fn edge_mentioned_in(
+        &self,
+        ctx: &TenantContext,
+        entity_id: Uuid,
+        fold_id: Uuid,
+        session_id: Uuid,
+    ) -> anyhow::Result<()>;
+
+    /// Create a CO_OCCURS_WITH edge (entity <-> entity).
+    async fn edge_co_occurs(
+        &self,
+        ctx: &TenantContext,
+        entity_a: Uuid,
+        entity_b: Uuid,
+        session_id: Uuid,
+    ) -> anyhow::Result<()>;
+
+    /// Create a SUPERSEDES edge (new fact -> old fact).
+    async fn edge_supersedes(
+        &self,
+        ctx: &TenantContext,
+        new_event_id: Uuid,
+        old_event_id: Uuid,
+        entity_id: Uuid,
+    ) -> anyhow::Result<()>;
 }
 
 /// In-memory mock storage for unit tests.
@@ -462,6 +500,48 @@ pub mod mock {
             outcome: &FeedbackOutcome,
         ) -> anyhow::Result<()> {
             self.feedback.lock().await.push(outcome.clone());
+            Ok(())
+        }
+
+        // --- Edge operations (no-op for mock) ---
+
+        async fn edge_folded_into(
+            &self,
+            _ctx: &TenantContext,
+            _source: Uuid,
+            _target: Uuid,
+            _session: Uuid,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn edge_mentioned_in(
+            &self,
+            _ctx: &TenantContext,
+            _entity: Uuid,
+            _fold: Uuid,
+            _session: Uuid,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn edge_co_occurs(
+            &self,
+            _ctx: &TenantContext,
+            _a: Uuid,
+            _b: Uuid,
+            _session: Uuid,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn edge_supersedes(
+            &self,
+            _ctx: &TenantContext,
+            _new: Uuid,
+            _old: Uuid,
+            _entity: Uuid,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
     }
