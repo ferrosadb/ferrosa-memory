@@ -21,6 +21,7 @@
 
 pub mod audit;
 pub mod auth;
+pub mod batch;
 pub mod compression;
 pub mod config;
 pub mod cql_storage;
@@ -36,6 +37,8 @@ pub mod metrics;
 pub mod plan;
 pub mod quota;
 pub mod router;
+#[cfg(test)]
+mod security_tests;
 pub mod session;
 pub mod storage;
 pub mod temporal;
