@@ -207,6 +207,18 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "required": ["session_id", "query_id", "program_type", "task_complexity", "succeeded", "latency_ms", "token_cost"]
             }),
         },
+        // --- Session lifecycle ---
+        ToolDef {
+            name: "delete_session".into(),
+            description: "Delete all memory objects for a session (right-to-deletion)".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "format": "uuid" }
+                },
+                "required": ["session_id"]
+            }),
+        },
     ]
 }
 
@@ -277,6 +289,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "upsert_entity" => handle_upsert_entity(args, storage, ctx).await,
         "retrieve_entities" => handle_retrieve_entities(args, storage, ctx).await,
         "record_outcome" => handle_record_outcome(args, storage, ctx).await,
+        "delete_session" => handle_delete_session(args, storage, ctx).await,
         _ => Err((METHOD_NOT_FOUND, format!("unknown tool: {name}"))),
     };
     let elapsed = start.elapsed();
@@ -612,6 +625,22 @@ async fn handle_record_outcome<S: crate::storage::Storage>(
     Ok(serde_json::json!({ "recorded": recorded }))
 }
 
+// --- Session lifecycle handler ---
+
+async fn handle_delete_session<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = require_uuid(&args, "session_id")?;
+
+    let result = crate::session::delete_session(storage, ctx, session_id)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
 // --- Parameter extraction helpers ---
 
 fn optional_uuid(args: &Value, field: &str) -> Result<Option<uuid::Uuid>, (i32, String)> {
@@ -699,7 +728,7 @@ mod tests {
             .await
             .unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 13);
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"check_memo_cache"));

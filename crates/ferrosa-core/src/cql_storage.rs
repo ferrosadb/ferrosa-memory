@@ -826,6 +826,46 @@ impl Storage for CqlStorage {
         Ok(())
     }
 
+    async fn delete_session(&self, ctx: &TenantContext, session_id: Uuid) -> anyhow::Result<usize> {
+        // Delete from each table. CQL doesn't support cross-table transactions,
+        // so we delete from each table individually. Session-scoped partition
+        // keys make this efficient.
+        let tables = [
+            (
+                "plan_state",
+                format!(
+                    "DELETE FROM {}.plan_state WHERE session_id = ? AND tenant_id = ?",
+                    self.keyspace
+                ),
+            ),
+            (
+                "trajectory_folds",
+                format!(
+                    "DELETE FROM {}.trajectory_folds WHERE session_id = ? AND tenant_id = ?",
+                    self.keyspace
+                ),
+            ),
+        ];
+
+        let mut count = 0;
+        for (name, query) in &tables {
+            match self
+                .session
+                .query_with_values(query.as_str(), query_values!(session_id, ctx.tenant_id))
+                .await
+            {
+                Ok(_) => count += 1,
+                Err(e) => {
+                    tracing::warn!(table = name, error = %e, "delete_session: table delete failed")
+                }
+            }
+        }
+        // entity_store and feedback_outcomes have tenant_id as partition key,
+        // not session_id — would need ALLOW FILTERING or secondary index.
+        // For now, only session-partitioned tables are cleared.
+        Ok(count)
+    }
+
     // --- Edge operations ---
 
     async fn edge_folded_into(

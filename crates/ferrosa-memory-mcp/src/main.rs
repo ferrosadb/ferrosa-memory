@@ -275,6 +275,17 @@ impl Storage for StorageBackend {
         }
     }
 
+    async fn delete_session(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+    ) -> anyhow::Result<usize> {
+        match self {
+            Self::Cql(s) => s.delete_session(ctx, session_id).await,
+            Self::Mock(s) => s.delete_session(ctx, session_id).await,
+        }
+    }
+
     async fn edge_folded_into(
         &self,
         ctx: &TenantContext,

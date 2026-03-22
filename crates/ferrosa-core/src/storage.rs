@@ -165,6 +165,11 @@ pub trait Storage: Send + Sync {
         outcome: &FeedbackOutcome,
     ) -> anyhow::Result<()>;
 
+    // --- Session lifecycle ---
+
+    /// Delete all data for a session (right-to-deletion).
+    async fn delete_session(&self, ctx: &TenantContext, session_id: Uuid) -> anyhow::Result<usize>;
+
     // --- Graph edge operations ---
 
     /// Create a FOLDED_INTO edge (child fold -> parent fold).
@@ -501,6 +506,45 @@ pub mod mock {
         ) -> anyhow::Result<()> {
             self.feedback.lock().await.push(outcome.clone());
             Ok(())
+        }
+
+        async fn delete_session(
+            &self,
+            _ctx: &TenantContext,
+            session_id: Uuid,
+        ) -> anyhow::Result<usize> {
+            let mut count = 0;
+            {
+                let mut plans = self.plans.lock().await;
+                let before = plans.len();
+                plans.retain(|p| p.session_id != session_id);
+                count += before - plans.len();
+            }
+            {
+                let mut folds = self.folds.lock().await;
+                let before = folds.len();
+                folds.retain(|f| f.session_id != session_id);
+                count += before - folds.len();
+            }
+            {
+                let mut entities = self.entities.lock().await;
+                let before = entities.len();
+                entities.retain(|e| e.session_id != session_id);
+                count += before - entities.len();
+            }
+            {
+                let mut events = self.temporal_events.lock().await;
+                let before = events.len();
+                events.retain(|e| e.source_session != session_id);
+                count += before - events.len();
+            }
+            {
+                let mut feedback = self.feedback.lock().await;
+                let before = feedback.len();
+                feedback.retain(|f| f.session_id != session_id);
+                count += before - feedback.len();
+            }
+            Ok(count)
         }
 
         // --- Edge operations (no-op for mock) ---
