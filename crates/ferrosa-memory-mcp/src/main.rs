@@ -234,6 +234,17 @@ impl Storage for StorageBackend {
         }
     }
 
+    async fn entity_list_session(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<EntityEntry>> {
+        match self {
+            Self::Cql(s) => s.entity_list_session(ctx, session_id).await,
+            Self::Mock(s) => s.entity_list_session(ctx, session_id).await,
+        }
+    }
+
     async fn temporal_put(&self, ctx: &TenantContext, event: &TemporalEvent) -> anyhow::Result<()> {
         match self {
             Self::Cql(s) => s.temporal_put(ctx, event).await,

@@ -386,6 +386,18 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "required": ["session_id", "query"]
             }),
         },
+        // --- Dream consolidation ---
+        ToolDef {
+            name: "run_consolidation".into(),
+            description: "Runs dream consolidation over a session's entities. Groups entities by source fold, creates CO_OCCURS edges between co-occurring entities, and identifies clusters (3+ entities in the same fold).\n\nCALL WHEN: After a session accumulates many entities — typically at session end or during idle periods. Strengthens the knowledge graph by discovering implicit connections.\nCost: O(entities) reads + O(pairs) edge writes.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "format": "uuid" }
+                },
+                "required": ["session_id"]
+            }),
+        },
     ]
 }
 
@@ -469,6 +481,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "get_temporal_chain" => handle_get_temporal_chain(args, storage, ctx).await,
         "explore_connections" => handle_explore_connections(args, session).await,
         "hybrid_search" => handle_hybrid_search(args, storage, ctx).await,
+        "run_consolidation" => handle_run_consolidation(args, storage, ctx).await,
         _ => Err((METHOD_NOT_FOUND, format!("unknown tool: {name}"))),
     };
     let elapsed = start.elapsed();
@@ -1061,6 +1074,22 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
     }))
 }
 
+// --- Dream consolidation handler ---
+
+async fn handle_run_consolidation<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = require_uuid(&args, "session_id")?;
+
+    let result = crate::dream::run_consolidation(storage, ctx, session_id)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
 // --- Parameter extraction helpers ---
 
 fn optional_uuid(args: &Value, field: &str) -> Result<Option<uuid::Uuid>, (i32, String)> {
@@ -1150,7 +1179,7 @@ mod tests {
             .await
             .unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 23);
+        assert_eq!(tools.len(), 24);
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"check_memo_cache"));

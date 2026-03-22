@@ -136,6 +136,13 @@ pub trait Storage: Send + Sync {
     /// Count entities in a session (for rate limiting).
     async fn entity_count(&self, ctx: &TenantContext, session_id: Uuid) -> anyhow::Result<usize>;
 
+    /// List all entities for a session (for consolidation).
+    async fn entity_list_session(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<EntityEntry>>;
+
     // --- Temporal event operations (Sprint 3) ---
 
     /// Store a temporal event.
@@ -456,6 +463,19 @@ pub mod mock {
                 .iter()
                 .filter(|e| e.session_id == session_id)
                 .count())
+        }
+
+        async fn entity_list_session(
+            &self,
+            _ctx: &TenantContext,
+            session_id: Uuid,
+        ) -> anyhow::Result<Vec<EntityEntry>> {
+            let entities = self.entities.lock().await;
+            Ok(entities
+                .iter()
+                .filter(|e| e.session_id == session_id)
+                .cloned()
+                .collect())
         }
 
         // --- Temporal operations ---

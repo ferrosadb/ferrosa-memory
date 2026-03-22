@@ -47,6 +47,7 @@ struct PreparedStatements {
     // Entity
     entity_put: PreparedQuery,
     entity_count: PreparedQuery,
+    entity_list_session: PreparedQuery,
     // Temporal
     temporal_put: PreparedQuery,
     temporal_get_current: PreparedQuery,
@@ -180,6 +181,13 @@ impl CqlStorage {
                     "SELECT entity_id FROM {ks}.entity_store WHERE tenant_id = ? AND session_id = ?"
                 ))
                 .await?,
+            entity_list_session: session
+                .prepare(format!(
+                    "SELECT entity_id, entity_name, entity_type, source_fold_id, \
+                     context_snippet, confidence, created_at \
+                     FROM {ks}.entity_store WHERE tenant_id = ? AND session_id = ?"
+                ))
+                .await?,
             temporal_put: session
                 .prepare(format!(
                     "INSERT INTO {ks}.temporal_events \
@@ -241,8 +249,7 @@ impl CqlStorage {
 
         tracing::info!(
             keyspace = ks,
-            statements = 21,
-            statements = 21,
+            statements = 22,
             "CQL storage connected, all statements prepared"
         );
 
@@ -779,6 +786,37 @@ impl Storage for CqlStorage {
             )
             .await?;
         Ok(rows.len())
+    }
+
+    async fn entity_list_session(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<EntityEntry>> {
+        let rows = self
+            .query_rows(
+                &self.stmts.entity_list_session,
+                query_values!(ctx.tenant_id, session_id),
+            )
+            .await?;
+
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            let created: chrono::NaiveDateTime = row.r_by_name("created_at")?;
+            results.push(EntityEntry {
+                tenant_id: ctx.tenant_id,
+                entity_id: row.r_by_name("entity_id")?,
+                session_id,
+                entity_name: row.r_by_name("entity_name")?,
+                entity_type: row.r_by_name("entity_type")?,
+                source_fold_id: row.r_by_name::<Uuid>("source_fold_id").ok(),
+                context_snippet: row.r_by_name("context_snippet")?,
+                entity_embedding: None,
+                confidence: f64::from(row.r_by_name::<f32>("confidence")?),
+                created_at: created.and_utc(),
+            });
+        }
+        Ok(results)
     }
 
     // --- Temporal operations ---

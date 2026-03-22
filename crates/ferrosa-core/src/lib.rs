@@ -26,6 +26,7 @@ pub mod compression;
 pub mod config;
 pub mod cql_storage;
 pub mod dispatch;
+pub mod dream;
 pub mod embedding;
 pub mod entity;
 pub mod feedback;
