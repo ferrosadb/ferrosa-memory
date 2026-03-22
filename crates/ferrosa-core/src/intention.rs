@@ -167,6 +167,21 @@ impl IntentionStore {
             .filter(|i| i.status == IntentionStatus::Pending)
             .collect()
     }
+
+    /// Snooze a triggered intention — resets to Pending so it can trigger again later.
+    pub fn snooze(&mut self, id: Uuid) -> bool {
+        if let Some(i) = self.intentions.iter_mut().find(|i| i.id == id) {
+            if i.status == IntentionStatus::Triggered {
+                i.status = IntentionStatus::Pending;
+                i.triggered_at = None;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
 }
 
 #[cfg(test)]

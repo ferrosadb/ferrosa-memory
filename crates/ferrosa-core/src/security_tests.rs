@@ -45,9 +45,15 @@ mod tests {
         let store = MockStorage::new();
         let ctx = ctx();
         let params = serde_json::json!({ "arguments": {} });
-        let err = dispatch::dispatch("tools/call", params, &store, &ctx)
-            .await
-            .unwrap_err();
+        let err = dispatch::dispatch(
+            "tools/call",
+            params,
+            &store,
+            &ctx,
+            &dispatch::SessionState::default(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, -32602); // INVALID_PARAMS
     }
 
@@ -56,9 +62,15 @@ mod tests {
         let store = MockStorage::new();
         let ctx = ctx();
         let params = serde_json::json!({ "name": "hack_the_planet" });
-        let err = dispatch::dispatch("tools/call", params, &store, &ctx)
-            .await
-            .unwrap_err();
+        let err = dispatch::dispatch(
+            "tools/call",
+            params,
+            &store,
+            &ctx,
+            &dispatch::SessionState::default(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, -32601); // METHOD_NOT_FOUND
     }
 
@@ -115,9 +127,15 @@ mod tests {
             "name": "query_feedback",
             "arguments": { "session_id": Uuid::new_v4().to_string() }
         });
-        let err = dispatch::dispatch("tools/call", params, &store, &ctx)
-            .await
-            .unwrap_err();
+        let err = dispatch::dispatch(
+            "tools/call",
+            params,
+            &store,
+            &ctx,
+            &dispatch::SessionState::default(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, -32601); // METHOD_NOT_FOUND
     }
 

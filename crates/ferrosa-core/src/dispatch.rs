@@ -10,9 +10,25 @@
 //! - `tools/call` — dispatches to the named tool handler
 //! - `notifications/initialized` — client acknowledgment (no-op)
 
+use std::sync::Arc;
+
 use serde_json::Value;
+use tokio::sync::Mutex;
 
 use crate::transport::{INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND};
+
+/// Per-session mutable state (not persisted in CQL).
+pub struct SessionState {
+    pub intentions: Arc<Mutex<crate::intention::IntentionStore>>,
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        Self {
+            intentions: Arc::new(Mutex::new(crate::intention::IntentionStore::new())),
+        }
+    }
+}
 
 /// MCP tool definition for `tools/list`.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -235,6 +251,72 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "required": ["session_id", "content", "entity_type"]
             }),
         },
+        // --- Intention tools (prospective memory) ---
+        ToolDef {
+            name: "set_intention".into(),
+            description: "Sets a prospective memory intention — a deferred action that triggers when a context condition is met.\n\nCALL WHEN: You or the user identify something to remember to do later when a specific context arises (e.g., 'when we work on auth, review error handling').\nDO NOT CALL: For immediate tasks. Use plan tools for current task state.\nReturns: intention_id for tracking.\nCost: ~1ms (in-memory).".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "description": { "type": "string", "maxLength": 4096, "description": "What to do when triggered" },
+                    "trigger": {
+                        "type": "object",
+                        "description": "Trigger condition",
+                        "properties": {
+                            "type": { "type": "string", "enum": ["Topic", "FilePattern", "Duration", "Context"] },
+                            "keywords": { "type": "array", "items": { "type": "string" }, "description": "For Topic triggers" },
+                            "pattern": { "type": "string", "description": "For FilePattern triggers" },
+                            "minutes": { "type": "integer", "minimum": 1, "description": "For Duration triggers" },
+                            "condition": { "type": "string", "description": "For Context triggers" }
+                        },
+                        "required": ["type"]
+                    },
+                    "priority": { "type": "string", "enum": ["low", "normal", "high", "critical"] }
+                },
+                "required": ["description", "trigger"]
+            }),
+        },
+        ToolDef {
+            name: "check_intentions".into(),
+            description: "Checks all pending intentions against the current context. Returns any that trigger.\n\nCALL WHEN: At the start of each new task or context switch. Lightweight scan of pending intentions.\nCost: ~1ms (in-memory).".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "context": { "type": "string", "maxLength": 8192, "description": "Current context to check against" }
+                },
+                "required": ["context"]
+            }),
+        },
+        ToolDef {
+            name: "complete_intention".into(),
+            description: "Marks a triggered intention as completed.\n\nCALL WHEN: After you have acted on a triggered intention.\nCost: ~1ms.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "intention_id": { "type": "string", "format": "uuid" }
+                },
+                "required": ["intention_id"]
+            }),
+        },
+        ToolDef {
+            name: "list_intentions".into(),
+            description: "Lists all intentions (pending, triggered, completed, snoozed).\n\nCALL WHEN: User asks about pending intentions, or for debugging intention state.\nCost: ~1ms.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        ToolDef {
+            name: "snooze_intention".into(),
+            description: "Snoozes a triggered intention — resets it to pending so it can trigger again later.\n\nCALL WHEN: An intention triggered but you want to defer action. Resets to pending state.\nCost: ~1ms.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "intention_id": { "type": "string", "format": "uuid" }
+                },
+                "required": ["intention_id"]
+            }),
+        },
     ]
 }
 
@@ -261,6 +343,7 @@ pub async fn dispatch<S: crate::storage::Storage>(
     params: Value,
     storage: &S,
     ctx: &crate::types::TenantContext,
+    session: &SessionState,
 ) -> Result<Value, (i32, String)> {
     match method {
         "initialize" => Ok(server_info()),
@@ -269,7 +352,7 @@ pub async fn dispatch<S: crate::storage::Storage>(
             let tools = tool_definitions();
             Ok(serde_json::json!({ "tools": tools }))
         }
-        "tools/call" => dispatch_tool(params, storage, ctx).await,
+        "tools/call" => dispatch_tool(params, storage, ctx, session).await,
         _ => Err((METHOD_NOT_FOUND, format!("unknown method: {method}"))),
     }
 }
@@ -279,6 +362,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
     params: Value,
     storage: &S,
     ctx: &crate::types::TenantContext,
+    session: &SessionState,
 ) -> Result<Value, (i32, String)> {
     let name = params
         .get("name")
@@ -307,6 +391,11 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "record_outcome" => handle_record_outcome(args, storage, ctx).await,
         "delete_session" => handle_delete_session(args, storage, ctx).await,
         "smart_ingest" => handle_smart_ingest(args, storage, ctx).await,
+        "set_intention" => handle_set_intention(args, session).await,
+        "check_intentions" => handle_check_intentions(args, session).await,
+        "complete_intention" => handle_complete_intention(args, session).await,
+        "list_intentions" => handle_list_intentions(session).await,
+        "snooze_intention" => handle_snooze_intention(args, session).await,
         _ => Err((METHOD_NOT_FOUND, format!("unknown tool: {name}"))),
     };
     let elapsed = start.elapsed();
@@ -688,6 +777,73 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
     serde_json::to_value(decision).map_err(|e| (INTERNAL_ERROR, e.to_string()))
 }
 
+// --- Intention handlers ---
+
+async fn handle_set_intention(args: Value, session: &SessionState) -> Result<Value, (i32, String)> {
+    let description = require_str(&args, "description")?;
+    let trigger_json = args
+        .get("trigger")
+        .ok_or((INVALID_PARAMS, "missing required object: trigger".into()))?;
+    let trigger: crate::intention::IntentionTrigger = serde_json::from_value(trigger_json.clone())
+        .map_err(|e| (INVALID_PARAMS, format!("invalid trigger: {e}")))?;
+    let priority: crate::intention::Priority = args
+        .get("priority")
+        .and_then(|v| v.as_str())
+        .map(|s| {
+            serde_json::from_value(Value::String(s.to_string()))
+                .unwrap_or(crate::intention::Priority::Normal)
+        })
+        .unwrap_or(crate::intention::Priority::Normal);
+
+    let mut store = session.intentions.lock().await;
+    let id = store.set(description, trigger, priority);
+    Ok(serde_json::json!({ "intention_id": id.to_string() }))
+}
+
+async fn handle_check_intentions(
+    args: Value,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let context = require_str(&args, "context")?;
+    let mut store = session.intentions.lock().await;
+    let triggered = store.check(context);
+    let triggered_json: Vec<Value> = triggered
+        .iter()
+        .map(|i| serde_json::to_value(i).unwrap_or(Value::Null))
+        .collect();
+    Ok(serde_json::json!({ "triggered": triggered_json }))
+}
+
+async fn handle_complete_intention(
+    args: Value,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let id = require_uuid(&args, "intention_id")?;
+    let mut store = session.intentions.lock().await;
+    let completed = store.complete(id);
+    Ok(serde_json::json!({ "completed": completed }))
+}
+
+async fn handle_list_intentions(session: &SessionState) -> Result<Value, (i32, String)> {
+    let store = session.intentions.lock().await;
+    let intentions = store.list();
+    let json: Vec<Value> = intentions
+        .iter()
+        .map(|i| serde_json::to_value(i).unwrap_or(Value::Null))
+        .collect();
+    Ok(serde_json::json!({ "intentions": json }))
+}
+
+async fn handle_snooze_intention(
+    args: Value,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let id = require_uuid(&args, "intention_id")?;
+    let mut store = session.intentions.lock().await;
+    let snoozed = store.snooze(id);
+    Ok(serde_json::json!({ "snoozed": snoozed }))
+}
+
 // --- Parameter extraction helpers ---
 
 fn optional_uuid(args: &Value, field: &str) -> Result<Option<uuid::Uuid>, (i32, String)> {
@@ -760,7 +916,8 @@ mod tests {
     async fn initialize_returns_server_info() {
         let store = MockStorage::new();
         let ctx = test_ctx();
-        let result = dispatch("initialize", Value::Null, &store, &ctx)
+        let session = SessionState::default();
+        let result = dispatch("initialize", Value::Null, &store, &ctx, &session)
             .await
             .unwrap();
         assert_eq!(result["serverInfo"]["name"], "ferrosa-memory-mcp");
@@ -771,11 +928,12 @@ mod tests {
     async fn tools_list_returns_all_tools() {
         let store = MockStorage::new();
         let ctx = test_ctx();
-        let result = dispatch("tools/list", Value::Null, &store, &ctx)
+        let session = SessionState::default();
+        let result = dispatch("tools/list", Value::Null, &store, &ctx, &session)
             .await
             .unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 14);
+        assert_eq!(tools.len(), 19);
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"check_memo_cache"));
@@ -783,13 +941,19 @@ mod tests {
         assert!(names.contains(&"write_plan_node"));
         assert!(names.contains(&"get_plan_context"));
         assert!(names.contains(&"update_plan_node"));
+        assert!(names.contains(&"set_intention"));
+        assert!(names.contains(&"check_intentions"));
+        assert!(names.contains(&"complete_intention"));
+        assert!(names.contains(&"list_intentions"));
+        assert!(names.contains(&"snooze_intention"));
     }
 
     #[tokio::test]
     async fn unknown_method_returns_error() {
         let store = MockStorage::new();
         let ctx = test_ctx();
-        let err = dispatch("bogus/method", Value::Null, &store, &ctx)
+        let session = SessionState::default();
+        let err = dispatch("bogus/method", Value::Null, &store, &ctx, &session)
             .await
             .unwrap_err();
         assert_eq!(err.0, METHOD_NOT_FOUND);
@@ -799,8 +963,9 @@ mod tests {
     async fn tools_call_unknown_tool() {
         let store = MockStorage::new();
         let ctx = test_ctx();
+        let session = SessionState::default();
         let params = serde_json::json!({ "name": "nonexistent_tool" });
-        let err = dispatch("tools/call", params, &store, &ctx)
+        let err = dispatch("tools/call", params, &store, &ctx, &session)
             .await
             .unwrap_err();
         assert_eq!(err.0, METHOD_NOT_FOUND);
@@ -810,11 +975,12 @@ mod tests {
     async fn tools_call_missing_params() {
         let store = MockStorage::new();
         let ctx = test_ctx();
+        let session = SessionState::default();
         let params = serde_json::json!({
             "name": "check_memo_cache",
             "arguments": {}
         });
-        let err = dispatch("tools/call", params, &store, &ctx)
+        let err = dispatch("tools/call", params, &store, &ctx, &session)
             .await
             .unwrap_err();
         assert_eq!(err.0, INVALID_PARAMS);
@@ -824,6 +990,7 @@ mod tests {
     async fn memo_round_trip_through_dispatch() {
         let store = MockStorage::new();
         let ctx = test_ctx();
+        let session = SessionState::default();
 
         // Store
         let store_params = serde_json::json!({
@@ -835,7 +1002,7 @@ mod tests {
                 "result": "cached answer"
             }
         });
-        let result = dispatch("tools/call", store_params, &store, &ctx)
+        let result = dispatch("tools/call", store_params, &store, &ctx, &session)
             .await
             .unwrap();
         assert_eq!(result["stored"], true);
@@ -849,7 +1016,7 @@ mod tests {
                 "model_version": "v1"
             }
         });
-        let result = dispatch("tools/call", check_params, &store, &ctx)
+        let result = dispatch("tools/call", check_params, &store, &ctx, &session)
             .await
             .unwrap();
         assert_eq!(result["hit"], true);
@@ -860,6 +1027,7 @@ mod tests {
     async fn plan_round_trip_through_dispatch() {
         let store = MockStorage::new();
         let ctx = test_ctx();
+        let session = SessionState::default();
         let sid = Uuid::new_v4();
 
         // Write
@@ -872,7 +1040,7 @@ mod tests {
                 "goal_text": "solve the problem"
             }
         });
-        let result = dispatch("tools/call", write_params, &store, &ctx)
+        let result = dispatch("tools/call", write_params, &store, &ctx, &session)
             .await
             .unwrap();
         assert_eq!(result["written"], true);
@@ -884,7 +1052,7 @@ mod tests {
                 "session_id": sid.to_string()
             }
         });
-        let result = dispatch("tools/call", get_params, &store, &ctx)
+        let result = dispatch("tools/call", get_params, &store, &ctx, &session)
             .await
             .unwrap();
         assert_eq!(result["nodes"].as_array().unwrap().len(), 1);
@@ -894,6 +1062,7 @@ mod tests {
     async fn smart_ingest_creates_on_new_content() {
         let store = MockStorage::new();
         let ctx = test_ctx();
+        let session = SessionState::default();
         let sid = Uuid::new_v4();
 
         let params = serde_json::json!({
@@ -904,8 +1073,51 @@ mod tests {
                 "entity_type": "concept"
             }
         });
-        let result = dispatch("tools/call", params, &store, &ctx).await.unwrap();
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
         assert_eq!(result["action"], "Created");
         assert!(result["entity_id"].is_string());
+    }
+
+    #[tokio::test]
+    async fn set_intention_and_check() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+
+        // Set
+        let params = serde_json::json!({
+            "name": "set_intention",
+            "arguments": {
+                "description": "Review auth error handling",
+                "trigger": { "type": "Topic", "keywords": ["auth", "authentication"] },
+                "priority": "high"
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        assert!(result["intention_id"].is_string());
+
+        // Check — no match
+        let params = serde_json::json!({
+            "name": "check_intentions",
+            "arguments": { "context": "working on database" }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        assert_eq!(result["triggered"].as_array().unwrap().len(), 0);
+
+        // Check — match
+        let params = serde_json::json!({
+            "name": "check_intentions",
+            "arguments": { "context": "now looking at auth middleware" }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        assert_eq!(result["triggered"].as_array().unwrap().len(), 1);
     }
 }

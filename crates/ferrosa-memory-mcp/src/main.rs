@@ -411,13 +411,17 @@ async fn main() -> anyhow::Result<()> {
 
             let storage_ref = Arc::clone(&storage);
             let ctx_ref = Arc::clone(&ctx);
+            let session = Arc::new(dispatch::SessionState::default());
+            let session_ref = Arc::clone(&session);
 
             let handler: transport::Handler = Box::new(move |method: &str, params| {
                 let storage = Arc::clone(&storage_ref);
                 let ctx = Arc::clone(&ctx_ref);
+                let session = Arc::clone(&session_ref);
                 let method = method.to_string();
                 Box::pin(async move {
-                    dispatch::dispatch(&method, params, storage.as_ref(), ctx.as_ref()).await
+                    dispatch::dispatch(&method, params, storage.as_ref(), ctx.as_ref(), &session)
+                        .await
                 })
             });
 

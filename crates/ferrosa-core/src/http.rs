@@ -122,7 +122,8 @@ async fn handle_connection<S: Storage>(
             let params = rpc_request.get("params").cloned().unwrap_or(Value::Null);
             let id = rpc_request.get("id").cloned();
 
-            let result = dispatch::dispatch(rpc_method, params, storage, &ctx).await;
+            let session = dispatch::SessionState::default();
+            let result = dispatch::dispatch(rpc_method, params, storage, &ctx, &session).await;
 
             let response_body = match result {
                 Ok(val) => serde_json::json!({
