@@ -68,6 +68,9 @@ pub struct ServerConfig {
     pub log_level: String,
     #[serde(default)]
     pub require_tls: bool,
+    /// Fixed tenant UUID for sharing data across sessions.
+    /// If not set, a random UUID is generated per session.
+    pub tenant_id: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -77,6 +80,7 @@ impl Default for ServerConfig {
             http_port: default_http_port(),
             log_level: default_log_level(),
             require_tls: false,
+            tenant_id: None,
         }
     }
 }

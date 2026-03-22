@@ -370,7 +370,12 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let tenant_id = uuid::Uuid::new_v4();
+    let tenant_id = config
+        .server
+        .tenant_id
+        .as_ref()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .unwrap_or_else(uuid::Uuid::new_v4);
     let metrics = Arc::new(ferrosa_core::metrics::MemoryMetrics::new()?);
     tracing::info!("metrics registered");
 
