@@ -2,37 +2,666 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Ferrosa Memory</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://d3js.org/d3.v7.min.js"></script>
 <style>
   :root {
     --bg-primary: #0a0a0f;
     --bg-secondary: #111118;
+    --bg-card: #16161f;
+    --bg-card-hover: #1c1c28;
     --text-primary: #e8e8ed;
     --text-secondary: #9494a3;
+    --text-muted: #6b6b7a;
     --accent: #e2725b;
+    --accent-warm: #d4a574;
+    --accent-green: #6bc9a0;
+    --accent-cool: #7c9cf5;
+    --accent-purple: #c882f0;
+    --accent-amber: #f4a261;
+    --accent-red: #e25b5b;
     --border: #1e1e2a;
   }
+
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { background: var(--bg-primary); color: var(--text-primary); font-family: Inter, system-ui, sans-serif; }
-  #status { padding: 1rem; color: var(--accent); }
-  #log { padding: 1rem; font-family: 'JetBrains Mono', monospace; font-size: 0.875rem; color: var(--text-secondary); max-height: calc(100vh - 4rem); overflow-y: auto; }
-  #log div { padding: 0.25rem 0; border-bottom: 1px solid var(--border); }
+  html, body { width: 100%; height: 100%; overflow: hidden; }
+
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Layout */
+  #app {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+  }
+
+  #header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 16px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    z-index: 10;
+  }
+
+  #header .logo {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  #header .logo .fe {
+    font-family: Georgia, 'Times New Roman', serif;
+    font-weight: 700;
+    font-size: 20px;
+    color: var(--accent);
+  }
+
+  #header .logo .label {
+    font-size: 13px;
+    color: var(--text-muted);
+    font-weight: 400;
+  }
+
+  #header .stats {
+    display: flex;
+    gap: 16px;
+    font-size: 11px;
+    color: var(--text-muted);
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  #header .stats .live {
+    color: var(--accent-green);
+    animation: pulse 2s ease-in-out infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
+
+  #main {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  /* Graph area */
+  #graph-container {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+  }
+
+  #graph-container svg {
+    width: 100%;
+    height: 100%;
+  }
+
+  /* Detail panel */
+  #detail-panel {
+    width: 260px;
+    background: var(--bg-secondary);
+    border-left: 1px solid var(--border);
+    overflow-y: auto;
+    flex-shrink: 0;
+    transition: width 0.2s ease;
+    padding: 16px;
+  }
+
+  #detail-panel.collapsed {
+    width: 0;
+    padding: 0;
+    overflow: hidden;
+  }
+
+  #detail-panel .section-label {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--accent);
+    margin-bottom: 8px;
+    margin-top: 16px;
+  }
+
+  #detail-panel .section-label:first-child {
+    margin-top: 0;
+  }
+
+  #detail-panel .entity-name {
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--text-primary);
+    margin-bottom: 12px;
+    word-break: break-word;
+  }
+
+  #detail-panel .field {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    padding: 3px 0;
+    color: var(--text-secondary);
+  }
+
+  #detail-panel .field .label {
+    color: var(--text-muted);
+  }
+
+  #detail-panel .edge-item {
+    font-size: 11px;
+    padding: 4px 0;
+    color: var(--text-secondary);
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  #detail-panel .edge-type {
+    font-size: 10px;
+    font-weight: 600;
+  }
+
+  #detail-panel .context-text {
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.6;
+    padding: 8px;
+    background: var(--bg-card);
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    word-break: break-word;
+  }
+
+  #detail-panel .empty {
+    color: var(--text-muted);
+    font-size: 12px;
+    font-style: italic;
+    padding: 20px 0;
+    text-align: center;
+  }
+
+  /* Tooltip */
+  .tooltip {
+    position: absolute;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 11px;
+    color: var(--text-primary);
+    pointer-events: none;
+    z-index: 100;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    white-space: nowrap;
+  }
+
+  .tooltip .type-badge {
+    font-size: 9px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  /* Connection status */
+  #connection-status {
+    position: fixed;
+    bottom: 16px;
+    left: 16px;
+    font-size: 11px;
+    color: var(--text-muted);
+    font-family: 'JetBrains Mono', monospace;
+    z-index: 20;
+    background: var(--bg-card);
+    padding: 4px 10px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+  }
 </style>
 </head>
 <body>
-<div id="status">Connecting...</div>
-<div id="log"></div>
+<div id="app">
+  <div id="header">
+    <div class="logo">
+      <span class="fe">Fe</span>
+      <span class="label">memory</span>
+    </div>
+    <div class="stats">
+      <span id="stat-nodes">0 nodes</span>
+      <span id="stat-edges">0 edges</span>
+      <span id="stat-status" class="live">CONNECTING</span>
+    </div>
+  </div>
+  <div id="main">
+    <div id="graph-container"></div>
+    <div id="detail-panel">
+      <div class="empty">Click a node to inspect</div>
+    </div>
+  </div>
+</div>
+<div id="connection-status">connecting...</div>
+<div class="tooltip" id="tooltip" style="display:none"></div>
+
 <script>
-const ws = new WebSocket(`ws://${location.host}/viz/ws`);
-ws.onopen = () => { document.getElementById('status').textContent = 'Connected \u2014 waiting for events'; };
-ws.onmessage = (e) => {
-  const event = JSON.parse(e.data);
-  const div = document.createElement('div');
-  div.textContent = `[${event.type}] ${JSON.stringify(event).slice(0, 200)}`;
-  document.getElementById('log').prepend(div);
+// === Color mappings (Ferrosa brand) ===
+const entityColors = {
+  concept: '#7c9cf5',
+  person: '#c882f0',
+  decision: '#e2725b',
+  pattern: '#f4a261',
+  org: '#d4a574',
+  event: '#6bc9a0',
+  place: '#9cb8f7',
+  preference: '#f7be7e',
+  fold: '#16161f',
 };
-ws.onclose = () => { document.getElementById('status').textContent = 'Disconnected'; };
-ws.onerror = () => { document.getElementById('status').textContent = 'Connection error'; };
+
+const edgeColors = {
+  CO_OCCURS: '#d4a574',
+  MENTIONED_IN: '#7c9cf5',
+  FOLDED_INTO: '#c882f0',
+  SUPERSEDES: '#e25b5b',
+};
+
+const stateOpacity = {
+  active: 1.0,
+  dormant: 0.6,
+  silent: 0.3,
+  unavailable: 0.15,
+};
+
+// === Data ===
+let nodes = [];
+let edges = [];
+let selectedNode = null;
+
+// === D3 setup ===
+const container = document.getElementById('graph-container');
+const width = container.clientWidth;
+const height = container.clientHeight;
+
+const svg = d3.select('#graph-container')
+  .append('svg')
+  .attr('width', '100%')
+  .attr('height', '100%');
+
+// Zoom behavior
+const g = svg.append('g');
+const zoom = d3.zoom()
+  .scaleExtent([0.1, 4])
+  .on('zoom', (event) => g.attr('transform', event.transform));
+svg.call(zoom);
+
+// Arrow markers for directed edges
+svg.append('defs').selectAll('marker')
+  .data(['CO_OCCURS', 'MENTIONED_IN', 'FOLDED_INTO', 'SUPERSEDES'])
+  .join('marker')
+  .attr('id', d => `arrow-${d}`)
+  .attr('viewBox', '0 -5 10 10')
+  .attr('refX', 20)
+  .attr('refY', 0)
+  .attr('markerWidth', 6)
+  .attr('markerHeight', 6)
+  .attr('orient', 'auto')
+  .append('path')
+  .attr('d', 'M0,-5L10,0L0,5')
+  .attr('fill', d => edgeColors[d] || '#333');
+
+// Layers
+const linkGroup = g.append('g').attr('class', 'links');
+const nodeGroup = g.append('g').attr('class', 'nodes');
+const labelGroup = g.append('g').attr('class', 'labels');
+
+// Force simulation
+const simulation = d3.forceSimulation()
+  .force('link', d3.forceLink().id(d => d.id).distance(100))
+  .force('charge', d3.forceManyBody().strength(-250))
+  .force('center', d3.forceCenter(width / 2, height / 2))
+  .force('collision', d3.forceCollide().radius(25))
+  .on('tick', ticked);
+
+simulation.stop();
+
+function ticked() {
+  linkGroup.selectAll('line')
+    .attr('x1', d => d.source.x)
+    .attr('y1', d => d.source.y)
+    .attr('x2', d => d.target.x)
+    .attr('y2', d => d.target.y);
+
+  nodeGroup.selectAll('circle')
+    .attr('cx', d => d.x)
+    .attr('cy', d => d.y);
+
+  labelGroup.selectAll('text')
+    .attr('x', d => d.x)
+    .attr('y', d => d.y - 14);
+}
+
+function nodeRadius(d) {
+  if (d.node_type === 'fold') return 5;
+  const base = 7;
+  return base + Math.min(d.confidence * 3, 4);
+}
+
+function nodeColor(d) {
+  return entityColors[d.entity_type] || entityColors[d.node_type] || '#555';
+}
+
+// === Render graph ===
+function render() {
+  // Links
+  const link = linkGroup.selectAll('line')
+    .data(edges, d => `${d.source.id || d.source}-${d.target.id || d.target}`);
+
+  link.exit().transition().duration(300).attr('stroke-opacity', 0).remove();
+
+  const linkEnter = link.enter().append('line')
+    .attr('stroke', d => edgeColors[d.edge_type] || '#333')
+    .attr('stroke-opacity', 0)
+    .attr('stroke-width', 1.5)
+    .attr('marker-end', d => `url(#arrow-${d.edge_type})`);
+
+  linkEnter.transition().duration(500).attr('stroke-opacity', 0.35);
+
+  // Nodes
+  const node = nodeGroup.selectAll('circle')
+    .data(nodes, d => d.id);
+
+  node.exit().transition().duration(300).attr('r', 0).remove();
+
+  const nodeEnter = node.enter().append('circle')
+    .attr('r', 0)
+    .attr('fill', nodeColor)
+    .attr('stroke', d => selectedNode && selectedNode.id === d.id ? '#fff' : 'none')
+    .attr('stroke-width', 2)
+    .attr('opacity', d => stateOpacity[d.state] || 1.0)
+    .attr('cursor', 'pointer')
+    .call(drag(simulation))
+    .on('click', (event, d) => selectNode(d))
+    .on('mouseenter', (event, d) => showTooltip(event, d))
+    .on('mouseleave', () => hideTooltip());
+
+  nodeEnter.transition().duration(500)
+    .attr('r', nodeRadius);
+
+  // Update existing
+  nodeGroup.selectAll('circle')
+    .attr('fill', nodeColor)
+    .attr('opacity', d => stateOpacity[d.state] || 1.0)
+    .attr('stroke', d => selectedNode && selectedNode.id === d.id ? '#fff' : 'none');
+
+  // Labels
+  const label = labelGroup.selectAll('text')
+    .data(nodes, d => d.id);
+
+  label.exit().remove();
+
+  label.enter().append('text')
+    .attr('text-anchor', 'middle')
+    .attr('fill', '#9494a3')
+    .attr('font-size', '9px')
+    .attr('font-family', 'Inter, sans-serif')
+    .attr('pointer-events', 'none')
+    .text(d => d.label.length > 20 ? d.label.slice(0, 18) + '...' : d.label);
+
+  // Update simulation
+  simulation.nodes(nodes);
+  simulation.force('link').links(edges);
+  simulation.alpha(0.3).restart();
+
+  // Update stats
+  document.getElementById('stat-nodes').textContent = `${nodes.length} nodes`;
+  document.getElementById('stat-edges').textContent = `${edges.length} edges`;
+}
+
+// === Drag behavior ===
+function drag(simulation) {
+  return d3.drag()
+    .on('start', (event, d) => {
+      if (!event.active) simulation.alphaTarget(0.3).restart();
+      d.fx = d.x;
+      d.fy = d.y;
+    })
+    .on('drag', (event, d) => {
+      d.fx = event.x;
+      d.fy = event.y;
+    })
+    .on('end', (event, d) => {
+      if (!event.active) simulation.alphaTarget(0);
+      // Keep pinned on single drag, unpin on double-click
+      // d.fx = null; d.fy = null;
+    });
+}
+
+// === Node selection ===
+function selectNode(d) {
+  selectedNode = d;
+  render();
+  updateDetailPanel(d);
+}
+
+function updateDetailPanel(d) {
+  const panel = document.getElementById('detail-panel');
+  const connectedEdges = edges.filter(e =>
+    (e.source.id || e.source) === d.id || (e.target.id || e.target) === d.id
+  );
+
+  let html = '';
+  html += `<div class="section-label">Selected</div>`;
+  html += `<div class="entity-name">${escapeHtml(d.label)}</div>`;
+
+  html += `<div class="field"><span class="label">Type</span><span>${d.entity_type}</span></div>`;
+  html += `<div class="field"><span class="label">Kind</span><span>${d.node_type}</span></div>`;
+  html += `<div class="field"><span class="label">State</span><span style="color:${stateColor(d.state)}">${d.state}</span></div>`;
+  html += `<div class="field"><span class="label">Confidence</span><span>${d.confidence.toFixed(2)}</span></div>`;
+  html += `<div class="field"><span class="label">Created</span><span>${d.created_at || '—'}</span></div>`;
+
+  if (d.context) {
+    html += `<div class="section-label">Context</div>`;
+    html += `<div class="context-text">${escapeHtml(d.context)}</div>`;
+  }
+
+  if (connectedEdges.length > 0) {
+    html += `<div class="section-label">Edges (${connectedEdges.length})</div>`;
+    for (const e of connectedEdges) {
+      const src = e.source.id || e.source;
+      const tgt = e.target.id || e.target;
+      const other = src === d.id ? tgt : src;
+      const otherNode = nodes.find(n => n.id === other);
+      const otherLabel = otherNode ? otherNode.label : other.slice(0, 8);
+      const color = edgeColors[e.edge_type] || '#555';
+      html += `<div class="edge-item"><span class="edge-type" style="color:${color}">${e.edge_type}</span> &rarr; ${escapeHtml(otherLabel)}</div>`;
+    }
+  }
+
+  panel.innerHTML = html;
+}
+
+function stateColor(state) {
+  switch (state) {
+    case 'active': return '#6bc9a0';
+    case 'dormant': return '#f4a261';
+    case 'silent': return '#6b6b7a';
+    case 'unavailable': return '#e25b5b';
+    default: return '#9494a3';
+  }
+}
+
+// === Tooltip ===
+function showTooltip(event, d) {
+  const tooltip = document.getElementById('tooltip');
+  tooltip.innerHTML = `<strong>${escapeHtml(d.label)}</strong><br><span class="type-badge">${d.entity_type} &middot; ${d.state}</span>`;
+  tooltip.style.display = 'block';
+  tooltip.style.left = (event.pageX + 12) + 'px';
+  tooltip.style.top = (event.pageY - 10) + 'px';
+}
+
+function hideTooltip() {
+  document.getElementById('tooltip').style.display = 'none';
+}
+
+// === WebSocket ===
+let ws;
+let reconnectTimer;
+
+function connect() {
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${protocol}//${location.host}/viz/ws`);
+
+  ws.onopen = () => {
+    document.getElementById('connection-status').textContent = 'connected';
+    document.getElementById('stat-status').textContent = 'LIVE';
+    document.getElementById('stat-status').className = 'live';
+    clearTimeout(reconnectTimer);
+  };
+
+  ws.onmessage = (e) => {
+    const event = JSON.parse(e.data);
+    handleEvent(event);
+  };
+
+  ws.onclose = () => {
+    document.getElementById('connection-status').textContent = 'disconnected — reconnecting...';
+    document.getElementById('stat-status').textContent = 'OFFLINE';
+    document.getElementById('stat-status').className = '';
+    reconnectTimer = setTimeout(connect, 3000);
+  };
+
+  ws.onerror = () => {
+    document.getElementById('connection-status').textContent = 'connection error';
+  };
+}
+
+function handleEvent(event) {
+  switch (event.type) {
+    case 'Snapshot':
+      nodes = event.nodes || [];
+      edges = (event.edges || []).map(e => ({...e}));
+      render();
+      break;
+
+    case 'EntityChanged':
+      handleEntityChanged(event.node, event.action);
+      break;
+
+    case 'EdgeCreated':
+      handleEdgeCreated(event.edge);
+      break;
+
+    case 'StateChanged':
+      handleStateChanged(event.entity_id, event.new_state);
+      break;
+
+    case 'FactUpdated':
+      // Flash the affected node
+      flashNode(event.entity_id);
+      break;
+
+    case 'FoldCompleted':
+      handleFoldCompleted(event);
+      break;
+  }
+}
+
+function handleEntityChanged(node, action) {
+  const existing = nodes.findIndex(n => n.id === node.id);
+  if (existing >= 0) {
+    // Update existing
+    nodes[existing] = {...nodes[existing], ...node};
+  } else {
+    // Add new — position near center with some jitter
+    node.x = width / 2 + (Math.random() - 0.5) * 100;
+    node.y = height / 2 + (Math.random() - 0.5) * 100;
+    nodes.push(node);
+  }
+  render();
+
+  // Flash animation for new nodes
+  if (action === 'Created' || action === 'Superseded') {
+    flashNode(node.id);
+  }
+}
+
+function handleEdgeCreated(edge) {
+  // Avoid duplicates
+  const exists = edges.find(e =>
+    ((e.source.id || e.source) === edge.source && (e.target.id || e.target) === edge.target) ||
+    ((e.source.id || e.source) === edge.target && (e.target.id || e.target) === edge.source)
+  );
+  if (!exists) {
+    edges.push({...edge});
+    render();
+  }
+}
+
+function handleStateChanged(entityId, newState) {
+  const node = nodes.find(n => n.id === entityId);
+  if (node) {
+    node.state = newState;
+    render();
+    flashNode(entityId);
+  }
+}
+
+function handleFoldCompleted(event) {
+  // Add fold as a small node if not present
+  const foldNode = {
+    id: event.fold_id,
+    label: (event.summary || '').slice(0, 30),
+    node_type: 'fold',
+    entity_type: 'fold',
+    state: 'active',
+    confidence: 1.0,
+    created_at: new Date().toISOString(),
+    context: event.summary || '',
+  };
+  if (!nodes.find(n => n.id === foldNode.id)) {
+    foldNode.x = width / 2 + (Math.random() - 0.5) * 80;
+    foldNode.y = height / 2 + (Math.random() - 0.5) * 80;
+    nodes.push(foldNode);
+    render();
+  }
+}
+
+function flashNode(nodeId) {
+  nodeGroup.selectAll('circle')
+    .filter(d => d.id === nodeId)
+    .transition().duration(200)
+    .attr('stroke', '#e2725b')
+    .attr('stroke-width', 4)
+    .transition().duration(800)
+    .attr('stroke', selectedNode && selectedNode.id === nodeId ? '#fff' : 'none')
+    .attr('stroke-width', 2);
+}
+
+// === Utilities ===
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+// === Window resize ===
+window.addEventListener('resize', () => {
+  const w = container.clientWidth;
+  const h = container.clientHeight;
+  simulation.force('center', d3.forceCenter(w / 2, h / 2));
+  simulation.alpha(0.1).restart();
+});
+
+// === Start ===
+connect();
 </script>
 </body>
 </html>
