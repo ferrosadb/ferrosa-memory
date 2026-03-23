@@ -238,4 +238,42 @@ mod tests {
             .unwrap();
         assert!(!result.hit, "different model version should miss");
     }
+
+    #[tokio::test]
+    async fn memo_embedding_round_trips_through_storage() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+
+        let embedding: Vec<f32> = (0..768).map(|i| i as f32 / 768.0).collect();
+
+        let stored = store_memo_result(
+            &store,
+            &ctx,
+            &StoreMemoParams {
+                prompt: "embedding test",
+                context_slice: "ctx",
+                model_version: "v1",
+                result: "answer with embedding",
+                embedding: Some(embedding.clone()),
+                ttl_days: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(stored.stored);
+
+        // Read back via memo_get and verify embedding
+        let entry = store
+            .memo_get(&ctx, &stored.content_hash, "v1")
+            .await
+            .unwrap()
+            .expect("memo entry should exist");
+        let stored_embedding = entry
+            .result_embedding
+            .expect("result_embedding should be Some");
+        assert_eq!(stored_embedding.len(), 768);
+        for (a, b) in embedding.iter().zip(stored_embedding.iter()) {
+            assert!((a - b).abs() < 1e-6, "embedding mismatch: {a} vs {b}");
+        }
+    }
 }

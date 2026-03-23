@@ -106,7 +106,7 @@ impl CqlStorage {
         let stmts = PreparedStatements {
             memo_get: session
                 .prepare(format!(
-                    "SELECT result, hit_count, created_at, last_hit_at, expires_at \
+                    "SELECT result, result_embedding, hit_count, created_at, last_hit_at, expires_at \
                      FROM {ks}.memo_cache WHERE content_hash = ? AND model_version = ? AND tenant_id = ?"
                 ))
                 .await?,
@@ -159,7 +159,7 @@ impl CqlStorage {
             fold_get: session
                 .prepare(format!(
                     "SELECT fold_id, depth, parent_fold_id, raw_trajectory, fold_summary, \
-                     token_count, compression_ratio, status, created_at, folded_at \
+                     fold_embedding, token_count, compression_ratio, status, created_at, folded_at \
                      FROM {ks}.trajectory_folds WHERE session_id = ? AND tenant_id = ? AND fold_id = ?"
                 ))
                 .await?,
@@ -192,7 +192,7 @@ impl CqlStorage {
             entity_list_session: session
                 .prepare(format!(
                     "SELECT entity_id, entity_name, entity_type, source_fold_id, \
-                     context_snippet, confidence, state, created_at \
+                     context_snippet, entity_embedding, confidence, state, created_at \
                      FROM {ks}.entity_store WHERE tenant_id = ? AND session_id = ?"
                 ))
                 .await?,
@@ -350,7 +350,12 @@ impl Storage for CqlStorage {
                 content_hash: content_hash.to_string(),
                 model_version: model_version.to_string(),
                 result,
-                result_embedding: None, // TODO: vector column read
+                result_embedding: row
+                    .r_by_name::<cdrs_tokio::types::blob::Blob>("result_embedding")
+                    .ok()
+                    .map(|blob| blob.into_vec())
+                    .filter(|v| !v.is_empty())
+                    .map(|v| crate::vector::decode_vector(&v)),
                 hit_count,
                 created_at: created_at.and_utc(),
                 last_hit_at: row
@@ -571,7 +576,12 @@ impl Storage for CqlStorage {
                 parent_fold_id: row.r_by_name::<Uuid>("parent_fold_id").ok(),
                 raw_trajectory: row.r_by_name("raw_trajectory")?,
                 fold_summary: row.r_by_name::<String>("fold_summary").ok(),
-                fold_embedding: None, // TODO: vector column read
+                fold_embedding: row
+                    .r_by_name::<cdrs_tokio::types::blob::Blob>("fold_embedding")
+                    .ok()
+                    .map(|blob| blob.into_vec())
+                    .filter(|v| !v.is_empty())
+                    .map(|v| crate::vector::decode_vector(&v)),
                 token_count: row.r_by_name("token_count")?,
                 compression_ratio: row.r_by_name::<f64>("compression_ratio").ok(),
                 status,
@@ -740,7 +750,7 @@ impl Storage for CqlStorage {
         // Fallback: exact case-insensitive match via ALLOW FILTERING
         let query = format!(
             "SELECT entity_id, entity_name, entity_type, source_fold_id, \
-             context_snippet, confidence, state, created_at \
+             context_snippet, entity_embedding, confidence, state, created_at \
              FROM {}.entity_store WHERE tenant_id = ? AND session_id = ? ALLOW FILTERING",
             self.keyspace
         );
@@ -768,7 +778,12 @@ impl Storage for CqlStorage {
                     entity_type: row.r_by_name("entity_type")?,
                     source_fold_id: row.r_by_name::<Uuid>("source_fold_id").ok(),
                     context_snippet: row.r_by_name("context_snippet")?,
-                    entity_embedding: None,
+                    entity_embedding: row
+                        .r_by_name::<cdrs_tokio::types::blob::Blob>("entity_embedding")
+                        .ok()
+                        .map(|blob| blob.into_vec())
+                        .filter(|v| !v.is_empty())
+                        .map(|v| crate::vector::decode_vector(&v)),
                     confidence: f64::from(row.r_by_name::<f32>("confidence")?),
                     state,
                     created_at: created.and_utc(),
@@ -891,7 +906,12 @@ impl Storage for CqlStorage {
                 entity_type: row.r_by_name("entity_type")?,
                 source_fold_id: row.r_by_name::<Uuid>("source_fold_id").ok(),
                 context_snippet: row.r_by_name("context_snippet")?,
-                entity_embedding: None,
+                entity_embedding: row
+                    .r_by_name::<cdrs_tokio::types::blob::Blob>("entity_embedding")
+                    .ok()
+                    .map(|blob| blob.into_vec())
+                    .filter(|v| !v.is_empty())
+                    .map(|v| crate::vector::decode_vector(&v)),
                 confidence: f64::from(row.r_by_name::<f32>("confidence")?),
                 state,
                 created_at: created.and_utc(),

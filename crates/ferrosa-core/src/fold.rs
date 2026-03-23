@@ -340,4 +340,41 @@ mod tests {
             assert_eq!(entity.source_fold_id, Some(fold_id));
         }
     }
+
+    #[tokio::test]
+    async fn fold_embedding_round_trips_through_storage() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let sid = Uuid::new_v4();
+
+        let embedding: Vec<f32> = (0..768).map(|i| i as f32 / 768.0).collect();
+
+        let fold_id = start_fold(&store, &ctx, sid, 0, None, "embedding test context")
+            .await
+            .unwrap();
+        complete_fold(
+            &store,
+            &ctx,
+            sid,
+            fold_id,
+            "summary with embedding",
+            embedding.clone(),
+        )
+        .await
+        .unwrap();
+
+        // Read back and verify embedding survives the round-trip
+        let fold = store.fold_get(&ctx, sid, fold_id).await.unwrap().unwrap();
+        assert_eq!(fold.status, FoldStatus::Folded);
+        let stored_embedding = fold
+            .fold_embedding
+            .expect("fold_embedding should be Some after complete");
+        assert_eq!(stored_embedding.len(), 768);
+        for (a, b) in embedding.iter().zip(stored_embedding.iter()) {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "embedding mismatch at value: {a} vs {b}"
+            );
+        }
+    }
 }
