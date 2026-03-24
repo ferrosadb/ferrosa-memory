@@ -307,7 +307,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         // --- Cognitive memory tools ---
         ToolDef {
             name: "smart_ingest".into(),
-            description: "Intelligently ingests content by comparing against existing memories. Uses prediction error gating to decide: CREATE (novel), UPDATE (similar topic), SUPERSEDE (contradicts existing), or SKIP (redundant).\n\nCALL WHEN: You learn something new that should be remembered — facts, decisions, patterns, preferences. This is the primary write path for building the knowledge graph.\nDO NOT CALL: For ephemeral conversation or task-specific state. Use plan tools for task state.\nRETURNS: The action taken and affected entity_id(s).\nCost: ~15ms (includes similarity search).".into(),
+            description: "YOUR PRIMARY TOOL FOR BUILDING LONG-TERM MEMORY. Automatically decides whether to CREATE, UPDATE, SUPERSEDE, or SKIP based on what you already know.\n\nCALL AGGRESSIVELY — every time you encounter something worth remembering:\n- User preferences, habits, or working style\n- Technical decisions and WHY they were made\n- Architecture patterns, library choices, configuration gotchas\n- People, roles, relationships mentioned in conversation\n- Project context: goals, constraints, deadlines, blockers\n- Debugging insights: what caused a bug, what fixed it\n- Tool/framework knowledge: 'X works well for Y', 'avoid Z because...'\n- Domain knowledge: business rules, API behaviors, data models\n- Corrections: 'user said X is wrong, Y is correct'\n\nDO NOT CALL for: ephemeral task state (use plan tools), raw code (derivable from files), or content the user explicitly marks as temporary.\n\nThe prediction error gate handles dedup — calling too often is better than missing important information. If in doubt, ingest it.\n\nRETURNS: action taken (Created/Updated/Superseded/Skipped) + entity_id.\nCost: ~15ms.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -323,7 +323,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         // --- Intention tools (prospective memory) ---
         ToolDef {
             name: "set_intention".into(),
-            description: "Sets a prospective memory intention — a deferred action that triggers when a context condition is met.\n\nCALL WHEN: You or the user identify something to remember to do later when a specific context arises (e.g., 'when we work on auth, review error handling').\nDO NOT CALL: For immediate tasks. Use plan tools for current task state.\nReturns: intention_id for tracking.\nCost: ~1ms (in-memory).".into(),
+            description: "Prospective memory — 'remember to do X when Y happens.' Sets a deferred action that auto-triggers on context match.\n\nCALL WHEN you notice something to do later:\n- 'When we touch auth, check the error handling'\n- 'Next time we open database.rs, add that index'\n- 'When user mentions deployment, remind about the TLS cert'\n- 'In 30 minutes, check if the build finished'\n\nTrigger types: Topic (keyword match), FilePattern (file glob), Duration (minutes), Context (flexible condition).\n\nIntentions persist across the session and trigger automatically when check_intentions runs. Set liberally — they cost nothing until triggered.\nCost: ~1ms.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -347,7 +347,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "check_intentions".into(),
-            description: "Checks all pending intentions against the current context. Returns any that trigger.\n\nCALL WHEN: At the start of each new task or context switch. Lightweight scan of pending intentions.\nCost: ~1ms (in-memory).".into(),
+            description: "Checks pending intentions against current context. Call FREQUENTLY — at every topic change, file open, or new task start. Pass a brief description of what you're doing now as context. Returns triggered intentions you should act on.\n\nCost: ~1ms. Call often — it's free.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -389,7 +389,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         // --- Temporal fact tools ---
         ToolDef {
             name: "write_temporal_fact".into(),
-            description: "Records a timestamped fact about an entity. Auto-supersedes the previous current fact for the same entity.\n\nCALL WHEN: You learn a new fact about an entity that may change over time (e.g., role, location, status). The old fact is preserved with a valid_until timestamp.\nDO NOT CALL: For static attributes unlikely to change. Use upsert_entity for those.\nReturns: event_id of the new fact.\nCost: ~5ms.".into(),
+            description: "Records a timestamped fact about an entity. Auto-supersedes the previous fact, preserving history.\n\nCALL WHEN facts change over time — this is how you track evolution:\n- Role changes: 'Alice is now VP' supersedes 'Alice is Director'\n- Status updates: 'deploy succeeded' supersedes 'deploy in progress'\n- Project state: 'using Rust 1.82' supersedes 'using Rust 1.78'\n- Preference changes: 'user prefers dark mode' supersedes 'user likes light mode'\n- Bug status: 'fixed in commit abc' supersedes 'investigating OOM'\n\nFirst call smart_ingest to create the entity, then write_temporal_fact for facts that evolve. The supersession chain is queryable — you can answer 'what was X before?'\n\nReturns: event_id of the new fact.\nCost: ~5ms.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -437,7 +437,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         // --- Hybrid search ---
         ToolDef {
             name: "hybrid_search".into(),
-            description: "Multi-strategy search combining phonetic entity lookup, ANN entity search, and ANN fold search with Reciprocal Rank Fusion.\n\nCALL WHEN: You need maximum recall across all memory types — entities and folds. Prefer this over separate retrieve_entities + retrieve_fold_context when you want a single ranked result set.\nProvide embedding for ANN strategies; without it only phonetic matching runs.\nCost: ~15ms (runs up to 3 strategies in sequence).".into(),
+            description: "Search across ALL memory types at once — entities, folds, and facts — using Reciprocal Rank Fusion to merge results.\n\nCALL AT THE START OF EVERY NEW TASK or when the user asks about something that might have prior context. This is your 'what do I already know about this?' tool.\n\nExamples of when to search:\n- User mentions a project, person, or concept → search for prior context\n- Starting implementation → search for related decisions and patterns\n- Debugging → search for prior bugs in the same area\n- User asks 'remember when...' → search for the memory\n\nProvide embedding for ANN strategies; without it only phonetic matching runs.\nCost: ~15ms.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -456,7 +456,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         // --- Dream consolidation ---
         ToolDef {
             name: "run_consolidation".into(),
-            description: "Runs dream consolidation over a session's entities. Groups entities by source fold, creates CO_OCCURS edges between co-occurring entities, and identifies clusters (3+ entities in the same fold).\n\nCALL WHEN: After a session accumulates many entities — typically at session end or during idle periods. Strengthens the knowledge graph by discovering implicit connections.\nCost: O(entities) reads + O(pairs) edge writes.".into(),
+            description: "Dream consolidation — discovers hidden connections between memories. Groups entities by shared context, creates CO_OCCURS graph edges, identifies clusters.\n\nCALL WHEN:\n- After ingesting 5+ new memories in a session\n- At the end of a productive work session\n- When the user says 'wrap up' or 'that's it for now'\n- Periodically during long sessions (every ~30 minutes of active work)\n\nThis is what makes the knowledge graph useful — individual memories become a connected web of knowledge. The more you consolidate, the richer the graph.\nCost: scales with entity count, typically <100ms.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
