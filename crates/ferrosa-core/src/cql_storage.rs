@@ -62,10 +62,6 @@ struct PreparedStatements {
     edge_mentioned_in: PreparedQuery,
     edge_co_occurs: PreparedQuery,
     edge_supersedes: PreparedQuery,
-    edge_list_folded_into: PreparedQuery,
-    edge_list_mentioned_in: PreparedQuery,
-    edge_list_co_occurs: PreparedQuery,
-    edge_list_supersedes: PreparedQuery,
     // Entity neighbor queries (spreading activation)
     edge_mentioned_in_by_entity: PreparedQuery,
     edge_co_occurs_by_a: PreparedQuery,
@@ -297,30 +293,8 @@ impl CqlStorage {
                      VALUES (?, ?, ?, ?, ?)"
                 ))
                 .await?,
-            edge_list_folded_into: session
-                .prepare(format!(
-                    "SELECT source_fold_id, target_fold_id \
-                     FROM {ks}.folded_into WHERE session_id = ? AND tenant_id = ? ALLOW FILTERING"
-                ))
-                .await?,
-            edge_list_mentioned_in: session
-                .prepare(format!(
-                    "SELECT entity_id, fold_id \
-                     FROM {ks}.mentioned_in WHERE session_id = ? AND tenant_id = ? ALLOW FILTERING"
-                ))
-                .await?,
-            edge_list_co_occurs: session
-                .prepare(format!(
-                    "SELECT entity_a, entity_b \
-                     FROM {ks}.co_occurs_with WHERE session_id = ? AND tenant_id = ? ALLOW FILTERING"
-                ))
-                .await?,
-            edge_list_supersedes: session
-                .prepare(format!(
-                    "SELECT new_event_id, old_event_id \
-                     FROM {ks}.supersedes WHERE tenant_id = ?"
-                ))
-                .await?,
+            // edge_list_* queries use dynamic queries in edge_list_session()
+            // because ALLOW FILTERING with prepared statements is unreliable.
             // Entity neighbor queries (spreading activation)
             edge_mentioned_in_by_entity: session
                 .prepare(format!(
@@ -1310,7 +1284,7 @@ impl Storage for CqlStorage {
     async fn edge_count(&self, ctx: &TenantContext) -> anyhow::Result<usize> {
         let mut total: usize = 0;
         let pk_cols = [
-            ("folded_into", "child_fold_id"),
+            ("folded_into", "source_fold_id"),
             ("mentioned_in", "entity_id"),
             ("co_occurs_with", "entity_a"),
             ("supersedes", "new_event_id"),
@@ -1471,56 +1445,65 @@ impl Storage for CqlStorage {
     ) -> anyhow::Result<Vec<(Uuid, Uuid, String)>> {
         let mut edges = Vec::new();
 
-        // FOLDED_INTO edges
-        let rows = self
-            .query_rows(
-                &self.stmts.edge_list_folded_into,
-                query_values!(session_id, ctx.tenant_id),
-            )
-            .await?;
-        for row in rows {
-            let src: Uuid = row.r_by_name("source_fold_id")?;
-            let tgt: Uuid = row.r_by_name("target_fold_id")?;
-            edges.push((src, tgt, "FOLDED_INTO".into()));
-        }
+        // Use dynamic queries — prepared statements with ALLOW FILTERING
+        // can fail on some Ferrosa versions. Each table is best-effort.
+        let edge_queries: &[(&str, &str, &str, &str)] = &[
+            (
+                "folded_into",
+                "source_fold_id",
+                "target_fold_id",
+                "FOLDED_INTO",
+            ),
+            ("mentioned_in", "entity_id", "fold_id", "MENTIONED_IN"),
+            ("co_occurs_with", "entity_a", "entity_b", "CO_OCCURS"),
+        ];
 
-        // MENTIONED_IN edges
-        let rows = self
-            .query_rows(
-                &self.stmts.edge_list_mentioned_in,
-                query_values!(session_id, ctx.tenant_id),
-            )
-            .await?;
-        for row in rows {
-            let src: Uuid = row.r_by_name("entity_id")?;
-            let tgt: Uuid = row.r_by_name("fold_id")?;
-            edges.push((src, tgt, "MENTIONED_IN".into()));
-        }
-
-        // CO_OCCURS_WITH edges
-        let rows = self
-            .query_rows(
-                &self.stmts.edge_list_co_occurs,
-                query_values!(session_id, ctx.tenant_id),
-            )
-            .await?;
-        for row in rows {
-            let src: Uuid = row.r_by_name("entity_a")?;
-            let tgt: Uuid = row.r_by_name("entity_b")?;
-            edges.push((src, tgt, "CO_OCCURS".into()));
+        for (table, src_col, tgt_col, label) in edge_queries {
+            let query = format!(
+                "SELECT {src_col}, {tgt_col} FROM {}.{table} \
+                 WHERE session_id = ? AND tenant_id = ? ALLOW FILTERING",
+                self.keyspace
+            );
+            match self
+                .session
+                .query_with_values(query, query_values!(session_id, ctx.tenant_id))
+                .await
+            {
+                Ok(envelope) => {
+                    let rows = envelope.response_body()?.into_rows().unwrap_or_default();
+                    for row in rows {
+                        if let (Ok(src), Ok(tgt)) = (
+                            row.r_by_name::<Uuid>(src_col),
+                            row.r_by_name::<Uuid>(tgt_col),
+                        ) {
+                            edges.push((src, tgt, label.to_string()));
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(table, error = %e, "edge query failed"),
+            }
         }
 
         // SUPERSEDES edges (not session-scoped, return all for tenant)
-        let rows = self
-            .query_rows(
-                &self.stmts.edge_list_supersedes,
-                query_values!(ctx.tenant_id),
-            )
-            .await?;
-        for row in rows {
-            let src: Uuid = row.r_by_name("new_event_id")?;
-            let tgt: Uuid = row.r_by_name("old_event_id")?;
-            edges.push((src, tgt, "SUPERSEDES".into()));
+        let query = format!(
+            "SELECT new_event_id, old_event_id FROM {}.supersedes \
+             WHERE tenant_id = ? ALLOW FILTERING",
+            self.keyspace
+        );
+        if let Ok(envelope) = self
+            .session
+            .query_with_values(query, query_values!(ctx.tenant_id))
+            .await
+        {
+            let rows = envelope.response_body()?.into_rows().unwrap_or_default();
+            for row in rows {
+                if let (Ok(src), Ok(tgt)) = (
+                    row.r_by_name::<Uuid>("new_event_id"),
+                    row.r_by_name::<Uuid>("old_event_id"),
+                ) {
+                    edges.push((src, tgt, "SUPERSEDES".into()));
+                }
+            }
         }
 
         Ok(edges)
