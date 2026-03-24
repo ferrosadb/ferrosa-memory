@@ -17,11 +17,57 @@ use tokio::sync::Mutex;
 
 use crate::transport::{INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND};
 
+/// Tracks per-entity retrieval counts for anomaly detection (FMEA F19).
+#[derive(Default)]
+pub struct RetrievalTracker {
+    counts: std::collections::HashMap<uuid::Uuid, usize>,
+}
+
+impl RetrievalTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record(&mut self, entity_id: uuid::Uuid) {
+        *self.counts.entry(entity_id).or_insert(0) += 1;
+    }
+
+    pub fn count(&self, entity_id: &uuid::Uuid) -> usize {
+        self.counts.get(entity_id).copied().unwrap_or(0)
+    }
+
+    pub fn mean(&self) -> f64 {
+        if self.counts.is_empty() {
+            return 0.0;
+        }
+        let sum: usize = self.counts.values().sum();
+        sum as f64 / self.counts.len() as f64
+    }
+
+    pub fn stddev(&self) -> f64 {
+        if self.counts.len() < 2 {
+            return 0.0;
+        }
+        let mean = self.mean();
+        let variance = self
+            .counts
+            .values()
+            .map(|&c| {
+                let diff = c as f64 - mean;
+                diff * diff
+            })
+            .sum::<f64>()
+            / self.counts.len() as f64;
+        variance.sqrt()
+    }
+}
+
 /// Per-session mutable state (not persisted in CQL).
 pub struct SessionState {
     pub intentions: Arc<Mutex<crate::intention::IntentionStore>>,
     pub graph: Option<Arc<crate::graph::GraphClient>>,
     pub event_bus: Arc<crate::viz::EventBus>,
+    pub retrieval_tracker: Arc<Mutex<RetrievalTracker>>,
 }
 
 impl Default for SessionState {
@@ -30,6 +76,7 @@ impl Default for SessionState {
             intentions: Arc::new(Mutex::new(crate::intention::IntentionStore::new())),
             graph: None,
             event_bus: Arc::new(crate::viz::EventBus::new()),
+            retrieval_tracker: Arc::new(Mutex::new(RetrievalTracker::new())),
         }
     }
 }
@@ -507,7 +554,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "complete_fold" => handle_complete_fold(args, storage, ctx, session).await,
         "retrieve_fold_context" => handle_retrieve_fold(args, storage, ctx).await,
         "upsert_entity" => handle_upsert_entity(args, storage, ctx, session).await,
-        "retrieve_entities" => handle_retrieve_entities(args, storage, ctx).await,
+        "retrieve_entities" => handle_retrieve_entities(args, storage, ctx, session).await,
         "record_outcome" => handle_record_outcome(args, storage, ctx).await,
         "delete_session" => handle_delete_session(args, storage, ctx).await,
         "smart_ingest" => handle_smart_ingest(args, storage, ctx, session).await,
@@ -870,6 +917,7 @@ async fn handle_retrieve_entities<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
     ctx: &crate::types::TenantContext,
+    session: &SessionState,
 ) -> Result<Value, (i32, String)> {
     let session_id = require_uuid(&args, "session_id")?;
     let query = require_str(&args, "query")?;
@@ -891,6 +939,27 @@ async fn handle_retrieve_entities<S: crate::storage::Storage>(
     )
     .await
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    // Track retrieval frequency and check for anomalies (STRIDE T1 / FMEA F19)
+    let security_config = crate::config::SecurityConfig::default();
+    let mut tracker = session.retrieval_tracker.lock().await;
+    for entity in &entities {
+        tracker.record(entity.entity_id);
+        let count = tracker.count(&entity.entity_id);
+        if crate::audit::check_anomaly(
+            count,
+            tracker.mean(),
+            tracker.stddev(),
+            &security_config,
+            None,
+        ) {
+            tracing::warn!(
+                entity_id = %entity.entity_id,
+                count,
+                "anomalous retrieval frequency"
+            );
+        }
+    }
 
     serde_json::to_value(&entities).map_err(|e| (INTERNAL_ERROR, e.to_string()))
 }
@@ -2000,5 +2069,128 @@ mod tests {
         let triggered = intention_store.check("writing rust code");
         assert_eq!(triggered.len(), 1);
         assert_eq!(triggered[0].description, "Previously stored intention");
+    }
+
+    #[test]
+    fn retrieval_tracker_stats() {
+        let mut tracker = RetrievalTracker::new();
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+
+        // Empty tracker
+        assert_eq!(tracker.mean(), 0.0);
+        assert_eq!(tracker.stddev(), 0.0);
+
+        // Single entity — stddev stays 0 (need 2+ for variance)
+        tracker.record(id_a);
+        assert_eq!(tracker.count(&id_a), 1);
+        assert_eq!(tracker.mean(), 1.0);
+        assert_eq!(tracker.stddev(), 0.0);
+
+        // Two entities with divergent counts
+        tracker.record(id_b);
+        for _ in 0..9 {
+            tracker.record(id_a);
+        }
+        assert_eq!(tracker.count(&id_a), 10);
+        assert_eq!(tracker.count(&id_b), 1);
+        assert_eq!(tracker.mean(), 5.5);
+        assert!(tracker.stddev() > 0.0);
+    }
+
+    #[test]
+    fn retrieval_tracker_anomaly_detection() {
+        // Simulate a realistic scenario: many baseline entities at low counts,
+        // one entity with anomalously high retrieval count.
+        let mut tracker = RetrievalTracker::new();
+        let config = crate::config::SecurityConfig::default();
+
+        // 20 baseline entities each retrieved once
+        let baseline_ids: Vec<Uuid> = (0..20).map(|_| Uuid::new_v4()).collect();
+        for &id in &baseline_ids {
+            tracker.record(id);
+        }
+
+        // One outlier entity retrieved 100 times
+        let outlier_id = Uuid::new_v4();
+        for _ in 0..100 {
+            tracker.record(outlier_id);
+        }
+
+        let count = tracker.count(&outlier_id);
+        let mean = tracker.mean();
+        let stddev = tracker.stddev();
+
+        // Baseline entities should NOT trigger anomaly
+        let baseline_count = tracker.count(&baseline_ids[0]);
+        assert!(
+            !crate::audit::check_anomaly(baseline_count, mean, stddev, &config, None),
+            "baseline entity should not be anomalous"
+        );
+
+        // Outlier SHOULD trigger anomaly
+        assert!(
+            crate::audit::check_anomaly(count, mean, stddev, &config, None),
+            "outlier count {count} with mean={mean:.1} stddev={stddev:.1} should be anomalous"
+        );
+    }
+
+    #[tokio::test]
+    async fn retrieve_entities_records_to_tracker() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+
+        // Upsert an entity
+        let params = serde_json::json!({
+            "name": "upsert_entity",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "entity_name": "TrackedEntity",
+                "entity_type": "concept",
+                "context_snippet": "testing retrieval tracking",
+                "confidence": 0.9
+            }
+        });
+        dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+
+        // Retrieve it several times
+        let retrieve_params = serde_json::json!({
+            "name": "retrieve_entities",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "query": "TrackedEntity",
+                "strategy": "phonetic"
+            }
+        });
+        for _ in 0..5 {
+            dispatch(
+                "tools/call",
+                retrieve_params.clone(),
+                &store,
+                &ctx,
+                &session,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Verify the tracker recorded all retrievals
+        let tracker = session.retrieval_tracker.lock().await;
+        let entities = store.entities.lock().await;
+        let entity_id = entities
+            .iter()
+            .find(|e| e.entity_name == "TrackedEntity")
+            .expect("entity should exist")
+            .entity_id;
+
+        assert_eq!(
+            tracker.count(&entity_id),
+            5,
+            "tracker should record each retrieval"
+        );
     }
 }
