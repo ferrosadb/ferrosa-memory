@@ -1,11 +1,11 @@
 # STRIDE Threat Model — ferrosa-memory-mcp
 
-> Last updated: 2026-03-21
-> Status: Updated — graph path changed to HTTP, TLS enforcement status noted
+> Last updated: 2026-03-23
+> Status: Updated — viz/WebSocket surface, smart ingest, spreading activation, session deletion threats added
 
 ## Scope
 
-Full system: MCP clients -> ferrosa-memory-mcp -> Ferrosa DB. Includes stdio and HTTP+SSE transports, all 12 MCP tools, 6 CQL tables, graph layer, embedding endpoint, and nightly batch job.
+Full system: MCP clients -> ferrosa-memory-mcp -> Ferrosa DB. Includes stdio and HTTP+SSE transports, all 32 MCP tools, 6 CQL tables, graph layer, embedding endpoint, viz WebSocket server, and nightly batch job.
 
 ## Data Flow Diagram
 
@@ -16,6 +16,7 @@ graph TB
         C2[Claude.ai<br/>HTTP client]
         C3[Third-party<br/>MCP client]
         OL[Ollama<br/>embedding endpoint]
+        WC[Viz WebSocket<br/>clients]
     end
 
     subgraph "Trust Boundary 1: MCP Server Process"
@@ -26,6 +27,8 @@ graph TB
         TH[Tool Handlers<br/>memo/plan/fold/entity/feedback]
         K[compression]
         E[embedding_client]
+        VZ[viz module]
+        HT[http module]
     end
 
     subgraph "Trust Boundary 2: Ferrosa DB Cluster"
@@ -42,12 +45,16 @@ graph TB
     C1 -->|stdio pipes| T
     C2 -->|HTTP+SSE| T
     C3 -->|HTTP+SSE| T
+    WC -->|WebSocket| HT
+    HT --> VZ
+    VZ -->|entity change events| WC
     T --> D
     D --> A
     A --> R
     R --> TH
     TH --> K
     TH --> E
+    TH --> VZ
     E -->|HTTP| OL
     TH -->|CQL| CQL
     TH -->|Cypher| GR
@@ -81,6 +88,7 @@ graph TB
 | S2 | Client supplies a forged `tenant_id` in tool parameters | auth | **Critical** (L:4 x I:5 = 20) | `tenant_id` is NEVER client-supplied. Extracted from authenticated session only. Input schema rejects any `tenant_id` field in tool params. |
 | S3 | Stdio client spoofing (local privilege escalation) | transport (TB0) | **Low** (L:1 x I:4 = 4) | stdio inherits process owner — OS-level trust. Document that stdio mode assumes local trust. |
 | S4 | Batch job credentials compromised | batch job (TB3) | **Medium** (L:2 x I:4 = 8) | Separate CQL credentials for batch job with read-only on `feedback_outcomes`, write-only on `routing_guidelines`. Least privilege. |
+| S5 | WebSocket connections bypass MCP auth — viz endpoint may lack tenant authentication | viz module (TB0→TB1) | **Medium** (L:3 x I:3 = 9) | Require auth token on WebSocket upgrade request. Reject unauthenticated connections before handshake completes. |
 
 ### T — Tampering
 
@@ -92,13 +100,15 @@ graph TB
 | T4 | CQL injection via tool parameters | cql_client | **High** (L:2 x I:5 = 10) | ALL queries use prepared statements with parameterized bindings. No string interpolation into CQL. |
 | T5 | Cypher injection via entity names or queries | graph_client (HTTP) | **High** (L:2 x I:5 = 10) | Parameterized Cypher queries via HTTP POST. Entity names passed as parameters, never interpolated into query strings. Graph client uses HTTP Basic auth on same-network endpoint (TB1b). |
 | T6 | Tampering with compressed data on S3 | storage (TB2) | **Medium** (L:1 x I:4 = 4) | S3 server-side encryption. Integrity check on decompression (store checksum alongside compressed data). |
+| T7 | Smart ingest manipulation — adversarial content could game the prediction error gate to either flood entities or suppress legitimate ingestion | smart_ingest | **Low-Medium** (L:2 x I:3 = 6) | Rate limiting on ingest calls. Monitor prediction error distribution for anomalies. Confidence floor on entity extraction. |
 
 ### R — Repudiation
 
 | ID | Threat | Component | Risk | Mitigation |
 |----|--------|-----------|------|------------|
-| R1 | Deny having written a poisoned entity or memo entry | entity_tools, memo_tools | **Medium** (L:3 x I:3 = 9) | Append-only audit log with `tenant_id`, `session_id`, timestamp, operation type. Audit rows cannot be deleted via MCP tools. |
+| R1 | Deny having written a poisoned entity or memo entry | entity_tools, memo_tools | **Medium** (L:3 x I:3 = 9) | Append-only audit log with `tenant_id`, `session_id`, timestamp, operation type. Audit rows cannot be deleted via MCP tools. **Status: PARTIAL** — CQL persistence added, but writes are best-effort (see R3). |
 | R2 | Deny having submitted false feedback outcomes | feedback_tools | **Low** (L:2 x I:2 = 4) | `feedback_outcomes` is write-only via MCP, with `tenant_id` and `session_id` from auth context. |
+| R3 | Audit log bypass via direct CQL — if audit writes are best-effort (fire-and-forget), failed audit writes are invisible | audit_log | **Medium** (L:3 x I:3 = 9) | Audit writes must be synchronous or use a write-ahead log. Monitor audit write failure rate. Alert on gaps in audit sequence. |
 
 ### I — Information Disclosure
 
@@ -109,16 +119,20 @@ graph TB
 | I3 | Embedding vectors reversed to reconstruct source text | all tables with embeddings | **Medium** (L:1 x I:3 = 3) | Embeddings alone are not reversible. Source text columns deleted with parent row on cascade delete. |
 | I4 | Ollama endpoint logs contain sensitive prompt content | embedding_client (TB2) | **Medium** (L:2 x I:3 = 6) | Ollama runs on local/private network. Document that embedding requests contain text fragments. Configure Ollama to disable request logging in production. |
 | I5 | Membership inference on agent memory store | all tables | **Medium** (L:2 x I:3 = 6) | Per "Unveiling Privacy Risks" paper. Mitigated by tenant isolation (attacker can only probe their own tenant). Rate limiting on retrieval tools. |
+| I6 | Viz WebSocket broadcasts all entity changes to any connected client without tenant scoping | viz module | **High** (L:3 x I:4 = 12) | WebSocket channels must be scoped to `tenant_id`. Filter entity change events before broadcast. Reject cross-tenant subscriptions. |
+| I7 | Spreading activation traversal could leak entity relationships across session boundaries | spread_activation | **Low-Medium** (L:2 x I:3 = 6) | Traversal queries must include `tenant_id` filter at every hop. Session-scoped activation should not cross into other sessions' private entities. |
 
 ### D — Denial of Service
 
 | ID | Threat | Component | Risk | Mitigation |
 |----|--------|-----------|------|------------|
-| D1 | Flood of `store_memo_result` calls fills storage | memo_tools | **Medium** (L:3 x I:3 = 9) | `max_memo_results` config cap. TTL-based expiry. Per-tenant storage quotas (Ferrosa-level). |
+| D1 | Flood of `store_memo_result` calls fills storage | memo_tools | **Medium** (L:3 x I:3 = 9) | `max_memo_results` config cap. TTL-based expiry. Per-tenant storage quotas (Ferrosa-level). **Status: MITIGATED** — quotas implemented (commit 57cf61b). |
 | D2 | Large `raw_trajectory` payloads in `append_to_fold` | fold_tools | **Medium** (L:3 x I:3 = 9) | Max payload size on `repl_turn` input (configurable, default 64KB). Token count tracking surfaces growth to caller. |
 | D3 | Expensive Cypher traversals on large entity graphs | graph_client | **High** (L:3 x I:4 = 12) | Query timeout on Cypher executions (configurable, default 5s). Limit traversal depth in all Cypher queries (max 3 hops). |
 | D4 | HTTP connection exhaustion | transport | **Medium** (L:3 x I:3 = 9) | Connection limit per source IP. Tokio's async model handles backpressure naturally. |
 | D5 | Ollama endpoint unavailable stalls tool calls | embedding_client | **Medium** (L:3 x I:3 = 9) | Timeout on embedding requests (default 10s). Graceful degradation: tools that require embedding fail fast with clear error, don't block other tools. |
+| D6 | Spreading activation with large `max_hops` on dense graphs could exhaust CPU | spread_activation | **Medium** (L:3 x I:3 = 9) | `max_hops` capped at 5 in tool schema. Visited-node set bounds total work. Query timeout on underlying Cypher traversals. |
+| D7 | Dream consolidation O(n^2) entity comparison could be slow for large sessions | run_consolidation | **Low** (L:2 x I:2 = 4) | Consolidation runs as background task. Limit batch size per invocation. Monitor execution time and abort if threshold exceeded. |
 
 ### E — Elevation of Privilege
 
@@ -127,6 +141,7 @@ graph TB
 | E1 | MCP client escalates to batch job credentials | auth | **High** (L:1 x I:5 = 5) | Batch job uses separate CQL credentials, not accessible via MCP server process. Different auth context. |
 | E2 | Tool call accesses `feedback_outcomes` read path | feedback_tools | **Medium** (L:2 x I:3 = 6) | `record_outcome` is write-only. No MCP tool exposes `SELECT` on `feedback_outcomes`. Read access only via batch job credentials. |
 | E3 | Attacker chains memo poisoning + routing manipulation | tool_router + memo_tools | **High** (L:1 x I:5 = 5) | Routing guidelines are written only by batch job (separate credentials). Memo cache doesn't influence routing decisions directly — only `feedback_outcomes` does, and that table is write-only via MCP. |
+| E4 | Session deletion without ownership verification — any authenticated tenant could delete another tenant's session | delete_session | **Critical** (L:2 x I:5 = 10) | `delete_session` must enforce `tenant_id` scoping — verify session belongs to requesting tenant before deletion. Return error if session not found within tenant scope. |
 
 ## Risk Summary
 
@@ -157,13 +172,13 @@ quadrantChart
 ## Critical Threats (Must mitigate before v1.0)
 
 1. **S2 — Tenant ID spoofing:** Architectural invariant — `tenant_id` never from client input. **Status: MITIGATED** — `TenantContext` required param in all handlers, type-system enforced.
-1. **T1 — Memory poisoning (MemoryGraft):** Confidence gating + anomaly detection + audit log. **Status: PARTIAL** — confidence gating (>=0.7) implemented, rate limiting (1000/session) implemented. Anomaly detection and audit log NOT yet implemented.
+1. **T1 — Memory poisoning (MemoryGraft):** Confidence gating + anomaly detection + audit log. **Status: PARTIAL** — confidence gating (>=0.7) implemented, rate limiting (1000/session) implemented. Anomaly detection on retrieval frequency implemented (commit 2226409). Audit log NOT yet implemented.
 1. **T4/T5 — CQL/Cypher injection:** Prepared statements only, zero string interpolation. **Status: MITIGATED** — all 17 CQL prepared statements parameterized. Graph queries use HTTP POST with serialized parameters.
 1. **I1 — Cross-tenant leakage:** Partition key design + auth-scoped queries. **Status: MITIGATED** — every CQL query includes `tenant_id` from auth context.
 
 ## High Threats (Mitigate in Phase 1-2)
 
-5. **S1 — Client impersonation:** TLS + HTTP Basic auth. **Status: PARTIAL** — HTTP Basic auth implemented, but `require_tls: false` currently hardcoded in main.rs. TLS enforcement needed before production HTTP deployment.
+5. **S1 — Client impersonation:** TLS + HTTP Basic auth. **Status: PARTIAL** — HTTP Basic auth implemented. TLS support added (commit 96f3542), but `require_tls: false` still default in main.rs. TLS enforcement needed before production HTTP deployment.
 1. **T2 — Memo cache poisoning:** Content hash verification + TTL. **Status: MITIGATED** — SHA-256 content hash, model version isolation, TTL support.
 1. **D3 — Cypher DoS:** Query timeout + depth limit. **Status: PARTIAL** — depth limit in traversal queries, but no explicit query timeout configured on HTTP client.
 1. **I2 — Raw trajectory exposure:** Compress fast, archive fast. **Status: PARTIAL** — compression engine working, but background compression job and S3 lifecycle not yet wired.

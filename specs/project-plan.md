@@ -1,7 +1,7 @@
 # Project Plan — ferrosa-memory-mcp
 
-> Last updated: 2026-03-21
-> Status: Updated — sprint completion status, new risks (vector column gap, graph edge writes)
+> Last updated: 2026-03-23
+> Status: Sprints 1-3 complete, Sprint 4 nearly complete (10/11), vector column and graph edge blockers resolved
 
 ## Overview
 
@@ -12,9 +12,9 @@
 | Sprint | Status | Completion |
 |--------|--------|------------|
 | Sprint 1 | **COMPLETE** | 14/14 tasks done |
-| Sprint 2 | **MOSTLY COMPLETE** | 6/8 tasks done — graph edge creation + S3 lifecycle remain |
-| Sprint 3 | **PARTIAL** | 5/10 tasks done — ANN search, anomaly detection, audit log remain |
-| Sprint 4 | **PARTIAL** | 3/11 tasks done — routing done, HTTP skeleton exists, batch job stub |
+| Sprint 2 | **COMPLETE** | 8/8 tasks done |
+| Sprint 3 | **COMPLETE** | 10/10 tasks done |
+| Sprint 4 | **NEARLY COMPLETE** | 10/11 tasks done — SUBSCRIBE integration remains |
 
 ---
 
@@ -49,7 +49,7 @@
 
 **Goal:** Trajectory fold lifecycle with graph edges, Rust-native compression, and S3 tiering.
 
-**Status: MOSTLY COMPLETE** — compression engine, fold lifecycle, and fold search working. Graph edge creation and S3 lifecycle remain.
+**Status: COMPLETE** — compression engine, fold lifecycle, fold search, graph edge creation, and S3 lifecycle all done.
 
 | # | Task | Size | Source | Success Criteria | Tests |
 |---|------|------|--------|-----------------|-------|
@@ -62,11 +62,7 @@
 | 2.7 | S3 lifecycle configuration for `status='archived'` rows | S | spec Section 4.3 | Documented `ferrosa-ctl` commands for Glacier lifecycle rule. Lifecycle triggers after 30 days. | Manual verification with Ferrosa tiering config |
 | 2.8 | Integration test: fold hierarchy with nested folds and graph traversal | M | spec Phase 2 | Create 3-level fold tree. Cypher traversal returns correct hierarchy. Fold summaries retrievable by ANN. | End-to-end with Ferrosa |
 
-**Sprint 2 exit criteria:** Fold lifecycle works end-to-end. Compression produces valid output. Graph edges queryable via Cypher. `retrieve_fold_context` returns ranked results. **PARTIAL** — fold lifecycle and compression work, but graph edge creation not implemented (F32) and `retrieve_fold_context` uses LIMIT-based fallback instead of ANN due to vector column gap (F31).
-
-**Remaining:**
-- 2.3: Graph edge creation for `FOLDED_INTO` (blocked on F32 — needs CQL INSERT into graph-annotated edge table)
-- 2.7: S3 lifecycle configuration (not yet wired)
+**Sprint 2 exit criteria:** Fold lifecycle works end-to-end. Compression produces valid output. Graph edges queryable via Cypher. `retrieve_fold_context` returns ranked results. **MET** — graph edge creation implemented (ca207aa), S3 lifecycle documented (1a953b5), vector column gap resolved (e5c9a27).
 
 ---
 
@@ -74,7 +70,7 @@
 
 **Goal:** Entity discovery with phonetic dedup, temporal fact chains, and feedback recording for routing optimization.
 
-**Status: PARTIAL** — phonetic entity matching, temporal chains, and feedback recording working. ANN entity search blocked on vector column gap (F31). Anomaly detection and audit log not implemented.
+**Status: COMPLETE** — phonetic entity matching, temporal chains, feedback recording, ANN entity search, graph edges, anomaly detection, and audit log all working.
 
 | # | Task | Size | Source | Success Criteria | Tests |
 |---|------|------|--------|-----------------|-------|
@@ -89,13 +85,7 @@
 | 3.9 | Audit log: append-only write log for entity, fold, and memo writes | M | STRIDE R1 | All writes emit audit row. Audit rows not deletable via MCP tools. | Integration: write entity -> verify audit row. Attempt delete -> rejected. |
 | 3.10 | Integration test: entity discovery + temporal chain + graph traversal | M | spec Phase 3 | Discover entities from fold context. Create temporal facts. Traverse entity graph via Cypher. | End-to-end with Ferrosa |
 
-**Sprint 3 exit criteria:** Entity upsert with phonetic dedup works. Temporal chains maintain integrity. Feedback recording functional. Anomaly detection and audit log operational. **PARTIAL** — entity dedup, temporal chains, and feedback work. Anomaly detection (3.8) and audit log (3.9) NOT implemented.
-
-**Remaining:**
-- 3.3: `retrieve_entities` ANN strategy returns empty (blocked on F31)
-- 3.4: Graph edge creation for entity edges (blocked on F32)
-- 3.8: Anomaly detection materialized view
-- 3.9: Audit log for entity/fold/memo writes
+**Sprint 3 exit criteria:** Entity upsert with phonetic dedup works. Temporal chains maintain integrity. Feedback recording functional. Anomaly detection and audit log operational. **MET** — ANN strategy fixed via vector column support (e5c9a27), graph edges implemented (ca207aa), anomaly detection added (2226409), audit log persistence implemented (12c0a4a).
 
 ---
 
@@ -103,7 +93,7 @@
 
 **Goal:** SRLM-inspired routing, HTTP+SSE transport, and all security mitigations from threat model.
 
-**Status: PARTIAL** — routing layer complete, HTTP transport skeleton exists. Batch job is a stub. TLS not enforced. Most security hardening tasks remain.
+**Status: NEARLY COMPLETE** — routing layer, HTTP+TLS, batch job, session deletion, quotas, security hardening, and integration tests all done. SUBSCRIBE integration remains.
 
 | # | Task | Size | Source | Success Criteria | Tests |
 |---|------|------|--------|-----------------|-------|
@@ -119,17 +109,10 @@
 | 4.10 | Security hardening sweep: verify all mitigations from threat model | M | STRIDE all | Checklist verification of all Critical and High threat mitigations. | Run TC01-TC24 as regression suite |
 | 4.11 | Integration test: full routing + feedback + guideline refresh cycle | L | spec Phase 4 | Query -> route -> retrieve -> record outcome -> batch job -> updated routing. Full loop. | End-to-end with Ferrosa |
 
-**Sprint 4 exit criteria:** HTTP+SSE transport functional with TLS. Router selects strategies with >80% accuracy on test workload. All Critical/High threat mitigations verified. Batch job produces routing guidelines. **NOT MET** — routing done (4.1, 4.2, 4.5), HTTP skeleton exists (4.4 partial), batch job stub only.
+**Sprint 4 exit criteria:** HTTP+SSE transport functional with TLS. Router selects strategies with >80% accuracy on test workload. All Critical/High threat mitigations verified. Batch job produces routing guidelines. **PARTIALLY MET** — all tasks complete except SUBSCRIBE integration (4.9), which is blocked on Ferrosa SUBSCRIBE support.
 
 **Remaining:**
-- 4.3: Batch job guideline refinement (stub with TODOs)
-- 4.4: HTTP+SSE completion + TLS enforcement (`require_tls: false` hardcoded)
-- 4.6: Right-to-deletion cascade
-- 4.7: Per-tenant storage quotas
-- 4.8: `memory_summary` virtual table
-- 4.9: SUBSCRIBE integration
-- 4.10: Security hardening sweep
-- 4.11: Full routing + feedback integration test
+- 4.9: SUBSCRIBE integration for real-time anomaly alerts (blocked on Ferrosa SUBSCRIBE support)
 
 ---
 
@@ -152,9 +135,9 @@
 
 | Risk | Likelihood | Impact | Mitigation | Status |
 |------|-----------|--------|------------|--------|
-| **cdrs-tokio v9 lacks vector column type** (FMEA F31, RPN 180) | **Confirmed** | **Critical** | Options: (1) custom vector serde for cdrs-tokio, (2) switch to scylla-rust-driver, (3) raw CQL bytes. **#1 production blocker.** | **Active** |
-| **Graph edge creation not implemented** (FMEA F32, RPN 140) | **Confirmed** | **High** | Edges are CQL INSERTs into graph-annotated tables. Implementation straightforward once patterns established. | **Active** |
-| Ferrosa CQL driver compatibility issues | Medium | High | cdrs-tokio v9 selected. Basic CQL operations work. Vector column is the remaining gap. | **Partially resolved** |
+| **cdrs-tokio v9 lacks vector column type** (FMEA F31, RPN 180) | **Confirmed** | **Critical** | Fixed via custom cdrs-tokio fork with vector column support (e5c9a27). Vector round-trip working end-to-end. | **Resolved** |
+| **Graph edge creation not implemented** (FMEA F32, RPN 140) | **Confirmed** | **High** | Implemented in ca207aa. Edges written via CQL INSERTs into graph-annotated tables, reads via HTTP Cypher. | **Resolved** |
+| Ferrosa CQL driver compatibility issues | Medium | High | Custom cdrs-tokio fork with vector support working. All CQL operations functional including vector columns. | **Resolved** |
 | Ferrosa graph layer requires Cypher (not CQL annotations) | Medium | Medium | Validated: writes go through CQL graph-annotated tables, reads through HTTP Cypher. neo4rs replaced with HTTP client (de901d1). | **Resolved** |
 | Ollama embedding latency too high for interactive use | Low | Medium | Embedding client working with 10s timeout. Latency acceptable in dev testing. | **Resolved** |
 | Ferrosa WASM UDF I/O limits prevent compression UDF | Medium | Low | ADR-001 already chose Rust-native compression in-process. WASM UDF is backlog (B6). | Mitigated |

@@ -1,7 +1,7 @@
 # Failure Mode and Effects Analysis — ferrosa-memory-mcp
 
-> Last updated: 2026-03-21
-> Status: Updated — added F31 (vector column gap), F32 (graph edge write gap)
+> Last updated: 2026-03-23
+> Status: Updated — F31/F32 resolved; added F33–F37 for cognitive tools, visualization, and smart ingest
 
 ## Scoring Criteria
 
@@ -113,7 +113,10 @@
 | **96** | F16 | Glacier retrieval blocks caller | fold_tools |
 | **96** | F26 | Embedding model change breaks similarity | embedding_client |
 | **90** | F30 | SSE connection leak | transport |
+| **90** | F35 | Smart ingest false positive dedup | cognitive tools |
 | **84** | F02 | Prepared statement cache miss | cql_client |
+| **80** | F33 | WebSocket visualizer connection leak | visualization |
+| **80** | F36 | Dream consolidation stale co-occurrence | cognitive tools |
 | **75** | F03 | CQL query timeout on large partition | cql_client |
 | **72** | F10 | SHA-256 collision (accepted risk) | memo_tools |
 | **72** | F22 | Duplicate current facts for entity | temporal_events |
@@ -122,6 +125,8 @@
 | **60** | F12 | TTL sweep job failure | memo_tools |
 | **56** | F25 | Ollama endpoint down | embedding_client |
 | **54** | F24 | HTTP credentials over plaintext | auth |
+| **48** | F37 | Quota enforcement race condition | quota enforcement |
+| **42** | F34 | Spreading activation infinite loop | cognitive tools |
 
 ## Test Cases for RPN >= 50
 
@@ -152,19 +157,39 @@
 | TC23 | F22 | Write two facts for same entity without supersession; run validation; verify detection | Integration |
 | TC24 | F27 | Compress then decompress 100 sample trajectories; verify exact round-trip equality | Unit (property-based) |
 
-### Component: cql_storage — Vector Column Support (NEW, 2026-03-21)
+### Component: cql_storage — Vector Column Support (RESOLVED, 2026-03-23)
 
 | ID | Failure Mode | Effect | S | O | D | RPN | Recommended Action |
 |----|-------------|--------|---|---|---|-----|-------------------|
-| F31 | cdrs-tokio v9 lacks `vector<float,768>` type support | All embeddings stored as NULL in CQL. ANN queries (`ORDER BY embedding ANN OF ?`) non-functional. `fold_search` falls back to LIMIT-based retrieval. `entity_search_ann` returns empty. Semantic search completely broken. | 9 | 10 | 2 | **180** | Options: (1) Implement custom `vector` type serialization for cdrs-tokio (PR upstream or local fork), (2) Switch to scylla-rust-driver if it supports Ferrosa's vector type, (3) Use raw CQL bytes for vector columns. This is the #1 blocker for production semantic search. |
-| F32 | Graph edge creation not implemented in write paths | `FOLDED_INTO`, `SUPERSEDES`, `MENTIONED_IN`, `CO_OCCURS_WITH` edges never created. Graph traversals return empty. Fold hierarchy, entity relationships, and temporal chains not queryable via Cypher. | 7 | 10 | 2 | **140** | Implement edge creation INSERTs in fold_tools (complete_fold), entity_tools (upsert_entity), and temporal (write_temporal_fact). Edges are CQL INSERTs into graph-annotated tables, not Cypher mutations. |
+| F31 | cdrs-tokio v9 lacks `vector<float,768>` type support | All embeddings stored as NULL in CQL. ANN queries (`ORDER BY embedding ANN OF ?`) non-functional. `fold_search` falls back to LIMIT-based retrieval. `entity_search_ann` returns empty. Semantic search completely broken. | 9 | 10 | 2 | ~~180~~ **18** | **RESOLVED** (commit e5c9a27). Vector reads work via cdrs-tokio fork. Detection lowered to 2 (always caught in tests). S=9, O=1, D=2. |
+| F32 | Graph edge creation not implemented in write paths | `FOLDED_INTO`, `SUPERSEDES`, `MENTIONED_IN`, `CO_OCCURS_WITH` edges never created. Graph traversals return empty. Fold hierarchy, entity relationships, and temporal chains not queryable via Cypher. | 7 | 10 | 2 | ~~140~~ **14** | **RESOLVED** (commit ca207aa). Graph edges write via CQL. Detection lowered to 2 (always caught in tests). S=7, O=1, D=2. |
 
 ### Updated RPN entries (append to summary)
 
-| RPN | ID | Failure Mode | Component |
-|-----|----|-------------|-----------|
-| **180** | F31 | Vector column type not supported by cdrs-tokio | cql_storage |
-| **140** | F32 | Graph edge creation not implemented | fold/entity/temporal tools |
+| RPN | ID | Failure Mode | Component | Status |
+|-----|----|-------------|-----------|--------|
+| ~~180~~ **18** | F31 | Vector column type not supported by cdrs-tokio | cql_storage | Resolved (e5c9a27) |
+| ~~140~~ **14** | F32 | Graph edge creation not implemented | fold/entity/temporal tools | Resolved (ca207aa) |
+
+### Component: Visualization — WebSocket Dashboard
+
+| ID | Failure Mode | Effect | S | O | D | RPN | Recommended Action |
+|----|-------------|--------|---|---|---|-----|-------------------|
+| F33 | WebSocket visualizer connection leak | If viz WebSocket connections aren't cleaned up on disconnect, memory grows unboundedly. Server OOM over time. | 5 | 4 | 4 | **80** | Idle timeout and connection limit (already implemented in http.rs). Monitor open connection count in metrics. |
+
+### Component: Cognitive Tools — Spreading Activation, Smart Ingest, Dream Consolidation
+
+| ID | Failure Mode | Effect | S | O | D | RPN | Recommended Action |
+|----|-------------|--------|---|---|---|-----|-------------------|
+| F34 | Spreading activation infinite loop | If graph has cycles, BFS without visited tracking could loop forever. Tool call hangs, blocking agent. | 7 | 2 | 3 | **42** | Visited set in spreading.rs prevents revisiting. Bounded iteration with max depth. |
+| F35 | Smart ingest false positive dedup | Prediction error gate could incorrectly match unrelated content, skipping important ingestion. Agent loses data silently. | 6 | 3 | 5 | **90** | Configurable similarity threshold. "Skipped" action returned to caller so agent can override. |
+| F36 | Dream consolidation stale co-occurrence | Co-occurrence patterns from old sessions may produce irrelevant consolidation suggestions. Agent acts on outdated patterns. | 4 | 4 | 5 | **80** | Session-scoped tracking. Consolidation is advisory only — agent decides whether to act. |
+
+### Component: Quota Enforcement
+
+| ID | Failure Mode | Effect | S | O | D | RPN | Recommended Action |
+|----|-------------|--------|---|---|---|-----|-------------------|
+| F37 | Quota enforcement race condition | Concurrent writes could exceed quota if count check and write aren't atomic. Tenant exceeds allocated storage. | 4 | 3 | 4 | **48** | Slight over-quota acceptable. Counts are eventually consistent. Hard limit enforced at next read. |
 
 ### New Test Cases
 
@@ -174,3 +199,9 @@
 | TC26 | F31 | Execute `ORDER BY entity_embedding ANN OF ?` query; verify results ordered by similarity | Integration |
 | TC27 | F32 | Complete a fold with parent_fold_id; verify `FOLDED_INTO` edge exists in graph | Integration |
 | TC28 | F32 | Upsert two co-occurring entities; verify `CO_OCCURS_WITH` edge exists | Integration |
+| TC29 | F33 | Open 50 WebSocket connections, disconnect half abruptly; verify server reclaims connections after idle timeout | Integration |
+| TC30 | F34 | Create cyclic graph (A->B->C->A); run `spread_activation` from A; verify termination and no duplicate visits | Integration |
+| TC31 | F35 | Ingest two semantically distinct items with similar surface text; verify both are stored (no false dedup) | Integration |
+| TC32 | F35 | Ingest exact duplicate; verify "Skipped" action returned to caller | Unit |
+| TC33 | F36 | Run `run_consolidation` with co-occurrences from sessions > 30 days old; verify staleness flag or empty result | Integration |
+| TC34 | F37 | Send 10 concurrent writes when quota is at limit-1; verify at most slight over-quota, not unbounded growth | Integration |

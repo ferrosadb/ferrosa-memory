@@ -75,6 +75,13 @@ mod tests {
     use super::*;
     use crate::storage::mock::MockStorage;
 
+    fn unwrap_tool_result(result: serde_json::Value) -> serde_json::Value {
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("CallToolResult missing content[0].text");
+        serde_json::from_str(text).unwrap_or(serde_json::Value::String(text.to_string()))
+    }
+
     #[tokio::test]
     async fn audit_entry_created() {
         let storage = MockStorage::new();
@@ -157,6 +164,7 @@ mod tests {
         let result = crate::dispatch::dispatch("tools/call", params, &storage, &ctx, &session)
             .await
             .unwrap();
+        let result = unwrap_tool_result(result);
         assert!(result["entity_id"].is_string());
 
         let entries = storage.audit_entries.lock().await;

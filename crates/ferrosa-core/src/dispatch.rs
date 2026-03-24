@@ -702,7 +702,19 @@ async fn dispatch_tool<S: crate::storage::Storage>(
             "tool call FAILED"
         ),
     }
-    result
+
+    // Wrap in MCP CallToolResult format: { content: [{type: "text", text: "..."}] }
+    // MCP clients expect this structure; without it, tool output is invisible.
+    result.map(|value| {
+        let text = if value.is_string() {
+            value.as_str().unwrap().to_string()
+        } else {
+            serde_json::to_string(&value).unwrap_or_else(|_| value.to_string())
+        };
+        serde_json::json!({
+            "content": [{"type": "text", "text": text}]
+        })
+    })
 }
 
 // --- Tool handlers ---
@@ -1855,6 +1867,15 @@ mod tests {
     use crate::types::TenantContext;
     use uuid::Uuid;
 
+    /// Extract the inner tool result from MCP CallToolResult wrapper.
+    /// Dispatch wraps results as {"content": [{"type": "text", "text": "..."}]}.
+    fn unwrap_tool_result(result: Value) -> Value {
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("CallToolResult missing content[0].text");
+        serde_json::from_str(text).unwrap_or(Value::String(text.to_string()))
+    }
+
     fn test_ctx() -> TenantContext {
         TenantContext {
             tenant_id: Uuid::new_v4(),
@@ -1963,6 +1984,7 @@ mod tests {
         let result = dispatch("tools/call", store_params, &store, &ctx, &session)
             .await
             .unwrap();
+        let result = unwrap_tool_result(result);
         assert_eq!(result["stored"], true);
 
         // Check
@@ -1977,6 +1999,7 @@ mod tests {
         let result = dispatch("tools/call", check_params, &store, &ctx, &session)
             .await
             .unwrap();
+        let result = unwrap_tool_result(result);
         assert_eq!(result["hit"], true);
         assert_eq!(result["result"], "cached answer");
     }
@@ -2001,6 +2024,7 @@ mod tests {
         let result = dispatch("tools/call", write_params, &store, &ctx, &session)
             .await
             .unwrap();
+        let result = unwrap_tool_result(result);
         assert_eq!(result["written"], true);
 
         // Get
@@ -2013,6 +2037,7 @@ mod tests {
         let result = dispatch("tools/call", get_params, &store, &ctx, &session)
             .await
             .unwrap();
+        let result = unwrap_tool_result(result);
         assert_eq!(result["nodes"].as_array().unwrap().len(), 1);
     }
 
@@ -2034,6 +2059,7 @@ mod tests {
         let result = dispatch("tools/call", params, &store, &ctx, &session)
             .await
             .unwrap();
+        let result = unwrap_tool_result(result);
         assert_eq!(result["action"], "Created");
         assert!(result["entity_id"].is_string());
     }
@@ -2056,6 +2082,7 @@ mod tests {
         let result = dispatch("tools/call", params, &store, &ctx, &session)
             .await
             .unwrap();
+        let result = unwrap_tool_result(result);
         assert!(result["intention_id"].is_string());
 
         // Check — no match
@@ -2066,6 +2093,7 @@ mod tests {
         let result = dispatch("tools/call", params, &store, &ctx, &session)
             .await
             .unwrap();
+        let result = unwrap_tool_result(result);
         assert_eq!(result["triggered"].as_array().unwrap().len(), 0);
 
         // Check — match
@@ -2076,6 +2104,7 @@ mod tests {
         let result = dispatch("tools/call", params, &store, &ctx, &session)
             .await
             .unwrap();
+        let result = unwrap_tool_result(result);
         assert_eq!(result["triggered"].as_array().unwrap().len(), 1);
     }
 
@@ -2100,6 +2129,7 @@ mod tests {
         let result = dispatch("tools/call", params, &store, &ctx, &session)
             .await
             .unwrap();
+        let result = unwrap_tool_result(result);
         assert!(result["event_id"].is_string());
 
         // Get the current fact
@@ -2113,6 +2143,7 @@ mod tests {
         let result = dispatch("tools/call", params, &store, &ctx, &session)
             .await
             .unwrap();
+        let result = unwrap_tool_result(result);
         assert_eq!(result["fact_text"], "Alice is VP of Engineering");
         assert_eq!(result["confidence"], 0.95);
 
@@ -2128,6 +2159,7 @@ mod tests {
         let result = dispatch("tools/call", params, &store, &ctx, &session)
             .await
             .unwrap();
+        let result = unwrap_tool_result(result);
         assert!(result["fact"].is_null());
     }
 
@@ -2184,6 +2216,7 @@ mod tests {
         let result = dispatch("tools/call", params, &store, &ctx, &session)
             .await
             .unwrap();
+        let result = unwrap_tool_result(result);
         assert!(result["count"].as_u64().unwrap() >= 1);
         let results = result["results"].as_array().unwrap();
         assert_eq!(results[0]["source"], "entity_phonetic");
@@ -2244,6 +2277,7 @@ mod tests {
         let result = dispatch("tools/call", params, &store, &ctx, &session)
             .await
             .unwrap();
+        let result = unwrap_tool_result(result);
         // Should have results from multiple strategies
         let count = result["count"].as_u64().unwrap();
         assert!(count >= 2, "expected at least 2 results, got {count}");
@@ -2277,6 +2311,7 @@ mod tests {
         let result = dispatch("tools/call", params, &store, &ctx, &session)
             .await
             .unwrap();
+        let result = unwrap_tool_result(result);
         assert_eq!(result["entity_count"], 0);
         assert_eq!(result["fold_count"], 0);
         assert_eq!(result["memo_count"], 0);
@@ -2301,6 +2336,7 @@ mod tests {
         let result = dispatch("tools/call", params, &store, &ctx, &session)
             .await
             .unwrap();
+        let result = unwrap_tool_result(result);
         let intention_id = result["intention_id"].as_str().unwrap().to_string();
 
         // Verify it was persisted to storage
@@ -2335,6 +2371,7 @@ mod tests {
         let result = dispatch("tools/call", params, &store, &ctx, &session)
             .await
             .unwrap();
+        let result = unwrap_tool_result(result);
         let intention_id = result["intention_id"].as_str().unwrap().to_string();
 
         // Trigger it
@@ -2362,6 +2399,7 @@ mod tests {
         let result = dispatch("tools/call", params, &store, &ctx, &session)
             .await
             .unwrap();
+        let result = unwrap_tool_result(result);
         assert_eq!(result["completed"], true);
 
         // Verify completed status was persisted
@@ -2545,6 +2583,13 @@ mod speculative_tests {
         }
     }
 
+    fn unwrap_tool_result(result: Value) -> Value {
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("CallToolResult missing content[0].text");
+        serde_json::from_str(text).unwrap_or(Value::String(text.to_string()))
+    }
+
     #[tokio::test]
     async fn predict_needed_returns_empty_with_no_history() {
         let store = MockStorage::new();
@@ -2561,6 +2606,7 @@ mod speculative_tests {
         let result = dispatch("tools/call", params, &store, &ctx, &session)
             .await
             .unwrap();
+        let result = unwrap_tool_result(result);
         assert_eq!(result["count"], 0);
         assert_eq!(result["recent_entity_count"], 0);
         assert!(result["predictions"].as_array().unwrap().is_empty());
@@ -2606,6 +2652,7 @@ mod speculative_tests {
         let result = dispatch("tools/call", params, &store, &ctx, &session)
             .await
             .unwrap();
+        let result = unwrap_tool_result(result);
         let predictions = result["predictions"].as_array().unwrap();
         assert!(!predictions.is_empty(), "should predict b and/or c");
         // b should be predicted with highest confidence
@@ -2628,6 +2675,7 @@ mod speculative_tests {
         let result = dispatch("tools/call", params, &store, &ctx, &session)
             .await
             .unwrap();
+        let result = unwrap_tool_result(result);
         assert!(result["predictions"].is_array());
     }
 }
