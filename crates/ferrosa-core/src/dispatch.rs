@@ -598,6 +598,18 @@ async fn handle_store_memo<S: crate::storage::Storage>(
         .await
         .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
+    // Audit log (best-effort, no session_id for memos)
+    let content_hash = result.content_hash.clone();
+    let _ = crate::audit::log_write(
+        storage,
+        ctx,
+        "store",
+        "memo_cache",
+        &content_hash,
+        uuid::Uuid::nil(),
+    )
+    .await;
+
     serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
 }
 
@@ -741,6 +753,17 @@ async fn handle_complete_fold<S: crate::storage::Storage>(
         entity_count: 0, // entity count not tracked at fold level
     });
 
+    // Audit log (best-effort)
+    let _ = crate::audit::log_write(
+        storage,
+        ctx,
+        "complete",
+        "trajectory_folds",
+        &fold_id.to_string(),
+        session_id,
+    )
+    .await;
+
     Ok(serde_json::json!({ "folded": folded, "compression_ratio": compression_ratio }))
 }
 
@@ -817,7 +840,7 @@ async fn handle_upsert_entity<S: crate::storage::Storage>(
 
     session.event_bus.emit(crate::viz::VizEvent::EntityChanged {
         node: crate::viz::VizNode {
-            id: entity_id,
+            id: entity_id.clone(),
             label: entity_name.to_string(),
             node_type: "entity".into(),
             entity_type: entity_type.to_string(),
@@ -828,6 +851,17 @@ async fn handle_upsert_entity<S: crate::storage::Storage>(
         },
         action: action.into(),
     });
+
+    // Audit log (best-effort)
+    let _ = crate::audit::log_write(
+        storage,
+        ctx,
+        "upsert",
+        "entity_store",
+        &entity_id,
+        session_id,
+    )
+    .await;
 
     Ok(result_json)
 }
@@ -1002,7 +1036,7 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
     if !entity_id.is_empty() {
         session.event_bus.emit(crate::viz::VizEvent::EntityChanged {
             node: crate::viz::VizNode {
-                id: entity_id,
+                id: entity_id.clone(),
                 label: content.chars().take(64).collect(),
                 node_type: "entity".into(),
                 entity_type: entity_type.to_string(),
@@ -1014,6 +1048,17 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
             action,
         });
     }
+
+    // Audit log (best-effort)
+    let _ = crate::audit::log_write(
+        storage,
+        ctx,
+        "ingest",
+        "entity_store",
+        &entity_id,
+        session_id,
+    )
+    .await;
 
     Ok(decision_json)
 }
@@ -1164,6 +1209,17 @@ async fn handle_write_temporal_fact<S: crate::storage::Storage>(
         fact_text: fact_text.to_string(),
         superseded: None,
     });
+
+    // Audit log (best-effort)
+    let _ = crate::audit::log_write(
+        storage,
+        ctx,
+        "write",
+        "temporal_events",
+        &event_id.to_string(),
+        session_id,
+    )
+    .await;
 
     Ok(serde_json::json!({ "event_id": event_id.to_string() }))
 }

@@ -26,12 +26,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 
+use uuid::Uuid;
+
 use crate::auth;
 use crate::dispatch;
 use crate::metrics::MemoryMetrics;
 use crate::storage::Storage;
 use crate::types::TenantContext;
-use crate::viz::EventBus;
+use crate::viz::{self, EventBus, VizEdge, VizEvent};
 
 /// Static HTML for the visualization dashboard.
 const VIZ_HTML: &str = include_str!("../assets/viz.html");
@@ -168,7 +170,16 @@ async fn handle_connection<S: Storage>(
 /// Serves the static HTML dashboard at `/viz` and upgrades `/viz/ws`
 /// connections to WebSocket for live event streaming. Runs independently
 /// of the MCP transport server.
-pub async fn serve_viz(port: u16, event_bus: Arc<EventBus>) -> anyhow::Result<()> {
+///
+/// On WebSocket connect, sends a `VizEvent::Snapshot` with current graph
+/// state so new clients don't start with a blank canvas.
+pub async fn serve_viz<S: Storage + 'static>(
+    port: u16,
+    event_bus: Arc<EventBus>,
+    storage: Arc<S>,
+    ctx: Arc<TenantContext>,
+    session_id: Uuid,
+) -> anyhow::Result<()> {
     let addr = format!("0.0.0.0:{port}");
     let listener = TcpListener::bind(&addr).await?;
     tracing::info!("viz server listening on {addr}");
@@ -176,8 +187,11 @@ pub async fn serve_viz(port: u16, event_bus: Arc<EventBus>) -> anyhow::Result<()
     loop {
         let (stream, peer) = listener.accept().await?;
         let bus = Arc::clone(&event_bus);
+        // Build snapshot before spawning because Storage async methods are not
+        // Send-bounded. The snapshot is built per-connection to stay fresh.
+        let snapshot = build_snapshot(&*storage, &ctx, session_id).await;
         tokio::spawn(async move {
-            if let Err(e) = handle_viz_connection(stream, bus).await {
+            if let Err(e) = handle_viz_connection(stream, bus, snapshot).await {
                 tracing::debug!("viz connection from {peer} closed: {e}");
             }
         });
@@ -190,6 +204,7 @@ pub async fn serve_viz(port: u16, event_bus: Arc<EventBus>) -> anyhow::Result<()
 async fn handle_viz_connection(
     mut stream: tokio::net::TcpStream,
     event_bus: Arc<EventBus>,
+    snapshot: VizEvent,
 ) -> anyhow::Result<()> {
     // Peek at the request to determine routing before consuming the stream
     let mut buf = vec![0u8; 4096];
@@ -251,7 +266,7 @@ async fn handle_viz_connection(
             )
             .await;
 
-            handle_viz_ws(ws_stream, event_bus).await;
+            handle_viz_ws(ws_stream, event_bus, snapshot).await;
         }
         _ => {
             let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
@@ -264,13 +279,28 @@ async fn handle_viz_connection(
 
 /// Handle a WebSocket connection for the viz dashboard.
 ///
-/// Subscribes to the event bus and streams each `VizEvent` as a JSON
+/// Sends a `VizEvent::Snapshot` with current graph state, then subscribes
+/// to the event bus and streams each incremental `VizEvent` as a JSON
 /// text frame. Runs until the client disconnects or the bus is dropped.
 async fn handle_viz_ws(
     ws_stream: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     event_bus: Arc<EventBus>,
+    snapshot: VizEvent,
 ) {
     let (mut write, _read) = futures_util::StreamExt::split(ws_stream);
+
+    // Send initial snapshot so clients don't start with a blank graph.
+    // TODO: The viz endpoint uses a fixed session_id from server startup. A future
+    // enhancement should accept session_id as a query parameter on /viz/ws so the
+    // dashboard can switch between sessions. In shared-memory mode (configured
+    // tenant_id), a tenant-level entity query would be more useful.
+    if let Ok(json) = serde_json::to_string(&snapshot)
+        && write.send(Message::Text(json)).await.is_err()
+    {
+        return; // Client disconnected during snapshot send
+    }
+
+    // Subscribe to incremental events (after snapshot to avoid race)
     let mut rx = event_bus.subscribe();
 
     // Stream events to the client
@@ -296,6 +326,49 @@ async fn handle_viz_ws(
             }
         }
     }
+}
+
+/// Build a `VizEvent::Snapshot` from current storage state.
+///
+/// Queries entities and edges for the given session and converts them
+/// to visualization types. Returns an empty snapshot if session_id is nil.
+async fn build_snapshot<S: Storage>(
+    storage: &S,
+    ctx: &TenantContext,
+    session_id: Uuid,
+) -> VizEvent {
+    // A nil session_id means we don't know which session to show yet.
+    if session_id.is_nil() {
+        return VizEvent::Snapshot {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        };
+    }
+
+    let nodes = match storage.entity_list_session(ctx, session_id).await {
+        Ok(entities) => entities.iter().map(viz::entity_to_viz_node).collect(),
+        Err(e) => {
+            tracing::warn!("viz: failed to load entities for snapshot: {e}");
+            Vec::new()
+        }
+    };
+
+    let edges = match storage.edge_list_session(ctx, session_id).await {
+        Ok(raw_edges) => raw_edges
+            .into_iter()
+            .map(|(src, tgt, etype)| VizEdge {
+                source: src.to_string(),
+                target: tgt.to_string(),
+                edge_type: etype,
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!("viz: failed to load edges for snapshot: {e}");
+            Vec::new()
+        }
+    };
+
+    VizEvent::Snapshot { nodes, edges }
 }
 
 /// Compute the Sec-WebSocket-Accept value per RFC 6455.

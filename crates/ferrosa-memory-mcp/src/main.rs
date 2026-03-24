@@ -379,6 +379,17 @@ impl Storage for StorageBackend {
         }
     }
 
+    async fn edge_list_session(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<(uuid::Uuid, uuid::Uuid, String)>> {
+        match self {
+            Self::Cql(s) => s.edge_list_session(ctx, session_id).await,
+            Self::Mock(s) => s.edge_list_session(ctx, session_id).await,
+        }
+    }
+
     async fn intention_put(
         &self,
         ctx: &TenantContext,
@@ -417,6 +428,17 @@ impl Storage for StorageBackend {
                 s.intention_update_status(ctx, id, status, triggered_at, completed_at)
                     .await
             }
+        }
+    }
+
+    async fn audit_put(
+        &self,
+        ctx: &TenantContext,
+        entry: &ferrosa_core::types::AuditEntry,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Cql(s) => s.audit_put(ctx, entry).await,
+            Self::Mock(s) => s.audit_put(ctx, entry).await,
         }
     }
 }
@@ -491,8 +513,16 @@ async fn main() -> anyhow::Result<()> {
     if config.viz.enabled {
         let viz_bus = Arc::clone(&shared_event_bus);
         let viz_port = config.viz.port;
+        let viz_storage = Arc::clone(&storage);
+        let viz_ctx = Arc::new(auth::authenticate_stdio(tenant_id));
+        // TODO: session_id should come from query params on /viz/ws. For now
+        // use nil UUID — the initial snapshot will be empty until a session
+        // is active and events begin flowing through the EventBus.
+        let viz_session_id = uuid::Uuid::nil();
         tokio::spawn(async move {
-            if let Err(e) = http::serve_viz(viz_port, viz_bus).await {
+            if let Err(e) =
+                http::serve_viz(viz_port, viz_bus, viz_storage, viz_ctx, viz_session_id).await
+            {
                 tracing::warn!("viz server error: {e}");
             }
         });

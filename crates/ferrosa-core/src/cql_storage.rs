@@ -61,12 +61,18 @@ struct PreparedStatements {
     edge_mentioned_in: PreparedQuery,
     edge_co_occurs: PreparedQuery,
     edge_supersedes: PreparedQuery,
+    edge_list_folded_into: PreparedQuery,
+    edge_list_mentioned_in: PreparedQuery,
+    edge_list_co_occurs: PreparedQuery,
+    edge_list_supersedes: PreparedQuery,
     // Feedback
     feedback_put: PreparedQuery,
     // Intentions
     intention_put: PreparedQuery,
     intention_list: PreparedQuery,
     intention_update_status: PreparedQuery,
+    // Audit
+    audit_put: PreparedQuery,
 }
 
 /// CQL storage backend.
@@ -269,6 +275,30 @@ impl CqlStorage {
                      VALUES (?, ?, ?, ?, ?)"
                 ))
                 .await?,
+            edge_list_folded_into: session
+                .prepare(format!(
+                    "SELECT source_fold_id, target_fold_id \
+                     FROM {ks}.folded_into WHERE session_id = ? AND tenant_id = ?"
+                ))
+                .await?,
+            edge_list_mentioned_in: session
+                .prepare(format!(
+                    "SELECT entity_id, fold_id \
+                     FROM {ks}.mentioned_in WHERE session_id = ? AND tenant_id = ?"
+                ))
+                .await?,
+            edge_list_co_occurs: session
+                .prepare(format!(
+                    "SELECT entity_a, entity_b \
+                     FROM {ks}.co_occurs_with WHERE session_id = ? AND tenant_id = ?"
+                ))
+                .await?,
+            edge_list_supersedes: session
+                .prepare(format!(
+                    "SELECT new_event_id, old_event_id \
+                     FROM {ks}.supersedes WHERE tenant_id = ?"
+                ))
+                .await?,
             // Intentions
             intention_put: session
                 .prepare(format!(
@@ -291,11 +321,18 @@ impl CqlStorage {
                      WHERE tenant_id = ? AND intention_id = ?"
                 ))
                 .await?,
+            audit_put: session
+                .prepare(format!(
+                    "INSERT INTO {ks}.audit_log \
+                     (tenant_id, audit_id, operation, target_table, target_id, session_id, created_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?)"
+                ))
+                .await?,
         };
 
         tracing::info!(
             keyspace = ks,
-            statements = 27,
+            statements = 28,
             "CQL storage connected, all statements prepared"
         );
 
@@ -1199,6 +1236,68 @@ impl Storage for CqlStorage {
         Ok(())
     }
 
+    async fn edge_list_session(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<(Uuid, Uuid, String)>> {
+        let mut edges = Vec::new();
+
+        // FOLDED_INTO edges
+        let rows = self
+            .query_rows(
+                &self.stmts.edge_list_folded_into,
+                query_values!(session_id, ctx.tenant_id),
+            )
+            .await?;
+        for row in rows {
+            let src: Uuid = row.r_by_name("source_fold_id")?;
+            let tgt: Uuid = row.r_by_name("target_fold_id")?;
+            edges.push((src, tgt, "FOLDED_INTO".into()));
+        }
+
+        // MENTIONED_IN edges
+        let rows = self
+            .query_rows(
+                &self.stmts.edge_list_mentioned_in,
+                query_values!(session_id, ctx.tenant_id),
+            )
+            .await?;
+        for row in rows {
+            let src: Uuid = row.r_by_name("entity_id")?;
+            let tgt: Uuid = row.r_by_name("fold_id")?;
+            edges.push((src, tgt, "MENTIONED_IN".into()));
+        }
+
+        // CO_OCCURS_WITH edges
+        let rows = self
+            .query_rows(
+                &self.stmts.edge_list_co_occurs,
+                query_values!(session_id, ctx.tenant_id),
+            )
+            .await?;
+        for row in rows {
+            let src: Uuid = row.r_by_name("entity_a")?;
+            let tgt: Uuid = row.r_by_name("entity_b")?;
+            edges.push((src, tgt, "CO_OCCURS".into()));
+        }
+
+        // SUPERSEDES edges (not session-scoped, return all for tenant)
+        let rows = self
+            .query_rows(
+                &self.stmts.edge_list_supersedes,
+                query_values!(ctx.tenant_id),
+            )
+            .await?;
+        for row in rows {
+            let src: Uuid = row.r_by_name("new_event_id")?;
+            let tgt: Uuid = row.r_by_name("old_event_id")?;
+            edges.push((src, tgt, "SUPERSEDES".into()));
+        }
+
+        Ok(edges)
+    }
+
     // --- Intention operations ---
 
     async fn intention_put(
@@ -1295,6 +1394,26 @@ impl Storage for CqlStorage {
                     completed_at.map(|t| t.naive_utc()),
                     ctx.tenant_id,
                     id
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    // --- Audit log operations ---
+
+    async fn audit_put(&self, ctx: &TenantContext, entry: &AuditEntry) -> anyhow::Result<()> {
+        self.session
+            .exec_with_values(
+                &self.stmts.audit_put,
+                query_values!(
+                    ctx.tenant_id,
+                    entry.audit_id,
+                    entry.operation.clone(),
+                    entry.target_table.clone(),
+                    entry.target_id.clone(),
+                    entry.session_id,
+                    entry.created_at.naive_utc()
                 ),
             )
             .await?;

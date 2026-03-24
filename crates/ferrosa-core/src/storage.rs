@@ -14,8 +14,8 @@
 use uuid::Uuid;
 
 use crate::types::{
-    EntityEntry, FeedbackOutcome, FoldEntry, FoldSummary, MemoEntry, MemoryState, PlanNode,
-    PlanStatus, TemporalEvent, TenantContext,
+    AuditEntry, EntityEntry, FeedbackOutcome, FoldEntry, FoldSummary, MemoEntry, MemoryState,
+    PlanNode, PlanStatus, TemporalEvent, TenantContext,
 };
 
 /// Core storage operations for the memory system.
@@ -229,6 +229,16 @@ pub trait Storage: Send + Sync {
         entity_id: Uuid,
     ) -> anyhow::Result<()>;
 
+    /// List all edges for a session as (source, target, edge_type) triples.
+    ///
+    /// Queries all four edge tables (folded_into, mentioned_in, co_occurs_with,
+    /// supersedes) and returns a unified list for visualization snapshots.
+    async fn edge_list_session(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<(Uuid, Uuid, String)>>;
+
     // --- Intention operations ---
 
     /// Store a new intention.
@@ -253,6 +263,11 @@ pub trait Storage: Send + Sync {
         triggered_at: Option<chrono::DateTime<chrono::Utc>>,
         completed_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> anyhow::Result<()>;
+
+    // --- Audit log operations ---
+
+    /// Persist an audit log entry (append-only, STRIDE R1).
+    async fn audit_put(&self, ctx: &TenantContext, entry: &AuditEntry) -> anyhow::Result<()>;
 }
 
 /// In-memory mock storage for unit tests.
@@ -264,6 +279,15 @@ pub mod mock {
     use crate::types::FoldStatus;
     use tokio::sync::Mutex;
 
+    /// An edge stored in mock storage: (source, target, edge_type, session_id).
+    #[derive(Clone)]
+    pub struct MockEdge {
+        pub source: Uuid,
+        pub target: Uuid,
+        pub edge_type: String,
+        pub session_id: Uuid,
+    }
+
     #[derive(Default)]
     pub struct MockStorage {
         pub memos: Mutex<Vec<MemoEntry>>,
@@ -273,6 +297,8 @@ pub mod mock {
         pub temporal_events: Mutex<Vec<TemporalEvent>>,
         pub feedback: Mutex<Vec<FeedbackOutcome>>,
         pub intentions: Mutex<Vec<crate::intention::Intention>>,
+        pub edges: Mutex<Vec<MockEdge>>,
+        pub audit_entries: Mutex<Vec<AuditEntry>>,
     }
 
     impl MockStorage {
@@ -637,46 +663,85 @@ pub mod mock {
             Ok(count)
         }
 
-        // --- Edge operations (no-op for mock) ---
+        // --- Edge operations ---
 
         async fn edge_folded_into(
             &self,
             _ctx: &TenantContext,
-            _source: Uuid,
-            _target: Uuid,
-            _session: Uuid,
+            source: Uuid,
+            target: Uuid,
+            session: Uuid,
         ) -> anyhow::Result<()> {
+            self.edges.lock().await.push(MockEdge {
+                source,
+                target,
+                edge_type: "FOLDED_INTO".into(),
+                session_id: session,
+            });
             Ok(())
         }
 
         async fn edge_mentioned_in(
             &self,
             _ctx: &TenantContext,
-            _entity: Uuid,
-            _fold: Uuid,
-            _session: Uuid,
+            entity: Uuid,
+            fold: Uuid,
+            session: Uuid,
         ) -> anyhow::Result<()> {
+            self.edges.lock().await.push(MockEdge {
+                source: entity,
+                target: fold,
+                edge_type: "MENTIONED_IN".into(),
+                session_id: session,
+            });
             Ok(())
         }
 
         async fn edge_co_occurs(
             &self,
             _ctx: &TenantContext,
-            _a: Uuid,
-            _b: Uuid,
-            _session: Uuid,
+            a: Uuid,
+            b: Uuid,
+            session: Uuid,
         ) -> anyhow::Result<()> {
+            self.edges.lock().await.push(MockEdge {
+                source: a,
+                target: b,
+                edge_type: "CO_OCCURS".into(),
+                session_id: session,
+            });
             Ok(())
         }
 
         async fn edge_supersedes(
             &self,
             _ctx: &TenantContext,
-            _new: Uuid,
-            _old: Uuid,
+            new_id: Uuid,
+            old_id: Uuid,
             _entity: Uuid,
         ) -> anyhow::Result<()> {
+            // Use new_event_id as source, old_event_id as target
+            // (entity_id is context, not an edge endpoint for the viz graph)
+            self.edges.lock().await.push(MockEdge {
+                source: new_id,
+                target: old_id,
+                edge_type: "SUPERSEDES".into(),
+                session_id: Uuid::nil(), // supersedes edges aren't session-scoped
+            });
             Ok(())
+        }
+
+        async fn edge_list_session(
+            &self,
+            _ctx: &TenantContext,
+            session_id: Uuid,
+        ) -> anyhow::Result<Vec<(Uuid, Uuid, String)>> {
+            let edges = self.edges.lock().await;
+            Ok(edges
+                .iter()
+                .filter(|e| e.session_id == session_id)
+                .map(|e| (e.source, e.target, e.edge_type.clone()))
+                .collect())
         }
 
         // --- Intention operations ---
@@ -712,6 +777,13 @@ pub mod mock {
                 i.triggered_at = triggered_at;
                 i.completed_at = completed_at;
             }
+            Ok(())
+        }
+
+        // --- Audit log operations ---
+
+        async fn audit_put(&self, _ctx: &TenantContext, entry: &AuditEntry) -> anyhow::Result<()> {
+            self.audit_entries.lock().await.push(entry.clone());
             Ok(())
         }
     }
