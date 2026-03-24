@@ -418,6 +418,7 @@ const simulation = d3.forceSimulation()
   .force('x', d3.forceX(width / 2).strength(0.03))
   .force('y', d3.forceY(height / 2).strength(0.03))
   .force('collision', d3.forceCollide().radius(40))
+  .alphaDecay(0.0076)
   .on('tick', ticked);
 
 simulation.stop();
