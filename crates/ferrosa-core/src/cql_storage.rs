@@ -300,19 +300,19 @@ impl CqlStorage {
             edge_list_folded_into: session
                 .prepare(format!(
                     "SELECT source_fold_id, target_fold_id \
-                     FROM {ks}.folded_into WHERE session_id = ? AND tenant_id = ?"
+                     FROM {ks}.folded_into WHERE session_id = ? AND tenant_id = ? ALLOW FILTERING"
                 ))
                 .await?,
             edge_list_mentioned_in: session
                 .prepare(format!(
                     "SELECT entity_id, fold_id \
-                     FROM {ks}.mentioned_in WHERE session_id = ? AND tenant_id = ?"
+                     FROM {ks}.mentioned_in WHERE session_id = ? AND tenant_id = ? ALLOW FILTERING"
                 ))
                 .await?,
             edge_list_co_occurs: session
                 .prepare(format!(
                     "SELECT entity_a, entity_b \
-                     FROM {ks}.co_occurs_with WHERE session_id = ? AND tenant_id = ?"
+                     FROM {ks}.co_occurs_with WHERE session_id = ? AND tenant_id = ? ALLOW FILTERING"
                 ))
                 .await?,
             edge_list_supersedes: session
