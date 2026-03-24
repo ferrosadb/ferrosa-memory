@@ -67,6 +67,7 @@ struct PreparedStatements {
     edge_list_supersedes: PreparedQuery,
     // Feedback
     feedback_put: PreparedQuery,
+    feedback_list_all: PreparedQuery,
     // Intentions
     intention_put: PreparedQuery,
     intention_list: PreparedQuery,
@@ -246,6 +247,13 @@ impl CqlStorage {
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 ))
                 .await?,
+            feedback_list_all: session
+                .prepare(format!(
+                    "SELECT tenant_id, session_id, query_id, program_type, task_complexity, \
+                     succeeded, latency_ms, token_cost, created_at \
+                     FROM {ks}.feedback_outcomes"
+                ))
+                .await?,
             // Edges
             edge_folded_into: session
                 .prepare(format!(
@@ -332,7 +340,7 @@ impl CqlStorage {
 
         tracing::info!(
             keyspace = ks,
-            statements = 28,
+            statements = 29,
             "CQL storage connected, all statements prepared"
         );
 
@@ -1100,6 +1108,57 @@ impl Storage for CqlStorage {
             )
             .await?;
         Ok(())
+    }
+
+    async fn feedback_list_all(&self) -> anyhow::Result<Vec<FeedbackOutcome>> {
+        let envelope = self.session.exec(&self.stmts.feedback_list_all).await?;
+        let body = envelope.response_body()?;
+        let rows = body.into_rows().unwrap_or_default();
+
+        let mut outcomes = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let tenant_id: Uuid = row
+                .by_name("tenant_id")?
+                .ok_or_else(|| anyhow::anyhow!("missing tenant_id"))?;
+            let session_id: Uuid = row
+                .by_name("session_id")?
+                .ok_or_else(|| anyhow::anyhow!("missing session_id"))?;
+            let query_id: Uuid = row
+                .by_name("query_id")?
+                .ok_or_else(|| anyhow::anyhow!("missing query_id"))?;
+            let program_type: String = row
+                .by_name("program_type")?
+                .ok_or_else(|| anyhow::anyhow!("missing program_type"))?;
+            let task_complexity: String = row
+                .by_name("task_complexity")?
+                .ok_or_else(|| anyhow::anyhow!("missing task_complexity"))?;
+            let succeeded: bool = row
+                .by_name("succeeded")?
+                .ok_or_else(|| anyhow::anyhow!("missing succeeded"))?;
+            let latency_ms: i32 = row
+                .by_name("latency_ms")?
+                .ok_or_else(|| anyhow::anyhow!("missing latency_ms"))?;
+            let token_cost: i32 = row
+                .by_name("token_cost")?
+                .ok_or_else(|| anyhow::anyhow!("missing token_cost"))?;
+            let created_at: chrono::NaiveDateTime = row
+                .by_name("created_at")?
+                .ok_or_else(|| anyhow::anyhow!("missing created_at"))?;
+
+            outcomes.push(FeedbackOutcome {
+                tenant_id,
+                session_id,
+                query_id,
+                program_type,
+                task_complexity,
+                succeeded,
+                latency_ms,
+                token_cost,
+                created_at: chrono::DateTime::from_naive_utc_and_offset(created_at, chrono::Utc),
+            });
+        }
+
+        Ok(outcomes)
     }
 
     async fn delete_session(&self, ctx: &TenantContext, session_id: Uuid) -> anyhow::Result<usize> {

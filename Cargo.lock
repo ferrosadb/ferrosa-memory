@@ -441,6 +441,7 @@ name = "ferrosa-memory-batch"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cdrs-tokio",
  "ferrosa-core",
  "tokio",
  "tracing",

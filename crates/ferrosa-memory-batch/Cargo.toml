@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 ferrosa-core = { path = "../ferrosa-core" }
+cdrs-tokio = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

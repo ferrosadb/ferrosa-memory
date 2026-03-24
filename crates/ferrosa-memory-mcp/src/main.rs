@@ -316,6 +316,13 @@ impl Storage for StorageBackend {
         }
     }
 
+    async fn feedback_list_all(&self) -> anyhow::Result<Vec<FeedbackOutcome>> {
+        match self {
+            Self::Cql(s) => s.feedback_list_all().await,
+            Self::Mock(s) => s.feedback_list_all().await,
+        }
+    }
+
     async fn delete_session(
         &self,
         ctx: &TenantContext,

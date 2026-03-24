@@ -186,6 +186,13 @@ pub trait Storage: Send + Sync {
         outcome: &FeedbackOutcome,
     ) -> anyhow::Result<()>;
 
+    /// List all feedback outcomes across tenants (batch job use only).
+    ///
+    /// Returns all rows from `feedback_outcomes`. In production this would
+    /// use token-range scanning; the current implementation issues a single
+    /// full-table query suitable for moderate data volumes.
+    async fn feedback_list_all(&self) -> anyhow::Result<Vec<FeedbackOutcome>>;
+
     // --- Session lifecycle ---
 
     /// Delete all data for a session (right-to-deletion).
@@ -622,6 +629,10 @@ pub mod mock {
         ) -> anyhow::Result<()> {
             self.feedback.lock().await.push(outcome.clone());
             Ok(())
+        }
+
+        async fn feedback_list_all(&self) -> anyhow::Result<Vec<FeedbackOutcome>> {
+            Ok(self.feedback.lock().await.clone())
         }
 
         async fn delete_session(
