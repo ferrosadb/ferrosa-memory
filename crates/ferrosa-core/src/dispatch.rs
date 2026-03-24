@@ -11,12 +11,35 @@
 //! - `notifications/initialized` — client acknowledgment (no-op)
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::transport::{INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND};
+
+/// Rotating hint counter for memory formation encouragement.
+static HINT_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// Pick a hint from a pool, rotating through them.
+fn pick_hint(hints: &[&str]) -> String {
+    let idx = HINT_COUNTER.fetch_add(1, Ordering::Relaxed) % hints.len();
+    hints[idx].to_string()
+}
+
+/// Hints shown after successful smart_ingest (one per response, rotating).
+const INGEST_HINTS: &[&str] = &[
+    "Did you learn something about the user's preferences or working style? Ingest that too.",
+    "Technical decisions and their reasoning are high-value memories — don't skip those.",
+    "User corrections ('no, do it this way') are especially important to remember.",
+    "Project constraints, deadlines, or blockers? Those are worth remembering.",
+    "Did you notice an architecture pattern or library gotcha? Ingest it.",
+    "People, roles, and relationships mentioned? Those build context over time.",
+    "Debugging insights — what caused a bug, what fixed it — save future you the trouble.",
+    "Configuration gotchas and environment details are easy to forget. Ingest them.",
+    "What did you learn about how this codebase works? That's worth a smart_ingest.",
+    "Any surprising behavior or non-obvious design choices? Those are prime memory candidates.",
+];
 
 /// Tracks per-entity retrieval counts for anomaly detection (FMEA F19).
 #[derive(Default)]
@@ -1399,22 +1422,14 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
     )
     .await;
 
-    // Add hint based on ingest action
+    // Add rotating hint to encourage continued memory formation
     let mut result = decision_json;
     if let Some(obj) = result.as_object_mut() {
         let hint = match action.as_str() {
-            "Created" => {
-                "Good. Also ingest any decisions, corrections, or patterns from this conversation."
-            }
-            "Updated" => {
-                "Entity updated. If facts changed over time, use write_temporal_fact to track the evolution."
-            }
-            "Skipped" => {
-                "Content too similar to existing memory. Try ingesting a different aspect or a more specific insight."
-            }
-            _ => "Ingest complete. Continue capturing insights from this conversation.",
+            "Skipped" => "Content too similar to existing memory. Try a different aspect or more specific insight.".to_string(),
+            _ => pick_hint(INGEST_HINTS),
         };
-        obj.insert("hint".into(), Value::String(hint.into()));
+        obj.insert("hint".into(), Value::String(hint));
     }
     Ok(result)
 }
@@ -1695,9 +1710,17 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
     let hint = if results.is_empty() {
-        "No matches. Consider ingesting what you're learning in this conversation with smart_ingest."
+        pick_hint(&[
+            "No matches — this topic is new to memory. Good candidate for smart_ingest.",
+            "Empty search. Ingest what you're learning in this conversation with smart_ingest.",
+            "Nothing found. Have you captured the key insights from this session yet?",
+        ])
     } else {
-        "Found prior context. Use spread_activation on result entity_ids to discover related memories."
+        pick_hint(&[
+            "Found prior context. Use spread_activation on result entity_ids to discover related memories.",
+            "Prior context found. Are there new insights to add with smart_ingest?",
+            "Check if any of these memories need updating with new information from this conversation.",
+        ])
     };
 
     Ok(serde_json::json!({
@@ -1736,7 +1759,9 @@ async fn handle_run_consolidation<S: crate::storage::Storage>(
     if let Some(obj) = json.as_object_mut() {
         obj.insert(
             "hint".into(),
-            Value::String("Consolidation complete. New connections are visible in the viz dashboard. Continue ingesting new learnings.".into()),
+            Value::String(
+                "Consolidation complete. New connections are visible in the viz dashboard. Continue ingesting new learnings.".into(),
+            ),
         );
     }
     Ok(json)
@@ -1784,10 +1809,16 @@ async fn handle_get_stats<S: crate::storage::Storage>(
 
     let hint = if entity_count == 0 {
         "Memory is empty. Start ingesting entities, decisions, and patterns with smart_ingest."
+            .to_string()
     } else if edge_count == 0 {
         "Entities exist but no connections. Run run_consolidation to discover relationships."
+            .to_string()
     } else {
-        "Memory healthy. Remember to ingest new insights from this conversation."
+        pick_hint(&[
+            "Memory healthy. Remember to ingest new insights from this conversation.",
+            "Have you learned anything about the user's preferences? Ingest with smart_ingest.",
+            "Project context, architecture decisions, and debugging insights are worth remembering.",
+        ])
     };
 
     Ok(serde_json::json!({
