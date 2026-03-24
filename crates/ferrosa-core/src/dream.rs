@@ -42,16 +42,22 @@ pub async fn run_consolidation(
         }
     }
 
-    // Create CO_OCCURS edges between pairs in same fold (cap at 10 per fold)
+    // Create CO_OCCURS edges between pairs in same fold that share context.
+    // Uses text similarity to avoid linking unrelated entities in large folds.
     let mut connections_created = 0;
     for group in fold_groups.values() {
-        let cap = group.len().min(10);
-        for i in 0..cap {
-            for j in (i + 1)..cap {
-                let _ = storage
-                    .edge_co_occurs(ctx, group[i].entity_id, group[j].entity_id, session_id)
-                    .await;
-                connections_created += 1;
+        for i in 0..group.len() {
+            for j in (i + 1)..group.len() {
+                let sim = crate::smart_ingest::compute_text_similarity(
+                    &group[i].context_snippet,
+                    &group[j].context_snippet,
+                );
+                if sim >= 0.15 {
+                    let _ = storage
+                        .edge_co_occurs(ctx, group[i].entity_id, group[j].entity_id, session_id)
+                        .await;
+                    connections_created += 1;
+                }
             }
         }
     }
