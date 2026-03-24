@@ -853,7 +853,7 @@ impl Storage for CqlStorage {
         let lower = name.to_lowercase();
         for row in rows {
             let entity_name: String = row.r_by_name("entity_name")?;
-            if entity_name.to_lowercase() == lower {
+            if entity_name.to_lowercase().contains(&lower) {
                 let created: chrono::NaiveDateTime = row.r_by_name("created_at")?;
                 let state = row
                     .r_by_name::<String>("state")
