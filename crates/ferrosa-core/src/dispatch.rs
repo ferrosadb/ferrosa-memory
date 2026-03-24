@@ -779,7 +779,7 @@ async fn handle_write_plan<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
-    let session_id = require_uuid(&args, "session_id")?;
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
     let depth = require_i32(&args, "depth")?;
     let subtask_id = require_str(&args, "subtask_id")?;
     let parent_subtask = args.get("parent_subtask").and_then(|v| v.as_str());
@@ -805,7 +805,7 @@ async fn handle_get_plan<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
-    let session_id = require_uuid(&args, "session_id")?;
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
     let max_depth = args
         .get("max_depth")
         .and_then(|v| v.as_i64())
@@ -823,7 +823,7 @@ async fn handle_update_plan<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
-    let session_id = require_uuid(&args, "session_id")?;
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
     let depth = require_i32(&args, "depth")?;
     let subtask_id = require_str(&args, "subtask_id")?;
     let status_str = require_str(&args, "status")?;
@@ -855,7 +855,7 @@ async fn handle_start_fold<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
-    let session_id = require_uuid(&args, "session_id")?;
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
     let depth = require_i32(&args, "depth")?;
     let parent_fold_id = optional_uuid(&args, "parent_fold_id")?;
     let initial_context = require_str(&args, "initial_context")?;
@@ -879,7 +879,7 @@ async fn handle_append_fold<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
-    let session_id = require_uuid(&args, "session_id")?;
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
     let fold_id = require_uuid(&args, "fold_id")?;
     let repl_turn = require_str(&args, "repl_turn")?;
 
@@ -897,7 +897,7 @@ async fn handle_complete_fold<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    let session_id = require_uuid(&args, "session_id")?;
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
     let fold_id = require_uuid(&args, "fold_id")?;
     let summary = require_str(&args, "summary")?;
     let embedding = require_f32_array(&args, "embedding")?;
@@ -933,7 +933,7 @@ async fn handle_retrieve_fold<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
-    let session_id = require_uuid(&args, "session_id")?;
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
     let query_embedding = require_f32_array(&args, "query_embedding")?;
     let query_text = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -978,7 +978,7 @@ async fn handle_upsert_entity<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    let session_id = require_uuid(&args, "session_id")?;
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
     let entity_name = require_str(&args, "entity_name")?;
     let entity_type = require_str(&args, "entity_type")?;
     let context_snippet = require_str(&args, "context_snippet")?;
@@ -1048,7 +1048,7 @@ async fn handle_retrieve_entities<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    let session_id = require_uuid(&args, "session_id")?;
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
     let query = require_str(&args, "query")?;
     let embedding = optional_f32_array(&args, "embedding")?;
 
@@ -1118,7 +1118,7 @@ async fn handle_promote_memory<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    let session_id = require_uuid(&args, "session_id")?;
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
     let entity_id = require_uuid(&args, "entity_id")?;
 
     let new_state = crate::entity::promote_memory(storage, ctx, session_id, entity_id)
@@ -1139,7 +1139,7 @@ async fn handle_demote_memory<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    let session_id = require_uuid(&args, "session_id")?;
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
     let entity_id = require_uuid(&args, "entity_id")?;
 
     let new_state = crate::entity::demote_memory(storage, ctx, session_id, entity_id)
@@ -1162,7 +1162,7 @@ async fn handle_importance_score<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    let session_id = require_uuid(&args, "session_id")?;
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
     let entity_id = require_uuid(&args, "entity_id")?;
 
     // Look up the entity to get created_at for recency
@@ -1203,7 +1203,7 @@ async fn handle_record_outcome<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
-    let session_id = require_uuid(&args, "session_id")?;
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
     let query_id = require_uuid(&args, "query_id")?;
     let program_type = require_str(&args, "program_type")?;
     let task_complexity = require_str(&args, "task_complexity")?;
@@ -1238,7 +1238,7 @@ async fn handle_delete_session<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
-    let session_id = require_uuid(&args, "session_id")?;
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
 
     let result = crate::session::delete_session(storage, ctx, session_id)
         .await
@@ -1517,7 +1517,7 @@ async fn handle_explore_connections(
     let results = match traversal {
         "fold_ancestors" => {
             let fold_id = require_uuid(&args, "fold_id")?;
-            let session_id = require_uuid(&args, "session_id")?;
+            let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
             graph
                 .get_fold_ancestors(fold_id, session_id, max_depth)
                 .await
@@ -1525,7 +1525,7 @@ async fn handle_explore_connections(
         }
         "related_entities" => {
             let entity_id = require_uuid(&args, "entity_id")?;
-            let session_id = require_uuid(&args, "session_id")?;
+            let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
             let mut r = graph
                 .find_related_entities(entity_id, session_id, max_depth)
                 .await
@@ -1535,7 +1535,7 @@ async fn handle_explore_connections(
         }
         "entities_in_fold" => {
             let fold_id = require_uuid(&args, "fold_id")?;
-            let session_id = require_uuid(&args, "session_id")?;
+            let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
             let mut r = graph
                 .get_entities_in_fold(fold_id, session_id)
                 .await
@@ -1609,7 +1609,7 @@ async fn handle_run_consolidation<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    let session_id = require_uuid(&args, "session_id")?;
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
 
     let result = crate::dream::run_consolidation(storage, ctx, session_id)
         .await
@@ -1637,7 +1637,7 @@ async fn handle_get_stats<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    let session_id = require_uuid(&args, "session_id")?;
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
     let entity_count = storage.entity_count(ctx, session_id).await.unwrap_or(0);
     let fold_count = storage.fold_count(ctx, session_id).await.unwrap_or(0);
     let memo_count = storage.memo_count(ctx).await.unwrap_or(0);
@@ -1658,7 +1658,7 @@ async fn handle_find_memory_chain<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
-    let _session_id = require_uuid(&args, "session_id")?;
+    let _session_id = optional_uuid(&args, "session_id")?;
     let source = require_uuid(&args, "source")?;
     let destination = require_uuid(&args, "destination")?;
     let max_hops = args
@@ -1686,7 +1686,7 @@ async fn handle_predict_needed(
     args: Value,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    let _session_id = require_uuid(&args, "session_id")?;
+    let _session_id = optional_uuid(&args, "session_id")?;
     let threshold = args
         .get("threshold")
         .and_then(|v| v.as_f64())
@@ -1723,7 +1723,7 @@ async fn handle_spread_activation<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
-    let session_id = require_uuid(&args, "session_id")?;
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
     let _ = session_id; // reserved for future tenant-scoped filtering
 
     let seeds_arr = args
@@ -1781,7 +1781,7 @@ async fn handle_find_duplicates<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
-    let session_id = require_uuid(&args, "session_id")?;
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
     let threshold = args
         .get("threshold")
         .and_then(|v| v.as_f64())
@@ -2620,14 +2620,14 @@ mod speculative_tests {
         let ctx = test_ctx();
         let session = SessionState::default();
 
-        // Missing session_id
+        // session_id is now optional — calling without it should succeed (empty predictions)
         let params = serde_json::json!({
             "name": "predict_needed",
             "arguments": {}
         });
-        let err = dispatch("tools/call", params, &store, &ctx, &session)
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
             .await
-            .unwrap_err();
-        assert_eq!(err.0, INVALID_PARAMS);
+            .unwrap();
+        assert!(result["predictions"].is_array());
     }
 }
