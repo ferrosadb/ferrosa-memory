@@ -65,6 +65,12 @@ struct PreparedStatements {
     edge_list_mentioned_in: PreparedQuery,
     edge_list_co_occurs: PreparedQuery,
     edge_list_supersedes: PreparedQuery,
+    // Entity neighbor queries (spreading activation)
+    edge_mentioned_in_by_entity: PreparedQuery,
+    edge_co_occurs_by_a: PreparedQuery,
+    edge_co_occurs_by_b: PreparedQuery,
+    edge_supersedes_by_new: PreparedQuery,
+    edge_supersedes_by_old: PreparedQuery,
     // Feedback
     feedback_put: PreparedQuery,
     feedback_list_all: PreparedQuery,
@@ -305,6 +311,37 @@ impl CqlStorage {
                 .prepare(format!(
                     "SELECT new_event_id, old_event_id \
                      FROM {ks}.supersedes WHERE tenant_id = ?"
+                ))
+                .await?,
+            // Entity neighbor queries (spreading activation)
+            edge_mentioned_in_by_entity: session
+                .prepare(format!(
+                    "SELECT fold_id \
+                     FROM {ks}.mentioned_in WHERE entity_id = ? AND tenant_id = ? ALLOW FILTERING"
+                ))
+                .await?,
+            edge_co_occurs_by_a: session
+                .prepare(format!(
+                    "SELECT entity_b \
+                     FROM {ks}.co_occurs_with WHERE entity_a = ? AND tenant_id = ? ALLOW FILTERING"
+                ))
+                .await?,
+            edge_co_occurs_by_b: session
+                .prepare(format!(
+                    "SELECT entity_a \
+                     FROM {ks}.co_occurs_with WHERE entity_b = ? AND tenant_id = ? ALLOW FILTERING"
+                ))
+                .await?,
+            edge_supersedes_by_new: session
+                .prepare(format!(
+                    "SELECT old_event_id \
+                     FROM {ks}.supersedes WHERE new_event_id = ? AND tenant_id = ? ALLOW FILTERING"
+                ))
+                .await?,
+            edge_supersedes_by_old: session
+                .prepare(format!(
+                    "SELECT new_event_id \
+                     FROM {ks}.supersedes WHERE old_event_id = ? AND tenant_id = ? ALLOW FILTERING"
                 ))
                 .await?,
             // Intentions
@@ -1355,6 +1392,76 @@ impl Storage for CqlStorage {
         }
 
         Ok(edges)
+    }
+
+    async fn edge_list_for_entity(
+        &self,
+        ctx: &TenantContext,
+        entity_id: Uuid,
+    ) -> anyhow::Result<Vec<(Uuid, String)>> {
+        let mut neighbors = Vec::new();
+
+        // MENTIONED_IN edges (entity -> fold)
+        let rows = self
+            .query_rows(
+                &self.stmts.edge_mentioned_in_by_entity,
+                query_values!(entity_id, ctx.tenant_id),
+            )
+            .await?;
+        for row in rows {
+            let fold_id: Uuid = row.r_by_name("fold_id")?;
+            neighbors.push((fold_id, "MENTIONED_IN".into()));
+        }
+
+        // CO_OCCURS_WITH edges (entity as entity_a)
+        let rows = self
+            .query_rows(
+                &self.stmts.edge_co_occurs_by_a,
+                query_values!(entity_id, ctx.tenant_id),
+            )
+            .await?;
+        for row in rows {
+            let other: Uuid = row.r_by_name("entity_b")?;
+            neighbors.push((other, "CO_OCCURS".into()));
+        }
+
+        // CO_OCCURS_WITH edges (entity as entity_b)
+        let rows = self
+            .query_rows(
+                &self.stmts.edge_co_occurs_by_b,
+                query_values!(entity_id, ctx.tenant_id),
+            )
+            .await?;
+        for row in rows {
+            let other: Uuid = row.r_by_name("entity_a")?;
+            neighbors.push((other, "CO_OCCURS".into()));
+        }
+
+        // SUPERSEDES edges (entity as new_event_id)
+        let rows = self
+            .query_rows(
+                &self.stmts.edge_supersedes_by_new,
+                query_values!(entity_id, ctx.tenant_id),
+            )
+            .await?;
+        for row in rows {
+            let old: Uuid = row.r_by_name("old_event_id")?;
+            neighbors.push((old, "SUPERSEDES".into()));
+        }
+
+        // SUPERSEDES edges (entity as old_event_id)
+        let rows = self
+            .query_rows(
+                &self.stmts.edge_supersedes_by_old,
+                query_values!(entity_id, ctx.tenant_id),
+            )
+            .await?;
+        for row in rows {
+            let new_id: Uuid = row.r_by_name("new_event_id")?;
+            neighbors.push((new_id, "SUPERSEDES".into()));
+        }
+
+        Ok(neighbors)
     }
 
     // --- Intention operations ---

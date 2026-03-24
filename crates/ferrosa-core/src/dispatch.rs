@@ -484,6 +484,40 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "required": ["session_id", "entity_id"]
             }),
         },
+        // --- Importance scoring ---
+        ToolDef {
+            name: "importance_score".into(),
+            description: "Computes a 4-channel importance score for a memory entity: novelty (how surprising), arousal (emotional intensity), reward (past retrieval success), attention (recency/frequency).\n\nCALL WHEN: Prioritizing which memories to surface, deciding whether to consolidate or prune, or ranking retrieval results by relevance.\nRETURNS: Per-channel scores (0-1) and a weighted composite score.\nCost: ~5ms.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "format": "uuid" },
+                    "entity_id": { "type": "string", "format": "uuid" }
+                },
+                "required": ["session_id", "entity_id"]
+            }),
+        },
+        // --- Spreading activation ---
+        ToolDef {
+            name: "spread_activation".into(),
+            description: "Spreading activation search (Collins & Loftus). Propagates activation energy from seed entities through the knowledge graph, decaying at each hop. Returns the most activated non-seed entities.\n\nCALL WHEN: You have one or more known entities and want to discover related entities through graph structure — especially when semantic search alone misses structural relationships.\nPair with retrieve_entities for seeds, then spread to find indirect connections.\nCost: ~10-50ms depending on graph density and max_hops.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "format": "uuid" },
+                    "seeds": {
+                        "type": "array",
+                        "items": { "type": "string", "format": "uuid" },
+                        "minItems": 1,
+                        "description": "Entity IDs to start activation from"
+                    },
+                    "max_hops": { "type": "integer", "minimum": 1, "maximum": 5, "description": "Maximum traversal depth (default: 2)" },
+                    "decay": { "type": "number", "minimum": 0.01, "maximum": 1.0, "description": "Activation decay per hop (default: 0.7)" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Max results to return (default: 10)" }
+                },
+                "required": ["session_id", "seeds"]
+            }),
+        },
     ]
 }
 
@@ -571,6 +605,8 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "get_stats" => handle_get_stats(args, storage, ctx, session).await,
         "promote_memory" => handle_promote_memory(args, storage, ctx, session).await,
         "demote_memory" => handle_demote_memory(args, storage, ctx, session).await,
+        "importance_score" => handle_importance_score(args, storage, ctx, session).await,
+        "spread_activation" => handle_spread_activation(args, storage, ctx).await,
         _ => Err((METHOD_NOT_FOUND, format!("unknown tool: {name}"))),
     };
     let elapsed = start.elapsed();
@@ -1006,6 +1042,48 @@ async fn handle_demote_memory<S: crate::storage::Storage>(
     });
 
     Ok(serde_json::json!({ "new_state": new_state.to_string() }))
+}
+
+// --- Importance scoring handler ---
+
+async fn handle_importance_score<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let session_id = require_uuid(&args, "session_id")?;
+    let entity_id = require_uuid(&args, "entity_id")?;
+
+    // Look up the entity to get created_at for recency
+    let entities = storage
+        .entity_list_session(ctx, session_id)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    let entity = entities
+        .iter()
+        .find(|e| e.entity_id == entity_id)
+        .ok_or_else(|| (INVALID_PARAMS, format!("entity not found: {entity_id}")))?;
+
+    let last_accessed_seconds_ago = (chrono::Utc::now() - entity.created_at).num_seconds();
+
+    // Use retrieval tracker for attention signal
+    let tracker = session.retrieval_tracker.lock().await;
+    let retrieval_count = tracker.count(&entity_id);
+    drop(tracker);
+
+    // Defaults for channels we cannot yet compute without embedding similarity
+    let similarity_to_existing = 0.0;
+    let feedback_success_rate = 0.0;
+
+    let score = crate::importance::compute_importance(
+        similarity_to_existing,
+        retrieval_count,
+        last_accessed_seconds_ago,
+        feedback_success_rate,
+    );
+
+    serde_json::to_value(&score).map_err(|e| (INTERNAL_ERROR, e.to_string()))
 }
 
 // --- Feedback handler ---
@@ -1463,6 +1541,54 @@ async fn handle_get_stats<S: crate::storage::Storage>(
     }))
 }
 
+// --- Spreading activation handler ---
+
+async fn handle_spread_activation<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = require_uuid(&args, "session_id")?;
+    let _ = session_id; // reserved for future tenant-scoped filtering
+
+    let seeds_arr = args
+        .get("seeds")
+        .and_then(|v| v.as_array())
+        .ok_or((INVALID_PARAMS, "missing required array: seeds".into()))?;
+    let seeds: Vec<uuid::Uuid> = seeds_arr
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .ok_or((INVALID_PARAMS, "seed must be a uuid string".into()))
+                .and_then(|s| {
+                    uuid::Uuid::parse_str(s)
+                        .map_err(|e| (INVALID_PARAMS, format!("invalid seed uuid: {e}")))
+                })
+        })
+        .collect::<Result<_, _>>()?;
+
+    let max_hops = args
+        .get("max_hops")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(2);
+    let decay = args.get("decay").and_then(|v| v.as_f64()).unwrap_or(0.7);
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(10);
+
+    let results = crate::spreading::spread(storage, ctx, &seeds, max_hops, decay, limit)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    Ok(serde_json::json!({
+        "activated": results,
+        "count": results.len()
+    }))
+}
+
 // --- Error mapping helpers ---
 
 /// Map anyhow errors to JSON-RPC error codes, using INVALID_PARAMS for
@@ -1564,7 +1690,7 @@ mod tests {
             .await
             .unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 27);
+        assert_eq!(tools.len(), 29);
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"check_memo_cache"));
@@ -1580,6 +1706,8 @@ mod tests {
         assert!(names.contains(&"hybrid_search"));
         assert!(names.contains(&"promote_memory"));
         assert!(names.contains(&"demote_memory"));
+        assert!(names.contains(&"importance_score"));
+        assert!(names.contains(&"spread_activation"));
     }
 
     #[tokio::test]

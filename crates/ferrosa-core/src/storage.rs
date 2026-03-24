@@ -246,6 +246,16 @@ pub trait Storage: Send + Sync {
         session_id: Uuid,
     ) -> anyhow::Result<Vec<(Uuid, Uuid, String)>>;
 
+    /// List all neighbors of an entity as (neighbor_id, edge_type) pairs.
+    ///
+    /// Searches mentioned_in, co_occurs_with, and supersedes edges where the
+    /// given entity_id appears as source or target. Used for spreading activation.
+    async fn edge_list_for_entity(
+        &self,
+        ctx: &TenantContext,
+        entity_id: Uuid,
+    ) -> anyhow::Result<Vec<(Uuid, String)>>;
+
     // --- Intention operations ---
 
     /// Store a new intention.
@@ -753,6 +763,23 @@ pub mod mock {
                 .filter(|e| e.session_id == session_id)
                 .map(|e| (e.source, e.target, e.edge_type.clone()))
                 .collect())
+        }
+
+        async fn edge_list_for_entity(
+            &self,
+            _ctx: &TenantContext,
+            entity_id: Uuid,
+        ) -> anyhow::Result<Vec<(Uuid, String)>> {
+            let edges = self.edges.lock().await;
+            let mut neighbors = Vec::new();
+            for e in edges.iter() {
+                if e.source == entity_id {
+                    neighbors.push((e.target, e.edge_type.clone()));
+                } else if e.target == entity_id {
+                    neighbors.push((e.source, e.edge_type.clone()));
+                }
+            }
+            Ok(neighbors)
         }
 
         // --- Intention operations ---

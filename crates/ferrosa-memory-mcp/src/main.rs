@@ -397,6 +397,17 @@ impl Storage for StorageBackend {
         }
     }
 
+    async fn edge_list_for_entity(
+        &self,
+        ctx: &TenantContext,
+        entity_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<(uuid::Uuid, String)>> {
+        match self {
+            Self::Cql(s) => s.edge_list_for_entity(ctx, entity_id).await,
+            Self::Mock(s) => s.edge_list_for_entity(ctx, entity_id).await,
+        }
+    }
+
     async fn intention_put(
         &self,
         ctx: &TenantContext,
@@ -572,6 +583,8 @@ async fn main() -> anyhow::Result<()> {
                 http::HttpConfig {
                     port: config.server.http_port,
                     require_tls: config.server.require_tls,
+                    cert_path: config.server.cert_path.clone(),
+                    key_path: config.server.key_path.clone(),
                 },
                 storage,
                 metrics,

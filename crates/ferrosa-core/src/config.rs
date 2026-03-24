@@ -88,6 +88,10 @@ pub struct ServerConfig {
     pub log_level: String,
     #[serde(default)]
     pub require_tls: bool,
+    /// Path to the TLS certificate file (PEM format).
+    pub cert_path: Option<String>,
+    /// Path to the TLS private key file (PEM format).
+    pub key_path: Option<String>,
     /// Fixed tenant UUID for sharing data across sessions.
     /// If not set, a random UUID is generated per session.
     pub tenant_id: Option<String>,
@@ -100,6 +104,8 @@ impl Default for ServerConfig {
             http_port: default_http_port(),
             log_level: default_log_level(),
             require_tls: false,
+            cert_path: None,
+            key_path: None,
             tenant_id: None,
         }
     }
@@ -402,6 +408,38 @@ feedback_export_cron = "0 3 * * *"
         assert_eq!(config.embeddings.dimensions, 1536);
         assert!(!config.security.audit_log_enabled);
         assert_eq!(config.routing.guideline_version, "v2");
+    }
+
+    #[test]
+    fn parse_tls_config_fields_optional() {
+        let toml = r#"
+[ferrosa]
+contact_points = ["localhost:9042"]
+"#;
+        let config = parse_config(toml).expect("should parse without TLS fields");
+        assert!(!config.server.require_tls);
+        assert!(config.server.cert_path.is_none());
+        assert!(config.server.key_path.is_none());
+    }
+
+    #[test]
+    fn parse_tls_config_fields_present() {
+        let toml = r#"
+[server]
+require_tls = true
+cert_path = "/etc/ssl/cert.pem"
+key_path = "/etc/ssl/key.pem"
+
+[ferrosa]
+contact_points = ["localhost:9042"]
+"#;
+        let config = parse_config(toml).expect("should parse with TLS fields");
+        assert!(config.server.require_tls);
+        assert_eq!(
+            config.server.cert_path.as_deref(),
+            Some("/etc/ssl/cert.pem")
+        );
+        assert_eq!(config.server.key_path.as_deref(), Some("/etc/ssl/key.pem"));
     }
 
     #[test]

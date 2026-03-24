@@ -22,5 +22,7 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 dirs = { workspace = true }
 cdrs-tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }

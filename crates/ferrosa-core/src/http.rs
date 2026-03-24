@@ -18,7 +18,10 @@
 //! - Connection limit per source IP (FMEA F30)
 //! - Idle connection timeout
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use futures_util::SinkExt;
 use serde_json::Value;
@@ -41,16 +44,101 @@ const VIZ_HTML: &str = include_str!("../assets/viz.html");
 /// Credential validator: takes (username, password), returns tenant_id if valid.
 pub type CredentialValidator = dyn Fn(&str, &str) -> Option<uuid::Uuid> + Send + Sync;
 
+/// Per-IP connection rate limiter.
+///
+/// Tracks connection counts per source IP within a rolling one-minute window.
+/// When an IP exceeds `max_per_minute` connections, subsequent connections
+/// are rejected until the window resets.
+pub struct RateLimiter {
+    limits: Mutex<HashMap<IpAddr, (usize, Instant)>>,
+    max_per_minute: usize,
+}
+
+impl RateLimiter {
+    /// Create a rate limiter allowing `max_per_minute` connections per IP.
+    pub fn new(max_per_minute: usize) -> Self {
+        assert!(max_per_minute > 0, "max_per_minute must be positive");
+        Self {
+            limits: Mutex::new(HashMap::new()),
+            max_per_minute,
+        }
+    }
+
+    /// Check whether a connection from `ip` should be allowed.
+    ///
+    /// Returns `true` if the connection is within the rate limit, `false` if
+    /// the IP has exceeded the limit. Automatically resets the counter when
+    /// the one-minute window expires.
+    pub fn check(&self, ip: IpAddr) -> bool {
+        let mut limits = self.limits.lock().expect("rate limiter lock poisoned");
+        let now = Instant::now();
+        let entry = limits.entry(ip).or_insert((0, now));
+
+        // Reset window if more than 60 seconds have elapsed
+        if now.duration_since(entry.1).as_secs() >= 60 {
+            entry.0 = 0;
+            entry.1 = now;
+        }
+
+        entry.0 += 1;
+        entry.0 <= self.max_per_minute
+    }
+}
+
+/// Load a TLS acceptor from PEM certificate and key files.
+///
+/// Reads the certificate chain and private key, then constructs a
+/// `tokio_rustls::TlsAcceptor` suitable for wrapping TCP streams.
+fn load_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<tokio_rustls::TlsAcceptor> {
+    use std::fs::File;
+    use std::io::BufReader;
+    use tokio_rustls::rustls;
+
+    let cert_file = File::open(cert_path)
+        .map_err(|e| anyhow::anyhow!("failed to open cert file {cert_path}: {e}"))?;
+    let mut cert_reader = BufReader::new(cert_file);
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut cert_reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("failed to parse certificates: {e}"))?;
+
+    if certs.is_empty() {
+        return Err(anyhow::anyhow!("no certificates found in {cert_path}"));
+    }
+
+    let key_file = File::open(key_path)
+        .map_err(|e| anyhow::anyhow!("failed to open key file {key_path}: {e}"))?;
+    let mut key_reader = BufReader::new(key_file);
+    let key = rustls_pemfile::private_key(&mut key_reader)
+        .map_err(|e| anyhow::anyhow!("failed to parse private key: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("no private key found in {key_path}"))?;
+
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| anyhow::anyhow!("TLS config error: {e}"))?;
+
+    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
+}
+
 /// HTTP server configuration.
 pub struct HttpConfig {
     pub port: u16,
     pub require_tls: bool,
+    pub cert_path: Option<String>,
+    pub key_path: Option<String>,
 }
 
 /// Run the HTTP transport server.
 ///
 /// Listens for TCP connections and handles MCP JSON-RPC over HTTP.
 /// Each request is authenticated via HTTP Basic auth.
+///
+/// When `require_tls` is true and certificate/key paths are configured,
+/// connections are wrapped in TLS via `tokio-rustls`. If `require_tls` is
+/// true but cert/key paths are missing, the server logs an error and exits.
+///
+/// All connections are rate-limited to 50 per IP per minute (FMEA F30).
 ///
 /// Note: connections are handled sequentially (no `tokio::spawn`) because
 /// the `Storage` trait's async methods aren't `Send`-bounded. This is fine
@@ -62,30 +150,97 @@ pub async fn serve_http<S: Storage>(
     metrics: Arc<MemoryMetrics>,
     credential_validator: Arc<CredentialValidator>,
 ) -> anyhow::Result<()> {
+    // Set up TLS if required
+    let tls_acceptor = if config.require_tls {
+        let cert = config.cert_path.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("require_tls is true but cert_path is not configured")
+        })?;
+        let key = config
+            .key_path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("require_tls is true but key_path is not configured"))?;
+        let acceptor = load_tls_acceptor(cert, key)?;
+        tracing::info!("TLS enabled with cert={cert} key={key}");
+        Some(acceptor)
+    } else {
+        None
+    };
+
+    let rate_limiter = RateLimiter::new(50);
     let addr = format!("0.0.0.0:{}", config.port);
     let listener = TcpListener::bind(&addr).await?;
-    tracing::info!("HTTP server listening on {addr}");
+    let protocol = if tls_acceptor.is_some() {
+        "HTTPS"
+    } else {
+        "HTTP"
+    };
+    tracing::info!("{protocol} server listening on {addr}");
 
     loop {
-        let (mut stream, peer) = listener.accept().await?;
-        if let Err(e) = handle_connection(
-            &mut stream,
-            storage.as_ref(),
-            &metrics,
-            credential_validator.as_ref(),
-        )
-        .await
-        {
-            tracing::warn!("connection from {peer} error: {e}");
+        let (stream, peer) = listener.accept().await?;
+
+        // Rate limit by source IP
+        if !rate_limiter.check(peer.ip()) {
+            tracing::warn!("rate limit exceeded for {peer}, dropping connection");
+            drop(stream);
+            continue;
+        }
+
+        if let Some(ref acceptor) = tls_acceptor {
+            // TLS-wrapped connection
+            match acceptor.accept(stream).await {
+                Ok(mut tls_stream) => {
+                    if let Err(e) = handle_connection_rw(
+                        &mut tls_stream,
+                        storage.as_ref(),
+                        &metrics,
+                        credential_validator.as_ref(),
+                    )
+                    .await
+                    {
+                        tracing::warn!("TLS connection from {peer} error: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("TLS handshake failed from {peer}: {e}");
+                }
+            }
+        } else {
+            // Plain TCP connection
+            let mut stream = stream;
+            if let Err(e) = handle_connection(
+                &mut stream,
+                storage.as_ref(),
+                &metrics,
+                credential_validator.as_ref(),
+            )
+            .await
+            {
+                tracing::warn!("connection from {peer} error: {e}");
+            }
         }
     }
 }
 
-/// Handle a single HTTP connection.
+/// Handle a single HTTP connection over a plain TCP stream.
 ///
-/// Reads the HTTP request, extracts auth, dispatches MCP, returns response.
+/// Delegates to `handle_connection_rw` which is generic over any
+/// `AsyncRead + AsyncWrite` stream.
 async fn handle_connection<S: Storage>(
     stream: &mut tokio::net::TcpStream,
+    storage: &S,
+    metrics: &MemoryMetrics,
+    credential_validator: &CredentialValidator,
+) -> anyhow::Result<()> {
+    handle_connection_rw(stream, storage, metrics, credential_validator).await
+}
+
+/// Handle a single HTTP connection over any async read/write stream.
+///
+/// Reads the HTTP request, extracts auth, dispatches MCP, returns response.
+/// Works with both plain TCP and TLS-wrapped streams.
+async fn handle_connection_rw<S: Storage, T: AsyncReadExt + AsyncWriteExt + Unpin>(
+    stream: &mut T,
     storage: &S,
     metrics: &MemoryMetrics,
     credential_validator: &CredentialValidator,
@@ -570,5 +725,69 @@ mod tests {
             .iter()
             .any(|(k, v)| k.eq_ignore_ascii_case("upgrade") && v.eq_ignore_ascii_case("websocket"));
         assert!(has_upgrade, "should detect upgrade header");
+    }
+
+    #[test]
+    fn rate_limiter_allows_within_limit() {
+        let limiter = RateLimiter::new(5);
+        let ip: IpAddr = "192.168.1.1".parse().unwrap();
+
+        for i in 1..=5 {
+            assert!(limiter.check(ip), "connection {i} should be allowed");
+        }
+    }
+
+    #[test]
+    fn rate_limiter_rejects_over_limit() {
+        let limiter = RateLimiter::new(3);
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        assert!(limiter.check(ip), "connection 1 should be allowed");
+        assert!(limiter.check(ip), "connection 2 should be allowed");
+        assert!(limiter.check(ip), "connection 3 should be allowed");
+        assert!(!limiter.check(ip), "connection 4 should be rejected");
+        assert!(!limiter.check(ip), "connection 5 should be rejected");
+    }
+
+    #[test]
+    fn rate_limiter_independent_per_ip() {
+        let limiter = RateLimiter::new(2);
+        let ip_a: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip_b: IpAddr = "10.0.0.2".parse().unwrap();
+
+        assert!(limiter.check(ip_a));
+        assert!(limiter.check(ip_a));
+        assert!(!limiter.check(ip_a), "ip_a should be rejected at limit");
+
+        // ip_b is independent and should still be allowed
+        assert!(limiter.check(ip_b), "ip_b should be allowed");
+        assert!(
+            limiter.check(ip_b),
+            "ip_b second connection should be allowed"
+        );
+        assert!(!limiter.check(ip_b), "ip_b should be rejected at limit");
+    }
+
+    #[test]
+    fn http_config_tls_fields() {
+        let config = HttpConfig {
+            port: 8765,
+            require_tls: false,
+            cert_path: None,
+            key_path: None,
+        };
+        assert!(!config.require_tls);
+        assert!(config.cert_path.is_none());
+        assert!(config.key_path.is_none());
+
+        let config_tls = HttpConfig {
+            port: 443,
+            require_tls: true,
+            cert_path: Some("/etc/ssl/cert.pem".into()),
+            key_path: Some("/etc/ssl/key.pem".into()),
+        };
+        assert!(config_tls.require_tls);
+        assert_eq!(config_tls.cert_path.as_deref(), Some("/etc/ssl/cert.pem"));
+        assert_eq!(config_tls.key_path.as_deref(), Some("/etc/ssl/key.pem"));
     }
 }
