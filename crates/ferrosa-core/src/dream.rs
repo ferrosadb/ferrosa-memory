@@ -19,6 +19,9 @@ pub struct DreamResult {
     pub entities_processed: usize,
     pub connections_created: usize,
     pub insights: Vec<String>,
+    /// Actual entity pairs connected (for viz event emission).
+    #[serde(skip)]
+    pub edges: Vec<(Uuid, Uuid)>,
 }
 
 /// Run consolidation over a session's entities.
@@ -45,6 +48,7 @@ pub async fn run_consolidation(
     // Create CO_OCCURS edges between pairs in same fold that share context.
     // Uses text similarity to avoid linking unrelated entities in large folds.
     let mut connections_created = 0;
+    let mut edges = Vec::new();
     for group in fold_groups.values() {
         for i in 0..group.len() {
             for j in (i + 1)..group.len() {
@@ -53,9 +57,10 @@ pub async fn run_consolidation(
                     &group[j].context_snippet,
                 );
                 if sim >= 0.05 {
-                    let _ = storage
-                        .edge_co_occurs(ctx, group[i].entity_id, group[j].entity_id, session_id)
-                        .await;
+                    let a = group[i].entity_id;
+                    let b = group[j].entity_id;
+                    let _ = storage.edge_co_occurs(ctx, a, b, session_id).await;
+                    edges.push((a, b));
                     connections_created += 1;
                 }
             }
@@ -80,6 +85,7 @@ pub async fn run_consolidation(
         entities_processed: entity_count,
         connections_created,
         insights,
+        edges,
     })
 }
 

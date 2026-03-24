@@ -1648,12 +1648,12 @@ async fn handle_run_consolidation<S: crate::storage::Storage>(
         .await
         .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
-    // Emit viz events for each connection created during consolidation
-    for _ in 0..result.connections_created {
+    // Emit viz events with actual entity pairs
+    for (src, tgt) in &result.edges {
         session.event_bus.emit(crate::viz::VizEvent::EdgeCreated {
             edge: crate::viz::VizEdge {
-                source: session_id.to_string(),
-                target: session_id.to_string(),
+                source: src.to_string(),
+                target: tgt.to_string(),
                 edge_type: "CO_OCCURS".into(),
             },
         });
