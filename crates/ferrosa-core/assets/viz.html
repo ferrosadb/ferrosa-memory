@@ -413,7 +413,7 @@ const labelGroup = g.append('g').attr('class', 'labels');
 
 // Force simulation
 const simulation = d3.forceSimulation()
-  .force('link', d3.forceLink().id(d => d.id).distance(350))
+  .force('link', d3.forceLink().id(d => d.id).distance(100))
   .force('charge', d3.forceManyBody().strength(-500))
   .force('x', d3.forceX(width / 2).strength(0.03))
   .force('y', d3.forceY(height / 2).strength(0.03))
@@ -505,9 +505,9 @@ function render() {
     .attr('pointer-events', 'none')
     .text(d => d.label.length > 20 ? d.label.slice(0, 18) + '...' : d.label);
 
-  // Update simulation
+  // Update simulation — scale link distance with node count
   simulation.nodes(nodes);
-  simulation.force('link').links(edges);
+  simulation.force('link').links(edges).distance(Math.max(100, nodes.length * 10));
   simulation.alpha(0.3).restart();
 
   // Update stats
