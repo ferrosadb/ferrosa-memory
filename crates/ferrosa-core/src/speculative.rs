@@ -205,24 +205,22 @@ mod tests {
 
     #[test]
     fn window_evicts_old_entries() {
-        let mut tracker = CoAccessTracker::new(2);
+        let mut tracker = CoAccessTracker::new(1);
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         let c = Uuid::new_v4();
-        let d = Uuid::new_v4();
 
         tracker.record(a);
+        // window: [a]
         tracker.record(b);
-        // window: [a, b]
+        // b pairs with a; window becomes [a, b], evicts a -> [b]
         tracker.record(c);
-        // window: [b, c] — a evicted
-        tracker.record(d);
-        // window: [c, d] — b evicted
+        // c pairs with b; window becomes [b, c], evicts b -> [c]
 
-        // d should be co-accessed with c only (not a or b, they were evicted)
-        let predictions = tracker.predict(&[d], 0.0, 10);
+        // c is co-accessed with b only (a was evicted before c was recorded)
+        let predictions = tracker.predict(&[c], 0.0, 10);
         assert_eq!(predictions.len(), 1);
-        assert_eq!(predictions[0].entity_id, c);
+        assert_eq!(predictions[0].entity_id, b);
     }
 
     #[test]

@@ -574,6 +574,24 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "required": ["session_id", "seeds"]
             }),
         },
+        // --- Duplicate detection ---
+        ToolDef {
+            name: "find_duplicates".into(),
+            description: "Scans a session\'s entities for potential duplicates using text similarity (Jaccard coefficient) on context snippets. Returns pairs above the threshold, sorted by similarity descending.\n\nCALL WHEN: After bulk entity ingestion, or when you suspect duplicate entities exist in a session. Useful before consolidation to identify merge candidates.\nDO NOT CALL: On sessions with very few entities (< 3). Use retrieve_entities with phonetic matching for single-entity dedup.\nCost: O(n^2) comparisons -- fast for <1000 entities per session.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "format": "uuid" },
+                    "threshold": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1,
+                        "description": "Similarity threshold (0-1). Default: 0.7. Higher = fewer, more confident matches."
+                    }
+                },
+                "required": ["session_id"]
+            }),
+        },
     ]
 }
 
@@ -663,7 +681,9 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "demote_memory" => handle_demote_memory(args, storage, ctx, session).await,
         "importance_score" => handle_importance_score(args, storage, ctx, session).await,
         "find_memory_chain" => handle_find_memory_chain(args, storage, ctx).await,
+        "predict_needed" => handle_predict_needed(args, session).await,
         "spread_activation" => handle_spread_activation(args, storage, ctx).await,
+        "find_duplicates" => handle_find_duplicates(args, storage, ctx).await,
         _ => Err((METHOD_NOT_FOUND, format!("unknown tool: {name}"))),
     };
     let elapsed = start.elapsed();
@@ -1631,6 +1651,42 @@ async fn handle_find_memory_chain<S: crate::storage::Storage>(
     }
 }
 
+async fn handle_predict_needed(
+    args: Value,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let _session_id = require_uuid(&args, "session_id")?;
+    let threshold = args
+        .get("threshold")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.3);
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+
+    if !(0.0..=1.0).contains(&threshold) {
+        return Err((
+            INVALID_PARAMS,
+            "threshold must be between 0.0 and 1.0".into(),
+        ));
+    }
+    if !(1..=20).contains(&limit) {
+        return Err((INVALID_PARAMS, "limit must be between 1 and 20".into()));
+    }
+
+    let tracker = session.retrieval_tracker.lock().await;
+    let recent = tracker.recent_ids(10);
+    drop(tracker);
+
+    let co_access = session.co_access.lock().await;
+    let predictions = co_access.predict(&recent, threshold, limit);
+    drop(co_access);
+
+    Ok(serde_json::json!({
+        "predictions": predictions,
+        "count": predictions.len(),
+        "recent_entity_count": recent.len(),
+    }))
+}
+
 async fn handle_spread_activation<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
@@ -1687,6 +1743,24 @@ fn map_quota_error(e: anyhow::Error) -> (i32, String) {
     } else {
         (INTERNAL_ERROR, e.to_string())
     }
+}
+
+async fn handle_find_duplicates<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = require_uuid(&args, "session_id")?;
+    let threshold = args
+        .get("threshold")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.7);
+
+    let pairs = crate::dedup::find_duplicates(storage, ctx, session_id, threshold)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    serde_json::to_value(&pairs).map_err(|e| (INTERNAL_ERROR, e.to_string()))
 }
 
 // --- Parameter extraction helpers ---
@@ -1778,7 +1852,7 @@ mod tests {
             .await
             .unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 31);
+        assert_eq!(tools.len(), 32);
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"check_memo_cache"));
@@ -1798,6 +1872,7 @@ mod tests {
         assert!(names.contains(&"find_memory_chain"));
         assert!(names.contains(&"predict_needed"));
         assert!(names.contains(&"spread_activation"));
+        assert!(names.contains(&"find_duplicates"));
     }
 
     #[tokio::test]
@@ -2422,5 +2497,106 @@ mod tests {
             5,
             "tracker should record each retrieval"
         );
+    }
+}
+
+#[cfg(test)]
+mod speculative_tests {
+    use super::*;
+    use crate::storage::mock::MockStorage;
+    use crate::types::TenantContext;
+    use uuid::Uuid;
+
+    fn test_ctx() -> TenantContext {
+        TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "test".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn predict_needed_returns_empty_with_no_history() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+
+        let params = serde_json::json!({
+            "name": "predict_needed",
+            "arguments": {
+                "session_id": sid.to_string()
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        assert_eq!(result["count"], 0);
+        assert_eq!(result["recent_entity_count"], 0);
+        assert!(result["predictions"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn predict_needed_with_targeted_recent() {
+        let session = SessionState::default();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+
+        // Build co-access history: a-b are strongly co-accessed
+        {
+            let mut co = session.co_access.lock().await;
+            for _ in 0..5 {
+                co.record(a);
+                co.record(b);
+            }
+            // a-c weakly co-accessed
+            co.record(a);
+            co.record(c);
+        }
+
+        // Only mark 'a' as recently retrieved
+        {
+            let mut tracker = session.retrieval_tracker.lock().await;
+            tracker.record(a);
+        }
+
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let sid = Uuid::new_v4();
+
+        let params = serde_json::json!({
+            "name": "predict_needed",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "threshold": 0.0,
+                "limit": 10
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let predictions = result["predictions"].as_array().unwrap();
+        assert!(!predictions.is_empty(), "should predict b and/or c");
+        // b should be predicted with highest confidence
+        let first = &predictions[0];
+        assert_eq!(first["entity_id"].as_str().unwrap(), b.to_string());
+        assert!((first["confidence"].as_f64().unwrap() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn predict_needed_validates_params() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+
+        // Missing session_id
+        let params = serde_json::json!({
+            "name": "predict_needed",
+            "arguments": {}
+        });
+        let err = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, INVALID_PARAMS);
     }
 }
