@@ -52,7 +52,7 @@ pub async fn run_consolidation(
                     &group[i].context_snippet,
                     &group[j].context_snippet,
                 );
-                if sim >= 0.15 {
+                if sim >= 0.05 {
                     let _ = storage
                         .edge_co_occurs(ctx, group[i].entity_id, group[j].entity_id, session_id)
                         .await;
