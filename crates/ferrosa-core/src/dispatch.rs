@@ -1778,7 +1778,7 @@ mod tests {
             .await
             .unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 30);
+        assert_eq!(tools.len(), 31);
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"check_memo_cache"));
@@ -1796,6 +1796,7 @@ mod tests {
         assert!(names.contains(&"demote_memory"));
         assert!(names.contains(&"importance_score"));
         assert!(names.contains(&"find_memory_chain"));
+        assert!(names.contains(&"predict_needed"));
         assert!(names.contains(&"spread_activation"));
     }
 
