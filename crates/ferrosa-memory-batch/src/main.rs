@@ -1,38 +1,33 @@
 //! # ferrosa-memory-batch
 //!
 //! Nightly batch job for routing guideline refinement (ADR-002).
-//!
-//! Reads failure pairs from `feedback_outcomes`, computes strategy accuracy
-//! per task complexity, and writes updated routing guidelines to the
-//! `routing_guidelines` config table.
+//! Also provides data migration utilities.
 //!
 //! ## Usage
 //!
 //! ```sh
-//! # Run once (triggered by cron or systemd timer)
+//! # Run guideline refinement (default)
 //! ferrosa-memory-batch
+//!
+//! # Migrate all entities to the configured default session_id
+//! ferrosa-memory-batch migrate-session
 //!
 //! # With config
 //! FERROSA_MEMORY_CONFIG=./ferrosa-memory.toml ferrosa-memory-batch
 //! ```
-//!
-//! ## Output
-//!
-//! Logs strategy accuracy statistics and writes a new guideline version
-//! to CQL. The MCP server reads the latest version on each request.
 
 use ferrosa_core::batch;
 use ferrosa_core::cql_storage::CqlStorage;
 use ferrosa_core::storage::Storage;
+use ferrosa_core::types::TenantContext;
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
-
-    tracing::info!("ferrosa-memory-batch starting");
 
     let config = match ferrosa_core::config::load_config() {
         Ok(c) => c,
@@ -44,16 +39,103 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    let subcommand = std::env::args().nth(1).unwrap_or_default();
+
+    match subcommand.as_str() {
+        "migrate-session" => migrate_session(&config).await,
+        _ => run_guidelines(&config).await,
+    }
+}
+
+/// Migrate all entities to the configured default session_id.
+///
+/// Reads all entities for the tenant, re-inserts with the target session_id,
+/// then deletes the old session partitions.
+async fn migrate_session(config: &ferrosa_core::config::Config) -> anyhow::Result<()> {
+    let target_sid = config
+        .server
+        .session_id
+        .as_ref()
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(|| anyhow::anyhow!("no session_id configured in [server]"))?;
+
+    let tenant_id = config
+        .server
+        .tenant_id
+        .as_ref()
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(|| anyhow::anyhow!("no tenant_id configured in [server]"))?;
+
+    let ctx = TenantContext {
+        tenant_id,
+        session_origin: "batch-migrate".into(),
+    };
+
+    tracing::info!(
+        tenant_id = %tenant_id,
+        target_session_id = %target_sid,
+        "starting session migration"
+    );
+
+    let storage = CqlStorage::connect(&config.ferrosa).await?;
+    tracing::info!("connected to CQL cluster");
+
+    // Read all entities for this tenant
+    let entities = storage.entity_list_all(&ctx).await?;
+    tracing::info!(count = entities.len(), "loaded entities");
+
+    let mut migrated = 0;
+    let mut skipped = 0;
+    let mut old_sessions: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+
+    for entity in &entities {
+        if entity.session_id == target_sid {
+            skipped += 1;
+            continue;
+        }
+
+        old_sessions.insert(entity.session_id);
+
+        // Re-insert with target session_id
+        let mut migrated_entity = entity.clone();
+        migrated_entity.session_id = target_sid;
+        storage.entity_put(&ctx, &migrated_entity).await?;
+        migrated += 1;
+    }
+
+    tracing::info!(
+        migrated = migrated,
+        skipped = skipped,
+        old_sessions = old_sessions.len(),
+        "entity migration complete"
+    );
+
+    // Delete old session partitions
+    for old_sid in &old_sessions {
+        match storage.delete_session(&ctx, *old_sid).await {
+            Ok(n) => tracing::info!(session_id = %old_sid, deleted = n, "cleaned old session"),
+            Err(e) => {
+                tracing::warn!(session_id = %old_sid, error = %e, "failed to clean old session")
+            }
+        }
+    }
+
+    tracing::info!("migration complete");
+    Ok(())
+}
+
+/// Run the nightly guideline refinement job.
+async fn run_guidelines(config: &ferrosa_core::config::Config) -> anyhow::Result<()> {
+    tracing::info!("ferrosa-memory-batch starting");
+
     tracing::info!(
         guideline_version = %config.routing.guideline_version,
         "current guideline version"
     );
 
-    // 1. Connect to CQL
     let storage = CqlStorage::connect(&config.ferrosa).await?;
     tracing::info!("connected to CQL cluster");
 
-    // 2. Query all feedback outcomes
     let outcomes = storage.feedback_list_all().await?;
 
     if outcomes.is_empty() {
@@ -64,7 +146,6 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(count = outcomes.len(), "loaded feedback outcomes");
 
-    // 3. Compute strategy accuracy per (program_type, task_complexity)
     let stats = batch::compute_strategy_accuracy(&outcomes);
 
     for s in &stats {
@@ -79,7 +160,6 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // 4. Generate updated routing guidelines
     let next_version = next_guideline_version(&config.routing.guideline_version);
     let guidelines = batch::generate_guidelines(&stats, &next_version);
 
@@ -89,7 +169,6 @@ async fn main() -> anyhow::Result<()> {
         "generated routing guidelines"
     );
 
-    // 5. Write routing guidelines to CQL
     let ks = &config.ferrosa.keyspace;
     let query = format!(
         "INSERT INTO {ks}.routing_guidelines (version, rules, created_at) VALUES (?, ?, toTimestamp(now()))"
@@ -108,7 +187,6 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Increment a version string like "v1" -> "v2", "v42" -> "v43".
-/// Falls back to "v1" if the format is unrecognized.
 fn next_guideline_version(current: &str) -> String {
     if let Some(num_str) = current.strip_prefix('v')
         && let Ok(n) = num_str.parse::<u64>()
