@@ -413,8 +413,8 @@ const labelGroup = g.append('g').attr('class', 'labels');
 
 // Force simulation
 const simulation = d3.forceSimulation()
-  .force('link', d3.forceLink().id(d => d.id).distance(250))
-  .force('charge', d3.forceManyBody().strength(-800))
+  .force('link', d3.forceLink().id(d => d.id).distance(350))
+  .force('charge', d3.forceManyBody().strength(-500))
   .force('x', d3.forceX(width / 2).strength(0.03))
   .force('y', d3.forceY(height / 2).strength(0.03))
   .force('collision', d3.forceCollide().radius(40))
