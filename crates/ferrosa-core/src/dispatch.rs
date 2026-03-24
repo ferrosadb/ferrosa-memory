@@ -84,6 +84,9 @@ pub struct SessionState {
     pub event_bus: Arc<crate::viz::EventBus>,
     pub retrieval_tracker: Arc<Mutex<RetrievalTracker>>,
     pub co_access: Arc<Mutex<crate::speculative::CoAccessTracker>>,
+    /// Configured default session_id for cross-session memory continuity.
+    /// Falls back to random UUID if not set.
+    pub default_session_id: Option<uuid::Uuid>,
 }
 
 impl Default for SessionState {
@@ -94,6 +97,7 @@ impl Default for SessionState {
             event_bus: Arc::new(crate::viz::EventBus::new()),
             retrieval_tracker: Arc::new(Mutex::new(RetrievalTracker::new())),
             co_access: Arc::new(Mutex::new(crate::speculative::CoAccessTracker::new(10))),
+            default_session_id: None,
         }
     }
 }
@@ -645,10 +649,18 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         .and_then(|v| v.as_str())
         .ok_or((INVALID_PARAMS, "missing tool name".into()))?;
 
-    let args = params
+    let mut args = params
         .get("arguments")
         .cloned()
         .unwrap_or(Value::Object(serde_json::Map::new()));
+
+    // Inject configured default session_id when caller omits it.
+    if args.get("session_id").and_then(|v| v.as_str()).is_none()
+        && let Some(default_sid) = session.default_session_id
+        && let Some(obj) = args.as_object_mut()
+    {
+        obj.insert("session_id".into(), Value::String(default_sid.to_string()));
+    }
 
     tracing::debug!(tool = name, "dispatching tool call");
     let start = std::time::Instant::now();

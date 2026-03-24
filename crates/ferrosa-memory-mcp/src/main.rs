@@ -547,6 +547,11 @@ async fn main() -> anyhow::Result<()> {
         .as_ref()
         .and_then(|s| uuid::Uuid::parse_str(s).ok())
         .unwrap_or_else(uuid::Uuid::new_v4);
+    let default_session_id = config
+        .server
+        .session_id
+        .as_ref()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok());
     let metrics = Arc::new(ferrosa_core::metrics::MemoryMetrics::new()?);
     tracing::info!("metrics registered");
 
@@ -582,10 +587,7 @@ async fn main() -> anyhow::Result<()> {
         let viz_port = config.viz.port;
         let viz_storage = Arc::clone(&storage);
         let viz_ctx = Arc::new(auth::authenticate_stdio(tenant_id));
-        // TODO: session_id should come from query params on /viz/ws. For now
-        // use nil UUID — the initial snapshot will be empty until a session
-        // is active and events begin flowing through the EventBus.
-        let viz_session_id = uuid::Uuid::nil();
+        let viz_session_id = default_session_id.unwrap_or_else(uuid::Uuid::nil);
         tokio::spawn(async move {
             if let Err(e) =
                 http::serve_viz(viz_port, viz_bus, viz_storage, viz_ctx, viz_session_id).await
@@ -605,8 +607,12 @@ async fn main() -> anyhow::Result<()> {
             let ctx_ref = Arc::clone(&ctx);
             let session = Arc::new(dispatch::SessionState {
                 event_bus: Arc::clone(&shared_event_bus),
+                default_session_id,
                 ..dispatch::SessionState::default()
             });
+            if let Some(sid) = default_session_id {
+                tracing::info!(session_id = %sid, "using configured default session_id");
+            }
             let session_ref = Arc::clone(&session);
 
             let handler: transport::Handler = Box::new(move |method: &str, params| {

@@ -95,6 +95,9 @@ pub struct ServerConfig {
     /// Fixed tenant UUID for sharing data across sessions.
     /// If not set, a random UUID is generated per session.
     pub tenant_id: Option<String>,
+    /// Fixed session UUID for cross-session memory continuity.
+    /// If set, all tools default to this session_id when none is provided.
+    pub session_id: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -107,6 +110,7 @@ impl Default for ServerConfig {
             cert_path: None,
             key_path: None,
             tenant_id: None,
+            session_id: None,
         }
     }
 }
