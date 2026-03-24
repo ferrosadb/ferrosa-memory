@@ -1241,6 +1241,95 @@ impl Storage for CqlStorage {
         Ok(outcomes)
     }
 
+    // --- Observability operations ---
+
+    async fn memo_total_hits(&self, ctx: &TenantContext) -> anyhow::Result<i64> {
+        // Client-side sum: fetch all hit_count values and sum.
+        // Workaround for Ferrosa returning aggregate columns as "system.sum".
+        let query = format!(
+            "SELECT hit_count FROM {}.memo_cache WHERE tenant_id = ? ALLOW FILTERING",
+            self.keyspace
+        );
+        let envelope = self
+            .session
+            .query_with_values(query, query_values!(ctx.tenant_id))
+            .await?;
+        let rows = envelope.response_body()?.into_rows().unwrap_or_default();
+        let mut total: i64 = 0;
+        for row in &rows {
+            let hits: i64 = row.r_by_name("hit_count").unwrap_or(0);
+            total += hits;
+        }
+        Ok(total)
+    }
+
+    async fn fold_count_by_status(
+        &self,
+        ctx: &TenantContext,
+        status: crate::types::FoldStatus,
+    ) -> anyhow::Result<usize> {
+        let status_str = match status {
+            crate::types::FoldStatus::Active => "active",
+            crate::types::FoldStatus::Folded => "folded",
+            crate::types::FoldStatus::Archived => "archived",
+        };
+        // Client-side count filtered by status.
+        let query = format!(
+            "SELECT status FROM {}.trajectory_folds WHERE tenant_id = ? ALLOW FILTERING",
+            self.keyspace
+        );
+        let envelope = self
+            .session
+            .query_with_values(query, query_values!(ctx.tenant_id))
+            .await?;
+        let rows = envelope.response_body()?.into_rows().unwrap_or_default();
+        let count = rows
+            .iter()
+            .filter(|r| {
+                r.r_by_name::<String>("status")
+                    .map(|s| s == status_str)
+                    .unwrap_or(false)
+            })
+            .count();
+        Ok(count)
+    }
+
+    async fn temporal_count(&self, ctx: &TenantContext) -> anyhow::Result<usize> {
+        let query = format!(
+            "SELECT event_id FROM {}.temporal_events WHERE tenant_id = ? ALLOW FILTERING",
+            self.keyspace
+        );
+        let envelope = self
+            .session
+            .query_with_values(query, query_values!(ctx.tenant_id))
+            .await?;
+        let rows = envelope.response_body()?.into_rows().unwrap_or_default();
+        Ok(rows.len())
+    }
+
+    async fn edge_count(&self, ctx: &TenantContext) -> anyhow::Result<usize> {
+        let mut total: usize = 0;
+        let pk_cols = [
+            ("folded_into", "child_fold_id"),
+            ("mentioned_in", "entity_id"),
+            ("co_occurs_with", "entity_a"),
+            ("supersedes", "new_event_id"),
+        ];
+        for (table, col) in &pk_cols {
+            let query = format!(
+                "SELECT {col} FROM {}.{table} WHERE tenant_id = ? ALLOW FILTERING",
+                self.keyspace
+            );
+            let envelope = self
+                .session
+                .query_with_values(query, query_values!(ctx.tenant_id))
+                .await?;
+            let rows = envelope.response_body()?.into_rows().unwrap_or_default();
+            total += rows.len();
+        }
+        Ok(total)
+    }
+
     async fn delete_session(&self, ctx: &TenantContext, session_id: Uuid) -> anyhow::Result<usize> {
         // Delete from each table. CQL doesn't support cross-table transactions,
         // so we delete from each table individually. Session-scoped partition

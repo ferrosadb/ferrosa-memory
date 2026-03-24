@@ -1658,16 +1658,49 @@ async fn handle_get_stats<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
-    let entity_count = storage.entity_count(ctx, session_id).await.unwrap_or(0);
-    let fold_count = storage.fold_count(ctx, session_id).await.unwrap_or(0);
+    let session_id = optional_uuid(&args, "session_id")?;
+
     let memo_count = storage.memo_count(ctx).await.unwrap_or(0);
+    let memo_total_hits = storage.memo_total_hits(ctx).await.unwrap_or(0);
+    let memo_hit_rate = if memo_count > 0 {
+        memo_total_hits as f64 / memo_count as f64
+    } else {
+        0.0
+    };
+
+    let entity_count = match session_id {
+        Some(sid) => storage.entity_count(ctx, sid).await.unwrap_or(0),
+        None => 0,
+    };
+
+    let active_fold_count = storage
+        .fold_count_by_status(ctx, crate::types::FoldStatus::Active)
+        .await
+        .unwrap_or(0);
+    let folded_count = storage
+        .fold_count_by_status(ctx, crate::types::FoldStatus::Folded)
+        .await
+        .unwrap_or(0);
+    let archived_fold_count = storage
+        .fold_count_by_status(ctx, crate::types::FoldStatus::Archived)
+        .await
+        .unwrap_or(0);
+
+    let temporal_fact_count = storage.temporal_count(ctx).await.unwrap_or(0);
+    let edge_count = storage.edge_count(ctx).await.unwrap_or(0);
     let intention_count = session.intentions.lock().await.list().len();
 
     Ok(serde_json::json!({
-        "entity_count": entity_count,
-        "fold_count": fold_count,
         "memo_count": memo_count,
+        "memo_total_hits": memo_total_hits,
+        "memo_hit_rate": memo_hit_rate,
+        "entity_count": entity_count,
+        "fold_count": active_fold_count + folded_count + archived_fold_count,
+        "active_fold_count": active_fold_count,
+        "folded_count": folded_count,
+        "archived_fold_count": archived_fold_count,
+        "temporal_fact_count": temporal_fact_count,
+        "edge_count": edge_count,
         "intention_count": intention_count
     }))
 }
@@ -2324,6 +2357,13 @@ mod tests {
         assert_eq!(result["entity_count"], 0);
         assert_eq!(result["fold_count"], 0);
         assert_eq!(result["memo_count"], 0);
+        assert_eq!(result["memo_total_hits"], 0);
+        assert_eq!(result["memo_hit_rate"], 0.0);
+        assert_eq!(result["active_fold_count"], 0);
+        assert_eq!(result["folded_count"], 0);
+        assert_eq!(result["archived_fold_count"], 0);
+        assert_eq!(result["temporal_fact_count"], 0);
+        assert_eq!(result["edge_count"], 0);
         assert_eq!(result["intention_count"], 0);
     }
 

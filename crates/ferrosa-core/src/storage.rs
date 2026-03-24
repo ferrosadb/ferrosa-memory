@@ -263,6 +263,24 @@ pub trait Storage: Send + Sync {
         entity_id: Uuid,
     ) -> anyhow::Result<Vec<(Uuid, String)>>;
 
+    // --- Observability operations (Sprint 4) ---
+
+    /// Sum of hit_count across all memos for this tenant.
+    async fn memo_total_hits(&self, ctx: &TenantContext) -> anyhow::Result<i64>;
+
+    /// Count folds by status for a tenant.
+    async fn fold_count_by_status(
+        &self,
+        ctx: &TenantContext,
+        status: crate::types::FoldStatus,
+    ) -> anyhow::Result<usize>;
+
+    /// Count temporal events for a tenant.
+    async fn temporal_count(&self, ctx: &TenantContext) -> anyhow::Result<usize>;
+
+    /// Count graph edges for a tenant (0 if graph backend not connected).
+    async fn edge_count(&self, ctx: &TenantContext) -> anyhow::Result<usize>;
+
     // --- Intention operations ---
 
     /// Store a new intention.
@@ -803,6 +821,30 @@ pub mod mock {
                 }
             }
             Ok(neighbors)
+        }
+
+        // --- Observability operations ---
+
+        async fn memo_total_hits(&self, _ctx: &TenantContext) -> anyhow::Result<i64> {
+            let memos = self.memos.lock().await;
+            Ok(memos.iter().map(|m| m.hit_count).sum())
+        }
+
+        async fn fold_count_by_status(
+            &self,
+            _ctx: &TenantContext,
+            status: FoldStatus,
+        ) -> anyhow::Result<usize> {
+            let folds = self.folds.lock().await;
+            Ok(folds.iter().filter(|f| f.status == status).count())
+        }
+
+        async fn temporal_count(&self, _ctx: &TenantContext) -> anyhow::Result<usize> {
+            Ok(self.temporal_events.lock().await.len())
+        }
+
+        async fn edge_count(&self, _ctx: &TenantContext) -> anyhow::Result<usize> {
+            Ok(self.edges.lock().await.len())
         }
 
         // --- Intention operations ---

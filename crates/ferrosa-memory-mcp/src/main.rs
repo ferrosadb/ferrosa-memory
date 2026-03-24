@@ -476,6 +476,38 @@ impl Storage for StorageBackend {
             Self::Mock(s) => s.audit_put(ctx, entry).await,
         }
     }
+
+    async fn memo_total_hits(&self, ctx: &TenantContext) -> anyhow::Result<i64> {
+        match self {
+            Self::Cql(s) => s.memo_total_hits(ctx).await,
+            Self::Mock(s) => s.memo_total_hits(ctx).await,
+        }
+    }
+
+    async fn fold_count_by_status(
+        &self,
+        ctx: &TenantContext,
+        status: ferrosa_core::types::FoldStatus,
+    ) -> anyhow::Result<usize> {
+        match self {
+            Self::Cql(s) => s.fold_count_by_status(ctx, status).await,
+            Self::Mock(s) => s.fold_count_by_status(ctx, status).await,
+        }
+    }
+
+    async fn temporal_count(&self, ctx: &TenantContext) -> anyhow::Result<usize> {
+        match self {
+            Self::Cql(s) => s.temporal_count(ctx).await,
+            Self::Mock(s) => s.temporal_count(ctx).await,
+        }
+    }
+
+    async fn edge_count(&self, ctx: &TenantContext) -> anyhow::Result<usize> {
+        match self {
+            Self::Cql(s) => s.edge_count(ctx).await,
+            Self::Mock(s) => s.edge_count(ctx).await,
+        }
+    }
 }
 
 #[tokio::main]
