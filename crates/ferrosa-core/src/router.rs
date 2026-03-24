@@ -211,4 +211,26 @@ mod tests {
         assert_eq!(default_k(&TaskComplexity::Linear), 5);
         assert_eq!(default_k(&TaskComplexity::Quadratic), 10);
     }
+
+    #[test]
+    fn related_to_routes_cypher_traversal() {
+        let decision = route(&RoutingContext {
+            query_text: "find things related to authentication",
+            has_entity_name: false,
+            has_content_hash: false,
+            task_complexity: TaskComplexity::Simple,
+        });
+        assert_eq!(decision.strategy, Strategy::CypherTraversal);
+    }
+
+    #[test]
+    fn entity_name_routes_phonetic() {
+        let decision = route(&RoutingContext {
+            query_text: "Alice",
+            has_entity_name: true,
+            has_content_hash: false,
+            task_complexity: TaskComplexity::Simple,
+        });
+        assert_eq!(decision.strategy, Strategy::Phonetic);
+    }
 }

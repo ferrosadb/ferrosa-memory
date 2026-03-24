@@ -234,6 +234,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "properties": {
                     "session_id": { "type": "string", "format": "uuid" },
                     "query_embedding": { "type": "array", "items": { "type": "number" } },
+                    "query": { "type": "string", "maxLength": 4096, "description": "Optional text query for routing optimization. If provided, the router selects optimal k and include_raw." },
                     "k": { "type": "integer", "minimum": 1, "maximum": 100 },
                     "include_raw": { "type": "boolean" }
                 },
@@ -934,11 +935,26 @@ async fn handle_retrieve_fold<S: crate::storage::Storage>(
 ) -> Result<Value, (i32, String)> {
     let session_id = require_uuid(&args, "session_id")?;
     let query_embedding = require_f32_array(&args, "query_embedding")?;
-    let k = args.get("k").and_then(|v| v.as_u64()).map(|v| v as usize);
+    let query_text = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+
+    // Use router for strategy selection
+    let decision = crate::router::route(&crate::router::RoutingContext {
+        query_text,
+        has_entity_name: false,
+        has_content_hash: false,
+        task_complexity: crate::router::TaskComplexity::Simple,
+    });
+
+    // User-provided k and include_raw override the router's suggestion
+    let k = args
+        .get("k")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .or(Some(decision.k));
     let include_raw = args
         .get("include_raw")
         .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+        .unwrap_or(decision.include_raw);
 
     let folds = crate::fold::retrieve_fold_context(
         storage,
@@ -1035,11 +1051,26 @@ async fn handle_retrieve_entities<S: crate::storage::Storage>(
     let session_id = require_uuid(&args, "session_id")?;
     let query = require_str(&args, "query")?;
     let embedding = optional_f32_array(&args, "embedding")?;
-    let strategy = args
-        .get("strategy")
-        .and_then(|v| v.as_str())
-        .unwrap_or("both");
-    let k = args.get("k").and_then(|v| v.as_u64()).map(|v| v as usize);
+
+    // Use router for strategy selection when user didn't specify
+    let user_strategy = args.get("strategy").and_then(|v| v.as_str());
+    let decision = crate::router::route(&crate::router::RoutingContext {
+        query_text: query,
+        has_entity_name: true, // entity retrieval implies entity context
+        has_content_hash: false,
+        task_complexity: crate::router::TaskComplexity::Simple,
+    });
+    let router_strategy = match decision.strategy {
+        crate::router::Strategy::Phonetic => "phonetic",
+        crate::router::Strategy::HnswAnn => "ann",
+        _ => "both",
+    };
+    let strategy = user_strategy.unwrap_or(router_strategy);
+    let k = args
+        .get("k")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .or(Some(decision.k));
 
     let entities = crate::entity::retrieve_entities(
         storage,
