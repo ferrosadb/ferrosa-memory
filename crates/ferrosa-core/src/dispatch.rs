@@ -271,7 +271,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     "strategy": { "type": "string", "enum": ["ann", "phonetic", "both"] },
                     "k": { "type": "integer", "minimum": 1, "maximum": 100 }
                 },
-                "required": ["session_id", "query"]
+                "required": ["query"]
             }),
         },
         // --- Feedback tool (Sprint 3) ---
@@ -317,7 +317,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     "embedding": { "type": "array", "items": { "type": "number" }, "description": "Optional embedding vector" },
                     "source_fold_id": { "type": "string", "format": "uuid", "description": "Fold that produced this content" }
                 },
-                "required": ["session_id", "content", "entity_type"]
+                "required": ["content", "entity_type"]
             }),
         },
         // --- Intention tools (prospective memory) ---
@@ -398,7 +398,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     "fact_text": { "type": "string", "maxLength": 4096, "description": "The fact to record" },
                     "confidence": { "type": "number", "minimum": 0, "maximum": 1, "description": "Confidence score (default: 1.0)" }
                 },
-                "required": ["session_id", "entity_id", "fact_text"]
+                "required": ["entity_id", "fact_text"]
             }),
         },
         ToolDef {
@@ -410,7 +410,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     "session_id": { "type": "string", "format": "uuid" },
                     "entity_id": { "type": "string", "format": "uuid" }
                 },
-                "required": ["session_id", "entity_id"]
+                "required": ["entity_id"]
             }),
         },
         // --- Graph traversal tool ---
@@ -450,7 +450,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Max results to return (default: 10)" }
                 },
-                "required": ["session_id", "query"]
+                "required": ["query"]
             }),
         },
         // --- Dream consolidation ---
@@ -487,7 +487,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     "session_id": { "type": "string", "format": "uuid" },
                     "entity_id": { "type": "string", "format": "uuid" }
                 },
-                "required": ["session_id", "entity_id"]
+                "required": ["entity_id"]
             }),
         },
         ToolDef {
@@ -499,7 +499,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     "session_id": { "type": "string", "format": "uuid" },
                     "entity_id": { "type": "string", "format": "uuid" }
                 },
-                "required": ["session_id", "entity_id"]
+                "required": ["entity_id"]
             }),
         },
         // --- Importance scoring ---
@@ -512,7 +512,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     "session_id": { "type": "string", "format": "uuid" },
                     "entity_id": { "type": "string", "format": "uuid" }
                 },
-                "required": ["session_id", "entity_id"]
+                "required": ["entity_id"]
             }),
         },
         // --- Memory chains ---
@@ -1255,7 +1255,7 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    let session_id = require_uuid(&args, "session_id")?;
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
     let content = require_str(&args, "content")?;
     let entity_type = require_str(&args, "entity_type")?;
     let embedding = optional_f32_array(&args, "embedding")?;
@@ -1446,7 +1446,7 @@ async fn handle_write_temporal_fact<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    let session_id = require_uuid(&args, "session_id")?;
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
     let entity_id = require_uuid(&args, "entity_id")?;
     let fact_text = require_str(&args, "fact_text")?;
     let confidence = args
@@ -1486,7 +1486,7 @@ async fn handle_get_temporal_chain<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
-    let _session_id = require_uuid(&args, "session_id")?;
+    let _session_id = optional_uuid(&args, "session_id")?;
     let entity_id = require_uuid(&args, "entity_id")?;
 
     let fact = crate::temporal::get_current_fact(storage, ctx, entity_id)
@@ -1579,7 +1579,7 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
-    let session_id = require_uuid(&args, "session_id")?;
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
     let query = require_str(&args, "query")?;
     let embedding = optional_f32_array(&args, "embedding")?;
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
