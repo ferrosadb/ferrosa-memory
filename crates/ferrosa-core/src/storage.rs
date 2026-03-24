@@ -249,6 +249,10 @@ pub trait Storage: Send + Sync {
         session_id: Uuid,
     ) -> anyhow::Result<Vec<(Uuid, Uuid, String)>>;
 
+    /// List all edges for a tenant (for viz snapshot when session is unknown).
+    async fn edge_list_all(&self, ctx: &TenantContext)
+    -> anyhow::Result<Vec<(Uuid, Uuid, String)>>;
+
     /// List all neighbors of an entity as (neighbor_id, edge_type) pairs.
     ///
     /// Searches mentioned_in, co_occurs_with, and supersedes edges where the
@@ -769,6 +773,17 @@ pub mod mock {
             Ok(edges
                 .iter()
                 .filter(|e| e.session_id == session_id)
+                .map(|e| (e.source, e.target, e.edge_type.clone()))
+                .collect())
+        }
+
+        async fn edge_list_all(
+            &self,
+            _ctx: &TenantContext,
+        ) -> anyhow::Result<Vec<(Uuid, Uuid, String)>> {
+            let edges = self.edges.lock().await;
+            Ok(edges
+                .iter()
                 .map(|e| (e.source, e.target, e.edge_type.clone()))
                 .collect())
         }

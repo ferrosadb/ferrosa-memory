@@ -1437,6 +1437,51 @@ impl Storage for CqlStorage {
         Ok(edges)
     }
 
+    #[allow(clippy::result_large_err)]
+    async fn edge_list_all(
+        &self,
+        ctx: &TenantContext,
+    ) -> anyhow::Result<Vec<(Uuid, Uuid, String)>> {
+        let mut edges = Vec::new();
+
+        let queries: &[(&str, &str, &str, &str)] = &[
+            ("co_occurs_with", "entity_a", "entity_b", "CO_OCCURS"),
+            ("mentioned_in", "entity_id", "fold_id", "MENTIONED_IN"),
+            (
+                "folded_into",
+                "source_fold_id",
+                "target_fold_id",
+                "FOLDED_INTO",
+            ),
+            ("supersedes", "new_event_id", "old_event_id", "SUPERSEDES"),
+        ];
+
+        for &(table, src_col, tgt_col, edge_type) in queries {
+            let query = format!(
+                "SELECT {src_col}, {tgt_col} FROM {}.{table} WHERE tenant_id = ? ALLOW FILTERING",
+                self.keyspace
+            );
+            if let Ok(frame) = self
+                .session()
+                .query_with_values(&query, query_values!(ctx.tenant_id))
+                .await
+                && let Ok(body) = frame.response_body()
+                && let Some(rows) = body.into_rows()
+            {
+                for row in rows {
+                    if let (Ok(a), Ok(b)) = (
+                        row.r_by_name::<Uuid>(src_col),
+                        row.r_by_name::<Uuid>(tgt_col),
+                    ) {
+                        edges.push((a, b, edge_type.into()));
+                    }
+                }
+            }
+        }
+
+        Ok(edges)
+    }
+
     async fn edge_list_for_entity(
         &self,
         ctx: &TenantContext,

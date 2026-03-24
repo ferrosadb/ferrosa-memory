@@ -404,6 +404,16 @@ impl Storage for StorageBackend {
         }
     }
 
+    async fn edge_list_all(
+        &self,
+        ctx: &TenantContext,
+    ) -> anyhow::Result<Vec<(uuid::Uuid, uuid::Uuid, String)>> {
+        match self {
+            Self::Cql(s) => s.edge_list_all(ctx).await,
+            Self::Mock(s) => s.edge_list_all(ctx).await,
+        }
+    }
+
     async fn edge_list_for_entity(
         &self,
         ctx: &TenantContext,

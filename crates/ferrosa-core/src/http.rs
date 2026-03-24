@@ -507,7 +507,13 @@ async fn build_snapshot<S: Storage>(
         }
     };
 
-    let edges = match storage.edge_list_session(ctx, session_id).await {
+    let edges_result = if session_id.is_nil() {
+        storage.edge_list_all(ctx).await
+    } else {
+        storage.edge_list_session(ctx, session_id).await
+    };
+
+    let edges = match edges_result {
         Ok(raw_edges) => raw_edges
             .into_iter()
             .map(|(src, tgt, etype)| VizEdge {
