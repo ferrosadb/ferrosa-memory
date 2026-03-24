@@ -10,6 +10,7 @@
 //! - `GET /health` — Health check
 //! - `GET /viz` — Memory graph visualizer HTML (served on viz port)
 //! - `GET /viz/ws` — WebSocket for live graph events (served on viz port)
+//! - `GET /subscribe/anomalies` — SSE stream of anomaly alerts (served on viz port)
 //!
 //! ## Security
 //!
@@ -355,7 +356,8 @@ pub async fn serve_viz<S: Storage + 'static>(
 
 /// Handle a single viz HTTP connection.
 ///
-/// Routes `/viz` to static HTML and `/viz/ws` to WebSocket upgrade.
+/// Routes `/viz` to static HTML, `/viz/ws` to WebSocket upgrade, and
+/// `/subscribe/anomalies` to an SSE stream of anomaly alerts (Sprint 4.9).
 async fn handle_viz_connection(
     mut stream: tokio::net::TcpStream,
     event_bus: Arc<EventBus>,
@@ -379,6 +381,9 @@ async fn handle_viz_connection(
                 VIZ_HTML
             );
             stream.write_all(response.as_bytes()).await?;
+        }
+        ("GET", "/subscribe/anomalies") => {
+            handle_anomaly_sse(stream, event_bus).await?;
         }
         ("GET", "/viz/ws") => {
             // Validate WebSocket upgrade headers
@@ -481,6 +486,57 @@ async fn handle_viz_ws(
             }
         }
     }
+}
+
+/// Handle an SSE connection for anomaly alert subscriptions (Sprint 4.9).
+///
+/// Sends HTTP headers for Server-Sent Events, then subscribes to the event
+/// bus and streams only `AnomalyDetected` events as SSE `data:` lines.
+/// Runs until the client disconnects or the event bus is dropped.
+async fn handle_anomaly_sse(
+    mut stream: tokio::net::TcpStream,
+    event_bus: Arc<EventBus>,
+) -> anyhow::Result<()> {
+    // Send SSE response headers
+    let headers = "HTTP/1.1 200 OK\r\n\
+                   Content-Type: text/event-stream\r\n\
+                   Cache-Control: no-cache\r\n\
+                   Connection: keep-alive\r\n\
+                   \r\n";
+    stream.write_all(headers.as_bytes()).await?;
+
+    let mut rx = event_bus.subscribe();
+    tracing::info!("anomaly SSE client connected");
+
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                // Only forward AnomalyDetected events
+                if !matches!(event, VizEvent::AnomalyDetected { .. }) {
+                    continue;
+                }
+                let json = match serde_json::to_string(&event) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        tracing::warn!("anomaly SSE: failed to serialize event: {e}");
+                        continue;
+                    }
+                };
+                let sse_frame = format!("event: anomaly\ndata: {json}\n\n");
+                if stream.write_all(sse_frame.as_bytes()).await.is_err() {
+                    break; // Client disconnected
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!("anomaly SSE: client lagged by {n} events");
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                break; // EventBus dropped
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Build a `VizEvent::Snapshot` from current storage state.
@@ -794,5 +850,17 @@ mod tests {
         assert!(config_tls.require_tls);
         assert_eq!(config_tls.cert_path.as_deref(), Some("/etc/ssl/cert.pem"));
         assert_eq!(config_tls.key_path.as_deref(), Some("/etc/ssl/key.pem"));
+    }
+
+    #[test]
+    fn parse_anomaly_subscribe_request() {
+        let raw = "GET /subscribe/anomalies HTTP/1.1\r\nHost: localhost:8766\r\nAccept: text/event-stream\r\n\r\n";
+        let (method, path, headers, _body) = parse_http_request(raw).unwrap();
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/subscribe/anomalies");
+        let has_accept = headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("accept") && v.contains("text/event-stream"));
+        assert!(has_accept, "should have SSE accept header");
     }
 }

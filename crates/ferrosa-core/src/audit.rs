@@ -117,6 +117,7 @@ mod tests {
             anomaly_detection_enabled: true,
             anomaly_sigma_threshold: 3.0,
             audit_log_enabled: true,
+            anomaly_alerts_enabled: true,
         };
         assert!(!check_anomaly(5, 3.0, 1.0, &config, None));
     }
@@ -127,6 +128,7 @@ mod tests {
             anomaly_detection_enabled: true,
             anomaly_sigma_threshold: 3.0,
             audit_log_enabled: true,
+            anomaly_alerts_enabled: true,
         };
         assert!(check_anomaly(10, 3.0, 1.0, &config, None));
     }
@@ -137,6 +139,7 @@ mod tests {
             anomaly_detection_enabled: false,
             anomaly_sigma_threshold: 3.0,
             audit_log_enabled: true,
+            anomaly_alerts_enabled: true,
         };
         assert!(!check_anomaly(100, 3.0, 1.0, &config, None));
     }

@@ -1104,18 +1104,27 @@ async fn handle_retrieve_entities<S: crate::storage::Storage>(
         tracker.record(entity.entity_id);
         co_access.record(entity.entity_id);
         let count = tracker.count(&entity.entity_id);
-        if crate::audit::check_anomaly(
-            count,
-            tracker.mean(),
-            tracker.stddev(),
-            &security_config,
-            None,
-        ) {
+        let mean = tracker.mean();
+        let stddev = tracker.stddev();
+        if crate::audit::check_anomaly(count, mean, stddev, &security_config, None) {
             tracing::warn!(
                 entity_id = %entity.entity_id,
                 count,
                 "anomalous retrieval frequency"
             );
+            // Emit anomaly alert via event bus (Sprint 4.9)
+            if security_config.anomaly_alerts_enabled {
+                session
+                    .event_bus
+                    .emit(crate::viz::VizEvent::AnomalyDetected {
+                        entity_id: entity.entity_id.to_string(),
+                        entity_name: entity.entity_name.clone(),
+                        retrieval_count: count,
+                        session_mean: mean,
+                        session_stddev: stddev,
+                        sigma_threshold: security_config.anomaly_sigma_threshold,
+                    });
+            }
         }
     }
 
@@ -2677,5 +2686,81 @@ mod speculative_tests {
             .unwrap();
         let result = unwrap_tool_result(result);
         assert!(result["predictions"].is_array());
+    }
+
+    #[tokio::test]
+    async fn anomaly_emits_event_on_bus() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+
+        // Subscribe to event bus before triggering anomaly
+        let mut rx = session.event_bus.subscribe();
+
+        // Create 20 distinct entities to establish a wide baseline
+        for i in 0..20 {
+            let params = serde_json::json!({
+                "name": "upsert_entity",
+                "arguments": {
+                    "session_id": sid.to_string(),
+                    "entity_name": format!("Baseline{i:02}"),
+                    "entity_type": "concept",
+                    "context_snippet": "baseline entity",
+                    "confidence": 0.9
+                }
+            });
+            dispatch("tools/call", params, &store, &ctx, &session)
+                .await
+                .unwrap();
+        }
+
+        // Retrieve all baseline entities once each to seed tracker
+        for i in 0..20 {
+            let params = serde_json::json!({
+                "name": "retrieve_entities",
+                "arguments": {
+                    "session_id": sid.to_string(),
+                    "query": format!("Baseline{i:02}"),
+                    "strategy": "phonetic"
+                }
+            });
+            dispatch("tools/call", params, &store, &ctx, &session)
+                .await
+                .unwrap();
+        }
+
+        // Now retrieve one entity many more times to create a clear outlier.
+        // With 20 entities at count 1 and outlier at count N, mean ~= N/21,
+        // stddev driven mostly by the outlier. We need count > mean + 3*stddev.
+        // At count=50 with 20 baselines at 1: mean=50+20/21=3.33, variance high
+        // enough that the outlier itself will exceed 3-sigma once the distribution
+        // has enough data points at the baseline.
+        let outlier_params = serde_json::json!({
+            "name": "retrieve_entities",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "query": "Baseline00",
+                "strategy": "phonetic"
+            }
+        });
+        for _ in 0..60 {
+            dispatch("tools/call", outlier_params.clone(), &store, &ctx, &session)
+                .await
+                .unwrap();
+        }
+
+        // Drain events and check for at least one AnomalyDetected
+        let mut found_anomaly = false;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, crate::viz::VizEvent::AnomalyDetected { .. }) {
+                found_anomaly = true;
+                let json = serde_json::to_string(&event).unwrap();
+                assert!(json.contains("AnomalyDetected"));
+                assert!(json.contains("Baseline00"));
+                break;
+            }
+        }
+        assert!(found_anomaly, "expected AnomalyDetected event on bus");
     }
 }

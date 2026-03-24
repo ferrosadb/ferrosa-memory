@@ -185,6 +185,8 @@ pub struct SecurityConfig {
     pub anomaly_detection_enabled: bool,
     #[serde(default = "default_sigma")]
     pub anomaly_sigma_threshold: f64,
+    #[serde(default = "default_true")]
+    pub anomaly_alerts_enabled: bool,
 }
 
 impl Default for SecurityConfig {
@@ -193,6 +195,7 @@ impl Default for SecurityConfig {
             audit_log_enabled: true,
             anomaly_detection_enabled: true,
             anomaly_sigma_threshold: default_sigma(),
+            anomaly_alerts_enabled: true,
         }
     }
 }
@@ -392,6 +395,7 @@ dimensions = 1536
 audit_log_enabled = false
 anomaly_detection_enabled = false
 anomaly_sigma_threshold = 2.5
+anomaly_alerts_enabled = false
 
 [routing]
 guideline_version = "v2"
@@ -407,6 +411,7 @@ feedback_export_cron = "0 3 * * *"
         assert_eq!(config.embeddings.provider, "openai");
         assert_eq!(config.embeddings.dimensions, 1536);
         assert!(!config.security.audit_log_enabled);
+        assert!(!config.security.anomaly_alerts_enabled);
         assert_eq!(config.routing.guideline_version, "v2");
     }
 

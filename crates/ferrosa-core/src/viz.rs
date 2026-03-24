@@ -64,6 +64,15 @@ pub enum VizEvent {
         summary: String,
         entity_count: usize,
     },
+    /// Anomaly detected on entity retrieval frequency (STRIDE T1).
+    AnomalyDetected {
+        entity_id: String,
+        entity_name: String,
+        retrieval_count: usize,
+        session_mean: f64,
+        session_stddev: f64,
+        sigma_threshold: f64,
+    },
 }
 
 /// Broadcast channel for visualization events.
@@ -220,6 +229,43 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains(r#""type":"FactUpdated"#));
         assert!(json.contains("old-event-id"));
+    }
+
+    #[test]
+    fn viz_event_anomaly_detected_serializes() {
+        let event = VizEvent::AnomalyDetected {
+            entity_id: "e1".into(),
+            entity_name: "SuspiciousEntity".into(),
+            retrieval_count: 25,
+            session_mean: 5.0,
+            session_stddev: 2.0,
+            sigma_threshold: 3.0,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"AnomalyDetected"#));
+        assert!(json.contains("SuspiciousEntity"));
+        assert!(json.contains("25"));
+        assert!(json.contains("5.0"));
+    }
+
+    #[tokio::test]
+    async fn event_bus_anomaly_received_by_subscriber() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+
+        bus.emit(VizEvent::AnomalyDetected {
+            entity_id: "e42".into(),
+            entity_name: "Outlier".into(),
+            retrieval_count: 50,
+            session_mean: 10.0,
+            session_stddev: 3.0,
+            sigma_threshold: 3.0,
+        });
+
+        let event = rx.recv().await.expect("should receive anomaly event");
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("AnomalyDetected"));
+        assert!(json.contains("Outlier"));
     }
 
     #[test]

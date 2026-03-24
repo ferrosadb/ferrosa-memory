@@ -1,7 +1,7 @@
 # Project Plan — ferrosa-memory-mcp
 
 > Last updated: 2026-03-23
-> Status: Sprints 1-3 complete, Sprint 4 nearly complete (10/11), vector column and graph edge blockers resolved
+> Status: Sprints 1-4 complete, vector column and graph edge blockers resolved
 
 ## Overview
 
@@ -14,7 +14,7 @@
 | Sprint 1 | **COMPLETE** | 14/14 tasks done |
 | Sprint 2 | **COMPLETE** | 8/8 tasks done |
 | Sprint 3 | **COMPLETE** | 10/10 tasks done |
-| Sprint 4 | **NEARLY COMPLETE** | 10/11 tasks done — SUBSCRIBE integration remains |
+| Sprint 4 | **COMPLETE** | 11/11 tasks done |
 
 ---
 
@@ -93,7 +93,7 @@
 
 **Goal:** SRLM-inspired routing, HTTP+SSE transport, and all security mitigations from threat model.
 
-**Status: NEARLY COMPLETE** — routing layer, HTTP+TLS, batch job, session deletion, quotas, security hardening, and integration tests all done. SUBSCRIBE integration remains.
+**Status: COMPLETE** — routing layer, HTTP+TLS, batch job, session deletion, quotas, security hardening, integration tests, and anomaly alert subscription all done.
 
 | # | Task | Size | Source | Success Criteria | Tests |
 |---|------|------|--------|-----------------|-------|
@@ -109,10 +109,7 @@
 | 4.10 | Security hardening sweep: verify all mitigations from threat model | M | STRIDE all | Checklist verification of all Critical and High threat mitigations. | Run TC01-TC24 as regression suite |
 | 4.11 | Integration test: full routing + feedback + guideline refresh cycle | L | spec Phase 4 | Query -> route -> retrieve -> record outcome -> batch job -> updated routing. Full loop. | End-to-end with Ferrosa |
 
-**Sprint 4 exit criteria:** HTTP+SSE transport functional with TLS. Router selects strategies with >80% accuracy on test workload. All Critical/High threat mitigations verified. Batch job produces routing guidelines. **PARTIALLY MET** — all tasks complete except SUBSCRIBE integration (4.9), which is blocked on Ferrosa SUBSCRIBE support.
-
-**Remaining:**
-- 4.9: SUBSCRIBE integration for real-time anomaly alerts (blocked on Ferrosa SUBSCRIBE support)
+**Sprint 4 exit criteria:** HTTP+SSE transport functional with TLS. Router selects strategies with >80% accuracy on test workload. All Critical/High threat mitigations verified. Batch job produces routing guidelines. **MET** — all tasks complete. SUBSCRIBE integration (4.9) implemented via EventBus + SSE endpoint (Ferrosa native SUBSCRIBE deferred to backlog).
 
 ---
 

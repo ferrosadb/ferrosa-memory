@@ -36,6 +36,7 @@ http_url = "http://localhost:17474"
 # audit_log_enabled = true
 # anomaly_detection_enabled = true
 # anomaly_sigma_threshold = 3.0
+# anomaly_alerts_enabled = true    # emit AnomalyDetected events via EventBus/SSE
 
 [routing]
 # guideline_version = "v1"
