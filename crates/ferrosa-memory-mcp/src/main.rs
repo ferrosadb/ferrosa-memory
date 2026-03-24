@@ -373,10 +373,22 @@ impl Storage for StorageBackend {
         a: uuid::Uuid,
         b: uuid::Uuid,
         session: uuid::Uuid,
+        strength: f32,
     ) -> anyhow::Result<()> {
         match self {
-            Self::Cql(s) => s.edge_co_occurs(ctx, a, b, session).await,
-            Self::Mock(s) => s.edge_co_occurs(ctx, a, b, session).await,
+            Self::Cql(s) => s.edge_co_occurs(ctx, a, b, session, strength).await,
+            Self::Mock(s) => s.edge_co_occurs(ctx, a, b, session, strength).await,
+        }
+    }
+
+    async fn edge_prune_stale(
+        &self,
+        ctx: &TenantContext,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<usize> {
+        match self {
+            Self::Cql(s) => s.edge_prune_stale(ctx, cutoff).await,
+            Self::Mock(s) => s.edge_prune_stale(ctx, cutoff).await,
         }
     }
 

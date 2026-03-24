@@ -221,14 +221,23 @@ pub trait Storage: Send + Sync {
         session_id: Uuid,
     ) -> anyhow::Result<()>;
 
-    /// Create a CO_OCCURS_WITH edge (entity <-> entity).
+    /// Create or reinforce a CO_OCCURS_WITH edge (entity <-> entity).
+    /// `strength` is the similarity score (0.0-1.0).
     async fn edge_co_occurs(
         &self,
         ctx: &TenantContext,
         entity_a: Uuid,
         entity_b: Uuid,
         session_id: Uuid,
+        strength: f32,
     ) -> anyhow::Result<()>;
+
+    /// Delete CO_OCCURS edges not reinforced since `cutoff`.
+    async fn edge_prune_stale(
+        &self,
+        ctx: &TenantContext,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<usize>;
 
     /// Create a SUPERSEDES edge (new fact -> old fact).
     async fn edge_supersedes(
@@ -754,6 +763,7 @@ pub mod mock {
             a: Uuid,
             b: Uuid,
             session: Uuid,
+            _strength: f32,
         ) -> anyhow::Result<()> {
             self.edges.lock().await.push(MockEdge {
                 source: a,
@@ -762,6 +772,14 @@ pub mod mock {
                 session_id: session,
             });
             Ok(())
+        }
+
+        async fn edge_prune_stale(
+            &self,
+            _ctx: &TenantContext,
+            _cutoff: chrono::DateTime<chrono::Utc>,
+        ) -> anyhow::Result<usize> {
+            Ok(0)
         }
 
         async fn edge_supersedes(

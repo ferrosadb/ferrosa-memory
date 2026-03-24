@@ -282,8 +282,8 @@ impl CqlStorage {
             edge_co_occurs: session
                 .prepare(format!(
                     "INSERT INTO {ks}.co_occurs_with \
-                     (entity_a, entity_b, session_id, tenant_id, created_at) \
-                     VALUES (?, ?, ?, ?, ?)"
+                     (entity_a, entity_b, session_id, tenant_id, created_at, strength, last_reinforced) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?)"
                 ))
                 .await?,
             edge_supersedes: session
@@ -1398,7 +1398,9 @@ impl Storage for CqlStorage {
         entity_a: Uuid,
         entity_b: Uuid,
         session_id: Uuid,
+        strength: f32,
     ) -> anyhow::Result<()> {
+        let now = chrono::Utc::now().naive_utc();
         self.session
             .exec_with_values(
                 &self.stmts.edge_co_occurs,
@@ -1407,11 +1409,13 @@ impl Storage for CqlStorage {
                     entity_b,
                     session_id,
                     ctx.tenant_id,
-                    chrono::Utc::now().naive_utc()
+                    now,
+                    strength,
+                    now
                 ),
             )
             .await?;
-        tracing::debug!(%entity_a, %entity_b, "CO_OCCURS_WITH edge created");
+        tracing::debug!(%entity_a, %entity_b, %strength, "CO_OCCURS_WITH edge created/reinforced");
         Ok(())
     }
 
@@ -1436,6 +1440,49 @@ impl Storage for CqlStorage {
             .await?;
         tracing::debug!(%new_event_id, %old_event_id, "SUPERSEDES edge created");
         Ok(())
+    }
+
+    async fn edge_prune_stale(
+        &self,
+        ctx: &TenantContext,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<usize> {
+        // Read all CO_OCCURS edges for tenant, delete those with
+        // last_reinforced < cutoff (or NULL last_reinforced).
+        let query = format!(
+            "SELECT entity_a, entity_b, last_reinforced \
+             FROM {}.co_occurs_with WHERE tenant_id = ? ALLOW FILTERING",
+            self.keyspace
+        );
+        let envelope = self
+            .session
+            .query_with_values(query, query_values!(ctx.tenant_id))
+            .await?;
+        let rows = envelope.response_body()?.into_rows().unwrap_or_default();
+
+        let cutoff_naive = cutoff.naive_utc();
+        let mut pruned = 0;
+        for row in &rows {
+            let stale = match row.r_by_name::<chrono::NaiveDateTime>("last_reinforced") {
+                Ok(ts) => ts < cutoff_naive,
+                Err(_) => true, // NULL last_reinforced = never reinforced
+            };
+            if stale {
+                let a: Uuid = row.r_by_name("entity_a")?;
+                let b: Uuid = row.r_by_name("entity_b")?;
+                let del = format!(
+                    "DELETE FROM {}.co_occurs_with WHERE entity_a = ? AND entity_b = ?",
+                    self.keyspace
+                );
+                self.session
+                    .query_with_values(del, query_values!(a, b))
+                    .await?;
+                pruned += 1;
+            }
+        }
+
+        tracing::info!(pruned, total = rows.len(), "edge pruning complete");
+        Ok(pruned)
     }
 
     async fn edge_list_session(

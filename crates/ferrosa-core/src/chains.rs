@@ -150,7 +150,10 @@ mod tests {
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
 
-        store.edge_co_occurs(&ctx, a, b, session).await.unwrap();
+        store
+            .edge_co_occurs(&ctx, a, b, session, 1.0)
+            .await
+            .unwrap();
 
         let chain = find_chain(&store, &ctx, a, b, 5).await.unwrap();
         let chain = chain.expect("should find direct path");
@@ -171,8 +174,14 @@ mod tests {
         let c = Uuid::new_v4();
 
         // a -> b -> c (no direct a -> c edge)
-        store.edge_co_occurs(&ctx, a, b, session).await.unwrap();
-        store.edge_co_occurs(&ctx, b, c, session).await.unwrap();
+        store
+            .edge_co_occurs(&ctx, a, b, session, 1.0)
+            .await
+            .unwrap();
+        store
+            .edge_co_occurs(&ctx, b, c, session, 1.0)
+            .await
+            .unwrap();
 
         let chain = find_chain(&store, &ctx, a, c, 5).await.unwrap();
         let chain = chain.expect("should find 2-hop path");
@@ -206,8 +215,14 @@ mod tests {
         let c = Uuid::new_v4();
 
         // a -> b -> c requires 2 hops, but max_hops = 1
-        store.edge_co_occurs(&ctx, a, b, session).await.unwrap();
-        store.edge_co_occurs(&ctx, b, c, session).await.unwrap();
+        store
+            .edge_co_occurs(&ctx, a, b, session, 1.0)
+            .await
+            .unwrap();
+        store
+            .edge_co_occurs(&ctx, b, c, session, 1.0)
+            .await
+            .unwrap();
 
         let chain = find_chain(&store, &ctx, a, c, 1).await.unwrap();
         assert!(chain.is_none(), "should not find path beyond max_hops");

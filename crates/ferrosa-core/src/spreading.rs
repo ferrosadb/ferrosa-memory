@@ -111,11 +111,11 @@ mod tests {
         // seed --co_occurs_with--> neighbor_a
         // seed --co_occurs_with--> neighbor_b
         store
-            .edge_co_occurs(&ctx, seed, neighbor_a, session)
+            .edge_co_occurs(&ctx, seed, neighbor_a, session, 1.0)
             .await
             .unwrap();
         store
-            .edge_co_occurs(&ctx, seed, neighbor_b, session)
+            .edge_co_occurs(&ctx, seed, neighbor_b, session, 1.0)
             .await
             .unwrap();
 
@@ -145,11 +145,11 @@ mod tests {
 
         // seed --CO_OCCURS--> middle --CO_OCCURS--> leaf
         store
-            .edge_co_occurs(&ctx, seed, middle, session)
+            .edge_co_occurs(&ctx, seed, middle, session, 1.0)
             .await
             .unwrap();
         store
-            .edge_co_occurs(&ctx, middle, leaf, session)
+            .edge_co_occurs(&ctx, middle, leaf, session, 1.0)
             .await
             .unwrap();
 
@@ -179,7 +179,7 @@ mod tests {
         let neighbor = Uuid::new_v4();
 
         store
-            .edge_co_occurs(&ctx, seed, neighbor, session)
+            .edge_co_occurs(&ctx, seed, neighbor, session, 1.0)
             .await
             .unwrap();
 
@@ -200,7 +200,7 @@ mod tests {
         for _ in 0..5 {
             let neighbor = Uuid::new_v4();
             store
-                .edge_co_occurs(&ctx, seed, neighbor, session)
+                .edge_co_occurs(&ctx, seed, neighbor, session, 1.0)
                 .await
                 .unwrap();
         }
@@ -262,15 +262,15 @@ mod tests {
         // seed --CO_OCCURS--> neighbor_b
         // neighbor_a --CO_OCCURS--> neighbor_b (gives b extra activation)
         store
-            .edge_co_occurs(&ctx, seed, neighbor_a, session)
+            .edge_co_occurs(&ctx, seed, neighbor_a, session, 1.0)
             .await
             .unwrap();
         store
-            .edge_co_occurs(&ctx, seed, neighbor_b, session)
+            .edge_co_occurs(&ctx, seed, neighbor_b, session, 1.0)
             .await
             .unwrap();
         store
-            .edge_co_occurs(&ctx, neighbor_a, neighbor_b, session)
+            .edge_co_occurs(&ctx, neighbor_a, neighbor_b, session, 1.0)
             .await
             .unwrap();
 

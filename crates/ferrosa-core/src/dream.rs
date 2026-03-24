@@ -59,7 +59,9 @@ pub async fn run_consolidation(
                 if sim >= 0.05 {
                     let a = group[i].entity_id;
                     let b = group[j].entity_id;
-                    let _ = storage.edge_co_occurs(ctx, a, b, session_id).await;
+                    let _ = storage
+                        .edge_co_occurs(ctx, a, b, session_id, sim as f32)
+                        .await;
                     edges.push((a, b));
                     connections_created += 1;
                 }
