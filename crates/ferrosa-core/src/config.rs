@@ -130,6 +130,8 @@ pub struct MemoryConfig {
     pub confidence_gate: f64,
     #[serde(default = "default_max_memo")]
     pub max_memo_results: u32,
+    #[serde(default = "default_max_entities")]
+    pub max_entities: u32,
 }
 
 impl Default for MemoryConfig {
@@ -141,6 +143,7 @@ impl Default for MemoryConfig {
             compression_threshold_tokens: default_compression_threshold(),
             confidence_gate: default_confidence_gate(),
             max_memo_results: default_max_memo(),
+            max_entities: default_max_entities(),
         }
     }
 }
@@ -242,6 +245,9 @@ fn default_confidence_gate() -> f64 {
 }
 fn default_max_memo() -> u32 {
     50
+}
+fn default_max_entities() -> u32 {
+    10000
 }
 fn default_provider() -> String {
     "ollama".into()

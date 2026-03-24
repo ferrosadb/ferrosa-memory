@@ -92,6 +92,24 @@ pub async fn store_memo_result(
     ctx: &TenantContext,
     params: &StoreMemoParams<'_>,
 ) -> anyhow::Result<MemoStoreResult> {
+    store_memo_result_with_config(storage, ctx, params, None).await
+}
+
+/// Store a sub-call result with optional quota enforcement via config.
+///
+/// When `config` is `Some`, enforces per-tenant memo count limits (FMEA D1).
+pub async fn store_memo_result_with_config(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    params: &StoreMemoParams<'_>,
+    config: Option<&crate::config::MemoryConfig>,
+) -> anyhow::Result<MemoStoreResult> {
+    // Per-tenant memo quota enforcement (FMEA D1)
+    if let Some(cfg) = config {
+        let count = storage.memo_count(ctx).await?;
+        crate::quota::check_memo_quota(count, cfg)?;
+    }
+
     let hash = content_hash(params.prompt, params.context_slice);
     let now = chrono::Utc::now();
     let expires = params
@@ -237,6 +255,83 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.hit, "different model version should miss");
+    }
+
+    #[tokio::test]
+    async fn store_memo_quota_exceeded() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+
+        // Config with max_memo_results = 2
+        let mut config = crate::config::MemoryConfig::default();
+        config.max_memo_results = 2;
+
+        // Store 2 memos (at limit)
+        for i in 0..2 {
+            let result = store_memo_result_with_config(
+                &store,
+                &ctx,
+                &StoreMemoParams {
+                    prompt: &format!("prompt_{i}"),
+                    context_slice: "ctx",
+                    model_version: "v1",
+                    result: "answer",
+                    embedding: None,
+                    ttl_days: None,
+                },
+                Some(&config),
+            )
+            .await;
+            assert!(result.is_ok(), "memo {i} should succeed under quota");
+        }
+
+        // 3rd should fail with QuotaExceeded
+        let err = store_memo_result_with_config(
+            &store,
+            &ctx,
+            &StoreMemoParams {
+                prompt: "prompt_overflow",
+                context_slice: "ctx",
+                model_version: "v1",
+                result: "answer",
+                embedding: None,
+                ttl_days: None,
+            },
+            Some(&config),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.downcast_ref::<crate::quota::QuotaExceeded>().is_some(),
+            "expected QuotaExceeded error, got: {err}"
+        );
+        assert!(err.to_string().contains("quota exceeded"));
+    }
+
+    #[tokio::test]
+    async fn store_memo_no_config_skips_quota() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+
+        // Without config, quota check is skipped — stores succeed regardless
+        for i in 0..5 {
+            let result = store_memo_result_with_config(
+                &store,
+                &ctx,
+                &StoreMemoParams {
+                    prompt: &format!("prompt_{i}"),
+                    context_slice: "ctx",
+                    model_version: "v1",
+                    result: "answer",
+                    embedding: None,
+                    ttl_days: None,
+                },
+                None,
+            )
+            .await;
+            assert!(result.is_ok(), "memo {i} should succeed without config");
+        }
     }
 
     #[tokio::test]

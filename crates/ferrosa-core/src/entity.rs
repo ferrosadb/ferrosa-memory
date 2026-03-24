@@ -50,6 +50,39 @@ pub async fn upsert_entity(
     source_fold_id: Option<Uuid>,
     confidence: Option<f64>,
 ) -> anyhow::Result<UpsertEntityResult> {
+    upsert_entity_with_limit(
+        storage,
+        ctx,
+        session_id,
+        entity_name,
+        entity_type,
+        context_snippet,
+        embedding,
+        source_fold_id,
+        confidence,
+        DEFAULT_MAX_ENTITIES_PER_SESSION,
+    )
+    .await
+}
+
+/// Upsert an entity with phonetic deduplication and a configurable entity limit.
+///
+/// Checks phonetic match first. If found, returns existing entity_id.
+/// If not found, creates a new entity. Rejects if confidence < gate or
+/// session entity count exceeds limit (FMEA D1 quota enforcement).
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_entity_with_limit(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    session_id: Uuid,
+    entity_name: &str,
+    entity_type: &str,
+    context_snippet: &str,
+    embedding: Option<Vec<f32>>,
+    source_fold_id: Option<Uuid>,
+    confidence: Option<f64>,
+    max_entities: usize,
+) -> anyhow::Result<UpsertEntityResult> {
     let confidence = confidence.unwrap_or(1.0);
     tracing::debug!(entity_name, entity_type, confidence, "upsert_entity");
 
@@ -63,16 +96,9 @@ pub async fn upsert_entity(
         anyhow::bail!("confidence {confidence} below gate {DEFAULT_CONFIDENCE_GATE}");
     }
 
-    // Rate limit: check entity count (FMEA F20)
+    // Per-tenant entity quota enforcement (FMEA D1)
     let count = storage.entity_count(ctx, session_id).await?;
-    if count >= DEFAULT_MAX_ENTITIES_PER_SESSION {
-        tracing::warn!(
-            count,
-            limit = DEFAULT_MAX_ENTITIES_PER_SESSION,
-            "entity rejected: rate limit"
-        );
-        anyhow::bail!("entity count {count} exceeds limit {DEFAULT_MAX_ENTITIES_PER_SESSION}");
-    }
+    crate::quota::check_quota(count, max_entities)?;
 
     // Check for phonetic match (deduplication)
     if let Some(existing) = storage
@@ -477,5 +503,69 @@ mod tests {
         let err = demote_memory(&store, &ctx, sid, bogus_id).await;
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn upsert_succeeds_under_configurable_quota() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let sid = Uuid::new_v4();
+
+        // With a limit of 5, creating 5 entities should succeed
+        for i in 0..5 {
+            let result = upsert_entity_with_limit(
+                &store,
+                &ctx,
+                sid,
+                &format!("entity_{i}"),
+                "thing",
+                "ctx",
+                None,
+                None,
+                None,
+                5,
+            )
+            .await;
+            assert!(result.is_ok(), "entity {i} should succeed under quota");
+        }
+    }
+
+    #[tokio::test]
+    async fn upsert_returns_quota_exceeded_at_limit() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let sid = Uuid::new_v4();
+
+        // Fill to the configurable limit of 3
+        for i in 0..3 {
+            upsert_entity_with_limit(
+                &store,
+                &ctx,
+                sid,
+                &format!("entity_{i}"),
+                "thing",
+                "ctx",
+                None,
+                None,
+                None,
+                3,
+            )
+            .await
+            .unwrap();
+        }
+
+        // The 4th should fail with QuotaExceeded
+        let err = upsert_entity_with_limit(
+            &store, &ctx, sid, "one_more", "thing", "ctx", None, None, None, 3,
+        )
+        .await
+        .unwrap_err();
+
+        // Verify it's a QuotaExceeded error (downcastable)
+        assert!(
+            err.downcast_ref::<crate::quota::QuotaExceeded>().is_some(),
+            "expected QuotaExceeded error, got: {err}"
+        );
+        assert!(err.to_string().contains("quota exceeded"));
     }
 }

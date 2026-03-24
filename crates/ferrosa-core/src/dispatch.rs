@@ -643,7 +643,7 @@ async fn handle_store_memo<S: crate::storage::Storage>(
 
     let result = crate::memo::store_memo_result(storage, ctx, &params)
         .await
-        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+        .map_err(map_quota_error)?;
 
     // Audit log (best-effort, no session_id for memos)
     let content_hash = result.content_hash.clone();
@@ -869,7 +869,7 @@ async fn handle_upsert_entity<S: crate::storage::Storage>(
         confidence,
     )
     .await
-    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    .map_err(map_quota_error)?;
 
     let result_json = serde_json::to_value(&result).map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
@@ -1461,6 +1461,18 @@ async fn handle_get_stats<S: crate::storage::Storage>(
         "memo_count": memo_count,
         "intention_count": intention_count
     }))
+}
+
+// --- Error mapping helpers ---
+
+/// Map anyhow errors to JSON-RPC error codes, using INVALID_PARAMS for
+/// quota violations (FMEA D1) and INTERNAL_ERROR for everything else.
+fn map_quota_error(e: anyhow::Error) -> (i32, String) {
+    if e.downcast_ref::<crate::quota::QuotaExceeded>().is_some() {
+        (INVALID_PARAMS, e.to_string())
+    } else {
+        (INTERNAL_ERROR, e.to_string())
+    }
 }
 
 // --- Parameter extraction helpers ---
