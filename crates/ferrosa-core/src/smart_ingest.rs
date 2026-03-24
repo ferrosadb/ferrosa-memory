@@ -330,7 +330,7 @@ fn is_common_word(word: &str) -> bool {
 
 /// Simple text similarity using word overlap (Jaccard coefficient).
 /// For production, this should use embedding cosine similarity.
-fn compute_text_similarity(a: &str, b: &str) -> f64 {
+pub fn compute_text_similarity(a: &str, b: &str) -> f64 {
     let words_a: std::collections::HashSet<&str> = a.split_whitespace().collect();
     let words_b: std::collections::HashSet<&str> = b.split_whitespace().collect();
     let intersection = words_a.intersection(&words_b).count();

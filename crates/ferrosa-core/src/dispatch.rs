@@ -21,6 +21,8 @@ use crate::transport::{INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND};
 #[derive(Default)]
 pub struct RetrievalTracker {
     counts: std::collections::HashMap<uuid::Uuid, usize>,
+    /// Ordered list of recently accessed entity IDs (most recent last).
+    recent: Vec<uuid::Uuid>,
 }
 
 impl RetrievalTracker {
@@ -30,10 +32,23 @@ impl RetrievalTracker {
 
     pub fn record(&mut self, entity_id: uuid::Uuid) {
         *self.counts.entry(entity_id).or_insert(0) += 1;
+        // Deduplicate in recent list — keep only the latest position.
+        self.recent.retain(|&id| id != entity_id);
+        self.recent.push(entity_id);
+        // Cap at 50 to bound memory.
+        if self.recent.len() > 50 {
+            self.recent.remove(0);
+        }
     }
 
     pub fn count(&self, entity_id: &uuid::Uuid) -> usize {
         self.counts.get(entity_id).copied().unwrap_or(0)
+    }
+
+    /// Returns the most recently accessed entity IDs (most recent last).
+    pub fn recent_ids(&self, limit: usize) -> Vec<uuid::Uuid> {
+        let start = self.recent.len().saturating_sub(limit);
+        self.recent[start..].to_vec()
     }
 
     pub fn mean(&self) -> f64 {
@@ -68,6 +83,7 @@ pub struct SessionState {
     pub graph: Option<Arc<crate::graph::GraphClient>>,
     pub event_bus: Arc<crate::viz::EventBus>,
     pub retrieval_tracker: Arc<Mutex<RetrievalTracker>>,
+    pub co_access: Arc<Mutex<crate::speculative::CoAccessTracker>>,
 }
 
 impl Default for SessionState {
@@ -77,6 +93,7 @@ impl Default for SessionState {
             graph: None,
             event_bus: Arc::new(crate::viz::EventBus::new()),
             retrieval_tracker: Arc::new(Mutex::new(RetrievalTracker::new())),
+            co_access: Arc::new(Mutex::new(crate::speculative::CoAccessTracker::new(10))),
         }
     }
 }
@@ -497,6 +514,45 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "required": ["session_id", "entity_id"]
             }),
         },
+        // --- Memory chains ---
+        ToolDef {
+            name: "find_memory_chain".into(),
+            description: "Discovers the shortest path between two entities through the knowledge graph using BFS traversal. Returns the chain of intermediate entities and edge types connecting source to destination.\n\nCALL WHEN: You need to understand HOW two concepts are related — not just whether they are, but the path of connections between them. Useful for explaining reasoning chains, tracing provenance, or finding indirect relationships.\nRETURNS: Ordered list of steps (entity_id + edge_type) forming the shortest path, plus hop count and confidence score.\nCost: ~5-20ms depending on graph density.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "format": "uuid" },
+                    "source": { "type": "string", "format": "uuid", "description": "Entity ID to start from" },
+                    "destination": { "type": "string", "format": "uuid", "description": "Entity ID to find path to" },
+                    "max_hops": { "type": "integer", "minimum": 1, "maximum": 10, "description": "Maximum path length (default: 5)" }
+                },
+                "required": ["session_id", "source", "destination"]
+            }),
+        },
+        // --- Speculative retrieval ---
+        ToolDef {
+            name: "predict_needed".into(),
+            description: "Predicts which entities will be needed based on co-access patterns. Analyzes which entities are frequently retrieved together and suggests entities likely to be needed given recent access history.\n\nCALL WHEN: After retrieving entities, to prefetch or surface related memories before they are explicitly requested.\nCost: ~1ms (in-memory co-access analysis).".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "format": "uuid" },
+                    "threshold": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "description": "Minimum confidence threshold (default: 0.3)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "description": "Maximum predictions to return (default: 10)"
+                    }
+                },
+                "required": ["session_id"]
+            }),
+        },
         // --- Spreading activation ---
         ToolDef {
             name: "spread_activation".into(),
@@ -606,6 +662,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "promote_memory" => handle_promote_memory(args, storage, ctx, session).await,
         "demote_memory" => handle_demote_memory(args, storage, ctx, session).await,
         "importance_score" => handle_importance_score(args, storage, ctx, session).await,
+        "find_memory_chain" => handle_find_memory_chain(args, storage, ctx).await,
         "spread_activation" => handle_spread_activation(args, storage, ctx).await,
         _ => Err((METHOD_NOT_FOUND, format!("unknown tool: {name}"))),
     };
@@ -979,8 +1036,10 @@ async fn handle_retrieve_entities<S: crate::storage::Storage>(
     // Track retrieval frequency and check for anomalies (STRIDE T1 / FMEA F19)
     let security_config = crate::config::SecurityConfig::default();
     let mut tracker = session.retrieval_tracker.lock().await;
+    let mut co_access = session.co_access.lock().await;
     for entity in &entities {
         tracker.record(entity.entity_id);
+        co_access.record(entity.entity_id);
         let count = tracker.count(&entity.entity_id);
         if crate::audit::check_anomaly(
             count,
@@ -1543,6 +1602,35 @@ async fn handle_get_stats<S: crate::storage::Storage>(
 
 // --- Spreading activation handler ---
 
+async fn handle_find_memory_chain<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let _session_id = require_uuid(&args, "session_id")?;
+    let source = require_uuid(&args, "source")?;
+    let destination = require_uuid(&args, "destination")?;
+    let max_hops = args
+        .get("max_hops")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(5);
+
+    let chain = crate::chains::find_chain(storage, ctx, source, destination, max_hops)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    match chain {
+        Some(c) => serde_json::to_value(&c).map_err(|e| (INTERNAL_ERROR, e.to_string())),
+        None => Ok(serde_json::json!({
+            "found": false,
+            "source": source.to_string(),
+            "destination": destination.to_string(),
+            "message": "No path found within max_hops"
+        })),
+    }
+}
+
 async fn handle_spread_activation<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
@@ -1690,7 +1778,7 @@ mod tests {
             .await
             .unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 29);
+        assert_eq!(tools.len(), 30);
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"check_memo_cache"));
@@ -1707,6 +1795,7 @@ mod tests {
         assert!(names.contains(&"promote_memory"));
         assert!(names.contains(&"demote_memory"));
         assert!(names.contains(&"importance_score"));
+        assert!(names.contains(&"find_memory_chain"));
         assert!(names.contains(&"spread_activation"));
     }
 
