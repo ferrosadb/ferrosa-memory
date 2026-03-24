@@ -275,6 +275,13 @@ impl Storage for StorageBackend {
         }
     }
 
+    async fn entity_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<EntityEntry>> {
+        match self {
+            Self::Cql(s) => s.entity_list_all(ctx).await,
+            Self::Mock(s) => s.entity_list_all(ctx).await,
+        }
+    }
+
     async fn temporal_put(&self, ctx: &TenantContext, event: &TemporalEvent) -> anyhow::Result<()> {
         match self {
             Self::Cql(s) => s.temporal_put(ctx, event).await,

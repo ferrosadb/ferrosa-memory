@@ -149,6 +149,9 @@ pub trait Storage: Send + Sync {
         session_id: Uuid,
     ) -> anyhow::Result<Vec<EntityEntry>>;
 
+    /// List all entities for a tenant (for viz snapshot).
+    async fn entity_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<EntityEntry>>;
+
     /// Update an entity's memory state (promote/demote lifecycle).
     async fn entity_update_state(
         &self,
@@ -574,6 +577,11 @@ pub mod mock {
                 .filter(|e| e.session_id == session_id)
                 .cloned()
                 .collect())
+        }
+
+        async fn entity_list_all(&self, _ctx: &TenantContext) -> anyhow::Result<Vec<EntityEntry>> {
+            let entities = self.entities.lock().await;
+            Ok(entities.clone())
         }
 
         async fn entity_update_state(

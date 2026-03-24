@@ -48,6 +48,7 @@ struct PreparedStatements {
     entity_put: PreparedQuery,
     entity_count: PreparedQuery,
     entity_list_session: PreparedQuery,
+    entity_list_all: PreparedQuery,
     entity_update_state: PreparedQuery,
     // Count queries for stats
     fold_count: PreparedQuery,
@@ -207,6 +208,13 @@ impl CqlStorage {
                     "SELECT entity_id, entity_name, entity_type, source_fold_id, \
                      context_snippet, entity_embedding, confidence, state, created_at \
                      FROM {ks}.entity_store WHERE tenant_id = ? AND session_id = ?"
+                ))
+                .await?,
+            entity_list_all: session
+                .prepare(format!(
+                    "SELECT entity_id, session_id, entity_name, entity_type, source_fold_id, \
+                     context_snippet, entity_embedding, confidence, state, created_at \
+                     FROM {ks}.entity_store WHERE tenant_id = ? ALLOW FILTERING"
                 ))
                 .await?,
             entity_update_state: session
@@ -984,6 +992,41 @@ impl Storage for CqlStorage {
                 tenant_id: ctx.tenant_id,
                 entity_id: row.r_by_name("entity_id")?,
                 session_id,
+                entity_name: row.r_by_name("entity_name")?,
+                entity_type: row.r_by_name("entity_type")?,
+                source_fold_id: row.r_by_name::<Uuid>("source_fold_id").ok(),
+                context_snippet: row.r_by_name("context_snippet")?,
+                entity_embedding: row
+                    .r_by_name::<cdrs_tokio::types::blob::Blob>("entity_embedding")
+                    .ok()
+                    .map(|blob| blob.into_vec())
+                    .filter(|v| !v.is_empty())
+                    .map(|v| crate::vector::decode_vector(&v)),
+                confidence: f64::from(row.r_by_name::<f32>("confidence")?),
+                state,
+                created_at: created.and_utc(),
+            });
+        }
+        Ok(results)
+    }
+
+    async fn entity_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<EntityEntry>> {
+        let rows = self
+            .query_rows(&self.stmts.entity_list_all, query_values!(ctx.tenant_id))
+            .await?;
+
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            let created: chrono::NaiveDateTime = row.r_by_name("created_at")?;
+            let state = row
+                .r_by_name::<String>("state")
+                .ok()
+                .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
+                .unwrap_or_default();
+            results.push(EntityEntry {
+                tenant_id: ctx.tenant_id,
+                entity_id: row.r_by_name("entity_id")?,
+                session_id: row.r_by_name("session_id")?,
                 entity_name: row.r_by_name("entity_name")?,
                 entity_type: row.r_by_name("entity_type")?,
                 source_fold_id: row.r_by_name::<Uuid>("source_fold_id").ok(),

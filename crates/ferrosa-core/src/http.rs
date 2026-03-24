@@ -492,15 +492,14 @@ async fn build_snapshot<S: Storage>(
     ctx: &TenantContext,
     session_id: Uuid,
 ) -> VizEvent {
-    // A nil session_id means we don't know which session to show yet.
-    if session_id.is_nil() {
-        return VizEvent::Snapshot {
-            nodes: Vec::new(),
-            edges: Vec::new(),
-        };
-    }
+    // If session_id is nil, show all entities for the tenant.
+    let entities_result = if session_id.is_nil() {
+        storage.entity_list_all(ctx).await
+    } else {
+        storage.entity_list_session(ctx, session_id).await
+    };
 
-    let nodes = match storage.entity_list_session(ctx, session_id).await {
+    let nodes = match entities_result {
         Ok(entities) => entities.iter().map(viz::entity_to_viz_node).collect(),
         Err(e) => {
             tracing::warn!("viz: failed to load entities for snapshot: {e}");
