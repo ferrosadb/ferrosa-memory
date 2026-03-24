@@ -11,6 +11,7 @@
 //! - `notifications/initialized` — client acknowledgment (no-op)
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -87,6 +88,10 @@ pub struct SessionState {
     /// Configured default session_id for cross-session memory continuity.
     /// Falls back to random UUID if not set.
     pub default_session_id: Option<uuid::Uuid>,
+    /// Notified on every tool call; used by the idle consolidation timer.
+    pub last_activity: Arc<tokio::sync::Notify>,
+    /// Set to true when a write tool succeeds; cleared by idle consolidation.
+    pub dirty: Arc<AtomicBool>,
 }
 
 impl Default for SessionState {
@@ -98,6 +103,8 @@ impl Default for SessionState {
             retrieval_tracker: Arc::new(Mutex::new(RetrievalTracker::new())),
             co_access: Arc::new(Mutex::new(crate::speculative::CoAccessTracker::new(10))),
             default_session_id: None,
+            last_activity: Arc::new(tokio::sync::Notify::new()),
+            dirty: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -715,6 +722,15 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         ),
     }
 
+    // Signal activity for idle consolidation timer.
+    session.last_activity.notify_one();
+
+    // Mark dirty on successful write operations so idle consolidation knows
+    // there is new data worth processing.
+    if result.is_ok() && is_write_tool(name) {
+        session.dirty.store(true, Ordering::Relaxed);
+    }
+
     // Wrap in MCP CallToolResult format: { content: [{type: "text", text: "..."}] }
     // MCP clients expect this structure; without it, tool output is invisible.
     result.map(|value| {
@@ -727,6 +743,30 @@ async fn dispatch_tool<S: crate::storage::Storage>(
             "content": [{"type": "text", "text": text}]
         })
     })
+}
+
+/// Returns true for tools that modify stored data (writes, upserts, deletes).
+/// Used to set the dirty flag for idle consolidation.
+fn is_write_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "store_memo_result"
+            | "write_plan_node"
+            | "update_plan_node"
+            | "start_fold"
+            | "append_to_fold"
+            | "complete_fold"
+            | "upsert_entity"
+            | "record_outcome"
+            | "delete_session"
+            | "smart_ingest"
+            | "set_intention"
+            | "complete_intention"
+            | "snooze_intention"
+            | "write_temporal_fact"
+            | "promote_memory"
+            | "demote_memory"
+    )
 }
 
 // --- Tool handlers ---
@@ -744,7 +784,16 @@ async fn handle_check_memo<S: crate::storage::Storage>(
         .await
         .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
-    serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+    let mut json = serde_json::to_value(&result).map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    if let Some(obj) = json.as_object_mut() {
+        let hint = if result.hit {
+            "Cache hit — reusing prior result. Record outcome with record_outcome for routing optimization."
+        } else {
+            "Cache miss. After completing the sub-call, store the result with store_memo_result."
+        };
+        obj.insert("hint".into(), Value::String(hint.into()));
+    }
+    Ok(json)
 }
 
 async fn handle_store_memo<S: crate::storage::Storage>(
@@ -1335,7 +1384,7 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
                 created_at: chrono::Utc::now().to_rfc3339(),
                 context: content.chars().take(256).collect(),
             },
-            action,
+            action: action.clone(),
         });
     }
 
@@ -1350,7 +1399,24 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
     )
     .await;
 
-    Ok(decision_json)
+    // Add hint based on ingest action
+    let mut result = decision_json;
+    if let Some(obj) = result.as_object_mut() {
+        let hint = match action.as_str() {
+            "Created" => {
+                "Good. Also ingest any decisions, corrections, or patterns from this conversation."
+            }
+            "Updated" => {
+                "Entity updated. If facts changed over time, use write_temporal_fact to track the evolution."
+            }
+            "Skipped" => {
+                "Content too similar to existing memory. Try ingesting a different aspect or a more specific insight."
+            }
+            _ => "Ingest complete. Continue capturing insights from this conversation.",
+        };
+        obj.insert("hint".into(), Value::String(hint.into()));
+    }
+    Ok(result)
 }
 
 // --- Intention handlers ---
@@ -1628,9 +1694,16 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
     .await
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
+    let hint = if results.is_empty() {
+        "No matches. Consider ingesting what you're learning in this conversation with smart_ingest."
+    } else {
+        "Found prior context. Use spread_activation on result entity_ids to discover related memories."
+    };
+
     Ok(serde_json::json!({
         "results": results,
-        "count": results.len()
+        "count": results.len(),
+        "hint": hint
     }))
 }
 
@@ -1659,7 +1732,14 @@ async fn handle_run_consolidation<S: crate::storage::Storage>(
         });
     }
 
-    serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+    let mut json = serde_json::to_value(&result).map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    if let Some(obj) = json.as_object_mut() {
+        obj.insert(
+            "hint".into(),
+            Value::String("Consolidation complete. New connections are visible in the viz dashboard. Continue ingesting new learnings.".into()),
+        );
+    }
+    Ok(json)
 }
 
 // --- Stats handler ---
@@ -1702,6 +1782,14 @@ async fn handle_get_stats<S: crate::storage::Storage>(
     let edge_count = storage.edge_count(ctx).await.unwrap_or(0);
     let intention_count = session.intentions.lock().await.list().len();
 
+    let hint = if entity_count == 0 {
+        "Memory is empty. Start ingesting entities, decisions, and patterns with smart_ingest."
+    } else if edge_count == 0 {
+        "Entities exist but no connections. Run run_consolidation to discover relationships."
+    } else {
+        "Memory healthy. Remember to ingest new insights from this conversation."
+    };
+
     Ok(serde_json::json!({
         "memo_count": memo_count,
         "memo_total_hits": memo_total_hits,
@@ -1713,7 +1801,8 @@ async fn handle_get_stats<S: crate::storage::Storage>(
         "archived_fold_count": archived_fold_count,
         "temporal_fact_count": temporal_fact_count,
         "edge_count": edge_count,
-        "intention_count": intention_count
+        "intention_count": intention_count,
+        "hint": hint
     }))
 }
 

@@ -7,6 +7,8 @@
 //! if CQL connection fails.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use ferrosa_core::auth;
 use ferrosa_core::cql_storage::CqlStorage;
@@ -522,6 +524,67 @@ impl Storage for StorageBackend {
     }
 }
 
+/// Background task that runs dream consolidation and edge pruning after
+/// a period of tool-call inactivity. Resets the timer on every tool call.
+/// Only runs when the dirty flag indicates new writes since the last run.
+async fn idle_consolidation_loop<S: Storage + Send + Sync + 'static>(
+    session: Arc<dispatch::SessionState>,
+    storage: Arc<S>,
+    ctx: Arc<TenantContext>,
+    idle_seconds: u64,
+) {
+    let timeout_dur = Duration::from_secs(idle_seconds);
+    loop {
+        // Wait for the first tool call activity.
+        session.last_activity.notified().await;
+
+        // Reset timer on each subsequent activity until we hit a timeout.
+        while tokio::time::timeout(timeout_dur, session.last_activity.notified())
+            .await
+            .is_ok()
+        {}
+
+        // Only consolidate if there were writes since the last run.
+        if !session.dirty.swap(false, Ordering::Relaxed) {
+            continue;
+        }
+
+        let sid = match session.default_session_id {
+            Some(id) => id,
+            None => continue,
+        };
+
+        run_idle_consolidation(storage.as_ref(), &ctx, sid).await;
+    }
+}
+
+/// Executes consolidation and stale-edge pruning. Separated from the loop
+/// to keep each function under the line limit.
+async fn run_idle_consolidation<S: Storage>(
+    storage: &S,
+    ctx: &TenantContext,
+    session_id: uuid::Uuid,
+) {
+    match ferrosa_core::dream::run_consolidation(storage, ctx, session_id).await {
+        Ok(r) => tracing::info!(
+            entities = r.entities_processed,
+            connections = r.connections_created,
+            "idle consolidation complete"
+        ),
+        Err(e) => tracing::warn!("idle consolidation failed: {e}"),
+    }
+
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(7);
+    match storage.edge_prune_stale(ctx, cutoff).await {
+        Ok(pruned) => {
+            if pruned > 0 {
+                tracing::info!(pruned, "idle edge pruning complete");
+            }
+        }
+        Err(e) => tracing::warn!("idle edge pruning failed: {e}"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let debug = std::env::args().any(|a| a == "--debug");
@@ -637,6 +700,21 @@ async fn main() -> anyhow::Result<()> {
                         .await
                 })
             });
+
+            // Spawn idle consolidation background task.
+            if config.server.idle_consolidation_enabled {
+                let idle_secs = config.server.idle_consolidation_seconds;
+                let idle_session = Arc::clone(&session);
+                let idle_storage = Arc::clone(&storage);
+                let idle_ctx = Arc::clone(&ctx);
+                tokio::spawn(idle_consolidation_loop(
+                    idle_session,
+                    idle_storage,
+                    idle_ctx,
+                    idle_secs,
+                ));
+                tracing::info!(idle_seconds = idle_secs, "idle consolidation enabled");
+            }
 
             transport::serve_stdio(handler).await?;
         }

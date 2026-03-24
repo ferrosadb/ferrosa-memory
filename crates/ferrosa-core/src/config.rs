@@ -98,6 +98,12 @@ pub struct ServerConfig {
     /// Fixed session UUID for cross-session memory continuity.
     /// If set, all tools default to this session_id when none is provided.
     pub session_id: Option<String>,
+    /// Enable automatic dream consolidation after idle timeout (default: true).
+    #[serde(default = "default_true")]
+    pub idle_consolidation_enabled: bool,
+    /// Seconds of inactivity before triggering idle consolidation (default: 20).
+    #[serde(default = "default_idle_seconds")]
+    pub idle_consolidation_seconds: u64,
 }
 
 impl Default for ServerConfig {
@@ -111,6 +117,8 @@ impl Default for ServerConfig {
             key_path: None,
             tenant_id: None,
             session_id: None,
+            idle_consolidation_enabled: true,
+            idle_consolidation_seconds: default_idle_seconds(),
         }
     }
 }
@@ -285,6 +293,9 @@ fn default_guideline_version() -> String {
 }
 fn default_cron() -> String {
     "0 2 * * *".into()
+}
+fn default_idle_seconds() -> u64 {
+    20
 }
 fn default_viz_enabled() -> bool {
     true
