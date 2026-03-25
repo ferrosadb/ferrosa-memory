@@ -1,7 +1,7 @@
 # Design Structure Matrix — ferrosa-memory-mcp
 
-> Last updated: 2026-03-23
-> Status: Full inventory — 34 modules (M1-M34), up from 14
+> Last updated: 2026-03-25
+> Status: Full inventory — 34 modules (M1-M34). HTTP+SSE anomaly subscription, get_stats enrichment, and visualization improvements added.
 
 ## Module Inventory
 
@@ -116,74 +116,33 @@ M34  .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .  
 ## Dependency Graph
 
 ```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#16161f','primaryTextColor':'#e8e8ed','primaryBorderColor':'#e2725b','lineColor':'#9494a3','secondaryColor':'#1c1c28','tertiaryColor':'#111118','clusterBkg':'#111118','clusterBorder':'#1e1e2a','edgeLabelBackground':'#111118','nodeTextColor':'#e8e8ed'}}}%%
 graph TD
-    %% MCP Protocol Layer
+    %% Protocol layer
     M1[transport] --> M2[dispatch]
     M30[http] --> M2
     M30 --> M3[auth]
     M30 --> M14[metrics]
-    M30 --> M29[storage]
-    M30 --> M32[types]
     M30 --> M34[viz]
 
-    %% Dispatch — the mega-hub
-    M2 --> M1
+    %% Dispatch — mega-hub fans out to all handlers
     M2 --> M3
     M2 --> M4[router]
-    M2 --> M5[memo]
-    M2 --> M6[plan]
-    M2 --> M7[fold]
-    M2 --> M8[entity]
-    M2 --> M9[feedback]
+    M2 --> TH
     M2 --> M15[audit]
-    M2 --> M17[dedup]
     M2 --> M18[config]
-    M2 --> M19[chains]
-    M2 --> M20[dream]
-    M2 --> M21[hybrid_search]
-    M2 --> M22[importance]
-    M2 --> M23[intention]
-    M2 --> M24[session]
-    M2 --> M25[smart_ingest]
-    M2 --> M26[speculative]
-    M2 --> M27[spreading]
-    M2 --> M28[temporal]
-    M2 --> M29
+    M2 --> M29[storage trait]
     M2 --> M31[quota]
-    M2 --> M32
+    M2 --> M32[types]
     M2 --> M34
 
-    %% Tool handlers -> storage trait + types
-    M5 --> M29
-    M5 --> M32
-    M6 --> M29
-    M6 --> M32
-    M7 --> M29
-    M7 --> M32
-    M8 --> M29
-    M8 --> M32
-    M9 --> M29
-    M9 --> M32
-    M17 --> M29
-    M17 --> M32
-    M19 --> M29
-    M19 --> M32
-    M20 --> M29
-    M20 --> M32
-    M21 --> M29
-    M21 --> M32
-    M24 --> M29
-    M24 --> M32
-    M25 --> M29
-    M25 --> M32
-    M27 --> M29
-    M27 --> M32
-    M28 --> M29
-    M28 --> M32
+    %% 16 tool handlers collapsed — each depends on storage + types
+    TH["16 Tool Handlers<br/><i>memo · plan · fold · entity · feedback<br/>chains · dream · hybrid_search · dedup<br/>importance · intention · session<br/>smart_ingest · speculative · spreading · temporal</i>"]
+    TH --> M29
+    TH --> M32
 
     %% Infrastructure
     M10[cql_storage] --> M18
-    M10 --> M23
     M10 --> M29
     M10 --> M32
     M10 --> M33[vector]
@@ -197,16 +156,14 @@ graph TD
     M31 --> M18
     M3 --> M32
 
-    %% Style — high fan-in/fan-out nodes
-    style M2 fill:#ff9999
-    style M29 fill:#ff9999
-    style M32 fill:#ffcc99
-    style M10 fill:#ffcc99
-    style M34 fill:#ccffcc
-    style M11 fill:#ccffcc
-    style M22 fill:#ccffcc
-    style M23 fill:#ccffcc
-    style M26 fill:#ccffcc
+    %% High fan-in/fan-out (terracotta)
+    style M2 fill:#e2725b,color:#fff
+    style M29 fill:#e2725b,color:#fff
+    %% Medium fan-in (copper)
+    style M32 fill:#d4a574,color:#111118
+    style M10 fill:#d4a574,color:#111118
+    %% Low complexity (verdigris)
+    style M34 fill:#6bc9a0,color:#111118
 ```
 
 ## Analysis

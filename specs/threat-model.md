@@ -1,7 +1,7 @@
 # STRIDE Threat Model — ferrosa-memory-mcp
 
-> Last updated: 2026-03-23
-> Status: Updated — viz/WebSocket surface, smart ingest, spreading activation, session deletion threats added
+> Last updated: 2026-03-25
+> Status: Updated — viz/WebSocket surface, smart ingest, spreading activation, session deletion threats added. SSE anomaly alert subscription added (Sprint 4.9).
 
 ## Scope
 
@@ -10,6 +10,7 @@ Full system: MCP clients -> ferrosa-memory-mcp -> Ferrosa DB. Includes stdio and
 ## Data Flow Diagram
 
 ```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#16161f','primaryTextColor':'#e8e8ed','primaryBorderColor':'#e2725b','lineColor':'#9494a3','secondaryColor':'#1c1c28','tertiaryColor':'#111118','clusterBkg':'#111118','clusterBorder':'#1e1e2a','edgeLabelBackground':'#111118','nodeTextColor':'#e8e8ed'}}}%%
 graph TB
     subgraph "Trust Boundary 0: External"
         C1[Claude Code<br/>stdio client]
@@ -63,9 +64,9 @@ graph TB
     BJ -->|CQL read| CQL
     BJ -->|CQL write| CQL
 
-    style A fill:#ff6666,color:#fff
-    style CQL fill:#ff9999
-    style OL fill:#ffcc99
+    style A fill:#e25b5b,color:#fff
+    style CQL fill:#e2725b,color:#fff
+    style OL fill:#d4a574,color:#111118
 ```
 
 ## Trust Boundaries
@@ -88,7 +89,7 @@ graph TB
 | S2 | Client supplies a forged `tenant_id` in tool parameters | auth | **Critical** (L:4 x I:5 = 20) | `tenant_id` is NEVER client-supplied. Extracted from authenticated session only. Input schema rejects any `tenant_id` field in tool params. |
 | S3 | Stdio client spoofing (local privilege escalation) | transport (TB0) | **Low** (L:1 x I:4 = 4) | stdio inherits process owner — OS-level trust. Document that stdio mode assumes local trust. |
 | S4 | Batch job credentials compromised | batch job (TB3) | **Medium** (L:2 x I:4 = 8) | Separate CQL credentials for batch job with read-only on `feedback_outcomes`, write-only on `routing_guidelines`. Least privilege. |
-| S5 | WebSocket connections bypass MCP auth — viz endpoint may lack tenant authentication | viz module (TB0→TB1) | **Medium** (L:3 x I:3 = 9) | Require auth token on WebSocket upgrade request. Reject unauthenticated connections before handshake completes. |
+| S5 | WebSocket connections bypass MCP auth — viz endpoint may lack tenant authentication | viz module (TB0→TB1) | **Low** (L:2 x I:3 = 6) | **MITIGATED** — WebSocket upgrade validates auth token. SSE anomaly subscription (`/subscribe/anomalies`) also requires auth. |
 
 ### T — Tampering
 
@@ -119,7 +120,7 @@ graph TB
 | I3 | Embedding vectors reversed to reconstruct source text | all tables with embeddings | **Medium** (L:1 x I:3 = 3) | Embeddings alone are not reversible. Source text columns deleted with parent row on cascade delete. |
 | I4 | Ollama endpoint logs contain sensitive prompt content | embedding_client (TB2) | **Medium** (L:2 x I:3 = 6) | Ollama runs on local/private network. Document that embedding requests contain text fragments. Configure Ollama to disable request logging in production. |
 | I5 | Membership inference on agent memory store | all tables | **Medium** (L:2 x I:3 = 6) | Per "Unveiling Privacy Risks" paper. Mitigated by tenant isolation (attacker can only probe their own tenant). Rate limiting on retrieval tools. |
-| I6 | Viz WebSocket broadcasts all entity changes to any connected client without tenant scoping | viz module | **High** (L:3 x I:4 = 12) | WebSocket channels must be scoped to `tenant_id`. Filter entity change events before broadcast. Reject cross-tenant subscriptions. |
+| I6 | Viz WebSocket broadcasts all entity changes to any connected client without tenant scoping | viz module | **Medium** (L:2 x I:4 = 8) | **PARTIALLY MITIGATED** — WebSocket connection requires auth, but tenant scoping of entity events needs verification. SSE anomaly alerts are tenant-scoped. |
 | I7 | Spreading activation traversal could leak entity relationships across session boundaries | spread_activation | **Low-Medium** (L:2 x I:3 = 6) | Traversal queries must include `tenant_id` filter at every hop. Session-scoped activation should not cross into other sessions' private entities. |
 
 ### D — Denial of Service
@@ -146,6 +147,7 @@ graph TB
 ## Risk Summary
 
 ```mermaid
+%%{init: {'theme':'dark'}}%%
 quadrantChart
     title Threat Risk Matrix
     x-axis Low Likelihood --> High Likelihood

@@ -1,123 +1,37 @@
 # Component Architecture
 
-> Last updated: 2026-03-23
-> Status: 31 modules — cognitive memory, hybrid search, visualization, and infrastructure layers complete
+> Last updated: 2026-03-25
+> Status: 31 modules — cognitive memory, hybrid search, visualization, and infrastructure layers complete. WebSocket anomaly alert subscription added (Sprint 4.9).
 
 ## Module Map
 
 ```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#16161f','primaryTextColor':'#e8e8ed','primaryBorderColor':'#e2725b','lineColor':'#9494a3','secondaryColor':'#1c1c28','tertiaryColor':'#111118','clusterBkg':'#111118','clusterBorder':'#1e1e2a','edgeLabelBackground':'#111118','nodeTextColor':'#e8e8ed'}}}%%
 graph TB
-    subgraph "MCP Layer"
-        TRANS[transport]
-        DISPATCH[tool_dispatch]
-    end
-
-    subgraph "Core Logic"
-        ROUTER[tool_router]
-        AUTH[auth]
-        COMPRESS[compression]
-        EMBED[embedding_client]
-    end
-
-    subgraph "Tool Modules"
-        MEMO[memo_tools]
-        PLAN[plan_tools]
-        FOLD[fold_tools]
-        ENTITY[entity_tools]
-        FEEDBACK[feedback_tools]
-    end
-
-    subgraph "Cognitive"
-        SINGEST[smart_ingest]
-        INTENT[intention]
-        DREAM[dream]
-        SPREAD[spreading]
-        IMPORT[importance]
-        CHAINS[chains]
-        SPEC[speculative]
-        DEDUP[dedup]
-    end
-
-    subgraph "Search"
-        HYBRID[hybrid_search]
-    end
-
-    subgraph "Storage"
-        CQL[cql_client<br/>cdrs-tokio CQL]
-        GRAPH[graph_client<br/>HTTP Cypher]
-    end
-
-    subgraph "Infrastructure"
-        AUDIT[audit]
-        QUOTA[quota]
-        SESSION[session]
-        VECTOR[vector]
-        TYPES[types]
-        BATCH[batch]
-    end
-
-    subgraph "Visualization"
-        VIZ[viz]
-        HTTP[http]
-    end
-
-    subgraph "Observability"
-        METRICS[metrics]
-    end
-
-    TRANS --> DISPATCH
-    DISPATCH --> AUTH
-    AUTH --> ROUTER
-    ROUTER --> MEMO
-    ROUTER --> PLAN
-    ROUTER --> FOLD
-    ROUTER --> ENTITY
-    ROUTER --> FEEDBACK
-    MEMO --> CQL
-    MEMO --> EMBED
-    MEMO --> COMPRESS
-    PLAN --> CQL
-    FOLD --> CQL
-    FOLD --> GRAPH
-    FOLD --> COMPRESS
-    FOLD --> EMBED
-    ENTITY --> CQL
-    ENTITY --> GRAPH
-    ENTITY --> EMBED
-    FEEDBACK --> CQL
-    CQL --> METRICS
-    GRAPH --> METRICS
-    ROUTER --> METRICS
-
-    %% Cognitive dependencies
-    SINGEST --> CQL
-    SINGEST --> EMBED
-    DREAM --> CQL
-    SPREAD --> CQL
-    CHAINS --> CQL
-    DEDUP --> CQL
-    INTENT --> CQL
-    SPEC --> CQL
-    IMPORT --> FEEDBACK
-
-    %% Search dependencies
-    HYBRID --> CQL
-    HYBRID --> EMBED
-
-    %% Infrastructure dependencies
-    AUDIT --> CQL
-    SESSION --> CQL
-    BATCH --> FEEDBACK
-    CQL --> VECTOR
-
-    %% Visualization dependencies
-    HTTP --> VIZ
-    HTTP --> METRICS
-    HTTP --> AUTH
-
-    %% Quota enforced at dispatch
-    DISPATCH --> QUOTA
+    A[transport] --> B[tool_dispatch]
+    B --> C[auth]
+    C --> D[tool_router]
+    D --> E[compression]
+    D --> F[embedding_client]
+    D --> G[memo_tools]
+    D --> H[plan_tools]
+    D --> I[fold_tools]
+    D --> J[entity_tools]
+    D --> K[feedback_tools]
+    G --> L[cql_client]
+    H --> L
+    I --> L
+    I --> M[graph_client]
+    J --> L
+    J --> M
+    K --> L
+    L --> N[audit]
+    L --> O[metrics]
+    L --> P[viz]
+    P --> Q[http]
 ```
+
+**Note:** Shows main call flow. Full 31-module dependency matrix in `dsm-analysis.md`.
 
 **Note:** `graph_client` (M11) uses the HTTP Cypher endpoint, which is working. Graph writes go through CQL (vertex/edge table INSERTs via `CqlStorage`), and graph reads/traversals go through HTTP POST against `/graph/query` via `reqwest`.
 
@@ -601,12 +515,13 @@ graph TB
 - `GET /health` — health check
 - `GET /viz` — memory graph visualizer HTML (viz port)
 - `GET /viz/ws` — WebSocket for live graph events (viz port)
+- `GET /subscribe/anomalies` — SSE stream of anomaly alerts (viz port, Sprint 4.9)
 
 **Security:** TLS required in production, HTTP Basic auth, per-IP connection limits (FMEA F30), idle connection timeout.
 
 **Dependencies:** `viz`, `auth`, `metrics`, `tokio`, `tokio-tungstenite`
 
-**Size estimate:** ~800 lines
+**Size estimate:** ~876 lines
 
 ---
 

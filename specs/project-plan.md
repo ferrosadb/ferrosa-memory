@@ -15,6 +15,7 @@
 | Sprint 2 | **COMPLETE** | 8/8 tasks done |
 | Sprint 3 | **COMPLETE** | 10/10 tasks done |
 | Sprint 4 | **COMPLETE** | 11/11 tasks done |
+| Sprint 4.9 | **COMPLETE** | SUBSCRIBE anomaly alerts, get_stats enrichment |
 
 ---
 
@@ -113,6 +114,22 @@
 
 ---
 
+## Sprint 4.9: Anomaly Alerts + Stats Enrichment
+
+**Goal:** Real-time anomaly alert subscription and enriched memory health statistics.
+
+**Status: COMPLETE** — SSE anomaly endpoint, get_stats with memory health metrics, rotating hints.
+
+| # | Task | Size | Source | Success Criteria | Tests |
+|---|------|------|--------|-----------------|-------|
+| 4.9.1 | `GET /subscribe/anomalies` SSE endpoint | M | spec Section 9.3, FMEA F19 | SSE stream emits `AnomalyDetected` events from EventBus. Requires auth. | Integration: trigger anomaly -> verify SSE event |
+| 4.9.2 | Enrich `get_stats` with memory health metrics | S | spec Section 9.2 | Returns memo_count, memo_hit_rate, entity_count, fold counts by status, temporal_fact_count, edge_count, intention_count, hint | Unit: verify all fields populated |
+| 4.9.3 | Rotating memory formation hints | S | User experience | Hints rotate through pool, encouraging proactive memory formation | Manual: call get_stats multiple times, verify rotating hints |
+
+**Sprint 4.9 exit criteria:** SSE anomaly subscription functional. get_stats returns comprehensive health metrics. **MET** — all tasks complete (commits 8409733, 2f0f957, 16c8976).
+
+---
+
 ## Backlog (Post-v1.0)
 
 | # | Task | Size | Source | Notes |
@@ -137,6 +154,7 @@
 | Ferrosa CQL driver compatibility issues | Medium | High | Custom cdrs-tokio fork with vector support working. All CQL operations functional including vector columns. | **Resolved** |
 | Ferrosa graph layer requires Cypher (not CQL annotations) | Medium | Medium | Validated: writes go through CQL graph-annotated tables, reads through HTTP Cypher. neo4rs replaced with HTTP client (de901d1). | **Resolved** |
 | Ollama embedding latency too high for interactive use | Low | Medium | Embedding client working with 10s timeout. Latency acceptable in dev testing. | **Resolved** |
+| WebSocket tenant scoping for entity broadcasts | Medium | High | **NEW** — WebSocket auth implemented, but per-tenant entity filtering needs verification (threat I6). | **Monitoring** |
 | Ferrosa WASM UDF I/O limits prevent compression UDF | Medium | Low | ADR-001 already chose Rust-native compression in-process. WASM UDF is backlog (B6). | Mitigated |
 | No native row TTL in Ferrosa beta | Medium | Low | Application-managed TTL sweep job as fallback (Sprint 1 task 1.10) | Mitigated |
 | Compression quality insufficient without model inference | Low | Medium | ADR-001 accepts this tradeoff for v1. Backlog B2 adds perplexity-based scoring. | Accepted |
@@ -146,6 +164,7 @@
 ## Dependencies
 
 ```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#16161f','primaryTextColor':'#e8e8ed','primaryBorderColor':'#e2725b','lineColor':'#9494a3','secondaryColor':'#1c1c28','tertiaryColor':'#111118','clusterBkg':'#111118','clusterBorder':'#1e1e2a','edgeLabelBackground':'#111118','nodeTextColor':'#e8e8ed'}}}%%
 graph LR
     S1[Sprint 1] --> S2[Sprint 2]
     S1 --> S3[Sprint 3]

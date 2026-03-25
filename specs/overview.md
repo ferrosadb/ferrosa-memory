@@ -2,11 +2,12 @@
 
 ## Purpose
 
-ferrosa-memory-mcp is a lightweight MCP server (300-500 lines of Rust) that exposes Ferrosa DB's index and graph infrastructure as typed tools for LLM agent trajectories. It provides durable, structured memory for Recursive Language Model (RLM) workloads — memoization, hierarchical plan state, trajectory fold/summarization, semantic retrieval, phonetic entity search, and a feedback loop for retrieval strategy refinement.
+ferrosa-memory-mcp is a Rust MCP server (~12,350 lines) that exposes Ferrosa DB's index and graph infrastructure as typed tools for LLM agent trajectories. It provides durable, structured memory for Recursive Language Model (RLM) workloads — memoization, hierarchical plan state, trajectory fold/summarization, semantic retrieval, phonetic entity search, spreading activation, dream consolidation, intention tracking, and a feedback loop for retrieval strategy refinement.
 
 ## Positioning
 
 ```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#16161f','primaryTextColor':'#e8e8ed','primaryBorderColor':'#e2725b','lineColor':'#9494a3','secondaryColor':'#1c1c28','tertiaryColor':'#111118','clusterBkg':'#111118','clusterBorder':'#1e1e2a','edgeLabelBackground':'#111118','nodeTextColor':'#e8e8ed'}}}%%
 graph LR
     subgraph Clients
         CC[Claude Code]
