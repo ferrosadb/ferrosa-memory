@@ -555,13 +555,15 @@ async fn build_snapshot<S: Storage>(
         storage.entity_list_session(ctx, session_id).await
     };
 
-    let nodes = match entities_result {
+    let nodes: Vec<viz::VizNode> = match entities_result {
         Ok(entities) => entities.iter().map(viz::entity_to_viz_node).collect(),
         Err(e) => {
             tracing::warn!("viz: failed to load entities for snapshot: {e}");
             Vec::new()
         }
     };
+
+    let node_ids: std::collections::HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
 
     let edges_result = if session_id.is_nil() {
         storage.edge_list_all(ctx).await
@@ -572,10 +574,18 @@ async fn build_snapshot<S: Storage>(
     let edges = match edges_result {
         Ok(raw_edges) => raw_edges
             .into_iter()
-            .map(|(src, tgt, etype)| VizEdge {
-                source: src.to_string(),
-                target: tgt.to_string(),
-                edge_type: etype,
+            .filter_map(|(src, tgt, etype)| {
+                let src_s = src.to_string();
+                let tgt_s = tgt.to_string();
+                if node_ids.contains(src_s.as_str()) && node_ids.contains(tgt_s.as_str()) {
+                    Some(VizEdge {
+                        source: src_s,
+                        target: tgt_s,
+                        edge_type: etype,
+                    })
+                } else {
+                    None
+                }
             })
             .collect(),
         Err(e) => {
