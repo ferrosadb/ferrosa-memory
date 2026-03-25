@@ -15,28 +15,37 @@ ferrosa-memory-mcp fixes this by providing durable, typed memory tools backed by
 
 ## Architecture
 
-```
-MCP Clients (Claude Code, Claude.ai, third-party)
-        │
-        │  MCP protocol (stdio / HTTP+SSE)
-        ▼
-┌─────────────────────────────────┐
-│     ferrosa-memory-mcp          │
-│                                 │
-│  Tool Router ─ Auth ─ Compress  │
-│        │                        │
-│     CQL + Cypher queries        │
-└─────────┬───────────────────────┘
-          │
-          ▼
-┌─────────────────────────────────┐
-│         Ferrosa DB              │
-│                                 │
-│  agent_memory keyspace          │
-│  HNSW · Phonetic · B-tree      │
-│  Property graph (Cypher)        │
-│  NVMe → S3 → Glacier tiering   │
-└─────────────────────────────────┘
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#16161f','primaryTextColor':'#e8e8ed','primaryBorderColor':'#e2725b','lineColor':'#9494a3','secondaryColor':'#1c1c28','tertiaryColor':'#111118','clusterBkg':'#111118','clusterBorder':'#1e1e2a','edgeLabelBackground':'#111118','nodeTextColor':'#e8e8ed'}}}%%
+graph TD
+    subgraph Clients
+        CC[Claude Code]
+        CA[Claude.ai]
+        TP[Third-party MCP clients]
+    end
+
+    subgraph MCP["ferrosa-memory-mcp"]
+        TR[Tool Router]
+        AT[Auth]
+        CU[Compression]
+    end
+
+    subgraph DB["Ferrosa DB"]
+        KS[agent_memory keyspace]
+        IX["HNSW · Phonetic · B-tree"]
+        GR["Property graph (Cypher)"]
+        ST["NVMe → S3 → Glacier"]
+    end
+
+    CC -->|stdio| TR
+    CA -->|HTTP+SSE| TR
+    TP -->|HTTP+SSE| TR
+    TR --> AT
+    AT -->|CQL + Cypher| KS
+    CU -->|compress before write| KS
+    KS --- IX
+    KS --- GR
+    KS --- ST
 ```
 
 The server is a thin adapter (~3,200 lines of Rust) that translates MCP tool calls into CQL and Cypher queries. All intelligence stays in the LLM; all durability stays in Ferrosa.
@@ -122,7 +131,7 @@ See [`examples/ferrosa-memory.toml`](examples/ferrosa-memory.toml) for all optio
 
 ```
 crates/
-  ferrosa-core/          Shared library (17 modules)
+  ferrosa-memory-core/          Shared library (17 modules)
   ferrosa-memory-mcp/    MCP server binary
   ferrosa-memory-batch/  Nightly routing guideline job
 ddl/                     CQL schema definitions

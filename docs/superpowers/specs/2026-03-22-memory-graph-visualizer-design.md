@@ -215,10 +215,10 @@ No external build tools. D3.js loaded from CDN. Inter font from Google Fonts.
 
 | File | Responsibility |
 |------|---------------|
-| `crates/ferrosa-core/src/viz.rs` | VizEvent, VizNode, VizEdge types, EventBus |
-| `crates/ferrosa-core/src/http.rs` | Add `/viz` and `/viz/ws` routes |
+| `crates/ferrosa-memory-core/src/viz.rs` | VizEvent, VizNode, VizEdge types, EventBus |
+| `crates/ferrosa-memory-core/src/http.rs` | Add `/viz` and `/viz/ws` routes |
 | `assets/viz.html` | Single-file HTML+CSS+JS dashboard |
-| `crates/ferrosa-core/src/dispatch.rs` | Emit VizEvents from handlers |
+| `crates/ferrosa-memory-core/src/dispatch.rs` | Emit VizEvents from handlers |
 
 ## Dependencies
 

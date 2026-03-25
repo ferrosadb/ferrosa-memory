@@ -10,14 +10,14 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use ferrosa_core::auth;
-use ferrosa_core::cql_storage::CqlStorage;
-use ferrosa_core::dispatch;
-use ferrosa_core::http;
-use ferrosa_core::storage::Storage;
-use ferrosa_core::storage::mock::MockStorage;
-use ferrosa_core::transport;
-use ferrosa_core::types::*;
+use ferrosa_memory_core::auth;
+use ferrosa_memory_core::cql_storage::CqlStorage;
+use ferrosa_memory_core::dispatch;
+use ferrosa_memory_core::http;
+use ferrosa_memory_core::storage::Storage;
+use ferrosa_memory_core::storage::mock::MockStorage;
+use ferrosa_memory_core::transport;
+use ferrosa_memory_core::types::*;
 use tracing_subscriber::EnvFilter;
 
 /// Enum dispatch wrapper — allows switching between real CQL and mock storage
@@ -442,7 +442,7 @@ impl Storage for StorageBackend {
     async fn intention_put(
         &self,
         ctx: &TenantContext,
-        intention: &ferrosa_core::intention::Intention,
+        intention: &ferrosa_memory_core::intention::Intention,
     ) -> anyhow::Result<()> {
         match self {
             Self::Cql(s) => s.intention_put(ctx, intention).await,
@@ -453,7 +453,7 @@ impl Storage for StorageBackend {
     async fn intention_list(
         &self,
         ctx: &TenantContext,
-    ) -> anyhow::Result<Vec<ferrosa_core::intention::Intention>> {
+    ) -> anyhow::Result<Vec<ferrosa_memory_core::intention::Intention>> {
         match self {
             Self::Cql(s) => s.intention_list(ctx).await,
             Self::Mock(s) => s.intention_list(ctx).await,
@@ -483,7 +483,7 @@ impl Storage for StorageBackend {
     async fn audit_put(
         &self,
         ctx: &TenantContext,
-        entry: &ferrosa_core::types::AuditEntry,
+        entry: &ferrosa_memory_core::types::AuditEntry,
     ) -> anyhow::Result<()> {
         match self {
             Self::Cql(s) => s.audit_put(ctx, entry).await,
@@ -501,7 +501,7 @@ impl Storage for StorageBackend {
     async fn fold_count_by_status(
         &self,
         ctx: &TenantContext,
-        status: ferrosa_core::types::FoldStatus,
+        status: ferrosa_memory_core::types::FoldStatus,
     ) -> anyhow::Result<usize> {
         match self {
             Self::Cql(s) => s.fold_count_by_status(ctx, status).await,
@@ -565,7 +565,7 @@ async fn run_idle_consolidation<S: Storage>(
     ctx: &TenantContext,
     session_id: uuid::Uuid,
 ) {
-    match ferrosa_core::dream::run_consolidation(storage, ctx, session_id).await {
+    match ferrosa_memory_core::dream::run_consolidation(storage, ctx, session_id).await {
         Ok(r) => tracing::info!(
             entities = r.entities_processed,
             connections = r.connections_created,
@@ -592,7 +592,7 @@ async fn main() -> anyhow::Result<()> {
     let default_filter = if debug {
         "debug,cdrs_tokio=debug,hyper=info,reqwest=info"
     } else {
-        "ferrosa_core=warn,ferrosa_memory_mcp=warn"
+        "ferrosa_memory_core=warn,ferrosa_memory_mcp=warn"
     };
 
     tracing_subscriber::fmt()
@@ -606,11 +606,11 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("ferrosa-memory-mcp starting (debug mode)");
     }
 
-    let config = match ferrosa_core::config::load_config() {
+    let config = match ferrosa_memory_core::config::load_config() {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("config not found ({e}), using defaults");
-            ferrosa_core::config::parse_config(
+            ferrosa_memory_core::config::parse_config(
                 "[ferrosa]\ncontact_points = [\"localhost:19042\"]\n",
             )?
         }
@@ -627,7 +627,7 @@ async fn main() -> anyhow::Result<()> {
         .session_id
         .as_ref()
         .and_then(|s| uuid::Uuid::parse_str(s).ok());
-    let metrics = Arc::new(ferrosa_core::metrics::MemoryMetrics::new()?);
+    let metrics = Arc::new(ferrosa_memory_core::metrics::MemoryMetrics::new()?);
     tracing::info!("metrics registered");
 
     // Connect to real Ferrosa, fall back to mock
@@ -643,12 +643,14 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Connect graph client via HTTP (non-fatal if it fails)
-    match ferrosa_core::graph::GraphClient::connect(&ferrosa_core::graph::GraphConfig {
-        http_url: config.graph.http_url.clone(),
-        username: config.graph.username.clone(),
-        password: config.graph.password.clone(),
-        keyspace: config.ferrosa.keyspace.clone(),
-    })
+    match ferrosa_memory_core::graph::GraphClient::connect(
+        &ferrosa_memory_core::graph::GraphConfig {
+            http_url: config.graph.http_url.clone(),
+            username: config.graph.username.clone(),
+            password: config.graph.password.clone(),
+            keyspace: config.ferrosa.keyspace.clone(),
+        },
+    )
     .await
     {
         Ok(_graph) => tracing::info!("connected to Ferrosa graph (HTTP)"),
@@ -656,7 +658,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Start visualization server if enabled
-    let shared_event_bus = Arc::new(ferrosa_core::viz::EventBus::new());
+    let shared_event_bus = Arc::new(ferrosa_memory_core::viz::EventBus::new());
     if config.viz.enabled {
         let viz_bus = Arc::clone(&shared_event_bus);
         let viz_port = config.viz.port;

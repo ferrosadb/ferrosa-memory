@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-ferrosa-core = { path = "../ferrosa-core" }
+ferrosa-memory-core = { path = "../ferrosa-memory-core" }
 cdrs-tokio = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

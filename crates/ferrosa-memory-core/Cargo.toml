@@ -1,5 +1,5 @@
 [package]
-name = "ferrosa-core"
+name = "ferrosa-memory-core"
 version.workspace = true
 edition.workspace = true
 

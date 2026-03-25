@@ -453,7 +453,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
-name = "ferrosa-core"
+name = "ferrosa-memory-batch"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cdrs-tokio",
+ "ferrosa-memory-core",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "ferrosa-memory-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -478,25 +491,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "ferrosa-memory-batch"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cdrs-tokio",
- "ferrosa-core",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "ferrosa-memory-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "ferrosa-core",
+ "ferrosa-memory-core",
  "serde",
  "serde_json",
  "tokio",

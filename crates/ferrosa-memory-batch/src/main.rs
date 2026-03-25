@@ -16,10 +16,10 @@
 //! FERROSA_MEMORY_CONFIG=./ferrosa-memory.toml ferrosa-memory-batch
 //! ```
 
-use ferrosa_core::batch;
-use ferrosa_core::cql_storage::CqlStorage;
-use ferrosa_core::storage::Storage;
-use ferrosa_core::types::TenantContext;
+use ferrosa_memory_core::batch;
+use ferrosa_memory_core::cql_storage::CqlStorage;
+use ferrosa_memory_core::storage::Storage;
+use ferrosa_memory_core::types::TenantContext;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -29,11 +29,11 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let config = match ferrosa_core::config::load_config() {
+    let config = match ferrosa_memory_core::config::load_config() {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("config not found ({e}), using defaults");
-            ferrosa_core::config::parse_config(
+            ferrosa_memory_core::config::parse_config(
                 "[ferrosa]\ncontact_points = [\"localhost:9042\"]\n",
             )?
         }
@@ -51,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
 ///
 /// Reads all entities for the tenant, re-inserts with the target session_id,
 /// then deletes the old session partitions.
-async fn migrate_session(config: &ferrosa_core::config::Config) -> anyhow::Result<()> {
+async fn migrate_session(config: &ferrosa_memory_core::config::Config) -> anyhow::Result<()> {
     let target_sid = config
         .server
         .session_id
@@ -125,7 +125,7 @@ async fn migrate_session(config: &ferrosa_core::config::Config) -> anyhow::Resul
 }
 
 /// Run the nightly guideline refinement job.
-async fn run_guidelines(config: &ferrosa_core::config::Config) -> anyhow::Result<()> {
+async fn run_guidelines(config: &ferrosa_memory_core::config::Config) -> anyhow::Result<()> {
     tracing::info!("ferrosa-memory-batch starting");
 
     tracing::info!(

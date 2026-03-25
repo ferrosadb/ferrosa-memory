@@ -1,5 +1,5 @@
 //! Live test: vector INSERT/SELECT via blob workaround.
-//! Run: cargo test -p ferrosa-core --test vector_live -- --ignored --nocapture
+//! Run: cargo test -p ferrosa-memory-core --test vector_live -- --ignored --nocapture
 
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
 use cdrs_tokio::query_values;
 use cdrs_tokio::types::ByName;
 use cdrs_tokio::types::blob::Blob;
-use ferrosa_core::vector;
+use ferrosa_memory_core::vector;
 
 #[tokio::test]
 #[ignore]

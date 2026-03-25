@@ -5,9 +5,9 @@
 //! graph vertices are CQL rows.
 //!
 //! Requires: docker compose up -d (single node on port 19042/17474)
-//! Run with: cargo test -p ferrosa-core --test graph_live -- --ignored
+//! Run with: cargo test -p ferrosa-memory-core --test graph_live -- --ignored
 
-use ferrosa_core::graph::{GraphClient, GraphConfig};
+use ferrosa_memory_core::graph::{GraphClient, GraphConfig};
 use uuid::Uuid;
 
 async fn connect_graph() -> GraphClient {

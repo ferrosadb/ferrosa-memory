@@ -1,5 +1,5 @@
 //! Live test — prepare each statement individually to find which fails.
-//! Run with: cargo test -p ferrosa-core --test cql_storage_live -- --ignored --nocapture
+//! Run with: cargo test -p ferrosa-memory-core --test cql_storage_live -- --ignored --nocapture
 
 use cdrs_tokio::authenticators::NoneAuthenticatorProvider;
 use cdrs_tokio::cluster::NodeTcpConfigBuilder;

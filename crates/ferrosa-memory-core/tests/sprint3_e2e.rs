@@ -1,7 +1,7 @@
 //! Sprint 3 integration tests (require live cluster).
-//! Run: cargo test -p ferrosa-core --test sprint3_e2e -- --ignored --nocapture
+//! Run: cargo test -p ferrosa-memory-core --test sprint3_e2e -- --ignored --nocapture
 
-use ferrosa_core::graph::{GraphClient, GraphConfig};
+use ferrosa_memory_core::graph::{GraphClient, GraphConfig};
 use uuid::Uuid;
 
 #[tokio::test]

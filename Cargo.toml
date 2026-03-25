@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/ferrosa-core", "crates/ferrosa-memory-mcp", "crates/ferrosa-memory-batch"]
+members = ["crates/ferrosa-memory-core", "crates/ferrosa-memory-mcp", "crates/ferrosa-memory-batch"]
 resolver = "2"
 
 [workspace.package]

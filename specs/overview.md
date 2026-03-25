@@ -67,7 +67,7 @@ Authentication: HTTP Basic (same credentials as CQL) in HTTP mode; stdio inherit
 ```
 ferrosa-memory/
 ├── crates/
-│   ├── ferrosa-core/          # Shared library: storage traits, tool handlers, config
+│   ├── ferrosa-memory-core/          # Shared library: storage traits, tool handlers, config
 │   ├── ferrosa-memory-mcp/    # MCP server binary (stdio + HTTP)
 │   └── ferrosa-memory-batch/  # Nightly batch job binary
 ├── ddl/                       # CQL schema files (001_keyspace, 002_folds_entities)

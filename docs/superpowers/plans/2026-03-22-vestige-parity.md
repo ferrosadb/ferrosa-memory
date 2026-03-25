@@ -14,19 +14,19 @@
 
 | File | Responsibility | Status |
 |------|---------------|--------|
-| `crates/ferrosa-core/src/dispatch.rs` | MCP tool registry + dispatch + handlers | Modify: add 12 new tools + handlers |
-| `crates/ferrosa-core/src/smart_ingest.rs` | Prediction error gating | Modify: add `source_fold_id` param |
-| `crates/ferrosa-core/src/intention.rs` | Prospective memory store | Modify: add CQL persistence methods |
-| `crates/ferrosa-core/src/temporal.rs` | Temporal fact chains | No change (already complete) |
-| `crates/ferrosa-core/src/graph.rs` | Cypher graph traversal client | Modify: add `explore_connections` |
-| `crates/ferrosa-core/src/dream.rs` | **New:** Consolidation/dream engine | Create |
-| `crates/ferrosa-core/src/hybrid_search.rs` | **New:** Multi-strategy search with RRF | Create |
-| `crates/ferrosa-core/src/storage.rs` | Storage trait | Modify: add 6 new trait methods |
-| `crates/ferrosa-core/src/storage.rs` (inline `mod mock`) | Mock storage | Modify: implement new trait methods |
-| `crates/ferrosa-core/src/cql_storage.rs` | CQL storage impl | Modify: implement new trait methods |
-| `crates/ferrosa-core/src/types.rs` | Domain types | Modify: add new types |
-| `crates/ferrosa-core/src/lib.rs` | Module declarations | Modify: add `dream`, `hybrid_search` |
-| `crates/ferrosa-core/src/entity.rs` | Entity upsert/retrieve | Modify: add co-occurrence edge creation |
+| `crates/ferrosa-memory-core/src/dispatch.rs` | MCP tool registry + dispatch + handlers | Modify: add 12 new tools + handlers |
+| `crates/ferrosa-memory-core/src/smart_ingest.rs` | Prediction error gating | Modify: add `source_fold_id` param |
+| `crates/ferrosa-memory-core/src/intention.rs` | Prospective memory store | Modify: add CQL persistence methods |
+| `crates/ferrosa-memory-core/src/temporal.rs` | Temporal fact chains | No change (already complete) |
+| `crates/ferrosa-memory-core/src/graph.rs` | Cypher graph traversal client | Modify: add `explore_connections` |
+| `crates/ferrosa-memory-core/src/dream.rs` | **New:** Consolidation/dream engine | Create |
+| `crates/ferrosa-memory-core/src/hybrid_search.rs` | **New:** Multi-strategy search with RRF | Create |
+| `crates/ferrosa-memory-core/src/storage.rs` | Storage trait | Modify: add 6 new trait methods |
+| `crates/ferrosa-memory-core/src/storage.rs` (inline `mod mock`) | Mock storage | Modify: implement new trait methods |
+| `crates/ferrosa-memory-core/src/cql_storage.rs` | CQL storage impl | Modify: implement new trait methods |
+| `crates/ferrosa-memory-core/src/types.rs` | Domain types | Modify: add new types |
+| `crates/ferrosa-memory-core/src/lib.rs` | Module declarations | Modify: add `dream`, `hybrid_search` |
+| `crates/ferrosa-memory-core/src/entity.rs` | Entity upsert/retrieve | Modify: add co-occurrence edge creation |
 | `ddl/006_intentions.cql` | **New:** Intentions table DDL | Create |
 
 ---
@@ -34,8 +34,8 @@
 ## Task 1: Wire `smart_ingest` MCP Tool
 
 **Files:**
-- Modify: `crates/ferrosa-core/src/dispatch.rs`
-- Modify: `crates/ferrosa-core/src/smart_ingest.rs`
+- Modify: `crates/ferrosa-memory-core/src/dispatch.rs`
+- Modify: `crates/ferrosa-memory-core/src/smart_ingest.rs`
 
 This is the highest-value tool — it replaces manual entity creation with intelligent CREATE/UPDATE/SUPERSEDE/SKIP decisions.
 
@@ -68,7 +68,7 @@ async fn smart_ingest_creates_on_new_content() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test --lib -p ferrosa-core smart_ingest_creates_on_new_content`
+Run: `cargo test --lib -p ferrosa-memory-core smart_ingest_creates_on_new_content`
 Expected: FAIL — no match arm for "smart_ingest" in dispatch_tool
 
 - [ ] **Step 3: Add ToolDef for smart_ingest**
@@ -169,13 +169,13 @@ assert_eq!(tools.len(), 14); // was 13
 
 - [ ] **Step 7: Run tests and verify pass**
 
-Run: `cargo test --lib -p ferrosa-core -- dispatch`
+Run: `cargo test --lib -p ferrosa-memory-core -- dispatch`
 Expected: All dispatch tests pass including the new one.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/ferrosa-core/src/dispatch.rs crates/ferrosa-core/src/smart_ingest.rs
+git add crates/ferrosa-memory-core/src/dispatch.rs crates/ferrosa-memory-core/src/smart_ingest.rs
 git commit -m "feat: wire smart_ingest MCP tool for prediction error gating"
 ```
 
@@ -184,8 +184,8 @@ git commit -m "feat: wire smart_ingest MCP tool for prediction error gating"
 ## Task 2: Wire Intention Tools (set, check, complete, list, snooze)
 
 **Files:**
-- Modify: `crates/ferrosa-core/src/dispatch.rs`
-- Modify: `crates/ferrosa-core/src/intention.rs`
+- Modify: `crates/ferrosa-memory-core/src/dispatch.rs`
+- Modify: `crates/ferrosa-memory-core/src/intention.rs`
 
 IntentionStore is currently in-memory. For now we wire it through dispatch using per-session state held in the transport layer. CQL persistence is Task 9.
 
@@ -229,10 +229,10 @@ pub async fn dispatch<S: crate::storage::Storage>(
 ```
 
 **All callers that must be updated** (pass `&SessionState::default()` or a shared instance):
-1. `crates/ferrosa-core/src/http.rs:125` — `dispatch::dispatch(rpc_method, params, storage, &ctx)` → add session param
+1. `crates/ferrosa-memory-core/src/http.rs:125` — `dispatch::dispatch(rpc_method, params, storage, &ctx)` → add session param
 2. `crates/ferrosa-memory-mcp/src/main.rs:420` — `dispatch::dispatch(&method, params, storage.as_ref(), ctx.as_ref())` → add session param. Create `SessionState` in the session setup and pass `Arc` clone.
-3. `crates/ferrosa-core/src/security_tests.rs:48,59,118` — 3 call sites, add `&dispatch::SessionState::default()`
-4. `crates/ferrosa-core/src/dispatch.rs` tests — all `dispatch(...)` calls in the `#[cfg(test)]` block (lines 716, 727, 745, 756, 770, 791, 805, 828, 840). Add `&SessionState::default()` to each.
+3. `crates/ferrosa-memory-core/src/security_tests.rs:48,59,118` — 3 call sites, add `&dispatch::SessionState::default()`
+4. `crates/ferrosa-memory-core/src/dispatch.rs` tests — all `dispatch(...)` calls in the `#[cfg(test)]` block (lines 716, 727, 745, 756, 770, 791, 805, 828, 840). Add `&SessionState::default()` to each.
 
 For `main.rs`, create the session state once per connection:
 ```rust
@@ -458,13 +458,13 @@ pub fn snooze(&mut self, id: Uuid) -> bool {
 
 Update `assert_eq!(tools.len(), 19);` (13 original + 1 smart_ingest + 5 intention = 19).
 
-Run: `cargo test --lib -p ferrosa-core`
+Run: `cargo test --lib -p ferrosa-memory-core`
 Expected: All tests pass.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/ferrosa-core/src/dispatch.rs crates/ferrosa-core/src/intention.rs crates/ferrosa-core/src/types.rs
+git add crates/ferrosa-memory-core/src/dispatch.rs crates/ferrosa-memory-core/src/intention.rs crates/ferrosa-memory-core/src/types.rs
 git commit -m "feat: wire intention MCP tools (set, check, complete, list, snooze)"
 ```
 
@@ -473,7 +473,7 @@ git commit -m "feat: wire intention MCP tools (set, check, complete, list, snooz
 ## Task 3: Wire Temporal Fact Tools
 
 **Files:**
-- Modify: `crates/ferrosa-core/src/dispatch.rs`
+- Modify: `crates/ferrosa-memory-core/src/dispatch.rs`
 
 The temporal module is already complete. We just need MCP tool wrappers.
 
@@ -583,10 +583,10 @@ async fn handle_get_temporal_chain<S: crate::storage::Storage>(
 
 - [ ] **Step 4: Update tool count, run tests, commit**
 
-Update count to 21 (19 + 2 temporal). Run: `cargo test --lib -p ferrosa-core`
+Update count to 21 (19 + 2 temporal). Run: `cargo test --lib -p ferrosa-memory-core`
 
 ```bash
-git add crates/ferrosa-core/src/dispatch.rs
+git add crates/ferrosa-memory-core/src/dispatch.rs
 git commit -m "feat: wire temporal fact MCP tools (write, get_chain)"
 ```
 
@@ -595,8 +595,8 @@ git commit -m "feat: wire temporal fact MCP tools (write, get_chain)"
 ## Task 4: Wire Graph Traversal Tool
 
 **Files:**
-- Modify: `crates/ferrosa-core/src/dispatch.rs`
-- Modify: `crates/ferrosa-core/src/graph.rs`
+- Modify: `crates/ferrosa-memory-core/src/dispatch.rs`
+- Modify: `crates/ferrosa-memory-core/src/graph.rs`
 
 Expose the graph client's traversal functions as a single `explore_connections` MCP tool that supports multiple traversal types.
 
@@ -709,7 +709,7 @@ If no graph client is configured, the tool returns a clear error rather than sil
 - [ ] **Step 4: Run tests, commit**
 
 ```bash
-git add crates/ferrosa-core/src/dispatch.rs crates/ferrosa-core/src/graph.rs
+git add crates/ferrosa-memory-core/src/dispatch.rs crates/ferrosa-memory-core/src/graph.rs
 git commit -m "feat: wire explore_connections MCP tool for graph traversal"
 ```
 
@@ -718,9 +718,9 @@ git commit -m "feat: wire explore_connections MCP tool for graph traversal"
 ## Task 5: Add Hybrid Search Tool
 
 **Files:**
-- Create: `crates/ferrosa-core/src/hybrid_search.rs`
-- Modify: `crates/ferrosa-core/src/dispatch.rs`
-- Modify: `crates/ferrosa-core/src/lib.rs`
+- Create: `crates/ferrosa-memory-core/src/hybrid_search.rs`
+- Modify: `crates/ferrosa-memory-core/src/dispatch.rs`
+- Modify: `crates/ferrosa-memory-core/src/lib.rs`
 
 Inspired by vestige's 7-stage search pipeline. Combines entity phonetic search + fold ANN search + entity ANN search using Reciprocal Rank Fusion (RRF).
 
@@ -874,7 +874,7 @@ ToolDef {
 - [ ] **Step 5: Run tests, commit**
 
 ```bash
-git add crates/ferrosa-core/src/hybrid_search.rs crates/ferrosa-core/src/lib.rs crates/ferrosa-core/src/dispatch.rs
+git add crates/ferrosa-memory-core/src/hybrid_search.rs crates/ferrosa-memory-core/src/lib.rs crates/ferrosa-memory-core/src/dispatch.rs
 git commit -m "feat: hybrid search MCP tool with RRF fusion"
 ```
 
@@ -883,11 +883,11 @@ git commit -m "feat: hybrid search MCP tool with RRF fusion"
 ## Task 6: Add Dream/Consolidation Engine
 
 **Files:**
-- Create: `crates/ferrosa-core/src/dream.rs`
-- Modify: `crates/ferrosa-core/src/dispatch.rs`
-- Modify: `crates/ferrosa-core/src/lib.rs`
-- Modify: `crates/ferrosa-core/src/storage.rs` (add `entity_list_session`)
-- Modify: `crates/ferrosa-core/src/cql_storage.rs` (implement)
+- Create: `crates/ferrosa-memory-core/src/dream.rs`
+- Modify: `crates/ferrosa-memory-core/src/dispatch.rs`
+- Modify: `crates/ferrosa-memory-core/src/lib.rs`
+- Modify: `crates/ferrosa-memory-core/src/storage.rs` (add `entity_list_session`)
+- Modify: `crates/ferrosa-memory-core/src/cql_storage.rs` (implement)
 - Modify: mock storage (implement)
 
 Inspired by vestige's 5-phase dream consolidation. Simplified to 3 phases for v1: **triage** (identify memories by importance), **connection discovery** (find co-occurring entities in same folds, create CO_OCCURS edges), **insight generation** (identify clusters of related entities).
@@ -1018,9 +1018,9 @@ ToolDef {
 - [ ] **Step 6: Run tests, commit**
 
 ```bash
-git add crates/ferrosa-core/src/dream.rs crates/ferrosa-core/src/lib.rs \
-       crates/ferrosa-core/src/dispatch.rs crates/ferrosa-core/src/storage.rs \
-       crates/ferrosa-core/src/cql_storage.rs
+git add crates/ferrosa-memory-core/src/dream.rs crates/ferrosa-memory-core/src/lib.rs \
+       crates/ferrosa-memory-core/src/dispatch.rs crates/ferrosa-memory-core/src/storage.rs \
+       crates/ferrosa-memory-core/src/cql_storage.rs
 git commit -m "feat: dream consolidation engine with co-occurrence discovery"
 ```
 
@@ -1029,10 +1029,10 @@ git commit -m "feat: dream consolidation engine with co-occurrence discovery"
 ## Task 7: Add Memory State Management (promote/demote)
 
 **Files:**
-- Modify: `crates/ferrosa-core/src/types.rs`
-- Modify: `crates/ferrosa-core/src/storage.rs`
-- Modify: `crates/ferrosa-core/src/entity.rs`
-- Modify: `crates/ferrosa-core/src/dispatch.rs`
+- Modify: `crates/ferrosa-memory-core/src/types.rs`
+- Modify: `crates/ferrosa-memory-core/src/storage.rs`
+- Modify: `crates/ferrosa-memory-core/src/entity.rs`
+- Modify: `crates/ferrosa-memory-core/src/dispatch.rs`
 
 Vestige tracks memory states: active → dormant → silent → unavailable. We'll add a `state` field to `EntityEntry` and expose promote/demote tools.
 
@@ -1102,9 +1102,9 @@ pub async fn demote_memory(
 - [ ] **Step 5: Run tests, commit**
 
 ```bash
-git add crates/ferrosa-core/src/types.rs crates/ferrosa-core/src/storage.rs \
-       crates/ferrosa-core/src/entity.rs crates/ferrosa-core/src/dispatch.rs \
-       crates/ferrosa-core/src/cql_storage.rs
+git add crates/ferrosa-memory-core/src/types.rs crates/ferrosa-memory-core/src/storage.rs \
+       crates/ferrosa-memory-core/src/entity.rs crates/ferrosa-memory-core/src/dispatch.rs \
+       crates/ferrosa-memory-core/src/cql_storage.rs
 git commit -m "feat: memory state management (promote/demote)"
 ```
 
@@ -1113,8 +1113,8 @@ git commit -m "feat: memory state management (promote/demote)"
 ## Task 8: Add Memory Health / Stats Tool
 
 **Files:**
-- Modify: `crates/ferrosa-core/src/dispatch.rs`
-- Modify: `crates/ferrosa-core/src/storage.rs` (add count methods)
+- Modify: `crates/ferrosa-memory-core/src/dispatch.rs`
+- Modify: `crates/ferrosa-memory-core/src/storage.rs` (add count methods)
 
 Simple stats aggregation — total entities, folds, memos, temporal facts per session.
 
@@ -1142,9 +1142,9 @@ git commit -m "feat: get_stats MCP tool for memory health monitoring"
 
 **Files:**
 - Create: `ddl/006_intentions.cql`
-- Modify: `crates/ferrosa-core/src/storage.rs`
-- Modify: `crates/ferrosa-core/src/cql_storage.rs`
-- Modify: `crates/ferrosa-core/src/intention.rs`
+- Modify: `crates/ferrosa-memory-core/src/storage.rs`
+- Modify: `crates/ferrosa-memory-core/src/cql_storage.rs`
+- Modify: `crates/ferrosa-memory-core/src/intention.rs`
 
 Persist intentions to CQL so they survive server restarts.
 
@@ -1180,8 +1180,8 @@ async fn intention_update_status(&self, ctx: &TenantContext, id: Uuid, status: &
 - [ ] **Step 5: Run tests, commit**
 
 ```bash
-git add ddl/006_intentions.cql crates/ferrosa-core/src/storage.rs \
-       crates/ferrosa-core/src/cql_storage.rs crates/ferrosa-core/src/intention.rs
+git add ddl/006_intentions.cql crates/ferrosa-memory-core/src/storage.rs \
+       crates/ferrosa-memory-core/src/cql_storage.rs crates/ferrosa-memory-core/src/intention.rs
 git commit -m "feat: persist intentions to CQL"
 ```
 
@@ -1190,8 +1190,8 @@ git commit -m "feat: persist intentions to CQL"
 ## Task 10: Auto-Entity Extraction on Fold Complete
 
 **Files:**
-- Modify: `crates/ferrosa-core/src/fold.rs`
-- Modify: `crates/ferrosa-core/src/smart_ingest.rs`
+- Modify: `crates/ferrosa-memory-core/src/fold.rs`
+- Modify: `crates/ferrosa-memory-core/src/smart_ingest.rs`
 
 The key missing automation: when `complete_fold()` is called with a summary, automatically extract entities from the summary text and ingest them via `smart_ingest`.
 
@@ -1228,7 +1228,7 @@ for (name, entity_type) in candidates {
 - [ ] **Step 3: Write test, run, commit**
 
 ```bash
-git add crates/ferrosa-core/src/fold.rs crates/ferrosa-core/src/smart_ingest.rs
+git add crates/ferrosa-memory-core/src/fold.rs crates/ferrosa-memory-core/src/smart_ingest.rs
 git commit -m "feat: auto-extract entities from fold summaries on complete"
 ```
 
@@ -1237,7 +1237,7 @@ git commit -m "feat: auto-extract entities from fold summaries on complete"
 ## Task 11: Rebuild Binary and Verify MCP Server
 
 **Files:**
-- Modify: `crates/ferrosa-core/src/dispatch.rs` (final tool count check)
+- Modify: `crates/ferrosa-memory-core/src/dispatch.rs` (final tool count check)
 - Possibly modify transport layer to pass SessionState
 
 - [ ] **Step 1: Run full test suite**

@@ -1,4 +1,4 @@
-//! # ferrosa-core
+//! # ferrosa-memory-core
 //!
 //! Shared library for the Ferrosa Memory MCP system. Contains configuration,
 //! metrics, authentication, storage traits, and tool implementations that are
@@ -15,7 +15,7 @@
 //! - [`plan`] — Plan state tool handlers
 //! - [`types`] — Shared domain types
 
-//! # ferrosa-core
+//! # ferrosa-memory-core
 //!
 //! Shared library for the Ferrosa Memory MCP system.
 

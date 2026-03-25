@@ -5,7 +5,7 @@
 
 ## Module Inventory
 
-34 modules identified from `ferrosa-core/src/lib.rs`:
+34 modules identified from `ferrosa-memory-core/src/lib.rs`:
 
 ### MCP Protocol Layer
 

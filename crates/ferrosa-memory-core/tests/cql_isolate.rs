@@ -1,5 +1,5 @@
 //! Isolate which column types cause PREPARE to fail.
-//! Run: cargo test -p ferrosa-core --test cql_isolate -- --ignored --nocapture
+//! Run: cargo test -p ferrosa-memory-core --test cql_isolate -- --ignored --nocapture
 
 use cdrs_tokio::authenticators::NoneAuthenticatorProvider;
 use cdrs_tokio::cluster::NodeTcpConfigBuilder;

@@ -6,9 +6,9 @@ During integration testing of ferrosa-memory-mcp against Ferrosa DB, we identifi
 and fixed 7 CQL protocol issues (all landed on `feature/udf-uda-query-time`) and
 documented 4 remaining issues that block specific features.
 
-**Reproduction tests:** `crates/ferrosa-core/tests/ferrosa_bugs.rs`
+**Reproduction tests:** `crates/ferrosa-memory-core/tests/ferrosa_bugs.rs`
 ```sh
-cargo test -p ferrosa-core --test ferrosa_bugs -- --ignored --nocapture
+cargo test -p ferrosa-memory-core --test ferrosa_bugs -- --ignored --nocapture
 ```
 
 ---

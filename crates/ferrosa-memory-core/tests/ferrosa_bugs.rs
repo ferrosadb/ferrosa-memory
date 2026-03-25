@@ -1,7 +1,7 @@
 //! Ferrosa/cdrs-tokio compatibility tests.
 //!
 //! Fixed tests and remaining open issues.
-//! Run: cargo test -p ferrosa-core --test ferrosa_bugs -- --ignored --nocapture
+//! Run: cargo test -p ferrosa-memory-core --test ferrosa_bugs -- --ignored --nocapture
 
 use std::sync::Arc;
 

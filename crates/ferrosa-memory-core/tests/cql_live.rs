@@ -1,5 +1,5 @@
 //! Live CQL integration test — minimal cdrs-tokio connection.
-//! Run with: cargo test -p ferrosa-core --test cql_live -- --ignored --nocapture
+//! Run with: cargo test -p ferrosa-memory-core --test cql_live -- --ignored --nocapture
 
 use std::sync::Arc;
 
