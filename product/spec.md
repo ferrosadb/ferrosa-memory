@@ -85,37 +85,44 @@ The design is grounded in the following papers, grouped by the architectural con
 
 ### 3.1 System Diagram
 
-```
-┌────────────────────────────────────────────────────────────┐
-│                    MCP Clients                              │
-│   Claude Code  │  Claude.ai  │  Third-party MCP clients    │
-└──────────────────────┬─────────────────────────────────────┘
-                       │  MCP protocol (stdio / HTTP+SSE)
-┌──────────────────────▼─────────────────────────────────────┐
-│              ferrosa-memory-mcp  (this project)             │
-│                                                             │
-│  ┌─────────────┐  ┌──────────────┐  ┌───────────────────┐  │
-│  │ Tool Router  │  │ Auth / Tenant│  │  Compression UDF  │  │
-│  │ (SRLM-style) │  │  Isolation   │  │  (LLMLingua/NL)   │  │
-│  └──────┬──────┘  └──────┬───────┘  └────────┬──────────┘  │
-│         └────────────────┼───────────────────┘             │
-│                          │ CQL + Cypher                     │
-└──────────────────────────┼─────────────────────────────────┘
-                           │
-┌──────────────────────────▼─────────────────────────────────┐
-│                     Ferrosa DB                              │
-│                                                             │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  agent_memory keyspace                               │   │
-│  │                                                      │   │
-│  │  memo_cache  │  plan_state  │  trajectory_folds      │   │
-│  │  entity_store│  feedback    │  temporal_events        │   │
-│  └──────────────────────────────────────────────────────┘   │
-│                                                             │
-│  Indexes: HNSW · IVFFlat · B-tree · Phonetic · Hash        │
-│  Graph:   Cypher · adjacency index · FOLDED_INTO edges      │
-│  Storage: NVMe (hot) → S3 Standard → S3 Glacier (cold)     │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#16161f','primaryTextColor':'#e8e8ed','primaryBorderColor':'#e2725b','lineColor':'#9494a3','secondaryColor':'#1c1c28','tertiaryColor':'#111118','clusterBkg':'#111118','clusterBorder':'#1e1e2a','edgeLabelBackground':'#111118','nodeTextColor':'#e8e8ed'}}}%%
+graph TD
+    subgraph Clients["MCP Clients"]
+        CC[Claude Code]
+        CA[Claude.ai]
+        TP[Third-party MCP clients]
+    end
+
+    subgraph MCP["ferrosa-memory-mcp"]
+        TR["Tool Router<br/>(SRLM-style)"]
+        AT["Auth / Tenant<br/>Isolation"]
+        CU["Compression<br/>(LLMLingua/NL)"]
+    end
+
+    subgraph DB["Ferrosa DB"]
+        subgraph KS["agent_memory keyspace"]
+            T1[memo_cache]
+            T2[plan_state]
+            T3[trajectory_folds]
+            T4[entity_store]
+            T5[feedback_outcomes]
+            T6[temporal_events]
+        end
+        IX["Indexes: HNSW · B-tree · Phonetic · Hash"]
+        GR["Graph: Cypher · adjacency index · FOLDED_INTO edges"]
+        ST["Storage: NVMe → S3 Standard → S3 Glacier"]
+    end
+
+    CC -->|stdio| TR
+    CA -->|HTTP+SSE| TR
+    TP -->|HTTP+SSE| TR
+    TR --> AT
+    AT -->|CQL + Cypher| KS
+    CU -->|compress before write| KS
+    KS --- IX
+    KS --- GR
+    KS --- ST
 ```
 
 ### 3.2 MCP Transport

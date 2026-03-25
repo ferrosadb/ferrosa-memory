@@ -1,7 +1,7 @@
 # Failure Mode and Effects Analysis — ferrosa-memory-mcp
 
-> Last updated: 2026-03-23
-> Status: Updated — F31/F32 resolved; added F33–F37 for cognitive tools, visualization, and smart ingest
+> Last updated: 2026-03-25
+> Status: Updated — F31/F32 resolved; added F33–F37 for cognitive tools, visualization, and smart ingest. get_stats enrichment and SSE anomaly subscription added (Sprint 4.9).
 
 ## Scoring Criteria
 
