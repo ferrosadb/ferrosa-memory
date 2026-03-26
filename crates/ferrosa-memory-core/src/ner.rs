@@ -146,11 +146,12 @@ pub fn apply_type_override(caller_type: &str, extracted_type: &str) -> String {
 
 /// Extract an entity from content using heuristics.
 ///
-/// Tries [`crate::smart_ingest::extract_entity_candidates`] first, then falls
+/// Tries [`crate::smart_ingest::extract_entity_candidates`] first, ranking them
+/// by quality (multi-word typed entities beat single-word concepts), then falls
 /// back to an 8-word truncation classified by [`crate::smart_ingest::infer_entity_type`].
 pub fn heuristic_extract_entity(content: &str) -> (String, String) {
     let candidates = crate::smart_ingest::extract_entity_candidates(content);
-    if let Some((name, etype)) = candidates.into_iter().next() {
+    if let Some((name, etype)) = rank_candidates(candidates) {
         (name, etype)
     } else {
         let truncated: String = content
@@ -160,6 +161,38 @@ pub fn heuristic_extract_entity(content: &str) -> (String, String) {
             .join(" ");
         let etype = crate::smart_ingest::infer_entity_type(&truncated);
         (truncated, etype.to_string())
+    }
+}
+
+/// Pick the best candidate from a list by scoring each one.
+///
+/// Scoring: multi-word + non-concept = 3, single-word + non-concept = 2,
+/// multi-word + concept = 1, single-word + concept = 0.
+fn rank_candidates(candidates: Vec<(String, String)>) -> Option<(String, String)> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut best = &candidates[0];
+    let mut best_score = candidate_score(best);
+    for candidate in &candidates[1..] {
+        let score = candidate_score(candidate);
+        if score > best_score {
+            best = candidate;
+            best_score = score;
+        }
+    }
+    Some((best.0.clone(), best.1.clone()))
+}
+
+/// Score a single candidate: higher is better.
+fn candidate_score(candidate: &(String, String)) -> u8 {
+    let multi_word = candidate.0.split_whitespace().count() >= 2;
+    let typed = candidate.1 != "concept";
+    match (multi_word, typed) {
+        (true, true) => 3,
+        (false, true) => 2,
+        (true, false) => 1,
+        (false, false) => 0,
     }
 }
 
@@ -777,5 +810,31 @@ mod tests {
         .await;
         assert_eq!(name, "Docker");
         assert_eq!(etype, "tool");
+    }
+
+    // --- rank_candidates / candidate_score tests ---
+
+    #[test]
+    fn heuristic_prefers_multi_word_over_single_word() {
+        let (name, _) = heuristic_extract_entity("Storage design by Ben Kearns is excellent");
+        assert_eq!(name, "Ben Kearns");
+    }
+
+    #[test]
+    fn heuristic_prefers_typed_over_concept() {
+        let (name, etype) = heuristic_extract_entity("Original design uses Docker containers");
+        assert_eq!(name, "Docker");
+        assert_eq!(etype, "tool");
+    }
+
+    #[test]
+    fn rank_candidates_empty_returns_none() {
+        assert!(rank_candidates(vec![]).is_none());
+    }
+
+    #[test]
+    fn rank_candidates_single_returns_it() {
+        let result = rank_candidates(vec![("Foo".into(), "concept".into())]);
+        assert_eq!(result, Some(("Foo".into(), "concept".into())));
     }
 }
