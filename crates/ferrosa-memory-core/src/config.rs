@@ -123,7 +123,7 @@ impl Default for ServerConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct FerrosaCqlConfig {
     pub contact_points: Vec<String>,
     #[serde(default = "default_keyspace")]

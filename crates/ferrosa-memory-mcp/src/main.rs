@@ -2,43 +2,83 @@
 //!
 //! MCP server binary that exposes Ferrosa's memory tools via stdio or HTTP+SSE.
 //!
-//! Connects to a real Ferrosa cluster via CQL (cdrs-tokio) and Bolt (neo4rs)
-//! when a config file is available. Falls back to in-memory mock storage
-//! if CQL connection fails.
+//! Connects to a real Ferrosa cluster via CQL (cdrs-tokio). If the initial
+//! connection fails, starts serving immediately with a "reconnecting" backend
+//! that returns errors, while a background task retries with exponential backoff.
+//! Never falls back to mock storage — mock silently loses data.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use ferrosa_memory_core::auth;
+use ferrosa_memory_core::config::FerrosaCqlConfig;
 use ferrosa_memory_core::cql_storage::CqlStorage;
 use ferrosa_memory_core::dispatch;
 use ferrosa_memory_core::http;
 use ferrosa_memory_core::storage::Storage;
-use ferrosa_memory_core::storage::mock::MockStorage;
 use ferrosa_memory_core::transport;
 use ferrosa_memory_core::types::*;
+use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 
-/// Enum dispatch wrapper — allows switching between real CQL and mock storage
-/// without requiring dyn-compatible traits.
-enum StorageBackend {
-    Cql(Box<CqlStorage>),
-    Mock(Box<MockStorage>),
+/// Storage wrapper that holds an `Option<CqlStorage>` behind a `RwLock`.
+///
+/// When `inner` is `None`, the server is still reconnecting — all Storage
+/// methods return a descriptive error. Once connected, the background task
+/// swaps in `Some(cql)` and all subsequent calls route to the real backend.
+struct ReconnectingStorage {
+    inner: RwLock<Option<CqlStorage>>,
 }
 
-/// Delegate all Storage methods to the inner variant.
-impl Storage for StorageBackend {
+impl ReconnectingStorage {
+    /// Create with an already-connected CQL backend.
+    fn connected(cql: CqlStorage) -> Self {
+        Self {
+            inner: RwLock::new(Some(cql)),
+        }
+    }
+
+    /// Create in "reconnecting" state — no backend available yet.
+    fn disconnected() -> Self {
+        Self {
+            inner: RwLock::new(None),
+        }
+    }
+
+    /// Swap in a newly connected CQL backend.
+    async fn set_connected(&self, cql: CqlStorage) {
+        let mut guard = self.inner.write().await;
+        *guard = Some(cql);
+    }
+}
+
+/// Error returned when CQL is not yet connected.
+const NOT_CONNECTED_MSG: &str = "CQL connection not yet established, retrying in background...";
+
+/// Macro to delegate a Storage trait method through the RwLock.
+///
+/// Acquires a read lock, checks for Some(cql), and forwards the call.
+/// Returns a clear error when the backend is still reconnecting.
+macro_rules! delegate {
+    ($self:ident, $method:ident $(, $arg:expr)*) => {{
+        let guard = $self.inner.read().await;
+        match guard.as_ref() {
+            Some(cql) => cql.$method($($arg),*).await,
+            None => Err(anyhow::anyhow!(NOT_CONNECTED_MSG)),
+        }
+    }};
+}
+
+/// Delegate all Storage methods through the RwLock<Option<CqlStorage>>.
+impl Storage for ReconnectingStorage {
     async fn memo_get(
         &self,
         ctx: &TenantContext,
         content_hash: &str,
         model_version: &str,
     ) -> anyhow::Result<Option<MemoEntry>> {
-        match self {
-            Self::Cql(s) => s.memo_get(ctx, content_hash, model_version).await,
-            Self::Mock(s) => s.memo_get(ctx, content_hash, model_version).await,
-        }
+        delegate!(self, memo_get, ctx, content_hash, model_version)
     }
 
     async fn memo_touch(
@@ -47,24 +87,15 @@ impl Storage for StorageBackend {
         content_hash: &str,
         model_version: &str,
     ) -> anyhow::Result<()> {
-        match self {
-            Self::Cql(s) => s.memo_touch(ctx, content_hash, model_version).await,
-            Self::Mock(s) => s.memo_touch(ctx, content_hash, model_version).await,
-        }
+        delegate!(self, memo_touch, ctx, content_hash, model_version)
     }
 
     async fn memo_put(&self, ctx: &TenantContext, entry: &MemoEntry) -> anyhow::Result<()> {
-        match self {
-            Self::Cql(s) => s.memo_put(ctx, entry).await,
-            Self::Mock(s) => s.memo_put(ctx, entry).await,
-        }
+        delegate!(self, memo_put, ctx, entry)
     }
 
     async fn plan_put(&self, ctx: &TenantContext, node: &PlanNode) -> anyhow::Result<()> {
-        match self {
-            Self::Cql(s) => s.plan_put(ctx, node).await,
-            Self::Mock(s) => s.plan_put(ctx, node).await,
-        }
+        delegate!(self, plan_put, ctx, node)
     }
 
     async fn plan_get(
@@ -73,10 +104,7 @@ impl Storage for StorageBackend {
         session_id: uuid::Uuid,
         max_depth: Option<i32>,
     ) -> anyhow::Result<Vec<PlanNode>> {
-        match self {
-            Self::Cql(s) => s.plan_get(ctx, session_id, max_depth).await,
-            Self::Mock(s) => s.plan_get(ctx, session_id, max_depth).await,
-        }
+        delegate!(self, plan_get, ctx, session_id, max_depth)
     }
 
     async fn plan_update_status(
@@ -88,23 +116,20 @@ impl Storage for StorageBackend {
         status: PlanStatus,
         outcome_summary: Option<&str>,
     ) -> anyhow::Result<()> {
-        match self {
-            Self::Cql(s) => {
-                s.plan_update_status(ctx, session_id, depth, subtask_id, status, outcome_summary)
-                    .await
-            }
-            Self::Mock(s) => {
-                s.plan_update_status(ctx, session_id, depth, subtask_id, status, outcome_summary)
-                    .await
-            }
-        }
+        delegate!(
+            self,
+            plan_update_status,
+            ctx,
+            session_id,
+            depth,
+            subtask_id,
+            status,
+            outcome_summary
+        )
     }
 
     async fn fold_put(&self, ctx: &TenantContext, entry: &FoldEntry) -> anyhow::Result<()> {
-        match self {
-            Self::Cql(s) => s.fold_put(ctx, entry).await,
-            Self::Mock(s) => s.fold_put(ctx, entry).await,
-        }
+        delegate!(self, fold_put, ctx, entry)
     }
 
     async fn fold_get(
@@ -113,10 +138,7 @@ impl Storage for StorageBackend {
         session_id: uuid::Uuid,
         fold_id: uuid::Uuid,
     ) -> anyhow::Result<Option<FoldEntry>> {
-        match self {
-            Self::Cql(s) => s.fold_get(ctx, session_id, fold_id).await,
-            Self::Mock(s) => s.fold_get(ctx, session_id, fold_id).await,
-        }
+        delegate!(self, fold_get, ctx, session_id, fold_id)
     }
 
     async fn fold_append(
@@ -126,10 +148,7 @@ impl Storage for StorageBackend {
         fold_id: uuid::Uuid,
         text: &str,
     ) -> anyhow::Result<()> {
-        match self {
-            Self::Cql(s) => s.fold_append(ctx, session_id, fold_id, text).await,
-            Self::Mock(s) => s.fold_append(ctx, session_id, fold_id, text).await,
-        }
+        delegate!(self, fold_append, ctx, session_id, fold_id, text)
     }
 
     async fn fold_complete(
@@ -141,30 +160,16 @@ impl Storage for StorageBackend {
         embedding: Vec<f32>,
         compression_ratio: f64,
     ) -> anyhow::Result<()> {
-        match self {
-            Self::Cql(s) => {
-                s.fold_complete(
-                    ctx,
-                    session_id,
-                    fold_id,
-                    summary,
-                    embedding,
-                    compression_ratio,
-                )
-                .await
-            }
-            Self::Mock(s) => {
-                s.fold_complete(
-                    ctx,
-                    session_id,
-                    fold_id,
-                    summary,
-                    embedding,
-                    compression_ratio,
-                )
-                .await
-            }
-        }
+        delegate!(
+            self,
+            fold_complete,
+            ctx,
+            session_id,
+            fold_id,
+            summary,
+            embedding,
+            compression_ratio
+        )
     }
 
     async fn fold_search(
@@ -175,23 +180,19 @@ impl Storage for StorageBackend {
         k: usize,
         include_raw: bool,
     ) -> anyhow::Result<Vec<FoldSummary>> {
-        match self {
-            Self::Cql(s) => {
-                s.fold_search(ctx, session_id, query_embedding, k, include_raw)
-                    .await
-            }
-            Self::Mock(s) => {
-                s.fold_search(ctx, session_id, query_embedding, k, include_raw)
-                    .await
-            }
-        }
+        delegate!(
+            self,
+            fold_search,
+            ctx,
+            session_id,
+            query_embedding,
+            k,
+            include_raw
+        )
     }
 
     async fn entity_put(&self, ctx: &TenantContext, entry: &EntityEntry) -> anyhow::Result<()> {
-        match self {
-            Self::Cql(s) => s.entity_put(ctx, entry).await,
-            Self::Mock(s) => s.entity_put(ctx, entry).await,
-        }
+        delegate!(self, entity_put, ctx, entry)
     }
 
     async fn entity_find_phonetic(
@@ -200,10 +201,7 @@ impl Storage for StorageBackend {
         session_id: uuid::Uuid,
         name: &str,
     ) -> anyhow::Result<Option<EntityEntry>> {
-        match self {
-            Self::Cql(s) => s.entity_find_phonetic(ctx, session_id, name).await,
-            Self::Mock(s) => s.entity_find_phonetic(ctx, session_id, name).await,
-        }
+        delegate!(self, entity_find_phonetic, ctx, session_id, name)
     }
 
     async fn entity_search_ann(
@@ -213,16 +211,7 @@ impl Storage for StorageBackend {
         query_embedding: &[f32],
         k: usize,
     ) -> anyhow::Result<Vec<EntityEntry>> {
-        match self {
-            Self::Cql(s) => {
-                s.entity_search_ann(ctx, session_id, query_embedding, k)
-                    .await
-            }
-            Self::Mock(s) => {
-                s.entity_search_ann(ctx, session_id, query_embedding, k)
-                    .await
-            }
-        }
+        delegate!(self, entity_search_ann, ctx, session_id, query_embedding, k)
     }
 
     async fn entity_count(
@@ -230,10 +219,7 @@ impl Storage for StorageBackend {
         ctx: &TenantContext,
         session_id: uuid::Uuid,
     ) -> anyhow::Result<usize> {
-        match self {
-            Self::Cql(s) => s.entity_count(ctx, session_id).await,
-            Self::Mock(s) => s.entity_count(ctx, session_id).await,
-        }
+        delegate!(self, entity_count, ctx, session_id)
     }
 
     async fn fold_count(
@@ -241,17 +227,11 @@ impl Storage for StorageBackend {
         ctx: &TenantContext,
         session_id: uuid::Uuid,
     ) -> anyhow::Result<usize> {
-        match self {
-            Self::Cql(s) => s.fold_count(ctx, session_id).await,
-            Self::Mock(s) => s.fold_count(ctx, session_id).await,
-        }
+        delegate!(self, fold_count, ctx, session_id)
     }
 
     async fn memo_count(&self, ctx: &TenantContext) -> anyhow::Result<usize> {
-        match self {
-            Self::Cql(s) => s.memo_count(ctx).await,
-            Self::Mock(s) => s.memo_count(ctx).await,
-        }
+        delegate!(self, memo_count, ctx)
     }
 
     async fn entity_update_state(
@@ -260,10 +240,7 @@ impl Storage for StorageBackend {
         entity_id: uuid::Uuid,
         state: MemoryState,
     ) -> anyhow::Result<()> {
-        match self {
-            Self::Cql(s) => s.entity_update_state(ctx, entity_id, state).await,
-            Self::Mock(s) => s.entity_update_state(ctx, entity_id, state).await,
-        }
+        delegate!(self, entity_update_state, ctx, entity_id, state)
     }
 
     async fn entity_list_session(
@@ -271,24 +248,15 @@ impl Storage for StorageBackend {
         ctx: &TenantContext,
         session_id: uuid::Uuid,
     ) -> anyhow::Result<Vec<EntityEntry>> {
-        match self {
-            Self::Cql(s) => s.entity_list_session(ctx, session_id).await,
-            Self::Mock(s) => s.entity_list_session(ctx, session_id).await,
-        }
+        delegate!(self, entity_list_session, ctx, session_id)
     }
 
     async fn entity_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<EntityEntry>> {
-        match self {
-            Self::Cql(s) => s.entity_list_all(ctx).await,
-            Self::Mock(s) => s.entity_list_all(ctx).await,
-        }
+        delegate!(self, entity_list_all, ctx)
     }
 
     async fn temporal_put(&self, ctx: &TenantContext, event: &TemporalEvent) -> anyhow::Result<()> {
-        match self {
-            Self::Cql(s) => s.temporal_put(ctx, event).await,
-            Self::Mock(s) => s.temporal_put(ctx, event).await,
-        }
+        delegate!(self, temporal_put, ctx, event)
     }
 
     async fn temporal_get_current(
@@ -296,10 +264,7 @@ impl Storage for StorageBackend {
         ctx: &TenantContext,
         entity_id: uuid::Uuid,
     ) -> anyhow::Result<Option<TemporalEvent>> {
-        match self {
-            Self::Cql(s) => s.temporal_get_current(ctx, entity_id).await,
-            Self::Mock(s) => s.temporal_get_current(ctx, entity_id).await,
-        }
+        delegate!(self, temporal_get_current, ctx, entity_id)
     }
 
     async fn temporal_invalidate(
@@ -308,10 +273,7 @@ impl Storage for StorageBackend {
         entity_id: uuid::Uuid,
         event_id: uuid::Uuid,
     ) -> anyhow::Result<()> {
-        match self {
-            Self::Cql(s) => s.temporal_invalidate(ctx, entity_id, event_id).await,
-            Self::Mock(s) => s.temporal_invalidate(ctx, entity_id, event_id).await,
-        }
+        delegate!(self, temporal_invalidate, ctx, entity_id, event_id)
     }
 
     async fn feedback_put(
@@ -319,16 +281,14 @@ impl Storage for StorageBackend {
         ctx: &TenantContext,
         outcome: &FeedbackOutcome,
     ) -> anyhow::Result<()> {
-        match self {
-            Self::Cql(s) => s.feedback_put(ctx, outcome).await,
-            Self::Mock(s) => s.feedback_put(ctx, outcome).await,
-        }
+        delegate!(self, feedback_put, ctx, outcome)
     }
 
     async fn feedback_list_all(&self) -> anyhow::Result<Vec<FeedbackOutcome>> {
-        match self {
-            Self::Cql(s) => s.feedback_list_all().await,
-            Self::Mock(s) => s.feedback_list_all().await,
+        let guard = self.inner.read().await;
+        match guard.as_ref() {
+            Some(cql) => cql.feedback_list_all().await,
+            None => Err(anyhow::anyhow!(NOT_CONNECTED_MSG)),
         }
     }
 
@@ -337,10 +297,7 @@ impl Storage for StorageBackend {
         ctx: &TenantContext,
         session_id: uuid::Uuid,
     ) -> anyhow::Result<usize> {
-        match self {
-            Self::Cql(s) => s.delete_session(ctx, session_id).await,
-            Self::Mock(s) => s.delete_session(ctx, session_id).await,
-        }
+        delegate!(self, delete_session, ctx, session_id)
     }
 
     async fn edge_folded_into(
@@ -350,10 +307,7 @@ impl Storage for StorageBackend {
         target: uuid::Uuid,
         session: uuid::Uuid,
     ) -> anyhow::Result<()> {
-        match self {
-            Self::Cql(s) => s.edge_folded_into(ctx, source, target, session).await,
-            Self::Mock(s) => s.edge_folded_into(ctx, source, target, session).await,
-        }
+        delegate!(self, edge_folded_into, ctx, source, target, session)
     }
 
     async fn edge_mentioned_in(
@@ -363,10 +317,7 @@ impl Storage for StorageBackend {
         fold: uuid::Uuid,
         session: uuid::Uuid,
     ) -> anyhow::Result<()> {
-        match self {
-            Self::Cql(s) => s.edge_mentioned_in(ctx, entity, fold, session).await,
-            Self::Mock(s) => s.edge_mentioned_in(ctx, entity, fold, session).await,
-        }
+        delegate!(self, edge_mentioned_in, ctx, entity, fold, session)
     }
 
     async fn edge_co_occurs(
@@ -377,10 +328,7 @@ impl Storage for StorageBackend {
         session: uuid::Uuid,
         strength: f32,
     ) -> anyhow::Result<()> {
-        match self {
-            Self::Cql(s) => s.edge_co_occurs(ctx, a, b, session, strength).await,
-            Self::Mock(s) => s.edge_co_occurs(ctx, a, b, session, strength).await,
-        }
+        delegate!(self, edge_co_occurs, ctx, a, b, session, strength)
     }
 
     async fn edge_prune_stale(
@@ -388,10 +336,7 @@ impl Storage for StorageBackend {
         ctx: &TenantContext,
         cutoff: chrono::DateTime<chrono::Utc>,
     ) -> anyhow::Result<usize> {
-        match self {
-            Self::Cql(s) => s.edge_prune_stale(ctx, cutoff).await,
-            Self::Mock(s) => s.edge_prune_stale(ctx, cutoff).await,
-        }
+        delegate!(self, edge_prune_stale, ctx, cutoff)
     }
 
     async fn edge_supersedes(
@@ -401,10 +346,7 @@ impl Storage for StorageBackend {
         old_id: uuid::Uuid,
         entity: uuid::Uuid,
     ) -> anyhow::Result<()> {
-        match self {
-            Self::Cql(s) => s.edge_supersedes(ctx, new_id, old_id, entity).await,
-            Self::Mock(s) => s.edge_supersedes(ctx, new_id, old_id, entity).await,
-        }
+        delegate!(self, edge_supersedes, ctx, new_id, old_id, entity)
     }
 
     async fn edge_list_session(
@@ -412,20 +354,14 @@ impl Storage for StorageBackend {
         ctx: &TenantContext,
         session_id: uuid::Uuid,
     ) -> anyhow::Result<Vec<(uuid::Uuid, uuid::Uuid, String)>> {
-        match self {
-            Self::Cql(s) => s.edge_list_session(ctx, session_id).await,
-            Self::Mock(s) => s.edge_list_session(ctx, session_id).await,
-        }
+        delegate!(self, edge_list_session, ctx, session_id)
     }
 
     async fn edge_list_all(
         &self,
         ctx: &TenantContext,
     ) -> anyhow::Result<Vec<(uuid::Uuid, uuid::Uuid, String)>> {
-        match self {
-            Self::Cql(s) => s.edge_list_all(ctx).await,
-            Self::Mock(s) => s.edge_list_all(ctx).await,
-        }
+        delegate!(self, edge_list_all, ctx)
     }
 
     async fn edge_list_for_entity(
@@ -433,10 +369,7 @@ impl Storage for StorageBackend {
         ctx: &TenantContext,
         entity_id: uuid::Uuid,
     ) -> anyhow::Result<Vec<(uuid::Uuid, String)>> {
-        match self {
-            Self::Cql(s) => s.edge_list_for_entity(ctx, entity_id).await,
-            Self::Mock(s) => s.edge_list_for_entity(ctx, entity_id).await,
-        }
+        delegate!(self, edge_list_for_entity, ctx, entity_id)
     }
 
     async fn intention_put(
@@ -444,20 +377,14 @@ impl Storage for StorageBackend {
         ctx: &TenantContext,
         intention: &ferrosa_memory_core::intention::Intention,
     ) -> anyhow::Result<()> {
-        match self {
-            Self::Cql(s) => s.intention_put(ctx, intention).await,
-            Self::Mock(s) => s.intention_put(ctx, intention).await,
-        }
+        delegate!(self, intention_put, ctx, intention)
     }
 
     async fn intention_list(
         &self,
         ctx: &TenantContext,
     ) -> anyhow::Result<Vec<ferrosa_memory_core::intention::Intention>> {
-        match self {
-            Self::Cql(s) => s.intention_list(ctx).await,
-            Self::Mock(s) => s.intention_list(ctx).await,
-        }
+        delegate!(self, intention_list, ctx)
     }
 
     async fn intention_update_status(
@@ -468,16 +395,15 @@ impl Storage for StorageBackend {
         triggered_at: Option<chrono::DateTime<chrono::Utc>>,
         completed_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> anyhow::Result<()> {
-        match self {
-            Self::Cql(s) => {
-                s.intention_update_status(ctx, id, status, triggered_at, completed_at)
-                    .await
-            }
-            Self::Mock(s) => {
-                s.intention_update_status(ctx, id, status, triggered_at, completed_at)
-                    .await
-            }
-        }
+        delegate!(
+            self,
+            intention_update_status,
+            ctx,
+            id,
+            status,
+            triggered_at,
+            completed_at
+        )
     }
 
     async fn audit_put(
@@ -485,17 +411,11 @@ impl Storage for StorageBackend {
         ctx: &TenantContext,
         entry: &ferrosa_memory_core::types::AuditEntry,
     ) -> anyhow::Result<()> {
-        match self {
-            Self::Cql(s) => s.audit_put(ctx, entry).await,
-            Self::Mock(s) => s.audit_put(ctx, entry).await,
-        }
+        delegate!(self, audit_put, ctx, entry)
     }
 
     async fn memo_total_hits(&self, ctx: &TenantContext) -> anyhow::Result<i64> {
-        match self {
-            Self::Cql(s) => s.memo_total_hits(ctx).await,
-            Self::Mock(s) => s.memo_total_hits(ctx).await,
-        }
+        delegate!(self, memo_total_hits, ctx)
     }
 
     async fn fold_count_by_status(
@@ -503,23 +423,53 @@ impl Storage for StorageBackend {
         ctx: &TenantContext,
         status: ferrosa_memory_core::types::FoldStatus,
     ) -> anyhow::Result<usize> {
-        match self {
-            Self::Cql(s) => s.fold_count_by_status(ctx, status).await,
-            Self::Mock(s) => s.fold_count_by_status(ctx, status).await,
-        }
+        delegate!(self, fold_count_by_status, ctx, status)
     }
 
     async fn temporal_count(&self, ctx: &TenantContext) -> anyhow::Result<usize> {
-        match self {
-            Self::Cql(s) => s.temporal_count(ctx).await,
-            Self::Mock(s) => s.temporal_count(ctx).await,
-        }
+        delegate!(self, temporal_count, ctx)
     }
 
     async fn edge_count(&self, ctx: &TenantContext) -> anyhow::Result<usize> {
-        match self {
-            Self::Cql(s) => s.edge_count(ctx).await,
-            Self::Mock(s) => s.edge_count(ctx).await,
+        delegate!(self, edge_count, ctx)
+    }
+}
+
+/// Backoff schedule for CQL reconnection: 1s, 2s, 4s, 8s, 16s, then 30s.
+fn next_backoff(attempt: u32) -> Duration {
+    if attempt < 5 {
+        Duration::from_secs(1 << attempt)
+    } else {
+        Duration::from_secs(30)
+    }
+}
+
+/// Background task that retries CQL connection with exponential backoff.
+///
+/// Once connected, swaps in the real backend via `set_connected`. Runs
+/// indefinitely until successful — the MCP server serves errors to callers
+/// in the meantime so they know what's happening.
+async fn cql_reconnect_loop(storage: Arc<ReconnectingStorage>, config: FerrosaCqlConfig) {
+    let mut attempt: u32 = 0;
+    loop {
+        let delay = next_backoff(attempt);
+        tracing::info!(
+            attempt = attempt + 1,
+            delay_secs = delay.as_secs(),
+            "CQL reconnection attempt scheduled"
+        );
+        tokio::time::sleep(delay).await;
+
+        match CqlStorage::connect(&config).await {
+            Ok(cql) => {
+                tracing::info!("CQL reconnection successful");
+                storage.set_connected(cql).await;
+                return;
+            }
+            Err(e) => {
+                attempt = attempt.saturating_add(1);
+                tracing::warn!(attempt, "CQL reconnection failed: {e}");
+            }
         }
     }
 }
@@ -630,15 +580,24 @@ async fn main() -> anyhow::Result<()> {
     let metrics = Arc::new(ferrosa_memory_core::metrics::MemoryMetrics::new()?);
     tracing::info!("metrics registered");
 
-    // Connect to real Ferrosa, fall back to mock
-    let storage: Arc<StorageBackend> = match CqlStorage::connect(&config.ferrosa).await {
+    // Connect to real Ferrosa — retry in background if initial connect fails.
+    // Never fall back to mock storage (mock silently loses data).
+    let storage: Arc<ReconnectingStorage> = match CqlStorage::connect(&config.ferrosa).await {
         Ok(cql) => {
             tracing::info!("connected to Ferrosa CQL cluster");
-            Arc::new(StorageBackend::Cql(Box::new(cql)))
+            Arc::new(ReconnectingStorage::connected(cql))
         }
         Err(e) => {
-            tracing::warn!("CQL connection failed ({e}), using in-memory mock storage");
-            Arc::new(StorageBackend::Mock(Box::new(MockStorage::new())))
+            tracing::warn!(
+                "CQL connection failed ({e}), starting in reconnecting mode — \
+                 tools will return errors until connection is established"
+            );
+            let storage = Arc::new(ReconnectingStorage::disconnected());
+            tokio::spawn(cql_reconnect_loop(
+                Arc::clone(&storage),
+                config.ferrosa.clone(),
+            ));
+            storage
         }
     };
 
