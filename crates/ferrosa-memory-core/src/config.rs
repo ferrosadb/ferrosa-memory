@@ -104,6 +104,13 @@ pub struct ServerConfig {
     /// Seconds of inactivity before triggering idle consolidation (default: 20).
     #[serde(default = "default_idle_seconds")]
     pub idle_consolidation_seconds: u64,
+    /// Days after which unreinforced CO_OCCURS edges are pruned. 0 = never prune (default: 0).
+    #[serde(default)]
+    pub stale_edge_max_days: u64,
+    /// Decay factor applied to CO_OCCURS edge weights each consolidation cycle (default: 0.95).
+    /// Unreinforced edges gradually lose strength; rediscovered edges are reset to full weight.
+    #[serde(default = "default_decay_factor")]
+    pub edge_decay_factor: f64,
 }
 
 impl Default for ServerConfig {
@@ -119,6 +126,8 @@ impl Default for ServerConfig {
             session_id: None,
             idle_consolidation_enabled: true,
             idle_consolidation_seconds: default_idle_seconds(),
+            stale_edge_max_days: 0,
+            edge_decay_factor: default_decay_factor(),
         }
     }
 }
@@ -296,6 +305,9 @@ fn default_cron() -> String {
 }
 fn default_idle_seconds() -> u64 {
     20
+}
+fn default_decay_factor() -> f64 {
+    0.95
 }
 fn default_viz_enabled() -> bool {
     true

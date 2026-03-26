@@ -40,6 +40,7 @@ pub mod importance;
 pub mod intention;
 pub mod memo;
 pub mod metrics;
+pub mod ner;
 pub mod plan;
 pub mod quota;
 pub mod router;

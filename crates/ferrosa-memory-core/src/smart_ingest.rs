@@ -221,6 +221,7 @@ pub async fn smart_ingest(
 /// Finds capitalized multi-word phrases (2+ capital-letter words) which are
 /// likely named entities (people, places, orgs, technical concepts). Also
 /// captures standalone capitalized words that are not common English words.
+/// Uses [`infer_entity_type`] to classify each candidate.
 pub fn extract_entity_candidates(text: &str) -> Vec<(String, String)> {
     let mut candidates = Vec::new();
 
@@ -250,7 +251,8 @@ pub fn extract_entity_candidates(text: &str) -> Vec<(String, String)> {
                 // Clean trailing punctuation
                 let clean = phrase.trim_end_matches(|c: char| c.is_ascii_punctuation());
                 if clean.len() > 1 {
-                    candidates.push((clean.to_string(), "concept".to_string()));
+                    let entity_type = infer_entity_type(clean);
+                    candidates.push((clean.to_string(), entity_type.to_string()));
                 }
             }
         } else {
@@ -260,6 +262,256 @@ pub fn extract_entity_candidates(text: &str) -> Vec<(String, String)> {
 
     candidates.dedup_by(|a, b| a.0 == b.0);
     candidates
+}
+
+/// Heuristic entity type inference from a capitalized phrase.
+///
+/// Classification priority (first match wins):
+/// 1. Organization suffixes (Inc, Corp, Ltd, Foundation, Labs, etc.)
+/// 2. All-caps acronyms (2–6 chars) → organization
+/// 3. Known tech/tool names → tool
+/// 4. Two-word phrase where first word is a common given name → person
+/// 5. Everything else → concept
+pub fn infer_entity_type(name: &str) -> &'static str {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return "concept";
+    }
+
+    // 1. Organization suffixes
+    let lower = trimmed.to_lowercase();
+    if has_org_suffix(&lower) {
+        return "organization";
+    }
+
+    // 2. All-caps acronym (e.g. AWS, IBM, NIST, NASA)
+    let alpha_only: String = trimmed.chars().filter(|c| c.is_alphabetic()).collect();
+    if (2..=6).contains(&alpha_only.len()) && alpha_only.chars().all(|c| c.is_uppercase()) {
+        return "organization";
+    }
+
+    // 3. Known tool / technology names
+    if is_known_tool(trimmed) {
+        return "tool";
+    }
+
+    // 4. Person heuristic: exactly 2 words, first is a common given name
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    if parts.len() == 2 && is_common_given_name(parts[0]) {
+        return "person";
+    }
+
+    "concept"
+}
+
+fn has_org_suffix(lower: &str) -> bool {
+    let last = lower.split_whitespace().next_back().unwrap_or("");
+    matches!(
+        last,
+        "inc"
+            | "inc."
+            | "corp"
+            | "corp."
+            | "corporation"
+            | "ltd"
+            | "ltd."
+            | "llc"
+            | "llp"
+            | "foundation"
+            | "labs"
+            | "laboratory"
+            | "institute"
+            | "university"
+            | "group"
+            | "systems"
+            | "technologies"
+            | "partners"
+            | "association"
+            | "consortium"
+    )
+}
+
+/// Small curated list of well-known tech tools and platforms.
+fn is_known_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "Docker"
+            | "Kubernetes"
+            | "Terraform"
+            | "Ansible"
+            | "Jenkins"
+            | "Grafana"
+            | "Prometheus"
+            | "Kafka"
+            | "Redis"
+            | "PostgreSQL"
+            | "Postgres"
+            | "MongoDB"
+            | "Cassandra"
+            | "Elasticsearch"
+            | "Nginx"
+            | "Git"
+            | "GitHub"
+            | "GitLab"
+            | "Cargo"
+            | "Rustup"
+            | "Clippy"
+            | "Neo4j"
+            | "ScyllaDB"
+            | "Ferrosa"
+            | "Linux"
+            | "Vim"
+            | "Neovim"
+            | "Emacs"
+            | "Webpack"
+            | "Vite"
+            | "Node"
+            | "Deno"
+            | "Bun"
+            | "Ollama"
+            | "LangChain"
+            | "Tokio"
+            | "Axum"
+            | "Actix"
+            | "Flask"
+            | "FastAPI"
+            | "Django"
+            | "Phoenix"
+            | "React"
+            | "Vue"
+            | "Svelte"
+            | "Playwright"
+    )
+}
+
+/// Common English given names (~120). A two-word phrase starting with one
+/// of these is likely a person name.
+fn is_common_given_name(word: &str) -> bool {
+    matches!(
+        word,
+        "Aaron"
+            | "Adam"
+            | "Alex"
+            | "Alice"
+            | "Amanda"
+            | "Amy"
+            | "Andrea"
+            | "Andrew"
+            | "Angela"
+            | "Anna"
+            | "Anthony"
+            | "Ashley"
+            | "Barbara"
+            | "Ben"
+            | "Benjamin"
+            | "Beth"
+            | "Brandon"
+            | "Brian"
+            | "Carol"
+            | "Charles"
+            | "Charlotte"
+            | "Chris"
+            | "Christina"
+            | "Christopher"
+            | "Claire"
+            | "Craig"
+            | "Dan"
+            | "Daniel"
+            | "Dave"
+            | "David"
+            | "Deborah"
+            | "Diana"
+            | "Donald"
+            | "Donna"
+            | "Dorothy"
+            | "Edward"
+            | "Elizabeth"
+            | "Emily"
+            | "Eric"
+            | "Frank"
+            | "Gary"
+            | "George"
+            | "Grace"
+            | "Hannah"
+            | "Helen"
+            | "Henry"
+            | "Jack"
+            | "Jacob"
+            | "James"
+            | "Jane"
+            | "Jason"
+            | "Jeff"
+            | "Jennifer"
+            | "Jessica"
+            | "Jim"
+            | "Joe"
+            | "John"
+            | "Jonathan"
+            | "Joseph"
+            | "Josh"
+            | "Joshua"
+            | "Julie"
+            | "Justin"
+            | "Karen"
+            | "Kate"
+            | "Katherine"
+            | "Kelly"
+            | "Ken"
+            | "Kevin"
+            | "Kim"
+            | "Laura"
+            | "Lauren"
+            | "Linda"
+            | "Lisa"
+            | "Luke"
+            | "Margaret"
+            | "Maria"
+            | "Mark"
+            | "Martin"
+            | "Mary"
+            | "Matt"
+            | "Matthew"
+            | "Megan"
+            | "Michael"
+            | "Michelle"
+            | "Mike"
+            | "Nancy"
+            | "Nathan"
+            | "Nicholas"
+            | "Nick"
+            | "Nicole"
+            | "Noah"
+            | "Olivia"
+            | "Patrick"
+            | "Paul"
+            | "Peter"
+            | "Rachel"
+            | "Rebecca"
+            | "Richard"
+            | "Robert"
+            | "Ronald"
+            | "Ryan"
+            | "Sam"
+            | "Samuel"
+            | "Sandra"
+            | "Sarah"
+            | "Scott"
+            | "Sean"
+            | "Sharon"
+            | "Sophia"
+            | "Stephen"
+            | "Steve"
+            | "Steven"
+            | "Susan"
+            | "Thomas"
+            | "Tim"
+            | "Timothy"
+            | "Tom"
+            | "Tony"
+            | "Tyler"
+            | "Victoria"
+            | "William"
+    )
 }
 
 fn is_common_word(word: &str) -> bool {
@@ -448,5 +700,63 @@ mod tests {
     fn extract_entities_all_lowercase() {
         let candidates = extract_entity_candidates("everything is lowercase here");
         assert!(candidates.is_empty());
+    }
+
+    // --- infer_entity_type tests ---
+
+    #[test]
+    fn infer_type_person() {
+        assert_eq!(infer_entity_type("Ben Kearns"), "person");
+        assert_eq!(infer_entity_type("Alice Smith"), "person");
+        assert_eq!(infer_entity_type("David Chen"), "person");
+    }
+
+    #[test]
+    fn infer_type_organization_suffix() {
+        assert_eq!(infer_entity_type("Acme Corp"), "organization");
+        assert_eq!(infer_entity_type("Mozilla Foundation"), "organization");
+        assert_eq!(infer_entity_type("HashiCorp Labs"), "organization");
+    }
+
+    #[test]
+    fn infer_type_organization_acronym() {
+        assert_eq!(infer_entity_type("AWS"), "organization");
+        assert_eq!(infer_entity_type("IBM"), "organization");
+        assert_eq!(infer_entity_type("NASA"), "organization");
+        assert_eq!(infer_entity_type("NIST"), "organization");
+    }
+
+    #[test]
+    fn infer_type_tool() {
+        assert_eq!(infer_entity_type("Docker"), "tool");
+        assert_eq!(infer_entity_type("Ferrosa"), "tool");
+        assert_eq!(infer_entity_type("Neo4j"), "tool");
+        assert_eq!(infer_entity_type("Tokio"), "tool");
+    }
+
+    #[test]
+    fn infer_type_concept_fallback() {
+        assert_eq!(infer_entity_type("Memory Lifecycle"), "concept");
+        assert_eq!(infer_entity_type("Dream Consolidation"), "concept");
+    }
+
+    #[test]
+    fn infer_type_empty() {
+        assert_eq!(infer_entity_type(""), "concept");
+        assert_eq!(infer_entity_type("  "), "concept");
+    }
+
+    #[test]
+    fn extract_entities_uses_ner() {
+        let text = "uses Docker and Ben Kearns built Ferrosa at Acme Labs";
+        let candidates = extract_entity_candidates(text);
+        let by_name: std::collections::HashMap<&str, &str> = candidates
+            .iter()
+            .map(|(n, t)| (n.as_str(), t.as_str()))
+            .collect();
+        assert_eq!(by_name.get("Docker"), Some(&"tool"));
+        assert_eq!(by_name.get("Ben Kearns"), Some(&"person"));
+        assert_eq!(by_name.get("Ferrosa"), Some(&"tool"));
+        assert_eq!(by_name.get("Acme Labs"), Some(&"organization"));
     }
 }

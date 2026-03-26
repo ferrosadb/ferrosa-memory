@@ -565,11 +565,22 @@ async fn build_snapshot<S: Storage>(
 
     let node_ids: std::collections::HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
 
-    let edges_result = if session_id.is_nil() {
-        storage.edge_list_all(ctx).await
-    } else {
-        storage.edge_list_session(ctx, session_id).await
+    // Load edges using the swapped tenant context — legacy edges have
+    // tenant_id and session_id swapped due to a data bug. The node_ids
+    // filter below ensures only edges between visible entities are shown.
+    let swapped_ctx = TenantContext {
+        tenant_id: session_id,
+        session_origin: ctx.session_origin.clone(),
     };
+    let mut all_edges = storage
+        .edge_list_all(&swapped_ctx)
+        .await
+        .unwrap_or_default();
+    // Also load correctly-keyed edges (from new consolidation runs).
+    if let Ok(mut correct) = storage.edge_list_all(ctx).await {
+        all_edges.append(&mut correct);
+    }
+    let edges_result: anyhow::Result<Vec<_>> = Ok(all_edges);
 
     let edges = match edges_result {
         Ok(raw_edges) => raw_edges

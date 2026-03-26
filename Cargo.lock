@@ -459,6 +459,7 @@ dependencies = [
  "anyhow",
  "cdrs-tokio",
  "ferrosa-memory-core",
+ "reqwest",
  "tokio",
  "tracing",
  "tracing-subscriber",

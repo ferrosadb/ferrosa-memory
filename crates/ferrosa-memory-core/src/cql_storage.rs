@@ -531,7 +531,9 @@ impl Storage for CqlStorage {
             let status: PlanStatus =
                 serde_json::from_str(&format!("\"{status_str}\"")).unwrap_or(PlanStatus::Pending);
 
-            let created: chrono::NaiveDateTime = row.r_by_name("created_at")?;
+            let created = row
+                .r_by_name::<chrono::NaiveDateTime>("created_at")
+                .unwrap_or_default();
 
             nodes.push(PlanNode {
                 session_id,
@@ -630,7 +632,9 @@ impl Storage for CqlStorage {
             let status_str: String = row.r_by_name("status")?;
             let status: FoldStatus =
                 serde_json::from_str(&format!("\"{status_str}\"")).unwrap_or(FoldStatus::Active);
-            let created: chrono::NaiveDateTime = row.r_by_name("created_at")?;
+            let created = row
+                .r_by_name::<chrono::NaiveDateTime>("created_at")
+                .unwrap_or_default();
 
             Ok(Some(FoldEntry {
                 session_id,
@@ -828,7 +832,9 @@ impl Storage for CqlStorage {
         for row in rows {
             let entity_name: String = row.r_by_name("entity_name")?;
             if entity_name.to_lowercase().contains(&lower) {
-                let created: chrono::NaiveDateTime = row.r_by_name("created_at")?;
+                let created = row
+                    .r_by_name::<chrono::NaiveDateTime>("created_at")
+                    .unwrap_or_default();
                 let state = row
                     .r_by_name::<String>("state")
                     .ok()
@@ -890,7 +896,9 @@ impl Storage for CqlStorage {
         let rows = envelope.response_body()?.into_rows().unwrap_or_default();
         let mut results = Vec::new();
         for row in rows {
-            let created: chrono::NaiveDateTime = row.r_by_name("created_at")?;
+            let created = row
+                .r_by_name::<chrono::NaiveDateTime>("created_at")
+                .unwrap_or_default();
             let state = row
                 .r_by_name::<String>("state")
                 .ok()
@@ -956,7 +964,9 @@ impl Storage for CqlStorage {
 
         let mut results = Vec::with_capacity(rows.len());
         for row in rows {
-            let created: chrono::NaiveDateTime = row.r_by_name("created_at")?;
+            let created = row
+                .r_by_name::<chrono::NaiveDateTime>("created_at")
+                .unwrap_or_default();
             let state = row
                 .r_by_name::<String>("state")
                 .ok()
@@ -976,7 +986,10 @@ impl Storage for CqlStorage {
                     .map(|blob| blob.into_vec())
                     .filter(|v| !v.is_empty())
                     .map(|v| crate::vector::decode_vector(&v)),
-                confidence: f64::from(row.r_by_name::<f32>("confidence")?),
+                confidence: row
+                    .r_by_name::<f32>("confidence")
+                    .map(f64::from)
+                    .unwrap_or(1.0),
                 state,
                 created_at: created.and_utc(),
             });
@@ -991,7 +1004,9 @@ impl Storage for CqlStorage {
 
         let mut results = Vec::with_capacity(rows.len());
         for row in rows {
-            let created: chrono::NaiveDateTime = row.r_by_name("created_at")?;
+            let created = row
+                .r_by_name::<chrono::NaiveDateTime>("created_at")
+                .unwrap_or_default();
             let state = row
                 .r_by_name::<String>("state")
                 .ok()
@@ -1011,7 +1026,10 @@ impl Storage for CqlStorage {
                     .map(|blob| blob.into_vec())
                     .filter(|v| !v.is_empty())
                     .map(|v| crate::vector::decode_vector(&v)),
-                confidence: f64::from(row.r_by_name::<f32>("confidence")?),
+                confidence: row
+                    .r_by_name::<f32>("confidence")
+                    .map(f64::from)
+                    .unwrap_or(1.0),
                 state,
                 created_at: created.and_utc(),
             });
@@ -1485,6 +1503,39 @@ impl Storage for CqlStorage {
         Ok(pruned)
     }
 
+    async fn edge_decay_weights(&self, ctx: &TenantContext, factor: f64) -> anyhow::Result<usize> {
+        let query = format!(
+            "SELECT entity_a, entity_b, strength \
+             FROM {}.co_occurs_with WHERE tenant_id = ? ALLOW FILTERING",
+            self.keyspace
+        );
+        let envelope = self
+            .session
+            .query_with_values(query, query_values!(ctx.tenant_id))
+            .await?;
+        let rows = envelope.response_body()?.into_rows().unwrap_or_default();
+
+        let mut decayed = 0;
+        for row in &rows {
+            let a: Uuid = row.r_by_name("entity_a")?;
+            let b: Uuid = row.r_by_name("entity_b")?;
+            let strength: f32 = row.r_by_name("strength").unwrap_or(1.0);
+            let new_strength = (f64::from(strength) * factor) as f32;
+            let update = format!(
+                "UPDATE {}.co_occurs_with SET strength = ? \
+                 WHERE entity_a = ? AND entity_b = ?",
+                self.keyspace
+            );
+            self.session
+                .query_with_values(update, query_values!(new_strength, a, b))
+                .await?;
+            decayed += 1;
+        }
+
+        tracing::info!(decayed, factor, "edge weight decay complete");
+        Ok(decayed)
+    }
+
     async fn edge_list_session(
         &self,
         ctx: &TenantContext,
@@ -1728,7 +1779,9 @@ impl Storage for CqlStorage {
                 serde_json::from_str(&format!("\"{status_str}\""))
                     .unwrap_or(crate::intention::IntentionStatus::Pending);
 
-            let created: chrono::NaiveDateTime = row.r_by_name("created_at")?;
+            let created = row
+                .r_by_name::<chrono::NaiveDateTime>("created_at")
+                .unwrap_or_default();
 
             results.push(crate::intention::Intention {
                 id: row.r_by_name("intention_id")?,

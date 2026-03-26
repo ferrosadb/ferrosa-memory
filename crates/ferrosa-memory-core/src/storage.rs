@@ -239,6 +239,10 @@ pub trait Storage: Send + Sync {
         cutoff: chrono::DateTime<chrono::Utc>,
     ) -> anyhow::Result<usize>;
 
+    /// Multiply all CO_OCCURS edge weights by `factor` (0.0–1.0).
+    /// Returns the number of edges decayed.
+    async fn edge_decay_weights(&self, ctx: &TenantContext, factor: f64) -> anyhow::Result<usize>;
+
     /// Create a SUPERSEDES edge (new fact -> old fact).
     async fn edge_supersedes(
         &self,
@@ -778,6 +782,14 @@ pub mod mock {
             &self,
             _ctx: &TenantContext,
             _cutoff: chrono::DateTime<chrono::Utc>,
+        ) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn edge_decay_weights(
+            &self,
+            _ctx: &TenantContext,
+            _factor: f64,
         ) -> anyhow::Result<usize> {
             Ok(0)
         }

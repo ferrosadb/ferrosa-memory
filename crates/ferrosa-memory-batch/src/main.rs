@@ -43,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
 
     match subcommand.as_str() {
         "migrate-session" => migrate_session(&config).await,
+        "retype-entities" => retype_entities(&config).await,
         _ => run_guidelines(&config).await,
     }
 }
@@ -121,6 +122,96 @@ async fn migrate_session(config: &ferrosa_memory_core::config::Config) -> anyhow
     }
 
     tracing::info!("migration complete");
+    Ok(())
+}
+
+/// Re-classify entity types using two-tier NER (heuristic + LLM).
+///
+/// Pass 1: Fast heuristic NER resolves obvious cases (acronyms, org suffixes,
+///         known tools, common names).
+/// Pass 2: Entities still typed "concept" after pass 1 are sent to the local
+///         Ollama model (qwen3.5:27b) for LLM-backed classification.
+///
+/// Only changes entities currently typed as "concept" — types explicitly set
+/// by the user or LLM are preserved.
+async fn retype_entities(config: &ferrosa_memory_core::config::Config) -> anyhow::Result<()> {
+    let tenant_id = config
+        .server
+        .tenant_id
+        .as_ref()
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(|| anyhow::anyhow!("no tenant_id configured in [server]"))?;
+
+    let ctx = TenantContext {
+        tenant_id,
+        session_origin: "batch-retype".into(),
+    };
+
+    let storage = CqlStorage::connect(&config.ferrosa).await?;
+    tracing::info!("connected to CQL cluster");
+
+    let entities = storage.entity_list_all(&ctx).await?;
+    let concept_count = entities
+        .iter()
+        .filter(|e| e.entity_type == "concept")
+        .count();
+    tracing::info!(
+        total = entities.len(),
+        concepts = concept_count,
+        "loaded entities"
+    );
+
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let ollama_url = &config.embeddings.ollama_base_url;
+    let llm_model = "qwen3.5:27b";
+
+    let mut retyped_heuristic = 0;
+    let mut retyped_llm = 0;
+    let mut skipped = 0;
+
+    for entity in &entities {
+        if entity.entity_type != "concept" {
+            skipped += 1;
+            continue;
+        }
+
+        let new_type = ferrosa_memory_core::ner::classify_entity(
+            &http,
+            ollama_url,
+            llm_model,
+            &entity.entity_name,
+            &entity.context_snippet,
+        )
+        .await;
+
+        if new_type == "concept" {
+            skipped += 1;
+            continue;
+        }
+
+        // Track whether heuristic or LLM resolved it.
+        let heuristic = ferrosa_memory_core::smart_ingest::infer_entity_type(&entity.entity_name);
+        if heuristic != "concept" {
+            retyped_heuristic += 1;
+        } else {
+            retyped_llm += 1;
+        }
+
+        let mut updated = entity.clone();
+        updated.entity_type = new_type.clone();
+        storage.entity_put(&ctx, &updated).await?;
+
+        tracing::info!(
+            name = %entity.entity_name,
+            old_type = "concept",
+            new_type,
+            "retyped entity"
+        );
+    }
+
+    tracing::info!(retyped_heuristic, retyped_llm, skipped, "retype complete");
     Ok(())
 }
 

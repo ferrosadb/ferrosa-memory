@@ -2,8 +2,10 @@
 //!
 //! Inspired by vestige's 5-phase dream cycle. Simplified for v1:
 //! 1. Triage — list entities for the session
-//! 2. Connection Discovery — find co-occurring entities (same source fold), create CO_OCCURS edges
-//! 3. Insight Generation — identify clusters (3+ entities in same fold)
+//! 2. Connection Discovery — compare entities by text similarity:
+//!    a. Within-fold groups (entities sharing a source fold)
+//!    b. Unfolded entities (ingested without a fold context, e.g. via `smart_ingest`)
+//! 3. Insight Generation — identify clusters (3+ co-occurring entities)
 
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -24,11 +26,21 @@ pub struct DreamResult {
     pub edges: Vec<(Uuid, Uuid)>,
 }
 
+/// Similarity threshold for creating CO_OCCURS edges (Jaccard on word sets).
+const CO_OCCURS_THRESHOLD: f64 = 0.05;
+
+/// Maximum number of unfolded entities to compare pairwise per run.
+/// Caps the O(n²) comparison to keep idle consolidation fast.
+const UNFOLDED_PAIR_CAP: usize = 200;
+
 /// Run consolidation over a session's entities.
 ///
-/// Groups entities by source fold, creates CO_OCCURS edges between
-/// entities sharing a fold, and identifies clusters of 3+ co-occurring
-/// entities as insights.
+/// Two-pass connection discovery:
+/// 1. Entities with a `source_fold_id` are grouped by fold and compared within each group.
+/// 2. Entities without a fold ("unfolded") are compared pairwise using text similarity,
+///    capped at [`UNFOLDED_PAIR_CAP`] most-recent entities to bound the O(n²) cost.
+///
+/// Clusters of 3+ co-occurring entities generate insight summaries.
 pub async fn run_consolidation(
     storage: &(impl Storage + ?Sized),
     ctx: &TenantContext,
@@ -37,39 +49,48 @@ pub async fn run_consolidation(
     let entities = storage.entity_list_session(ctx, session_id).await?;
     let entity_count = entities.len();
 
-    // Group by source_fold_id
+    // Partition into folded (grouped by fold_id) and unfolded.
     let mut fold_groups: HashMap<Uuid, Vec<&crate::types::EntityEntry>> = HashMap::new();
+    let mut unfolded: Vec<&crate::types::EntityEntry> = Vec::new();
     for entity in &entities {
         if let Some(fold_id) = entity.source_fold_id {
             fold_groups.entry(fold_id).or_default().push(entity);
+        } else {
+            unfolded.push(entity);
         }
     }
 
-    // Create CO_OCCURS edges between pairs in same fold that share context.
-    // Uses text similarity to avoid linking unrelated entities in large folds.
     let mut connections_created = 0;
     let mut edges = Vec::new();
-    for group in fold_groups.values() {
-        for i in 0..group.len() {
-            for j in (i + 1)..group.len() {
-                let sim = crate::smart_ingest::compute_text_similarity(
-                    &group[i].context_snippet,
-                    &group[j].context_snippet,
-                );
-                if sim >= 0.05 {
-                    let a = group[i].entity_id;
-                    let b = group[j].entity_id;
-                    let _ = storage
-                        .edge_co_occurs(ctx, a, b, session_id, sim as f32)
-                        .await;
-                    edges.push((a, b));
-                    connections_created += 1;
-                }
-            }
-        }
+
+    // Pass 1: within-fold comparison (existing behaviour).
+    create_edges_for_groups(
+        fold_groups.values(),
+        storage,
+        ctx,
+        session_id,
+        &mut connections_created,
+        &mut edges,
+    )
+    .await;
+
+    // Pass 2: unfolded entities — compare most-recent pairs by text similarity.
+    // Sort by created_at descending so the cap keeps the freshest entities.
+    unfolded.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    unfolded.truncate(UNFOLDED_PAIR_CAP);
+    if unfolded.len() >= 2 {
+        create_edges_for_groups(
+            std::iter::once(&unfolded),
+            storage,
+            ctx,
+            session_id,
+            &mut connections_created,
+            &mut edges,
+        )
+        .await;
     }
 
-    // Identify clusters (3+ entities in same fold)
+    // Identify clusters (3+ entities in same fold).
     let mut insights = Vec::new();
     for (fold_id, group) in &fold_groups {
         if group.len() >= 3 {
@@ -82,6 +103,15 @@ pub async fn run_consolidation(
             ));
         }
     }
+    // Cluster insight for unfolded entities too.
+    if unfolded.len() >= 3 {
+        let names: Vec<&str> = unfolded.iter().map(|e| e.entity_name.as_str()).collect();
+        insights.push(format!(
+            "Unfolded cluster: {} ({} entities co-occurring)",
+            names.join(", "),
+            unfolded.len()
+        ));
+    }
 
     Ok(DreamResult {
         entities_processed: entity_count,
@@ -89,6 +119,40 @@ pub async fn run_consolidation(
         insights,
         edges,
     })
+}
+
+/// Compare all pairs within each group and create CO_OCCURS edges for pairs
+/// exceeding the similarity threshold.
+async fn create_edges_for_groups<'a, I, S>(
+    groups: I,
+    storage: &S,
+    ctx: &TenantContext,
+    session_id: Uuid,
+    connections_created: &mut usize,
+    edges: &mut Vec<(Uuid, Uuid)>,
+) where
+    I: Iterator<Item = &'a Vec<&'a crate::types::EntityEntry>>,
+    S: Storage + ?Sized,
+{
+    for group in groups {
+        for i in 0..group.len() {
+            for j in (i + 1)..group.len() {
+                let sim = crate::smart_ingest::compute_text_similarity(
+                    &group[i].context_snippet,
+                    &group[j].context_snippet,
+                );
+                if sim >= CO_OCCURS_THRESHOLD {
+                    let a = group[i].entity_id;
+                    let b = group[j].entity_id;
+                    let _ = storage
+                        .edge_co_occurs(ctx, a, b, session_id, sim as f32)
+                        .await;
+                    edges.push((a, b));
+                    *connections_created += 1;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -187,5 +251,51 @@ mod tests {
         assert_eq!(result.connections_created, 3);
         assert_eq!(result.insights.len(), 1);
         assert!(result.insights[0].contains("3 entities co-occurring"));
+    }
+
+    #[tokio::test]
+    async fn unfolded_entities_get_co_occurs_edges() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session_id = Uuid::new_v4();
+
+        // Add two entities WITHOUT a source fold (typical smart_ingest usage)
+        let e1 = make_entity(ctx.tenant_id, session_id, "Alice", None);
+        let e2 = make_entity(ctx.tenant_id, session_id, "Bob", None);
+        {
+            let mut entities = store.entities.lock().await;
+            entities.push(e1);
+            entities.push(e2);
+        }
+
+        let result = run_consolidation(&store, &ctx, session_id).await.unwrap();
+
+        assert_eq!(result.entities_processed, 2);
+        assert_eq!(result.connections_created, 1);
+        assert!(result.insights.is_empty()); // only 2, need 3+ for insight
+    }
+
+    #[tokio::test]
+    async fn unfolded_cluster_generates_insight() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session_id = Uuid::new_v4();
+
+        let e1 = make_entity(ctx.tenant_id, session_id, "Alpha", None);
+        let e2 = make_entity(ctx.tenant_id, session_id, "Beta", None);
+        let e3 = make_entity(ctx.tenant_id, session_id, "Gamma", None);
+        {
+            let mut entities = store.entities.lock().await;
+            entities.push(e1);
+            entities.push(e2);
+            entities.push(e3);
+        }
+
+        let result = run_consolidation(&store, &ctx, session_id).await.unwrap();
+
+        assert_eq!(result.entities_processed, 3);
+        assert_eq!(result.connections_created, 3);
+        assert_eq!(result.insights.len(), 1);
+        assert!(result.insights[0].contains("Unfolded cluster"));
     }
 }

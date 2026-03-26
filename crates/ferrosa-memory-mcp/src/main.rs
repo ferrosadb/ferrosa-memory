@@ -8,7 +8,7 @@
 //! Never falls back to mock storage — mock silently loses data.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ferrosa_memory_core::auth;
@@ -27,44 +27,124 @@ use tracing_subscriber::EnvFilter;
 /// When `inner` is `None`, the server is still reconnecting — all Storage
 /// methods return a descriptive error. Once connected, the background task
 /// swaps in `Some(cql)` and all subsequent calls route to the real backend.
+///
+/// If a connected session starts returning connection errors (e.g. rolling
+/// restart), the delegate macro marks it disconnected and signals the
+/// reconnect watcher to re-establish the session.
+///
+/// ## Cancel safety
+///
+/// A generation counter prevents a stale connection-error callback from
+/// disconnecting a freshly reconnected session. `mark_disconnected` only
+/// nulls the session when the generation matches the one captured before
+/// the failed query. `notify_one` is called while the write lock is still
+/// held so the signal cannot be lost to cancellation.
 struct ReconnectingStorage {
     inner: RwLock<Option<CqlStorage>>,
+    /// Monotonically increasing generation — bumped on every `set_connected`.
+    /// Prevents stale errors from disconnecting a fresh session.
+    generation: AtomicU64,
+    /// Signalled when a connection error is detected, waking the reconnect loop.
+    reconnect_signal: tokio::sync::Notify,
+    /// Config needed to reconnect (stashed at creation time).
+    cql_config: FerrosaCqlConfig,
 }
 
 impl ReconnectingStorage {
     /// Create with an already-connected CQL backend.
-    fn connected(cql: CqlStorage) -> Self {
+    fn connected(cql: CqlStorage, config: FerrosaCqlConfig) -> Self {
         Self {
             inner: RwLock::new(Some(cql)),
+            generation: AtomicU64::new(1),
+            reconnect_signal: tokio::sync::Notify::new(),
+            cql_config: config,
         }
     }
 
     /// Create in "reconnecting" state — no backend available yet.
-    fn disconnected() -> Self {
+    fn disconnected(config: FerrosaCqlConfig) -> Self {
         Self {
             inner: RwLock::new(None),
+            generation: AtomicU64::new(0),
+            reconnect_signal: tokio::sync::Notify::new(),
+            cql_config: config,
         }
     }
 
-    /// Swap in a newly connected CQL backend.
+    /// Swap in a newly connected CQL backend and bump the generation.
     async fn set_connected(&self, cql: CqlStorage) {
         let mut guard = self.inner.write().await;
         *guard = Some(cql);
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// Read the current generation (captured before a query, checked after).
+    fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Mark as disconnected and signal the reconnect watcher, but only if the
+    /// generation hasn't changed since the caller observed the error. This
+    /// prevents a stale error from a pre-reconnect query from killing a fresh
+    /// session.
+    ///
+    /// The signal is sent while the write lock is held so the pair
+    /// (set-to-None, notify) is atomic w.r.t. cancellation.
+    async fn mark_disconnected(&self, observed_gen: u64) {
+        let mut guard = self.inner.write().await;
+        let current = self.generation.load(Ordering::Acquire);
+        if current != observed_gen {
+            // A reconnect already happened — this is a stale error.
+            return;
+        }
+        if guard.is_some() {
+            tracing::warn!("CQL connection lost — entering reconnecting mode");
+            *guard = None;
+            // Signal while lock is held: even if this future is cancelled after
+            // the signal, the None state is already visible to readers.
+            self.reconnect_signal.notify_one();
+        }
     }
 }
 
 /// Error returned when CQL is not yet connected.
 const NOT_CONNECTED_MSG: &str = "CQL connection not yet established, retrying in background...";
 
+/// Returns true if the error looks like a connection / transport failure
+/// (as opposed to a query-level error like "table not found").
+fn is_connection_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_lowercase();
+    msg.contains("broken pipe")
+        || msg.contains("connection reset")
+        || msg.contains("connection refused")
+        || msg.contains("transport")
+        || msg.contains("channel closed")
+        || msg.contains("io error")
+        || msg.contains("timed out")
+        || msg.contains("not connected")
+        || msg.contains("eof")
+}
+
 /// Macro to delegate a Storage trait method through the RwLock.
 ///
-/// Acquires a read lock, checks for Some(cql), and forwards the call.
-/// Returns a clear error when the backend is still reconnecting.
+/// Captures the generation before the query. On connection errors, calls
+/// `mark_disconnected` with the captured generation so stale errors from
+/// pre-reconnect queries cannot kill a fresh session.
 macro_rules! delegate {
     ($self:ident, $method:ident $(, $arg:expr)*) => {{
+        let conn_gen = $self.current_generation();
         let guard = $self.inner.read().await;
         match guard.as_ref() {
-            Some(cql) => cql.$method($($arg),*).await,
+            Some(cql) => {
+                let result = cql.$method($($arg),*).await;
+                if let Err(ref e) = result {
+                    if is_connection_error(e) {
+                        drop(guard); // release read lock before taking write lock
+                        $self.mark_disconnected(conn_gen).await;
+                    }
+                }
+                result
+            }
             None => Err(anyhow::anyhow!(NOT_CONNECTED_MSG)),
         }
     }};
@@ -339,6 +419,10 @@ impl Storage for ReconnectingStorage {
         delegate!(self, edge_prune_stale, ctx, cutoff)
     }
 
+    async fn edge_decay_weights(&self, ctx: &TenantContext, factor: f64) -> anyhow::Result<usize> {
+        delegate!(self, edge_decay_weights, ctx, factor)
+    }
+
     async fn edge_supersedes(
         &self,
         ctx: &TenantContext,
@@ -444,46 +528,80 @@ fn next_backoff(attempt: u32) -> Duration {
     }
 }
 
-/// Background task that retries CQL connection with exponential backoff.
+/// Persistent reconnection watcher.
 ///
-/// Once connected, swaps in the real backend via `set_connected`. Runs
-/// indefinitely until successful — the MCP server serves errors to callers
-/// in the meantime so they know what's happening.
-async fn cql_reconnect_loop(storage: Arc<ReconnectingStorage>, config: FerrosaCqlConfig) {
-    let mut attempt: u32 = 0;
+/// Waits for `reconnect_signal` (fired on initial failure or mid-operation
+/// connection loss), then retries with exponential backoff until connected.
+/// After connecting, goes back to waiting for the next signal — survives
+/// rolling restarts, network blips, etc.
+///
+/// ## Cancel safety
+///
+/// This task is spawned via `tokio::spawn` and never aborted, so
+/// cancellation within the retry loop is not a concern. The `notified()`
+/// call at the top is cancel-safe per tokio docs. After successful
+/// reconnection the inner state is checked to avoid spurious retry
+/// cycles from stale permits.
+async fn cql_reconnect_watcher(storage: Arc<ReconnectingStorage>) {
     loop {
-        let delay = next_backoff(attempt);
-        tracing::info!(
-            attempt = attempt + 1,
-            delay_secs = delay.as_secs(),
-            "CQL reconnection attempt scheduled"
-        );
-        tokio::time::sleep(delay).await;
+        // Wait until someone signals that reconnection is needed.
+        storage.reconnect_signal.notified().await;
 
-        match CqlStorage::connect(&config).await {
-            Ok(cql) => {
-                tracing::info!("CQL reconnection successful");
-                storage.set_connected(cql).await;
-                return;
+        // Check if we actually need to reconnect — a permit may have been
+        // stored by a stale mark_disconnected that lost the generation race,
+        // or by a second error while we were already reconnecting.
+        {
+            let guard = storage.inner.read().await;
+            if guard.is_some() {
+                tracing::debug!("reconnect watcher: spurious signal, already connected");
+                continue;
             }
-            Err(e) => {
-                attempt = attempt.saturating_add(1);
-                tracing::warn!(attempt, "CQL reconnection failed: {e}");
+        }
+
+        tracing::info!("reconnect watcher: connection loss detected, starting reconnection");
+
+        let mut attempt: u32 = 0;
+        loop {
+            let delay = next_backoff(attempt);
+            tracing::info!(
+                attempt = attempt + 1,
+                delay_secs = delay.as_secs(),
+                "CQL reconnection attempt scheduled"
+            );
+            tokio::time::sleep(delay).await;
+
+            match CqlStorage::connect(&storage.cql_config).await {
+                Ok(cql) => {
+                    tracing::info!("CQL reconnection successful");
+                    storage.set_connected(cql).await;
+                    break; // back to waiting for next signal
+                }
+                Err(e) => {
+                    attempt = attempt.saturating_add(1);
+                    tracing::warn!(attempt, "CQL reconnection failed: {e}");
+                }
             }
         }
     }
 }
 
-/// Background task that runs dream consolidation and edge pruning after
+/// Idle-consolidation configuration passed from `main()`.
+struct IdleConsolidationConfig {
+    idle_seconds: u64,
+    stale_edge_max_days: u64,
+    edge_decay_factor: f64,
+}
+
+/// Background task that runs dream consolidation and edge maintenance after
 /// a period of tool-call inactivity. Resets the timer on every tool call.
 /// Only runs when the dirty flag indicates new writes since the last run.
 async fn idle_consolidation_loop<S: Storage + Send + Sync + 'static>(
     session: Arc<dispatch::SessionState>,
     storage: Arc<S>,
     ctx: Arc<TenantContext>,
-    idle_seconds: u64,
+    cfg: IdleConsolidationConfig,
 ) {
-    let timeout_dur = Duration::from_secs(idle_seconds);
+    let timeout_dur = Duration::from_secs(cfg.idle_seconds);
     loop {
         // Wait for the first tool call activity.
         session.last_activity.notified().await;
@@ -504,17 +622,31 @@ async fn idle_consolidation_loop<S: Storage + Send + Sync + 'static>(
             None => continue,
         };
 
-        run_idle_consolidation(storage.as_ref(), &ctx, sid).await;
+        run_idle_consolidation(storage.as_ref(), &ctx, sid, &cfg).await;
     }
 }
 
-/// Executes consolidation and stale-edge pruning. Separated from the loop
-/// to keep each function under the line limit.
+/// Executes consolidation, edge weight decay, and optional stale-edge pruning.
 async fn run_idle_consolidation<S: Storage>(
     storage: &S,
     ctx: &TenantContext,
     session_id: uuid::Uuid,
+    cfg: &IdleConsolidationConfig,
 ) {
+    // 1. Decay existing edge weights so unreinforced edges lose strength.
+    if cfg.edge_decay_factor < 1.0 {
+        match storage.edge_decay_weights(ctx, cfg.edge_decay_factor).await {
+            Ok(n) if n > 0 => tracing::info!(
+                decayed = n,
+                factor = cfg.edge_decay_factor,
+                "edge decay applied"
+            ),
+            Err(e) => tracing::warn!("edge decay failed: {e}"),
+            _ => {}
+        }
+    }
+
+    // 2. Run consolidation — rediscovered edges get fresh weights.
     match ferrosa_memory_core::dream::run_consolidation(storage, ctx, session_id).await {
         Ok(r) => tracing::info!(
             entities = r.entities_processed,
@@ -524,14 +656,16 @@ async fn run_idle_consolidation<S: Storage>(
         Err(e) => tracing::warn!("idle consolidation failed: {e}"),
     }
 
-    let cutoff = chrono::Utc::now() - chrono::Duration::days(7);
-    match storage.edge_prune_stale(ctx, cutoff).await {
-        Ok(pruned) => {
-            if pruned > 0 {
-                tracing::info!(pruned, "idle edge pruning complete");
+    // 3. Optionally prune stale edges (0 = disabled).
+    if cfg.stale_edge_max_days > 0 {
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(cfg.stale_edge_max_days as i64);
+        match storage.edge_prune_stale(ctx, cutoff).await {
+            Ok(pruned) if pruned > 0 => {
+                tracing::info!(pruned, "idle edge pruning complete")
             }
+            Err(e) => tracing::warn!("idle edge pruning failed: {e}"),
+            _ => {}
         }
-        Err(e) => tracing::warn!("idle edge pruning failed: {e}"),
     }
 }
 
@@ -585,21 +719,23 @@ async fn main() -> anyhow::Result<()> {
     let storage: Arc<ReconnectingStorage> = match CqlStorage::connect(&config.ferrosa).await {
         Ok(cql) => {
             tracing::info!("connected to Ferrosa CQL cluster");
-            Arc::new(ReconnectingStorage::connected(cql))
+            Arc::new(ReconnectingStorage::connected(cql, config.ferrosa.clone()))
         }
         Err(e) => {
             tracing::warn!(
                 "CQL connection failed ({e}), starting in reconnecting mode — \
                  tools will return errors until connection is established"
             );
-            let storage = Arc::new(ReconnectingStorage::disconnected());
-            tokio::spawn(cql_reconnect_loop(
-                Arc::clone(&storage),
-                config.ferrosa.clone(),
-            ));
+            let storage = Arc::new(ReconnectingStorage::disconnected(config.ferrosa.clone()));
+            // Signal immediately so the watcher starts its first attempt.
+            storage.reconnect_signal.notify_one();
             storage
         }
     };
+
+    // Always spawn the reconnect watcher — it handles both initial failure
+    // and mid-operation connection loss (rolling restarts, network blips).
+    tokio::spawn(cql_reconnect_watcher(Arc::clone(&storage)));
 
     // Connect graph client via HTTP (non-fatal if it fails)
     match ferrosa_memory_core::graph::GraphClient::connect(
@@ -664,7 +800,11 @@ async fn main() -> anyhow::Result<()> {
 
             // Spawn idle consolidation background task.
             if config.server.idle_consolidation_enabled {
-                let idle_secs = config.server.idle_consolidation_seconds;
+                let idle_cfg = IdleConsolidationConfig {
+                    idle_seconds: config.server.idle_consolidation_seconds,
+                    stale_edge_max_days: config.server.stale_edge_max_days,
+                    edge_decay_factor: config.server.edge_decay_factor,
+                };
                 let idle_session = Arc::clone(&session);
                 let idle_storage = Arc::clone(&storage);
                 let idle_ctx = Arc::clone(&ctx);
@@ -672,9 +812,14 @@ async fn main() -> anyhow::Result<()> {
                     idle_session,
                     idle_storage,
                     idle_ctx,
-                    idle_secs,
+                    idle_cfg,
                 ));
-                tracing::info!(idle_seconds = idle_secs, "idle consolidation enabled");
+                tracing::info!(
+                    idle_seconds = config.server.idle_consolidation_seconds,
+                    decay_factor = config.server.edge_decay_factor,
+                    prune_days = config.server.stale_edge_max_days,
+                    "idle consolidation enabled"
+                );
             }
 
             transport::serve_stdio(handler).await?;
