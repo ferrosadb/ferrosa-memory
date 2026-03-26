@@ -115,6 +115,10 @@ pub struct SessionState {
     pub last_activity: Arc<tokio::sync::Notify>,
     /// Set to true when a write tool succeeds; cleared by idle consolidation.
     pub dirty: Arc<AtomicBool>,
+    /// Base URL for the Ollama API (used for NER extraction).
+    pub ollama_base_url: String,
+    /// Model name for NER entity extraction via Ollama.
+    pub ner_model: String,
 }
 
 impl Default for SessionState {
@@ -128,6 +132,8 @@ impl Default for SessionState {
             default_session_id: None,
             last_activity: Arc::new(tokio::sync::Notify::new()),
             dirty: Arc::new(AtomicBool::new(false)),
+            ollama_base_url: "http://localhost:11434".to_string(),
+            ner_model: "qwen3.5:27b".to_string(),
         }
     }
 }
@@ -348,6 +354,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     "session_id": { "type": "string", "format": "uuid" },
                     "content": { "type": "string", "maxLength": 8192, "description": "The content to ingest" },
                     "entity_type": { "type": "string", "enum": ["person", "place", "event", "concept", "org", "decision", "pattern", "preference"] },
+                    "entity_name": { "type": "string", "maxLength": 256, "description": "Clean entity name (e.g. 'Ben Kearns', 'Ferrosa'). If omitted, extracted automatically from content via LLM or heuristic." },
                     "embedding": { "type": "array", "items": { "type": "number" }, "description": "Optional embedding vector" },
                     "source_fold_id": { "type": "string", "format": "uuid", "description": "Fold that produced this content" }
                 },
@@ -1366,6 +1373,20 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
     let embedding = optional_f32_array(&args, "embedding")?;
     let source_fold_id = optional_uuid(&args, "source_fold_id")?;
 
+    let entity_name = args
+        .get("entity_name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let ner_config = crate::smart_ingest::NerConfig {
+        http: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_default(),
+        ollama_base_url: session.ollama_base_url.clone(),
+        model: session.ner_model.clone(),
+    };
+
     let config = crate::smart_ingest::IngestConfig::default();
     let decision = crate::smart_ingest::smart_ingest(
         storage,
@@ -1376,8 +1397,8 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
         embedding.as_deref(),
         source_fold_id,
         &config,
-        None,
-        None,
+        entity_name.as_deref(),
+        Some(&ner_config),
     )
     .await
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
