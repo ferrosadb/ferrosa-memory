@@ -196,6 +196,15 @@ fn candidate_score(candidate: &(String, String)) -> u8 {
     }
 }
 
+/// Truncate content for LLM prompts, breaking at word boundaries.
+fn truncate_for_prompt(content: &str, max_chars: usize) -> String {
+    if content.len() <= max_chars {
+        return content.to_string();
+    }
+    let boundary = content[..max_chars].rfind(' ').unwrap_or(max_chars);
+    format!("{}...", &content[..boundary])
+}
+
 /// Call Ollama to extract the primary named entity from content.
 async fn llm_extract_entity(
     http: &reqwest::Client,
@@ -203,11 +212,16 @@ async fn llm_extract_entity(
     model: &str,
     content: &str,
 ) -> anyhow::Result<(String, String)> {
+    let truncated_content = truncate_for_prompt(content, 500);
     let prompt = format!(
-        "/no_think\nExtract the primary named entity from this text.\n\
-         Return JSON: {{\"name\": \"...\", \"type\": \"person|org|tool|project|place|event|concept|decision|pattern|preference\"}}\n\
-         Text: {content}\n\
-         Reply with ONLY the JSON, nothing else."
+        "/no_think\nExtract the single most important named entity from this text.\n\
+         Return JSON: {{\"name\": \"<entity name>\", \"type\": \"<one of: person|org|tool|project|place|event|concept|decision|pattern|preference>\"}}\n\
+         Rules:\n\
+         - name must be a proper noun or specific name (e.g. \"Ben Kearns\", \"Docker\", \"Ferrosa\")\n\
+         - name must NOT be empty\n\
+         - name must NOT be a generic word like \"Storage\" or \"Original\"\n\
+         Text: {truncated_content}\n\
+         JSON:"
     );
 
     let body = serde_json::json!({
@@ -836,5 +850,27 @@ mod tests {
     fn rank_candidates_single_returns_it() {
         let result = rank_candidates(vec![("Foo".into(), "concept".into())]);
         assert_eq!(result, Some(("Foo".into(), "concept".into())));
+    }
+
+    #[test]
+    fn truncate_for_prompt_short_content() {
+        let short = "Ben Kearns built Ferrosa";
+        assert_eq!(truncate_for_prompt(short, 500), short);
+    }
+
+    #[test]
+    fn truncate_for_prompt_long_content() {
+        let long = "word ".repeat(200); // 1000 chars
+        let result = truncate_for_prompt(&long, 500);
+        assert!(result.len() <= 504); // 500 + "..."
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_for_prompt_breaks_at_word_boundary() {
+        let text = "hello world this is a test of truncation";
+        let result = truncate_for_prompt(text, 15);
+        // Should break at word boundary, not mid-word
+        assert_eq!(result, "hello world...");
     }
 }
