@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ferrosa-memory": {
+      "command": "/home/bkearns/src/ferrosa-memory/target/debug/ferrosa-memory-mcp",
+      "args": ["--debug"],
+      "env": {
+        "FERROSA_MEMORY_CONFIG": "/home/bkearns/src/ferrosa-memory/ferrosa-memory.toml"
+      },
+      "type": "stdio"
+    }
+  }
+}

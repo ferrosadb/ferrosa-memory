@@ -14,7 +14,7 @@ repos:
     rev: v2.4.1
     hooks:
       - id: codespell
-        args: ['--skip=Cargo.lock,target']
+        args: ['--skip=Cargo.lock,target', '--ignore-words-list=wit']
 
   - repo: https://github.com/compilerla/conventional-pre-commit
     rev: v4.0.0
@@ -33,7 +33,7 @@ repos:
 
       - id: cargo-clippy
         name: cargo clippy
-        entry: cargo clippy --workspace -- -D warnings
+        entry: cargo clippy --workspace --all-targets -- -D warnings
         language: system
         types: [rust]
         pass_filenames: false

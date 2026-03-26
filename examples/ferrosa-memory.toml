@@ -1,5 +1,5 @@
-# Example configuration for ferrosa-memory-mcp
-# Copy to ./ferrosa-memory.toml or set FERROSA_MEMORY_CONFIG=/path/to/file
+# Configuration for ferrosa-memory-mcp
+# Matches the docker-compose.yml development cluster
 
 [server]
 transport = "stdio"          # "stdio" for Claude Code, "http" for remote
@@ -7,8 +7,8 @@ transport = "stdio"          # "stdio" for Claude Code, "http" for remote
 # log_level = "info"
 
 [ferrosa]
-contact_points = ["localhost:9042"]
-# keyspace = "agent_memory"
+contact_points = ["localhost:19042", "localhost:19043", "localhost:19044"]
+keyspace = "agent_memory"
 # replication_factor = 3
 # consistency = "LOCAL_QUORUM"
 
@@ -26,10 +26,17 @@ ollama_base_url = "http://localhost:11434"
 model = "nomic-embed-text"
 dimensions = 768
 
+[graph]
+bolt_uri = "bolt://localhost:17687"
+username = "neo4j"
+password = "neo4j"
+http_url = "http://localhost:17474"
+
 [security]
 # audit_log_enabled = true
 # anomaly_detection_enabled = true
 # anomaly_sigma_threshold = 3.0
+# anomaly_alerts_enabled = true    # emit AnomalyDetected events via EventBus/SSE
 
 [routing]
 # guideline_version = "v1"

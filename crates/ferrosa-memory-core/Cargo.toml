@@ -1,0 +1,28 @@
+[package]
+name = "ferrosa-memory-core"
+version.workspace = true
+edition.workspace = true
+
+[features]
+mock-storage = []
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+prometheus = { workspace = true }
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+dirs = { workspace = true }
+cdrs-tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }

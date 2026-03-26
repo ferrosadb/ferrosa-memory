@@ -1,1 +1,7 @@
 /target
+ferrosa-memory.toml
+.fastembed_cache/
+.superpowers/
+.claude/worktrees/
+.opencode/
+opencode.json

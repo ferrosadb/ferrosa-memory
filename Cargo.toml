@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/ferrosa-core", "crates/ferrosa-memory-mcp", "crates/ferrosa-memory-batch"]
+members = ["crates/ferrosa-memory-core", "crates/ferrosa-memory-mcp", "crates/ferrosa-memory-batch"]
 resolver = "2"
 
 [workspace.package]
@@ -27,6 +27,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 prometheus = "0.14"
 
 # Hashing
+sha1 = "0.10"
 sha2 = "0.10"
 
 # UUIDs
@@ -41,3 +42,18 @@ anyhow = "1"
 
 # Config
 dirs = "6"
+
+# CQL driver (Ferrosa/Cassandra) — using fork with VECTOR type support
+# PR: https://github.com/krojew/cdrs-tokio/pull/221
+cdrs-tokio = { git = "https://github.com/bkearns/cdrs-tokio.git", branch = "feature/vector-type", features = ["derive"] }
+
+# TLS
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+
+# WebSocket (viz dashboard)
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+
+# neo4rs removed — Ferrosa's Bolt is v5, neo4rs 0.8 only supports v4
+# Graph queries go through Ferrosa's HTTP /graph/query endpoint via reqwest

@@ -1,62 +1,39 @@
 # Component Architecture
 
+> Last updated: 2026-03-25
+> Status: 31 modules — cognitive memory, hybrid search, visualization, and infrastructure layers complete. WebSocket anomaly alert subscription added (Sprint 4.9).
+
 ## Module Map
 
 ```mermaid
+%%{init: {'theme':'dark','themeVariables':{'primaryColor':'#16161f','primaryTextColor':'#e8e8ed','primaryBorderColor':'#e2725b','lineColor':'#9494a3','secondaryColor':'#1c1c28','tertiaryColor':'#111118','clusterBkg':'#111118','clusterBorder':'#1e1e2a','edgeLabelBackground':'#111118','nodeTextColor':'#e8e8ed'}}}%%
 graph TB
-    subgraph "MCP Layer"
-        TRANS[transport]
-        DISPATCH[tool_dispatch]
-    end
-
-    subgraph "Core Logic"
-        ROUTER[tool_router]
-        AUTH[auth]
-        COMPRESS[compression]
-        EMBED[embedding_client]
-    end
-
-    subgraph "Tool Modules"
-        MEMO[memo_tools]
-        PLAN[plan_tools]
-        FOLD[fold_tools]
-        ENTITY[entity_tools]
-        FEEDBACK[feedback_tools]
-    end
-
-    subgraph "Storage"
-        CQL[cql_client]
-        GRAPH[graph_client]
-    end
-
-    subgraph "Observability"
-        METRICS[metrics]
-    end
-
-    TRANS --> DISPATCH
-    DISPATCH --> AUTH
-    AUTH --> ROUTER
-    ROUTER --> MEMO
-    ROUTER --> PLAN
-    ROUTER --> FOLD
-    ROUTER --> ENTITY
-    ROUTER --> FEEDBACK
-    MEMO --> CQL
-    MEMO --> EMBED
-    MEMO --> COMPRESS
-    PLAN --> CQL
-    FOLD --> CQL
-    FOLD --> GRAPH
-    FOLD --> COMPRESS
-    FOLD --> EMBED
-    ENTITY --> CQL
-    ENTITY --> GRAPH
-    ENTITY --> EMBED
-    FEEDBACK --> CQL
-    CQL --> METRICS
-    GRAPH --> METRICS
-    ROUTER --> METRICS
+    A[transport] --> B[tool_dispatch]
+    B --> C[auth]
+    C --> D[tool_router]
+    D --> E[compression]
+    D --> F[embedding_client]
+    D --> G[memo_tools]
+    D --> H[plan_tools]
+    D --> I[fold_tools]
+    D --> J[entity_tools]
+    D --> K[feedback_tools]
+    G --> L[cql_client]
+    H --> L
+    I --> L
+    I --> M[graph_client]
+    J --> L
+    J --> M
+    K --> L
+    L --> N[audit]
+    L --> O[metrics]
+    L --> P[viz]
+    P --> Q[http]
 ```
+
+**Note:** Shows main call flow. Full 31-module dependency matrix in `dsm-analysis.md`.
+
+**Note:** `graph_client` (M11) uses the HTTP Cypher endpoint, which is working. Graph writes go through CQL (vertex/edge table INSERTs via `CqlStorage`), and graph reads/traversals go through HTTP POST against `/graph/query` via `reqwest`.
 
 ## Components
 
@@ -71,7 +48,7 @@ graph TB
 
 **Dependencies:** `tokio`, `serde_json`, `hyper` (HTTP mode only)
 
-**Size estimate:** ~80 lines
+**Size estimate:** ~180 lines
 
 ---
 
@@ -81,11 +58,11 @@ graph TB
 
 **Interface:**
 - `dispatch(tool_name, params) -> Result<Value>` — routes to the correct tool handler
-- `list_tools() -> Vec<ToolSchema>` — returns all 12 tool definitions for MCP `tools/list`
+- `list_tools() -> Vec<ToolSchema>` — returns all tool definitions for MCP `tools/list`
 
-**Dependencies:** `transport`, `auth`
+**Dependencies:** `transport`, `auth`, `quota`
 
-**Size estimate:** ~60 lines
+**Size estimate:** ~2,700 lines
 
 ---
 
@@ -104,7 +81,7 @@ graph TB
 
 **Dependencies:** None (leaf module)
 
-**Size estimate:** ~40 lines
+**Size estimate:** ~130 lines
 
 ---
 
@@ -127,7 +104,7 @@ graph TB
 
 **Dependencies:** `cql_client` (reads `feedback_outcomes` for routing optimization), `metrics`
 
-**Size estimate:** ~100 lines
+**Size estimate:** ~240 lines
 
 ---
 
@@ -143,7 +120,7 @@ graph TB
 
 **Dependencies:** `cql_client`, `embedding_client`, `compression`, `metrics`
 
-**Size estimate:** ~80 lines
+**Size estimate:** ~370 lines
 
 ---
 
@@ -160,7 +137,7 @@ graph TB
 
 **Dependencies:** `cql_client`, `metrics`
 
-**Size estimate:** ~70 lines
+**Size estimate:** ~260 lines
 
 ---
 
@@ -178,7 +155,7 @@ graph TB
 
 **Dependencies:** `cql_client`, `graph_client`, `compression`, `embedding_client`, `metrics`
 
-**Size estimate:** ~120 lines
+**Size estimate:** ~380 lines
 
 ---
 
@@ -194,7 +171,7 @@ graph TB
 
 **Dependencies:** `cql_client`, `graph_client`, `embedding_client`, `metrics`
 
-**Size estimate:** ~90 lines
+**Size estimate:** ~570 lines
 
 ---
 
@@ -209,7 +186,7 @@ graph TB
 
 **Dependencies:** `cql_client`, `metrics`
 
-**Size estimate:** ~30 lines
+**Size estimate:** ~80 lines
 
 ---
 
@@ -221,28 +198,32 @@ graph TB
 - `connect(config) -> Result<CqlClient>`
 - `execute(statement, params) -> Result<Rows>`
 - `execute_batch(statements) -> Result<()>`
-- Prepared statement cache for all 6 tables
+- Prepared statement cache for all tables
 
-**Dependencies:** `cdrs-tokio` or `scylla-rust-driver`, `metrics`
+**Dependencies:** `cdrs-tokio`, `vector`, `metrics`
 
-**Size estimate:** ~100 lines
+**Size estimate:** ~1,680 lines
 
 ---
 
-### 11. `graph_client` — Cypher Graph Client
+### 11. `graph_client` — HTTP Cypher Client
 
-**Responsibility:** Executes Cypher queries against Ferrosa's graph layer for multi-hop traversals and edge management.
+**Responsibility:** Executes Cypher MATCH queries against Ferrosa's HTTP graph endpoint for multi-hop traversals.
+
+**Implementation note (updated 2026-03-21):** Switched from neo4rs (Bolt v4) to HTTP POST against `/graph/query` in commit de901d1. Ferrosa's Bolt endpoint is v5, which neo4rs 0.8 does not support. The HTTP Cypher approach is working. Graph writes (vertex/edge creation) go through CQL INSERTs into graph-annotated tables via `CqlStorage`, not through this client.
 
 **Interface:**
-- `create_vertex(label, properties) -> Result<()>`
-- `create_edge(from, to, edge_type, properties) -> Result<()>`
-- `traverse(cypher_query) -> Result<Vec<Row>>`
+- `connect(config) -> Result<GraphClient>` — HTTP connection with Basic auth
+- `get_fold_ancestors(fold_id) -> Result<Vec<Uuid>>` — `FOLDED_INTO` traversal
+- `find_related_entities(entity_id, hops) -> Result<Vec<Value>>` — `CO_OCCURS_WITH` N-hop
+- `get_entities_in_fold(fold_id) -> Result<Vec<Value>>` — `MENTIONED_IN` lookup
+- `get_supersession_chain(event_id) -> Result<Vec<Value>>` — `SUPERSEDES` chain
 
-**Edge types managed:** `FOLDED_INTO`, `CO_OCCURS_WITH`, `MENTIONED_IN`, `SUPERSEDES`
+**Edge types queried:** `FOLDED_INTO`, `CO_OCCURS_WITH`, `MENTIONED_IN`, `SUPERSEDES`
 
-**Dependencies:** `cql_client` (Cypher may route through CQL in Ferrosa), `metrics`
+**Dependencies:** `reqwest` (HTTP), `serde_json` — no dependency on `cql_client` or `metrics`
 
-**Size estimate:** ~80 lines
+**Size estimate:** ~240 lines
 
 ---
 
@@ -258,7 +239,7 @@ graph TB
 
 **Dependencies:** None (leaf module, pure Rust)
 
-**Size estimate:** ~150 lines
+**Size estimate:** ~340 lines
 
 ---
 
@@ -274,7 +255,7 @@ graph TB
 
 **Dependencies:** `reqwest`, `serde_json`
 
-**Size estimate:** ~50 lines
+**Size estimate:** ~140 lines
 
 ---
 
@@ -292,29 +273,292 @@ graph TB
 
 **Dependencies:** `prometheus` crate
 
-**Size estimate:** ~60 lines
+**Size estimate:** ~180 lines
+
+---
+
+### 15. `smart_ingest` — Prediction Error Gated Ingestion
+
+**Responsibility:** Decides whether new content should CREATE a new entity, UPDATE an existing one, or SUPERSEDE outdated information. Implements prediction error gating (Sinclair & Bhavnani 2020): only store what is surprising relative to existing memories.
+
+**Interface:**
+- `smart_ingest(storage, ctx, session_id, name, type, snippet, embedding) -> IngestDecision`
+- Returns `Created`, `Updated`, or `Superseded` with entity IDs and similarity scores
+
+**Dependencies:** `cql_client`, `embedding_client`
+
+**Size estimate:** ~460 lines
+
+---
+
+### 16. `intention` — Prospective Memory Tracking
+
+**Responsibility:** "Remember to do X when Y happens." Implements prospective memory (Brandimonte et al. 1996) — deferred actions that trigger when a context condition is met.
+
+**Interface:**
+- `set_intention(description, trigger, priority)` — create a new intention
+- `check_intentions(context)` — evaluate triggers against current context
+- `complete_intention(id)` — mark as done
+- `snooze_intention(id, until)` — defer until a later time
+- `list_intentions()` — list active intentions
+
+**Trigger types:** topic mention, time-based, or keyword match.
+
+**Dependencies:** `cql_client`
+
+**Size estimate:** ~250 lines
+
+---
+
+### 17. `dream` — Dream Consolidation Engine
+
+**Responsibility:** Periodic memory processing inspired by vestige's dream cycle. Groups entities by source fold, discovers co-occurrence relationships, creates `CO_OCCURS` graph edges, and identifies entity clusters as insights.
+
+**Interface:**
+- `run_consolidation(storage, ctx, session_id) -> DreamResult`
+- Returns entity count, connections created, and insight strings
+
+**Dependencies:** `cql_client`
+
+**Size estimate:** ~180 lines
+
+---
+
+### 18. `spreading` — Spreading Activation Search
+
+**Responsibility:** Collins & Loftus semantic network retrieval. Propagates activation energy from seed entities through the knowledge graph, decaying at each hop. Returns the most activated non-seed entities for associative recall.
+
+**Interface:**
+- `spread(storage, ctx, seed_ids, decay, depth, limit) -> Vec<ActivatedNode>`
+- Seeds start at activation 1.0; energy decays multiplicatively per hop
+
+**Dependencies:** `cql_client`
+
+**Size estimate:** ~290 lines
+
+---
+
+### 19. `importance` — Multi-Channel Importance Scoring
+
+**Responsibility:** Neuroscience-inspired 4-channel importance model (vestige pattern). Scores memories on novelty, arousal, reward, and attention to prioritize retrieval and guide promotion/demotion.
+
+**Interface:**
+- `compute_importance(similarity, retrieval_count, recency, success_rate) -> ImportanceScore`
+- Channels: novelty (1 - similarity), arousal (keyword heuristic), reward (feedback success), attention (recency decay)
+
+**Dependencies:** None (pure computation, uses `feedback_tools` data indirectly)
+
+**Size estimate:** ~75 lines
+
+---
+
+### 20. `chains` — Memory Chain Path Discovery
+
+**Responsibility:** BFS traversal to find shortest paths between two entities via graph edges. Explains how concepts are connected through the knowledge graph.
+
+**Interface:**
+- `find_chain(storage, ctx, source_id, dest_id, max_depth) -> Option<MemoryChain>`
+- Returns path steps with edge types; confidence decays with hop count
+
+**Dependencies:** `cql_client`
+
+**Size estimate:** ~230 lines
+
+---
+
+### 21. `speculative` — Speculative Retrieval
+
+**Responsibility:** Predicts which memories will be needed based on co-access patterns. When entities A and B are frequently retrieved together, retrieving A suggests B.
+
+**Interface:**
+- `CoAccessTracker::record(entity_id)` — tracks access within a sliding window
+- `CoAccessTracker::predict(entity_id) -> Vec<Prediction>` — returns co-accessed entities ranked by confidence
+
+**Dependencies:** `cql_client`
+
+**Size estimate:** ~250 lines
+
+---
+
+### 22. `dedup` — Duplicate Entity Detection
+
+**Responsibility:** Finds semantically similar entities that may be duplicates. Uses Jaccard coefficient on context snippets to surface merge candidates.
+
+**Interface:**
+- `find_duplicates(storage, ctx, session_id, threshold) -> Vec<DuplicatePair>`
+- Returns pairs with similarity scores above the given threshold
+
+**Dependencies:** `cql_client`
+
+**Size estimate:** ~270 lines
+
+---
+
+### 23. `hybrid_search` — Cross-Type Search with RRF
+
+**Responsibility:** Searches across entities, folds, and memos simultaneously using Reciprocal Rank Fusion to merge ranked result lists into a single unified ranking.
+
+**Interface:**
+- `hybrid_search(storage, ctx, query, embedding, k) -> Vec<SearchResult>`
+- RRF merge with k=60 across multiple retrieval strategies
+
+**Dependencies:** `cql_client`, `embedding_client`
+
+**Size estimate:** ~230 lines
+
+---
+
+### 24. `audit` — Audit Logging and Anomaly Detection
+
+**Responsibility:** Append-only audit log (STRIDE R1). Records every write operation to the `audit_log` table. Audit rows are write-only through this module — they cannot be deleted via MCP tools. Also tracks entity retrieval frequency for anomaly detection (FMEA F19).
+
+**Interface:**
+- `log_write(storage, ctx, operation, target_table, target_id, session_id) -> Uuid`
+- `check_anomaly(storage, ctx, config) -> Option<AnomalyAlert>`
+
+**Dependencies:** `cql_client`, `metrics`
+
+**Size estimate:** ~180 lines
+
+---
+
+### 25. `quota` — Per-Tenant Storage Quotas
+
+**Responsibility:** Enforces per-tenant entity and memo result limits (FMEA D1). Rejects writes when configured limits are exceeded.
+
+**Interface:**
+- `check_quota(current_count, max) -> Result<(), QuotaExceeded>`
+- `check_memo_quota(current_count, config) -> Result<(), QuotaExceeded>`
+
+**Dependencies:** `config`
+
+**Size estimate:** ~75 lines
+
+---
+
+### 26. `session` — Session Deletion Cascade
+
+**Responsibility:** Right-to-deletion implementation. Cascade deletes all memory objects for a session across plan_state, trajectory_folds, entity_store, temporal_events, and feedback_outcomes.
+
+**Interface:**
+- `delete_session(storage, ctx, session_id) -> DeleteSessionResult`
+- Returns count of objects removed
+
+**Dependencies:** `cql_client`
+
+**Size estimate:** ~145 lines
+
+---
+
+### 27. `vector` — Vector Serialization
+
+**Responsibility:** Encode/decode `Vec<f32>` to CQL `VECTOR<float, N>` wire format. Workaround for cdrs-tokio v9 lacking native VECTOR type support (type ID 0x0023). Serializes as big-endian IEEE 754 f32 bytes (Blob).
+
+**Interface:**
+- `encode_vector(values) -> Vec<u8>` — f32 slice to CQL wire bytes
+- `decode_vector(bytes) -> Vec<f32>` — CQL wire bytes to f32 vec
+
+**Dependencies:** None (leaf module, pure Rust)
+
+**Size estimate:** ~70 lines
+
+---
+
+### 28. `types` — Shared Type Definitions
+
+**Responsibility:** Core domain types shared across all modules: `TenantContext`, `PlanNode`, `PlanStatus`, `FeedbackOutcome`, `TemporalEvent`, `AuditEntry`, and tool parameter/result structs.
+
+**Dependencies:** `serde`, `uuid`, `chrono`
+
+**Size estimate:** ~200 lines
+
+---
+
+### 29. `batch` — Batch Job Logic
+
+**Responsibility:** Offline strategy accuracy computation and guideline generation (ADR-002). Reads feedback outcomes, groups by `(program_type, task_complexity)`, and produces updated routing guidelines.
+
+**Interface:**
+- `compute_strategy_accuracy(outcomes) -> Vec<StrategyStats>`
+- `generate_guidelines(stats) -> Vec<RoutingGuideline>`
+
+**Dependencies:** `feedback_tools` (data), `types`
+
+**Size estimate:** ~190 lines
+
+---
+
+### 30. `viz` — Visualizer Event Bus
+
+**Responsibility:** Typed event system for the memory graph dashboard. Provides a broadcast channel that tool handlers emit events to and the WebSocket endpoint subscribes from. Events include full `Snapshot` on connect, then incremental deltas (`NodeAdded`, `EdgeAdded`, `NodeUpdated`) as the graph mutates.
+
+**Interface:**
+- `VizBus::new() -> VizBus` — creates broadcast channel
+- `VizBus::send(event)` — emit a `VizEvent` to all subscribers
+- `VizBus::subscribe() -> Receiver<VizEvent>` — subscribe to event stream
+
+**Event types:** `Snapshot`, `NodeAdded`, `EdgeAdded`, `NodeUpdated`, `NodeRemoved`
+
+**Dependencies:** `tokio::sync::broadcast`
+
+**Size estimate:** ~250 lines
+
+---
+
+### 31. `http` — HTTP Server and WebSocket Endpoint
+
+**Responsibility:** HTTP+SSE transport for remote MCP clients. Serves JSON-RPC via POST, Prometheus metrics scrape, health check, and the memory graph visualizer dashboard with live WebSocket updates. TLS support for production.
+
+**Endpoints:**
+- `POST /mcp` — JSON-RPC request/response
+- `GET /metrics` — Prometheus metrics scrape
+- `GET /health` — health check
+- `GET /viz` — memory graph visualizer HTML (viz port)
+- `GET /viz/ws` — WebSocket for live graph events (viz port)
+- `GET /subscribe/anomalies` — SSE stream of anomaly alerts (viz port, Sprint 4.9)
+
+**Security:** TLS required in production, HTTP Basic auth, per-IP connection limits (FMEA F30), idle connection timeout.
+
+**Dependencies:** `viz`, `auth`, `metrics`, `tokio`, `tokio-tungstenite`
+
+**Size estimate:** ~876 lines
 
 ---
 
 ## Size Summary
 
-| Module | Lines (est.) |
-|--------|-------------|
-| transport | 80 |
-| tool_dispatch | 60 |
-| auth | 40 |
-| tool_router | 100 |
-| memo_tools | 80 |
-| plan_tools | 70 |
-| fold_tools | 120 |
-| entity_tools | 90 |
-| feedback_tools | 30 |
-| cql_client | 100 |
-| graph_client | 80 |
-| compression | 150 |
-| embedding_client | 50 |
-| metrics | 60 |
-| config + main | 50 |
-| **Total** | **~1,160** |
-
-The spec estimated 300-500 lines for a "thin adapter." The actual total is higher because we're including the compression engine (150 lines) and embedding client (50 lines) that the spec originally delegated to Python, plus the routing layer (100 lines) which is non-trivial logic. The core MCP adapter (transport + dispatch + auth + tool handlers) is ~500 lines, consistent with the spec estimate.
+| Module | Lines (actual) |
+|--------|---------------|
+| transport | 180 |
+| tool_dispatch | 2,700 |
+| auth | 130 |
+| tool_router | 240 |
+| memo_tools | 370 |
+| plan_tools | 260 |
+| fold_tools | 380 |
+| entity_tools | 570 |
+| feedback_tools | 80 |
+| cql_client | 1,680 |
+| graph_client | 240 |
+| compression | 340 |
+| embedding_client | 140 |
+| metrics | 180 |
+| smart_ingest | 460 |
+| intention | 250 |
+| dream | 180 |
+| spreading | 290 |
+| importance | 75 |
+| chains | 230 |
+| speculative | 250 |
+| dedup | 270 |
+| hybrid_search | 230 |
+| audit | 180 |
+| quota | 75 |
+| session | 145 |
+| vector | 70 |
+| types | 200 |
+| batch | 190 |
+| viz | 250 |
+| http | 800 |
+| config + storage | 1,320 |
+| **Total** | **~12,350** |
