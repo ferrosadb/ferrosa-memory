@@ -153,7 +153,7 @@ async fn debug_query_bind_values_vs_inline() {
     let s = connect!();
     let tid = uuid::Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
     let sid = uuid::Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
-    let eid = uuid::Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap();
+    let _eid = uuid::Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap();
 
     // Insert with inline values (no bind markers)
     s.query(

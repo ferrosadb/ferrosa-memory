@@ -263,8 +263,10 @@ mod tests {
         let ctx = test_ctx();
 
         // Config with max_memo_results = 2
-        let mut config = crate::config::MemoryConfig::default();
-        config.max_memo_results = 2;
+        let config = crate::config::MemoryConfig {
+            max_memo_results: 2,
+            ..Default::default()
+        };
 
         // Store 2 memos (at limit)
         for i in 0..2 {

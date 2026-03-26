@@ -8,7 +8,6 @@ use cdrs_tokio::cluster::NodeTcpConfigBuilder;
 use cdrs_tokio::cluster::session::{SessionBuilder, TcpSessionBuilder};
 use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
 use cdrs_tokio::query_values;
-use cdrs_tokio::types::ByName;
 use cdrs_tokio::types::blob::Blob;
 use ferrosa_memory_core::vector;
 

@@ -405,12 +405,9 @@ mod tests {
         let text = "However the system Also provides Some features";
         let candidates = extract_entity_candidates(text);
         let names: Vec<&str> = candidates.iter().map(|c| c.0.as_str()).collect();
-        assert!(
-            !names.iter().any(|n| *n == "However"),
-            "should filter However"
-        );
-        assert!(!names.iter().any(|n| *n == "Also"), "should filter Also");
-        assert!(!names.iter().any(|n| *n == "Some"), "should filter Some");
+        assert!(!names.contains(&"However"), "should filter However");
+        assert!(!names.contains(&"Also"), "should filter Also");
+        assert!(!names.contains(&"Some"), "should filter Some");
     }
 
     #[test]
