@@ -1376,6 +1376,8 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
         embedding.as_deref(),
         source_fold_id,
         &config,
+        None,
+        None,
     )
     .await
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
