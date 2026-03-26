@@ -221,22 +221,31 @@ pub async fn extract_entity_from_content(
     content: &str,
     caller_type: &str,
 ) -> (String, String) {
-    // Tier 2: LLM extraction
+    // Tier 2: Heuristic extraction (fast, free)
+    let (heuristic_name, heuristic_type) = heuristic_extract_entity(content);
+
+    // If heuristic found a clean entity (not a truncated sentence fragment),
+    // use it directly. A name with ≤5 words that isn't the 8-word truncation
+    // fallback is considered clean.
+    let is_truncation_fallback = heuristic_name.split_whitespace().count() >= 6;
+    if !is_truncation_fallback {
+        let final_type = apply_type_override(caller_type, &heuristic_type);
+        return (heuristic_name, final_type);
+    }
+
+    // Tier 3: LLM extraction (heuristic failed — got a sentence fragment)
     match llm_extract_entity(http, ollama_base_url, model, content).await {
         Ok((name, extracted_type)) => {
             let final_type = apply_type_override(caller_type, &extracted_type);
             tracing::info!(name = %name, extracted_type, final_type, "LLM entity extraction succeeded");
-            return (name, final_type);
+            (name, final_type)
         }
         Err(e) => {
-            tracing::debug!(error = %e, "LLM entity extraction failed, using heuristic");
+            tracing::debug!(error = %e, "LLM entity extraction failed, using heuristic result");
+            let final_type = apply_type_override(caller_type, &heuristic_type);
+            (heuristic_name, final_type)
         }
     }
-
-    // Tier 3: Heuristic extraction
-    let (name, extracted_type) = heuristic_extract_entity(content);
-    let final_type = apply_type_override(caller_type, &extracted_type);
-    (name, final_type)
 }
 
 /// Classify an entity using heuristics first, falling back to LLM for
