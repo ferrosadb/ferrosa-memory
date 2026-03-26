@@ -267,8 +267,6 @@ pub fn extract_entity_candidates(text: &str) -> Vec<(String, String)> {
         if word.len() > 1
             && word.chars().next().is_some_and(|c| c.is_uppercase())
             && !is_common_word(word)
-            // skip sentence starters (i > 0)
-            && i > 0
         {
             // Collect consecutive capitalized words
             let start = i;
@@ -676,8 +674,6 @@ mod tests {
 
     #[test]
     fn extract_entities_from_technical_text() {
-        // First word is skipped by the sentence-starter heuristic (i > 0),
-        // so prefix with a lowercase word to push entities past position 0.
         let text = "uses Ferrosa with LSM-tree storage and S3 tiering";
         let candidates = extract_entity_candidates(text);
         let names: Vec<&str> = candidates.iter().map(|c| c.0.as_str()).collect();
@@ -697,19 +693,28 @@ mod tests {
     }
 
     #[test]
-    fn extract_entities_skips_sentence_starters() {
+    fn extract_entities_at_sentence_start() {
         let text = "Cassandra is great. Redis is fast.";
         let candidates = extract_entity_candidates(text);
         let names: Vec<&str> = candidates.iter().map(|c| c.0.as_str()).collect();
-        // "Cassandra" is at i=0, so it is skipped as a sentence starter
         assert!(
-            !names.contains(&"Cassandra"),
-            "should skip sentence-starting word"
+            names.contains(&"Cassandra"),
+            "should extract entity at sentence start, got: {names:?}"
         );
-        // "Redis" is at i > 0 and capitalized, so it should be captured
         assert!(
             names.contains(&"Redis"),
-            "should extract mid-sentence entity"
+            "should extract mid-sentence entity, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn extract_entities_at_position_zero() {
+        let text = "Ben Kearns built Ferrosa from scratch";
+        let candidates = extract_entity_candidates(text);
+        let names: Vec<&str> = candidates.iter().map(|c| c.0.as_str()).collect();
+        assert!(
+            names.contains(&"Ben Kearns"),
+            "should extract entity at position 0, got: {names:?}"
         );
     }
 
