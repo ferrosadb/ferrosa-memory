@@ -150,7 +150,7 @@ macro_rules! delegate {
     }};
 }
 
-/// Delegate all Storage methods through the RwLock<Option<CqlStorage>>.
+/// Delegate all Storage methods through the `RwLock<Option<CqlStorage>>`.
 impl Storage for ReconnectingStorage {
     async fn memo_get(
         &self,

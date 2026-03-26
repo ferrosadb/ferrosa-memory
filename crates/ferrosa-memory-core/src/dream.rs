@@ -38,7 +38,7 @@ const UNFOLDED_PAIR_CAP: usize = 200;
 /// Two-pass connection discovery:
 /// 1. Entities with a `source_fold_id` are grouped by fold and compared within each group.
 /// 2. Entities without a fold ("unfolded") are compared pairwise using text similarity,
-///    capped at [`UNFOLDED_PAIR_CAP`] most-recent entities to bound the O(n²) cost.
+///    capped at `UNFOLDED_PAIR_CAP` most-recent entities to bound the O(n²) cost.
 ///
 /// Clusters of 3+ co-occurring entities generate insight summaries.
 pub async fn run_consolidation(

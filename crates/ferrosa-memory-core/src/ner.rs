@@ -1,7 +1,7 @@
 //! LLM-backed named entity recognition via Ollama.
 //!
 //! Two-tier classification:
-//! 1. Fast heuristic pass ([`smart_ingest::infer_entity_type`]) — handles
+//! 1. Fast heuristic pass (`infer_entity_type`) — handles
 //!    obvious cases (acronyms, org suffixes, known tools, common names).
 //! 2. LLM fallback ([`llm_classify_entity`]) — sends ambiguous entities to
 //!    a local Ollama model for classification.

@@ -1,11 +1,11 @@
-//! Vector serialization for CQL VECTOR<float, N> type.
+//! Vector serialization for CQL `VECTOR<float, N>` type.
 //!
 //! cdrs-tokio v9 doesn't support the VECTOR type (type ID 0x0023).
-//! We work around this by serializing Vec<f32> to raw bytes (Blob)
-//! and deserializing back. The CQL wire format for VECTOR<float, N>
+//! We work around this by serializing `Vec<f32>` to raw bytes (Blob)
+//! and deserializing back. The CQL wire format for `VECTOR<float, N>`
 //! is N consecutive big-endian IEEE 754 f32 values.
 
-/// Serialize a Vec<f32> to CQL VECTOR wire format (big-endian f32 bytes).
+/// Serialize a `Vec<f32>` to CQL VECTOR wire format (big-endian f32 bytes).
 pub fn encode_vector(values: &[f32]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(values.len() * 4);
     for &v in values {
@@ -14,7 +14,7 @@ pub fn encode_vector(values: &[f32]) -> Vec<u8> {
     buf
 }
 
-/// Deserialize CQL VECTOR wire format to Vec<f32>.
+/// Deserialize CQL VECTOR wire format to `Vec<f32>`.
 pub fn decode_vector(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(4)
