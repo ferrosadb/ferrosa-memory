@@ -44,6 +44,7 @@ async fn main() -> anyhow::Result<()> {
     match subcommand.as_str() {
         "migrate-session" => migrate_session(&config).await,
         "retype-entities" => retype_entities(&config).await,
+        "rename-entities" => rename_entities(&config).await,
         _ => run_guidelines(&config).await,
     }
 }
@@ -212,6 +213,84 @@ async fn retype_entities(config: &ferrosa_memory_core::config::Config) -> anyhow
     }
 
     tracing::info!(retyped_heuristic, retyped_llm, skipped, "retype complete");
+    Ok(())
+}
+
+/// Re-extract entity names using three-tier NER for entities with
+/// sentence-fragment names (>5 words).
+async fn rename_entities(config: &ferrosa_memory_core::config::Config) -> anyhow::Result<()> {
+    let tenant_id = config
+        .server
+        .tenant_id
+        .as_ref()
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(|| anyhow::anyhow!("no tenant_id configured in [server]"))?;
+
+    let ctx = TenantContext {
+        tenant_id,
+        session_origin: "batch-rename".into(),
+    };
+
+    let storage = CqlStorage::connect(&config.ferrosa).await?;
+    tracing::info!("connected to CQL cluster");
+
+    let entities = storage.entity_list_all(&ctx).await?;
+    let fragment_count = entities
+        .iter()
+        .filter(|e| e.entity_name.split_whitespace().count() > 5)
+        .count();
+    tracing::info!(
+        total = entities.len(),
+        fragments = fragment_count,
+        "loaded entities"
+    );
+
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let ollama_url = &config.embeddings.ollama_base_url;
+    let ner_model = &config.embeddings.ner_model;
+
+    let mut renamed = 0;
+    let mut skipped = 0;
+
+    for entity in &entities {
+        let word_count = entity.entity_name.split_whitespace().count();
+        if word_count <= 5 {
+            skipped += 1;
+            continue;
+        }
+
+        let (new_name, new_type) = ferrosa_memory_core::ner::extract_entity_from_content(
+            &http,
+            ollama_url,
+            ner_model,
+            &entity.context_snippet,
+            &entity.entity_type,
+        )
+        .await;
+
+        if new_name == entity.entity_name && new_type == entity.entity_type {
+            skipped += 1;
+            continue;
+        }
+
+        let mut updated = entity.clone();
+        updated.entity_name = new_name.clone();
+        updated.entity_type = new_type.clone();
+        storage.entity_put(&ctx, &updated).await?;
+
+        tracing::info!(
+            old_name = %entity.entity_name.chars().take(50).collect::<String>(),
+            new_name = %new_name,
+            old_type = %entity.entity_type,
+            new_type = %new_type,
+            "renamed entity"
+        );
+        renamed += 1;
+    }
+
+    tracing::info!(renamed, skipped, "rename complete");
     Ok(())
 }
 
