@@ -850,3 +850,148 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- is_connection_error tests ---
+
+    #[test]
+    fn is_connection_error_broken_pipe() {
+        let err = anyhow::anyhow!("Broken pipe");
+        assert!(is_connection_error(&err));
+    }
+
+    #[test]
+    fn is_connection_error_connection_reset() {
+        let err = anyhow::anyhow!("Connection reset by peer");
+        assert!(is_connection_error(&err));
+    }
+
+    #[test]
+    fn is_connection_error_connection_refused() {
+        let err = anyhow::anyhow!("Connection refused");
+        assert!(is_connection_error(&err));
+    }
+
+    #[test]
+    fn is_connection_error_transport() {
+        let err = anyhow::anyhow!("Transport error occurred");
+        assert!(is_connection_error(&err));
+    }
+
+    #[test]
+    fn is_connection_error_channel_closed() {
+        let err = anyhow::anyhow!("Channel closed unexpectedly");
+        assert!(is_connection_error(&err));
+    }
+
+    #[test]
+    fn is_connection_error_io_error() {
+        let err = anyhow::anyhow!("IO error: something went wrong");
+        assert!(is_connection_error(&err));
+    }
+
+    #[test]
+    fn is_connection_error_timed_out() {
+        let err = anyhow::anyhow!("Request timed out");
+        assert!(is_connection_error(&err));
+    }
+
+    #[test]
+    fn is_connection_error_not_connected() {
+        let err = anyhow::anyhow!("Not connected to server");
+        assert!(is_connection_error(&err));
+    }
+
+    #[test]
+    fn is_connection_error_eof() {
+        let err = anyhow::anyhow!("Unexpected EOF");
+        assert!(is_connection_error(&err));
+    }
+
+    #[test]
+    fn is_connection_error_case_insensitive() {
+        let err = anyhow::anyhow!("BROKEN PIPE from server");
+        assert!(is_connection_error(&err));
+    }
+
+    #[test]
+    fn is_connection_error_false_for_query_error() {
+        let err = anyhow::anyhow!("table not found: agent_memory.entities");
+        assert!(!is_connection_error(&err));
+    }
+
+    #[test]
+    fn is_connection_error_false_for_auth_error() {
+        let err = anyhow::anyhow!("authentication failed: bad credentials");
+        assert!(!is_connection_error(&err));
+    }
+
+    #[test]
+    fn is_connection_error_false_for_parse_error() {
+        let err = anyhow::anyhow!("failed to parse CQL response");
+        assert!(!is_connection_error(&err));
+    }
+
+    #[test]
+    fn is_connection_error_false_for_generic_error() {
+        let err = anyhow::anyhow!("something went wrong");
+        assert!(!is_connection_error(&err));
+    }
+
+    // --- next_backoff tests ---
+
+    #[test]
+    fn next_backoff_attempt_0() {
+        assert_eq!(next_backoff(0), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn next_backoff_attempt_1() {
+        assert_eq!(next_backoff(1), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn next_backoff_attempt_2() {
+        assert_eq!(next_backoff(2), Duration::from_secs(4));
+    }
+
+    #[test]
+    fn next_backoff_attempt_3() {
+        assert_eq!(next_backoff(3), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn next_backoff_attempt_4() {
+        assert_eq!(next_backoff(4), Duration::from_secs(16));
+    }
+
+    #[test]
+    fn next_backoff_attempt_5_caps_at_30() {
+        assert_eq!(next_backoff(5), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn next_backoff_attempt_10_still_capped() {
+        assert_eq!(next_backoff(10), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn next_backoff_attempt_100_still_capped() {
+        assert_eq!(next_backoff(100), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn next_backoff_u32_max_capped() {
+        assert_eq!(next_backoff(u32::MAX), Duration::from_secs(30));
+    }
+
+    /// Verify the NOT_CONNECTED_MSG constant is non-empty.
+    #[test]
+    fn not_connected_msg_is_non_empty() {
+        assert!(!NOT_CONNECTED_MSG.is_empty());
+        assert!(NOT_CONNECTED_MSG.contains("CQL"));
+    }
+}

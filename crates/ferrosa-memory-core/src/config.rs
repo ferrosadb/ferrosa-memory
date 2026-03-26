@@ -493,4 +493,221 @@ contact_points = "not_an_array"
         let result = parse_config(toml);
         assert!(result.is_err(), "contact_points must be an array");
     }
+
+    #[test]
+    fn default_decay_factor_returns_0_95() {
+        assert!((default_decay_factor() - 0.95).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn server_config_default_stale_edge_max_days() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.stale_edge_max_days, 0);
+    }
+
+    #[test]
+    fn server_config_default_edge_decay_factor() {
+        let cfg = ServerConfig::default();
+        assert!((cfg.edge_decay_factor - 0.95).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn server_config_default_idle_consolidation_enabled() {
+        let cfg = ServerConfig::default();
+        assert!(cfg.idle_consolidation_enabled);
+    }
+
+    #[test]
+    fn server_config_default_idle_seconds() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.idle_consolidation_seconds, 20);
+    }
+
+    #[test]
+    fn server_config_default_transport_stdio() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.transport, "stdio");
+    }
+
+    #[test]
+    fn server_config_default_http_port() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.http_port, 8765);
+    }
+
+    #[test]
+    fn server_config_default_log_level() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.log_level, "info");
+    }
+
+    #[test]
+    fn server_config_default_tls_disabled() {
+        let cfg = ServerConfig::default();
+        assert!(!cfg.require_tls);
+        assert!(cfg.cert_path.is_none());
+        assert!(cfg.key_path.is_none());
+    }
+
+    #[test]
+    fn server_config_default_tenant_session_none() {
+        let cfg = ServerConfig::default();
+        assert!(cfg.tenant_id.is_none());
+        assert!(cfg.session_id.is_none());
+    }
+
+    #[test]
+    fn parse_toml_with_stale_edge_and_decay() {
+        let toml = r#"
+[server]
+stale_edge_max_days = 30
+edge_decay_factor = 0.85
+
+[ferrosa]
+contact_points = ["localhost:9042"]
+"#;
+        let config = parse_config(toml).expect("should parse stale edge config");
+        assert_eq!(config.server.stale_edge_max_days, 30);
+        assert!((config.server.edge_decay_factor - 0.85).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_toml_with_idle_consolidation() {
+        let toml = r#"
+[server]
+idle_consolidation_enabled = false
+idle_consolidation_seconds = 60
+
+[ferrosa]
+contact_points = ["localhost:9042"]
+"#;
+        let config = parse_config(toml).expect("should parse idle consolidation config");
+        assert!(!config.server.idle_consolidation_enabled);
+        assert_eq!(config.server.idle_consolidation_seconds, 60);
+    }
+
+    #[test]
+    fn parse_toml_with_graph_config() {
+        let toml = r#"
+[ferrosa]
+contact_points = ["localhost:9042"]
+
+[graph]
+bolt_uri = "bolt://remote:7687"
+username = "admin"
+password = "secret"
+http_url = "http://remote:7474"
+"#;
+        let config = parse_config(toml).expect("should parse graph config");
+        assert_eq!(config.graph.bolt_uri, "bolt://remote:7687");
+        assert_eq!(config.graph.username, "admin");
+        assert_eq!(config.graph.password, "secret");
+        assert_eq!(config.graph.http_url, "http://remote:7474");
+    }
+
+    #[test]
+    fn graph_config_defaults() {
+        let cfg = GraphDbConfig::default();
+        assert_eq!(cfg.bolt_uri, "bolt://localhost:7687");
+        assert_eq!(cfg.username, "neo4j");
+        assert_eq!(cfg.password, "neo4j");
+        assert_eq!(cfg.http_url, "http://localhost:7474");
+    }
+
+    #[test]
+    fn parse_toml_with_viz_config() {
+        let toml = r#"
+[ferrosa]
+contact_points = ["localhost:9042"]
+
+[viz]
+enabled = false
+port = 9999
+"#;
+        let config = parse_config(toml).expect("should parse viz config");
+        assert!(!config.viz.enabled);
+        assert_eq!(config.viz.port, 9999);
+    }
+
+    #[test]
+    fn viz_config_defaults() {
+        let cfg = VizConfig::default();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.port, 8766);
+    }
+
+    #[test]
+    fn memory_config_defaults() {
+        let cfg = MemoryConfig::default();
+        assert_eq!(cfg.default_ttl_days, 7);
+        assert_eq!(cfg.fold_ttl_days, 30);
+        assert_eq!(cfg.archive_after_days, 30);
+        assert_eq!(cfg.compression_threshold_tokens, 512);
+        assert!((cfg.confidence_gate - 0.7).abs() < f64::EPSILON);
+        assert_eq!(cfg.max_memo_results, 50);
+        assert_eq!(cfg.max_entities, 10000);
+    }
+
+    #[test]
+    fn embedding_config_defaults() {
+        let cfg = EmbeddingConfig::default();
+        assert_eq!(cfg.provider, "ollama");
+        assert_eq!(cfg.ollama_base_url, "http://localhost:11434");
+        assert_eq!(cfg.model, "nomic-embed-text");
+        assert_eq!(cfg.dimensions, 768);
+    }
+
+    #[test]
+    fn security_config_defaults() {
+        let cfg = SecurityConfig::default();
+        assert!(cfg.audit_log_enabled);
+        assert!(cfg.anomaly_detection_enabled);
+        assert!((cfg.anomaly_sigma_threshold - 3.0).abs() < f64::EPSILON);
+        assert!(cfg.anomaly_alerts_enabled);
+    }
+
+    #[test]
+    fn routing_config_defaults() {
+        let cfg = RoutingConfig::default();
+        assert_eq!(cfg.guideline_version, "v1");
+        assert_eq!(cfg.feedback_export_cron, "0 2 * * *");
+    }
+
+    #[test]
+    fn parse_toml_defaults_for_optional_sections() {
+        let toml = r#"
+[ferrosa]
+contact_points = ["localhost:9042"]
+"#;
+        let config = parse_config(toml).expect("should parse with all defaults");
+        // Verify all default sections are populated
+        assert_eq!(config.server.transport, "stdio");
+        assert!(config.viz.enabled);
+        assert_eq!(config.graph.bolt_uri, "bolt://localhost:7687");
+        assert_eq!(config.memory.default_ttl_days, 7);
+        assert_eq!(config.embeddings.provider, "ollama");
+        assert!(config.security.audit_log_enabled);
+        assert_eq!(config.routing.guideline_version, "v1");
+    }
+
+    #[test]
+    fn parse_toml_with_tenant_and_session_ids() {
+        let toml = r#"
+[server]
+tenant_id = "550e8400-e29b-41d4-a716-446655440000"
+session_id = "660e8400-e29b-41d4-a716-446655440000"
+
+[ferrosa]
+contact_points = ["localhost:9042"]
+"#;
+        let config = parse_config(toml).expect("should parse tenant/session IDs");
+        assert_eq!(
+            config.server.tenant_id.as_deref(),
+            Some("550e8400-e29b-41d4-a716-446655440000")
+        );
+        assert_eq!(
+            config.server.session_id.as_deref(),
+            Some("660e8400-e29b-41d4-a716-446655440000")
+        );
+    }
 }

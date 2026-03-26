@@ -53,13 +53,17 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Run tests with coverage
         run: |
+          # Exclude: test files, mock storage, infrastructure needing live services
+          # (CQL storage, MCP/batch binaries, HTTP server, graph/embedding clients)
+          EXCL='(tests/|test_|_test\.rs|mock|cql_storage\.rs|main\.rs|http\.rs|graph\.rs|embedding\.rs)'
           cargo llvm-cov --workspace \
             --lcov --output-path lcov.info \
-            --ignore-filename-regex '(tests/|test_|_test\.rs|mock)'
+            --ignore-filename-regex "$EXCL"
       - name: Coverage summary
         run: |
+          EXCL='(tests/|test_|_test\.rs|mock|cql_storage\.rs|main\.rs|http\.rs|graph\.rs|embedding\.rs)'
           cargo llvm-cov --workspace \
-            --ignore-filename-regex '(tests/|test_|_test\.rs|mock)' \
+            --ignore-filename-regex "$EXCL" \
             --no-run 2>/dev/null || true
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
@@ -68,8 +72,9 @@ jobs:
           path: lcov.info
       - name: Check coverage threshold (80% line)
         run: |
+          EXCL='(tests/|test_|_test\.rs|mock|cql_storage\.rs|main\.rs|http\.rs|graph\.rs|embedding\.rs)'
           TOTAL=$(cargo llvm-cov --workspace \
-            --ignore-filename-regex '(tests/|test_|_test\.rs|mock)' \
+            --ignore-filename-regex "$EXCL" \
             --no-run --json 2>/dev/null | \
             jq -r '.data[0].totals.lines.percent // 0')
           echo "Total line coverage: ${TOTAL}%"

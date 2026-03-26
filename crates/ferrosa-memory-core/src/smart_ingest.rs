@@ -759,4 +759,356 @@ mod tests {
         assert_eq!(by_name.get("Ferrosa"), Some(&"tool"));
         assert_eq!(by_name.get("Acme Labs"), Some(&"organization"));
     }
+
+    // --- has_org_suffix tests ---
+
+    #[test]
+    fn has_org_suffix_inc() {
+        assert!(has_org_suffix("acme inc"));
+        assert!(has_org_suffix("acme inc."));
+    }
+
+    #[test]
+    fn has_org_suffix_corp() {
+        assert!(has_org_suffix("acme corp"));
+        assert!(has_org_suffix("acme corp."));
+        assert!(has_org_suffix("acme corporation"));
+    }
+
+    #[test]
+    fn has_org_suffix_ltd() {
+        assert!(has_org_suffix("acme ltd"));
+        assert!(has_org_suffix("acme ltd."));
+    }
+
+    #[test]
+    fn has_org_suffix_llc_llp() {
+        assert!(has_org_suffix("acme llc"));
+        assert!(has_org_suffix("acme llp"));
+    }
+
+    #[test]
+    fn has_org_suffix_foundation_labs() {
+        assert!(has_org_suffix("mozilla foundation"));
+        assert!(has_org_suffix("hashicorp labs"));
+    }
+
+    #[test]
+    fn has_org_suffix_institute_university() {
+        assert!(has_org_suffix("mit institute"));
+        assert!(has_org_suffix("stanford university"));
+    }
+
+    #[test]
+    fn has_org_suffix_group_systems() {
+        assert!(has_org_suffix("carlyle group"));
+        assert!(has_org_suffix("bae systems"));
+    }
+
+    #[test]
+    fn has_org_suffix_technologies_partners() {
+        assert!(has_org_suffix("palantir technologies"));
+        assert!(has_org_suffix("andreessen partners"));
+    }
+
+    #[test]
+    fn has_org_suffix_association_consortium() {
+        assert!(has_org_suffix("national association"));
+        assert!(has_org_suffix("w3c consortium"));
+    }
+
+    #[test]
+    fn has_org_suffix_laboratory() {
+        assert!(has_org_suffix("bell laboratory"));
+    }
+
+    #[test]
+    fn has_org_suffix_false_for_non_org() {
+        assert!(!has_org_suffix("hello world"));
+        assert!(!has_org_suffix("docker"));
+        assert!(!has_org_suffix("rust programming"));
+        assert!(!has_org_suffix(""));
+    }
+
+    #[test]
+    fn has_org_suffix_single_word_suffix() {
+        // A single word that is itself a suffix
+        assert!(has_org_suffix("foundation"));
+        assert!(has_org_suffix("university"));
+    }
+
+    // --- is_known_tool tests ---
+
+    #[test]
+    fn is_known_tool_matches_various_tools() {
+        assert!(is_known_tool("Docker"));
+        assert!(is_known_tool("Kubernetes"));
+        assert!(is_known_tool("Terraform"));
+        assert!(is_known_tool("Redis"));
+        assert!(is_known_tool("PostgreSQL"));
+        assert!(is_known_tool("Git"));
+        assert!(is_known_tool("GitHub"));
+        assert!(is_known_tool("Cargo"));
+        assert!(is_known_tool("Neo4j"));
+        assert!(is_known_tool("Tokio"));
+        assert!(is_known_tool("Ollama"));
+        assert!(is_known_tool("React"));
+        assert!(is_known_tool("Svelte"));
+        assert!(is_known_tool("Playwright"));
+    }
+
+    #[test]
+    fn is_known_tool_case_sensitive() {
+        // is_known_tool is case-sensitive
+        assert!(!is_known_tool("docker"));
+        assert!(!is_known_tool("DOCKER"));
+        assert!(!is_known_tool("kubernetes"));
+    }
+
+    #[test]
+    fn is_known_tool_false_for_non_tools() {
+        assert!(!is_known_tool("FooBar"));
+        assert!(!is_known_tool("Hello"));
+        assert!(!is_known_tool(""));
+        assert!(!is_known_tool("Memory"));
+        assert!(!is_known_tool("Consolidation"));
+    }
+
+    #[test]
+    fn is_known_tool_rust_ecosystem() {
+        assert!(is_known_tool("Rustup"));
+        assert!(is_known_tool("Clippy"));
+        assert!(is_known_tool("Axum"));
+        assert!(is_known_tool("Actix"));
+    }
+
+    #[test]
+    fn is_known_tool_js_ecosystem() {
+        assert!(is_known_tool("Webpack"));
+        assert!(is_known_tool("Vite"));
+        assert!(is_known_tool("Node"));
+        assert!(is_known_tool("Deno"));
+        assert!(is_known_tool("Bun"));
+        assert!(is_known_tool("Vue"));
+    }
+
+    #[test]
+    fn is_known_tool_python_ecosystem() {
+        assert!(is_known_tool("Flask"));
+        assert!(is_known_tool("FastAPI"));
+        assert!(is_known_tool("Django"));
+    }
+
+    #[test]
+    fn is_known_tool_databases() {
+        assert!(is_known_tool("MongoDB"));
+        assert!(is_known_tool("Cassandra"));
+        assert!(is_known_tool("Elasticsearch"));
+        assert!(is_known_tool("ScyllaDB"));
+        assert!(is_known_tool("Postgres"));
+    }
+
+    // --- is_common_given_name tests ---
+
+    #[test]
+    fn is_common_given_name_matches() {
+        assert!(is_common_given_name("Alice"));
+        assert!(is_common_given_name("Ben"));
+        assert!(is_common_given_name("David"));
+        assert!(is_common_given_name("Emily"));
+        assert!(is_common_given_name("John"));
+        assert!(is_common_given_name("Sarah"));
+        assert!(is_common_given_name("William"));
+    }
+
+    #[test]
+    fn is_common_given_name_case_sensitive() {
+        assert!(!is_common_given_name("alice"));
+        assert!(!is_common_given_name("ALICE"));
+        assert!(!is_common_given_name("ben"));
+    }
+
+    #[test]
+    fn is_common_given_name_non_matches() {
+        assert!(!is_common_given_name("Docker"));
+        assert!(!is_common_given_name("Zzyzx"));
+        assert!(!is_common_given_name(""));
+        assert!(!is_common_given_name("Gandalf"));
+        assert!(!is_common_given_name("Xander"));
+    }
+
+    #[test]
+    fn is_common_given_name_edge_names() {
+        // Short names
+        assert!(is_common_given_name("Kim"));
+        assert!(is_common_given_name("Sam"));
+        assert!(is_common_given_name("Tom"));
+        assert!(is_common_given_name("Joe"));
+        assert!(is_common_given_name("Dan"));
+        assert!(is_common_given_name("Jim"));
+        assert!(is_common_given_name("Ken"));
+        assert!(is_common_given_name("Ben"));
+        assert!(is_common_given_name("Amy"));
+    }
+
+    // --- infer_entity_type edge cases ---
+
+    #[test]
+    fn infer_type_mixed_case_acronym() {
+        // Not all-caps, so not treated as org acronym
+        assert_ne!(infer_entity_type("AwS"), "organization");
+    }
+
+    #[test]
+    fn infer_type_single_word_not_tool() {
+        // Single word, not a known tool, not an acronym
+        assert_eq!(infer_entity_type("Consolidation"), "concept");
+    }
+
+    #[test]
+    fn infer_type_three_word_phrase() {
+        // Three words: not exactly 2 words, so person heuristic doesn't apply
+        assert_eq!(infer_entity_type("Alice Bob Charlie"), "concept");
+    }
+
+    #[test]
+    fn infer_type_trailing_whitespace() {
+        assert_eq!(infer_entity_type("  Docker  "), "tool");
+        assert_eq!(infer_entity_type("  AWS  "), "organization");
+    }
+
+    #[test]
+    fn infer_type_org_suffix_takes_priority() {
+        // "Jenkins Labs" — "Jenkins" is a known tool, but org suffix takes priority
+        assert_eq!(infer_entity_type("Jenkins Labs"), "organization");
+    }
+
+    #[test]
+    fn infer_type_two_char_acronym() {
+        // Two-char all-caps is still treated as org
+        assert_eq!(infer_entity_type("AI"), "organization");
+    }
+
+    #[test]
+    fn infer_type_six_char_acronym() {
+        // Six-char all-caps is the max for acronym
+        assert_eq!(infer_entity_type("ABCDEF"), "organization");
+    }
+
+    #[test]
+    fn infer_type_seven_char_acronym_not_org() {
+        // Seven-char all-caps exceeds the acronym range
+        assert_ne!(infer_entity_type("ABCDEFG"), "organization");
+    }
+
+    #[test]
+    fn infer_type_person_with_known_first_name() {
+        assert_eq!(infer_entity_type("Chris Evans"), "person");
+        assert_eq!(infer_entity_type("Grace Hopper"), "person");
+        assert_eq!(infer_entity_type("Noah Smith"), "person");
+    }
+
+    #[test]
+    fn infer_type_single_known_name_not_person() {
+        // Single word that is a common name but not 2 words — not "person"
+        // "Alice" alone — not a known tool, not an org suffix, not an acronym
+        assert_eq!(infer_entity_type("Alice"), "concept");
+    }
+
+    // --- text similarity edge cases ---
+
+    #[test]
+    fn text_similarity_empty_strings() {
+        assert_eq!(compute_text_similarity("", ""), 0.0);
+    }
+
+    #[test]
+    fn text_similarity_one_empty() {
+        assert_eq!(compute_text_similarity("hello world", ""), 0.0);
+        assert_eq!(compute_text_similarity("", "hello world"), 0.0);
+    }
+
+    #[test]
+    fn text_similarity_single_word_match() {
+        assert!((compute_text_similarity("hello", "hello") - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn text_similarity_subset() {
+        let sim = compute_text_similarity("a b", "a b c d");
+        // intersection = 2, union = 4, expected = 0.5
+        assert!((sim - 0.5).abs() < 0.01);
+    }
+
+    // --- is_common_word tests ---
+
+    #[test]
+    fn is_common_word_filters_expected() {
+        assert!(is_common_word("The"));
+        assert!(is_common_word("This"));
+        assert!(is_common_word("However"));
+        assert!(is_common_word("Because"));
+        assert!(is_common_word("If"));
+        assert!(is_common_word("Or"));
+    }
+
+    #[test]
+    fn is_common_word_does_not_filter_entities() {
+        assert!(!is_common_word("Docker"));
+        assert!(!is_common_word("Alice"));
+        assert!(!is_common_word("NASA"));
+        assert!(!is_common_word("Ferrosa"));
+    }
+
+    // --- IngestConfig default tests ---
+
+    #[test]
+    fn ingest_config_default_thresholds() {
+        let cfg = IngestConfig::default();
+        assert!((cfg.create_threshold - 0.3).abs() < f64::EPSILON);
+        assert!((cfg.skip_threshold - 0.9).abs() < f64::EPSILON);
+        assert!((cfg.update_threshold - 0.6).abs() < f64::EPSILON);
+    }
+
+    // --- extract_entity_candidates edge cases ---
+
+    #[test]
+    fn extract_entities_deduplicates() {
+        let text = "uses Docker and Docker again";
+        let candidates = extract_entity_candidates(text);
+        let docker_count = candidates.iter().filter(|(n, _)| n == "Docker").count();
+        // dedup_by removes consecutive duplicates
+        assert!(docker_count <= 1);
+    }
+
+    #[test]
+    fn extract_entities_strips_trailing_punctuation() {
+        let text = "uses Docker, Redis. PostgreSQL!";
+        let candidates = extract_entity_candidates(text);
+        let names: Vec<&str> = candidates.iter().map(|c| c.0.as_str()).collect();
+        // Names should not have trailing punctuation
+        for name in &names {
+            assert!(
+                !name.ends_with(','),
+                "name should not end with comma: {name}"
+            );
+            assert!(
+                !name.ends_with('.'),
+                "name should not end with period: {name}"
+            );
+            assert!(
+                !name.ends_with('!'),
+                "name should not end with bang: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_entities_single_word_entity() {
+        // Single capitalized word that is not common should be extracted
+        let text = "uses Ferrosa for storage";
+        let candidates = extract_entity_candidates(text);
+        let names: Vec<&str> = candidates.iter().map(|c| c.0.as_str()).collect();
+        assert!(names.contains(&"Ferrosa"));
+    }
 }

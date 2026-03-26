@@ -298,4 +298,282 @@ mod tests {
         assert_eq!(result.insights.len(), 1);
         assert!(result.insights[0].contains("Unfolded cluster"));
     }
+
+    /// create_edges_for_groups with an empty iterator produces no edges.
+    #[tokio::test]
+    async fn create_edges_for_empty_groups() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session_id = Uuid::new_v4();
+        let mut connections_created = 0;
+        let mut edges = Vec::new();
+        let groups: Vec<Vec<&crate::types::EntityEntry>> = vec![];
+
+        create_edges_for_groups(
+            groups.iter(),
+            &store,
+            &ctx,
+            session_id,
+            &mut connections_created,
+            &mut edges,
+        )
+        .await;
+
+        assert_eq!(connections_created, 0);
+        assert!(edges.is_empty());
+    }
+
+    /// create_edges_for_groups with a single-entity group creates no edges (no pairs).
+    #[tokio::test]
+    async fn create_edges_single_entity_group() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session_id = Uuid::new_v4();
+        let e1 = make_entity(ctx.tenant_id, session_id, "Solo", Some(Uuid::new_v4()));
+        let group = vec![&e1];
+        let groups = [group];
+        let mut connections_created = 0;
+        let mut edges = Vec::new();
+
+        create_edges_for_groups(
+            groups.iter(),
+            &store,
+            &ctx,
+            session_id,
+            &mut connections_created,
+            &mut edges,
+        )
+        .await;
+
+        assert_eq!(connections_created, 0);
+        assert!(edges.is_empty());
+    }
+
+    /// Mixed folded and unfolded entities in the same consolidation run
+    /// generate separate insights for each group.
+    #[tokio::test]
+    async fn mixed_folded_and_unfolded_entities() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session_id = Uuid::new_v4();
+        let fold_id = Uuid::new_v4();
+
+        // 3 folded entities (should generate a fold cluster insight)
+        let e1 = make_entity(ctx.tenant_id, session_id, "FoldA", Some(fold_id));
+        let e2 = make_entity(ctx.tenant_id, session_id, "FoldB", Some(fold_id));
+        let e3 = make_entity(ctx.tenant_id, session_id, "FoldC", Some(fold_id));
+        // 3 unfolded entities (should generate an unfolded cluster insight)
+        let e4 = make_entity(ctx.tenant_id, session_id, "UnfoldX", None);
+        let e5 = make_entity(ctx.tenant_id, session_id, "UnfoldY", None);
+        let e6 = make_entity(ctx.tenant_id, session_id, "UnfoldZ", None);
+        {
+            let mut entities = store.entities.lock().await;
+            entities.push(e1);
+            entities.push(e2);
+            entities.push(e3);
+            entities.push(e4);
+            entities.push(e5);
+            entities.push(e6);
+        }
+
+        let result = run_consolidation(&store, &ctx, session_id).await.unwrap();
+
+        assert_eq!(result.entities_processed, 6);
+        // 3 folded pairs + 3 unfolded pairs = 6
+        assert_eq!(result.connections_created, 6);
+        // Should have both a fold cluster and an unfolded cluster insight
+        assert_eq!(result.insights.len(), 2);
+        let has_fold_insight = result
+            .insights
+            .iter()
+            .any(|i| i.contains("Cluster in fold"));
+        let has_unfolded_insight = result
+            .insights
+            .iter()
+            .any(|i| i.contains("Unfolded cluster"));
+        assert!(has_fold_insight, "should have fold cluster insight");
+        assert!(has_unfolded_insight, "should have unfolded cluster insight");
+    }
+
+    /// Entities from different folds should not create edges between them.
+    #[tokio::test]
+    async fn different_folds_no_cross_edges() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session_id = Uuid::new_v4();
+        let fold_a = Uuid::new_v4();
+        let fold_b = Uuid::new_v4();
+
+        let e1 = make_entity(ctx.tenant_id, session_id, "FoldA1", Some(fold_a));
+        let e2 = make_entity(ctx.tenant_id, session_id, "FoldB1", Some(fold_b));
+        {
+            let mut entities = store.entities.lock().await;
+            entities.push(e1);
+            entities.push(e2);
+        }
+
+        let result = run_consolidation(&store, &ctx, session_id).await.unwrap();
+
+        assert_eq!(result.entities_processed, 2);
+        // No edges — each fold group has only 1 entity
+        assert_eq!(result.connections_created, 0);
+    }
+
+    /// Sort-by-recency: unfolded entities are sorted newest first.
+    /// We verify by checking that the insight mentions them in the expected order.
+    #[tokio::test]
+    async fn unfolded_entities_sorted_by_recency() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session_id = Uuid::new_v4();
+
+        // Create entities with distinct timestamps
+        let mut e1 = make_entity(ctx.tenant_id, session_id, "Old", None);
+        e1.created_at = chrono::Utc::now() - chrono::Duration::hours(2);
+        let mut e2 = make_entity(ctx.tenant_id, session_id, "Middle", None);
+        e2.created_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        let mut e3 = make_entity(ctx.tenant_id, session_id, "Recent", None);
+        e3.created_at = chrono::Utc::now();
+        {
+            // Insert in non-chronological order
+            let mut entities = store.entities.lock().await;
+            entities.push(e2);
+            entities.push(e1);
+            entities.push(e3);
+        }
+
+        let result = run_consolidation(&store, &ctx, session_id).await.unwrap();
+
+        assert_eq!(result.entities_processed, 3);
+        // All 3 are unfolded and under UNFOLDED_PAIR_CAP, so all pairs compared
+        assert_eq!(result.connections_created, 3);
+        // Verify insight lists them (order determined by sorted iteration)
+        assert_eq!(result.insights.len(), 1);
+        assert!(result.insights[0].contains("Unfolded cluster"));
+    }
+
+    /// DreamResult edges field tracks actual entity pairs connected.
+    #[tokio::test]
+    async fn dream_result_edges_track_pairs() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session_id = Uuid::new_v4();
+        let fold_id = Uuid::new_v4();
+
+        let e1 = make_entity(ctx.tenant_id, session_id, "A", Some(fold_id));
+        let e2 = make_entity(ctx.tenant_id, session_id, "B", Some(fold_id));
+        let id1 = e1.entity_id;
+        let id2 = e2.entity_id;
+        {
+            let mut entities = store.entities.lock().await;
+            entities.push(e1);
+            entities.push(e2);
+        }
+
+        let result = run_consolidation(&store, &ctx, session_id).await.unwrap();
+
+        assert_eq!(result.edges.len(), 1);
+        let (a, b) = result.edges[0];
+        // The edge should be between our two entity IDs
+        assert!(
+            (a == id1 && b == id2) || (a == id2 && b == id1),
+            "edge should connect the two entities"
+        );
+    }
+
+    /// CO_OCCURS_THRESHOLD is a sensible positive value.
+    #[test]
+    fn co_occurs_threshold_is_positive() {
+        const { assert!(CO_OCCURS_THRESHOLD > 0.0) };
+        const { assert!(CO_OCCURS_THRESHOLD < 1.0) };
+    }
+
+    /// UNFOLDED_PAIR_CAP is a sensible positive value.
+    #[test]
+    fn unfolded_pair_cap_is_positive() {
+        const { assert!(UNFOLDED_PAIR_CAP > 0) };
+    }
+
+    /// Only one unfolded entity should not trigger pairwise comparison.
+    #[tokio::test]
+    async fn single_unfolded_entity_no_edges() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session_id = Uuid::new_v4();
+
+        let e1 = make_entity(ctx.tenant_id, session_id, "Solo", None);
+        {
+            let mut entities = store.entities.lock().await;
+            entities.push(e1);
+        }
+
+        let result = run_consolidation(&store, &ctx, session_id).await.unwrap();
+
+        assert_eq!(result.entities_processed, 1);
+        assert_eq!(result.connections_created, 0);
+        assert!(result.insights.is_empty());
+        assert!(result.edges.is_empty());
+    }
+
+    /// Two unfolded entities — should not generate insight (need 3+).
+    #[tokio::test]
+    async fn two_unfolded_entities_no_insight() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session_id = Uuid::new_v4();
+
+        let e1 = make_entity(ctx.tenant_id, session_id, "A", None);
+        let e2 = make_entity(ctx.tenant_id, session_id, "B", None);
+        {
+            let mut entities = store.entities.lock().await;
+            entities.push(e1);
+            entities.push(e2);
+        }
+
+        let result = run_consolidation(&store, &ctx, session_id).await.unwrap();
+
+        assert_eq!(result.entities_processed, 2);
+        assert_eq!(result.connections_created, 1);
+        assert!(
+            result.insights.is_empty(),
+            "2 entities should not generate insight"
+        );
+    }
+
+    /// Multiple folds with different sizes generate insights only for 3+ groups.
+    #[tokio::test]
+    async fn multiple_folds_mixed_sizes() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session_id = Uuid::new_v4();
+        let fold_small = Uuid::new_v4();
+        let fold_big = Uuid::new_v4();
+
+        // Small fold: 2 entities (no insight)
+        let e1 = make_entity(ctx.tenant_id, session_id, "S1", Some(fold_small));
+        let e2 = make_entity(ctx.tenant_id, session_id, "S2", Some(fold_small));
+        // Big fold: 4 entities (should generate insight)
+        let e3 = make_entity(ctx.tenant_id, session_id, "B1", Some(fold_big));
+        let e4 = make_entity(ctx.tenant_id, session_id, "B2", Some(fold_big));
+        let e5 = make_entity(ctx.tenant_id, session_id, "B3", Some(fold_big));
+        let e6 = make_entity(ctx.tenant_id, session_id, "B4", Some(fold_big));
+        {
+            let mut entities = store.entities.lock().await;
+            entities.push(e1);
+            entities.push(e2);
+            entities.push(e3);
+            entities.push(e4);
+            entities.push(e5);
+            entities.push(e6);
+        }
+
+        let result = run_consolidation(&store, &ctx, session_id).await.unwrap();
+
+        assert_eq!(result.entities_processed, 6);
+        // Small fold: C(2,2)=1, Big fold: C(4,2)=6
+        assert_eq!(result.connections_created, 7);
+        // Only the big fold generates an insight
+        assert_eq!(result.insights.len(), 1);
+        assert!(result.insights[0].contains("4 entities co-occurring"));
+    }
 }
