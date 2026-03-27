@@ -634,6 +634,7 @@ async fn build_snapshot<S: Storage>(
     }
     let edges_result: anyhow::Result<Vec<_>> = Ok(all_edges);
 
+    // Send all edges to the client — the viz slider filters client-side.
     let edges = match edges_result {
         Ok(raw_edges) => raw_edges
             .into_iter()

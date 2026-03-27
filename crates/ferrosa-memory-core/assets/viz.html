@@ -727,6 +727,11 @@
       <span class="fe">Fe</span>
       <span class="label">memory</span>
     </div>
+    <div style="display:flex;align-items:center;gap:6px;margin:0 12px;">
+      <label for="edge-slider" style="font-size:10px;color:var(--text-muted);white-space:nowrap;">Edges</label>
+      <input type="range" id="edge-slider" min="0" max="100" value="20" style="width:80px;accent-color:var(--accent);">
+      <span id="edge-count" style="font-size:10px;color:var(--text-secondary);min-width:40px;">20%</span>
+    </div>
     <div class="header-buttons right">
       <div class="connection-indicator" id="connection-indicator">
         <span class="dot"></span>
@@ -823,7 +828,9 @@ const stateColorMap = {
 
 // === Data ===
 let nodes = [];
+let allEdges = [];
 let edges = [];
+let edgeFilterPct = 20;
 let selectedNode = null;
 let searchPanelOpen = false;
 let infoPanelOpen = false;
@@ -966,10 +973,10 @@ const simulation = d3.forceSimulation()
     const s = d.strength || 0.1;
     return Math.max(30, 200 * (1 - s));
   }))
-  .force('charge', d3.forceManyBody().strength(-500))
-  .force('x', d3.forceX(width / 2).strength(0.03))
-  .force('y', d3.forceY(height / 2).strength(0.03))
-  .force('collision', d3.forceCollide().radius(40))
+  .force('charge', d3.forceManyBody().strength(-1500).distanceMax(800))
+  .force('x', d3.forceX(width / 2).strength(0.005))
+  .force('y', d3.forceY(height / 2).strength(0.005))
+  .force('collision', d3.forceCollide().radius(20))
   .alphaDecay(0.0076)
   .on('tick', ticked);
 
@@ -1420,7 +1427,8 @@ function handleEvent(event) {
   switch (event.type) {
     case 'Snapshot':
       nodes = event.nodes || [];
-      edges = (event.edges || []).map(e => ({...e}));
+      allEdges = (event.edges || []).map(e => ({...e}));
+      applyEdgeFilter();
       render();
       if (infoPanelOpen) {
         renderInfoPanel();
@@ -1472,16 +1480,16 @@ function handleEntityChanged(node, action) {
 
 let edgeBatchTimer = null;
 function handleEdgeCreated(edge) {
-  const exists = edges.find(e =>
+  const exists = allEdges.find(e =>
     ((e.source.id || e.source) === edge.source && (e.target.id || e.target) === edge.target) ||
     ((e.source.id || e.source) === edge.target && (e.target.id || e.target) === edge.source)
   );
   if (!exists) {
-    edges.push({...edge});
-    // Debounce render — consolidation can emit thousands of edges at once
+    allEdges.push({...edge});
     if (edgeBatchTimer) clearTimeout(edgeBatchTimer);
     edgeBatchTimer = setTimeout(() => {
       edgeBatchTimer = null;
+      applyEdgeFilter();
       render();
       if (infoPanelOpen) renderInfoPanel();
     }, 100);
@@ -1547,6 +1555,33 @@ window.addEventListener('resize', () => {
   simulation.force('center', d3.forceCenter(width / 2, height / 2));
   simulation.alpha(0.1).restart();
 });
+
+// === Edge filter ===
+function applyEdgeFilter() {
+  if (edgeFilterPct >= 100) {
+    edges = allEdges.slice();
+  } else if (edgeFilterPct <= 0) {
+    edges = [];
+  } else {
+    const count = Math.max(1, Math.round(allEdges.length * edgeFilterPct / 100));
+    edges = allEdges.slice(0, count);
+  }
+  document.getElementById('edge-count').textContent =
+    `${edges.length}/${allEdges.length}`;
+}
+
+document.getElementById('edge-slider').addEventListener('input', (e) => {
+  edgeFilterPct = parseInt(e.target.value, 10);
+  applyEdgeFilter();
+  render();
+});
+
+// === Idle animation — keep the simulation gently alive ===
+setInterval(() => {
+  if (simulation.alpha() < 0.02) {
+    simulation.alpha(0.02).restart();
+  }
+}, 3000);
 
 // === Consolidation button ===
 document.getElementById('btn-consolidate').addEventListener('click', async () => {
