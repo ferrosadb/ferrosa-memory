@@ -144,11 +144,18 @@ async fn create_edges_for_groups<'a, I, S>(
                 if sim >= CO_OCCURS_THRESHOLD {
                     let a = group[i].entity_id;
                     let b = group[j].entity_id;
-                    let _ = storage
+                    match storage
                         .edge_co_occurs(ctx, a, b, session_id, sim as f32)
-                        .await;
-                    edges.push((a, b));
-                    *connections_created += 1;
+                        .await
+                    {
+                        Ok(()) => {
+                            edges.push((a, b));
+                            *connections_created += 1;
+                        }
+                        Err(e) => {
+                            tracing::warn!(%a, %b, error = %e, "CO_OCCURS edge failed");
+                        }
+                    }
                 }
             }
         }

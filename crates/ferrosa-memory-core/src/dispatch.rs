@@ -1774,6 +1774,7 @@ async fn handle_run_consolidation<S: crate::storage::Storage>(
                 source: src.to_string(),
                 target: tgt.to_string(),
                 edge_type: "CO_OCCURS".into(),
+                strength: None,
             },
         });
     }

@@ -32,6 +32,9 @@ pub struct VizEdge {
     pub target: String,
     /// "CO_OCCURS", "MENTIONED_IN", "FOLDED_INTO", "SUPERSEDES"
     pub edge_type: String,
+    /// Similarity strength (0.0–1.0) for CO_OCCURS edges.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strength: Option<f32>,
 }
 
 /// Typed event pushed to all connected WebSocket clients.
@@ -200,6 +203,7 @@ mod tests {
                 source: "n1".into(),
                 target: "n2".into(),
                 edge_type: "CO_OCCURS".into(),
+                strength: Some(0.85),
             }],
         };
         let json = serde_json::to_string(&event).unwrap();
