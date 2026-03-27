@@ -983,7 +983,7 @@ function ticked() {
 function nodeRadius(d) {
   if (d.node_type === 'fold') return 5;
   const base = 7;
-  return base + Math.min(d.confidence * 3, 4);
+  return base + Math.min((d.confidence || 1) * 3, 4);
 }
 
 function nodeColor(d) {
@@ -1006,17 +1006,15 @@ function render() {
 
   linkEnter.transition().duration(500).attr('stroke-opacity', 0.35);
 
-  // Nodes
-  const node = nodeGroup.selectAll('circle')
-    .data(nodes, d => d.id);
-
-  node.exit().transition().duration(300).attr('r', 0).remove();
-
-  const nodeEnter = node.enter().append('circle')
-    .attr('r', 0)
+  // Nodes — full rebuild to avoid D3 data-join exit issues
+  nodeGroup.selectAll('circle').remove();
+  nodeGroup.selectAll('circle')
+    .data(nodes, d => d.id)
+    .enter().append('circle')
+    .attr('r', nodeRadius)
     .attr('fill', nodeColor)
-    .attr('stroke', d => selectedNode && selectedNode.id === d.id ? '#fff' : 'none')
-    .attr('stroke-width', 2)
+    .attr('stroke', d => selectedNode && selectedNode.id === d.id ? '#fff' : 'rgba(255,255,255,0.2)')
+    .attr('stroke-width', d => selectedNode && selectedNode.id === d.id ? 3 : 1)
     .attr('opacity', d => stateOpacity[d.state] || 1.0)
     .attr('cursor', 'pointer')
     .call(drag(simulation))
@@ -1024,28 +1022,18 @@ function render() {
     .on('mouseenter', (event, d) => showTooltip(event, d))
     .on('mouseleave', () => hideTooltip());
 
-  nodeEnter.transition().duration(500)
-    .attr('r', nodeRadius);
 
-  // Update existing
-  nodeGroup.selectAll('circle')
-    .attr('fill', nodeColor)
-    .attr('opacity', d => stateOpacity[d.state] || 1.0)
-    .attr('stroke', d => selectedNode && selectedNode.id === d.id ? '#fff' : 'none');
-
-  // Labels
-  const label = labelGroup.selectAll('text')
-    .data(nodes, d => d.id);
-
-  label.exit().remove();
-
-  label.enter().append('text')
+  // Labels — full rebuild to match circles
+  labelGroup.selectAll('text').remove();
+  labelGroup.selectAll('text')
+    .data(nodes, d => d.id)
+    .enter().append('text')
     .attr('text-anchor', 'middle')
     .attr('fill', '#9494a3')
     .attr('font-size', '9px')
     .attr('font-family', 'Inter, sans-serif')
     .attr('pointer-events', 'none')
-    .text(d => d.label.length > 20 ? d.label.slice(0, 18) + '...' : d.label);
+    .text(d => d.label && d.label.length > 20 ? d.label.slice(0, 18) + '...' : (d.label || ''));
 
   // Update simulation
   simulation.nodes(nodes);
@@ -1072,11 +1060,76 @@ function drag(simulation) {
 
 // === Node selection ===
 function selectNode(d) {
-  selectedNode = d;
-  render();
+  // Toggle: clicking the same node deselects
+  if (selectedNode && selectedNode.id === d.id) {
+    selectedNode = null;
+    clearSelectionHighlight();
+  } else {
+    selectedNode = d;
+    highlightConnections(d);
+  }
   if (infoPanelOpen) {
     renderInfoPanel();
   }
+}
+
+function highlightConnections(node) {
+  // Find all neighbors connected by edges
+  const neighborIds = new Set();
+  neighborIds.add(node.id);
+  edges.forEach(e => {
+    const srcId = e.source.id || e.source;
+    const tgtId = e.target.id || e.target;
+    if (srcId === node.id) neighborIds.add(tgtId);
+    if (tgtId === node.id) neighborIds.add(srcId);
+  });
+
+  // Dim non-connected nodes
+  nodeGroup.selectAll('circle')
+    .transition().duration(200)
+    .attr('opacity', d => neighborIds.has(d.id) ? 1.0 : 0.15)
+    .attr('stroke', d => {
+      if (d.id === node.id) return '#fff';
+      if (neighborIds.has(d.id)) return '#e2725b';
+      return 'rgba(255,255,255,0.1)';
+    })
+    .attr('stroke-width', d => d.id === node.id ? 3 : neighborIds.has(d.id) ? 2 : 1);
+
+  labelGroup.selectAll('text')
+    .transition().duration(200)
+    .attr('opacity', d => neighborIds.has(d.id) ? 1.0 : 0.1)
+    .attr('fill', d => neighborIds.has(d.id) ? '#e8e8ed' : '#9494a3');
+
+  linkGroup.selectAll('line')
+    .transition().duration(200)
+    .attr('stroke-opacity', d => {
+      const srcId = d.source.id || d.source;
+      const tgtId = d.target.id || d.target;
+      return (srcId === node.id || tgtId === node.id) ? 0.8 : 0.03;
+    })
+    .attr('stroke-width', d => {
+      const srcId = d.source.id || d.source;
+      const tgtId = d.target.id || d.target;
+      return (srcId === node.id || tgtId === node.id) ? 3 : 1.5;
+    });
+}
+
+function clearSelectionHighlight() {
+  nodeGroup.selectAll('circle')
+    .transition().duration(200)
+    .attr('opacity', d => stateOpacity[d.state] || 1.0)
+    .attr('stroke', 'rgba(255,255,255,0.15)')
+    .attr('stroke-width', 1);
+
+  labelGroup.selectAll('text')
+    .transition().duration(200)
+    .attr('opacity', 1.0)
+    .attr('fill', '#9494a3');
+
+  linkGroup.selectAll('line')
+    .transition().duration(200)
+    .attr('stroke-opacity', 0.35)
+    .attr('stroke-width', 1.5);
 }
 
 function focusNode(nodeId) {
@@ -1388,7 +1441,8 @@ function handleEvent(event) {
 function handleEntityChanged(node, action) {
   const existing = nodes.findIndex(n => n.id === node.id);
   if (existing >= 0) {
-    nodes[existing] = {...nodes[existing], ...node};
+    // Mutate in-place to preserve D3 data-join identity and sim positions
+    Object.assign(nodes[existing], node);
   } else {
     node.x = width / 2 + (Math.random() - 0.5) * 100;
     node.y = height / 2 + (Math.random() - 0.5) * 100;
