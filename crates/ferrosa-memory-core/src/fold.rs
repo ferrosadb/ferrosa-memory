@@ -138,6 +138,8 @@ pub async fn complete_fold(
             None,
             Some(fold_id),
             &crate::smart_ingest::IngestConfig::default(),
+            Some(&name),
+            None,
         )
         .await;
     }

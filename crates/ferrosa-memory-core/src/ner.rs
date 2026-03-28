@@ -1,12 +1,11 @@
-//! LLM-backed named entity recognition via Ollama.
+//! Named entity recognition — extraction and classification via Ollama.
 //!
-//! Two-tier classification:
-//! 1. Fast heuristic pass (`infer_entity_type`) — handles
-//!    obvious cases (acronyms, org suffixes, known tools, common names).
-//! 2. LLM fallback ([`llm_classify_entity`]) — sends ambiguous entities to
-//!    a local Ollama model for classification.
+//! Three-tier entity extraction from content:
+//! 1. Explicit name (caller provides `entity_name`)
+//! 2. LLM extraction via Ollama (returns name + type)
+//! 3. Heuristic fallback (capitalized phrases + `infer_entity_type`)
 //!
-//! The LLM is only called when the heuristic returns "concept" (uncertain).
+//! Also provides standalone classification for existing entity names.
 
 use serde::Deserialize;
 
@@ -98,6 +97,202 @@ async fn llm_classify_inner(
         .unwrap_or("concept");
 
     Ok(classified.to_string())
+}
+
+/// Parse an LLM JSON response containing `{"name": "...", "type": "..."}`.
+///
+/// Handles embedded JSON in surrounding text, missing fields, and invalid JSON.
+/// Returns `(name, type)` where an empty name means extraction failed, and
+/// type defaults to `"concept"`.
+pub fn parse_extraction_response(raw: &str) -> (String, String) {
+    #[derive(Deserialize)]
+    struct ExtractionResponse {
+        name: Option<String>,
+        #[serde(rename = "type")]
+        entity_type: Option<String>,
+    }
+
+    let trimmed = raw.trim();
+    let json_start = trimmed.find('{');
+    let json_end = trimmed.rfind('}');
+
+    let json_str = match (json_start, json_end) {
+        (Some(s), Some(e)) if e > s => &trimmed[s..=e],
+        _ => return (String::new(), "concept".to_string()),
+    };
+
+    match serde_json::from_str::<ExtractionResponse>(json_str) {
+        Ok(resp) => {
+            let name = resp.name.unwrap_or_default().trim().to_string();
+            let etype = resp
+                .entity_type
+                .map(|t| t.trim().to_lowercase())
+                .filter(|t| VALID_TYPES.contains(&t.as_str()))
+                .unwrap_or_else(|| "concept".to_string());
+            (name, etype)
+        }
+        Err(_) => (String::new(), "concept".to_string()),
+    }
+}
+
+/// Apply a type override: only replace the caller's type when it was `"concept"`.
+pub fn apply_type_override(caller_type: &str, extracted_type: &str) -> String {
+    if caller_type == "concept" {
+        extracted_type.to_string()
+    } else {
+        caller_type.to_string()
+    }
+}
+
+/// Extract an entity from content using heuristics.
+///
+/// Tries [`crate::smart_ingest::extract_entity_candidates`] first, ranking them
+/// by quality (multi-word typed entities beat single-word concepts), then falls
+/// back to an 8-word truncation classified by [`crate::smart_ingest::infer_entity_type`].
+pub fn heuristic_extract_entity(content: &str) -> (String, String) {
+    let candidates = crate::smart_ingest::extract_entity_candidates(content);
+    if let Some((name, etype)) = rank_candidates(candidates) {
+        (name, etype)
+    } else {
+        let truncated: String = content
+            .split_whitespace()
+            .take(8)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let etype = crate::smart_ingest::infer_entity_type(&truncated);
+        (truncated, etype.to_string())
+    }
+}
+
+/// Pick the best candidate from a list by scoring each one.
+///
+/// Scoring: multi-word + non-concept = 3, single-word + non-concept = 2,
+/// multi-word + concept = 1, single-word + concept = 0.
+fn rank_candidates(candidates: Vec<(String, String)>) -> Option<(String, String)> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut best = &candidates[0];
+    let mut best_score = candidate_score(best);
+    for candidate in &candidates[1..] {
+        let score = candidate_score(candidate);
+        if score > best_score {
+            best = candidate;
+            best_score = score;
+        }
+    }
+    Some((best.0.clone(), best.1.clone()))
+}
+
+/// Score a single candidate: higher is better.
+fn candidate_score(candidate: &(String, String)) -> u8 {
+    let multi_word = candidate.0.split_whitespace().count() >= 2;
+    let typed = candidate.1 != "concept";
+    match (multi_word, typed) {
+        (true, true) => 3,
+        (false, true) => 2,
+        (true, false) => 1,
+        (false, false) => 0,
+    }
+}
+
+/// Truncate content for LLM prompts, breaking at word boundaries.
+fn truncate_for_prompt(content: &str, max_chars: usize) -> String {
+    if content.len() <= max_chars {
+        return content.to_string();
+    }
+    let boundary = content[..max_chars].rfind(' ').unwrap_or(max_chars);
+    format!("{}...", &content[..boundary])
+}
+
+/// Call Ollama to extract the primary named entity from content.
+async fn llm_extract_entity(
+    http: &reqwest::Client,
+    ollama_base_url: &str,
+    model: &str,
+    content: &str,
+) -> anyhow::Result<(String, String)> {
+    let truncated_content = truncate_for_prompt(content, 500);
+    let prompt = format!(
+        "/no_think\nExtract the single most important named entity from this text.\n\
+         Return JSON: {{\"name\": \"<entity name>\", \"type\": \"<one of: person|org|tool|project|place|event|concept|decision|pattern|preference>\"}}\n\
+         Rules:\n\
+         - name must be a proper noun or specific name (e.g. \"Ben Kearns\", \"Docker\", \"Ferrosa\")\n\
+         - name must NOT be empty\n\
+         - name must NOT be a generic word like \"Storage\" or \"Original\"\n\
+         Text: {truncated_content}\n\
+         JSON:"
+    );
+
+    let body = serde_json::json!({
+        "model": model,
+        "prompt": prompt,
+        "stream": false,
+        "options": {
+            "temperature": 0.0,
+            "num_predict": 60
+        }
+    });
+
+    let resp = http
+        .post(format!("{ollama_base_url}/api/generate"))
+        .json(&body)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        anyhow::bail!("Ollama returned {}", resp.status());
+    }
+
+    let parsed: OllamaGenerateResponse = resp.json().await?;
+    let (name, etype) = parse_extraction_response(&parsed.response);
+
+    if name.is_empty() {
+        anyhow::bail!("LLM returned empty entity name");
+    }
+
+    Ok((name, etype))
+}
+
+/// Extract an entity from free-text content using a three-tier strategy:
+///
+/// 1. **Tier 2** — LLM extraction via Ollama (returns name + type)
+/// 2. **Tier 3** — Heuristic fallback (capitalized phrases + `infer_entity_type`)
+///
+/// Tier 1 (explicit caller-provided name) is handled upstream before calling
+/// this function.
+pub async fn extract_entity_from_content(
+    http: &reqwest::Client,
+    ollama_base_url: &str,
+    model: &str,
+    content: &str,
+    caller_type: &str,
+) -> (String, String) {
+    // Tier 2: Heuristic extraction (fast, free)
+    let (heuristic_name, heuristic_type) = heuristic_extract_entity(content);
+
+    // If heuristic found a clean entity (not a truncated sentence fragment),
+    // use it directly. A name with ≤5 words that isn't the 8-word truncation
+    // fallback is considered clean.
+    let is_truncation_fallback = heuristic_name.split_whitespace().count() >= 6;
+    if !is_truncation_fallback {
+        let final_type = apply_type_override(caller_type, &heuristic_type);
+        return (heuristic_name, final_type);
+    }
+
+    // Tier 3: LLM extraction (heuristic failed — got a sentence fragment)
+    match llm_extract_entity(http, ollama_base_url, model, content).await {
+        Ok((name, extracted_type)) => {
+            let final_type = apply_type_override(caller_type, &extracted_type);
+            tracing::info!(name = %name, extracted_type, final_type, "LLM entity extraction succeeded");
+            (name, final_type)
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "LLM entity extraction failed, using heuristic result");
+            let final_type = apply_type_override(caller_type, &heuristic_type);
+            (heuristic_name, final_type)
+        }
+    }
 }
 
 /// Classify an entity using heuristics first, falling back to LLM for
@@ -550,5 +745,132 @@ mod tests {
             .copied()
             .unwrap_or("concept");
         assert_eq!(classified, "place");
+    }
+
+    // --- parse_extraction_response tests ---
+
+    #[test]
+    fn parse_llm_json_response_extracts_name_and_type() {
+        let json = r#"{"name": "Ben Kearns", "type": "person"}"#;
+        let (name, etype) = parse_extraction_response(json);
+        assert_eq!(name, "Ben Kearns");
+        assert_eq!(etype, "person");
+    }
+
+    #[test]
+    fn parse_llm_json_response_garbage_returns_none() {
+        let (name, etype) = parse_extraction_response("not json at all");
+        assert!(name.is_empty());
+        assert_eq!(etype, "concept");
+    }
+
+    #[test]
+    fn parse_llm_json_response_missing_name_returns_empty() {
+        let json = r#"{"type": "person"}"#;
+        let (name, etype) = parse_extraction_response(json);
+        assert!(name.is_empty());
+        assert_eq!(etype, "person");
+    }
+
+    #[test]
+    fn parse_llm_json_embedded_in_text() {
+        let raw = "Here is the result: {\"name\": \"Docker\", \"type\": \"tool\"} hope that helps";
+        let (name, etype) = parse_extraction_response(raw);
+        assert_eq!(name, "Docker");
+        assert_eq!(etype, "tool");
+    }
+
+    // --- heuristic_extract_entity tests ---
+
+    #[test]
+    fn heuristic_extraction_finds_capitalized_entity() {
+        // Note: extract_entity_candidates skips position-0 words (sentence starters),
+        // so we prefix with a lowercase word to push named entities past index 0.
+        let (name, etype) =
+            heuristic_extract_entity("the developer Ben Kearns built Ferrosa from scratch");
+        assert_eq!(name, "Ben Kearns");
+        assert_eq!(etype, "person");
+    }
+
+    #[test]
+    fn heuristic_extraction_falls_back_to_truncation() {
+        let (name, etype) =
+            heuristic_extract_entity("everything is lowercase no entities here at all today");
+        assert_eq!(name, "everything is lowercase no entities here at all");
+        assert_eq!(etype, "concept");
+    }
+
+    // --- apply_type_override tests ---
+
+    #[test]
+    fn type_override_only_for_concept() {
+        assert_eq!(apply_type_override("concept", "person"), "person");
+        assert_eq!(apply_type_override("person", "tool"), "person");
+        assert_eq!(apply_type_override("org", "concept"), "org");
+    }
+
+    // --- extract_entity_from_content tests ---
+
+    #[tokio::test]
+    async fn extract_entity_from_content_uses_heuristic_when_llm_down() {
+        let http = reqwest::Client::new();
+        let (name, etype) = extract_entity_from_content(
+            &http,
+            "http://invalid:99999",
+            "fake-model",
+            "The project called Docker is widely used",
+            "concept",
+        )
+        .await;
+        assert_eq!(name, "Docker");
+        assert_eq!(etype, "tool");
+    }
+
+    // --- rank_candidates / candidate_score tests ---
+
+    #[test]
+    fn heuristic_prefers_multi_word_over_single_word() {
+        let (name, _) = heuristic_extract_entity("Storage design by Ben Kearns is excellent");
+        assert_eq!(name, "Ben Kearns");
+    }
+
+    #[test]
+    fn heuristic_prefers_typed_over_concept() {
+        let (name, etype) = heuristic_extract_entity("Original design uses Docker containers");
+        assert_eq!(name, "Docker");
+        assert_eq!(etype, "tool");
+    }
+
+    #[test]
+    fn rank_candidates_empty_returns_none() {
+        assert!(rank_candidates(vec![]).is_none());
+    }
+
+    #[test]
+    fn rank_candidates_single_returns_it() {
+        let result = rank_candidates(vec![("Foo".into(), "concept".into())]);
+        assert_eq!(result, Some(("Foo".into(), "concept".into())));
+    }
+
+    #[test]
+    fn truncate_for_prompt_short_content() {
+        let short = "Ben Kearns built Ferrosa";
+        assert_eq!(truncate_for_prompt(short, 500), short);
+    }
+
+    #[test]
+    fn truncate_for_prompt_long_content() {
+        let long = "word ".repeat(200); // 1000 chars
+        let result = truncate_for_prompt(&long, 500);
+        assert!(result.len() <= 504); // 500 + "..."
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_for_prompt_breaks_at_word_boundary() {
+        let text = "hello world this is a test of truncation";
+        let result = truncate_for_prompt(text, 15);
+        // Should break at word boundary, not mid-word
+        assert_eq!(result, "hello world...");
     }
 }

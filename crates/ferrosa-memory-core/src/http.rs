@@ -343,6 +343,58 @@ pub async fn serve_viz<S: Storage + 'static>(
     loop {
         let (stream, peer) = listener.accept().await?;
         let bus = Arc::clone(&event_bus);
+
+        // Peek at the request path before deciding how to handle it.
+        // /consolidate needs storage access (not Send-safe), so handle it
+        // on this task. Everything else is spawned.
+        let mut peek_buf = [0u8; 256];
+        let peeked = stream.peek(&mut peek_buf).await.unwrap_or(0);
+        let peek_str = String::from_utf8_lossy(&peek_buf[..peeked]);
+
+        if peek_str.contains("POST /consolidate") {
+            // Cancel safety: runs on the accept task (not spawned), so only
+            // cancelled on shutdown. run_consolidation is idempotent (edge
+            // upserts), so partial completion is safe. Edge events are
+            // best-effort — missed events show up on next snapshot refresh.
+            let result = crate::dream::run_consolidation(storage.as_ref(), &ctx, session_id).await;
+            let (status, body) = match result {
+                Ok(r) => {
+                    for (src, tgt) in &r.edges {
+                        event_bus.emit(crate::viz::VizEvent::EdgeCreated {
+                            edge: crate::viz::VizEdge {
+                                source: src.to_string(),
+                                target: tgt.to_string(),
+                                edge_type: "CO_OCCURS".into(),
+                                strength: None,
+                            },
+                        });
+                    }
+                    let json = serde_json::json!({
+                        "entities_processed": r.entities_processed,
+                        "connections_created": r.connections_created,
+                        "insights": r.insights,
+                    });
+                    ("200 OK", json.to_string())
+                }
+                Err(e) => {
+                    let json = serde_json::json!({"error": e.to_string()});
+                    ("500 Internal Server Error", json.to_string())
+                }
+            };
+            // Consume the request then send response
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.try_read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 {status}\r\n\
+                 Content-Type: application/json\r\n\
+                 Access-Control-Allow-Origin: *\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.try_write(response.as_bytes());
+            continue;
+        }
+
         // Build snapshot before spawning because Storage async methods are not
         // Send-bounded. The snapshot is built per-connection to stay fresh.
         let snapshot = build_snapshot(&*storage, &ctx, session_id).await;
@@ -593,6 +645,7 @@ async fn build_snapshot<S: Storage>(
                         source: src_s,
                         target: tgt_s,
                         edge_type: etype,
+                        strength: None, // TODO: include from edge_list_all
                     })
                 } else {
                     None

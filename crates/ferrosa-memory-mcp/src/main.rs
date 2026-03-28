@@ -780,6 +780,8 @@ async fn main() -> anyhow::Result<()> {
             let session = Arc::new(dispatch::SessionState {
                 event_bus: Arc::clone(&shared_event_bus),
                 default_session_id,
+                ollama_base_url: config.embeddings.ollama_base_url.clone(),
+                ner_model: config.embeddings.ner_model.clone(),
                 ..dispatch::SessionState::default()
             });
             if let Some(sid) = default_session_id {
