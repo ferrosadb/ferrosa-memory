@@ -152,6 +152,12 @@ pub trait Storage: Send + Sync {
     /// List all entities for a tenant (for viz snapshot).
     async fn entity_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<EntityEntry>>;
 
+    /// List all folds for a tenant (sync/export use only — uses ALLOW FILTERING).
+    async fn fold_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<FoldEntry>>;
+
+    /// List all temporal events for a tenant (sync/export use only — uses ALLOW FILTERING).
+    async fn temporal_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<TemporalEvent>>;
+
     /// Update an entity's memory state (promote/demote lifecycle).
     async fn entity_update_state(
         &self,
@@ -617,6 +623,19 @@ pub mod mock {
         async fn entity_list_all(&self, _ctx: &TenantContext) -> anyhow::Result<Vec<EntityEntry>> {
             let entities = self.entities.lock().await;
             Ok(entities.clone())
+        }
+
+        async fn fold_list_all(&self, _ctx: &TenantContext) -> anyhow::Result<Vec<FoldEntry>> {
+            let folds = self.folds.lock().await;
+            Ok(folds.clone())
+        }
+
+        async fn temporal_list_all(
+            &self,
+            _ctx: &TenantContext,
+        ) -> anyhow::Result<Vec<TemporalEvent>> {
+            let events = self.temporal_events.lock().await;
+            Ok(events.clone())
         }
 
         async fn entity_update_state(

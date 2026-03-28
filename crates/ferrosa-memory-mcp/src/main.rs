@@ -335,6 +335,20 @@ impl Storage for ReconnectingStorage {
         delegate!(self, entity_list_all, ctx)
     }
 
+    async fn fold_list_all(
+        &self,
+        ctx: &TenantContext,
+    ) -> anyhow::Result<Vec<ferrosa_memory_core::types::FoldEntry>> {
+        delegate!(self, fold_list_all, ctx)
+    }
+
+    async fn temporal_list_all(
+        &self,
+        ctx: &TenantContext,
+    ) -> anyhow::Result<Vec<ferrosa_memory_core::types::TemporalEvent>> {
+        delegate!(self, temporal_list_all, ctx)
+    }
+
     async fn temporal_put(&self, ctx: &TenantContext, event: &TemporalEvent) -> anyhow::Result<()> {
         delegate!(self, temporal_put, ctx, event)
     }

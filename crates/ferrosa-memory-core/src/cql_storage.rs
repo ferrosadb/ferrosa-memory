@@ -77,6 +77,9 @@ struct PreparedStatements {
     intention_update_status: PreparedQuery,
     // Audit
     audit_put: PreparedQuery,
+    // Sync/export list queries
+    fold_list_all: PreparedQuery,
+    temporal_list_all: PreparedQuery,
 }
 
 /// CQL storage backend.
@@ -355,11 +358,26 @@ impl CqlStorage {
                      VALUES (?, ?, ?, ?, ?, ?, ?)"
                 ))
                 .await?,
+            fold_list_all: session
+                .prepare(format!(
+                    "SELECT session_id, fold_id, depth, parent_fold_id, raw_trajectory, \
+                     fold_summary, fold_embedding, token_count, compression_ratio, status, \
+                     created_at, folded_at \
+                     FROM {ks}.trajectory_folds WHERE tenant_id = ? ALLOW FILTERING"
+                ))
+                .await?,
+            temporal_list_all: session
+                .prepare(format!(
+                    "SELECT entity_id, event_time, event_id, fact_text, supersedes_id, \
+                     valid_until, source_session, confidence \
+                     FROM {ks}.temporal_events WHERE tenant_id = ? ALLOW FILTERING"
+                ))
+                .await?,
         };
 
         tracing::info!(
             keyspace = ks,
-            statements = 29,
+            statements = 31,
             "CQL storage connected, all statements prepared"
         );
 
@@ -373,6 +391,11 @@ impl CqlStorage {
     /// Get a reference to the raw CQL session for ad-hoc queries.
     pub fn session(&self) -> &CqlSession {
         &self.session
+    }
+
+    /// Get the keyspace name this storage is connected to.
+    pub fn keyspace(&self) -> &str {
+        &self.keyspace
     }
 
     /// Helper: execute a prepared query and return rows.
@@ -1032,6 +1055,72 @@ impl Storage for CqlStorage {
                     .unwrap_or(1.0),
                 state,
                 created_at: created.and_utc(),
+            });
+        }
+        Ok(results)
+    }
+
+    async fn fold_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<FoldEntry>> {
+        let rows = self
+            .query_rows(&self.stmts.fold_list_all, query_values!(ctx.tenant_id))
+            .await?;
+
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            let status_str: String = row.r_by_name("status").unwrap_or_default();
+            let status: FoldStatus =
+                serde_json::from_str(&format!("\"{status_str}\"")).unwrap_or(FoldStatus::Active);
+            let created = row
+                .r_by_name::<chrono::NaiveDateTime>("created_at")
+                .unwrap_or_default();
+            results.push(FoldEntry {
+                session_id: row.r_by_name("session_id")?,
+                fold_id: row.r_by_name("fold_id")?,
+                tenant_id: ctx.tenant_id,
+                depth: row.r_by_name("depth")?,
+                parent_fold_id: row.r_by_name::<Uuid>("parent_fold_id").ok(),
+                raw_trajectory: row.r_by_name("raw_trajectory").unwrap_or_default(),
+                fold_summary: row.r_by_name::<String>("fold_summary").ok(),
+                fold_embedding: row
+                    .r_by_name::<cdrs_tokio::types::blob::Blob>("fold_embedding")
+                    .ok()
+                    .map(|blob| blob.into_vec())
+                    .filter(|v| !v.is_empty())
+                    .map(|v| crate::vector::decode_vector(&v)),
+                token_count: row.r_by_name("token_count")?,
+                compression_ratio: row.r_by_name::<f64>("compression_ratio").ok(),
+                status,
+                created_at: created.and_utc(),
+                folded_at: row
+                    .r_by_name::<chrono::NaiveDateTime>("folded_at")
+                    .ok()
+                    .map(|t| t.and_utc()),
+            });
+        }
+        Ok(results)
+    }
+
+    async fn temporal_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<TemporalEvent>> {
+        let rows = self
+            .query_rows(&self.stmts.temporal_list_all, query_values!(ctx.tenant_id))
+            .await?;
+
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            let event_time: chrono::NaiveDateTime = row.r_by_name("event_time")?;
+            results.push(TemporalEvent {
+                tenant_id: ctx.tenant_id,
+                entity_id: row.r_by_name("entity_id")?,
+                event_time: event_time.and_utc(),
+                event_id: row.r_by_name("event_id")?,
+                fact_text: row.r_by_name("fact_text")?,
+                supersedes_id: row.r_by_name::<Uuid>("supersedes_id").ok(),
+                valid_until: row
+                    .r_by_name::<chrono::NaiveDateTime>("valid_until")
+                    .ok()
+                    .map(|t| t.and_utc()),
+                source_session: row.r_by_name("source_session")?,
+                confidence: f64::from(row.r_by_name::<f32>("confidence").unwrap_or(1.0)),
             });
         }
         Ok(results)
