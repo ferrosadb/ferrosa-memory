@@ -406,11 +406,7 @@ pub trait Storage: Send + Sync {
     ) -> anyhow::Result<()>;
 
     /// Clear derived cache entries whose key starts with `pred`.
-    async fn derived_cache_clear(
-        &self,
-        ctx: &TenantContext,
-        pred: &str,
-    ) -> anyhow::Result<()>;
+    async fn derived_cache_clear(&self, ctx: &TenantContext, pred: &str) -> anyhow::Result<()>;
 
     // --- Provenance operations (Sprint 5) ---
 
@@ -1158,11 +1154,7 @@ pub mod mock {
 
         // --- Rule registry operations ---
 
-        async fn rule_put(
-            &self,
-            _ctx: &TenantContext,
-            entry: &RuleEntry,
-        ) -> anyhow::Result<()> {
+        async fn rule_put(&self, _ctx: &TenantContext, entry: &RuleEntry) -> anyhow::Result<()> {
             self.rules.lock().await.push(entry.clone());
             Ok(())
         }
@@ -1399,11 +1391,13 @@ pub mod mock {
             }];
 
             // Miss
-            assert!(storage
-                .derived_cache_get(&ctx, "key1")
-                .await
-                .unwrap()
-                .is_empty());
+            assert!(
+                storage
+                    .derived_cache_get(&ctx, "key1")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
 
             // Put + hit
             storage
@@ -1415,11 +1409,13 @@ pub mod mock {
 
             // Clear by prefix
             storage.derived_cache_clear(&ctx, "key").await.unwrap();
-            assert!(storage
-                .derived_cache_get(&ctx, "key1")
-                .await
-                .unwrap()
-                .is_empty());
+            assert!(
+                storage
+                    .derived_cache_get(&ctx, "key1")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         }
 
         #[tokio::test]
@@ -1437,10 +1433,7 @@ pub mod mock {
                 parent_kind: "base".into(),
             }];
 
-            storage
-                .provenance_put(&ctx, "edge1", &steps)
-                .await
-                .unwrap();
+            storage.provenance_put(&ctx, "edge1", &steps).await.unwrap();
             let got = storage.provenance_get(&ctx, "edge1").await.unwrap();
             assert_eq!(got.len(), 1);
             assert_eq!(got[0].parent_pred, "co_occurs");

@@ -623,11 +623,7 @@ impl Storage for ReconnectingStorage {
         delegate!(self, derived_cache_put, ctx, cache_key, facts)
     }
 
-    async fn derived_cache_clear(
-        &self,
-        ctx: &TenantContext,
-        pred: &str,
-    ) -> anyhow::Result<()> {
+    async fn derived_cache_clear(&self, ctx: &TenantContext, pred: &str) -> anyhow::Result<()> {
         delegate!(self, derived_cache_clear, ctx, pred)
     }
 

@@ -2018,11 +2018,7 @@ impl Storage for CqlStorage {
         anyhow::bail!("derived_cache_put: CQL table not yet created (Sprint 5)")
     }
 
-    async fn derived_cache_clear(
-        &self,
-        _ctx: &TenantContext,
-        _pred: &str,
-    ) -> anyhow::Result<()> {
+    async fn derived_cache_clear(&self, _ctx: &TenantContext, _pred: &str) -> anyhow::Result<()> {
         anyhow::bail!("derived_cache_clear: CQL table not yet created (Sprint 5)")
     }
 

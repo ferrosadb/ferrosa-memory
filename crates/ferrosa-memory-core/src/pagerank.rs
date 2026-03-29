@@ -71,8 +71,7 @@ pub async fn compute_ppr(
                     in_neighbors
                         .iter()
                         .map(|u| {
-                            let out_deg =
-                                outgoing.get(u).map(|v| v.len()).unwrap_or(1) as f64;
+                            let out_deg = outgoing.get(u).map(|v| v.len()).unwrap_or(1) as f64;
                             scores.get(u).unwrap_or(&0.0) / out_deg
                         })
                         .sum()
@@ -158,14 +157,8 @@ mod tests {
         let b = Uuid::new_v4();
         let c = Uuid::new_v4();
 
-        storage
-            .edge_co_occurs(&ctx, a, b, sid, 1.0)
-            .await
-            .unwrap();
-        storage
-            .edge_co_occurs(&ctx, b, c, sid, 1.0)
-            .await
-            .unwrap();
+        storage.edge_co_occurs(&ctx, a, b, sid, 1.0).await.unwrap();
+        storage.edge_co_occurs(&ctx, b, c, sid, 1.0).await.unwrap();
 
         let config = RmhConfig::default();
         let mut seeds = HashMap::new();
@@ -187,10 +180,7 @@ mod tests {
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
 
-        storage
-            .edge_co_occurs(&ctx, a, b, sid, 1.0)
-            .await
-            .unwrap();
+        storage.edge_co_occurs(&ctx, a, b, sid, 1.0).await.unwrap();
 
         let config = RmhConfig::default();
         let ranks = compute_ppr(&storage, &ctx, sid, &config, &HashMap::new())

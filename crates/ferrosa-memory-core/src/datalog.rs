@@ -248,10 +248,7 @@ pub fn evaluate(
 /// Uses nested-loop join: for each body atom left-to-right, find all matching
 /// facts and extend the variable binding. After all atoms match, check builtin
 /// filters and instantiate the head.
-fn evaluate_rule(
-    rule: &DatalogRule,
-    all_facts: &FactSet,
-) -> Vec<(Vec<Term>, Vec<ProvenanceStep>)> {
+fn evaluate_rule(rule: &DatalogRule, all_facts: &FactSet) -> Vec<(Vec<Term>, Vec<ProvenanceStep>)> {
     let mut results = Vec::new();
 
     // Start with a single empty binding
@@ -271,14 +268,9 @@ fn evaluate_rule(
                         if fact_args.len() != body_atom.args.len() {
                             continue;
                         }
-                        if let Some(new_binding) =
-                            try_unify(&body_atom.args, fact_args, binding)
-                        {
+                        if let Some(new_binding) = try_unify(&body_atom.args, fact_args, binding) {
                             let mut new_prov = provenance.clone();
-                            new_prov.push(make_provenance_step(
-                                &body_atom.predicate,
-                                fact_args,
-                            ));
+                            new_prov.push(make_provenance_step(&body_atom.predicate, fact_args));
                             next_bindings.push((new_binding, new_prov));
                         }
                     }
@@ -579,9 +571,7 @@ pub async fn query_predicate(
     // 4. Cache results and record telemetry
     let elapsed_ms = start.elapsed().as_millis() as i64;
     if !results.is_empty() {
-        storage
-            .derived_cache_put(ctx, &cache_key, &results)
-            .await?;
+        storage.derived_cache_put(ctx, &cache_key, &results).await?;
     }
     storage
         .heat_record(ctx, predicate, false, Some(elapsed_ms))
@@ -653,8 +643,7 @@ mod tests {
 
     #[test]
     fn test_parse_string_constants() {
-        let rule =
-            parse_rule(r#"label(X, "person") :- instance_of(X, "person")."#).unwrap();
+        let rule = parse_rule(r#"label(X, "person") :- instance_of(X, "person")."#).unwrap();
         assert_eq!(rule.head.args[1], Term::ConstStr("person".into()));
         assert_eq!(rule.body[0].args[1], Term::ConstStr("person".into()));
     }
@@ -671,10 +660,7 @@ mod tests {
     fn test_parse_greater_than_filter() {
         let rule = parse_rule("hot(X) :- warmth(X, W), W > 0.5.").unwrap();
         assert_eq!(rule.filters.len(), 1);
-        assert_eq!(
-            rule.filters[0],
-            BuiltinFilter::GreaterThan("W".into(), 0.5)
-        );
+        assert_eq!(rule.filters[0], BuiltinFilter::GreaterThan("W".into(), 0.5));
     }
 
     #[test]
@@ -900,10 +886,7 @@ mod tests {
             (conf - 0.9).abs() < f64::EPSILON,
             "expected confidence 0.9, got {conf}"
         );
-        assert!(
-            conf >= 0.0 && conf <= 1.0,
-            "confidence must be in [0, 1]"
-        );
+        assert!(conf >= 0.0 && conf <= 1.0, "confidence must be in [0, 1]");
     }
 
     #[test]
@@ -926,9 +909,8 @@ mod tests {
         facts.insert("co_occurs", vec![Term::Const(a), Term::Const(b)]);
         facts.insert("co_occurs", vec![Term::Const(b), Term::Const(c)]);
 
-        let rules = vec![
-            parse_rule("related(X, Z) :- co_occurs(X, Y), co_occurs(Y, Z), X != Z.").unwrap(),
-        ];
+        let rules =
+            vec![parse_rule("related(X, Z) :- co_occurs(X, Y), co_occurs(Y, Z), X != Z.").unwrap()];
         let (_, derived) = evaluate(&rules, &facts, 100, 50000);
 
         assert!(!derived.is_empty(), "should have derived facts");
@@ -1017,17 +999,11 @@ mod tests {
         let mut facts = FactSet::new();
         facts.insert(
             "part_of",
-            vec![
-                Term::ConstStr("wheel".into()),
-                Term::ConstStr("car".into()),
-            ],
+            vec![Term::ConstStr("wheel".into()), Term::ConstStr("car".into())],
         );
         facts.insert(
             "part_of",
-            vec![
-                Term::ConstStr("car".into()),
-                Term::ConstStr("fleet".into()),
-            ],
+            vec![Term::ConstStr("car".into()), Term::ConstStr("fleet".into())],
         );
 
         let rules = builtin_rules();
@@ -1066,10 +1042,8 @@ mod tests {
         let (all_facts, _) = evaluate(&rules, &facts, 100, 50000);
 
         // related(a, c) via a->b->c, and related(c, a) via c->b->a
-        let has_related_ac =
-            all_facts.contains("related", &[Term::Const(a), Term::Const(c)]);
-        let has_related_ca =
-            all_facts.contains("related", &[Term::Const(c), Term::Const(a)]);
+        let has_related_ac = all_facts.contains("related", &[Term::Const(a), Term::Const(c)]);
+        let has_related_ca = all_facts.contains("related", &[Term::Const(c), Term::Const(a)]);
         assert!(has_related_ac, "need related(a,c)");
         assert!(has_related_ca, "need related(c,a)");
 

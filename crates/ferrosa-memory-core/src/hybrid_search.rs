@@ -145,7 +145,11 @@ pub async fn hybrid_search(
     }
 
     // Build weights for the initial 3 signals
-    let mut weights = vec![config.phonetic_weight, config.ann_weight, config.fold_weight];
+    let mut weights = vec![
+        config.phonetic_weight,
+        config.ann_weight,
+        config.fold_weight,
+    ];
 
     // Strategy 4: Warmth signal — rank existing candidates by warmth score
     if let Some(warmth) = warmth_scores {
@@ -325,11 +329,7 @@ mod tests {
         let list2 = vec![make_result(uuid1, "b", 1.0)];
 
         // Equal weights: score = 1/61 + 1/61 = 2/61
-        let merged_equal = rrf_merge(
-            vec![list1.clone(), list2.clone()],
-            60.0,
-            &[1.0, 1.0],
-        );
+        let merged_equal = rrf_merge(vec![list1.clone(), list2.clone()], 60.0, &[1.0, 1.0]);
         let score_equal = merged_equal[0].score;
 
         // Higher weight on list2: score = 1/61 + 2/61 = 3/61
@@ -416,11 +416,7 @@ mod tests {
         let list2 = vec![make_result(id1, "ann", 1.0), make_result(id2, "ann", 0.9)];
         let list3 = vec![make_result(id2, "fold", 0.8)];
 
-        let merged = rrf_merge(
-            vec![list1, list2, list3],
-            60.0,
-            &[1.0, 1.0, 1.0],
-        );
+        let merged = rrf_merge(vec![list1, list2, list3], 60.0, &[1.0, 1.0, 1.0]);
 
         // id1: rank 0 in list1 + rank 0 in list2 = 1/61 + 1/61 = 2/61
         let id1_result = merged.iter().find(|r| r.id == id1).unwrap();

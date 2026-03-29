@@ -190,9 +190,16 @@ mod tests {
         let eid = Uuid::new_v4();
         let sid = Uuid::new_v4();
 
-        boost_on_access(&storage, &ctx, eid, sid, &DecayZone::Knowledge, &default_config())
-            .await
-            .unwrap();
+        boost_on_access(
+            &storage,
+            &ctx,
+            eid,
+            sid,
+            &DecayZone::Knowledge,
+            &default_config(),
+        )
+        .await
+        .unwrap();
 
         let entry = storage.warmth_get(&ctx, eid).await.unwrap().unwrap();
         assert!(
@@ -210,12 +217,26 @@ mod tests {
         let eid = Uuid::new_v4();
         let sid = Uuid::new_v4();
 
-        boost_on_access(&storage, &ctx, eid, sid, &DecayZone::Knowledge, &default_config())
-            .await
-            .unwrap();
-        boost_on_access(&storage, &ctx, eid, sid, &DecayZone::Knowledge, &default_config())
-            .await
-            .unwrap();
+        boost_on_access(
+            &storage,
+            &ctx,
+            eid,
+            sid,
+            &DecayZone::Knowledge,
+            &default_config(),
+        )
+        .await
+        .unwrap();
+        boost_on_access(
+            &storage,
+            &ctx,
+            eid,
+            sid,
+            &DecayZone::Knowledge,
+            &default_config(),
+        )
+        .await
+        .unwrap();
 
         let entry = storage.warmth_get(&ctx, eid).await.unwrap().unwrap();
         assert!(
@@ -273,9 +294,16 @@ mod tests {
         let eid = Uuid::new_v4();
         let sid = Uuid::new_v4();
 
-        boost_on_access(&storage, &ctx, eid, sid, &DecayZone::Knowledge, &default_config())
-            .await
-            .unwrap();
+        boost_on_access(
+            &storage,
+            &ctx,
+            eid,
+            sid,
+            &DecayZone::Knowledge,
+            &default_config(),
+        )
+        .await
+        .unwrap();
 
         // Immediately after boost, score should be very close to warmth (near-zero elapsed)
         let score = compute_warmth_score(&storage, &ctx, eid, &default_config())
@@ -304,7 +332,9 @@ mod tests {
             .await
             .unwrap();
 
-        let scores = get_warmth_scores(&storage, &ctx, sid, &config).await.unwrap();
+        let scores = get_warmth_scores(&storage, &ctx, sid, &config)
+            .await
+            .unwrap();
         assert_eq!(scores.len(), 2);
         assert!(scores.contains_key(&eid1));
         assert!(scores.contains_key(&eid2));
@@ -336,9 +366,16 @@ mod tests {
             .await
             .unwrap();
 
-        boost_on_access(&storage, &ctx, eid, sid, &DecayZone::Knowledge, &default_config())
-            .await
-            .unwrap();
+        boost_on_access(
+            &storage,
+            &ctx,
+            eid,
+            sid,
+            &DecayZone::Knowledge,
+            &default_config(),
+        )
+        .await
+        .unwrap();
 
         // Neighbor should have received warmth_boost_amount * warmth_neighbor_ratio = 0.3 * 0.5 = 0.15
         let neighbor_entry = storage.warmth_get(&ctx, neighbor).await.unwrap().unwrap();
@@ -355,7 +392,13 @@ mod tests {
         let id_decay = (-0.1 * 0.1 * 10.0_f64).exp(); // ~0.99
         let kn_decay = (-0.1 * 1.0 * 10.0_f64).exp(); // ~0.37
         let op_decay = (-0.1 * 3.0 * 10.0_f64).exp(); // ~0.05
-        assert!(id_decay > kn_decay, "identity should decay slower than knowledge");
-        assert!(kn_decay > op_decay, "knowledge should decay slower than operational");
+        assert!(
+            id_decay > kn_decay,
+            "identity should decay slower than knowledge"
+        );
+        assert!(
+            kn_decay > op_decay,
+            "knowledge should decay slower than operational"
+        );
     }
 }

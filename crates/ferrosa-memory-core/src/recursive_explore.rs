@@ -270,9 +270,10 @@ mod tests {
         let subs = decompose_query("caching or indexing strategies");
         assert!(subs.len() >= 2);
         assert_eq!(subs[0].query_text, "caching or indexing strategies"); // original
-        assert!(subs
-            .iter()
-            .any(|s| s.query_text == "caching" || s.query_text.contains("caching")));
+        assert!(
+            subs.iter()
+                .any(|s| s.query_text == "caching" || s.query_text.contains("caching"))
+        );
     }
 
     #[test]
@@ -295,10 +296,10 @@ mod tests {
     fn test_decompose_quoted_phrases() {
         let subs = decompose_query(r#"search for "memory system" and "graph traversal""#);
         // Should have original + conjunction splits + quoted phrases
-        assert!(subs
-            .iter()
-            .any(|s| s.query_text == "memory system"
-                || s.query_text.contains("memory system")));
+        assert!(
+            subs.iter()
+                .any(|s| s.query_text == "memory system" || s.query_text.contains("memory system"))
+        );
     }
 
     #[test]
@@ -307,7 +308,11 @@ mod tests {
         // Original + only one split (second is duplicate of first split)
         let texts: Vec<_> = subs.iter().map(|s| s.query_text.to_lowercase()).collect();
         let unique: HashSet<_> = texts.iter().collect();
-        assert_eq!(texts.len(), unique.len(), "should not have duplicate sub-queries");
+        assert_eq!(
+            texts.len(),
+            unique.len(),
+            "should not have duplicate sub-queries"
+        );
     }
 
     #[test]

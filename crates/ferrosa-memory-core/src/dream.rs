@@ -676,8 +676,14 @@ mod tests {
         }
 
         // Pre-create co-occurs edges so PageRank has an adjacency graph
-        store.edge_co_occurs(&ctx, id1, id2, sid, 0.8).await.unwrap();
-        store.edge_co_occurs(&ctx, id2, id3, sid, 0.7).await.unwrap();
+        store
+            .edge_co_occurs(&ctx, id1, id2, sid, 0.8)
+            .await
+            .unwrap();
+        store
+            .edge_co_occurs(&ctx, id2, id3, sid, 0.7)
+            .await
+            .unwrap();
 
         let result = run_consolidation(&store, &ctx, sid).await.unwrap();
 
@@ -687,11 +693,17 @@ mod tests {
         // (e.g., related(X, Z) via transitive co-occurrence)
         // The exact count depends on builtin rules matching the graph structure.
         // PageRank should have updated scores for nodes in the edge graph
-        assert!(result.pagerank_updated >= 2, "expected at least 2 nodes with PageRank, got {}", result.pagerank_updated);
+        assert!(
+            result.pagerank_updated >= 2,
+            "expected at least 2 nodes with PageRank, got {}",
+            result.pagerank_updated
+        );
         // PageRank creates warmth entries with warmth=0.0; decay prunes those below threshold
         // so warmth_decayed may be non-zero (entries created by PageRank then pruned by decay)
-        assert!(result.warmth_decayed <= result.pagerank_updated,
-            "should not prune more entries than PageRank created");
+        assert!(
+            result.warmth_decayed <= result.pagerank_updated,
+            "should not prune more entries than PageRank created"
+        );
     }
 
     /// Empty session produces zero for all new consolidation fields.
@@ -719,8 +731,17 @@ mod tests {
         let result = run_consolidation(&store, &ctx, sid).await.unwrap();
         let json = serde_json::to_value(&result).expect("should serialize DreamResult");
 
-        assert!(json.get("derived_facts_count").is_some(), "missing derived_facts_count in JSON");
-        assert!(json.get("pagerank_updated").is_some(), "missing pagerank_updated in JSON");
-        assert!(json.get("warmth_decayed").is_some(), "missing warmth_decayed in JSON");
+        assert!(
+            json.get("derived_facts_count").is_some(),
+            "missing derived_facts_count in JSON"
+        );
+        assert!(
+            json.get("pagerank_updated").is_some(),
+            "missing pagerank_updated in JSON"
+        );
+        assert!(
+            json.get("warmth_decayed").is_some(),
+            "missing warmth_decayed in JSON"
+        );
     }
 }

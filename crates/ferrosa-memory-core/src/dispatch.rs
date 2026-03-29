@@ -2115,14 +2115,11 @@ async fn handle_recursive_explore<S: crate::storage::Storage>(
         .unwrap_or_else(uuid::Uuid::new_v4);
 
     // Parse optional embedding
-    let embedding: Option<Vec<f32>> = args
-        .get("embedding")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_f64().map(|f| f as f32))
-                .collect()
-        });
+    let embedding: Option<Vec<f32>> = args.get("embedding").and_then(|v| v.as_array()).map(|arr| {
+        arr.iter()
+            .filter_map(|v| v.as_f64().map(|f| f as f32))
+            .collect()
+    });
     let embedding_ref = embedding.as_deref();
 
     let mut rmh_config = crate::config::RmhConfig::default();
@@ -2146,10 +2143,7 @@ async fn handle_recursive_explore<S: crate::storage::Storage>(
     .await
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(20) as usize;
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
     let results: Vec<Value> = result
         .results
         .iter()
@@ -2188,8 +2182,7 @@ async fn handle_query_derived<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
     let predicate = require_str(&args, "predicate")?;
-    let session_id = optional_uuid(&args, "session_id")?
-        .unwrap_or_else(uuid::Uuid::new_v4);
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
 
     let config = crate::config::DatalogConfig::default();
     let facts = crate::datalog::query_predicate(storage, ctx, session_id, predicate, &config)
@@ -2294,7 +2287,10 @@ async fn handle_manage_rules<S: crate::storage::Storage>(
             crate::datalog::parse_rule(rule_body)
                 .map_err(|e| (INVALID_PARAMS, format!("Invalid rule syntax: {e}")))?;
 
-            let family = args.get("family").and_then(|v| v.as_str()).unwrap_or("custom");
+            let family = args
+                .get("family")
+                .and_then(|v| v.as_str())
+                .unwrap_or("custom");
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or(rule_id);
             let weight = args
                 .get("rule_weight")
@@ -2357,9 +2353,13 @@ async fn handle_manage_rules<S: crate::storage::Storage>(
                         .rule_put(ctx, &rule)
                         .await
                         .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
-                    Ok(serde_json::json!({ "action": "deprecate", "rule_id": rule_id, "deprecated": true }))
+                    Ok(
+                        serde_json::json!({ "action": "deprecate", "rule_id": rule_id, "deprecated": true }),
+                    )
                 }
-                None => Ok(serde_json::json!({ "action": "deprecate", "rule_id": rule_id, "deprecated": false, "error": "Rule not found" })),
+                None => Ok(
+                    serde_json::json!({ "action": "deprecate", "rule_id": rule_id, "deprecated": false, "error": "Rule not found" }),
+                ),
             }
         }
         _ => Err((
