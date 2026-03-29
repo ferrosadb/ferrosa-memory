@@ -30,6 +30,8 @@ pub struct DreamResult {
     pub pagerank_updated: usize,
     /// Number of warmth entries pruned by Ebbinghaus decay.
     pub warmth_decayed: usize,
+    /// Predicates promoted to durable materialization during this cycle.
+    pub promoted_predicates: Vec<String>,
 }
 
 /// Similarity threshold for creating CO_OCCURS edges (Jaccard on word sets).
@@ -178,6 +180,23 @@ pub async fn run_consolidation(
             }
         };
 
+    // Phase 7: Check predicates for promotion
+    let promotion_config = crate::config::PromotionConfig::default();
+    let promoted_predicates = match crate::promotion::check_and_promote(
+        storage,
+        ctx,
+        session_id,
+        &promotion_config,
+    )
+    .await
+    {
+        Ok(promoted) => promoted,
+        Err(e) => {
+            tracing::warn!(error = %e, "promotion check failed (non-fatal)");
+            vec![]
+        }
+    };
+
     Ok(DreamResult {
         entities_processed: entity_count,
         connections_created,
@@ -186,6 +205,7 @@ pub async fn run_consolidation(
         derived_facts_count,
         pagerank_updated,
         warmth_decayed,
+        promoted_predicates,
     })
 }
 

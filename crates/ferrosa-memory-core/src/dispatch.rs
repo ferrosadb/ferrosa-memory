@@ -701,6 +701,23 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "required": ["action"]
             }),
         },
+        // --- Predicate promotion ---
+        ToolDef {
+            name: "promote_predicate".into(),
+            description: "Promote a derived predicate to durable materialization.\n\n\
+                CALL WHEN:\n\
+                - A derived predicate is queried frequently and you want faster access\n\
+                - You want to persist inference results beyond the ephemeral cache TTL\n\n\
+                Cost: Runs Datalog evaluation + writes to durable tables.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Session UUID" },
+                    "predicate": { "type": "string", "description": "Predicate to promote (e.g., 'related', 'isa', 'reachable')" }
+                },
+                "required": ["predicate"]
+            }),
+        },
     ]
 }
 
@@ -804,6 +821,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "recursive_explore" => handle_recursive_explore(args, storage, ctx, session).await,
         "query_derived" => handle_query_derived(args, storage, ctx).await,
         "manage_rules" => handle_manage_rules(args, storage, ctx).await,
+        "promote_predicate" => handle_promote_predicate(args, storage, ctx).await,
         _ => Err((METHOD_NOT_FOUND, format!("unknown tool: {name}"))),
     };
     let elapsed = start.elapsed();
@@ -867,6 +885,7 @@ fn is_write_tool(name: &str) -> bool {
             | "promote_memory"
             | "demote_memory"
             | "manage_rules"
+            | "promote_predicate"
     )
 }
 
@@ -2369,6 +2388,32 @@ async fn handle_manage_rules<S: crate::storage::Storage>(
     }
 }
 
+async fn handle_promote_predicate<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let predicate = require_str(&args, "predicate")?;
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
+
+    let config = crate::config::PromotionConfig::default();
+
+    let count = crate::promotion::batch_materialize(storage, ctx, session_id, predicate, &config)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    Ok(serde_json::json!({
+        "predicate": predicate,
+        "materialized_count": count,
+        "status": if count > 0 { "promoted" } else { "no_facts_to_materialize" },
+        "hint": if count > 0 {
+            "Predicate promoted to durable storage. Future queries will use materialized facts."
+        } else {
+            "No derived facts found for this predicate. Run recursive_explore first to populate the graph."
+        }
+    }))
+}
+
 // --- Error mapping helpers ---
 
 /// Map anyhow errors to JSON-RPC error codes, using INVALID_PARAMS for
@@ -2497,7 +2542,7 @@ mod tests {
             .await
             .unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 35);
+        assert_eq!(tools.len(), 36);
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"check_memo_cache"));
@@ -2521,6 +2566,7 @@ mod tests {
         assert!(names.contains(&"recursive_explore"));
         assert!(names.contains(&"query_derived"));
         assert!(names.contains(&"manage_rules"));
+        assert!(names.contains(&"promote_predicate"));
     }
 
     #[tokio::test]

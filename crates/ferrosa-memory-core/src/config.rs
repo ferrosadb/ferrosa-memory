@@ -41,6 +41,8 @@ pub struct Config {
     pub rmh: RmhConfig,
     #[serde(default)]
     pub datalog: DatalogConfig,
+    #[serde(default)]
+    pub promotion: PromotionConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,6 +148,34 @@ impl Default for DatalogConfig {
             max_facts: default_max_facts(),
             cache_ttl_seconds: default_cache_ttl(),
             confidence_combination: default_confidence_strategy(),
+        }
+    }
+}
+
+/// Promotion pipeline configuration (B10).
+#[derive(Debug, Deserialize, Clone)]
+pub struct PromotionConfig {
+    /// Heat score threshold above which a predicate becomes a promotion candidate.
+    #[serde(default = "default_promotion_threshold")]
+    pub promotion_threshold: f64,
+    /// Maximum total rows across all promoted predicates.
+    #[serde(default = "default_size_budget")]
+    pub size_budget_rows: usize,
+    /// Number of days of heat data to consider.
+    #[serde(default = "default_promotion_window_days")]
+    pub window_days: u32,
+    /// Multiplier applied to reuse benefit when scoring promotion candidates.
+    #[serde(default = "default_reuse_factor")]
+    pub reuse_factor: f64,
+}
+
+impl Default for PromotionConfig {
+    fn default() -> Self {
+        Self {
+            promotion_threshold: default_promotion_threshold(),
+            size_budget_rows: default_size_budget(),
+            window_days: default_promotion_window_days(),
+            reuse_factor: default_reuse_factor(),
         }
     }
 }
@@ -446,6 +476,18 @@ fn default_cache_ttl() -> u64 {
 }
 fn default_confidence_strategy() -> String {
     "min_parent_times_weight".to_string()
+}
+fn default_promotion_threshold() -> f64 {
+    1000.0
+}
+fn default_size_budget() -> usize {
+    100_000
+}
+fn default_promotion_window_days() -> u32 {
+    7
+}
+fn default_reuse_factor() -> f64 {
+    1.0
 }
 
 /// Resolve the config file path. Checks, in order:
@@ -945,5 +987,46 @@ confidence_combination = "product"
         assert_eq!(config.datalog.max_facts, 100000);
         assert_eq!(config.datalog.cache_ttl_seconds, 7200);
         assert_eq!(config.datalog.confidence_combination, "product");
+    }
+
+    #[test]
+    fn promotion_config_defaults() {
+        let cfg = PromotionConfig::default();
+        assert!((cfg.promotion_threshold - 1000.0).abs() < f64::EPSILON);
+        assert_eq!(cfg.size_budget_rows, 100_000);
+        assert_eq!(cfg.window_days, 7);
+        assert!((cfg.reuse_factor - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_config_defaults_promotion() {
+        let toml = r#"
+[ferrosa]
+contact_points = ["localhost:9042"]
+"#;
+        let config = parse_config(toml).expect("should parse with promotion defaults");
+        assert!((config.promotion.promotion_threshold - 1000.0).abs() < f64::EPSILON);
+        assert_eq!(config.promotion.size_budget_rows, 100_000);
+        assert_eq!(config.promotion.window_days, 7);
+        assert!((config.promotion.reuse_factor - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_config_promotion_overrides() {
+        let toml = r#"
+[ferrosa]
+contact_points = ["localhost:9042"]
+
+[promotion]
+promotion_threshold = 2000.0
+size_budget_rows = 50000
+window_days = 14
+reuse_factor = 1.5
+"#;
+        let config = parse_config(toml).expect("should parse with promotion overrides");
+        assert!((config.promotion.promotion_threshold - 2000.0).abs() < f64::EPSILON);
+        assert_eq!(config.promotion.size_budget_rows, 50000);
+        assert_eq!(config.promotion.window_days, 14);
+        assert!((config.promotion.reuse_factor - 1.5).abs() < f64::EPSILON);
     }
 }

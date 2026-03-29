@@ -44,6 +44,7 @@ pub mod metrics;
 pub mod ner;
 pub mod pagerank;
 pub mod plan;
+pub mod promotion;
 pub mod quota;
 pub mod recursive_explore;
 pub mod router;
