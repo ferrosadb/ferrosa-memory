@@ -382,6 +382,64 @@ pub struct SubQuery {
     pub reasoning: String,
 }
 
+// ─── B10: Materialization + Promotion types ────────────────────
+
+/// A durably materialized derived edge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaterializedEdge {
+    pub tenant_id: Uuid,
+    pub src_id: String,
+    pub shard: i16,
+    pub pred: String,
+    pub dst_id: String,
+    pub rule_id: String,
+    pub support_count: i32,
+    pub confidence: f64,
+    pub batch_id: String,
+    pub materialized_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Promotion status for a predicate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromotionStatus {
+    Candidate,
+    Promoted,
+    Demoted,
+}
+
+impl std::fmt::Display for PromotionStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Candidate => write!(f, "candidate"),
+            Self::Promoted => write!(f, "promoted"),
+            Self::Demoted => write!(f, "demoted"),
+        }
+    }
+}
+
+/// A promoted predicate registry entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromotedPredicate {
+    pub tenant_id: Uuid,
+    pub pred: String,
+    pub promotion_score: f64,
+    pub estimated_rows: i32,
+    pub materialized_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub batch_id: Option<String>,
+    pub status: PromotionStatus,
+}
+
+/// Heat data for a predicate over a time window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PredicateHeat {
+    pub pred: String,
+    pub total_hits: i64,
+    pub total_compute_ms: i64,
+    pub total_requests: i64,
+    pub days_observed: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,12 +492,28 @@ mod tests {
             Term::Var("X".into()),
             Term::Const(Uuid::nil()),
             Term::ConstStr("hello".into()),
-            Term::ConstFloat(OrderedFloat(3.14)),
+            Term::ConstFloat(OrderedFloat(2.72)),
         ];
         for term in terms {
             let json = serde_json::to_string(&term).unwrap();
             let back: Term = serde_json::from_str(&json).unwrap();
             assert_eq!(back, term);
         }
+    }
+
+    #[test]
+    fn test_promotion_status_serde() {
+        let status = PromotionStatus::Promoted;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"promoted\"");
+        let back: PromotionStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, status);
+    }
+
+    #[test]
+    fn test_promotion_status_display() {
+        assert_eq!(PromotionStatus::Candidate.to_string(), "candidate");
+        assert_eq!(PromotionStatus::Promoted.to_string(), "promoted");
+        assert_eq!(PromotionStatus::Demoted.to_string(), "demoted");
     }
 }

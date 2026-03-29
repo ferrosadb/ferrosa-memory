@@ -14,9 +14,9 @@
 use uuid::Uuid;
 
 use crate::types::{
-    AuditEntry, DerivedFact, EntityEntry, FeedbackOutcome, FoldEntry, FoldSummary, MemoEntry,
-    MemoryState, PlanNode, PlanStatus, ProvenanceStep, RuleEntry, RuleState, TemporalEvent,
-    TenantContext, WarmthEntry,
+    AuditEntry, DerivedFact, EntityEntry, FeedbackOutcome, FoldEntry, FoldSummary,
+    MaterializedEdge, MemoEntry, MemoryState, PlanNode, PlanStatus, PromotedPredicate,
+    ProvenanceStep, RuleEntry, RuleState, TemporalEvent, TenantContext, WarmthEntry,
 };
 
 /// Core storage operations for the memory system.
@@ -444,6 +444,56 @@ pub trait Storage: Send + Sync {
         pred: &str,
         days: u32,
     ) -> anyhow::Result<(i64, i64)>;
+
+    // --- Durable materialization operations (B10) ---
+
+    /// Store a materialized edge (durable).
+    async fn materialized_edge_put(
+        &self,
+        ctx: &TenantContext,
+        edge: &MaterializedEdge,
+    ) -> anyhow::Result<()>;
+
+    /// Query materialized edges by source ID.
+    async fn materialized_edges_by_src(
+        &self,
+        ctx: &TenantContext,
+        src_id: &str,
+        pred: Option<&str>,
+    ) -> anyhow::Result<Vec<MaterializedEdge>>;
+
+    /// Query materialized edges by predicate.
+    async fn materialized_edges_by_pred(
+        &self,
+        ctx: &TenantContext,
+        pred: &str,
+    ) -> anyhow::Result<Vec<MaterializedEdge>>;
+
+    /// Delete all materialized edges for a predicate (for rematerialization).
+    async fn materialized_edges_clear(&self, ctx: &TenantContext, pred: &str)
+    -> anyhow::Result<()>;
+
+    // --- Promotion registry operations (B10) ---
+
+    /// Get promotion status for a predicate.
+    async fn promoted_predicate_get(
+        &self,
+        ctx: &TenantContext,
+        pred: &str,
+    ) -> anyhow::Result<Option<PromotedPredicate>>;
+
+    /// Set promotion status for a predicate.
+    async fn promoted_predicate_put(
+        &self,
+        ctx: &TenantContext,
+        entry: &PromotedPredicate,
+    ) -> anyhow::Result<()>;
+
+    /// List all promoted predicates.
+    async fn promoted_predicate_list(
+        &self,
+        ctx: &TenantContext,
+    ) -> anyhow::Result<Vec<PromotedPredicate>>;
 }
 
 /// In-memory mock storage for unit tests.
@@ -481,6 +531,8 @@ pub mod mock {
         pub derived_cache: Mutex<HashMap<String, Vec<DerivedFact>>>,
         pub provenance: Mutex<HashMap<String, Vec<ProvenanceStep>>>,
         pub heat_records: Mutex<Vec<(String, bool, Option<i64>)>>,
+        pub materialized_edges: Mutex<Vec<MaterializedEdge>>,
+        pub promoted_predicates: Mutex<Vec<PromotedPredicate>>,
     }
 
     impl MockStorage {
@@ -1278,6 +1330,95 @@ pub mod mock {
             }
             Ok((hit_count, compute_sum))
         }
+
+        // --- Durable materialization operations (B10) ---
+
+        async fn materialized_edge_put(
+            &self,
+            _ctx: &TenantContext,
+            edge: &MaterializedEdge,
+        ) -> anyhow::Result<()> {
+            self.materialized_edges.lock().await.push(edge.clone());
+            Ok(())
+        }
+
+        async fn materialized_edges_by_src(
+            &self,
+            ctx: &TenantContext,
+            src_id: &str,
+            pred: Option<&str>,
+        ) -> anyhow::Result<Vec<MaterializedEdge>> {
+            let edges = self.materialized_edges.lock().await;
+            Ok(edges
+                .iter()
+                .filter(|e| {
+                    e.tenant_id == ctx.tenant_id
+                        && e.src_id == src_id
+                        && pred.is_none_or(|p| e.pred == p)
+                })
+                .cloned()
+                .collect())
+        }
+
+        async fn materialized_edges_by_pred(
+            &self,
+            ctx: &TenantContext,
+            pred: &str,
+        ) -> anyhow::Result<Vec<MaterializedEdge>> {
+            let edges = self.materialized_edges.lock().await;
+            Ok(edges
+                .iter()
+                .filter(|e| e.tenant_id == ctx.tenant_id && e.pred == pred)
+                .cloned()
+                .collect())
+        }
+
+        async fn materialized_edges_clear(
+            &self,
+            ctx: &TenantContext,
+            pred: &str,
+        ) -> anyhow::Result<()> {
+            let mut edges = self.materialized_edges.lock().await;
+            edges.retain(|e| !(e.tenant_id == ctx.tenant_id && e.pred == pred));
+            Ok(())
+        }
+
+        // --- Promotion registry operations (B10) ---
+
+        async fn promoted_predicate_get(
+            &self,
+            ctx: &TenantContext,
+            pred: &str,
+        ) -> anyhow::Result<Option<PromotedPredicate>> {
+            let entries = self.promoted_predicates.lock().await;
+            Ok(entries
+                .iter()
+                .find(|e| e.tenant_id == ctx.tenant_id && e.pred == pred)
+                .cloned())
+        }
+
+        async fn promoted_predicate_put(
+            &self,
+            _ctx: &TenantContext,
+            entry: &PromotedPredicate,
+        ) -> anyhow::Result<()> {
+            let mut entries = self.promoted_predicates.lock().await;
+            entries.retain(|e| !(e.tenant_id == entry.tenant_id && e.pred == entry.pred));
+            entries.push(entry.clone());
+            Ok(())
+        }
+
+        async fn promoted_predicate_list(
+            &self,
+            ctx: &TenantContext,
+        ) -> anyhow::Result<Vec<PromotedPredicate>> {
+            let entries = self.promoted_predicates.lock().await;
+            Ok(entries
+                .iter()
+                .filter(|e| e.tenant_id == ctx.tenant_id)
+                .cloned()
+                .collect())
+        }
     }
 
     #[cfg(test)]
@@ -1463,6 +1604,133 @@ pub mod mock {
             let (hits, compute) = storage.heat_get(&ctx, "co_occurs", 7).await.unwrap();
             assert_eq!(hits, 2);
             assert_eq!(compute, 90);
+        }
+
+        #[tokio::test]
+        async fn test_materialized_edge_crud() {
+            use crate::types::MaterializedEdge;
+
+            let storage = MockStorage::new();
+            let ctx = TenantContext {
+                tenant_id: Uuid::new_v4(),
+                session_origin: "test".into(),
+            };
+
+            let edge = MaterializedEdge {
+                tenant_id: ctx.tenant_id,
+                src_id: "entity_a".into(),
+                shard: 0,
+                pred: "related_to".into(),
+                dst_id: "entity_b".into(),
+                rule_id: "r1".into(),
+                support_count: 2,
+                confidence: 0.85,
+                batch_id: "batch_001".into(),
+                materialized_at: chrono::Utc::now(),
+            };
+
+            // Initially empty
+            let results = storage
+                .materialized_edges_by_src(&ctx, "entity_a", None)
+                .await
+                .unwrap();
+            assert!(results.is_empty());
+
+            // Put + query by src
+            storage.materialized_edge_put(&ctx, &edge).await.unwrap();
+            let results = storage
+                .materialized_edges_by_src(&ctx, "entity_a", None)
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].dst_id, "entity_b");
+
+            // Query by src + pred filter
+            let results = storage
+                .materialized_edges_by_src(&ctx, "entity_a", Some("related_to"))
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            let results = storage
+                .materialized_edges_by_src(&ctx, "entity_a", Some("other_pred"))
+                .await
+                .unwrap();
+            assert!(results.is_empty());
+
+            // Query by pred
+            let results = storage
+                .materialized_edges_by_pred(&ctx, "related_to")
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 1);
+
+            // Clear
+            storage
+                .materialized_edges_clear(&ctx, "related_to")
+                .await
+                .unwrap();
+            let results = storage
+                .materialized_edges_by_pred(&ctx, "related_to")
+                .await
+                .unwrap();
+            assert!(results.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_promoted_predicate_crud() {
+            use crate::types::{PromotedPredicate, PromotionStatus};
+
+            let storage = MockStorage::new();
+            let ctx = TenantContext {
+                tenant_id: Uuid::new_v4(),
+                session_origin: "test".into(),
+            };
+
+            // Initially empty
+            let result = storage
+                .promoted_predicate_get(&ctx, "related_to")
+                .await
+                .unwrap();
+            assert!(result.is_none());
+
+            let entry = PromotedPredicate {
+                tenant_id: ctx.tenant_id,
+                pred: "related_to".into(),
+                promotion_score: 1500.0,
+                estimated_rows: 500,
+                materialized_at: None,
+                batch_id: None,
+                status: PromotionStatus::Candidate,
+            };
+
+            // Put + get
+            storage.promoted_predicate_put(&ctx, &entry).await.unwrap();
+            let result = storage
+                .promoted_predicate_get(&ctx, "related_to")
+                .await
+                .unwrap();
+            assert!(result.is_some());
+            assert_eq!(result.unwrap().status, PromotionStatus::Candidate);
+
+            // List
+            let list = storage.promoted_predicate_list(&ctx).await.unwrap();
+            assert_eq!(list.len(), 1);
+
+            // Upsert (update status)
+            let updated = PromotedPredicate {
+                status: PromotionStatus::Promoted,
+                materialized_at: Some(chrono::Utc::now()),
+                batch_id: Some("batch_001".into()),
+                ..entry.clone()
+            };
+            storage
+                .promoted_predicate_put(&ctx, &updated)
+                .await
+                .unwrap();
+            let list = storage.promoted_predicate_list(&ctx).await.unwrap();
+            assert_eq!(list.len(), 1);
+            assert_eq!(list[0].status, PromotionStatus::Promoted);
+            assert!(list[0].batch_id.is_some());
         }
     }
 }

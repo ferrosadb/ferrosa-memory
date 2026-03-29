@@ -666,6 +666,56 @@ impl Storage for ReconnectingStorage {
     ) -> anyhow::Result<(i64, i64)> {
         delegate!(self, heat_get, ctx, pred, days)
     }
+
+    async fn materialized_edge_put(
+        &self,
+        ctx: &TenantContext,
+        edge: &MaterializedEdge,
+    ) -> anyhow::Result<()> {
+        delegate!(self, materialized_edge_put, ctx, edge)
+    }
+    async fn materialized_edges_by_src(
+        &self,
+        ctx: &TenantContext,
+        src_id: &str,
+        pred: Option<&str>,
+    ) -> anyhow::Result<Vec<MaterializedEdge>> {
+        delegate!(self, materialized_edges_by_src, ctx, src_id, pred)
+    }
+    async fn materialized_edges_by_pred(
+        &self,
+        ctx: &TenantContext,
+        pred: &str,
+    ) -> anyhow::Result<Vec<MaterializedEdge>> {
+        delegate!(self, materialized_edges_by_pred, ctx, pred)
+    }
+    async fn materialized_edges_clear(
+        &self,
+        ctx: &TenantContext,
+        pred: &str,
+    ) -> anyhow::Result<()> {
+        delegate!(self, materialized_edges_clear, ctx, pred)
+    }
+    async fn promoted_predicate_get(
+        &self,
+        ctx: &TenantContext,
+        pred: &str,
+    ) -> anyhow::Result<Option<PromotedPredicate>> {
+        delegate!(self, promoted_predicate_get, ctx, pred)
+    }
+    async fn promoted_predicate_put(
+        &self,
+        ctx: &TenantContext,
+        entry: &PromotedPredicate,
+    ) -> anyhow::Result<()> {
+        delegate!(self, promoted_predicate_put, ctx, entry)
+    }
+    async fn promoted_predicate_list(
+        &self,
+        ctx: &TenantContext,
+    ) -> anyhow::Result<Vec<PromotedPredicate>> {
+        delegate!(self, promoted_predicate_list, ctx)
+    }
 }
 
 /// Backoff schedule for CQL reconnection: 1s, 2s, 4s, 8s, 16s, then 30s.

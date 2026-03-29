@@ -886,7 +886,7 @@ mod tests {
             (conf - 0.9).abs() < f64::EPSILON,
             "expected confidence 0.9, got {conf}"
         );
-        assert!(conf >= 0.0 && conf <= 1.0, "confidence must be in [0, 1]");
+        assert!((0.0..=1.0).contains(&conf), "confidence must be in [0, 1]");
     }
 
     #[test]

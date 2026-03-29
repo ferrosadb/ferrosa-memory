@@ -21,6 +21,22 @@ use crate::config::FerrosaCqlConfig;
 use crate::storage::Storage;
 use crate::types::*;
 
+fn parse_decay_zone(s: &str) -> DecayZone {
+    match s {
+        "identity" => DecayZone::Identity,
+        "operational" => DecayZone::Operational,
+        _ => DecayZone::Knowledge,
+    }
+}
+
+fn parse_rule_state(s: &str) -> RuleState {
+    match s {
+        "deprecated" => RuleState::Deprecated,
+        "superseded" => RuleState::Superseded,
+        _ => RuleState::Active,
+    }
+}
+
 /// Type alias for the cdrs-tokio TCP session.
 pub type CqlSession = Session<
     TransportTcp,
@@ -80,6 +96,23 @@ struct PreparedStatements {
     // Sync/export list queries
     fold_list_all: PreparedQuery,
     temporal_list_all: PreparedQuery,
+    // Warmth (Sprint 5)
+    warmth_get: PreparedQuery,
+    warmth_put: PreparedQuery,
+    warmth_list_session: PreparedQuery,
+    warmth_delete: PreparedQuery,
+    // Rules (Sprint 5)
+    rule_put_by_id: PreparedQuery,
+    rule_put_by_family: PreparedQuery,
+    rule_get: PreparedQuery,
+    rule_list_family: PreparedQuery,
+    // Derived cache (Sprint 5)
+    derived_cache_get: PreparedQuery,
+    derived_cache_put: PreparedQuery,
+    derived_cache_clear: PreparedQuery,
+    // Provenance (Sprint 5)
+    provenance_put: PreparedQuery,
+    provenance_get: PreparedQuery,
 }
 
 /// CQL storage backend.
@@ -373,11 +406,102 @@ impl CqlStorage {
                      FROM {ks}.temporal_events WHERE tenant_id = ? ALLOW FILTERING"
                 ))
                 .await?,
+            // Warmth (Sprint 5)
+            warmth_get: session
+                .prepare(format!(
+                    "SELECT entity_id, session_id, warmth, pagerank, last_accessed_at, \
+                     access_count, decay_zone, updated_at \
+                     FROM {ks}.entity_warmth WHERE tenant_id = ? AND entity_id = ?"
+                ))
+                .await?,
+            warmth_put: session
+                .prepare(format!(
+                    "INSERT INTO {ks}.entity_warmth \
+                     (tenant_id, entity_id, session_id, warmth, pagerank, last_accessed_at, \
+                      access_count, decay_zone, updated_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                ))
+                .await?,
+            warmth_list_session: session
+                .prepare(format!(
+                    "SELECT entity_id, session_id, warmth, pagerank, last_accessed_at, \
+                     access_count, decay_zone, updated_at \
+                     FROM {ks}.entity_warmth WHERE session_id = ?"
+                ))
+                .await?,
+            warmth_delete: session
+                .prepare(format!(
+                    "DELETE FROM {ks}.entity_warmth WHERE tenant_id = ? AND entity_id = ?"
+                ))
+                .await?,
+            // Rules (Sprint 5)
+            rule_put_by_id: session
+                .prepare(format!(
+                    "INSERT INTO {ks}.rules_by_id \
+                     (tenant_id, rule_id, version, name, family, state, rule_body, \
+                      rule_weight, incremental, created_at, updated_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                ))
+                .await?,
+            rule_put_by_family: session
+                .prepare(format!(
+                    "INSERT INTO {ks}.rules_by_family \
+                     (tenant_id, family, state, rule_id, version, updated_at) \
+                     VALUES (?, ?, ?, ?, ?, ?)"
+                ))
+                .await?,
+            rule_get: session
+                .prepare(format!(
+                    "SELECT rule_id, version, name, family, state, rule_body, \
+                     rule_weight, incremental, created_at, updated_at \
+                     FROM {ks}.rules_by_id WHERE tenant_id = ? AND rule_id = ? LIMIT 1"
+                ))
+                .await?,
+            rule_list_family: session
+                .prepare(format!(
+                    "SELECT rule_id, version, name, family, state, rule_body, \
+                     rule_weight, incremental, created_at, updated_at \
+                     FROM {ks}.rules_by_id WHERE tenant_id = ? ALLOW FILTERING"
+                ))
+                .await?,
+            // Derived cache (Sprint 5)
+            derived_cache_get: session
+                .prepare(format!(
+                    "SELECT seq, src_id, pred, dst_id, confidence, rule_id, computed_at \
+                     FROM {ks}.derived_cache_by_query WHERE tenant_id = ? AND cache_key = ?"
+                ))
+                .await?,
+            derived_cache_put: session
+                .prepare(format!(
+                    "INSERT INTO {ks}.derived_cache_by_query \
+                     (tenant_id, cache_key, seq, src_id, pred, dst_id, confidence, rule_id, computed_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL 3600"
+                ))
+                .await?,
+            derived_cache_clear: session
+                .prepare(format!(
+                    "DELETE FROM {ks}.derived_cache_by_query WHERE tenant_id = ? AND cache_key = ?"
+                ))
+                .await?,
+            // Provenance (Sprint 5)
+            provenance_put: session
+                .prepare(format!(
+                    "INSERT INTO {ks}.derivation_provenance \
+                     (tenant_id, derived_edge_id, seq, parent_src, parent_pred, parent_dst, parent_kind) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?)"
+                ))
+                .await?,
+            provenance_get: session
+                .prepare(format!(
+                    "SELECT seq, parent_src, parent_pred, parent_dst, parent_kind \
+                     FROM {ks}.derivation_provenance WHERE tenant_id = ? AND derived_edge_id = ?"
+                ))
+                .await?,
         };
 
         tracing::info!(
             keyspace = ks,
-            statements = 31,
+            statements = 44,
             "CQL storage connected, all statements prepared"
         );
 
@@ -1935,130 +2059,511 @@ impl Storage for CqlStorage {
         Ok(())
     }
 
-    // --- Warmth operations (Sprint 5) --- stubs pending CQL table creation
+    // --- Warmth operations (Sprint 5) ---
 
     async fn warmth_get(
         &self,
-        _ctx: &TenantContext,
-        _entity_id: Uuid,
+        ctx: &TenantContext,
+        entity_id: Uuid,
     ) -> anyhow::Result<Option<WarmthEntry>> {
-        anyhow::bail!("warmth_get: CQL table not yet created (Sprint 5)")
+        let rows = self
+            .query_rows(
+                &self.stmts.warmth_get,
+                query_values!(ctx.tenant_id, entity_id),
+            )
+            .await?;
+
+        if let Some(row) = rows.into_iter().next() {
+            let last_accessed = row
+                .r_by_name::<chrono::NaiveDateTime>("last_accessed_at")
+                .unwrap_or_default();
+            let updated = row
+                .r_by_name::<chrono::NaiveDateTime>("updated_at")
+                .unwrap_or_default();
+            let zone_str: String = row.r_by_name("decay_zone").unwrap_or_default();
+
+            Ok(Some(WarmthEntry {
+                tenant_id: ctx.tenant_id,
+                entity_id,
+                session_id: row.r_by_name("session_id")?,
+                warmth: row.r_by_name("warmth")?,
+                pagerank: row.r_by_name::<f64>("pagerank").unwrap_or(0.0),
+                last_accessed_at: last_accessed.and_utc(),
+                access_count: i64::from(row.r_by_name::<i32>("access_count").unwrap_or(0)),
+                decay_zone: parse_decay_zone(&zone_str),
+                updated_at: updated.and_utc(),
+            }))
+        } else {
+            Ok(None)
+        }
     }
 
-    async fn warmth_put(&self, _ctx: &TenantContext, _entry: &WarmthEntry) -> anyhow::Result<()> {
-        anyhow::bail!("warmth_put: CQL table not yet created (Sprint 5)")
+    async fn warmth_put(&self, ctx: &TenantContext, entry: &WarmthEntry) -> anyhow::Result<()> {
+        self.session
+            .exec_with_values(
+                &self.stmts.warmth_put,
+                query_values!(
+                    ctx.tenant_id,
+                    entry.entity_id,
+                    entry.session_id,
+                    entry.warmth,
+                    entry.pagerank,
+                    entry.last_accessed_at.naive_utc(),
+                    entry.access_count as i32,
+                    entry.decay_zone.to_string(),
+                    entry.updated_at.naive_utc()
+                ),
+            )
+            .await?;
+        Ok(())
     }
 
     async fn warmth_boost(
         &self,
-        _ctx: &TenantContext,
-        _entity_id: Uuid,
-        _amount: f64,
-        _session_id: Uuid,
+        ctx: &TenantContext,
+        entity_id: Uuid,
+        amount: f64,
+        session_id: Uuid,
     ) -> anyhow::Result<()> {
-        anyhow::bail!("warmth_boost: CQL table not yet created (Sprint 5)")
+        let now = chrono::Utc::now();
+        let entry = if let Some(existing) = self.warmth_get(ctx, entity_id).await? {
+            WarmthEntry {
+                warmth: existing.warmth + amount,
+                access_count: existing.access_count + 1,
+                last_accessed_at: now,
+                updated_at: now,
+                ..existing
+            }
+        } else {
+            WarmthEntry {
+                tenant_id: ctx.tenant_id,
+                entity_id,
+                session_id,
+                warmth: amount,
+                pagerank: 0.0,
+                last_accessed_at: now,
+                access_count: 1,
+                decay_zone: DecayZone::Knowledge,
+                updated_at: now,
+            }
+        };
+        self.warmth_put(ctx, &entry).await
     }
 
     async fn warmth_list_session(
         &self,
-        _ctx: &TenantContext,
-        _session_id: Uuid,
+        ctx: &TenantContext,
+        session_id: Uuid,
     ) -> anyhow::Result<Vec<WarmthEntry>> {
-        anyhow::bail!("warmth_list_session: CQL table not yet created (Sprint 5)")
+        let rows = self
+            .query_rows(&self.stmts.warmth_list_session, query_values!(session_id))
+            .await?;
+
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            let last_accessed = row
+                .r_by_name::<chrono::NaiveDateTime>("last_accessed_at")
+                .unwrap_or_default();
+            let updated = row
+                .r_by_name::<chrono::NaiveDateTime>("updated_at")
+                .unwrap_or_default();
+            let zone_str: String = row.r_by_name("decay_zone").unwrap_or_default();
+
+            results.push(WarmthEntry {
+                tenant_id: ctx.tenant_id,
+                entity_id: row.r_by_name("entity_id")?,
+                session_id,
+                warmth: row.r_by_name("warmth")?,
+                pagerank: row.r_by_name::<f64>("pagerank").unwrap_or(0.0),
+                last_accessed_at: last_accessed.and_utc(),
+                access_count: i64::from(row.r_by_name::<i32>("access_count").unwrap_or(0)),
+                decay_zone: parse_decay_zone(&zone_str),
+                updated_at: updated.and_utc(),
+            });
+        }
+        Ok(results)
     }
 
     async fn warmth_decay_all(
         &self,
-        _ctx: &TenantContext,
-        _session_id: Uuid,
-        _elapsed_hours: f64,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        elapsed_hours: f64,
     ) -> anyhow::Result<usize> {
-        anyhow::bail!("warmth_decay_all: CQL table not yet created (Sprint 5)")
+        let entries = self.warmth_list_session(ctx, session_id).await?;
+        let now = chrono::Utc::now();
+        let mut pruned = 0;
+
+        for entry in &entries {
+            let multiplier = entry.decay_zone.decay_multiplier();
+            let new_warmth = entry.warmth * (-0.1 * elapsed_hours * multiplier).exp();
+
+            if new_warmth < 0.01 {
+                // Below threshold: delete the row
+                self.session
+                    .exec_with_values(
+                        &self.stmts.warmth_delete,
+                        query_values!(ctx.tenant_id, entry.entity_id),
+                    )
+                    .await?;
+                pruned += 1;
+            } else {
+                // Update with decayed warmth
+                let updated = WarmthEntry {
+                    warmth: new_warmth,
+                    updated_at: now,
+                    ..entry.clone()
+                };
+                self.warmth_put(ctx, &updated).await?;
+            }
+        }
+
+        Ok(pruned)
     }
 
-    // --- Rule registry operations (Sprint 5) --- stubs pending CQL table creation
+    // --- Rule registry operations (Sprint 5) ---
 
-    async fn rule_put(&self, _ctx: &TenantContext, _entry: &RuleEntry) -> anyhow::Result<()> {
-        anyhow::bail!("rule_put: CQL table not yet created (Sprint 5)")
+    async fn rule_put(&self, ctx: &TenantContext, entry: &RuleEntry) -> anyhow::Result<()> {
+        let state_str = entry.state.to_string();
+        let now = chrono::Utc::now().naive_utc();
+
+        // Denormalized write: rules_by_id
+        self.session
+            .exec_with_values(
+                &self.stmts.rule_put_by_id,
+                query_values!(
+                    ctx.tenant_id,
+                    entry.rule_id.clone(),
+                    entry.version,
+                    entry.name.clone(),
+                    entry.family.clone(),
+                    state_str.clone(),
+                    entry.rule_body.clone(),
+                    entry.rule_weight,
+                    entry.incremental,
+                    entry.created_at.naive_utc(),
+                    now
+                ),
+            )
+            .await?;
+
+        // Denormalized write: rules_by_family
+        self.session
+            .exec_with_values(
+                &self.stmts.rule_put_by_family,
+                query_values!(
+                    ctx.tenant_id,
+                    entry.family.clone(),
+                    state_str,
+                    entry.rule_id.clone(),
+                    entry.version,
+                    now
+                ),
+            )
+            .await?;
+
+        Ok(())
     }
 
     async fn rule_list_family(
         &self,
-        _ctx: &TenantContext,
-        _family: &str,
-        _state: RuleState,
+        ctx: &TenantContext,
+        family: &str,
+        state: RuleState,
     ) -> anyhow::Result<Vec<RuleEntry>> {
-        anyhow::bail!("rule_list_family: CQL table not yet created (Sprint 5)")
+        let state_str = state.to_string();
+
+        // Fetch all rules for tenant, filter client-side by family and state.
+        // This is efficient for small rule sets (typically < 100 rules).
+        let rows = self
+            .query_rows(&self.stmts.rule_list_family, query_values!(ctx.tenant_id))
+            .await?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            let row_family: String = row.r_by_name("family").unwrap_or_default();
+            let row_state: String = row.r_by_name("state").unwrap_or_default();
+            if row_family != family || row_state != state_str {
+                continue;
+            }
+            let created = row
+                .r_by_name::<chrono::NaiveDateTime>("created_at")
+                .unwrap_or_default();
+            let updated = row
+                .r_by_name::<chrono::NaiveDateTime>("updated_at")
+                .unwrap_or_default();
+
+            results.push(RuleEntry {
+                tenant_id: ctx.tenant_id,
+                rule_id: row.r_by_name("rule_id")?,
+                version: row.r_by_name("version")?,
+                name: row.r_by_name("name")?,
+                family: row_family,
+                state: parse_rule_state(&row_state),
+                rule_body: row.r_by_name("rule_body")?,
+                rule_weight: row.r_by_name::<f64>("rule_weight").unwrap_or(1.0),
+                incremental: row.r_by_name::<bool>("incremental").unwrap_or(false),
+                created_at: created.and_utc(),
+                updated_at: updated.and_utc(),
+            });
+        }
+
+        // Sort by version descending (CQL clustering is per-partition only)
+        results.sort_by(|a, b| b.version.cmp(&a.version));
+        Ok(results)
     }
 
     async fn rule_get(
         &self,
-        _ctx: &TenantContext,
-        _rule_id: &str,
+        ctx: &TenantContext,
+        rule_id: &str,
     ) -> anyhow::Result<Option<RuleEntry>> {
-        anyhow::bail!("rule_get: CQL table not yet created (Sprint 5)")
+        let rows = self
+            .query_rows(
+                &self.stmts.rule_get,
+                query_values!(ctx.tenant_id, rule_id.to_string()),
+            )
+            .await?;
+
+        if let Some(row) = rows.into_iter().next() {
+            let created = row
+                .r_by_name::<chrono::NaiveDateTime>("created_at")
+                .unwrap_or_default();
+            let updated = row
+                .r_by_name::<chrono::NaiveDateTime>("updated_at")
+                .unwrap_or_default();
+            let state_str: String = row.r_by_name("state").unwrap_or_default();
+
+            Ok(Some(RuleEntry {
+                tenant_id: ctx.tenant_id,
+                rule_id: row.r_by_name("rule_id")?,
+                version: row.r_by_name("version")?,
+                name: row.r_by_name("name")?,
+                family: row.r_by_name("family")?,
+                state: parse_rule_state(&state_str),
+                rule_body: row.r_by_name("rule_body")?,
+                rule_weight: row.r_by_name::<f64>("rule_weight").unwrap_or(1.0),
+                incremental: row.r_by_name::<bool>("incremental").unwrap_or(false),
+                created_at: created.and_utc(),
+                updated_at: updated.and_utc(),
+            }))
+        } else {
+            Ok(None)
+        }
     }
 
-    // --- Derived cache operations (Sprint 5) --- stubs pending CQL table creation
+    // --- Derived cache operations (Sprint 5) ---
 
     async fn derived_cache_get(
         &self,
-        _ctx: &TenantContext,
-        _cache_key: &str,
+        ctx: &TenantContext,
+        cache_key: &str,
     ) -> anyhow::Result<Vec<DerivedFact>> {
-        anyhow::bail!("derived_cache_get: CQL table not yet created (Sprint 5)")
+        let rows = self
+            .query_rows(
+                &self.stmts.derived_cache_get,
+                query_values!(ctx.tenant_id, cache_key.to_string()),
+            )
+            .await?;
+
+        let mut facts = Vec::with_capacity(rows.len());
+        for row in rows {
+            let src_id: Uuid = row.r_by_name("src_id")?;
+            let dst_id: Uuid = row.r_by_name("dst_id")?;
+
+            facts.push(DerivedFact {
+                src_id: src_id.to_string(),
+                pred: row.r_by_name("pred")?,
+                dst_id: dst_id.to_string(),
+                confidence: row.r_by_name::<f64>("confidence").unwrap_or(1.0),
+                rule_id: row.r_by_name("rule_id").unwrap_or_default(),
+                support_count: 1,   // Not stored in CQL; default to 1
+                provenance: vec![], // Loaded separately via provenance_get
+            });
+        }
+        Ok(facts)
     }
 
     async fn derived_cache_put(
         &self,
-        _ctx: &TenantContext,
-        _cache_key: &str,
-        _facts: &[DerivedFact],
+        ctx: &TenantContext,
+        cache_key: &str,
+        facts: &[DerivedFact],
     ) -> anyhow::Result<()> {
-        anyhow::bail!("derived_cache_put: CQL table not yet created (Sprint 5)")
+        let now = chrono::Utc::now().naive_utc();
+
+        for (idx, fact) in facts.iter().enumerate() {
+            let src_uuid: Uuid = fact.src_id.parse().map_err(|e| {
+                anyhow::anyhow!(
+                    "derived_cache_put: invalid src_id UUID '{}': {}",
+                    fact.src_id,
+                    e
+                )
+            })?;
+            let dst_uuid: Uuid = fact.dst_id.parse().map_err(|e| {
+                anyhow::anyhow!(
+                    "derived_cache_put: invalid dst_id UUID '{}': {}",
+                    fact.dst_id,
+                    e
+                )
+            })?;
+
+            self.session
+                .exec_with_values(
+                    &self.stmts.derived_cache_put,
+                    query_values!(
+                        ctx.tenant_id,
+                        cache_key.to_string(),
+                        idx as i32,
+                        src_uuid,
+                        fact.pred.clone(),
+                        dst_uuid,
+                        fact.confidence,
+                        fact.rule_id.clone(),
+                        now
+                    ),
+                )
+                .await?;
+        }
+        Ok(())
     }
 
-    async fn derived_cache_clear(&self, _ctx: &TenantContext, _pred: &str) -> anyhow::Result<()> {
-        anyhow::bail!("derived_cache_clear: CQL table not yet created (Sprint 5)")
+    async fn derived_cache_clear(&self, ctx: &TenantContext, pred: &str) -> anyhow::Result<()> {
+        // Delete the partition for this exact cache_key.
+        // The `pred` parameter is used as cache_key in the derived_cache table.
+        self.session
+            .exec_with_values(
+                &self.stmts.derived_cache_clear,
+                query_values!(ctx.tenant_id, pred.to_string()),
+            )
+            .await?;
+        tracing::debug!(pred, "derived cache cleared for key");
+        Ok(())
     }
 
-    // --- Provenance operations (Sprint 5) --- stubs pending CQL table creation
+    // --- Provenance operations (Sprint 5) ---
 
     async fn provenance_put(
         &self,
-        _ctx: &TenantContext,
-        _derived_edge_id: &str,
-        _steps: &[ProvenanceStep],
+        ctx: &TenantContext,
+        derived_edge_id: &str,
+        steps: &[ProvenanceStep],
     ) -> anyhow::Result<()> {
-        anyhow::bail!("provenance_put: CQL table not yet created (Sprint 5)")
+        for (idx, step) in steps.iter().enumerate() {
+            self.session
+                .exec_with_values(
+                    &self.stmts.provenance_put,
+                    query_values!(
+                        ctx.tenant_id,
+                        derived_edge_id.to_string(),
+                        idx as i32,
+                        step.parent_src.clone(),
+                        step.parent_pred.clone(),
+                        step.parent_dst.clone(),
+                        step.parent_kind.clone()
+                    ),
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     async fn provenance_get(
         &self,
-        _ctx: &TenantContext,
-        _derived_edge_id: &str,
+        ctx: &TenantContext,
+        derived_edge_id: &str,
     ) -> anyhow::Result<Vec<ProvenanceStep>> {
-        anyhow::bail!("provenance_get: CQL table not yet created (Sprint 5)")
+        let rows = self
+            .query_rows(
+                &self.stmts.provenance_get,
+                query_values!(ctx.tenant_id, derived_edge_id.to_string()),
+            )
+            .await?;
+
+        let mut steps = Vec::with_capacity(rows.len());
+        for row in rows {
+            steps.push(ProvenanceStep {
+                parent_src: row.r_by_name("parent_src")?,
+                parent_pred: row.r_by_name("parent_pred")?,
+                parent_dst: row.r_by_name("parent_dst")?,
+                parent_kind: row.r_by_name("parent_kind")?,
+            });
+        }
+        Ok(steps)
     }
 
-    // --- Heat telemetry operations (Sprint 5) --- stubs pending CQL table creation
+    // --- Heat telemetry operations (Sprint 5) ---
+    // Heat DDL (counter tables) not yet created — will be implemented in B10.
+    // These are no-ops that log a debug message; heat is telemetry, not critical path.
 
     async fn heat_record(
         &self,
         _ctx: &TenantContext,
-        _pred: &str,
+        pred: &str,
         _hit: bool,
         _compute_ms: Option<i64>,
     ) -> anyhow::Result<()> {
-        anyhow::bail!("heat_record: CQL table not yet created (Sprint 5)")
+        tracing::debug!(pred, "heat_record: no-op (heat DDL pending B10)");
+        Ok(())
     }
 
     async fn heat_get(
         &self,
         _ctx: &TenantContext,
-        _pred: &str,
+        pred: &str,
         _days: u32,
     ) -> anyhow::Result<(i64, i64)> {
-        anyhow::bail!("heat_get: CQL table not yet created (Sprint 5)")
+        tracing::debug!(pred, "heat_get: no-op (heat DDL pending B10)");
+        Ok((0, 0))
+    }
+
+    async fn materialized_edge_put(
+        &self,
+        _ctx: &TenantContext,
+        _edge: &MaterializedEdge,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("materialized_edge_put: CQL not yet implemented (B10)")
+    }
+    async fn materialized_edges_by_src(
+        &self,
+        _ctx: &TenantContext,
+        _src_id: &str,
+        _pred: Option<&str>,
+    ) -> anyhow::Result<Vec<MaterializedEdge>> {
+        anyhow::bail!("materialized_edges_by_src: CQL not yet implemented (B10)")
+    }
+    async fn materialized_edges_by_pred(
+        &self,
+        _ctx: &TenantContext,
+        _pred: &str,
+    ) -> anyhow::Result<Vec<MaterializedEdge>> {
+        anyhow::bail!("materialized_edges_by_pred: CQL not yet implemented (B10)")
+    }
+    async fn materialized_edges_clear(
+        &self,
+        _ctx: &TenantContext,
+        _pred: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("materialized_edges_clear: CQL not yet implemented (B10)")
+    }
+    async fn promoted_predicate_get(
+        &self,
+        _ctx: &TenantContext,
+        _pred: &str,
+    ) -> anyhow::Result<Option<PromotedPredicate>> {
+        anyhow::bail!("promoted_predicate_get: CQL not yet implemented (B10)")
+    }
+    async fn promoted_predicate_put(
+        &self,
+        _ctx: &TenantContext,
+        _entry: &PromotedPredicate,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("promoted_predicate_put: CQL not yet implemented (B10)")
+    }
+    async fn promoted_predicate_list(
+        &self,
+        _ctx: &TenantContext,
+    ) -> anyhow::Result<Vec<PromotedPredicate>> {
+        anyhow::bail!("promoted_predicate_list: CQL not yet implemented (B10)")
     }
 }
