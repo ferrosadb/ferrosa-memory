@@ -2,7 +2,7 @@
 
 ## Purpose
 
-ferrosa-memory-mcp is a Rust MCP server (~12,350 lines) that exposes Ferrosa DB's index and graph infrastructure as typed tools for LLM agent trajectories. It provides durable, structured memory for Recursive Language Model (RLM) workloads — memoization, hierarchical plan state, trajectory fold/summarization, semantic retrieval, phonetic entity search, spreading activation, dream consolidation, intention tracking, and a feedback loop for retrieval strategy refinement.
+ferrosa-memory-mcp is a Rust MCP server (~14,150 lines) that exposes Ferrosa DB's index and graph infrastructure as typed tools for LLM agent trajectories. It provides durable, structured memory for Recursive Language Model (RLM) workloads — memoization, hierarchical plan state, trajectory fold/summarization, semantic retrieval, phonetic entity search, spreading activation, dream consolidation, intention tracking, Datalog graph inference with provenance-tracked derived knowledge, recursive multi-pass exploration, and a feedback loop for retrieval strategy refinement.
 
 ## Positioning
 
@@ -87,6 +87,12 @@ Six tables:
 5. `temporal_events` — timestamped facts with supersession chains
 6. `feedback_outcomes` — retrieval strategy success/failure pairs
 
+## Datalog Inference and Recursive Exploration
+
+The Datalog inference layer operates as a logical view over existing CQL storage. Existing entity edges are normalized into canonical predicates (`edge(Src, Pred, Dst)`, `node(Id)`) at query time, enabling semi-naive evaluation of transitive closure, taxonomy hierarchies, and co-occurrence clustering without migrating the underlying schema. Derived facts carry provenance chains and are cached with TTL in ephemeral CQL tables.
+
+The recursive exploration engine builds on the Datalog layer to support multi-pass retrieval. Complex queries are decomposed into sub-queries, each pass runs 5-signal RRF fusion (phonetic, ANN, fold, warmth, PageRank), then Datalog evaluation discovers connected entity clusters via `related()`, `cluster()`, and `reachable()` derived predicates. Convergence is detected when the Datalog fixpoint produces no new facts or novelty drops below a configurable threshold. Persistent warmth (Ebbinghaus decay with zone-based multipliers) and Personalized PageRank scores feed into the fusion pipeline to bias retrieval toward frequently accessed and structurally important entities.
+
 ## Research Foundation
 
-Design grounded in: RLM (memoization), SRLM (tool routing), ReCAP (plan state), Context-Folding (trajectory folds), Zep (temporal chaining), MIRIX (memory type taxonomy), ACON (feedback learning), MCPShield + MemoryGraft (security model). See spec Section 2 for full citations.
+Design grounded in: RLM (memoization), SRLM (tool routing), ReCAP (plan state), Context-Folding (trajectory folds), Zep (temporal chaining), MIRIX (memory type taxonomy), ACON (feedback learning), MCPShield + MemoryGraft (security model), Recursive Memory Harness (persistent warmth, recursive exploration), and Datalog graph materialization (semi-naive inference, provenance, ephemeral caching). See spec Section 2 for full citations.

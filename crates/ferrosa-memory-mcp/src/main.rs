@@ -531,6 +531,145 @@ impl Storage for ReconnectingStorage {
     async fn edge_count(&self, ctx: &TenantContext) -> anyhow::Result<usize> {
         delegate!(self, edge_count, ctx)
     }
+
+    // --- Warmth operations (Sprint 5) ---
+
+    async fn warmth_get(
+        &self,
+        ctx: &TenantContext,
+        entity_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<ferrosa_memory_core::types::WarmthEntry>> {
+        delegate!(self, warmth_get, ctx, entity_id)
+    }
+
+    async fn warmth_put(
+        &self,
+        ctx: &TenantContext,
+        entry: &ferrosa_memory_core::types::WarmthEntry,
+    ) -> anyhow::Result<()> {
+        delegate!(self, warmth_put, ctx, entry)
+    }
+
+    async fn warmth_boost(
+        &self,
+        ctx: &TenantContext,
+        entity_id: uuid::Uuid,
+        amount: f64,
+        session_id: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        delegate!(self, warmth_boost, ctx, entity_id, amount, session_id)
+    }
+
+    async fn warmth_list_session(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<ferrosa_memory_core::types::WarmthEntry>> {
+        delegate!(self, warmth_list_session, ctx, session_id)
+    }
+
+    async fn warmth_decay_all(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        elapsed_hours: f64,
+    ) -> anyhow::Result<usize> {
+        delegate!(self, warmth_decay_all, ctx, session_id, elapsed_hours)
+    }
+
+    // --- Rule registry operations (Sprint 5) ---
+
+    async fn rule_put(
+        &self,
+        ctx: &TenantContext,
+        entry: &ferrosa_memory_core::types::RuleEntry,
+    ) -> anyhow::Result<()> {
+        delegate!(self, rule_put, ctx, entry)
+    }
+
+    async fn rule_list_family(
+        &self,
+        ctx: &TenantContext,
+        family: &str,
+        state: ferrosa_memory_core::types::RuleState,
+    ) -> anyhow::Result<Vec<ferrosa_memory_core::types::RuleEntry>> {
+        delegate!(self, rule_list_family, ctx, family, state)
+    }
+
+    async fn rule_get(
+        &self,
+        ctx: &TenantContext,
+        rule_id: &str,
+    ) -> anyhow::Result<Option<ferrosa_memory_core::types::RuleEntry>> {
+        delegate!(self, rule_get, ctx, rule_id)
+    }
+
+    // --- Derived cache operations (Sprint 5) ---
+
+    async fn derived_cache_get(
+        &self,
+        ctx: &TenantContext,
+        cache_key: &str,
+    ) -> anyhow::Result<Vec<ferrosa_memory_core::types::DerivedFact>> {
+        delegate!(self, derived_cache_get, ctx, cache_key)
+    }
+
+    async fn derived_cache_put(
+        &self,
+        ctx: &TenantContext,
+        cache_key: &str,
+        facts: &[ferrosa_memory_core::types::DerivedFact],
+    ) -> anyhow::Result<()> {
+        delegate!(self, derived_cache_put, ctx, cache_key, facts)
+    }
+
+    async fn derived_cache_clear(
+        &self,
+        ctx: &TenantContext,
+        pred: &str,
+    ) -> anyhow::Result<()> {
+        delegate!(self, derived_cache_clear, ctx, pred)
+    }
+
+    // --- Provenance operations (Sprint 5) ---
+
+    async fn provenance_put(
+        &self,
+        ctx: &TenantContext,
+        derived_edge_id: &str,
+        steps: &[ferrosa_memory_core::types::ProvenanceStep],
+    ) -> anyhow::Result<()> {
+        delegate!(self, provenance_put, ctx, derived_edge_id, steps)
+    }
+
+    async fn provenance_get(
+        &self,
+        ctx: &TenantContext,
+        derived_edge_id: &str,
+    ) -> anyhow::Result<Vec<ferrosa_memory_core::types::ProvenanceStep>> {
+        delegate!(self, provenance_get, ctx, derived_edge_id)
+    }
+
+    // --- Heat telemetry operations (Sprint 5) ---
+
+    async fn heat_record(
+        &self,
+        ctx: &TenantContext,
+        pred: &str,
+        hit: bool,
+        compute_ms: Option<i64>,
+    ) -> anyhow::Result<()> {
+        delegate!(self, heat_record, ctx, pred, hit, compute_ms)
+    }
+
+    async fn heat_get(
+        &self,
+        ctx: &TenantContext,
+        pred: &str,
+        days: u32,
+    ) -> anyhow::Result<(i64, i64)> {
+        delegate!(self, heat_get, ctx, pred, days)
+    }
 }
 
 /// Backoff schedule for CQL reconnection: 1s, 2s, 4s, 8s, 16s, then 30s.

@@ -1934,4 +1934,135 @@ impl Storage for CqlStorage {
             .await?;
         Ok(())
     }
+
+    // --- Warmth operations (Sprint 5) --- stubs pending CQL table creation
+
+    async fn warmth_get(
+        &self,
+        _ctx: &TenantContext,
+        _entity_id: Uuid,
+    ) -> anyhow::Result<Option<WarmthEntry>> {
+        anyhow::bail!("warmth_get: CQL table not yet created (Sprint 5)")
+    }
+
+    async fn warmth_put(&self, _ctx: &TenantContext, _entry: &WarmthEntry) -> anyhow::Result<()> {
+        anyhow::bail!("warmth_put: CQL table not yet created (Sprint 5)")
+    }
+
+    async fn warmth_boost(
+        &self,
+        _ctx: &TenantContext,
+        _entity_id: Uuid,
+        _amount: f64,
+        _session_id: Uuid,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("warmth_boost: CQL table not yet created (Sprint 5)")
+    }
+
+    async fn warmth_list_session(
+        &self,
+        _ctx: &TenantContext,
+        _session_id: Uuid,
+    ) -> anyhow::Result<Vec<WarmthEntry>> {
+        anyhow::bail!("warmth_list_session: CQL table not yet created (Sprint 5)")
+    }
+
+    async fn warmth_decay_all(
+        &self,
+        _ctx: &TenantContext,
+        _session_id: Uuid,
+        _elapsed_hours: f64,
+    ) -> anyhow::Result<usize> {
+        anyhow::bail!("warmth_decay_all: CQL table not yet created (Sprint 5)")
+    }
+
+    // --- Rule registry operations (Sprint 5) --- stubs pending CQL table creation
+
+    async fn rule_put(&self, _ctx: &TenantContext, _entry: &RuleEntry) -> anyhow::Result<()> {
+        anyhow::bail!("rule_put: CQL table not yet created (Sprint 5)")
+    }
+
+    async fn rule_list_family(
+        &self,
+        _ctx: &TenantContext,
+        _family: &str,
+        _state: RuleState,
+    ) -> anyhow::Result<Vec<RuleEntry>> {
+        anyhow::bail!("rule_list_family: CQL table not yet created (Sprint 5)")
+    }
+
+    async fn rule_get(
+        &self,
+        _ctx: &TenantContext,
+        _rule_id: &str,
+    ) -> anyhow::Result<Option<RuleEntry>> {
+        anyhow::bail!("rule_get: CQL table not yet created (Sprint 5)")
+    }
+
+    // --- Derived cache operations (Sprint 5) --- stubs pending CQL table creation
+
+    async fn derived_cache_get(
+        &self,
+        _ctx: &TenantContext,
+        _cache_key: &str,
+    ) -> anyhow::Result<Vec<DerivedFact>> {
+        anyhow::bail!("derived_cache_get: CQL table not yet created (Sprint 5)")
+    }
+
+    async fn derived_cache_put(
+        &self,
+        _ctx: &TenantContext,
+        _cache_key: &str,
+        _facts: &[DerivedFact],
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("derived_cache_put: CQL table not yet created (Sprint 5)")
+    }
+
+    async fn derived_cache_clear(
+        &self,
+        _ctx: &TenantContext,
+        _pred: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("derived_cache_clear: CQL table not yet created (Sprint 5)")
+    }
+
+    // --- Provenance operations (Sprint 5) --- stubs pending CQL table creation
+
+    async fn provenance_put(
+        &self,
+        _ctx: &TenantContext,
+        _derived_edge_id: &str,
+        _steps: &[ProvenanceStep],
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("provenance_put: CQL table not yet created (Sprint 5)")
+    }
+
+    async fn provenance_get(
+        &self,
+        _ctx: &TenantContext,
+        _derived_edge_id: &str,
+    ) -> anyhow::Result<Vec<ProvenanceStep>> {
+        anyhow::bail!("provenance_get: CQL table not yet created (Sprint 5)")
+    }
+
+    // --- Heat telemetry operations (Sprint 5) --- stubs pending CQL table creation
+
+    async fn heat_record(
+        &self,
+        _ctx: &TenantContext,
+        _pred: &str,
+        _hit: bool,
+        _compute_ms: Option<i64>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("heat_record: CQL table not yet created (Sprint 5)")
+    }
+
+    async fn heat_get(
+        &self,
+        _ctx: &TenantContext,
+        _pred: &str,
+        _days: u32,
+    ) -> anyhow::Result<(i64, i64)> {
+        anyhow::bail!("heat_get: CQL table not yet created (Sprint 5)")
+    }
 }

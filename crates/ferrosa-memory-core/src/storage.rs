@@ -14,8 +14,9 @@
 use uuid::Uuid;
 
 use crate::types::{
-    AuditEntry, EntityEntry, FeedbackOutcome, FoldEntry, FoldSummary, MemoEntry, MemoryState,
-    PlanNode, PlanStatus, TemporalEvent, TenantContext,
+    AuditEntry, DerivedFact, EntityEntry, FeedbackOutcome, FoldEntry, FoldSummary, MemoEntry,
+    MemoryState, PlanNode, PlanStatus, ProvenanceStep, RuleEntry, RuleState, TemporalEvent,
+    TenantContext, WarmthEntry,
 };
 
 /// Core storage operations for the memory system.
@@ -329,6 +330,124 @@ pub trait Storage: Send + Sync {
 
     /// Persist an audit log entry (append-only, STRIDE R1).
     async fn audit_put(&self, ctx: &TenantContext, entry: &AuditEntry) -> anyhow::Result<()>;
+
+    // --- Warmth operations (Sprint 5) ---
+
+    /// Get the warmth entry for an entity.
+    async fn warmth_get(
+        &self,
+        ctx: &TenantContext,
+        entity_id: Uuid,
+    ) -> anyhow::Result<Option<WarmthEntry>>;
+
+    /// Store or replace a warmth entry.
+    async fn warmth_put(&self, ctx: &TenantContext, entry: &WarmthEntry) -> anyhow::Result<()>;
+
+    /// Boost an entity's warmth score by `amount`, creating the entry if needed.
+    async fn warmth_boost(
+        &self,
+        ctx: &TenantContext,
+        entity_id: Uuid,
+        amount: f64,
+        session_id: Uuid,
+    ) -> anyhow::Result<()>;
+
+    /// List all warmth entries for a session.
+    async fn warmth_list_session(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<WarmthEntry>>;
+
+    /// Apply time-based decay to all warmth entries in a session.
+    /// Returns the number of entries pruned (dropped below threshold).
+    async fn warmth_decay_all(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        elapsed_hours: f64,
+    ) -> anyhow::Result<usize>;
+
+    // --- Rule registry operations (Sprint 5) ---
+
+    /// Store a rule entry.
+    async fn rule_put(&self, ctx: &TenantContext, entry: &RuleEntry) -> anyhow::Result<()>;
+
+    /// List rules matching a family and state, sorted by version descending.
+    async fn rule_list_family(
+        &self,
+        ctx: &TenantContext,
+        family: &str,
+        state: RuleState,
+    ) -> anyhow::Result<Vec<RuleEntry>>;
+
+    /// Get the highest-version rule entry by rule_id.
+    async fn rule_get(
+        &self,
+        ctx: &TenantContext,
+        rule_id: &str,
+    ) -> anyhow::Result<Option<RuleEntry>>;
+
+    // --- Derived cache operations (Sprint 5) ---
+
+    /// Get cached derived facts by cache key.
+    async fn derived_cache_get(
+        &self,
+        ctx: &TenantContext,
+        cache_key: &str,
+    ) -> anyhow::Result<Vec<DerivedFact>>;
+
+    /// Store derived facts under a cache key.
+    async fn derived_cache_put(
+        &self,
+        ctx: &TenantContext,
+        cache_key: &str,
+        facts: &[DerivedFact],
+    ) -> anyhow::Result<()>;
+
+    /// Clear derived cache entries whose key starts with `pred`.
+    async fn derived_cache_clear(
+        &self,
+        ctx: &TenantContext,
+        pred: &str,
+    ) -> anyhow::Result<()>;
+
+    // --- Provenance operations (Sprint 5) ---
+
+    /// Store provenance steps for a derived edge.
+    async fn provenance_put(
+        &self,
+        ctx: &TenantContext,
+        derived_edge_id: &str,
+        steps: &[ProvenanceStep],
+    ) -> anyhow::Result<()>;
+
+    /// Get provenance steps for a derived edge.
+    async fn provenance_get(
+        &self,
+        ctx: &TenantContext,
+        derived_edge_id: &str,
+    ) -> anyhow::Result<Vec<ProvenanceStep>>;
+
+    // --- Heat telemetry operations (Sprint 5) ---
+
+    /// Record a heat telemetry event for a predicate.
+    async fn heat_record(
+        &self,
+        ctx: &TenantContext,
+        pred: &str,
+        hit: bool,
+        compute_ms: Option<i64>,
+    ) -> anyhow::Result<()>;
+
+    /// Get aggregated heat telemetry for a predicate over `days`.
+    /// Returns (count_of_hits, sum_of_compute_ms).
+    async fn heat_get(
+        &self,
+        ctx: &TenantContext,
+        pred: &str,
+        days: u32,
+    ) -> anyhow::Result<(i64, i64)>;
 }
 
 /// In-memory mock storage for unit tests.
@@ -337,7 +456,8 @@ pub trait Storage: Send + Sync {
 #[cfg(any(test, feature = "mock-storage"))]
 pub mod mock {
     use super::*;
-    use crate::types::FoldStatus;
+    use crate::types::{DecayZone, FoldStatus};
+    use std::collections::HashMap;
     use tokio::sync::Mutex;
 
     /// An edge stored in mock storage: (source, target, edge_type, session_id).
@@ -360,6 +480,11 @@ pub mod mock {
         pub intentions: Mutex<Vec<crate::intention::Intention>>,
         pub edges: Mutex<Vec<MockEdge>>,
         pub audit_entries: Mutex<Vec<AuditEntry>>,
+        pub warmth_entries: Mutex<Vec<WarmthEntry>>,
+        pub rules: Mutex<Vec<RuleEntry>>,
+        pub derived_cache: Mutex<HashMap<String, Vec<DerivedFact>>>,
+        pub provenance: Mutex<HashMap<String, Vec<ProvenanceStep>>>,
+        pub heat_records: Mutex<Vec<(String, bool, Option<i64>)>>,
     }
 
     impl MockStorage {
@@ -937,6 +1062,414 @@ pub mod mock {
         async fn audit_put(&self, _ctx: &TenantContext, entry: &AuditEntry) -> anyhow::Result<()> {
             self.audit_entries.lock().await.push(entry.clone());
             Ok(())
+        }
+
+        // --- Warmth operations ---
+
+        async fn warmth_get(
+            &self,
+            ctx: &TenantContext,
+            entity_id: Uuid,
+        ) -> anyhow::Result<Option<WarmthEntry>> {
+            let entries = self.warmth_entries.lock().await;
+            Ok(entries
+                .iter()
+                .find(|e| e.tenant_id == ctx.tenant_id && e.entity_id == entity_id)
+                .cloned())
+        }
+
+        async fn warmth_put(
+            &self,
+            _ctx: &TenantContext,
+            entry: &WarmthEntry,
+        ) -> anyhow::Result<()> {
+            let mut entries = self.warmth_entries.lock().await;
+            if let Some(existing) = entries
+                .iter_mut()
+                .find(|e| e.tenant_id == entry.tenant_id && e.entity_id == entry.entity_id)
+            {
+                *existing = entry.clone();
+            } else {
+                entries.push(entry.clone());
+            }
+            Ok(())
+        }
+
+        async fn warmth_boost(
+            &self,
+            ctx: &TenantContext,
+            entity_id: Uuid,
+            amount: f64,
+            session_id: Uuid,
+        ) -> anyhow::Result<()> {
+            let mut entries = self.warmth_entries.lock().await;
+            if let Some(existing) = entries
+                .iter_mut()
+                .find(|e| e.tenant_id == ctx.tenant_id && e.entity_id == entity_id)
+            {
+                existing.warmth += amount;
+                existing.access_count += 1;
+                existing.last_accessed_at = chrono::Utc::now();
+                existing.updated_at = chrono::Utc::now();
+            } else {
+                entries.push(WarmthEntry {
+                    tenant_id: ctx.tenant_id,
+                    entity_id,
+                    session_id,
+                    warmth: amount,
+                    pagerank: 0.0,
+                    last_accessed_at: chrono::Utc::now(),
+                    access_count: 1,
+                    decay_zone: DecayZone::Knowledge,
+                    updated_at: chrono::Utc::now(),
+                });
+            }
+            Ok(())
+        }
+
+        async fn warmth_list_session(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+        ) -> anyhow::Result<Vec<WarmthEntry>> {
+            let entries = self.warmth_entries.lock().await;
+            Ok(entries
+                .iter()
+                .filter(|e| e.tenant_id == ctx.tenant_id && e.session_id == session_id)
+                .cloned()
+                .collect())
+        }
+
+        async fn warmth_decay_all(
+            &self,
+            _ctx: &TenantContext,
+            session_id: Uuid,
+            elapsed_hours: f64,
+        ) -> anyhow::Result<usize> {
+            let mut entries = self.warmth_entries.lock().await;
+            for entry in entries.iter_mut().filter(|e| e.session_id == session_id) {
+                entry.warmth *=
+                    (-elapsed_hours * entry.decay_zone.decay_multiplier() * 0.1_f64).exp();
+            }
+            let before = entries.len();
+            entries.retain(|e| e.session_id != session_id || e.warmth >= 0.01);
+            Ok(before - entries.len())
+        }
+
+        // --- Rule registry operations ---
+
+        async fn rule_put(
+            &self,
+            _ctx: &TenantContext,
+            entry: &RuleEntry,
+        ) -> anyhow::Result<()> {
+            self.rules.lock().await.push(entry.clone());
+            Ok(())
+        }
+
+        async fn rule_list_family(
+            &self,
+            _ctx: &TenantContext,
+            family: &str,
+            state: RuleState,
+        ) -> anyhow::Result<Vec<RuleEntry>> {
+            let rules = self.rules.lock().await;
+            let mut matched: Vec<RuleEntry> = rules
+                .iter()
+                .filter(|r| r.family == family && r.state == state)
+                .cloned()
+                .collect();
+            matched.sort_by(|a, b| b.version.cmp(&a.version));
+            Ok(matched)
+        }
+
+        async fn rule_get(
+            &self,
+            _ctx: &TenantContext,
+            rule_id: &str,
+        ) -> anyhow::Result<Option<RuleEntry>> {
+            let rules = self.rules.lock().await;
+            let mut matched: Vec<&RuleEntry> =
+                rules.iter().filter(|r| r.rule_id == rule_id).collect();
+            matched.sort_by(|a, b| b.version.cmp(&a.version));
+            Ok(matched.first().cloned().cloned())
+        }
+
+        // --- Derived cache operations ---
+
+        async fn derived_cache_get(
+            &self,
+            _ctx: &TenantContext,
+            cache_key: &str,
+        ) -> anyhow::Result<Vec<DerivedFact>> {
+            let cache = self.derived_cache.lock().await;
+            Ok(cache.get(cache_key).cloned().unwrap_or_default())
+        }
+
+        async fn derived_cache_put(
+            &self,
+            _ctx: &TenantContext,
+            cache_key: &str,
+            facts: &[DerivedFact],
+        ) -> anyhow::Result<()> {
+            let mut cache = self.derived_cache.lock().await;
+            cache.insert(cache_key.to_string(), facts.to_vec());
+            Ok(())
+        }
+
+        async fn derived_cache_clear(
+            &self,
+            _ctx: &TenantContext,
+            pred: &str,
+        ) -> anyhow::Result<()> {
+            let mut cache = self.derived_cache.lock().await;
+            cache.retain(|k, _| !k.starts_with(pred));
+            Ok(())
+        }
+
+        // --- Provenance operations ---
+
+        async fn provenance_put(
+            &self,
+            _ctx: &TenantContext,
+            derived_edge_id: &str,
+            steps: &[ProvenanceStep],
+        ) -> anyhow::Result<()> {
+            let mut prov = self.provenance.lock().await;
+            prov.insert(derived_edge_id.to_string(), steps.to_vec());
+            Ok(())
+        }
+
+        async fn provenance_get(
+            &self,
+            _ctx: &TenantContext,
+            derived_edge_id: &str,
+        ) -> anyhow::Result<Vec<ProvenanceStep>> {
+            let prov = self.provenance.lock().await;
+            Ok(prov.get(derived_edge_id).cloned().unwrap_or_default())
+        }
+
+        // --- Heat telemetry operations ---
+
+        async fn heat_record(
+            &self,
+            _ctx: &TenantContext,
+            pred: &str,
+            hit: bool,
+            compute_ms: Option<i64>,
+        ) -> anyhow::Result<()> {
+            self.heat_records
+                .lock()
+                .await
+                .push((pred.to_string(), hit, compute_ms));
+            Ok(())
+        }
+
+        async fn heat_get(
+            &self,
+            _ctx: &TenantContext,
+            pred: &str,
+            _days: u32,
+        ) -> anyhow::Result<(i64, i64)> {
+            let records = self.heat_records.lock().await;
+            let mut hit_count: i64 = 0;
+            let mut compute_sum: i64 = 0;
+            for (p, hit, ms) in records.iter() {
+                if p == pred {
+                    if *hit {
+                        hit_count += 1;
+                    }
+                    if let Some(val) = ms {
+                        compute_sum += val;
+                    }
+                }
+            }
+            Ok((hit_count, compute_sum))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_warmth_crud() {
+            let storage = MockStorage::new();
+            let ctx = TenantContext {
+                tenant_id: Uuid::new_v4(),
+                session_origin: "test".into(),
+            };
+            let eid = Uuid::new_v4();
+            let sid = Uuid::new_v4();
+
+            // Initially empty
+            assert!(storage.warmth_get(&ctx, eid).await.unwrap().is_none());
+
+            // Boost creates entry
+            storage.warmth_boost(&ctx, eid, 0.3, sid).await.unwrap();
+            let entry = storage.warmth_get(&ctx, eid).await.unwrap().unwrap();
+            assert!((entry.warmth - 0.3).abs() < f64::EPSILON);
+            assert_eq!(entry.access_count, 1);
+
+            // Second boost increments
+            storage.warmth_boost(&ctx, eid, 0.3, sid).await.unwrap();
+            let entry = storage.warmth_get(&ctx, eid).await.unwrap().unwrap();
+            assert!((entry.warmth - 0.6).abs() < f64::EPSILON);
+            assert_eq!(entry.access_count, 2);
+
+            // List session
+            let entries = storage.warmth_list_session(&ctx, sid).await.unwrap();
+            assert_eq!(entries.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn test_warmth_decay() {
+            let storage = MockStorage::new();
+            let ctx = TenantContext {
+                tenant_id: Uuid::new_v4(),
+                session_origin: "test".into(),
+            };
+            let sid = Uuid::new_v4();
+
+            // Create entry with high warmth
+            storage
+                .warmth_boost(&ctx, Uuid::new_v4(), 5.0, sid)
+                .await
+                .unwrap();
+
+            // Decay should reduce warmth but not prune
+            let pruned = storage.warmth_decay_all(&ctx, sid, 10.0).await.unwrap();
+            assert_eq!(pruned, 0); // 5.0 * exp(-0.1 * 10 * 1.0) ~ 1.84 > 0.01
+
+            // Heavy decay should prune
+            let pruned = storage.warmth_decay_all(&ctx, sid, 100.0).await.unwrap();
+            assert_eq!(pruned, 1);
+        }
+
+        #[tokio::test]
+        async fn test_rule_registry() {
+            let storage = MockStorage::new();
+            let ctx = TenantContext {
+                tenant_id: Uuid::new_v4(),
+                session_origin: "test".into(),
+            };
+
+            let rule = RuleEntry {
+                tenant_id: ctx.tenant_id,
+                rule_id: "test_rule".into(),
+                version: 1,
+                name: "Test".into(),
+                family: "test_family".into(),
+                state: RuleState::Active,
+                rule_body: "related(X, Y) :- co_occurs(X, Y).".into(),
+                rule_weight: 1.0,
+                incremental: false,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            };
+            storage.rule_put(&ctx, &rule).await.unwrap();
+
+            let found = storage.rule_get(&ctx, "test_rule").await.unwrap();
+            assert!(found.is_some());
+            assert_eq!(found.unwrap().version, 1);
+
+            let family = storage
+                .rule_list_family(&ctx, "test_family", RuleState::Active)
+                .await
+                .unwrap();
+            assert_eq!(family.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn test_derived_cache() {
+            let storage = MockStorage::new();
+            let ctx = TenantContext {
+                tenant_id: Uuid::new_v4(),
+                session_origin: "test".into(),
+            };
+
+            let facts = vec![DerivedFact {
+                src_id: "a".into(),
+                pred: "related".into(),
+                dst_id: "b".into(),
+                confidence: 0.9,
+                rule_id: "r1".into(),
+                support_count: 1,
+                provenance: vec![],
+            }];
+
+            // Miss
+            assert!(storage
+                .derived_cache_get(&ctx, "key1")
+                .await
+                .unwrap()
+                .is_empty());
+
+            // Put + hit
+            storage
+                .derived_cache_put(&ctx, "key1", &facts)
+                .await
+                .unwrap();
+            let cached = storage.derived_cache_get(&ctx, "key1").await.unwrap();
+            assert_eq!(cached.len(), 1);
+
+            // Clear by prefix
+            storage.derived_cache_clear(&ctx, "key").await.unwrap();
+            assert!(storage
+                .derived_cache_get(&ctx, "key1")
+                .await
+                .unwrap()
+                .is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_provenance() {
+            let storage = MockStorage::new();
+            let ctx = TenantContext {
+                tenant_id: Uuid::new_v4(),
+                session_origin: "test".into(),
+            };
+
+            let steps = vec![ProvenanceStep {
+                parent_src: "a".into(),
+                parent_pred: "co_occurs".into(),
+                parent_dst: "b".into(),
+                parent_kind: "base".into(),
+            }];
+
+            storage
+                .provenance_put(&ctx, "edge1", &steps)
+                .await
+                .unwrap();
+            let got = storage.provenance_get(&ctx, "edge1").await.unwrap();
+            assert_eq!(got.len(), 1);
+            assert_eq!(got[0].parent_pred, "co_occurs");
+        }
+
+        #[tokio::test]
+        async fn test_heat_telemetry() {
+            let storage = MockStorage::new();
+            let ctx = TenantContext {
+                tenant_id: Uuid::new_v4(),
+                session_origin: "test".into(),
+            };
+
+            storage
+                .heat_record(&ctx, "co_occurs", true, Some(50))
+                .await
+                .unwrap();
+            storage
+                .heat_record(&ctx, "co_occurs", true, Some(30))
+                .await
+                .unwrap();
+            storage
+                .heat_record(&ctx, "co_occurs", false, Some(10))
+                .await
+                .unwrap();
+
+            let (hits, compute) = storage.heat_get(&ctx, "co_occurs", 7).await.unwrap();
+            assert_eq!(hits, 2);
+            assert_eq!(compute, 90);
         }
     }
 }

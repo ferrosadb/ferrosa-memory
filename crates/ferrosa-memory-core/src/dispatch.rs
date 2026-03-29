@@ -627,6 +627,73 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "required": ["session_id"]
             }),
         },
+        // --- Recursive exploration ---
+        ToolDef {
+            name: "recursive_explore".into(),
+            description: "Recursive multi-pass query exploration with Datalog-driven discovery.\n\n\
+                CALL WHEN:\n\
+                - Complex multi-hop queries that need connected knowledge clusters\n\
+                - Queries involving relationships between entities\n\
+                - When hybrid_search returns too few results\n\n\
+                DO NOT CALL:\n\
+                - For simple name lookups (use retrieve_entities)\n\
+                - For direct entity retrieval by ID\n\n\
+                Cost: Multiple passes × hybrid_search cost. Bounded by max_passes.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Session UUID" },
+                    "query": { "type": "string", "description": "Search query to explore recursively" },
+                    "embedding": { "type": "array", "items": { "type": "number" }, "description": "Optional query embedding vector" },
+                    "max_passes": { "type": "integer", "minimum": 1, "maximum": 5, "description": "Max exploration passes (default 3)" },
+                    "convergence_threshold": { "type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Novelty ratio for convergence (default 0.1)" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Max results (default 20)" }
+                },
+                "required": ["query"]
+            }),
+        },
+        // --- Datalog query ---
+        ToolDef {
+            name: "query_derived".into(),
+            description: "Query Datalog-derived facts with provenance.\n\n\
+                CALL WHEN:\n\
+                - You need to explain why entity A relates to entity B\n\
+                - You want transitive closure (related, reachable, isa)\n\
+                - You need derived facts with explanation chains\n\n\
+                DO NOT CALL:\n\
+                - For raw entity retrieval (use retrieve_entities)\n\n\
+                Cost: Cache hit is free. Cache miss computes Datalog evaluation.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Session UUID" },
+                    "predicate": { "type": "string", "description": "Derived predicate to query (e.g., 'related', 'reachable', 'isa', 'cluster')" }
+                },
+                "required": ["predicate"]
+            }),
+        },
+        // --- Datalog rule management ---
+        ToolDef {
+            name: "manage_rules".into(),
+            description: "CRUD for Datalog rule registry.\n\n\
+                CALL WHEN:\n\
+                - Adding custom inference rules\n\
+                - Listing active rules\n\
+                - Deprecating old rules\n\n\
+                Cost: Low (registry operations).".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list", "get", "put", "deprecate"], "description": "CRUD action" },
+                    "rule_id": { "type": "string", "description": "Rule ID (for get/put/deprecate)" },
+                    "family": { "type": "string", "description": "Rule family (for list/put)" },
+                    "rule_body": { "type": "string", "description": "Datalog rule text (for put)" },
+                    "name": { "type": "string", "description": "Human-readable name (for put)" },
+                    "rule_weight": { "type": "number", "description": "Rule confidence weight (default 1.0)" }
+                },
+                "required": ["action"]
+            }),
+        },
     ]
 }
 
@@ -727,6 +794,9 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "predict_needed" => handle_predict_needed(args, session).await,
         "spread_activation" => handle_spread_activation(args, storage, ctx).await,
         "find_duplicates" => handle_find_duplicates(args, storage, ctx).await,
+        "recursive_explore" => handle_recursive_explore(args, storage, ctx, session).await,
+        "query_derived" => handle_query_derived(args, storage, ctx).await,
+        "manage_rules" => handle_manage_rules(args, storage, ctx).await,
         _ => Err((METHOD_NOT_FOUND, format!("unknown tool: {name}"))),
     };
     let elapsed = start.elapsed();
@@ -789,6 +859,7 @@ fn is_write_tool(name: &str) -> bool {
             | "write_temporal_fact"
             | "promote_memory"
             | "demote_memory"
+            | "manage_rules"
     )
 }
 
@@ -1210,6 +1281,20 @@ async fn handle_retrieve_entities<S: crate::storage::Storage>(
                     });
             }
         }
+    }
+
+    // Warmth boost for retrieved entities (fire-and-forget)
+    let rmh_config = crate::config::RmhConfig::default();
+    for entity in &entities {
+        let _ = crate::warmth::boost_on_access(
+            storage,
+            ctx,
+            entity.entity_id,
+            session_id,
+            &crate::types::DecayZone::Knowledge,
+            &rmh_config,
+        )
+        .await;
     }
 
     serde_json::to_value(&entities).map_err(|e| (INTERNAL_ERROR, e.to_string()))
@@ -1705,6 +1790,9 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         query,
         embedding.as_deref(),
         limit,
+        None,
+        None,
+        &crate::hybrid_search::FusionConfig::default(),
     )
     .await
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
@@ -1844,7 +1932,7 @@ async fn handle_find_memory_chain<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
-    let _session_id = optional_uuid(&args, "session_id")?;
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
     let source = require_uuid(&args, "source")?;
     let destination = require_uuid(&args, "destination")?;
     let max_hops = args
@@ -1858,7 +1946,22 @@ async fn handle_find_memory_chain<S: crate::storage::Storage>(
         .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
     match chain {
-        Some(c) => serde_json::to_value(&c).map_err(|e| (INTERNAL_ERROR, e.to_string())),
+        Some(ref c) => {
+            // Warmth boost for entities on the path (fire-and-forget)
+            let rmh_config = crate::config::RmhConfig::default();
+            for step in &c.steps {
+                let _ = crate::warmth::boost_on_access(
+                    storage,
+                    ctx,
+                    step.entity_id,
+                    session_id,
+                    &crate::types::DecayZone::Knowledge,
+                    &rmh_config,
+                )
+                .await;
+            }
+            serde_json::to_value(c).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+        }
         None => Ok(serde_json::json!({
             "found": false,
             "source": source.to_string(),
@@ -1910,7 +2013,6 @@ async fn handle_spread_activation<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
     let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
-    let _ = session_id; // reserved for future tenant-scoped filtering
 
     let seeds_arr = args
         .get("seeds")
@@ -1944,10 +2046,303 @@ async fn handle_spread_activation<S: crate::storage::Storage>(
         .await
         .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
+    // Warmth boost for seeds and top activated results (fire-and-forget)
+    let rmh_config = crate::config::RmhConfig::default();
+    for seed_id in &seeds {
+        let _ = crate::warmth::boost_on_access(
+            storage,
+            ctx,
+            *seed_id,
+            session_id,
+            &crate::types::DecayZone::Knowledge,
+            &rmh_config,
+        )
+        .await;
+    }
+    for activated in &results {
+        let _ = crate::warmth::boost_on_access(
+            storage,
+            ctx,
+            activated.entity_id,
+            session_id,
+            &crate::types::DecayZone::Knowledge,
+            &rmh_config,
+        )
+        .await;
+    }
+
     Ok(serde_json::json!({
         "activated": results,
         "count": results.len()
     }))
+}
+
+// --- Recursive explore / Datalog / Rule handlers ---
+
+async fn handle_recursive_explore<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let query = require_str(&args, "query")?;
+    let session_id = optional_uuid(&args, "session_id")?
+        .or(session.default_session_id)
+        .unwrap_or_else(uuid::Uuid::new_v4);
+
+    // Parse optional embedding
+    let embedding: Option<Vec<f32>> = args
+        .get("embedding")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_f64().map(|f| f as f32))
+                .collect()
+        });
+    let embedding_ref = embedding.as_deref();
+
+    let mut rmh_config = crate::config::RmhConfig::default();
+    if let Some(mp) = args.get("max_passes").and_then(|v| v.as_u64()) {
+        rmh_config.max_explore_passes = mp as usize;
+    }
+    if let Some(ct) = args.get("convergence_threshold").and_then(|v| v.as_f64()) {
+        rmh_config.convergence_threshold = ct;
+    }
+    let datalog_config = crate::config::DatalogConfig::default();
+
+    let result = crate::recursive_explore::explore(
+        storage,
+        ctx,
+        session_id,
+        query,
+        embedding_ref,
+        &rmh_config,
+        &datalog_config,
+    )
+    .await
+    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20) as usize;
+    let results: Vec<Value> = result
+        .results
+        .iter()
+        .take(limit)
+        .map(|r| {
+            serde_json::json!({
+                "id": r.id.to_string(),
+                "source": r.source,
+                "content": r.content,
+                "score": r.score,
+                "result_type": r.result_type,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "results": results,
+        "count": results.len(),
+        "sub_queries": result.sub_queries.iter().map(|sq| {
+            serde_json::json!({ "query": sq.query_text, "reasoning": sq.reasoning })
+        }).collect::<Vec<_>>(),
+        "passes": result.passes,
+        "converged": result.converged,
+        "derived_facts_count": result.derived_facts_count,
+        "hint": if results.is_empty() {
+            "No results found. Try smart_ingest to add entities first."
+        } else {
+            "Recursive exploration found connected knowledge clusters."
+        }
+    }))
+}
+
+async fn handle_query_derived<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let predicate = require_str(&args, "predicate")?;
+    let session_id = optional_uuid(&args, "session_id")?
+        .unwrap_or_else(uuid::Uuid::new_v4);
+
+    let config = crate::config::DatalogConfig::default();
+    let facts = crate::datalog::query_predicate(storage, ctx, session_id, predicate, &config)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    let results: Vec<Value> = facts
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "src_id": f.src_id,
+                "predicate": f.pred,
+                "dst_id": f.dst_id,
+                "confidence": f.confidence,
+                "rule_id": f.rule_id,
+                "support_count": f.support_count,
+                "provenance": f.provenance.iter().map(|p| {
+                    serde_json::json!({
+                        "parent_src": p.parent_src,
+                        "parent_pred": p.parent_pred,
+                        "parent_dst": p.parent_dst,
+                        "parent_kind": p.parent_kind,
+                    })
+                }).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "predicate": predicate,
+        "derived_facts": results,
+        "count": results.len(),
+    }))
+}
+
+async fn handle_manage_rules<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let action = require_str(&args, "action")?;
+
+    match action {
+        "list" => {
+            let family = args.get("family").and_then(|v| v.as_str()).unwrap_or("*");
+            if family == "*" {
+                // List all active rules -- return built-in rules
+                let builtins = crate::datalog::builtin_rules();
+                return Ok(serde_json::json!({
+                    "action": "list",
+                    "rules": builtins.iter().map(|r| {
+                        serde_json::json!({ "head": r.head.predicate, "body_count": r.body.len() })
+                    }).collect::<Vec<_>>(),
+                    "count": builtins.len(),
+                    "hint": "Showing built-in rules. Use family parameter to filter stored rules."
+                }));
+            }
+            let rules = storage
+                .rule_list_family(ctx, family, crate::types::RuleState::Active)
+                .await
+                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+            let results: Vec<Value> = rules
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "rule_id": r.rule_id,
+                        "version": r.version,
+                        "name": r.name,
+                        "family": r.family,
+                        "state": r.state.to_string(),
+                        "rule_body": r.rule_body,
+                        "rule_weight": r.rule_weight,
+                    })
+                })
+                .collect();
+
+            Ok(serde_json::json!({ "action": "list", "rules": results, "count": results.len() }))
+        }
+        "get" => {
+            let rule_id = require_str(&args, "rule_id")?;
+            let rule = storage
+                .rule_get(ctx, rule_id)
+                .await
+                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+            match rule {
+                Some(r) => Ok(serde_json::json!({
+                    "action": "get",
+                    "rule": {
+                        "rule_id": r.rule_id, "version": r.version, "name": r.name,
+                        "family": r.family, "rule_body": r.rule_body, "rule_weight": r.rule_weight
+                    }
+                })),
+                None => Ok(serde_json::json!({ "action": "get", "rule": null })),
+            }
+        }
+        "put" => {
+            let rule_id = require_str(&args, "rule_id")?;
+            let rule_body = require_str(&args, "rule_body")?;
+
+            // Validate rule parses (STRIDE S7 -- reject malformed rules)
+            crate::datalog::parse_rule(rule_body)
+                .map_err(|e| (INVALID_PARAMS, format!("Invalid rule syntax: {e}")))?;
+
+            let family = args.get("family").and_then(|v| v.as_str()).unwrap_or("custom");
+            let name = args.get("name").and_then(|v| v.as_str()).unwrap_or(rule_id);
+            let weight = args
+                .get("rule_weight")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0);
+
+            // Get current version to auto-increment
+            let version = match storage
+                .rule_get(ctx, rule_id)
+                .await
+                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+            {
+                Some(existing) => existing.version + 1,
+                None => 1,
+            };
+
+            let entry = crate::types::RuleEntry {
+                tenant_id: ctx.tenant_id,
+                rule_id: rule_id.to_string(),
+                version,
+                name: name.to_string(),
+                family: family.to_string(),
+                state: crate::types::RuleState::Active,
+                rule_body: rule_body.to_string(),
+                rule_weight: weight,
+                incremental: false,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            };
+
+            storage
+                .rule_put(ctx, &entry)
+                .await
+                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+            // Invalidate derived cache for affected predicates
+            let parsed = crate::datalog::parse_rule(rule_body).unwrap();
+            let _ = storage
+                .derived_cache_clear(ctx, &parsed.head.predicate)
+                .await;
+
+            Ok(serde_json::json!({
+                "action": "put",
+                "rule_id": rule_id,
+                "version": version,
+                "hint": "Rule stored. Derived cache invalidated for affected predicate."
+            }))
+        }
+        "deprecate" => {
+            let rule_id = require_str(&args, "rule_id")?;
+            match storage
+                .rule_get(ctx, rule_id)
+                .await
+                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+            {
+                Some(mut rule) => {
+                    rule.state = crate::types::RuleState::Deprecated;
+                    rule.updated_at = chrono::Utc::now();
+                    storage
+                        .rule_put(ctx, &rule)
+                        .await
+                        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+                    Ok(serde_json::json!({ "action": "deprecate", "rule_id": rule_id, "deprecated": true }))
+                }
+                None => Ok(serde_json::json!({ "action": "deprecate", "rule_id": rule_id, "deprecated": false, "error": "Rule not found" })),
+            }
+        }
+        _ => Err((
+            INVALID_PARAMS,
+            format!("Unknown action: {action}. Use list/get/put/deprecate."),
+        )),
+    }
 }
 
 // --- Error mapping helpers ---
@@ -2078,7 +2473,7 @@ mod tests {
             .await
             .unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 32);
+        assert_eq!(tools.len(), 35);
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"check_memo_cache"));
@@ -2099,6 +2494,9 @@ mod tests {
         assert!(names.contains(&"predict_needed"));
         assert!(names.contains(&"spread_activation"));
         assert!(names.contains(&"find_duplicates"));
+        assert!(names.contains(&"recursive_explore"));
+        assert!(names.contains(&"query_derived"));
+        assert!(names.contains(&"manage_rules"));
     }
 
     #[tokio::test]

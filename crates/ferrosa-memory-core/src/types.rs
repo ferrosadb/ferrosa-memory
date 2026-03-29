@@ -3,6 +3,7 @@
 //! These types represent the core data structures that flow through the system:
 //! tool parameters, tool results, and internal representations of stored data.
 
+use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -194,4 +195,251 @@ pub struct AuditEntry {
     pub target_id: String,
     pub session_id: Uuid,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+// ─── Sprint 5: Warmth types ────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum DecayZone {
+    Identity,
+    Knowledge,
+    Operational,
+}
+
+impl DecayZone {
+    pub fn decay_multiplier(&self) -> f64 {
+        match self {
+            Self::Identity => 0.1,
+            Self::Knowledge => 1.0,
+            Self::Operational => 3.0,
+        }
+    }
+}
+
+impl std::fmt::Display for DecayZone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Identity => write!(f, "identity"),
+            Self::Knowledge => write!(f, "knowledge"),
+            Self::Operational => write!(f, "operational"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WarmthEntry {
+    pub tenant_id: Uuid,
+    pub entity_id: Uuid,
+    pub session_id: Uuid,
+    pub warmth: f64,
+    pub pagerank: f64,
+    pub last_accessed_at: chrono::DateTime<chrono::Utc>,
+    pub access_count: i64,
+    pub decay_zone: DecayZone,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+// ─── Sprint 5: Datalog types ───────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value")]
+pub enum Term {
+    Var(String),
+    Const(Uuid),
+    ConstStr(String),
+    ConstFloat(OrderedFloat<f64>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Atom {
+    pub predicate: String,
+    pub args: Vec<Term>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum BuiltinFilter {
+    GreaterThan(String, f64),
+    LessThan(String, f64),
+    NotEqual(String, String),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DatalogRule {
+    pub head: Atom,
+    pub body: Vec<Atom>,
+    pub filters: Vec<BuiltinFilter>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleEntry {
+    pub tenant_id: Uuid,
+    pub rule_id: String,
+    pub version: i32,
+    pub name: String,
+    pub family: String,
+    pub state: RuleState,
+    pub rule_body: String,
+    pub rule_weight: f64,
+    pub incremental: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleState {
+    Active,
+    Deprecated,
+    Superseded,
+}
+
+impl std::fmt::Display for RuleState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Active => write!(f, "active"),
+            Self::Deprecated => write!(f, "deprecated"),
+            Self::Superseded => write!(f, "superseded"),
+        }
+    }
+}
+
+// ─── Sprint 5: Fact set and derived facts ──────────────────────
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FactSet {
+    pub facts: std::collections::HashMap<String, std::collections::HashSet<Vec<Term>>>,
+}
+
+impl FactSet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, predicate: &str, args: Vec<Term>) -> bool {
+        self.facts
+            .entry(predicate.to_string())
+            .or_default()
+            .insert(args)
+    }
+
+    pub fn contains(&self, predicate: &str, args: &[Term]) -> bool {
+        self.facts
+            .get(predicate)
+            .is_some_and(|set| set.contains(args))
+    }
+
+    pub fn len(&self) -> usize {
+        self.facts.values().map(|s| s.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get(&self, predicate: &str) -> Option<&std::collections::HashSet<Vec<Term>>> {
+        self.facts.get(predicate)
+    }
+
+    pub fn predicates(&self) -> impl Iterator<Item = &String> {
+        self.facts.keys()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DerivedFact {
+    pub src_id: String,
+    pub pred: String,
+    pub dst_id: String,
+    pub confidence: f64,
+    pub rule_id: String,
+    pub support_count: i32,
+    pub provenance: Vec<ProvenanceStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvenanceStep {
+    pub parent_src: String,
+    pub parent_pred: String,
+    pub parent_dst: String,
+    pub parent_kind: String,
+}
+
+// ─── Sprint 5: Recursive exploration types ─────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecursiveExploreResult {
+    pub sub_queries: Vec<SubQuery>,
+    pub results: Vec<crate::hybrid_search::SearchResult>,
+    pub passes: usize,
+    pub converged: bool,
+    pub derived_facts_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubQuery {
+    pub query_text: String,
+    pub reasoning: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decay_zone_multipliers() {
+        assert!((DecayZone::Identity.decay_multiplier() - 0.1).abs() < f64::EPSILON);
+        assert!((DecayZone::Knowledge.decay_multiplier() - 1.0).abs() < f64::EPSILON);
+        assert!((DecayZone::Operational.decay_multiplier() - 3.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_fact_set_operations() {
+        let mut fs = FactSet::new();
+        assert!(fs.is_empty());
+
+        let args = vec![
+            Term::Const(Uuid::new_v4()),
+            Term::ConstStr("co_occurs".into()),
+            Term::Const(Uuid::new_v4()),
+        ];
+        assert!(fs.insert("edge", args.clone()));
+        assert!(!fs.insert("edge", args.clone())); // duplicate
+        assert_eq!(fs.len(), 1);
+        assert!(fs.contains("edge", &args));
+        assert!(!fs.contains("node", &args));
+    }
+
+    #[test]
+    fn test_decay_zone_serde() {
+        let zone = DecayZone::Identity;
+        let json = serde_json::to_string(&zone).unwrap();
+        assert_eq!(json, "\"identity\"");
+        let back: DecayZone = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, zone);
+    }
+
+    #[test]
+    fn test_rule_state_serde() {
+        let state = RuleState::Active;
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(json, "\"active\"");
+        let back: RuleState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, state);
+    }
+
+    #[test]
+    fn test_term_serde_round_trip() {
+        let terms = vec![
+            Term::Var("X".into()),
+            Term::Const(Uuid::nil()),
+            Term::ConstStr("hello".into()),
+            Term::ConstFloat(OrderedFloat(3.14)),
+        ];
+        for term in terms {
+            let json = serde_json::to_string(&term).unwrap();
+            let back: Term = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, term);
+        }
+    }
 }

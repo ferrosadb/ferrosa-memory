@@ -1,7 +1,7 @@
 # Failure Mode and Effects Analysis — ferrosa-memory-mcp
 
-> Last updated: 2026-03-25
-> Status: Updated — F31/F32 resolved; added F33–F37 for cognitive tools, visualization, and smart ingest. get_stats enrichment and SSE anomaly subscription added (Sprint 4.9).
+> Last updated: 2026-03-29
+> Status: Updated — Sprint 5 failure modes added (F42–F52) for Datalog inference, warmth field, PageRank, and recursive explore components.
 
 ## Scoring Criteria
 
@@ -103,9 +103,12 @@
 |-----|----|-------------|-----------|
 | **189** | F19 | Memory poisoning via crafted entities | entity_tools |
 | **168** | F18 | Phonetic false merge corrupts entities | entity_tools |
+| **150** | F51 | Query decomposition produces irrelevant sub-queries | recursive_explore |
 | **144** | F17 | HNSW returns irrelevant fold summaries | fold_tools |
+| **140** | F45 | Derived cache returns stale facts after rule change | datalog |
 | **126** | F13 | Orphaned fold vertex (partial write) | fold_tools |
 | **120** | F06 | Router selects wrong strategy | tool_router |
+| **120** | F46 | Warmth runaway feedback loop | warmth |
 | **108** | F01 | CQL connection pool exhaustion | cql_client |
 | **105** | F09 | Stale memo cache (model version) | memo_tools |
 | **105** | F21 | Broken supersession chain | temporal_events |
@@ -117,16 +120,24 @@
 | **84** | F02 | Prepared statement cache miss | cql_client |
 | **80** | F33 | WebSocket visualizer connection leak | visualization |
 | **80** | F36 | Dream consolidation stale co-occurrence | cognitive tools |
+| **80** | F43 | Rule parsing accepts invalid syntax | datalog |
 | **75** | F03 | CQL query timeout on large partition | cql_client |
+| **75** | F48 | Decay pass deletes still-relevant entities | warmth |
 | **72** | F10 | SHA-256 collision (accepted risk) | memo_tools |
 | **72** | F22 | Duplicate current facts for entity | temporal_events |
 | **72** | F29 | Malformed JSON-RPC crashes server | transport |
+| **72** | F42 | Semi-naive evaluation diverges (no fixpoint) | datalog |
 | **60** | F11 | Thundering herd duplicate writes | memo_tools |
 | **60** | F12 | TTL sweep job failure | memo_tools |
+| **60** | F44 | Confidence propagation produces values > 1.0 | datalog |
 | **56** | F25 | Ollama endpoint down | embedding_client |
 | **54** | F24 | HTTP credentials over plaintext | auth |
 | **48** | F37 | Quota enforcement race condition | quota enforcement |
 | **42** | F34 | Spreading activation infinite loop | cognitive tools |
+| **36** | F47 | Warmth boost blocks retrieval response | warmth |
+| **36** | F52 | Convergence detection fails (never converges) | recursive_explore |
+| **27** | F49 | PPR computation fails during consolidation | pagerank |
+| **16** | F50 | PPR scores all zero (disconnected graph) | pagerank |
 
 ## Test Cases for RPN >= 50
 
@@ -191,6 +202,37 @@
 |----|-------------|--------|---|---|---|-----|-------------------|
 | F37 | Quota enforcement race condition | Concurrent writes could exceed quota if count check and write aren't atomic. Tenant exceeds allocated storage. | 4 | 3 | 4 | **48** | Slight over-quota acceptable. Counts are eventually consistent. Hard limit enforced at next read. |
 
+### Component: datalog (M35) — Inference Engine
+
+| ID | Failure Mode | Effect | S | O | D | RPN | Recommended Action |
+|----|-------------|--------|---|---|---|-----|-------------------|
+| F42 | Semi-naive evaluation diverges (no fixpoint) | Infinite loop, CPU exhaustion. Tool call hangs indefinitely, blocking agent. | 8 | 3 | 3 | **72** | `max_iterations=100` hard cap in evaluator. Log iteration count on every evaluation. Alert if >50 iterations on any single evaluation. Integration test with cyclic rules verifies cap triggers. |
+| F43 | Rule parsing accepts invalid syntax | Garbage rules stored in registry, causing evaluation errors or panics on next inference. | 5 | 4 | 4 | **80** | `parse_rule()` validates before storage — reject rules that don't produce valid AST. Test all built-in rules parse correctly. Fuzz test parser with random input. |
+| F44 | Confidence propagation produces values > 1.0 | Derived facts with inflated confidence bias retrieval results, undermining trust calibration. | 4 | 3 | 5 | **60** | Clamp derived confidence to `[0.0, 1.0]` after every computation. Use `min(parent_confidences) * rule_weight` per spec Section 11. Unit test with chain of high-confidence parents verifies clamping. |
+| F45 | Derived cache returns stale facts after rule change | Incorrect inference results served from cache, contradicting current rule set. | 7 | 4 | 5 | **140** | Invalidate cache for affected predicate families on any rule change via `derived_cache_clear()`. Include `rule_version` in cache key. Integration test: change rule, verify cache miss on next query. |
+
+### Component: warmth (M36) — Persistent Spreading Activation
+
+| ID | Failure Mode | Effect | S | O | D | RPN | Recommended Action |
+|----|-------------|--------|---|---|---|-----|-------------------|
+| F46 | Warmth runaway feedback loop | Popular entities dominate all searches via self-reinforcing warmth. Cold start problem for new entities. Retrieval diversity collapses. | 6 | 4 | 5 | **120** | Max warmth cap 10.0 in `warmth_boost()`. Ebbinghaus decay in consolidation normalizes distribution. Monitor warmth distribution in `get_stats` — flag if >10% entities at cap. |
+| F47 | Warmth boost blocks retrieval response | Added latency on every retrieval call from synchronous warmth updates. | 4 | 3 | 3 | **36** | Fire-and-forget via `tokio::spawn`. Boost failure does not affect retrieval result. Log boost errors separately. |
+| F48 | Decay pass deletes still-relevant entities | Aggressive Ebbinghaus decay removes important memories that haven't been accessed recently but remain valuable. | 5 | 3 | 5 | **75** | Identity zone has 0.1x decay multiplier (nearly permanent). Access resets decay timer. Conservative prune threshold (0.01). Integration test: verify Identity-zone entity survives aggressive decay pass. |
+
+### Component: pagerank (M37) — Personalized PageRank
+
+| ID | Failure Mode | Effect | S | O | D | RPN | Recommended Action |
+|----|-------------|--------|---|---|---|-----|-------------------|
+| F49 | PPR computation fails during consolidation | Stale PageRank scores remain in warmth table. 5-signal fusion uses outdated graph centrality signal. | 3 | 3 | 3 | **27** | Non-fatal — fusion degrades gracefully to 4 signals. Log warning on PPR failure. Consolidation continues with remaining phases. |
+| F50 | PPR scores all zero (disconnected graph) | PageRank signal adds no value to 5-signal fusion. All entities tied on this signal. | 2 | 4 | 2 | **16** | Expected behavior for sparse or disconnected graphs. Document as normal. Fusion weights auto-compensate via RRF (zero-contribution signal has no effect on ranking). |
+
+### Component: recursive_explore (M38) — Recursive Query
+
+| ID | Failure Mode | Effect | S | O | D | RPN | Recommended Action |
+|----|-------------|--------|---|---|---|-----|-------------------|
+| F51 | Query decomposition produces irrelevant sub-queries | Noise results mixed with signal. Retrieval quality degrades compared to single-pass `hybrid_search`. | 5 | 5 | 6 | **150** | Original query always included as first sub-query (guarantees baseline quality). Cap at 5 sub-queries. Score synthesis favors multi-pass consensus — results appearing in multiple passes ranked higher. |
+| F52 | Convergence detection fails (never converges) | Max passes exhausted on every exploration. Consistently high latency for `recursive_explore` calls. | 4 | 3 | 3 | **36** | Hard cap at `max_passes` (default 3). Total timeout for exploration. Convergence threshold configurable. Log pass count and convergence status for monitoring. |
+
 ### New Test Cases
 
 | Test ID | For FMEA | Test Description | Type |
@@ -205,3 +247,16 @@
 | TC32 | F35 | Ingest exact duplicate; verify "Skipped" action returned to caller | Unit |
 | TC33 | F36 | Run `run_consolidation` with co-occurrences from sessions > 30 days old; verify staleness flag or empty result | Integration |
 | TC34 | F37 | Send 10 concurrent writes when quota is at limit-1; verify at most slight over-quota, not unbounded growth | Integration |
+| TC35 | F42 | Create cyclic Datalog rules (A->B->C->A transitive closure); evaluate; verify fixpoint reached within `max_iterations` and evaluation terminates | Unit |
+| TC36 | F42 | Set `max_iterations=5`; provide rules that need >5 iterations; verify early bail with warning | Unit |
+| TC37 | F43 | Attempt to store malformed rule body via `manage_rules`; verify rejection with parse error | Unit |
+| TC38 | F43 | Parse all built-in rule families (taxonomy, part-of, co-occurrence, reachability); verify all produce valid AST | Unit |
+| TC39 | F44 | Chain 5 rules with confidence 0.95 each, weight 1.0; verify derived confidence clamped to <= 1.0 | Unit |
+| TC40 | F45 | Store derived facts in cache; change rule via `manage_rules`; query same predicate; verify cache miss and re-derivation | Integration |
+| TC41 | F46 | Boost same entity 100 times; verify warmth capped at 10.0 | Unit |
+| TC42 | F46 | Run decay pass on session with 50 entities; verify warmth distribution normalized (no entity >10.0) | Unit |
+| TC43 | F48 | Create entity in Identity decay zone; run aggressive decay; verify entity survives with warmth above prune threshold | Unit |
+| TC44 | F48 | Create entity in Operational zone with warmth 0.02; run decay; verify pruned below 0.01 threshold | Unit |
+| TC45 | F51 | Run `recursive_explore` with a single-entity query; verify original query appears in sub-queries and results contain the entity | Integration |
+| TC46 | F51 | Run `recursive_explore` with nonsensical query; verify graceful degradation (returns some results via original query, not empty) | Integration |
+| TC47 | F52 | Set `max_passes=2`; run exploration on large graph that won't converge; verify exactly 2 passes and `converged=false` | Unit |
