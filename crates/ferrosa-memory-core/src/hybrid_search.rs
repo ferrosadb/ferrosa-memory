@@ -1,12 +1,14 @@
 //! Hybrid search — multi-strategy retrieval with Reciprocal Rank Fusion.
 
-use serde::Serialize;
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::storage::Storage;
 use crate::types::TenantContext;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub id: Uuid,
     pub source: String,
@@ -15,20 +17,43 @@ pub struct SearchResult {
     pub result_type: String,
 }
 
-/// Reciprocal Rank Fusion: merge ranked lists.
-///
-/// Each item's RRF score is `sum(1 / (k + rank + 1))` across all lists
-/// where it appears. The `k` parameter (typically 60) controls how much
-/// lower-ranked items are penalized.
-fn rrf_merge(lists: Vec<Vec<SearchResult>>, k: f64) -> Vec<SearchResult> {
-    use std::collections::HashMap;
+/// Configuration for 5-signal RRF fusion weights.
+/// Default weight 1.0 for all signals. Set to 0.0 to disable a signal.
+#[derive(Debug, Clone)]
+pub struct FusionConfig {
+    pub phonetic_weight: f64,
+    pub ann_weight: f64,
+    pub fold_weight: f64,
+    pub warmth_weight: f64,
+    pub pagerank_weight: f64,
+}
 
+impl Default for FusionConfig {
+    fn default() -> Self {
+        Self {
+            phonetic_weight: 1.0,
+            ann_weight: 1.0,
+            fold_weight: 1.0,
+            warmth_weight: 1.0,
+            pagerank_weight: 1.0,
+        }
+    }
+}
+
+/// Reciprocal Rank Fusion: merge ranked lists with per-signal weights.
+///
+/// Each item's RRF score is `sum(weight_i / (k + rank + 1))` across all lists
+/// where it appears. The `k` parameter (typically 60) controls how much
+/// lower-ranked items are penalized. Each list's contribution is scaled by
+/// the corresponding entry in `weights` (defaults to 1.0 if not provided).
+fn rrf_merge(lists: Vec<Vec<SearchResult>>, k: f64, weights: &[f64]) -> Vec<SearchResult> {
     assert!(k >= 0.0, "RRF k parameter must be non-negative");
 
     let mut scores: HashMap<Uuid, (f64, SearchResult)> = HashMap::new();
-    for list in &lists {
+    for (list_idx, list) in lists.iter().enumerate() {
+        let weight = weights.get(list_idx).copied().unwrap_or(1.0);
         for (rank, item) in list.iter().enumerate() {
-            let rrf_score = 1.0 / (k + rank as f64 + 1.0);
+            let rrf_score = weight / (k + rank as f64 + 1.0);
             scores
                 .entry(item.id)
                 .and_modify(|(s, _)| *s += rrf_score)
@@ -50,8 +75,10 @@ fn rrf_merge(lists: Vec<Vec<SearchResult>>, k: f64) -> Vec<SearchResult> {
     merged
 }
 
-/// Run a hybrid search combining phonetic entity lookup, ANN entity search,
-/// and ANN fold search. Results are fused via Reciprocal Rank Fusion.
+/// Run a hybrid search combining up to 5 signals: phonetic entity lookup,
+/// ANN entity search, ANN fold search, warmth scores, and pagerank scores.
+/// Results are fused via weighted Reciprocal Rank Fusion.
+#[allow(clippy::too_many_arguments)]
 pub async fn hybrid_search(
     storage: &(impl Storage + ?Sized),
     ctx: &TenantContext,
@@ -59,6 +86,9 @@ pub async fn hybrid_search(
     query: &str,
     embedding: Option<&[f32]>,
     limit: usize,
+    warmth_scores: Option<&HashMap<Uuid, f64>>,
+    pagerank_scores: Option<&HashMap<Uuid, f64>>,
+    config: &FusionConfig,
 ) -> anyhow::Result<Vec<SearchResult>> {
     anyhow::ensure!(!query.is_empty(), "query must not be empty");
     anyhow::ensure!(limit > 0 && limit <= 50, "limit must be between 1 and 50");
@@ -114,7 +144,64 @@ pub async fn hybrid_search(
         );
     }
 
-    let merged = rrf_merge(lists, 60.0);
+    // Build weights for the initial 3 signals
+    let mut weights = vec![
+        config.phonetic_weight,
+        config.ann_weight,
+        config.fold_weight,
+    ];
+
+    // Strategy 4: Warmth signal — rank existing candidates by warmth score
+    if let Some(warmth) = warmth_scores {
+        let mut warmth_ranked: Vec<SearchResult> = lists
+            .iter()
+            .flatten()
+            .filter_map(|r| {
+                warmth.get(&r.id).map(|score| SearchResult {
+                    id: r.id,
+                    source: "warmth".to_string(),
+                    content: r.content.clone(),
+                    score: *score,
+                    result_type: r.result_type.clone(),
+                })
+            })
+            .collect();
+        warmth_ranked.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        warmth_ranked.dedup_by_key(|r| r.id);
+        lists.push(warmth_ranked);
+        weights.push(config.warmth_weight);
+    }
+
+    // Strategy 5: PageRank signal — same approach
+    if let Some(pagerank) = pagerank_scores {
+        let mut pr_ranked: Vec<SearchResult> = lists
+            .iter()
+            .flatten()
+            .filter_map(|r| {
+                pagerank.get(&r.id).map(|score| SearchResult {
+                    id: r.id,
+                    source: "pagerank".to_string(),
+                    content: r.content.clone(),
+                    score: *score,
+                    result_type: r.result_type.clone(),
+                })
+            })
+            .collect();
+        pr_ranked.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        pr_ranked.dedup_by_key(|r| r.id);
+        lists.push(pr_ranked);
+        weights.push(config.pagerank_weight);
+    }
+
+    let merged = rrf_merge(lists, 60.0, &weights);
     Ok(merged.into_iter().take(limit).collect())
 }
 
@@ -122,9 +209,19 @@ pub async fn hybrid_search(
 mod tests {
     use super::*;
 
+    fn make_result(id: Uuid, source: &str, score: f64) -> SearchResult {
+        SearchResult {
+            id,
+            source: source.into(),
+            content: format!("content-{source}"),
+            score,
+            result_type: "entity".into(),
+        }
+    }
+
     #[test]
     fn rrf_merge_empty_lists() {
-        let result = rrf_merge(vec![], 60.0);
+        let result = rrf_merge(vec![], 60.0, &[]);
         assert!(result.is_empty());
     }
 
@@ -148,7 +245,7 @@ mod tests {
                 result_type: "entity".into(),
             },
         ];
-        let merged = rrf_merge(vec![list], 60.0);
+        let merged = rrf_merge(vec![list], 60.0, &[1.0]);
         assert_eq!(merged.len(), 2);
         // Rank 0 score: 1/(60+0+1) = 1/61
         assert!((merged[0].score - 1.0 / 61.0).abs() < 1e-10);
@@ -187,7 +284,7 @@ mod tests {
             },
         ];
 
-        let merged = rrf_merge(vec![list_a, list_b], 60.0);
+        let merged = rrf_merge(vec![list_a, list_b], 60.0, &[1.0, 1.0]);
         assert_eq!(merged.len(), 2);
 
         // shared_id appears at rank 0 in list_a and rank 1 in list_b
@@ -218,10 +315,115 @@ mod tests {
             })
             .collect();
 
-        let merged = rrf_merge(vec![list], 60.0);
+        let merged = rrf_merge(vec![list], 60.0, &[1.0]);
         // Should be in descending score order (rank 0 has highest RRF score)
         for i in 0..merged.len() - 1 {
             assert!(merged[i].score >= merged[i + 1].score);
         }
+    }
+
+    #[test]
+    fn rrf_merge_with_weights_boosts_higher_weighted_list() {
+        let uuid1 = Uuid::new_v4();
+        let list1 = vec![make_result(uuid1, "a", 1.0)];
+        let list2 = vec![make_result(uuid1, "b", 1.0)];
+
+        // Equal weights: score = 1/61 + 1/61 = 2/61
+        let merged_equal = rrf_merge(vec![list1.clone(), list2.clone()], 60.0, &[1.0, 1.0]);
+        let score_equal = merged_equal[0].score;
+
+        // Higher weight on list2: score = 1/61 + 2/61 = 3/61
+        let merged_weighted = rrf_merge(vec![list1, list2], 60.0, &[1.0, 2.0]);
+        let score_weighted = merged_weighted[0].score;
+
+        assert!(score_weighted > score_equal);
+        // Verify exact values
+        assert!((score_equal - 2.0 / 61.0).abs() < 1e-10);
+        assert!((score_weighted - 3.0 / 61.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn rrf_merge_zero_weight_disables_signal() {
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+
+        let list1 = vec![make_result(id1, "a", 1.0)];
+        let list2 = vec![make_result(id2, "b", 1.0)];
+
+        // Zero weight on list1 means only list2 contributes
+        let merged = rrf_merge(vec![list1, list2], 60.0, &[0.0, 1.0]);
+        assert_eq!(merged.len(), 2);
+
+        // id1 should have score 0 (disabled), id2 should have 1/61
+        let id1_result = merged.iter().find(|r| r.id == id1).unwrap();
+        let id2_result = merged.iter().find(|r| r.id == id2).unwrap();
+        assert!((id1_result.score - 0.0).abs() < 1e-10);
+        assert!((id2_result.score - 1.0 / 61.0).abs() < 1e-10);
+
+        // id2 should rank first
+        assert_eq!(merged[0].id, id2);
+    }
+
+    #[test]
+    fn rrf_merge_missing_weights_default_to_one() {
+        let id1 = Uuid::new_v4();
+        let list1 = vec![make_result(id1, "a", 1.0)];
+        let list2 = vec![make_result(id1, "b", 1.0)];
+
+        // Only provide weight for first list; second defaults to 1.0
+        let merged = rrf_merge(vec![list1, list2], 60.0, &[1.0]);
+        assert_eq!(merged.len(), 1);
+        // score = 1.0/61 + 1.0/61 = 2/61
+        assert!((merged[0].score - 2.0 / 61.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn rrf_merge_five_signal_fusion() {
+        let id1 = Uuid::new_v4();
+        let lists = vec![
+            vec![make_result(id1, "phonetic", 1.0)],
+            vec![make_result(id1, "ann", 1.0)],
+            vec![make_result(id1, "fold", 1.0)],
+            vec![make_result(id1, "warmth", 1.0)],
+            vec![make_result(id1, "pagerank", 1.0)],
+        ];
+        let weights = [1.0, 1.0, 1.0, 1.0, 1.0];
+
+        let merged = rrf_merge(lists, 60.0, &weights);
+        assert_eq!(merged.len(), 1);
+        // All 5 signals at rank 0: score = 5 * (1/61)
+        assert!((merged[0].score - 5.0 / 61.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn fusion_config_default_all_ones() {
+        let config = FusionConfig::default();
+        assert!((config.phonetic_weight - 1.0).abs() < f64::EPSILON);
+        assert!((config.ann_weight - 1.0).abs() < f64::EPSILON);
+        assert!((config.fold_weight - 1.0).abs() < f64::EPSILON);
+        assert!((config.warmth_weight - 1.0).abs() < f64::EPSILON);
+        assert!((config.pagerank_weight - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn backward_compatible_three_signals_with_default_config() {
+        // Verify that 3 lists with default weights [1.0, 1.0, 1.0]
+        // produce identical results to the old unweighted behavior.
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+
+        let list1 = vec![make_result(id1, "phonetic", 1.0)];
+        let list2 = vec![make_result(id1, "ann", 1.0), make_result(id2, "ann", 0.9)];
+        let list3 = vec![make_result(id2, "fold", 0.8)];
+
+        let merged = rrf_merge(vec![list1, list2, list3], 60.0, &[1.0, 1.0, 1.0]);
+
+        // id1: rank 0 in list1 + rank 0 in list2 = 1/61 + 1/61 = 2/61
+        let id1_result = merged.iter().find(|r| r.id == id1).unwrap();
+        assert!((id1_result.score - 2.0 / 61.0).abs() < 1e-10);
+
+        // id2: rank 1 in list2 + rank 0 in list3 = 1/62 + 1/61
+        let id2_result = merged.iter().find(|r| r.id == id2).unwrap();
+        assert!((id2_result.score - (1.0 / 62.0 + 1.0 / 61.0)).abs() < 1e-10);
     }
 }

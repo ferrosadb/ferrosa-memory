@@ -1,7 +1,7 @@
 # Project Plan — ferrosa-memory-mcp
 
-> Last updated: 2026-03-23
-> Status: Sprints 1-4 complete, vector column and graph edge blockers resolved
+> Last updated: 2026-03-29
+> Status: Sprints 1-4 complete. Sprint 5 (RMH + Datalog) planned.
 
 ## Overview
 
@@ -16,6 +16,7 @@
 | Sprint 3 | **COMPLETE** | 10/10 tasks done |
 | Sprint 4 | **COMPLETE** | 11/11 tasks done |
 | Sprint 4.9 | **COMPLETE** | SUBSCRIBE anomaly alerts, get_stats enrichment |
+| Sprint 5 | **PLANNED** | RMH + Datalog Graph Inference (12 tasks) |
 
 ---
 
@@ -130,6 +131,62 @@
 
 ---
 
+## Sprint 5: Recursive Memory Harness + Datalog Graph Inference
+
+**Goal:** Datalog-style inference engine with semi-naive evaluation, persistent warmth field with Ebbinghaus decay, Personalized PageRank, enhanced 5-signal fusion, and recursive query exploration with convergence detection. Adds 3 new MCP tools: `recursive_explore`, `query_derived`, `manage_rules`.
+
+**Dependencies:** Requires all of Sprint 1-4 (complete). Builds on `spreading.rs`, `hybrid_search.rs`, `chains.rs`, `dream.rs`, `entity.rs`.
+
+**Sources:** [RMH/Ori Mnemos](https://orimnemos.com/rmh/), [RLM paper](https://arxiv.org/abs/2512.24601) (MIT CSAIL), [`~/datalog_graph_materialization_spec.md`](file:///Users/bkearns/datalog_graph_materialization_spec.md).
+
+**Status: PLANNED**
+
+### Phase A: Foundation (parallelizable)
+
+| # | Task | Size | Source | Success Criteria | Tests |
+|---|------|------|--------|-----------------|-------|
+| 5.1 | DDL: `entity_warmth`, `rules_by_id`, `rules_by_family`, `derived_cache_by_query`, `derived_cache_by_pred`, `derivation_provenance` tables | M | Datalog spec §8.4-8.8, RMH warmth | Tables created in `agent_memory` keyspace. TTL on cache tables. Graph annotations where needed. | DDL executes without error on Ferrosa |
+| 5.2 | Types: `WarmthEntry`, `DecayZone`, `Term`, `Atom`, `BuiltinFilter`, `DatalogRule`, `RuleEntry`, `RuleState`, `FactSet`, `DerivedFact`, `ProvenanceStep`, `RecursiveExploreResult`, `SubQuery` | M | Datalog spec §6, RMH | All types compile. Serde round-trip. `DecayZone::decay_multiplier()` returns correct factors. | Unit: serde round-trip, decay multiplier values |
+| 5.3 | Config: `[rmh]` and `[datalog]` sections with all parameters defaulted | S | Config pattern | Config parses with/without new sections. All defaults correct. | Unit: parse with defaults, parse with overrides, parse without section |
+
+### Phase B: Storage + Engine (depends on Phase A)
+
+| # | Task | Size | Source | Success Criteria | Tests |
+|---|------|------|--------|-----------------|-------|
+| 5.4 | Storage trait: 15 new methods (warmth 5, rule registry 3, derived cache 3, provenance 2, heat 2) + MockStorage | L | DSM, Datalog spec §8 | Trait compiles. MockStorage CRUD tests pass. All methods tenant-scoped. | Unit: each MockStorage method |
+| 5.5 | CQL Storage: 15 prepared statements for warmth, rules, cache, provenance, heat | L | CQL pattern | All methods pass integration tests against live Ferrosa. Prepared statements parameterized. TTL on cache writes. | Integration: round-trip each method against Ferrosa |
+| 5.6 | Datalog engine: semi-naive evaluator, rule parser, canonical fact extraction, query-time derivation, provenance tracking | XL | Datalog spec §6,10,16 | Fixpoint reached on test graphs. Transitive closure + taxonomy derived correctly. Provenance tracks parent facts. Cache hit/miss works. | Unit: triangle closure, diamond graph, taxonomy isa 3-level, confidence propagation, parse round-trip, max iteration cap |
+
+### Phase C: Cognitive Modules (depends on Phase B, parallelizable)
+
+| # | Task | Size | Source | Success Criteria | Tests |
+|---|------|------|--------|-----------------|-------|
+| 5.7 | Warmth module: `boost_on_access`, `compute_warmth_score`, `run_decay_pass`, `get_warmth_scores` | L | RMH, Ori Mnemos | Warmth accumulates across accesses. Ebbinghaus decay reduces over time. Zone differentiation works. Neighbor spreading at 50%. | Unit: boost, repeated access, decay, zone rates, neighbor spread, pruning |
+| 5.8 | PageRank: `compute_ppr` (power iteration, alpha=0.45), `update_pagerank_scores` | L | RMH PPR, Ori alpha=0.45 | PPR scores non-negative, sum ~1.0. High-connectivity entities get higher scores. Personalization biases toward seeds. | Unit: 3-node graph, diamond, disconnected, personalization effect |
+| 5.9 | Enhanced fusion: 5-signal RRF (add warmth + pagerank), `FusionConfig` with per-signal weights | M | RMH 4-signal, Ori fusion | Warm+authoritative entities rank higher. Backward compatible when warmth/pagerank are None. | Unit: warmth boost ranking, pagerank boost, backward compat, existing RRF tests pass |
+
+### Phase D: Recursive Exploration + Integration (depends on Phase C)
+
+| # | Task | Size | Source | Success Criteria | Tests |
+|---|------|------|--------|-----------------|-------|
+| 5.10 | Recursive explore: `decompose_query`, `explore` with Datalog-driven multi-pass, convergence detection | XL | RMH recursive resolution, RLM paper | Surfaces 2-hop entities that single-pass misses. Convergence stops when graph exhausted. Guard rails respected. | Unit: single-pass convergence, multi-pass discovery, convergence detection, max_passes cap, dedup, empty graph |
+| 5.11 | MCP tools: `recursive_explore`, `query_derived`, `manage_rules` + warmth boost wiring in all retrieval handlers | L | MCP tool pattern | Tools in `tools/list`. Valid invocations return results. Warmth boosts fire on all retrievals. | Unit: dispatch with MockStorage, JSON structure, param validation |
+| 5.12 | Consolidation: Datalog batch inference + PPR + warmth decay + cache invalidation in `run_consolidation` | M | Dream pattern, Datalog spec §16.1 | Consolidation computes derived facts, PPR, and decays warmth. DreamResult includes new counters. | Unit: consolidation with entities+edges produces non-zero derived facts and PPR scores |
+
+**Sprint 5 exit criteria:**
+1. `cargo test --workspace` passes with all new + existing tests
+2. `recursive_explore` tool in `tools/list`, produces multi-pass results with provenance
+3. `query_derived` returns derived facts with explanation chains
+4. `manage_rules` supports CRUD on rule registry
+5. Datalog engine reaches fixpoint, derives transitive closure + taxonomy correctly
+6. Warmth persists, decays with zone differentiation, boosts on access
+7. PageRank computed during consolidation, feeds into 5-signal fusion
+8. Derived fact cache with TTL works (hit → fast, miss → compute + cache)
+9. Provenance tracks parent facts for all derivations
+10. All Sprint 1-4 tests pass (no regressions)
+
+---
+
 ## Backlog (Post-v1.0)
 
 | # | Task | Size | Source | Notes |
@@ -142,6 +199,14 @@
 | B6 | WASM UDF for in-database compression | M | spec Section 4.3 | Moves compression into Ferrosa SSTable flush path |
 | B7 | `INSERT IF NOT EXISTS` (LWT) for thundering herd | S | FMEA F11 | Blocked on Ferrosa LWT support |
 | B8 | Native row TTL in Ferrosa | S | spec Section 8.3 | Replace application-managed TTL sweep if Ferrosa adds native TTL |
+| B9 | Generic `nodes_by_id` / `edges_by_src/dst/pred` tables | XL | Datalog spec §8.1-8.2 | Replace entity_store + typed edge tables with generic schema. Major migration. |
+| B10 | Durable materialization tables + promotion pipeline | L | Datalog spec §8.3, §15 | `derived_edges_by_src/pred` tables, `should_promote()` scoring, workload-driven promotion |
+| B11 | Specialized materialized tables (methodology_members, tool_preferences) | M | Datalog spec §8.9 | Depends on B10 promotion pipeline |
+| B12 | NVMe pinning for cache tables | S | Datalog spec §13.3 | Infrastructure config for hierarchical storage placement |
+| B13 | Incremental Datalog delta propagation | L | Datalog spec §16.2 | Replace batch recomputation with incremental fact propagation on bounded edits |
+| B14 | Louvain community detection | M | RMH/Ori Mnemos | Graph community detection for cluster identification |
+| B15 | BM25 full-text search signal | L | RMH/Ori Mnemos | TF-IDF ranking. Blocked on Ferrosa full-text index support. |
+| B16 | LLM-powered query decomposition | M | RMH/RLM paper | Optional LLM-assisted sub-query generation for recursive_explore |
 
 ---
 
@@ -158,6 +223,12 @@
 | Ferrosa WASM UDF I/O limits prevent compression UDF | Medium | Low | ADR-001 already chose Rust-native compression in-process. WASM UDF is backlog (B6). | Mitigated |
 | No native row TTL in Ferrosa beta | Medium | Low | Application-managed TTL sweep job as fallback (Sprint 1 task 1.10) | Mitigated |
 | Compression quality insufficient without model inference | Low | Medium | ADR-001 accepts this tradeoff for v1. Backlog B2 adds perplexity-based scoring. | Accepted |
+| **Datalog fact explosion on dense graphs** (FMEA F42, RPN 72) | Medium | High | max_facts=50000 cap, max_iterations=100, entity cap 1000 bounds input. Log warning and bail on cap hit. | **Open** |
+| **Warmth runaway feedback loop** (FMEA F46, RPN 120) | Medium | Medium | Max warmth cap 10.0. Ebbinghaus decay in consolidation. Monitor warmth distribution in get_stats. | **Open** |
+| **Derived cache staleness after rule change** (FMEA F45, RPN 140) | Medium | High | Invalidate cache for affected predicate families on rule change. Include rule_version in cache key. | **Open** |
+| **Rule injection via manage_rules** (STRIDE S7) | Medium | High | Rule body validation (parse before storing). Rule family isolation. Audit log for all rule changes. | **Open** |
+| Query decomposition quality without LLM | Medium | Medium | Heuristic v1. Always includes original query. Backlog B16: optional LLM-powered decomposition. | Accepted |
+| 15 new Storage trait methods increases trait surface | Medium | Low | All follow established patterns. MockStorage straightforward. Fan-in analysis acceptable. | Accepted |
 
 ---
 
@@ -170,11 +241,13 @@ graph LR
     S1 --> S3[Sprint 3]
     S2 --> S4[Sprint 4]
     S3 --> S4
+    S4 --> S5[Sprint 5]
 
     S1 --- note1["Foundation: cql_client, auth, transport, memo, plan"]
     S2 --- note2["Folds: compression, graph, fold lifecycle"]
     S3 --- note3["Entities: phonetic, temporal, feedback, audit"]
     S4 --- note4["Routing: strategy selection, HTTP, hardening"]
+    S5 --- note5["RMH + Datalog: inference, warmth, PPR, recursive explore"]
 ```
 
-Sprint 2 and Sprint 3 can run in parallel after Sprint 1 completes — they share infrastructure (cql_client, auth, metrics) but don't depend on each other's tool implementations. Sprint 4 requires both.
+Sprint 2 and Sprint 3 can run in parallel after Sprint 1 completes — they share infrastructure (cql_client, auth, metrics) but don't depend on each other's tool implementations. Sprint 4 requires both. Sprint 5 requires Sprint 4 (builds on entity graph, routing, feedback loop, and consolidation pipeline).

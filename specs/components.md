@@ -1,7 +1,7 @@
 # Component Architecture
 
-> Last updated: 2026-03-25
-> Status: 31 modules — cognitive memory, hybrid search, visualization, and infrastructure layers complete. WebSocket anomaly alert subscription added (Sprint 4.9).
+> Last updated: 2026-03-29
+> Status: 35 modules — cognitive memory, hybrid search, visualization, infrastructure, Datalog inference, and recursive exploration layers complete. Sprint 5 adds datalog, warmth, pagerank, and recursive_explore modules.
 
 ## Module Map
 
@@ -18,6 +18,7 @@ graph TB
     D --> I[fold_tools]
     D --> J[entity_tools]
     D --> K[feedback_tools]
+    D --> RE[recursive_explore]
     G --> L[cql_client]
     H --> L
     I --> L
@@ -25,13 +26,21 @@ graph TB
     J --> L
     J --> M
     K --> L
+    RE --> DL[datalog]
+    RE --> W[warmth]
+    RE --> HS[hybrid_search]
+    RE --> SP[spreading]
+    DL --> L
+    W --> L
+    PR[pagerank] --> L
+    PR --> W
     L --> N[audit]
     L --> O[metrics]
     L --> P[viz]
     P --> Q[http]
 ```
 
-**Note:** Shows main call flow. Full 31-module dependency matrix in `dsm-analysis.md`.
+**Note:** Shows main call flow. Full 35-module dependency matrix in `dsm-analysis.md`.
 
 **Note:** `graph_client` (M11) uses the HTTP Cypher endpoint, which is working. Graph writes go through CQL (vertex/edge table INSERTs via `CqlStorage`), and graph reads/traversals go through HTTP POST against `/graph/query` via `reqwest`.
 
@@ -525,6 +534,66 @@ graph TB
 
 ---
 
+### 32. `datalog` — Semi-Naive Datalog Evaluator
+
+**Responsibility:** Semi-naive Datalog evaluator with rule parsing, canonical fact extraction, query-time derivation, provenance tracking, and ephemeral cache integration. Normalizes existing storage edges into canonical predicates (`edge(Src, Pred, Dst)`, `node(Id)`) at query time. Supports built-in rule families for taxonomy closure, part-of closure, transitive co-occurrence, and multi-edge-type reachability.
+
+**Interface:**
+- `load_session_facts(storage, ctx, session_id) -> FactSet` — normalize storage into canonical predicates
+- `evaluate(rules, initial_facts, max_iterations, max_facts) -> (FactSet, Vec<DerivedFact>)` — semi-naive fixpoint evaluation with provenance
+- `parse_rule(text) -> Result<DatalogRule>` — parse Datalog syntax into rule AST
+- `query_predicate(storage, ctx, session_id, predicate, params) -> Vec<DerivedFact>` — query-time derivation with cache check
+
+**Dependencies:** `cql_client`, `types`, `config`
+
+**Size estimate:** ~800 lines
+
+---
+
+### 33. `warmth` — Persistent Spreading Activation with Ebbinghaus Decay
+
+**Responsibility:** Persistent spreading activation with Ebbinghaus decay. Boosts entity warmth on access, spreads to 1-hop neighbors at 50%, applies zone-based decay multipliers (Identity 0.1x, Knowledge 1.0x, Operational 3.0x). Prunes entries below configurable threshold.
+
+**Interface:**
+- `boost_on_access(storage, ctx, entity_id, session_id, decay_zone)` — increment warmth, boost 1-hop neighbors
+- `compute_warmth_score(storage, ctx, entity_id) -> f64` — live score with time-decay applied
+- `run_decay_pass(storage, ctx, session_id) -> usize` — batch Ebbinghaus decay, prune below threshold
+- `get_warmth_scores(storage, ctx, session_id) -> HashMap<Uuid, f64>` — bulk read with live decay
+
+**Dependencies:** `cql_client`, `types`, `config`
+
+**Size estimate:** ~300 lines
+
+---
+
+### 34. `pagerank` — Personalized PageRank via Power Iteration
+
+**Responsibility:** Personalized PageRank via power iteration (alpha=0.45). Computes authority scores over the entity graph seeded from the retrieval tracker, writes resulting ranks to the warmth table for use in 5-signal RRF fusion.
+
+**Interface:**
+- `compute_ppr(storage, ctx, session_id, alpha, iterations, seeds) -> HashMap<Uuid, f64>` — power iteration PPR
+- `update_pagerank_scores(storage, ctx, session_id, ranks)` — write to warmth table
+
+**Dependencies:** `cql_client`, `types`, `config`
+
+**Size estimate:** ~200 lines
+
+---
+
+### 35. `recursive_explore` — Recursive Query Decomposition
+
+**Responsibility:** Recursive query decomposition with multi-pass retrieval. Decomposes complex queries into sub-queries, runs iterative passes through hybrid search and Datalog evaluation, discovers connected entity clusters via transitive closure, and detects convergence via Datalog fixpoint or novelty threshold. All returned entities receive warmth boosts with provenance tracking.
+
+**Interface:**
+- `decompose_query(query) -> Vec<SubQuery>` — heuristic decomposition (split on conjunctions, extract entity names, keyword extraction)
+- `explore(storage, ctx, session_id, query, embedding, config) -> RecursiveExploreResult` — multi-pass retrieval with Datalog integration
+
+**Dependencies:** `cql_client`, `types`, `datalog`, `warmth`, `hybrid_search`, `spreading`
+
+**Size estimate:** ~500 lines
+
+---
+
 ## Size Summary
 
 | Module | Lines (actual) |
@@ -561,4 +630,8 @@ graph TB
 | viz | 250 |
 | http | 800 |
 | config + storage | 1,320 |
-| **Total** | **~12,350** |
+| datalog | 800 |
+| warmth | 300 |
+| pagerank | 200 |
+| recursive_explore | 500 |
+| **Total** | **~14,150** |

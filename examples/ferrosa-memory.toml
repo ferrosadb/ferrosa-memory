@@ -5,6 +5,7 @@
 transport = "stdio"          # "stdio" for Claude Code, "http" for remote
 # http_port = 8765           # only used in http mode
 # log_level = "info"
+tenant_id = "00000000-0000-0000-0000-000000000001"
 
 [ferrosa]
 contact_points = ["localhost:19042", "localhost:19043", "localhost:19044"]

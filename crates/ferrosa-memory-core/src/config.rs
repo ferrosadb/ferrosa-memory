@@ -12,6 +12,8 @@
 //! - `[embeddings]` — embedding provider configuration
 //! - `[security]` — audit and anomaly detection settings
 //! - `[routing]` — guideline version and batch schedule
+//! - `[rmh]` — Resonant Memory Hierarchy warmth and exploration parameters
+//! - `[datalog]` — Datalog inference engine limits and caching
 
 use std::path::{Path, PathBuf};
 
@@ -35,6 +37,12 @@ pub struct Config {
     pub graph: GraphDbConfig,
     #[serde(default)]
     pub viz: VizConfig,
+    #[serde(default)]
+    pub rmh: RmhConfig,
+    #[serde(default)]
+    pub datalog: DatalogConfig,
+    #[serde(default)]
+    pub promotion: PromotionConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +82,100 @@ impl Default for VizConfig {
         Self {
             enabled: default_viz_enabled(),
             port: default_viz_port(),
+        }
+    }
+}
+
+/// Resonant Memory Hierarchy configuration.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RmhConfig {
+    #[serde(default = "default_warmth_boost")]
+    pub warmth_boost_amount: f64,
+    #[serde(default = "default_neighbor_ratio")]
+    pub warmth_neighbor_ratio: f64,
+    #[serde(default = "default_prune_threshold")]
+    pub warmth_prune_threshold: f64,
+    #[serde(default = "default_warmth_cap")]
+    pub warmth_cap: f64,
+    #[serde(default = "default_ppr_alpha")]
+    pub ppr_alpha: f64,
+    #[serde(default = "default_ppr_iterations")]
+    pub ppr_iterations: usize,
+    #[serde(default = "default_decay_lambda")]
+    pub decay_lambda: f64,
+    #[serde(default = "default_max_passes")]
+    pub max_explore_passes: usize,
+    #[serde(default = "default_convergence")]
+    pub convergence_threshold: f64,
+    #[serde(default = "default_max_explore_entities")]
+    pub max_explore_entities: usize,
+}
+
+impl Default for RmhConfig {
+    fn default() -> Self {
+        Self {
+            warmth_boost_amount: default_warmth_boost(),
+            warmth_neighbor_ratio: default_neighbor_ratio(),
+            warmth_prune_threshold: default_prune_threshold(),
+            warmth_cap: default_warmth_cap(),
+            ppr_alpha: default_ppr_alpha(),
+            ppr_iterations: default_ppr_iterations(),
+            decay_lambda: default_decay_lambda(),
+            max_explore_passes: default_max_passes(),
+            convergence_threshold: default_convergence(),
+            max_explore_entities: default_max_explore_entities(),
+        }
+    }
+}
+
+/// Datalog inference engine configuration.
+#[derive(Debug, Deserialize, Clone)]
+pub struct DatalogConfig {
+    #[serde(default = "default_max_iterations")]
+    pub max_iterations: usize,
+    #[serde(default = "default_max_facts")]
+    pub max_facts: usize,
+    #[serde(default = "default_cache_ttl")]
+    pub cache_ttl_seconds: u64,
+    #[serde(default = "default_confidence_strategy")]
+    pub confidence_combination: String,
+}
+
+impl Default for DatalogConfig {
+    fn default() -> Self {
+        Self {
+            max_iterations: default_max_iterations(),
+            max_facts: default_max_facts(),
+            cache_ttl_seconds: default_cache_ttl(),
+            confidence_combination: default_confidence_strategy(),
+        }
+    }
+}
+
+/// Promotion pipeline configuration (B10).
+#[derive(Debug, Deserialize, Clone)]
+pub struct PromotionConfig {
+    /// Heat score threshold above which a predicate becomes a promotion candidate.
+    #[serde(default = "default_promotion_threshold")]
+    pub promotion_threshold: f64,
+    /// Maximum total rows across all promoted predicates.
+    #[serde(default = "default_size_budget")]
+    pub size_budget_rows: usize,
+    /// Number of days of heat data to consider.
+    #[serde(default = "default_promotion_window_days")]
+    pub window_days: u32,
+    /// Multiplier applied to reuse benefit when scoring promotion candidates.
+    #[serde(default = "default_reuse_factor")]
+    pub reuse_factor: f64,
+}
+
+impl Default for PromotionConfig {
+    fn default() -> Self {
+        Self {
+            promotion_threshold: default_promotion_threshold(),
+            size_budget_rows: default_size_budget(),
+            window_days: default_promotion_window_days(),
+            reuse_factor: default_reuse_factor(),
         }
     }
 }
@@ -332,6 +434,60 @@ fn default_graph_pass() -> String {
 }
 fn default_http_graph_url() -> String {
     "http://localhost:7474".into()
+}
+fn default_warmth_boost() -> f64 {
+    0.3
+}
+fn default_neighbor_ratio() -> f64 {
+    0.5
+}
+fn default_prune_threshold() -> f64 {
+    0.01
+}
+fn default_warmth_cap() -> f64 {
+    10.0
+}
+fn default_ppr_alpha() -> f64 {
+    0.45
+}
+fn default_ppr_iterations() -> usize {
+    20
+}
+fn default_decay_lambda() -> f64 {
+    0.1
+}
+fn default_max_passes() -> usize {
+    3
+}
+fn default_convergence() -> f64 {
+    0.1
+}
+fn default_max_explore_entities() -> usize {
+    50
+}
+fn default_max_iterations() -> usize {
+    100
+}
+fn default_max_facts() -> usize {
+    50000
+}
+fn default_cache_ttl() -> u64 {
+    3600
+}
+fn default_confidence_strategy() -> String {
+    "min_parent_times_weight".to_string()
+}
+fn default_promotion_threshold() -> f64 {
+    1000.0
+}
+fn default_size_budget() -> usize {
+    100_000
+}
+fn default_promotion_window_days() -> u32 {
+    7
+}
+fn default_reuse_factor() -> f64 {
+    1.0
 }
 
 /// Resolve the config file path. Checks, in order:
@@ -694,6 +850,8 @@ contact_points = ["localhost:9042"]
         assert_eq!(config.embeddings.provider, "ollama");
         assert!(config.security.audit_log_enabled);
         assert_eq!(config.routing.guideline_version, "v1");
+        assert!((config.rmh.warmth_boost_amount - 0.3).abs() < f64::EPSILON);
+        assert_eq!(config.datalog.max_iterations, 100);
     }
 
     #[test]
@@ -737,5 +895,138 @@ contact_points = ["localhost:9042"]
             config.server.session_id.as_deref(),
             Some("660e8400-e29b-41d4-a716-446655440000")
         );
+    }
+
+    #[test]
+    fn rmh_config_defaults() {
+        let cfg = RmhConfig::default();
+        assert!((cfg.warmth_boost_amount - 0.3).abs() < f64::EPSILON);
+        assert!((cfg.warmth_neighbor_ratio - 0.5).abs() < f64::EPSILON);
+        assert!((cfg.warmth_prune_threshold - 0.01).abs() < f64::EPSILON);
+        assert!((cfg.warmth_cap - 10.0).abs() < f64::EPSILON);
+        assert!((cfg.ppr_alpha - 0.45).abs() < f64::EPSILON);
+        assert_eq!(cfg.ppr_iterations, 20);
+        assert!((cfg.decay_lambda - 0.1).abs() < f64::EPSILON);
+        assert_eq!(cfg.max_explore_passes, 3);
+        assert!((cfg.convergence_threshold - 0.1).abs() < f64::EPSILON);
+        assert_eq!(cfg.max_explore_entities, 50);
+    }
+
+    #[test]
+    fn datalog_config_defaults() {
+        let cfg = DatalogConfig::default();
+        assert_eq!(cfg.max_iterations, 100);
+        assert_eq!(cfg.max_facts, 50000);
+        assert_eq!(cfg.cache_ttl_seconds, 3600);
+        assert_eq!(cfg.confidence_combination, "min_parent_times_weight");
+    }
+
+    #[test]
+    fn test_config_defaults_rmh() {
+        let toml = r#"
+[ferrosa]
+contact_points = ["localhost:9042"]
+"#;
+        let config = parse_config(toml).expect("should parse with rmh defaults");
+        assert!((config.rmh.warmth_boost_amount - 0.3).abs() < f64::EPSILON);
+        assert!((config.rmh.ppr_alpha - 0.45).abs() < f64::EPSILON);
+        assert_eq!(config.rmh.ppr_iterations, 20);
+        assert_eq!(config.rmh.max_explore_passes, 3);
+        assert!((config.rmh.warmth_cap - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_config_defaults_datalog() {
+        let toml = r#"
+[ferrosa]
+contact_points = ["localhost:9042"]
+"#;
+        let config = parse_config(toml).expect("should parse with datalog defaults");
+        assert_eq!(config.datalog.max_iterations, 100);
+        assert_eq!(config.datalog.max_facts, 50000);
+        assert_eq!(config.datalog.cache_ttl_seconds, 3600);
+        assert_eq!(
+            config.datalog.confidence_combination,
+            "min_parent_times_weight"
+        );
+    }
+
+    #[test]
+    fn test_config_rmh_overrides() {
+        let toml = r#"
+[ferrosa]
+contact_points = ["localhost:9042"]
+
+[rmh]
+warmth_boost_amount = 0.5
+ppr_alpha = 0.85
+max_explore_passes = 5
+"#;
+        let config = parse_config(toml).expect("should parse with rmh overrides");
+        assert!((config.rmh.warmth_boost_amount - 0.5).abs() < f64::EPSILON);
+        assert!((config.rmh.ppr_alpha - 0.85).abs() < f64::EPSILON);
+        assert_eq!(config.rmh.max_explore_passes, 5);
+        // Non-overridden fields keep defaults
+        assert!((config.rmh.warmth_neighbor_ratio - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_config_datalog_overrides() {
+        let toml = r#"
+[ferrosa]
+contact_points = ["localhost:9042"]
+
+[datalog]
+max_iterations = 200
+max_facts = 100000
+cache_ttl_seconds = 7200
+confidence_combination = "product"
+"#;
+        let config = parse_config(toml).expect("should parse with datalog overrides");
+        assert_eq!(config.datalog.max_iterations, 200);
+        assert_eq!(config.datalog.max_facts, 100000);
+        assert_eq!(config.datalog.cache_ttl_seconds, 7200);
+        assert_eq!(config.datalog.confidence_combination, "product");
+    }
+
+    #[test]
+    fn promotion_config_defaults() {
+        let cfg = PromotionConfig::default();
+        assert!((cfg.promotion_threshold - 1000.0).abs() < f64::EPSILON);
+        assert_eq!(cfg.size_budget_rows, 100_000);
+        assert_eq!(cfg.window_days, 7);
+        assert!((cfg.reuse_factor - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_config_defaults_promotion() {
+        let toml = r#"
+[ferrosa]
+contact_points = ["localhost:9042"]
+"#;
+        let config = parse_config(toml).expect("should parse with promotion defaults");
+        assert!((config.promotion.promotion_threshold - 1000.0).abs() < f64::EPSILON);
+        assert_eq!(config.promotion.size_budget_rows, 100_000);
+        assert_eq!(config.promotion.window_days, 7);
+        assert!((config.promotion.reuse_factor - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_config_promotion_overrides() {
+        let toml = r#"
+[ferrosa]
+contact_points = ["localhost:9042"]
+
+[promotion]
+promotion_threshold = 2000.0
+size_budget_rows = 50000
+window_days = 14
+reuse_factor = 1.5
+"#;
+        let config = parse_config(toml).expect("should parse with promotion overrides");
+        assert!((config.promotion.promotion_threshold - 2000.0).abs() < f64::EPSILON);
+        assert_eq!(config.promotion.size_budget_rows, 50000);
+        assert_eq!(config.promotion.window_days, 14);
+        assert!((config.promotion.reuse_factor - 1.5).abs() < f64::EPSILON);
     }
 }

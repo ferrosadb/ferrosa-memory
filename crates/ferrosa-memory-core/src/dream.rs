@@ -24,6 +24,14 @@ pub struct DreamResult {
     /// Actual entity pairs connected (for viz event emission).
     #[serde(skip)]
     pub edges: Vec<(Uuid, Uuid)>,
+    /// Number of Datalog-derived facts from batch inference.
+    pub derived_facts_count: usize,
+    /// Number of entities with updated PageRank scores.
+    pub pagerank_updated: usize,
+    /// Number of warmth entries pruned by Ebbinghaus decay.
+    pub warmth_decayed: usize,
+    /// Predicates promoted to durable materialization during this cycle.
+    pub promoted_predicates: Vec<String>,
 }
 
 /// Similarity threshold for creating CO_OCCURS edges (Jaccard on word sets).
@@ -113,11 +121,91 @@ pub async fn run_consolidation(
         ));
     }
 
+    // Phase 4: Datalog batch inference — derive facts from the updated graph
+    let derived_facts_count = match crate::datalog::load_session_facts(storage, ctx, session_id)
+        .await
+    {
+        Ok(facts) => {
+            let rules = crate::datalog::builtin_rules();
+            let datalog_config = crate::config::DatalogConfig::default();
+            let (_all_facts, derived) = crate::datalog::evaluate(
+                &rules,
+                &facts,
+                datalog_config.max_iterations,
+                datalog_config.max_facts,
+            );
+            let count = derived.len();
+            if !derived.is_empty() {
+                let cache_key = format!("consolidation:{}", session_id);
+                if let Err(e) = storage.derived_cache_put(ctx, &cache_key, &derived).await {
+                    tracing::warn!(error = %e, "failed to cache derived facts during consolidation");
+                }
+            }
+            count
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "datalog batch inference failed during consolidation");
+            0
+        }
+    };
+
+    // Phase 5: Compute Personalized PageRank
+    let rmh_config = crate::config::RmhConfig::default();
+    let pagerank_updated = {
+        let seeds = std::collections::HashMap::new();
+        match crate::pagerank::compute_ppr(storage, ctx, session_id, &rmh_config, &seeds).await {
+            Ok(ranks) => {
+                let count = ranks.len();
+                if let Err(e) =
+                    crate::pagerank::update_pagerank_scores(storage, ctx, session_id, &ranks).await
+                {
+                    tracing::warn!(error = %e, "failed to write PageRank scores during consolidation");
+                }
+                count
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "PageRank computation failed during consolidation");
+                0
+            }
+        }
+    };
+
+    // Phase 6: Ebbinghaus warmth decay
+    let warmth_decayed =
+        match crate::warmth::run_decay_pass(storage, ctx, session_id, &rmh_config).await {
+            Ok(pruned) => pruned,
+            Err(e) => {
+                tracing::warn!(error = %e, "warmth decay pass failed during consolidation");
+                0
+            }
+        };
+
+    // Phase 7: Check predicates for promotion
+    let promotion_config = crate::config::PromotionConfig::default();
+    let promoted_predicates = match crate::promotion::check_and_promote(
+        storage,
+        ctx,
+        session_id,
+        &promotion_config,
+    )
+    .await
+    {
+        Ok(promoted) => promoted,
+        Err(e) => {
+            tracing::warn!(error = %e, "promotion check failed (non-fatal)");
+            vec![]
+        }
+    };
+
     Ok(DreamResult {
         entities_processed: entity_count,
         connections_created,
         insights,
         edges,
+        derived_facts_count,
+        pagerank_updated,
+        warmth_decayed,
+        promoted_predicates,
     })
 }
 
@@ -582,5 +670,98 @@ mod tests {
         // Only the big fold generates an insight
         assert_eq!(result.insights.len(), 1);
         assert!(result.insights[0].contains("4 entities co-occurring"));
+    }
+
+    /// Consolidation with entities and co-occurrence edges runs Datalog inference,
+    /// PageRank, and warmth decay without error.
+    #[tokio::test]
+    async fn consolidation_with_datalog_and_pagerank() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let sid = Uuid::new_v4();
+
+        // Add three entities in the same fold
+        let fold_id = Uuid::new_v4();
+        let e1 = make_entity(ctx.tenant_id, sid, "alpha", Some(fold_id));
+        let e2 = make_entity(ctx.tenant_id, sid, "beta", Some(fold_id));
+        let e3 = make_entity(ctx.tenant_id, sid, "gamma", Some(fold_id));
+        let id1 = e1.entity_id;
+        let id2 = e2.entity_id;
+        let id3 = e3.entity_id;
+        {
+            let mut entities = store.entities.lock().await;
+            entities.push(e1);
+            entities.push(e2);
+            entities.push(e3);
+        }
+
+        // Pre-create co-occurs edges so PageRank has an adjacency graph
+        store
+            .edge_co_occurs(&ctx, id1, id2, sid, 0.8)
+            .await
+            .unwrap();
+        store
+            .edge_co_occurs(&ctx, id2, id3, sid, 0.7)
+            .await
+            .unwrap();
+
+        let result = run_consolidation(&store, &ctx, sid).await.unwrap();
+
+        // Should have processed all 3 entities
+        assert!(result.entities_processed >= 3);
+        // Datalog should have derived at least some facts from the co-occurrence chain
+        // (e.g., related(X, Z) via transitive co-occurrence)
+        // The exact count depends on builtin rules matching the graph structure.
+        // PageRank should have updated scores for nodes in the edge graph
+        assert!(
+            result.pagerank_updated >= 2,
+            "expected at least 2 nodes with PageRank, got {}",
+            result.pagerank_updated
+        );
+        // PageRank creates warmth entries with warmth=0.0; decay prunes those below threshold
+        // so warmth_decayed may be non-zero (entries created by PageRank then pruned by decay)
+        assert!(
+            result.warmth_decayed <= result.pagerank_updated,
+            "should not prune more entries than PageRank created"
+        );
+    }
+
+    /// Empty session produces zero for all new consolidation fields.
+    #[tokio::test]
+    async fn consolidation_empty_session_new_fields() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let sid = Uuid::new_v4();
+
+        let result = run_consolidation(&store, &ctx, sid).await.unwrap();
+
+        assert_eq!(result.entities_processed, 0);
+        assert_eq!(result.derived_facts_count, 0);
+        assert_eq!(result.pagerank_updated, 0);
+        assert_eq!(result.warmth_decayed, 0);
+    }
+
+    /// DreamResult serialization includes the new fields.
+    #[tokio::test]
+    async fn dream_result_serializes_new_fields() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let sid = Uuid::new_v4();
+
+        let result = run_consolidation(&store, &ctx, sid).await.unwrap();
+        let json = serde_json::to_value(&result).expect("should serialize DreamResult");
+
+        assert!(
+            json.get("derived_facts_count").is_some(),
+            "missing derived_facts_count in JSON"
+        );
+        assert!(
+            json.get("pagerank_updated").is_some(),
+            "missing pagerank_updated in JSON"
+        );
+        assert!(
+            json.get("warmth_decayed").is_some(),
+            "missing warmth_decayed in JSON"
+        );
     }
 }

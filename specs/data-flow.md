@@ -179,7 +179,57 @@ sequenceDiagram
     Note over MCP: On next request, router loads latest guideline_version
 ```
 
-## 7. Data Tiering Path
+## 7. Recursive Exploration Flow
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'actorBkg':'#16161f','actorTextColor':'#e8e8ed','actorBorder':'#e2725b','signalColor':'#9494a3','signalTextColor':'#e8e8ed','labelBoxBkgColor':'#16161f','labelBoxBorderColor':'#e2725b','labelTextColor':'#e8e8ed','loopTextColor':'#e8e8ed','noteBkgColor':'#1c1c28','noteBorderColor':'#d4a574','noteTextColor':'#e8e8ed','activationBkgColor':'#1c1c28','activationBorderColor':'#e2725b'}}}%%
+sequenceDiagram
+    participant C as MCP Client
+    participant RE as recursive_explore
+    participant HS as hybrid_search
+    participant DL as datalog
+    participant W as warmth
+    participant S as cql_client
+
+    C->>RE: recursive_explore(session_id, query, embedding)
+    RE->>RE: decompose_query(query) -> sub_queries
+
+    Note over RE: Pass 1: Initial retrieval
+    loop Each sub_query
+        RE->>HS: hybrid_search(sub_query, embedding, 5-signal RRF)
+        HS-->>RE: seed entities + folds
+    end
+
+    loop Pass 2..N (max 5 passes)
+        RE->>DL: load_session_facts(session_id)
+        DL->>S: entity_list_session + edge_list_session + warmth_list_session
+        S-->>DL: raw rows
+        DL-->>DL: normalize to canonical predicates
+
+        RE->>DL: evaluate(rules, facts, max_iter=100)
+        DL->>DL: semi-naive fixpoint (related, cluster, reachable)
+        DL-->>RE: derived_facts + provenance
+
+        RE->>RE: discover new entities from derived facts
+
+        alt New entities found (novelty > threshold)
+            RE->>HS: hybrid_search(new entity contexts)
+            HS-->>RE: additional results
+        else Converged (no new facts OR novelty < threshold)
+            RE->>RE: break loop
+        end
+    end
+
+    Note over RE,W: Warmth boost for all returned entities
+    loop Each returned entity
+        RE->>W: boost_on_access(entity_id, session_id, decay_zone)
+        W->>S: warmth_boost + 1-hop neighbor spread
+    end
+
+    RE-->>C: RecursiveExploreResult {results, sub_queries, passes, converged, provenance}
+```
+
+## 8. Data Tiering Path
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#16161f','primaryTextColor':'#e8e8ed','primaryBorderColor':'#e2725b','lineColor':'#9494a3','secondaryColor':'#1c1c28','tertiaryColor':'#111118','clusterBkg':'#111118','clusterBorder':'#1e1e2a','edgeLabelBackground':'#111118','nodeTextColor':'#e8e8ed'}}}%%
