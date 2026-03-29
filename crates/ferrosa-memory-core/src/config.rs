@@ -257,6 +257,8 @@ pub struct EmbeddingConfig {
     pub model: String,
     #[serde(default = "default_dimensions")]
     pub dimensions: u32,
+    #[serde(default = "default_ner_model")]
+    pub ner_model: String,
 }
 
 impl Default for EmbeddingConfig {
@@ -266,6 +268,7 @@ impl Default for EmbeddingConfig {
             ollama_base_url: default_ollama_url(),
             model: default_embed_model(),
             dimensions: default_dimensions(),
+            ner_model: default_ner_model(),
         }
     }
 }
@@ -362,6 +365,9 @@ fn default_embed_model() -> String {
 }
 fn default_dimensions() -> u32 {
     768
+}
+fn default_ner_model() -> String {
+    "qwen3.5:27b".into()
 }
 fn default_true() -> bool {
     true
@@ -804,6 +810,28 @@ contact_points = ["localhost:9042"]
         assert_eq!(config.routing.guideline_version, "v1");
         assert!((config.rmh.warmth_boost_amount - 0.3).abs() < f64::EPSILON);
         assert_eq!(config.datalog.max_iterations, 100);
+    }
+
+    #[test]
+    fn embedding_config_has_ner_model_default() {
+        let config = EmbeddingConfig::default();
+        assert_eq!(config.ner_model, "qwen3.5:27b");
+    }
+
+    #[test]
+    fn parse_toml_with_ner_model() {
+        let toml_str = r#"
+[server]
+transport = "stdio"
+
+[ferrosa]
+contact_points = ["localhost:9042"]
+
+[embeddings]
+ner_model = "llama3:8b"
+"#;
+        let config = parse_config(toml_str).unwrap();
+        assert_eq!(config.embeddings.ner_model, "llama3:8b");
     }
 
     #[test]

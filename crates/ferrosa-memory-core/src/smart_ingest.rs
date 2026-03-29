@@ -56,6 +56,44 @@ impl Default for IngestConfig {
     }
 }
 
+/// NER configuration for LLM-based entity extraction.
+pub struct NerConfig {
+    pub http: reqwest::Client,
+    pub ollama_base_url: String,
+    pub model: String,
+}
+
+/// Three-tier entity name resolution.
+/// Tier 1: explicit name -> Tier 2: LLM extraction -> Tier 3: heuristic
+async fn resolve_entity_name(
+    explicit_name: Option<&str>,
+    content: &str,
+    caller_type: &str,
+    ner_config: Option<&NerConfig>,
+) -> (String, String) {
+    // Tier 1: explicit name provided
+    if let Some(name) = explicit_name
+        && !name.trim().is_empty()
+    {
+        return (name.trim().to_string(), caller_type.to_string());
+    }
+
+    // Tier 2+3: LLM extraction with heuristic fallback
+    if let Some(ner) = ner_config {
+        return crate::ner::extract_entity_from_content(
+            &ner.http,
+            &ner.ollama_base_url,
+            &ner.model,
+            content,
+            caller_type,
+        )
+        .await;
+    }
+
+    // No NER config — heuristic only
+    crate::ner::heuristic_extract_entity(content)
+}
+
 /// Smart ingest: decide whether to create, update, supersede, or skip.
 ///
 /// Uses entity search to find similar existing memories, then applies
@@ -70,7 +108,13 @@ pub async fn smart_ingest(
     embedding: Option<&[f32]>,
     source_fold_id: Option<Uuid>,
     config: &IngestConfig,
+    entity_name: Option<&str>,
+    ner_config: Option<&NerConfig>,
 ) -> anyhow::Result<IngestDecision> {
+    // Resolve entity name once for all code paths
+    let (resolved_name, resolved_type) =
+        resolve_entity_name(entity_name, content, entity_type, ner_config).await;
+
     // Search for similar existing entities
     let existing = if let Some(emb) = embedding {
         storage.entity_search_ann(ctx, session_id, emb, 3).await?
@@ -97,12 +141,8 @@ pub async fn smart_ingest(
             tenant_id: ctx.tenant_id,
             entity_id,
             session_id,
-            entity_name: content
-                .split_whitespace()
-                .take(8)
-                .collect::<Vec<_>>()
-                .join(" "),
-            entity_type: entity_type.to_string(),
+            entity_name: resolved_name.clone(),
+            entity_type: resolved_type.clone(),
             source_fold_id,
             context_snippet: content.to_string(),
             entity_embedding: embedding.map(|e| e.to_vec()),
@@ -156,12 +196,8 @@ pub async fn smart_ingest(
             tenant_id: ctx.tenant_id,
             entity_id: new_id,
             session_id,
-            entity_name: content
-                .split_whitespace()
-                .take(8)
-                .collect::<Vec<_>>()
-                .join(" "),
-            entity_type: entity_type.to_string(),
+            entity_name: resolved_name.clone(),
+            entity_type: resolved_type.clone(),
             source_fold_id,
             context_snippet: content.to_string(),
             entity_embedding: embedding.map(|e| e.to_vec()),
@@ -193,12 +229,8 @@ pub async fn smart_ingest(
         tenant_id: ctx.tenant_id,
         entity_id,
         session_id,
-        entity_name: content
-            .split_whitespace()
-            .take(8)
-            .collect::<Vec<_>>()
-            .join(" "),
-        entity_type: entity_type.to_string(),
+        entity_name: resolved_name.clone(),
+        entity_type: resolved_type.clone(),
         source_fold_id,
         context_snippet: content.to_string(),
         entity_embedding: embedding.map(|e| e.to_vec()),
@@ -235,8 +267,6 @@ pub fn extract_entity_candidates(text: &str) -> Vec<(String, String)> {
         if word.len() > 1
             && word.chars().next().is_some_and(|c| c.is_uppercase())
             && !is_common_word(word)
-            // skip sentence starters (i > 0)
-            && i > 0
         {
             // Collect consecutive capitalized words
             let start = i;
@@ -633,6 +663,8 @@ mod tests {
             None,
             None,
             &IngestConfig::default(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -642,8 +674,6 @@ mod tests {
 
     #[test]
     fn extract_entities_from_technical_text() {
-        // First word is skipped by the sentence-starter heuristic (i > 0),
-        // so prefix with a lowercase word to push entities past position 0.
         let text = "uses Ferrosa with LSM-tree storage and S3 tiering";
         let candidates = extract_entity_candidates(text);
         let names: Vec<&str> = candidates.iter().map(|c| c.0.as_str()).collect();
@@ -663,19 +693,28 @@ mod tests {
     }
 
     #[test]
-    fn extract_entities_skips_sentence_starters() {
+    fn extract_entities_at_sentence_start() {
         let text = "Cassandra is great. Redis is fast.";
         let candidates = extract_entity_candidates(text);
         let names: Vec<&str> = candidates.iter().map(|c| c.0.as_str()).collect();
-        // "Cassandra" is at i=0, so it is skipped as a sentence starter
         assert!(
-            !names.contains(&"Cassandra"),
-            "should skip sentence-starting word"
+            names.contains(&"Cassandra"),
+            "should extract entity at sentence start, got: {names:?}"
         );
-        // "Redis" is at i > 0 and capitalized, so it should be captured
         assert!(
             names.contains(&"Redis"),
-            "should extract mid-sentence entity"
+            "should extract mid-sentence entity, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn extract_entities_at_position_zero() {
+        let text = "Ben Kearns built Ferrosa from scratch";
+        let candidates = extract_entity_candidates(text);
+        let names: Vec<&str> = candidates.iter().map(|c| c.0.as_str()).collect();
+        assert!(
+            names.contains(&"Ben Kearns"),
+            "should extract entity at position 0, got: {names:?}"
         );
     }
 
@@ -1110,5 +1149,70 @@ mod tests {
         let candidates = extract_entity_candidates(text);
         let names: Vec<&str> = candidates.iter().map(|c| c.0.as_str()).collect();
         assert!(names.contains(&"Ferrosa"));
+    }
+
+    #[tokio::test]
+    async fn smart_ingest_uses_explicit_entity_name() {
+        use crate::storage::mock::MockStorage;
+
+        let store = MockStorage::new();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "test".into(),
+        };
+
+        let result = smart_ingest(
+            &store,
+            &ctx,
+            Uuid::new_v4(),
+            "Ben Kearns is the developer of ferrosa-memory-mcp and has ops background",
+            "person",
+            None,
+            None,
+            &IngestConfig::default(),
+            Some("Ben Kearns"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result, IngestDecision::Created { .. }));
+
+        let entities = store.entities.lock().await;
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].entity_name, "Ben Kearns");
+    }
+
+    #[tokio::test]
+    async fn smart_ingest_without_name_falls_back_to_heuristic() {
+        use crate::storage::mock::MockStorage;
+
+        let store = MockStorage::new();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "test".into(),
+        };
+
+        let result = smart_ingest(
+            &store,
+            &ctx,
+            Uuid::new_v4(),
+            "The project called Docker is widely used in production",
+            "concept",
+            None,
+            None,
+            &IngestConfig::default(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result, IngestDecision::Created { .. }));
+
+        let entities = store.entities.lock().await;
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].entity_name, "Docker");
+        assert_eq!(entities[0].entity_type, "tool");
     }
 }
