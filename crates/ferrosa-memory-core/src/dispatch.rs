@@ -300,6 +300,37 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "batch_ingest".into(),
+            description: "Batch ingest multiple entities in a single call.\n\n\
+                CALL WHEN:\n\
+                - Ingesting 5+ entities at once (codebase indexing, document extraction, bulk import)\n\
+                - Performance matters — single round-trip instead of N sequential calls\n\n\
+                Each entity follows the same schema as upsert_entity. Returns array of results.\n\n\
+                Cost: ~15ms + 5ms per entity (vs 15ms per entity with individual calls).".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "format": "uuid", "description": "Session UUID" },
+                    "entities": {
+                        "type": "array",
+                        "description": "Array of entities to ingest",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "entity_name": { "type": "string", "maxLength": 512 },
+                                "entity_type": { "type": "string", "enum": ["person", "place", "event", "concept", "org"] },
+                                "context_snippet": { "type": "string", "maxLength": 4096 },
+                                "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+                            },
+                            "required": ["entity_name", "entity_type", "context_snippet"]
+                        },
+                        "maxItems": 100
+                    }
+                },
+                "required": ["session_id", "entities"]
+            }),
+        },
+        ToolDef {
             name: "retrieve_entities".into(),
             description: "Retrieves named entities by name (phonetic fuzzy match), semantic similarity (ANN), or both.\n\nCALL WHEN: Need to find entities related to current query. Use strategy='phonetic' for known names with possible variants. Use strategy='ann' for semantic search. Use strategy='both' for maximum recall.\nCost: phonetic ~5ms, ann ~10ms, both ~15ms.".into(),
             input_schema: serde_json::json!({
@@ -796,6 +827,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "complete_fold" => handle_complete_fold(args, storage, ctx, session).await,
         "retrieve_fold_context" => handle_retrieve_fold(args, storage, ctx).await,
         "upsert_entity" => handle_upsert_entity(args, storage, ctx, session).await,
+        "batch_ingest" => handle_batch_ingest(args, storage, ctx, session).await,
         "retrieve_entities" => handle_retrieve_entities(args, storage, ctx, session).await,
         "record_outcome" => handle_record_outcome(args, storage, ctx).await,
         "delete_session" => handle_delete_session(args, storage, ctx).await,
@@ -875,6 +907,7 @@ fn is_write_tool(name: &str) -> bool {
             | "append_to_fold"
             | "complete_fold"
             | "upsert_entity"
+            | "batch_ingest"
             | "record_outcome"
             | "delete_session"
             | "smart_ingest"
@@ -1233,6 +1266,131 @@ async fn handle_upsert_entity<S: crate::storage::Storage>(
     .await;
 
     Ok(result_json)
+}
+
+async fn handle_batch_ingest<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let session_id = require_uuid(&args, "session_id")?;
+    let entities = args
+        .get("entities")
+        .and_then(|v| v.as_array())
+        .ok_or((INVALID_PARAMS, "entities must be an array".to_string()))?;
+
+    if entities.len() > 100 {
+        return Err((
+            INVALID_PARAMS,
+            format!(
+                "entities array length {} exceeds maximum of 100",
+                entities.len()
+            ),
+        ));
+    }
+
+    let mut results = Vec::with_capacity(entities.len());
+    let mut created: usize = 0;
+    let mut skipped: usize = 0;
+    let mut errors: usize = 0;
+
+    for (i, entity_json) in entities.iter().enumerate() {
+        let name = entity_json
+            .get("entity_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let entity_type = entity_json
+            .get("entity_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("concept");
+        let context = entity_json
+            .get("context_snippet")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let confidence = entity_json.get("confidence").and_then(|v| v.as_f64());
+
+        if name.is_empty() || context.is_empty() {
+            skipped += 1;
+            results.push(serde_json::json!({
+                "index": i, "status": "skipped", "reason": "empty name or context"
+            }));
+            continue;
+        }
+
+        match crate::entity::upsert_entity(
+            storage,
+            ctx,
+            session_id,
+            name,
+            entity_type,
+            context,
+            None,
+            None,
+            confidence,
+        )
+        .await
+        {
+            Ok(result) => {
+                let status = if result.is_new { "created" } else { "existing" };
+                if result.is_new {
+                    created += 1;
+                } else {
+                    skipped += 1;
+                }
+
+                // Emit viz event for each entity
+                session.event_bus.emit(crate::viz::VizEvent::EntityChanged {
+                    node: crate::viz::VizNode {
+                        id: result.entity_id.to_string(),
+                        label: name.to_string(),
+                        node_type: "entity".into(),
+                        entity_type: entity_type.to_string(),
+                        state: "active".into(),
+                        confidence: confidence.unwrap_or(1.0),
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                        context: context.to_string(),
+                    },
+                    action: status.into(),
+                });
+
+                results.push(serde_json::json!({
+                    "index": i,
+                    "status": status,
+                    "entity_id": result.entity_id.to_string(),
+                }));
+            }
+            Err(e) => {
+                errors += 1;
+                results.push(serde_json::json!({
+                    "index": i, "status": "error", "error": e.to_string()
+                }));
+            }
+        }
+    }
+
+    // Audit log (best-effort)
+    let _ = crate::audit::log_write(
+        storage,
+        ctx,
+        "batch_ingest",
+        "entity_store",
+        &format!("{} entities", entities.len()),
+        session_id,
+    )
+    .await;
+
+    Ok(serde_json::json!({
+        "created": created,
+        "skipped": skipped,
+        "errors": errors,
+        "total": entities.len(),
+        "results": results,
+        "hint": format!(
+            "Batch ingested {} entities. Run run_consolidation to build edges.",
+            entities.len()
+        )
+    }))
 }
 
 async fn handle_retrieve_entities<S: crate::storage::Storage>(
@@ -2542,10 +2700,11 @@ mod tests {
             .await
             .unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 36);
+        assert_eq!(tools.len(), 37);
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"check_memo_cache"));
+        assert!(names.contains(&"batch_ingest"));
         assert!(names.contains(&"store_memo_result"));
         assert!(names.contains(&"write_plan_node"));
         assert!(names.contains(&"get_plan_context"));
