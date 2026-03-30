@@ -1,7 +1,7 @@
 # Failure Mode and Effects Analysis — ferrosa-memory-mcp
 
 > Last updated: 2026-03-29
-> Status: Updated — Sprint 5 failure modes added (F42–F52) for Datalog inference, warmth field, PageRank, and recursive explore components.
+> Status: Updated — Sprint 5/5b failure modes added (F42–F56) for Datalog inference, warmth field, PageRank, recursive explore, and promotion components.
 
 ## Scoring Criteria
 
@@ -104,6 +104,7 @@
 | **189** | F19 | Memory poisoning via crafted entities | entity_tools |
 | **168** | F18 | Phonetic false merge corrupts entities | entity_tools |
 | **150** | F51 | Query decomposition produces irrelevant sub-queries | recursive_explore |
+| **150** | F55 | Materialized facts become stale after base graph changes | promotion |
 | **144** | F17 | HNSW returns irrelevant fold summaries | fold_tools |
 | **140** | F45 | Derived cache returns stale facts after rule change | datalog |
 | **126** | F13 | Orphaned fold vertex (partial write) | fold_tools |
@@ -127,15 +128,18 @@
 | **72** | F22 | Duplicate current facts for entity | temporal_events |
 | **72** | F29 | Malformed JSON-RPC crashes server | transport |
 | **72** | F42 | Semi-naive evaluation diverges (no fixpoint) | datalog |
+| **72** | F54 | batch_materialize fails mid-write | promotion |
 | **60** | F11 | Thundering herd duplicate writes | memo_tools |
 | **60** | F12 | TTL sweep job failure | memo_tools |
 | **60** | F44 | Confidence propagation produces values > 1.0 | datalog |
+| **60** | F53 | Promotion score inflated by bursty query patterns | promotion |
 | **56** | F25 | Ollama endpoint down | embedding_client |
 | **54** | F24 | HTTP credentials over plaintext | auth |
 | **48** | F37 | Quota enforcement race condition | quota enforcement |
 | **42** | F34 | Spreading activation infinite loop | cognitive tools |
 | **36** | F47 | Warmth boost blocks retrieval response | warmth |
 | **36** | F52 | Convergence detection fails (never converges) | recursive_explore |
+| **36** | F56 | Size budget exceeded for durable tables | promotion |
 | **27** | F49 | PPR computation fails during consolidation | pagerank |
 | **16** | F50 | PPR scores all zero (disconnected graph) | pagerank |
 
@@ -232,6 +236,15 @@
 |----|-------------|--------|---|---|---|-----|-------------------|
 | F51 | Query decomposition produces irrelevant sub-queries | Noise results mixed with signal. Retrieval quality degrades compared to single-pass `hybrid_search`. | 5 | 5 | 6 | **150** | Original query always included as first sub-query (guarantees baseline quality). Cap at 5 sub-queries. Score synthesis favors multi-pass consensus — results appearing in multiple passes ranked higher. |
 | F52 | Convergence detection fails (never converges) | Max passes exhausted on every exploration. Consistently high latency for `recursive_explore` calls. | 4 | 3 | 3 | **36** | Hard cap at `max_passes` (default 3). Total timeout for exploration. Convergence threshold configurable. Log pass count and convergence status for monitoring. |
+
+### Component: promotion (M39) — Workload-Driven Materialization
+
+| ID | Failure Mode | Effect | S | O | D | RPN | Recommended Action |
+|----|-------------|--------|---|---|---|-----|-------------------|
+| F53 | Promotion score inflated by bursty query patterns | Predicate promoted prematurely, wasting durable storage | 3 | 4 | 5 | **60** | Use 7-day rolling window. Require minimum days_observed > 3. Track update rate. |
+| F54 | batch_materialize fails mid-write | Partial materialization — some edges written, others missing | 6 | 3 | 4 | **72** | Clear before write (existing). Retry on next consolidation. Provenance tracks batch_id for audit. |
+| F55 | Materialized facts become stale after base graph changes | Durable facts diverge from live Datalog evaluation | 5 | 5 | 6 | **150** | Rematerialize on rule version change. consolidation Phase 7 refreshes promoted predicates. TTL on promotion status. |
+| F56 | Size budget exceeded for durable tables | Storage growth, potentially unbounded | 4 | 3 | 3 | **36** | size_budget_rows config cap. estimated_rows check before promotion. |
 
 ### New Test Cases
 

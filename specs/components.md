@@ -1,7 +1,7 @@
 # Component Architecture
 
 > Last updated: 2026-03-29
-> Status: 35 modules — cognitive memory, hybrid search, visualization, infrastructure, Datalog inference, and recursive exploration layers complete. Sprint 5 adds datalog, warmth, pagerank, and recursive_explore modules.
+> Status: 36 modules — cognitive memory, hybrid search, visualization, infrastructure, Datalog inference, recursive exploration, and B10 promotion pipeline layers complete. Sprint 5 adds datalog, warmth, pagerank, and recursive_explore modules. B10 adds promotion pipeline for workload-driven materialization.
 
 ## Module Map
 
@@ -34,13 +34,16 @@ graph TB
     W --> L
     PR[pagerank] --> L
     PR --> W
+    B --> PROM[promotion]
+    PROM --> DL
+    PROM --> L
     L --> N[audit]
     L --> O[metrics]
     L --> P[viz]
     P --> Q[http]
 ```
 
-**Note:** Shows main call flow. Full 35-module dependency matrix in `dsm-analysis.md`.
+**Note:** Shows main call flow. Full 36-module dependency matrix in `dsm-analysis.md`.
 
 **Note:** `graph_client` (M11) uses the HTTP Cypher endpoint, which is working. Graph writes go through CQL (vertex/edge table INSERTs via `CqlStorage`), and graph reads/traversals go through HTTP POST against `/graph/query` via `reqwest`.
 
@@ -594,6 +597,22 @@ graph TB
 
 ---
 
+### 36. `promotion` — Workload-Driven Promotion Pipeline
+
+**Responsibility:** Evaluate derived predicate heat (query frequency x compute cost) and promote hot predicates from ephemeral cache to durable materialized storage. Implements the promotion scoring formula from the Datalog graph materialization spec.
+
+**Interface:**
+- `compute_promotion_score(heat, config) -> f64` — promotion score formula
+- `should_promote(heat, estimated_rows, config) -> bool` — threshold + size budget gate
+- `batch_materialize(storage, ctx, session_id, predicate, config) -> usize` — materialize derived facts durably
+- `check_and_promote(storage, ctx, session_id, config) -> Vec<String>` — auto-promote hot predicates
+
+**Dependencies:** `storage`, `types`, `config`, `datalog`
+
+**Size estimate:** ~250 lines
+
+---
+
 ## Size Summary
 
 | Module | Lines (actual) |
@@ -634,4 +653,5 @@ graph TB
 | warmth | 300 |
 | pagerank | 200 |
 | recursive_explore | 500 |
-| **Total** | **~14,150** |
+| promotion | 250 |
+| **Total** | **~14,400** |

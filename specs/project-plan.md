@@ -1,7 +1,7 @@
 # Project Plan — ferrosa-memory-mcp
 
 > Last updated: 2026-03-29
-> Status: Sprints 1-4 complete. Sprint 5 (RMH + Datalog) planned.
+> Status: Sprints 1-5b complete. Sprint 5 (RMH + Datalog) and Sprint 5b (Durable Materialization) done.
 
 ## Overview
 
@@ -16,7 +16,7 @@
 | Sprint 3 | **COMPLETE** | 10/10 tasks done |
 | Sprint 4 | **COMPLETE** | 11/11 tasks done |
 | Sprint 4.9 | **COMPLETE** | SUBSCRIBE anomaly alerts, get_stats enrichment |
-| Sprint 5 | **PLANNED** | RMH + Datalog Graph Inference (12 tasks) |
+| Sprint 5 | **COMPLETE** | RMH + Datalog + Promotion (12+4 tasks) |
 
 ---
 
@@ -139,7 +139,7 @@
 
 **Sources:** [RMH/Ori Mnemos](https://orimnemos.com/rmh/), [RLM paper](https://arxiv.org/abs/2512.24601) (MIT CSAIL), [`~/datalog_graph_materialization_spec.md`](file:///Users/bkearns/datalog_graph_materialization_spec.md).
 
-**Status: PLANNED**
+**Status: COMPLETE**
 
 ### Phase A: Foundation (parallelizable)
 
@@ -187,6 +187,23 @@
 
 ---
 
+## Sprint 5b: Durable Materialization Pipeline (B10)
+
+**Goal:** Workload-driven promotion pipeline — heat telemetry, promotion scoring, batch materialization, and automatic promotion during dream consolidation.
+
+**Status: COMPLETE** — promotion.rs module, promote_predicate MCP tool, consolidation Phase 7, DDL 015-016.
+
+| # | Task | Size | Source | Success Criteria | Tests |
+|---|------|------|--------|-----------------|-------|
+| B10a | DDL: heat telemetry + durable materialization tables | S | Datalog spec §8.3, §8.8 | 2 DDL files, 5 tables created | DDL executes on Ferrosa |
+| B10b | Types + Storage: MaterializedEdge, PromotedPredicate, 7 trait methods + MockStorage | L | Datalog spec §8.3, §15 | Trait compiles, MockStorage tests pass | Unit: CRUD round-trip for all 7 methods |
+| B10c | Promotion engine: scoring, should_promote, batch_materialize, check_and_promote | L | Datalog spec §15 | Promotion formula correct, batch materialize writes to durable tables | Unit: 7 tests covering scoring, thresholds, budget, materialization |
+| B10d | MCP tool + consolidation: promote_predicate tool, dream Phase 7 | M | MCP pattern, dream pattern | Tool in tools/list, consolidation runs promotion check | Unit: dispatch test, consolidation test |
+
+**Sprint 5b exit criteria:** All 4 tasks complete. promote_predicate MCP tool functional. Consolidation Phase 7 runs promotion check. **MET.**
+
+---
+
 ## Backlog (Post-v1.0)
 
 | # | Task | Size | Source | Notes |
@@ -200,8 +217,7 @@
 | B7 | `INSERT IF NOT EXISTS` (LWT) for thundering herd | S | FMEA F11 | Blocked on Ferrosa LWT support |
 | B8 | Native row TTL in Ferrosa | S | spec Section 8.3 | Replace application-managed TTL sweep if Ferrosa adds native TTL |
 | B9 | Generic `nodes_by_id` / `edges_by_src/dst/pred` tables | XL | Datalog spec §8.1-8.2 | Replace entity_store + typed edge tables with generic schema. Major migration. |
-| B10 | Durable materialization tables + promotion pipeline | L | Datalog spec §8.3, §15 | `derived_edges_by_src/pred` tables, `should_promote()` scoring, workload-driven promotion |
-| B11 | Specialized materialized tables (methodology_members, tool_preferences) | M | Datalog spec §8.9 | Depends on B10 promotion pipeline |
+| B11 | Specialized materialized tables (methodology_members, tool_preferences) | M | Datalog spec §8.9 | Depends on B10 promotion pipeline (complete) |
 | B12 | NVMe pinning for cache tables | S | Datalog spec §13.3 | Infrastructure config for hierarchical storage placement |
 | B13 | Incremental Datalog delta propagation | L | Datalog spec §16.2 | Replace batch recomputation with incremental fact propagation on bounded edits |
 | B14 | Louvain community detection | M | RMH/Ori Mnemos | Graph community detection for cluster identification |
@@ -225,7 +241,7 @@
 | Compression quality insufficient without model inference | Low | Medium | ADR-001 accepts this tradeoff for v1. Backlog B2 adds perplexity-based scoring. | Accepted |
 | **Datalog fact explosion on dense graphs** (FMEA F42, RPN 72) | Medium | High | max_facts=50000 cap, max_iterations=100, entity cap 1000 bounds input. Log warning and bail on cap hit. | **Open** |
 | **Warmth runaway feedback loop** (FMEA F46, RPN 120) | Medium | Medium | Max warmth cap 10.0. Ebbinghaus decay in consolidation. Monitor warmth distribution in get_stats. | **Open** |
-| **Derived cache staleness after rule change** (FMEA F45, RPN 140) | Medium | High | Invalidate cache for affected predicate families on rule change. Include rule_version in cache key. | **Open** |
+| **Derived cache staleness after rule change** (FMEA F45, RPN 140) | Medium | High | Invalidate cache for affected predicate families on rule change. Include rule_version in cache key. Cache invalidation implemented in manage_rules put action. | **Mitigated** |
 | **Rule injection via manage_rules** (STRIDE S7) | Medium | High | Rule body validation (parse before storing). Rule family isolation. Audit log for all rule changes. | **Open** |
 | Query decomposition quality without LLM | Medium | Medium | Heuristic v1. Always includes original query. Backlog B16: optional LLM-powered decomposition. | Accepted |
 | 15 new Storage trait methods increases trait surface | Medium | Low | All follow established patterns. MockStorage straightforward. Fan-in analysis acceptable. | Accepted |
