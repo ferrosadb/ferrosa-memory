@@ -1437,7 +1437,13 @@ function handleEvent(event) {
   switch (event.type) {
     case 'Snapshot':
       nodes = event.nodes || [];
-      allEdges = (event.edges || []).map(e => ({...e}));
+      // Sort: typed edges first (depends_on, contains, etc.), CO_OCCURS last
+      allEdges = (event.edges || []).map(e => ({...e}))
+        .sort((a, b) => {
+          const aTyped = a.edge_type !== 'CO_OCCURS' ? 0 : 1;
+          const bTyped = b.edge_type !== 'CO_OCCURS' ? 0 : 1;
+          return aTyped - bTyped;
+        });
       buildEdgeTypeFilters();
       applyEdgeFilter();
       render();
