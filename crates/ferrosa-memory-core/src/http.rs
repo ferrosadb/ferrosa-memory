@@ -439,6 +439,19 @@ async fn handle_viz_connection(
             );
             stream.write_all(response.as_bytes()).await?;
         }
+        ("GET", "/viz/snapshot") => {
+            let body = serde_json::to_string(&snapshot).unwrap_or_default();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/json\r\n\
+                 Cache-Control: no-cache\r\n\
+                 Access-Control-Allow-Origin: *\r\n\
+                 Content-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await?;
+        }
         ("GET", "/subscribe/anomalies") => {
             handle_anomaly_sse(stream, event_bus).await?;
         }
