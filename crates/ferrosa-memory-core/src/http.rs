@@ -635,7 +635,7 @@ async fn build_snapshot<S: Storage>(
     let edges_result: anyhow::Result<Vec<_>> = Ok(all_edges);
 
     // Send all edges to the client — the viz slider filters client-side.
-    let edges = match edges_result {
+    let mut edges: Vec<VizEdge> = match edges_result {
         Ok(raw_edges) => raw_edges
             .into_iter()
             .filter_map(|(src, tgt, etype)| {
@@ -646,7 +646,7 @@ async fn build_snapshot<S: Storage>(
                         source: src_s,
                         target: tgt_s,
                         edge_type: etype,
-                        strength: None, // TODO: include from edge_list_all
+                        strength: None,
                     })
                 } else {
                     None
@@ -658,6 +658,29 @@ async fn build_snapshot<S: Storage>(
             Vec::new()
         }
     };
+
+    // Load typed edges (depends_on, contains, calls, etc.)
+    let typed_edges = if session_id.is_nil() {
+        // No session — skip typed edges (they require session_id)
+        Vec::new()
+    } else {
+        storage
+            .typed_edge_list_session(ctx, session_id)
+            .await
+            .unwrap_or_default()
+    };
+    for te in typed_edges {
+        let src_s = te.src_id.to_string();
+        let dst_s = te.dst_id.to_string();
+        if node_ids.contains(src_s.as_str()) && node_ids.contains(dst_s.as_str()) {
+            edges.push(VizEdge {
+                source: src_s,
+                target: dst_s,
+                edge_type: te.edge_type,
+                strength: Some(te.weight as f32),
+            });
+        }
+    }
 
     VizEvent::Snapshot { nodes, edges }
 }

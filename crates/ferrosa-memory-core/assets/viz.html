@@ -732,6 +732,7 @@
       <input type="range" id="edge-slider" min="0" max="100" value="20" style="width:80px;accent-color:var(--accent);">
       <span id="edge-count" style="font-size:10px;color:var(--text-secondary);min-width:40px;">20%</span>
     </div>
+    <div style="display:flex;align-items:center;gap:4px;margin:0 8px;" id="edge-type-filters"></div>
     <div class="header-buttons right">
       <div class="connection-indicator" id="connection-indicator">
         <span class="dot"></span>
@@ -810,7 +811,16 @@ const edgeColors = {
   MENTIONED_IN: '#7c9cf5',
   FOLDED_INTO: '#c882f0',
   SUPERSEDES: '#e25b5b',
+  depends_on: '#ff7eb3',
+  contains: '#7effa0',
+  part_of: '#7ec8ff',
+  calls: '#ffe07e',
+  implements: '#c97eff',
+  uses: '#7effda',
+  subclass_of: '#ff9d7e',
+  related_to: '#d4a574',
 };
+let activeEdgeTypes = new Set(); // empty = show all
 
 const stateOpacity = {
   active: 1.0,
@@ -1428,6 +1438,7 @@ function handleEvent(event) {
     case 'Snapshot':
       nodes = event.nodes || [];
       allEdges = (event.edges || []).map(e => ({...e}));
+      buildEdgeTypeFilters();
       applyEdgeFilter();
       render();
       if (infoPanelOpen) {
@@ -1558,16 +1569,52 @@ window.addEventListener('resize', () => {
 
 // === Edge filter ===
 function applyEdgeFilter() {
+  // Step 1: filter by type (if any types are active)
+  let filtered = allEdges;
+  if (activeEdgeTypes.size > 0) {
+    filtered = allEdges.filter(e => activeEdgeTypes.has(e.edge_type));
+  }
+  // Step 2: filter by percentage slider
   if (edgeFilterPct >= 100) {
-    edges = allEdges.slice();
+    edges = filtered.slice();
   } else if (edgeFilterPct <= 0) {
     edges = [];
   } else {
-    const count = Math.max(1, Math.round(allEdges.length * edgeFilterPct / 100));
-    edges = allEdges.slice(0, count);
+    const count = Math.max(1, Math.round(filtered.length * edgeFilterPct / 100));
+    edges = filtered.slice(0, count);
   }
   document.getElementById('edge-count').textContent =
     `${edges.length}/${allEdges.length}`;
+}
+
+function buildEdgeTypeFilters() {
+  const types = new Set(allEdges.map(e => e.edge_type));
+  const container = document.getElementById('edge-type-filters');
+  container.innerHTML = '';
+  for (const t of [...types].sort()) {
+    const color = edgeColors[t] || '#888';
+    const chip = document.createElement('button');
+    chip.textContent = t;
+    chip.dataset.type = t;
+    chip.style.cssText = `
+      font-size:9px; padding:1px 6px; border-radius:8px; cursor:pointer;
+      border:1px solid ${color}; color:${color}; background:transparent;
+      opacity:${activeEdgeTypes.size === 0 || activeEdgeTypes.has(t) ? 1 : 0.3};
+    `;
+    chip.addEventListener('click', () => {
+      if (activeEdgeTypes.has(t)) {
+        activeEdgeTypes.delete(t);
+      } else {
+        activeEdgeTypes.add(t);
+      }
+      // If all types selected, reset to "show all" mode
+      if (activeEdgeTypes.size === types.size) activeEdgeTypes.clear();
+      buildEdgeTypeFilters();
+      applyEdgeFilter();
+      render();
+    });
+    container.appendChild(chip);
+  }
 }
 
 document.getElementById('edge-slider').addEventListener('input', (e) => {
