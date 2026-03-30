@@ -2566,4 +2566,27 @@ impl Storage for CqlStorage {
     ) -> anyhow::Result<Vec<PromotedPredicate>> {
         anyhow::bail!("promoted_predicate_list: CQL not yet implemented (B10)")
     }
+
+    // --- Typed edge operations ---
+
+    async fn typed_edge_put(&self, _ctx: &TenantContext, _edge: &TypedEdge) -> anyhow::Result<()> {
+        anyhow::bail!("typed_edge_put: CQL not yet implemented")
+    }
+
+    async fn typed_edge_list_session(
+        &self,
+        _ctx: &TenantContext,
+        _session_id: Uuid,
+    ) -> anyhow::Result<Vec<TypedEdge>> {
+        anyhow::bail!("typed_edge_list_session: CQL not yet implemented")
+    }
+
+    async fn typed_edge_list_from(
+        &self,
+        _ctx: &TenantContext,
+        _session_id: Uuid,
+        _src_id: Uuid,
+    ) -> anyhow::Result<Vec<TypedEdge>> {
+        anyhow::bail!("typed_edge_list_from: CQL not yet implemented")
+    }
 }

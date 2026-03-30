@@ -716,6 +716,29 @@ impl Storage for ReconnectingStorage {
     ) -> anyhow::Result<Vec<PromotedPredicate>> {
         delegate!(self, promoted_predicate_list, ctx)
     }
+
+    // --- Typed edge operations ---
+
+    async fn typed_edge_put(&self, ctx: &TenantContext, edge: &TypedEdge) -> anyhow::Result<()> {
+        delegate!(self, typed_edge_put, ctx, edge)
+    }
+
+    async fn typed_edge_list_session(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<TypedEdge>> {
+        delegate!(self, typed_edge_list_session, ctx, session_id)
+    }
+
+    async fn typed_edge_list_from(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        src_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<TypedEdge>> {
+        delegate!(self, typed_edge_list_from, ctx, session_id, src_id)
+    }
 }
 
 /// Backoff schedule for CQL reconnection: 1s, 2s, 4s, 8s, 16s, then 30s.

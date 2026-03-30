@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::types::{
     AuditEntry, DerivedFact, EntityEntry, FeedbackOutcome, FoldEntry, FoldSummary,
     MaterializedEdge, MemoEntry, MemoryState, PlanNode, PlanStatus, PromotedPredicate,
-    ProvenanceStep, RuleEntry, RuleState, TemporalEvent, TenantContext, WarmthEntry,
+    ProvenanceStep, RuleEntry, RuleState, TemporalEvent, TenantContext, TypedEdge, WarmthEntry,
 };
 
 /// Core storage operations for the memory system.
@@ -445,6 +445,26 @@ pub trait Storage: Send + Sync {
         days: u32,
     ) -> anyhow::Result<(i64, i64)>;
 
+    // --- Typed edge operations ---
+
+    /// Create a typed, labeled edge between two entities.
+    async fn typed_edge_put(&self, ctx: &TenantContext, edge: &TypedEdge) -> anyhow::Result<()>;
+
+    /// List all typed edges for a session.
+    async fn typed_edge_list_session(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<TypedEdge>>;
+
+    /// List typed edges from a specific source entity.
+    async fn typed_edge_list_from(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        src_id: Uuid,
+    ) -> anyhow::Result<Vec<TypedEdge>>;
+
     // --- Durable materialization operations (B10) ---
 
     /// Store a materialized edge (durable).
@@ -533,6 +553,7 @@ pub mod mock {
         pub heat_records: Mutex<Vec<(String, bool, Option<i64>)>>,
         pub materialized_edges: Mutex<Vec<MaterializedEdge>>,
         pub promoted_predicates: Mutex<Vec<PromotedPredicate>>,
+        pub typed_edges: Mutex<Vec<TypedEdge>>,
     }
 
     impl MockStorage {
@@ -1416,6 +1437,47 @@ pub mod mock {
             Ok(entries
                 .iter()
                 .filter(|e| e.tenant_id == ctx.tenant_id)
+                .cloned()
+                .collect())
+        }
+
+        // --- Typed edge operations ---
+
+        async fn typed_edge_put(
+            &self,
+            _ctx: &TenantContext,
+            edge: &TypedEdge,
+        ) -> anyhow::Result<()> {
+            let mut edges = self.typed_edges.lock().await;
+            edges.push(edge.clone());
+            Ok(())
+        }
+
+        async fn typed_edge_list_session(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+        ) -> anyhow::Result<Vec<TypedEdge>> {
+            let edges = self.typed_edges.lock().await;
+            Ok(edges
+                .iter()
+                .filter(|e| e.tenant_id == ctx.tenant_id && e.session_id == session_id)
+                .cloned()
+                .collect())
+        }
+
+        async fn typed_edge_list_from(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+            src_id: Uuid,
+        ) -> anyhow::Result<Vec<TypedEdge>> {
+            let edges = self.typed_edges.lock().await;
+            Ok(edges
+                .iter()
+                .filter(|e| {
+                    e.tenant_id == ctx.tenant_id && e.session_id == session_id && e.src_id == src_id
+                })
                 .cloned()
                 .collect())
         }

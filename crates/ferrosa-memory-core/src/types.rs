@@ -382,6 +382,21 @@ pub struct SubQuery {
     pub reasoning: String,
 }
 
+// ─── Typed edges ───────────────────────────────────────────────
+
+/// A typed, labeled edge between two entities.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypedEdge {
+    pub tenant_id: Uuid,
+    pub session_id: Uuid,
+    pub src_id: Uuid,
+    pub edge_type: String,
+    pub dst_id: Uuid,
+    pub weight: f64,
+    pub metadata: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
 // ─── B10: Materialization + Promotion types ────────────────────
 
 /// A durably materialized derived edge.
