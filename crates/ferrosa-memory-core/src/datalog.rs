@@ -508,6 +508,21 @@ pub async fn load_session_facts(
         );
     }
 
+    // Load typed edges as specific predicates
+    let typed_edges = storage.typed_edge_list_session(ctx, session_id).await?;
+    for te in &typed_edges {
+        let pred = &te.edge_type;
+        facts.insert(pred, vec![Term::Const(te.src_id), Term::Const(te.dst_id)]);
+        facts.insert(
+            "edge",
+            vec![
+                Term::Const(te.src_id),
+                Term::ConstStr(pred.clone()),
+                Term::Const(te.dst_id),
+            ],
+        );
+    }
+
     // Load warmth scores
     let warmth_entries = storage.warmth_list_session(ctx, session_id).await?;
     for w in &warmth_entries {

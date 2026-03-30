@@ -749,6 +749,55 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "required": ["predicate"]
             }),
         },
+        // --- Typed edge tools ---
+        ToolDef {
+            name: "create_edge".into(),
+            description: "Create a typed, labeled edge between two entities.\n\n\
+                CALL WHEN:\n\
+                - Building a knowledge graph with semantic relationships\n\
+                - Recording dependencies (depends_on), containment (contains), inheritance (subclass_of)\n\
+                - Any time you discover a specific relationship between entities\n\n\
+                Edge types: depends_on, contains, part_of, subclass_of, calls, implements, uses, related_to\n\n\
+                Cost: ~5ms per edge.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "format": "uuid" },
+                    "src_entity_id": { "type": "string", "format": "uuid", "description": "Source entity UUID" },
+                    "dst_entity_id": { "type": "string", "format": "uuid", "description": "Destination entity UUID" },
+                    "edge_type": { "type": "string", "description": "Relationship type (depends_on, contains, part_of, subclass_of, calls, implements, uses)" },
+                    "weight": { "type": "number", "minimum": 0, "maximum": 1, "description": "Edge strength (default 1.0)" },
+                    "metadata": { "type": "string", "description": "Optional metadata about the relationship" }
+                },
+                "required": ["session_id", "src_entity_id", "dst_entity_id", "edge_type"]
+            }),
+        },
+        ToolDef {
+            name: "batch_create_edges".into(),
+            description: "Create multiple typed edges in a single call.\n\n\
+                Cost: ~5ms + 2ms per edge.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "format": "uuid" },
+                    "edges": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "src_entity_id": { "type": "string", "format": "uuid" },
+                                "dst_entity_id": { "type": "string", "format": "uuid" },
+                                "edge_type": { "type": "string" },
+                                "weight": { "type": "number" }
+                            },
+                            "required": ["src_entity_id", "dst_entity_id", "edge_type"]
+                        },
+                        "maxItems": 200
+                    }
+                },
+                "required": ["session_id", "edges"]
+            }),
+        },
     ]
 }
 
@@ -854,6 +903,8 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "query_derived" => handle_query_derived(args, storage, ctx).await,
         "manage_rules" => handle_manage_rules(args, storage, ctx).await,
         "promote_predicate" => handle_promote_predicate(args, storage, ctx).await,
+        "create_edge" => handle_create_edge(args, storage, ctx, session).await,
+        "batch_create_edges" => handle_batch_create_edges(args, storage, ctx, session).await,
         _ => Err((METHOD_NOT_FOUND, format!("unknown tool: {name}"))),
     };
     let elapsed = start.elapsed();
@@ -919,6 +970,8 @@ fn is_write_tool(name: &str) -> bool {
             | "demote_memory"
             | "manage_rules"
             | "promote_predicate"
+            | "create_edge"
+            | "batch_create_edges"
     )
 }
 
@@ -2572,6 +2625,136 @@ async fn handle_promote_predicate<S: crate::storage::Storage>(
     }))
 }
 
+// --- Typed edge handlers ---
+
+async fn handle_create_edge<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let session_id = require_uuid(&args, "session_id")?;
+    let src_id = require_uuid(&args, "src_entity_id")?;
+    let dst_id = require_uuid(&args, "dst_entity_id")?;
+    let edge_type = require_str(&args, "edge_type")?;
+    let weight = args.get("weight").and_then(|v| v.as_f64()).unwrap_or(1.0);
+    let metadata = args
+        .get("metadata")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let edge = crate::types::TypedEdge {
+        tenant_id: ctx.tenant_id,
+        session_id,
+        src_id,
+        edge_type: edge_type.to_string(),
+        dst_id,
+        weight,
+        metadata,
+        created_at: chrono::Utc::now(),
+    };
+
+    storage
+        .typed_edge_put(ctx, &edge)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    session.dirty.store(true, Ordering::Relaxed);
+    session.last_activity.notify_waiters();
+
+    Ok(serde_json::json!({
+        "created": true,
+        "src_id": src_id.to_string(),
+        "edge_type": edge_type,
+        "dst_id": dst_id.to_string(),
+        "weight": weight,
+    }))
+}
+
+async fn handle_batch_create_edges<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let session_id = require_uuid(&args, "session_id")?;
+    let edges = args
+        .get("edges")
+        .and_then(|v| v.as_array())
+        .ok_or((INVALID_PARAMS, "edges must be an array".to_string()))?;
+
+    if edges.len() > 200 {
+        return Err((
+            INVALID_PARAMS,
+            format!("edges array length {} exceeds maximum of 200", edges.len()),
+        ));
+    }
+
+    let mut created: usize = 0;
+    let mut errors: usize = 0;
+
+    for edge_json in edges {
+        let src_id = match edge_json
+            .get("src_entity_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        {
+            Some(id) => id,
+            None => {
+                errors += 1;
+                continue;
+            }
+        };
+        let dst_id = match edge_json
+            .get("dst_entity_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        {
+            Some(id) => id,
+            None => {
+                errors += 1;
+                continue;
+            }
+        };
+        let edge_type = match edge_json.get("edge_type").and_then(|v| v.as_str()) {
+            Some(t) => t,
+            None => {
+                errors += 1;
+                continue;
+            }
+        };
+        let weight = edge_json
+            .get("weight")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0);
+
+        let edge = crate::types::TypedEdge {
+            tenant_id: ctx.tenant_id,
+            session_id,
+            src_id,
+            edge_type: edge_type.to_string(),
+            dst_id,
+            weight,
+            metadata: None,
+            created_at: chrono::Utc::now(),
+        };
+
+        match storage.typed_edge_put(ctx, &edge).await {
+            Ok(()) => created += 1,
+            Err(_) => errors += 1,
+        }
+    }
+
+    session.dirty.store(true, Ordering::Relaxed);
+    session.last_activity.notify_waiters();
+
+    Ok(serde_json::json!({
+        "created": created,
+        "errors": errors,
+        "total": edges.len(),
+    }))
+}
+
 // --- Error mapping helpers ---
 
 /// Map anyhow errors to JSON-RPC error codes, using INVALID_PARAMS for
@@ -2700,7 +2883,7 @@ mod tests {
             .await
             .unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 37);
+        assert_eq!(tools.len(), 39);
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"check_memo_cache"));
@@ -2726,6 +2909,8 @@ mod tests {
         assert!(names.contains(&"query_derived"));
         assert!(names.contains(&"manage_rules"));
         assert!(names.contains(&"promote_predicate"));
+        assert!(names.contains(&"create_edge"));
+        assert!(names.contains(&"batch_create_edges"));
     }
 
     #[tokio::test]
