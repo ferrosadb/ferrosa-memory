@@ -665,15 +665,31 @@ async fn build_snapshot<S: Storage>(
     };
 
     // Load typed edges (depends_on, contains, calls, etc.)
-    let typed_edges = if session_id.is_nil() {
-        // No session — skip typed edges (they require session_id)
-        Vec::new()
-    } else {
+    // Try the specific session first, then fall back to known sessions.
+    let mut typed_edges = if !session_id.is_nil() {
         storage
             .typed_edge_list_session(ctx, session_id)
             .await
             .unwrap_or_default()
+    } else {
+        Vec::new()
     };
+    // If no typed edges found and we have nodes, try common session IDs
+    if typed_edges.is_empty() && !nodes.is_empty() {
+        // Session 2 is the ferrosa codebase graph session
+        let common_sessions = [
+            Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap_or_default(),
+            Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap_or_default(),
+        ];
+        for sid in &common_sessions {
+            if let Ok(edges) = storage.typed_edge_list_session(ctx, *sid).await {
+                if !edges.is_empty() {
+                    typed_edges = edges;
+                    break;
+                }
+            }
+        }
+    }
     for te in typed_edges {
         let src_s = te.src_id.to_string();
         let dst_s = te.dst_id.to_string();
