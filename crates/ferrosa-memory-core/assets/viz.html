@@ -729,8 +729,8 @@
     </div>
     <div style="display:flex;align-items:center;gap:6px;margin:0 12px;">
       <label for="edge-slider" style="font-size:10px;color:var(--text-muted);white-space:nowrap;">Edges</label>
-      <input type="range" id="edge-slider" min="0" max="100" value="20" style="width:80px;accent-color:var(--accent);">
-      <span id="edge-count" style="font-size:10px;color:var(--text-secondary);min-width:40px;">20%</span>
+      <input type="range" id="edge-slider" min="0" max="100" value="100" style="width:80px;accent-color:var(--accent);">
+      <span id="edge-count" style="font-size:10px;color:var(--text-secondary);min-width:40px;">100%</span>
     </div>
     <div style="display:flex;align-items:center;gap:4px;margin:0 8px;" id="edge-type-filters"></div>
     <div class="header-buttons right">
@@ -840,7 +840,7 @@ const stateColorMap = {
 let nodes = [];
 let allEdges = [];
 let edges = [];
-let edgeFilterPct = 20;
+let edgeFilterPct = 100;
 let selectedNode = null;
 let searchPanelOpen = false;
 let infoPanelOpen = false;
