@@ -428,7 +428,12 @@ async fn handle_viz_connection(
     match (method, path) {
         ("GET", "/viz") => {
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: text/html; charset=utf-8\r\n\
+                 Cache-Control: no-cache, no-store, must-revalidate\r\n\
+                 Pragma: no-cache\r\n\
+                 Expires: 0\r\n\
+                 Content-Length: {}\r\n\r\n{}",
                 VIZ_HTML.len(),
                 VIZ_HTML
             );
