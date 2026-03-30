@@ -695,11 +695,11 @@ async fn build_snapshot<S: Storage>(
             Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap_or_default(),
         ];
         for sid in &common_sessions {
-            if let Ok(edges) = storage.typed_edge_list_session(ctx, *sid).await {
-                if !edges.is_empty() {
-                    typed_edges = edges;
-                    break;
-                }
+            if let Ok(edges) = storage.typed_edge_list_session(ctx, *sid).await
+                && !edges.is_empty()
+            {
+                typed_edges = edges;
+                break;
             }
         }
     }
