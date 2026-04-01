@@ -1022,7 +1022,7 @@ impl Storage for CqlStorage {
             let vec_literal: String = format!(
                 "[{}]",
                 emb.iter()
-                    .map(|v| format!("{v}"))
+                    .map(|v| format!("{v:.8}"))
                     .collect::<Vec<_>>()
                     .join(",")
             );
@@ -1167,7 +1167,7 @@ impl Storage for CqlStorage {
         // Ferrosa also requires literal integer for LIMIT in ANN queries.
         let vec_literal: String = format!(
             "[{}]",
-            query_embedding.iter().map(|v| format!("{v}")).collect::<Vec<_>>().join(",")
+            query_embedding.iter().map(|v| format!("{v:.8}")).collect::<Vec<_>>().join(",")
         );
         let query = format!(
             "SELECT entity_id, entity_name, entity_type, source_fold_id, \

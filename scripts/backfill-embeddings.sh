@@ -54,7 +54,7 @@ for r in missing:
         errors += 1
         continue
 
-    vec_literal = '[' + ','.join(str(v) for v in vec) + ']'
+    vec_literal = '[' + ','.join(f'{v:.8f}' for v in vec) + ']'
     try:
         session.execute(
             f'UPDATE agent_memory.entity_store SET entity_embedding = {vec_literal} '
