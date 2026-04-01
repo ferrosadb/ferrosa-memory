@@ -117,12 +117,21 @@ pub trait Storage: Send + Sync {
     /// Store a new entity.
     async fn entity_put(&self, ctx: &TenantContext, entry: &EntityEntry) -> anyhow::Result<()>;
 
-    /// Find entity by phonetic match on name.
+    /// Find entities by name match, ranked by relevance.
+    /// Matches on exact name, :: segment, and substring (in that priority order).
     async fn entity_find_phonetic(
         &self,
         ctx: &TenantContext,
         session_id: Uuid,
         name: &str,
+    ) -> anyhow::Result<Vec<EntityEntry>>;
+
+    /// Get a single entity by primary key (targeted lookup, no scan).
+    async fn entity_get_by_id(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        entity_id: Uuid,
     ) -> anyhow::Result<Option<EntityEntry>>;
 
     /// Search entities by embedding similarity.
@@ -750,12 +759,39 @@ pub mod mock {
             _ctx: &TenantContext,
             session_id: Uuid,
             name: &str,
-        ) -> anyhow::Result<Option<EntityEntry>> {
+        ) -> anyhow::Result<Vec<EntityEntry>> {
             let entities = self.entities.lock().await;
             let lower = name.to_lowercase();
+            let mut scored: Vec<(u8, &EntityEntry)> = entities
+                .iter()
+                .filter(|e| e.session_id == session_id)
+                .filter_map(|e| {
+                    let en = e.entity_name.to_lowercase();
+                    if en == lower {
+                        Some((0, e)) // exact match
+                    } else if en.split("::").any(|seg| seg == lower) {
+                        Some((1, e)) // segment match
+                    } else if en.contains(&lower) {
+                        Some((2, e)) // substring match
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            scored.sort_by_key(|(rank, _)| *rank);
+            Ok(scored.into_iter().map(|(_, e)| e.clone()).collect())
+        }
+
+        async fn entity_get_by_id(
+            &self,
+            _ctx: &TenantContext,
+            session_id: Uuid,
+            entity_id: Uuid,
+        ) -> anyhow::Result<Option<EntityEntry>> {
+            let entities = self.entities.lock().await;
             Ok(entities
                 .iter()
-                .find(|e| e.session_id == session_id && e.entity_name.to_lowercase() == lower)
+                .find(|e| e.session_id == session_id && e.entity_id == entity_id)
                 .cloned())
         }
 

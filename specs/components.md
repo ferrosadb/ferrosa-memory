@@ -1,7 +1,7 @@
 # Component Architecture
 
-> Last updated: 2026-03-29
-> Status: 36 modules — cognitive memory, hybrid search, visualization, infrastructure, Datalog inference, recursive exploration, and B10 promotion pipeline layers complete. Sprint 5 adds datalog, warmth, pagerank, and recursive_explore modules. B10 adds promotion pipeline for workload-driven materialization.
+> Last updated: 2026-04-01
+> Status: 37 modules — cognitive memory, hybrid search, visualization, infrastructure, Datalog inference, recursive exploration, B10 promotion pipeline, and NER layers complete. Dynamic type registry, ghost row resilience, and stale prepared statement recovery added.
 
 ## Module Map
 
@@ -43,7 +43,7 @@ graph TB
     P --> Q[http]
 ```
 
-**Note:** Shows main call flow. Full 36-module dependency matrix in `dsm-analysis.md`.
+**Note:** Shows main call flow. Full 37-module dependency matrix in `dsm-analysis.md`.
 
 **Note:** `graph_client` (M11) uses the HTTP Cypher endpoint, which is working. Graph writes go through CQL (vertex/edge table INSERTs via `CqlStorage`), and graph reads/traversals go through HTTP POST against `/graph/query` via `reqwest`.
 
@@ -70,7 +70,7 @@ graph TB
 
 **Interface:**
 - `dispatch(tool_name, params) -> Result<Value>` — routes to the correct tool handler
-- `list_tools() -> Vec<ToolSchema>` — returns all tool definitions for MCP `tools/list`
+- `tool_definitions(entity_types) -> Vec<ToolSchema>` — builds tool schemas dynamically from the type registry (entity_type enums are not hardcoded)
 
 **Dependencies:** `transport`, `auth`, `quota`
 
@@ -204,13 +204,20 @@ graph TB
 
 ### 10. `cql_client` — CQL Storage Client
 
-**Responsibility:** Manages CQL connection pool, prepared statements, and query execution against Ferrosa.
+**Responsibility:** Manages CQL connection pool, prepared statements, and query execution against Ferrosa. Loads dynamic type registry at startup.
 
 **Interface:**
 - `connect(config) -> Result<CqlClient>`
 - `execute(statement, params) -> Result<Rows>`
 - `execute_batch(statements) -> Result<()>`
-- Prepared statement cache for all tables
+- `load_entity_types() -> Vec<String>` — reads from `entity_types` table, falls back to defaults
+- `load_edge_types() -> Vec<String>` — reads from `edge_types` table
+- Prepared statement cache for all tables (44 statements)
+
+**Resilience:**
+- Ghost rows (NULL required fields) are skipped in `entity_list_session` and `entity_find_phonetic`
+- Stale prepared statement errors (after node restart) trigger automatic reconnection via `ReconnectingStorage`
+- `entity_put` uses base INSERT with required fields only; optional fields (source_fold_id, entity_embedding) written via separate UPDATE to avoid cdrs-tokio Option serialization issues with Ferrosa VECTOR columns
 
 **Dependencies:** `cdrs-tokio`, `vector`, `metrics`
 

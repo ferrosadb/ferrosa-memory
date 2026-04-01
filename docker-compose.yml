@@ -2,8 +2,8 @@
 # 3-node Ferrosa cluster + RustFS (S3) + Ollama (embeddings)
 #
 # Usage:
-#   docker compose up -d
-#   docker compose exec ollama ollama pull nomic-embed-text
+#   podman compose up -d
+#   podman compose exec ollama ollama pull nomic-embed-text
 #
 # Ports:
 #   19042-19044  CQL (node1-3)

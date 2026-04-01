@@ -559,6 +559,96 @@
     text-align: center;
   }
 
+  /* Filter dropdowns */
+  .filter-dropdown {
+    position: relative;
+    display: inline-block;
+  }
+  .filter-btn {
+    font-size: 11px;
+    padding: 4px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    background: var(--bg-card);
+    white-space: nowrap;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .filter-btn:hover { border-color: var(--accent); color: var(--text-primary); }
+  .filter-btn .count {
+    font-size: 9px;
+    background: var(--accent);
+    color: #fff;
+    border-radius: 8px;
+    padding: 0 5px;
+    min-width: 16px;
+    text-align: center;
+  }
+  .filter-menu {
+    display: none;
+    position: absolute;
+    top: 100%;
+    left: 0;
+    margin-top: 4px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 6px 0;
+    min-width: 160px;
+    max-height: 300px;
+    overflow-y: auto;
+    z-index: 200;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  }
+  .filter-menu.open { display: block; }
+  .filter-menu label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 12px;
+    cursor: pointer;
+    font-size: 11px;
+    color: var(--text-secondary);
+    transition: background 0.1s;
+  }
+  .filter-menu label:hover { background: var(--bg-card-hover); color: var(--text-primary); }
+  .filter-menu label .swatch {
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    flex-shrink: 0;
+  }
+  .filter-menu label input { display: none; }
+  .filter-menu label.checked { color: var(--text-primary); font-weight: 600; }
+  .filter-menu .menu-actions {
+    display: flex;
+    gap: 8px;
+    padding: 6px 12px;
+    border-top: 1px solid var(--border);
+    margin-top: 4px;
+  }
+  .filter-menu .menu-actions button {
+    font-size: 10px;
+    color: var(--text-muted);
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 2px 4px;
+  }
+  .filter-menu .menu-actions button:hover { color: var(--accent); }
+
+  @media (max-width: 600px) {
+    #header { padding: 8px 10px; flex-wrap: wrap; gap: 6px; }
+    .header-buttons.right { margin-left: 0; }
+    .filter-btn { font-size: 10px; padding: 3px 8px; }
+    .filter-menu { min-width: 140px; }
+    #header .logo { position: static; transform: none; }
+    .header-filters { width: 100%; display: flex; gap: 6px; justify-content: center; }
+  }
+
   #main {
     display: flex;
     flex: 1;
@@ -727,12 +817,17 @@
       <span class="fe">Fe</span>
       <span class="label">memory</span>
     </div>
-    <div style="display:flex;align-items:center;gap:6px;margin:0 12px;">
-      <label for="edge-slider" style="font-size:10px;color:var(--text-muted);white-space:nowrap;">Edges</label>
-      <input type="range" id="edge-slider" min="0" max="100" value="100" style="width:80px;accent-color:var(--accent);">
-      <span id="edge-count" style="font-size:10px;color:var(--text-secondary);min-width:40px;">100%</span>
+    <div class="header-filters" style="display:flex;align-items:center;gap:6px;margin:0 12px;">
+      <div class="filter-dropdown" id="node-type-dropdown">
+        <button class="filter-btn" id="node-type-btn">Nodes <span class="count" id="node-type-count">all</span></button>
+        <div class="filter-menu" id="node-type-menu"></div>
+      </div>
+      <div class="filter-dropdown" id="edge-type-dropdown">
+        <button class="filter-btn" id="edge-type-btn">Edges <span class="count" id="edge-type-count">all</span></button>
+        <div class="filter-menu" id="edge-type-menu"></div>
+      </div>
+      <span id="edge-count" style="font-size:10px;color:var(--text-muted);min-width:40px;"></span>
     </div>
-    <div style="display:flex;align-items:center;gap:4px;margin:0 8px;" id="edge-type-filters"></div>
     <div class="header-buttons right">
       <div class="connection-indicator" id="connection-indicator">
         <span class="dot"></span>
@@ -804,6 +899,12 @@ const entityColors = {
   place: '#9cb8f7',
   preference: '#f7be7e',
   fold: '#16161f',
+  document: '#4ecdc4',
+  section: '#45b7aa',
+  crate: '#ff6b6b',
+  module: '#ffa94d',
+  bug: '#e25b5b',
+  app: '#c882f0',
 };
 
 const edgeColors = {
@@ -819,8 +920,10 @@ const edgeColors = {
   uses: '#7effda',
   subclass_of: '#ff9d7e',
   related_to: '#d4a574',
+  references: '#87ceeb',
 };
 let activeEdgeTypes = new Set(); // empty = show all
+let activeNodeTypes = new Set(); // empty = show all
 
 const stateOpacity = {
   active: 1.0,
@@ -1436,16 +1539,16 @@ function connect() {
 function handleEvent(event) {
   switch (event.type) {
     case 'Snapshot':
-      nodes = event.nodes || [];
-      // Sort: typed edges first (depends_on, contains, etc.), CO_OCCURS last
+      allNodes = event.nodes || [];
+      nodes = allNodes.slice();
       allEdges = (event.edges || []).map(e => ({...e}))
         .sort((a, b) => {
           const aTyped = a.edge_type !== 'CO_OCCURS' ? 0 : 1;
           const bTyped = b.edge_type !== 'CO_OCCURS' ? 0 : 1;
           return aTyped - bTyped;
         });
-      buildEdgeTypeFilters();
-      applyEdgeFilter();
+      rebuildFilters();
+      applyFilters();
       render();
       if (infoPanelOpen) {
         renderInfoPanel();
@@ -1475,13 +1578,19 @@ function handleEvent(event) {
 }
 
 function handleEntityChanged(node, action) {
-  const existing = nodes.findIndex(n => n.id === node.id);
-  if (existing >= 0) {
-    // Mutate in-place to preserve D3 data-join identity and sim positions
-    Object.assign(nodes[existing], node);
+  const existingAll = allNodes.findIndex(n => n.id === node.id);
+  if (existingAll >= 0) {
+    Object.assign(allNodes[existingAll], node);
   } else {
     node.x = width / 2 + (Math.random() - 0.5) * 100;
     node.y = height / 2 + (Math.random() - 0.5) * 100;
+    allNodes.push(node);
+  }
+  // Also update the filtered nodes array
+  const existing = nodes.findIndex(n => n.id === node.id);
+  if (existing >= 0) {
+    Object.assign(nodes[existing], node);
+  } else if (activeNodeTypes.size === 0 || activeNodeTypes.has(node.entity_type || node.node_type)) {
     nodes.push(node);
   }
   render();
@@ -1506,7 +1615,7 @@ function handleEdgeCreated(edge) {
     if (edgeBatchTimer) clearTimeout(edgeBatchTimer);
     edgeBatchTimer = setTimeout(() => {
       edgeBatchTimer = null;
-      applyEdgeFilter();
+      applyFilters();
       render();
       if (infoPanelOpen) renderInfoPanel();
     }, 100);
@@ -1573,60 +1682,116 @@ window.addEventListener('resize', () => {
   simulation.alpha(0.1).restart();
 });
 
-// === Edge filter ===
-function applyEdgeFilter() {
-  // Step 1: filter by type (if any types are active)
-  let filtered = allEdges;
-  if (activeEdgeTypes.size > 0) {
-    filtered = allEdges.filter(e => activeEdgeTypes.has(e.edge_type));
-  }
-  // Step 2: filter by percentage slider
-  if (edgeFilterPct >= 100) {
-    edges = filtered.slice();
-  } else if (edgeFilterPct <= 0) {
-    edges = [];
+// === Filter dropdowns ===
+let allNodes = []; // keep a reference for node filtering
+
+function applyFilters() {
+  // Node type filter
+  if (activeNodeTypes.size > 0) {
+    const visibleIds = new Set(allNodes.filter(n => activeNodeTypes.has(n.entity_type || n.node_type)).map(n => n.id));
+    nodes = allNodes.filter(n => visibleIds.has(n.id));
+    // Edge filter: only show edges where both endpoints are visible
+    let filtered = allEdges.filter(e => {
+      const src = e.source.id || e.source;
+      const dst = e.target.id || e.target;
+      return visibleIds.has(src) && visibleIds.has(dst);
+    });
+    if (activeEdgeTypes.size > 0) {
+      filtered = filtered.filter(e => activeEdgeTypes.has(e.edge_type));
+    }
+    edges = filtered;
   } else {
-    const count = Math.max(1, Math.round(filtered.length * edgeFilterPct / 100));
-    edges = filtered.slice(0, count);
+    nodes = allNodes.slice();
+    if (activeEdgeTypes.size > 0) {
+      edges = allEdges.filter(e => activeEdgeTypes.has(e.edge_type));
+    } else {
+      edges = allEdges.slice();
+    }
   }
   document.getElementById('edge-count').textContent =
-    `${edges.length}/${allEdges.length}`;
+    `${nodes.length}n ${edges.length}e`;
 }
 
-function buildEdgeTypeFilters() {
-  const types = new Set(allEdges.map(e => e.edge_type));
-  const container = document.getElementById('edge-type-filters');
-  container.innerHTML = '';
-  for (const t of [...types].sort()) {
-    const color = edgeColors[t] || '#888';
-    const chip = document.createElement('button');
-    chip.textContent = t;
-    chip.dataset.type = t;
-    chip.style.cssText = `
-      font-size:9px; padding:1px 6px; border-radius:8px; cursor:pointer;
-      border:1px solid ${color}; color:${color}; background:transparent;
-      opacity:${activeEdgeTypes.size === 0 || activeEdgeTypes.has(t) ? 1 : 0.3};
-    `;
-    chip.addEventListener('click', () => {
-      if (activeEdgeTypes.has(t)) {
-        activeEdgeTypes.delete(t);
+function buildFilterMenu(menuId, btnCountId, items, activeSet, colorMap, onChange) {
+  const menu = document.getElementById(menuId);
+  menu.innerHTML = '';
+  const sorted = [...items].sort();
+  for (const t of sorted) {
+    const color = colorMap[t] || '#888';
+    const label = document.createElement('label');
+    label.className = activeSet.size === 0 || activeSet.has(t) ? 'checked' : '';
+    const swatch = document.createElement('span');
+    swatch.className = 'swatch';
+    swatch.style.background = color;
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.checked = activeSet.size === 0 || activeSet.has(t);
+    const text = document.createTextNode(t);
+    const countSpan = document.createElement('span');
+    countSpan.style.cssText = 'margin-left:auto;font-size:9px;color:var(--text-muted)';
+    label.appendChild(input);
+    label.appendChild(swatch);
+    label.appendChild(text);
+    label.appendChild(countSpan);
+    label.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      if (activeSet.has(t)) {
+        activeSet.delete(t);
       } else {
-        activeEdgeTypes.add(t);
+        activeSet.add(t);
       }
-      // If all types selected, reset to "show all" mode
-      if (activeEdgeTypes.size === types.size) activeEdgeTypes.clear();
-      buildEdgeTypeFilters();
-      applyEdgeFilter();
-      render();
+      if (activeSet.size === items.size) activeSet.clear();
+      onChange();
     });
-    container.appendChild(chip);
+    menu.appendChild(label);
   }
+  // Actions row
+  const actions = document.createElement('div');
+  actions.className = 'menu-actions';
+  const allBtn = document.createElement('button');
+  allBtn.textContent = 'All';
+  allBtn.addEventListener('click', () => { activeSet.clear(); onChange(); });
+  const noneBtn = document.createElement('button');
+  noneBtn.textContent = 'None';
+  noneBtn.addEventListener('click', () => { for (const t of items) activeSet.add(t); onChange(); });
+  actions.appendChild(allBtn);
+  actions.appendChild(noneBtn);
+  menu.appendChild(actions);
+
+  // Update button count
+  const countEl = document.getElementById(btnCountId);
+  countEl.textContent = activeSet.size === 0 ? 'all' : `${activeSet.size}`;
 }
 
-document.getElementById('edge-slider').addEventListener('input', (e) => {
-  edgeFilterPct = parseInt(e.target.value, 10);
-  applyEdgeFilter();
-  render();
+function rebuildFilters() {
+  const nodeTypes = new Set(allNodes.map(n => n.entity_type || n.node_type).filter(Boolean));
+  const edgeTypes = new Set(allEdges.map(e => e.edge_type));
+  buildFilterMenu('node-type-menu', 'node-type-count', nodeTypes, activeNodeTypes, entityColors, () => {
+    rebuildFilters();
+    applyFilters();
+    render();
+  });
+  buildFilterMenu('edge-type-menu', 'edge-type-count', edgeTypes, activeEdgeTypes, edgeColors, () => {
+    rebuildFilters();
+    applyFilters();
+    render();
+  });
+}
+
+// Toggle dropdown menus
+document.getElementById('node-type-btn').addEventListener('click', (e) => {
+  e.stopPropagation();
+  document.getElementById('node-type-menu').classList.toggle('open');
+  document.getElementById('edge-type-menu').classList.remove('open');
+});
+document.getElementById('edge-type-btn').addEventListener('click', (e) => {
+  e.stopPropagation();
+  document.getElementById('edge-type-menu').classList.toggle('open');
+  document.getElementById('node-type-menu').classList.remove('open');
+});
+document.addEventListener('click', () => {
+  document.getElementById('node-type-menu').classList.remove('open');
+  document.getElementById('edge-type-menu').classList.remove('open');
 });
 
 // === Idle animation — keep the simulation gently alive ===

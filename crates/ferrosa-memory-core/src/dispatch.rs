@@ -119,6 +119,10 @@ pub struct SessionState {
     pub ollama_base_url: String,
     /// Model name for NER entity extraction via Ollama.
     pub ner_model: String,
+    /// Dynamic entity types loaded from the type registry table.
+    pub entity_types: Vec<String>,
+    /// Dynamic edge types loaded from the type registry table.
+    pub edge_types: Vec<String>,
 }
 
 impl Default for SessionState {
@@ -134,6 +138,14 @@ impl Default for SessionState {
             dirty: Arc::new(AtomicBool::new(false)),
             ollama_base_url: "http://localhost:11434".to_string(),
             ner_model: "qwen3.5:27b".to_string(),
+            entity_types: vec![
+                "person", "place", "event", "concept", "org", "bug",
+                "decision", "pattern", "preference",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+            edge_types: Vec::new(),
         }
     }
 }
@@ -148,7 +160,9 @@ pub struct ToolDef {
 }
 
 /// Build all tool definitions for the memory server.
-pub fn tool_definitions() -> Vec<ToolDef> {
+/// Entity types are loaded dynamically from the type registry.
+pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
+    let entity_type_enum: Value = serde_json::json!(entity_types);
     vec![
         ToolDef {
             name: "check_memo_cache".into(),
@@ -290,7 +304,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "properties": {
                     "session_id": { "type": "string", "format": "uuid" },
                     "entity_name": { "type": "string", "maxLength": 512 },
-                    "entity_type": { "type": "string", "enum": ["person", "place", "event", "concept", "org"] },
+                    "entity_type": { "type": "string", "enum": entity_type_enum },
                     "context_snippet": { "type": "string", "maxLength": 4096 },
                     "embedding": { "type": "array", "items": { "type": "number" } },
                     "source_fold_id": { "type": "string", "format": "uuid" },
@@ -318,7 +332,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                             "type": "object",
                             "properties": {
                                 "entity_name": { "type": "string", "maxLength": 512 },
-                                "entity_type": { "type": "string", "enum": ["person", "place", "event", "concept", "org"] },
+                                "entity_type": { "type": "string", "enum": entity_type_enum },
                                 "context_snippet": { "type": "string", "maxLength": 4096 },
                                 "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
                             },
@@ -384,7 +398,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "properties": {
                     "session_id": { "type": "string", "format": "uuid" },
                     "content": { "type": "string", "maxLength": 8192, "description": "The content to ingest" },
-                    "entity_type": { "type": "string", "enum": ["person", "place", "event", "concept", "org", "decision", "pattern", "preference"] },
+                    "entity_type": { "type": "string", "enum": entity_type_enum },
                     "entity_name": { "type": "string", "maxLength": 256, "description": "Clean entity name (e.g. 'Ben Kearns', 'Ferrosa'). If omitted, extracted automatically from content via LLM or heuristic." },
                     "embedding": { "type": "array", "items": { "type": "number" }, "description": "Optional embedding vector" },
                     "source_fold_id": { "type": "string", "format": "uuid", "description": "Fold that produced this content" }
@@ -830,7 +844,7 @@ pub async fn dispatch<S: crate::storage::Storage>(
         "initialize" => Ok(server_info()),
         "notifications/initialized" => Ok(Value::Null),
         "tools/list" => {
-            let tools = tool_definitions();
+            let tools = tool_definitions(&session.entity_types);
             Ok(serde_json::json!({ "tools": tools }))
         }
         "tools/call" => dispatch_tool(params, storage, ctx, session).await,
@@ -889,7 +903,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "write_temporal_fact" => handle_write_temporal_fact(args, storage, ctx, session).await,
         "get_temporal_chain" => handle_get_temporal_chain(args, storage, ctx).await,
         "explore_connections" => handle_explore_connections(args, session).await,
-        "hybrid_search" => handle_hybrid_search(args, storage, ctx).await,
+        "hybrid_search" => handle_hybrid_search(args, storage, ctx, session).await,
         "run_consolidation" => handle_run_consolidation(args, storage, ctx, session).await,
         "get_stats" => handle_get_stats(args, storage, ctx, session).await,
         "promote_memory" => handle_promote_memory(args, storage, ctx, session).await,
@@ -909,11 +923,16 @@ async fn dispatch_tool<S: crate::storage::Storage>(
     };
     let elapsed = start.elapsed();
     match &result {
-        Ok(_) => tracing::debug!(
-            tool = name,
-            elapsed_ms = elapsed.as_millis() as u64,
-            "tool call OK"
-        ),
+        Ok(v) => {
+            let bytes = serde_json::to_string(&v).map(|s| s.len()).unwrap_or(0);
+            tracing::debug!(
+                tool = name,
+                elapsed_ms = elapsed.as_millis() as u64,
+                response_bytes = bytes,
+                est_tokens = bytes / 4,
+                "tool call OK"
+            );
+        }
         Err((code, msg)) => tracing::warn!(
             tool = name,
             code,
@@ -1261,9 +1280,26 @@ async fn handle_upsert_entity<S: crate::storage::Storage>(
     let entity_name = require_str(&args, "entity_name")?;
     let entity_type = require_str(&args, "entity_type")?;
     let context_snippet = require_str(&args, "context_snippet")?;
-    let embedding = optional_f32_array(&args, "embedding")?;
+    let mut embedding = optional_f32_array(&args, "embedding")?;
     let source_fold_id = optional_uuid(&args, "source_fold_id")?;
     let confidence = args.get("confidence").and_then(|v| v.as_f64());
+
+    // Auto-generate embedding if not provided and Ollama is configured.
+    if embedding.is_none() && !session.ollama_base_url.is_empty() {
+        let client = crate::embedding::EmbeddingClient::new(
+            &crate::config::EmbeddingConfig {
+                provider: "ollama".into(),
+                ollama_base_url: session.ollama_base_url.clone(),
+                model: "nomic-embed-text".into(),
+                dimensions: 768,
+                ner_model: String::new(),
+            },
+        );
+        match client.embed(context_snippet).await {
+            Ok(emb) => embedding = Some(emb),
+            Err(e) => tracing::debug!("embedding generation skipped: {e}"),
+        }
+    }
 
     let result = crate::entity::upsert_entity(
         storage,
@@ -1454,7 +1490,24 @@ async fn handle_retrieve_entities<S: crate::storage::Storage>(
 ) -> Result<Value, (i32, String)> {
     let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
     let query = require_str(&args, "query")?;
-    let embedding = optional_f32_array(&args, "embedding")?;
+    let mut embedding = optional_f32_array(&args, "embedding")?;
+
+    // Auto-generate query embedding for ANN search if Ollama is configured.
+    if embedding.is_none() && !session.ollama_base_url.is_empty() {
+        let client = crate::embedding::EmbeddingClient::new(
+            &crate::config::EmbeddingConfig {
+                provider: "ollama".into(),
+                ollama_base_url: session.ollama_base_url.clone(),
+                model: "nomic-embed-text".into(),
+                dimensions: 768,
+                ner_model: String::new(),
+            },
+        );
+        match client.embed(query).await {
+            Ok(emb) => embedding = Some(emb),
+            Err(e) => tracing::debug!("query embedding generation skipped: {e}"),
+        }
+    }
 
     // Use router for strategy selection when user didn't specify
     let user_strategy = args.get("strategy").and_then(|v| v.as_str());
@@ -1534,7 +1587,27 @@ async fn handle_retrieve_entities<S: crate::storage::Storage>(
         .await;
     }
 
-    serde_json::to_value(&entities).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+    // Strip embeddings and truncate context to reduce MCP response token cost.
+    let slim: Vec<Value> = entities
+        .iter()
+        .map(|e| {
+            let ctx = if e.context_snippet.len() > 200 {
+                format!("{}...", &e.context_snippet[..e.context_snippet.floor_char_boundary(200)])
+            } else {
+                e.context_snippet.clone()
+            };
+            serde_json::json!({
+                "entity_id": e.entity_id,
+                "entity_name": e.entity_name,
+                "entity_type": e.entity_type,
+                "confidence": e.confidence,
+                "state": e.state,
+                "created_at": e.created_at,
+                "context_snippet": ctx,
+            })
+        })
+        .collect();
+    serde_json::to_value(&slim).map_err(|e| (INTERNAL_ERROR, e.to_string()))
 }
 
 // --- Memory state handlers ---
@@ -1685,8 +1758,25 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
     let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
     let content = require_str(&args, "content")?;
     let entity_type = require_str(&args, "entity_type")?;
-    let embedding = optional_f32_array(&args, "embedding")?;
+    let mut embedding = optional_f32_array(&args, "embedding")?;
     let source_fold_id = optional_uuid(&args, "source_fold_id")?;
+
+    // Auto-generate embedding if not provided and Ollama is configured.
+    if embedding.is_none() && !session.ollama_base_url.is_empty() {
+        let client = crate::embedding::EmbeddingClient::new(
+            &crate::config::EmbeddingConfig {
+                provider: "ollama".into(),
+                ollama_base_url: session.ollama_base_url.clone(),
+                model: "nomic-embed-text".into(),
+                dimensions: 768,
+                ner_model: String::new(),
+            },
+        );
+        match client.embed(content).await {
+            Ok(emb) => embedding = Some(emb),
+            Err(e) => tracing::debug!("embedding generation skipped: {e}"),
+        }
+    }
 
     let entity_name = args
         .get("entity_name")
@@ -2030,11 +2120,29 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
     ctx: &crate::types::TenantContext,
+    session: &SessionState,
 ) -> Result<Value, (i32, String)> {
     let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
     let query = require_str(&args, "query")?;
-    let embedding = optional_f32_array(&args, "embedding")?;
+    let mut embedding = optional_f32_array(&args, "embedding")?;
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+
+    // Auto-generate query embedding for ANN search if Ollama is configured.
+    if embedding.is_none() && !session.ollama_base_url.is_empty() {
+        let client = crate::embedding::EmbeddingClient::new(
+            &crate::config::EmbeddingConfig {
+                provider: "ollama".into(),
+                ollama_base_url: session.ollama_base_url.clone(),
+                model: "nomic-embed-text".into(),
+                dimensions: 768,
+                ner_model: String::new(),
+            },
+        );
+        match client.embed(query).await {
+            Ok(emb) => embedding = Some(emb),
+            Err(e) => tracing::debug!("query embedding generation skipped: {e}"),
+        }
+    }
 
     let results = crate::hybrid_search::hybrid_search(
         storage,

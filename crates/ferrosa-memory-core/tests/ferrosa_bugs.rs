@@ -227,6 +227,90 @@ async fn debug_query_bind_values_vs_inline() {
     assert!(!rows3.is_empty(), "prepared+execute should find data");
 }
 
+// ---- OPEN: Secondary index queries return only first page ----
+//
+// On a table with ~20K rows, secondary index queries return only ~3,500 rows
+// (first result page) instead of all matching rows. Full table scan returns all.
+//
+// Observed on Ferrosa with cdrs-tokio. May be:
+// a) Ferrosa not auto-paging secondary index queries
+// b) cdrs-tokio not following paging state from RESULT frames
+// c) Interaction between ALLOW FILTERING and secondary index result sets
+//
+// Impact: edge_list_all returned 3,521/17,604 rows, causing the viz to show
+// a sparse graph. edge_list_session returned 0/17,604 before adding a
+// session_id secondary index (ddl/018_edge_session_indexes.cql).
+//
+// Requires: co_occurs_with table with >5000 rows (run consolidation first).
+// Run: cargo test -p ferrosa-memory-core --test ferrosa_bugs -- --ignored open_secondary_index_paging --nocapture
+
+#[tokio::test]
+#[ignore]
+async fn open_secondary_index_paging() {
+    let s = connect!();
+    let tid = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+    let sid = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+
+    // Full table scan — ground truth
+    let r_all = s
+        .query("SELECT entity_a FROM agent_memory.co_occurs_with")
+        .await
+        .expect("full scan");
+    let total = r_all
+        .response_body()
+        .unwrap()
+        .into_rows()
+        .unwrap_or_default()
+        .len();
+    eprintln!("  full scan (no WHERE): {total} rows");
+    if total < 5000 {
+        eprintln!("  SKIP: need >5000 rows to trigger paging. Run consolidation first.");
+        return;
+    }
+
+    // Query 1: secondary index on tenant_id (idx_co_occurs_by_tenant)
+    let r_tenant = s
+        .query_with_values(
+            "SELECT entity_a FROM agent_memory.co_occurs_with \
+             WHERE tenant_id = ? ALLOW FILTERING",
+            query_values!(tid),
+        )
+        .await
+        .expect("tenant filter");
+    let tenant_rows = r_tenant
+        .response_body()
+        .unwrap()
+        .into_rows()
+        .unwrap_or_default()
+        .len();
+    eprintln!("  WHERE tenant_id (indexed): {tenant_rows} rows");
+
+    // Query 2: secondary indexes on both columns
+    let r_both = s
+        .query_with_values(
+            "SELECT entity_a FROM agent_memory.co_occurs_with \
+             WHERE session_id = ? AND tenant_id = ? ALLOW FILTERING",
+            query_values!(sid, tid),
+        )
+        .await
+        .expect("session+tenant filter");
+    let both_rows = r_both
+        .response_body()
+        .unwrap()
+        .into_rows()
+        .unwrap_or_default()
+        .len();
+    eprintln!("  WHERE session_id + tenant_id (both indexed): {both_rows} rows");
+
+    // BUG: tenant_id-only query returns first page (~3500 rows) instead of all
+    assert_eq!(
+        tenant_rows, both_rows,
+        "tenant_id-only query returned {tenant_rows} rows but combined query returned \
+         {both_rows} — secondary index queries return inconsistent result counts. \
+         Expected both to return the same number of matching rows."
+    );
+}
+
 // ---- OPEN: Phonetic index ----
 
 #[tokio::test]
@@ -256,4 +340,115 @@ async fn open_phonetic_match() {
         !rows.is_empty(),
         "phonetic match should find 'John Smith' for 'Jon Smyth'"
     );
+}
+
+/// Ghost rows with NULL required fields must not crash row-scanning queries.
+///
+/// The Python CQL loader can create rows where clustering columns (entity_id,
+/// src_id) are NULL. These ghost rows caused entity_list_session,
+/// entity_find_phonetic, and typed_edge_list_session to return Err, which
+/// broke the viz snapshot and all entity writes (via dedup check).
+///
+/// This test inserts ghost rows into both entity_store and typed_edges,
+/// then verifies that CqlStorage methods skip them gracefully.
+#[tokio::test]
+#[ignore] // Requires live Ferrosa cluster on port 19042
+async fn ghost_rows_do_not_crash_queries() {
+    use ferrosa_memory_core::cql_storage::CqlStorage;
+    use ferrosa_memory_core::config::FerrosaCqlConfig;
+    use ferrosa_memory_core::storage::Storage;
+    use ferrosa_memory_core::types::TenantContext;
+    use uuid::Uuid;
+
+    let config = FerrosaCqlConfig {
+        contact_points: vec!["localhost:19042".into()],
+        keyspace: "agent_memory".into(),
+        replication_factor: 3,
+        consistency: "ONE".into(),
+    };
+    let storage = match CqlStorage::connect(&config).await {
+        Ok(s) => s,
+        Err(_) => { eprintln!("SKIP: no CQL connection"); return; }
+    };
+
+    let tenant_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let ctx = TenantContext {
+        tenant_id,
+        session_origin: "stdio".to_string(),
+    };
+
+    // Insert a valid entity
+    let valid_id = Uuid::new_v4();
+    let session = storage.session();
+    session.query_with_values(
+        format!(
+            "INSERT INTO agent_memory.entity_store \
+             (tenant_id, session_id, entity_id, entity_name, entity_type, \
+              context_snippet, confidence, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, toTimestamp(now()))"
+        ),
+        query_values!(tenant_id, session_id, valid_id, "valid-entity".to_string(), "concept".to_string(), "a real entity".to_string(), 1.0_f32),
+    ).await.expect("insert valid entity");
+
+    // Insert a ghost entity row (NULL entity_name via incomplete insert)
+    session.query_with_values(
+        format!(
+            "INSERT INTO agent_memory.entity_store \
+             (tenant_id, session_id, entity_id, confidence, created_at) \
+             VALUES (?, ?, ?, ?, toTimestamp(now()))"
+        ),
+        query_values!(tenant_id, session_id, Uuid::new_v4(), 0.5_f32),
+    ).await.expect("insert ghost entity");
+
+    // Insert a valid typed edge
+    session.query_with_values(
+        format!(
+            "INSERT INTO agent_memory.typed_edges \
+             (tenant_id, session_id, src_id, edge_type, dst_id, weight, metadata, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, toTimestamp(now()))"
+        ),
+        query_values!(tenant_id, session_id, valid_id, "contains".to_string(), Uuid::new_v4(), 0.9_f64, "".to_string()),
+    ).await.expect("insert valid edge");
+
+    // Insert a ghost typed edge (NULL edge_type)
+    session.query_with_values(
+        format!(
+            "INSERT INTO agent_memory.typed_edges \
+             (tenant_id, session_id, src_id, edge_type, dst_id, weight, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, toTimestamp(now()))"
+        ),
+        query_values!(tenant_id, session_id, Uuid::new_v4(), "".to_string(), Uuid::new_v4(), 0.0_f64),
+    ).await.expect("insert ghost edge");
+
+    // entity_list_session must not crash — should return the valid entity only
+    let entities = storage.entity_list_session(&ctx, session_id).await
+        .expect("entity_list_session should not crash on ghost rows");
+    assert!(
+        entities.iter().any(|e| e.entity_name == "valid-entity"),
+        "should find the valid entity, got: {:?}",
+        entities.iter().map(|e| &e.entity_name).collect::<Vec<_>>()
+    );
+
+    // entity_find_phonetic must not crash
+    let matches = storage.entity_find_phonetic(&ctx, session_id, "valid").await
+        .expect("entity_find_phonetic should not crash on ghost rows");
+    assert!(
+        matches.iter().any(|e| e.entity_name == "valid-entity"),
+        "phonetic search should find valid-entity"
+    );
+
+    // typed_edge_list_session must not crash — should return the valid edge only
+    let edges = storage.typed_edge_list_session(&ctx, session_id).await
+        .expect("typed_edge_list_session should not crash on ghost rows");
+    assert_eq!(edges.len(), 1, "should have 1 valid edge, got {}", edges.len());
+    assert_eq!(edges[0].edge_type, "contains");
+
+    // Cleanup
+    let _ = session.query(format!(
+        "DELETE FROM agent_memory.entity_store WHERE tenant_id = {tenant_id} AND session_id = {session_id}"
+    )).await;
+    let _ = session.query(format!(
+        "DELETE FROM agent_memory.typed_edges WHERE tenant_id = {tenant_id} AND session_id = {session_id}"
+    )).await;
 }

@@ -3,6 +3,10 @@ name = "ferrosa-memory-mcp"
 version.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "fix-edge-sessions"
+path = "src/tools/fix_edge_sessions.rs"
+
 [dependencies]
 ferrosa-memory-core = { path = "../ferrosa-memory-core" }
 tokio = { workspace = true }
@@ -13,3 +17,4 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }
+cdrs-tokio = { workspace = true }

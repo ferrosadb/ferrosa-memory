@@ -127,6 +127,27 @@ pub fn entity_to_viz_node(entry: &crate::types::EntityEntry) -> VizNode {
     }
 }
 
+/// Convert a `FoldEntry` into a `VizNode` for the visualization graph.
+pub fn fold_to_viz_node(entry: &crate::types::FoldEntry) -> VizNode {
+    let label = entry
+        .fold_summary
+        .as_deref()
+        .unwrap_or("(unfold)")
+        .chars()
+        .take(60)
+        .collect::<String>();
+    VizNode {
+        id: entry.fold_id.to_string(),
+        label,
+        node_type: "fold".into(),
+        entity_type: format!("fold-d{}", entry.depth),
+        state: format!("{:?}", entry.status).to_lowercase(),
+        confidence: entry.compression_ratio.unwrap_or(0.0),
+        created_at: entry.created_at.to_rfc3339(),
+        context: String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

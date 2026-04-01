@@ -403,7 +403,8 @@ mod tests {
 
     #[test]
     fn no_tool_reads_feedback_outcomes() {
-        let tools = dispatch::tool_definitions();
+        let default_types: Vec<String> = vec!["concept".into(), "person".into()];
+        let tools = dispatch::tool_definitions(&default_types);
         let feedback_readers: Vec<_> = tools
             .iter()
             .filter(|t| {

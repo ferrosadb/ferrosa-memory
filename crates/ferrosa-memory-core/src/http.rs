@@ -618,20 +618,32 @@ async fn build_snapshot<S: Storage>(
     ctx: &TenantContext,
     session_id: Uuid,
 ) -> VizEvent {
-    // If session_id is nil, show all entities for the tenant.
-    let entities_result = if session_id.is_nil() {
-        storage.entity_list_all(ctx).await
-    } else {
-        storage.entity_list_session(ctx, session_id).await
-    };
+    // Query entities for the configured session (nil UUID is a valid session).
+    tracing::info!(
+        tenant_id = %ctx.tenant_id,
+        %session_id,
+        session_is_nil = session_id.is_nil(),
+        "viz: building snapshot"
+    );
+    let entities_result = storage.entity_list_session(ctx, session_id).await;
 
-    let nodes: Vec<viz::VizNode> = match entities_result {
-        Ok(entities) => entities.iter().map(viz::entity_to_viz_node).collect(),
+    let mut nodes: Vec<viz::VizNode> = match &entities_result {
+        Ok(entities) => {
+            tracing::info!(count = entities.len(), "viz: loaded entities for snapshot");
+            entities.iter().map(viz::entity_to_viz_node).collect()
+        }
         Err(e) => {
             tracing::warn!("viz: failed to load entities for snapshot: {e}");
             Vec::new()
         }
     };
+
+    // Load folds so MENTIONED_IN and FOLDED_INTO edges have visible targets.
+    let folds_result = storage.fold_list_all(ctx).await;
+    match folds_result {
+        Ok(folds) => nodes.extend(folds.iter().map(viz::fold_to_viz_node)),
+        Err(e) => tracing::warn!("viz: failed to load folds for snapshot: {e}"),
+    }
 
     let node_ids: std::collections::HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
 
@@ -652,7 +664,9 @@ async fn build_snapshot<S: Storage>(
     }
     let edges_result: anyhow::Result<Vec<_>> = Ok(all_edges);
 
-    // Send all edges to the client — the viz slider filters client-side.
+    // Send CO_OCCURS edges that have a real strength value.
+    // Zero/null strength edges are noise (e.g., bulk-ingested entities that
+    // co-occur only because they share the same session).
     let mut edges: Vec<VizEdge> = match edges_result {
         Ok(raw_edges) => raw_edges
             .into_iter()
@@ -676,33 +690,14 @@ async fn build_snapshot<S: Storage>(
             Vec::new()
         }
     };
+    // Drop CO_OCCURS edges with no strength — they add no information.
+    edges.retain(|e| e.strength.is_some() || e.edge_type != "CO_OCCURS");
 
-    // Load typed edges (depends_on, contains, calls, etc.)
-    // Try the specific session first, then fall back to known sessions.
-    let mut typed_edges = if !session_id.is_nil() {
-        storage
-            .typed_edge_list_session(ctx, session_id)
-            .await
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    // If no typed edges found and we have nodes, try common session IDs
-    if typed_edges.is_empty() && !nodes.is_empty() {
-        // Session 2 is the ferrosa codebase graph session
-        let common_sessions = [
-            Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap_or_default(),
-            Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap_or_default(),
-        ];
-        for sid in &common_sessions {
-            if let Ok(edges) = storage.typed_edge_list_session(ctx, *sid).await
-                && !edges.is_empty()
-            {
-                typed_edges = edges;
-                break;
-            }
-        }
-    }
+    // Load typed edges (depends_on, contains, calls, etc.) for the configured session.
+    let typed_edges = storage
+        .typed_edge_list_session(ctx, session_id)
+        .await
+        .unwrap_or_default();
     for te in typed_edges {
         let src_s = te.src_id.to_string();
         let dst_s = te.dst_id.to_string();

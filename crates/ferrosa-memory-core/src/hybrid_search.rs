@@ -95,15 +95,24 @@ pub async fn hybrid_search(
 
     let mut lists = Vec::new();
 
-    // Strategy 1: Phonetic entity search
-    if let Ok(Some(entity)) = storage.entity_find_phonetic(ctx, session_id, query).await {
-        lists.push(vec![SearchResult {
-            id: entity.entity_id,
-            source: "entity_phonetic".into(),
-            content: entity.context_snippet.clone(),
-            score: 1.0,
-            result_type: "entity".into(),
-        }]);
+    // Strategy 1: Phonetic entity search (ranked by match quality)
+    if let Ok(entities) = storage.entity_find_phonetic(ctx, session_id, query).await {
+        if !entities.is_empty() {
+            lists.push(
+                entities
+                    .into_iter()
+                    .take(limit)
+                    .enumerate()
+                    .map(|(i, e)| SearchResult {
+                        id: e.entity_id,
+                        source: "entity_phonetic".into(),
+                        content: e.context_snippet.clone(),
+                        score: 1.0 - (i as f64 * 0.1), // rank decay
+                        result_type: "entity".into(),
+                    })
+                    .collect(),
+            );
+        }
     }
 
     // Strategy 2: ANN entity search
@@ -156,7 +165,7 @@ pub async fn hybrid_search(
         let mut warmth_ranked: Vec<SearchResult> = lists
             .iter()
             .flatten()
-            .filter_map(|r| {
+            .filter_map(|r: &SearchResult| {
                 warmth.get(&r.id).map(|score| SearchResult {
                     id: r.id,
                     source: "warmth".to_string(),

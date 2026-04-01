@@ -123,6 +123,9 @@ fn is_connection_error(err: &anyhow::Error) -> bool {
         || msg.contains("timed out")
         || msg.contains("not connected")
         || msg.contains("eof")
+        // Stale prepared statements after node restart — need full reconnect
+        // to re-prepare all statements.
+        || msg.contains("column or udt property")
 }
 
 /// Macro to delegate a Storage trait method through the RwLock.
@@ -280,8 +283,17 @@ impl Storage for ReconnectingStorage {
         ctx: &TenantContext,
         session_id: uuid::Uuid,
         name: &str,
-    ) -> anyhow::Result<Option<EntityEntry>> {
+    ) -> anyhow::Result<Vec<EntityEntry>> {
         delegate!(self, entity_find_phonetic, ctx, session_id, name)
+    }
+
+    async fn entity_get_by_id(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        entity_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<EntityEntry>> {
+        delegate!(self, entity_get_by_id, ctx, session_id, entity_id)
     }
 
     async fn entity_search_ann(
@@ -959,8 +971,22 @@ async fn main() -> anyhow::Result<()> {
     // and mid-operation connection loss (rolling restarts, network blips).
     tokio::spawn(cql_reconnect_watcher(Arc::clone(&storage)));
 
+    // Load dynamic type registry from the database (falls back to defaults).
+    let (entity_types, edge_types) = {
+        let guard = storage.inner.read().await;
+        if let Some(ref cql) = *guard {
+            let et = cql.load_entity_types().await;
+            let edg = cql.load_edge_types().await;
+            tracing::info!(entity_types = et.len(), edge_types = edg.len(), "loaded type registry");
+            (et, edg)
+        } else {
+            tracing::info!("no CQL connection yet, using default type registry");
+            (ferrosa_memory_core::cql_storage::CqlStorage::default_entity_types(), Vec::new())
+        }
+    };
+
     // Connect graph client via HTTP (non-fatal if it fails)
-    match ferrosa_memory_core::graph::GraphClient::connect(
+    let graph_client = match ferrosa_memory_core::graph::GraphClient::connect(
         &ferrosa_memory_core::graph::GraphConfig {
             http_url: config.graph.http_url.clone(),
             username: config.graph.username.clone(),
@@ -970,8 +996,14 @@ async fn main() -> anyhow::Result<()> {
     )
     .await
     {
-        Ok(_graph) => tracing::info!("connected to Ferrosa graph (HTTP)"),
-        Err(e) => tracing::warn!("graph connection failed ({e}), graph traversals disabled"),
+        Ok(graph) => {
+            tracing::info!("connected to Ferrosa graph (HTTP)");
+            Some(Arc::new(graph))
+        }
+        Err(e) => {
+            tracing::warn!("graph connection failed ({e}), graph traversals disabled");
+            None
+        }
     };
 
     // Start visualization server if enabled
@@ -1004,6 +1036,9 @@ async fn main() -> anyhow::Result<()> {
                 default_session_id,
                 ollama_base_url: config.embeddings.ollama_base_url.clone(),
                 ner_model: config.embeddings.ner_model.clone(),
+                entity_types: entity_types.clone(),
+                edge_types: edge_types.clone(),
+                graph: graph_client.clone(),
                 ..dispatch::SessionState::default()
             });
             if let Some(sid) = default_session_id {

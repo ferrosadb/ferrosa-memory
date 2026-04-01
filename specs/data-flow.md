@@ -255,3 +255,47 @@ graph LR
     D -->|lifecycle 30d| F
     E -->|lifecycle 30d| G
 ```
+
+## 9. Type Registry and Tool Schema Generation
+
+At MCP server startup, the type registry is loaded from CQL and used to build dynamic tool schemas. New entity or edge types can be added by inserting rows into the registry tables — no recompile required.
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'actorBkg':'#16161f','actorTextColor':'#e8e8ed','actorBorder':'#e2725b','signalColor':'#9494a3','signalTextColor':'#e8e8ed','labelBoxBkgColor':'#16161f','labelBoxBorderColor':'#e2725b','labelTextColor':'#e8e8ed','loopTextColor':'#e8e8ed','noteBkgColor':'#1c1c28','noteBorderColor':'#d4a574','noteTextColor':'#e8e8ed','activationBkgColor':'#1c1c28','activationBorderColor':'#e2725b'}}}%%
+sequenceDiagram
+    participant MCP as ferrosa-memory-mcp
+    participant CQL as CqlStorage
+    participant DB as Ferrosa DB
+
+    MCP->>CQL: connect(config)
+    CQL->>DB: Prepare 44 statements
+    DB-->>CQL: PreparedStatements
+    MCP->>CQL: load_entity_types()
+    CQL->>DB: SELECT type_name FROM entity_types
+    DB-->>CQL: [person, place, bug, document, ...]
+    MCP->>CQL: load_edge_types()
+    CQL->>DB: SELECT type_name FROM edge_types
+    DB-->>CQL: [depends_on, contains, calls, ...]
+    Note over MCP: Build tool schemas with<br/>dynamic entity_type enums
+    MCP->>MCP: tool_definitions(entity_types)
+```
+
+## 10. External Codebase Ingestion (via skilltools)
+
+The `skilltools ingest` CLI/MCP tool extracts codebase structure and documentation into the fmem knowledge graph via direct CQL inserts. This is external to the MCP server process.
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'actorBkg':'#16161f','actorTextColor':'#e8e8ed','actorBorder':'#e2725b','signalColor':'#9494a3','signalTextColor':'#e8e8ed','labelBoxBkgColor':'#16161f','labelBoxBorderColor':'#e2725b','labelTextColor':'#e8e8ed','loopTextColor':'#e8e8ed','noteBkgColor':'#1c1c28','noteBorderColor':'#d4a574','noteTextColor':'#e8e8ed','activationBkgColor':'#1c1c28','activationBorderColor':'#e2725b'}}}%%
+sequenceDiagram
+    participant ST as skilltools ingest
+    participant PY as Python CQL loader
+    participant DB as Ferrosa DB
+    participant VIZ as Viz Server
+
+    ST->>ST: extract(dir) → entities + edges
+    Note over ST: Rust: crates, modules, deps<br/>Markdown: documents, sections<br/>Cross-refs: section→code entity
+    ST->>PY: write entities.json + edges.json
+    PY->>DB: INSERT INTO entity_store (batch)
+    PY->>DB: INSERT INTO typed_edges (batch)
+    Note over VIZ: Next browser connect<br/>sees new entities in snapshot
+```

@@ -14,3 +14,8 @@ See [specs/project-plan.md](specs/project-plan.md) for the current project plan 
 ## Architecture
 
 See [specs/](specs/) for full architecture specs, DSM analysis, threat model, and FMEA.
+
+## Related Projects
+
+- `../ferrosa/` — Ferrosa DB engine. Architecture specs at `../ferrosa/specs/` (CQL protocol, SUBSCRIBE semantics, storage engine, graph engine, consensus).
+- `../research/tools/skilltools/` — CLI/MCP companion tool. Provides `ingest` for codebase/docs→memory ingestion, plus code analysis tools (DSM, digest, smell-detect, etc.).

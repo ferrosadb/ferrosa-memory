@@ -125,13 +125,11 @@ pub async fn smart_ingest(
             .take(5)
             .collect::<Vec<_>>()
             .join(" ");
-        match storage
+        let mut matches = storage
             .entity_find_phonetic(ctx, session_id, &name_hint)
-            .await?
-        {
-            Some(e) => vec![e],
-            None => vec![],
-        }
+            .await?;
+        matches.truncate(3);
+        matches
     };
 
     if existing.is_empty() {
@@ -158,9 +156,17 @@ pub async fn smart_ingest(
         return Ok(IngestDecision::Created { entity_id });
     }
 
-    // Compare with most similar existing memory
-    // For now, use a simple heuristic: check content overlap
-    let best_match = &existing[0];
+    // Compare with most similar existing memory.
+    // Phonetic matches are lightweight (no context), so fetch full entity for comparison.
+    let best_match = if existing[0].context_snippet.is_empty() {
+        // Lightweight match — fetch full entity for similarity comparison
+        storage
+            .entity_get_by_id(ctx, session_id, existing[0].entity_id)
+            .await?
+            .unwrap_or_else(|| existing[0].clone())
+    } else {
+        existing[0].clone()
+    };
     let similarity = compute_text_similarity(content, &best_match.context_snippet);
 
     if similarity > config.skip_threshold {
