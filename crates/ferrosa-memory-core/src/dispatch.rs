@@ -111,6 +111,8 @@ pub struct SessionState {
     /// Configured default session_id for cross-session memory continuity.
     /// Falls back to random UUID if not set.
     pub default_session_id: Option<uuid::Uuid>,
+    /// Repository path for intention scoping (from CLAUDE_PROJECT_DIR or config).
+    pub repo: String,
     /// Notified on every tool call; used by the idle consolidation timer.
     pub last_activity: Arc<tokio::sync::Notify>,
     /// Set to true when a write tool succeeds; cleared by idle consolidation.
@@ -134,6 +136,7 @@ impl Default for SessionState {
             retrieval_tracker: Arc::new(Mutex::new(RetrievalTracker::new())),
             co_access: Arc::new(Mutex::new(crate::speculative::CoAccessTracker::new(10))),
             default_session_id: None,
+            repo: String::new(),
             last_activity: Arc::new(tokio::sync::Notify::new()),
             dirty: Arc::new(AtomicBool::new(false)),
             ollama_base_url: "http://localhost:11434".to_string(),
@@ -406,14 +409,15 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                 "required": ["content", "entity_type"]
             }),
         },
-        // --- Intention tools (prospective memory) ---
+        // --- Intention tools (prospective memory, repo-scoped) ---
         ToolDef {
             name: "set_intention".into(),
-            description: "Prospective memory — 'remember to do X when Y happens.' Sets a deferred action that auto-triggers on context match.\n\nCALL WHEN you notice something to do later:\n- 'When we touch auth, check the error handling'\n- 'Next time we open database.rs, add that index'\n- 'When user mentions deployment, remind about the TLS cert'\n- 'In 30 minutes, check if the build finished'\n\nTrigger types: Topic (keyword match), FilePattern (file glob), Duration (minutes), Context (flexible condition).\n\nIntentions persist across the session and trigger automatically when check_intentions runs. Set liberally — they cost nothing until triggered.\nCost: ~1ms.".into(),
+            description: "Prospective memory — 'remember to do X when Y happens.' Sets a deferred action that auto-triggers on context match.\n\nCALL WHEN you notice something to do later:\n- 'When we touch auth, check the error handling'\n- 'Next time we open database.rs, add that index'\n- 'When user mentions deployment, remind about the TLS cert'\n- 'In 30 minutes, check if the build finished'\n\nTrigger types: Topic (keyword match), FilePattern (file glob), Duration (minutes), Context (flexible condition).\n\nIntentions are repo-scoped and persist across sessions. They trigger automatically when check_intentions runs. Set liberally — they cost nothing until triggered.\nCost: ~1ms.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "description": { "type": "string", "maxLength": 4096, "description": "What to do when triggered" },
+                    "repo": { "type": "string", "maxLength": 512, "description": "Repository path for scoping (defaults to server's configured repo)" },
                     "trigger": {
                         "type": "object",
                         "description": "Trigger condition",
@@ -433,11 +437,12 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "check_intentions".into(),
-            description: "Checks pending intentions against current context. Call FREQUENTLY — at every topic change, file open, or new task start. Pass a brief description of what you're doing now as context. Returns triggered intentions you should act on.\n\nCost: ~1ms. Call often — it's free.".into(),
+            description: "Checks pending intentions against current context. Call FREQUENTLY — at every topic change, file open, or new task start. Pass a brief description of what you're doing now as context. Returns triggered intentions you should act on.\n\nIntentions are repo-scoped — only intentions for the current repo are checked.\nCost: ~1ms. Call often — it's free.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "context": { "type": "string", "maxLength": 8192, "description": "Current context to check against" }
+                    "context": { "type": "string", "maxLength": 8192, "description": "Current context to check against" },
+                    "repo": { "type": "string", "maxLength": 512, "description": "Repository path (defaults to server's configured repo)" }
                 },
                 "required": ["context"]
             }),
@@ -455,10 +460,12 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "list_intentions".into(),
-            description: "Lists all intentions (pending, triggered, completed, snoozed).\n\nCALL WHEN: User asks about pending intentions, or for debugging intention state.\nCost: ~1ms.".into(),
+            description: "Lists intentions. By default lists current repo's intentions from the in-memory store.\n\nPass all_repos: true to list intentions across ALL repos from durable storage — useful for seeing all threads you're coordinating across projects.\n\nCALL WHEN: User asks about pending intentions, wants a cross-project overview, or for debugging intention state.\nCost: ~1ms (in-memory), ~15ms (all_repos).".into(),
             input_schema: serde_json::json!({
                 "type": "object",
-                "properties": {}
+                "properties": {
+                    "all_repos": { "type": "boolean", "description": "If true, list intentions across ALL repos from storage (not just current session)" }
+                }
             }),
         },
         ToolDef {
@@ -898,7 +905,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "set_intention" => handle_set_intention(args, storage, ctx, session).await,
         "check_intentions" => handle_check_intentions(args, storage, ctx, session).await,
         "complete_intention" => handle_complete_intention(args, storage, ctx, session).await,
-        "list_intentions" => handle_list_intentions(session).await,
+        "list_intentions" => handle_list_intentions(args, storage, ctx, session).await,
         "snooze_intention" => handle_snooze_intention(args, storage, ctx, session).await,
         "write_temporal_fact" => handle_write_temporal_fact(args, storage, ctx, session).await,
         "get_temporal_chain" => handle_get_temporal_chain(args, storage, ctx).await,
@@ -1864,12 +1871,23 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
 
 // --- Intention handlers ---
 
+/// Resolve repo from tool args, falling back to session default.
+fn resolve_repo<'a>(args: &'a Value, session: &'a SessionState) -> &'a str {
+    args.get("repo")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&session.repo)
+}
+
 async fn handle_set_intention<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
+    let repo = resolve_repo(&args, session);
+    if repo.is_empty() {
+        return Err((INVALID_PARAMS, "repo is required (pass explicitly or configure server repo)".into()));
+    }
     let description = require_str(&args, "description")?;
     let trigger_json = args
         .get("trigger")
@@ -1886,7 +1904,7 @@ async fn handle_set_intention<S: crate::storage::Storage>(
         .unwrap_or(crate::intention::Priority::Normal);
 
     let mut store = session.intentions.lock().await;
-    let intention = store.set(description, trigger, priority);
+    let intention = store.set(repo, description, trigger, priority);
     let id = intention.id;
 
     // Persist to storage (best-effort -- in-memory is primary)
@@ -1903,6 +1921,7 @@ async fn handle_check_intentions<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
+    let repo = resolve_repo(&args, session);
     let context = require_str(&args, "context")?;
     let mut store = session.intentions.lock().await;
     let triggered = store.check(context);
@@ -1918,7 +1937,14 @@ async fn handle_check_intentions<S: crate::storage::Storage>(
             .trim_matches('"')
             .to_string();
         if let Err(e) = storage
-            .intention_update_status(ctx, intention.id, &status_str, intention.triggered_at, None)
+            .intention_update_status(
+                ctx,
+                repo,
+                intention.id,
+                &status_str,
+                intention.triggered_at,
+                None,
+            )
             .await
         {
             tracing::warn!(id = %intention.id, error = %e, "failed to persist intention trigger");
@@ -1934,13 +1960,14 @@ async fn handle_complete_intention<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
+    let repo = resolve_repo(&args, session);
     let id = require_uuid(&args, "intention_id")?;
     let mut store = session.intentions.lock().await;
     let completed = store.complete(id);
 
     if completed
         && let Err(e) = storage
-            .intention_update_status(ctx, id, "completed", None, Some(chrono::Utc::now()))
+            .intention_update_status(ctx, repo, id, "completed", None, Some(chrono::Utc::now()))
             .await
     {
         tracing::warn!(%id, error = %e, "failed to persist intention completion");
@@ -1949,14 +1976,38 @@ async fn handle_complete_intention<S: crate::storage::Storage>(
     Ok(serde_json::json!({ "completed": completed }))
 }
 
-async fn handle_list_intentions(session: &SessionState) -> Result<Value, (i32, String)> {
-    let store = session.intentions.lock().await;
-    let intentions = store.list();
-    let json: Vec<Value> = intentions
-        .iter()
-        .map(|i| serde_json::to_value(i).unwrap_or(Value::Null))
-        .collect();
-    Ok(serde_json::json!({ "intentions": json }))
+async fn handle_list_intentions<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let all_repos = args
+        .get("all_repos")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if all_repos {
+        // Load from CQL across all repos
+        let intentions = storage
+            .intention_list_all(ctx)
+            .await
+            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+        let json: Vec<Value> = intentions
+            .iter()
+            .map(|i| serde_json::to_value(i).unwrap_or(Value::Null))
+            .collect();
+        Ok(serde_json::json!({ "intentions": json, "source": "all_repos" }))
+    } else {
+        // In-memory store (current repo only)
+        let store = session.intentions.lock().await;
+        let intentions = store.list();
+        let json: Vec<Value> = intentions
+            .iter()
+            .map(|i| serde_json::to_value(i).unwrap_or(Value::Null))
+            .collect();
+        Ok(serde_json::json!({ "intentions": json, "source": "session" }))
+    }
 }
 
 async fn handle_snooze_intention<S: crate::storage::Storage>(
@@ -1965,13 +2016,14 @@ async fn handle_snooze_intention<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
+    let repo = resolve_repo(&args, session);
     let id = require_uuid(&args, "intention_id")?;
     let mut store = session.intentions.lock().await;
     let snoozed = store.snooze(id);
 
     if snoozed
         && let Err(e) = storage
-            .intention_update_status(ctx, id, "pending", None, None)
+            .intention_update_status(ctx, repo, id, "pending", None, None)
             .await
     {
         tracing::warn!(%id, error = %e, "failed to persist intention snooze");
@@ -3162,7 +3214,10 @@ mod tests {
     async fn set_intention_and_check() {
         let store = MockStorage::new();
         let ctx = test_ctx();
-        let session = SessionState::default();
+        let session = SessionState {
+            repo: "/test/repo".into(),
+            ..SessionState::default()
+        };
 
         // Set
         let params = serde_json::json!({
@@ -3423,7 +3478,10 @@ mod tests {
     async fn intention_persists_to_storage() {
         let store = MockStorage::new();
         let ctx = test_ctx();
-        let session = SessionState::default();
+        let session = SessionState {
+            repo: "/test/repo".into(),
+            ..SessionState::default()
+        };
 
         // Set an intention — should persist to mock storage
         let params = serde_json::json!({
@@ -3445,20 +3503,28 @@ mod tests {
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].id.to_string(), intention_id);
         assert_eq!(stored[0].description, "Check SQL injection patterns");
+        assert_eq!(stored[0].repo, "/test/repo");
         drop(stored);
 
-        // Read back from storage trait
+        // Read back from storage trait (repo-scoped)
         use crate::storage::Storage as _;
-        let loaded = store.intention_list(&ctx).await.unwrap();
+        let loaded = store.intention_list(&ctx, "/test/repo").await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id.to_string(), intention_id);
+
+        // Different repo returns empty
+        let other = store.intention_list(&ctx, "/other/repo").await.unwrap();
+        assert!(other.is_empty());
     }
 
     #[tokio::test]
     async fn intention_complete_persists_status() {
         let store = MockStorage::new();
         let ctx = test_ctx();
-        let session = SessionState::default();
+        let session = SessionState {
+            repo: "/test/repo".into(),
+            ..SessionState::default()
+        };
 
         // Set an intention
         let params = serde_json::json!({
@@ -3523,6 +3589,7 @@ mod tests {
         // Simulate pre-existing intentions in storage (from previous session)
         let intention = Intention {
             id: Uuid::new_v4(),
+            repo: "/test/repo".into(),
             description: "Previously stored intention".into(),
             trigger: IntentionTrigger::Topic {
                 keywords: vec!["rust".into()],
@@ -3535,8 +3602,8 @@ mod tests {
         };
         store.intention_put(&ctx, &intention).await.unwrap();
 
-        // Load from storage into IntentionStore
-        let loaded = store.intention_list(&ctx).await.unwrap();
+        // Load from storage into IntentionStore (repo-scoped)
+        let loaded = store.intention_list(&ctx, "/test/repo").await.unwrap();
         let mut intention_store = IntentionStore::new();
         intention_store.load(loaded);
 

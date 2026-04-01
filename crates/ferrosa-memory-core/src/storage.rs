@@ -312,15 +312,22 @@ pub trait Storage: Send + Sync {
 
     // --- Intention operations ---
 
-    /// Store a new intention.
+    /// Store a new intention (repo is on the Intention struct).
     async fn intention_put(
         &self,
         ctx: &TenantContext,
         intention: &crate::intention::Intention,
     ) -> anyhow::Result<()>;
 
-    /// List all intentions for a tenant.
+    /// List intentions for a tenant, scoped to a specific repo.
     async fn intention_list(
+        &self,
+        ctx: &TenantContext,
+        repo: &str,
+    ) -> anyhow::Result<Vec<crate::intention::Intention>>;
+
+    /// List all intentions for a tenant across all repos (for sync/admin).
+    async fn intention_list_all(
         &self,
         ctx: &TenantContext,
     ) -> anyhow::Result<Vec<crate::intention::Intention>>;
@@ -329,6 +336,7 @@ pub trait Storage: Send + Sync {
     async fn intention_update_status(
         &self,
         ctx: &TenantContext,
+        repo: &str,
         id: Uuid,
         status: &str,
         triggered_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -1140,6 +1148,21 @@ pub mod mock {
         async fn intention_list(
             &self,
             _ctx: &TenantContext,
+            repo: &str,
+        ) -> anyhow::Result<Vec<crate::intention::Intention>> {
+            Ok(self
+                .intentions
+                .lock()
+                .await
+                .iter()
+                .filter(|i| i.repo == repo)
+                .cloned()
+                .collect())
+        }
+
+        async fn intention_list_all(
+            &self,
+            _ctx: &TenantContext,
         ) -> anyhow::Result<Vec<crate::intention::Intention>> {
             Ok(self.intentions.lock().await.clone())
         }
@@ -1147,6 +1170,7 @@ pub mod mock {
         async fn intention_update_status(
             &self,
             _ctx: &TenantContext,
+            _repo: &str,
             id: Uuid,
             status: &str,
             triggered_at: Option<chrono::DateTime<chrono::Utc>>,

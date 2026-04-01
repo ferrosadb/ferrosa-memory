@@ -262,7 +262,7 @@ async fn sync_all(
 
     // --- Intentions ---
     let intentions = src
-        .intention_list(ctx)
+        .intention_list_all(ctx)
         .await
         .context("listing intentions from source")?;
     stats.intentions = intentions.len();

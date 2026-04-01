@@ -90,6 +90,7 @@ struct PreparedStatements {
     // Intentions
     intention_put: PreparedQuery,
     intention_list: PreparedQuery,
+    intention_list_all: PreparedQuery,
     intention_update_status: PreparedQuery,
     // Audit
     audit_put: PreparedQuery,
@@ -362,26 +363,33 @@ impl CqlStorage {
                      FROM {ks}.supersedes WHERE old_event_id = ? AND tenant_id = ? ALLOW FILTERING"
                 ))
                 .await?,
-            // Intentions
+            // Intentions (repo-scoped)
             intention_put: session
                 .prepare(format!(
                     "INSERT INTO {ks}.intentions \
-                     (tenant_id, intention_id, description, trigger_json, priority, \
+                     (tenant_id, repo, intention_id, description, trigger_json, priority, \
                       status, created_at, triggered_at, completed_at) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 ))
                 .await?,
             intention_list: session
                 .prepare(format!(
-                    "SELECT intention_id, description, trigger_json, priority, status, \
+                    "SELECT intention_id, repo, description, trigger_json, priority, status, \
                      created_at, triggered_at, completed_at \
-                     FROM {ks}.intentions WHERE tenant_id = ?"
+                     FROM {ks}.intentions WHERE tenant_id = ? AND repo = ?"
+                ))
+                .await?,
+            intention_list_all: session
+                .prepare(format!(
+                    "SELECT intention_id, repo, description, trigger_json, priority, status, \
+                     created_at, triggered_at, completed_at \
+                     FROM {ks}.intentions WHERE tenant_id = ? ALLOW FILTERING"
                 ))
                 .await?,
             intention_update_status: session
                 .prepare(format!(
                     "UPDATE {ks}.intentions SET status = ?, triggered_at = ?, completed_at = ? \
-                     WHERE tenant_id = ? AND intention_id = ?"
+                     WHERE tenant_id = ? AND repo = ? AND intention_id = ?"
                 ))
                 .await?,
             audit_put: session
@@ -2127,6 +2135,7 @@ impl Storage for CqlStorage {
                 &self.stmts.intention_put,
                 query_values!(
                     ctx.tenant_id,
+                    intention.repo.clone(),
                     intention.id,
                     intention.description.clone(),
                     trigger_json,
@@ -2144,9 +2153,13 @@ impl Storage for CqlStorage {
     async fn intention_list(
         &self,
         ctx: &TenantContext,
+        repo: &str,
     ) -> anyhow::Result<Vec<crate::intention::Intention>> {
         let rows = self
-            .query_rows(&self.stmts.intention_list, query_values!(ctx.tenant_id))
+            .query_rows(
+                &self.stmts.intention_list,
+                query_values!(ctx.tenant_id, repo.to_string()),
+            )
             .await?;
 
         let mut results = Vec::with_capacity(rows.len());
@@ -2168,8 +2181,68 @@ impl Storage for CqlStorage {
                 .r_by_name::<chrono::NaiveDateTime>("created_at")
                 .unwrap_or_default();
 
+            let repo_val: String = row
+                .r_by_name("repo")
+                .unwrap_or_else(|_| repo.to_string());
+
             results.push(crate::intention::Intention {
                 id: row.r_by_name("intention_id")?,
+                repo: repo_val,
+                description: row.r_by_name("description")?,
+                trigger,
+                priority,
+                status,
+                created_at: created.and_utc(),
+                triggered_at: row
+                    .r_by_name::<chrono::NaiveDateTime>("triggered_at")
+                    .ok()
+                    .map(|t| t.and_utc()),
+                completed_at: row
+                    .r_by_name::<chrono::NaiveDateTime>("completed_at")
+                    .ok()
+                    .map(|t| t.and_utc()),
+            });
+        }
+        Ok(results)
+    }
+
+    async fn intention_list_all(
+        &self,
+        ctx: &TenantContext,
+    ) -> anyhow::Result<Vec<crate::intention::Intention>> {
+        let rows = self
+            .query_rows(
+                &self.stmts.intention_list_all,
+                query_values!(ctx.tenant_id),
+            )
+            .await?;
+
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            let trigger_json: String = row.r_by_name("trigger_json")?;
+            let trigger: crate::intention::IntentionTrigger = serde_json::from_str(&trigger_json)?;
+
+            let priority_str: String = row.r_by_name("priority")?;
+            let priority: crate::intention::Priority =
+                serde_json::from_str(&format!("\"{priority_str}\""))
+                    .unwrap_or(crate::intention::Priority::Normal);
+
+            let status_str: String = row.r_by_name("status")?;
+            let status: crate::intention::IntentionStatus =
+                serde_json::from_str(&format!("\"{status_str}\""))
+                    .unwrap_or(crate::intention::IntentionStatus::Pending);
+
+            let created = row
+                .r_by_name::<chrono::NaiveDateTime>("created_at")
+                .unwrap_or_default();
+
+            let repo_val: String = row
+                .r_by_name("repo")
+                .unwrap_or_default();
+
+            results.push(crate::intention::Intention {
+                id: row.r_by_name("intention_id")?,
+                repo: repo_val,
                 description: row.r_by_name("description")?,
                 trigger,
                 priority,
@@ -2191,6 +2264,7 @@ impl Storage for CqlStorage {
     async fn intention_update_status(
         &self,
         ctx: &TenantContext,
+        repo: &str,
         id: Uuid,
         status: &str,
         triggered_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -2204,6 +2278,7 @@ impl Storage for CqlStorage {
                     triggered_at.map(|t| t.naive_utc()),
                     completed_at.map(|t| t.naive_utc()),
                     ctx.tenant_id,
+                    repo.to_string(),
                     id
                 ),
             )

@@ -493,13 +493,22 @@ impl Storage for ReconnectingStorage {
     async fn intention_list(
         &self,
         ctx: &TenantContext,
+        repo: &str,
     ) -> anyhow::Result<Vec<ferrosa_memory_core::intention::Intention>> {
-        delegate!(self, intention_list, ctx)
+        delegate!(self, intention_list, ctx, repo)
+    }
+
+    async fn intention_list_all(
+        &self,
+        ctx: &TenantContext,
+    ) -> anyhow::Result<Vec<ferrosa_memory_core::intention::Intention>> {
+        delegate!(self, intention_list_all, ctx)
     }
 
     async fn intention_update_status(
         &self,
         ctx: &TenantContext,
+        repo: &str,
         id: uuid::Uuid,
         status: &str,
         triggered_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -509,6 +518,7 @@ impl Storage for ReconnectingStorage {
             self,
             intention_update_status,
             ctx,
+            repo,
             id,
             status,
             triggered_at,
@@ -945,6 +955,15 @@ async fn main() -> anyhow::Result<()> {
         .session_id
         .as_ref()
         .and_then(|s| uuid::Uuid::parse_str(s).ok());
+
+    // Resolve repo for intention scoping: CLAUDE_PROJECT_DIR env > config > empty.
+    let repo = std::env::var("CLAUDE_PROJECT_DIR")
+        .unwrap_or_else(|_| String::new());
+    if repo.is_empty() {
+        tracing::warn!("CLAUDE_PROJECT_DIR not set — intentions will require explicit repo param");
+    } else {
+        tracing::info!(repo = %repo, "intention scoping: repo from CLAUDE_PROJECT_DIR");
+    }
     let metrics = Arc::new(ferrosa_memory_core::metrics::MemoryMetrics::new()?);
     tracing::info!("metrics registered");
 
@@ -1034,6 +1053,7 @@ async fn main() -> anyhow::Result<()> {
             let session = Arc::new(dispatch::SessionState {
                 event_bus: Arc::clone(&shared_event_bus),
                 default_session_id,
+                repo: repo.clone(),
                 ollama_base_url: config.embeddings.ollama_base_url.clone(),
                 ner_model: config.embeddings.ner_model.clone(),
                 entity_types: entity_types.clone(),
@@ -1043,6 +1063,27 @@ async fn main() -> anyhow::Result<()> {
             });
             if let Some(sid) = default_session_id {
                 tracing::info!(session_id = %sid, "using configured default session_id");
+            }
+
+            // Load persisted intentions from CQL (repo-scoped).
+            if !repo.is_empty() {
+                let load_storage = Arc::clone(&storage);
+                let load_ctx = Arc::clone(&ctx);
+                let load_session = Arc::clone(&session);
+                let load_repo = repo.clone();
+                tokio::spawn(async move {
+                    match load_storage.intention_list(&load_ctx, &load_repo).await {
+                        Ok(intentions) if !intentions.is_empty() => {
+                            let count = intentions.len();
+                            load_session.intentions.lock().await.load(intentions);
+                            tracing::info!(count, repo = %load_repo, "loaded persisted intentions");
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to load intentions from storage");
+                        }
+                    }
+                });
             }
             let session_ref = Arc::clone(&session);
 

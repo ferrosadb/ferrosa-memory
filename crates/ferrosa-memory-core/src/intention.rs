@@ -15,6 +15,8 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Intention {
     pub id: Uuid,
+    /// Repository path this intention is scoped to (e.g. "/Users/ben/src/ferrosa-memory").
+    pub repo: String,
     pub description: String,
     pub trigger: IntentionTrigger,
     pub priority: Priority,
@@ -56,8 +58,8 @@ pub enum IntentionStatus {
     Cancelled,
 }
 
-/// In-memory intention store (backed by CQL in production).
-/// For now, held in the session — intentions persist via entity_store.
+/// In-memory intention store backed by CQL persistence.
+/// Intentions are loaded from CQL on session start and written through on mutation.
 pub struct IntentionStore {
     intentions: Vec<Intention>,
 }
@@ -75,9 +77,10 @@ impl IntentionStore {
         }
     }
 
-    /// Set a new intention. Returns the created Intention for persistence.
+    /// Set a new intention scoped to a repository. Returns the created Intention for persistence.
     pub fn set(
         &mut self,
+        repo: &str,
         description: &str,
         trigger: IntentionTrigger,
         priority: Priority,
@@ -85,6 +88,7 @@ impl IntentionStore {
         let id = Uuid::new_v4();
         let intention = Intention {
             id,
+            repo: repo.to_string(),
             description: description.to_string(),
             trigger,
             priority,
@@ -93,7 +97,7 @@ impl IntentionStore {
             triggered_at: None,
             completed_at: None,
         };
-        tracing::info!(%id, description, "intention set");
+        tracing::info!(%id, repo, description, "intention set");
         self.intentions.push(intention.clone());
         intention
     }
@@ -197,6 +201,7 @@ mod tests {
     fn set_and_check_topic_intention() {
         let mut store = IntentionStore::new();
         store.set(
+            "/test/repo",
             "Review error handling in auth module",
             IntentionTrigger::Topic {
                 keywords: vec!["auth".into(), "authentication".into()],
@@ -218,6 +223,7 @@ mod tests {
     fn complete_intention() {
         let mut store = IntentionStore::new();
         let intention = store.set(
+            "/test/repo",
             "Add tests",
             IntentionTrigger::Topic {
                 keywords: vec!["test".into()],
@@ -236,6 +242,7 @@ mod tests {
     fn file_pattern_trigger() {
         let mut store = IntentionStore::new();
         store.set(
+            "/test/repo",
             "Check for SQL injection",
             IntentionTrigger::FilePattern {
                 pattern: "query".into(),
