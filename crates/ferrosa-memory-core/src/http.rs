@@ -395,9 +395,21 @@ pub async fn serve_viz<S: Storage + 'static>(
             continue;
         }
 
+        // Check for session_id override in query string (e.g., /viz/ws?session=UUID)
+        let effective_session = if let Some(pos) = peek_str.find("session=") {
+            let start = pos + 8;
+            let end = peek_str[start..]
+                .find(|c: char| c == '&' || c == ' ' || c == '\r' || c == '\n')
+                .map(|i| start + i)
+                .unwrap_or(peek_str.len().min(start + 36));
+            Uuid::parse_str(&peek_str[start..end]).unwrap_or(session_id)
+        } else {
+            session_id
+        };
+
         // Build snapshot before spawning because Storage async methods are not
         // Send-bounded. The snapshot is built per-connection to stay fresh.
-        let snapshot = build_snapshot(&*storage, &ctx, session_id).await;
+        let snapshot = build_snapshot(&*storage, &ctx, effective_session).await;
         tokio::spawn(async move {
             if let Err(e) = handle_viz_connection(stream, bus, snapshot).await {
                 tracing::debug!("viz connection from {peer} closed: {e}");
