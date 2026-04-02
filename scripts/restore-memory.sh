@@ -60,8 +60,12 @@ host = '$CQL_HOST'
 port = int('$CQL_PORT')
 backup_dir = '$BACKUP_DIR'
 
-cluster = Cluster([host], port=port, load_balancing_policy=RoundRobinPolicy(), protocol_version=4)
+cluster = Cluster([host], port=port, load_balancing_policy=RoundRobinPolicy(), protocol_version=4, connect_timeout=15)
 session = cluster.connect('agent_memory')
+
+# Verify connection is healthy before restoring
+row = session.execute('SELECT COUNT(*) FROM agent_memory.entity_store').one()
+print(f'  connected OK (current entities: {row[0]})', file=sys.stderr)
 
 def parse_uuid(s):
     return uuid.UUID(s) if s else None
@@ -120,7 +124,8 @@ if os.path.exists(path):
             ))
             count += 1
         except Exception as ex:
-            pass
+            if count == 0:
+                print(f'  WARN: first edge error: {ex}', file=sys.stderr)
         if count % 1000 == 0 and count > 0:
             print(f'  typed_edges: {count}/{len(edges)}', file=sys.stderr)
     print(f'  typed_edges: {count}/{len(edges)} restored', file=sys.stderr)
