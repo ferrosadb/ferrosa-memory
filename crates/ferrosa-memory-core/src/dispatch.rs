@@ -904,6 +904,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
     }
 
     tracing::debug!(tool = name, "dispatching tool call");
+    let input_bytes = serde_json::to_string(&args).map(|s| s.len()).unwrap_or(0) as i32;
     let start = std::time::Instant::now();
     let result = match name {
         "check_memo_cache" => handle_check_memo(args, storage, ctx).await,
@@ -979,7 +980,8 @@ async fn dispatch_tool<S: crate::storage::Storage>(
 
     // Wrap in MCP CallToolResult format: { content: [{type: "text", text: "..."}] }
     // MCP clients expect this structure; without it, tool output is invisible.
-    result.map(|value| {
+    let is_err = result.is_err();
+    let wrapped = result.map(|value| {
         let text = if value.is_string() {
             value.as_str().unwrap().to_string()
         } else {
@@ -988,7 +990,24 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         serde_json::json!({
             "content": [{"type": "text", "text": text}]
         })
-    })
+    });
+
+    // Log tool usage (best-effort).
+    let output_bytes = wrapped
+        .as_ref()
+        .map(|v| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
+        .unwrap_or(0) as i32;
+    let estimated_tokens = (input_bytes + output_bytes) / 4;
+    let latency_ms = start.elapsed().as_millis() as i32;
+    let repo = session.repo.get().map(|s| s.as_str()).unwrap_or("");
+    if let Err(e) = storage
+        .tool_usage_put(ctx, name, repo, input_bytes, output_bytes, estimated_tokens, latency_ms, is_err)
+        .await
+    {
+        tracing::debug!(error = %e, "tool usage logging failed");
+    }
+
+    wrapped
 }
 
 /// Returns true for tools that modify stored data (writes, upserts, deletes).

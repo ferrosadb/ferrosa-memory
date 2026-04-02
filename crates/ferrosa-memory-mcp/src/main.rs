@@ -526,6 +526,39 @@ impl Storage for ReconnectingStorage {
         )
     }
 
+    async fn tool_usage_put(
+        &self,
+        ctx: &TenantContext,
+        tool_name: &str,
+        repo: &str,
+        input_bytes: i32,
+        output_bytes: i32,
+        estimated_tokens: i32,
+        latency_ms: i32,
+        error: bool,
+    ) -> anyhow::Result<()> {
+        delegate!(
+            self,
+            tool_usage_put,
+            ctx,
+            tool_name,
+            repo,
+            input_bytes,
+            output_bytes,
+            estimated_tokens,
+            latency_ms,
+            error
+        )
+    }
+
+    async fn tool_usage_query(
+        &self,
+        ctx: &TenantContext,
+        day: &str,
+    ) -> anyhow::Result<Vec<ferrosa_memory_core::types::ToolUsageRow>> {
+        delegate!(self, tool_usage_query, ctx, day)
+    }
+
     async fn audit_put(
         &self,
         ctx: &TenantContext,

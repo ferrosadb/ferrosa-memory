@@ -92,6 +92,9 @@ struct PreparedStatements {
     intention_list: PreparedQuery,
     intention_list_all: PreparedQuery,
     intention_update_status: PreparedQuery,
+    // Tool usage logging
+    tool_usage_put: PreparedQuery,
+    tool_usage_query: PreparedQuery,
     // Audit
     audit_put: PreparedQuery,
     // Sync/export list queries
@@ -390,6 +393,21 @@ impl CqlStorage {
                 .prepare(format!(
                     "UPDATE {ks}.intentions SET status = ?, triggered_at = ?, completed_at = ? \
                      WHERE tenant_id = ? AND repo = ? AND intention_id = ?"
+                ))
+                .await?,
+            tool_usage_put: session
+                .prepare(format!(
+                    "INSERT INTO {ks}.tool_usage_log \
+                     (tenant_id, day, call_id, tool_name, repo, input_bytes, output_bytes, \
+                      estimated_tokens, latency_ms, error) \
+                     VALUES (?, ?, now(), ?, ?, ?, ?, ?, ?, ?)"
+                ))
+                .await?,
+            tool_usage_query: session
+                .prepare(format!(
+                    "SELECT tool_name, repo, input_bytes, output_bytes, estimated_tokens, \
+                     latency_ms, error, dateOf(call_id) as created_at \
+                     FROM {ks}.tool_usage_log WHERE tenant_id = ? AND day = ?"
                 ))
                 .await?,
             audit_put: session
@@ -2309,6 +2327,70 @@ impl Storage for CqlStorage {
             )
             .await?;
         Ok(())
+    }
+
+    // --- Tool usage logging ---
+
+    async fn tool_usage_put(
+        &self,
+        ctx: &TenantContext,
+        tool_name: &str,
+        repo: &str,
+        input_bytes: i32,
+        output_bytes: i32,
+        estimated_tokens: i32,
+        latency_ms: i32,
+        error: bool,
+    ) -> anyhow::Result<()> {
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        self.session
+            .exec_with_values(
+                &self.stmts.tool_usage_put,
+                query_values!(
+                    ctx.tenant_id,
+                    today,
+                    tool_name.to_string(),
+                    repo.to_string(),
+                    input_bytes,
+                    output_bytes,
+                    estimated_tokens,
+                    latency_ms,
+                    error
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn tool_usage_query(
+        &self,
+        ctx: &TenantContext,
+        day: &str,
+    ) -> anyhow::Result<Vec<crate::types::ToolUsageRow>> {
+        let rows = self
+            .query_rows(
+                &self.stmts.tool_usage_query,
+                query_values!(ctx.tenant_id, day.to_string()),
+            )
+            .await?;
+
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            results.push(crate::types::ToolUsageRow {
+                tool_name: row.r_by_name("tool_name")?,
+                repo: row.r_by_name::<String>("repo").unwrap_or_default(),
+                input_bytes: row.r_by_name("input_bytes")?,
+                output_bytes: row.r_by_name("output_bytes")?,
+                estimated_tokens: row.r_by_name("estimated_tokens")?,
+                latency_ms: row.r_by_name("latency_ms")?,
+                error: row.r_by_name("error")?,
+                created_at: row
+                    .r_by_name::<chrono::NaiveDateTime>("created_at")
+                    .map(|t| t.and_utc())
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+            });
+        }
+        Ok(results)
     }
 
     // --- Audit log operations ---

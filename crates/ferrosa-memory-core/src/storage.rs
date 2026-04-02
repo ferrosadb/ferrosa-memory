@@ -16,7 +16,8 @@ use uuid::Uuid;
 use crate::types::{
     AuditEntry, DerivedFact, EntityEntry, FeedbackOutcome, FoldEntry, FoldSummary,
     MaterializedEdge, MemoEntry, MemoryState, PlanNode, PlanStatus, PromotedPredicate,
-    ProvenanceStep, RuleEntry, RuleState, TemporalEvent, TenantContext, TypedEdge, WarmthEntry,
+    ProvenanceStep, RuleEntry, RuleState, TemporalEvent, TenantContext, ToolUsageRow, TypedEdge,
+    WarmthEntry,
 };
 
 /// Core storage operations for the memory system.
@@ -342,6 +343,28 @@ pub trait Storage: Send + Sync {
         triggered_at: Option<chrono::DateTime<chrono::Utc>>,
         completed_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> anyhow::Result<()>;
+
+    // --- Tool usage logging ---
+
+    /// Log a tool call's token usage (fire-and-forget, best-effort).
+    async fn tool_usage_put(
+        &self,
+        ctx: &TenantContext,
+        tool_name: &str,
+        repo: &str,
+        input_bytes: i32,
+        output_bytes: i32,
+        estimated_tokens: i32,
+        latency_ms: i32,
+        error: bool,
+    ) -> anyhow::Result<()>;
+
+    /// Query tool usage for a given day (YYYY-MM-DD string).
+    async fn tool_usage_query(
+        &self,
+        ctx: &TenantContext,
+        day: &str,
+    ) -> anyhow::Result<Vec<ToolUsageRow>>;
 
     // --- Audit log operations ---
 
@@ -1191,6 +1214,28 @@ pub mod mock {
         async fn audit_put(&self, _ctx: &TenantContext, entry: &AuditEntry) -> anyhow::Result<()> {
             self.audit_entries.lock().await.push(entry.clone());
             Ok(())
+        }
+
+        async fn tool_usage_put(
+            &self,
+            _ctx: &TenantContext,
+            _tool_name: &str,
+            _repo: &str,
+            _input_bytes: i32,
+            _output_bytes: i32,
+            _estimated_tokens: i32,
+            _latency_ms: i32,
+            _error: bool,
+        ) -> anyhow::Result<()> {
+            Ok(()) // no-op in tests
+        }
+
+        async fn tool_usage_query(
+            &self,
+            _ctx: &TenantContext,
+            _day: &str,
+        ) -> anyhow::Result<Vec<ToolUsageRow>> {
+            Ok(vec![])
         }
 
         // --- Warmth operations ---
