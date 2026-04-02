@@ -2011,20 +2011,19 @@ impl Storage for CqlStorage {
              WHERE tenant_id = ? ALLOW FILTERING",
             self.keyspace
         );
-        if let Ok(prepared) = self.session.prepare(query).await {
-            if let Ok(envelope) = self
-                .session
-                .exec_with_values(&prepared, query_values!(ctx.tenant_id))
-                .await
-            {
-                let rows = envelope.response_body()?.into_rows().unwrap_or_default();
-                for row in rows {
-                    if let (Ok(src), Ok(tgt)) = (
-                        row.r_by_name::<Uuid>("new_event_id"),
-                        row.r_by_name::<Uuid>("old_event_id"),
-                    ) {
-                        edges.push((src, tgt, "SUPERSEDES".into()));
-                    }
+        if let Ok(prepared) = self.session.prepare(query).await
+        && let Ok(envelope) = self
+            .session
+            .exec_with_values(&prepared, query_values!(ctx.tenant_id))
+            .await
+        {
+            let rows = envelope.response_body()?.into_rows().unwrap_or_default();
+            for row in rows {
+                if let (Ok(src), Ok(tgt)) = (
+                    row.r_by_name::<Uuid>("new_event_id"),
+                    row.r_by_name::<Uuid>("old_event_id"),
+                ) {
+                    edges.push((src, tgt, "SUPERSEDES".into()));
                 }
             }
         }

@@ -399,7 +399,7 @@ pub async fn serve_viz<S: Storage + 'static>(
         let effective_session = if let Some(pos) = peek_str.find("session=") {
             let start = pos + 8;
             let end = peek_str[start..]
-                .find(|c: char| c == '&' || c == ' ' || c == '\r' || c == '\n')
+                .find(|c: char| ['&', ' ', '\r', '\n'].contains(&c))
                 .map(|i| start + i)
                 .unwrap_or(peek_str.len().min(start + 36));
             Uuid::parse_str(&peek_str[start..end]).unwrap_or(session_id)
