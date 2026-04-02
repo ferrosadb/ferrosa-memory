@@ -36,7 +36,7 @@ fi
 echo "Restoring from: $BACKUP_DIR"
 
 # Count rows in backup
-for f in entity_store typed_edges entity_types edge_types; do
+for f in entity_store typed_edges entity_types edge_types intentions; do
     if [ -f "$BACKUP_DIR/$f.json" ]; then
         COUNT=$(python3 -c "import json; print(len(json.load(open('$BACKUP_DIR/$f.json'))))")
         echo "  $f: $COUNT rows"
@@ -148,6 +148,32 @@ if os.path.exists(path):
             (t['type_name'], t.get('description', ''), t.get('src_types', ''), t.get('dst_types', ''), parse_dt(t.get('created_at')) or datetime.datetime.now(datetime.UTC))
         )
     print(f'  edge_types: {len(etypes)} restored', file=sys.stderr)
+
+# Restore intentions
+path = os.path.join(backup_dir, 'intentions.json')
+if os.path.exists(path):
+    intents = json.load(open(path))
+    q = 'INSERT INTO agent_memory.intentions (tenant_id, repo, intention_id, description, trigger_json, priority, status, created_at, triggered_at, completed_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)'
+    count = 0
+    for i in intents:
+        if not i.get('intention_id'): continue
+        try:
+            session.execute(q, (
+                parse_uuid(i['tenant_id']),
+                i.get('repo', ''),
+                parse_uuid(i['intention_id']),
+                i.get('description', ''),
+                i.get('trigger_json', '{}'),
+                i.get('priority', 'normal'),
+                i.get('status', 'pending'),
+                parse_dt(i.get('created_at')) or datetime.datetime.now(datetime.UTC),
+                parse_dt(i.get('triggered_at')),
+                parse_dt(i.get('completed_at')),
+            ))
+            count += 1
+        except Exception as ex:
+            print(f'  WARN: intention {i.get(\"intention_id\")}: {ex}', file=sys.stderr)
+    print(f'  intentions: {count}/{len(intents)} restored', file=sys.stderr)
 
 cluster.shutdown()
 print('Restore complete.', file=sys.stderr)

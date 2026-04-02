@@ -83,9 +83,19 @@ with open(os.path.join(backup_dir, 'edge_types.json'), 'w') as f:
     json.dump(etypes, f, default=uuid_serializer)
 print(f'  edge_types: {len(etypes)} rows', file=sys.stderr)
 
+# Dump intentions
+print('  dumping intentions...', file=sys.stderr)
+rows = list(session.execute('SELECT * FROM agent_memory.intentions'))
+intents = []
+for r in rows:
+    intents.append({c: getattr(r, c) for c in r._fields})
+with open(os.path.join(backup_dir, 'intentions.json'), 'w') as f:
+    json.dump(intents, f, default=uuid_serializer)
+print(f'  intentions: {len(intents)} rows', file=sys.stderr)
+
 cluster.shutdown()
 
-total = len(entities) + len(edges) + len(types) + len(etypes)
+total = len(entities) + len(edges) + len(types) + len(etypes) + len(intents)
 print(f'  total: {total} rows backed up', file=sys.stderr)
 "
 
