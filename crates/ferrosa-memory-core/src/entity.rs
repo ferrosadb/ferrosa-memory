@@ -579,23 +579,43 @@ mod tests {
 
         // Create a code entity and a doc section that both contain "graph"
         upsert_entity(
-            &store, &ctx, sid,
-            "ferrosa-memory-core::graph", "module",
-            "Graph client for HTTP Cypher queries", None, None, None,
-        ).await.unwrap();
+            &store,
+            &ctx,
+            sid,
+            "ferrosa-memory-core::graph",
+            "module",
+            "Graph client for HTTP Cypher queries",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         upsert_entity(
-            &store, &ctx, sid,
-            "doc:pitr.md::Dependency Graph", "section",
-            "Shows the dependency graph of tasks", None, None, None,
-        ).await.unwrap();
+            &store,
+            &ctx,
+            sid,
+            "doc:pitr.md::Dependency Graph",
+            "section",
+            "Shows the dependency graph of tasks",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         // Phonetic search for "graph" should return results ranked by match quality
-        let results = retrieve_entities(
-            &store, &ctx, sid, "graph", None, "phonetic", Some(10),
-        ).await.unwrap();
+        let results = retrieve_entities(&store, &ctx, sid, "graph", None, "phonetic", Some(10))
+            .await
+            .unwrap();
 
-        assert!(results.len() >= 2, "should return multiple matches, got {}", results.len());
+        assert!(
+            results.len() >= 2,
+            "should return multiple matches, got {}",
+            results.len()
+        );
 
         // The module with "graph" as a :: segment should rank higher than
         // a section where "graph" is part of a longer heading

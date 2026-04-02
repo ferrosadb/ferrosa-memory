@@ -957,8 +957,7 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|s| uuid::Uuid::parse_str(s).ok());
 
     // Resolve repo for intention scoping: CLAUDE_PROJECT_DIR env > config > empty.
-    let repo = std::env::var("CLAUDE_PROJECT_DIR")
-        .unwrap_or_else(|_| String::new());
+    let repo = std::env::var("CLAUDE_PROJECT_DIR").unwrap_or_else(|_| String::new());
     if repo.is_empty() {
         tracing::warn!("CLAUDE_PROJECT_DIR not set — intentions will require explicit repo param");
     } else {
@@ -996,11 +995,18 @@ async fn main() -> anyhow::Result<()> {
         if let Some(ref cql) = *guard {
             let et = cql.load_entity_types().await;
             let edg = cql.load_edge_types().await;
-            tracing::info!(entity_types = et.len(), edge_types = edg.len(), "loaded type registry");
+            tracing::info!(
+                entity_types = et.len(),
+                edge_types = edg.len(),
+                "loaded type registry"
+            );
             (et, edg)
         } else {
             tracing::info!("no CQL connection yet, using default type registry");
-            (ferrosa_memory_core::cql_storage::CqlStorage::default_entity_types(), Vec::new())
+            (
+                ferrosa_memory_core::cql_storage::CqlStorage::default_entity_types(),
+                Vec::new(),
+            )
         }
     };
 

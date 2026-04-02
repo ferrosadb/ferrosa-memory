@@ -16,9 +16,7 @@ use ferrosa_memory_core::cql_storage::CqlStorage;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     let dry_run = std::env::args().any(|a| a == "--dry-run");
 
@@ -52,9 +50,8 @@ async fn main() -> anyhow::Result<()> {
     for (table, src_col, dst_col) in updatable_tables {
         tracing::info!("--- Scanning {table} ---");
 
-        let query = format!(
-            "SELECT {src_col}, {dst_col}, session_id, tenant_id FROM agent_memory.{table}"
-        );
+        let query =
+            format!("SELECT {src_col}, {dst_col}, session_id, tenant_id FROM agent_memory.{table}");
         let rows = session
             .query(query)
             .await?
@@ -190,9 +187,15 @@ async fn main() -> anyhow::Result<()> {
     if te_rows.is_empty() {
         tracing::info!("typed_edges: all edges OK");
     } else if dry_run {
-        tracing::info!("typed_edges: {} edges need fix (skipped, dry-run)", te_rows.len());
+        tracing::info!(
+            "typed_edges: {} edges need fix (skipped, dry-run)",
+            te_rows.len()
+        );
     } else {
-        tracing::info!("typed_edges: migrating {} edges (DELETE+INSERT)", te_rows.len());
+        tracing::info!(
+            "typed_edges: migrating {} edges (DELETE+INSERT)",
+            te_rows.len()
+        );
         let mut fixed = 0;
         for te in &te_rows {
             // Delete old row
@@ -254,14 +257,20 @@ async fn main() -> anyhow::Result<()> {
     };
     use ferrosa_memory_core::storage::Storage;
     let session_edges = storage.edge_list_session(&ctx, target_session).await?;
-    tracing::info!("edge_list_session(tenant={tenant_id}, session={target_session}): {} edges", session_edges.len());
+    tracing::info!(
+        "edge_list_session(tenant={tenant_id}, session={target_session}): {} edges",
+        session_edges.len()
+    );
     if !session_edges.is_empty() {
         let sample = &session_edges[0];
         tracing::info!("  sample: {} -> {} ({})", sample.0, sample.1, sample.2);
     }
 
     let all_edges = storage.edge_list_all(&ctx).await?;
-    tracing::info!("edge_list_all(tenant={tenant_id}): {} edges", all_edges.len());
+    tracing::info!(
+        "edge_list_all(tenant={tenant_id}): {} edges",
+        all_edges.len()
+    );
 
     // Also test with swapped ctx like viz does
     let swapped_ctx = ferrosa_memory_core::types::TenantContext {
@@ -269,7 +278,10 @@ async fn main() -> anyhow::Result<()> {
         session_origin: "migration".into(),
     };
     let swapped_edges = storage.edge_list_all(&swapped_ctx).await?;
-    tracing::info!("edge_list_all(tenant={target_session} [swapped]): {} edges", swapped_edges.len());
+    tracing::info!(
+        "edge_list_all(tenant={target_session} [swapped]): {} edges",
+        swapped_edges.len()
+    );
 
     tracing::info!("done");
     Ok(())

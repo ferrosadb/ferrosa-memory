@@ -572,10 +572,20 @@ impl CqlStorage {
     }
 
     pub fn default_entity_types() -> Vec<String> {
-        ["person", "place", "event", "concept", "org", "bug", "decision", "pattern", "preference"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
+        [
+            "person",
+            "place",
+            "event",
+            "concept",
+            "org",
+            "bug",
+            "decision",
+            "pattern",
+            "preference",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
     }
 
     /// Get the keyspace name this storage is connected to.
@@ -1021,7 +1031,10 @@ impl Storage for CqlStorage {
             );
             let _ = self
                 .session
-                .query_with_values(q, query_values!(fold_id, ctx.tenant_id, entry.session_id, entry.entity_id))
+                .query_with_values(
+                    q,
+                    query_values!(fold_id, ctx.tenant_id, entry.session_id, entry.entity_id),
+                )
                 .await;
         }
         if let Some(ref emb) = entry.entity_embedding {
@@ -1041,7 +1054,10 @@ impl Storage for CqlStorage {
             );
             if let Err(e) = self
                 .session
-                .query_with_values(q, query_values!(ctx.tenant_id, entry.session_id, entry.entity_id))
+                .query_with_values(
+                    q,
+                    query_values!(ctx.tenant_id, entry.session_id, entry.entity_id),
+                )
                 .await
             {
                 tracing::warn!(entity_id = %entry.entity_id, error = %e, "failed to store entity_embedding");
@@ -1091,8 +1107,12 @@ impl Storage for CqlStorage {
                 continue;
             };
 
-            let Ok(entity_id) = row.r_by_name::<Uuid>("entity_id") else { continue };
-            let Ok(entity_type) = row.r_by_name::<String>("entity_type") else { continue };
+            let Ok(entity_id) = row.r_by_name::<Uuid>("entity_id") else {
+                continue;
+            };
+            let Ok(entity_type) = row.r_by_name::<String>("entity_type") else {
+                continue;
+            };
             let created = row
                 .r_by_name::<chrono::NaiveDateTime>("created_at")
                 .unwrap_or_default();
@@ -1102,19 +1122,22 @@ impl Storage for CqlStorage {
                 .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
                 .unwrap_or_default();
 
-            scored.push((rank, EntityEntry {
-                tenant_id: ctx.tenant_id,
-                entity_id,
-                session_id,
-                entity_name,
-                entity_type,
-                source_fold_id: None, // not fetched in lightweight query
-                context_snippet: String::new(), // not fetched
-                entity_embedding: None, // not fetched
-                confidence: f64::from(row.r_by_name::<f32>("confidence").unwrap_or(1.0)),
-                state,
-                created_at: created.and_utc(),
-            }));
+            scored.push((
+                rank,
+                EntityEntry {
+                    tenant_id: ctx.tenant_id,
+                    entity_id,
+                    session_id,
+                    entity_name,
+                    entity_type,
+                    source_fold_id: None, // not fetched in lightweight query
+                    context_snippet: String::new(), // not fetched
+                    entity_embedding: None, // not fetched
+                    confidence: f64::from(row.r_by_name::<f32>("confidence").unwrap_or(1.0)),
+                    state,
+                    created_at: created.and_utc(),
+                },
+            ));
         }
 
         scored.sort_by_key(|(rank, _)| *rank);
@@ -1139,11 +1162,21 @@ impl Storage for CqlStorage {
             .await?;
         let rows = envelope.response_body()?.into_rows().unwrap_or_default();
         if let Some(row) = rows.first() {
-            let Ok(entity_name) = row.r_by_name::<String>("entity_name") else { return Ok(None) };
-            let Ok(entity_type) = row.r_by_name::<String>("entity_type") else { return Ok(None) };
-            let context_snippet = row.r_by_name::<String>("context_snippet").unwrap_or_default();
-            let created = row.r_by_name::<chrono::NaiveDateTime>("created_at").unwrap_or_default();
-            let state = row.r_by_name::<String>("state").ok()
+            let Ok(entity_name) = row.r_by_name::<String>("entity_name") else {
+                return Ok(None);
+            };
+            let Ok(entity_type) = row.r_by_name::<String>("entity_type") else {
+                return Ok(None);
+            };
+            let context_snippet = row
+                .r_by_name::<String>("context_snippet")
+                .unwrap_or_default();
+            let created = row
+                .r_by_name::<chrono::NaiveDateTime>("created_at")
+                .unwrap_or_default();
+            let state = row
+                .r_by_name::<String>("state")
+                .ok()
                 .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
                 .unwrap_or_default();
             Ok(Some(EntityEntry {
@@ -1175,7 +1208,11 @@ impl Storage for CqlStorage {
         // Ferrosa also requires literal integer for LIMIT in ANN queries.
         let vec_literal: String = format!(
             "[{}]",
-            query_embedding.iter().map(|v| format!("{v:.8}")).collect::<Vec<_>>().join(",")
+            query_embedding
+                .iter()
+                .map(|v| format!("{v:.8}"))
+                .collect::<Vec<_>>()
+                .join(",")
         );
         let query = format!(
             "SELECT entity_id, entity_name, entity_type, source_fold_id, \
@@ -1186,10 +1223,7 @@ impl Storage for CqlStorage {
         );
         let envelope = match self
             .session
-            .query_with_values(
-                query,
-                query_values!(ctx.tenant_id, session_id),
-            )
+            .query_with_values(query, query_values!(ctx.tenant_id, session_id))
             .await
         {
             Ok(e) => e,
@@ -1954,8 +1988,7 @@ impl Storage for CqlStorage {
                         .await
                     {
                         Ok(envelope) => {
-                            let rows =
-                                envelope.response_body()?.into_rows().unwrap_or_default();
+                            let rows = envelope.response_body()?.into_rows().unwrap_or_default();
                             for row in rows {
                                 if let (Ok(src), Ok(tgt)) = (
                                     row.r_by_name::<Uuid>(src_col),
@@ -2181,9 +2214,7 @@ impl Storage for CqlStorage {
                 .r_by_name::<chrono::NaiveDateTime>("created_at")
                 .unwrap_or_default();
 
-            let repo_val: String = row
-                .r_by_name("repo")
-                .unwrap_or_else(|_| repo.to_string());
+            let repo_val: String = row.r_by_name("repo").unwrap_or_else(|_| repo.to_string());
 
             results.push(crate::intention::Intention {
                 id: row.r_by_name("intention_id")?,
@@ -2211,10 +2242,7 @@ impl Storage for CqlStorage {
         ctx: &TenantContext,
     ) -> anyhow::Result<Vec<crate::intention::Intention>> {
         let rows = self
-            .query_rows(
-                &self.stmts.intention_list_all,
-                query_values!(ctx.tenant_id),
-            )
+            .query_rows(&self.stmts.intention_list_all, query_values!(ctx.tenant_id))
             .await?;
 
         let mut results = Vec::with_capacity(rows.len());
@@ -2236,9 +2264,7 @@ impl Storage for CqlStorage {
                 .r_by_name::<chrono::NaiveDateTime>("created_at")
                 .unwrap_or_default();
 
-            let repo_val: String = row
-                .r_by_name("repo")
-                .unwrap_or_default();
+            let repo_val: String = row.r_by_name("repo").unwrap_or_default();
 
             results.push(crate::intention::Intention {
                 id: row.r_by_name("intention_id")?,
@@ -2858,10 +2884,16 @@ impl Storage for CqlStorage {
         let mut edges = Vec::new();
         for row in rows {
             // Skip ghost rows with NULL required fields.
-            let Ok(src_id) = row.r_by_name::<Uuid>("src_id") else { continue };
-            let Ok(dst_id) = row.r_by_name::<Uuid>("dst_id") else { continue };
+            let Ok(src_id) = row.r_by_name::<Uuid>("src_id") else {
+                continue;
+            };
+            let Ok(dst_id) = row.r_by_name::<Uuid>("dst_id") else {
+                continue;
+            };
             let edge_type = row.r_by_name::<String>("edge_type").unwrap_or_default();
-            if edge_type.is_empty() { continue };
+            if edge_type.is_empty() {
+                continue;
+            };
             let created = row
                 .r_by_name::<chrono::NaiveDateTime>("created_at")
                 .unwrap_or_default();

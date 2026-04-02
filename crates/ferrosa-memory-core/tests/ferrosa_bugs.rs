@@ -354,8 +354,8 @@ async fn open_phonetic_match() {
 #[tokio::test]
 #[ignore] // Requires live Ferrosa cluster on port 19042
 async fn ghost_rows_do_not_crash_queries() {
-    use ferrosa_memory_core::cql_storage::CqlStorage;
     use ferrosa_memory_core::config::FerrosaCqlConfig;
+    use ferrosa_memory_core::cql_storage::CqlStorage;
     use ferrosa_memory_core::storage::Storage;
     use ferrosa_memory_core::types::TenantContext;
     use uuid::Uuid;
@@ -368,7 +368,10 @@ async fn ghost_rows_do_not_crash_queries() {
     };
     let storage = match CqlStorage::connect(&config).await {
         Ok(s) => s,
-        Err(_) => { eprintln!("SKIP: no CQL connection"); return; }
+        Err(_) => {
+            eprintln!("SKIP: no CQL connection");
+            return;
+        }
     };
 
     let tenant_id = Uuid::new_v4();
@@ -381,48 +384,85 @@ async fn ghost_rows_do_not_crash_queries() {
     // Insert a valid entity
     let valid_id = Uuid::new_v4();
     let session = storage.session();
-    session.query_with_values(
-        format!(
-            "INSERT INTO agent_memory.entity_store \
+    session
+        .query_with_values(
+            format!(
+                "INSERT INTO agent_memory.entity_store \
              (tenant_id, session_id, entity_id, entity_name, entity_type, \
               context_snippet, confidence, created_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, toTimestamp(now()))"
-        ),
-        query_values!(tenant_id, session_id, valid_id, "valid-entity".to_string(), "concept".to_string(), "a real entity".to_string(), 1.0_f32),
-    ).await.expect("insert valid entity");
+            ),
+            query_values!(
+                tenant_id,
+                session_id,
+                valid_id,
+                "valid-entity".to_string(),
+                "concept".to_string(),
+                "a real entity".to_string(),
+                1.0_f32
+            ),
+        )
+        .await
+        .expect("insert valid entity");
 
     // Insert a ghost entity row (NULL entity_name via incomplete insert)
-    session.query_with_values(
-        format!(
-            "INSERT INTO agent_memory.entity_store \
+    session
+        .query_with_values(
+            format!(
+                "INSERT INTO agent_memory.entity_store \
              (tenant_id, session_id, entity_id, confidence, created_at) \
              VALUES (?, ?, ?, ?, toTimestamp(now()))"
-        ),
-        query_values!(tenant_id, session_id, Uuid::new_v4(), 0.5_f32),
-    ).await.expect("insert ghost entity");
+            ),
+            query_values!(tenant_id, session_id, Uuid::new_v4(), 0.5_f32),
+        )
+        .await
+        .expect("insert ghost entity");
 
     // Insert a valid typed edge
-    session.query_with_values(
-        format!(
-            "INSERT INTO agent_memory.typed_edges \
+    session
+        .query_with_values(
+            format!(
+                "INSERT INTO agent_memory.typed_edges \
              (tenant_id, session_id, src_id, edge_type, dst_id, weight, metadata, created_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, toTimestamp(now()))"
-        ),
-        query_values!(tenant_id, session_id, valid_id, "contains".to_string(), Uuid::new_v4(), 0.9_f64, "".to_string()),
-    ).await.expect("insert valid edge");
+            ),
+            query_values!(
+                tenant_id,
+                session_id,
+                valid_id,
+                "contains".to_string(),
+                Uuid::new_v4(),
+                0.9_f64,
+                "".to_string()
+            ),
+        )
+        .await
+        .expect("insert valid edge");
 
     // Insert a ghost typed edge (NULL edge_type)
-    session.query_with_values(
-        format!(
-            "INSERT INTO agent_memory.typed_edges \
+    session
+        .query_with_values(
+            format!(
+                "INSERT INTO agent_memory.typed_edges \
              (tenant_id, session_id, src_id, edge_type, dst_id, weight, created_at) \
              VALUES (?, ?, ?, ?, ?, ?, toTimestamp(now()))"
-        ),
-        query_values!(tenant_id, session_id, Uuid::new_v4(), "".to_string(), Uuid::new_v4(), 0.0_f64),
-    ).await.expect("insert ghost edge");
+            ),
+            query_values!(
+                tenant_id,
+                session_id,
+                Uuid::new_v4(),
+                "".to_string(),
+                Uuid::new_v4(),
+                0.0_f64
+            ),
+        )
+        .await
+        .expect("insert ghost edge");
 
     // entity_list_session must not crash — should return the valid entity only
-    let entities = storage.entity_list_session(&ctx, session_id).await
+    let entities = storage
+        .entity_list_session(&ctx, session_id)
+        .await
         .expect("entity_list_session should not crash on ghost rows");
     assert!(
         entities.iter().any(|e| e.entity_name == "valid-entity"),
@@ -431,7 +471,9 @@ async fn ghost_rows_do_not_crash_queries() {
     );
 
     // entity_find_phonetic must not crash
-    let matches = storage.entity_find_phonetic(&ctx, session_id, "valid").await
+    let matches = storage
+        .entity_find_phonetic(&ctx, session_id, "valid")
+        .await
         .expect("entity_find_phonetic should not crash on ghost rows");
     assert!(
         matches.iter().any(|e| e.entity_name == "valid-entity"),
@@ -439,9 +481,16 @@ async fn ghost_rows_do_not_crash_queries() {
     );
 
     // typed_edge_list_session must not crash — should return the valid edge only
-    let edges = storage.typed_edge_list_session(&ctx, session_id).await
+    let edges = storage
+        .typed_edge_list_session(&ctx, session_id)
+        .await
         .expect("typed_edge_list_session should not crash on ghost rows");
-    assert_eq!(edges.len(), 1, "should have 1 valid edge, got {}", edges.len());
+    assert_eq!(
+        edges.len(),
+        1,
+        "should have 1 valid edge, got {}",
+        edges.len()
+    );
     assert_eq!(edges[0].edge_type, "contains");
 
     // Cleanup

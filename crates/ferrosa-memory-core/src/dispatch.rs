@@ -142,8 +142,15 @@ impl Default for SessionState {
             ollama_base_url: "http://localhost:11434".to_string(),
             ner_model: "qwen3.5:27b".to_string(),
             entity_types: vec![
-                "person", "place", "event", "concept", "org", "bug",
-                "decision", "pattern", "preference",
+                "person",
+                "place",
+                "event",
+                "concept",
+                "org",
+                "bug",
+                "decision",
+                "pattern",
+                "preference",
             ]
             .into_iter()
             .map(String::from)
@@ -1293,15 +1300,13 @@ async fn handle_upsert_entity<S: crate::storage::Storage>(
 
     // Auto-generate embedding if not provided and Ollama is configured.
     if embedding.is_none() && !session.ollama_base_url.is_empty() {
-        let client = crate::embedding::EmbeddingClient::new(
-            &crate::config::EmbeddingConfig {
-                provider: "ollama".into(),
-                ollama_base_url: session.ollama_base_url.clone(),
-                model: "nomic-embed-text".into(),
-                dimensions: 768,
-                ner_model: String::new(),
-            },
-        );
+        let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
+            provider: "ollama".into(),
+            ollama_base_url: session.ollama_base_url.clone(),
+            model: "nomic-embed-text".into(),
+            dimensions: 768,
+            ner_model: String::new(),
+        });
         match client.embed(context_snippet).await {
             Ok(emb) => embedding = Some(emb),
             Err(e) => tracing::debug!("embedding generation skipped: {e}"),
@@ -1501,15 +1506,13 @@ async fn handle_retrieve_entities<S: crate::storage::Storage>(
 
     // Auto-generate query embedding for ANN search if Ollama is configured.
     if embedding.is_none() && !session.ollama_base_url.is_empty() {
-        let client = crate::embedding::EmbeddingClient::new(
-            &crate::config::EmbeddingConfig {
-                provider: "ollama".into(),
-                ollama_base_url: session.ollama_base_url.clone(),
-                model: "nomic-embed-text".into(),
-                dimensions: 768,
-                ner_model: String::new(),
-            },
-        );
+        let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
+            provider: "ollama".into(),
+            ollama_base_url: session.ollama_base_url.clone(),
+            model: "nomic-embed-text".into(),
+            dimensions: 768,
+            ner_model: String::new(),
+        });
         match client.embed(query).await {
             Ok(emb) => embedding = Some(emb),
             Err(e) => tracing::debug!("query embedding generation skipped: {e}"),
@@ -1599,7 +1602,10 @@ async fn handle_retrieve_entities<S: crate::storage::Storage>(
         .iter()
         .map(|e| {
             let ctx = if e.context_snippet.len() > 200 {
-                format!("{}...", &e.context_snippet[..e.context_snippet.floor_char_boundary(200)])
+                format!(
+                    "{}...",
+                    &e.context_snippet[..e.context_snippet.floor_char_boundary(200)]
+                )
             } else {
                 e.context_snippet.clone()
             };
@@ -1770,15 +1776,13 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
 
     // Auto-generate embedding if not provided and Ollama is configured.
     if embedding.is_none() && !session.ollama_base_url.is_empty() {
-        let client = crate::embedding::EmbeddingClient::new(
-            &crate::config::EmbeddingConfig {
-                provider: "ollama".into(),
-                ollama_base_url: session.ollama_base_url.clone(),
-                model: "nomic-embed-text".into(),
-                dimensions: 768,
-                ner_model: String::new(),
-            },
-        );
+        let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
+            provider: "ollama".into(),
+            ollama_base_url: session.ollama_base_url.clone(),
+            model: "nomic-embed-text".into(),
+            dimensions: 768,
+            ner_model: String::new(),
+        });
         match client.embed(content).await {
             Ok(emb) => embedding = Some(emb),
             Err(e) => tracing::debug!("embedding generation skipped: {e}"),
@@ -1886,7 +1890,10 @@ async fn handle_set_intention<S: crate::storage::Storage>(
 ) -> Result<Value, (i32, String)> {
     let repo = resolve_repo(&args, session);
     if repo.is_empty() {
-        return Err((INVALID_PARAMS, "repo is required (pass explicitly or configure server repo)".into()));
+        return Err((
+            INVALID_PARAMS,
+            "repo is required (pass explicitly or configure server repo)".into(),
+        ));
     }
     let description = require_str(&args, "description")?;
     let trigger_json = args
@@ -2181,15 +2188,13 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
 
     // Auto-generate query embedding for ANN search if Ollama is configured.
     if embedding.is_none() && !session.ollama_base_url.is_empty() {
-        let client = crate::embedding::EmbeddingClient::new(
-            &crate::config::EmbeddingConfig {
-                provider: "ollama".into(),
-                ollama_base_url: session.ollama_base_url.clone(),
-                model: "nomic-embed-text".into(),
-                dimensions: 768,
-                ner_model: String::new(),
-            },
-        );
+        let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
+            provider: "ollama".into(),
+            ollama_base_url: session.ollama_base_url.clone(),
+            model: "nomic-embed-text".into(),
+            dimensions: 768,
+            ner_model: String::new(),
+        });
         match client.embed(query).await {
             Ok(emb) => embedding = Some(emb),
             Err(e) => tracing::debug!("query embedding generation skipped: {e}"),
