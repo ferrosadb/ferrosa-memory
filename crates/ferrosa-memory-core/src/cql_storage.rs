@@ -2162,6 +2162,33 @@ impl Storage for CqlStorage {
             neighbors.push((new_id, "SUPERSEDES".into()));
         }
 
+        // Typed edges (contains, references, calls, depends_on, etc.)
+        // Query the nil session (used by skilltools ingest) and the default session.
+        let nil_session = Uuid::nil();
+        let query = "SELECT src_id, edge_type, dst_id FROM agent_memory.typed_edges \
+                     WHERE tenant_id = ? AND session_id = ?";
+        let prepared = self.session.prepare(query).await?;
+        let rows = self
+            .query_rows(&prepared, query_values!(ctx.tenant_id, nil_session))
+            .await
+            .unwrap_or_default();
+        for row in rows {
+            let src: Uuid = match row.r_by_name("src_id") {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let dst: Uuid = match row.r_by_name("dst_id") {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let edge_type: String = row.r_by_name("edge_type").unwrap_or_default();
+            if src == entity_id {
+                neighbors.push((dst, edge_type));
+            } else if dst == entity_id {
+                neighbors.push((src, edge_type));
+            }
+        }
+
         Ok(neighbors)
     }
 
