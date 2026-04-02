@@ -1253,6 +1253,13 @@ impl Storage for CqlStorage {
         let rows = envelope.response_body()?.into_rows().unwrap_or_default();
         let mut results = Vec::new();
         for row in rows {
+            // Skip ghost rows with null required fields (P0 write-loss artifact).
+            let Ok(entity_id) = row.r_by_name::<Uuid>("entity_id") else {
+                continue;
+            };
+            let Ok(entity_name) = row.r_by_name::<String>("entity_name") else {
+                continue;
+            };
             let created = row
                 .r_by_name::<chrono::NaiveDateTime>("created_at")
                 .unwrap_or_default();
@@ -1263,14 +1270,14 @@ impl Storage for CqlStorage {
                 .unwrap_or_default();
             results.push(EntityEntry {
                 tenant_id: ctx.tenant_id,
-                entity_id: row.r_by_name("entity_id")?,
+                entity_id,
                 session_id,
-                entity_name: row.r_by_name("entity_name")?,
-                entity_type: row.r_by_name("entity_type")?,
+                entity_name,
+                entity_type: row.r_by_name("entity_type").unwrap_or_default(),
                 source_fold_id: row.r_by_name::<Uuid>("source_fold_id").ok(),
-                context_snippet: row.r_by_name("context_snippet")?,
-                entity_embedding: None, // Don't return embedding bytes in search results
-                confidence: f64::from(row.r_by_name::<f32>("confidence")?),
+                context_snippet: row.r_by_name("context_snippet").unwrap_or_default(),
+                entity_embedding: None,
+                confidence: row.r_by_name::<f32>("confidence").map(f64::from).unwrap_or(0.0),
                 state,
                 created_at: created.and_utc(),
             });
