@@ -97,7 +97,7 @@ pub async fn hybrid_search(
 
     // Strategy 1: Phonetic entity search (ranked by match quality)
     if let Ok(entities) = storage.entity_find_phonetic(ctx, session_id, query).await
-    && !entities.is_empty()
+        && !entities.is_empty()
     {
         lists.push(
             entities

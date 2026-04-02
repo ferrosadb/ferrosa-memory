@@ -2012,10 +2012,10 @@ impl Storage for CqlStorage {
             self.keyspace
         );
         if let Ok(prepared) = self.session.prepare(query).await
-        && let Ok(envelope) = self
-            .session
-            .exec_with_values(&prepared, query_values!(ctx.tenant_id))
-            .await
+            && let Ok(envelope) = self
+                .session
+                .exec_with_values(&prepared, query_values!(ctx.tenant_id))
+                .await
         {
             let rows = envelope.response_body()?.into_rows().unwrap_or_default();
             for row in rows {
