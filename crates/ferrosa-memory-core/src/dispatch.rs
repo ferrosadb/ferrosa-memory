@@ -929,7 +929,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "snooze_intention" => handle_snooze_intention(args, storage, ctx, session).await,
         "write_temporal_fact" => handle_write_temporal_fact(args, storage, ctx, session).await,
         "get_temporal_chain" => handle_get_temporal_chain(args, storage, ctx).await,
-        "explore_connections" => handle_explore_connections(args, session).await,
+        "explore_connections" => handle_explore_connections(args, storage, ctx, session).await,
         "hybrid_search" => handle_hybrid_search(args, storage, ctx, session).await,
         "run_consolidation" => handle_run_consolidation(args, storage, ctx, session).await,
         "get_stats" => handle_get_stats(args, storage, ctx, session).await,
@@ -2133,21 +2133,22 @@ async fn handle_get_temporal_chain<S: crate::storage::Storage>(
 
 // --- Graph traversal handler ---
 
-async fn handle_explore_connections(
+async fn handle_explore_connections<S: crate::storage::Storage>(
     args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    let graph = session
-        .graph
-        .as_ref()
-        .ok_or((INTERNAL_ERROR, "graph client not configured".into()))?;
-
     let traversal = require_str(&args, "traversal")?;
     let max_depth = args.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(2) as usize;
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
     let results = match traversal {
         "fold_ancestors" => {
+            let graph = session
+                .graph
+                .as_ref()
+                .ok_or((INTERNAL_ERROR, "graph client not configured".into()))?;
             let fold_id = require_uuid(&args, "fold_id")?;
             let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
             graph
@@ -2158,14 +2159,46 @@ async fn handle_explore_connections(
         "related_entities" => {
             let entity_id = require_uuid(&args, "entity_id")?;
             let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
-            let mut r = graph
-                .find_related_entities(entity_id, session_id, max_depth)
-                .await
-                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
-            r.truncate(limit);
-            r
+            // Try graph backend first, fall back to CQL typed_edges
+            if let Some(graph) = session.graph.as_ref() {
+                let mut r = graph
+                    .find_related_entities(entity_id, session_id, max_depth)
+                    .await
+                    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+                r.truncate(limit);
+                r
+            } else {
+                // CQL fallback: query typed_edges for direct connections
+                let edges = storage
+                    .edge_list_for_entity(ctx, entity_id)
+                    .await
+                    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+                let mut results: Vec<String> = Vec::new();
+                for (other_id, edge_type) in edges.into_iter().take(limit) {
+                    let name = storage
+                        .entity_get_by_id(ctx, session_id, other_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|e| e.entity_name)
+                        .unwrap_or_else(|| other_id.to_string());
+                    results.push(
+                        serde_json::to_string(&serde_json::json!({
+                            "entity_id": other_id.to_string(),
+                            "entity_name": name,
+                            "edge_type": edge_type,
+                        }))
+                        .unwrap_or_default(),
+                    );
+                }
+                results
+            }
         }
         "entities_in_fold" => {
+            let graph = session
+                .graph
+                .as_ref()
+                .ok_or((INTERNAL_ERROR, "graph client not configured".into()))?;
             let fold_id = require_uuid(&args, "fold_id")?;
             let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
             let mut r = graph
@@ -2176,13 +2209,12 @@ async fn handle_explore_connections(
             r
         }
         "supersession_chain" => {
+            let graph = session
+                .graph
+                .as_ref()
+                .ok_or((INTERNAL_ERROR, "graph client not configured".into()))?;
             let entity_id = require_uuid(&args, "entity_id")?;
-            let event_id = entity_id; // event_id is passed via entity_id field
-            // For supersession_chain, we need both event_id and entity_id.
-            // The tool schema uses entity_id for the event, and fold_id is repurposed
-            // as the actual entity_id context. But the graph method signature is
-            // (event_id, entity_id). We pass entity_id as event_id since the Cypher
-            // query uses it as the starting fact node.
+            let event_id = entity_id;
             let fact_entity_id = optional_uuid(&args, "fold_id")?.unwrap_or(event_id);
             graph
                 .get_supersession_chain(event_id, fact_entity_id)
@@ -3353,15 +3385,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explore_connections_requires_graph() {
+    async fn explore_connections_related_entities_cql_fallback() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default(); // graph is None — uses CQL fallback
+        let params = serde_json::json!({
+            "name": "explore_connections",
+            "arguments": {
+                "traversal": "related_entities",
+                "entity_id": Uuid::new_v4().to_string()
+            }
+        });
+        // Should succeed with empty results (CQL fallback, no edges in mock)
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn explore_connections_fold_requires_graph() {
         let store = MockStorage::new();
         let ctx = test_ctx();
         let session = SessionState::default(); // graph is None
         let params = serde_json::json!({
             "name": "explore_connections",
             "arguments": {
-                "traversal": "related_entities",
-                "entity_id": Uuid::new_v4().to_string()
+                "traversal": "fold_ancestors",
+                "fold_id": Uuid::new_v4().to_string()
             }
         });
         let err = dispatch("tools/call", params, &store, &ctx, &session)
