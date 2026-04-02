@@ -13,12 +13,33 @@ BACKUP_ROOT="${FMEM_BACKUP_DIR:-$HOME/data/ferrosa-memory/backups}"
 CQL_HOST="${FMEM_CQL_HOST:-localhost}"
 CQL_PORT="${FMEM_CQL_PORT:-19042}"
 MAX_BACKUPS=10
+MIN_ENTITIES=100  # refuse to backup if fewer entities than this
+
+# Pre-flight: verify CQL is reachable and has data before creating backup dir.
+ENTITY_COUNT=$(python3 -c "
+from cassandra.cluster import Cluster
+from cassandra.policies import RoundRobinPolicy
+try:
+    cluster = Cluster(['$CQL_HOST'], port=int('$CQL_PORT'), load_balancing_policy=RoundRobinPolicy(), protocol_version=4, connect_timeout=5)
+    session = cluster.connect('agent_memory')
+    rows = session.execute('SELECT COUNT(*) FROM agent_memory.entity_store')
+    print(rows.one()[0])
+    cluster.shutdown()
+except Exception as e:
+    print(f'ERROR: {e}', __import__('sys').stderr)
+    print(0)
+" 2>/dev/null)
+
+if [ "$ENTITY_COUNT" -lt "$MIN_ENTITIES" ] 2>/dev/null; then
+    echo "$(date): SKIPPING backup — cluster returned $ENTITY_COUNT entities (min: $MIN_ENTITIES). Cluster may be down or empty."
+    exit 0
+fi
 
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 BACKUP_DIR="$BACKUP_ROOT/$TIMESTAMP"
 mkdir -p "$BACKUP_DIR"
 
-echo "$(date): backing up fmem to $BACKUP_DIR"
+echo "$(date): backing up fmem to $BACKUP_DIR ($ENTITY_COUNT entities verified)"
 
 python3 -c "
 import json, uuid, datetime, sys, os
