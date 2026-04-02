@@ -111,8 +111,8 @@ pub struct SessionState {
     /// Configured default session_id for cross-session memory continuity.
     /// Falls back to random UUID if not set.
     pub default_session_id: Option<uuid::Uuid>,
-    /// Repository path for intention scoping (from CLAUDE_PROJECT_DIR or config).
-    pub repo: String,
+    /// Repository path for intention scoping (from CLAUDE_PROJECT_DIR, config, or MCP initialize roots).
+    pub repo: std::sync::OnceLock<String>,
     /// Notified on every tool call; used by the idle consolidation timer.
     pub last_activity: Arc<tokio::sync::Notify>,
     /// Set to true when a write tool succeeds; cleared by idle consolidation.
@@ -136,7 +136,7 @@ impl Default for SessionState {
             retrieval_tracker: Arc::new(Mutex::new(RetrievalTracker::new())),
             co_access: Arc::new(Mutex::new(crate::speculative::CoAccessTracker::new(10))),
             default_session_id: None,
-            repo: String::new(),
+            repo: std::sync::OnceLock::new(),
             last_activity: Arc::new(tokio::sync::Notify::new()),
             dirty: Arc::new(AtomicBool::new(false)),
             ollama_base_url: "http://localhost:11434".to_string(),
@@ -855,7 +855,19 @@ pub async fn dispatch<S: crate::storage::Storage>(
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
     match method {
-        "initialize" => Ok(server_info()),
+        "initialize" => {
+            // Extract repo from client roots (MCP spec: roots[].uri).
+            if session.repo.get().is_none() {
+                if let Some(roots) = params.get("roots").and_then(|v| v.as_array()) {
+                    if let Some(uri) = roots.first().and_then(|r| r.get("uri")).and_then(|u| u.as_str()) {
+                        let path = uri.strip_prefix("file://").unwrap_or(uri).to_string();
+                        let _ = session.repo.set(path.clone());
+                        tracing::info!(repo = %path, "repo set from MCP initialize roots");
+                    }
+                }
+            }
+            Ok(server_info())
+        }
         "notifications/initialized" => Ok(Value::Null),
         "tools/list" => {
             let tools = tool_definitions(&session.entity_types);
@@ -1879,7 +1891,7 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
 fn resolve_repo<'a>(args: &'a Value, session: &'a SessionState) -> &'a str {
     args.get("repo")
         .and_then(|v| v.as_str())
-        .unwrap_or(&session.repo)
+        .unwrap_or_else(|| session.repo.get().map(|s| s.as_str()).unwrap_or(""))
 }
 
 async fn handle_set_intention<S: crate::storage::Storage>(
@@ -3220,7 +3232,11 @@ mod tests {
         let store = MockStorage::new();
         let ctx = test_ctx();
         let session = SessionState {
-            repo: "/test/repo".into(),
+            repo: {
+                let l = std::sync::OnceLock::new();
+                let _ = l.set("/test/repo".to_string());
+                l
+            },
             ..SessionState::default()
         };
 
@@ -3484,7 +3500,11 @@ mod tests {
         let store = MockStorage::new();
         let ctx = test_ctx();
         let session = SessionState {
-            repo: "/test/repo".into(),
+            repo: {
+                let l = std::sync::OnceLock::new();
+                let _ = l.set("/test/repo".to_string());
+                l
+            },
             ..SessionState::default()
         };
 
@@ -3527,7 +3547,11 @@ mod tests {
         let store = MockStorage::new();
         let ctx = test_ctx();
         let session = SessionState {
-            repo: "/test/repo".into(),
+            repo: {
+                let l = std::sync::OnceLock::new();
+                let _ = l.set("/test/repo".to_string());
+                l
+            },
             ..SessionState::default()
         };
 

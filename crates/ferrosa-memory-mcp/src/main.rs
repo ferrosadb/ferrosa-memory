@@ -1056,10 +1056,14 @@ async fn main() -> anyhow::Result<()> {
 
             let storage_ref = Arc::clone(&storage);
             let ctx_ref = Arc::clone(&ctx);
+            let repo_lock = std::sync::OnceLock::new();
+            if !repo.is_empty() {
+                let _ = repo_lock.set(repo.clone());
+            }
             let session = Arc::new(dispatch::SessionState {
                 event_bus: Arc::clone(&shared_event_bus),
                 default_session_id,
-                repo: repo.clone(),
+                repo: repo_lock,
                 ollama_base_url: config.embeddings.ollama_base_url.clone(),
                 ner_model: config.embeddings.ner_model.clone(),
                 entity_types: entity_types.clone(),
