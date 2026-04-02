@@ -1931,7 +1931,7 @@ async fn handle_check_intentions<S: crate::storage::Storage>(
     let repo = resolve_repo(&args, session);
     let context = require_str(&args, "context")?;
     let mut store = session.intentions.lock().await;
-    let triggered = store.check(context);
+    let triggered = store.check(context, repo);
     let triggered_json: Vec<Value> = triggered
         .iter()
         .map(|i| serde_json::to_value(i).unwrap_or(Value::Null))
@@ -3613,7 +3613,7 @@ mod tests {
         intention_store.load(loaded);
 
         // Verify the loaded intention triggers correctly
-        let triggered = intention_store.check("writing rust code");
+        let triggered = intention_store.check("writing rust code", "/test/repo");
         assert_eq!(triggered.len(), 1);
         assert_eq!(triggered[0].description, "Previously stored intention");
     }

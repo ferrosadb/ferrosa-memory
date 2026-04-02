@@ -108,12 +108,17 @@ impl IntentionStore {
     }
 
     /// Check which intentions are triggered by the current context.
-    pub fn check(&mut self, context: &str) -> Vec<&Intention> {
+    /// If `repo` is non-empty, only intentions for that repo are checked.
+    pub fn check(&mut self, context: &str, repo: &str) -> Vec<&Intention> {
         let context_lower = context.to_lowercase();
         let mut triggered = Vec::new();
 
         for intention in &mut self.intentions {
             if intention.status != IntentionStatus::Pending {
+                continue;
+            }
+            // Skip intentions for other repos
+            if !repo.is_empty() && intention.repo != repo {
                 continue;
             }
 
@@ -210,11 +215,11 @@ mod tests {
         );
 
         // Should not trigger on unrelated context
-        let triggered = store.check("working on the database layer");
+        let triggered = store.check("working on the database layer", "/test/repo");
         assert!(triggered.is_empty());
 
         // Should trigger on matching context
-        let triggered = store.check("now looking at the auth middleware");
+        let triggered = store.check("now looking at the auth middleware", "/test/repo");
         assert_eq!(triggered.len(), 1);
         assert!(triggered[0].description.contains("error handling"));
     }
@@ -231,7 +236,7 @@ mod tests {
             Priority::Normal,
         );
 
-        store.check("running tests");
+        store.check("running tests", "/test/repo");
         assert!(store.complete(intention.id));
 
         let pending = store.pending();
@@ -250,7 +255,7 @@ mod tests {
             Priority::Critical,
         );
 
-        let triggered = store.check("editing cql_storage.rs with query methods");
+        let triggered = store.check("editing cql_storage.rs with query methods", "/test/repo");
         assert_eq!(triggered.len(), 1);
     }
 }
