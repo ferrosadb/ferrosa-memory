@@ -120,12 +120,21 @@ total = len(entities) + len(edges) + len(types) + len(etypes) + len(intents)
 print(f'  total: {total} rows backed up', file=sys.stderr)
 "
 
-# Prune old backups, keep last MAX_BACKUPS
+# Clean up empty backup dirs (from skipped runs or failures)
 cd "$BACKUP_ROOT"
-BACKUP_COUNT=$(ls -1d 2* 2>/dev/null | wc -l | tr -d ' ')
-if [ "$BACKUP_COUNT" -gt "$MAX_BACKUPS" ]; then
-    PRUNE_COUNT=$((BACKUP_COUNT - MAX_BACKUPS))
-    ls -1d 2* | head -n "$PRUNE_COUNT" | while read dir; do
+for dir in 2*; do
+    [ -d "$dir" ] || continue
+    if [ ! -f "$dir/entity_store.json" ]; then
+        rm -rf "$dir"
+        echo "  removed empty backup dir: $dir"
+    fi
+done
+
+# Prune old backups, keep last MAX_BACKUPS (only count successful ones)
+GOOD_BACKUPS=$(ls -1d 2*/entity_store.json 2>/dev/null | sed 's|/entity_store.json||' | wc -l | tr -d ' ')
+if [ "$GOOD_BACKUPS" -gt "$MAX_BACKUPS" ]; then
+    PRUNE_COUNT=$((GOOD_BACKUPS - MAX_BACKUPS))
+    ls -1d 2*/entity_store.json | sed 's|/entity_store.json||' | head -n "$PRUNE_COUNT" | while read dir; do
         rm -rf "$dir"
         echo "  pruned old backup: $dir"
     done
