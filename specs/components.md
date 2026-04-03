@@ -1,7 +1,7 @@
 # Component Architecture
 
-> Last updated: 2026-04-01
-> Status: 37 modules — cognitive memory, hybrid search, visualization, infrastructure, Datalog inference, recursive exploration, B10 promotion pipeline, and NER layers complete. Dynamic type registry, ghost row resilience, and stale prepared statement recovery added.
+> Last updated: 2026-04-02
+> Status: 38 modules — cognitive memory, hybrid search, visualization, infrastructure, Datalog inference, recursive exploration, B10 promotion pipeline, and NER layers complete. Dynamic type registry, ghost row resilience, and stale prepared statement recovery added.
 
 ## Module Map
 
@@ -43,7 +43,7 @@ graph TB
     P --> Q[http]
 ```
 
-**Note:** Shows main call flow. Full 37-module dependency matrix in `dsm-analysis.md`.
+**Note:** Shows main call flow. Full 38-module dependency matrix in `dsm-analysis.md`.
 
 **Note:** `graph_client` (M11) uses the HTTP Cypher endpoint, which is working. Graph writes go through CQL (vertex/edge table INSERTs via `CqlStorage`), and graph reads/traversals go through HTTP POST against `/graph/query` via `reqwest`.
 
@@ -620,6 +620,25 @@ graph TB
 
 ---
 
+### 37. `ner` — Named Entity Recognition
+
+**Responsibility:** Three-tier named entity extraction and classification from free-text content. Tier 1: explicit caller-provided name (handled upstream). Tier 2: heuristic extraction via capitalized phrase detection and `infer_entity_type`. Tier 3: LLM extraction via Ollama `/api/generate` when heuristics produce low-confidence results (sentence fragment fallback). Also provides standalone entity classification that tries heuristics first and falls back to LLM for ambiguous ("concept") cases.
+
+**Interface:**
+- `extract_entity_from_content(http, ollama_url, model, content, caller_type) -> (String, String)` — three-tier extraction returning `(name, type)`
+- `classify_entity(http, ollama_url, model, entity_name, context) -> String` — heuristic-first classification with LLM fallback
+- `llm_classify_entity(http, ollama_url, model, entity_name, context) -> String` — direct LLM classification via Ollama
+- `heuristic_extract_entity(content) -> (String, String)` — capitalized phrase extraction with candidate ranking
+- `parse_extraction_response(raw) -> (String, String)` — parse LLM JSON `{"name", "type"}` responses
+
+**Valid types:** person, organization, tool, project, place, event, concept
+
+**Dependencies:** `reqwest` (HTTP to Ollama), `smart_ingest` (for `infer_entity_type` and `extract_entity_candidates` heuristics)
+
+**Size estimate:** ~315 lines (logic), ~560 lines (tests), ~877 lines total
+
+---
+
 ## Size Summary
 
 | Module | Lines (actual) |
@@ -661,4 +680,5 @@ graph TB
 | pagerank | 200 |
 | recursive_explore | 500 |
 | promotion | 250 |
-| **Total** | **~14,400** |
+| ner | 315 |
+| **Total** | **~14,715** |

@@ -56,6 +56,7 @@ graph LR
 | [visualization.md](visualization.md) | Real-time graph dashboard — WebSocket protocol, D3.js frontend, event types |
 | [dsm-analysis.md](dsm-analysis.md) | Design Structure Matrix — module boundaries and coupling |
 | [fmea.md](fmea.md) | Failure Mode and Effects Analysis with RPN scoring |
+| [lsp-code-indexing.md](lsp-code-indexing.md) | LSP-based code indexing spec for structural codebase ingestion |
 
 ## Source
 

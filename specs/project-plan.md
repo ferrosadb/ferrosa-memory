@@ -1,7 +1,7 @@
 # Project Plan — ferrosa-memory-mcp
 
-> Last updated: 2026-03-29
-> Status: Sprints 1-5b complete. Sprint 5 (RMH + Datalog) and Sprint 5b (Durable Materialization) done.
+> Last updated: 2026-04-02
+> Status: Sprints 1-6 complete. Sprint 6 (Production Hardening) covers Apr 1-2 work.
 
 ## Overview
 
@@ -17,6 +17,8 @@
 | Sprint 4 | **COMPLETE** | 11/11 tasks done |
 | Sprint 4.9 | **COMPLETE** | SUBSCRIBE anomaly alerts, get_stats enrichment |
 | Sprint 5 | **COMPLETE** | RMH + Datalog + Promotion (12+4 tasks) |
+| Sprint 5b | **COMPLETE** | Durable materialization pipeline (4 tasks) |
+| Sprint 6 | **COMPLETE** | Production hardening, type registry, infra (14 items) |
 
 ---
 
@@ -204,6 +206,64 @@
 
 ---
 
+## Sprint 6: Production Hardening + Type Registry
+
+**Goal:** Production stability, dynamic type system, operational tooling, visualization polish, and infrastructure for reliable cluster management.
+
+**Status: COMPLETE** -- all items shipped Apr 1-2 (commits 1085955 through aedeba6).
+
+### Type System + Schema
+
+| # | Task | Size | Source | Status |
+|---|------|------|--------|--------|
+| 6.1 | Dynamic type registry with auto-type detection (entity_types + edge_types tables, DDL 019) | M | Production needs | **DONE** (1085955) |
+| 6.2 | Tool usage logging for token analysis (tool_usage_log table, DDL 009) | S | Observability | **DONE** (325e3df) |
+| 6.3 | Fixed-point notation for VECTOR CQL literals | S | Bug fix | **DONE** (0254f1e) |
+
+### Resilience + Query Fixes
+
+| # | Task | Size | Source | Status |
+|---|------|------|--------|--------|
+| 6.4 | ANN search ghost row resilience (skips null entity_id) | S | Bug fix, FMEA | **DONE** (bf74e93) |
+| 6.5 | explore_connections CQL fallback for graph queries without graph backend | M | Feature | **DONE** (2ca1bd9, 6088d64) |
+| 6.6 | edge_list_for_entity includes typed_edges | S | Bug fix | **DONE** (6088d64) |
+| 6.7 | smart_ingest exact-name dedup | S | Bug fix | **DONE** (12ba1a6) |
+| 6.8 | Viz typed edges from nil session, CQL broadcast config | S | Production fix | **DONE** (69b63a5) |
+
+### Intentions + Scoping
+
+| # | Task | Size | Source | Status |
+|---|------|------|--------|--------|
+| 6.9 | Repo-scoped intentions with CQL persistence | M | Feature | **DONE** (103ccbb, b9d6059) |
+| 6.10 | Extract repo from MCP initialize roots via OnceLock | S | Infra | **DONE** (dbc1ad9) |
+
+### Visualization
+
+| # | Task | Size | Source | Status |
+|---|------|------|--------|--------|
+| 6.11 | Viz favicon, clickable entity type highlighting, hamburger menu for mobile | M | UX | **DONE** (aedeba6) |
+| 6.12 | Viz session switching | S | UX | **DONE** (12ba1a6) |
+
+### Infrastructure + Operations
+
+| # | Task | Size | Source | Status |
+|---|------|------|--------|--------|
+| 6.13 | Backup/restore scripts (backup-memory.sh, restore-memory.sh, start-cluster.sh) | M | Ops | **DONE** (bd515ba, 51b2ec8, 95a7550) |
+| 6.14 | LaunchAgent for auto-starting cluster on login | S | Ops | **DONE** |
+| 6.15 | FERROSA_CQL_BROADCAST added to docker-compose for CQL driver peer discovery | S | Infra | **DONE** (69b63a5) |
+| 6.16 | Backfill-embeddings script | S | Ops | **DONE** |
+
+### Specs + Policy
+
+| # | Task | Size | Source | Status |
+|---|------|------|--------|--------|
+| 6.17 | LSP-based code indexing spec (specs/lsp-code-indexing.md) | M | Research | **DONE** (70f4cb7) |
+| 6.18 | "No Workarounds for Ferrosa Bugs" policy added to CLAUDE.md | S | Policy | **DONE** |
+
+**Sprint 6 exit criteria:** Production cluster stable with auto-restart. Dynamic type registry operational. CQL fallback paths functional for graph-less deployments. Viz usable on mobile. Backup/restore tested. **MET.**
+
+---
+
 ## Backlog (Post-v1.0)
 
 | # | Task | Size | Source | Notes |
@@ -223,6 +283,7 @@
 | B14 | Louvain community detection | M | RMH/Ori Mnemos | Graph community detection for cluster identification |
 | B15 | BM25 full-text search signal | L | RMH/Ori Mnemos | TF-IDF ranking. Blocked on Ferrosa full-text index support. |
 | B16 | LLM-powered query decomposition | M | RMH/RLM paper | Optional LLM-assisted sub-query generation for recursive_explore |
+| B17 | LSP-based code indexing | XL | specs/lsp-code-indexing.md | Multi-language code intelligence via LSP servers. Spec written (Sprint 6). |
 
 ---
 
@@ -258,12 +319,14 @@ graph LR
     S2 --> S4[Sprint 4]
     S3 --> S4
     S4 --> S5[Sprint 5]
+    S5 --> S6[Sprint 6]
 
     S1 --- note1["Foundation: cql_client, auth, transport, memo, plan"]
     S2 --- note2["Folds: compression, graph, fold lifecycle"]
     S3 --- note3["Entities: phonetic, temporal, feedback, audit"]
     S4 --- note4["Routing: strategy selection, HTTP, hardening"]
     S5 --- note5["RMH + Datalog: inference, warmth, PPR, recursive explore"]
+    S6 --- note6["Production: type registry, CQL fallbacks, ops tooling, viz"]
 ```
 
-Sprint 2 and Sprint 3 can run in parallel after Sprint 1 completes — they share infrastructure (cql_client, auth, metrics) but don't depend on each other's tool implementations. Sprint 4 requires both. Sprint 5 requires Sprint 4 (builds on entity graph, routing, feedback loop, and consolidation pipeline).
+Sprint 2 and Sprint 3 can run in parallel after Sprint 1 completes — they share infrastructure (cql_client, auth, metrics) but don't depend on each other's tool implementations. Sprint 4 requires both. Sprint 5 requires Sprint 4 (builds on entity graph, routing, feedback loop, and consolidation pipeline). Sprint 6 is production hardening work that spans the full stack.
