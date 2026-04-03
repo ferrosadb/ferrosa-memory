@@ -2,7 +2,7 @@
 
 ## Overview
 
-ferrosa-memory-mcp is a Rust MCP server (~12,350 lines) that exposes Ferrosa DB's index and graph infrastructure as typed memory tools for LLM agent trajectories. It provides durable, structured memory for Recursive Language Model (RLM) workloads — memoization, hierarchical plan state, trajectory fold/summarization, semantic retrieval, phonetic entity search, spreading activation, dream consolidation, intention tracking, and a feedback loop for retrieval strategy refinement.
+ferrosa-memory-mcp is a Rust MCP server (~14,400 lines) that exposes Ferrosa DB's index and graph infrastructure as typed memory tools for LLM agent trajectories. It provides durable, structured memory for Recursive Language Model (RLM) workloads — memoization, hierarchical plan state, trajectory fold/summarization, semantic retrieval, phonetic entity search, spreading activation, dream consolidation, intention tracking, and a feedback loop for retrieval strategy refinement.
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#16161f','primaryTextColor':'#e8e8ed','primaryBorderColor':'#e2725b','lineColor':'#9494a3','secondaryColor':'#1c1c28','tertiaryColor':'#111118','clusterBkg':'#111118','clusterBorder':'#1e1e2a','edgeLabelBackground':'#111118','nodeTextColor':'#e8e8ed'}}}%%
@@ -39,7 +39,7 @@ graph LR
 
 **Stack:** Rust (Tokio), cdrs-tokio for CQL, reqwest for HTTP Cypher, Ollama for embeddings (nomic-embed-text, 768d). No Python anywhere — all algorithms (LLMLingua compression, spreading activation, dream consolidation) ported to native Rust.
 
-**32 MCP tools** across 8 functional groups: memoization, plan state, trajectory folds, entity graph, temporal chains, feedback/routing, cognitive memory (spreading activation, dream consolidation, importance scoring, intention tracking), and hybrid search.
+**32+ MCP tools** across 8 functional groups: memoization, plan state, trajectory folds, entity graph, temporal chains, feedback/routing, cognitive memory (spreading activation, dream consolidation, importance scoring, intention tracking), and hybrid search. Entity type schemas are dynamic — loaded from the `entity_types` registry table at startup.
 
 ## Index
 
@@ -65,3 +65,4 @@ All specs derived from `ferrosa-memory-mcp-spec.md` (v0.1, 2026-03-21).
 
 - **2026-03-21 (init):** Full 5-phase blueprint created
 - **2026-03-21 (update):** Drift detected after 8 commits. Updated: graph_client HTTP refactor, DSM M11 decoupling, vector column gap (F31), graph edge write gap (F32), sprint completion tracking, risk register updates
+- **2026-04-01 (update):** Dynamic type registry (DDL 019), multiselect filter UI in viz, extended entity/edge color mapping, CO_OCCURS noise filtering, ghost row resilience, stale prepared statement recovery, NER module, skilltools ingest data flow, markdown docs ingestion support

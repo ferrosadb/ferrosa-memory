@@ -15,6 +15,8 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Intention {
     pub id: Uuid,
+    /// Repository path this intention is scoped to (e.g. "/Users/ben/src/ferrosa-memory").
+    pub repo: String,
     pub description: String,
     pub trigger: IntentionTrigger,
     pub priority: Priority,
@@ -56,8 +58,8 @@ pub enum IntentionStatus {
     Cancelled,
 }
 
-/// In-memory intention store (backed by CQL in production).
-/// For now, held in the session — intentions persist via entity_store.
+/// In-memory intention store backed by CQL persistence.
+/// Intentions are loaded from CQL on session start and written through on mutation.
 pub struct IntentionStore {
     intentions: Vec<Intention>,
 }
@@ -75,9 +77,10 @@ impl IntentionStore {
         }
     }
 
-    /// Set a new intention. Returns the created Intention for persistence.
+    /// Set a new intention scoped to a repository. Returns the created Intention for persistence.
     pub fn set(
         &mut self,
+        repo: &str,
         description: &str,
         trigger: IntentionTrigger,
         priority: Priority,
@@ -85,6 +88,7 @@ impl IntentionStore {
         let id = Uuid::new_v4();
         let intention = Intention {
             id,
+            repo: repo.to_string(),
             description: description.to_string(),
             trigger,
             priority,
@@ -93,7 +97,7 @@ impl IntentionStore {
             triggered_at: None,
             completed_at: None,
         };
-        tracing::info!(%id, description, "intention set");
+        tracing::info!(%id, repo, description, "intention set");
         self.intentions.push(intention.clone());
         intention
     }
@@ -104,12 +108,17 @@ impl IntentionStore {
     }
 
     /// Check which intentions are triggered by the current context.
-    pub fn check(&mut self, context: &str) -> Vec<&Intention> {
+    /// If `repo` is non-empty, only intentions for that repo are checked.
+    pub fn check(&mut self, context: &str, repo: &str) -> Vec<&Intention> {
         let context_lower = context.to_lowercase();
         let mut triggered = Vec::new();
 
         for intention in &mut self.intentions {
             if intention.status != IntentionStatus::Pending {
+                continue;
+            }
+            // Skip intentions for other repos
+            if !repo.is_empty() && intention.repo != repo {
                 continue;
             }
 
@@ -197,6 +206,7 @@ mod tests {
     fn set_and_check_topic_intention() {
         let mut store = IntentionStore::new();
         store.set(
+            "/test/repo",
             "Review error handling in auth module",
             IntentionTrigger::Topic {
                 keywords: vec!["auth".into(), "authentication".into()],
@@ -205,11 +215,11 @@ mod tests {
         );
 
         // Should not trigger on unrelated context
-        let triggered = store.check("working on the database layer");
+        let triggered = store.check("working on the database layer", "/test/repo");
         assert!(triggered.is_empty());
 
         // Should trigger on matching context
-        let triggered = store.check("now looking at the auth middleware");
+        let triggered = store.check("now looking at the auth middleware", "/test/repo");
         assert_eq!(triggered.len(), 1);
         assert!(triggered[0].description.contains("error handling"));
     }
@@ -218,6 +228,7 @@ mod tests {
     fn complete_intention() {
         let mut store = IntentionStore::new();
         let intention = store.set(
+            "/test/repo",
             "Add tests",
             IntentionTrigger::Topic {
                 keywords: vec!["test".into()],
@@ -225,7 +236,7 @@ mod tests {
             Priority::Normal,
         );
 
-        store.check("running tests");
+        store.check("running tests", "/test/repo");
         assert!(store.complete(intention.id));
 
         let pending = store.pending();
@@ -236,6 +247,7 @@ mod tests {
     fn file_pattern_trigger() {
         let mut store = IntentionStore::new();
         store.set(
+            "/test/repo",
             "Check for SQL injection",
             IntentionTrigger::FilePattern {
                 pattern: "query".into(),
@@ -243,7 +255,7 @@ mod tests {
             Priority::Critical,
         );
 
-        let triggered = store.check("editing cql_storage.rs with query methods");
+        let triggered = store.check("editing cql_storage.rs with query methods", "/test/repo");
         assert_eq!(triggered.len(), 1);
     }
 }

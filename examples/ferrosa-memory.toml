@@ -1,5 +1,5 @@
 # Configuration for ferrosa-memory-mcp
-# Matches the docker-compose.yml development cluster
+# Matches the docker-compose.yml development cluster (run with: podman compose up -d)
 
 [server]
 transport = "stdio"          # "stdio" for Claude Code, "http" for remote

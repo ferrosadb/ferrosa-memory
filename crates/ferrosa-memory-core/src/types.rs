@@ -197,6 +197,21 @@ pub struct AuditEntry {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+// ─── Tool usage logging ────────────────────────────────────────
+
+/// A row from the tool_usage_log table for token analysis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolUsageRow {
+    pub tool_name: String,
+    pub repo: String,
+    pub input_bytes: i32,
+    pub output_bytes: i32,
+    pub estimated_tokens: i32,
+    pub latency_ms: i32,
+    pub error: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
 // ─── Sprint 5: Warmth types ────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

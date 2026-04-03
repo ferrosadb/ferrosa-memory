@@ -593,6 +593,7 @@ name = "ferrosa-memory-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cdrs-tokio",
  "chrono",
  "ferrosa-memory-core",
  "serde",

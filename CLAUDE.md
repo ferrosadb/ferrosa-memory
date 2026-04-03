@@ -14,3 +14,22 @@ See [specs/project-plan.md](specs/project-plan.md) for the current project plan 
 ## Architecture
 
 See [specs/](specs/) for full architecture specs, DSM analysis, threat model, and FMEA.
+
+## Session Restore
+
+On every session start (including after `/clear`), immediately restore context from ferrosa-memory before doing anything else:
+
+1. Call `check_intentions` with the current git branch and recent commit subjects as context
+2. Call `hybrid_search` with the current branch name and any relevant keywords from recent commits
+3. Briefly summarize what was being worked on so the user knows you have context
+
+Do not wait for the user to ask — this is automatic.
+
+## No Workarounds for Ferrosa Bugs
+
+This project is a test program for the Ferrosa database. Never build workarounds, fallback logic, or compatibility shims in this repo for missing or broken Ferrosa functionality. If the database has a bug, file a report in `../ferrosa/specs/` and fix it upstream. Working around database bugs here hides them and defeats the purpose of this project.
+
+## Related Projects
+
+- `../ferrosa/` — Ferrosa DB engine. Architecture specs at `../ferrosa/specs/` (CQL protocol, SUBSCRIBE semantics, storage engine, graph engine, consensus).
+- `../research/tools/skilltools/` — CLI/MCP companion tool. Provides `ingest` for codebase/docs→memory ingestion, plus code analysis tools (DSM, digest, smell-detect, etc.).

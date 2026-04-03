@@ -16,7 +16,8 @@ use uuid::Uuid;
 use crate::types::{
     AuditEntry, DerivedFact, EntityEntry, FeedbackOutcome, FoldEntry, FoldSummary,
     MaterializedEdge, MemoEntry, MemoryState, PlanNode, PlanStatus, PromotedPredicate,
-    ProvenanceStep, RuleEntry, RuleState, TemporalEvent, TenantContext, TypedEdge, WarmthEntry,
+    ProvenanceStep, RuleEntry, RuleState, TemporalEvent, TenantContext, ToolUsageRow, TypedEdge,
+    WarmthEntry,
 };
 
 /// Core storage operations for the memory system.
@@ -117,12 +118,21 @@ pub trait Storage: Send + Sync {
     /// Store a new entity.
     async fn entity_put(&self, ctx: &TenantContext, entry: &EntityEntry) -> anyhow::Result<()>;
 
-    /// Find entity by phonetic match on name.
+    /// Find entities by name match, ranked by relevance.
+    /// Matches on exact name, :: segment, and substring (in that priority order).
     async fn entity_find_phonetic(
         &self,
         ctx: &TenantContext,
         session_id: Uuid,
         name: &str,
+    ) -> anyhow::Result<Vec<EntityEntry>>;
+
+    /// Get a single entity by primary key (targeted lookup, no scan).
+    async fn entity_get_by_id(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        entity_id: Uuid,
     ) -> anyhow::Result<Option<EntityEntry>>;
 
     /// Search entities by embedding similarity.
@@ -303,15 +313,22 @@ pub trait Storage: Send + Sync {
 
     // --- Intention operations ---
 
-    /// Store a new intention.
+    /// Store a new intention (repo is on the Intention struct).
     async fn intention_put(
         &self,
         ctx: &TenantContext,
         intention: &crate::intention::Intention,
     ) -> anyhow::Result<()>;
 
-    /// List all intentions for a tenant.
+    /// List intentions for a tenant, scoped to a specific repo.
     async fn intention_list(
+        &self,
+        ctx: &TenantContext,
+        repo: &str,
+    ) -> anyhow::Result<Vec<crate::intention::Intention>>;
+
+    /// List all intentions for a tenant across all repos (for sync/admin).
+    async fn intention_list_all(
         &self,
         ctx: &TenantContext,
     ) -> anyhow::Result<Vec<crate::intention::Intention>>;
@@ -320,11 +337,35 @@ pub trait Storage: Send + Sync {
     async fn intention_update_status(
         &self,
         ctx: &TenantContext,
+        repo: &str,
         id: Uuid,
         status: &str,
         triggered_at: Option<chrono::DateTime<chrono::Utc>>,
         completed_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> anyhow::Result<()>;
+
+    // --- Tool usage logging ---
+
+    /// Log a tool call's token usage (fire-and-forget, best-effort).
+    #[allow(clippy::too_many_arguments)]
+    async fn tool_usage_put(
+        &self,
+        ctx: &TenantContext,
+        tool_name: &str,
+        repo: &str,
+        input_bytes: i32,
+        output_bytes: i32,
+        estimated_tokens: i32,
+        latency_ms: i32,
+        error: bool,
+    ) -> anyhow::Result<()>;
+
+    /// Query tool usage for a given day (YYYY-MM-DD string).
+    async fn tool_usage_query(
+        &self,
+        ctx: &TenantContext,
+        day: &str,
+    ) -> anyhow::Result<Vec<ToolUsageRow>>;
 
     // --- Audit log operations ---
 
@@ -750,12 +791,39 @@ pub mod mock {
             _ctx: &TenantContext,
             session_id: Uuid,
             name: &str,
-        ) -> anyhow::Result<Option<EntityEntry>> {
+        ) -> anyhow::Result<Vec<EntityEntry>> {
             let entities = self.entities.lock().await;
             let lower = name.to_lowercase();
+            let mut scored: Vec<(u8, &EntityEntry)> = entities
+                .iter()
+                .filter(|e| e.session_id == session_id)
+                .filter_map(|e| {
+                    let en = e.entity_name.to_lowercase();
+                    if en == lower {
+                        Some((0, e)) // exact match
+                    } else if en.split("::").any(|seg| seg == lower) {
+                        Some((1, e)) // segment match
+                    } else if en.contains(&lower) {
+                        Some((2, e)) // substring match
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            scored.sort_by_key(|(rank, _)| *rank);
+            Ok(scored.into_iter().map(|(_, e)| e.clone()).collect())
+        }
+
+        async fn entity_get_by_id(
+            &self,
+            _ctx: &TenantContext,
+            session_id: Uuid,
+            entity_id: Uuid,
+        ) -> anyhow::Result<Option<EntityEntry>> {
+            let entities = self.entities.lock().await;
             Ok(entities
                 .iter()
-                .find(|e| e.session_id == session_id && e.entity_name.to_lowercase() == lower)
+                .find(|e| e.session_id == session_id && e.entity_id == entity_id)
                 .cloned())
         }
 
@@ -1104,6 +1172,21 @@ pub mod mock {
         async fn intention_list(
             &self,
             _ctx: &TenantContext,
+            repo: &str,
+        ) -> anyhow::Result<Vec<crate::intention::Intention>> {
+            Ok(self
+                .intentions
+                .lock()
+                .await
+                .iter()
+                .filter(|i| i.repo == repo)
+                .cloned()
+                .collect())
+        }
+
+        async fn intention_list_all(
+            &self,
+            _ctx: &TenantContext,
         ) -> anyhow::Result<Vec<crate::intention::Intention>> {
             Ok(self.intentions.lock().await.clone())
         }
@@ -1111,6 +1194,7 @@ pub mod mock {
         async fn intention_update_status(
             &self,
             _ctx: &TenantContext,
+            _repo: &str,
             id: Uuid,
             status: &str,
             triggered_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -1131,6 +1215,28 @@ pub mod mock {
         async fn audit_put(&self, _ctx: &TenantContext, entry: &AuditEntry) -> anyhow::Result<()> {
             self.audit_entries.lock().await.push(entry.clone());
             Ok(())
+        }
+
+        async fn tool_usage_put(
+            &self,
+            _ctx: &TenantContext,
+            _tool_name: &str,
+            _repo: &str,
+            _input_bytes: i32,
+            _output_bytes: i32,
+            _estimated_tokens: i32,
+            _latency_ms: i32,
+            _error: bool,
+        ) -> anyhow::Result<()> {
+            Ok(()) // no-op in tests
+        }
+
+        async fn tool_usage_query(
+            &self,
+            _ctx: &TenantContext,
+            _day: &str,
+        ) -> anyhow::Result<Vec<ToolUsageRow>> {
+            Ok(vec![])
         }
 
         // --- Warmth operations ---

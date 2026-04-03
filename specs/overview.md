@@ -2,7 +2,7 @@
 
 ## Purpose
 
-ferrosa-memory-mcp is a Rust MCP server (~14,150 lines) that exposes Ferrosa DB's index and graph infrastructure as typed tools for LLM agent trajectories. It provides durable, structured memory for Recursive Language Model (RLM) workloads — memoization, hierarchical plan state, trajectory fold/summarization, semantic retrieval, phonetic entity search, spreading activation, dream consolidation, intention tracking, Datalog graph inference with provenance-tracked derived knowledge, recursive multi-pass exploration, and a feedback loop for retrieval strategy refinement.
+ferrosa-memory-mcp is a Rust MCP server (~14,400 lines) that exposes Ferrosa DB's index and graph infrastructure as typed tools for LLM agent trajectories. It provides durable, structured memory for Recursive Language Model (RLM) workloads — memoization, hierarchical plan state, trajectory fold/summarization, semantic retrieval, phonetic entity search, spreading activation, dream consolidation, intention tracking, Datalog graph inference with provenance-tracked derived knowledge, recursive multi-pass exploration, and a feedback loop for retrieval strategy refinement.
 
 ## Positioning
 
@@ -70,8 +70,9 @@ ferrosa-memory/
 │   ├── ferrosa-memory-core/          # Shared library: storage traits, tool handlers, config
 │   ├── ferrosa-memory-mcp/    # MCP server binary (stdio + HTTP)
 │   └── ferrosa-memory-batch/  # Nightly batch job binary
-├── ddl/                       # CQL schema files (001_keyspace, 002_folds_entities)
-├── docker-compose.yml         # Dev cluster (3-node Ferrosa + RustFS + Ollama)
+│   ├── ferrosa-memory-sync/    # Cross-device sync binary
+├── ddl/                       # CQL schema files (001–019)
+├── docker-compose.yml         # Dev cluster via podman compose (3-node Ferrosa + RustFS + Ollama)
 └── specs/                     # Architecture documentation
 ```
 
@@ -79,13 +80,21 @@ ferrosa-memory/
 
 All tables in `agent_memory` keyspace, RF=3 (configurable).
 
-Six tables:
+Eight tables:
 1. `memo_cache` — sub-call memoization
-2. `plan_state` — hierarchical plan trees
-3. `trajectory_folds` — fold summaries with graph edges
-4. `entity_store` — named entities with phonetic + vector indexes
-5. `temporal_events` — timestamped facts with supersession chains
-6. `feedback_outcomes` — retrieval strategy success/failure pairs
+1. `plan_state` — hierarchical plan trees
+1. `trajectory_folds` — fold summaries with graph edges
+1. `entity_store` — named entities with phonetic + vector indexes
+1. `temporal_events` — timestamped facts with supersession chains
+1. `feedback_outcomes` — retrieval strategy success/failure pairs
+1. `entity_types` — dynamic type registry for entity types (DDL 019)
+1. `edge_types` — dynamic type registry for edge types with source/destination constraints (DDL 019)
+
+## Dynamic Type Registry
+
+Entity and edge types are stored in `entity_types` and `edge_types` tables rather than hardcoded in the binary. At MCP startup, `CqlStorage::load_entity_types()` and `load_edge_types()` query these tables and build the MCP tool schemas dynamically. New types can be added by inserting a row — no recompile required.
+
+Seeded types include: person, place, event, concept, org, decision, pattern, preference, bug, document, section. Edge types: depends_on, contains, calls, references, CO_OCCURS, MENTIONED_IN, FOLDED_INTO, SUPERSEDES.
 
 ## Datalog Inference and Recursive Exploration
 

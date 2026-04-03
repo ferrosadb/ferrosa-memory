@@ -111,6 +111,8 @@ pub struct SessionState {
     /// Configured default session_id for cross-session memory continuity.
     /// Falls back to random UUID if not set.
     pub default_session_id: Option<uuid::Uuid>,
+    /// Repository path for intention scoping (from CLAUDE_PROJECT_DIR, config, or MCP initialize roots).
+    pub repo: std::sync::OnceLock<String>,
     /// Notified on every tool call; used by the idle consolidation timer.
     pub last_activity: Arc<tokio::sync::Notify>,
     /// Set to true when a write tool succeeds; cleared by idle consolidation.
@@ -119,6 +121,10 @@ pub struct SessionState {
     pub ollama_base_url: String,
     /// Model name for NER entity extraction via Ollama.
     pub ner_model: String,
+    /// Dynamic entity types loaded from the type registry table.
+    pub entity_types: Vec<String>,
+    /// Dynamic edge types loaded from the type registry table.
+    pub edge_types: Vec<String>,
 }
 
 impl Default for SessionState {
@@ -130,10 +136,26 @@ impl Default for SessionState {
             retrieval_tracker: Arc::new(Mutex::new(RetrievalTracker::new())),
             co_access: Arc::new(Mutex::new(crate::speculative::CoAccessTracker::new(10))),
             default_session_id: None,
+            repo: std::sync::OnceLock::new(),
             last_activity: Arc::new(tokio::sync::Notify::new()),
             dirty: Arc::new(AtomicBool::new(false)),
             ollama_base_url: "http://localhost:11434".to_string(),
             ner_model: "qwen3.5:27b".to_string(),
+            entity_types: vec![
+                "person",
+                "place",
+                "event",
+                "concept",
+                "org",
+                "bug",
+                "decision",
+                "pattern",
+                "preference",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+            edge_types: Vec::new(),
         }
     }
 }
@@ -148,7 +170,9 @@ pub struct ToolDef {
 }
 
 /// Build all tool definitions for the memory server.
-pub fn tool_definitions() -> Vec<ToolDef> {
+/// Entity types are loaded dynamically from the type registry.
+pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
+    let entity_type_enum: Value = serde_json::json!(entity_types);
     vec![
         ToolDef {
             name: "check_memo_cache".into(),
@@ -290,7 +314,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "properties": {
                     "session_id": { "type": "string", "format": "uuid" },
                     "entity_name": { "type": "string", "maxLength": 512 },
-                    "entity_type": { "type": "string", "enum": ["person", "place", "event", "concept", "org"] },
+                    "entity_type": { "type": "string", "enum": entity_type_enum },
                     "context_snippet": { "type": "string", "maxLength": 4096 },
                     "embedding": { "type": "array", "items": { "type": "number" } },
                     "source_fold_id": { "type": "string", "format": "uuid" },
@@ -318,7 +342,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                             "type": "object",
                             "properties": {
                                 "entity_name": { "type": "string", "maxLength": 512 },
-                                "entity_type": { "type": "string", "enum": ["person", "place", "event", "concept", "org"] },
+                                "entity_type": { "type": "string", "enum": entity_type_enum },
                                 "context_snippet": { "type": "string", "maxLength": 4096 },
                                 "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
                             },
@@ -384,7 +408,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "properties": {
                     "session_id": { "type": "string", "format": "uuid" },
                     "content": { "type": "string", "maxLength": 8192, "description": "The content to ingest" },
-                    "entity_type": { "type": "string", "enum": ["person", "place", "event", "concept", "org", "decision", "pattern", "preference"] },
+                    "entity_type": { "type": "string", "enum": entity_type_enum },
                     "entity_name": { "type": "string", "maxLength": 256, "description": "Clean entity name (e.g. 'Ben Kearns', 'Ferrosa'). If omitted, extracted automatically from content via LLM or heuristic." },
                     "embedding": { "type": "array", "items": { "type": "number" }, "description": "Optional embedding vector" },
                     "source_fold_id": { "type": "string", "format": "uuid", "description": "Fold that produced this content" }
@@ -392,14 +416,15 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "required": ["content", "entity_type"]
             }),
         },
-        // --- Intention tools (prospective memory) ---
+        // --- Intention tools (prospective memory, repo-scoped) ---
         ToolDef {
             name: "set_intention".into(),
-            description: "Prospective memory — 'remember to do X when Y happens.' Sets a deferred action that auto-triggers on context match.\n\nCALL WHEN you notice something to do later:\n- 'When we touch auth, check the error handling'\n- 'Next time we open database.rs, add that index'\n- 'When user mentions deployment, remind about the TLS cert'\n- 'In 30 minutes, check if the build finished'\n\nTrigger types: Topic (keyword match), FilePattern (file glob), Duration (minutes), Context (flexible condition).\n\nIntentions persist across the session and trigger automatically when check_intentions runs. Set liberally — they cost nothing until triggered.\nCost: ~1ms.".into(),
+            description: "Prospective memory — 'remember to do X when Y happens.' Sets a deferred action that auto-triggers on context match.\n\nCALL WHEN you notice something to do later:\n- 'When we touch auth, check the error handling'\n- 'Next time we open database.rs, add that index'\n- 'When user mentions deployment, remind about the TLS cert'\n- 'In 30 minutes, check if the build finished'\n\nTrigger types: Topic (keyword match), FilePattern (file glob), Duration (minutes), Context (flexible condition).\n\nIntentions are repo-scoped and persist across sessions. They trigger automatically when check_intentions runs. Set liberally — they cost nothing until triggered.\nCost: ~1ms.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "description": { "type": "string", "maxLength": 4096, "description": "What to do when triggered" },
+                    "repo": { "type": "string", "maxLength": 512, "description": "Repository path for scoping (defaults to server's configured repo)" },
                     "trigger": {
                         "type": "object",
                         "description": "Trigger condition",
@@ -419,11 +444,12 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "check_intentions".into(),
-            description: "Checks pending intentions against current context. Call FREQUENTLY — at every topic change, file open, or new task start. Pass a brief description of what you're doing now as context. Returns triggered intentions you should act on.\n\nCost: ~1ms. Call often — it's free.".into(),
+            description: "Checks pending intentions against current context. Call FREQUENTLY — at every topic change, file open, or new task start. Pass a brief description of what you're doing now as context. Returns triggered intentions you should act on.\n\nIntentions are repo-scoped — only intentions for the current repo are checked.\nCost: ~1ms. Call often — it's free.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "context": { "type": "string", "maxLength": 8192, "description": "Current context to check against" }
+                    "context": { "type": "string", "maxLength": 8192, "description": "Current context to check against" },
+                    "repo": { "type": "string", "maxLength": 512, "description": "Repository path (defaults to server's configured repo)" }
                 },
                 "required": ["context"]
             }),
@@ -441,10 +467,12 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "list_intentions".into(),
-            description: "Lists all intentions (pending, triggered, completed, snoozed).\n\nCALL WHEN: User asks about pending intentions, or for debugging intention state.\nCost: ~1ms.".into(),
+            description: "Lists intentions. By default lists current repo's intentions from the in-memory store.\n\nPass all_repos: true to list intentions across ALL repos from durable storage — useful for seeing all threads you're coordinating across projects.\n\nCALL WHEN: User asks about pending intentions, wants a cross-project overview, or for debugging intention state.\nCost: ~1ms (in-memory), ~15ms (all_repos).".into(),
             input_schema: serde_json::json!({
                 "type": "object",
-                "properties": {}
+                "properties": {
+                    "all_repos": { "type": "boolean", "description": "If true, list intentions across ALL repos from storage (not just current session)" }
+                }
             }),
         },
         ToolDef {
@@ -827,10 +855,25 @@ pub async fn dispatch<S: crate::storage::Storage>(
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
     match method {
-        "initialize" => Ok(server_info()),
+        "initialize" => {
+            // Extract repo from client roots (MCP spec: roots[].uri).
+            if session.repo.get().is_none()
+                && let Some(uri) = params
+                    .get("roots")
+                    .and_then(|v| v.as_array())
+                    .and_then(|roots| roots.first())
+                    .and_then(|r| r.get("uri"))
+                    .and_then(|u| u.as_str())
+            {
+                let path = uri.strip_prefix("file://").unwrap_or(uri).to_string();
+                let _ = session.repo.set(path.clone());
+                tracing::info!(repo = %path, "repo set from MCP initialize roots");
+            }
+            Ok(server_info())
+        }
         "notifications/initialized" => Ok(Value::Null),
         "tools/list" => {
-            let tools = tool_definitions();
+            let tools = tool_definitions(&session.entity_types);
             Ok(serde_json::json!({ "tools": tools }))
         }
         "tools/call" => dispatch_tool(params, storage, ctx, session).await,
@@ -864,6 +907,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
     }
 
     tracing::debug!(tool = name, "dispatching tool call");
+    let input_bytes = serde_json::to_string(&args).map(|s| s.len()).unwrap_or(0) as i32;
     let start = std::time::Instant::now();
     let result = match name {
         "check_memo_cache" => handle_check_memo(args, storage, ctx).await,
@@ -884,12 +928,12 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "set_intention" => handle_set_intention(args, storage, ctx, session).await,
         "check_intentions" => handle_check_intentions(args, storage, ctx, session).await,
         "complete_intention" => handle_complete_intention(args, storage, ctx, session).await,
-        "list_intentions" => handle_list_intentions(session).await,
+        "list_intentions" => handle_list_intentions(args, storage, ctx, session).await,
         "snooze_intention" => handle_snooze_intention(args, storage, ctx, session).await,
         "write_temporal_fact" => handle_write_temporal_fact(args, storage, ctx, session).await,
         "get_temporal_chain" => handle_get_temporal_chain(args, storage, ctx).await,
-        "explore_connections" => handle_explore_connections(args, session).await,
-        "hybrid_search" => handle_hybrid_search(args, storage, ctx).await,
+        "explore_connections" => handle_explore_connections(args, storage, ctx, session).await,
+        "hybrid_search" => handle_hybrid_search(args, storage, ctx, session).await,
         "run_consolidation" => handle_run_consolidation(args, storage, ctx, session).await,
         "get_stats" => handle_get_stats(args, storage, ctx, session).await,
         "promote_memory" => handle_promote_memory(args, storage, ctx, session).await,
@@ -909,11 +953,16 @@ async fn dispatch_tool<S: crate::storage::Storage>(
     };
     let elapsed = start.elapsed();
     match &result {
-        Ok(_) => tracing::debug!(
-            tool = name,
-            elapsed_ms = elapsed.as_millis() as u64,
-            "tool call OK"
-        ),
+        Ok(v) => {
+            let bytes = serde_json::to_string(&v).map(|s| s.len()).unwrap_or(0);
+            tracing::debug!(
+                tool = name,
+                elapsed_ms = elapsed.as_millis() as u64,
+                response_bytes = bytes,
+                est_tokens = bytes / 4,
+                "tool call OK"
+            );
+        }
         Err((code, msg)) => tracing::warn!(
             tool = name,
             code,
@@ -934,7 +983,8 @@ async fn dispatch_tool<S: crate::storage::Storage>(
 
     // Wrap in MCP CallToolResult format: { content: [{type: "text", text: "..."}] }
     // MCP clients expect this structure; without it, tool output is invisible.
-    result.map(|value| {
+    let is_err = result.is_err();
+    let wrapped = result.map(|value| {
         let text = if value.is_string() {
             value.as_str().unwrap().to_string()
         } else {
@@ -943,7 +993,33 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         serde_json::json!({
             "content": [{"type": "text", "text": text}]
         })
-    })
+    });
+
+    // Log tool usage (best-effort).
+    let output_bytes = wrapped
+        .as_ref()
+        .map(|v| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
+        .unwrap_or(0) as i32;
+    let estimated_tokens = (input_bytes + output_bytes) / 4;
+    let latency_ms = start.elapsed().as_millis() as i32;
+    let repo = session.repo.get().map(|s| s.as_str()).unwrap_or("");
+    if let Err(e) = storage
+        .tool_usage_put(
+            ctx,
+            name,
+            repo,
+            input_bytes,
+            output_bytes,
+            estimated_tokens,
+            latency_ms,
+            is_err,
+        )
+        .await
+    {
+        tracing::debug!(error = %e, "tool usage logging failed");
+    }
+
+    wrapped
 }
 
 /// Returns true for tools that modify stored data (writes, upserts, deletes).
@@ -1261,9 +1337,24 @@ async fn handle_upsert_entity<S: crate::storage::Storage>(
     let entity_name = require_str(&args, "entity_name")?;
     let entity_type = require_str(&args, "entity_type")?;
     let context_snippet = require_str(&args, "context_snippet")?;
-    let embedding = optional_f32_array(&args, "embedding")?;
+    let mut embedding = optional_f32_array(&args, "embedding")?;
     let source_fold_id = optional_uuid(&args, "source_fold_id")?;
     let confidence = args.get("confidence").and_then(|v| v.as_f64());
+
+    // Auto-generate embedding if not provided and Ollama is configured.
+    if embedding.is_none() && !session.ollama_base_url.is_empty() {
+        let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
+            provider: "ollama".into(),
+            ollama_base_url: session.ollama_base_url.clone(),
+            model: "nomic-embed-text".into(),
+            dimensions: 768,
+            ner_model: String::new(),
+        });
+        match client.embed(context_snippet).await {
+            Ok(emb) => embedding = Some(emb),
+            Err(e) => tracing::debug!("embedding generation skipped: {e}"),
+        }
+    }
 
     let result = crate::entity::upsert_entity(
         storage,
@@ -1454,7 +1545,22 @@ async fn handle_retrieve_entities<S: crate::storage::Storage>(
 ) -> Result<Value, (i32, String)> {
     let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
     let query = require_str(&args, "query")?;
-    let embedding = optional_f32_array(&args, "embedding")?;
+    let mut embedding = optional_f32_array(&args, "embedding")?;
+
+    // Auto-generate query embedding for ANN search if Ollama is configured.
+    if embedding.is_none() && !session.ollama_base_url.is_empty() {
+        let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
+            provider: "ollama".into(),
+            ollama_base_url: session.ollama_base_url.clone(),
+            model: "nomic-embed-text".into(),
+            dimensions: 768,
+            ner_model: String::new(),
+        });
+        match client.embed(query).await {
+            Ok(emb) => embedding = Some(emb),
+            Err(e) => tracing::debug!("query embedding generation skipped: {e}"),
+        }
+    }
 
     // Use router for strategy selection when user didn't specify
     let user_strategy = args.get("strategy").and_then(|v| v.as_str());
@@ -1534,7 +1640,30 @@ async fn handle_retrieve_entities<S: crate::storage::Storage>(
         .await;
     }
 
-    serde_json::to_value(&entities).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+    // Strip embeddings and truncate context to reduce MCP response token cost.
+    let slim: Vec<Value> = entities
+        .iter()
+        .map(|e| {
+            let ctx = if e.context_snippet.len() > 200 {
+                format!(
+                    "{}...",
+                    &e.context_snippet[..e.context_snippet.floor_char_boundary(200)]
+                )
+            } else {
+                e.context_snippet.clone()
+            };
+            serde_json::json!({
+                "entity_id": e.entity_id,
+                "entity_name": e.entity_name,
+                "entity_type": e.entity_type,
+                "confidence": e.confidence,
+                "state": e.state,
+                "created_at": e.created_at,
+                "context_snippet": ctx,
+            })
+        })
+        .collect();
+    serde_json::to_value(&slim).map_err(|e| (INTERNAL_ERROR, e.to_string()))
 }
 
 // --- Memory state handlers ---
@@ -1685,8 +1814,23 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
     let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
     let content = require_str(&args, "content")?;
     let entity_type = require_str(&args, "entity_type")?;
-    let embedding = optional_f32_array(&args, "embedding")?;
+    let mut embedding = optional_f32_array(&args, "embedding")?;
     let source_fold_id = optional_uuid(&args, "source_fold_id")?;
+
+    // Auto-generate embedding if not provided and Ollama is configured.
+    if embedding.is_none() && !session.ollama_base_url.is_empty() {
+        let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
+            provider: "ollama".into(),
+            ollama_base_url: session.ollama_base_url.clone(),
+            model: "nomic-embed-text".into(),
+            dimensions: 768,
+            ner_model: String::new(),
+        });
+        match client.embed(content).await {
+            Ok(emb) => embedding = Some(emb),
+            Err(e) => tracing::debug!("embedding generation skipped: {e}"),
+        }
+    }
 
     let entity_name = args
         .get("entity_name")
@@ -1774,12 +1918,26 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
 
 // --- Intention handlers ---
 
+/// Resolve repo from tool args, falling back to session default.
+fn resolve_repo<'a>(args: &'a Value, session: &'a SessionState) -> &'a str {
+    args.get("repo")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| session.repo.get().map(|s| s.as_str()).unwrap_or(""))
+}
+
 async fn handle_set_intention<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
+    let repo = resolve_repo(&args, session);
+    if repo.is_empty() {
+        return Err((
+            INVALID_PARAMS,
+            "repo is required (pass explicitly or configure server repo)".into(),
+        ));
+    }
     let description = require_str(&args, "description")?;
     let trigger_json = args
         .get("trigger")
@@ -1796,7 +1954,7 @@ async fn handle_set_intention<S: crate::storage::Storage>(
         .unwrap_or(crate::intention::Priority::Normal);
 
     let mut store = session.intentions.lock().await;
-    let intention = store.set(description, trigger, priority);
+    let intention = store.set(repo, description, trigger, priority);
     let id = intention.id;
 
     // Persist to storage (best-effort -- in-memory is primary)
@@ -1813,9 +1971,10 @@ async fn handle_check_intentions<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
+    let repo = resolve_repo(&args, session);
     let context = require_str(&args, "context")?;
     let mut store = session.intentions.lock().await;
-    let triggered = store.check(context);
+    let triggered = store.check(context, repo);
     let triggered_json: Vec<Value> = triggered
         .iter()
         .map(|i| serde_json::to_value(i).unwrap_or(Value::Null))
@@ -1828,7 +1987,14 @@ async fn handle_check_intentions<S: crate::storage::Storage>(
             .trim_matches('"')
             .to_string();
         if let Err(e) = storage
-            .intention_update_status(ctx, intention.id, &status_str, intention.triggered_at, None)
+            .intention_update_status(
+                ctx,
+                repo,
+                intention.id,
+                &status_str,
+                intention.triggered_at,
+                None,
+            )
             .await
         {
             tracing::warn!(id = %intention.id, error = %e, "failed to persist intention trigger");
@@ -1844,13 +2010,14 @@ async fn handle_complete_intention<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
+    let repo = resolve_repo(&args, session);
     let id = require_uuid(&args, "intention_id")?;
     let mut store = session.intentions.lock().await;
     let completed = store.complete(id);
 
     if completed
         && let Err(e) = storage
-            .intention_update_status(ctx, id, "completed", None, Some(chrono::Utc::now()))
+            .intention_update_status(ctx, repo, id, "completed", None, Some(chrono::Utc::now()))
             .await
     {
         tracing::warn!(%id, error = %e, "failed to persist intention completion");
@@ -1859,14 +2026,38 @@ async fn handle_complete_intention<S: crate::storage::Storage>(
     Ok(serde_json::json!({ "completed": completed }))
 }
 
-async fn handle_list_intentions(session: &SessionState) -> Result<Value, (i32, String)> {
-    let store = session.intentions.lock().await;
-    let intentions = store.list();
-    let json: Vec<Value> = intentions
-        .iter()
-        .map(|i| serde_json::to_value(i).unwrap_or(Value::Null))
-        .collect();
-    Ok(serde_json::json!({ "intentions": json }))
+async fn handle_list_intentions<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let all_repos = args
+        .get("all_repos")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if all_repos {
+        // Load from CQL across all repos
+        let intentions = storage
+            .intention_list_all(ctx)
+            .await
+            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+        let json: Vec<Value> = intentions
+            .iter()
+            .map(|i| serde_json::to_value(i).unwrap_or(Value::Null))
+            .collect();
+        Ok(serde_json::json!({ "intentions": json, "source": "all_repos" }))
+    } else {
+        // In-memory store (current repo only)
+        let store = session.intentions.lock().await;
+        let intentions = store.list();
+        let json: Vec<Value> = intentions
+            .iter()
+            .map(|i| serde_json::to_value(i).unwrap_or(Value::Null))
+            .collect();
+        Ok(serde_json::json!({ "intentions": json, "source": "session" }))
+    }
 }
 
 async fn handle_snooze_intention<S: crate::storage::Storage>(
@@ -1875,13 +2066,14 @@ async fn handle_snooze_intention<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
+    let repo = resolve_repo(&args, session);
     let id = require_uuid(&args, "intention_id")?;
     let mut store = session.intentions.lock().await;
     let snoozed = store.snooze(id);
 
     if snoozed
         && let Err(e) = storage
-            .intention_update_status(ctx, id, "pending", None, None)
+            .intention_update_status(ctx, repo, id, "pending", None, None)
             .await
     {
         tracing::warn!(%id, error = %e, "failed to persist intention snooze");
@@ -1953,21 +2145,22 @@ async fn handle_get_temporal_chain<S: crate::storage::Storage>(
 
 // --- Graph traversal handler ---
 
-async fn handle_explore_connections(
+async fn handle_explore_connections<S: crate::storage::Storage>(
     args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    let graph = session
-        .graph
-        .as_ref()
-        .ok_or((INTERNAL_ERROR, "graph client not configured".into()))?;
-
     let traversal = require_str(&args, "traversal")?;
     let max_depth = args.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(2) as usize;
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
     let results = match traversal {
         "fold_ancestors" => {
+            let graph = session
+                .graph
+                .as_ref()
+                .ok_or((INTERNAL_ERROR, "graph client not configured".into()))?;
             let fold_id = require_uuid(&args, "fold_id")?;
             let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
             graph
@@ -1978,14 +2171,46 @@ async fn handle_explore_connections(
         "related_entities" => {
             let entity_id = require_uuid(&args, "entity_id")?;
             let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
-            let mut r = graph
-                .find_related_entities(entity_id, session_id, max_depth)
-                .await
-                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
-            r.truncate(limit);
-            r
+            // Try graph backend first, fall back to CQL typed_edges
+            if let Some(graph) = session.graph.as_ref() {
+                let mut r = graph
+                    .find_related_entities(entity_id, session_id, max_depth)
+                    .await
+                    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+                r.truncate(limit);
+                r
+            } else {
+                // CQL fallback: query typed_edges for direct connections
+                let edges = storage
+                    .edge_list_for_entity(ctx, entity_id)
+                    .await
+                    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+                let mut results: Vec<String> = Vec::new();
+                for (other_id, edge_type) in edges.into_iter().take(limit) {
+                    let name = storage
+                        .entity_get_by_id(ctx, session_id, other_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|e| e.entity_name)
+                        .unwrap_or_else(|| other_id.to_string());
+                    results.push(
+                        serde_json::to_string(&serde_json::json!({
+                            "entity_id": other_id.to_string(),
+                            "entity_name": name,
+                            "edge_type": edge_type,
+                        }))
+                        .unwrap_or_default(),
+                    );
+                }
+                results
+            }
         }
         "entities_in_fold" => {
+            let graph = session
+                .graph
+                .as_ref()
+                .ok_or((INTERNAL_ERROR, "graph client not configured".into()))?;
             let fold_id = require_uuid(&args, "fold_id")?;
             let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
             let mut r = graph
@@ -1996,13 +2221,12 @@ async fn handle_explore_connections(
             r
         }
         "supersession_chain" => {
+            let graph = session
+                .graph
+                .as_ref()
+                .ok_or((INTERNAL_ERROR, "graph client not configured".into()))?;
             let entity_id = require_uuid(&args, "entity_id")?;
-            let event_id = entity_id; // event_id is passed via entity_id field
-            // For supersession_chain, we need both event_id and entity_id.
-            // The tool schema uses entity_id for the event, and fold_id is repurposed
-            // as the actual entity_id context. But the graph method signature is
-            // (event_id, entity_id). We pass entity_id as event_id since the Cypher
-            // query uses it as the starting fact node.
+            let event_id = entity_id;
             let fact_entity_id = optional_uuid(&args, "fold_id")?.unwrap_or(event_id);
             graph
                 .get_supersession_chain(event_id, fact_entity_id)
@@ -2030,11 +2254,27 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
     ctx: &crate::types::TenantContext,
+    session: &SessionState,
 ) -> Result<Value, (i32, String)> {
     let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
     let query = require_str(&args, "query")?;
-    let embedding = optional_f32_array(&args, "embedding")?;
+    let mut embedding = optional_f32_array(&args, "embedding")?;
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+
+    // Auto-generate query embedding for ANN search if Ollama is configured.
+    if embedding.is_none() && !session.ollama_base_url.is_empty() {
+        let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
+            provider: "ollama".into(),
+            ollama_base_url: session.ollama_base_url.clone(),
+            model: "nomic-embed-text".into(),
+            dimensions: 768,
+            ner_model: String::new(),
+        });
+        match client.embed(query).await {
+            Ok(emb) => embedding = Some(emb),
+            Err(e) => tracing::debug!("query embedding generation skipped: {e}"),
+        }
+    }
 
     let results = crate::hybrid_search::hybrid_search(
         storage,
@@ -3054,7 +3294,14 @@ mod tests {
     async fn set_intention_and_check() {
         let store = MockStorage::new();
         let ctx = test_ctx();
-        let session = SessionState::default();
+        let session = SessionState {
+            repo: {
+                let l = std::sync::OnceLock::new();
+                let _ = l.set("/test/repo".to_string());
+                l
+            },
+            ..SessionState::default()
+        };
 
         // Set
         let params = serde_json::json!({
@@ -3150,15 +3397,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explore_connections_requires_graph() {
+    async fn explore_connections_related_entities_cql_fallback() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default(); // graph is None — uses CQL fallback
+        let params = serde_json::json!({
+            "name": "explore_connections",
+            "arguments": {
+                "traversal": "related_entities",
+                "entity_id": Uuid::new_v4().to_string()
+            }
+        });
+        // Should succeed with empty results (CQL fallback, no edges in mock)
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn explore_connections_fold_requires_graph() {
         let store = MockStorage::new();
         let ctx = test_ctx();
         let session = SessionState::default(); // graph is None
         let params = serde_json::json!({
             "name": "explore_connections",
             "arguments": {
-                "traversal": "related_entities",
-                "entity_id": Uuid::new_v4().to_string()
+                "traversal": "fold_ancestors",
+                "fold_id": Uuid::new_v4().to_string()
             }
         });
         let err = dispatch("tools/call", params, &store, &ctx, &session)
@@ -3315,7 +3582,14 @@ mod tests {
     async fn intention_persists_to_storage() {
         let store = MockStorage::new();
         let ctx = test_ctx();
-        let session = SessionState::default();
+        let session = SessionState {
+            repo: {
+                let l = std::sync::OnceLock::new();
+                let _ = l.set("/test/repo".to_string());
+                l
+            },
+            ..SessionState::default()
+        };
 
         // Set an intention — should persist to mock storage
         let params = serde_json::json!({
@@ -3337,20 +3611,32 @@ mod tests {
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].id.to_string(), intention_id);
         assert_eq!(stored[0].description, "Check SQL injection patterns");
+        assert_eq!(stored[0].repo, "/test/repo");
         drop(stored);
 
-        // Read back from storage trait
+        // Read back from storage trait (repo-scoped)
         use crate::storage::Storage as _;
-        let loaded = store.intention_list(&ctx).await.unwrap();
+        let loaded = store.intention_list(&ctx, "/test/repo").await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id.to_string(), intention_id);
+
+        // Different repo returns empty
+        let other = store.intention_list(&ctx, "/other/repo").await.unwrap();
+        assert!(other.is_empty());
     }
 
     #[tokio::test]
     async fn intention_complete_persists_status() {
         let store = MockStorage::new();
         let ctx = test_ctx();
-        let session = SessionState::default();
+        let session = SessionState {
+            repo: {
+                let l = std::sync::OnceLock::new();
+                let _ = l.set("/test/repo".to_string());
+                l
+            },
+            ..SessionState::default()
+        };
 
         // Set an intention
         let params = serde_json::json!({
@@ -3415,6 +3701,7 @@ mod tests {
         // Simulate pre-existing intentions in storage (from previous session)
         let intention = Intention {
             id: Uuid::new_v4(),
+            repo: "/test/repo".into(),
             description: "Previously stored intention".into(),
             trigger: IntentionTrigger::Topic {
                 keywords: vec!["rust".into()],
@@ -3427,13 +3714,13 @@ mod tests {
         };
         store.intention_put(&ctx, &intention).await.unwrap();
 
-        // Load from storage into IntentionStore
-        let loaded = store.intention_list(&ctx).await.unwrap();
+        // Load from storage into IntentionStore (repo-scoped)
+        let loaded = store.intention_list(&ctx, "/test/repo").await.unwrap();
         let mut intention_store = IntentionStore::new();
         intention_store.load(loaded);
 
         // Verify the loaded intention triggers correctly
-        let triggered = intention_store.check("writing rust code");
+        let triggered = intention_store.check("writing rust code", "/test/repo");
         assert_eq!(triggered.len(), 1);
         assert_eq!(triggered[0].description, "Previously stored intention");
     }

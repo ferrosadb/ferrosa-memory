@@ -115,24 +115,42 @@ pub async fn smart_ingest(
     let (resolved_name, resolved_type) =
         resolve_entity_name(entity_name, content, entity_type, ner_config).await;
 
-    // Search for similar existing entities
-    let existing = if let Some(emb) = embedding {
-        storage.entity_search_ann(ctx, session_id, emb, 3).await?
+    // Always check for exact name match first (cheap phonetic scan).
+    // This prevents duplicates when the same entity is updated with new content,
+    // regardless of whether ANN or phonetic search is the primary strategy.
+    let mut existing = if !resolved_name.is_empty() {
+        let mut matches = storage
+            .entity_find_phonetic(ctx, session_id, &resolved_name)
+            .await?;
+        // Keep only exact name matches for dedup
+        matches.retain(|e| e.entity_name == resolved_name);
+        matches.truncate(1);
+        matches
     } else {
-        // Fall back to phonetic search on the first few words
-        let name_hint = content
-            .split_whitespace()
-            .take(5)
-            .collect::<Vec<_>>()
-            .join(" ");
-        match storage
-            .entity_find_phonetic(ctx, session_id, &name_hint)
-            .await?
-        {
-            Some(e) => vec![e],
-            None => vec![],
-        }
+        Vec::new()
     };
+
+    // If no exact name match, fall back to semantic/phonetic search
+    if existing.is_empty() {
+        existing = if let Some(emb) = embedding {
+            storage.entity_search_ann(ctx, session_id, emb, 3).await?
+        } else {
+            let name_hint = if !resolved_name.is_empty() {
+                resolved_name.clone()
+            } else {
+                content
+                    .split_whitespace()
+                    .take(5)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let mut matches = storage
+                .entity_find_phonetic(ctx, session_id, &name_hint)
+                .await?;
+            matches.truncate(3);
+            matches
+        };
+    }
 
     if existing.is_empty() {
         // No similar memories — create new
@@ -158,9 +176,39 @@ pub async fn smart_ingest(
         return Ok(IngestDecision::Created { entity_id });
     }
 
-    // Compare with most similar existing memory
-    // For now, use a simple heuristic: check content overlap
-    let best_match = &existing[0];
+    // Compare with most similar existing memory.
+    // Phonetic matches are lightweight (no context), so fetch full entity for comparison.
+    let best_match = if existing[0].context_snippet.is_empty() {
+        // Lightweight match — fetch full entity for similarity comparison
+        storage
+            .entity_get_by_id(ctx, session_id, existing[0].entity_id)
+            .await?
+            .unwrap_or_else(|| existing[0].clone())
+    } else {
+        existing[0].clone()
+    };
+
+    // Exact name match → always update, regardless of content similarity.
+    // This handles the case where the same entity is being updated with new info
+    // (e.g., marking a bug as resolved).
+    if best_match.entity_name == resolved_name {
+        let updated = crate::types::EntityEntry {
+            context_snippet: content.to_string(),
+            entity_embedding: embedding.map(|e| e.to_vec()),
+            created_at: chrono::Utc::now(),
+            ..best_match.clone()
+        };
+        storage.entity_put(ctx, &updated).await?;
+        tracing::info!(
+            entity_id = %best_match.entity_id,
+            "smart_ingest: UPDATED (exact name match)"
+        );
+        return Ok(IngestDecision::Updated {
+            entity_id: best_match.entity_id,
+            similarity: 1.0,
+        });
+    }
+
     let similarity = compute_text_similarity(content, &best_match.context_snippet);
 
     if similarity > config.skip_threshold {

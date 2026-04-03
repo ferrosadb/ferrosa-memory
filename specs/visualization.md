@@ -1,7 +1,7 @@
 # Memory Graph Visualizer
 
-> Last updated: 2026-03-25
-> Status: Implemented (Sprint 4.5–4.9). Mobile-responsive panels, anomaly SSE, dangling edge filtering complete.
+> Last updated: 2026-04-01
+> Status: Implemented. Multiselect filter dropdowns (node type + edge type), extended color mapping (document, section, crate, module, bug), CO_OCCURS noise filtering, mobile-responsive panels, anomaly SSE.
 
 Real-time force-directed graph visualization of the memory knowledge graph, embedded in the MCP server binary. Point a browser at a local port, see entities, folds, and edges as an interactive D3.js graph. Live updates stream via WebSocket as the memory system processes new content.
 
@@ -51,9 +51,9 @@ sequenceDiagram
     V-->>B: Static HTML+CSS+JS (single file)
 
     B->>V: GET /viz/ws (WebSocket upgrade)
-    V->>S: build_snapshot (entity_list + edge_list)
+    V->>S: build_snapshot (entity_list_session + typed_edge_list_session)
     S-->>V: entities + edges
-    Note over V: Filter dangling edges<br/>(both endpoints must exist)
+    Note over V: Skip ghost rows (NULL fields)<br/>Filter dangling edges<br/>Drop CO_OCCURS with no strength
     V-->>B: VizEvent::Snapshot { nodes, edges }
     V->>EB: subscribe()
 
@@ -73,6 +73,8 @@ sequenceDiagram
 **Key design decisions:**
 - Snapshot is built **per connection** before subscribing to the event bus — no race condition between initial state and live deltas
 - Dangling edges (where source or target node doesn't exist) are **filtered out** of snapshots
+- CO_OCCURS edges with no `strength` value are dropped (noise from bulk ingestion)
+- Ghost rows (NULL required fields from bulk CQL inserts) are silently skipped
 - If the browser falls behind, lagged events are dropped with a warning (broadcast channel capacity: 256)
 - Auto-reconnect after 3 seconds on disconnect
 
@@ -111,7 +113,8 @@ Seven event types, all serialized as JSON with a `type` discriminator tag:
 {
   source: string,       // source node id
   target: string,       // target node id
-  edge_type: string     // "CO_OCCURS", "MENTIONED_IN", "FOLDED_INTO", "SUPERSEDES"
+  edge_type: string,    // "CO_OCCURS", "MENTIONED_IN", "FOLDED_INTO", "SUPERSEDES", "depends_on", "contains", "calls", "references"
+  strength: f32 | null  // similarity strength for CO_OCCURS; weight for typed edges
 }
 ```
 
@@ -135,11 +138,13 @@ Full-viewport dark background (`#0a0a0f` Void). Three regions:
 
 | Parameter | Value | Effect |
 |-----------|-------|--------|
-| Link distance | 100px | Spacing between connected nodes |
-| Charge strength | -500 | Repulsion between all nodes |
-| Center X/Y strength | 0.03 | Gentle pull toward canvas center |
-| Collision radius | 40px | Prevents node overlap |
+| Link distance | `200 * (1 - strength)` (30–200px) | Higher strength = closer nodes |
+| Charge strength | -1500, max 800px | Strong repulsion between all nodes |
+| Center X/Y strength | 0.005 | Gentle pull toward canvas center |
+| Collision radius | 20px | Prevents node overlap |
 | Alpha decay | 0.0076 | Slow cooling for smooth convergence |
+
+Link distance is driven by edge `strength`: `depends_on` (1.0) → 30px, `contains` (0.9) → 50px, `calls` (0.7) → 90px. Edges without strength default to 0.1 → 180px.
 
 ### Color Mapping (Ferrosa Brand)
 
@@ -155,6 +160,12 @@ Full-viewport dark background (`#0a0a0f` Void). Three regions:
 | event | Verdigris | `#6bc9a0` |
 | place | Steel Blue (light) | `#9cb8f7` |
 | preference | Amber (light) | `#f7be7e` |
+| document | Teal | `#4ecdc4` |
+| section | Teal (dark) | `#45b7aa` |
+| crate | Coral Red | `#ff6b6b` |
+| module | Orange | `#ffa94d` |
+| bug | Rust Red | `#e25b5b` |
+| app | Amethyst | `#c882f0` |
 | fold | Slate with border | `#16161f` stroke `#1e1e2a` |
 
 **Edge types → line color:**
@@ -165,8 +176,25 @@ Full-viewport dark background (`#0a0a0f` Void). Three regions:
 | MENTIONED_IN | Steel Blue | `#7c9cf5` |
 | FOLDED_INTO | Amethyst | `#c882f0` |
 | SUPERSEDES | Rust Red | `#e25b5b` |
+| depends_on | Pink | `#ff7eb3` |
+| contains | Green | `#7effa0` |
+| calls | Yellow | `#ffe07e` |
+| references | Sky Blue | `#87ceeb` |
 
 Node radius scales with confidence (7–11px for entities, 5px for folds).
+
+### Filter UI
+
+Two multiselect dropdown menus in the header bar allow filtering by node type and edge type:
+
+1. **Nodes dropdown** — lists all entity types present in the graph with color swatches. Toggling types filters which nodes are visible; edges with hidden endpoints are also hidden.
+1. **Edges dropdown** — lists all edge types present in the graph with color swatches. Toggling types filters which edges are drawn.
+
+Each dropdown has **All** and **None** quick-select buttons. When no types are explicitly selected, all types are shown (empty set = show all).
+
+Node type filtering also filters edges: only edges between two visible nodes are shown. This means selecting only "crate" nodes will show only `depends_on` edges between crates.
+
+On mobile (<600px), the filter dropdowns wrap below the logo in the header. Dropdown menus are touch-friendly with adequate tap targets.
 
 ### Animations
 

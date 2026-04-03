@@ -21,7 +21,7 @@ use crate::storage::Storage;
 use crate::types::{EntityEntry, MemoryState, TenantContext};
 
 /// Maximum entities per session (configurable via config, hardcoded default).
-const DEFAULT_MAX_ENTITIES_PER_SESSION: usize = 1000;
+const DEFAULT_MAX_ENTITIES_PER_SESSION: usize = 50_000;
 
 /// Default confidence gate — reject entities below this threshold.
 const DEFAULT_CONFIDENCE_GATE: f64 = 0.7;
@@ -100,11 +100,11 @@ pub async fn upsert_entity_with_limit(
     let count = storage.entity_count(ctx, session_id).await?;
     crate::quota::check_quota(count, max_entities)?;
 
-    // Check for phonetic match (deduplication)
-    if let Some(existing) = storage
+    // Check for phonetic match (deduplication) — use first (best-ranked) result
+    let phonetic_matches = storage
         .entity_find_phonetic(ctx, session_id, entity_name)
-        .await?
-    {
+        .await?;
+    if let Some(existing) = phonetic_matches.first() {
         tracing::info!(entity_name, entity_id = %existing.entity_id, "entity deduplicated (phonetic match)");
         return Ok(UpsertEntityResult {
             entity_id: existing.entity_id,
@@ -165,8 +165,9 @@ pub async fn retrieve_entities(
 
     match strategy {
         "phonetic" => {
-            let result = storage.entity_find_phonetic(ctx, session_id, query).await?;
-            Ok(result.into_iter().collect())
+            let mut results = storage.entity_find_phonetic(ctx, session_id, query).await?;
+            results.truncate(k);
+            Ok(results)
         }
         "ann" => {
             let emb =
@@ -177,9 +178,8 @@ pub async fn retrieve_entities(
             let mut results = Vec::new();
 
             // Phonetic first
-            if let Some(e) = storage.entity_find_phonetic(ctx, session_id, query).await? {
-                results.push(e);
-            }
+            let phonetic = storage.entity_find_phonetic(ctx, session_id, query).await?;
+            results.extend(phonetic);
 
             // ANN if embedding provided
             if let Some(emb) = embedding {
@@ -567,5 +567,62 @@ mod tests {
             "expected QuotaExceeded error, got: {err}"
         );
         assert!(err.to_string().contains("quota exceeded"));
+    }
+
+    #[tokio::test]
+    async fn phonetic_search_finds_code_entity_by_segment() {
+        // Bug: searching "graph" should match "ferrosa-memory-core::graph"
+        // but previously returned the first alphabetical match instead.
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let sid = Uuid::new_v4();
+
+        // Create a code entity and a doc section that both contain "graph"
+        upsert_entity(
+            &store,
+            &ctx,
+            sid,
+            "ferrosa-memory-core::graph",
+            "module",
+            "Graph client for HTTP Cypher queries",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        upsert_entity(
+            &store,
+            &ctx,
+            sid,
+            "doc:pitr.md::Dependency Graph",
+            "section",
+            "Shows the dependency graph of tasks",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Phonetic search for "graph" should return results ranked by match quality
+        let results = retrieve_entities(&store, &ctx, sid, "graph", None, "phonetic", Some(10))
+            .await
+            .unwrap();
+
+        assert!(
+            results.len() >= 2,
+            "should return multiple matches, got {}",
+            results.len()
+        );
+
+        // The module with "graph" as a :: segment should rank higher than
+        // a section where "graph" is part of a longer heading
+        assert_eq!(
+            results[0].entity_name, "ferrosa-memory-core::graph",
+            "exact segment match should rank first, got: {}",
+            results[0].entity_name
+        );
     }
 }

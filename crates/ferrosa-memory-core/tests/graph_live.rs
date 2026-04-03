@@ -4,7 +4,7 @@
 //! via graph HTTP (MATCH queries). This matches Ferrosa's architecture:
 //! graph vertices are CQL rows.
 //!
-//! Requires: docker compose up -d (single node on port 19042/17474)
+//! Requires: podman compose up -d (single node on port 19042/17474)
 //! Run with: cargo test -p ferrosa-memory-core --test graph_live -- --ignored
 
 use ferrosa_memory_core::graph::{GraphClient, GraphConfig};
