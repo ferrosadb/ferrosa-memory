@@ -78,6 +78,7 @@ services:
       FERROSA_DATA_DIR: /var/lib/ferrosa
       FERROSA_AUTH_DISABLED: "true"
       FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_CQL_BROADCAST: "127.0.0.1:19042"
       FERROSA_WEB_BIND: "0.0.0.0:9090"
       FERROSA_GRAPH_ENABLED: "true"
       FERROSA_CLUSTER_NAME: ferrosa-memory
@@ -116,6 +117,7 @@ services:
       FERROSA_DATA_DIR: /var/lib/ferrosa
       FERROSA_AUTH_DISABLED: "true"
       FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_CQL_BROADCAST: "127.0.0.1:19043"
       FERROSA_WEB_BIND: "0.0.0.0:9090"
       FERROSA_GRAPH_ENABLED: "true"
       FERROSA_CLUSTER_NAME: ferrosa-memory
@@ -157,6 +159,7 @@ services:
       FERROSA_DATA_DIR: /var/lib/ferrosa
       FERROSA_AUTH_DISABLED: "true"
       FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_CQL_BROADCAST: "127.0.0.1:19044"
       FERROSA_WEB_BIND: "0.0.0.0:9090"
       FERROSA_GRAPH_ENABLED: "true"
       FERROSA_CLUSTER_NAME: ferrosa-memory

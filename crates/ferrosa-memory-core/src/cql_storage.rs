@@ -1277,7 +1277,10 @@ impl Storage for CqlStorage {
                 source_fold_id: row.r_by_name::<Uuid>("source_fold_id").ok(),
                 context_snippet: row.r_by_name("context_snippet").unwrap_or_default(),
                 entity_embedding: None,
-                confidence: row.r_by_name::<f32>("confidence").map(f64::from).unwrap_or(0.0),
+                confidence: row
+                    .r_by_name::<f32>("confidence")
+                    .map(f64::from)
+                    .unwrap_or(0.0),
                 state,
                 created_at: created.and_utc(),
             });

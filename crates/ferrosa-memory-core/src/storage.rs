@@ -347,6 +347,7 @@ pub trait Storage: Send + Sync {
     // --- Tool usage logging ---
 
     /// Log a tool call's token usage (fire-and-forget, best-effort).
+    #[allow(clippy::too_many_arguments)]
     async fn tool_usage_put(
         &self,
         ctx: &TenantContext,

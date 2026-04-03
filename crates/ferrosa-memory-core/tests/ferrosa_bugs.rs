@@ -386,12 +386,11 @@ async fn ghost_rows_do_not_crash_queries() {
     let session = storage.session();
     session
         .query_with_values(
-            format!(
-                "INSERT INTO agent_memory.entity_store \
+            "INSERT INTO agent_memory.entity_store \
              (tenant_id, session_id, entity_id, entity_name, entity_type, \
               context_snippet, confidence, created_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, toTimestamp(now()))"
-            ),
+                .to_string(),
             query_values!(
                 tenant_id,
                 session_id,
@@ -408,11 +407,10 @@ async fn ghost_rows_do_not_crash_queries() {
     // Insert a ghost entity row (NULL entity_name via incomplete insert)
     session
         .query_with_values(
-            format!(
-                "INSERT INTO agent_memory.entity_store \
+            "INSERT INTO agent_memory.entity_store \
              (tenant_id, session_id, entity_id, confidence, created_at) \
              VALUES (?, ?, ?, ?, toTimestamp(now()))"
-            ),
+                .to_string(),
             query_values!(tenant_id, session_id, Uuid::new_v4(), 0.5_f32),
         )
         .await
@@ -421,11 +419,10 @@ async fn ghost_rows_do_not_crash_queries() {
     // Insert a valid typed edge
     session
         .query_with_values(
-            format!(
-                "INSERT INTO agent_memory.typed_edges \
+            "INSERT INTO agent_memory.typed_edges \
              (tenant_id, session_id, src_id, edge_type, dst_id, weight, metadata, created_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, toTimestamp(now()))"
-            ),
+                .to_string(),
             query_values!(
                 tenant_id,
                 session_id,
@@ -442,11 +439,10 @@ async fn ghost_rows_do_not_crash_queries() {
     // Insert a ghost typed edge (NULL edge_type)
     session
         .query_with_values(
-            format!(
-                "INSERT INTO agent_memory.typed_edges \
+            "INSERT INTO agent_memory.typed_edges \
              (tenant_id, session_id, src_id, edge_type, dst_id, weight, created_at) \
              VALUES (?, ?, ?, ?, ?, ?, toTimestamp(now()))"
-            ),
+                .to_string(),
             query_values!(
                 tenant_id,
                 session_id,

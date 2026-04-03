@@ -857,14 +857,17 @@ pub async fn dispatch<S: crate::storage::Storage>(
     match method {
         "initialize" => {
             // Extract repo from client roots (MCP spec: roots[].uri).
-            if session.repo.get().is_none() {
-                if let Some(roots) = params.get("roots").and_then(|v| v.as_array()) {
-                    if let Some(uri) = roots.first().and_then(|r| r.get("uri")).and_then(|u| u.as_str()) {
-                        let path = uri.strip_prefix("file://").unwrap_or(uri).to_string();
-                        let _ = session.repo.set(path.clone());
-                        tracing::info!(repo = %path, "repo set from MCP initialize roots");
-                    }
-                }
+            if session.repo.get().is_none()
+                && let Some(uri) = params
+                    .get("roots")
+                    .and_then(|v| v.as_array())
+                    .and_then(|roots| roots.first())
+                    .and_then(|r| r.get("uri"))
+                    .and_then(|u| u.as_str())
+            {
+                let path = uri.strip_prefix("file://").unwrap_or(uri).to_string();
+                let _ = session.repo.set(path.clone());
+                tracing::info!(repo = %path, "repo set from MCP initialize roots");
             }
             Ok(server_info())
         }
@@ -1001,7 +1004,16 @@ async fn dispatch_tool<S: crate::storage::Storage>(
     let latency_ms = start.elapsed().as_millis() as i32;
     let repo = session.repo.get().map(|s| s.as_str()).unwrap_or("");
     if let Err(e) = storage
-        .tool_usage_put(ctx, name, repo, input_bytes, output_bytes, estimated_tokens, latency_ms, is_err)
+        .tool_usage_put(
+            ctx,
+            name,
+            repo,
+            input_bytes,
+            output_bytes,
+            estimated_tokens,
+            latency_ms,
+            is_err,
+        )
         .await
     {
         tracing::debug!(error = %e, "tool usage logging failed");

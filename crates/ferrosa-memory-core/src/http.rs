@@ -705,11 +705,25 @@ async fn build_snapshot<S: Storage>(
     // Drop CO_OCCURS edges with no strength — they add no information.
     edges.retain(|e| e.strength.is_some() || e.edge_type != "CO_OCCURS");
 
-    // Load typed edges (depends_on, contains, calls, etc.) for the configured session.
-    let typed_edges = storage
-        .typed_edge_list_session(ctx, session_id)
-        .await
-        .unwrap_or_default();
+    // Load typed edges (depends_on, contains, calls, etc.).
+    // Probe both the configured session and nil session (used by skilltools ingest).
+    let mut session_ids_to_probe = vec![session_id];
+    let nil = uuid::Uuid::nil();
+    if session_id != nil {
+        session_ids_to_probe.push(nil);
+    }
+    let mut typed_edges = Vec::new();
+    for sid in session_ids_to_probe {
+        match storage.typed_edge_list_session(ctx, sid).await {
+            Ok(mut te) => {
+                tracing::info!(session_id = %sid, count = te.len(), "viz: loaded typed edges");
+                typed_edges.append(&mut te);
+            }
+            Err(e) => {
+                tracing::warn!(session_id = %sid, error = %e, "viz: typed_edge_list_session failed");
+            }
+        }
+    }
     for te in typed_edges {
         let src_s = te.src_id.to_string();
         let dst_s = te.dst_id.to_string();
@@ -1001,5 +1015,216 @@ mod tests {
             .iter()
             .any(|(k, v)| k.eq_ignore_ascii_case("accept") && v.contains("text/event-stream"));
         assert!(has_accept, "should have SSE accept header");
+    }
+
+    // --- build_snapshot tests ---
+
+    use crate::storage::mock::{MockEdge, MockStorage};
+    use crate::types::{EntityEntry, MemoryState, TenantContext, TypedEdge};
+
+    fn test_tenant() -> TenantContext {
+        TenantContext {
+            tenant_id: Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            session_origin: String::new(),
+        }
+    }
+
+    fn test_entity(tenant_id: Uuid, session_id: Uuid, id: Uuid, name: &str) -> EntityEntry {
+        EntityEntry {
+            tenant_id,
+            entity_id: id,
+            session_id,
+            entity_name: name.to_string(),
+            entity_type: "concept".to_string(),
+            source_fold_id: None,
+            context_snippet: String::new(),
+            entity_embedding: None,
+            confidence: 0.9,
+            state: MemoryState::Active,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn test_typed_edge(
+        tenant_id: Uuid,
+        session_id: Uuid,
+        src: Uuid,
+        dst: Uuid,
+        edge_type: &str,
+    ) -> TypedEdge {
+        TypedEdge {
+            tenant_id,
+            session_id,
+            src_id: src,
+            edge_type: edge_type.to_string(),
+            dst_id: dst,
+            weight: 1.0,
+            metadata: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_typed_edges_from_nil_session_appear_with_nil_viz_session() {
+        let ctx = test_tenant();
+        let nil = Uuid::nil();
+        let e1 = Uuid::new_v4();
+        let e2 = Uuid::new_v4();
+
+        let storage = MockStorage::new();
+        storage.entities.lock().await.extend(vec![
+            test_entity(ctx.tenant_id, nil, e1, "foo"),
+            test_entity(ctx.tenant_id, nil, e2, "bar"),
+        ]);
+        storage.typed_edges.lock().await.push(test_typed_edge(
+            ctx.tenant_id,
+            nil,
+            e1,
+            e2,
+            "depends_on",
+        ));
+
+        let snap = build_snapshot(&storage, &ctx, nil).await;
+        let VizEvent::Snapshot { edges, .. } = snap else {
+            panic!("expected Snapshot");
+        };
+        assert_eq!(edges.len(), 1, "typed edge under nil session should appear");
+        assert_eq!(edges[0].edge_type, "depends_on");
+    }
+
+    #[tokio::test]
+    async fn snapshot_typed_edges_from_nil_session_appear_with_nonnil_viz_session() {
+        let ctx = test_tenant();
+        let nil = Uuid::nil();
+        let viz_session = Uuid::new_v4();
+        let e1 = Uuid::new_v4();
+        let e2 = Uuid::new_v4();
+
+        let storage = MockStorage::new();
+        // Entities under the viz session (entity_list_session filters by session)
+        storage.entities.lock().await.extend(vec![
+            test_entity(ctx.tenant_id, viz_session, e1, "foo"),
+            test_entity(ctx.tenant_id, viz_session, e2, "bar"),
+        ]);
+        // Edge stored under nil session (e.g. skilltools ingest)
+        storage.typed_edges.lock().await.push(test_typed_edge(
+            ctx.tenant_id,
+            nil,
+            e1,
+            e2,
+            "contains",
+        ));
+
+        let snap = build_snapshot(&storage, &ctx, viz_session).await;
+        let VizEvent::Snapshot { edges, .. } = snap else {
+            panic!("expected Snapshot");
+        };
+        assert_eq!(
+            edges.len(),
+            1,
+            "nil-session typed edge should appear even when viz uses a different session"
+        );
+        assert_eq!(edges[0].edge_type, "contains");
+    }
+
+    #[tokio::test]
+    async fn snapshot_combines_typed_edges_from_both_sessions() {
+        let ctx = test_tenant();
+        let nil = Uuid::nil();
+        let viz_session = Uuid::new_v4();
+        let e1 = Uuid::new_v4();
+        let e2 = Uuid::new_v4();
+        let e3 = Uuid::new_v4();
+
+        let storage = MockStorage::new();
+        // All entities under the viz session so they appear in the node set
+        storage.entities.lock().await.extend(vec![
+            test_entity(ctx.tenant_id, viz_session, e1, "a"),
+            test_entity(ctx.tenant_id, viz_session, e2, "b"),
+            test_entity(ctx.tenant_id, viz_session, e3, "c"),
+        ]);
+        // Edges split across nil and viz sessions
+        storage.typed_edges.lock().await.extend(vec![
+            test_typed_edge(ctx.tenant_id, nil, e1, e2, "calls"),
+            test_typed_edge(ctx.tenant_id, viz_session, e2, e3, "depends_on"),
+        ]);
+
+        let snap = build_snapshot(&storage, &ctx, viz_session).await;
+        let VizEvent::Snapshot { edges, .. } = snap else {
+            panic!("expected Snapshot");
+        };
+        assert_eq!(
+            edges.len(),
+            2,
+            "should combine edges from nil and viz session"
+        );
+        let types: std::collections::HashSet<&str> =
+            edges.iter().map(|e| e.edge_type.as_str()).collect();
+        assert!(types.contains("calls"));
+        assert!(types.contains("depends_on"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_excludes_typed_edges_with_missing_endpoints() {
+        let ctx = test_tenant();
+        let nil = Uuid::nil();
+        let e1 = Uuid::new_v4();
+        let orphan = Uuid::new_v4(); // not in entities
+
+        let storage = MockStorage::new();
+        storage
+            .entities
+            .lock()
+            .await
+            .push(test_entity(ctx.tenant_id, nil, e1, "foo"));
+        // Edge points to entity not in the node set
+        storage.typed_edges.lock().await.push(test_typed_edge(
+            ctx.tenant_id,
+            nil,
+            e1,
+            orphan,
+            "references",
+        ));
+
+        let snap = build_snapshot(&storage, &ctx, nil).await;
+        let VizEvent::Snapshot { edges, .. } = snap else {
+            panic!("expected Snapshot");
+        };
+        assert_eq!(
+            edges.len(),
+            0,
+            "edge with missing endpoint should be excluded"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_filters_co_occurs_without_strength() {
+        let ctx = test_tenant();
+        let nil = Uuid::nil();
+        let e1 = Uuid::new_v4();
+        let e2 = Uuid::new_v4();
+
+        let storage = MockStorage::new();
+        storage.entities.lock().await.extend(vec![
+            test_entity(ctx.tenant_id, nil, e1, "foo"),
+            test_entity(ctx.tenant_id, nil, e2, "bar"),
+        ]);
+        // MockEdge produces CO_OCCURS with no strength via edge_list_all
+        storage.edges.lock().await.push(MockEdge {
+            source: e1,
+            target: e2,
+            edge_type: "CO_OCCURS".to_string(),
+            session_id: nil,
+        });
+
+        let snap = build_snapshot(&storage, &ctx, nil).await;
+        let VizEvent::Snapshot { edges, .. } = snap else {
+            panic!("expected Snapshot");
+        };
+        assert_eq!(
+            edges.len(),
+            0,
+            "CO_OCCURS without strength should be filtered out"
+        );
     }
 }

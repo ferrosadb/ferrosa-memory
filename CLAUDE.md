@@ -25,6 +25,10 @@ On every session start (including after `/clear`), immediately restore context f
 
 Do not wait for the user to ask — this is automatic.
 
+## No Workarounds for Ferrosa Bugs
+
+This project is a test program for the Ferrosa database. Never build workarounds, fallback logic, or compatibility shims in this repo for missing or broken Ferrosa functionality. If the database has a bug, file a report in `../ferrosa/specs/` and fix it upstream. Working around database bugs here hides them and defeats the purpose of this project.
+
 ## Related Projects
 
 - `../ferrosa/` — Ferrosa DB engine. Architecture specs at `../ferrosa/specs/` (CQL protocol, SUBSCRIBE semantics, storage engine, graph engine, consensus).
