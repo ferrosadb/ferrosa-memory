@@ -1,0 +1,91 @@
+# Level 3 Semantic: Graph completeness -- density and connectivity
+#
+# Validates that the knowledge graph achieves meaningful density when
+# entities are connected with typed edges. Creates 6 entities with
+# explicit edges, then measures graph density and connectivity.
+
+[scenario]
+id = "semantic-graph-completeness"
+name = "Graph Completeness: Density and Connectivity"
+description = """
+Tests semantic repository graph completeness. Creates a network of 6 \
+entities with typed edges representing real architectural relationships \
+(depends_on, contains, uses). Runs consolidation for additional edge \
+discovery. Measures graph density, connectivity, and verifies that the \
+graph forms a connected component rather than isolated islands."""
+level = 3
+tags = ["semantic", "graph", "density", "connectivity", "completeness"]
+timeout_ms = 45000
+
+# Step 1-6: Create 6 entities forming an architecture graph
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "API Gateway", entity_type = "concept", context_snippet = "API Gateway is the entry point for all external HTTP requests. Routes to downstream microservices." }
+
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "Auth Service", entity_type = "project", context_snippet = "Auth Service handles OAuth2 authentication and JWT token issuance for the API Gateway." }
+
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "User Service", entity_type = "project", context_snippet = "User Service manages user profiles, preferences, and account data. Called by Auth Service for identity resolution." }
+
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "PostgreSQL", entity_type = "concept", context_snippet = "PostgreSQL is the relational database backing User Service and Auth Service for persistent storage." }
+
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "Redis Cache", entity_type = "concept", context_snippet = "Redis Cache provides session caching and rate limiting for the API Gateway and Auth Service." }
+
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "Message Queue", entity_type = "concept", context_snippet = "Message Queue (NATS) handles async event delivery between Auth Service, User Service, and the API Gateway." }
+
+# Step 7: Create typed edges between entities
+# Note: src_entity_id and dst_entity_id will be injected by the runner
+# from entity_ids returned by preceding upsert_entity steps
+[[steps]]
+tool = "batch_create_edges"
+arguments = { edges = [
+    { src_entity_id = "placeholder", dst_entity_id = "placeholder", edge_type = "uses", weight = 1.0 },
+    { src_entity_id = "placeholder", dst_entity_id = "placeholder", edge_type = "uses", weight = 1.0 },
+    { src_entity_id = "placeholder", dst_entity_id = "placeholder", edge_type = "depends_on", weight = 1.0 },
+    { src_entity_id = "placeholder", dst_entity_id = "placeholder", edge_type = "depends_on", weight = 1.0 },
+    { src_entity_id = "placeholder", dst_entity_id = "placeholder", edge_type = "depends_on", weight = 0.8 },
+    { src_entity_id = "placeholder", dst_entity_id = "placeholder", edge_type = "uses", weight = 0.9 },
+    { src_entity_id = "placeholder", dst_entity_id = "placeholder", edge_type = "uses", weight = 0.9 },
+] }
+
+# Step 8: Run consolidation for additional edge discovery
+[[steps]]
+tool = "run_consolidation"
+arguments = {}
+
+# Step 9: Explore the graph to measure connectivity
+[[steps]]
+tool = "explore_connections"
+expect_in_response = ["API Gateway", "Auth Service"]
+arguments = { traversal = "related_entities", max_depth = 3, limit = 20 }
+
+# Step 10: Spread activation to measure reachability
+[[steps]]
+tool = "spread_activation"
+arguments = { seeds = ["placeholder"], max_hops = 3, decay = 0.7, limit = 10 }
+
+[grading]
+methods = ["programmatic", "claim_rubric"]
+
+[grading.claim_rubric]
+claims = [
+    "Six entities are created representing an architecture graph",
+    "Typed edges (uses, depends_on) connect the entities",
+    "Consolidation discovers additional CO_OCCURS edges",
+    "Graph exploration reaches multiple entities within 3 hops",
+    "Spread activation propagates through the connected graph",
+    "No isolated entity islands exist after edge creation and consolidation",
+]
+passing_threshold = 0.75
+
+[semantic]
+expect_type_consistency = true

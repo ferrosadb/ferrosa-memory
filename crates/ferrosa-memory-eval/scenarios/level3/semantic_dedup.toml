@@ -1,0 +1,85 @@
+# Level 3 Semantic: Semantic deduplication via smart_ingest + find_duplicates
+#
+# Validates that the system recognizes near-duplicate entities and makes
+# correct UPDATE/SKIP decisions rather than creating redundant copies.
+# Also verifies that find_duplicates detects overlapping descriptions.
+
+[scenario]
+id = "semantic-dedup"
+name = "Semantic Deduplication: Near-Duplicate Detection"
+description = """
+Tests semantic repository deduplication accuracy. Inserts entities via \
+smart_ingest with near-duplicate descriptions (same concept, different \
+phrasing). Verifies that smart_ingest makes UPDATE or SKIP decisions \
+for subsequent ingestions rather than creating redundant entities. Also \
+verifies that find_duplicates detects overlapping entities after creation."""
+level = 3
+tags = ["semantic", "dedup", "smart_ingest", "find_duplicates", "precision"]
+timeout_ms = 30000
+
+# Step 1: Ingest the original entity
+[[steps]]
+tool = "smart_ingest"
+expect_in_response = ["Created"]
+expect_action = "Created"
+arguments = { content = "Ferrosa is a distributed database engine written in Rust that supports CQL, graph traversal, and vector search.", entity_type = "project", entity_name = "Ferrosa" }
+
+# Step 2: Ingest a near-duplicate with different phrasing (should UPDATE)
+[[steps]]
+tool = "smart_ingest"
+expect_in_response = ["Updated"]
+expect_action = "Updated"
+arguments = { content = "Ferrosa DB is a Rust-based distributed database providing CQL queries, knowledge graph edges, and ANN vector similarity search.", entity_type = "project", entity_name = "Ferrosa DB" }
+
+# Step 3: Ingest another near-duplicate with more detail (should UPDATE)
+[[steps]]
+tool = "smart_ingest"
+expect_in_response = ["Updated"]
+expect_action = "Updated"
+arguments = { content = "The Ferrosa database engine, implemented in Rust, offers CQL protocol compatibility, typed graph edges with traversal, HNSW-based vector search, and Datalog inference.", entity_type = "project", entity_name = "Ferrosa" }
+
+# Step 4: Ingest something clearly different (should CREATE)
+[[steps]]
+tool = "smart_ingest"
+expect_in_response = ["Created"]
+expect_action = "Created"
+arguments = { content = "Redis is an in-memory key-value store used for caching, session management, and pub/sub messaging.", entity_type = "project", entity_name = "Redis" }
+
+# Step 5: Run find_duplicates to check detection
+[[steps]]
+tool = "find_duplicates"
+arguments = { threshold = 0.6 }
+
+# Step 6: Verify entity count reflects deduplication
+[[steps]]
+tool = "retrieve_entities"
+expect_in_response = ["Ferrosa"]
+arguments = { query = "Ferrosa database", strategy = "phonetic" }
+
+[grading]
+methods = ["programmatic", "claim_rubric", "llm_judge"]
+
+[grading.claim_rubric]
+claims = [
+    "First Ferrosa ingest creates a new entity",
+    "Second ingest (rephrased Ferrosa) updates existing entity, not creates new",
+    "Third ingest (expanded Ferrosa) updates existing entity, not creates new",
+    "Redis ingest creates a separate new entity (clearly different)",
+    "find_duplicates correctly identifies near-duplicate Ferrosa descriptions",
+    "Total entity count reflects deduplication (2 entities, not 4)",
+]
+passing_threshold = 0.75
+
+[grading.llm_judge]
+rubric = """
+Evaluate whether the system correctly handled near-duplicate content:
+1. Three descriptions of Ferrosa (different phrasing, same concept) should result
+   in a single entity with UPDATE decisions for the 2nd and 3rd ingests.
+2. Redis description (clearly different concept) should create a separate entity.
+3. find_duplicates should detect the semantic overlap if any duplicates slipped through.
+Judge PASS if deduplication decisions are correct and entity count is minimal.
+"""
+
+[semantic]
+expect_type_consistency = true
+expect_dedup_on_update = true

@@ -1,0 +1,81 @@
+# Level 3 Semantic: Inference correctness via Datalog rules and derived facts
+#
+# Validates that the semantic repository correctly derives new facts from
+# base facts using Datalog rules. Adds rules, creates base fact entities,
+# then queries for derived facts and verifies correctness.
+
+[scenario]
+id = "semantic-inference-correctness"
+name = "Inference Correctness: Datalog Rule Evaluation"
+description = """
+Tests semantic repository inference capability. Registers Datalog rules \
+for transitivity and category membership, creates base fact entities with \
+typed edges, then queries query_derived to verify that the inference \
+engine correctly derives transitive relationships and category membership \
+from the base facts."""
+level = 3
+tags = ["semantic", "inference", "datalog", "derived_facts", "correctness"]
+timeout_ms = 45000
+
+# Step 1: Register a transitivity rule
+[[steps]]
+tool = "manage_rules"
+arguments = { action = "put", rule_id = "transitive_depends", family = "dependency", name = "Transitive Dependency", rule_body = "depends_on(X, Z) :- depends_on(X, Y), depends_on(Y, Z)" }
+
+# Step 2: Register an ISA inheritance rule
+[[steps]]
+tool = "manage_rules"
+arguments = { action = "put", rule_id = "isa_transitivity", family = "ontology", name = "ISA Transitivity", rule_body = "isa(X, Z) :- isa(X, Y), isa(Y, Z)" }
+
+# Step 3: Create base entity A (high-level module)
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "CQL Parser", entity_type = "concept", context_snippet = "CQL Parser is the lexer and parser module that converts CQL text into an AST. Depends on the Token module." }
+
+# Step 4: Create base entity B (mid-level module)
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "Token Module", entity_type = "concept", context_snippet = "Token Module defines CQL token types and provides lexical analysis. Depends on the Unicode Normalizer." }
+
+# Step 5: Create base entity C (foundation module)
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "Unicode Normalizer", entity_type = "concept", context_snippet = "Unicode Normalizer handles UTF-8 normalization for consistent string comparison in CQL parsing." }
+
+# Step 6: Create typed edge: A depends_on B
+[[steps]]
+tool = "create_edge"
+arguments = { edge_type = "depends_on", metadata = "CQL Parser depends on Token Module for lexical tokens" }
+
+# Step 7: Create typed edge: B depends_on C
+[[steps]]
+tool = "create_edge"
+arguments = { edge_type = "depends_on", metadata = "Token Module depends on Unicode Normalizer for text normalization" }
+
+# Step 8: Query for derived transitive dependencies (A depends_on C)
+[[steps]]
+tool = "query_derived"
+expect_in_response = ["CQL Parser", "Unicode Normalizer"]
+arguments = { predicate = "depends_on" }
+
+# Step 9: Verify rules are listed
+[[steps]]
+tool = "manage_rules"
+expect_in_response = ["transitive_depends", "isa_transitivity"]
+arguments = { action = "list" }
+
+[grading]
+methods = ["programmatic", "claim_rubric"]
+
+[grading.claim_rubric]
+claims = [
+    "Datalog transitivity rule is registered and active",
+    "ISA inheritance rule is registered and active",
+    "Base entities and dependency edges are created correctly",
+    "Derived facts include transitive dependency: CQL Parser depends_on Unicode Normalizer",
+    "Rule listing shows both registered rules",
+]
+passing_threshold = 0.75
+
+[semantic]
+expect_type_consistency = true

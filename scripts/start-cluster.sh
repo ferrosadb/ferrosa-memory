@@ -2,6 +2,8 @@
 # Wait for podman machine to be ready, then start the ferrosa-memory cluster.
 # Used by com.ferrosa-memory.cluster LaunchAgent.
 
+export PATH="/opt/homebrew/bin:$PATH"
+
 LOG="/tmp/ferrosa-memory-cluster.log"
 exec >> "$LOG" 2>&1
 echo "$(date): start-cluster.sh invoked"

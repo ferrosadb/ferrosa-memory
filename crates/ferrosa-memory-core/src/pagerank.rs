@@ -112,6 +112,45 @@ pub async fn update_pagerank_scores(
                     session_id,
                     warmth: 0.0,
                     pagerank: *score,
+                    reputation: 0.0,
+                    last_accessed_at: chrono::Utc::now(),
+                    access_count: 0,
+                    decay_zone: DecayZone::Knowledge,
+                    updated_at: chrono::Utc::now(),
+                };
+                storage.warmth_put(ctx, &entry).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Apply reputation deltas to the warmth table.
+///
+/// Each entry in `deltas` maps entity_id to a reputation change (positive or negative).
+/// If the entity has no warmth entry yet, one is created with only the reputation field set.
+/// Reputation is clamped to [-1.0, 1.0] to prevent runaway penalties or inflation.
+pub async fn update_reputation_scores(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    session_id: Uuid,
+    deltas: &HashMap<Uuid, f64>,
+) -> anyhow::Result<()> {
+    for (entity_id, delta) in deltas {
+        match storage.warmth_get(ctx, *entity_id).await? {
+            Some(mut entry) => {
+                entry.reputation = (entry.reputation + delta).clamp(-1.0, 1.0);
+                entry.updated_at = chrono::Utc::now();
+                storage.warmth_put(ctx, &entry).await?;
+            }
+            None => {
+                let entry = WarmthEntry {
+                    tenant_id: ctx.tenant_id,
+                    entity_id: *entity_id,
+                    session_id,
+                    warmth: 0.0,
+                    pagerank: 0.0,
+                    reputation: delta.clamp(-1.0, 1.0),
                     last_accessed_at: chrono::Utc::now(),
                     access_count: 0,
                     decay_zone: DecayZone::Knowledge,
@@ -255,6 +294,7 @@ mod tests {
             session_id: sid,
             warmth: 5.0,
             pagerank: 0.1,
+            reputation: 0.0,
             last_accessed_at: chrono::Utc::now(),
             access_count: 3,
             decay_zone: DecayZone::Identity,
@@ -274,6 +314,117 @@ mod tests {
         // Warmth and other fields should be preserved
         assert!((entry.warmth - 5.0).abs() < f64::EPSILON);
         assert_eq!(entry.access_count, 3);
+        assert_eq!(entry.decay_zone, DecayZone::Identity);
+    }
+
+    #[tokio::test]
+    async fn test_update_reputation_creates_entry() {
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+        let sid = Uuid::new_v4();
+        let eid = Uuid::new_v4();
+
+        let mut deltas = HashMap::new();
+        deltas.insert(eid, -0.2);
+
+        update_reputation_scores(&storage, &ctx, sid, &deltas)
+            .await
+            .unwrap();
+
+        let entry = storage.warmth_get(&ctx, eid).await.unwrap().unwrap();
+        assert!((entry.reputation - (-0.2)).abs() < f64::EPSILON);
+        assert!((entry.warmth - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_update_reputation_accumulates() {
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+        let sid = Uuid::new_v4();
+        let eid = Uuid::new_v4();
+
+        let mut deltas = HashMap::new();
+        deltas.insert(eid, -0.2);
+        update_reputation_scores(&storage, &ctx, sid, &deltas)
+            .await
+            .unwrap();
+
+        // Apply another penalty
+        update_reputation_scores(&storage, &ctx, sid, &deltas)
+            .await
+            .unwrap();
+
+        let entry = storage.warmth_get(&ctx, eid).await.unwrap().unwrap();
+        assert!((entry.reputation - (-0.4)).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_update_reputation_clamps_to_bounds() {
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+        let sid = Uuid::new_v4();
+        let eid = Uuid::new_v4();
+
+        // Apply extreme negative delta
+        let mut deltas = HashMap::new();
+        deltas.insert(eid, -5.0);
+        update_reputation_scores(&storage, &ctx, sid, &deltas)
+            .await
+            .unwrap();
+
+        let entry = storage.warmth_get(&ctx, eid).await.unwrap().unwrap();
+        assert!(
+            (entry.reputation - (-1.0)).abs() < f64::EPSILON,
+            "should clamp to -1.0"
+        );
+
+        // Apply extreme positive delta
+        deltas.insert(eid, 10.0);
+        update_reputation_scores(&storage, &ctx, sid, &deltas)
+            .await
+            .unwrap();
+
+        let entry = storage.warmth_get(&ctx, eid).await.unwrap().unwrap();
+        assert!(
+            (entry.reputation - 1.0).abs() < f64::EPSILON,
+            "should clamp to 1.0"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_reputation_preserves_other_fields() {
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+        let sid = Uuid::new_v4();
+        let eid = Uuid::new_v4();
+
+        // Create existing entry with non-default fields
+        let existing = WarmthEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: eid,
+            session_id: sid,
+            warmth: 3.0,
+            pagerank: 0.5,
+            reputation: 0.0,
+            last_accessed_at: chrono::Utc::now(),
+            access_count: 7,
+            decay_zone: DecayZone::Identity,
+            updated_at: chrono::Utc::now(),
+        };
+        storage.warmth_put(&ctx, &existing).await.unwrap();
+
+        let mut deltas = HashMap::new();
+        deltas.insert(eid, -0.3);
+        update_reputation_scores(&storage, &ctx, sid, &deltas)
+            .await
+            .unwrap();
+
+        let entry = storage.warmth_get(&ctx, eid).await.unwrap().unwrap();
+        assert!((entry.reputation - (-0.3)).abs() < f64::EPSILON);
+        // Other fields preserved
+        assert!((entry.warmth - 3.0).abs() < f64::EPSILON);
+        assert!((entry.pagerank - 0.5).abs() < f64::EPSILON);
+        assert_eq!(entry.access_count, 7);
         assert_eq!(entry.decay_zone, DecayZone::Identity);
     }
 }

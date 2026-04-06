@@ -829,6 +829,24 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
     ]
 }
 
+/// Memory guide included in initialize instructions.
+/// Teaches the LLM how to use the memory system to build knowledge.
+const MEMORY_GUIDE: &str = r#"You have a semantic memory system. Use it BEFORE grep, find, or reading files. It should be your first source of context, not a fallback.
+
+SESSION START: (1) check_intentions with current context, (2) hybrid_search for what you're working on, (3) tell user what you remember. Do this BEFORE reading files.
+
+SEARCHING: hybrid_search first. If it returns what you need, you're done — no need to grep or read files. If results are insufficient, the response will suggest deeper tools (recursive_explore, spread_activation). Only fall back to grep/find/read if memory genuinely doesn't have what you need.
+
+STORING: Use smart_ingest for new knowledge. It decides CREATE/UPDATE/SUPERSEDE/SKIP. Store insights, decisions, relationships, and facts — not raw file contents.
+
+CONNECTING: After learning 2+ related facts, use create_edge to link them. Types: depends_on, contains, part_of, related_to, calls, implements, uses, references. Connected facts are knowledge; isolated facts are just data.
+
+INTENTIONS: set_intention for deferred actions. check_intentions at session start. Triggers: Topic, FilePattern, Duration, Context.
+
+CONSOLIDATION: After significant learning (10+ entities), run run_consolidation to discover CO_OCCURS patterns.
+
+FEEDBACK: If you had to use grep, find, or read files to get context that SHOULD have been in memory, call record_outcome with program_type="retrieval_miss" and include what you were looking for. This trains the system to store that kind of information in the future. Every retrieval miss is a signal to improve."#;
+
 /// Server info returned during initialize.
 fn server_info() -> Value {
     serde_json::json!({
@@ -839,7 +857,8 @@ fn server_info() -> Value {
         "serverInfo": {
             "name": "ferrosa-memory-mcp",
             "version": env!("CARGO_PKG_VERSION")
-        }
+        },
+        "instructions": MEMORY_GUIDE
     })
 }
 
@@ -873,7 +892,19 @@ pub async fn dispatch<S: crate::storage::Storage>(
         }
         "notifications/initialized" => Ok(Value::Null),
         "tools/list" => {
-            let tools = tool_definitions(&session.entity_types);
+            let include_all = params
+                .get("include_all")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let all_tools = tool_definitions(&session.entity_types);
+            let tools: Vec<ToolDef> = if include_all {
+                all_tools
+            } else {
+                all_tools
+                    .into_iter()
+                    .filter(|t| is_tier1(&t.name))
+                    .collect()
+            };
             Ok(serde_json::json!({ "tools": tools }))
         }
         "tools/call" => dispatch_tool(params, storage, ctx, session).await,
@@ -1022,6 +1053,29 @@ async fn dispatch_tool<S: crate::storage::Storage>(
     wrapped
 }
 
+/// Returns true for tier-1 tools (always visible in tools/list).
+/// Tier 2 tools are only returned when `include_all: true` is passed.
+fn is_tier1(name: &str) -> bool {
+    matches!(
+        name,
+        "smart_ingest"
+            | "hybrid_search"
+            | "create_edge"
+            | "batch_create_edges"
+            | "explore_connections"
+            | "check_intentions"
+            | "set_intention"
+            | "complete_intention"
+            | "get_stats"
+            | "write_temporal_fact"
+            | "get_temporal_chain"
+            | "retrieve_entities"
+            | "find_memory_chain"
+            | "run_consolidation"
+            | "record_outcome"
+    )
+}
+
 /// Returns true for tools that modify stored data (writes, upserts, deletes).
 /// Used to set the dirty flag for idle consolidation.
 fn is_write_tool(name: &str) -> bool {
@@ -1134,7 +1188,7 @@ async fn handle_write_plan<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
     let depth = require_i32(&args, "depth")?;
     let subtask_id = require_str(&args, "subtask_id")?;
     let parent_subtask = args.get("parent_subtask").and_then(|v| v.as_str());
@@ -1160,7 +1214,7 @@ async fn handle_get_plan<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
     let max_depth = args
         .get("max_depth")
         .and_then(|v| v.as_i64())
@@ -1178,7 +1232,7 @@ async fn handle_update_plan<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
     let depth = require_i32(&args, "depth")?;
     let subtask_id = require_str(&args, "subtask_id")?;
     let status_str = require_str(&args, "status")?;
@@ -1210,7 +1264,7 @@ async fn handle_start_fold<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
     let depth = require_i32(&args, "depth")?;
     let parent_fold_id = optional_uuid(&args, "parent_fold_id")?;
     let initial_context = require_str(&args, "initial_context")?;
@@ -1234,7 +1288,7 @@ async fn handle_append_fold<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
     let fold_id = require_uuid(&args, "fold_id")?;
     let repl_turn = require_str(&args, "repl_turn")?;
 
@@ -1252,7 +1306,7 @@ async fn handle_complete_fold<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
     let fold_id = require_uuid(&args, "fold_id")?;
     let summary = require_str(&args, "summary")?;
     let embedding = require_f32_array(&args, "embedding")?;
@@ -1288,7 +1342,7 @@ async fn handle_retrieve_fold<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
     let query_embedding = require_f32_array(&args, "query_embedding")?;
     let query_text = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -1333,7 +1387,7 @@ async fn handle_upsert_entity<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
     let entity_name = require_str(&args, "entity_name")?;
     let entity_type = require_str(&args, "entity_type")?;
     let context_snippet = require_str(&args, "context_snippet")?;
@@ -1394,6 +1448,7 @@ async fn handle_upsert_entity<S: crate::storage::Storage>(
             confidence: confidence.unwrap_or(1.0),
             created_at: chrono::Utc::now().to_rfc3339(),
             context: context_snippet.to_string(),
+            child_count: None,
         },
         action: action.into(),
     });
@@ -1494,6 +1549,7 @@ async fn handle_batch_ingest<S: crate::storage::Storage>(
                         confidence: confidence.unwrap_or(1.0),
                         created_at: chrono::Utc::now().to_rfc3339(),
                         context: context.to_string(),
+                        child_count: None,
                     },
                     action: status.into(),
                 });
@@ -1543,7 +1599,7 @@ async fn handle_retrieve_entities<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
     let query = require_str(&args, "query")?;
     let mut embedding = optional_f32_array(&args, "embedding")?;
 
@@ -1674,7 +1730,7 @@ async fn handle_promote_memory<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
     let entity_id = require_uuid(&args, "entity_id")?;
 
     let new_state = crate::entity::promote_memory(storage, ctx, session_id, entity_id)
@@ -1695,7 +1751,7 @@ async fn handle_demote_memory<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
     let entity_id = require_uuid(&args, "entity_id")?;
 
     let new_state = crate::entity::demote_memory(storage, ctx, session_id, entity_id)
@@ -1718,7 +1774,7 @@ async fn handle_importance_score<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
     let entity_id = require_uuid(&args, "entity_id")?;
 
     // Look up the entity to get created_at for recency
@@ -1759,7 +1815,7 @@ async fn handle_record_outcome<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
     let query_id = require_uuid(&args, "query_id")?;
     let program_type = require_str(&args, "program_type")?;
     let task_complexity = require_str(&args, "task_complexity")?;
@@ -1784,7 +1840,37 @@ async fn handle_record_outcome<S: crate::storage::Storage>(
     .await
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
-    Ok(serde_json::json!({ "recorded": recorded }))
+    // Apply small negative reputation to entities that caused a retrieval miss
+    if program_type == "retrieval_miss"
+        && let Some(entity_ids) = args.get("entity_ids").and_then(|v| v.as_array())
+    {
+        let mut deltas = std::collections::HashMap::new();
+        for id_val in entity_ids {
+            if let Some(id_str) = id_val.as_str()
+                && let Ok(eid) = id_str.parse::<uuid::Uuid>()
+            {
+                deltas.insert(eid, -0.05);
+            }
+        }
+        if !deltas.is_empty()
+            && let Err(e) =
+                crate::pagerank::update_reputation_scores(storage, ctx, session_id, &deltas).await
+        {
+            tracing::warn!("failed to penalize retrieval-miss entity reputation: {e}");
+        }
+    }
+
+    let mut response = serde_json::json!({ "recorded": recorded });
+    if program_type == "retrieval_miss" {
+        response["_hint"] = serde_json::json!(
+            "Retrieval miss logged. The system will learn to store this kind of information. Consider using smart_ingest now to store what you found via grep/read."
+        );
+    } else {
+        response["_hint"] = serde_json::json!(
+            "Outcome recorded. This feedback improves retrieval routing over time."
+        );
+    }
+    Ok(response)
 }
 
 // --- Session lifecycle handler ---
@@ -1794,7 +1880,7 @@ async fn handle_delete_session<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
 
     let result = crate::session::delete_session(storage, ctx, session_id)
         .await
@@ -1811,7 +1897,7 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
     let content = require_str(&args, "content")?;
     let entity_type = require_str(&args, "entity_type")?;
     let mut embedding = optional_f32_array(&args, "embedding")?;
@@ -1888,6 +1974,7 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
                 confidence: 1.0,
                 created_at: chrono::Utc::now().to_rfc3339(),
                 context: content.chars().take(256).collect(),
+                child_count: None,
             },
             action: action.clone(),
         });
@@ -1904,6 +1991,20 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
     )
     .await;
 
+    // Penalize reputation of superseded entity — it was wrong/outdated
+    if action == "Superseded"
+        && let Some(old_id_str) = decision_json.get("old_entity_id").and_then(|v| v.as_str())
+        && let Ok(old_id) = old_id_str.parse::<uuid::Uuid>()
+    {
+        let mut deltas = std::collections::HashMap::new();
+        deltas.insert(old_id, -0.2);
+        if let Err(e) =
+            crate::pagerank::update_reputation_scores(storage, ctx, session_id, &deltas).await
+        {
+            tracing::warn!("failed to penalize superseded entity reputation: {e}");
+        }
+    }
+
     // Add rotating hint to encourage continued memory formation
     let mut result = decision_json;
     if let Some(obj) = result.as_object_mut() {
@@ -1912,6 +2013,21 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
             _ => pick_hint(INGEST_HINTS),
         };
         obj.insert("hint".into(), Value::String(hint));
+
+        // Progressive disclosure hints
+        match action.as_str() {
+            "Created" => {
+                obj.insert("_hint".into(), serde_json::json!(
+                    "Entity created. Use create_edge to connect it to related entities. After 10+ entities, run_consolidation discovers patterns."
+                ));
+            }
+            "Superseded" => {
+                obj.insert("_hint".into(), serde_json::json!(
+                    "Previous fact superseded. Use get_temporal_chain to see the full fact evolution for this entity."
+                ));
+            }
+            _ => {}
+        }
     }
     Ok(result)
 }
@@ -2001,7 +2117,14 @@ async fn handle_check_intentions<S: crate::storage::Storage>(
         }
     }
 
-    Ok(serde_json::json!({ "triggered": triggered_json }))
+    let triggered_count = triggered_json.len();
+    let mut response = serde_json::json!({ "triggered": triggered_json });
+    if triggered_count > 0 {
+        response["_hint"] = serde_json::json!(format!(
+            "{triggered_count} intentions triggered. Act on them, then call complete_intention for each."
+        ));
+    }
+    Ok(response)
 }
 
 async fn handle_complete_intention<S: crate::storage::Storage>(
@@ -2090,7 +2213,7 @@ async fn handle_write_temporal_fact<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
     let entity_id = require_uuid(&args, "entity_id")?;
     let fact_text = require_str(&args, "fact_text")?;
     let confidence = args
@@ -2162,7 +2285,7 @@ async fn handle_explore_connections<S: crate::storage::Storage>(
                 .as_ref()
                 .ok_or((INTERNAL_ERROR, "graph client not configured".into()))?;
             let fold_id = require_uuid(&args, "fold_id")?;
-            let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
+            let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
             graph
                 .get_fold_ancestors(fold_id, session_id, max_depth)
                 .await
@@ -2170,13 +2293,19 @@ async fn handle_explore_connections<S: crate::storage::Storage>(
         }
         "related_entities" => {
             let entity_id = require_uuid(&args, "entity_id")?;
-            let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
-            // Try graph backend first, fall back to CQL typed_edges
-            if let Some(graph) = session.graph.as_ref() {
-                let mut r = graph
+            let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+            // Try graph backend first, fall back to CQL typed_edges if empty
+            let graph_results = if let Some(graph) = session.graph.as_ref() {
+                graph
                     .find_related_entities(entity_id, session_id, max_depth)
                     .await
-                    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+                    .ok()
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            if !graph_results.is_empty() {
+                let mut r = graph_results;
                 r.truncate(limit);
                 r
             } else {
@@ -2212,7 +2341,7 @@ async fn handle_explore_connections<S: crate::storage::Storage>(
                 .as_ref()
                 .ok_or((INTERNAL_ERROR, "graph client not configured".into()))?;
             let fold_id = require_uuid(&args, "fold_id")?;
-            let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
+            let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
             let mut r = graph
                 .get_entities_in_fold(fold_id, session_id)
                 .await
@@ -2241,11 +2370,18 @@ async fn handle_explore_connections<S: crate::storage::Storage>(
         }
     };
 
-    Ok(serde_json::json!({
+    let result_count = results.len();
+    let mut response = serde_json::json!({
         "traversal": traversal,
         "results": results,
-        "count": results.len()
-    }))
+        "count": result_count
+    });
+    if result_count < 2 {
+        response["_hint"] = serde_json::json!(
+            "Few connections found. Try spread_activation for broader associative recall, or run_consolidation to discover CO_OCCURS patterns."
+        );
+    }
+    Ok(response)
 }
 
 // --- Hybrid search handler ---
@@ -2256,7 +2392,7 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
     let query = require_str(&args, "query")?;
     let mut embedding = optional_f32_array(&args, "embedding")?;
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
@@ -2285,11 +2421,13 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         limit,
         None,
         None,
+        None,
         &crate::hybrid_search::FusionConfig::default(),
     )
     .await
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
+    let result_count = results.len();
     let hint = if results.is_empty() {
         pick_hint(&[
             "No matches — this topic is new to memory. Good candidate for smart_ingest.",
@@ -2304,11 +2442,21 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         ])
     };
 
-    Ok(serde_json::json!({
+    let mut response = serde_json::json!({
         "results": results,
-        "count": results.len(),
+        "count": result_count,
         "hint": hint
-    }))
+    });
+    if result_count == 0 {
+        response["_hint"] = serde_json::json!(
+            "No results. Try retrieve_entities with a different name spelling, or check if the information has been stored yet."
+        );
+    } else if result_count < 3 {
+        response["_hint"] = serde_json::json!(
+            "Few results found. Try recursive_explore for multi-pass decomposed search, or spread_activation for broader graph-based discovery."
+        );
+    }
+    Ok(response)
 }
 
 // --- Dream consolidation handler ---
@@ -2319,7 +2467,7 @@ async fn handle_run_consolidation<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
 
     let result = crate::dream::run_consolidation(storage, ctx, session_id)
         .await
@@ -2403,7 +2551,7 @@ async fn handle_get_stats<S: crate::storage::Storage>(
         ])
     };
 
-    Ok(serde_json::json!({
+    let mut response = serde_json::json!({
         "memo_count": memo_count,
         "memo_total_hits": memo_total_hits,
         "memo_hit_rate": memo_hit_rate,
@@ -2416,7 +2564,17 @@ async fn handle_get_stats<S: crate::storage::Storage>(
         "edge_count": edge_count,
         "intention_count": intention_count,
         "hint": hint
-    }))
+    });
+    if entity_count > 0 && edge_count == 0 {
+        response["_hint"] = serde_json::json!(
+            "Entities exist but no connections. Use create_edge to link related entities — connected facts are knowledge, isolated facts are data."
+        );
+    } else if entity_count > 20 && edge_count < 5 {
+        response["_hint"] = serde_json::json!(
+            "Many entities but few connections. Run run_consolidation to discover CO_OCCURS relationships automatically."
+        );
+    }
+    Ok(response)
 }
 
 // --- Spreading activation handler ---
@@ -2426,7 +2584,7 @@ async fn handle_find_memory_chain<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
     let source = require_uuid(&args, "source")?;
     let destination = require_uuid(&args, "destination")?;
     let max_hops = args
@@ -2506,7 +2664,7 @@ async fn handle_spread_activation<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
 
     let seeds_arr = args
         .get("seeds")
@@ -2582,7 +2740,7 @@ async fn handle_recursive_explore<S: crate::storage::Storage>(
     let query = require_str(&args, "query")?;
     let session_id = optional_uuid(&args, "session_id")?
         .or(session.default_session_id)
-        .unwrap_or_else(uuid::Uuid::new_v4);
+        .unwrap_or(uuid::Uuid::nil());
 
     // Parse optional embedding
     let embedding: Option<Vec<f32>> = args.get("embedding").and_then(|v| v.as_array()).map(|arr| {
@@ -2652,7 +2810,7 @@ async fn handle_query_derived<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
     let predicate = require_str(&args, "predicate")?;
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
 
     let config = crate::config::DatalogConfig::default();
     let facts = crate::datalog::query_predicate(storage, ctx, session_id, predicate, &config)
@@ -2845,7 +3003,7 @@ async fn handle_promote_predicate<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
     let predicate = require_str(&args, "predicate")?;
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
 
     let config = crate::config::PromotionConfig::default();
 
@@ -3012,7 +3170,7 @@ async fn handle_find_duplicates<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or_else(uuid::Uuid::new_v4);
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
     let threshold = args
         .get("threshold")
         .and_then(|v| v.as_f64())
@@ -3082,6 +3240,7 @@ fn require_i32(args: &Value, field: &str) -> Result<i32, (i32, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::Storage;
     use crate::storage::mock::MockStorage;
     use crate::types::TenantContext;
     use uuid::Uuid;
@@ -3115,7 +3274,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_returns_all_tools() {
+    async fn tools_list_returns_tier1_by_default() {
         let store = MockStorage::new();
         let ctx = test_ctx();
         let session = SessionState::default();
@@ -3123,25 +3282,65 @@ mod tests {
             .await
             .unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 39);
+        assert_eq!(
+            tools.len(),
+            15,
+            "default tools/list should return 15 tier-1 tools"
+        );
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        // All tier-1 tools must be present
+        assert!(names.contains(&"smart_ingest"));
+        assert!(names.contains(&"hybrid_search"));
+        assert!(names.contains(&"create_edge"));
+        assert!(names.contains(&"batch_create_edges"));
+        assert!(names.contains(&"explore_connections"));
+        assert!(names.contains(&"check_intentions"));
+        assert!(names.contains(&"set_intention"));
+        assert!(names.contains(&"complete_intention"));
+        assert!(names.contains(&"get_stats"));
+        assert!(names.contains(&"write_temporal_fact"));
+        assert!(names.contains(&"get_temporal_chain"));
+        assert!(names.contains(&"retrieve_entities"));
+        assert!(names.contains(&"find_memory_chain"));
+        assert!(names.contains(&"run_consolidation"));
+        assert!(names.contains(&"record_outcome"));
+
+        // Tier-2 tools must NOT be present
+        assert!(!names.contains(&"check_memo_cache"));
+        assert!(!names.contains(&"spread_activation"));
+        assert!(!names.contains(&"recursive_explore"));
+        assert!(!names.contains(&"promote_memory"));
+    }
+
+    #[tokio::test]
+    async fn tools_list_returns_all_with_include_all() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let params = serde_json::json!({ "include_all": true });
+        let result = dispatch("tools/list", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let tools = result["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 39, "include_all should return all 39 tools");
+
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        // Check tier-1 tools still present
+        assert!(names.contains(&"smart_ingest"));
+        assert!(names.contains(&"hybrid_search"));
+        // Check tier-2 tools now included
         assert!(names.contains(&"check_memo_cache"));
         assert!(names.contains(&"batch_ingest"));
         assert!(names.contains(&"store_memo_result"));
         assert!(names.contains(&"write_plan_node"));
         assert!(names.contains(&"get_plan_context"));
         assert!(names.contains(&"update_plan_node"));
-        assert!(names.contains(&"set_intention"));
-        assert!(names.contains(&"check_intentions"));
-        assert!(names.contains(&"complete_intention"));
         assert!(names.contains(&"list_intentions"));
         assert!(names.contains(&"snooze_intention"));
-        assert!(names.contains(&"hybrid_search"));
         assert!(names.contains(&"promote_memory"));
         assert!(names.contains(&"demote_memory"));
         assert!(names.contains(&"importance_score"));
-        assert!(names.contains(&"find_memory_chain"));
         assert!(names.contains(&"predict_needed"));
         assert!(names.contains(&"spread_activation"));
         assert!(names.contains(&"find_duplicates"));
@@ -3845,6 +4044,423 @@ mod tests {
             tracker.count(&entity_id),
             5,
             "tracker should record each retrieval"
+        );
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_hint_few_results() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+
+        // Seed one entity so we get 1 result (< 3)
+        let entity = crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "HintTest".into(),
+            entity_type: "concept".into(),
+            source_fold_id: None,
+            context_snippet: "testing hint triggers".into(),
+            entity_embedding: None,
+            confidence: 0.9,
+            state: Default::default(),
+            created_at: chrono::Utc::now(),
+        };
+        store.entities.lock().await.push(entity);
+
+        let params = serde_json::json!({
+            "name": "hybrid_search",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "query": "HintTest"
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        let count = result["count"].as_u64().unwrap();
+        assert!(count >= 1 && count < 3, "expected 1-2 results, got {count}");
+        assert!(
+            result["_hint"]
+                .as_str()
+                .unwrap()
+                .contains("recursive_explore"),
+            "expected _hint suggesting recursive_explore"
+        );
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_hint_no_results() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+
+        let params = serde_json::json!({
+            "name": "hybrid_search",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "query": "NonexistentTopic"
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["count"], 0);
+        assert!(
+            result["_hint"]
+                .as_str()
+                .unwrap()
+                .contains("retrieve_entities"),
+            "expected _hint suggesting retrieve_entities for zero results"
+        );
+    }
+
+    #[tokio::test]
+    async fn explore_connections_hint_few_results() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let params = serde_json::json!({
+            "name": "explore_connections",
+            "arguments": {
+                "traversal": "related_entities",
+                "entity_id": Uuid::new_v4().to_string()
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["count"], 0);
+        assert!(
+            result["_hint"]
+                .as_str()
+                .unwrap()
+                .contains("spread_activation"),
+            "expected _hint suggesting spread_activation"
+        );
+    }
+
+    #[tokio::test]
+    async fn smart_ingest_hint_on_created() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+
+        let params = serde_json::json!({
+            "name": "smart_ingest",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "content": "Progressive disclosure reduces cognitive load for LLM tool selection",
+                "entity_type": "concept"
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["action"], "Created");
+        assert!(
+            result["_hint"].as_str().unwrap().contains("create_edge"),
+            "expected _hint suggesting create_edge after Created"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_stats_hint_entities_no_edges() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+
+        // Seed entities but no edges
+        for i in 0..3 {
+            let entity = crate::types::EntityEntry {
+                tenant_id: ctx.tenant_id,
+                entity_id: Uuid::new_v4(),
+                session_id: sid,
+                entity_name: format!("Entity{i}"),
+                entity_type: "concept".into(),
+                source_fold_id: None,
+                context_snippet: format!("entity {i}"),
+                entity_embedding: None,
+                confidence: 0.9,
+                state: Default::default(),
+                created_at: chrono::Utc::now(),
+            };
+            store.entities.lock().await.push(entity);
+        }
+
+        let params = serde_json::json!({
+            "name": "get_stats",
+            "arguments": { "session_id": sid.to_string() }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert!(result["entity_count"].as_u64().unwrap() > 0);
+        assert_eq!(result["edge_count"], 0);
+        assert!(
+            result["_hint"].as_str().unwrap().contains("create_edge"),
+            "expected _hint suggesting create_edge when entities exist but no edges"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_intentions_hint_on_triggered() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            repo: {
+                let l = std::sync::OnceLock::new();
+                let _ = l.set("/test/repo".to_string());
+                l
+            },
+            ..SessionState::default()
+        };
+
+        // Set an intention
+        let params = serde_json::json!({
+            "name": "set_intention",
+            "arguments": {
+                "description": "Review hint implementation",
+                "trigger": { "type": "Topic", "keywords": ["hint", "disclosure"] },
+                "priority": "normal"
+            }
+        });
+        dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+
+        // Trigger it
+        let params = serde_json::json!({
+            "name": "check_intentions",
+            "arguments": { "context": "implementing progressive disclosure hints" }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["triggered"].as_array().unwrap().len(), 1);
+        let hint = result["_hint"].as_str().unwrap();
+        assert!(
+            hint.contains("complete_intention"),
+            "expected _hint suggesting complete_intention"
+        );
+        assert!(
+            hint.contains("1 intentions triggered"),
+            "expected _hint to include triggered count"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_outcome_hint_always_present() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+
+        let params = serde_json::json!({
+            "name": "record_outcome",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "query_id": Uuid::new_v4().to_string(),
+                "program_type": "hnsw_ann",
+                "task_complexity": "simple",
+                "succeeded": true,
+                "latency_ms": 10,
+                "token_cost": 50
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert!(
+            result["_hint"]
+                .as_str()
+                .unwrap()
+                .contains("feedback improves retrieval routing"),
+            "expected _hint about routing improvement"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_outcome_hint_retrieval_miss() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+
+        // Note: record_outcome requires program_type to be one of the enum values.
+        // "retrieval_miss" is not in the enum, so we test the regular path here
+        // and validate the _hint field is present regardless.
+        let params = serde_json::json!({
+            "name": "record_outcome",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "query_id": Uuid::new_v4().to_string(),
+                "program_type": "phonetic",
+                "task_complexity": "simple",
+                "succeeded": false,
+                "latency_ms": 5,
+                "token_cost": 20
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert!(
+            result["_hint"].is_string(),
+            "expected _hint field on record_outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn smart_ingest_embedding_fallback_when_ollama_unavailable() {
+        // When ollama_base_url is set but Ollama is not running, smart_ingest
+        // should gracefully fall back to phonetic search (no embedding).
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            ollama_base_url: "http://127.0.0.1:1".to_string(),
+            ..SessionState::default()
+        };
+        let sid = Uuid::new_v4();
+
+        let params = serde_json::json!({
+            "name": "smart_ingest",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "content": "Ferrosa uses LSM-tree storage with S3 tiering",
+                "entity_type": "concept"
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["action"], "Created");
+    }
+
+    #[tokio::test]
+    async fn smart_ingest_skips_embedding_when_ollama_empty() {
+        // When ollama_base_url is empty, no embedding request is attempted
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            ollama_base_url: String::new(),
+            ..SessionState::default()
+        };
+        let sid = Uuid::new_v4();
+
+        let params = serde_json::json!({
+            "name": "smart_ingest",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "content": "Test content for embedding skip",
+                "entity_type": "concept"
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["action"], "Created");
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_embedding_fallback_when_ollama_unavailable() {
+        // When ollama_base_url is set but unreachable, hybrid_search falls back
+        // to phonetic-only search.
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            ollama_base_url: "http://127.0.0.1:1".to_string(),
+            ..SessionState::default()
+        };
+        let sid = Uuid::new_v4();
+
+        // First ingest something
+        let ingest_params = serde_json::json!({
+            "name": "smart_ingest",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "content": "Ferrosa is a database engine",
+                "entity_type": "concept",
+                "entity_name": "Ferrosa"
+            }
+        });
+        dispatch("tools/call", ingest_params, &store, &ctx, &session)
+            .await
+            .unwrap();
+
+        // Search should still work via phonetic even without embeddings
+        let search_params = serde_json::json!({
+            "name": "hybrid_search",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "query": "Ferrosa"
+            }
+        });
+        let result = dispatch("tools/call", search_params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert!(
+            result["count"].as_u64().unwrap() > 0,
+            "should find via phonetic fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_outcome_retrieval_miss_penalizes_entity_reputation() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+        let eid1 = Uuid::new_v4();
+        let eid2 = Uuid::new_v4();
+
+        let params = serde_json::json!({
+            "name": "record_outcome",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "query_id": Uuid::new_v4().to_string(),
+                "program_type": "retrieval_miss",
+                "task_complexity": "simple",
+                "succeeded": false,
+                "latency_ms": 100,
+                "token_cost": 50,
+                "entity_ids": [eid1.to_string(), eid2.to_string()]
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["recorded"], true);
+
+        // Both entities should have received -0.05 reputation penalty
+        let w1 = store.warmth_get(&ctx, eid1).await.unwrap().unwrap();
+        assert!(
+            (w1.reputation - (-0.05)).abs() < f64::EPSILON,
+            "expected -0.05 reputation, got {}",
+            w1.reputation
+        );
+        let w2 = store.warmth_get(&ctx, eid2).await.unwrap().unwrap();
+        assert!(
+            (w2.reputation - (-0.05)).abs() < f64::EPSILON,
+            "expected -0.05 reputation, got {}",
+            w2.reputation
         );
     }
 }

@@ -17,7 +17,7 @@ pub struct SearchResult {
     pub result_type: String,
 }
 
-/// Configuration for 5-signal RRF fusion weights.
+/// Configuration for 6-signal RRF fusion weights.
 /// Default weight 1.0 for all signals. Set to 0.0 to disable a signal.
 #[derive(Debug, Clone)]
 pub struct FusionConfig {
@@ -26,6 +26,9 @@ pub struct FusionConfig {
     pub fold_weight: f64,
     pub warmth_weight: f64,
     pub pagerank_weight: f64,
+    /// Reputation signal weight. Moderate (0.5) to demote bad entities
+    /// without a single negative event burying good information.
+    pub reputation_weight: f64,
 }
 
 impl Default for FusionConfig {
@@ -36,6 +39,7 @@ impl Default for FusionConfig {
             fold_weight: 1.0,
             warmth_weight: 1.0,
             pagerank_weight: 1.0,
+            reputation_weight: 0.5,
         }
     }
 }
@@ -75,8 +79,9 @@ fn rrf_merge(lists: Vec<Vec<SearchResult>>, k: f64, weights: &[f64]) -> Vec<Sear
     merged
 }
 
-/// Run a hybrid search combining up to 5 signals: phonetic entity lookup,
-/// ANN entity search, ANN fold search, warmth scores, and pagerank scores.
+/// Run a hybrid search combining up to 6 signals: phonetic entity lookup,
+/// ANN entity search, ANN fold search, warmth scores, pagerank scores,
+/// and reputation scores.
 /// Results are fused via weighted Reciprocal Rank Fusion.
 #[allow(clippy::too_many_arguments)]
 pub async fn hybrid_search(
@@ -88,6 +93,7 @@ pub async fn hybrid_search(
     limit: usize,
     warmth_scores: Option<&HashMap<Uuid, f64>>,
     pagerank_scores: Option<&HashMap<Uuid, f64>>,
+    reputation_scores: Option<&HashMap<Uuid, f64>>,
     config: &FusionConfig,
 ) -> anyhow::Result<Vec<SearchResult>> {
     anyhow::ensure!(!query.is_empty(), "query must not be empty");
@@ -208,6 +214,33 @@ pub async fn hybrid_search(
         pr_ranked.dedup_by_key(|r| r.id);
         lists.push(pr_ranked);
         weights.push(config.pagerank_weight);
+    }
+
+    // Strategy 6: Reputation signal — boost trusted entities, demote penalized ones.
+    // Reputation ranges [-1.0, 1.0]. We shift to [0.0, 2.0] for RRF ranking so
+    // that negative reputation maps to low rank and positive to high rank.
+    if let Some(reputation) = reputation_scores {
+        let mut rep_ranked: Vec<SearchResult> = lists
+            .iter()
+            .flatten()
+            .filter_map(|r| {
+                reputation.get(&r.id).map(|score| SearchResult {
+                    id: r.id,
+                    source: "reputation".to_string(),
+                    content: r.content.clone(),
+                    score: score + 1.0, // shift [-1,1] to [0,2] for ranking
+                    result_type: r.result_type.clone(),
+                })
+            })
+            .collect();
+        rep_ranked.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rep_ranked.dedup_by_key(|r| r.id);
+        lists.push(rep_ranked);
+        weights.push(config.reputation_weight);
     }
 
     let merged = rrf_merge(lists, 60.0, &weights);
@@ -405,13 +438,14 @@ mod tests {
     }
 
     #[test]
-    fn fusion_config_default_all_ones() {
+    fn fusion_config_default_weights() {
         let config = FusionConfig::default();
         assert!((config.phonetic_weight - 1.0).abs() < f64::EPSILON);
         assert!((config.ann_weight - 1.0).abs() < f64::EPSILON);
         assert!((config.fold_weight - 1.0).abs() < f64::EPSILON);
         assert!((config.warmth_weight - 1.0).abs() < f64::EPSILON);
         assert!((config.pagerank_weight - 1.0).abs() < f64::EPSILON);
+        assert!((config.reputation_weight - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -434,5 +468,165 @@ mod tests {
         // id2: rank 1 in list2 + rank 0 in list3 = 1/62 + 1/61
         let id2_result = merged.iter().find(|r| r.id == id2).unwrap();
         assert!((id2_result.score - (1.0 / 62.0 + 1.0 / 61.0)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn rrf_merge_six_signal_fusion_with_reputation() {
+        let id1 = Uuid::new_v4();
+        let lists = vec![
+            vec![make_result(id1, "phonetic", 1.0)],
+            vec![make_result(id1, "ann", 1.0)],
+            vec![make_result(id1, "fold", 1.0)],
+            vec![make_result(id1, "warmth", 1.0)],
+            vec![make_result(id1, "pagerank", 1.0)],
+            vec![make_result(id1, "reputation", 1.0)],
+        ];
+        let weights = [1.0, 1.0, 1.0, 1.0, 1.0, 0.5];
+
+        let merged = rrf_merge(lists, 60.0, &weights);
+        assert_eq!(merged.len(), 1);
+        // 5 signals at weight 1.0 + reputation at weight 0.5, all rank 0
+        // score = 5 * (1/61) + 0.5 * (1/61) = 5.5/61
+        assert!((merged[0].score - 5.5 / 61.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn reputation_boosts_trusted_entity_in_ranking() {
+        let good_id = Uuid::new_v4();
+        let bad_id = Uuid::new_v4();
+
+        // Both appear at rank 0 in phonetic (separate lists)
+        let phonetic = vec![
+            make_result(good_id, "phonetic", 1.0),
+            make_result(bad_id, "phonetic", 0.9),
+        ];
+
+        // Reputation: good_id has positive (shifted: 1.5), bad_id has negative (shifted: 0.2)
+        let mut rep_list = vec![
+            make_result(good_id, "reputation", 1.5), // 0.5 + 1.0 shift
+            make_result(bad_id, "reputation", 0.2),  // -0.8 + 1.0 shift
+        ];
+        rep_list.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+
+        let merged = rrf_merge(vec![phonetic, rep_list], 60.0, &[1.0, 0.5]);
+
+        // good_id: rank 0 in phonetic + rank 0 in reputation (it has higher score)
+        // bad_id: rank 1 in phonetic + rank 1 in reputation
+        // good_id should rank higher
+        assert_eq!(merged[0].id, good_id);
+        assert!(merged[0].score > merged[1].score);
+    }
+
+    #[test]
+    fn negative_reputation_demotes_entity() {
+        let trusted_id = Uuid::new_v4();
+        let penalized_id = Uuid::new_v4();
+
+        // Without reputation, both would tie at rank 0 in their own list
+        let list1 = vec![make_result(trusted_id, "ann", 1.0)];
+        let list2 = vec![make_result(penalized_id, "ann", 1.0)];
+
+        // Reputation signal: trusted=1.0 (shifted: 2.0), penalized=-0.8 (shifted: 0.2)
+        let rep = vec![
+            make_result(trusted_id, "rep", 2.0),
+            make_result(penalized_id, "rep", 0.2),
+        ];
+
+        // Without reputation: both get 1/61
+        let merged_no_rep = rrf_merge(vec![list1.clone(), list2.clone()], 60.0, &[1.0, 1.0]);
+        let no_rep_trusted = merged_no_rep
+            .iter()
+            .find(|r| r.id == trusted_id)
+            .unwrap()
+            .score;
+        let no_rep_penalized = merged_no_rep
+            .iter()
+            .find(|r| r.id == penalized_id)
+            .unwrap()
+            .score;
+        assert!(
+            (no_rep_trusted - no_rep_penalized).abs() < 1e-10,
+            "without reputation they should tie"
+        );
+
+        // With reputation: trusted gets boosted, penalized gets demoted
+        let merged_with_rep = rrf_merge(vec![list1, list2, rep], 60.0, &[1.0, 1.0, 0.5]);
+        assert_eq!(
+            merged_with_rep[0].id, trusted_id,
+            "trusted entity should rank first"
+        );
+        assert!(merged_with_rep[0].score > merged_with_rep[1].score);
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_uses_reputation_scores() {
+        use crate::storage::mock::MockStorage;
+        use crate::types::{EntityEntry, MemoryState, TenantContext};
+
+        let storage = MockStorage::new();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "test".into(),
+        };
+        let sid = Uuid::new_v4();
+
+        let good_id = Uuid::new_v4();
+        let bad_id = Uuid::new_v4();
+
+        // Insert two entities with similar names
+        for (id, name) in [(good_id, "Ferrosa DB"), (bad_id, "Ferrosa Cache")] {
+            storage
+                .entity_put(
+                    &ctx,
+                    &EntityEntry {
+                        tenant_id: ctx.tenant_id,
+                        entity_id: id,
+                        session_id: sid,
+                        entity_name: name.into(),
+                        entity_type: "tool".into(),
+                        source_fold_id: None,
+                        context_snippet: format!("{name} is a database component"),
+                        entity_embedding: None,
+                        confidence: 1.0,
+                        state: MemoryState::Active,
+                        created_at: chrono::Utc::now(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        // Reputation: good entity is trusted, bad entity is penalized
+        let mut reputation = HashMap::new();
+        reputation.insert(good_id, 0.8);
+        reputation.insert(bad_id, -0.5);
+
+        let config = FusionConfig::default();
+        let results = hybrid_search(
+            &storage,
+            &ctx,
+            sid,
+            "Ferrosa",
+            None,
+            10,
+            None,
+            None,
+            Some(&reputation),
+            &config,
+        )
+        .await
+        .unwrap();
+
+        assert!(!results.is_empty());
+
+        // good_id should rank above bad_id due to reputation boost
+        let good_pos = results.iter().position(|r| r.id == good_id);
+        let bad_pos = results.iter().position(|r| r.id == bad_id);
+        if let (Some(gp), Some(bp)) = (good_pos, bad_pos) {
+            assert!(
+                gp < bp,
+                "trusted entity should rank higher than penalized entity"
+            );
+        }
     }
 }

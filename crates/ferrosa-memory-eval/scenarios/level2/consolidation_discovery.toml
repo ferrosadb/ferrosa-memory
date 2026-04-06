@@ -1,0 +1,60 @@
+# Level 2 DIKW: Information -> Knowledge via consolidation discovery
+#
+# Validates that run_consolidation discovers CO_OCCURS edges between
+# entities that share contextual overlap. Creates 3 related entities
+# in the same session, runs consolidation, then verifies edges emerged.
+
+[scenario]
+id = "dikw-consolidation-discovery"
+name = "Consolidation Discovery: CO_OCCURS Edge Emergence"
+description = """
+Tests the Information->Knowledge DIKW transition. Individual entities \
+(information) become connected knowledge when consolidation discovers \
+CO_OCCURS relationships between contextually related memories. Creates \
+three entities that share overlapping context, runs dream consolidation, \
+and verifies that CO_OCCURS edges are created."""
+level = 2
+dikw_transition = "info_knowledge"
+tags = ["dikw", "consolidation", "co_occurs", "info_knowledge", "dream"]
+timeout_ms = 30000
+
+# Step 1: Upsert entity -- the person
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "Bob Martinez", entity_type = "person", context_snippet = "Bob Martinez is the database architect who designed the Ferrosa storage engine and CQL protocol." }
+
+# Step 2: Upsert entity -- the project (shares context with Bob)
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "Ferrosa Storage Engine", entity_type = "project", context_snippet = "The Ferrosa storage engine is a distributed database with CQL protocol support, designed by Bob Martinez." }
+
+# Step 3: Upsert entity -- a decision (shares context with both)
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "ADR-005 CQL Wire Protocol", entity_type = "decision", context_snippet = "ADR-005: Chose CQL wire protocol for Ferrosa storage engine compatibility. Authored by Bob Martinez." }
+
+# Step 4: Run consolidation to discover relationships
+[[steps]]
+tool = "run_consolidation"
+arguments = {}
+
+# Step 5: Explore connections from first entity to verify edges
+[[steps]]
+tool = "explore_connections"
+arguments = { traversal = "related_entities", max_depth = 2, limit = 10 }
+
+[grading]
+methods = ["programmatic", "claim_rubric"]
+
+[grading.claim_rubric]
+claims = [
+    "Three entities are created successfully",
+    "Consolidation discovers relationships between contextually related entities",
+    "CO_OCCURS edges link entities that share overlapping context",
+    "explore_connections returns connected entities after consolidation",
+]
+passing_threshold = 0.75
+
+[dikw]
+expect_entity_count_gte = 3
+expect_edge_types = ["CO_OCCURS"]

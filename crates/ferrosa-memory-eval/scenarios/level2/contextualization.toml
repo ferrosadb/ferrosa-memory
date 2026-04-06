@@ -1,0 +1,67 @@
+# Level 2 DIKW: Data -> Information transition via type assignment
+#
+# Validates that raw entity data becomes structured information when
+# entity types are assigned. Upserts 3 entities with distinct types,
+# then retrieves them to verify type assignment persists.
+
+[scenario]
+id = "dikw-contextualization"
+name = "Contextualization: Data -> Information via Type Assignment"
+description = """
+Tests the Data->Information DIKW transition. Raw text (data) becomes \
+structured information when entity types (person, project, bug) are \
+assigned and persisted. Verifies that upsert_entity correctly stores \
+typed entities and retrieve_entities returns them with types intact."""
+level = 2
+dikw_transition = "data_info"
+tags = ["dikw", "contextualization", "entity_types", "data_info"]
+timeout_ms = 30000
+
+# Step 1: Upsert a person entity
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "Alice Chen", entity_type = "person", context_snippet = "Alice Chen is the lead backend engineer responsible for the authentication service." }
+
+# Step 2: Upsert a project entity
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "AuthService", entity_type = "project", context_snippet = "AuthService is the centralized authentication microservice handling OAuth2 and SAML flows." }
+
+# Step 3: Upsert a bug entity
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "AUTH-1042", entity_type = "bug", context_snippet = "AUTH-1042: Token refresh race condition causes intermittent 401 errors under high concurrency." }
+
+# Step 4: Retrieve person entity to verify type assigned
+[[steps]]
+tool = "retrieve_entities"
+expect_in_response = ["Alice Chen", "person"]
+arguments = { query = "Alice Chen", strategy = "phonetic" }
+
+# Step 5: Retrieve project entity
+[[steps]]
+tool = "retrieve_entities"
+expect_in_response = ["AuthService"]
+arguments = { query = "AuthService", strategy = "phonetic" }
+
+# Step 6: Retrieve bug entity
+[[steps]]
+tool = "retrieve_entities"
+expect_in_response = ["AUTH-1042"]
+arguments = { query = "AUTH-1042", strategy = "phonetic" }
+
+[grading]
+methods = ["programmatic", "claim_rubric"]
+
+[grading.claim_rubric]
+claims = [
+    "Person entity 'Alice Chen' is created with type 'person'",
+    "Project entity 'AuthService' is created with type 'project'",
+    "Bug entity 'AUTH-1042' is created with type 'bug'",
+    "Retrieved entities retain their assigned types",
+]
+passing_threshold = 0.75
+
+[dikw]
+expect_entity_count_gte = 3
+expect_edge_types = []

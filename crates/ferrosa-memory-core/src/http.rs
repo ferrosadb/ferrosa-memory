@@ -341,7 +341,7 @@ pub async fn serve_viz<S: Storage + 'static>(
     tracing::info!("viz server listening on {addr}");
 
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (mut stream, peer) = listener.accept().await?;
         let bus = Arc::clone(&event_bus);
 
         // Peek at the request path before deciding how to handle it.
@@ -381,9 +381,10 @@ pub async fn serve_viz<S: Storage + 'static>(
                     ("500 Internal Server Error", json.to_string())
                 }
             };
-            // Consume the request then send response
+            // Consume the request then send response (async to avoid CPU spin)
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut buf = vec![0u8; 4096];
-            let _ = stream.try_read(&mut buf);
+            let _ = stream.read(&mut buf).await;
             let response = format!(
                 "HTTP/1.1 {status}\r\n\
                  Content-Type: application/json\r\n\
@@ -391,7 +392,7 @@ pub async fn serve_viz<S: Storage + 'static>(
                  Content-Length: {}\r\n\r\n{body}",
                 body.len()
             );
-            let _ = stream.try_write(response.as_bytes());
+            let _ = stream.write_all(response.as_bytes()).await;
             continue;
         }
 
@@ -521,50 +522,178 @@ async fn handle_viz_connection(
 
 /// Handle a WebSocket connection for the viz dashboard.
 ///
-/// Sends a `VizEvent::Snapshot` with current graph state, then subscribes
-/// to the event bus and streams each incremental `VizEvent` as a JSON
-/// text frame. Runs until the client disconnects or the bus is dropped.
+/// Sends a clustered `VizEvent::Snapshot` (crate level by default), then
+/// listens for both event bus broadcasts and client drill-down messages.
+/// The full flat node/edge data is kept in memory so drill-down requests
+/// can be served without re-querying storage.
 async fn handle_viz_ws(
     ws_stream: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     event_bus: Arc<EventBus>,
     snapshot: VizEvent,
 ) {
-    let (mut write, _read) = futures_util::StreamExt::split(ws_stream);
+    use futures_util::StreamExt;
 
-    // Send initial snapshot so clients don't start with a blank graph.
-    // TODO: The viz endpoint uses a fixed session_id from server startup. A future
-    // enhancement should accept session_id as a query parameter on /viz/ws so the
-    // dashboard can switch between sessions. In shared-memory mode (configured
-    // tenant_id), a tenant-level entity query would be more useful.
-    if let Ok(json) = serde_json::to_string(&snapshot)
-        && write.send(Message::Text(json)).await.is_err()
-    {
-        return; // Client disconnected during snapshot send
+    let (mut write, mut read) = futures_util::StreamExt::split(ws_stream);
+
+    // Extract the full flat data from the snapshot for clustering.
+    let (full_nodes, full_edges) = match &snapshot {
+        VizEvent::Snapshot { nodes, edges, .. } => (nodes.clone(), edges.clone()),
+        _ => (vec![], vec![]),
+    };
+
+    // Track navigation state for drill_up support.
+    let mut nav_stack: Vec<(viz::VizLevel, Option<String>)> = Vec::new();
+    let mut current_level = viz::VizLevel::Crate;
+    let mut current_parent: Option<String> = None;
+
+    // Track view mode: "detail" (flat) or "overview" (clustered).
+    // Default to clustered overview when graph is large (>2000 nodes).
+    let large_graph = full_nodes.len() > 2000;
+    let mut view_mode = if large_graph {
+        String::from("overview")
+    } else {
+        String::from("detail")
+    };
+
+    // Send initial snapshot — clustered for large graphs, flat for small.
+    let initial = if large_graph {
+        current_level = viz::VizLevel::Crate;
+        cluster_snapshot(&full_nodes, &full_edges, &viz::VizLevel::Crate, None)
+    } else {
+        snapshot
+    };
+    if let Ok(json) = serde_json::to_string(&initial) {
+        if write.send(Message::Text(json)).await.is_err() {
+            return;
+        }
     }
 
     // Subscribe to incremental events (after snapshot to avoid race)
     let mut rx = event_bus.subscribe();
 
-    // Stream events to the client
+    // Multiplex: listen for both broadcast events and client messages.
     loop {
-        match rx.recv().await {
-            Ok(event) => {
-                let json = match serde_json::to_string(&event) {
-                    Ok(j) => j,
-                    Err(e) => {
-                        tracing::warn!("viz: failed to serialize event: {e}");
-                        continue;
+        tokio::select! {
+            // Broadcast event from the event bus
+            result = rx.recv() => {
+                match result {
+                    Ok(event) => {
+                        // Only forward incremental events when at the flat
+                        // (function) level — clustered levels get full
+                        // snapshots on drill-down so incrementals would be
+                        // confusing.
+                        if current_level == viz::VizLevel::Function {
+                            let json = match serde_json::to_string(&event) {
+                                Ok(j) => j,
+                                Err(e) => {
+                                    tracing::warn!("viz: failed to serialize event: {e}");
+                                    continue;
+                                }
+                            };
+                            if write.send(Message::Text(json)).await.is_err() {
+                                break;
+                            }
+                        }
                     }
-                };
-                if write.send(Message::Text(json)).await.is_err() {
-                    break; // Client disconnected
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("viz: WebSocket client lagged by {n} events");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
                 }
             }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                tracing::warn!("viz: WebSocket client lagged by {n} events");
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                break; // EventBus dropped
+            // Client message (drill_down / drill_up)
+            msg = read.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(client_msg) = serde_json::from_str::<viz::VizClientMessage>(&text) {
+                            let new_snapshot = match client_msg {
+                                viz::VizClientMessage::DrillDown { level, parent } => {
+                                    // Push current state onto nav stack
+                                    nav_stack.push((current_level.clone(), current_parent.clone()));
+                                    current_level = level.clone();
+                                    current_parent = parent.clone();
+                                    cluster_snapshot(
+                                        &full_nodes,
+                                        &full_edges,
+                                        &level,
+                                        parent.as_deref(),
+                                    )
+                                }
+                                viz::VizClientMessage::DrillUp => {
+                                    if let Some((prev_level, prev_parent)) = nav_stack.pop() {
+                                        current_level = prev_level.clone();
+                                        current_parent = prev_parent.clone();
+                                        cluster_snapshot(
+                                            &full_nodes,
+                                            &full_edges,
+                                            &prev_level,
+                                            prev_parent.as_deref(),
+                                        )
+                                    } else {
+                                        // Already at top — send crate level
+                                        current_level = viz::VizLevel::Crate;
+                                        current_parent = None;
+                                        cluster_snapshot(
+                                            &full_nodes,
+                                            &full_edges,
+                                            &viz::VizLevel::Crate,
+                                            None,
+                                        )
+                                    }
+                                }
+                                viz::VizClientMessage::ToggleView { mode } => {
+                                    view_mode = mode.clone();
+                                    if mode == "overview" {
+                                        // Reset to crate-level clustered view
+                                        nav_stack.clear();
+                                        current_level = viz::VizLevel::Crate;
+                                        current_parent = None;
+                                        cluster_snapshot(
+                                            &full_nodes,
+                                            &full_edges,
+                                            &viz::VizLevel::Crate,
+                                            None,
+                                        )
+                                    } else {
+                                        // "detail" — send full flat snapshot
+                                        nav_stack.clear();
+                                        current_level = viz::VizLevel::Function;
+                                        current_parent = None;
+                                        let total_n = full_nodes.len();
+                                        let total_e = full_edges.len();
+                                        VizEvent::Snapshot {
+                                            nodes: full_nodes.clone(),
+                                            edges: full_edges.clone(),
+                                            level: None,
+                                            parent: None,
+                                            total_nodes: Some(total_n),
+                                            total_edges: Some(total_e),
+                                        }
+                                    }
+                                }
+                                viz::VizClientMessage::ExploreNeighborhood { entity_id, hops } => {
+                                    let hops = hops.min(3); // cap at 3
+                                    neighborhood_snapshot(
+                                        &full_nodes,
+                                        &full_edges,
+                                        &entity_id,
+                                        hops,
+                                    )
+                                }
+                            };
+                            if let Ok(json) = serde_json::to_string(&new_snapshot) {
+                                if write.send(Message::Text(json)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(_)) => break,
+                    _ => {} // Ignore ping/pong/binary
+                }
             }
         }
     }
@@ -670,10 +799,23 @@ async fn build_snapshot<S: Storage>(
         .edge_list_all(&swapped_ctx)
         .await
         .unwrap_or_default();
+    tracing::info!(
+        swapped_count = all_edges.len(),
+        "viz: loaded edges with swapped ctx"
+    );
     // Also load correctly-keyed edges (from new consolidation runs).
     if let Ok(mut correct) = storage.edge_list_all(ctx).await {
+        tracing::info!(
+            correct_count = correct.len(),
+            "viz: loaded edges with correct ctx"
+        );
         all_edges.append(&mut correct);
     }
+    tracing::info!(
+        total_edges = all_edges.len(),
+        node_count = node_ids.len(),
+        "viz: total edges before node filter"
+    );
     let edges_result: anyhow::Result<Vec<_>> = Ok(all_edges);
 
     // Send CO_OCCURS edges that have a real strength value.
@@ -702,8 +844,12 @@ async fn build_snapshot<S: Storage>(
             Vec::new()
         }
     };
-    // Drop CO_OCCURS edges with no strength — they add no information.
-    edges.retain(|e| e.strength.is_some() || e.edge_type != "CO_OCCURS");
+    // Assign default strength to CO_OCCURS edges that lack it (from co_occurs_with table).
+    for e in &mut edges {
+        if e.edge_type == "CO_OCCURS" && e.strength.is_none() {
+            e.strength = Some(0.5);
+        }
+    }
 
     // Load typed edges (depends_on, contains, calls, etc.).
     // Probe both the configured session and nil session (used by skilltools ingest).
@@ -737,7 +883,430 @@ async fn build_snapshot<S: Storage>(
         }
     }
 
-    VizEvent::Snapshot { nodes, edges }
+    let total_n = nodes.len();
+    let total_e = edges.len();
+    VizEvent::Snapshot {
+        nodes,
+        edges,
+        level: None,
+        parent: None,
+        total_nodes: Some(total_n),
+        total_edges: Some(total_e),
+    }
+}
+
+/// Build a clustered `VizEvent::Snapshot` at the requested hierarchy level.
+///
+/// Operates on already-fetched full node/edge data (avoids requiring `Storage`
+/// which is not `Send`-bounded, so this can run inside `tokio::spawn`).
+///
+/// - `level=crate` (default): groups entities by crate name (first `::` segment),
+///   aggregates edges between crates. Non-code entities go into a "Research" cluster.
+/// - `level=module&parent=X`: shows modules within crate X.
+/// - `level=function&parent=X::Y`: shows leaf entities within module X::Y.
+fn cluster_snapshot(
+    all_nodes: &[viz::VizNode],
+    all_edges: &[viz::VizEdge],
+    level: &viz::VizLevel,
+    parent: Option<&str>,
+) -> VizEvent {
+    let graph_total_nodes = all_nodes.len();
+    let graph_total_edges = all_edges.len();
+    // Helper: extract the crate name from an entity label (first `::` segment).
+    fn crate_name(label: &str) -> &str {
+        label.split("::").next().unwrap_or(label)
+    }
+
+    // Helper: extract crate::module from an entity label (first two `::` segments).
+    fn module_name(label: &str) -> String {
+        let parts: Vec<&str> = label.split("::").collect();
+        if parts.len() >= 2 {
+            format!("{}::{}", parts[0], parts[1])
+        } else {
+            label.to_string()
+        }
+    }
+
+    // Classify entity types into "code" vs "research" for top-level grouping.
+    fn is_code_entity(entity_type: &str) -> bool {
+        matches!(
+            entity_type,
+            "crate" | "module" | "section" | "function" | "struct"
+                | "enum" | "trait" | "impl" | "method" | "const"
+                | "type" | "macro" | "mod" | "app"
+        )
+    }
+
+    fn is_code_entity_group(group_name: &str) -> bool {
+        !matches!(group_name, "Papers" | "People" | "Concepts" | "Organizations" | "Decisions" | "Other")
+    }
+
+    match level {
+        viz::VizLevel::Crate => {
+            // Group all entities by crate. Non-code entities go to "Research".
+            let mut crate_groups: std::collections::HashMap<String, Vec<usize>> =
+                std::collections::HashMap::new();
+
+            for (i, node) in all_nodes.iter().enumerate() {
+                let group = if is_code_entity(&node.entity_type) {
+                    let label = &node.label;
+                    if label.contains("::") || node.entity_type == "crate" {
+                        crate_name(label).to_string()
+                    } else {
+                        // Bare names (functions without crate prefix) → group as "Ungrouped Code"
+                        "Ungrouped Code".to_string()
+                    }
+                } else {
+                    // Group non-code entities by type: "Papers", "People", "Concepts", etc.
+                    match node.entity_type.as_str() {
+                        "document" => "Papers".to_string(),
+                        "person" => "People".to_string(),
+                        "concept" => "Concepts".to_string(),
+                        "org" => "Organizations".to_string(),
+                        "bug" | "decision" | "pattern" | "preference" => "Decisions".to_string(),
+                        _ => "Other".to_string(),
+                    }
+                };
+                crate_groups.entry(group).or_default().push(i);
+            }
+
+            // Build one aggregate node per crate.
+            let mut crate_nodes: Vec<viz::VizNode> = Vec::new();
+            // Map original node id -> crate group name
+            let mut node_to_crate: std::collections::HashMap<&str, String> =
+                std::collections::HashMap::new();
+
+            for (crate_label, member_indices) in &crate_groups {
+                let child_count = member_indices.len();
+
+                // Determine entity_type for the cluster node
+                let entity_type = if matches!(crate_label.as_str(), "Papers" | "People" | "Concepts" | "Organizations" | "Decisions" | "Other") {
+                    match crate_label.as_str() {
+                        "Papers" => "document",
+                        "People" => "person",
+                        "Concepts" => "concept",
+                        "Organizations" => "org",
+                        "Decisions" => "decision",
+                        _ => "concept",
+                    }.to_string()
+                } else {
+                    "crate".to_string()
+                };
+
+                // Use max confidence from members
+                let max_confidence = member_indices
+                    .iter()
+                    .map(|&i| all_nodes[i].confidence)
+                    .fold(0.0_f64, f64::max);
+
+                for &i in member_indices {
+                    node_to_crate.insert(&all_nodes[i].id, crate_label.clone());
+                }
+
+                crate_nodes.push(viz::VizNode {
+                    id: format!("cluster:{crate_label}"),
+                    label: crate_label.clone(),
+                    node_type: "cluster".into(),
+                    entity_type,
+                    state: "active".into(),
+                    confidence: max_confidence,
+                    created_at: String::new(),
+                    context: format!("{child_count} entities"),
+                    child_count: Some(child_count),
+                });
+            }
+
+            // Aggregate edges between crate clusters.
+            let mut edge_weights: std::collections::HashMap<(String, String), (f64, String)> =
+                std::collections::HashMap::new();
+
+            for edge in all_edges {
+                let src_crate = node_to_crate.get(edge.source.as_str());
+                let tgt_crate = node_to_crate.get(edge.target.as_str());
+                if let (Some(sc), Some(tc)) = (src_crate, tgt_crate) {
+                    if sc == tc {
+                        continue; // skip intra-crate edges
+                    }
+                    let key = if sc < tc {
+                        (format!("cluster:{sc}"), format!("cluster:{tc}"))
+                    } else {
+                        (format!("cluster:{tc}"), format!("cluster:{sc}"))
+                    };
+                    let weight = edge.strength.unwrap_or(0.5) as f64;
+                    let entry = edge_weights.entry(key).or_insert((0.0, edge.edge_type.clone()));
+                    entry.0 += weight;
+                }
+            }
+
+            let crate_edges: Vec<viz::VizEdge> = edge_weights
+                .into_iter()
+                .map(|((src, tgt), (weight, etype))| viz::VizEdge {
+                    source: src,
+                    target: tgt,
+                    edge_type: etype,
+                    strength: Some(weight.min(1.0) as f32),
+                })
+                .collect();
+
+            VizEvent::Snapshot {
+                nodes: crate_nodes,
+                edges: crate_edges,
+                level: Some("crate".into()),
+                parent: None, total_nodes: Some(graph_total_nodes), total_edges: Some(graph_total_edges),
+            }
+        }
+
+        viz::VizLevel::Module => {
+            let parent_crate = parent.unwrap_or("");
+
+            // Filter to entities belonging to the specified crate/group.
+            let in_crate: Vec<&viz::VizNode> = all_nodes
+                .iter()
+                .filter(|n| {
+                    if !is_code_entity_group(parent_crate) {
+                        // For non-code groups, match by entity type
+                        match parent_crate {
+                            "Papers" => n.entity_type == "document",
+                            "People" => n.entity_type == "person",
+                            "Concepts" => n.entity_type == "concept",
+                            "Organizations" => n.entity_type == "org",
+                            "Decisions" => matches!(n.entity_type.as_str(), "decision" | "bug" | "pattern" | "preference"),
+                            _ => !is_code_entity(&n.entity_type),
+                        }
+                    } else {
+                        is_code_entity(&n.entity_type) && crate_name(&n.label) == parent_crate
+                    }
+                })
+                .collect();
+
+            // Group by module (second :: segment).
+            let mut mod_groups: std::collections::HashMap<String, Vec<usize>> =
+                std::collections::HashMap::new();
+
+            // For non-code groups, show individual entities directly (flat, no sub-grouping)
+            if !is_code_entity_group(parent_crate) {
+                let node_ids: std::collections::HashSet<&str> = in_crate.iter().map(|n| n.id.as_str()).collect();
+                let flat_nodes: Vec<viz::VizNode> = in_crate.iter().map(|n| (*n).clone()).collect();
+                let flat_edges: Vec<viz::VizEdge> = all_edges.iter()
+                    .filter(|e| node_ids.contains(e.source.as_str()) && node_ids.contains(e.target.as_str()))
+                    .cloned()
+                    .collect();
+                return VizEvent::Snapshot {
+                    nodes: flat_nodes,
+                    edges: flat_edges,
+                    level: Some("function".into()), // leaf level — no further drill-down
+                    parent: Some(parent_crate.to_string()),
+                    total_nodes: Some(graph_total_nodes),
+                    total_edges: Some(graph_total_edges),
+                };
+            }
+
+            for (i, node) in in_crate.iter().enumerate() {
+                let group = if false {
+                    // (dead branch — non-code handled above)
+                    node.entity_type.clone()
+                } else {
+                    let parts: Vec<&str> = node.label.split("::").collect();
+                    if parts.len() >= 2 {
+                        parts[1].to_string()
+                    } else {
+                        "(root)".to_string()
+                    }
+                };
+                mod_groups.entry(group).or_default().push(i);
+            }
+
+            let mut mod_nodes: Vec<viz::VizNode> = Vec::new();
+            let mut node_to_mod: std::collections::HashMap<&str, String> =
+                std::collections::HashMap::new();
+
+            for (mod_label, member_indices) in &mod_groups {
+                let child_count = member_indices.len();
+                let full_label = if !is_code_entity_group(parent_crate) {
+                    mod_label.clone()
+                } else {
+                    format!("{parent_crate}::{mod_label}")
+                };
+
+                let max_confidence = member_indices
+                    .iter()
+                    .map(|&i| in_crate[i].confidence)
+                    .fold(0.0_f64, f64::max);
+
+                for &i in member_indices {
+                    node_to_mod.insert(&in_crate[i].id, full_label.clone());
+                }
+
+                mod_nodes.push(viz::VizNode {
+                    id: format!("cluster:{full_label}"),
+                    label: mod_label.clone(),
+                    node_type: "cluster".into(),
+                    entity_type: "module".into(),
+                    state: "active".into(),
+                    confidence: max_confidence,
+                    created_at: String::new(),
+                    context: format!("{child_count} entities"),
+                    child_count: Some(child_count),
+                });
+            }
+
+            // Aggregate edges between modules.
+            let member_ids: std::collections::HashSet<&str> =
+                in_crate.iter().map(|n| n.id.as_str()).collect();
+
+            let mut edge_weights: std::collections::HashMap<(String, String), (f64, String)> =
+                std::collections::HashMap::new();
+
+            for edge in all_edges {
+                let src_in = member_ids.contains(edge.source.as_str());
+                let tgt_in = member_ids.contains(edge.target.as_str());
+                if !src_in || !tgt_in {
+                    continue;
+                }
+                let src_mod = node_to_mod.get(edge.source.as_str());
+                let tgt_mod = node_to_mod.get(edge.target.as_str());
+                if let (Some(sm), Some(tm)) = (src_mod, tgt_mod) {
+                    if sm == tm {
+                        continue;
+                    }
+                    let key = if sm < tm {
+                        (format!("cluster:{sm}"), format!("cluster:{tm}"))
+                    } else {
+                        (format!("cluster:{tm}"), format!("cluster:{sm}"))
+                    };
+                    let weight = edge.strength.unwrap_or(0.5) as f64;
+                    let entry = edge_weights.entry(key).or_insert((0.0, edge.edge_type.clone()));
+                    entry.0 += weight;
+                }
+            }
+
+            let mod_edges: Vec<viz::VizEdge> = edge_weights
+                .into_iter()
+                .map(|((src, tgt), (weight, etype))| viz::VizEdge {
+                    source: src,
+                    target: tgt,
+                    edge_type: etype,
+                    strength: Some(weight.min(1.0) as f32),
+                })
+                .collect();
+
+            VizEvent::Snapshot {
+                nodes: mod_nodes,
+                edges: mod_edges,
+                level: Some("module".into()),
+                parent: Some(parent_crate.to_string()), total_nodes: Some(graph_total_nodes), total_edges: Some(graph_total_edges),
+            }
+        }
+
+        viz::VizLevel::Function => {
+            let parent_module = parent.unwrap_or("");
+
+            // Filter to entities within the specified module.
+            let in_module: Vec<&viz::VizNode> = all_nodes
+                .iter()
+                .filter(|n| {
+                    if !is_code_entity(&n.entity_type) {
+                        // For research drill-down, parent_module is the entity_type
+                        n.entity_type == parent_module
+                    } else {
+                        let mn = module_name(&n.label);
+                        mn == parent_module
+                    }
+                })
+                .collect();
+
+            let member_ids: std::collections::HashSet<&str> =
+                in_module.iter().map(|n| n.id.as_str()).collect();
+
+            // Return the raw entity nodes (no clustering).
+            let leaf_nodes: Vec<viz::VizNode> = in_module
+                .iter()
+                .map(|n| (*n).clone())
+                .collect();
+
+            let leaf_edges: Vec<viz::VizEdge> = all_edges
+                .iter()
+                .filter(|e| {
+                    member_ids.contains(e.source.as_str())
+                        && member_ids.contains(e.target.as_str())
+                })
+                .cloned()
+                .collect();
+
+            VizEvent::Snapshot {
+                nodes: leaf_nodes,
+                edges: leaf_edges,
+                level: Some("function".into()),
+                parent: Some(parent_module.to_string()), total_nodes: Some(graph_total_nodes), total_edges: Some(graph_total_edges),
+            }
+        }
+    }
+}
+
+/// Build a `VizEvent::Snapshot` containing only the neighborhood of a given
+/// entity, found by BFS through the edge list for up to `hops` levels.
+///
+/// Returns all reached nodes plus edges that connect any two reached nodes.
+fn neighborhood_snapshot(
+    all_nodes: &[viz::VizNode],
+    all_edges: &[viz::VizEdge],
+    entity_id: &str,
+    hops: usize,
+) -> VizEvent {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    let graph_total_nodes = all_nodes.len();
+    let graph_total_edges = all_edges.len();
+
+    // Build adjacency list from edges.
+    let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
+    for edge in all_edges {
+        adjacency.entry(edge.source.as_str()).or_default().push(edge.target.as_str());
+        adjacency.entry(edge.target.as_str()).or_default().push(edge.source.as_str());
+    }
+
+    // BFS from entity_id for `hops` levels.
+    let mut visited: HashSet<&str> = HashSet::new();
+    let mut queue: VecDeque<(&str, usize)> = VecDeque::new();
+
+    visited.insert(entity_id);
+    queue.push_back((entity_id, 0));
+
+    while let Some((current, depth)) = queue.pop_front() {
+        if depth >= hops {
+            continue;
+        }
+        if let Some(neighbors) = adjacency.get(current) {
+            for &neighbor in neighbors {
+                if visited.insert(neighbor) {
+                    queue.push_back((neighbor, depth + 1));
+                }
+            }
+        }
+    }
+
+    // Collect nodes that were reached.
+    let neighborhood_nodes: Vec<viz::VizNode> = all_nodes
+        .iter()
+        .filter(|n| visited.contains(n.id.as_str()))
+        .cloned()
+        .collect();
+
+    // Collect edges where both endpoints are in the neighborhood.
+    let neighborhood_edges: Vec<viz::VizEdge> = all_edges
+        .iter()
+        .filter(|e| visited.contains(e.source.as_str()) && visited.contains(e.target.as_str()))
+        .cloned()
+        .collect();
+
+    VizEvent::Snapshot {
+        nodes: neighborhood_nodes,
+        edges: neighborhood_edges,
+        level: Some("neighborhood".into()),
+        parent: Some(entity_id.to_string()),
+        total_nodes: Some(graph_total_nodes),
+        total_edges: Some(graph_total_edges),
+    }
 }
 
 /// Compute the Sec-WebSocket-Accept value per RFC 6455.

@@ -1293,6 +1293,7 @@ pub mod mock {
                     session_id,
                     warmth: amount,
                     pagerank: 0.0,
+                    reputation: 0.0,
                     last_accessed_at: chrono::Utc::now(),
                     access_count: 1,
                     decay_zone: DecayZone::Knowledge,

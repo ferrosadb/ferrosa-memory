@@ -443,9 +443,9 @@ impl CqlStorage {
             warmth_put: session
                 .prepare(format!(
                     "INSERT INTO {ks}.entity_warmth \
-                     (tenant_id, entity_id, session_id, warmth, pagerank, last_accessed_at, \
+                     (tenant_id, entity_id, session_id, warmth, pagerank, reputation, last_accessed_at, \
                       access_count, decay_zone, updated_at) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 ))
                 .await?,
             warmth_list_session: session
@@ -2479,6 +2479,7 @@ impl Storage for CqlStorage {
                 session_id: row.r_by_name("session_id")?,
                 warmth: row.r_by_name("warmth")?,
                 pagerank: row.r_by_name::<f64>("pagerank").unwrap_or(0.0),
+                reputation: row.r_by_name::<f64>("reputation").unwrap_or(0.0),
                 last_accessed_at: last_accessed.and_utc(),
                 access_count: i64::from(row.r_by_name::<i32>("access_count").unwrap_or(0)),
                 decay_zone: parse_decay_zone(&zone_str),
@@ -2499,6 +2500,7 @@ impl Storage for CqlStorage {
                     entry.session_id,
                     entry.warmth,
                     entry.pagerank,
+                    entry.reputation,
                     entry.last_accessed_at.naive_utc(),
                     entry.access_count as i32,
                     entry.decay_zone.to_string(),
@@ -2532,6 +2534,7 @@ impl Storage for CqlStorage {
                 session_id,
                 warmth: amount,
                 pagerank: 0.0,
+                reputation: 0.0,
                 last_accessed_at: now,
                 access_count: 1,
                 decay_zone: DecayZone::Knowledge,
@@ -2566,6 +2569,7 @@ impl Storage for CqlStorage {
                 session_id,
                 warmth: row.r_by_name("warmth")?,
                 pagerank: row.r_by_name::<f64>("pagerank").unwrap_or(0.0),
+                reputation: row.r_by_name::<f64>("reputation").unwrap_or(0.0),
                 last_accessed_at: last_accessed.and_utc(),
                 access_count: i64::from(row.r_by_name::<i32>("access_count").unwrap_or(0)),
                 decay_zone: parse_decay_zone(&zone_str),

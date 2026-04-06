@@ -48,14 +48,24 @@ When multiple codebases are ingested sequentially via `skilltools ingest --cql`,
 
 All entities from all ingests should persist. The `entity_store` partition should hold the union of all ingested entities since the entity_ids are unique UUIDv5 values.
 
-## Reproduction
+## Reproduction (confirmed 2026-04-05)
 
 ```bash
-skilltools ingest --cql localhost:19042 /path/to/codebase-a
-# Verify: entity count matches reported count
-skilltools ingest --cql localhost:19042 /path/to/codebase-b
-# Verify: entity count = sum of both ingests (no loss)
+# Step 1: Insert 100 test entities via direct CQL — all persist
+# Step 2: Insert 500 more via direct CQL — all persist (total 634)
+# Step 3: skilltools ingest ferrosa-memory (2,873 entities) — all prior data survives (total 3,847)
+# Step 4: skilltools ingest ferrosa (11,579 entities) — PRIOR DATA LOST
+
+# Results after step 4:
+#   Total entities: 2,210 (was 3,191 before step 4)
+#   Batch 1 (100 direct CQL): 100/100 survived
+#   Batch 2 (500 direct CQL): 116/500 survived (384 LOST)
+#   ferrosa-memory-core: present but deduped
 ```
+
+**Key finding:** Small writes (100, 500 entities) survive across ingests. But a LARGE write (11,579 entities) to the same partition causes ~1,000 existing entities to disappear. This points to a memtable flush or SSTable compaction bug where the new SSTable REPLACES instead of MERGING with existing SSTables.
+
+The loss is selective — not all prior data is lost, just a portion. This is consistent with an SSTable replacement during compaction where one input SSTable is dropped instead of merged.
 
 ## Impact
 
