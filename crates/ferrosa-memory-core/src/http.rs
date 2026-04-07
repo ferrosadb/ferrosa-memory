@@ -396,6 +396,63 @@ pub async fn serve_viz<S: Storage + 'static>(
             continue;
         }
 
+        // Proxy /viz/api/enrich/models to LM Studio to list available models.
+        if peek_str.contains("GET /viz/api/enrich/models") {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+
+            // Extract llm_url from query string (?url=http://...)
+            let llm_url = if let Some(pos) = peek_str.find("url=") {
+                let start = pos + 4;
+                let end = peek_str[start..]
+                    .find(|c: char| ['&', ' ', '\r', '\n'].contains(&c))
+                    .map(|i| start + i)
+                    .unwrap_or(peek_str.len().min(start + 100));
+                peek_str[start..end]
+                    .replace("%3A", ":")
+                    .replace("%2F", "/")
+                    .replace("%3a", ":")
+                    .replace("%2f", "/")
+            } else {
+                "http://localhost:1234".to_string()
+            };
+
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_default();
+            let (status, body) = match client
+                .get(format!("{}/v1/models", llm_url.trim_end_matches('/')))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    ("200 OK", resp.text().await.unwrap_or_default())
+                }
+                Ok(resp) => {
+                    let s = resp.status();
+                    (
+                        "502 Bad Gateway",
+                        format!("{{\"error\":\"LLM API returned {s}\"}}"),
+                    )
+                }
+                Err(e) => (
+                    "502 Bad Gateway",
+                    format!("{{\"error\":\"{}\"}}", e.to_string().replace('"', "'")),
+                ),
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\n\
+                 Content-Type: application/json\r\n\
+                 Access-Control-Allow-Origin: *\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            continue;
+        }
+
         // Check for session_id override in query string (e.g., /viz/ws?session=UUID)
         let effective_session = if let Some(pos) = peek_str.find("session=") {
             let start = pos + 8;

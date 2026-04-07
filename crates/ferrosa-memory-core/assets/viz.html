@@ -1298,6 +1298,12 @@
             <path d="M16 5h3v3"></path>
           </svg>
         </button>
+        <button class="icon-btn" id="btn-settings" title="LLM Settings" aria-label="Settings">
+          <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+        </button>
       </div>
       <div class="header-filters" style="display:flex;align-items:center;gap:6px;margin:0 12px;">
         <button class="view-toggle" id="btn-view-toggle" title="Toggle Overview/Detail">Detail</button>
@@ -1379,6 +1385,39 @@
         </div>
         <div class="search-count" id="search-count"></div>
         <div class="search-results" id="search-results"></div>
+      </div>
+    </div>
+
+    <!-- Settings Panel -->
+    <div class="panel search-panel" id="settings-panel" style="display:none;z-index:200;">
+      <div class="panel-content">
+        <div class="search-header">
+          <span class="label">LLM Settings</span>
+          <button class="search-close" id="settings-close" title="Close" aria-label="Close settings">
+            <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M18 6 6 18"></path>
+              <path d="m6 6 12 12"></path>
+            </svg>
+          </button>
+        </div>
+        <div style="padding:8px 0;">
+          <label style="font-size:12px;color:#888;display:block;margin-bottom:4px;">LLM Endpoint URL</label>
+          <input type="text" id="llm-url" value="http://localhost:1234" style="width:100%;padding:6px 8px;border:1px solid #444;border-radius:4px;background:#1a1a2e;color:#e0e0e0;font-size:13px;" />
+          <button id="btn-fetch-models" style="margin-top:8px;padding:6px 12px;background:#2a6;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;">Fetch Models</button>
+          <div id="models-status" style="font-size:11px;color:#888;margin-top:4px;"></div>
+        </div>
+        <div style="padding:8px 0;">
+          <label style="font-size:12px;color:#888;display:block;margin-bottom:4px;">Model</label>
+          <select id="llm-model" style="width:100%;padding:6px 8px;border:1px solid #444;border-radius:4px;background:#1a1a2e;color:#e0e0e0;font-size:13px;">
+            <option value="">-- fetch models first --</option>
+          </select>
+        </div>
+        <div style="padding:8px 0;border-top:1px solid #333;margin-top:8px;">
+          <div style="font-size:12px;color:#888;margin-bottom:4px;">Enrichment</div>
+          <button id="btn-enrich-lint" style="padding:6px 12px;background:#26a;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;margin-right:6px;">Lint Only</button>
+          <button id="btn-enrich-run" style="padding:6px 12px;background:#a62;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;">Enrich Crates</button>
+          <div id="enrich-status" style="font-size:11px;color:#888;margin-top:6px;max-height:200px;overflow-y:auto;"></div>
+        </div>
       </div>
     </div>
 
@@ -2862,6 +2901,59 @@ document.getElementById('btn-consolidate').addEventListener('click', async () =>
   btn.disabled = false;
   setTimeout(() => { btn.title = 'Dream Consolidation'; }, 5000);
 });
+
+// === Settings panel ===
+document.getElementById('btn-settings').addEventListener('click', () => {
+  const panel = document.getElementById('settings-panel');
+  panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+});
+document.getElementById('settings-close').addEventListener('click', () => {
+  document.getElementById('settings-panel').style.display = 'none';
+});
+
+document.getElementById('btn-fetch-models').addEventListener('click', async () => {
+  const url = document.getElementById('llm-url').value.trim();
+  const status = document.getElementById('models-status');
+  const select = document.getElementById('llm-model');
+  status.textContent = 'Fetching models...';
+  try {
+    const resp = await fetch(`/viz/api/enrich/models?url=${encodeURIComponent(url)}`);
+    const data = await resp.json();
+    if (data.error) {
+      status.textContent = `Error: ${data.error}`;
+      return;
+    }
+    const models = (data.data || []).map(m => m.id);
+    select.innerHTML = '';
+    models.forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = m;
+      opt.textContent = m;
+      select.appendChild(opt);
+    });
+    status.textContent = `${models.length} models found`;
+    // Save to localStorage
+    localStorage.setItem('fmem-llm-url', url);
+    if (models.length > 0) localStorage.setItem('fmem-llm-model', models[0]);
+  } catch (e) {
+    status.textContent = `Failed: ${e.message}`;
+  }
+});
+
+document.getElementById('llm-model').addEventListener('change', (e) => {
+  localStorage.setItem('fmem-llm-model', e.target.value);
+});
+
+// Restore saved LLM settings
+(function() {
+  const savedUrl = localStorage.getItem('fmem-llm-url');
+  const savedModel = localStorage.getItem('fmem-llm-model');
+  if (savedUrl) document.getElementById('llm-url').value = savedUrl;
+  if (savedModel) {
+    const select = document.getElementById('llm-model');
+    select.innerHTML = `<option value="${savedModel}">${savedModel}</option>`;
+  }
+})();
 
 // === Initialize panels ===
 searchResultsEl.innerHTML = '<div class="search-empty">Type to search...</div>';
