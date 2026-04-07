@@ -43,6 +43,8 @@ pub struct Config {
     pub datalog: DatalogConfig,
     #[serde(default)]
     pub promotion: PromotionConfig,
+    #[serde(default)]
+    pub enrich: EnrichConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -178,6 +180,47 @@ impl Default for PromotionConfig {
             reuse_factor: default_reuse_factor(),
         }
     }
+}
+
+/// LLM enrichment pipeline configuration.
+#[derive(Debug, Deserialize, Clone)]
+pub struct EnrichConfig {
+    /// Base URL for the OpenAI-compatible LLM API (e.g., LM Studio).
+    #[serde(default = "default_enrich_url")]
+    pub llm_base_url: String,
+    /// Model name to use for enrichment.
+    #[serde(default = "default_enrich_model")]
+    pub llm_model: String,
+    /// Number of entities per LLM batch call.
+    #[serde(default = "default_enrich_batch")]
+    pub batch_size: usize,
+    /// Maximum tokens per LLM response.
+    #[serde(default = "default_enrich_max_tokens")]
+    pub max_tokens: u32,
+}
+
+impl Default for EnrichConfig {
+    fn default() -> Self {
+        Self {
+            llm_base_url: default_enrich_url(),
+            llm_model: default_enrich_model(),
+            batch_size: default_enrich_batch(),
+            max_tokens: default_enrich_max_tokens(),
+        }
+    }
+}
+
+fn default_enrich_url() -> String {
+    "http://localhost:1234".into()
+}
+fn default_enrich_model() -> String {
+    "google/gemma-4-31b".into()
+}
+fn default_enrich_batch() -> usize {
+    10
+}
+fn default_enrich_max_tokens() -> u32 {
+    2048
 }
 
 #[derive(Debug, Deserialize)]

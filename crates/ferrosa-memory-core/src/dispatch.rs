@@ -125,6 +125,10 @@ pub struct SessionState {
     pub entity_types: Vec<String>,
     /// Dynamic edge types loaded from the type registry table.
     pub edge_types: Vec<String>,
+    /// Base URL for the enrichment LLM (OpenAI-compatible API).
+    pub enrich_llm_url: String,
+    /// Model name for enrichment LLM.
+    pub enrich_llm_model: String,
 }
 
 impl Default for SessionState {
@@ -156,6 +160,8 @@ impl Default for SessionState {
             .map(String::from)
             .collect(),
             edge_types: Vec::new(),
+            enrich_llm_url: "http://localhost:1234".to_string(),
+            enrich_llm_model: "google/gemma-4-31b".to_string(),
         }
     }
 }
@@ -565,6 +571,42 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                 "required": ["session_id"]
             }),
         },
+        // --- Enrichment pipeline ---
+        ToolDef {
+            name: "enrich_entities".into(),
+            description: "Post-ingest enrichment: generates LLM descriptions for code entities, \
+                annotates edge relationships, and lints the knowledge graph.\n\n\
+                CALL WHEN: After skilltools ingest populates the graph with structural entities. \
+                Transforms shallow structural facts into searchable semantic knowledge.\n\n\
+                Operations: enrich (LLM descriptions), annotate (edge explanations), lint (graph analysis).\n\
+                Idempotent — safe to run multiple times. Already-enriched entities are skipped.\n\
+                Cost: ~2-5 min for 1000 entities (local LLM). Lint is instant.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "format": "uuid" },
+                    "operations": {
+                        "type": "array",
+                        "items": { "type": "string", "enum": ["enrich", "annotate", "lint"] },
+                        "description": "Which operations to run. Default: all three."
+                    },
+                    "entity_types": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Filter: only enrich entities of these types"
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Re-enrich already-enriched entities. Default: false."
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "Lint only, don't write changes. Default: false."
+                    }
+                },
+                "required": ["session_id"]
+            }),
+        },
         // --- Stats tool ---
         ToolDef {
             name: "get_stats".into(),
@@ -966,6 +1008,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "explore_connections" => handle_explore_connections(args, storage, ctx, session).await,
         "hybrid_search" => handle_hybrid_search(args, storage, ctx, session).await,
         "run_consolidation" => handle_run_consolidation(args, storage, ctx, session).await,
+        "enrich_entities" => handle_enrich_entities(args, storage, ctx, session).await,
         "get_stats" => handle_get_stats(args, storage, ctx, session).await,
         "promote_memory" => handle_promote_memory(args, storage, ctx, session).await,
         "demote_memory" => handle_demote_memory(args, storage, ctx, session).await,
@@ -1102,6 +1145,7 @@ fn is_write_tool(name: &str) -> bool {
             | "promote_predicate"
             | "create_edge"
             | "batch_create_edges"
+            | "enrich_entities"
     )
 }
 
@@ -2495,6 +2539,55 @@ async fn handle_run_consolidation<S: crate::storage::Storage>(
         );
     }
     Ok(json)
+}
+
+// --- Enrichment handler ---
+
+async fn handle_enrich_entities<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let session_id = require_uuid(&args, "session_id")?;
+    let operations = args
+        .get("operations")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec!["enrich".into(), "annotate".into(), "lint".into()]);
+    let entity_type_filter = args
+        .get("entity_types")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        });
+    let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+    let dry_run = args
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let enrich_config = crate::enrich::EnrichRunConfig {
+        llm_base_url: session.enrich_llm_url.clone(),
+        llm_model: session.enrich_llm_model.clone(),
+        operations,
+        entity_type_filter,
+        force,
+        dry_run,
+        batch_size: 10,
+    };
+
+    let result = crate::enrich::run_enrichment(storage, ctx, session_id, &enrich_config)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    serde_json::to_value(&result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
 }
 
 // --- Stats handler ---

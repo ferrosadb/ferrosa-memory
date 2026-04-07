@@ -1023,17 +1023,33 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(cql_reconnect_watcher(Arc::clone(&storage)));
 
     // Load dynamic type registry from the database (falls back to defaults).
+    // Timeout after 3s to avoid blocking startup on slow/empty tables.
     let (entity_types, edge_types) = {
         let guard = storage.inner.read().await;
         if let Some(ref cql) = *guard {
-            let et = cql.load_entity_types().await;
-            let edg = cql.load_edge_types().await;
-            tracing::info!(
-                entity_types = et.len(),
-                edge_types = edg.len(),
-                "loaded type registry"
-            );
-            (et, edg)
+            let load_result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                let et = cql.load_entity_types().await;
+                let edg = cql.load_edge_types().await;
+                (et, edg)
+            })
+            .await;
+            match load_result {
+                Ok((et, edg)) => {
+                    tracing::info!(
+                        entity_types = et.len(),
+                        edge_types = edg.len(),
+                        "loaded type registry"
+                    );
+                    (et, edg)
+                }
+                Err(_) => {
+                    tracing::warn!("type registry load timed out (3s), using defaults");
+                    (
+                        ferrosa_memory_core::cql_storage::CqlStorage::default_entity_types(),
+                        Vec::new(),
+                    )
+                }
+            }
         } else {
             tracing::info!("no CQL connection yet, using default type registry");
             (
@@ -1102,6 +1118,8 @@ async fn main() -> anyhow::Result<()> {
                 entity_types: entity_types.clone(),
                 edge_types: edge_types.clone(),
                 graph: graph_client.clone(),
+                enrich_llm_url: config.enrich.llm_base_url.clone(),
+                enrich_llm_model: config.enrich.llm_model.clone(),
                 ..dispatch::SessionState::default()
             });
             if let Some(sid) = default_session_id {
