@@ -64,9 +64,7 @@ pub enum VizClientMessage {
     /// Return to the parent level.
     DrillUp,
     /// Toggle between overview (clustered) and detail (flat) view.
-    ToggleView {
-        mode: String,
-    },
+    ToggleView { mode: String },
     /// Explore the neighborhood of an entity via BFS.
     ExploreNeighborhood {
         entity_id: String,
@@ -285,7 +283,9 @@ mod tests {
                 strength: Some(0.85),
             }],
             level: None,
-            parent: None, total_nodes: None, total_edges: None,
+            parent: None,
+            total_nodes: None,
+            total_edges: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains(r#""type":"Snapshot"#));

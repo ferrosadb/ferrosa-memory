@@ -931,14 +931,28 @@ fn cluster_snapshot(
     fn is_code_entity(entity_type: &str) -> bool {
         matches!(
             entity_type,
-            "crate" | "module" | "section" | "function" | "struct"
-                | "enum" | "trait" | "impl" | "method" | "const"
-                | "type" | "macro" | "mod" | "app"
+            "crate"
+                | "module"
+                | "section"
+                | "function"
+                | "struct"
+                | "enum"
+                | "trait"
+                | "impl"
+                | "method"
+                | "const"
+                | "type"
+                | "macro"
+                | "mod"
+                | "app"
         )
     }
 
     fn is_code_entity_group(group_name: &str) -> bool {
-        !matches!(group_name, "Papers" | "People" | "Concepts" | "Organizations" | "Decisions" | "Other")
+        !matches!(
+            group_name,
+            "Papers" | "People" | "Concepts" | "Organizations" | "Decisions" | "Other"
+        )
     }
 
     match level {
@@ -980,7 +994,10 @@ fn cluster_snapshot(
                 let child_count = member_indices.len();
 
                 // Determine entity_type for the cluster node
-                let entity_type = if matches!(crate_label.as_str(), "Papers" | "People" | "Concepts" | "Organizations" | "Decisions" | "Other") {
+                let entity_type = if matches!(
+                    crate_label.as_str(),
+                    "Papers" | "People" | "Concepts" | "Organizations" | "Decisions" | "Other"
+                ) {
                     match crate_label.as_str() {
                         "Papers" => "document",
                         "People" => "person",
@@ -988,7 +1005,8 @@ fn cluster_snapshot(
                         "Organizations" => "org",
                         "Decisions" => "decision",
                         _ => "concept",
-                    }.to_string()
+                    }
+                    .to_string()
                 } else {
                     "crate".to_string()
                 };
@@ -1033,7 +1051,9 @@ fn cluster_snapshot(
                         (format!("cluster:{tc}"), format!("cluster:{sc}"))
                     };
                     let weight = edge.strength.unwrap_or(0.5) as f64;
-                    let entry = edge_weights.entry(key).or_insert((0.0, edge.edge_type.clone()));
+                    let entry = edge_weights
+                        .entry(key)
+                        .or_insert((0.0, edge.edge_type.clone()));
                     entry.0 += weight;
                 }
             }
@@ -1052,7 +1072,9 @@ fn cluster_snapshot(
                 nodes: crate_nodes,
                 edges: crate_edges,
                 level: Some("crate".into()),
-                parent: None, total_nodes: Some(graph_total_nodes), total_edges: Some(graph_total_edges),
+                parent: None,
+                total_nodes: Some(graph_total_nodes),
+                total_edges: Some(graph_total_edges),
             }
         }
 
@@ -1070,7 +1092,10 @@ fn cluster_snapshot(
                             "People" => n.entity_type == "person",
                             "Concepts" => n.entity_type == "concept",
                             "Organizations" => n.entity_type == "org",
-                            "Decisions" => matches!(n.entity_type.as_str(), "decision" | "bug" | "pattern" | "preference"),
+                            "Decisions" => matches!(
+                                n.entity_type.as_str(),
+                                "decision" | "bug" | "pattern" | "preference"
+                            ),
                             _ => !is_code_entity(&n.entity_type),
                         }
                     } else {
@@ -1085,10 +1110,14 @@ fn cluster_snapshot(
 
             // For non-code groups, show individual entities directly (flat, no sub-grouping)
             if !is_code_entity_group(parent_crate) {
-                let node_ids: std::collections::HashSet<&str> = in_crate.iter().map(|n| n.id.as_str()).collect();
+                let node_ids: std::collections::HashSet<&str> =
+                    in_crate.iter().map(|n| n.id.as_str()).collect();
                 let flat_nodes: Vec<viz::VizNode> = in_crate.iter().map(|n| (*n).clone()).collect();
-                let flat_edges: Vec<viz::VizEdge> = all_edges.iter()
-                    .filter(|e| node_ids.contains(e.source.as_str()) && node_ids.contains(e.target.as_str()))
+                let flat_edges: Vec<viz::VizEdge> = all_edges
+                    .iter()
+                    .filter(|e| {
+                        node_ids.contains(e.source.as_str()) && node_ids.contains(e.target.as_str())
+                    })
                     .cloned()
                     .collect();
                 return VizEvent::Snapshot {
@@ -1175,7 +1204,9 @@ fn cluster_snapshot(
                         (format!("cluster:{tm}"), format!("cluster:{sm}"))
                     };
                     let weight = edge.strength.unwrap_or(0.5) as f64;
-                    let entry = edge_weights.entry(key).or_insert((0.0, edge.edge_type.clone()));
+                    let entry = edge_weights
+                        .entry(key)
+                        .or_insert((0.0, edge.edge_type.clone()));
                     entry.0 += weight;
                 }
             }
@@ -1194,7 +1225,9 @@ fn cluster_snapshot(
                 nodes: mod_nodes,
                 edges: mod_edges,
                 level: Some("module".into()),
-                parent: Some(parent_crate.to_string()), total_nodes: Some(graph_total_nodes), total_edges: Some(graph_total_edges),
+                parent: Some(parent_crate.to_string()),
+                total_nodes: Some(graph_total_nodes),
+                total_edges: Some(graph_total_edges),
             }
         }
 
@@ -1219,16 +1252,12 @@ fn cluster_snapshot(
                 in_module.iter().map(|n| n.id.as_str()).collect();
 
             // Return the raw entity nodes (no clustering).
-            let leaf_nodes: Vec<viz::VizNode> = in_module
-                .iter()
-                .map(|n| (*n).clone())
-                .collect();
+            let leaf_nodes: Vec<viz::VizNode> = in_module.iter().map(|n| (*n).clone()).collect();
 
             let leaf_edges: Vec<viz::VizEdge> = all_edges
                 .iter()
                 .filter(|e| {
-                    member_ids.contains(e.source.as_str())
-                        && member_ids.contains(e.target.as_str())
+                    member_ids.contains(e.source.as_str()) && member_ids.contains(e.target.as_str())
                 })
                 .cloned()
                 .collect();
@@ -1237,7 +1266,9 @@ fn cluster_snapshot(
                 nodes: leaf_nodes,
                 edges: leaf_edges,
                 level: Some("function".into()),
-                parent: Some(parent_module.to_string()), total_nodes: Some(graph_total_nodes), total_edges: Some(graph_total_edges),
+                parent: Some(parent_module.to_string()),
+                total_nodes: Some(graph_total_nodes),
+                total_edges: Some(graph_total_edges),
             }
         }
     }
@@ -1261,8 +1292,14 @@ fn neighborhood_snapshot(
     // Build adjacency list from edges.
     let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
     for edge in all_edges {
-        adjacency.entry(edge.source.as_str()).or_default().push(edge.target.as_str());
-        adjacency.entry(edge.target.as_str()).or_default().push(edge.source.as_str());
+        adjacency
+            .entry(edge.source.as_str())
+            .or_default()
+            .push(edge.target.as_str());
+        adjacency
+            .entry(edge.target.as_str())
+            .or_default()
+            .push(edge.source.as_str());
     }
 
     // BFS from entity_id for `hops` levels.
