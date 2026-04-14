@@ -10,6 +10,6 @@ source: ferrosa-memory DIKW pipeline test
 source-location: "ferrosa-memory/scripts/test-dikw-pipeline.sh"
 ---
 
-# RETRACTED — this is a ferrosa bug, not skilltools
+# RETRACTED — this is a ferrosa bug, not forge
 
 See ferrosa bug report instead.

@@ -314,7 +314,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
         // --- Entity tools (Sprint 3) ---
         ToolDef {
             name: "upsert_entity".into(),
-            description: "Writes a discovered named entity to the entity store. Deduplicates via phonetic matching.\n\nCALL WHEN: Any time you identify a named entity (person, place, org, event, concept) from content. Always link to source_fold_id.\nCheck is_new in response: if false, entity already exists — use the returned entity_id to attach new facts.".into(),
+            description: "Writes a discovered named entity to the entity store. Deduplicates via phonetic matching.\n\nCALL WHEN: Any time you identify a named entity (person, place, org, event, concept) from content.\nCheck is_new in response: if false, entity already exists — use the returned entity_id to attach new facts.\n\nNote: source_fold_id is optional — omit if not in a fold context.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -323,7 +323,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                     "entity_type": { "type": "string", "enum": entity_type_enum },
                     "context_snippet": { "type": "string", "maxLength": 4096 },
                     "embedding": { "type": "array", "items": { "type": "number" } },
-                    "source_fold_id": { "type": "string", "format": "uuid" },
+                    "source_fold_id": { "type": "string", "format": "uuid", "description": "Optional: fold UUID from start_fold. Omit if not in a fold context." },
                     "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
                 },
                 "required": ["session_id", "entity_name", "entity_type", "context_snippet"]
@@ -417,7 +417,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                     "entity_type": { "type": "string", "enum": entity_type_enum },
                     "entity_name": { "type": "string", "maxLength": 256, "description": "Clean entity name (e.g. 'Ben Kearns', 'Ferrosa'). If omitted, extracted automatically from content via LLM or heuristic." },
                     "embedding": { "type": "array", "items": { "type": "number" }, "description": "Optional embedding vector" },
-                    "source_fold_id": { "type": "string", "format": "uuid", "description": "Fold that produced this content" }
+                    "source_fold_id": { "type": "string", "format": "uuid", "description": "Optional: UUID of the fold (conversation thread) that produced this content. Omit or pass null if not in a fold context. DO NOT pass a file path — this field expects a fold UUID from start_fold, or null." }
                 },
                 "required": ["content", "entity_type"]
             }),
@@ -576,7 +576,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             name: "enrich_entities".into(),
             description: "Post-ingest enrichment: generates LLM descriptions for code entities, \
                 annotates edge relationships, and lints the knowledge graph.\n\n\
-                CALL WHEN: After skilltools ingest populates the graph with structural entities. \
+                CALL WHEN: After frg ingest populates the graph with structural entities. \
                 Transforms shallow structural facts into searchable semantic knowledge.\n\n\
                 Operations: enrich (LLM descriptions), annotate (edge explanations), lint (graph analysis).\n\
                 Idempotent — safe to run multiple times. Already-enriched entities are skipped.\n\
@@ -3280,9 +3280,18 @@ async fn handle_find_duplicates<S: crate::storage::Storage>(
 
 fn optional_uuid(args: &Value, field: &str) -> Result<Option<uuid::Uuid>, (i32, String)> {
     match args.get(field).and_then(|v| v.as_str()) {
-        Some(s) => uuid::Uuid::parse_str(s)
-            .map(Some)
-            .map_err(|e| (INVALID_PARAMS, format!("invalid uuid {field}: {e}"))),
+        Some(s) => {
+            // For optional UUID fields, treat invalid UUIDs as None rather than erroring.
+            // This handles cases where callers pass non-UUID values (e.g., file paths) for
+            // optional parameters - they're simply ignored with a debug log.
+            match uuid::Uuid::parse_str(s) {
+                Ok(u) => Ok(Some(u)),
+                Err(_) => {
+                    tracing::debug!(field = %field, value = %s, "optional_uuid: ignoring invalid UUID, treating as None");
+                    Ok(None)
+                }
+            }
+        }
         None => Ok(None),
     }
 }
@@ -3416,7 +3425,7 @@ mod tests {
             .await
             .unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 39, "include_all should return all 39 tools");
+        assert_eq!(tools.len(), 40, "include_all should return all 40 tools");
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         // Check tier-1 tools still present
@@ -4175,7 +4184,7 @@ mod tests {
             .unwrap();
         let result = unwrap_tool_result(result);
         let count = result["count"].as_u64().unwrap();
-        assert!(count >= 1 && count < 3, "expected 1-2 results, got {count}");
+        assert!((1..3).contains(&count), "expected 1-2 results, got {count}");
         assert!(
             result["_hint"]
                 .as_str()

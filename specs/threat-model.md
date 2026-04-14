@@ -1,11 +1,11 @@
 # STRIDE Threat Model — ferrosa-memory-mcp
 
-> Last updated: 2026-03-29
-> Status: Updated — Sprint 5 Datalog inference, warmth field, recursive explore, derived cache, and rule management threats added.
+> Last updated: 2026-04-10
+> Status: Updated — shared HTTP deployment review added for auth boundary, probe semantics, secret handling, and viz exposure.
 
 ## Scope
 
-Full system: MCP clients -> ferrosa-memory-mcp -> Ferrosa DB. Includes stdio and HTTP+SSE transports, all 35 MCP tools (32 existing + recursive_explore, query_derived, manage_rules), 10 CQL tables (6 existing + warmth, rules, derived cache, provenance), graph layer, Datalog inference engine, embedding endpoint, viz WebSocket server, and nightly batch job.
+Full system: MCP clients -> ferrosa-memory-mcp -> Ferrosa DB. Includes stdio and HTTP transports, all MCP tools, graph layer, Datalog inference engine, embedding endpoint, viz dashboard surface, and nightly batch job. This update focuses on the shared HTTP deployment boundary rather than new tool families.
 
 ## Data Flow Diagram
 
@@ -100,11 +100,11 @@ graph TB
 
 | ID | Threat | Component | Risk | Mitigation |
 |----|--------|-----------|------|------------|
-| S1 | Attacker impersonates a legitimate MCP client over HTTP | transport (TB0) | **High** (L:3 x I:4 = 12) | HTTP Basic auth over TLS. Reject connections without valid credentials. |
+| S1 | Attacker impersonates a legitimate MCP client over HTTP | transport (TB0) | **Critical** (L:4 x I:4 = 16) | Replace permissive validator with real principal validation. Require TLS. Fail startup when shared HTTP auth source is missing. |
 | S2 | Client supplies a forged `tenant_id` in tool parameters | auth | **Critical** (L:4 x I:5 = 20) | `tenant_id` is NEVER client-supplied. Extracted from authenticated session only. Input schema rejects any `tenant_id` field in tool params. |
 | S3 | Stdio client spoofing (local privilege escalation) | transport (TB0) | **Low** (L:1 x I:4 = 4) | stdio inherits process owner — OS-level trust. Document that stdio mode assumes local trust. |
 | S4 | Batch job credentials compromised | batch job (TB3) | **Medium** (L:2 x I:4 = 8) | Separate CQL credentials for batch job with read-only on `feedback_outcomes`, write-only on `routing_guidelines`. Least privilege. |
-| S5 | WebSocket connections bypass MCP auth — viz endpoint may lack tenant authentication | viz module (TB0→TB1) | **Low** (L:2 x I:3 = 6) | **MITIGATED** — WebSocket upgrade validates auth token. SSE anomaly subscription (`/subscribe/anomalies`) also requires auth. |
+| S5 | Viz and anomaly routes bypass MCP auth and reuse a stdio-style tenant context | viz module (TB0→TB1) | **High** (L:3 x I:4 = 12) | Do not expose viz on the public shared endpoint. If enabled, require the same auth boundary or internal-only exposure. |
 | S7 | Rule injection via `manage_rules` tool — malicious agent injects rules that derive false facts, poisoning inference results | datalog (TB1) | **Medium** (L:3 x I:4 = 12) | Rule body validation (parse before storing — reject rules that don't produce valid AST). Rule family isolation (rules only operate within their declared family). Audit log for all rule changes with `tenant_id`, `session_id`, rule_id, old/new body. |
 
 ### T — Tampering
@@ -120,6 +120,7 @@ graph TB
 | T7 | Smart ingest manipulation — adversarial content could game the prediction error gate to either flood entities or suppress legitimate ingestion | smart_ingest | **Low-Medium** (L:2 x I:3 = 6) | Rate limiting on ingest calls. Monitor prediction error distribution for anomalies. Confidence floor on entity extraction. |
 | T8 | Warmth field manipulation — adversarial access patterns to artificially inflate warmth scores and bias retrieval toward attacker-controlled entities | warmth (TB1) | **Medium** (L:3 x I:3 = 9) | Max warmth cap (10.0) prevents unbounded inflation. Ebbinghaus decay normalization in consolidation. Anomaly detection on warmth distribution (flag entities with warmth >3σ above session mean). |
 | T9 | Derived cache poisoning — corrupted or stale cache entries return wrong derived facts, leading to incorrect inference results | derived_cache (TB1→TB2) | **Low-High** (L:2 x I:4 = 8) | TTL limits exposure window (default 3600s). Cache key includes `rule_version` — rule changes invalidate affected entries. Provenance chain allows downstream verification of any derived fact. |
+| T10 | Misconfigured shared HTTP startup uses default/fixed tenant for all users | auth / main bootstrap | **Critical** (L:3 x I:5 = 15) | Forbid fixed/default tenant fallback in shared HTTP mode. Startup validation must reject HTTP mode without explicit auth source and tenant mapping backend. |
 
 ### R — Repudiation
 
@@ -138,7 +139,7 @@ graph TB
 | I3 | Embedding vectors reversed to reconstruct source text | all tables with embeddings | **Medium** (L:1 x I:3 = 3) | Embeddings alone are not reversible. Source text columns deleted with parent row on cascade delete. |
 | I4 | Ollama endpoint logs contain sensitive prompt content | embedding_client (TB2) | **Medium** (L:2 x I:3 = 6) | Ollama runs on local/private network. Document that embedding requests contain text fragments. Configure Ollama to disable request logging in production. |
 | I5 | Membership inference on agent memory store | all tables | **Medium** (L:2 x I:3 = 6) | Per "Unveiling Privacy Risks" paper. Mitigated by tenant isolation (attacker can only probe their own tenant). Rate limiting on retrieval tools. |
-| I6 | Viz WebSocket broadcasts all entity changes to any connected client without tenant scoping | viz module | **Medium** (L:2 x I:4 = 8) | **PARTIALLY MITIGATED** — WebSocket connection requires auth, but tenant scoping of entity events needs verification. SSE anomaly alerts are tenant-scoped. |
+| I6 | Viz WebSocket broadcasts all entity changes to any connected client without tenant scoping | viz module | **High** (L:3 x I:4 = 12) | Not mitigated for shared deployment. Keep viz off the public shared endpoint unless it shares the MCP auth boundary and tenant scoping. |
 | I7 | Spreading activation traversal could leak entity relationships across session boundaries | spread_activation | **Low-Medium** (L:2 x I:3 = 6) | Traversal queries must include `tenant_id` filter at every hop. Session-scoped activation should not cross into other sessions' private entities. |
 | I8 | Provenance leaks cross-tenant facts — provenance chain for a derived fact references parent facts from other tenants, disclosing their existence or content | datalog / provenance (TB1→TB2) | **Critical** (L:2 x I:5 = 10) | All provenance queries scoped by `tenant_id` at the Storage trait level. `load_session_facts()` only loads facts for the authenticated tenant. Tenant isolation enforced in every Storage method (warmth, rules, cache, provenance). Integration test: derive facts in tenant A, query provenance in tenant B, verify empty result. |
 
@@ -209,7 +210,9 @@ quadrantChart
 
 ## High Threats (Mitigate in Phase 1-2)
 
-5. **S1 — Client impersonation:** TLS + HTTP Basic auth. **Status: PARTIAL** — HTTP Basic auth implemented. TLS support added (commit 96f3542), but `require_tls: false` still default in main.rs. TLS enforcement needed before production HTTP deployment.
+5. **S1 — Client impersonation:** TLS + real principal validation. **Status: NOT MITIGATED FOR SHARED HTTP** — TLS code exists, but the current validator accepts any credentials and maps them to the configured tenant.
+1. **S5 — Viz auth bypass:** separate listener currently does not share the MCP auth boundary. **Status: NOT MITIGATED FOR SHARED DEPLOYMENT** — safe only when viz remains local/internal.
+1. **T10 — Shared tenant fallback:** HTTP mode can still rely on a configured/fallback tenant. **Status: NOT MITIGATED** — startup validation required.
 1. **T2 — Memo cache poisoning:** Content hash verification + TTL. **Status: MITIGATED** — SHA-256 content hash, model version isolation, TTL support.
 1. **D3 — Cypher DoS:** Query timeout + depth limit. **Status: PARTIAL** — depth limit in traversal queries, but no explicit query timeout configured on HTTP client.
 1. **I2 — Raw trajectory exposure:** Compress fast, archive fast. **Status: PARTIAL** — compression engine working, but background compression job and S3 lifecycle not yet wired.

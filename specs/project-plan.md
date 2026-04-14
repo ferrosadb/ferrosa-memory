@@ -1,7 +1,7 @@
 # Project Plan — ferrosa-memory-mcp
 
-> Last updated: 2026-04-02
-> Status: Sprints 1-6 complete. Sprint 6 (Production Hardening) covers Apr 1-2 work.
+> Last updated: 2026-04-10
+> Status: Sprints 1-6 complete. Sprint 7 added for shared HTTP deployment hardening.
 
 ## Overview
 
@@ -264,6 +264,25 @@
 
 ---
 
+## Sprint 7: Shared HTTP Deployment Hardening
+
+**Goal:** Make the HTTP transport safe for a real shared service without regressing local stdio workflows.
+
+**Status: PLANNED**
+
+| # | Task | Size | Source | Success Criteria | Tests |
+|---|------|------|--------|-----------------|-------|
+| 7.1 | Replace permissive HTTP validator with real auth backend and principal -> tenant mapping | M | threat-model S1, FMEA F57, shared-http-deployment | Invalid credentials are rejected. Each configured principal resolves to exactly one tenant. No request parameter can set `tenant_id`. | Unit: validator rejects bad creds. Integration: two principals map to isolated tenants. |
+| 7.2 | Add startup guardrails for shared HTTP mode | S | threat-model T10, FMEA F61 | HTTP mode fails startup if auth source missing, TLS required but cert/key absent, or fixed/default tenant fallback is enabled. | Unit: config validation matrix. |
+| 7.3 | Split `/health` into `/healthz/live` and `/healthz/ready` | S | shared-http-deployment, FMEA F58 | Liveness returns 200 when process loop is healthy. Readiness returns 200 only when CQL and auth backend are ready. | Integration: disconnected CQL => live=200, ready=503. |
+| 7.4 | Wire production secret inputs for TLS and auth files | S | shared-http-deployment, FMEA F59 | Container/runtime config uses mounted files or injected env vars only. No plaintext secrets added to tracked config. | Manual: start container with mounted secrets; verify startup succeeds. |
+| 7.5 | Disable viz by default in shared deployments and document safe operator-only exposure | S | ADR-003, threat-model S5, FMEA F60 | Shared HTTP examples do not expose viz. Optional viz mode binds separately and is documented as internal-only or equivalently authenticated. | Manual: shared endpoint has no public viz route by default. |
+| 7.6 | Document Codex/Claude shared-endpoint client configs plus stdio fallback | S | user request, shared-http-deployment | Repo includes copy-pasteable shared HTTP config examples and local stdio fallback examples. | Manual: config examples validate against documented env vars. |
+
+**Sprint 7 exit criteria:** shared HTTP rejects invalid credentials, enforces startup guardrails, exposes clear liveness/readiness probes, and ships documented secret/TLS/client wiring without removing stdio mode.
+
+---
+
 ## Backlog (Post-v1.0)
 
 | # | Task | Size | Source | Notes |
@@ -304,6 +323,9 @@
 | **Warmth runaway feedback loop** (FMEA F46, RPN 120) | Medium | Medium | Max warmth cap 10.0. Ebbinghaus decay in consolidation. Monitor warmth distribution in get_stats. | **Open** |
 | **Derived cache staleness after rule change** (FMEA F45, RPN 140) | Medium | High | Invalidate cache for affected predicate families on rule change. Include rule_version in cache key. Cache invalidation implemented in manage_rules put action. | **Mitigated** |
 | **Rule injection via manage_rules** (STRIDE S7) | Medium | High | Rule body validation (parse before storing). Rule family isolation. Audit log for all rule changes. | **Open** |
+| **Permissive shared HTTP auth validator** (FMEA F57, STRIDE S1) | High | Critical | Replace validator with real principal mapping before exposing shared endpoint. | **Open** |
+| **Shared HTTP tenant fallback misconfiguration** (FMEA F61, STRIDE T10) | Medium | High | Fail startup if HTTP mode lacks explicit auth backend or relies on fixed/default tenant behavior. | **Open** |
+| **Public viz exposure without shared auth boundary** (FMEA F60, STRIDE S5) | Medium | High | Disable viz by default on shared deployments. If enabled, restrict to internal or equivalently authenticated surface. | **Open** |
 | Query decomposition quality without LLM | Medium | Medium | Heuristic v1. Always includes original query. Backlog B16: optional LLM-powered decomposition. | Accepted |
 | 15 new Storage trait methods increases trait surface | Medium | Low | All follow established patterns. MockStorage straightforward. Fan-in analysis acceptable. | Accepted |
 
@@ -320,6 +342,7 @@ graph LR
     S3 --> S4
     S4 --> S5[Sprint 5]
     S5 --> S6[Sprint 6]
+    S6 --> S7[Sprint 7]
 
     S1 --- note1["Foundation: cql_client, auth, transport, memo, plan"]
     S2 --- note2["Folds: compression, graph, fold lifecycle"]
@@ -327,6 +350,7 @@ graph LR
     S4 --- note4["Routing: strategy selection, HTTP, hardening"]
     S5 --- note5["RMH + Datalog: inference, warmth, PPR, recursive explore"]
     S6 --- note6["Production: type registry, CQL fallbacks, ops tooling, viz"]
+    S7 --- note7["Shared HTTP: auth, TLS, probes, secret wiring, viz boundary"]
 ```
 
 Sprint 2 and Sprint 3 can run in parallel after Sprint 1 completes — they share infrastructure (cql_client, auth, metrics) but don't depend on each other's tool implementations. Sprint 4 requires both. Sprint 5 requires Sprint 4 (builds on entity graph, routing, feedback loop, and consolidation pipeline). Sprint 6 is production hardening work that spans the full stack.

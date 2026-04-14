@@ -519,18 +519,18 @@ pub fn run_lint(entities: &[EntityEntry], edges: &[TypedEdge]) -> LintReport {
             // Simple word-boundary check.
             if ctx.contains(name) {
                 let target = entities.iter().find(|e| e.entity_name == *name);
-                if let Some(target) = target {
-                    if !ref_targets.contains(&(entity.entity_id, target.entity_id)) {
-                        findings.push(LintFinding {
-                            severity: LintSeverity::Info,
-                            check: "missing_cross_reference".into(),
-                            entity_name: Some(entity.entity_name.clone()),
-                            message: format!(
-                                "Section '{}' mentions '{}' but has no 'references' edge",
-                                entity.entity_name, name
-                            ),
-                        });
-                    }
+                if let Some(target) = target
+                    && !ref_targets.contains(&(entity.entity_id, target.entity_id))
+                {
+                    findings.push(LintFinding {
+                        severity: LintSeverity::Info,
+                        check: "missing_cross_reference".into(),
+                        entity_name: Some(entity.entity_name.clone()),
+                        message: format!(
+                            "Section '{}' mentions '{}' but has no 'references' edge",
+                            entity.entity_name, name
+                        ),
+                    });
                 }
             }
         }

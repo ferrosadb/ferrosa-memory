@@ -1,7 +1,10 @@
 /target
+/target-podman
+/target-podman-linux
 ferrosa-memory.toml
 .fastembed_cache/
 .superpowers/
 .claude/worktrees/
 .opencode/
 opencode.json
+.runtime/

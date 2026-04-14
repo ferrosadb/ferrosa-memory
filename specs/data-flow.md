@@ -290,14 +290,14 @@ Every MCP tool call is logged to the `tool_usage_log` table for token usage anal
 
 **Read path:** Analytics queries aggregate by day and tool name for cost attribution and usage trending. Not exposed as an MCP tool — queried via direct CQL.
 
-## 11. External Codebase Ingestion (via skilltools)
+## 11. External Codebase Ingestion (via forge)
 
-The `skilltools ingest` CLI/MCP tool extracts codebase structure and documentation into the fmem knowledge graph via direct CQL inserts. This is external to the MCP server process.
+The `frg ingest` CLI/MCP tool extracts codebase structure and documentation into the fmem knowledge graph via direct CQL inserts. This is external to the MCP server process.
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'actorBkg':'#16161f','actorTextColor':'#e8e8ed','actorBorder':'#e2725b','signalColor':'#9494a3','signalTextColor':'#e8e8ed','labelBoxBkgColor':'#16161f','labelBoxBorderColor':'#e2725b','labelTextColor':'#e8e8ed','loopTextColor':'#e8e8ed','noteBkgColor':'#1c1c28','noteBorderColor':'#d4a574','noteTextColor':'#e8e8ed','activationBkgColor':'#1c1c28','activationBorderColor':'#e2725b'}}}%%
 sequenceDiagram
-    participant ST as skilltools ingest
+    participant ST as frg ingest
     participant PY as Python CQL loader
     participant DB as Ferrosa DB
     participant VIZ as Viz Server

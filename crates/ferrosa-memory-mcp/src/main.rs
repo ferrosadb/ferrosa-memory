@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use ferrosa_memory_core::auth;
 use ferrosa_memory_core::config::FerrosaCqlConfig;
+use ferrosa_memory_core::config::{Config, validate_shared_http_config};
 use ferrosa_memory_core::cql_storage::CqlStorage;
 use ferrosa_memory_core::dispatch;
 use ferrosa_memory_core::http;
@@ -83,6 +84,13 @@ impl ReconnectingStorage {
         self.generation.load(Ordering::Acquire)
     }
 
+    fn is_ready(&self) -> bool {
+        self.inner
+            .try_read()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
+    }
+
     /// Mark as disconnected and signal the reconnect watcher, but only if the
     /// generation hasn't changed since the caller observed the error. This
     /// prevents a stale error from a pre-reconnect query from killing a fresh
@@ -126,6 +134,29 @@ fn is_connection_error(err: &anyhow::Error) -> bool {
         // Stale prepared statements after node restart — need full reconnect
         // to re-prepare all statements.
         || msg.contains("column or udt property")
+}
+
+fn stdio_tenant_id(config: &Config) -> uuid::Uuid {
+    config
+        .server
+        .tenant_id
+        .as_ref()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .unwrap_or_else(uuid::Uuid::new_v4)
+}
+
+#[cfg(test)]
+fn build_http_validator(config: &Config) -> anyhow::Result<Arc<http::CredentialValidator>> {
+    validate_shared_http_config(config)?;
+    let auth_file = config
+        .server
+        .auth_file
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("HTTP transport requires server.auth_file"))?;
+    let validator = Arc::new(auth::FileAuthValidator::from_path(auth_file)?);
+    Ok(Arc::new(move |user: &str, pass: &str| {
+        validator.validate(user, pass)
+    }))
 }
 
 /// Macro to delegate a Storage trait method through the RwLock.
@@ -294,6 +325,29 @@ impl Storage for ReconnectingStorage {
         entity_id: uuid::Uuid,
     ) -> anyhow::Result<Option<EntityEntry>> {
         delegate!(self, entity_get_by_id, ctx, session_id, entity_id)
+    }
+
+    async fn entity_get_batch(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        entity_ids: &[uuid::Uuid],
+    ) -> anyhow::Result<Vec<EntityEntry>> {
+        let conn_gen = self.current_generation();
+        let guard = self.inner.read().await;
+        match guard.as_ref() {
+            Some(cql) => {
+                let result = cql.entity_get_batch(ctx, session_id, entity_ids).await;
+                if let Err(ref e) = result
+                    && is_connection_error(e)
+                {
+                    drop(guard);
+                    self.mark_disconnected(conn_gen).await;
+                }
+                result
+            }
+            None => Err(anyhow::anyhow!(NOT_CONNECTED_MSG)),
+        }
     }
 
     async fn entity_search_ann(
@@ -977,12 +1031,11 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let tenant_id = config
-        .server
-        .tenant_id
-        .as_ref()
-        .and_then(|s| uuid::Uuid::parse_str(s).ok())
-        .unwrap_or_else(uuid::Uuid::new_v4);
+    if config.server.transport == "http" {
+        validate_shared_http_config(&config)?;
+    }
+
+    let tenant_id = stdio_tenant_id(&config);
     let default_session_id = config
         .server
         .session_id
@@ -1080,22 +1133,56 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Start visualization server if enabled
+    // Start visualization server if enabled.
+    //
+    // Viz is unauthenticated. Under stdio transport we bind 0.0.0.0 (local trust
+    // model). Under HTTP transport we force loopback (127.0.0.1) and require an
+    // explicit `[viz] tenant_id` — the spec bans tenant fallback in HTTP mode.
     let shared_event_bus = Arc::new(ferrosa_memory_core::viz::EventBus::new());
     if config.viz.enabled {
+        let transport = config.server.transport.as_str();
+        let (viz_bind, viz_tenant_id) = match transport {
+            "stdio" => ("0.0.0.0", tenant_id),
+            "http" => {
+                let raw = config.viz.tenant_id.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "viz.enabled = true under HTTP transport requires [viz] tenant_id"
+                    )
+                })?;
+                let parsed = uuid::Uuid::parse_str(raw)
+                    .map_err(|e| anyhow::anyhow!("[viz] tenant_id is not a valid UUID: {e}"))?;
+                ("127.0.0.1", parsed)
+            }
+            _ => ("0.0.0.0", tenant_id),
+        };
         let viz_bus = Arc::clone(&shared_event_bus);
         let viz_port = config.viz.port;
         let viz_storage = Arc::clone(&storage);
-        let viz_ctx = Arc::new(auth::authenticate_stdio(tenant_id));
+        let viz_ctx = Arc::new(auth::authenticate_stdio(viz_tenant_id));
         let viz_session_id = default_session_id.unwrap_or_else(uuid::Uuid::nil);
         tokio::spawn(async move {
-            if let Err(e) =
-                http::serve_viz(viz_port, viz_bus, viz_storage, viz_ctx, viz_session_id).await
+            if let Err(e) = http::serve_viz(
+                viz_bind,
+                viz_port,
+                viz_bus,
+                viz_storage,
+                viz_ctx,
+                viz_session_id,
+            )
+            .await
             {
                 tracing::warn!("viz server error: {e}");
             }
         });
-        tracing::info!("viz dashboard at http://localhost:{}/viz", config.viz.port);
+        tracing::info!(
+            "viz dashboard at http://{}:{}/viz",
+            if viz_bind == "0.0.0.0" {
+                "localhost"
+            } else {
+                viz_bind
+            },
+            config.viz.port
+        );
     }
 
     match config.server.transport.as_str() {
@@ -1187,9 +1274,36 @@ async fn main() -> anyhow::Result<()> {
         }
         "http" => {
             tracing::info!("serving on HTTP port {}", config.server.http_port);
+            let auth_validator =
+                Arc::new(auth::FileAuthValidator::from_path(
+                    config.server.auth_file.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("HTTP transport requires server.auth_file")
+                    })?,
+                )?);
+            let closure_validator: Arc<http::CredentialValidator> = Arc::new({
+                let v = Arc::clone(&auth_validator);
+                move |user: &str, pass: &str| v.validate(user, pass)
+            });
 
-            let validator: Arc<http::CredentialValidator> =
-                Arc::new(move |_user: &str, _pass: &str| Some(tenant_id));
+            let sighup_validator = Arc::clone(&auth_validator);
+            #[cfg(unix)]
+            tokio::spawn(async move {
+                use tokio::signal::unix::{SignalKind, signal};
+                let mut stream =
+                    signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
+                loop {
+                    stream.recv().await;
+                    tracing::info!(path = %sighup_validator.path(), "SIGHUP received, reloading auth file");
+                    match sighup_validator.reload() {
+                        Ok(count) => tracing::info!(principals = count, "auth file reloaded"),
+                        Err(e) => {
+                            tracing::error!(error = %e, "failed to reload auth file, keeping old principals")
+                        }
+                    }
+                }
+            });
+
+            let readiness_storage = Arc::clone(&storage);
 
             http::serve_http(
                 http::HttpConfig {
@@ -1197,10 +1311,11 @@ async fn main() -> anyhow::Result<()> {
                     require_tls: config.server.require_tls,
                     cert_path: config.server.cert_path.clone(),
                     key_path: config.server.key_path.clone(),
+                    readiness_checker: Arc::new(move || readiness_storage.is_ready()),
                 },
                 storage,
                 metrics,
-                validator,
+                closure_validator,
             )
             .await?;
         }
@@ -1215,6 +1330,7 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     // --- is_connection_error tests ---
 
@@ -1300,6 +1416,78 @@ mod tests {
     fn is_connection_error_false_for_generic_error() {
         let err = anyhow::anyhow!("something went wrong");
         assert!(!is_connection_error(&err));
+    }
+
+    #[test]
+    fn stdio_tenant_id_uses_configured_value() {
+        let config = ferrosa_memory_core::config::parse_config(
+            r#"
+[ferrosa]
+contact_points = ["localhost:19042"]
+[server]
+tenant_id = "00000000-0000-0000-0000-000000000123"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            stdio_tenant_id(&config),
+            uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000123").unwrap()
+        );
+    }
+
+    #[test]
+    fn build_http_validator_loads_auth_file() {
+        let tenant_id = uuid::Uuid::new_v4();
+        let auth_path =
+            std::env::temp_dir().join(format!("ferrosa-auth-{}.toml", uuid::Uuid::new_v4()));
+        fs::write(
+            &auth_path,
+            format!(
+                "[[principal]]\nusername = \"alice\"\npassword_sha256 = \"{}\"\ntenant_id = \"{}\"\n",
+                {
+                    use sha2::{Digest, Sha256};
+                    let mut hasher = Sha256::new();
+                    hasher.update(b"s3cret");
+                    format!("{:x}", hasher.finalize())
+                },
+                tenant_id
+            ),
+        )
+        .unwrap();
+
+        let config = ferrosa_memory_core::config::parse_config(&format!(
+            r#"
+[ferrosa]
+contact_points = ["localhost:19042"]
+[server]
+transport = "http"
+require_tls = true
+cert_path = "/etc/ssl/cert.pem"
+key_path = "/etc/ssl/key.pem"
+auth_file = "{}"
+"#,
+            auth_path.display()
+        ))
+        .unwrap();
+
+        let validator = build_http_validator(&config).unwrap();
+        assert_eq!(validator("alice", "s3cret"), Some(tenant_id));
+        assert_eq!(validator("alice", "wrong"), None);
+
+        let _ = fs::remove_file(auth_path);
+    }
+
+    #[tokio::test]
+    async fn reconnecting_storage_reports_readiness() {
+        let cfg = FerrosaCqlConfig {
+            contact_points: vec!["localhost:19042".into()],
+            keyspace: "agent_memory".into(),
+            replication_factor: 3,
+            consistency: "LOCAL_QUORUM".into(),
+        };
+        let storage = ReconnectingStorage::disconnected(cfg);
+        assert!(!storage.is_ready());
     }
 
     // --- next_backoff tests ---

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Automated reproduction of P0 data loss bug.
-# Requires: running 3-node ferrosa cluster on ports 19042-19044, skilltools installed.
+# Requires: running 3-node ferrosa cluster on ports 19042-19044, forge installed.
 #
 # Usage: ./scripts/test-data-loss.sh
 #
@@ -68,14 +68,14 @@ check_canaries "After canary insert"
 # Step 2: Small ingest (ferrosa-memory)
 echo ""
 echo "Step 2: Ingesting ferrosa-memory (~2,800 entities)..."
-skilltools ingest --cql "$CQL_HOST:$CQL_PORT" "$(dirname "$0")/.." > /dev/null 2>&1
+frg ingest --cql "$CQL_HOST:$CQL_PORT" "$(dirname "$0")/.." > /dev/null 2>&1
 check_canaries "After ferrosa-memory ingest"
 
 # Step 3: Large ingest (ferrosa) — this triggers the bug
 echo ""
 echo "Step 3: Ingesting ferrosa (~11,000 entities) — THIS IS THE TRIGGER..."
 if [ -d "$(dirname "$0")/../../ferrosa" ]; then
-    skilltools ingest --cql "$CQL_HOST:$CQL_PORT" "$(dirname "$0")/../../ferrosa" > /dev/null 2>&1
+    frg ingest --cql "$CQL_HOST:$CQL_PORT" "$(dirname "$0")/../../ferrosa" > /dev/null 2>&1
     check_canaries "After ferrosa ingest (immediate)"
 else
     echo "  SKIP: ../ferrosa directory not found"

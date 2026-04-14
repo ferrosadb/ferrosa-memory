@@ -128,12 +128,20 @@ pub trait Storage: Send + Sync {
     ) -> anyhow::Result<Vec<EntityEntry>>;
 
     /// Get a single entity by primary key (targeted lookup, no scan).
-    async fn entity_get_by_id(
+    fn entity_get_by_id(
         &self,
         ctx: &TenantContext,
         session_id: Uuid,
         entity_id: Uuid,
-    ) -> anyhow::Result<Option<EntityEntry>>;
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<EntityEntry>>> + Send;
+
+    /// Batch get multiple entities by their IDs (single query).
+    fn entity_get_batch(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        entity_ids: &[Uuid],
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<EntityEntry>>> + Send;
 
     /// Search entities by embedding similarity.
     async fn entity_search_ann(
@@ -432,11 +440,11 @@ pub trait Storage: Send + Sync {
     // --- Derived cache operations (Sprint 5) ---
 
     /// Get cached derived facts by cache key.
-    async fn derived_cache_get(
+    fn derived_cache_get(
         &self,
         ctx: &TenantContext,
         cache_key: &str,
-    ) -> anyhow::Result<Vec<DerivedFact>>;
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<DerivedFact>>> + Send;
 
     /// Store derived facts under a cache key.
     async fn derived_cache_put(
@@ -825,6 +833,20 @@ pub mod mock {
                 .iter()
                 .find(|e| e.session_id == session_id && e.entity_id == entity_id)
                 .cloned())
+        }
+
+        async fn entity_get_batch(
+            &self,
+            _ctx: &TenantContext,
+            session_id: Uuid,
+            entity_ids: &[Uuid],
+        ) -> anyhow::Result<Vec<EntityEntry>> {
+            let entities = self.entities.lock().await;
+            Ok(entities
+                .iter()
+                .filter(|e| e.session_id == session_id && entity_ids.contains(&e.entity_id))
+                .cloned()
+                .collect())
         }
 
         async fn entity_search_ann(
@@ -1351,7 +1373,7 @@ pub mod mock {
                 .filter(|r| r.family == family && r.state == state)
                 .cloned()
                 .collect();
-            matched.sort_by(|a, b| b.version.cmp(&a.version));
+            matched.sort_by_key(|r| std::cmp::Reverse(r.version));
             Ok(matched)
         }
 
@@ -1363,7 +1385,7 @@ pub mod mock {
             let rules = self.rules.lock().await;
             let mut matched: Vec<&RuleEntry> =
                 rules.iter().filter(|r| r.rule_id == rule_id).collect();
-            matched.sort_by(|a, b| b.version.cmp(&a.version));
+            matched.sort_by_key(|r| std::cmp::Reverse(r.version));
             Ok(matched.first().cloned().cloned())
         }
 

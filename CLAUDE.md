@@ -32,4 +32,15 @@ This project is a test program for the Ferrosa database. Never build workarounds
 ## Related Projects
 
 - `../ferrosa/` — Ferrosa DB engine. Architecture specs at `../ferrosa/specs/` (CQL protocol, SUBSCRIBE semantics, storage engine, graph engine, consensus).
-- `../research/tools/skilltools/` — CLI/MCP companion tool. Provides `ingest` for codebase/docs→memory ingestion, plus code analysis tools (DSM, digest, smell-detect, etc.).
+- `../research/tools/forge/` — CLI/MCP companion tool. Provides `ingest` for codebase/docs→memory ingestion, plus code analysis tools (DSM, digest, smell-detect, etc.).
+
+## Using forge `cargo` Tool
+
+Use `mcp__forge__cargo` instead of bash for all Rust/Cargo commands. Supports: `build`, `check`, `test`, `clippy`, `fmt_check`.
+
+**Example:**
+```
+mcp__forge__cargo(command="test", path="./ferrosa-memory", args="--package ferrosa-memory-core")
+```
+
+Returns structured JSON with parsed failures (`{test_name, error}` pairs), 16KB raw output for test failures. See `.claude/skills/cargo.skill.md` for full documentation.

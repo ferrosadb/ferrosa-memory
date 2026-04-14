@@ -1,7 +1,7 @@
 # Component Architecture
 
-> Last updated: 2026-04-02
-> Status: 38 modules — cognitive memory, hybrid search, visualization, infrastructure, Datalog inference, recursive exploration, B10 promotion pipeline, and NER layers complete. Dynamic type registry, ghost row resilience, and stale prepared statement recovery added.
+> Last updated: 2026-04-10
+> Status: 38 modules plus deployment blueprint update. Shared HTTP posture now explicitly distinguishes local stdio trust from production HTTP requirements.
 
 ## Module Map
 
@@ -88,8 +88,12 @@ graph TB
 
 **Behavior:**
 - stdio mode: inherits process owner credentials (local trust)
-- HTTP mode: HTTP Basic auth against CQL credentials
+- HTTP mode: must validate a real principal and map it to a tenant
 - Rejects tool calls from unrecognized session origins (MCPShield pattern)
+
+**Current gap:** the live HTTP path is still wired to a permissive validator in `ferrosa-memory-mcp/src/main.rs` that returns the configured tenant for any username/password pair. This is acceptable for local testing only.
+
+**Blueprint requirement:** shared HTTP mode must fail startup unless an auth backend is configured. One principal maps to exactly one tenant; `tenant_id` remains server-derived only.
 
 **Dependencies:** None (leaf module)
 

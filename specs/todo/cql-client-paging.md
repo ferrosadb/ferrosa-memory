@@ -2,7 +2,7 @@
 
 ## Problem
 
-All CQL clients (ferrosa-memory-core CqlStorage, skilltools ingest, restore script) fetch full partitions without paging. With 15K+ entities in a single `(tenant_id, session_id)` partition (~209MB), this causes:
+All CQL clients (ferrosa-memory-core CqlStorage, frg ingest, restore script) fetch full partitions without paging. With 15K+ entities in a single `(tenant_id, session_id)` partition (~209MB), this causes:
 
 1. The CQL server assembles the entire 209MB response in memory
 2. If the SSTable is partially written, the read fails and the entire partition is skipped
@@ -30,7 +30,7 @@ session.default_fetch_size = 5000
 
 ### 3. Skilltools Ingest
 
-The Rust CQL driver used by skilltools should also page reads if it does any SELECT queries during ingest.
+The Rust CQL driver used by forge should also page reads if it does any SELECT queries during ingest.
 
 ### 4. Backup Script
 

@@ -1,14 +1,17 @@
 #!/bin/bash
-# Wait for podman machine to be ready, then start the ferrosa-memory cluster.
-# Used by com.ferrosa-memory.cluster LaunchAgent.
+# Wait for podman machine to be ready, then start the ferrosa-memory stack.
+# Used by the user LaunchAgent at login.
 
 export PATH="/opt/homebrew/bin:$PATH"
+export PODMAN_COMPOSE_PROVIDER="${PODMAN_COMPOSE_PROVIDER:-podman-compose}"
 
 LOG="/tmp/ferrosa-memory-cluster.log"
 exec >> "$LOG" 2>&1
 echo "$(date): start-cluster.sh invoked"
 
 PODMAN=/opt/homebrew/bin/podman
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 MAX_WAIT=120
 WAITED=0
 
@@ -28,8 +31,8 @@ if ! "$PODMAN" machine list --format '{{.Running}}' | grep -q true; then
     "$PODMAN" machine start
 fi
 
-echo "$(date): podman ready after ${WAITED}s, starting cluster"
-cd /Users/bkearns/src/ferrosa-memory
+echo "$(date): podman ready after ${WAITED}s, starting stack"
+cd "$REPO_ROOT"
 "$PODMAN" compose up -d
 
 echo "$(date): podman compose up -d exited with $?"

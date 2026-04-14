@@ -22,12 +22,12 @@ When the LLM stores information from a web search via `smart_ingest`:
 - Store as temporal fact for provenance
 - Tag entity with `source_type: "web"`
 
-### Tier 2: Deep Indexing (skilltools ingest_url, on demand)
+### Tier 2: Deep Indexing (frg ingest_url, on demand)
 
-Add to `../research/tools/skilltools/` an `ingest_url` command:
+Add to `../research/tools/forge/` an `ingest_url` command:
 
 ```
-skilltools ingest_url https://www.ontotext.com/knowledgehub/fundamentals/semantic-repository/
+frg ingest_url https://www.ontotext.com/knowledgehub/fundamentals/semantic-repository/
 ```
 
 This:
@@ -46,7 +46,7 @@ This:
 ### Tier 3: Site Graph (future)
 
 For domains that keep appearing in web searches (tracked via `record_outcome`):
-- Auto-suggest: "This domain has been searched 5 times. Run `skilltools ingest_url --depth 2 {domain}` to build a site graph."
+- Auto-suggest: "This domain has been searched 5 times. Run `frg ingest_url --depth 2 {domain}` to build a site graph."
 - Creates a `Website` entity with `contains` edges to all page entities
 - Pages link to each other via `references` edges
 - The full site structure becomes queryable via SPARQL or graph traversal
@@ -55,7 +55,7 @@ For domains that keep appearing in web searches (tracked via `record_outcome`):
 
 In `hybrid_search` response, when a result has `source_type: "web"`:
 ```json
-"_hint": "This knowledge came from {url}. If you need more from this source, suggest the user run: skilltools ingest_url {url}"
+"_hint": "This knowledge came from {url}. If you need more from this source, suggest the user run: frg ingest_url {url}"
 ```
 
 In `record_outcome` with `program_type: "web_search"`:
@@ -76,7 +76,7 @@ With ingestion: First session indexes, subsequent sessions query the graph.
 ## Implementation Order
 
 1. Add `source_url` parameter to `smart_ingest` (ferrosa-memory, ~1 day)
-2. Add `ingest_url` command to skilltools (~3 days)
+2. Add `ingest_url` command to forge (~3 days)
 3. Add web-source hints to hybrid_search responses (~1 hour)
 4. Add domain frequency tracking to record_outcome (~1 day)
 5. Site graph crawling (future sprint)
@@ -87,7 +87,7 @@ With ingestion: First session indexes, subsequent sessions query the graph.
 - `crates/ferrosa-memory-core/src/dispatch.rs` — add `source_url` to smart_ingest schema
 - `crates/ferrosa-memory-core/src/smart_ingest.rs` — store URL provenance
 
-### skilltools (../research/tools/skilltools/)
+### forge (../research/tools/forge/)
 - New command: `src/ingest_url.rs` or equivalent
 - Uses ferrosa-memory MCP tools for storage
 - HTML→concept extraction (can use Ollama or heuristic)

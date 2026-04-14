@@ -84,7 +84,7 @@ pub async fn run_consolidation(
 
     // Pass 2: unfolded entities — compare most-recent pairs by text similarity.
     // Sort by created_at descending so the cap keeps the freshest entities.
-    unfolded.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    unfolded.sort_by_key(|e| std::cmp::Reverse(e.created_at));
     unfolded.truncate(UNFOLDED_PAIR_CAP);
     if unfolded.len() >= 2 {
         create_edges_for_groups(

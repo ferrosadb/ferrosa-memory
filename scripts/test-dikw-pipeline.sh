@@ -11,7 +11,7 @@
 #   Phase 6: End-to-end search quality
 #   Phase 7: Multi-node verification
 #
-# Requires: running 3-node ferrosa cluster, skilltools, Python cassandra-driver
+# Requires: running 3-node ferrosa cluster, forge, Python cassandra-driver
 #
 # Usage: ./scripts/test-dikw-pipeline.sh [--skip-ingest]
 #   --skip-ingest  Skip phases 1-2 if data already loaded (for iterating on later phases)
@@ -199,7 +199,7 @@ if $SKIP_INGEST; then
     echo ""
 else
     echo "Phase 1: Data — ingesting ferrosa-memory (~2,800 entities)..."
-    skilltools ingest --cql "$CQL_HOST:$CQL_PORT" "$PROJECT_DIR" > /dev/null 2>&1
+    frg ingest --cql "$CQL_HOST:$CQL_PORT" "$PROJECT_DIR" > /dev/null 2>&1
 
     ENTITY_COUNT=$(cql_count "entity_store")
     echo "  entity count: $ENTITY_COUNT (pre-flush, may include memtable)"
@@ -254,7 +254,7 @@ else
         PHASE_RESULTS+=("SKIP Phase 2: Data (ferrosa dir not found)")
         echo ""
     else
-        skilltools ingest --cql "$CQL_HOST:$CQL_PORT" "$FERROSA_DIR" > /dev/null 2>&1
+        frg ingest --cql "$CQL_HOST:$CQL_PORT" "$FERROSA_DIR" > /dev/null 2>&1
 
         PRE_FLUSH=$(cql_count "entity_store")
         echo "  entity count: $PRE_FLUSH (pre-flush)"
@@ -370,7 +370,7 @@ echo "  derived_cache entries: $DERIVED_CACHE_COUNT"
 POST_CONSOL_ENTITIES=$(cql_count "entity_store")
 echo "  entity count post-consolidation: $POST_CONSOL_ENTITIES"
 
-# Typed edges survived (skilltools creates depends_on, calls, contains)
+# Typed edges survived (forge creates depends_on, calls, contains)
 TYPED_COUNT=$(cql_query "
 rows = session.execute('SELECT count(*) FROM agent_memory.typed_edges WHERE tenant_id = %s AND session_id = %s', (t, s))
 print(rows.one()[0])
@@ -389,7 +389,7 @@ print(', '.join(f'{k}={v}' for k,v in sorted(types.items())))
 echo "  edge type distribution: $EDGE_TYPES"
 
 # Note: hybrid_search requires phonetic index + embeddings.
-# skilltools ingest bypasses smart_ingest so entities lack phonetic/embedding indices.
+# frg ingest bypasses smart_ingest so entities lack phonetic/embedding indices.
 # This is a known limitation, not a data loss issue.
 
 PHASE4_OK=true
@@ -412,7 +412,7 @@ fi
 echo "Phase 5: Wisdom — checking warmth and pagerank..."
 
 # Note: warmth requires entity access via smart_ingest/hybrid_search.
-# skilltools ingest bypasses this, so warmth/pagerank won't be populated
+# frg ingest bypasses this, so warmth/pagerank won't be populated
 # from ingestion alone. Consolidation should trigger pagerank computation.
 
 # Check if consolidation created warmth/pagerank entries
@@ -448,7 +448,7 @@ PHASE5_OK=true
 # Consolidation may or may not produce pagerank depending on edge density.
 # The key assertion: smart_ingest + hybrid_search works end-to-end.
 if [ "$SEARCH_COUNT" -lt 1 ]; then
-    echo "  NOTE: hybrid_search found no results — phonetic index may not cover skilltools entities"
+    echo "  NOTE: hybrid_search found no results — phonetic index may not cover forge entities"
     echo "  This is a known limitation when entities lack phonetic indices"
 fi
 

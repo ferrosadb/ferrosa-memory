@@ -1,60 +1,44 @@
 # ferrosa-memory-mcp development cluster
-# 3-node Ferrosa cluster + RustFS (S3) + Ollama (embeddings)
+# 3-node Ferrosa cluster + MinIO (S3)
 #
 # Usage:
 #   podman compose up -d
-#   podman compose exec ollama ollama pull nomic-embed-text
 #
 # Ports:
 #   19042-19044  CQL (node1-3)
 #   17687-17689  Bolt/Cypher (node1-3)
 #   17474-17476  Graph HTTP (node1-3)
 #   19090-19092  Web console (node1-3)
-#   19000-19001  RustFS S3 + console
-#   11434        Ollama API
+#   19000-19001  MinIO S3 + console
 
 services:
-  # --- S3-compatible object storage ---
+  # --- S3-compatible object storage (MinIO — supports conditional PUT/CAS) ---
 
-  volume-permissions:
-    image: alpine
-    volumes:
-      - ~/data/ferrosa-memory/rustfs:/data
-    command: >
-      sh -c "chown -R 10001:10001 /data && echo 'permissions fixed'"
-    restart: "no"
-
-  rustfs:
-    image: rustfs/rustfs:latest
-    depends_on:
-      volume-permissions:
-        condition: service_completed_successfully
+  minio:
+    image: minio/minio:latest
     ports:
       - "19000:9000"
       - "19001:9001"
     environment:
-      RUSTFS_VOLUMES: /data/rustfs0
-      RUSTFS_ADDRESS: "0.0.0.0:9000"
-      RUSTFS_CONSOLE_ADDRESS: "0.0.0.0:9001"
-      RUSTFS_CONSOLE_ENABLE: "true"
-      RUSTFS_ACCESS_KEY: rustfsadmin
-      RUSTFS_SECRET_KEY: rustfsadmin  # pragma: allowlist secret
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin  # pragma: allowlist secret
     volumes:
-      - ~/data/ferrosa-memory/rustfs:/data
+      - ~/data/ferrosa-memory/minio:/data
+    command: server /data --console-address ":9001"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
       interval: 5s
       timeout: 5s
       retries: 10
       start_period: 10s
 
-  rustfs-init:
+  minio-init:
     image: minio/mc
     depends_on:
-      rustfs:
+      minio:
         condition: service_healthy
     entrypoint: >
-      sh -c "mc alias set local http://rustfs:9000 rustfsadmin rustfsadmin &&
+      sh -c "mc alias set local http://minio:9000 minioadmin minioadmin &&
              mc mb local/ferrosa-memory --ignore-existing &&
              echo 'bucket created'"
     restart: "no"
@@ -65,8 +49,13 @@ services:
   node1:
     image: ferrosa-memory-node
     stop_grace_period: 35s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     depends_on:
-      rustfs-init:
+      minio-init:
         condition: service_completed_successfully
     ports:
       - "19042:9042"    # CQL
@@ -88,12 +77,12 @@ services:
       FERROSA_CLUSTER_MODE: standalone
       FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
       FERROSA_INTERNODE_BROADCAST: "node1:7000"
-      FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_S3_ENDPOINT: "http://minio:9000"
       FERROSA_S3_BUCKET: ferrosa-memory
       FERROSA_S3_REGION: us-east-1
       FERROSA_S3_ALLOW_HTTP: "true"
-      FERROSA_S3_ACCESS_KEY_ID: rustfsadmin
-      FERROSA_S3_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
+      FERROSA_S3_ACCESS_KEY_ID: minioadmin
+      FERROSA_S3_SECRET_ACCESS_KEY: minioadmin  # pragma: allowlist secret
       FERROSA_S3_PREFIX: node1
     volumes:
       - ~/data/ferrosa-memory/node1:/var/lib/ferrosa
@@ -107,6 +96,11 @@ services:
   node2:
     image: ferrosa-memory-node
     stop_grace_period: 35s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     depends_on:
       node1:
         condition: service_healthy
@@ -130,12 +124,12 @@ services:
       FERROSA_SEED: "node1:7000"
       FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
       FERROSA_INTERNODE_BROADCAST: "node2:7000"
-      FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_S3_ENDPOINT: "http://minio:9000"
       FERROSA_S3_BUCKET: ferrosa-memory
       FERROSA_S3_REGION: us-east-1
       FERROSA_S3_ALLOW_HTTP: "true"
-      FERROSA_S3_ACCESS_KEY_ID: rustfsadmin
-      FERROSA_S3_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
+      FERROSA_S3_ACCESS_KEY_ID: minioadmin
+      FERROSA_S3_SECRET_ACCESS_KEY: minioadmin  # pragma: allowlist secret
       FERROSA_S3_PREFIX: node2
     volumes:
       - ~/data/ferrosa-memory/node2:/var/lib/ferrosa
@@ -149,6 +143,11 @@ services:
   node3:
     image: ferrosa-memory-node
     stop_grace_period: 35s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     depends_on:
       node1:
         condition: service_healthy
@@ -174,12 +173,12 @@ services:
       FERROSA_SEED: "node1:7000"
       FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
       FERROSA_INTERNODE_BROADCAST: "node3:7000"
-      FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_S3_ENDPOINT: "http://minio:9000"
       FERROSA_S3_BUCKET: ferrosa-memory
       FERROSA_S3_REGION: us-east-1
       FERROSA_S3_ALLOW_HTTP: "true"
-      FERROSA_S3_ACCESS_KEY_ID: rustfsadmin
-      FERROSA_S3_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
+      FERROSA_S3_ACCESS_KEY_ID: minioadmin
+      FERROSA_S3_SECRET_ACCESS_KEY: minioadmin  # pragma: allowlist secret
       FERROSA_S3_PREFIX: node3
     volumes:
       - ~/data/ferrosa-memory/node3:/var/lib/ferrosa
@@ -190,27 +189,27 @@ services:
       retries: 30
       start_period: 15s
 
-  # --- Ollama embedding server ---
-
-  ollama:
-    image: ollama/ollama:latest
+  ferrosa-memory-mcp:
+    build:
+      context: .
+      dockerfile: Containerfile
+    stop_grace_period: 35s
+    depends_on:
+      node1:
+        condition: service_healthy
+      node2:
+        condition: service_healthy
+      node3:
+        condition: service_healthy
+    environment:
+      FERROSA_MEMORY_CONFIG: /run/secrets/ferrosa-memory/ferrosa-memory-http-podman.toml
     ports:
-      - "11434:11434"
+      - "18765:8765"
     volumes:
-      - ollama-data:/root/.ollama
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+      - ./.runtime:/run/secrets/ferrosa-memory:ro
     healthcheck:
-      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/11434' || exit 1"]
-      interval: 10s
+      test: ["CMD", "curl", "-skf", "https://127.0.0.1:8765/healthz/live"]
+      interval: 5s
       timeout: 5s
-      retries: 10
+      retries: 20
       start_period: 10s
-
-volumes:
-  ollama-data:

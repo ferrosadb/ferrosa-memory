@@ -1,7 +1,7 @@
 # Failure Mode and Effects Analysis — ferrosa-memory-mcp
 
-> Last updated: 2026-03-29
-> Status: Updated — Sprint 5/5b failure modes added (F42–F56) for Datalog inference, warmth field, PageRank, recursive explore, and promotion components.
+> Last updated: 2026-04-10
+> Status: Updated — shared HTTP deployment failure modes added for auth, probes, secrets, and viz exposure.
 
 ## Scoring Criteria
 
@@ -246,6 +246,16 @@
 | F55 | Materialized facts become stale after base graph changes | Durable facts diverge from live Datalog evaluation | 5 | 5 | 6 | **150** | Rematerialize on rule version change. consolidation Phase 7 refreshes promoted predicates. TTL on promotion status. |
 | F56 | Size budget exceeded for durable tables | Storage growth, potentially unbounded | 4 | 3 | 3 | **36** | size_budget_rows config cap. estimated_rows check before promotion. |
 
+### Component: shared HTTP deployment boundary
+
+| ID | Failure Mode | Effect | S | O | D | RPN | Recommended Action |
+|----|-------------|--------|---|---|---|-----|-------------------|
+| F57 | Permissive HTTP validator accepts any credentials | Full tenant compromise on shared endpoint; all callers land in the same tenant | 10 | 4 | 7 | **280** | Replace with real principal validation and tenant mapping. Add startup test that invalid credentials are rejected. |
+| F58 | Readiness probe returns success while CQL is disconnected | Traffic routed to a nonfunctional instance; widespread 5xx after deploy/restart | 8 | 4 | 5 | **160** | Split liveness and readiness. Readiness must require live CQL and loaded auth backend. |
+| F59 | TLS/auth secrets baked into container config or committed examples | Credential leakage and difficult rotation | 9 | 3 | 6 | **162** | Use mounted files or runtime env injection only. Keep examples redacted. Document rotation procedure. |
+| F60 | Viz exposed on shared deployment without equivalent auth boundary | Cross-tenant snapshot/event leakage and operator surface exposed to end users | 8 | 3 | 6 | **144** | Disable viz by default in shared deployments. If enabled, require same auth/TLS posture or internal-only exposure. |
+| F61 | Shared HTTP starts with fixed/default tenant fallback enabled | Multiple users silently share one tenant namespace | 9 | 3 | 7 | **189** | In HTTP mode, fail startup when auth mapping is absent and disallow random/fixed tenant fallback. |
+
 ### New Test Cases
 
 | Test ID | For FMEA | Test Description | Type |
@@ -273,3 +283,8 @@
 | TC45 | F51 | Run `recursive_explore` with a single-entity query; verify original query appears in sub-queries and results contain the entity | Integration |
 | TC46 | F51 | Run `recursive_explore` with nonsensical query; verify graceful degradation (returns some results via original query, not empty) | Integration |
 | TC47 | F52 | Set `max_passes=2`; run exploration on large graph that won't converge; verify exactly 2 passes and `converged=false` | Unit |
+| TC48 | F57 | Start HTTP server with shared mode auth backend; send invalid Basic auth; verify 401/authorization failure and no tenant context created | Integration |
+| TC49 | F58 | Start server disconnected from CQL; verify `/healthz/live` succeeds while `/healthz/ready` returns not-ready | Integration |
+| TC50 | F59 | Build/start production container config from repo examples; verify required secrets are mounted/injected and no plaintext credentials live in tracked config | Manual |
+| TC51 | F60 | Start shared deployment defaults; verify viz listener is disabled or unreachable from the public endpoint | Integration |
+| TC52 | F61 | Attempt shared HTTP startup with only fixed/default tenant configured and no auth mapping source; verify startup fails fast | Unit + Integration |

@@ -50,6 +50,7 @@ graph LR
 | [data-flow.md](data-flow.md) | Data flow diagrams — tool call paths, storage paths, retrieval paths |
 | [threat-model.md](threat-model.md) | STRIDE threat analysis with trust boundaries |
 | [project-plan.md](project-plan.md) | Timeboxed sprint plan prioritized by risk |
+| [shared-http-deployment.md](shared-http-deployment.md) | Production HTTP deployment blueprint: auth, TLS, probes, tenant policy, viz boundary |
 | [decisions/](decisions/) | Architecture Decision Records |
 
 | [memory-lifecycle.md](memory-lifecycle.md) | Memory consolidation, forgetting, importance decay, and state machine |
@@ -66,4 +67,5 @@ All specs derived from `ferrosa-memory-mcp-spec.md` (v0.1, 2026-03-21).
 
 - **2026-03-21 (init):** Full 5-phase blueprint created
 - **2026-03-21 (update):** Drift detected after 8 commits. Updated: graph_client HTTP refactor, DSM M11 decoupling, vector column gap (F31), graph edge write gap (F32), sprint completion tracking, risk register updates
-- **2026-04-01 (update):** Dynamic type registry (DDL 019), multiselect filter UI in viz, extended entity/edge color mapping, CO_OCCURS noise filtering, ghost row resilience, stale prepared statement recovery, NER module, skilltools ingest data flow, markdown docs ingestion support
+- **2026-04-01 (update):** Dynamic type registry (DDL 019), multiselect filter UI in viz, extended entity/edge color mapping, CO_OCCURS noise filtering, ghost row resilience, stale prepared statement recovery, NER module, frg ingest data flow, markdown docs ingestion support
+- **2026-04-10 (update):** Shared HTTP deployment blueprint: real auth boundary, TLS/secret handling, multi-tenant policy, liveness/readiness probes, and viz exposure decision

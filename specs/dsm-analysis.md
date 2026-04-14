@@ -1,7 +1,7 @@
 # Design Structure Matrix — ferrosa-memory-mcp
 
-> Last updated: 2026-03-29
-> Status: Full inventory — 39 modules (M1-M39). Sprint 5 adds Datalog inference, warmth field, PageRank, and recursive exploration. B10 adds promotion pipeline for workload-driven materialization.
+> Last updated: 2026-04-10
+> Status: Full inventory plus shared-HTTP deployment review. The main new concern is not a new module but an overloaded deployment boundary around `main.rs`, `http`, and `viz`.
 
 ## Module Inventory
 
@@ -402,3 +402,9 @@ Phase 6: Orchestration
   dispatch (depends on nearly everything)
   http (depends on auth, dispatch, metrics, storage, types, viz)
 ```
+
+## 2026-04-10 Deployment Notes
+
+1. `crates/ferrosa-memory-mcp/src/main.rs` is now the highest-risk deployment hotspot. Git churn and bug-fix history both concentrate there because it owns transport selection, tenant defaults, viz startup, and the HTTP validator wiring.
+2. Module coupling does not require an immediate viz crate split. The stronger requirement is deployment separation: `http` and `viz` may stay code-coupled, but they should not remain equally exposed surfaces in a shared service.
+3. The recommended next refactor is to move shared-HTTP bootstrap rules into a dedicated deployment config path so auth/TLS/probe policy stops living as ad hoc wiring in `main.rs`.

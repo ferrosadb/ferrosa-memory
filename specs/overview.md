@@ -50,7 +50,20 @@ graph LR
 - **stdio** — default for Claude Code local usage (`~/.claude/settings.json`)
 - **HTTP + SSE** — remote / multi-user deployment, Claude.ai connectors
 
-Authentication: HTTP Basic (same credentials as CQL) in HTTP mode; stdio inherits process owner credentials.
+Authentication:
+
+- `stdio` remains local-trust only and may use a fixed configured tenant for development.
+- Shared HTTP must use real authenticated principals mapped to tenants; it must not reuse the current permissive validator.
+- Public viz exposure is not part of the shared MCP endpoint decision.
+
+## Shared HTTP Deployment Posture
+
+The codebase now supports both local stdio and remote HTTP, but they are different trust models:
+
+- **Local stdio** — developer-owned process, fixed/default tenant acceptable, viz can stay enabled.
+- **Shared HTTP** — multi-user service, TLS required, one authenticated principal per tenant, readiness probes required, viz disabled by default.
+
+The current implementation is still in a local-first posture because `crates/ferrosa-memory-mcp/src/main.rs` uses a permissive HTTP credential validator. Shared deployment work must close that gap before the HTTP transport is exposed beyond a trusted local environment.
 
 ## Technology Stack
 
