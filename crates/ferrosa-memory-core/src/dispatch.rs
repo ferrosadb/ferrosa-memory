@@ -218,13 +218,13 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "depth": { "type": "integer", "minimum": 0, "maximum": 100 },
                     "subtask_id": { "type": "string", "maxLength": 256 },
                     "parent_subtask": { "type": "string", "maxLength": 256 },
                     "goal_text": { "type": "string", "maxLength": 4096 }
                 },
-                "required": ["session_id", "depth", "subtask_id", "goal_text"]
+                "required": ["depth", "subtask_id", "goal_text"]
             }),
         },
         ToolDef {
@@ -233,10 +233,10 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "max_depth": { "type": "integer", "minimum": 0, "maximum": 100 }
                 },
-                "required": ["session_id"]
+                "required": []
             }),
         },
         ToolDef {
@@ -245,13 +245,13 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "depth": { "type": "integer", "minimum": 0, "maximum": 100 },
                     "subtask_id": { "type": "string", "maxLength": 256 },
                     "status": { "type": "string", "enum": ["pending", "active", "complete", "failed"] },
                     "outcome_summary": { "type": "string", "maxLength": 4096 }
                 },
-                "required": ["session_id", "depth", "subtask_id", "status"]
+                "required": ["depth", "subtask_id", "status"]
             }),
         },
         // --- Fold tools (Sprint 2) ---
@@ -261,12 +261,12 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "depth": { "type": "integer", "minimum": 0, "maximum": 100 },
                     "parent_fold_id": { "type": "string", "format": "uuid" },
                     "initial_context": { "type": "string", "maxLength": 131072 }
                 },
-                "required": ["session_id", "depth", "initial_context"]
+                "required": ["depth", "initial_context"]
             }),
         },
         ToolDef {
@@ -276,10 +276,10 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "fold_id": { "type": "string", "format": "uuid" },
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "repl_turn": { "type": "string", "maxLength": 131072 }
                 },
-                "required": ["fold_id", "session_id", "repl_turn"]
+                "required": ["fold_id", "repl_turn"]
             }),
         },
         ToolDef {
@@ -289,11 +289,11 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "fold_id": { "type": "string", "format": "uuid" },
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "summary": { "type": "string", "maxLength": 131072 },
                     "embedding": { "type": "array", "items": { "type": "number" } }
                 },
-                "required": ["fold_id", "session_id", "summary", "embedding"]
+                "required": ["fold_id", "summary", "embedding"]
             }),
         },
         ToolDef {
@@ -302,13 +302,13 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "query_embedding": { "type": "array", "items": { "type": "number" } },
                     "query": { "type": "string", "maxLength": 4096, "description": "Optional text query for routing optimization. If provided, the router selects optimal k and include_raw." },
                     "k": { "type": "integer", "minimum": 1, "maximum": 100 },
                     "include_raw": { "type": "boolean" }
                 },
-                "required": ["session_id", "query_embedding"]
+                "required": ["query_embedding"]
             }),
         },
         // --- Entity tools (Sprint 3) ---
@@ -318,7 +318,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "entity_name": { "type": "string", "maxLength": 512 },
                     "entity_type": { "type": "string", "enum": entity_type_enum },
                     "context_snippet": { "type": "string", "maxLength": 4096 },
@@ -326,7 +326,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                     "source_fold_id": { "type": "string", "format": "uuid", "description": "Optional: fold UUID from start_fold. Omit if not in a fold context." },
                     "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
                 },
-                "required": ["session_id", "entity_name", "entity_type", "context_snippet"]
+                "required": ["entity_name", "entity_type", "context_snippet"]
             }),
         },
         ToolDef {
@@ -340,7 +340,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid", "description": "Session UUID" },
+                    "session_id": { "type": "string", "description": "Session UUID" },
                     "entities": {
                         "type": "array",
                         "description": "Array of entities to ingest",
@@ -357,7 +357,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                         "maxItems": 100
                     }
                 },
-                "required": ["session_id", "entities"]
+                "required": ["entities"]
             }),
         },
         ToolDef {
@@ -366,7 +366,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "query": { "type": "string", "maxLength": 4096 },
                     "embedding": { "type": "array", "items": { "type": "number" } },
                     "strategy": { "type": "string", "enum": ["ann", "phonetic", "both"] },
@@ -382,7 +382,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "query_id": { "type": "string", "format": "uuid" },
                     "program_type": { "type": "string", "enum": ["hnsw_ann", "phonetic", "cypher_hop", "btree_range", "memo_hit"] },
                     "task_complexity": { "type": "string", "enum": ["simple", "linear", "quadratic"] },
@@ -390,7 +390,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                     "latency_ms": { "type": "integer", "minimum": 0 },
                     "token_cost": { "type": "integer", "minimum": 0 }
                 },
-                "required": ["session_id", "query_id", "program_type", "task_complexity", "succeeded", "latency_ms", "token_cost"]
+                "required": ["query_id", "program_type", "task_complexity", "succeeded", "latency_ms", "token_cost"]
             }),
         },
         // --- Session lifecycle ---
@@ -412,7 +412,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "content": { "type": "string", "maxLength": 8192, "description": "The content to ingest" },
                     "entity_type": { "type": "string", "enum": entity_type_enum },
                     "entity_name": { "type": "string", "maxLength": 256, "description": "Clean entity name (e.g. 'Ben Kearns', 'Ferrosa'). If omitted, extracted automatically from content via LLM or heuristic." },
@@ -499,7 +499,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "entity_id": { "type": "string", "format": "uuid" },
                     "fact_text": { "type": "string", "maxLength": 4096, "description": "The fact to record" },
                     "confidence": { "type": "number", "minimum": 0, "maximum": 1, "description": "Confidence score (default: 1.0)" }
@@ -513,7 +513,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "entity_id": { "type": "string", "format": "uuid" }
                 },
                 "required": ["entity_id"]
@@ -533,7 +533,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                     },
                     "entity_id": { "type": "string", "format": "uuid", "description": "Entity or event ID (required for related_entities, supersession_chain)" },
                     "fold_id": { "type": "string", "format": "uuid", "description": "Fold ID (required for fold_ancestors, entities_in_fold)" },
-                    "session_id": { "type": "string", "format": "uuid", "description": "Session ID (required for fold_ancestors, related_entities, entities_in_fold)" },
+                    "session_id": { "type": "string", "description": "Session ID (required for fold_ancestors, related_entities, entities_in_fold)" },
                     "max_depth": { "type": "integer", "minimum": 1, "maximum": 5, "description": "Maximum traversal depth (default: 2)" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum results to return (default: 10)" }
                 },
@@ -547,7 +547,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "query": { "type": "string", "maxLength": 4096, "description": "Search query text (used for phonetic matching)" },
                     "embedding": {
                         "type": "array",
@@ -566,9 +566,9 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" }
+                    "session_id": { "type": "string" }
                 },
-                "required": ["session_id"]
+                "required": []
             }),
         },
         // --- Enrichment pipeline ---
@@ -584,7 +584,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "operations": {
                         "type": "array",
                         "items": { "type": "string", "enum": ["enrich", "annotate", "lint"] },
@@ -604,7 +604,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                         "description": "Lint only, don't write changes. Default: false."
                     }
                 },
-                "required": ["session_id"]
+                "required": []
             }),
         },
         // --- Stats tool ---
@@ -614,9 +614,9 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" }
+                    "session_id": { "type": "string" }
                 },
-                "required": ["session_id"]
+                "required": []
             }),
         },
         // --- Memory state management ---
@@ -626,7 +626,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "entity_id": { "type": "string", "format": "uuid" }
                 },
                 "required": ["entity_id"]
@@ -638,7 +638,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "entity_id": { "type": "string", "format": "uuid" }
                 },
                 "required": ["entity_id"]
@@ -651,7 +651,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "entity_id": { "type": "string", "format": "uuid" }
                 },
                 "required": ["entity_id"]
@@ -664,12 +664,12 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "source": { "type": "string", "format": "uuid", "description": "Entity ID to start from" },
                     "destination": { "type": "string", "format": "uuid", "description": "Entity ID to find path to" },
                     "max_hops": { "type": "integer", "minimum": 1, "maximum": 10, "description": "Maximum path length (default: 5)" }
                 },
-                "required": ["session_id", "source", "destination"]
+                "required": ["source", "destination"]
             }),
         },
         // --- Speculative retrieval ---
@@ -679,7 +679,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "threshold": {
                         "type": "number",
                         "minimum": 0.0,
@@ -693,7 +693,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                         "description": "Maximum predictions to return (default: 10)"
                     }
                 },
-                "required": ["session_id"]
+                "required": []
             }),
         },
         // --- Spreading activation ---
@@ -703,7 +703,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "seeds": {
                         "type": "array",
                         "items": { "type": "string", "format": "uuid" },
@@ -714,7 +714,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                     "decay": { "type": "number", "minimum": 0.01, "maximum": 1.0, "description": "Activation decay per hop (default: 0.7)" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Max results to return (default: 10)" }
                 },
-                "required": ["session_id", "seeds"]
+                "required": ["seeds"]
             }),
         },
         // --- Duplicate detection ---
@@ -724,7 +724,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "threshold": {
                         "type": "number",
                         "minimum": 0,
@@ -732,7 +732,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                         "description": "Similarity threshold (0-1). Default: 0.7. Higher = fewer, more confident matches."
                     }
                 },
-                "required": ["session_id"]
+                "required": []
             }),
         },
         // --- Recursive exploration ---
@@ -832,14 +832,14 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "src_entity_id": { "type": "string", "format": "uuid", "description": "Source entity UUID" },
                     "dst_entity_id": { "type": "string", "format": "uuid", "description": "Destination entity UUID" },
                     "edge_type": { "type": "string", "description": "Relationship type (depends_on, contains, part_of, subclass_of, calls, implements, uses)" },
                     "weight": { "type": "number", "minimum": 0, "maximum": 1, "description": "Edge strength (default 1.0)" },
                     "metadata": { "type": "string", "description": "Optional metadata about the relationship" }
                 },
-                "required": ["session_id", "src_entity_id", "dst_entity_id", "edge_type"]
+                "required": ["src_entity_id", "dst_entity_id", "edge_type"]
             }),
         },
         ToolDef {
@@ -849,7 +849,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "edges": {
                         "type": "array",
                         "items": {
@@ -865,7 +865,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                         "maxItems": 200
                     }
                 },
-                "required": ["session_id", "edges"]
+                "required": ["edges"]
             }),
         },
     ]
@@ -971,13 +971,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         .cloned()
         .unwrap_or(Value::Object(serde_json::Map::new()));
 
-    // Inject configured default session_id when caller omits it.
-    if args.get("session_id").and_then(|v| v.as_str()).is_none()
-        && let Some(default_sid) = session.default_session_id
-        && let Some(obj) = args.as_object_mut()
-    {
-        obj.insert("session_id".into(), Value::String(default_sid.to_string()));
-    }
+    resolve_session_id(&mut args, session.default_session_id)?;
 
     tracing::debug!(tool = name, "dispatching tool call");
     let input_bytes = serde_json::to_string(&args).map(|s| s.len()).unwrap_or(0) as i32;
@@ -3278,6 +3272,78 @@ async fn handle_find_duplicates<S: crate::storage::Storage>(
 
 // --- Parameter extraction helpers ---
 
+/// Resolve `session_id` in tool-call arguments using the configured default.
+///
+/// Without this, the dispatcher only treated a *missing* `session_id` as a
+/// fallback trigger — so callers passing `"default"`, `""`, `null`, or an
+/// invalid UUID would either hit MCP client-side schema rejection or land in
+/// the nil-UUID scope (silent wrong-session bug).
+///
+/// Rules:
+/// - missing / null / empty / `"default"` / non-UUID string → inject the
+///   configured default when one exists
+/// - valid UUID string → passthrough
+/// - non-UUID input AND no configured default → `INVALID_PARAMS` with a
+///   message naming the field and the offending value (fail loud)
+/// - missing AND no configured default → leave alone; downstream handler
+///   decides whether the field was required
+fn resolve_session_id(
+    args: &mut Value,
+    default: Option<uuid::Uuid>,
+) -> Result<(), (i32, String)> {
+    let Some(obj) = args.as_object_mut() else {
+        return Ok(());
+    };
+
+    let caller_value = obj.get("session_id").cloned();
+    let needs_fallback = match &caller_value {
+        None => true,
+        Some(Value::Null) => true,
+        Some(Value::String(s)) => {
+            s.is_empty()
+                || s.eq_ignore_ascii_case("default")
+                || uuid::Uuid::parse_str(s).is_err()
+        }
+        Some(_) => true,
+    };
+
+    if !needs_fallback {
+        return Ok(());
+    }
+
+    // Observability: if the caller provided a non-empty value that failed to
+    // parse, warn. Missing/null is the common, intentional path and stays
+    // silent. Per the fail-loud rules, fallbacks must be observable.
+    let caller_explicitly_bad = matches!(
+        &caller_value,
+        Some(Value::String(s)) if !s.is_empty()
+    ) || matches!(&caller_value, Some(v) if !v.is_null() && !v.is_string());
+
+    if let Some(sid) = default {
+        if caller_explicitly_bad {
+            tracing::warn!(
+                provided = %caller_value.as_ref().unwrap(),
+                default = %sid,
+                "substituted configured default for caller-provided session_id"
+            );
+        }
+        obj.insert("session_id".into(), Value::String(sid.to_string()));
+        return Ok(());
+    }
+
+    match caller_value {
+        None | Some(Value::Null) => Ok(()),
+        Some(v) => Err((
+            INVALID_PARAMS,
+            format!(
+                "session_id {} is not a valid UUID and no default session is configured; \
+                 pass a valid UUID or configure server.default_session_id",
+                v
+            ),
+        )),
+    }
+}
+
 fn optional_uuid(args: &Value, field: &str) -> Result<Option<uuid::Uuid>, (i32, String)> {
     match args.get(field).and_then(|v| v.as_str()) {
         Some(s) => {
@@ -4751,5 +4817,180 @@ mod speculative_tests {
             }
         }
         assert!(found_anomaly, "expected AnomalyDetected event on bus");
+    }
+
+    // --- Session ID resolution (bug: explore_connections rejects non-UUID session_id) ---
+    //
+    // The dispatcher injects the configured default_session_id when the caller
+    // passes a placeholder (missing, null, empty, literal "default") or an
+    // invalid UUID. Callers should never silently get Uuid::nil() scope.
+
+    #[test]
+    fn resolve_session_id_injects_default_when_absent() {
+        let default_sid = Uuid::new_v4();
+        let mut args = serde_json::json!({});
+        resolve_session_id(&mut args, Some(default_sid)).unwrap();
+        assert_eq!(args["session_id"], default_sid.to_string());
+    }
+
+    #[test]
+    fn resolve_session_id_injects_default_when_null() {
+        let default_sid = Uuid::new_v4();
+        let mut args = serde_json::json!({ "session_id": null });
+        resolve_session_id(&mut args, Some(default_sid)).unwrap();
+        assert_eq!(args["session_id"], default_sid.to_string());
+    }
+
+    #[test]
+    fn resolve_session_id_injects_default_when_empty_string() {
+        let default_sid = Uuid::new_v4();
+        let mut args = serde_json::json!({ "session_id": "" });
+        resolve_session_id(&mut args, Some(default_sid)).unwrap();
+        assert_eq!(args["session_id"], default_sid.to_string());
+    }
+
+    #[test]
+    fn resolve_session_id_injects_default_when_literal_default() {
+        let default_sid = Uuid::new_v4();
+        let mut args = serde_json::json!({ "session_id": "default" });
+        resolve_session_id(&mut args, Some(default_sid)).unwrap();
+        assert_eq!(args["session_id"], default_sid.to_string());
+    }
+
+    #[test]
+    fn resolve_session_id_injects_default_when_invalid_uuid() {
+        let default_sid = Uuid::new_v4();
+        let mut args = serde_json::json!({ "session_id": "not-a-uuid" });
+        resolve_session_id(&mut args, Some(default_sid)).unwrap();
+        assert_eq!(args["session_id"], default_sid.to_string());
+    }
+
+    #[test]
+    fn resolve_session_id_passes_through_valid_uuid() {
+        let default_sid = Uuid::new_v4();
+        let caller_sid = Uuid::new_v4();
+        let mut args = serde_json::json!({ "session_id": caller_sid.to_string() });
+        resolve_session_id(&mut args, Some(default_sid)).unwrap();
+        assert_eq!(args["session_id"], caller_sid.to_string());
+    }
+
+    #[test]
+    fn resolve_session_id_fails_loud_when_invalid_and_no_default() {
+        let mut args = serde_json::json!({ "session_id": "default" });
+        let err = resolve_session_id(&mut args, None).unwrap_err();
+        assert_eq!(err.0, INVALID_PARAMS);
+        assert!(
+            err.1.contains("session_id") && err.1.contains("default"),
+            "error should name the field and bad value, got: {}",
+            err.1
+        );
+    }
+
+    #[test]
+    fn resolve_session_id_leaves_absent_alone_when_no_default() {
+        // No default and no caller value — let the handler decide whether to
+        // error on missing session_id. (Some tools don't need one.)
+        let mut args = serde_json::json!({});
+        resolve_session_id(&mut args, None).unwrap();
+        assert!(args.get("session_id").is_none());
+    }
+
+    #[test]
+    fn resolve_session_id_handles_non_object_args() {
+        // Defensive: some tool calls arrive with Value::Null as arguments.
+        let mut args = Value::Null;
+        resolve_session_id(&mut args, Some(Uuid::new_v4())).unwrap();
+    }
+
+    // Schema invariants: after the refactor-session-id-schemas sweep, only
+    // delete_session (destructive) may keep `format:uuid` and `required: session_id`.
+    // Every other tool must advertise session_id as a plain optional string so
+    // the dispatcher's resolve_session_id fallback can fire for "default", "",
+    // or omitted values.
+
+    const STRICT_SESSION_TOOLS: &[&str] = &["delete_session"];
+
+    #[test]
+    fn tool_schemas_do_not_require_uuid_format_on_session_id() {
+        let tools = tool_definitions(&["person".to_string()]);
+        for tool in &tools {
+            if STRICT_SESSION_TOOLS.contains(&tool.name.as_str()) {
+                continue;
+            }
+            let sid = &tool.input_schema["properties"]["session_id"];
+            if sid.is_null() {
+                continue;
+            }
+            assert_ne!(
+                sid.get("format"),
+                Some(&serde_json::json!("uuid")),
+                "tool {}: session_id must not carry format:uuid — blocks config fallback in strict MCP clients",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn tool_schemas_do_not_list_session_id_as_required() {
+        let tools = tool_definitions(&["person".to_string()]);
+        for tool in &tools {
+            if STRICT_SESSION_TOOLS.contains(&tool.name.as_str()) {
+                continue;
+            }
+            let required = tool
+                .input_schema
+                .get("required")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                !required.iter().any(|v| v == "session_id"),
+                "tool {}: session_id must not be in required — server falls back to default_session_id",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn delete_session_schema_stays_strict() {
+        let tools = tool_definitions(&["person".to_string()]);
+        let tool = tools.iter().find(|t| t.name == "delete_session").unwrap();
+        let sid = &tool.input_schema["properties"]["session_id"];
+        assert_eq!(
+            sid.get("format"),
+            Some(&serde_json::json!("uuid")),
+            "delete_session must keep format:uuid to prevent accidental fallback to default on typo"
+        );
+        let required = tool.input_schema["required"].as_array().unwrap();
+        assert!(
+            required.iter().any(|v| v == "session_id"),
+            "delete_session must keep session_id as required"
+        );
+    }
+
+    #[tokio::test]
+    async fn explore_connections_accepts_default_string_when_session_configured() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let default_sid = Uuid::new_v4();
+        let session = SessionState {
+            default_session_id: Some(default_sid),
+            ..SessionState::default()
+        };
+        let params = serde_json::json!({
+            "name": "explore_connections",
+            "arguments": {
+                "session_id": "default",
+                "traversal": "related_entities",
+                "entity_id": Uuid::new_v4().to_string(),
+                "max_depth": 1
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session).await;
+        assert!(
+            result.is_ok(),
+            "expected 'default' to resolve to configured session, got: {:?}",
+            result
+        );
     }
 }
