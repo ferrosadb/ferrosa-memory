@@ -37,6 +37,70 @@ fn parse_rule_state(s: &str) -> RuleState {
     }
 }
 
+/// Extract the Sprint 1 "rich schema" columns from a CQL row.
+///
+/// Returns the fields as a tuple in the order they appear on `EntityEntry`:
+/// `(description, description_embedding, tags, properties, content_hash,
+/// updated_at, scope, ingested_by_session)`. Every field is tolerant of
+/// missing/NULL data — legacy rows ingested before the migration return
+/// sensible defaults (None / empty / Session) so reads never fail.
+#[allow(clippy::type_complexity)]
+fn extract_rich_entity_fields(
+    row: &Row,
+) -> (
+    Option<String>,
+    Option<Vec<f32>>,
+    Vec<String>,
+    serde_json::Value,
+    Option<String>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    EntityScope,
+    Option<Uuid>,
+) {
+    let description = row.r_by_name::<String>("description").ok();
+    let description_embedding = row
+        .r_by_name::<cdrs_tokio::types::blob::Blob>("description_embedding")
+        .ok()
+        .map(|blob| blob.into_vec())
+        .filter(|v| !v.is_empty())
+        .map(|v| crate::vector::decode_vector(&v));
+    let tags = row
+        .r_by_name::<String>("tags")
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_default();
+    let properties = row
+        .r_by_name::<String>("properties")
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let content_hash = row.r_by_name::<String>("content_hash").ok();
+    let updated_at = row
+        .r_by_name::<chrono::NaiveDateTime>("updated_at")
+        .ok()
+        .map(|ndt| ndt.and_utc());
+    let scope = row
+        .r_by_name::<String>("scope")
+        .ok()
+        .and_then(|s| match s.as_str() {
+            "global" => Some(EntityScope::Global),
+            "session" => Some(EntityScope::Session),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let ingested_by_session = row.r_by_name::<Uuid>("ingested_by_session").ok();
+    (
+        description,
+        description_embedding,
+        tags,
+        properties,
+        content_hash,
+        updated_at,
+        scope,
+        ingested_by_session,
+    )
+}
+
 /// Type alias for the cdrs-tokio TCP session.
 pub type CqlSession = Session<
     TransportTcp,
@@ -242,14 +306,18 @@ impl CqlStorage {
             entity_list_session: session
                 .prepare(format!(
                     "SELECT entity_id, entity_name, entity_type, source_fold_id, \
-                     context_snippet, entity_embedding, confidence, state, created_at \
+                     context_snippet, entity_embedding, confidence, state, created_at, \
+                     description, description_embedding, tags, properties, content_hash, \
+                     updated_at, scope, ingested_by_session \
                      FROM {ks}.entity_store WHERE tenant_id = ? AND session_id = ?"
                 ))
                 .await?,
             entity_list_all: session
                 .prepare(format!(
                     "SELECT entity_id, session_id, entity_name, entity_type, source_fold_id, \
-                     context_snippet, entity_embedding, confidence, state, created_at \
+                     context_snippet, entity_embedding, confidence, state, created_at, \
+                     description, description_embedding, tags, properties, content_hash, \
+                     updated_at, scope, ingested_by_session \
                      FROM {ks}.entity_store WHERE tenant_id = ? ALLOW FILTERING"
                 ))
                 .await?,
@@ -1081,6 +1149,185 @@ impl Storage for CqlStorage {
                 tracing::warn!(entity_id = %entry.entity_id, error = %e, "failed to store entity_embedding");
             }
         }
+
+        // --- Rich entity fields (Sprint 1 slice 1b) ---
+        // scope + updated_at are always set. ingested_by_session is optional
+        // (populated for global-scope entities to record which session
+        // originally ingested them).
+        let scope_str = match entry.scope {
+            EntityScope::Session => "session",
+            EntityScope::Global => "global",
+        };
+        let updated_at_ndt = entry
+            .updated_at
+            .unwrap_or(entry.created_at)
+            .naive_utc();
+        let q = format!(
+            "UPDATE {ks}.entity_store SET scope = ?, updated_at = ? \
+             WHERE tenant_id = ? AND session_id = ? AND entity_id = ?",
+            ks = self.keyspace,
+        );
+        if let Err(e) = self
+            .session
+            .query_with_values(
+                q,
+                query_values!(
+                    scope_str.to_string(),
+                    updated_at_ndt,
+                    ctx.tenant_id,
+                    entry.session_id,
+                    entry.entity_id
+                ),
+            )
+            .await
+        {
+            tracing::warn!(entity_id = %entry.entity_id, error = %e, "failed to store scope/updated_at");
+        }
+
+        if let Some(ingester) = entry.ingested_by_session {
+            let q = format!(
+                "UPDATE {ks}.entity_store SET ingested_by_session = ? \
+                 WHERE tenant_id = ? AND session_id = ? AND entity_id = ?",
+                ks = self.keyspace,
+            );
+            if let Err(e) = self
+                .session
+                .query_with_values(
+                    q,
+                    query_values!(
+                        ingester,
+                        ctx.tenant_id,
+                        entry.session_id,
+                        entry.entity_id
+                    ),
+                )
+                .await
+            {
+                tracing::warn!(entity_id = %entry.entity_id, error = %e, "failed to store ingested_by_session");
+            }
+        }
+
+        // Optional text fields.
+        if let Some(ref desc) = entry.description {
+            let q = format!(
+                "UPDATE {ks}.entity_store SET description = ? \
+                 WHERE tenant_id = ? AND session_id = ? AND entity_id = ?",
+                ks = self.keyspace,
+            );
+            if let Err(e) = self
+                .session
+                .query_with_values(
+                    q,
+                    query_values!(
+                        desc.clone(),
+                        ctx.tenant_id,
+                        entry.session_id,
+                        entry.entity_id
+                    ),
+                )
+                .await
+            {
+                tracing::warn!(entity_id = %entry.entity_id, error = %e, "failed to store description");
+            }
+        }
+
+        if let Some(ref emb) = entry.description_embedding {
+            let vec_literal: String = format!(
+                "[{}]",
+                emb.iter()
+                    .map(|v| format!("{v:.8}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let q = format!(
+                "UPDATE {ks}.entity_store SET description_embedding = {vec_literal} \
+                 WHERE tenant_id = ? AND session_id = ? AND entity_id = ?",
+                ks = self.keyspace,
+            );
+            if let Err(e) = self
+                .session
+                .query_with_values(
+                    q,
+                    query_values!(ctx.tenant_id, entry.session_id, entry.entity_id),
+                )
+                .await
+            {
+                tracing::warn!(entity_id = %entry.entity_id, error = %e, "failed to store description_embedding");
+            }
+        }
+
+        if !entry.tags.is_empty() {
+            let tags_json = serde_json::to_string(&entry.tags).unwrap_or_else(|_| "[]".into());
+            let q = format!(
+                "UPDATE {ks}.entity_store SET tags = ? \
+                 WHERE tenant_id = ? AND session_id = ? AND entity_id = ?",
+                ks = self.keyspace,
+            );
+            if let Err(e) = self
+                .session
+                .query_with_values(
+                    q,
+                    query_values!(
+                        tags_json,
+                        ctx.tenant_id,
+                        entry.session_id,
+                        entry.entity_id
+                    ),
+                )
+                .await
+            {
+                tracing::warn!(entity_id = %entry.entity_id, error = %e, "failed to store tags");
+            }
+        }
+
+        if !entry.properties.is_null() {
+            let props_json =
+                serde_json::to_string(&entry.properties).unwrap_or_else(|_| "{}".into());
+            let q = format!(
+                "UPDATE {ks}.entity_store SET properties = ? \
+                 WHERE tenant_id = ? AND session_id = ? AND entity_id = ?",
+                ks = self.keyspace,
+            );
+            if let Err(e) = self
+                .session
+                .query_with_values(
+                    q,
+                    query_values!(
+                        props_json,
+                        ctx.tenant_id,
+                        entry.session_id,
+                        entry.entity_id
+                    ),
+                )
+                .await
+            {
+                tracing::warn!(entity_id = %entry.entity_id, error = %e, "failed to store properties");
+            }
+        }
+
+        if let Some(ref hash) = entry.content_hash {
+            let q = format!(
+                "UPDATE {ks}.entity_store SET content_hash = ? \
+                 WHERE tenant_id = ? AND session_id = ? AND entity_id = ?",
+                ks = self.keyspace,
+            );
+            if let Err(e) = self
+                .session
+                .query_with_values(
+                    q,
+                    query_values!(
+                        hash.clone(),
+                        ctx.tenant_id,
+                        entry.session_id,
+                        entry.entity_id
+                    ),
+                )
+                .await
+            {
+                tracing::warn!(entity_id = %entry.entity_id, error = %e, "failed to store content_hash");
+            }
+        }
+
         Ok(())
     }
 
@@ -1171,7 +1418,9 @@ impl Storage for CqlStorage {
     ) -> anyhow::Result<Option<EntityEntry>> {
         let query = format!(
             "SELECT entity_id, entity_name, entity_type, source_fold_id, \
-             context_snippet, confidence, state, created_at \
+             context_snippet, confidence, state, created_at, \
+             description, description_embedding, tags, properties, content_hash, \
+             updated_at, scope, ingested_by_session \
              FROM {}.entity_store WHERE tenant_id = ? AND session_id = ? AND entity_id = ?",
             self.keyspace
         );
@@ -1198,6 +1447,16 @@ impl Storage for CqlStorage {
                 .ok()
                 .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
                 .unwrap_or_default();
+            let (
+                description,
+                description_embedding,
+                tags,
+                properties,
+                content_hash,
+                updated_at,
+                scope,
+                ingested_by_session,
+            ) = extract_rich_entity_fields(row);
             Ok(Some(EntityEntry {
                 tenant_id: ctx.tenant_id,
                 entity_id,
@@ -1210,7 +1469,14 @@ impl Storage for CqlStorage {
                 confidence: f64::from(row.r_by_name::<f32>("confidence").unwrap_or(1.0)),
                 state,
                 created_at: created.and_utc(),
-                ..Default::default()
+                description,
+                description_embedding,
+                tags,
+                properties,
+                content_hash,
+                updated_at,
+                scope,
+                ingested_by_session,
             }))
         } else {
             Ok(None)
@@ -1230,7 +1496,9 @@ impl Storage for CqlStorage {
         let placeholders: Vec<String> = entity_ids.iter().map(|_| "?".to_string()).collect();
         let query = format!(
             "SELECT entity_id, entity_name, entity_type, source_fold_id, \
-                 context_snippet, confidence, state, created_at \
+                 context_snippet, confidence, state, created_at, \
+                 description, description_embedding, tags, properties, content_hash, \
+                 updated_at, scope, ingested_by_session \
                  FROM {}.entity_store WHERE tenant_id = ? AND session_id = ? AND entity_id IN ({})",
             self.keyspace,
             placeholders.join(", ")
@@ -1275,6 +1543,16 @@ impl Storage for CqlStorage {
                 .ok()
                 .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
                 .unwrap_or_default();
+            let (
+                description,
+                description_embedding,
+                tags,
+                properties,
+                content_hash,
+                updated_at,
+                scope,
+                ingested_by_session,
+            ) = extract_rich_entity_fields(&row);
             results.push(EntityEntry {
                 tenant_id: ctx.tenant_id,
                 entity_id,
@@ -1287,7 +1565,14 @@ impl Storage for CqlStorage {
                 confidence: f64::from(row.r_by_name::<f32>("confidence").unwrap_or(1.0)),
                 state,
                 created_at: created.and_utc(),
-                ..Default::default()
+                description,
+                description_embedding,
+                tags,
+                properties,
+                content_hash,
+                updated_at,
+                scope,
+                ingested_by_session,
             });
         }
         Ok(results)
@@ -1431,6 +1716,16 @@ impl Storage for CqlStorage {
                 .ok()
                 .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
                 .unwrap_or_default();
+            let (
+                description,
+                description_embedding,
+                tags,
+                properties,
+                content_hash,
+                updated_at,
+                scope,
+                ingested_by_session,
+            ) = extract_rich_entity_fields(&row);
             results.push(EntityEntry {
                 tenant_id: ctx.tenant_id,
                 entity_id,
@@ -1451,7 +1746,14 @@ impl Storage for CqlStorage {
                     .unwrap_or(1.0),
                 state,
                 created_at: created.and_utc(),
-                ..Default::default()
+                description,
+                description_embedding,
+                tags,
+                properties,
+                content_hash,
+                updated_at,
+                scope,
+                ingested_by_session,
             });
         }
         Ok(results)
@@ -1472,6 +1774,16 @@ impl Storage for CqlStorage {
                 .ok()
                 .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
                 .unwrap_or_default();
+            let (
+                description,
+                description_embedding,
+                tags,
+                properties,
+                content_hash,
+                updated_at,
+                scope,
+                ingested_by_session,
+            ) = extract_rich_entity_fields(&row);
             results.push(EntityEntry {
                 tenant_id: ctx.tenant_id,
                 entity_id: row.r_by_name("entity_id")?,
@@ -1492,7 +1804,14 @@ impl Storage for CqlStorage {
                     .unwrap_or(1.0),
                 state,
                 created_at: created.and_utc(),
-                ..Default::default()
+                description,
+                description_embedding,
+                tags,
+                properties,
+                content_hash,
+                updated_at,
+                scope,
+                ingested_by_session,
             });
         }
         Ok(results)
