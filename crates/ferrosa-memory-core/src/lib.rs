@@ -60,6 +60,7 @@ pub mod speculative;
 pub mod spreading;
 pub mod storage;
 pub mod temporal;
+pub mod test_cluster;
 pub mod transport;
 pub mod types;
 pub mod vector;
