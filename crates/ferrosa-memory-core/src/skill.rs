@@ -628,6 +628,236 @@ pub struct InvokeSkillResult {
     pub prerequisites: Vec<String>,
 }
 
+/// Result of an `ensure_parent_tag` call.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum EnsureParentTagAction {
+    Created { child_id: Uuid, parent_id: Uuid },
+    Skipped { child_id: Uuid, parent_id: Uuid },
+}
+
+/// Idempotently create a `PARENT_TAG` edge from `child` to `parent`, by name.
+/// Resolves (or creates) both tag entities. If the edge already exists,
+/// returns `Skipped`. Relies on the graph client's cycle check when one is
+/// provided — fails loud if cycle would form or the check itself errors.
+pub async fn ensure_parent_tag(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    caller_session_id: Uuid,
+    child_tag_raw: &str,
+    parent_tag_raw: &str,
+    graph_client: Option<&crate::graph::GraphClient>,
+) -> anyhow::Result<EnsureParentTagAction> {
+    let child_tag = normalize_tag(child_tag_raw);
+    let parent_tag = normalize_tag(parent_tag_raw);
+    anyhow::ensure!(!child_tag.is_empty(), "child_tag must not be empty");
+    anyhow::ensure!(!parent_tag.is_empty(), "parent_tag must not be empty");
+    anyhow::ensure!(
+        child_tag != parent_tag,
+        "child and parent tags must differ; got {child_tag:?}"
+    );
+
+    let (_, ingested_by) = crate::scope::resolve_storage_session(
+        caller_session_id,
+        EntityScope::Global,
+        ctx.tenant_id,
+    );
+    let global_session = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
+    let now = chrono::Utc::now();
+
+    let child_id =
+        ensure_tag_entity(storage, ctx, global_session, &child_tag, ingested_by, now).await?;
+    let parent_id =
+        ensure_tag_entity(storage, ctx, global_session, &parent_tag, ingested_by, now).await?;
+
+    // Idempotency: check for existing PARENT_TAG edge.
+    let existing = storage
+        .typed_edge_list_from(ctx, global_session, child_id)
+        .await
+        .unwrap_or_default();
+    if existing
+        .iter()
+        .any(|e| e.edge_type == "PARENT_TAG" && e.dst_id == parent_id)
+    {
+        return Ok(EnsureParentTagAction::Skipped {
+            child_id,
+            parent_id,
+        });
+    }
+
+    // Cycle check (when graph client is wired).
+    if let Some(graph) = graph_client {
+        match graph
+            .would_create_cycle(child_id, parent_id, "PARENT_TAG")
+            .await
+        {
+            Ok(true) => {
+                anyhow::bail!(
+                    "PARENT_TAG edge {} -> {} would form a cycle; rejecting",
+                    child_tag,
+                    parent_tag
+                );
+            }
+            Ok(false) => {}
+            Err(e) => {
+                anyhow::bail!(
+                    "PARENT_TAG cycle check failed (graph unreachable): {}. \
+                     Retry when the graph is healthy.",
+                    e
+                );
+            }
+        }
+    }
+
+    let edge = TypedEdge {
+        tenant_id: ctx.tenant_id,
+        session_id: global_session,
+        src_id: child_id,
+        edge_type: "PARENT_TAG".into(),
+        dst_id: parent_id,
+        weight: 1.0,
+        metadata: None,
+        created_at: now,
+    };
+    storage.typed_edge_put(ctx, &edge).await?;
+
+    Ok(EnsureParentTagAction::Created {
+        child_id,
+        parent_id,
+    })
+}
+
+/// Result of a `verify_skill` call. Always returned (never errors on
+/// missing skill — the caller wants to see negative results too).
+#[derive(Debug, Clone, Serialize)]
+pub struct VerifySkillResult {
+    pub exists: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    pub tags: Vec<String>,
+    pub prerequisites: Vec<String>,
+    pub required_by: Vec<String>,
+    pub missing_prerequisites: Vec<String>,
+}
+
+/// Verify a skill's graph neighborhood — resolved tags, prerequisites,
+/// reverse-prerequisites, and any prerequisites declared at ingest time
+/// that still haven't landed as REQUIRES edges (e.g., because the prereq
+/// skill wasn't ingested at the time). Returns `{exists: false}` for
+/// unknown skill names; never errors on miss.
+pub async fn verify_skill(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    skill_name: &str,
+) -> anyhow::Result<VerifySkillResult> {
+    let Some(entity) = get_skill_by_name(storage, ctx, skill_name).await? else {
+        return Ok(VerifySkillResult {
+            exists: false,
+            entity_id: None,
+            version: None,
+            content_hash: None,
+            tags: Vec::new(),
+            prerequisites: Vec::new(),
+            required_by: Vec::new(),
+            missing_prerequisites: Vec::new(),
+        });
+    };
+
+    let global_session = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
+
+    // Outgoing edges → TAGGED_AS tags + REQUIRES prerequisites.
+    let outgoing = storage
+        .typed_edge_list_from(ctx, global_session, entity.entity_id)
+        .await
+        .unwrap_or_default();
+    let mut tags: Vec<String> = Vec::new();
+    let mut prerequisites: Vec<String> = Vec::new();
+    for edge in &outgoing {
+        let Some(target) = storage
+            .entity_get_by_id(ctx, global_session, edge.dst_id)
+            .await
+            .unwrap_or(None)
+        else {
+            continue;
+        };
+        match edge.edge_type.as_str() {
+            "TAGGED_AS" if target.entity_type == "tag" => tags.push(target.entity_name),
+            "REQUIRES" if target.entity_type == "skill" => {
+                prerequisites.push(target.entity_name)
+            }
+            _ => {}
+        }
+    }
+    tags.sort();
+    prerequisites.sort();
+
+    // Incoming REQUIRES edges → skills that require this one. Session-wide
+    // scan filtered to REQUIRES with dst_id == our entity.
+    let all_edges = storage
+        .typed_edge_list_session(ctx, global_session)
+        .await
+        .unwrap_or_default();
+    let mut required_by: Vec<String> = Vec::new();
+    for edge in &all_edges {
+        if edge.edge_type != "REQUIRES" || edge.dst_id != entity.entity_id {
+            continue;
+        }
+        if let Some(source) = storage
+            .entity_get_by_id(ctx, global_session, edge.src_id)
+            .await
+            .unwrap_or(None)
+            && source.entity_type == "skill"
+        {
+            required_by.push(source.entity_name);
+        }
+    }
+    required_by.sort();
+
+    // Missing prerequisites: names declared at ingest that never landed as
+    // edges. `ingest_skill` doesn't currently persist the raw prereq list
+    // into properties — callers who want missing-prereq diagnostics must
+    // set `properties.raw_prerequisites` (forge's skill-ingest does). For
+    // callers that don't populate it, this stays empty — no false
+    // positives.
+    let raw_prereqs: Vec<String> = entity
+        .properties
+        .get("raw_prerequisites")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let resolved: std::collections::HashSet<&str> =
+        prerequisites.iter().map(|s| s.as_str()).collect();
+    let missing_prerequisites: Vec<String> = raw_prereqs
+        .into_iter()
+        .filter(|p| !resolved.contains(p.as_str()))
+        .collect();
+
+    let version = entity
+        .properties
+        .get("version")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    Ok(VerifySkillResult {
+        exists: true,
+        entity_id: Some(entity.entity_id),
+        version,
+        content_hash: entity.content_hash.clone(),
+        tags,
+        prerequisites,
+        required_by,
+        missing_prerequisites,
+    })
+}
+
 /// Build an `InvokeSkillResult` from a skill entity. The caller is
 /// responsible for ensuring `entity.entity_type == "skill"`.
 pub fn build_invoke_result(entity: &EntityEntry) -> InvokeSkillResult {
@@ -1079,6 +1309,173 @@ mod tests {
             .unwrap();
         let found = get_skill_by_name(&storage, &ctx, "tdd-typo").await.unwrap();
         assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn ensure_parent_tag_creates_on_first_call() {
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+        let caller = Uuid::new_v4();
+        let action = ensure_parent_tag(&storage, &ctx, caller, "tdd", "testing", None)
+            .await
+            .unwrap();
+        assert!(matches!(action, EnsureParentTagAction::Created { .. }));
+
+        // Both tag entities should now exist in the global partition.
+        let global = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
+        let entities = storage.entity_list_session(&ctx, global).await.unwrap();
+        let tag_names: Vec<&str> = entities
+            .iter()
+            .filter(|e| e.entity_type == "tag")
+            .map(|e| e.entity_name.as_str())
+            .collect();
+        assert!(tag_names.contains(&"tdd"));
+        assert!(tag_names.contains(&"testing"));
+    }
+
+    #[tokio::test]
+    async fn ensure_parent_tag_is_idempotent() {
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+        let caller = Uuid::new_v4();
+        let first = ensure_parent_tag(&storage, &ctx, caller, "tdd", "testing", None)
+            .await
+            .unwrap();
+        let second = ensure_parent_tag(&storage, &ctx, caller, "tdd", "testing", None)
+            .await
+            .unwrap();
+        assert!(matches!(first, EnsureParentTagAction::Created { .. }));
+        assert!(matches!(second, EnsureParentTagAction::Skipped { .. }));
+
+        // Only one edge landed despite two calls.
+        let global = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
+        let edges = storage
+            .typed_edge_list_session(&ctx, global)
+            .await
+            .unwrap();
+        let parent_edges: Vec<&TypedEdge> =
+            edges.iter().filter(|e| e.edge_type == "PARENT_TAG").collect();
+        assert_eq!(parent_edges.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ensure_parent_tag_normalizes_names() {
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+        let caller = Uuid::new_v4();
+        // Caller uses mixed case / spaces — normalize_tag should collapse
+        // these onto the same underlying tag entities.
+        let first = ensure_parent_tag(&storage, &ctx, caller, "TDD", "Testing", None)
+            .await
+            .unwrap();
+        let second = ensure_parent_tag(&storage, &ctx, caller, "tdd", "testing", None)
+            .await
+            .unwrap();
+        assert!(matches!(first, EnsureParentTagAction::Created { .. }));
+        assert!(matches!(second, EnsureParentTagAction::Skipped { .. }));
+    }
+
+    #[tokio::test]
+    async fn ensure_parent_tag_rejects_self_loop() {
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+        let caller = Uuid::new_v4();
+        let err = ensure_parent_tag(&storage, &ctx, caller, "tdd", "tdd", None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("must differ"));
+    }
+
+    #[tokio::test]
+    async fn verify_skill_reports_exists_false_for_missing() {
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+        let result = verify_skill(&storage, &ctx, "does-not-exist").await.unwrap();
+        assert!(!result.exists);
+        assert!(result.tags.is_empty());
+        assert!(result.prerequisites.is_empty());
+    }
+
+    #[tokio::test]
+    async fn verify_skill_surfaces_tags_and_prerequisites() {
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+        // Seed a prereq skill first.
+        ingest_skill(&storage, &ctx, base_params("unit-testing"), None, None)
+            .await
+            .unwrap();
+        // Skill under test — tagged, with prereq.
+        let mut p = base_params("tdd");
+        p.tags = vec!["methodology".into()];
+        p.prerequisites = vec!["unit-testing".into()];
+        ingest_skill(&storage, &ctx, p, None, None).await.unwrap();
+
+        let result = verify_skill(&storage, &ctx, "tdd").await.unwrap();
+        assert!(result.exists);
+        assert!(result.entity_id.is_some());
+        // Category + extra tag should both show up.
+        assert!(result.tags.contains(&"testing".to_string()));
+        assert!(result.tags.contains(&"methodology".to_string()));
+        assert_eq!(result.prerequisites, vec!["unit-testing".to_string()]);
+        assert!(result.missing_prerequisites.is_empty());
+    }
+
+    #[tokio::test]
+    async fn verify_skill_reports_required_by() {
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+        // "unit-testing" will end up required by "tdd".
+        ingest_skill(&storage, &ctx, base_params("unit-testing"), None, None)
+            .await
+            .unwrap();
+        let mut p = base_params("tdd");
+        p.prerequisites = vec!["unit-testing".into()];
+        ingest_skill(&storage, &ctx, p, None, None).await.unwrap();
+
+        let result = verify_skill(&storage, &ctx, "unit-testing").await.unwrap();
+        assert!(result.exists);
+        assert_eq!(result.required_by, vec!["tdd".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn verify_skill_reports_missing_prereqs_when_raw_tracked() {
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+        // Create skill with a prereq that doesn't exist. ingest_skill
+        // silently skips the missing prereq edge today. Simulate the
+        // forge-ingest behavior of recording raw_prerequisites in
+        // properties so verify_skill can cross-check.
+        let mut p = base_params("tdd");
+        p.prerequisites = vec!["unit-testing".into()]; // won't resolve
+        let action = ingest_skill(&storage, &ctx, p, None, None).await.unwrap();
+
+        // Manually patch properties.raw_prerequisites via a fetch+put —
+        // emulates what forge's skill-ingest pipeline will do.
+        let global = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
+        let mut entity = storage
+            .entity_get_by_id(&ctx, global, action.entity_id())
+            .await
+            .unwrap()
+            .unwrap();
+        if let Some(obj) = entity.properties.as_object_mut() {
+            obj.insert(
+                "raw_prerequisites".into(),
+                serde_json::json!(["unit-testing"]),
+            );
+        }
+        storage.entity_put(&ctx, &entity).await.unwrap();
+
+        let result = verify_skill(&storage, &ctx, "tdd").await.unwrap();
+        assert!(result.exists);
+        assert_eq!(
+            result.missing_prerequisites,
+            vec!["unit-testing".to_string()],
+            "prereq declared at ingest but never resolved to a REQUIRES edge must be reported"
+        );
+        assert!(
+            result.prerequisites.is_empty(),
+            "resolved prereqs is empty because the edge never landed"
+        );
     }
 
     #[tokio::test]

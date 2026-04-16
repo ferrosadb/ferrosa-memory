@@ -790,7 +790,19 @@ pub mod mock {
             _ctx: &TenantContext,
             entry: &EntityEntry,
         ) -> anyhow::Result<()> {
-            self.entities.lock().await.push(entry.clone());
+            let mut entities = self.entities.lock().await;
+            // Upsert by (session_id, entity_id) — CQL INSERT on the same
+            // primary key replaces the row, so the mock should mirror that.
+            // Previously this pushed unconditionally, leaving stale entries
+            // behind after updates and causing `entity_get_by_id` to
+            // return the pre-update value.
+            if let Some(pos) = entities.iter().position(|e| {
+                e.session_id == entry.session_id && e.entity_id == entry.entity_id
+            }) {
+                entities[pos] = entry.clone();
+            } else {
+                entities.push(entry.clone());
+            }
             Ok(())
         }
 

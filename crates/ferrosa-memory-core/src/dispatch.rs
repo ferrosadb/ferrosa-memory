@@ -489,6 +489,31 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                 "required": ["skill_name"]
             }),
         },
+        ToolDef {
+            name: "ensure_parent_tag".into(),
+            description: "Idempotently create a PARENT_TAG edge between two tags in the global taxonomy, resolving tags by name (creating them if missing).\n\nCALL WHEN: Building or extending the tag hierarchy — e.g. declaring that 'tdd' is a sub-category of 'testing', or that 'testing' is a sub-category of 'quality'. forge's fmem-skill-ingest uses this when ingesting `tag-hierarchy.yaml`.\n\nNames are normalized (lowercased, dash-separated). Returns action=Created on first call, action=Skipped on subsequent identical calls. Cycles are rejected via the graph client's DAG check.\nCost: ~5ms for idempotent re-runs, ~20ms when creating both tags + edge.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Caller session UUID (optional; used for ingested_by_session audit)." },
+                    "child_tag": { "type": "string", "maxLength": 256, "description": "Narrower tag name (e.g. 'tdd')." },
+                    "parent_tag": { "type": "string", "maxLength": 256, "description": "Broader tag name (e.g. 'testing')." }
+                },
+                "required": ["child_tag", "parent_tag"]
+            }),
+        },
+        ToolDef {
+            name: "verify_skill".into(),
+            description: "Verify a skill's graph neighborhood for ingest pipelines and audits. Returns resolved tags, prerequisites (outgoing REQUIRES), required_by (incoming REQUIRES), and missing_prerequisites (raw names declared at ingest that never landed as edges).\n\nCALL WHEN: A bulk ingest finishes and the caller wants to confirm every skill's edges are intact. Safe to call for unknown skill names — returns {exists: false} cleanly, not an error.\n\nThis is an administrative read. For executing a skill, use invoke_skill.\nCost: ~10ms (one entity lookup + two edge scans).".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Caller session UUID (optional)." },
+                    "skill_name": { "type": "string", "maxLength": 256, "description": "Exact skill name (case-sensitive)." }
+                },
+                "required": ["skill_name"]
+            }),
+        },
         // --- Intention tools (prospective memory, repo-scoped) ---
         ToolDef {
             name: "set_intention".into(),
@@ -1064,6 +1089,8 @@ async fn dispatch_tool<S: crate::storage::Storage>(
             handle_retrieve_skills_for_context(args, storage, ctx, session).await
         }
         "invoke_skill" => handle_invoke_skill(args, storage, ctx, session).await,
+        "ensure_parent_tag" => handle_ensure_parent_tag(args, storage, ctx, session).await,
+        "verify_skill" => handle_verify_skill(args, storage, ctx, session).await,
         "set_intention" => handle_set_intention(args, storage, ctx, session).await,
         "check_intentions" => handle_check_intentions(args, storage, ctx, session).await,
         "complete_intention" => handle_complete_intention(args, storage, ctx, session).await,
@@ -1171,6 +1198,8 @@ fn is_tier1(name: &str) -> bool {
             | "ingest_skill"
             | "retrieve_skills_for_context"
             | "invoke_skill"
+            | "ensure_parent_tag"
+            | "verify_skill"
             | "hybrid_search"
             | "create_edge"
             | "batch_create_edges"
@@ -2365,6 +2394,43 @@ async fn handle_invoke_skill<S: crate::storage::Storage>(
     };
 
     let result = crate::skill::build_invoke_result(&entity);
+    serde_json::to_value(&result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
+async fn handle_ensure_parent_tag<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let child_tag = require_str(&args, "child_tag")?.to_string();
+    let parent_tag = require_str(&args, "parent_tag")?.to_string();
+    let caller_session = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+
+    let action = crate::skill::ensure_parent_tag(
+        storage,
+        ctx,
+        caller_session,
+        &child_tag,
+        &parent_tag,
+        session.graph.as_deref(),
+    )
+    .await
+    .map_err(|e| (INVALID_PARAMS, e.to_string()))?;
+
+    serde_json::to_value(&action).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
+async fn handle_verify_skill<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    _session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let name = require_str(&args, "skill_name")?.to_string();
+    let result = crate::skill::verify_skill(storage, ctx, &name)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
     serde_json::to_value(&result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
 }
 
@@ -3754,8 +3820,8 @@ mod tests {
         let tools = result["tools"].as_array().unwrap();
         assert_eq!(
             tools.len(),
-            18,
-            "default tools/list should return 18 tier-1 tools"
+            20,
+            "default tools/list should return 20 tier-1 tools"
         );
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -3793,7 +3859,7 @@ mod tests {
             .await
             .unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 43, "include_all should return all 43 tools");
+        assert_eq!(tools.len(), 45, "include_all should return all 45 tools");
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         // Check tier-1 tools still present
