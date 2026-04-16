@@ -1080,6 +1080,13 @@ async fn main() -> anyhow::Result<()> {
     let (entity_types, edge_types) = {
         let guard = storage.inner.read().await;
         if let Some(ref cql) = *guard {
+            // Seed Sprint 1 types idempotently before loading — ensures skill,
+            // tag, TAGGED_AS, PARENT_TAG, and REQUIRES are registered even on
+            // installations that predate those additions.
+            if let Err(e) = cql.seed_sprint1_types().await {
+                tracing::warn!(error = %e, "type registry seed failed (non-fatal)");
+            }
+
             let load_result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
                 let et = cql.load_entity_types().await;
                 let edg = cql.load_edge_types().await;

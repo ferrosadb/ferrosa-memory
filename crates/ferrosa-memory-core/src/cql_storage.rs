@@ -668,6 +668,8 @@ impl CqlStorage {
             "decision",
             "pattern",
             "preference",
+            "skill",
+            "tag",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -677,6 +679,92 @@ impl CqlStorage {
     /// Get the keyspace name this storage is connected to.
     pub fn keyspace(&self) -> &str {
         &self.keyspace
+    }
+
+    /// Idempotently register the Sprint 1 entity and edge types in the type
+    /// registry. Safe to run on every startup — CQL INSERT on the primary
+    /// key is upsert, so re-running is a no-op for existing entries.
+    ///
+    /// Adds:
+    /// - entity_types: `skill`, `tag`
+    /// - edge_types: `TAGGED_AS` (entity → tag), `PARENT_TAG` (tag → tag
+    ///   hierarchy), `REQUIRES` (skill prerequisite)
+    ///
+    /// `SUPERSEDES` was already seeded in DDL 019; versions of skills link
+    /// via that edge type.
+    pub async fn seed_sprint1_types(&self) -> anyhow::Result<()> {
+        let ks = &self.keyspace;
+        let now = "toTimestamp(now())";
+
+        // Entity types (upsert).
+        let entity_seeds: &[(&str, &str)] = &[
+            (
+                "skill",
+                "A methodology or procedure with structured steps (e.g. TDD, STRIDE threat modeling). Retrieved for context-aware suggestions.",
+            ),
+            (
+                "tag",
+                "A classification label. Tags form a hierarchy via PARENT_TAG edges; entities attach via TAGGED_AS.",
+            ),
+        ];
+        for (name, desc) in entity_seeds {
+            let q = format!(
+                "INSERT INTO {ks}.entity_types (type_name, description, created_at) \
+                 VALUES (?, ?, {now})"
+            );
+            if let Err(e) = self
+                .session
+                .query_with_values(q, query_values!(name.to_string(), desc.to_string()))
+                .await
+            {
+                tracing::warn!(type_name = %name, error = %e, "seed_sprint1_types: entity insert failed");
+            }
+        }
+
+        // Edge types (upsert).
+        let edge_seeds: &[(&str, &str, &str, &str)] = &[
+            (
+                "TAGGED_AS",
+                "Entity belongs to a tag. Source: any entity. Destination: tag.",
+                "",
+                "tag",
+            ),
+            (
+                "PARENT_TAG",
+                "Tag is a sub-category of another tag (hierarchy DAG). Source and destination: tag.",
+                "tag",
+                "tag",
+            ),
+            (
+                "REQUIRES",
+                "Source skill has a prerequisite skill. Source: skill. Destination: skill.",
+                "skill",
+                "skill",
+            ),
+        ];
+        for (name, desc, src, dst) in edge_seeds {
+            let q = format!(
+                "INSERT INTO {ks}.edge_types (type_name, description, src_types, dst_types, created_at) \
+                 VALUES (?, ?, ?, ?, {now})"
+            );
+            if let Err(e) = self
+                .session
+                .query_with_values(
+                    q,
+                    query_values!(
+                        name.to_string(),
+                        desc.to_string(),
+                        src.to_string(),
+                        dst.to_string()
+                    ),
+                )
+                .await
+            {
+                tracing::warn!(edge_type = %name, error = %e, "seed_sprint1_types: edge insert failed");
+            }
+        }
+
+        Ok(())
     }
 
     /// Helper: execute a prepared query and return rows.
