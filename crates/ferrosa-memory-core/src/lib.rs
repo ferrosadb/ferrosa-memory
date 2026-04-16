@@ -42,6 +42,7 @@ pub mod importance;
 pub mod intention;
 pub mod memo;
 pub mod metrics;
+pub mod migration;
 pub mod ner;
 pub mod pagerank;
 pub mod plan;

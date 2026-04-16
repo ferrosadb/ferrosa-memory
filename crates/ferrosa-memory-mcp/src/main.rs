@@ -1075,6 +1075,30 @@ async fn main() -> anyhow::Result<()> {
     // and mid-operation connection loss (rolling restarts, network blips).
     tokio::spawn(cql_reconnect_watcher(Arc::clone(&storage)));
 
+    // Run schema migrations before loading the type registry — migration
+    // 020 adds columns that later queries assume. Failure is fatal: partial
+    // migrations leave the keyspace in a half-upgraded state and the
+    // operator's recovery path is a backup restore.
+    {
+        let guard = storage.inner.read().await;
+        if let Some(ref cql) = *guard {
+            match ferrosa_memory_core::migration::run_migrations(
+                cql.session(),
+                cql.keyspace(),
+            )
+            .await
+            {
+                Ok(0) => tracing::debug!("schema up to date"),
+                Ok(n) => tracing::info!(applied = n, "schema migrations applied"),
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "schema migration failed, aborting startup: {e}"
+                    ));
+                }
+            }
+        }
+    }
+
     // Load dynamic type registry from the database (falls back to defaults).
     // Timeout after 3s to avoid blocking startup on slow/empty tables.
     let (entity_types, edge_types) = {
