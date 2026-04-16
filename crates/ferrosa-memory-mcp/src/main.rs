@@ -1112,6 +1112,31 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Embedding provider health check (non-fatal). Many tools require
+    // embeddings; failing here warns loudly at startup rather than surfacing
+    // later as per-request failures.
+    let embed_health = ferrosa_memory_core::embedding::EmbeddingClient::new(&config.embeddings);
+    match embed_health.health_check().await {
+        Ok(()) => tracing::info!(
+            provider = %config.embeddings.provider,
+            url = %config.embeddings.ollama_base_url,
+            model = %config.embeddings.model,
+            "embedding provider reachable and model loaded"
+        ),
+        Err(e) => tracing::warn!(
+            provider = %config.embeddings.provider,
+            url = %config.embeddings.ollama_base_url,
+            model = %config.embeddings.model,
+            error = %e,
+            "embedding provider check failed — tools that require embeddings \
+             (smart_ingest, hybrid_search, retrieve_fold_context, retrieve_entities) \
+             will fail at call time. Start Ollama and ensure '{}' is pulled: \
+             `ollama pull {}`",
+            config.embeddings.model,
+            config.embeddings.model
+        ),
+    }
+
     // Connect graph client via HTTP (non-fatal if it fails)
     let graph_client = match ferrosa_memory_core::graph::GraphClient::connect(
         &ferrosa_memory_core::graph::GraphConfig {
@@ -1202,6 +1227,8 @@ async fn main() -> anyhow::Result<()> {
                 repo: repo_lock,
                 ollama_base_url: config.embeddings.ollama_base_url.clone(),
                 ner_model: config.embeddings.ner_model.clone(),
+                embed_model: config.embeddings.model.clone(),
+                embed_dimensions: config.embeddings.dimensions,
                 entity_types: entity_types.clone(),
                 edge_types: edge_types.clone(),
                 graph: graph_client.clone(),

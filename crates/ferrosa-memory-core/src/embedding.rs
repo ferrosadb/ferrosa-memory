@@ -117,16 +117,71 @@ impl EmbeddingClient {
         Ok(embedding.into_iter().map(|v| v as f32).collect())
     }
 
-    /// Health check: verify the embedding endpoint is reachable.
+    /// Health check: verify the embedding endpoint is reachable AND the
+    /// configured model is loaded.
+    ///
+    /// Returns `Err(Unavailable)` if Ollama can't be reached, or
+    /// `Err(RequestFailed)` with a clear message if the configured model is
+    /// not in the loaded model list.
     pub async fn health_check(&self) -> Result<(), EmbeddingError> {
         let url = format!("{}/api/tags", self.base_url);
-        self.http
+        let resp = self
+            .http
             .get(&url)
             .send()
             .await
             .map_err(|e| EmbeddingError::Unavailable(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            return Err(EmbeddingError::Unavailable(format!(
+                "status {}",
+                resp.status()
+            )));
+        }
+
+        let body: OllamaTagsResponse = resp
+            .json()
+            .await
+            .map_err(|e| EmbeddingError::BadResponse(e.to_string()))?;
+
+        if !is_model_loaded(&body.models, &self.model) {
+            return Err(EmbeddingError::RequestFailed(format!(
+                "model '{}' not loaded; loaded models: {}",
+                self.model,
+                body.models
+                    .iter()
+                    .map(|m| m.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+
         Ok(())
     }
+}
+
+/// Shape of Ollama's `/api/tags` response (subset we care about).
+#[derive(Deserialize)]
+struct OllamaTagsResponse {
+    models: Vec<OllamaLoadedModel>,
+}
+
+#[derive(Deserialize)]
+struct OllamaLoadedModel {
+    name: String,
+}
+
+/// Check if a model matching `target` is in the loaded list.
+///
+/// Ollama appends `:latest` to unqualified names (`nomic-embed-text` becomes
+/// `nomic-embed-text:latest` in the tags output). Match on both the full name
+/// and the prefix-before-colon so config can specify either form.
+fn is_model_loaded(loaded: &[OllamaLoadedModel], target: &str) -> bool {
+    loaded.iter().any(|m| {
+        m.name == target
+            || m.name.split(':').next() == Some(target)
+            || target.split(':').next() == m.name.split(':').next()
+    })
 }
 
 #[cfg(test)]
@@ -138,6 +193,40 @@ mod tests {
         let config = EmbeddingConfig::default();
         let client = EmbeddingClient::new(&config);
         assert_eq!(client.dimensions, 768);
-        assert_eq!(client.model, "nomic-embed-text");
+        assert_eq!(client.model, "nomic-embed-text-v2-moe");
+    }
+
+    fn model(name: &str) -> OllamaLoadedModel {
+        OllamaLoadedModel { name: name.into() }
+    }
+
+    #[test]
+    fn is_model_loaded_exact_match() {
+        let loaded = vec![model("nomic-embed-text:latest")];
+        assert!(is_model_loaded(&loaded, "nomic-embed-text:latest"));
+    }
+
+    #[test]
+    fn is_model_loaded_target_unqualified_loaded_latest() {
+        // Config says "nomic-embed-text"; Ollama reports "nomic-embed-text:latest".
+        let loaded = vec![model("nomic-embed-text:latest")];
+        assert!(is_model_loaded(&loaded, "nomic-embed-text"));
+    }
+
+    #[test]
+    fn is_model_loaded_target_latest_loaded_unqualified() {
+        let loaded = vec![model("nomic-embed-text")];
+        assert!(is_model_loaded(&loaded, "nomic-embed-text:latest"));
+    }
+
+    #[test]
+    fn is_model_loaded_rejects_missing_model() {
+        let loaded = vec![model("qwen3.5:latest"), model("gemma4:26b")];
+        assert!(!is_model_loaded(&loaded, "nomic-embed-text"));
+    }
+
+    #[test]
+    fn is_model_loaded_rejects_empty_list() {
+        assert!(!is_model_loaded(&[], "nomic-embed-text"));
     }
 }

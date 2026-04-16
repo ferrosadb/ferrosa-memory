@@ -117,10 +117,14 @@ pub struct SessionState {
     pub last_activity: Arc<tokio::sync::Notify>,
     /// Set to true when a write tool succeeds; cleared by idle consolidation.
     pub dirty: Arc<AtomicBool>,
-    /// Base URL for the Ollama API (used for NER extraction).
+    /// Base URL for the Ollama API (used for embeddings and NER extraction).
     pub ollama_base_url: String,
     /// Model name for NER entity extraction via Ollama.
     pub ner_model: String,
+    /// Model name for text embedding via Ollama (default nomic-embed-text-v2-moe).
+    pub embed_model: String,
+    /// Expected embedding dimensions (default 768).
+    pub embed_dimensions: u32,
     /// Dynamic entity types loaded from the type registry table.
     pub entity_types: Vec<String>,
     /// Dynamic edge types loaded from the type registry table.
@@ -145,6 +149,8 @@ impl Default for SessionState {
             dirty: Arc::new(AtomicBool::new(false)),
             ollama_base_url: "http://localhost:11434".to_string(),
             ner_model: "qwen3.5:27b".to_string(),
+            embed_model: "nomic-embed-text-v2-moe".to_string(),
+            embed_dimensions: 768,
             entity_types: vec![
                 "person",
                 "place",
@@ -1438,8 +1444,8 @@ async fn handle_upsert_entity<S: crate::storage::Storage>(
         let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
             provider: "ollama".into(),
             ollama_base_url: session.ollama_base_url.clone(),
-            model: "nomic-embed-text".into(),
-            dimensions: 768,
+            model: session.embed_model.clone(),
+            dimensions: session.embed_dimensions,
             ner_model: String::new(),
         });
         match client.embed(context_snippet).await {
@@ -1646,8 +1652,8 @@ async fn handle_retrieve_entities<S: crate::storage::Storage>(
         let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
             provider: "ollama".into(),
             ollama_base_url: session.ollama_base_url.clone(),
-            model: "nomic-embed-text".into(),
-            dimensions: 768,
+            model: session.embed_model.clone(),
+            dimensions: session.embed_dimensions,
             ner_model: String::new(),
         });
         match client.embed(query).await {
@@ -1946,8 +1952,8 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
         let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
             provider: "ollama".into(),
             ollama_base_url: session.ollama_base_url.clone(),
-            model: "nomic-embed-text".into(),
-            dimensions: 768,
+            model: session.embed_model.clone(),
+            dimensions: session.embed_dimensions,
             ner_model: String::new(),
         });
         match client.embed(content).await {
@@ -2440,8 +2446,8 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
             provider: "ollama".into(),
             ollama_base_url: session.ollama_base_url.clone(),
-            model: "nomic-embed-text".into(),
-            dimensions: 768,
+            model: session.embed_model.clone(),
+            dimensions: session.embed_dimensions,
             ner_model: String::new(),
         });
         match client.embed(query).await {

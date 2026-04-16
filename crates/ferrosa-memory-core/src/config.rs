@@ -445,7 +445,7 @@ fn default_ollama_url() -> String {
     "http://localhost:11434".into()
 }
 fn default_embed_model() -> String {
-    "nomic-embed-text".into()
+    "nomic-embed-text-v2-moe".into()
 }
 fn default_dimensions() -> u32 {
     768
@@ -957,7 +957,7 @@ port = 9999
         let cfg = EmbeddingConfig::default();
         assert_eq!(cfg.provider, "ollama");
         assert_eq!(cfg.ollama_base_url, "http://localhost:11434");
-        assert_eq!(cfg.model, "nomic-embed-text");
+        assert_eq!(cfg.model, "nomic-embed-text-v2-moe");
         assert_eq!(cfg.dimensions, 768);
     }
 
