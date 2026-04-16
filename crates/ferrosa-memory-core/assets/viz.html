@@ -1376,6 +1376,14 @@
           <button class="filter-btn" id="edge-type-btn">Edges <span class="count" id="edge-type-count">all</span></button>
           <div class="filter-menu" id="edge-type-menu"></div>
         </div>
+        <div class="filter-dropdown" id="session-dropdown">
+          <button class="filter-btn" id="session-btn" title="Filter by the session each node belongs to. Global nodes are cross-session.">Sessions <span class="count" id="session-count">all</span></button>
+          <div class="filter-menu" id="session-menu"></div>
+        </div>
+        <div class="filter-dropdown" id="scope-dropdown">
+          <button class="filter-btn" id="scope-btn" title="Scope: all (default, tenant-wide), session (configured viz session only), global (tenant-global entities only)">Scope <span class="count" id="scope-count">all</span></button>
+          <div class="filter-menu" id="scope-menu"></div>
+        </div>
         <div class="preset-buttons">
           <button class="preset-btn" id="preset-code" title="Code entities only">Code</button>
           <button class="preset-btn" id="preset-research" title="Research entities only">Research</button>
@@ -1551,6 +1559,11 @@ const edgeColors = {
 let activeEdgeTypes = new Set(); // empty = show all
 let activeNodeTypes = new Set(); // empty = show all
 let activeProjects = new Set(); // empty = show all
+let activeSessions = new Set(); // empty = show all sessions (including global sentinel)
+// Scope is effectively a single-select but reuses the menu dropdown pattern
+// via activeScope ("all" | "session-only" | "global-only"). "all" is the
+// default and matches what the backend serves by default.
+let activeScope = 'all';
 
 // Extract project name from entity label (first :: segment, or entity_type for non-code)
 function getProject(node) {
@@ -1963,11 +1976,15 @@ function render() {
     .attr('fill', nodeColor)
     .attr('stroke', d => {
       if (selectedNode && selectedNode.id === d.id) return '#fff';
+      // Global-scope nodes (skills, tags, shared concepts) get a warm
+      // stroke so they're visually distinct from session-local nodes.
+      if (d.is_global) return '#e2725b';
       if (d.child_count != null) return 'rgba(255,255,255,0.4)';
       return 'rgba(255,255,255,0.15)';
     })
     .attr('stroke-width', d => {
       if (selectedNode && selectedNode.id === d.id) return 3;
+      if (d.is_global) return 2;
       if (d.child_count != null) return 2;
       return 1;
     })
@@ -2417,7 +2434,17 @@ function showTooltip(event, d) {
   if (d.child_count != null) {
     extra = ` &middot; ${d.child_count} children &middot; double-click to expand`;
   }
-  tooltip.innerHTML = `<strong>${escapeHtml(d.label)}</strong><br><span class="type-badge">${d.entity_type} &middot; ${d.state}${extra}</span>`;
+  // Scope badge: "global" for tenant-sentinel-partition nodes, or a short
+  // 8-char prefix of the session UUID for session-local nodes. Helps the
+  // user see where a node lives at a glance.
+  let scopeBadge = '';
+  if (d.is_global) {
+    scopeBadge = ' &middot; <span style="color:#e2725b">global</span>';
+  } else if (d.session_id) {
+    const short = d.session_id.length > 8 ? d.session_id.slice(0, 8) : d.session_id;
+    scopeBadge = ` &middot; session ${short}`;
+  }
+  tooltip.innerHTML = `<strong>${escapeHtml(d.label)}</strong><br><span class="type-badge">${d.entity_type} &middot; ${d.state}${scopeBadge}${extra}</span>`;
   tooltip.style.display = 'block';
   tooltip.style.left = (event.pageX + 12) + 'px';
   tooltip.style.top = (event.pageY - 10) + 'px';
@@ -2808,6 +2835,23 @@ function applyFilters() {
   // Start with all nodes, then apply filters progressively
   let filtered = allNodes.slice();
 
+  // Scope filter (session-local / global-only / all).
+  if (activeScope === 'session-only') {
+    filtered = filtered.filter(n => !n.is_global);
+  } else if (activeScope === 'global-only') {
+    filtered = filtered.filter(n => n.is_global === true);
+  }
+
+  // Session filter — active when the user has manually picked a subset.
+  // Global nodes share the tenant-sentinel session_id and show up as
+  // "(global)" in the menu.
+  if (activeSessions.size > 0) {
+    filtered = filtered.filter(n => {
+      if (n.is_global) return activeSessions.has('(global)');
+      return activeSessions.has(n.session_id || '');
+    });
+  }
+
   // Project filter
   if (activeProjects.size > 0) {
     filtered = filtered.filter(n => activeProjects.has(getProject(n)));
@@ -2818,7 +2862,7 @@ function applyFilters() {
     filtered = filtered.filter(n => activeNodeTypes.has(n.entity_type || n.node_type));
   }
 
-  if (activeProjects.size > 0 || activeNodeTypes.size > 0) {
+  if (activeProjects.size > 0 || activeNodeTypes.size > 0 || activeSessions.size > 0 || activeScope !== 'all') {
     const visibleIds = new Set(filtered.map(n => n.id));
     nodes = filtered;
     // Edge filter: only show edges where both endpoints are visible
@@ -2923,6 +2967,30 @@ function rebuildFilters() {
     render();
   });
 
+  // --- Session filter ---
+  // Distinct sessions present in the current snapshot. Global nodes share
+  // the tenant sentinel session_id and are represented as "(global)" in
+  // the menu so the user can filter them in/out as a group.
+  const sessionSet = new Set(
+    allNodes.map(n => n.is_global ? '(global)' : (n.session_id || ''))
+      .filter(s => s)
+  );
+  const sessionColors = {};
+  const sessionPalette = ['#5ba3e2', '#5be27b', '#e2c45b', '#c95be2', '#e25b8a', '#5be2c4', '#8ae25b'];
+  let si = 0;
+  for (const s of [...sessionSet].sort()) {
+    sessionColors[s] = s === '(global)' ? '#e2725b' : sessionPalette[si++ % sessionPalette.length];
+  }
+  buildFilterMenu('session-menu', 'session-count', sessionSet, activeSessions, sessionColors, () => {
+    // Translate "(global)" back to the sentinel node set via the is_global flag.
+    rebuildFilters();
+    applyFilters();
+    render();
+  });
+
+  // --- Scope filter (single-select radio, reuses menu DOM) ---
+  buildScopeMenu();
+
   // --- Project quick-filter pills ---
   const pillContainer = document.getElementById('project-pills');
   pillContainer.innerHTML = '';
@@ -2988,6 +3056,39 @@ function rebuildFilters() {
 }
 
 // Helper: hex color to rgba string
+function buildScopeMenu() {
+  const menu = document.getElementById('scope-menu');
+  if (!menu) return;
+  menu.innerHTML = '';
+  const options = [
+    { value: 'all', label: 'All (tenant-wide)' },
+    { value: 'session-only', label: 'Session only' },
+    { value: 'global-only', label: 'Global only' },
+  ];
+  for (const opt of options) {
+    const label = document.createElement('label');
+    label.className = activeScope === opt.value ? 'checked' : '';
+    const input = document.createElement('input');
+    input.type = 'radio';
+    input.name = 'scope';
+    input.checked = activeScope === opt.value;
+    label.appendChild(input);
+    label.appendChild(document.createTextNode(' ' + opt.label));
+    label.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      activeScope = opt.value;
+      buildScopeMenu();
+      applyFilters();
+      render();
+    });
+    menu.appendChild(label);
+  }
+  const countEl = document.getElementById('scope-count');
+  if (countEl) {
+    countEl.textContent = activeScope === 'all' ? 'all' : activeScope.replace('-only', '');
+  }
+}
+
 function hexToRgba(hex, alpha) {
   const r = parseInt(hex.slice(1, 3), 16);
   const g = parseInt(hex.slice(3, 5), 16);
@@ -2996,27 +3097,41 @@ function hexToRgba(hex, alpha) {
 }
 
 // Toggle dropdown menus
+function closeAllFilterMenus(except) {
+  ['project-menu', 'node-type-menu', 'edge-type-menu', 'session-menu', 'scope-menu'].forEach(id => {
+    if (id !== except) {
+      const el = document.getElementById(id);
+      if (el) el.classList.remove('open');
+    }
+  });
+}
 document.getElementById('project-btn').addEventListener('click', (e) => {
   e.stopPropagation();
   document.getElementById('project-menu').classList.toggle('open');
-  document.getElementById('node-type-menu').classList.remove('open');
-  document.getElementById('edge-type-menu').classList.remove('open');
+  closeAllFilterMenus('project-menu');
 });
 document.getElementById('node-type-btn').addEventListener('click', (e) => {
   e.stopPropagation();
   document.getElementById('node-type-menu').classList.toggle('open');
-  document.getElementById('project-menu').classList.remove('open');
-  document.getElementById('edge-type-menu').classList.remove('open');
+  closeAllFilterMenus('node-type-menu');
 });
 document.getElementById('edge-type-btn').addEventListener('click', (e) => {
   e.stopPropagation();
   document.getElementById('edge-type-menu').classList.toggle('open');
-  document.getElementById('project-menu').classList.remove('open');
-  document.getElementById('node-type-menu').classList.remove('open');
+  closeAllFilterMenus('edge-type-menu');
+});
+document.getElementById('session-btn').addEventListener('click', (e) => {
+  e.stopPropagation();
+  document.getElementById('session-menu').classList.toggle('open');
+  closeAllFilterMenus('session-menu');
+});
+document.getElementById('scope-btn').addEventListener('click', (e) => {
+  e.stopPropagation();
+  document.getElementById('scope-menu').classList.toggle('open');
+  closeAllFilterMenus('scope-menu');
 });
 document.addEventListener('click', () => {
-  document.getElementById('node-type-menu').classList.remove('open');
-  document.getElementById('edge-type-menu').classList.remove('open');
+  closeAllFilterMenus(null);
 });
 
 // === Idle animation — keep the simulation gently alive ===
