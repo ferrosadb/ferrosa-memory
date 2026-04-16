@@ -520,7 +520,17 @@ pub async fn serve_viz<S: Storage + 'static>(
         // Send-bounded. The snapshot is built per-connection to stay fresh.
         let storage_clone = Arc::clone(&storage);
         let ctx_clone = Arc::clone(&ctx);
-        let snapshot = build_snapshot(&*storage, &ctx, effective_session).await;
+        // Default to All scope — UI shows every entity for the tenant across
+        // sessions. Clients can add `?scope=session|global` on future
+        // endpoints to narrow the view (frontend work item:
+        // specs/todo/feat-viz-cross-session.md).
+        let snapshot = build_snapshot(
+            &*storage,
+            &ctx,
+            effective_session,
+            VizSnapshotScope::All,
+        )
+        .await;
         tokio::spawn(async move {
             if let Err(e) =
                 handle_viz_connection(stream, bus, snapshot, storage_clone, ctx_clone).await
@@ -957,23 +967,57 @@ async fn handle_anomaly_sse(
     Ok(())
 }
 
+/// Scope of a viz snapshot: which partitions the builder pulls entities from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VizSnapshotScope {
+    /// Just the configured viz session (pre-Sprint-1 behavior).
+    SessionOnly,
+    /// Only global-scope entities (tenant sentinel partition).
+    GlobalOnly,
+    /// Every entity for the tenant (union across sessions).
+    #[default]
+    All,
+}
+
+impl VizSnapshotScope {
+    /// Parse a scope value from a query string. Unknown values → `All`.
+    pub fn parse(raw: &str) -> Self {
+        match raw {
+            "session" => Self::SessionOnly,
+            "global" => Self::GlobalOnly,
+            _ => Self::All,
+        }
+    }
+}
+
 /// Build a `VizEvent::Snapshot` from current storage state.
 ///
-/// Queries entities and edges for the given session and converts them
-/// to visualization types. Returns an empty snapshot if session_id is nil.
+/// Queries entities and edges for the given scope and converts them
+/// to visualization types. `scope=SessionOnly` preserves pre-Sprint-1
+/// behavior (one session); `All` unions every partition for the tenant;
+/// `GlobalOnly` hits only the tenant-global sentinel.
 async fn build_snapshot<S: Storage>(
     storage: &S,
     ctx: &TenantContext,
     session_id: Uuid,
+    scope: VizSnapshotScope,
 ) -> VizEvent {
-    // Query entities for the configured session (nil UUID is a valid session).
+    // Query entities for the configured scope.
     tracing::info!(
         tenant_id = %ctx.tenant_id,
         %session_id,
         session_is_nil = session_id.is_nil(),
+        ?scope,
         "viz: building snapshot"
     );
-    let entities_result = storage.entity_list_session(ctx, session_id).await;
+    let entities_result = match scope {
+        VizSnapshotScope::SessionOnly => storage.entity_list_session(ctx, session_id).await,
+        VizSnapshotScope::GlobalOnly => {
+            let global = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
+            storage.entity_list_session(ctx, global).await
+        }
+        VizSnapshotScope::All => storage.entity_list_all(ctx).await,
+    };
 
     let mut nodes: Vec<viz::VizNode> = match &entities_result {
         Ok(entities) => {
@@ -1238,6 +1282,7 @@ fn cluster_snapshot(
                     created_at: String::new(),
                     context: format!("{child_count} entities"),
                     child_count: Some(child_count),
+                    ..Default::default()
                 });
             }
 
@@ -1383,6 +1428,7 @@ fn cluster_snapshot(
                     created_at: String::new(),
                     context: format!("{child_count} entities"),
                     child_count: Some(child_count),
+                    ..Default::default()
                 });
             }
 
@@ -1964,7 +2010,7 @@ mod tests {
             "depends_on",
         ));
 
-        let snap = build_snapshot(&storage, &ctx, nil).await;
+        let snap = build_snapshot(&storage, &ctx, nil, VizSnapshotScope::SessionOnly).await;
         let VizEvent::Snapshot { edges, .. } = snap else {
             panic!("expected Snapshot");
         };
@@ -1995,7 +2041,7 @@ mod tests {
             "contains",
         ));
 
-        let snap = build_snapshot(&storage, &ctx, viz_session).await;
+        let snap = build_snapshot(&storage, &ctx, viz_session, VizSnapshotScope::SessionOnly).await;
         let VizEvent::Snapshot { edges, .. } = snap else {
             panic!("expected Snapshot");
         };
@@ -2029,7 +2075,7 @@ mod tests {
             test_typed_edge(ctx.tenant_id, viz_session, e2, e3, "depends_on"),
         ]);
 
-        let snap = build_snapshot(&storage, &ctx, viz_session).await;
+        let snap = build_snapshot(&storage, &ctx, viz_session, VizSnapshotScope::SessionOnly).await;
         let VizEvent::Snapshot { edges, .. } = snap else {
             panic!("expected Snapshot");
         };
@@ -2066,7 +2112,7 @@ mod tests {
             "references",
         ));
 
-        let snap = build_snapshot(&storage, &ctx, nil).await;
+        let snap = build_snapshot(&storage, &ctx, nil, VizSnapshotScope::SessionOnly).await;
         let VizEvent::Snapshot { edges, .. } = snap else {
             panic!("expected Snapshot");
         };
@@ -2097,7 +2143,7 @@ mod tests {
             session_id: nil,
         });
 
-        let snap = build_snapshot(&storage, &ctx, nil).await;
+        let snap = build_snapshot(&storage, &ctx, nil, VizSnapshotScope::SessionOnly).await;
         let VizEvent::Snapshot { edges, .. } = snap else {
             panic!("expected Snapshot");
         };

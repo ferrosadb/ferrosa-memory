@@ -1493,6 +1493,7 @@ async fn handle_upsert_entity<S: crate::storage::Storage>(
             created_at: chrono::Utc::now().to_rfc3339(),
             context: context_snippet.to_string(),
             child_count: None,
+            ..Default::default()
         },
         action: action.into(),
     });
@@ -1594,6 +1595,7 @@ async fn handle_batch_ingest<S: crate::storage::Storage>(
                         created_at: chrono::Utc::now().to_rfc3339(),
                         context: context.to_string(),
                         child_count: None,
+                        ..Default::default()
                     },
                     action: status.into(),
                 });
@@ -2019,6 +2021,7 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
                 created_at: chrono::Utc::now().to_rfc3339(),
                 context: content.chars().take(256).collect(),
                 child_count: None,
+                ..Default::default()
             },
             action: action.clone(),
         });

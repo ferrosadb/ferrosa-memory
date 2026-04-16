@@ -27,6 +27,32 @@ pub struct VizNode {
     /// Absent for leaf nodes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub child_count: Option<usize>,
+    /// The session this node belongs to (or the tenant-global sentinel for
+    /// global-scope entities). Lets the UI render a per-node badge and
+    /// filter client-side.
+    pub session_id: String,
+    /// True when the node lives in the tenant-global partition. Convenience
+    /// for UI rendering — derivable from `session_id`, but spared the
+    /// round-trip check.
+    pub is_global: bool,
+}
+
+impl Default for VizNode {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            label: String::new(),
+            node_type: String::new(),
+            entity_type: String::new(),
+            state: String::new(),
+            confidence: 0.0,
+            created_at: String::new(),
+            context: String::new(),
+            child_count: None,
+            session_id: String::new(),
+            is_global: false,
+        }
+    }
 }
 
 /// An edge in the visualization graph.
@@ -167,6 +193,8 @@ impl Default for EventBus {
 
 /// Convert an `EntityEntry` into a `VizNode` for the visualization graph.
 pub fn entity_to_viz_node(entry: &crate::types::EntityEntry) -> VizNode {
+    let is_global = matches!(entry.scope, crate::types::EntityScope::Global)
+        || entry.session_id == crate::scope::tenant_global_session_uuid(entry.tenant_id);
     VizNode {
         id: entry.entity_id.to_string(),
         label: entry.entity_name.clone(),
@@ -177,6 +205,8 @@ pub fn entity_to_viz_node(entry: &crate::types::EntityEntry) -> VizNode {
         created_at: entry.created_at.to_rfc3339(),
         context: entry.context_snippet.clone(),
         child_count: None,
+        session_id: entry.session_id.to_string(),
+        is_global,
     }
 }
 
@@ -199,6 +229,8 @@ pub fn fold_to_viz_node(entry: &crate::types::FoldEntry) -> VizNode {
         created_at: entry.created_at.to_rfc3339(),
         context: String::new(),
         child_count: None,
+        session_id: entry.session_id.to_string(),
+        is_global: false,
     }
 }
 
@@ -249,6 +281,7 @@ mod tests {
                 created_at: "2026-01-01T00:00:00Z".into(),
                 context: "test context".into(),
                 child_count: None,
+                ..Default::default()
             },
             action: "created".into(),
         });
@@ -275,6 +308,7 @@ mod tests {
                 created_at: "2026-01-01T00:00:00Z".into(),
                 context: "ctx".into(),
                 child_count: None,
+                ..Default::default()
             }],
             edges: vec![VizEdge {
                 source: "n1".into(),
