@@ -343,6 +343,305 @@ pub async fn ingest_skill(
     })
 }
 
+/// A single skill retrieval hit, returned by `retrieve_skills_for_context`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SkillHit {
+    pub skill_name: String,
+    pub entity_id: Uuid,
+    pub score: f64,
+    pub description: String,
+    pub category: String,
+    pub version: String,
+    pub used_in_session: bool,
+}
+
+/// Retrieve skills relevant to the given context, scored by a cheap
+/// heuristic: cosine similarity over description_embedding when available,
+/// plus keyword overlap against the skill's trigger_keywords and tags.
+///
+/// This is deliberately simpler than `hybrid_search` — the skill catalog
+/// is small (dozens of entries), so a linear scan over the global partition
+/// is fine. We can swap in the full two-stage re-rank pipeline later when
+/// catalog size warrants it.
+#[allow(clippy::too_many_arguments)]
+pub async fn retrieve_skills_for_context(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    caller_session_id: Uuid,
+    context: &str,
+    query_embedding: Option<&[f32]>,
+    limit: usize,
+    min_score: f64,
+    used_entity_ids: &std::collections::HashSet<Uuid>,
+) -> anyhow::Result<Vec<SkillHit>> {
+    anyhow::ensure!(!context.is_empty(), "context must not be empty");
+
+    let _ = caller_session_id; // reserved for session-scope skills in a future pass
+
+    let global_session = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
+    let all = storage
+        .entity_list_session(ctx, global_session)
+        .await
+        .unwrap_or_default();
+
+    let context_lower = context.to_lowercase();
+    let context_tokens: std::collections::HashSet<String> = context_lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|s| !s.is_empty() && s.len() > 2)
+        .map(str::to_string)
+        .collect();
+
+    let mut hits: Vec<SkillHit> = all
+        .into_iter()
+        .filter(|e| e.entity_type == "skill")
+        .filter_map(|e| {
+            let score = score_skill_against_context(
+                &e,
+                &context_lower,
+                &context_tokens,
+                query_embedding,
+            );
+            if score < min_score {
+                return None;
+            }
+            let category = e
+                .properties
+                .get("category")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let version = e
+                .properties
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let description = e.description.clone().unwrap_or_default();
+            let used_in_session = used_entity_ids.contains(&e.entity_id);
+            Some(SkillHit {
+                skill_name: e.entity_name.clone(),
+                entity_id: e.entity_id,
+                score,
+                description,
+                category,
+                version,
+                used_in_session,
+            })
+        })
+        .collect();
+
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    hits.truncate(limit);
+    Ok(hits)
+}
+
+/// Compute a relevance score in [0, 1+] for a skill entity against a query.
+/// Signals:
+///   - cosine similarity over description_embedding (if both sides have one)
+///   - keyword overlap between query tokens and skill trigger_keywords + tags
+///   - name substring boost (query contains the skill name)
+fn score_skill_against_context(
+    skill: &EntityEntry,
+    context_lower: &str,
+    context_tokens: &std::collections::HashSet<String>,
+    query_embedding: Option<&[f32]>,
+) -> f64 {
+    let mut score = 0.0;
+
+    // 1. Semantic similarity over description embeddings.
+    if let (Some(qe), Some(de)) = (query_embedding, skill.description_embedding.as_ref()) {
+        let sim = cosine_similarity(qe, de);
+        score += sim * 0.5;
+    }
+
+    // 2. Trigger keyword overlap.
+    let triggers: Vec<&str> = skill
+        .properties
+        .get("trigger_keywords")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    // Trigger keywords are often multi-word phrases ("red-green-refactor",
+    // "kent beck"). Check substring against the full lowercased context,
+    // not just the token set.
+    let trigger_matches = triggers
+        .iter()
+        .filter(|t| {
+            let lowered = t.to_lowercase();
+            context_lower.contains(&lowered)
+                || context_tokens.contains(&lowered)
+        })
+        .count();
+    if !triggers.is_empty() {
+        score += 0.3 * (trigger_matches as f64 / triggers.len() as f64);
+    }
+
+    // 3. Tag overlap — any tag word appears in context.
+    let tag_matches = skill
+        .tags
+        .iter()
+        .filter(|t| context_lower.contains(t.as_str()))
+        .count();
+    if tag_matches > 0 {
+        score += 0.1 * (tag_matches.min(3) as f64);
+    }
+
+    // 4. Name hit — context mentions the skill by name.
+    let name_lower = skill.entity_name.to_lowercase();
+    if context_lower.contains(&name_lower) {
+        score += 0.3;
+    }
+
+    score
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0f64;
+    let mut na = 0.0f64;
+    let mut nb = 0.0f64;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let x = *x as f64;
+        let y = *y as f64;
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
+}
+
+/// Fetch a skill by name from the global partition. Returns `Ok(Some(skill))`
+/// for an exact-name match, `Ok(None)` if no skill has that name.
+pub async fn get_skill_by_name(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    name: &str,
+) -> anyhow::Result<Option<EntityEntry>> {
+    let global_session = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
+    let mut matches = storage
+        .entity_find_phonetic(ctx, global_session, name)
+        .await
+        .unwrap_or_default();
+    matches.retain(|e| e.entity_name == name && e.entity_type == "skill");
+    if let Some(head) = matches.first() {
+        // entity_find_phonetic is lightweight — fetch the full entity for the steps.
+        storage
+            .entity_get_by_id(ctx, global_session, head.entity_id)
+            .await
+    } else {
+        Ok(None)
+    }
+}
+
+/// Closest skill names (phonetic-match top-K) for did_you_mean hints on a
+/// missed `invoke_skill` lookup.
+pub async fn similar_skill_names(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    name: &str,
+    k: usize,
+) -> Vec<String> {
+    let global_session = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
+    let mut matches = storage
+        .entity_find_phonetic(ctx, global_session, name)
+        .await
+        .unwrap_or_default();
+    matches.retain(|e| e.entity_type == "skill");
+    matches
+        .into_iter()
+        .take(k)
+        .map(|e| e.entity_name)
+        .collect()
+}
+
+/// Structured response returned by `invoke_skill`. Purely data — no tool
+/// orchestration here; the caller decides how to drive the steps.
+#[derive(Debug, Clone, Serialize)]
+pub struct InvokeSkillResult {
+    pub skill_name: String,
+    pub entity_id: Uuid,
+    pub description: String,
+    pub category: String,
+    pub version: String,
+    pub steps: Vec<Step>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_step_prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_criteria: Option<String>,
+    pub output_artifacts: Vec<String>,
+    pub prerequisites_satisfied: bool,
+    pub prerequisites: Vec<String>,
+}
+
+/// Build an `InvokeSkillResult` from a skill entity. The caller is
+/// responsible for ensuring `entity.entity_type == "skill"`.
+pub fn build_invoke_result(entity: &EntityEntry) -> InvokeSkillResult {
+    let steps: Vec<Step> = entity
+        .properties
+        .get("steps")
+        .cloned()
+        .map(|v| serde_json::from_value::<Vec<Step>>(v).unwrap_or_default())
+        .unwrap_or_default();
+    let first_step_prompt = steps.first().map(|s| s.instruction.clone());
+    let completion_criteria = entity
+        .properties
+        .get("completion_criteria")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let output_artifacts: Vec<String> = entity
+        .properties
+        .get("output_artifacts")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let category = entity
+        .properties
+        .get("category")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let version = entity
+        .properties
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    InvokeSkillResult {
+        skill_name: entity.entity_name.clone(),
+        entity_id: entity.entity_id,
+        description: entity.description.clone().unwrap_or_default(),
+        category,
+        version,
+        steps,
+        first_step_prompt,
+        completion_criteria,
+        output_artifacts,
+        // Prerequisite satisfaction check is deferred — it requires walking
+        // REQUIRES edges and confirming each prereq has been used/acknowledged
+        // in the caller's session. Placeholder: true when there are none.
+        prerequisites_satisfied: true,
+        prerequisites: Vec::new(),
+    }
+}
+
 /// Resolve or create a tag entity (entity_type="tag", scope=Global) by name.
 async fn ensure_tag_entity(
     storage: &(impl Storage + ?Sized),
@@ -614,5 +913,155 @@ mod tests {
         let action = ingest_skill(&storage, &ctx, p, None).await.unwrap();
         // Ingest succeeds even with a dangling prereq (logged, not failed).
         assert!(matches!(action, SkillIngestAction::Created { .. }));
+    }
+
+    #[tokio::test]
+    async fn retrieve_skills_returns_matching_by_name() {
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+        ingest_skill(&storage, &ctx, base_params("tdd"), None)
+            .await
+            .unwrap();
+        ingest_skill(&storage, &ctx, base_params("threat-model"), None)
+            .await
+            .unwrap();
+        let caller = Uuid::new_v4();
+        let hits = retrieve_skills_for_context(
+            &storage,
+            &ctx,
+            caller,
+            "I need to do some TDD",
+            None,
+            5,
+            0.01,
+            &std::collections::HashSet::new(),
+        )
+        .await
+        .unwrap();
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].skill_name, "tdd");
+    }
+
+    #[tokio::test]
+    async fn retrieve_skills_scores_trigger_keyword_matches() {
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+        let mut p = base_params("tdd");
+        p.trigger_keywords = vec!["red-green-refactor".into(), "kent".into()];
+        ingest_skill(&storage, &ctx, p, None).await.unwrap();
+        let caller = Uuid::new_v4();
+        let hits = retrieve_skills_for_context(
+            &storage,
+            &ctx,
+            caller,
+            "applying red-green-refactor to this bug",
+            None,
+            5,
+            0.01,
+            &std::collections::HashSet::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].score > 0.0);
+    }
+
+    #[tokio::test]
+    async fn retrieve_skills_flags_used_in_session() {
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+        let action = ingest_skill(&storage, &ctx, base_params("tdd"), None)
+            .await
+            .unwrap();
+        let caller = Uuid::new_v4();
+        let mut used = std::collections::HashSet::new();
+        used.insert(action.entity_id());
+        let hits = retrieve_skills_for_context(
+            &storage,
+            &ctx,
+            caller,
+            "tdd",
+            None,
+            5,
+            0.0,
+            &used,
+        )
+        .await
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].used_in_session);
+    }
+
+    #[tokio::test]
+    async fn retrieve_skills_respects_min_score() {
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+        ingest_skill(&storage, &ctx, base_params("tdd"), None)
+            .await
+            .unwrap();
+        let caller = Uuid::new_v4();
+        // High min_score filters out weak matches (no trigger keyword hit).
+        let hits = retrieve_skills_for_context(
+            &storage,
+            &ctx,
+            caller,
+            "unrelated query about deploying to kubernetes",
+            None,
+            5,
+            0.5,
+            &std::collections::HashSet::new(),
+        )
+        .await
+        .unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_skill_by_name_returns_matching() {
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+        ingest_skill(&storage, &ctx, base_params("tdd"), None)
+            .await
+            .unwrap();
+        let found = get_skill_by_name(&storage, &ctx, "tdd").await.unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().entity_name, "tdd");
+    }
+
+    #[tokio::test]
+    async fn get_skill_by_name_none_on_miss() {
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+        ingest_skill(&storage, &ctx, base_params("tdd"), None)
+            .await
+            .unwrap();
+        let found = get_skill_by_name(&storage, &ctx, "tdd-typo").await.unwrap();
+        assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn build_invoke_result_populates_steps_and_first_prompt() {
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+        ingest_skill(&storage, &ctx, base_params("tdd"), None)
+            .await
+            .unwrap();
+        let entity = get_skill_by_name(&storage, &ctx, "tdd")
+            .await
+            .unwrap()
+            .expect("tdd must be retrievable");
+        let result = build_invoke_result(&entity);
+        assert_eq!(result.skill_name, "tdd");
+        assert_eq!(result.category, "testing");
+        assert!(!result.version.is_empty());
+        assert_eq!(result.steps.len(), 1);
+        assert_eq!(
+            result.first_step_prompt.as_deref(),
+            Some("write a failing test")
+        );
+        assert_eq!(
+            result.completion_criteria.as_deref(),
+            Some("all steps complete")
+        );
     }
 }

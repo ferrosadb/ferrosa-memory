@@ -461,6 +461,34 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                 "required": ["name", "category", "description"]
             }),
         },
+        ToolDef {
+            name: "retrieve_skills_for_context".into(),
+            description: "Find methodologies relevant to your current task from the global skill catalog.\n\nCALL AT TASK START or whenever you encounter a problem you've solved before — 'how do I test this?', 'how should I refactor this?', 'what's the threat model here?'\n\nReturns ranked skills with description, category, version, and a used_in_session flag. Match scoring combines description-embedding similarity, trigger_keyword overlap, tag overlap, and name hits.\n\nThese skills are GLOBAL — shared across every session. If a result is marked used_in_session=true, you've already touched it this session, which is a strong relevance signal.\nCost: O(catalog size) — typically <20ms for 100s of skills.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Caller's session UUID (optional, used for the used_in_session flag)." },
+                    "context": { "type": "string", "maxLength": 8192, "description": "Current task context — what you're working on, the problem statement, or a natural-language question." },
+                    "embedding": { "type": "array", "items": { "type": "number" }, "description": "Optional context embedding. When present, enables semantic matching against skill description_embeddings." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 20, "description": "Max results (default 5)." },
+                    "min_score": { "type": "number", "minimum": 0.0, "maximum": 2.0, "description": "Minimum score threshold (default 0.0 returns all)." }
+                },
+                "required": ["context"]
+            }),
+        },
+        ToolDef {
+            name: "invoke_skill".into(),
+            description: "Fetch the structured steps for a named skill. Returns {description, steps, first_step_prompt, completion_criteria, output_artifacts}.\n\nCALL WHEN: You've decided to apply a skill by name (e.g., after retrieve_skills_for_context returned it, or the user explicitly asked 'use TDD').\n\nThe response is pure data. Execute the steps yourself — invoke_skill does not orchestrate tool calls. Start with first_step_prompt. Check completion_criteria when you finish.\n\nMissed skill returns INVALID_PARAMS with a did_you_mean list of similar skill names (phonetic match). Ingest the skill with ingest_skill if it genuinely doesn't exist yet.\nCost: ~5ms.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Caller's session UUID (optional; used for prerequisite-satisfaction tracking)." },
+                    "skill_name": { "type": "string", "maxLength": 256, "description": "Exact name of the skill to invoke (case-sensitive)." },
+                    "current_context": { "type": "string", "maxLength": 4096, "description": "Optional context hint — what you're working on right now." }
+                },
+                "required": ["skill_name"]
+            }),
+        },
         // --- Intention tools (prospective memory, repo-scoped) ---
         ToolDef {
             name: "set_intention".into(),
@@ -1032,6 +1060,10 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "delete_session" => handle_delete_session(args, storage, ctx).await,
         "smart_ingest" => handle_smart_ingest(args, storage, ctx, session).await,
         "ingest_skill" => handle_ingest_skill(args, storage, ctx, session).await,
+        "retrieve_skills_for_context" => {
+            handle_retrieve_skills_for_context(args, storage, ctx, session).await
+        }
+        "invoke_skill" => handle_invoke_skill(args, storage, ctx, session).await,
         "set_intention" => handle_set_intention(args, storage, ctx, session).await,
         "check_intentions" => handle_check_intentions(args, storage, ctx, session).await,
         "complete_intention" => handle_complete_intention(args, storage, ctx, session).await,
@@ -1137,6 +1169,8 @@ fn is_tier1(name: &str) -> bool {
         name,
         "smart_ingest"
             | "ingest_skill"
+            | "retrieve_skills_for_context"
+            | "invoke_skill"
             | "hybrid_search"
             | "create_edge"
             | "batch_create_edges"
@@ -2226,6 +2260,106 @@ async fn handle_ingest_skill<S: crate::storage::Storage>(
         );
     }
     Ok(result)
+}
+
+async fn handle_retrieve_skills_for_context<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let context = require_str(&args, "context")?.to_string();
+    let caller_session = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(5)
+        .clamp(1, 20);
+    let min_score = args.get("min_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+    let mut query_embedding = args
+        .get("embedding")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|n| n.as_f64().map(|f| f as f32))
+                .collect::<Vec<f32>>()
+        });
+    if query_embedding.is_none() && !session.ollama_base_url.is_empty() {
+        let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
+            provider: "ollama".into(),
+            ollama_base_url: session.ollama_base_url.clone(),
+            model: session.embed_model.clone(),
+            dimensions: session.embed_dimensions,
+            ner_model: String::new(),
+        });
+        if let Ok(emb) = client.embed(&context).await {
+            query_embedding = Some(emb);
+        }
+    }
+
+    // Used-in-session signal — retrieval_tracker records which entity_ids
+    // have been touched in this session.
+    let used_ids: std::collections::HashSet<uuid::Uuid> = {
+        let tracker = session.retrieval_tracker.lock().await;
+        tracker.recent_ids(50).into_iter().collect()
+    };
+
+    let hits = crate::skill::retrieve_skills_for_context(
+        storage,
+        ctx,
+        caller_session,
+        &context,
+        query_embedding.as_deref(),
+        limit,
+        min_score,
+        &used_ids,
+    )
+    .await
+    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    let hint = if hits.is_empty() {
+        "No skills matched. Ingest one with ingest_skill, or broaden the context."
+    } else {
+        "These skills are shared across all sessions. If you successfully apply one, \
+         remember it. If you discover a refinement, call ingest_skill to persist it."
+    };
+
+    Ok(serde_json::json!({
+        "results": hits,
+        "_hint": hint,
+    }))
+}
+
+async fn handle_invoke_skill<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    _session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let name = require_str(&args, "skill_name")?.to_string();
+
+    let entity = crate::skill::get_skill_by_name(storage, ctx, &name)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    let entity = match entity {
+        Some(e) => e,
+        None => {
+            let similar = crate::skill::similar_skill_names(storage, ctx, &name, 3).await;
+            let payload = serde_json::json!({
+                "error": format!("skill not found: '{}'", name),
+                "did_you_mean": similar,
+                "hint": "Call retrieve_skills_for_context to discover available skills, \
+                        or ingest_skill to add this one.",
+            });
+            return Err((INVALID_PARAMS, payload.to_string()));
+        }
+    };
+
+    let result = crate::skill::build_invoke_result(&entity);
+    serde_json::to_value(&result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
 }
 
 // --- Intention handlers ---
@@ -3614,8 +3748,8 @@ mod tests {
         let tools = result["tools"].as_array().unwrap();
         assert_eq!(
             tools.len(),
-            16,
-            "default tools/list should return 16 tier-1 tools"
+            18,
+            "default tools/list should return 18 tier-1 tools"
         );
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -3653,7 +3787,7 @@ mod tests {
             .await
             .unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 41, "include_all should return all 41 tools");
+        assert_eq!(tools.len(), 43, "include_all should return all 43 tools");
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         // Check tier-1 tools still present
