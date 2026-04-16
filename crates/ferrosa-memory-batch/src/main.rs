@@ -45,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
         "migrate-session" => migrate_session(&config).await,
         "retype-entities" => retype_entities(&config).await,
         "rename-entities" => rename_entities(&config).await,
+        "backfill-rich-entities" => backfill_rich_entities(&config).await,
         _ => run_guidelines(&config).await,
     }
 }
@@ -356,6 +357,181 @@ async fn run_guidelines(config: &ferrosa_memory_core::config::Config) -> anyhow:
     Ok(())
 }
 
+// --- Rich entity schema backfill -------------------------------------
+
+/// Parse the boundary between an ENRICHED_PREFIX'd context_snippet and the
+/// original content. Returns `(description, original_context)` when the
+/// input is in the legacy format, `None` otherwise.
+fn split_enriched_context(raw: &str) -> Option<(String, String)> {
+    const PREFIX: &str = "[enriched] ";
+    const SEPARATOR: &str = "\n---\n";
+    let tail = raw.strip_prefix(PREFIX)?;
+    match tail.split_once(SEPARATOR) {
+        Some((desc, orig)) => Some((desc.to_string(), orig.to_string())),
+        // Prefix present but no separator — treat everything after the
+        // prefix as the description and leave original blank.
+        None => Some((tail.to_string(), String::new())),
+    }
+}
+
+/// Backfill the rich entity schema columns on existing rows.
+///
+/// Phases:
+/// - 1: migrate legacy ENRICHED_PREFIX context_snippet into the dedicated
+///   `description` field, restoring the original extraction text to
+///   `context_snippet`.
+/// - 2: generate `description_embedding` for any entity with a populated
+///   `description` but no embedding.
+/// - 4: compute `content_hash = sha256(name || description ||
+///   properties_json)` for entities that have a description but no stored
+///   hash.
+///
+/// Phase 0 (v1 → v2 re-embedding of existing `entity_embedding`,
+/// `fold_embedding`, and `memo_embedding`) is deliberately not included
+/// here — it's a much larger migration that affects three tables and
+/// requires coordinated read/write. Track via the backfill work item.
+///
+/// Flags (all via env because the batch binary is minimal):
+/// - `BACKFILL_PHASES=1,2,4` — comma-separated phase list (default 1,2,4)
+/// - `BACKFILL_DRY_RUN=1` — don't write
+/// - `BACKFILL_FORCE=1` — re-generate description_embedding even when present
+async fn backfill_rich_entities(
+    config: &ferrosa_memory_core::config::Config,
+) -> anyhow::Result<()> {
+    let tenant_id = config
+        .server
+        .tenant_id
+        .as_ref()
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(|| anyhow::anyhow!("no tenant_id configured in [server]"))?;
+    let ctx = TenantContext {
+        tenant_id,
+        session_origin: "batch-backfill".into(),
+    };
+
+    let phases: std::collections::HashSet<u8> = std::env::var("BACKFILL_PHASES")
+        .unwrap_or_else(|_| "1,2,4".into())
+        .split(',')
+        .filter_map(|s| s.trim().parse::<u8>().ok())
+        .collect();
+    let dry_run = std::env::var("BACKFILL_DRY_RUN").is_ok();
+    let force = std::env::var("BACKFILL_FORCE").is_ok();
+
+    tracing::info!(
+        tenant_id = %tenant_id,
+        phases = ?phases,
+        dry_run,
+        force,
+        "backfill-rich-entities starting"
+    );
+
+    let storage = CqlStorage::connect(&config.ferrosa).await?;
+    let entities = storage.entity_list_all(&ctx).await?;
+    tracing::info!(count = entities.len(), "loaded entities for backfill");
+
+    let embed_client = ferrosa_memory_core::embedding::EmbeddingClient::new(
+        &config.embeddings,
+    );
+
+    let mut p1_migrated = 0usize;
+    let mut p2_embedded = 0usize;
+    let mut p2_failed = 0usize;
+    let mut p4_hashed = 0usize;
+
+    for entity in &entities {
+        let mut working = entity.clone();
+        let mut changed = false;
+
+        // Phase 1: split ENRICHED_PREFIX into description + clean context.
+        if phases.contains(&1)
+            && working.description.is_none()
+            && let Some((desc, orig)) = split_enriched_context(&working.context_snippet)
+        {
+            working.description = Some(desc);
+            working.context_snippet = orig;
+            working.updated_at = Some(chrono::Utc::now());
+            changed = true;
+            p1_migrated += 1;
+        }
+
+        // Phase 2: generate description_embedding when missing (or --force).
+        if phases.contains(&2)
+            && let Some(ref desc) = working.description
+            && (working.description_embedding.is_none() || force)
+        {
+            match embed_client.embed(desc).await {
+                Ok(v) => {
+                    working.description_embedding = Some(v);
+                    working.updated_at = Some(chrono::Utc::now());
+                    changed = true;
+                    p2_embedded += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        entity = %working.entity_name,
+                        error = %e,
+                        "Phase 2: description embedding failed; skipping entity"
+                    );
+                    p2_failed += 1;
+                }
+            }
+        }
+
+        // Phase 4: content_hash backfill.
+        if phases.contains(&4)
+            && working.description.is_some()
+            && working.content_hash.is_none()
+        {
+            let props_json = serde_json::to_string(&working.properties).unwrap_or_default();
+            let hash = sha256_hex(&format!(
+                "{}|{}|{}",
+                working.entity_name,
+                working.description.as_deref().unwrap_or(""),
+                props_json
+            ));
+            working.content_hash = Some(format!("sha256:{hash}"));
+            changed = true;
+            p4_hashed += 1;
+        }
+
+        if changed
+            && !dry_run
+            && let Err(e) = storage.entity_put(&ctx, &working).await
+        {
+            tracing::warn!(
+                entity = %working.entity_name,
+                error = %e,
+                "entity_put failed during backfill"
+            );
+        }
+    }
+
+    tracing::info!(
+        p1_migrated,
+        p2_embedded,
+        p2_failed,
+        p4_hashed,
+        dry_run,
+        "backfill-rich-entities complete"
+    );
+
+    if p2_failed > 0 && !dry_run {
+        anyhow::bail!(
+            "{p2_failed} entities failed Phase 2 embedding — check embedding provider and re-run"
+        );
+    }
+
+    Ok(())
+}
+
+fn sha256_hex(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(input.as_bytes());
+    let out = h.finalize();
+    out.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 /// Increment a version string like "v1" -> "v2", "v42" -> "v43".
 fn next_guideline_version(current: &str) -> String {
     if let Some(num_str) = current.strip_prefix('v')
@@ -382,5 +558,43 @@ mod tests {
         assert_eq!(next_guideline_version(""), "v1");
         assert_eq!(next_guideline_version("latest"), "v1");
         assert_eq!(next_guideline_version("abc"), "v1");
+    }
+
+    #[test]
+    fn split_enriched_parses_legacy_format() {
+        let raw = "[enriched] Foo manages bar state.\n---\nstruct `Foo` @ src/lib.rs:42";
+        let (desc, orig) = split_enriched_context(raw).unwrap();
+        assert_eq!(desc, "Foo manages bar state.");
+        assert_eq!(orig, "struct `Foo` @ src/lib.rs:42");
+    }
+
+    #[test]
+    fn split_enriched_returns_none_on_plain_context() {
+        assert!(split_enriched_context("struct `Foo` @ src/lib.rs:42").is_none());
+        assert!(split_enriched_context("").is_none());
+    }
+
+    #[test]
+    fn split_enriched_handles_prefix_without_separator() {
+        // Edge case: prefix present but no separator — treat the rest as the
+        // description and leave original context blank. Not ideal but the
+        // migration is still safe to run.
+        let (desc, orig) = split_enriched_context("[enriched] just a description").unwrap();
+        assert_eq!(desc, "just a description");
+        assert!(orig.is_empty());
+    }
+
+    #[test]
+    fn sha256_hex_is_deterministic() {
+        let a = sha256_hex("hello");
+        let b = sha256_hex("hello");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn sha256_hex_differs_for_different_inputs() {
+        assert_ne!(sha256_hex("a"), sha256_hex("b"));
     }
 }

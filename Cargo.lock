@@ -554,8 +554,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cdrs-tokio",
+ "chrono",
  "ferrosa-memory-core",
  "reqwest",
+ "serde_json",
+ "sha2",
  "tokio",
  "tracing",
  "tracing-subscriber",
