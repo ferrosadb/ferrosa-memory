@@ -126,6 +126,7 @@ pub async fn explore(
             None,
             None,
             &fusion_config,
+            None,
         )
         .await?;
 

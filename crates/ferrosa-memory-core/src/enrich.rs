@@ -30,6 +30,13 @@ pub struct EnrichRunConfig {
     pub force: bool,
     pub dry_run: bool,
     pub batch_size: usize,
+    /// Embedding provider URL + model, used to generate `description_embedding`
+    /// alongside each LLM-generated description. When unset (empty url),
+    /// description is written without an embedding.
+    #[doc(hidden)]
+    pub ollama_base_url: String,
+    pub embed_model: String,
+    pub embed_dimensions: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -149,7 +156,11 @@ impl EnrichLlm {
 // ---------------------------------------------------------------------------
 
 fn is_enriched(entity: &EntityEntry) -> bool {
-    entity.context_snippet.starts_with(ENRICHED_PREFIX)
+    // New canonical signal: dedicated `description` field populated.
+    // Legacy format (pre-Sprint 1): ENRICHED_PREFIX smashed into
+    // context_snippet. Recognize both so re-runs skip correctly during
+    // the migration window.
+    entity.description.is_some() || entity.context_snippet.starts_with(ENRICHED_PREFIX)
 }
 
 fn is_edge_annotated(edge: &TypedEdge) -> bool {
@@ -617,6 +628,24 @@ pub async fn run_enrichment(
             "enrichment: starting entity enrichment"
         );
 
+        // Optional embedding client for populating description_embedding
+        // alongside each LLM-generated description.
+        let embed_client = if !config.ollama_base_url.is_empty()
+            && !config.embed_model.is_empty()
+        {
+            Some(crate::embedding::EmbeddingClient::new(
+                &crate::config::EmbeddingConfig {
+                    provider: "ollama".into(),
+                    ollama_base_url: config.ollama_base_url.clone(),
+                    model: config.embed_model.clone(),
+                    dimensions: config.embed_dimensions,
+                    ner_model: String::new(),
+                },
+            ))
+        } else {
+            None
+        };
+
         for (batch_idx, batch) in batches.iter().enumerate() {
             let user_prompt = build_enrich_prompt(batch, &entity_map);
 
@@ -631,13 +660,32 @@ pub async fn run_enrichment(
                                         .iter()
                                         .find(|e| e.entity_name == enrichment.entity)
                                     {
-                                        let original = strip_enrichment(&entity.context_snippet);
+                                        // Generate description_embedding if a provider is
+                                        // configured. Falls back to None on error — we still
+                                        // want the description written even if embedding fails.
+                                        let desc_embedding = match &embed_client {
+                                            Some(c) => match c.embed(&enrichment.description).await {
+                                                Ok(v) => Some(v),
+                                                Err(e) => {
+                                                    tracing::debug!(
+                                                        entity = %entity.entity_name,
+                                                        error = %e,
+                                                        "description embedding generation skipped"
+                                                    );
+                                                    None
+                                                }
+                                            },
+                                            None => None,
+                                        };
+
+                                        let now = chrono::Utc::now();
+                                        // Write to the dedicated description field (Sprint 1).
+                                        // Leave context_snippet alone — it's the raw
+                                        // extraction source, not a retrieval signal.
                                         let enriched = EntityEntry {
-                                            context_snippet: format!(
-                                                "{}{}\n---\n{}",
-                                                ENRICHED_PREFIX, enrichment.description, original
-                                            ),
-                                            created_at: chrono::Utc::now(),
+                                            description: Some(enrichment.description.clone()),
+                                            description_embedding: desc_embedding,
+                                            updated_at: Some(now),
                                             ..entity.clone()
                                         };
                                         if let Err(e) = storage.entity_put(ctx, &enriched).await {
@@ -791,6 +839,48 @@ mod tests {
     fn strip_unenriched_is_noop() {
         let ctx = "struct `Foo` @ src/lib.rs:42";
         assert_eq!(strip_enrichment(ctx), ctx);
+    }
+
+    #[test]
+    fn is_enriched_recognizes_new_description_field() {
+        // Sprint 1: the canonical enriched signal is a populated
+        // description field. Legacy ENRICHED_PREFIX in context_snippet is
+        // also accepted (transition window until backfill runs).
+        let new_format = EntityEntry {
+            tenant_id: Uuid::nil(),
+            entity_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            entity_name: "Foo".into(),
+            entity_type: "struct".into(),
+            source_fold_id: None,
+            context_snippet: "struct `Foo` @ src/lib.rs:42".into(),
+            entity_embedding: None,
+            confidence: 0.9,
+            state: crate::types::MemoryState::Active,
+            created_at: chrono::Utc::now(),
+            description: Some("Foo manages bar state.".into()),
+            ..Default::default()
+        };
+        assert!(is_enriched(&new_format));
+    }
+
+    #[test]
+    fn is_enriched_false_on_plain_entity() {
+        let plain = EntityEntry {
+            tenant_id: Uuid::nil(),
+            entity_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            entity_name: "Foo".into(),
+            entity_type: "concept".into(),
+            source_fold_id: None,
+            context_snippet: "plain source text".into(),
+            entity_embedding: None,
+            confidence: 1.0,
+            state: crate::types::MemoryState::Active,
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        };
+        assert!(!is_enriched(&plain));
     }
 
     #[test]

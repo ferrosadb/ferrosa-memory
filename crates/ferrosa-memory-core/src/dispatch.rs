@@ -2467,6 +2467,7 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         None,
         None,
         &crate::hybrid_search::FusionConfig::default(),
+        None,
     )
     .await
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
@@ -2581,6 +2582,9 @@ async fn handle_enrich_entities<S: crate::storage::Storage>(
         force,
         dry_run,
         batch_size: 10,
+        ollama_base_url: session.ollama_base_url.clone(),
+        embed_model: session.embed_model.clone(),
+        embed_dimensions: session.embed_dimensions,
     };
 
     let result = crate::enrich::run_enrichment(storage, ctx, session_id, &enrich_config)
