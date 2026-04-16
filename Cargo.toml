@@ -31,7 +31,7 @@ sha1 = "0.10"
 sha2 = "0.10"
 
 # UUIDs
-uuid = { version = "1", features = ["v4", "v7", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }

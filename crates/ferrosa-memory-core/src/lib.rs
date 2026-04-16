@@ -49,6 +49,7 @@ pub mod promotion;
 pub mod quota;
 pub mod recursive_explore;
 pub mod router;
+pub mod scope;
 #[cfg(test)]
 mod security_tests;
 pub mod session;
