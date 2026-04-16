@@ -428,6 +428,39 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                 "required": ["content", "entity_type"]
             }),
         },
+        // --- Skills layer ---
+        ToolDef {
+            name: "ingest_skill".into(),
+            description: "Ingest a methodology into the global skill catalog. Skills are shared across all sessions and tenants' queries.\n\nCALL WHEN: You encounter or refine a reusable methodology — TDD, STRIDE threat modeling, debugging process, refactoring pattern, etc.\n\nThe server generates the version (YYYYMMDDNN) — do not pass it. Pass content_hash for idempotent re-ingest; re-running with an unchanged hash is a no-op.\n\nSkills are stored with entity_type='skill', scope='global'. Category and additional tags become tag entities + TAGGED_AS edges. Prerequisites become REQUIRES edges (skipped if the prereq skill hasn't been ingested yet — re-run later).\n\nLEARN AND REFINE: If you use a skill and discover a better step, a missing prerequisite, or a clearer description, call ingest_skill again to refine it. Your changes persist across all sessions.\nCost: ~20ms + one embed call for description.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Caller's session UUID (optional, recorded for audit). Omit or pass 'default' to use the configured default session." },
+                    "name": { "type": "string", "maxLength": 256, "description": "Unique skill identifier (e.g., 'tdd', 'threat-model')" },
+                    "category": { "type": "string", "maxLength": 128, "description": "Primary tag (e.g., 'testing', 'security'). Becomes a tag entity + TAGGED_AS edge." },
+                    "description": { "type": "string", "maxLength": 4096, "description": "2-4 sentence description of what the skill does and when to use it. Embedded for retrieval." },
+                    "trigger_keywords": { "type": "array", "items": { "type": "string" }, "description": "Keywords that indicate this skill is relevant." },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Additional tags beyond category." },
+                    "prerequisites": { "type": "array", "items": { "type": "string" }, "description": "Names of other skills this requires." },
+                    "steps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "phase": { "type": "string" },
+                                "instruction": { "type": "string" }
+                            },
+                            "required": ["instruction"]
+                        },
+                        "description": "Ordered steps to follow when invoking the skill."
+                    },
+                    "output_artifacts": { "type": "array", "items": { "type": "string" }, "description": "Artifacts the skill produces (e.g., 'checklist', 'diagram')." },
+                    "completion_criteria": { "type": "string", "maxLength": 1024, "description": "How to tell when the skill's work is done." },
+                    "content_hash": { "type": "string", "maxLength": 128, "description": "Caller-computed content hash for idempotent re-ingest. Passing the same hash as the stored skill is a no-op." }
+                },
+                "required": ["name", "category", "description"]
+            }),
+        },
         // --- Intention tools (prospective memory, repo-scoped) ---
         ToolDef {
             name: "set_intention".into(),
@@ -998,6 +1031,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "record_outcome" => handle_record_outcome(args, storage, ctx).await,
         "delete_session" => handle_delete_session(args, storage, ctx).await,
         "smart_ingest" => handle_smart_ingest(args, storage, ctx, session).await,
+        "ingest_skill" => handle_ingest_skill(args, storage, ctx, session).await,
         "set_intention" => handle_set_intention(args, storage, ctx, session).await,
         "check_intentions" => handle_check_intentions(args, storage, ctx, session).await,
         "complete_intention" => handle_complete_intention(args, storage, ctx, session).await,
@@ -1102,6 +1136,7 @@ fn is_tier1(name: &str) -> bool {
     matches!(
         name,
         "smart_ingest"
+            | "ingest_skill"
             | "hybrid_search"
             | "create_edge"
             | "batch_create_edges"
@@ -2075,6 +2110,120 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
             }
             _ => {}
         }
+    }
+    Ok(result)
+}
+
+// --- Skills handlers ---
+
+async fn handle_ingest_skill<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let name = require_str(&args, "name")?.to_string();
+    let category = require_str(&args, "category")?.to_string();
+    let description = require_str(&args, "description")?.to_string();
+    let caller_session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+
+    let trigger_keywords = args
+        .get("trigger_keywords")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let tags = args
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let prerequisites = args
+        .get("prerequisites")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let steps: Vec<crate::skill::Step> = args
+        .get("steps")
+        .cloned()
+        .map(|v| serde_json::from_value(v).unwrap_or_default())
+        .unwrap_or_default();
+    let output_artifacts = args
+        .get("output_artifacts")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let completion_criteria = args
+        .get("completion_criteria")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let content_hash = args
+        .get("content_hash")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let params = crate::skill::IngestSkillParams {
+        name,
+        category,
+        description,
+        trigger_keywords,
+        tags,
+        prerequisites,
+        steps,
+        output_artifacts,
+        completion_criteria,
+        content_hash,
+        caller_session_id,
+    };
+
+    // Build an embedding client from session config so description_embedding
+    // is populated alongside the skill entity.
+    let embed_client = if !session.ollama_base_url.is_empty() {
+        Some(crate::embedding::EmbeddingClient::new(
+            &crate::config::EmbeddingConfig {
+                provider: "ollama".into(),
+                ollama_base_url: session.ollama_base_url.clone(),
+                model: session.embed_model.clone(),
+                dimensions: session.embed_dimensions,
+                ner_model: String::new(),
+            },
+        ))
+    } else {
+        None
+    };
+
+    let action = crate::skill::ingest_skill(storage, ctx, params, embed_client.as_ref())
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    let mut result = serde_json::to_value(&action)
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert(
+            "_hint".into(),
+            Value::String(
+                "Skills are global knowledge shared across every session. If you \
+                 use this skill and learn something new — a better step, a missing \
+                 prerequisite, a clearer description — call ingest_skill again with \
+                 the refinement. Your changes persist."
+                    .into(),
+            ),
+        );
     }
     Ok(result)
 }
@@ -3465,8 +3614,8 @@ mod tests {
         let tools = result["tools"].as_array().unwrap();
         assert_eq!(
             tools.len(),
-            15,
-            "default tools/list should return 15 tier-1 tools"
+            16,
+            "default tools/list should return 16 tier-1 tools"
         );
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -3504,7 +3653,7 @@ mod tests {
             .await
             .unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 40, "include_all should return all 40 tools");
+        assert_eq!(tools.len(), 41, "include_all should return all 41 tools");
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         // Check tier-1 tools still present
