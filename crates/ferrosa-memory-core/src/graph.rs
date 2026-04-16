@@ -151,6 +151,37 @@ impl GraphClient {
         Ok(extract_string_column(&resp))
     }
 
+    /// Check whether adding an edge `src -[edge_type]-> dst` would create a
+    /// cycle in the existing DAG. Used before emitting `PARENT_TAG`
+    /// (tag hierarchy) and `REQUIRES` (skill prerequisite) edges.
+    ///
+    /// A cycle forms when there is already a path from `dst` back to `src`
+    /// via `edge_type` — adding `src -> dst` closes that loop.
+    ///
+    /// Uses a bounded depth of 32 hops to cap query cost; any taxonomy
+    /// deeper than that has bigger problems than cycle detection.
+    ///
+    /// Returns `Ok(true)` if the edge would form a cycle (reject it),
+    /// `Ok(false)` if safe to add. Fails loud on query errors so callers
+    /// can treat an unreachable graph as fail-closed.
+    pub async fn would_create_cycle(
+        &self,
+        src_entity_id: Uuid,
+        dst_entity_id: Uuid,
+        edge_type: &str,
+    ) -> anyhow::Result<bool> {
+        let cypher = build_cycle_query(src_entity_id, dst_entity_id, edge_type);
+        let resp = self.query(&cypher).await?;
+        // Response shape: rows: [[true]] or [[false]].
+        let value = resp
+            .rows
+            .first()
+            .and_then(|row| row.first())
+            .cloned()
+            .unwrap_or(serde_json::Value::Bool(false));
+        Ok(value.as_bool().unwrap_or(false))
+    }
+
     /// Get entities mentioned in a specific fold.
     pub async fn get_entities_in_fold(
         &self,
@@ -179,6 +210,28 @@ impl GraphClient {
         let resp = self.query(&cypher).await?;
         Ok(extract_string_column(&resp))
     }
+}
+
+/// Build the Cypher query for the cycle check. Extracted so unit tests can
+/// assert on the exact query shape without a live graph endpoint.
+///
+/// The edge_type must be alphanumeric-or-underscore — enforced by the
+/// callers (edge type registry validation). A separate `sanitize_edge_type`
+/// helper trims anything unusual defensively.
+fn build_cycle_query(src: Uuid, dst: Uuid, edge_type: &str) -> String {
+    // take_while stops at the first unsafe char — prevents an attacker from
+    // stuffing injected Cypher after a benign prefix (filter would keep the
+    // good chars while silently dropping the bad ones, producing a
+    // malformed-but-concatenated identifier).
+    let safe_type: String = edge_type
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    format!(
+        "MATCH path = (dst {{entity_id: '{dst}'}})\
+         -[:{safe_type}*1..32]->(src {{entity_id: '{src}'}}) \
+         RETURN count(path) > 0 AS would_cycle"
+    )
 }
 
 /// Extract first column as strings from a Cypher response.
@@ -223,6 +276,52 @@ mod tests {
             base64_encode("cassandra:cassandra"),
             "Y2Fzc2FuZHJhOmNhc3NhbmRyYQ=="
         );
+    }
+
+    #[test]
+    fn cycle_query_names_dst_and_src_in_correct_direction() {
+        // Adding src -> dst cycles iff a path already exists from dst back
+        // to src. The query must traverse FROM dst TO src, not the other
+        // way around — a classic off-by-direction bug that would silently
+        // pass every cycle attempt.
+        let src = Uuid::from_u128(0x1);
+        let dst = Uuid::from_u128(0x2);
+        let q = build_cycle_query(src, dst, "PARENT_TAG");
+        // The dst binding must appear BEFORE the src binding in the path.
+        let dst_pos = q.find(&dst.to_string()).expect("dst must appear");
+        let src_pos = q.find(&src.to_string()).expect("src must appear");
+        assert!(
+            dst_pos < src_pos,
+            "dst must be the starting node of the path traversal, got: {q}"
+        );
+        assert!(q.contains("[:PARENT_TAG*1..32]"));
+        assert!(q.contains("would_cycle"));
+    }
+
+    #[test]
+    fn cycle_query_sanitizes_edge_type_injection() {
+        // Prevent a caller from injecting Cypher via edge_type. The sanitizer
+        // stops at the first unsafe char — everything after the first `'`,
+        // `;`, space, `/`, etc. is dropped.
+        let src = Uuid::from_u128(0x1);
+        let dst = Uuid::from_u128(0x2);
+        let q = build_cycle_query(src, dst, "DROP'; MATCH (n) DETACH DELETE n; //");
+        // Injection markers must never reach the query.
+        assert!(!q.contains("';"), "quote+semicolon must be stripped: {q}");
+        assert!(!q.contains("DELETE"), "DELETE must be stripped: {q}");
+        assert!(!q.contains("//"), "comment marker must be stripped: {q}");
+        assert!(!q.contains(" MATCH (n)"), "nested MATCH must be stripped: {q}");
+        // Only the benign prefix ("DROP") survives inside the edge-type
+        // brackets; UUIDs still carry their own quotes, which is fine.
+        assert!(q.contains("[:DROP*1..32]"));
+    }
+
+    #[test]
+    fn cycle_query_accepts_underscore_edge_types() {
+        let src = Uuid::from_u128(0x1);
+        let dst = Uuid::from_u128(0x2);
+        let q = build_cycle_query(src, dst, "TAGGED_AS");
+        assert!(q.contains("[:TAGGED_AS*1..32]"));
     }
 
     #[test]

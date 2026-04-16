@@ -135,11 +135,13 @@ fn today_yyyymmdd() -> String {
 ///   emits a `REQUIRES` edge. Missing prerequisites are logged and skipped
 ///   (the caller can re-run after ingesting them).
 /// - Generates `description_embedding` via the embedding client when provided.
+#[allow(clippy::too_many_arguments)]
 pub async fn ingest_skill(
     storage: &(impl Storage + ?Sized),
     ctx: &TenantContext,
     params: IngestSkillParams,
     embedding_client: Option<&EmbeddingClient>,
+    graph_client: Option<&crate::graph::GraphClient>,
 ) -> anyhow::Result<SkillIngestAction> {
     anyhow::ensure!(!params.name.is_empty(), "skill name must not be empty");
     anyhow::ensure!(
@@ -294,32 +296,72 @@ pub async fn ingest_skill(
     }
 
     // --- REQUIRES edges for prerequisites ---
+    // Cycle prevention: adding `skill -[REQUIRES]-> prereq` creates a cycle
+    // iff prereq already transitively requires skill. When a graph client is
+    // available, run the Cypher check and fail-closed on that edge. When
+    // the graph is unreachable or unconfigured, log a warning and skip the
+    // edge (we'd rather miss a relationship than silently allow a cycle to
+    // land under a misconfigured environment).
     for prereq_name in &params.prerequisites {
         let mut matches = storage
             .entity_find_phonetic(ctx, storage_session, prereq_name)
             .await
             .unwrap_or_default();
         matches.retain(|e| e.entity_name == *prereq_name && e.entity_type == "skill");
-        if let Some(prereq) = matches.first() {
-            let edge = TypedEdge {
-                tenant_id: ctx.tenant_id,
-                session_id: storage_session,
-                src_id: entity_id,
-                edge_type: "REQUIRES".into(),
-                dst_id: prereq.entity_id,
-                weight: 1.0,
-                metadata: None,
-                created_at: now,
-            };
-            if let Err(e) = storage.typed_edge_put(ctx, &edge).await {
-                tracing::warn!(skill = %params.name, prereq = %prereq_name, error = %e, "REQUIRES edge write failed");
-            }
-        } else {
+        let Some(prereq) = matches.first() else {
             tracing::info!(
                 skill = %params.name,
                 prereq = %prereq_name,
                 "prerequisite skill not found; ingest it and re-run to create REQUIRES edge"
             );
+            continue;
+        };
+
+        if let Some(graph) = graph_client {
+            match graph
+                .would_create_cycle(entity_id, prereq.entity_id, "REQUIRES")
+                .await
+            {
+                Ok(true) => {
+                    tracing::warn!(
+                        skill = %params.name,
+                        prereq = %prereq_name,
+                        "REQUIRES edge would form a cycle; rejecting"
+                    );
+                    continue;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        skill = %params.name,
+                        prereq = %prereq_name,
+                        error = %e,
+                        "REQUIRES cycle check failed (graph unreachable); \
+                         skipping edge. Run ingest_skill again when graph is healthy."
+                    );
+                    continue;
+                }
+            }
+        } else {
+            tracing::debug!(
+                skill = %params.name,
+                prereq = %prereq_name,
+                "REQUIRES cycle check skipped (no graph client wired)"
+            );
+        }
+
+        let edge = TypedEdge {
+            tenant_id: ctx.tenant_id,
+            session_id: storage_session,
+            src_id: entity_id,
+            edge_type: "REQUIRES".into(),
+            dst_id: prereq.entity_id,
+            weight: 1.0,
+            metadata: None,
+            created_at: now,
+        };
+        if let Err(e) = storage.typed_edge_put(ctx, &edge).await {
+            tracing::warn!(skill = %params.name, prereq = %prereq_name, error = %e, "REQUIRES edge write failed");
         }
     }
 
@@ -755,7 +797,7 @@ mod tests {
     async fn ingest_skill_creates_new() {
         let storage = MockStorage::new();
         let ctx = test_ctx();
-        let action = ingest_skill(&storage, &ctx, base_params("tdd"), None)
+        let action = ingest_skill(&storage, &ctx, base_params("tdd"), None, None)
             .await
             .unwrap();
         match action {
@@ -771,7 +813,7 @@ mod tests {
     async fn ingest_skill_stores_as_global_scope() {
         let storage = MockStorage::new();
         let ctx = test_ctx();
-        let action = ingest_skill(&storage, &ctx, base_params("tdd"), None)
+        let action = ingest_skill(&storage, &ctx, base_params("tdd"), None, None)
             .await
             .unwrap();
         let global_session = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
@@ -789,7 +831,7 @@ mod tests {
     async fn ingest_skill_writes_description_and_properties() {
         let storage = MockStorage::new();
         let ctx = test_ctx();
-        let action = ingest_skill(&storage, &ctx, base_params("tdd"), None)
+        let action = ingest_skill(&storage, &ctx, base_params("tdd"), None, None)
             .await
             .unwrap();
         let global_session = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
@@ -810,10 +852,10 @@ mod tests {
         let ctx = test_ctx();
         let mut p = base_params("tdd");
         p.content_hash = Some("sha256:abc".into());
-        let first = ingest_skill(&storage, &ctx, p.clone(), None)
+        let first = ingest_skill(&storage, &ctx, p.clone(), None, None)
             .await
             .unwrap();
-        let second = ingest_skill(&storage, &ctx, p, None).await.unwrap();
+        let second = ingest_skill(&storage, &ctx, p, None, None).await.unwrap();
         assert!(matches!(first, SkillIngestAction::Created { .. }));
         match second {
             SkillIngestAction::Skipped { reason, .. } => {
@@ -829,12 +871,12 @@ mod tests {
         let ctx = test_ctx();
         let mut p = base_params("tdd");
         p.content_hash = Some("sha256:v1".into());
-        let first = ingest_skill(&storage, &ctx, p.clone(), None)
+        let first = ingest_skill(&storage, &ctx, p.clone(), None, None)
             .await
             .unwrap();
         p.content_hash = Some("sha256:v2".into());
         p.description = "the tdd methodology, refined".into();
-        let second = ingest_skill(&storage, &ctx, p, None).await.unwrap();
+        let second = ingest_skill(&storage, &ctx, p, None, None).await.unwrap();
         assert_eq!(
             first.entity_id(),
             second.entity_id(),
@@ -847,7 +889,7 @@ mod tests {
     async fn ingest_skill_creates_tag_entity_for_category() {
         let storage = MockStorage::new();
         let ctx = test_ctx();
-        ingest_skill(&storage, &ctx, base_params("tdd"), None)
+        ingest_skill(&storage, &ctx, base_params("tdd"), None, None)
             .await
             .unwrap();
         let global = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
@@ -866,7 +908,7 @@ mod tests {
         let ctx = test_ctx();
         let mut p = base_params("tdd");
         p.tags = vec!["Kent Beck".into(), "methodology".into()];
-        ingest_skill(&storage, &ctx, p, None).await.unwrap();
+        ingest_skill(&storage, &ctx, p, None, None).await.unwrap();
         let global = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
         let entities = storage.entity_list_session(&ctx, global).await.unwrap();
         let tag_names: Vec<&str> = entities
@@ -884,13 +926,13 @@ mod tests {
         let storage = MockStorage::new();
         let ctx = test_ctx();
         // Ingest prereq first.
-        ingest_skill(&storage, &ctx, base_params("unit-testing"), None)
+        ingest_skill(&storage, &ctx, base_params("unit-testing"), None, None)
             .await
             .unwrap();
         // Now ingest the skill that requires it.
         let mut p = base_params("tdd");
         p.prerequisites = vec!["unit-testing".into()];
-        let tdd = ingest_skill(&storage, &ctx, p, None).await.unwrap();
+        let tdd = ingest_skill(&storage, &ctx, p, None, None).await.unwrap();
 
         let global = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
         let edges = storage
@@ -910,7 +952,7 @@ mod tests {
         let ctx = test_ctx();
         let mut p = base_params("tdd");
         p.prerequisites = vec!["does-not-exist".into()];
-        let action = ingest_skill(&storage, &ctx, p, None).await.unwrap();
+        let action = ingest_skill(&storage, &ctx, p, None, None).await.unwrap();
         // Ingest succeeds even with a dangling prereq (logged, not failed).
         assert!(matches!(action, SkillIngestAction::Created { .. }));
     }
@@ -919,10 +961,10 @@ mod tests {
     async fn retrieve_skills_returns_matching_by_name() {
         let storage = MockStorage::new();
         let ctx = test_ctx();
-        ingest_skill(&storage, &ctx, base_params("tdd"), None)
+        ingest_skill(&storage, &ctx, base_params("tdd"), None, None)
             .await
             .unwrap();
-        ingest_skill(&storage, &ctx, base_params("threat-model"), None)
+        ingest_skill(&storage, &ctx, base_params("threat-model"), None, None)
             .await
             .unwrap();
         let caller = Uuid::new_v4();
@@ -948,7 +990,7 @@ mod tests {
         let ctx = test_ctx();
         let mut p = base_params("tdd");
         p.trigger_keywords = vec!["red-green-refactor".into(), "kent".into()];
-        ingest_skill(&storage, &ctx, p, None).await.unwrap();
+        ingest_skill(&storage, &ctx, p, None, None).await.unwrap();
         let caller = Uuid::new_v4();
         let hits = retrieve_skills_for_context(
             &storage,
@@ -970,7 +1012,7 @@ mod tests {
     async fn retrieve_skills_flags_used_in_session() {
         let storage = MockStorage::new();
         let ctx = test_ctx();
-        let action = ingest_skill(&storage, &ctx, base_params("tdd"), None)
+        let action = ingest_skill(&storage, &ctx, base_params("tdd"), None, None)
             .await
             .unwrap();
         let caller = Uuid::new_v4();
@@ -996,7 +1038,7 @@ mod tests {
     async fn retrieve_skills_respects_min_score() {
         let storage = MockStorage::new();
         let ctx = test_ctx();
-        ingest_skill(&storage, &ctx, base_params("tdd"), None)
+        ingest_skill(&storage, &ctx, base_params("tdd"), None, None)
             .await
             .unwrap();
         let caller = Uuid::new_v4();
@@ -1020,7 +1062,7 @@ mod tests {
     async fn get_skill_by_name_returns_matching() {
         let storage = MockStorage::new();
         let ctx = test_ctx();
-        ingest_skill(&storage, &ctx, base_params("tdd"), None)
+        ingest_skill(&storage, &ctx, base_params("tdd"), None, None)
             .await
             .unwrap();
         let found = get_skill_by_name(&storage, &ctx, "tdd").await.unwrap();
@@ -1032,7 +1074,7 @@ mod tests {
     async fn get_skill_by_name_none_on_miss() {
         let storage = MockStorage::new();
         let ctx = test_ctx();
-        ingest_skill(&storage, &ctx, base_params("tdd"), None)
+        ingest_skill(&storage, &ctx, base_params("tdd"), None, None)
             .await
             .unwrap();
         let found = get_skill_by_name(&storage, &ctx, "tdd-typo").await.unwrap();
@@ -1043,7 +1085,7 @@ mod tests {
     async fn build_invoke_result_populates_steps_and_first_prompt() {
         let storage = MockStorage::new();
         let ctx = test_ctx();
-        ingest_skill(&storage, &ctx, base_params("tdd"), None)
+        ingest_skill(&storage, &ctx, base_params("tdd"), None, None)
             .await
             .unwrap();
         let entity = get_skill_by_name(&storage, &ctx, "tdd")

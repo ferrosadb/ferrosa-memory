@@ -2241,9 +2241,15 @@ async fn handle_ingest_skill<S: crate::storage::Storage>(
         None
     };
 
-    let action = crate::skill::ingest_skill(storage, ctx, params, embed_client.as_ref())
-        .await
-        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    let action = crate::skill::ingest_skill(
+        storage,
+        ctx,
+        params,
+        embed_client.as_ref(),
+        session.graph.as_deref(),
+    )
+    .await
+    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
     let mut result = serde_json::to_value(&action)
         .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
