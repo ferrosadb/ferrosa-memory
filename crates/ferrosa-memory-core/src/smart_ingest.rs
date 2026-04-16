@@ -167,6 +167,7 @@ pub async fn smart_ingest(
             confidence: 1.0,
             state: crate::types::MemoryState::default(),
             created_at: chrono::Utc::now(),
+            ..Default::default()
         };
         storage.entity_put(ctx, &entry).await?;
         tracing::info!(
@@ -252,6 +253,7 @@ pub async fn smart_ingest(
             confidence: 1.0,
             state: crate::types::MemoryState::default(),
             created_at: chrono::Utc::now(),
+            ..Default::default()
         };
         storage.entity_put(ctx, &entry).await?;
         // Create supersession edge
@@ -285,6 +287,7 @@ pub async fn smart_ingest(
         confidence: 1.0,
         state: crate::types::MemoryState::default(),
         created_at: chrono::Utc::now(),
+        ..Default::default()
     };
     storage.entity_put(ctx, &entry).await?;
     tracing::info!(

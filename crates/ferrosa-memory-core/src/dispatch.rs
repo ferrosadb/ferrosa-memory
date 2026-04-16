@@ -3827,6 +3827,7 @@ mod tests {
             confidence: 0.9,
             state: Default::default(),
             created_at: chrono::Utc::now(),
+            ..Default::default()
         };
         store.entities.lock().await.push(entity.clone());
 
@@ -3869,6 +3870,7 @@ mod tests {
             confidence: 0.95,
             state: Default::default(),
             created_at: chrono::Utc::now(),
+            ..Default::default()
         };
         store.entities.lock().await.push(entity);
 
@@ -4241,6 +4243,7 @@ mod tests {
             confidence: 0.9,
             state: Default::default(),
             created_at: chrono::Utc::now(),
+            ..Default::default()
         };
         store.entities.lock().await.push(entity);
 
@@ -4367,6 +4370,7 @@ mod tests {
                 confidence: 0.9,
                 state: Default::default(),
                 created_at: chrono::Utc::now(),
+                ..Default::default()
             };
             store.entities.lock().await.push(entity);
         }

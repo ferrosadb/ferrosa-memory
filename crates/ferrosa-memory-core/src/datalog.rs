@@ -1117,6 +1117,7 @@ mod tests {
                     confidence: 0.9,
                     state: crate::types::MemoryState::Active,
                     created_at: chrono::Utc::now(),
+                    ..Default::default()
                 },
             )
             .await
@@ -1136,6 +1137,7 @@ mod tests {
                     confidence: 0.8,
                     state: crate::types::MemoryState::Active,
                     created_at: chrono::Utc::now(),
+                    ..Default::default()
                 },
             )
             .await
@@ -1201,6 +1203,7 @@ mod tests {
                         confidence: 1.0,
                         state: crate::types::MemoryState::Active,
                         created_at: chrono::Utc::now(),
+                        ..Default::default()
                     },
                 )
                 .await

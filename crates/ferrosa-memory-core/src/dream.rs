@@ -282,6 +282,7 @@ mod tests {
             confidence: 0.9,
             state: Default::default(),
             created_at: chrono::Utc::now(),
+            ..Default::default()
         }
     }
 

@@ -782,6 +782,7 @@ mod tests {
             confidence: 0.9,
             state: crate::types::MemoryState::Active,
             created_at: chrono::Utc::now(),
+            ..Default::default()
         }));
         assert_eq!(strip_enrichment(&enriched), original);
     }
@@ -819,6 +820,7 @@ Done."#;
             confidence: 0.9,
             state: crate::types::MemoryState::Active,
             created_at: chrono::Utc::now(),
+            ..Default::default()
         }];
         let report = run_lint(&entities, &[]);
         assert!(report.findings.iter().any(|f| f.check == "orphan_entity"));
@@ -841,6 +843,7 @@ Done."#;
                 confidence: 0.9,
                 state: crate::types::MemoryState::Active,
                 created_at: chrono::Utc::now(),
+                ..Default::default()
             },
             EntityEntry {
                 tenant_id: Uuid::nil(),
@@ -854,6 +857,7 @@ Done."#;
                 confidence: 0.9,
                 state: crate::types::MemoryState::Active,
                 created_at: chrono::Utc::now(),
+                ..Default::default()
             },
         ];
         // Edge connects them but not via "contains".

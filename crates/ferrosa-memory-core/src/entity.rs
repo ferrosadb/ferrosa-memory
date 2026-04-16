@@ -126,6 +126,7 @@ pub async fn upsert_entity_with_limit(
         confidence,
         state: crate::types::MemoryState::default(),
         created_at: chrono::Utc::now(),
+        ..Default::default()
     };
 
     storage.entity_put(ctx, &entry).await?;

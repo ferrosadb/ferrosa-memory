@@ -367,6 +367,7 @@ mod tests {
             confidence: 0.85,
             state: crate::types::MemoryState::Dormant,
             created_at: chrono::Utc::now(),
+            ..Default::default()
         };
 
         let node = entity_to_viz_node(&entry);

@@ -140,6 +140,22 @@ impl std::fmt::Display for MemoryState {
     }
 }
 
+/// Scope of an entity: session-local (default) or global to the tenant.
+///
+/// Session-scoped entities live in their session's partition and are
+/// invisible to other sessions. Global-scoped entities live in the tenant's
+/// global sentinel partition and are visible to every session.
+///
+/// Used for shared knowledge (skills, tags, concepts, decisions, code
+/// symbols) that should cross session boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EntityScope {
+    #[default]
+    Session,
+    Global,
+}
+
 /// A named entity discovered during trajectory traversal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityEntry {
@@ -155,6 +171,65 @@ pub struct EntityEntry {
     #[serde(default)]
     pub state: MemoryState,
     pub created_at: chrono::DateTime<chrono::Utc>,
+
+    // --- Richer entity model (Sprint 1) ---
+    /// Curated, retrieval-optimized description (distinct from `context_snippet`,
+    /// which is the extraction source).
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Embedding of `description` (same model/dimensions as `entity_embedding`).
+    #[serde(default)]
+    pub description_embedding: Option<Vec<f32>>,
+    /// Denormalized tag names — direct tags plus all ancestor tags. Source of
+    /// truth is the `TAGGED_AS` / `PARENT_TAG` edge graph; this column is a
+    /// materialized filter index.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Type-specific structured data. Shape is validated per `entity_type` at
+    /// ingest time (e.g. skills carry `category`, `steps`, `trigger_keywords`).
+    #[serde(default)]
+    pub properties: serde_json::Value,
+    /// Content-hash for idempotent re-ingest. Populated by callers that care
+    /// about update semantics (e.g. forge's skill ingester).
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    /// Last modification timestamp. `None` for legacy rows — callers should
+    /// fall back to `created_at`.
+    #[serde(default)]
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Session vs global storage partition.
+    #[serde(default)]
+    pub scope: EntityScope,
+    /// For global-scope entities, the session that originally ingested them
+    /// (audit + session-affinity re-rank signal).
+    #[serde(default)]
+    pub ingested_by_session: Option<Uuid>,
+}
+
+impl Default for EntityEntry {
+    fn default() -> Self {
+        Self {
+            tenant_id: Uuid::nil(),
+            entity_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            entity_name: String::new(),
+            entity_type: String::new(),
+            source_fold_id: None,
+            context_snippet: String::new(),
+            entity_embedding: None,
+            confidence: 0.0,
+            state: MemoryState::default(),
+            created_at: chrono::DateTime::<chrono::Utc>::default(),
+            description: None,
+            description_embedding: None,
+            tags: Vec::new(),
+            properties: serde_json::Value::Null,
+            content_hash: None,
+            updated_at: None,
+            scope: EntityScope::default(),
+            ingested_by_session: None,
+        }
+    }
 }
 
 /// A temporal event/fact for an entity.
@@ -549,5 +624,91 @@ mod tests {
         assert_eq!(PromotionStatus::Candidate.to_string(), "candidate");
         assert_eq!(PromotionStatus::Promoted.to_string(), "promoted");
         assert_eq!(PromotionStatus::Demoted.to_string(), "demoted");
+    }
+
+    // --- Richer entity model (Sprint 1 slice 1a) ---
+
+    #[test]
+    fn entity_scope_default_is_session() {
+        assert_eq!(EntityScope::default(), EntityScope::Session);
+    }
+
+    #[test]
+    fn entity_scope_serde_as_lowercase_strings() {
+        assert_eq!(
+            serde_json::to_string(&EntityScope::Session).unwrap(),
+            "\"session\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EntityScope::Global).unwrap(),
+            "\"global\""
+        );
+
+        let back: EntityScope = serde_json::from_str("\"global\"").unwrap();
+        assert_eq!(back, EntityScope::Global);
+    }
+
+    #[test]
+    fn entity_entry_deserializes_from_legacy_json_with_defaults() {
+        // Old rows on disk won't have the new fields. Deserialization must
+        // succeed and populate sensible defaults so existing data is readable.
+        let now = chrono::Utc::now();
+        let legacy = serde_json::json!({
+            "tenant_id": Uuid::nil(),
+            "entity_id": Uuid::nil(),
+            "session_id": Uuid::nil(),
+            "entity_name": "x",
+            "entity_type": "concept",
+            "source_fold_id": null,
+            "context_snippet": "",
+            "entity_embedding": null,
+            "confidence": 1.0,
+            "created_at": now,
+        });
+        let entry: EntityEntry = serde_json::from_value(legacy).unwrap();
+        assert_eq!(entry.description, None);
+        assert_eq!(entry.description_embedding, None);
+        assert!(entry.tags.is_empty());
+        assert_eq!(entry.properties, serde_json::Value::Null);
+        assert_eq!(entry.content_hash, None);
+        assert_eq!(entry.updated_at, None);
+        assert_eq!(entry.scope, EntityScope::Session);
+        assert_eq!(entry.ingested_by_session, None);
+    }
+
+    #[test]
+    fn entity_entry_round_trip_preserves_new_fields() {
+        let now = chrono::Utc::now();
+        let ingester = Uuid::new_v4();
+        let original = EntityEntry {
+            tenant_id: Uuid::new_v4(),
+            entity_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            entity_name: "tdd".into(),
+            entity_type: "skill".into(),
+            source_fold_id: None,
+            context_snippet: "original source".into(),
+            entity_embedding: Some(vec![0.1, 0.2]),
+            confidence: 0.9,
+            state: MemoryState::default(),
+            created_at: now,
+            description: Some("Guides red-green-refactor cycles.".into()),
+            description_embedding: Some(vec![0.3, 0.4]),
+            tags: vec!["testing".into(), "quality".into()],
+            properties: serde_json::json!({"category": "task-level"}),
+            content_hash: Some("sha256:abc".into()),
+            updated_at: Some(now),
+            scope: EntityScope::Global,
+            ingested_by_session: Some(ingester),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let back: EntityEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.entity_name, "tdd");
+        assert_eq!(back.description.as_deref(), Some("Guides red-green-refactor cycles."));
+        assert_eq!(back.tags, vec!["testing".to_string(), "quality".into()]);
+        assert_eq!(back.properties, serde_json::json!({"category": "task-level"}));
+        assert_eq!(back.content_hash.as_deref(), Some("sha256:abc"));
+        assert_eq!(back.scope, EntityScope::Global);
+        assert_eq!(back.ingested_by_session, Some(ingester));
     }
 }

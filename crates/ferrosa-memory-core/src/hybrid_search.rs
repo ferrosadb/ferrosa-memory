@@ -590,6 +590,7 @@ mod tests {
                         confidence: 1.0,
                         state: MemoryState::Active,
                         created_at: chrono::Utc::now(),
+                        ..Default::default()
                     },
                 )
                 .await

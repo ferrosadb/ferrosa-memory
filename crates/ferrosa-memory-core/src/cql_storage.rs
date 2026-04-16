@@ -1154,6 +1154,7 @@ impl Storage for CqlStorage {
                     confidence: f64::from(row.r_by_name::<f32>("confidence").unwrap_or(1.0)),
                     state,
                     created_at: created.and_utc(),
+                    ..Default::default()
                 },
             ));
         }
@@ -1209,6 +1210,7 @@ impl Storage for CqlStorage {
                 confidence: f64::from(row.r_by_name::<f32>("confidence").unwrap_or(1.0)),
                 state,
                 created_at: created.and_utc(),
+                ..Default::default()
             }))
         } else {
             Ok(None)
@@ -1285,6 +1287,7 @@ impl Storage for CqlStorage {
                 confidence: f64::from(row.r_by_name::<f32>("confidence").unwrap_or(1.0)),
                 state,
                 created_at: created.and_utc(),
+                ..Default::default()
             });
         }
         Ok(results)
@@ -1358,6 +1361,7 @@ impl Storage for CqlStorage {
                     .unwrap_or(0.0),
                 state,
                 created_at: created.and_utc(),
+                ..Default::default()
             });
         }
         Ok(results)
@@ -1447,6 +1451,7 @@ impl Storage for CqlStorage {
                     .unwrap_or(1.0),
                 state,
                 created_at: created.and_utc(),
+                ..Default::default()
             });
         }
         Ok(results)
@@ -1487,6 +1492,7 @@ impl Storage for CqlStorage {
                     .unwrap_or(1.0),
                 state,
                 created_at: created.and_utc(),
+                ..Default::default()
             });
         }
         Ok(results)
