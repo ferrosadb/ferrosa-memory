@@ -55,6 +55,7 @@ pub const MIGRATIONS: &[Migration] = &[Migration {
     ddl: include_str!("../../../ddl/020_rich_entity_schema.cql"),
 }];
 
+
 /// Error type for migration failures. Every variant carries enough context
 /// for an operator to triage and reach for the backup.
 #[derive(Debug, thiserror::Error)]
@@ -91,6 +92,11 @@ pub async fn run_migrations(
     session: &CqlSession,
     keyspace: &str,
 ) -> Result<usize, MigrationError> {
+    // Pre-requisite: the keyspace and DDLs 001-019 must already be applied.
+    // Fresh keyspaces are bootstrapped by the operator (same practice as
+    // pre-versioning: `cqlsh < ddl/NNN_*.cql`) or, in test harnesses, via
+    // the helper at `test_cluster::bootstrap_schema`. This runner owns
+    // migrations 20 forward.
     ensure_schema_version_table(session, keyspace)
         .await
         .map_err(|e| MigrationError::Setup { source: e })?;
@@ -99,34 +105,28 @@ pub async fn run_migrations(
         .await
         .map_err(|e| MigrationError::Setup { source: e })?;
 
-    // Detect adoption: if schema_version is empty but the keyspace has
-    // tables from the pre-versioning era, seed the baseline.
     let current = match current {
         Some(v) => v,
         None => {
-            let has_legacy = keyspace_has_legacy_tables(session, keyspace)
-                .await
-                .unwrap_or(false);
-            if has_legacy {
-                tracing::info!(
-                    baseline = PRE_VERSIONING_BASELINE,
-                    "schema_version empty but legacy tables present; seeding adoption baseline"
-                );
-                record_version(
-                    session,
-                    keyspace,
-                    PRE_VERSIONING_BASELINE,
-                    "pre-versioning baseline (adoption seed)",
-                )
-                .await
-                .map_err(|e| MigrationError::BookkeepingWrite {
-                    version: PRE_VERSIONING_BASELINE,
-                    source: e,
-                })?;
-                PRE_VERSIONING_BASELINE
-            } else {
-                0
-            }
+            // schema_version is empty. Seed the adoption baseline so the
+            // keyspace is marked as "pre-versioning — up to v19" before
+            // modern migrations run.
+            tracing::info!(
+                baseline = PRE_VERSIONING_BASELINE,
+                "schema_version empty; seeding pre-versioning adoption baseline"
+            );
+            record_version(
+                session,
+                keyspace,
+                PRE_VERSIONING_BASELINE,
+                "pre-versioning baseline (adoption seed)",
+            )
+            .await
+            .map_err(|e| MigrationError::BookkeepingWrite {
+                version: PRE_VERSIONING_BASELINE,
+                source: e,
+            })?;
+            PRE_VERSIONING_BASELINE
         }
     };
 
@@ -159,6 +159,16 @@ pub async fn run_migrations(
         target = code_max,
         "applying schema migrations"
     );
+
+    // Pin the session's default keyspace to the configured one before
+    // running each migration. DDL files must NOT hardcode `USE <ks>;` —
+    // they're deployable into any keyspace (dev, test, per-tenant). The
+    // split_cql helper strips any stray USE statements defensively.
+    let use_ks = format!("USE {keyspace}");
+    session
+        .query(&use_ks)
+        .await
+        .map_err(|e| MigrationError::Setup { source: e.into() })?;
 
     let mut applied = 0usize;
     let mut last_good = current;
@@ -249,20 +259,6 @@ async fn record_version(
     Ok(())
 }
 
-async fn keyspace_has_legacy_tables(
-    session: &CqlSession,
-    keyspace: &str,
-) -> anyhow::Result<bool> {
-    // If `entity_store` exists, this keyspace was bootstrapped with the
-    // pre-versioning DDLs.
-    let q = format!(
-        "SELECT table_name FROM system_schema.tables \
-         WHERE keyspace_name = '{keyspace}' AND table_name = 'entity_store'"
-    );
-    let envelope = session.query(q).await?;
-    let rows = envelope.response_body()?.into_rows().unwrap_or_default();
-    Ok(!rows.is_empty())
-}
 
 fn hostname() -> Option<String> {
     std::env::var("HOSTNAME")
@@ -279,8 +275,12 @@ fn _assert_query_values_type_used() {
 /// Split a CQL DDL script into individual statements.
 ///
 /// Strips line comments (`-- ...` to end of line), ignores blank lines and
-/// whitespace, and splits on `;`. Does not handle block comments or strings
-/// containing semicolons — the DDL files under `ddl/` don't use those.
+/// whitespace, and splits on `;`. Also drops `USE <keyspace>` statements —
+/// the migration runner pins the session's default keyspace from the
+/// configured one, so hardcoded USE clauses in DDL files would override
+/// (and may target a keyspace that doesn't exist in test/per-tenant
+/// deployments). Does not handle block comments or strings containing
+/// semicolons — the DDL files under `ddl/` don't use those.
 pub fn split_cql(ddl: &str) -> Vec<String> {
     let mut stripped = String::with_capacity(ddl.len());
     for line in ddl.lines() {
@@ -295,6 +295,15 @@ pub fn split_cql(ddl: &str) -> Vec<String> {
         .split(';')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+        .filter(|s| {
+            // Drop USE statements (case-insensitive, first token).
+            let first_token: String = s
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_ascii_uppercase();
+            first_token != "USE"
+        })
         .collect()
 }
 
@@ -337,6 +346,25 @@ mod tests {
     fn split_cql_ignores_empty_and_whitespace() {
         let ddl = ";;\n\n   ;  \n\n";
         assert!(split_cql(ddl).is_empty());
+    }
+
+    #[test]
+    fn split_cql_drops_use_statements() {
+        // DDLs may include `USE agent_memory;` for cqlsh convenience, but
+        // the migration runner pins the keyspace itself — USE must be
+        // filtered out so it doesn't point a test deployment at a
+        // nonexistent production keyspace.
+        let ddl = "USE agent_memory;\nALTER TABLE entity_store ADD foo text;";
+        let stmts = split_cql(ddl);
+        assert_eq!(stmts.len(), 1);
+        assert!(stmts[0].starts_with("ALTER TABLE"));
+    }
+
+    #[test]
+    fn split_cql_drops_use_case_insensitive() {
+        let ddl = "use agent_memory;\nUse agent_memory;\nALTER TABLE foo ADD bar text;";
+        let stmts = split_cql(ddl);
+        assert_eq!(stmts.len(), 1);
     }
 
     #[test]
