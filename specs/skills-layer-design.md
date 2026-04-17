@@ -493,7 +493,21 @@ A single embedding model is used for both `entity_embedding` (name) and `descrip
 
 ### Tag name normalization
 
-Tags are normalized at ingest: lowercased, dash-separated, alphanumeric + dash only. Enforced in `smart_ingest` when `entity_type="tag"`. `"Chaos Engineering"` → `chaos-engineering`. Invalid input (spaces, special chars) is normalized, not rejected, so callers don't have to pre-normalize.
+Tags are normalized at ingest: lowercased, dash-separated, alphanumeric + dash only. Enforced in `smart_ingest` when `entity_type="tag"`, applied by `ingest_skill` / `retrieve_skills_for_context` / `ensure_parent_tag` before lookup or write. Invalid input is normalized, not rejected, so callers don't have to pre-normalize.
+
+Exact rule:
+- Every character that isn't `[a-z0-9]` (after lowercasing) becomes `-`
+- Consecutive `-` collapse to one
+- Leading/trailing `-` strip
+
+Examples:
+- `"Chaos Engineering"` → `chaos-engineering`
+- `"unit_testing"` → `unit-testing` (underscore is NOT preserved — noted by forge's skill-ingest implementation)
+- `"foo/bar/baz"` → `foo-bar-baz`
+- `"!!!symbols!!!"` → `symbols`
+- `"  extra  "` → `extra`
+
+**Underscore is not preserved.** If callers (e.g. forge's skill-ingest pipeline) have tag names using underscore in their source data (`tag-hierarchy.yaml`, SKILL.md frontmatter), they should expect the underscore to collapse to dash server-side and use the dashed form when querying.
 
 ### Tag hierarchy — cycle prevention via Cypher
 

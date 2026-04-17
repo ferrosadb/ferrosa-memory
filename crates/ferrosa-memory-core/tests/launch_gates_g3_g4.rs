@@ -111,11 +111,12 @@ async fn g3_backfill_migrates_enriched_prefix_and_populates_description_embeddin
             p1_migrated += 1;
 
             // Phase 2: generate description_embedding if provider is up.
-            if embed_ok && let Some(ref d) = working.description {
-                if let Ok(v) = embed_client.embed(d).await {
-                    working.description_embedding = Some(v);
-                    p2_embedded += 1;
-                }
+            if embed_ok
+                && let Some(ref d) = working.description
+                && let Ok(v) = embed_client.embed(d).await
+            {
+                working.description_embedding = Some(v);
+                p2_embedded += 1;
             }
 
             storage.entity_put(&ctx, &working).await.expect("put");

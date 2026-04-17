@@ -135,20 +135,14 @@ async fn skill_round_trip_on_live_cluster() {
     .await
     .expect("ingest tdd");
     // Tolerate re-runs. Same content_hash → Skipped with same entity_id.
-    let tdd_id = match &tdd_action {
-        SkillIngestAction::Created { entity_id, version } => {
-            eprintln!("created tdd: {entity_id} v{version}");
-            *entity_id
-        }
-        SkillIngestAction::Skipped { entity_id, .. } => {
-            eprintln!("re-run: tdd already at same content_hash ({entity_id})");
-            *entity_id
-        }
-        SkillIngestAction::Updated { entity_id, .. } => {
-            eprintln!("updated tdd: {entity_id}");
-            *entity_id
-        }
-    };
+    let tdd_id = tdd_action.entity_id();
+    eprintln!("tdd ingest: {tdd_action:?}");
+    assert!(
+        tdd_action.missing_prerequisites().is_empty(),
+        "unit-testing was seeded first, so tdd's prereq must resolve cleanly; \
+         got missing: {:?}",
+        tdd_action.missing_prerequisites()
+    );
 
     // Step 2: retrieve_skills_for_context should surface TDD.
     let hits = retrieve_skills_for_context(

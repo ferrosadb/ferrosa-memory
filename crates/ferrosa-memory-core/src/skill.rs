@@ -57,11 +57,21 @@ pub enum SkillIngestAction {
     Created {
         entity_id: Uuid,
         version: String,
+        /// Prerequisite skill names the caller declared that couldn't be
+        /// resolved to REQUIRES edges (because the target skill hadn't
+        /// been ingested yet). Empty when every prereq resolved. The
+        /// skill itself still landed — these are deferred, not fatal.
+        /// Callers can either ingest the missing prereqs and re-run
+        /// this skill, or accept the partial graph.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        missing_prerequisites: Vec<String>,
     },
     Updated {
         entity_id: Uuid,
         version: String,
         prior_version: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        missing_prerequisites: Vec<String>,
     },
     Skipped {
         entity_id: Uuid,
@@ -76,6 +86,22 @@ impl SkillIngestAction {
             Self::Created { entity_id, .. }
             | Self::Updated { entity_id, .. }
             | Self::Skipped { entity_id, .. } => *entity_id,
+        }
+    }
+
+    /// Prerequisite names declared at ingest that didn't resolve to a
+    /// REQUIRES edge. Empty for Skipped (the skill was unchanged).
+    pub fn missing_prerequisites(&self) -> &[String] {
+        match self {
+            Self::Created {
+                missing_prerequisites,
+                ..
+            }
+            | Self::Updated {
+                missing_prerequisites,
+                ..
+            } => missing_prerequisites,
+            Self::Skipped { .. } => &[],
         }
     }
 }
@@ -205,7 +231,9 @@ pub async fn ingest_skill(
         .collect();
     let new_version = next_version(&today, &today_versions);
 
-    // Build properties JSON.
+    // Build properties JSON. `raw_prerequisites` is the caller-declared
+    // list before REQUIRES-edge resolution, stored so `verify_skill` can
+    // report prereqs that were deferred (target skill not yet ingested).
     let properties = serde_json::json!({
         "category": params.category,
         "trigger_keywords": params.trigger_keywords,
@@ -213,6 +241,7 @@ pub async fn ingest_skill(
         "output_artifacts": params.output_artifacts,
         "completion_criteria": params.completion_criteria,
         "version": new_version,
+        "raw_prerequisites": params.prerequisites.clone(),
     });
 
     // Tags = category + explicit tags, all normalized.
@@ -302,6 +331,11 @@ pub async fn ingest_skill(
     // the graph is unreachable or unconfigured, log a warning and skip the
     // edge (we'd rather miss a relationship than silently allow a cycle to
     // land under a misconfigured environment).
+    //
+    // Deferred prereqs (target skill not ingested yet) are collected into
+    // `missing_prereqs` and surfaced on the result so callers don't need
+    // a separate verify_skill round-trip to notice.
+    let mut missing_prereqs: Vec<String> = Vec::new();
     for prereq_name in &params.prerequisites {
         let mut matches = storage
             .entity_find_phonetic(ctx, storage_session, prereq_name)
@@ -314,6 +348,7 @@ pub async fn ingest_skill(
                 prereq = %prereq_name,
                 "prerequisite skill not found; ingest it and re-run to create REQUIRES edge"
             );
+            missing_prereqs.push(prereq_name.clone());
             continue;
         };
 
@@ -328,6 +363,7 @@ pub async fn ingest_skill(
                         prereq = %prereq_name,
                         "REQUIRES edge would form a cycle; rejecting"
                     );
+                    missing_prereqs.push(prereq_name.clone());
                     continue;
                 }
                 Ok(false) => {}
@@ -339,6 +375,7 @@ pub async fn ingest_skill(
                         "REQUIRES cycle check failed (graph unreachable); \
                          skipping edge. Run ingest_skill again when graph is healthy."
                     );
+                    missing_prereqs.push(prereq_name.clone());
                     continue;
                 }
             }
@@ -362,6 +399,7 @@ pub async fn ingest_skill(
         };
         if let Err(e) = storage.typed_edge_put(ctx, &edge).await {
             tracing::warn!(skill = %params.name, prereq = %prereq_name, error = %e, "REQUIRES edge write failed");
+            missing_prereqs.push(prereq_name.clone());
         }
     }
 
@@ -376,11 +414,13 @@ pub async fn ingest_skill(
             entity_id,
             version: new_version,
             prior_version,
+            missing_prerequisites: missing_prereqs,
         }
     } else {
         SkillIngestAction::Created {
             entity_id,
             version: new_version,
+            missing_prerequisites: missing_prereqs,
         }
     })
 }
@@ -1441,40 +1481,47 @@ mod tests {
     async fn verify_skill_reports_missing_prereqs_when_raw_tracked() {
         let storage = MockStorage::new();
         let ctx = test_ctx();
-        // Create skill with a prereq that doesn't exist. ingest_skill
-        // silently skips the missing prereq edge today. Simulate the
-        // forge-ingest behavior of recording raw_prerequisites in
-        // properties so verify_skill can cross-check.
+        // Ingest a skill declaring a prereq that doesn't exist yet. The
+        // server now records raw_prerequisites on every ingest (so
+        // verify_skill cross-checks work without the caller patching
+        // properties).
         let mut p = base_params("tdd");
         p.prerequisites = vec!["unit-testing".into()]; // won't resolve
         let action = ingest_skill(&storage, &ctx, p, None, None).await.unwrap();
-
-        // Manually patch properties.raw_prerequisites via a fetch+put —
-        // emulates what forge's skill-ingest pipeline will do.
-        let global = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
-        let mut entity = storage
-            .entity_get_by_id(&ctx, global, action.entity_id())
-            .await
-            .unwrap()
-            .unwrap();
-        if let Some(obj) = entity.properties.as_object_mut() {
-            obj.insert(
-                "raw_prerequisites".into(),
-                serde_json::json!(["unit-testing"]),
-            );
-        }
-        storage.entity_put(&ctx, &entity).await.unwrap();
+        // The ingest action itself surfaces the missing prereq — callers
+        // no longer need to follow up with verify_skill to see this.
+        assert_eq!(
+            action.missing_prerequisites(),
+            &["unit-testing".to_string()],
+            "ingest_skill must surface deferred prereqs in the action response"
+        );
 
         let result = verify_skill(&storage, &ctx, "tdd").await.unwrap();
         assert!(result.exists);
         assert_eq!(
             result.missing_prerequisites,
             vec!["unit-testing".to_string()],
-            "prereq declared at ingest but never resolved to a REQUIRES edge must be reported"
+            "verify_skill must also see the missing prereq"
         );
         assert!(
             result.prerequisites.is_empty(),
             "resolved prereqs is empty because the edge never landed"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_skill_missing_prereqs_empty_when_all_resolve() {
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+        ingest_skill(&storage, &ctx, base_params("unit-testing"), None, None)
+            .await
+            .unwrap();
+        let mut p = base_params("tdd");
+        p.prerequisites = vec!["unit-testing".into()];
+        let action = ingest_skill(&storage, &ctx, p, None, None).await.unwrap();
+        assert!(
+            action.missing_prerequisites().is_empty(),
+            "all prereqs resolved; missing list must be empty"
         );
     }
 
