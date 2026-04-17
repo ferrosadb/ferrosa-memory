@@ -2663,8 +2663,11 @@ impl Storage for CqlStorage {
         // Typed edges (contains, references, calls, depends_on, etc.)
         // Query the nil session (used by frg ingest) and the default session.
         let nil_session = Uuid::nil();
-        let query = "SELECT src_id, edge_type, dst_id FROM agent_memory.typed_edges \
-                     WHERE tenant_id = ? AND session_id = ?";
+        let query = format!(
+            "SELECT src_id, edge_type, dst_id FROM {}.typed_edges \
+             WHERE tenant_id = ? AND session_id = ?",
+            self.keyspace
+        );
         let prepared = self.session.prepare(query).await?;
         let rows = self
             .query_rows(&prepared, query_values!(ctx.tenant_id, nil_session))
@@ -3453,9 +3456,12 @@ impl Storage for CqlStorage {
     // --- Typed edge operations ---
 
     async fn typed_edge_put(&self, ctx: &TenantContext, edge: &TypedEdge) -> anyhow::Result<()> {
-        let query = "INSERT INTO agent_memory.typed_edges \
-            (tenant_id, session_id, src_id, edge_type, dst_id, weight, metadata, created_at) \
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+        let query = format!(
+            "INSERT INTO {}.typed_edges \
+             (tenant_id, session_id, src_id, edge_type, dst_id, weight, metadata, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            self.keyspace
+        );
         self.session
             .query_with_values(
                 query,
@@ -3479,9 +3485,12 @@ impl Storage for CqlStorage {
         ctx: &TenantContext,
         session_id: Uuid,
     ) -> anyhow::Result<Vec<TypedEdge>> {
-        let query = "SELECT src_id, edge_type, dst_id, weight, metadata, created_at \
-            FROM agent_memory.typed_edges \
-            WHERE tenant_id = ? AND session_id = ?";
+        let query = format!(
+            "SELECT src_id, edge_type, dst_id, weight, metadata, created_at \
+             FROM {}.typed_edges \
+             WHERE tenant_id = ? AND session_id = ?",
+            self.keyspace
+        );
         let prepared = self.session.prepare(query).await?;
         let rows = self
             .session
@@ -3530,9 +3539,12 @@ impl Storage for CqlStorage {
         session_id: Uuid,
         src_id: Uuid,
     ) -> anyhow::Result<Vec<TypedEdge>> {
-        let query = "SELECT src_id, edge_type, dst_id, weight, metadata, created_at \
-            FROM agent_memory.typed_edges \
-            WHERE tenant_id = ? AND session_id = ? AND src_id = ?";
+        let query = format!(
+            "SELECT src_id, edge_type, dst_id, weight, metadata, created_at \
+             FROM {}.typed_edges \
+             WHERE tenant_id = ? AND session_id = ? AND src_id = ?",
+            self.keyspace
+        );
         let prepared = self.session.prepare(query).await?;
         let rows = self
             .session
