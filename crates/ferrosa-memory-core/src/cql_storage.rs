@@ -925,7 +925,10 @@ impl Storage for CqlStorage {
 
             let created = row
                 .r_by_name::<chrono::NaiveDateTime>("created_at")
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
+                    Default::default()
+                });
 
             nodes.push(PlanNode {
                 session_id,
@@ -1026,7 +1029,10 @@ impl Storage for CqlStorage {
                 serde_json::from_str(&format!("\"{status_str}\"")).unwrap_or(FoldStatus::Active);
             let created = row
                 .r_by_name::<chrono::NaiveDateTime>("created_at")
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
+                    Default::default()
+                });
 
             Ok(Some(FoldEntry {
                 session_id,
@@ -1246,10 +1252,7 @@ impl Storage for CqlStorage {
             EntityScope::Session => "session",
             EntityScope::Global => "global",
         };
-        let updated_at_ndt = entry
-            .updated_at
-            .unwrap_or(entry.created_at)
-            .naive_utc();
+        let updated_at_ndt = entry.updated_at.unwrap_or(entry.created_at).naive_utc();
         let q = format!(
             "UPDATE {ks}.entity_store SET scope = ?, updated_at = ? \
              WHERE tenant_id = ? AND session_id = ? AND entity_id = ?",
@@ -1282,12 +1285,7 @@ impl Storage for CqlStorage {
                 .session
                 .query_with_values(
                     q,
-                    query_values!(
-                        ingester,
-                        ctx.tenant_id,
-                        entry.session_id,
-                        entry.entity_id
-                    ),
+                    query_values!(ingester, ctx.tenant_id, entry.session_id, entry.entity_id),
                 )
                 .await
             {
@@ -1355,12 +1353,7 @@ impl Storage for CqlStorage {
                 .session
                 .query_with_values(
                     q,
-                    query_values!(
-                        tags_json,
-                        ctx.tenant_id,
-                        entry.session_id,
-                        entry.entity_id
-                    ),
+                    query_values!(tags_json, ctx.tenant_id, entry.session_id, entry.entity_id),
                 )
                 .await
             {
@@ -1380,12 +1373,7 @@ impl Storage for CqlStorage {
                 .session
                 .query_with_values(
                     q,
-                    query_values!(
-                        props_json,
-                        ctx.tenant_id,
-                        entry.session_id,
-                        entry.entity_id
-                    ),
+                    query_values!(props_json, ctx.tenant_id, entry.session_id, entry.entity_id),
                 )
                 .await
             {
@@ -1468,7 +1456,10 @@ impl Storage for CqlStorage {
             };
             let created = row
                 .r_by_name::<chrono::NaiveDateTime>("created_at")
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
+                    Default::default()
+                });
             let state = row
                 .r_by_name::<String>("state")
                 .ok()
@@ -1526,10 +1517,13 @@ impl Storage for CqlStorage {
             };
             let context_snippet = row
                 .r_by_name::<String>("context_snippet")
-                .unwrap_or_default();
+                .map_err(|e| anyhow::anyhow!("required column `context_snippet` read failed: {e}"))?;
             let created = row
                 .r_by_name::<chrono::NaiveDateTime>("created_at")
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
+                    Default::default()
+                });
             let state = row
                 .r_by_name::<String>("state")
                 .ok()
@@ -1622,10 +1616,13 @@ impl Storage for CqlStorage {
             };
             let context_snippet = row
                 .r_by_name::<String>("context_snippet")
-                .unwrap_or_default();
+                .map_err(|e| anyhow::anyhow!("required column `context_snippet` read failed: {e}"))?;
             let created = row
                 .r_by_name::<chrono::NaiveDateTime>("created_at")
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
+                    Default::default()
+                });
             let state = row
                 .r_by_name::<String>("state")
                 .ok()
@@ -1713,7 +1710,10 @@ impl Storage for CqlStorage {
             };
             let created = row
                 .r_by_name::<chrono::NaiveDateTime>("created_at")
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
+                    Default::default()
+                });
             let state = row
                 .r_by_name::<String>("state")
                 .ok()
@@ -1795,10 +1795,13 @@ impl Storage for CqlStorage {
             };
             let context_snippet = row
                 .r_by_name::<String>("context_snippet")
-                .unwrap_or_default();
+                .map_err(|e| anyhow::anyhow!("required column `context_snippet` read failed: {e}"))?;
             let created = row
                 .r_by_name::<chrono::NaiveDateTime>("created_at")
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
+                    Default::default()
+                });
             let state = row
                 .r_by_name::<String>("state")
                 .ok()
@@ -1856,7 +1859,10 @@ impl Storage for CqlStorage {
         for row in rows {
             let created = row
                 .r_by_name::<chrono::NaiveDateTime>("created_at")
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
+                    Default::default()
+                });
             let state = row
                 .r_by_name::<String>("state")
                 .ok()
@@ -1917,7 +1923,10 @@ impl Storage for CqlStorage {
                 serde_json::from_str(&format!("\"{status_str}\"")).unwrap_or(FoldStatus::Active);
             let created = row
                 .r_by_name::<chrono::NaiveDateTime>("created_at")
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
+                    Default::default()
+                });
             results.push(FoldEntry {
                 session_id: row.r_by_name("session_id")?,
                 fold_id: row.r_by_name("fold_id")?,
@@ -2240,6 +2249,7 @@ impl Storage for CqlStorage {
             ("mentioned_in", "entity_id"),
             ("co_occurs_with", "entity_a"),
             ("supersedes", "new_event_id"),
+            ("typed_edges", "src_id"),
         ];
         for (table, col) in &pk_cols {
             let query = format!(
@@ -2757,7 +2767,10 @@ impl Storage for CqlStorage {
 
             let created = row
                 .r_by_name::<chrono::NaiveDateTime>("created_at")
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
+                    Default::default()
+                });
 
             let repo_val: String = row.r_by_name("repo").unwrap_or_else(|_| repo.to_string());
 
@@ -2807,7 +2820,10 @@ impl Storage for CqlStorage {
 
             let created = row
                 .r_by_name::<chrono::NaiveDateTime>("created_at")
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
+                    Default::default()
+                });
 
             let repo_val: String = row.r_by_name("repo").unwrap_or_default();
 
@@ -2958,10 +2974,16 @@ impl Storage for CqlStorage {
         if let Some(row) = rows.into_iter().next() {
             let last_accessed = row
                 .r_by_name::<chrono::NaiveDateTime>("last_accessed_at")
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    tracing::warn!(col = "last_accessed_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
+                    Default::default()
+                });
             let updated = row
                 .r_by_name::<chrono::NaiveDateTime>("updated_at")
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    tracing::warn!(col = "updated_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
+                    Default::default()
+                });
             let zone_str: String = row.r_by_name("decay_zone").unwrap_or_default();
 
             Ok(Some(WarmthEntry {
@@ -3048,10 +3070,16 @@ impl Storage for CqlStorage {
         for row in rows {
             let last_accessed = row
                 .r_by_name::<chrono::NaiveDateTime>("last_accessed_at")
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    tracing::warn!(col = "last_accessed_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
+                    Default::default()
+                });
             let updated = row
                 .r_by_name::<chrono::NaiveDateTime>("updated_at")
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    tracing::warn!(col = "updated_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
+                    Default::default()
+                });
             let zone_str: String = row.r_by_name("decay_zone").unwrap_or_default();
 
             results.push(WarmthEntry {
@@ -3174,10 +3202,16 @@ impl Storage for CqlStorage {
             }
             let created = row
                 .r_by_name::<chrono::NaiveDateTime>("created_at")
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
+                    Default::default()
+                });
             let updated = row
                 .r_by_name::<chrono::NaiveDateTime>("updated_at")
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    tracing::warn!(col = "updated_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
+                    Default::default()
+                });
 
             results.push(RuleEntry {
                 tenant_id: ctx.tenant_id,
@@ -3214,10 +3248,16 @@ impl Storage for CqlStorage {
         if let Some(row) = rows.into_iter().next() {
             let created = row
                 .r_by_name::<chrono::NaiveDateTime>("created_at")
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
+                    Default::default()
+                });
             let updated = row
                 .r_by_name::<chrono::NaiveDateTime>("updated_at")
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    tracing::warn!(col = "updated_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
+                    Default::default()
+                });
             let state_str: String = row.r_by_name("state").unwrap_or_default();
 
             Ok(Some(RuleEntry {
@@ -3515,7 +3555,64 @@ impl Storage for CqlStorage {
             };
             let created = row
                 .r_by_name::<chrono::NaiveDateTime>("created_at")
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
+                    Default::default()
+                });
+            edges.push(TypedEdge {
+                tenant_id: ctx.tenant_id,
+                session_id,
+                src_id,
+                edge_type,
+                dst_id,
+                weight: row.r_by_name::<f64>("weight").unwrap_or(1.0),
+                metadata: row
+                    .r_by_name::<String>("metadata")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
+                created_at: created.and_utc(),
+            });
+        }
+        Ok(edges)
+    }
+
+    async fn typed_edge_list_all(
+        &self,
+        ctx: &TenantContext,
+    ) -> anyhow::Result<Vec<TypedEdge>> {
+        let query = format!(
+            "SELECT src_id, edge_type, dst_id, weight, metadata, created_at, session_id \
+             FROM {}.typed_edges WHERE tenant_id = ? ALLOW FILTERING",
+            self.keyspace
+        );
+        let prepared = self.session.prepare(query).await?;
+        let rows = self
+            .session
+            .exec_with_values(&prepared, query_values!(ctx.tenant_id))
+            .await?
+            .response_body()?
+            .into_rows()
+            .unwrap_or_default();
+
+        let mut edges = Vec::new();
+        for row in rows {
+            let Ok(src_id) = row.r_by_name::<Uuid>("src_id") else {
+                continue;
+            };
+            let Ok(dst_id) = row.r_by_name::<Uuid>("dst_id") else {
+                continue;
+            };
+            let edge_type = row.r_by_name::<String>("edge_type").unwrap_or_default();
+            if edge_type.is_empty() {
+                continue;
+            }
+            let session_id = row.r_by_name::<Uuid>("session_id").unwrap_or(Uuid::nil());
+            let created = row
+                .r_by_name::<chrono::NaiveDateTime>("created_at")
+                .unwrap_or_else(|e| {
+                    tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
+                    Default::default()
+                });
             edges.push(TypedEdge {
                 tenant_id: ctx.tenant_id,
                 session_id,
@@ -3558,7 +3655,10 @@ impl Storage for CqlStorage {
         for row in rows {
             let created = row
                 .r_by_name::<chrono::NaiveDateTime>("created_at")
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
+                    Default::default()
+                });
             edges.push(TypedEdge {
                 tenant_id: ctx.tenant_id,
                 session_id,
