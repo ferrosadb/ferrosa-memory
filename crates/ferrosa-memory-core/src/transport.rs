@@ -104,18 +104,26 @@ pub async fn serve_stdio(handler: Handler) -> anyhow::Result<()> {
         let response = match serde_json::from_str::<JsonRpcRequest>(&line) {
             Ok(req) => {
                 let id = req.id.clone();
-                match (handler)(&req.method, req.params).await {
-                    Ok(result) => JsonRpcResponse::success(id, result),
-                    Err((code, msg)) => JsonRpcResponse::error(id, code, msg),
-                }
+                let result = match (handler)(&req.method, req.params).await {
+                    Ok(result) => JsonRpcResponse::success(id.clone(), result),
+                    Err((code, msg)) => JsonRpcResponse::error(id.clone(), code, msg),
+                };
+                // JSON-RPC notifications omit `id` and must not receive a response.
+                id.map(|_| result)
             }
-            Err(e) => JsonRpcResponse::error(None, PARSE_ERROR, format!("parse error: {e}")),
+            Err(e) => Some(JsonRpcResponse::error(
+                None,
+                PARSE_ERROR,
+                format!("parse error: {e}"),
+            )),
         };
 
-        let mut out = serde_json::to_vec(&response)?;
-        out.push(b'\n');
-        stdout.write_all(&out).await?;
-        stdout.flush().await?;
+        if let Some(response) = response {
+            let mut out = serde_json::to_vec(&response)?;
+            out.push(b'\n');
+            stdout.write_all(&out).await?;
+            stdout.flush().await?;
+        }
     }
 
     Ok(())
@@ -145,6 +153,15 @@ mod tests {
         let json = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
         let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
         assert!(req.id.is_none());
+    }
+
+    #[test]
+    fn notification_without_id_would_not_emit_response() {
+        let json = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
+        let id = req.id.clone();
+        let response = id.map(|_| JsonRpcResponse::success(req.id, serde_json::json!(null)));
+        assert!(response.is_none());
     }
 
     #[test]

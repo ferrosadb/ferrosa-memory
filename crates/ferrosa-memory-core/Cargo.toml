@@ -27,3 +27,4 @@ rustls-pemfile = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 ordered-float = { workspace = true }
+tempfile = { workspace = true }

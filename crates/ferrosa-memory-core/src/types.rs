@@ -249,6 +249,10 @@ pub struct WarmthEntry {
     pub session_id: Uuid,
     pub warmth: f64,
     pub pagerank: f64,
+    /// Reputation/trust score. Positive = verified/useful, negative = contradicted/missed.
+    /// Accumulated via supersede events (-0.2) and retrieval misses (-0.05).
+    #[serde(default)]
+    pub reputation: f64,
     pub last_accessed_at: chrono::DateTime<chrono::Utc>,
     pub access_count: i64,
     pub decay_zone: DecayZone,

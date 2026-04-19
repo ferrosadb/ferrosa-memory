@@ -1,0 +1,89 @@
+# Level 3 Semantic: Multi-hop reasoning via graph traversal
+#
+# Validates that the system can follow a chain A -> B -> C -> D and discover
+# the path between distant entities. Creates a 4-node chain with typed
+# edges, then uses explore_connections and spread_activation to find the
+# path and verify intermediate entities are present in results.
+
+[scenario]
+id = "semantic-multi-hop-reasoning"
+name = "Multi-Hop Reasoning: Chain Traversal A -> B -> C -> D"
+description = """
+Tests semantic repository multi-hop query expressiveness. Creates a chain \
+of 4 entities (Feature -> Module -> Library -> CVE) connected by typed edges. \
+Uses explore_connections with increasing depth and spread_activation to \
+verify that the system can traverse the full chain and return intermediate \
+entities in the path from A to D."""
+level = 3
+tags = ["semantic", "multi_hop", "reasoning", "graph_traversal", "chain"]
+timeout_ms = 45000
+
+# Step 1: Create entity A -- a feature
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "User Authentication Feature", entity_type = "concept", context_snippet = "User Authentication Feature provides login, logout, and session management for the web application." }
+
+# Step 2: Create entity B -- a module the feature depends on
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "JWT Token Handler", entity_type = "concept", context_snippet = "JWT Token Handler module generates and validates JSON Web Tokens for the User Authentication Feature." }
+
+# Step 3: Create entity C -- a library the module uses
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "jsonwebtoken-rs", entity_type = "concept", context_snippet = "jsonwebtoken-rs is the Rust JWT library used by the JWT Token Handler for cryptographic token operations." }
+
+# Step 4: Create entity D -- a CVE affecting the library
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "CVE-2026-1234", entity_type = "bug", context_snippet = "CVE-2026-1234 is a critical vulnerability in jsonwebtoken-rs allowing token forgery via algorithm confusion." }
+
+# Step 5: Create edge A -> B (depends_on)
+[[steps]]
+tool = "create_edge"
+arguments = { edge_type = "depends_on", metadata = "User Authentication Feature depends on JWT Token Handler" }
+
+# Step 6: Create edge B -> C (uses)
+[[steps]]
+tool = "create_edge"
+arguments = { edge_type = "uses", metadata = "JWT Token Handler uses jsonwebtoken-rs library" }
+
+# Step 7: Create edge C -> D (related_to)
+[[steps]]
+tool = "create_edge"
+arguments = { edge_type = "related_to", metadata = "jsonwebtoken-rs is affected by CVE-2026-1234" }
+
+# Step 8: Explore from entity A with depth 1 (should find B only)
+[[steps]]
+tool = "explore_connections"
+expect_in_response = ["JWT Token Handler"]
+arguments = { traversal = "related_entities", max_depth = 1, limit = 10 }
+
+# Step 9: Explore from entity A with depth 3 (should find B, C, D)
+[[steps]]
+tool = "explore_connections"
+expect_in_response = ["JWT Token Handler", "jsonwebtoken-rs", "CVE-2026-1234"]
+arguments = { traversal = "related_entities", max_depth = 3, limit = 10 }
+
+# Step 10: Spread activation from A to verify full chain reachability
+[[steps]]
+tool = "spread_activation"
+expect_in_response = ["CVE-2026-1234"]
+arguments = { seeds = ["placeholder"], max_hops = 4, decay = 0.7, limit = 10 }
+
+[grading]
+methods = ["programmatic", "claim_rubric"]
+
+[grading.claim_rubric]
+claims = [
+    "Four entities form a chain: Feature -> Module -> Library -> CVE",
+    "Typed edges connect each adjacent pair in the chain",
+    "Depth-1 traversal from A finds only B (direct neighbor)",
+    "Depth-3 traversal from A finds B, C, and D (full chain)",
+    "Spread activation from A reaches D at the end of the chain",
+    "Intermediate entities (B, C) appear in multi-hop results",
+]
+passing_threshold = 0.75
+
+[semantic]
+expect_type_consistency = true

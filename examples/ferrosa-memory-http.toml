@@ -1,0 +1,31 @@
+# Shared HTTP configuration for ferrosa-memory-mcp
+# Use for a shared endpoint, not local stdio development.
+
+[server]
+transport = "http"
+http_port = 8765
+log_level = "info"
+require_tls = true
+cert_path = "/run/secrets/ferrosa-memory/tls.crt"
+key_path = "/run/secrets/ferrosa-memory/tls.key"
+auth_file = "/run/secrets/ferrosa-memory/http-auth.toml"
+
+[ferrosa]
+contact_points = ["ferrosa-node1:9042", "ferrosa-node2:9042", "ferrosa-node3:9042"]
+keyspace = "agent_memory"
+replication_factor = 3
+consistency = "LOCAL_QUORUM"
+
+[embeddings]
+provider = "ollama"
+ollama_base_url = "http://ollama:11434"
+model = "nomic-embed-text"
+dimensions = 768
+
+[graph]
+http_url = "http://ferrosa-node1:7474"
+username = "neo4j"
+password = "neo4j"
+
+[viz]
+enabled = false

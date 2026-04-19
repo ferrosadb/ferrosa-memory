@@ -43,6 +43,8 @@ pub struct Config {
     pub datalog: DatalogConfig,
     #[serde(default)]
     pub promotion: PromotionConfig,
+    #[serde(default)]
+    pub enrich: EnrichConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,6 +77,13 @@ pub struct VizConfig {
     pub enabled: bool,
     #[serde(default = "default_viz_port")]
     pub port: u16,
+    /// Tenant UUID viz should read under when running in HTTP transport mode.
+    ///
+    /// Viz is unauthenticated (loopback-only), so the tenant cannot come from
+    /// a request principal. In stdio mode this is unused — viz inherits the
+    /// stdio tenant. In HTTP mode this is required if `enabled = true`.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
 }
 
 impl Default for VizConfig {
@@ -82,6 +91,7 @@ impl Default for VizConfig {
         Self {
             enabled: default_viz_enabled(),
             port: default_viz_port(),
+            tenant_id: None,
         }
     }
 }
@@ -180,6 +190,47 @@ impl Default for PromotionConfig {
     }
 }
 
+/// LLM enrichment pipeline configuration.
+#[derive(Debug, Deserialize, Clone)]
+pub struct EnrichConfig {
+    /// Base URL for the OpenAI-compatible LLM API (e.g., LM Studio).
+    #[serde(default = "default_enrich_url")]
+    pub llm_base_url: String,
+    /// Model name to use for enrichment.
+    #[serde(default = "default_enrich_model")]
+    pub llm_model: String,
+    /// Number of entities per LLM batch call.
+    #[serde(default = "default_enrich_batch")]
+    pub batch_size: usize,
+    /// Maximum tokens per LLM response.
+    #[serde(default = "default_enrich_max_tokens")]
+    pub max_tokens: u32,
+}
+
+impl Default for EnrichConfig {
+    fn default() -> Self {
+        Self {
+            llm_base_url: default_enrich_url(),
+            llm_model: default_enrich_model(),
+            batch_size: default_enrich_batch(),
+            max_tokens: default_enrich_max_tokens(),
+        }
+    }
+}
+
+fn default_enrich_url() -> String {
+    "http://localhost:1234".into()
+}
+fn default_enrich_model() -> String {
+    "google/gemma-4-31b".into()
+}
+fn default_enrich_batch() -> usize {
+    10
+}
+fn default_enrich_max_tokens() -> u32 {
+    2048
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ServerConfig {
     #[serde(default = "default_transport")]
@@ -194,6 +245,8 @@ pub struct ServerConfig {
     pub cert_path: Option<String>,
     /// Path to the TLS private key file (PEM format).
     pub key_path: Option<String>,
+    /// Path to the file-backed HTTP auth principal database.
+    pub auth_file: Option<String>,
     /// Fixed tenant UUID for sharing data across sessions.
     /// If not set, a random UUID is generated per session.
     pub tenant_id: Option<String>,
@@ -224,6 +277,7 @@ impl Default for ServerConfig {
             require_tls: false,
             cert_path: None,
             key_path: None,
+            auth_file: None,
             tenant_id: None,
             session_id: None,
             idle_consolidation_enabled: true,
@@ -522,6 +576,27 @@ pub fn parse_config(toml_str: &str) -> Result<Config, toml::de::Error> {
     toml::from_str(toml_str)
 }
 
+pub fn validate_shared_http_config(config: &Config) -> anyhow::Result<()> {
+    if config.server.transport != "http" {
+        return Ok(());
+    }
+
+    if !config.server.require_tls {
+        anyhow::bail!("HTTP transport requires TLS in shared mode");
+    }
+    if config.server.cert_path.is_none() || config.server.key_path.is_none() {
+        anyhow::bail!("HTTP transport requires cert_path and key_path");
+    }
+    if config.server.auth_file.is_none() {
+        anyhow::bail!("HTTP transport requires server.auth_file");
+    }
+    if config.server.tenant_id.is_some() {
+        anyhow::bail!("HTTP transport must not use server.tenant_id fallback");
+    }
+
+    Ok(())
+}
+
 /// Load config from the resolved path, or return an error if not found.
 pub fn load_config() -> anyhow::Result<Config> {
     let path = resolve_config_path().ok_or_else(|| {
@@ -637,6 +712,22 @@ contact_points = ["localhost:9042"]
     }
 
     #[test]
+    fn parse_auth_file_field_present() {
+        let toml = r#"
+[server]
+auth_file = "/etc/ferrosa/auth.toml"
+
+[ferrosa]
+contact_points = ["localhost:9042"]
+"#;
+        let config = parse_config(toml).expect("should parse auth_file");
+        assert_eq!(
+            config.server.auth_file.as_deref(),
+            Some("/etc/ferrosa/auth.toml")
+        );
+    }
+
+    #[test]
     fn parse_invalid_config_missing_required() {
         let toml = r#"
 [server]
@@ -709,6 +800,7 @@ contact_points = "not_an_array"
         assert!(!cfg.require_tls);
         assert!(cfg.cert_path.is_none());
         assert!(cfg.key_path.is_none());
+        assert!(cfg.auth_file.is_none());
     }
 
     #[test]
@@ -716,6 +808,56 @@ contact_points = "not_an_array"
         let cfg = ServerConfig::default();
         assert!(cfg.tenant_id.is_none());
         assert!(cfg.session_id.is_none());
+    }
+
+    #[test]
+    fn validate_shared_http_requires_auth_file() {
+        let toml = r#"
+[ferrosa]
+contact_points = ["localhost:19042"]
+[server]
+transport = "http"
+require_tls = true
+cert_path = "/etc/ssl/cert.pem"
+key_path = "/etc/ssl/key.pem"
+"#;
+        let config = parse_config(toml).unwrap();
+        let err = validate_shared_http_config(&config).unwrap_err();
+        assert!(err.to_string().contains("auth_file"));
+    }
+
+    #[test]
+    fn validate_shared_http_rejects_tenant_fallback() {
+        let toml = r#"
+[ferrosa]
+contact_points = ["localhost:19042"]
+[server]
+transport = "http"
+require_tls = true
+cert_path = "/etc/ssl/cert.pem"
+key_path = "/etc/ssl/key.pem"
+auth_file = "/etc/ferrosa/auth.toml"
+tenant_id = "00000000-0000-0000-0000-000000000001"
+"#;
+        let config = parse_config(toml).unwrap();
+        let err = validate_shared_http_config(&config).unwrap_err();
+        assert!(err.to_string().contains("tenant_id"));
+    }
+
+    #[test]
+    fn validate_shared_http_accepts_required_fields() {
+        let toml = r#"
+[ferrosa]
+contact_points = ["localhost:19042"]
+[server]
+transport = "http"
+require_tls = true
+cert_path = "/etc/ssl/cert.pem"
+key_path = "/etc/ssl/key.pem"
+auth_file = "/etc/ferrosa/auth.toml"
+"#;
+        let config = parse_config(toml).unwrap();
+        validate_shared_http_config(&config).expect("shared http config should validate");
     }
 
     #[test]

@@ -1,5 +1,7 @@
 # Configuration for ferrosa-memory-mcp
 # Matches the docker-compose.yml development cluster (run with: podman compose up -d)
+# This file is for local stdio usage. For a shared HTTP endpoint, use
+# `examples/ferrosa-memory-http.toml` plus `examples/http-auth.toml`.
 
 [server]
 transport = "stdio"          # "stdio" for Claude Code, "http" for remote

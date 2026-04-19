@@ -5,7 +5,7 @@
 //! stream of `VizEvent` variants — first a full `Snapshot`, then incremental
 //! deltas as the memory graph mutates.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 /// A node in the visualization graph (entity or fold).
@@ -23,6 +23,10 @@ pub struct VizNode {
     pub created_at: String,
     /// Context snippet for the detail panel.
     pub context: String,
+    /// Number of children when this is an aggregate (crate/module) node.
+    /// Absent for leaf nodes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_count: Option<usize>,
 }
 
 /// An edge in the visualization graph.
@@ -37,6 +41,42 @@ pub struct VizEdge {
     pub strength: Option<f32>,
 }
 
+/// Hierarchical drill-down level for the visualization.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VizLevel {
+    #[default]
+    Crate,
+    Module,
+    Function,
+}
+
+/// Message sent from the browser client to the server over WebSocket.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum VizClientMessage {
+    /// Drill into a child level.
+    DrillDown {
+        level: VizLevel,
+        #[serde(default)]
+        parent: Option<String>,
+    },
+    /// Return to the parent level.
+    DrillUp,
+    /// Toggle between overview (clustered) and detail (flat) view.
+    ToggleView { mode: String },
+    /// Explore the neighborhood of an entity via BFS.
+    ExploreNeighborhood {
+        entity_id: String,
+        #[serde(default = "default_hops")]
+        hops: usize,
+    },
+}
+
+fn default_hops() -> usize {
+    2
+}
+
 /// Typed event pushed to all connected WebSocket clients.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
@@ -45,6 +85,18 @@ pub enum VizEvent {
     Snapshot {
         nodes: Vec<VizNode>,
         edges: Vec<VizEdge>,
+        /// Current drill-down level.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        level: Option<String>,
+        /// Parent context for drill-down (e.g. crate name).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent: Option<String>,
+        /// Total entities in the full graph (not just this level).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        total_nodes: Option<usize>,
+        /// Total edges in the full graph (not just this level).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        total_edges: Option<usize>,
     },
     /// Entity created or updated.
     EntityChanged { node: VizNode, action: String },
@@ -124,6 +176,7 @@ pub fn entity_to_viz_node(entry: &crate::types::EntityEntry) -> VizNode {
         confidence: entry.confidence,
         created_at: entry.created_at.to_rfc3339(),
         context: entry.context_snippet.clone(),
+        child_count: None,
     }
 }
 
@@ -145,6 +198,7 @@ pub fn fold_to_viz_node(entry: &crate::types::FoldEntry) -> VizNode {
         confidence: entry.compression_ratio.unwrap_or(0.0),
         created_at: entry.created_at.to_rfc3339(),
         context: String::new(),
+        child_count: None,
     }
 }
 
@@ -194,6 +248,7 @@ mod tests {
                 confidence: 0.9,
                 created_at: "2026-01-01T00:00:00Z".into(),
                 context: "test context".into(),
+                child_count: None,
             },
             action: "created".into(),
         });
@@ -219,6 +274,7 @@ mod tests {
                 confidence: 1.0,
                 created_at: "2026-01-01T00:00:00Z".into(),
                 context: "ctx".into(),
+                child_count: None,
             }],
             edges: vec![VizEdge {
                 source: "n1".into(),
@@ -226,6 +282,10 @@ mod tests {
                 edge_type: "CO_OCCURS".into(),
                 strength: Some(0.85),
             }],
+            level: None,
+            parent: None,
+            total_nodes: None,
+            total_edges: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains(r#""type":"Snapshot"#));

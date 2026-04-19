@@ -36,6 +36,8 @@ graph LR
 
 The viz server runs on a **separate port** (default 8766, or `http_port + 1`) from the MCP transport. It serves the dashboard HTML as a static string compiled into the binary via `include_str!` — no build tools, no node_modules.
 
+For shared HTTP deployments, viz is considered an operator/internal surface and should be disabled by default unless it is protected by the same auth boundary as the MCP endpoint.
+
 ## Data Flow
 
 ```mermaid
@@ -270,7 +272,7 @@ enabled = true        # default: true when HTTP transport active
 port = 8766           # default: http_port + 1
 ```
 
-In stdio mode (Claude Code), the viz server starts on a separate port. In HTTP mode, viz routes are added to the same HTTP server.
+In stdio mode (Claude Code), the viz server starts on a separate port. For shared HTTP deployments, keep viz on a separate listener and do not expose it by default as part of the public MCP endpoint.
 
 ## File Manifest
 

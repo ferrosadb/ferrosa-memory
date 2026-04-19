@@ -280,14 +280,24 @@ sequenceDiagram
     MCP->>MCP: tool_definitions(entity_types)
 ```
 
-## 10. External Codebase Ingestion (via skilltools)
+## 10. Tool Usage Logging (DDL 009)
 
-The `skilltools ingest` CLI/MCP tool extracts codebase structure and documentation into the fmem knowledge graph via direct CQL inserts. This is external to the MCP server process.
+Every MCP tool call is logged to the `tool_usage_log` table for token usage analytics. The table is partitioned by `(tenant_id, day)` with `call_id` (timeuuid) clustering in descending order for efficient recent-first queries.
+
+**Columns recorded:** `tool_name`, `repo`, `input_bytes`, `output_bytes`, `estimated_tokens`, `latency_ms`, `error` (boolean).
+
+**Write path:** After each tool handler returns, `tool_dispatch` writes a row to `tool_usage_log` with the call metrics. This is fire-and-forget (does not block the tool response).
+
+**Read path:** Analytics queries aggregate by day and tool name for cost attribution and usage trending. Not exposed as an MCP tool — queried via direct CQL.
+
+## 11. External Codebase Ingestion (via forge)
+
+The `frg ingest` CLI/MCP tool extracts codebase structure and documentation into the fmem knowledge graph via direct CQL inserts. This is external to the MCP server process.
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'actorBkg':'#16161f','actorTextColor':'#e8e8ed','actorBorder':'#e2725b','signalColor':'#9494a3','signalTextColor':'#e8e8ed','labelBoxBkgColor':'#16161f','labelBoxBorderColor':'#e2725b','labelTextColor':'#e8e8ed','loopTextColor':'#e8e8ed','noteBkgColor':'#1c1c28','noteBorderColor':'#d4a574','noteTextColor':'#e8e8ed','activationBkgColor':'#1c1c28','activationBorderColor':'#e2725b'}}}%%
 sequenceDiagram
-    participant ST as skilltools ingest
+    participant ST as frg ingest
     participant PY as Python CQL loader
     participant DB as Ferrosa DB
     participant VIZ as Viz Server

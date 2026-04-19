@@ -7,7 +7,8 @@
 //!
 //! - `POST /mcp` — JSON-RPC request/response
 //! - `GET /metrics` — Prometheus metrics scrape
-//! - `GET /health` — Health check
+//! - `GET /healthz/live` — Liveness check
+//! - `GET /healthz/ready` — Readiness check
 //! - `GET /viz` — Memory graph visualizer HTML (served on viz port)
 //! - `GET /viz/ws` — WebSocket for live graph events (served on viz port)
 //! - `GET /subscribe/anomalies` — SSE stream of anomaly alerts (served on viz port)
@@ -128,6 +129,7 @@ pub struct HttpConfig {
     pub require_tls: bool,
     pub cert_path: Option<String>,
     pub key_path: Option<String>,
+    pub readiness_checker: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 /// Run the HTTP transport server.
@@ -196,6 +198,7 @@ pub async fn serve_http<S: Storage>(
                         storage.as_ref(),
                         &metrics,
                         credential_validator.as_ref(),
+                        config.readiness_checker.as_ref(),
                     )
                     .await
                     {
@@ -214,6 +217,7 @@ pub async fn serve_http<S: Storage>(
                 storage.as_ref(),
                 &metrics,
                 credential_validator.as_ref(),
+                config.readiness_checker.as_ref(),
             )
             .await
             {
@@ -232,8 +236,16 @@ async fn handle_connection<S: Storage>(
     storage: &S,
     metrics: &MemoryMetrics,
     credential_validator: &CredentialValidator,
+    readiness_checker: &(dyn Fn() -> bool + Send + Sync),
 ) -> anyhow::Result<()> {
-    handle_connection_rw(stream, storage, metrics, credential_validator).await
+    handle_connection_rw(
+        stream,
+        storage,
+        metrics,
+        credential_validator,
+        readiness_checker,
+    )
+    .await
 }
 
 /// Handle a single HTTP connection over any async read/write stream.
@@ -245,6 +257,7 @@ async fn handle_connection_rw<S: Storage, T: AsyncReadExt + AsyncWriteExt + Unpi
     storage: &S,
     metrics: &MemoryMetrics,
     credential_validator: &CredentialValidator,
+    readiness_checker: &(dyn Fn() -> bool + Send + Sync),
 ) -> anyhow::Result<()> {
     let mut buf = vec![0u8; 65536];
     let n = stream.read(&mut buf).await?;
@@ -256,28 +269,59 @@ async fn handle_connection_rw<S: Storage, T: AsyncReadExt + AsyncWriteExt + Unpi
     // Parse HTTP request line and headers
     let (method, path, headers, body) = parse_http_request(&request)?;
 
+    let response = handle_http_request(
+        method,
+        path,
+        &headers,
+        body,
+        storage,
+        metrics,
+        credential_validator,
+        readiness_checker,
+    )
+    .await?;
+    stream.write_all(response.as_bytes()).await?;
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_http_request<S: Storage>(
+    method: &str,
+    path: &str,
+    headers: &[(String, String)],
+    body: &str,
+    storage: &S,
+    metrics: &MemoryMetrics,
+    credential_validator: &CredentialValidator,
+    readiness_checker: &(dyn Fn() -> bool + Send + Sync),
+) -> anyhow::Result<String> {
     match (method, path) {
-        ("GET", "/health") => {
-            let response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nok";
-            stream.write_all(response.as_bytes()).await?;
+        ("GET", "/health") | ("GET", "/healthz/live") => Ok(text_response("200 OK", "ok")),
+        ("GET", "/healthz/ready") => {
+            if readiness_checker() {
+                Ok(text_response("200 OK", "ready"))
+            } else {
+                Ok(text_response("503 Service Unavailable", "not ready"))
+            }
         }
         ("GET", "/metrics") => {
             let mut buf = Vec::new();
             let encoder = prometheus::TextEncoder::new();
             prometheus::Encoder::encode(&encoder, &metrics.registry.gather(), &mut buf)?;
             let body = String::from_utf8(buf)?;
-            let response = format!(
+            Ok(format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\n\r\n{}",
                 body.len(),
                 body
-            );
-            stream.write_all(response.as_bytes()).await?;
+            ))
         }
         ("POST", "/mcp") => {
-            // Authenticate
-            let ctx = authenticate_from_headers(&headers, credential_validator)?;
+            let ctx = match authenticate_from_headers(headers, credential_validator) {
+                Ok(ctx) => ctx,
+                Err(_) => return Ok(text_response("401 Unauthorized", "unauthorized")),
+            };
 
-            // Parse JSON-RPC
             let rpc_request: serde_json::Value =
                 serde_json::from_str(body).map_err(|e| anyhow::anyhow!("invalid JSON: {e}"))?;
 
@@ -305,20 +349,26 @@ async fn handle_connection_rw<S: Storage, T: AsyncReadExt + AsyncWriteExt + Unpi
             };
 
             let body_str = serde_json::to_string(&response_body)?;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                body_str.len(),
-                body_str
-            );
-            stream.write_all(response.as_bytes()).await?;
+            Ok(json_response("200 OK", &body_str))
         }
-        _ => {
-            let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-            stream.write_all(response.as_bytes()).await?;
-        }
+        _ => Ok("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".into()),
     }
+}
 
-    Ok(())
+fn text_response(status: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
+fn json_response(status: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    )
 }
 
 /// Run the visualization dashboard HTTP server on a dedicated port.
@@ -330,18 +380,19 @@ async fn handle_connection_rw<S: Storage, T: AsyncReadExt + AsyncWriteExt + Unpi
 /// On WebSocket connect, sends a `VizEvent::Snapshot` with current graph
 /// state so new clients don't start with a blank canvas.
 pub async fn serve_viz<S: Storage + 'static>(
+    bind_addr: &str,
     port: u16,
     event_bus: Arc<EventBus>,
     storage: Arc<S>,
     ctx: Arc<TenantContext>,
     session_id: Uuid,
 ) -> anyhow::Result<()> {
-    let addr = format!("0.0.0.0:{port}");
+    let addr = format!("{bind_addr}:{port}");
     let listener = TcpListener::bind(&addr).await?;
     tracing::info!("viz server listening on {addr}");
 
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (mut stream, peer) = listener.accept().await?;
         let bus = Arc::clone(&event_bus);
 
         // Peek at the request path before deciding how to handle it.
@@ -381,9 +432,10 @@ pub async fn serve_viz<S: Storage + 'static>(
                     ("500 Internal Server Error", json.to_string())
                 }
             };
-            // Consume the request then send response
+            // Consume the request then send response (async to avoid CPU spin)
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut buf = vec![0u8; 4096];
-            let _ = stream.try_read(&mut buf);
+            let _ = stream.read(&mut buf).await;
             let response = format!(
                 "HTTP/1.1 {status}\r\n\
                  Content-Type: application/json\r\n\
@@ -391,7 +443,64 @@ pub async fn serve_viz<S: Storage + 'static>(
                  Content-Length: {}\r\n\r\n{body}",
                 body.len()
             );
-            let _ = stream.try_write(response.as_bytes());
+            let _ = stream.write_all(response.as_bytes()).await;
+            continue;
+        }
+
+        // Proxy /viz/api/enrich/models to LM Studio to list available models.
+        if peek_str.contains("GET /viz/api/enrich/models") {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+
+            // Extract llm_url from query string (?url=http://...)
+            let llm_url = if let Some(pos) = peek_str.find("url=") {
+                let start = pos + 4;
+                let end = peek_str[start..]
+                    .find(|c: char| ['&', ' ', '\r', '\n'].contains(&c))
+                    .map(|i| start + i)
+                    .unwrap_or(peek_str.len().min(start + 100));
+                peek_str[start..end]
+                    .replace("%3A", ":")
+                    .replace("%2F", "/")
+                    .replace("%3a", ":")
+                    .replace("%2f", "/")
+            } else {
+                "http://localhost:1234".to_string()
+            };
+
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_default();
+            let (status, body) = match client
+                .get(format!("{}/v1/models", llm_url.trim_end_matches('/')))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    ("200 OK", resp.text().await.unwrap_or_default())
+                }
+                Ok(resp) => {
+                    let s = resp.status();
+                    (
+                        "502 Bad Gateway",
+                        format!("{{\"error\":\"LLM API returned {s}\"}}"),
+                    )
+                }
+                Err(e) => (
+                    "502 Bad Gateway",
+                    format!("{{\"error\":\"{}\"}}", e.to_string().replace('"', "'")),
+                ),
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\n\
+                 Content-Type: application/json\r\n\
+                 Access-Control-Allow-Origin: *\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
             continue;
         }
 
@@ -409,9 +518,13 @@ pub async fn serve_viz<S: Storage + 'static>(
 
         // Build snapshot before spawning because Storage async methods are not
         // Send-bounded. The snapshot is built per-connection to stay fresh.
+        let storage_clone = Arc::clone(&storage);
+        let ctx_clone = Arc::clone(&ctx);
         let snapshot = build_snapshot(&*storage, &ctx, effective_session).await;
         tokio::spawn(async move {
-            if let Err(e) = handle_viz_connection(stream, bus, snapshot).await {
+            if let Err(e) =
+                handle_viz_connection(stream, bus, snapshot, storage_clone, ctx_clone).await
+            {
                 tracing::debug!("viz connection from {peer} closed: {e}");
             }
         });
@@ -422,10 +535,12 @@ pub async fn serve_viz<S: Storage + 'static>(
 ///
 /// Routes `/viz` to static HTML, `/viz/ws` to WebSocket upgrade, and
 /// `/subscribe/anomalies` to an SSE stream of anomaly alerts (Sprint 4.9).
-async fn handle_viz_connection(
+async fn handle_viz_connection<S: crate::storage::Storage + Send + Sync + 'static>(
     mut stream: tokio::net::TcpStream,
     event_bus: Arc<EventBus>,
     snapshot: VizEvent,
+    storage: Arc<S>,
+    ctx: Arc<crate::types::TenantContext>,
 ) -> anyhow::Result<()> {
     // Peek at the request to determine routing before consuming the stream
     let mut buf = vec![0u8; 4096];
@@ -451,8 +566,108 @@ async fn handle_viz_connection(
             );
             stream.write_all(response.as_bytes()).await?;
         }
-        ("GET", "/viz/snapshot") => {
+        (method, path) if method == "GET" && path.starts_with("/viz/snapshot") => {
             let body = serde_json::to_string(&snapshot).unwrap_or_default();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/json\r\n\
+                 Cache-Control: no-cache\r\n\
+                 Access-Control-Allow-Origin: *\r\n\
+                 Content-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await?;
+        }
+        (method, path) if method == "GET" && path.starts_with("/viz/api/derived_facts") => {
+            // Fetch derived facts from cache for the viz tab
+            // Parse query string from path (e.g., /viz/api/derived_facts?session_id=xxx&limit=100)
+            let query_string = path.split('?').nth(1).unwrap_or("");
+
+            let session_id = query_string
+                .split('&')
+                .find(|p| p.starts_with("session_id="))
+                .and_then(|p| p.split('=').nth(1))
+                .unwrap_or("00000000-0000-0000-0000-000000000000")
+                .to_string();
+
+            let limit: usize = query_string
+                .split('&')
+                .find(|p| p.starts_with("limit="))
+                .and_then(|p| p.split('=').nth(1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(100);
+
+            let session_uuid = uuid::Uuid::parse_str(&session_id).unwrap_or(uuid::Uuid::nil());
+            let cache_key = format!("consolidation:{}", session_uuid);
+
+            let derived_facts = storage
+                .derived_cache_get(&ctx, &cache_key)
+                .await
+                .unwrap_or_default();
+            let total = derived_facts.len();
+
+            // Collect unique entity IDs for batch lookup
+            let mut entity_ids: Vec<uuid::Uuid> = Vec::new();
+            let mut seen: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
+            for fact in &derived_facts {
+                if let Ok(id) = uuid::Uuid::parse_str(&fact.src_id)
+                    && seen.insert(id)
+                {
+                    entity_ids.push(id);
+                }
+                if let Ok(id) = uuid::Uuid::parse_str(&fact.dst_id)
+                    && seen.insert(id)
+                {
+                    entity_ids.push(id);
+                }
+            }
+
+            // Batch fetch entity names using single query
+            let mut entity_names: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            if !entity_ids.is_empty() {
+                let entities = storage
+                    .entity_get_batch(&ctx, session_uuid, &entity_ids)
+                    .await
+                    .unwrap_or_default();
+                for entity in entities {
+                    entity_names.insert(entity.entity_id.to_string(), entity.entity_name);
+                }
+            }
+
+            let facts: Vec<_> = derived_facts
+                .into_iter()
+                .take(limit)
+                .map(|f| {
+                    let src_name = entity_names
+                        .get(&f.src_id)
+                        .cloned()
+                        .unwrap_or_else(|| f.src_id[..8].to_string() + "...");
+                    let dst_name = entity_names
+                        .get(&f.dst_id)
+                        .cloned()
+                        .unwrap_or_else(|| f.dst_id[..8].to_string() + "...");
+                    serde_json::json!({
+                        "src_id": f.src_id,
+                        "src_name": src_name,
+                        "pred": f.pred,
+                        "dst_id": f.dst_id,
+                        "dst_name": dst_name,
+                        "confidence": f.confidence,
+                        "rule_id": f.rule_id,
+                        "support_count": f.support_count,
+                    })
+                })
+                .collect();
+
+            let body = serde_json::json!({
+                "derived_facts": facts,
+                "count": facts.len(),
+                "total": total,
+            })
+            .to_string();
+
             let response = format!(
                 "HTTP/1.1 200 OK\r\n\
                  Content-Type: application/json\r\n\
@@ -521,50 +736,171 @@ async fn handle_viz_connection(
 
 /// Handle a WebSocket connection for the viz dashboard.
 ///
-/// Sends a `VizEvent::Snapshot` with current graph state, then subscribes
-/// to the event bus and streams each incremental `VizEvent` as a JSON
-/// text frame. Runs until the client disconnects or the bus is dropped.
+/// Sends a clustered `VizEvent::Snapshot` (crate level by default), then
+/// listens for both event bus broadcasts and client drill-down messages.
+/// The full flat node/edge data is kept in memory so drill-down requests
+/// can be served without re-querying storage.
 async fn handle_viz_ws(
     ws_stream: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     event_bus: Arc<EventBus>,
     snapshot: VizEvent,
 ) {
-    let (mut write, _read) = futures_util::StreamExt::split(ws_stream);
+    use futures_util::StreamExt;
 
-    // Send initial snapshot so clients don't start with a blank graph.
-    // TODO: The viz endpoint uses a fixed session_id from server startup. A future
-    // enhancement should accept session_id as a query parameter on /viz/ws so the
-    // dashboard can switch between sessions. In shared-memory mode (configured
-    // tenant_id), a tenant-level entity query would be more useful.
-    if let Ok(json) = serde_json::to_string(&snapshot)
+    let (mut write, mut read) = futures_util::StreamExt::split(ws_stream);
+
+    // Extract the full flat data from the snapshot for clustering.
+    let (full_nodes, full_edges) = match &snapshot {
+        VizEvent::Snapshot { nodes, edges, .. } => (nodes.clone(), edges.clone()),
+        _ => (vec![], vec![]),
+    };
+
+    // Track navigation state for drill_up support.
+    let mut nav_stack: Vec<(viz::VizLevel, Option<String>)> = Vec::new();
+    let mut current_level = viz::VizLevel::Crate;
+    let mut current_parent: Option<String> = None;
+
+    // Default to clustered overview when graph is large (>2000 nodes).
+    let large_graph = full_nodes.len() > 2000;
+
+    // Send initial snapshot — clustered for large graphs, flat for small.
+    let initial = if large_graph {
+        current_level = viz::VizLevel::Crate;
+        cluster_snapshot(&full_nodes, &full_edges, &viz::VizLevel::Crate, None)
+    } else {
+        snapshot
+    };
+    if let Ok(json) = serde_json::to_string(&initial)
         && write.send(Message::Text(json)).await.is_err()
     {
-        return; // Client disconnected during snapshot send
+        return;
     }
 
     // Subscribe to incremental events (after snapshot to avoid race)
     let mut rx = event_bus.subscribe();
 
-    // Stream events to the client
+    // Multiplex: listen for both broadcast events and client messages.
     loop {
-        match rx.recv().await {
-            Ok(event) => {
-                let json = match serde_json::to_string(&event) {
-                    Ok(j) => j,
-                    Err(e) => {
-                        tracing::warn!("viz: failed to serialize event: {e}");
-                        continue;
+        tokio::select! {
+            // Broadcast event from the event bus
+            result = rx.recv() => {
+                match result {
+                    Ok(event) => {
+                        // Only forward incremental events when at the flat
+                        // (function) level — clustered levels get full
+                        // snapshots on drill-down so incrementals would be
+                        // confusing.
+                        if current_level == viz::VizLevel::Function {
+                            let json = match serde_json::to_string(&event) {
+                                Ok(j) => j,
+                                Err(e) => {
+                                    tracing::warn!("viz: failed to serialize event: {e}");
+                                    continue;
+                                }
+                            };
+                            if write.send(Message::Text(json)).await.is_err() {
+                                break;
+                            }
+                        }
                     }
-                };
-                if write.send(Message::Text(json)).await.is_err() {
-                    break; // Client disconnected
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("viz: WebSocket client lagged by {n} events");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
                 }
             }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                tracing::warn!("viz: WebSocket client lagged by {n} events");
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                break; // EventBus dropped
+            // Client message (drill_down / drill_up)
+            msg = read.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(client_msg) = serde_json::from_str::<viz::VizClientMessage>(&text) {
+                            let new_snapshot = match client_msg {
+                                viz::VizClientMessage::DrillDown { level, parent } => {
+                                    // Push current state onto nav stack
+                                    nav_stack.push((current_level.clone(), current_parent.clone()));
+                                    current_level = level.clone();
+                                    current_parent = parent.clone();
+                                    cluster_snapshot(
+                                        &full_nodes,
+                                        &full_edges,
+                                        &level,
+                                        parent.as_deref(),
+                                    )
+                                }
+                                viz::VizClientMessage::DrillUp => {
+                                    if let Some((prev_level, prev_parent)) = nav_stack.pop() {
+                                        current_level = prev_level.clone();
+                                        current_parent = prev_parent.clone();
+                                        cluster_snapshot(
+                                            &full_nodes,
+                                            &full_edges,
+                                            &prev_level,
+                                            prev_parent.as_deref(),
+                                        )
+                                    } else {
+                                        // Already at top — send crate level
+                                        current_level = viz::VizLevel::Crate;
+                                        current_parent = None;
+                                        cluster_snapshot(
+                                            &full_nodes,
+                                            &full_edges,
+                                            &viz::VizLevel::Crate,
+                                            None,
+                                        )
+                                    }
+                                }
+                                viz::VizClientMessage::ToggleView { mode } => {
+                                    if mode == "overview" {
+                                        // Reset to crate-level clustered view
+                                        nav_stack.clear();
+                                        current_level = viz::VizLevel::Crate;
+                                        current_parent = None;
+                                        cluster_snapshot(
+                                            &full_nodes,
+                                            &full_edges,
+                                            &viz::VizLevel::Crate,
+                                            None,
+                                        )
+                                    } else {
+                                        // "detail" — send full flat snapshot
+                                        nav_stack.clear();
+                                        current_level = viz::VizLevel::Function;
+                                        current_parent = None;
+                                        let total_n = full_nodes.len();
+                                        let total_e = full_edges.len();
+                                        VizEvent::Snapshot {
+                                            nodes: full_nodes.clone(),
+                                            edges: full_edges.clone(),
+                                            level: None,
+                                            parent: None,
+                                            total_nodes: Some(total_n),
+                                            total_edges: Some(total_e),
+                                        }
+                                    }
+                                }
+                                viz::VizClientMessage::ExploreNeighborhood { entity_id, hops } => {
+                                    let hops = hops.min(3); // cap at 3
+                                    neighborhood_snapshot(
+                                        &full_nodes,
+                                        &full_edges,
+                                        &entity_id,
+                                        hops,
+                                    )
+                                }
+                            };
+                            if let Ok(json) = serde_json::to_string(&new_snapshot)
+                                && write.send(Message::Text(json)).await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(_)) => break,
+                    _ => {} // Ignore ping/pong/binary
+                }
             }
         }
     }
@@ -670,10 +1006,23 @@ async fn build_snapshot<S: Storage>(
         .edge_list_all(&swapped_ctx)
         .await
         .unwrap_or_default();
+    tracing::info!(
+        swapped_count = all_edges.len(),
+        "viz: loaded edges with swapped ctx"
+    );
     // Also load correctly-keyed edges (from new consolidation runs).
     if let Ok(mut correct) = storage.edge_list_all(ctx).await {
+        tracing::info!(
+            correct_count = correct.len(),
+            "viz: loaded edges with correct ctx"
+        );
         all_edges.append(&mut correct);
     }
+    tracing::info!(
+        total_edges = all_edges.len(),
+        node_count = node_ids.len(),
+        "viz: total edges before node filter"
+    );
     let edges_result: anyhow::Result<Vec<_>> = Ok(all_edges);
 
     // Send CO_OCCURS edges that have a real strength value.
@@ -702,11 +1051,15 @@ async fn build_snapshot<S: Storage>(
             Vec::new()
         }
     };
-    // Drop CO_OCCURS edges with no strength — they add no information.
-    edges.retain(|e| e.strength.is_some() || e.edge_type != "CO_OCCURS");
+    // Assign default strength to CO_OCCURS edges that lack it (from co_occurs_with table).
+    for e in &mut edges {
+        if e.edge_type == "CO_OCCURS" && e.strength.is_none() {
+            e.strength = Some(0.5);
+        }
+    }
 
     // Load typed edges (depends_on, contains, calls, etc.).
-    // Probe both the configured session and nil session (used by skilltools ingest).
+    // Probe both the configured session and nil session (used by frg ingest).
     let mut session_ids_to_probe = vec![session_id];
     let nil = uuid::Uuid::nil();
     if session_id != nil {
@@ -737,7 +1090,467 @@ async fn build_snapshot<S: Storage>(
         }
     }
 
-    VizEvent::Snapshot { nodes, edges }
+    let total_n = nodes.len();
+    let total_e = edges.len();
+    VizEvent::Snapshot {
+        nodes,
+        edges,
+        level: None,
+        parent: None,
+        total_nodes: Some(total_n),
+        total_edges: Some(total_e),
+    }
+}
+
+/// Build a clustered `VizEvent::Snapshot` at the requested hierarchy level.
+///
+/// Operates on already-fetched full node/edge data (avoids requiring `Storage`
+/// which is not `Send`-bounded, so this can run inside `tokio::spawn`).
+///
+/// - `level=crate` (default): groups entities by crate name (first `::` segment),
+///   aggregates edges between crates. Non-code entities go into a "Research" cluster.
+/// - `level=module&parent=X`: shows modules within crate X.
+/// - `level=function&parent=X::Y`: shows leaf entities within module X::Y.
+fn cluster_snapshot(
+    all_nodes: &[viz::VizNode],
+    all_edges: &[viz::VizEdge],
+    level: &viz::VizLevel,
+    parent: Option<&str>,
+) -> VizEvent {
+    let graph_total_nodes = all_nodes.len();
+    let graph_total_edges = all_edges.len();
+    // Helper: extract the crate name from an entity label (first `::` segment).
+    fn crate_name(label: &str) -> &str {
+        label.split("::").next().unwrap_or(label)
+    }
+
+    // Helper: extract crate::module from an entity label (first two `::` segments).
+    fn module_name(label: &str) -> String {
+        let parts: Vec<&str> = label.split("::").collect();
+        if parts.len() >= 2 {
+            format!("{}::{}", parts[0], parts[1])
+        } else {
+            label.to_string()
+        }
+    }
+
+    // Classify entity types into "code" vs "research" for top-level grouping.
+    fn is_code_entity(entity_type: &str) -> bool {
+        matches!(
+            entity_type,
+            "crate"
+                | "module"
+                | "section"
+                | "function"
+                | "struct"
+                | "enum"
+                | "trait"
+                | "impl"
+                | "method"
+                | "const"
+                | "type"
+                | "macro"
+                | "mod"
+                | "app"
+        )
+    }
+
+    fn is_code_entity_group(group_name: &str) -> bool {
+        !matches!(
+            group_name,
+            "Papers" | "People" | "Concepts" | "Organizations" | "Decisions" | "Other"
+        )
+    }
+
+    match level {
+        viz::VizLevel::Crate => {
+            // Group all entities by crate. Non-code entities go to "Research".
+            let mut crate_groups: std::collections::HashMap<String, Vec<usize>> =
+                std::collections::HashMap::new();
+
+            for (i, node) in all_nodes.iter().enumerate() {
+                let group = if is_code_entity(&node.entity_type) {
+                    let label = &node.label;
+                    if label.contains("::") || node.entity_type == "crate" {
+                        crate_name(label).to_string()
+                    } else {
+                        // Bare names (functions without crate prefix) → group as "Ungrouped Code"
+                        "Ungrouped Code".to_string()
+                    }
+                } else {
+                    // Group non-code entities by type: "Papers", "People", "Concepts", etc.
+                    match node.entity_type.as_str() {
+                        "document" => "Papers".to_string(),
+                        "person" => "People".to_string(),
+                        "concept" => "Concepts".to_string(),
+                        "org" => "Organizations".to_string(),
+                        "bug" | "decision" | "pattern" | "preference" => "Decisions".to_string(),
+                        _ => "Other".to_string(),
+                    }
+                };
+                crate_groups.entry(group).or_default().push(i);
+            }
+
+            // Build one aggregate node per crate.
+            let mut crate_nodes: Vec<viz::VizNode> = Vec::new();
+            // Map original node id -> crate group name
+            let mut node_to_crate: std::collections::HashMap<&str, String> =
+                std::collections::HashMap::new();
+
+            for (crate_label, member_indices) in &crate_groups {
+                let child_count = member_indices.len();
+
+                // Determine entity_type for the cluster node
+                let entity_type = if matches!(
+                    crate_label.as_str(),
+                    "Papers" | "People" | "Concepts" | "Organizations" | "Decisions" | "Other"
+                ) {
+                    match crate_label.as_str() {
+                        "Papers" => "document",
+                        "People" => "person",
+                        "Concepts" => "concept",
+                        "Organizations" => "org",
+                        "Decisions" => "decision",
+                        _ => "concept",
+                    }
+                    .to_string()
+                } else {
+                    "crate".to_string()
+                };
+
+                // Use max confidence from members
+                let max_confidence = member_indices
+                    .iter()
+                    .map(|&i| all_nodes[i].confidence)
+                    .fold(0.0_f64, f64::max);
+
+                for &i in member_indices {
+                    node_to_crate.insert(&all_nodes[i].id, crate_label.clone());
+                }
+
+                crate_nodes.push(viz::VizNode {
+                    id: format!("cluster:{crate_label}"),
+                    label: crate_label.clone(),
+                    node_type: "cluster".into(),
+                    entity_type,
+                    state: "active".into(),
+                    confidence: max_confidence,
+                    created_at: String::new(),
+                    context: format!("{child_count} entities"),
+                    child_count: Some(child_count),
+                });
+            }
+
+            // Aggregate edges between crate clusters.
+            let mut edge_weights: std::collections::HashMap<(String, String), (f64, String)> =
+                std::collections::HashMap::new();
+
+            for edge in all_edges {
+                let src_crate = node_to_crate.get(edge.source.as_str());
+                let tgt_crate = node_to_crate.get(edge.target.as_str());
+                if let (Some(sc), Some(tc)) = (src_crate, tgt_crate) {
+                    if sc == tc {
+                        continue; // skip intra-crate edges
+                    }
+                    let key = if sc < tc {
+                        (format!("cluster:{sc}"), format!("cluster:{tc}"))
+                    } else {
+                        (format!("cluster:{tc}"), format!("cluster:{sc}"))
+                    };
+                    let weight = edge.strength.unwrap_or(0.5) as f64;
+                    let entry = edge_weights
+                        .entry(key)
+                        .or_insert((0.0, edge.edge_type.clone()));
+                    entry.0 += weight;
+                }
+            }
+
+            let crate_edges: Vec<viz::VizEdge> = edge_weights
+                .into_iter()
+                .map(|((src, tgt), (weight, etype))| viz::VizEdge {
+                    source: src,
+                    target: tgt,
+                    edge_type: etype,
+                    strength: Some(weight.min(1.0) as f32),
+                })
+                .collect();
+
+            VizEvent::Snapshot {
+                nodes: crate_nodes,
+                edges: crate_edges,
+                level: Some("crate".into()),
+                parent: None,
+                total_nodes: Some(graph_total_nodes),
+                total_edges: Some(graph_total_edges),
+            }
+        }
+
+        viz::VizLevel::Module => {
+            let parent_crate = parent.unwrap_or("");
+
+            // Filter to entities belonging to the specified crate/group.
+            let in_crate: Vec<&viz::VizNode> = all_nodes
+                .iter()
+                .filter(|n| {
+                    if !is_code_entity_group(parent_crate) {
+                        // For non-code groups, match by entity type
+                        match parent_crate {
+                            "Papers" => n.entity_type == "document",
+                            "People" => n.entity_type == "person",
+                            "Concepts" => n.entity_type == "concept",
+                            "Organizations" => n.entity_type == "org",
+                            "Decisions" => matches!(
+                                n.entity_type.as_str(),
+                                "decision" | "bug" | "pattern" | "preference"
+                            ),
+                            _ => !is_code_entity(&n.entity_type),
+                        }
+                    } else {
+                        is_code_entity(&n.entity_type) && crate_name(&n.label) == parent_crate
+                    }
+                })
+                .collect();
+
+            // Group by module (second :: segment).
+            let mut mod_groups: std::collections::HashMap<String, Vec<usize>> =
+                std::collections::HashMap::new();
+
+            // For non-code groups, show individual entities directly (flat, no sub-grouping)
+            if !is_code_entity_group(parent_crate) {
+                let node_ids: std::collections::HashSet<&str> =
+                    in_crate.iter().map(|n| n.id.as_str()).collect();
+                let flat_nodes: Vec<viz::VizNode> = in_crate.iter().map(|n| (*n).clone()).collect();
+                let flat_edges: Vec<viz::VizEdge> = all_edges
+                    .iter()
+                    .filter(|e| {
+                        node_ids.contains(e.source.as_str()) && node_ids.contains(e.target.as_str())
+                    })
+                    .cloned()
+                    .collect();
+                return VizEvent::Snapshot {
+                    nodes: flat_nodes,
+                    edges: flat_edges,
+                    level: Some("function".into()), // leaf level — no further drill-down
+                    parent: Some(parent_crate.to_string()),
+                    total_nodes: Some(graph_total_nodes),
+                    total_edges: Some(graph_total_edges),
+                };
+            }
+
+            for (i, node) in in_crate.iter().enumerate() {
+                let group = if false {
+                    // (dead branch — non-code handled above)
+                    node.entity_type.clone()
+                } else {
+                    let parts: Vec<&str> = node.label.split("::").collect();
+                    if parts.len() >= 2 {
+                        parts[1].to_string()
+                    } else {
+                        "(root)".to_string()
+                    }
+                };
+                mod_groups.entry(group).or_default().push(i);
+            }
+
+            let mut mod_nodes: Vec<viz::VizNode> = Vec::new();
+            let mut node_to_mod: std::collections::HashMap<&str, String> =
+                std::collections::HashMap::new();
+
+            for (mod_label, member_indices) in &mod_groups {
+                let child_count = member_indices.len();
+                let full_label = if !is_code_entity_group(parent_crate) {
+                    mod_label.clone()
+                } else {
+                    format!("{parent_crate}::{mod_label}")
+                };
+
+                let max_confidence = member_indices
+                    .iter()
+                    .map(|&i| in_crate[i].confidence)
+                    .fold(0.0_f64, f64::max);
+
+                for &i in member_indices {
+                    node_to_mod.insert(&in_crate[i].id, full_label.clone());
+                }
+
+                mod_nodes.push(viz::VizNode {
+                    id: format!("cluster:{full_label}"),
+                    label: mod_label.clone(),
+                    node_type: "cluster".into(),
+                    entity_type: "module".into(),
+                    state: "active".into(),
+                    confidence: max_confidence,
+                    created_at: String::new(),
+                    context: format!("{child_count} entities"),
+                    child_count: Some(child_count),
+                });
+            }
+
+            // Aggregate edges between modules.
+            let member_ids: std::collections::HashSet<&str> =
+                in_crate.iter().map(|n| n.id.as_str()).collect();
+
+            let mut edge_weights: std::collections::HashMap<(String, String), (f64, String)> =
+                std::collections::HashMap::new();
+
+            for edge in all_edges {
+                let src_in = member_ids.contains(edge.source.as_str());
+                let tgt_in = member_ids.contains(edge.target.as_str());
+                if !src_in || !tgt_in {
+                    continue;
+                }
+                let src_mod = node_to_mod.get(edge.source.as_str());
+                let tgt_mod = node_to_mod.get(edge.target.as_str());
+                if let (Some(sm), Some(tm)) = (src_mod, tgt_mod) {
+                    if sm == tm {
+                        continue;
+                    }
+                    let key = if sm < tm {
+                        (format!("cluster:{sm}"), format!("cluster:{tm}"))
+                    } else {
+                        (format!("cluster:{tm}"), format!("cluster:{sm}"))
+                    };
+                    let weight = edge.strength.unwrap_or(0.5) as f64;
+                    let entry = edge_weights
+                        .entry(key)
+                        .or_insert((0.0, edge.edge_type.clone()));
+                    entry.0 += weight;
+                }
+            }
+
+            let mod_edges: Vec<viz::VizEdge> = edge_weights
+                .into_iter()
+                .map(|((src, tgt), (weight, etype))| viz::VizEdge {
+                    source: src,
+                    target: tgt,
+                    edge_type: etype,
+                    strength: Some(weight.min(1.0) as f32),
+                })
+                .collect();
+
+            VizEvent::Snapshot {
+                nodes: mod_nodes,
+                edges: mod_edges,
+                level: Some("module".into()),
+                parent: Some(parent_crate.to_string()),
+                total_nodes: Some(graph_total_nodes),
+                total_edges: Some(graph_total_edges),
+            }
+        }
+
+        viz::VizLevel::Function => {
+            let parent_module = parent.unwrap_or("");
+
+            // Filter to entities within the specified module.
+            let in_module: Vec<&viz::VizNode> = all_nodes
+                .iter()
+                .filter(|n| {
+                    if !is_code_entity(&n.entity_type) {
+                        // For research drill-down, parent_module is the entity_type
+                        n.entity_type == parent_module
+                    } else {
+                        let mn = module_name(&n.label);
+                        mn == parent_module
+                    }
+                })
+                .collect();
+
+            let member_ids: std::collections::HashSet<&str> =
+                in_module.iter().map(|n| n.id.as_str()).collect();
+
+            // Return the raw entity nodes (no clustering).
+            let leaf_nodes: Vec<viz::VizNode> = in_module.iter().map(|n| (*n).clone()).collect();
+
+            let leaf_edges: Vec<viz::VizEdge> = all_edges
+                .iter()
+                .filter(|e| {
+                    member_ids.contains(e.source.as_str()) && member_ids.contains(e.target.as_str())
+                })
+                .cloned()
+                .collect();
+
+            VizEvent::Snapshot {
+                nodes: leaf_nodes,
+                edges: leaf_edges,
+                level: Some("function".into()),
+                parent: Some(parent_module.to_string()),
+                total_nodes: Some(graph_total_nodes),
+                total_edges: Some(graph_total_edges),
+            }
+        }
+    }
+}
+
+/// Build a `VizEvent::Snapshot` containing only the neighborhood of a given
+/// entity, found by BFS through the edge list for up to `hops` levels.
+///
+/// Returns all reached nodes plus edges that connect any two reached nodes.
+fn neighborhood_snapshot(
+    all_nodes: &[viz::VizNode],
+    all_edges: &[viz::VizEdge],
+    entity_id: &str,
+    hops: usize,
+) -> VizEvent {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    let graph_total_nodes = all_nodes.len();
+    let graph_total_edges = all_edges.len();
+
+    // Build adjacency list from edges.
+    let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
+    for edge in all_edges {
+        adjacency
+            .entry(edge.source.as_str())
+            .or_default()
+            .push(edge.target.as_str());
+        adjacency
+            .entry(edge.target.as_str())
+            .or_default()
+            .push(edge.source.as_str());
+    }
+
+    // BFS from entity_id for `hops` levels.
+    let mut visited: HashSet<&str> = HashSet::new();
+    let mut queue: VecDeque<(&str, usize)> = VecDeque::new();
+
+    visited.insert(entity_id);
+    queue.push_back((entity_id, 0));
+
+    while let Some((current, depth)) = queue.pop_front() {
+        if depth >= hops {
+            continue;
+        }
+        if let Some(neighbors) = adjacency.get(current) {
+            for &neighbor in neighbors {
+                if visited.insert(neighbor) {
+                    queue.push_back((neighbor, depth + 1));
+                }
+            }
+        }
+    }
+
+    // Collect nodes that were reached.
+    let neighborhood_nodes: Vec<viz::VizNode> = all_nodes
+        .iter()
+        .filter(|n| visited.contains(n.id.as_str()))
+        .cloned()
+        .collect();
+
+    // Collect edges where both endpoints are in the neighborhood.
+    let neighborhood_edges: Vec<viz::VizEdge> = all_edges
+        .iter()
+        .filter(|e| visited.contains(e.source.as_str()) && visited.contains(e.target.as_str()))
+        .cloned()
+        .collect();
+
+    VizEvent::Snapshot {
+        nodes: neighborhood_nodes,
+        edges: neighborhood_edges,
+        level: Some("neighborhood".into()),
+        parent: Some(entity_id.to_string()),
+        total_nodes: Some(graph_total_nodes),
+        total_edges: Some(graph_total_edges),
+    }
 }
 
 /// Compute the Sec-WebSocket-Accept value per RFC 6455.
@@ -864,13 +1677,14 @@ fn parse_http_request(raw: &str) -> anyhow::Result<ParsedRequest<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::MemoryMetrics;
 
     #[test]
     fn parse_http_get() {
-        let raw = "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let raw = "GET /healthz/live HTTP/1.1\r\nHost: localhost\r\n\r\n";
         let (method, path, headers, body) = parse_http_request(raw).unwrap();
         assert_eq!(method, "GET");
-        assert_eq!(path, "/health");
+        assert_eq!(path, "/healthz/live");
         assert_eq!(headers.len(), 1);
         assert_eq!(body, "");
     }
@@ -989,6 +1803,7 @@ mod tests {
             require_tls: false,
             cert_path: None,
             key_path: None,
+            readiness_checker: Arc::new(|| true),
         };
         assert!(!config.require_tls);
         assert!(config.cert_path.is_none());
@@ -999,10 +1814,74 @@ mod tests {
             require_tls: true,
             cert_path: Some("/etc/ssl/cert.pem".into()),
             key_path: Some("/etc/ssl/key.pem".into()),
+            readiness_checker: Arc::new(|| true),
         };
         assert!(config_tls.require_tls);
         assert_eq!(config_tls.cert_path.as_deref(), Some("/etc/ssl/cert.pem"));
         assert_eq!(config_tls.key_path.as_deref(), Some("/etc/ssl/key.pem"));
+    }
+
+    #[tokio::test]
+    async fn healthz_ready_returns_503_when_not_ready() {
+        let metrics = MemoryMetrics::new().unwrap();
+        let storage = MockStorage::new();
+        let response = handle_http_request(
+            "GET",
+            "/healthz/ready",
+            &[],
+            "",
+            &storage,
+            &metrics,
+            &|_, _| None,
+            &|| false,
+        )
+        .await
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert!(response.contains("not ready"));
+    }
+
+    #[tokio::test]
+    async fn healthz_live_returns_200_even_when_not_ready() {
+        let metrics = MemoryMetrics::new().unwrap();
+        let storage = MockStorage::new();
+        let response = handle_http_request(
+            "GET",
+            "/healthz/live",
+            &[],
+            "",
+            &storage,
+            &metrics,
+            &|_, _| None,
+            &|| false,
+        )
+        .await
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn mcp_request_returns_401_on_invalid_credentials() {
+        let metrics = MemoryMetrics::new().unwrap();
+        let storage = MockStorage::new();
+        let headers = vec![(
+            "Authorization".to_string(),
+            "Basic dXNlcjp3cm9uZw==".to_string(),
+        )];
+        let response = handle_http_request(
+            "POST",
+            "/mcp",
+            &headers,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            &storage,
+            &metrics,
+            &|_, _| None,
+            &|| true,
+        )
+        .await
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 401 Unauthorized"));
     }
 
     #[test]
@@ -1106,7 +1985,7 @@ mod tests {
             test_entity(ctx.tenant_id, viz_session, e1, "foo"),
             test_entity(ctx.tenant_id, viz_session, e2, "bar"),
         ]);
-        // Edge stored under nil session (e.g. skilltools ingest)
+        // Edge stored under nil session (e.g. frg ingest)
         storage.typed_edges.lock().await.push(test_typed_edge(
             ctx.tenant_id,
             nil,
@@ -1221,10 +2100,22 @@ mod tests {
         let VizEvent::Snapshot { edges, .. } = snap else {
             panic!("expected Snapshot");
         };
-        assert_eq!(
-            edges.len(),
-            0,
-            "CO_OCCURS without strength should be filtered out"
+        // CO_OCCURS edges without strength now get a default strength of 0.5 (line 906-908)
+        // so they are included in the snapshot rather than filtered out.
+        // Note: edge appears twice because build_snapshot loads from both swapped_ctx and correct ctx,
+        // and when session_id is nil, both are nil so the same edge is loaded twice.
+        assert!(
+            !edges.is_empty(),
+            "CO_OCCURS edge should be present with default strength"
         );
+        for edge in &edges {
+            if edge.edge_type == "CO_OCCURS" {
+                assert_eq!(
+                    edge.strength,
+                    Some(0.5),
+                    "CO_OCCURS edge should have default strength 0.5"
+                );
+            }
+        }
     }
 }

@@ -1,0 +1,67 @@
+# Level 2 DIKW: Information -> Knowledge via recursive multi-source synthesis
+#
+# Validates that recursive_explore synthesizes knowledge from multiple
+# entity sources. Seeds an entity network, then uses recursive_explore
+# with a complex query to verify multi-pass discovery.
+
+[scenario]
+id = "dikw-recursive-exploration"
+name = "Recursive Exploration: Multi-Source Knowledge Synthesis"
+description = """
+Tests the Information->Knowledge DIKW transition via recursive exploration. \
+Seeds a network of entities across different types, then uses recursive_explore \
+with a complex multi-part query. Verifies that the recursive multi-pass \
+algorithm discovers connections across entity boundaries that a single \
+hybrid_search pass would miss."""
+level = 2
+dikw_transition = "info_knowledge"
+tags = ["dikw", "recursive_explore", "synthesis", "info_knowledge", "multi_pass"]
+timeout_ms = 45000
+
+# Step 1: Seed a person entity
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "Dana Park", entity_type = "person", context_snippet = "Dana Park is the security lead who implemented the TLS certificate rotation system for the deployment pipeline." }
+
+# Step 2: Seed a concept entity
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "Certificate Rotation", entity_type = "concept", context_snippet = "Certificate rotation is an automated process that replaces TLS certificates before expiry to prevent outages in the deployment pipeline." }
+
+# Step 3: Seed a bug entity linking person and concept
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "DEPLOY-789", entity_type = "bug", context_snippet = "DEPLOY-789: TLS certificate rotation failed silently, causing a 4-hour production outage. Root cause was a race condition in Dana Park's renewal daemon." }
+
+# Step 4: Seed a decision entity
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "ADR-012 Mutual TLS", entity_type = "decision", context_snippet = "ADR-012: Adopt mutual TLS for all inter-service communication after the DEPLOY-789 outage. Requires certificate rotation to handle both client and server certs." }
+
+# Step 5: Seed another related entity
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "Deployment Pipeline", entity_type = "project", context_snippet = "The deployment pipeline automates build, test, and release stages. Uses mutual TLS and certificate rotation for secure artifact delivery." }
+
+# Step 6: Recursive explore with a complex query
+[[steps]]
+tool = "recursive_explore"
+expect_in_response = ["Dana Park", "DEPLOY-789", "certificate"]
+arguments = { query = "What caused the TLS outage and what decisions were made to prevent it from happening again?", max_passes = 3, limit = 20 }
+
+[grading]
+methods = ["programmatic", "claim_rubric"]
+
+[grading.claim_rubric]
+claims = [
+    "Recursive exploration discovers the person (Dana Park) connected to the incident",
+    "The bug entity (DEPLOY-789) is found as the root cause",
+    "The decision (ADR-012 Mutual TLS) is surfaced as a preventive measure",
+    "Multiple entity types are synthesized into a coherent answer",
+    "Multi-pass exploration finds entities that share contextual overlap",
+]
+passing_threshold = 0.75
+
+[dikw]
+expect_entity_count_gte = 5
+expect_edge_types = []

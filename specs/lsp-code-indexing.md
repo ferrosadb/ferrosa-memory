@@ -2,18 +2,18 @@
 
 ## Problem
 
-The skilltools `ingest` pipeline extracts code entities at module/crate granularity only. Function signatures, struct definitions, trait impls, and TODO comments are not indexed. Agents fall back to expensive grep+read cycles that burn tokens.
+The forge `ingest` pipeline extracts code entities at module/crate granularity only. Function signatures, struct definitions, trait impls, and TODO comments are not indexed. Agents fall back to expensive grep+read cycles that burn tokens.
 
 See: `/Users/bkearns/src/ferrosa/ferrosa-memory-indexing-gap.md`
 
 ## Solution
 
-Use the Language Server Protocol (LSP) to extract fine-grained code symbols during `skilltools ingest`. LSP is language-agnostic — the same client code works for Rust, Python, Go, TypeScript, Elixir, etc.
+Use the Language Server Protocol (LSP) to extract fine-grained code symbols during `frg ingest`. LSP is language-agnostic — the same client code works for Rust, Python, Go, TypeScript, Elixir, etc.
 
 ## Architecture
 
 ```
-skilltools ingest --cql localhost:19042 /path/to/project
+frg ingest --cql localhost:19042 /path/to/project
     |
     v
 [1. Detect language(s)]  -- Cargo.toml? mix.exs? go.mod? package.json?
@@ -84,11 +84,11 @@ For each language, check PATH for the standard LSP binary:
 When `op-init` or `ingest` detects a language but can't find its LSP:
 
 ```
-[skilltools] Detected Rust project (Cargo.toml found)
-[skilltools] rust-analyzer not found in PATH
-[skilltools] Install it for function-level code indexing:
-[skilltools]   rustup component add rust-analyzer
-[skilltools] Without it, ingest will use module-level extraction only.
+[forge] Detected Rust project (Cargo.toml found)
+[forge] rust-analyzer not found in PATH
+[forge] Install it for function-level code indexing:
+[forge]   rustup component add rust-analyzer
+[forge] Without it, ingest will use module-level extraction only.
 ```
 
 This message goes to stdout so the user sees it in their terminal. The ingest continues with degraded (module-level) extraction rather than failing.
@@ -104,8 +104,8 @@ The `op-init` skill already detects project type. Add LSP detection to its outpu
 
 ## Implementation Plan
 
-### Phase 1: LSP client library (in skilltools)
-- New crate: `skilltools/crates/lsp-client/`
+### Phase 1: LSP client library (in forge)
+- New crate: `forge/crates/lsp-client/`
 - Minimal JSON-RPC stdio client
 - `initialize` / `documentSymbol` / `shutdown` lifecycle
 - LSP binary detection and install prompting

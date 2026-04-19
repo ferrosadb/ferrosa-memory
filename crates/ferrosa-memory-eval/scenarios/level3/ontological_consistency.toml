@@ -1,0 +1,87 @@
+# Level 3 Semantic: Ontological consistency across entity updates
+#
+# Validates that entity types remain stable and consistent across updates.
+# Creates entities with various types, updates some via upsert and smart_ingest,
+# then verifies type assignments have not drifted.
+
+[scenario]
+id = "semantic-ontological-consistency"
+name = "Ontological Consistency: Type Stability Across Updates"
+description = """
+Tests semantic repository ontological consistency. Creates entities with \
+specific types (person, project, decision, bug), then performs updates via \
+both upsert_entity and smart_ingest. Verifies that entity types remain \
+stable -- a person should not become a project after an update, and type \
+assignments should be consistent across retrieval methods."""
+level = 3
+tags = ["semantic", "ontology", "type_consistency", "stability", "updates"]
+timeout_ms = 30000
+
+# Step 1: Create a person entity
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "Carlos Rivera", entity_type = "person", context_snippet = "Carlos Rivera is the DevOps lead who manages the CI/CD pipeline and infrastructure automation." }
+
+# Step 2: Create a project entity
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "CI Pipeline", entity_type = "project", context_snippet = "CI Pipeline is the continuous integration system that runs tests, linting, and builds on every pull request." }
+
+# Step 3: Create a decision entity
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "ADR-007 Container Runtime", entity_type = "decision", context_snippet = "ADR-007: Use Podman instead of Docker for container builds in the CI pipeline, for rootless security." }
+
+# Step 4: Create a bug entity
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "CI-2051", entity_type = "bug", context_snippet = "CI-2051: Flaky test timeout in the integration suite causes spurious build failures on ARM64 runners." }
+
+# Step 5: Update person entity with new information (type should stay person)
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "Carlos Rivera", entity_type = "person", context_snippet = "Carlos Rivera is the DevOps lead who manages the CI/CD pipeline. Recently promoted to principal engineer overseeing all infrastructure." }
+
+# Step 6: Update project via smart_ingest (type should stay project)
+[[steps]]
+tool = "smart_ingest"
+arguments = { content = "CI Pipeline now supports ARM64 native builds after the migration from x86-only runners. Carlos Rivera led the effort.", entity_type = "project", entity_name = "CI Pipeline" }
+
+# Step 7: Update bug via smart_ingest (type should stay bug)
+[[steps]]
+tool = "smart_ingest"
+arguments = { content = "CI-2051 flaky test timeout has been resolved by increasing the integration test timeout to 120s on ARM64 runners.", entity_type = "bug", entity_name = "CI-2051" }
+
+# Step 8: Retrieve person entity and verify type
+[[steps]]
+tool = "retrieve_entities"
+expect_in_response = ["Carlos Rivera", "person"]
+arguments = { query = "Carlos Rivera", strategy = "phonetic" }
+
+# Step 9: Retrieve project entity and verify type
+[[steps]]
+tool = "retrieve_entities"
+expect_in_response = ["CI Pipeline"]
+arguments = { query = "CI Pipeline", strategy = "phonetic" }
+
+# Step 10: Retrieve bug entity and verify type
+[[steps]]
+tool = "retrieve_entities"
+expect_in_response = ["CI-2051"]
+arguments = { query = "CI-2051", strategy = "phonetic" }
+
+[grading]
+methods = ["programmatic", "claim_rubric"]
+
+[grading.claim_rubric]
+claims = [
+    "Person entity retains type 'person' after update",
+    "Project entity retains type 'project' after smart_ingest update",
+    "Bug entity retains type 'bug' after smart_ingest update",
+    "Decision entity type is stable without modification",
+    "No entity type has drifted from its original assignment",
+]
+passing_threshold = 0.75
+
+[semantic]
+expect_type_consistency = true

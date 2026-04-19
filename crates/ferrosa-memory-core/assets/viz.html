@@ -185,6 +185,44 @@
     padding: 12px 16px;
   }
 
+  .derived-facts-count {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-bottom: 8px;
+  }
+
+  .derived-facts-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    overflow-y: auto;
+    max-height: calc(100vh - 200px);
+  }
+
+  .derived-fact-item {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px;
+    font-size: 11px;
+  }
+
+  .derived-fact-item .fact-pred {
+    font-weight: 700;
+    color: var(--accent);
+    margin-bottom: 4px;
+  }
+
+  .derived-fact-item .fact-entities {
+    color: var(--text-secondary);
+    margin-bottom: 4px;
+  }
+
+  .derived-fact-item .fact-meta {
+    color: var(--text-muted);
+    font-size: 10px;
+  }
+
   .search-header {
     display: flex;
     align-items: center;
@@ -780,6 +818,86 @@
     .entity-name-large {
       font-size: 16px;
     }
+
+    /* View toggle: 44px min tap target on mobile */
+    .view-toggle {
+      min-height: 44px;
+      min-width: 44px;
+      padding: 6px 12px;
+      font-size: 11px;
+    }
+
+    /* Preset buttons: 44px min tap target on mobile */
+    .preset-buttons {
+      gap: 6px;
+    }
+
+    .preset-btn {
+      min-height: 44px;
+      min-width: 44px;
+      padding: 6px 12px;
+      font-size: 11px;
+    }
+
+    /* Project pills: 44px min tap target on mobile */
+    #project-pills {
+      padding: 4px 10px;
+      gap: 6px;
+    }
+
+    .project-pill {
+      min-height: 44px;
+      padding: 4px 12px;
+      font-size: 11px;
+      border-radius: 22px;
+    }
+
+    /* Breadcrumbs: wrap on narrow screens */
+    #breadcrumb-bar {
+      flex-wrap: wrap;
+      padding: 6px 10px;
+      gap: 2px 4px;
+    }
+
+    #breadcrumb-bar .crumb {
+      font-size: 11px;
+    }
+
+    #breadcrumb-bar .level-hint {
+      width: 100%;
+      margin-left: 0;
+      margin-top: 2px;
+    }
+
+    /* Explore controls: ensure tap targets in info panel */
+    .explore-controls {
+      padding: 10px;
+      gap: 8px;
+    }
+
+    .explore-btn {
+      min-height: 44px;
+      min-width: 44px;
+      padding: 8px 16px;
+      font-size: 12px;
+    }
+
+    .hop-slider {
+      width: 100px;
+      min-height: 44px;
+      padding: 19px 0;
+    }
+
+    /* Explore-back-bar: 44px tap target */
+    #explore-back-bar {
+      padding: 6px 10px;
+    }
+
+    #explore-back-bar .explore-back-btn {
+      min-height: 44px;
+      padding: 6px 14px;
+      font-size: 12px;
+    }
   }
 
   /* Hamburger menu — hidden on desktop */
@@ -837,6 +955,51 @@
     .search-results {
       max-height: calc(70vh - 100px);
     }
+
+    /* Preset buttons: wrap to fill width on very narrow screens */
+    .preset-buttons {
+      flex-wrap: wrap;
+    }
+
+    .preset-btn {
+      flex: 1 1 auto;
+      min-height: 44px;
+      text-align: center;
+      justify-content: center;
+    }
+
+    /* Project pills: tighter padding */
+    #project-pills {
+      padding: 3px 8px;
+      gap: 4px;
+    }
+
+    .project-pill {
+      padding: 4px 10px;
+      font-size: 10px;
+      min-height: 44px;
+    }
+
+    /* Explore controls: full-width explore button */
+    .explore-controls {
+      flex-direction: column;
+      align-items: stretch;
+    }
+
+    .explore-btn {
+      width: 100%;
+      justify-content: center;
+    }
+
+    /* Breadcrumbs: smaller text */
+    #breadcrumb-bar .crumb {
+      font-size: 10px;
+      padding: 2px 4px;
+    }
+
+    #breadcrumb-bar .sep {
+      font-size: 9px;
+    }
   }
 
   @media (min-width: 1025px) {
@@ -847,6 +1010,310 @@
     .info-panel.open {
       max-width: 420px;
     }
+  }
+
+  /* Fix: override inline display:none for panels */
+  #derived-facts-panel,
+  #settings-panel {
+    display: flex !important;
+  }
+
+  /* Breadcrumb bar for hierarchical drill-down */
+  #breadcrumb-bar {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 6px 16px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    font-size: 12px;
+    min-height: 32px;
+  }
+
+  #breadcrumb-bar .crumb {
+    color: var(--accent-cool);
+    cursor: pointer;
+    padding: 2px 6px;
+    border-radius: 4px;
+    transition: all 0.15s ease;
+    white-space: nowrap;
+  }
+
+  #breadcrumb-bar .crumb:hover {
+    background: var(--bg-card);
+    color: var(--accent);
+  }
+
+  #breadcrumb-bar .crumb.current {
+    color: var(--text-primary);
+    cursor: default;
+    font-weight: 600;
+  }
+
+  #breadcrumb-bar .crumb.current:hover {
+    background: transparent;
+    color: var(--text-primary);
+  }
+
+  #breadcrumb-bar .sep {
+    color: var(--text-muted);
+    font-size: 10px;
+    user-select: none;
+  }
+
+  #breadcrumb-bar .back-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: pointer;
+    margin-right: 8px;
+    transition: all 0.15s ease;
+  }
+
+  #breadcrumb-bar .back-btn:hover {
+    background: var(--bg-card);
+    border-color: var(--accent);
+  }
+
+  #breadcrumb-bar .back-btn svg {
+    width: 14px;
+    height: 14px;
+    stroke: var(--text-secondary);
+    stroke-width: 2;
+    fill: none;
+  }
+
+  #breadcrumb-bar .back-btn:hover svg {
+    stroke: var(--accent);
+  }
+
+  #breadcrumb-bar .back-btn.hidden {
+    visibility: hidden;
+  }
+
+  #breadcrumb-bar .level-hint {
+    margin-left: auto;
+    font-size: 10px;
+    color: var(--text-muted);
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  /* View toggle button */
+  .view-toggle {
+    font-size: 10px;
+    padding: 4px 10px;
+    min-height: 32px;
+    border-radius: 6px;
+    cursor: pointer;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    background: var(--bg-card);
+    white-space: nowrap;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-family: 'JetBrains Mono', monospace;
+    transition: all 0.15s ease;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .view-toggle:hover { border-color: var(--accent); color: var(--text-primary); }
+  .view-toggle:active { transform: scale(0.96); }
+  .view-toggle.active { border-color: var(--accent); color: var(--accent); background: rgba(226, 114, 91, 0.1); }
+
+  /* Preset buttons */
+  .preset-buttons {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+  }
+  .preset-btn {
+    font-size: 10px;
+    padding: 3px 8px;
+    min-height: 32px;
+    border-radius: 4px;
+    cursor: pointer;
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    background: transparent;
+    white-space: nowrap;
+    transition: all 0.15s ease;
+    font-family: 'Inter', sans-serif;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .preset-btn:hover { border-color: var(--accent); color: var(--text-primary); }
+  .preset-btn:active { transform: scale(0.96); }
+  .preset-btn.active { border-color: var(--accent); color: var(--accent); background: rgba(226, 114, 91, 0.1); }
+
+  /* Explore controls in info panel */
+  .explore-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 12px;
+    padding: 10px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    flex-wrap: wrap;
+  }
+  .explore-btn {
+    font-size: 11px;
+    padding: 5px 12px;
+    min-width: 44px;
+    min-height: 44px;
+    border-radius: 6px;
+    cursor: pointer;
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    background: transparent;
+    white-space: nowrap;
+    transition: all 0.15s ease;
+    font-weight: 600;
+    -webkit-tap-highlight-color: transparent;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .explore-btn:hover { background: rgba(226, 114, 91, 0.15); color: var(--text-primary); }
+  .explore-btn:active { transform: scale(0.96); }
+  .hop-slider-label {
+    font-size: 10px;
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+  .hop-slider {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 80px;
+    height: 6px;
+    background: var(--border);
+    border-radius: 3px;
+    outline: none;
+    accent-color: var(--accent);
+    cursor: pointer;
+    touch-action: manipulation;
+    /* Enlarge touch target via padding without affecting visual track size */
+    padding: 19px 0;
+    background-clip: content-box;
+  }
+  .hop-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 22px;
+    height: 22px;
+    background: var(--accent);
+    border: 2px solid var(--bg-primary);
+    border-radius: 50%;
+    cursor: pointer;
+  }
+  .hop-slider::-moz-range-thumb {
+    width: 22px;
+    height: 22px;
+    background: var(--accent);
+    border: 2px solid var(--bg-primary);
+    border-radius: 50%;
+    cursor: pointer;
+    border: none;
+  }
+  .hop-value {
+    font-size: 11px;
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--text-primary);
+    min-width: 16px;
+  }
+
+  /* Back to full graph bar */
+  #explore-back-bar {
+    display: none;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 16px;
+    background: rgba(226, 114, 91, 0.1);
+    border-bottom: 1px solid var(--accent);
+    flex-shrink: 0;
+    font-size: 12px;
+  }
+  #explore-back-bar .explore-back-btn {
+    font-size: 11px;
+    padding: 3px 10px;
+    min-height: 32px;
+    border-radius: 4px;
+    cursor: pointer;
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    background: transparent;
+    transition: all 0.15s ease;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #explore-back-bar .explore-back-btn:hover { background: rgba(226, 114, 91, 0.15); }
+  #explore-back-bar .explore-back-btn:active { transform: scale(0.96); }
+  #explore-back-bar .explore-label {
+    color: var(--text-secondary);
+    font-size: 11px;
+  }
+
+  /* Project quick-filter pills */
+  #project-pills {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 16px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+    -webkit-overflow-scrolling: touch;
+  }
+  #project-pills:empty { display: none; }
+  #project-pills::-webkit-scrollbar { height: 3px; }
+  #project-pills::-webkit-scrollbar-track { background: transparent; }
+  #project-pills::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+  .project-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 10px;
+    min-height: 28px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-family: 'JetBrains Mono', monospace;
+    cursor: pointer;
+    white-space: nowrap;
+    border: 1px solid transparent;
+    transition: all 0.15s ease;
+    user-select: none;
+    flex-shrink: 0;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .project-pill:active { transform: scale(0.96); }
+  .project-pill .pill-count { font-size: 9px; opacity: 0.7; }
+  .project-pill:hover { filter: brightness(1.2); }
+  .project-pill.active {
+    border-color: var(--text-primary);
+    filter: brightness(1.1);
+    box-shadow: 0 0 6px rgba(255,255,255,0.15);
+  }
+  .project-pill.pill-all {
+    background: var(--bg-card);
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+  }
+  .project-pill.pill-all:hover { border-color: var(--text-muted); color: var(--text-primary); }
+  .project-pill.pill-all.hidden { display: none; }
+
+  @media (max-width: 600px) {
+    #project-pills { padding: 3px 10px; gap: 4px; }
+    .project-pill { font-size: 10px; padding: 4px 10px; min-height: 44px; }
   }
 </style>
 </head>
@@ -875,8 +1342,32 @@
             <path d="M16 5h3v3"></path>
           </svg>
         </button>
+        <button class="icon-btn" id="btn-settings" title="LLM Settings" aria-label="Settings">
+          <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+        </button>
+        <button class="icon-btn" id="btn-derived-facts" title="Derived Facts" aria-label="Derived Facts">
+          <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3"></circle>
+            <circle cx="6" cy="6" r="2"></circle>
+            <circle cx="18" cy="6" r="2"></circle>
+            <circle cx="6" cy="18" r="2"></circle>
+            <circle cx="18" cy="18" r="2"></circle>
+            <path d="M8 8l2 2"></path>
+            <path d="M14 8l-2 2"></path>
+            <path d="M8 16l2-2"></path>
+            <path d="M14 16l-2-2"></path>
+          </svg>
+        </button>
       </div>
       <div class="header-filters" style="display:flex;align-items:center;gap:6px;margin:0 12px;">
+        <button class="view-toggle" id="btn-view-toggle" title="Toggle Overview/Detail">Detail</button>
+        <div class="filter-dropdown" id="project-dropdown">
+          <button class="filter-btn" id="project-btn">Project <span class="count" id="project-count">all</span></button>
+          <div class="filter-menu" id="project-menu"></div>
+        </div>
         <div class="filter-dropdown" id="node-type-dropdown">
           <button class="filter-btn" id="node-type-btn">Nodes <span class="count" id="node-type-count">all</span></button>
           <div class="filter-menu" id="node-type-menu"></div>
@@ -884,6 +1375,11 @@
         <div class="filter-dropdown" id="edge-type-dropdown">
           <button class="filter-btn" id="edge-type-btn">Edges <span class="count" id="edge-type-count">all</span></button>
           <div class="filter-menu" id="edge-type-menu"></div>
+        </div>
+        <div class="preset-buttons">
+          <button class="preset-btn" id="preset-code" title="Code entities only">Code</button>
+          <button class="preset-btn" id="preset-research" title="Research entities only">Research</button>
+          <button class="preset-btn" id="preset-all" title="Clear all filters">All</button>
         </div>
         <span id="edge-count" style="font-size:10px;color:var(--text-muted);min-width:40px;"></span>
       </div>
@@ -906,8 +1402,24 @@
       </button>
     </div>
   </div>
+  <div id="breadcrumb-bar">
+    <button class="back-btn hidden" id="breadcrumb-back" title="Back" aria-label="Go back">
+      <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M19 12H5"></path>
+        <path d="M12 19l-7-7 7-7"></path>
+      </svg>
+    </button>
+    <span class="crumb current" id="breadcrumb-root">All Crates</span>
+    <span class="level-hint" id="level-hint">crate level</span>
+  </div>
+  <div id="explore-back-bar">
+    <button class="explore-back-btn" id="explore-back-btn">Back to full graph</button>
+    <span class="explore-label" id="explore-label"></span>
+  </div>
+  <div id="project-pills"></div>
   <div id="main">
     <div id="graph-container"></div>
+    <div class="tooltip" id="tooltip" style="display:none;"></div>
 
     <!-- Search Panel -->
     <div class="panel search-panel" id="search-panel">
@@ -933,6 +1445,39 @@
       </div>
     </div>
 
+    <!-- Settings Panel -->
+    <div class="panel search-panel" id="settings-panel" style="display:none;z-index:200;opacity:0;width:0;">
+      <div class="panel-content">
+        <div class="search-header">
+          <span class="label">LLM Settings</span>
+          <button class="search-close" id="settings-close" title="Close" aria-label="Close settings">
+            <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M18 6 6 18"></path>
+              <path d="m6 6 12 12"></path>
+            </svg>
+          </button>
+        </div>
+        <div style="padding:8px 0;">
+          <label style="font-size:12px;color:#888;display:block;margin-bottom:4px;">LLM Endpoint URL</label>
+          <input type="text" id="llm-url" value="http://localhost:1234" style="width:100%;padding:6px 8px;border:1px solid #444;border-radius:4px;background:#1a1a2e;color:#e0e0e0;font-size:13px;" />
+          <button id="btn-fetch-models" style="margin-top:8px;padding:6px 12px;background:#2a6;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;">Fetch Models</button>
+          <div id="models-status" style="font-size:11px;color:#888;margin-top:4px;"></div>
+        </div>
+        <div style="padding:8px 0;">
+          <label style="font-size:12px;color:#888;display:block;margin-bottom:4px;">Model</label>
+          <select id="llm-model" style="width:100%;padding:6px 8px;border:1px solid #444;border-radius:4px;background:#1a1a2e;color:#e0e0e0;font-size:13px;">
+            <option value="">-- fetch models first --</option>
+          </select>
+        </div>
+        <div style="padding:8px 0;border-top:1px solid #333;margin-top:8px;">
+          <div style="font-size:12px;color:#888;margin-bottom:4px;">Enrichment</div>
+          <button id="btn-enrich-lint" style="padding:6px 12px;background:#26a;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;margin-right:6px;">Lint Only</button>
+          <button id="btn-enrich-run" style="padding:6px 12px;background:#a62;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;">Enrich Crates</button>
+          <div id="enrich-status" style="font-size:11px;color:#888;margin-top:6px;max-height:200px;overflow-y:auto;"></div>
+        </div>
+      </div>
+    </div>
+
     <!-- Info Panel -->
     <div class="panel info-panel" id="info-panel">
       <div class="panel-content">
@@ -946,6 +1491,23 @@
           </button>
         </div>
         <div id="info-content"></div>
+      </div>
+    </div>
+
+    <!-- Derived Facts Panel -->
+    <div class="panel search-panel" id="derived-facts-panel" style="display:none;z-index:200;">
+      <div class="panel-content">
+        <div class="search-header">
+          <span class="label">Derived Facts</span>
+          <button class="search-close" id="derived-facts-close" title="Close" aria-label="Close derived facts">
+            <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M18 6 6 18"></path>
+              <path d="m6 6 12 12"></path>
+            </svg>
+          </button>
+        </div>
+        <div class="derived-facts-count" id="derived-facts-count"></div>
+        <div class="derived-facts-list" id="derived-facts-list"></div>
       </div>
     </div>
   </div>
@@ -988,6 +1550,20 @@ const edgeColors = {
 };
 let activeEdgeTypes = new Set(); // empty = show all
 let activeNodeTypes = new Set(); // empty = show all
+let activeProjects = new Set(); // empty = show all
+
+// Extract project name from entity label (first :: segment, or entity_type for non-code)
+function getProject(node) {
+  const label = node.label || '';
+  if (label.includes('::')) {
+    const prefix = label.split('::')[0];
+    if (prefix.startsWith('ferrosa-memory')) return 'ferrosa-memory';
+    if (prefix.startsWith('ferrosa')) return 'ferrosa';
+    if (prefix.startsWith('doc:')) return 'docs';
+    return prefix;
+  }
+  return 'other';
+}
 
 const stateOpacity = {
   active: 1.0,
@@ -1013,6 +1589,14 @@ let searchPanelOpen = false;
 let infoPanelOpen = false;
 let searchQuery = '';
 let searchResults = [];
+
+// === Hierarchical navigation state ===
+let currentLevel = 'crate';   // 'crate', 'module', 'function', 'neighborhood'
+let currentParent = null;      // e.g. 'ferrosa-cluster', 'ferrosa-cluster::coordinator'
+let navStack = [];             // [{level, parent}] for back navigation
+let viewMode = 'detail';      // 'detail' (flat) or 'overview' (clustered)
+let isExploring = false;       // true when showing a neighborhood exploration
+let exploreHops = 2;           // default hop count for exploration
 
 // === Panel controls ===
 const searchPanel = document.getElementById('search-panel');
@@ -1086,11 +1670,143 @@ function toggleInfoPanel() {
   }
 }
 
+let derivedFactsPanelOpen = false;
+const derivedFactsPanel = document.getElementById('derived-facts-panel');
+
+function openDerivedFactsPanel() {
+  if (searchPanelOpen) closeSearchPanel();
+  if (infoPanelOpen) closeInfoPanel();
+  derivedFactsPanelOpen = true;
+  derivedFactsPanel.classList.add('open');
+  derivedFactsPanel.style.width = '1px';
+  setTimeout(() => {
+    const targetWidth = Math.min(window.innerWidth * 0.5, 500);
+    derivedFactsPanel.style.width = targetWidth + 'px';
+  }, 10);
+  loadDerivedFacts();
+}
+
+function closeDerivedFactsPanel() {
+  derivedFactsPanelOpen = false;
+  derivedFactsPanel.classList.remove('open');
+  derivedFactsPanel.style.width = '0';
+}
+
+function toggleDerivedFactsPanel() {
+  if (derivedFactsPanelOpen) {
+    closeDerivedFactsPanel();
+  } else {
+    openDerivedFactsPanel();
+  }
+}
+
+async function loadDerivedFacts() {
+  const countEl = document.getElementById('derived-facts-count');
+  const listEl = document.getElementById('derived-facts-list');
+  listEl.innerHTML = '<div style="color:var(--text-muted);font-size:12px;">Loading...</div>';
+
+  try {
+    const resp = await fetch('/viz/api/derived_facts?session_id=00000000-0000-0000-0000-000000000000&limit=50');
+    const data = await resp.json();
+
+    countEl.textContent = `Showing ${data.count} of ${data.total} derived facts`;
+
+    if (data.derived_facts.length === 0) {
+      listEl.innerHTML = '<div style="color:var(--text-muted);font-size:12px;">No derived facts yet. Run consolidation to generate inferences.</div>';
+      return;
+    }
+
+    listEl.innerHTML = data.derived_facts.map(fact => `
+      <div class="derived-fact-item">
+        <div class="fact-pred">${fact.pred}</div>
+        <div class="fact-entities">
+          <span style="color:var(--accent-cool)" title="${fact.src_id}">${fact.src_name}</span>
+          →
+          <span style="color:var(--accent-purple)" title="${fact.dst_id}">${fact.dst_name}</span>
+        </div>
+        <div class="fact-meta">
+          rule: ${fact.rule_id || 'unknown'} | confidence: ${fact.confidence?.toFixed(2) || 'N/A'} | support: ${fact.support_count || 0}
+        </div>
+      </div>
+    `).join('');
+  } catch (e) {
+    listEl.innerHTML = `<div style="color:var(--accent-red);font-size:12px;">Error loading derived facts: ${e.message}</div>`;
+  }
+}
+
+function closeAllPanels() {
+  closeSearchPanel();
+  closeInfoPanel();
+  closeDerivedFactsPanel();
+}
+
 // Event listeners for panel buttons
 document.getElementById('btn-search').addEventListener('click', toggleSearchPanel);
 document.getElementById('btn-info').addEventListener('click', toggleInfoPanel);
+document.getElementById('btn-derived-facts').addEventListener('click', toggleDerivedFactsPanel);
 document.getElementById('search-close').addEventListener('click', closeSearchPanel);
 document.getElementById('info-close').addEventListener('click', closeInfoPanel);
+document.getElementById('derived-facts-close').addEventListener('click', closeDerivedFactsPanel);
+
+// View toggle button
+document.getElementById('btn-view-toggle').addEventListener('click', () => {
+  viewMode = viewMode === 'detail' ? 'overview' : 'detail';
+  const btn = document.getElementById('btn-view-toggle');
+  btn.textContent = viewMode === 'detail' ? 'Detail' : 'Overview';
+  btn.classList.toggle('active', viewMode === 'overview');
+  isExploring = false;
+  document.getElementById('explore-back-bar').style.display = 'none';
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'toggle_view', mode: viewMode }));
+  }
+});
+
+// Preset filter buttons
+document.getElementById('preset-code').addEventListener('click', () => applyPreset('code'));
+document.getElementById('preset-research').addEventListener('click', () => applyPreset('research'));
+document.getElementById('preset-all').addEventListener('click', () => applyPreset('all'));
+
+function applyPreset(preset) {
+  // Clear active state from all preset buttons
+  document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active'));
+
+  const codeNodeTypes = ['function', 'struct', 'module', 'crate', 'enum', 'trait', 'impl', 'method', 'const', 'type', 'macro', 'mod', 'section', 'app'];
+  const codeEdgeTypes = ['references', 'contains', 'calls', 'depends_on', 'implements', 'uses', 'part_of', 'subclass_of'];
+  const researchNodeTypes = ['document', 'person', 'concept', 'org', 'decision', 'bug', 'pattern', 'preference', 'event'];
+  const researchEdgeTypes = ['related_to', 'CO_OCCURS', 'MENTIONED_IN', 'FOLDED_INTO'];
+
+  if (preset === 'code') {
+    activeNodeTypes.clear();
+    activeEdgeTypes.clear();
+    codeNodeTypes.forEach(t => activeNodeTypes.add(t));
+    codeEdgeTypes.forEach(t => activeEdgeTypes.add(t));
+    document.getElementById('preset-code').classList.add('active');
+  } else if (preset === 'research') {
+    activeNodeTypes.clear();
+    activeEdgeTypes.clear();
+    researchNodeTypes.forEach(t => activeNodeTypes.add(t));
+    researchEdgeTypes.forEach(t => activeEdgeTypes.add(t));
+    document.getElementById('preset-research').classList.add('active');
+  } else {
+    // 'all' — clear all filters
+    activeNodeTypes.clear();
+    activeEdgeTypes.clear();
+    activeProjects.clear();
+  }
+  rebuildFilters();
+  applyFilters();
+  render();
+}
+
+// Explore back button
+document.getElementById('explore-back-btn').addEventListener('click', () => {
+  isExploring = false;
+  document.getElementById('explore-back-bar').style.display = 'none';
+  // Request the current view mode's full snapshot
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'toggle_view', mode: viewMode }));
+  }
+});
 
 // Hamburger menu toggle
 document.getElementById('btn-hamburger').addEventListener('click', () => {
@@ -1105,7 +1821,7 @@ document.addEventListener('click', (e) => {
   }
 });
 
-// Escape key closes panels
+// Escape key closes panels, Backspace navigates up
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     closeAllPanels();
@@ -1115,6 +1831,13 @@ document.addEventListener('keydown', (e) => {
       searchResults = [];
       searchCount.textContent = '';
       clearSearchHighlight();
+    }
+  }
+  // Backspace drills up (unless typing in an input)
+  if (e.key === 'Backspace' && document.activeElement.tagName !== 'INPUT') {
+    e.preventDefault();
+    if (currentLevel !== 'crate') {
+      sendDrillUp();
     }
   }
 });
@@ -1137,7 +1860,15 @@ const zoom = d3.zoom()
 svg.call(zoom);
 
 // Arrow markers for directed edges
-svg.append('defs').selectAll('marker')
+// Glow filter for cluster nodes
+const glowDefs = svg.append('defs');
+const glowFilter = glowDefs.append('filter').attr('id', 'glow');
+glowFilter.append('feGaussianBlur').attr('stdDeviation', '3').attr('result', 'coloredBlur');
+const feMerge = glowFilter.append('feMerge');
+feMerge.append('feMergeNode').attr('in', 'coloredBlur');
+feMerge.append('feMergeNode').attr('in', 'SourceGraphic');
+
+svg.select('defs').selectAll('marker')
   .data(['CO_OCCURS', 'MENTIONED_IN', 'FOLDED_INTO', 'SUPERSEDES'])
   .join('marker')
   .attr('id', d => `arrow-${d}`)
@@ -1190,6 +1921,11 @@ function ticked() {
 
 function nodeRadius(d) {
   if (d.node_type === 'fold') return 5;
+  // Cluster nodes scale by child_count
+  if (d.child_count != null && d.child_count > 0) {
+    const base = 12;
+    return base + Math.min(Math.sqrt(d.child_count) * 3, 30);
+  }
   const base = 7;
   return base + Math.min((d.confidence || 1) * 3, 4);
 }
@@ -1207,12 +1943,16 @@ function render() {
   link.exit().transition().duration(300).attr('stroke-opacity', 0).remove();
 
   const linkEnter = link.enter().append('line')
-    .attr('stroke', d => edgeColors[d.edge_type] || '#333')
+    .attr('stroke', d => edgeColors[d.edge_type] || '#444')
     .attr('stroke-opacity', 0)
-    .attr('stroke-width', 1.5)
+    .attr('stroke-width', d => {
+      // Thicker edges for aggregated cluster connections
+      const w = d.strength || d.weight || 1;
+      return Math.max(1.5, Math.min(w > 10 ? Math.log2(w) : 1.5, 6));
+    })
     .attr('marker-end', d => `url(#arrow-${d.edge_type})`);
 
-  linkEnter.transition().duration(500).attr('stroke-opacity', 0.35);
+  linkEnter.transition().duration(500).attr('stroke-opacity', 0.5);
 
   // Nodes — full rebuild to avoid D3 data-join exit issues
   nodeGroup.selectAll('circle').remove();
@@ -1221,27 +1961,64 @@ function render() {
     .enter().append('circle')
     .attr('r', nodeRadius)
     .attr('fill', nodeColor)
-    .attr('stroke', d => selectedNode && selectedNode.id === d.id ? '#fff' : 'rgba(255,255,255,0.2)')
-    .attr('stroke-width', d => selectedNode && selectedNode.id === d.id ? 3 : 1)
+    .attr('stroke', d => {
+      if (selectedNode && selectedNode.id === d.id) return '#fff';
+      if (d.child_count != null) return 'rgba(255,255,255,0.4)';
+      return 'rgba(255,255,255,0.15)';
+    })
+    .attr('stroke-width', d => {
+      if (selectedNode && selectedNode.id === d.id) return 3;
+      if (d.child_count != null) return 2;
+      return 1;
+    })
     .attr('opacity', d => stateOpacity[d.state] || 1.0)
+    .attr('filter', d => d.child_count != null ? 'url(#glow)' : null)
     .attr('cursor', 'pointer')
     .call(drag(simulation))
     .on('click', (event, d) => selectNode(d))
+    .on('dblclick', (event, d) => drillInto(d))
     .on('mouseenter', (event, d) => showTooltip(event, d))
     .on('mouseleave', () => hideTooltip());
 
 
   // Labels — full rebuild to match circles
+  // Labels: only show for cluster nodes (child_count > 0) or when few nodes visible.
+  // Leaf nodes show labels on hover via tooltip.
   labelGroup.selectAll('text').remove();
+  const showAllLabels = nodes.length <= 30;
   labelGroup.selectAll('text')
-    .data(nodes, d => d.id)
+    .data(nodes.filter(d => showAllLabels || d.child_count != null), d => d.id)
     .enter().append('text')
     .attr('text-anchor', 'middle')
-    .attr('fill', '#9494a3')
-    .attr('font-size', '9px')
+    .attr('fill', d => d.child_count != null ? '#ccc' : '#777')
+    .attr('font-size', d => {
+      if (d.child_count != null && d.child_count > 100) return '11px';
+      if (d.child_count != null) return '10px';
+      return '8px';
+    })
+    .attr('font-weight', d => d.child_count != null ? '600' : '400')
     .attr('font-family', 'Inter, sans-serif')
     .attr('pointer-events', 'none')
-    .text(d => d.label && d.label.length > 20 ? d.label.slice(0, 18) + '...' : (d.label || ''));
+    .text(d => {
+      let lbl = d.label || '';
+      if (d.child_count != null) lbl += ` (${d.child_count})`;
+      return lbl.length > 22 ? lbl.slice(0, 20) + '…' : lbl;
+    });
+
+  // Adjust simulation forces based on level and node count
+  const nodeCount = nodes.length;
+  if (nodeCount <= 50) {
+    // Few nodes (crate or module level) — strong repulsion, longer links
+    simulation.force('charge', d3.forceManyBody().strength(-2500).distanceMax(1000));
+    simulation.force('collision', d3.forceCollide().radius(d => nodeRadius(d) + 10));
+  } else if (nodeCount <= 200) {
+    simulation.force('charge', d3.forceManyBody().strength(-1500).distanceMax(800));
+    simulation.force('collision', d3.forceCollide().radius(20));
+  } else {
+    // Many nodes — weaker repulsion to avoid explosion
+    simulation.force('charge', d3.forceManyBody().strength(-800).distanceMax(500));
+    simulation.force('collision', d3.forceCollide().radius(12));
+  }
 
   // Update simulation
   simulation.nodes(nodes);
@@ -1539,8 +2316,10 @@ function renderInfoPanel() {
 
   html += '<div class="info-section">';
   html += '<div class="section-title">Graph Statistics</div>';
-  html += `<div class="stat-row"><span class="label">Total Nodes</span><span class="value">${nodes.length}</span></div>`;
-  html += `<div class="stat-row"><span class="label">Total Edges</span><span class="value">${edges.length}</span></div>`;
+  if (window._totalNodes != null) {
+    html += `<div class="stat-row"><span class="label">Full Graph</span><span class="value">${window._totalNodes.toLocaleString()} nodes / ${window._totalEdges.toLocaleString()} edges</span></div>`;
+  }
+  html += `<div class="stat-row"><span class="label">Visible</span><span class="value">${nodes.length.toLocaleString()} nodes / ${edges.length.toLocaleString()} edges</span></div>`;
 
   // Connection status
   const connIndicator = document.getElementById('connection-indicator');
@@ -1597,6 +2376,16 @@ function renderInfoPanel() {
       html += '<div class="context-text">' + escapeHtml(selectedNode.context) + '</div>';
     }
 
+    // Explore neighborhood controls (only for non-cluster nodes)
+    if (selectedNode.child_count == null) {
+      html += '<div class="explore-controls">';
+      html += `<button class="explore-btn" onclick="sendExploreNeighborhood('${selectedNode.id}', exploreHops)">Explore</button>`;
+      html += '<span class="hop-slider-label">Hops:</span>';
+      html += `<input type="range" class="hop-slider" min="1" max="3" value="${exploreHops}" oninput="exploreHops=parseInt(this.value);document.getElementById('hop-value-display').textContent=this.value">`;
+      html += `<span class="hop-value" id="hop-value-display">${exploreHops}</span>`;
+      html += '</div>';
+    }
+
     if (connectedEdges.length > 0) {
       html += `<div class="stat-row" style="margin-top:12px"><span class="label">Connected Edges</span><span class="value">${connectedEdges.length}</span></div>`;
       html += '<div class="edge-list">';
@@ -1624,7 +2413,11 @@ function renderInfoPanel() {
 // === Tooltip ===
 function showTooltip(event, d) {
   const tooltip = document.getElementById('tooltip');
-  tooltip.innerHTML = `<strong>${escapeHtml(d.label)}</strong><br><span class="type-badge">${d.entity_type} &middot; ${d.state}</span>`;
+  let extra = '';
+  if (d.child_count != null) {
+    extra = ` &middot; ${d.child_count} children &middot; double-click to expand`;
+  }
+  tooltip.innerHTML = `<strong>${escapeHtml(d.label)}</strong><br><span class="type-badge">${d.entity_type} &middot; ${d.state}${extra}</span>`;
   tooltip.style.display = 'block';
   tooltip.style.left = (event.pageX + 12) + 'px';
   tooltip.style.top = (event.pageY - 10) + 'px';
@@ -1633,6 +2426,138 @@ function showTooltip(event, d) {
 function hideTooltip() {
   document.getElementById('tooltip').style.display = 'none';
 }
+
+// === Hierarchical drill-down ===
+function drillInto(d) {
+  // Only cluster nodes (with child_count) can be drilled into
+  if (d.child_count == null || d.child_count === 0) return;
+  // Cannot drill deeper than function level
+  if (currentLevel === 'function') return;
+
+  let nextLevel, parentName;
+  if (currentLevel === 'crate') {
+    nextLevel = 'module';
+    parentName = d.label;  // crate name
+  } else if (currentLevel === 'module') {
+    nextLevel = 'function';
+    // For module level, parent is "crate::module"
+    parentName = currentParent ? `${currentParent}::${d.label}` : d.label;
+  } else {
+    return;
+  }
+
+  sendDrillDown(nextLevel, parentName);
+}
+
+function sendDrillDown(level, parent) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({
+    type: 'drill_down',
+    level: level,
+    parent: parent || null
+  }));
+}
+
+function sendDrillUp() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type: 'drill_up' }));
+}
+
+function sendExploreNeighborhood(entityId, hops) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  isExploring = true;
+  ws.send(JSON.stringify({
+    type: 'explore_neighborhood',
+    entity_id: entityId,
+    hops: hops
+  }));
+}
+
+function navigateTo(level, parent) {
+  // Navigate to a specific level (used by breadcrumb clicks)
+  if (level === currentLevel && parent === currentParent) return;
+
+  if (level === 'crate') {
+    // Go back to top — send drill_up enough times or just request crate level
+    sendDrillDown('crate', null);
+  } else {
+    sendDrillDown(level, parent);
+  }
+}
+
+function updateBreadcrumbs(level, parent) {
+  currentLevel = level || 'crate';
+  currentParent = parent || null;
+
+  const bar = document.getElementById('breadcrumb-bar');
+  const backBtn = document.getElementById('breadcrumb-back');
+  const hint = document.getElementById('level-hint');
+
+  // Clear existing crumbs (keep back button and hint)
+  const existingCrumbs = bar.querySelectorAll('.crumb, .sep');
+  existingCrumbs.forEach(el => el.remove());
+
+  // Show/hide back button
+  if (currentLevel === 'crate') {
+    backBtn.classList.add('hidden');
+  } else {
+    backBtn.classList.remove('hidden');
+  }
+
+  // Build breadcrumb trail
+  const crumbs = [];
+
+  // Always show "All Crates" as root
+  if (currentLevel === 'crate') {
+    crumbs.push({ label: 'All Crates', level: 'crate', parent: null, current: true });
+  } else {
+    crumbs.push({ label: 'All Crates', level: 'crate', parent: null, current: false });
+
+    if (currentLevel === 'module' && currentParent) {
+      crumbs.push({ label: currentParent, level: 'module', parent: currentParent, current: true });
+    } else if (currentLevel === 'function' && currentParent) {
+      // Show crate crumb
+      const parts = currentParent.split('::');
+      const crateName = parts[0];
+      crumbs.push({ label: crateName, level: 'module', parent: crateName, current: false });
+      crumbs.push({ label: currentParent, level: 'function', parent: currentParent, current: true });
+    }
+  }
+
+  // Render crumbs (insert before hint)
+  for (let i = 0; i < crumbs.length; i++) {
+    if (i > 0) {
+      const sep = document.createElement('span');
+      sep.className = 'sep';
+      sep.textContent = '>';
+      bar.insertBefore(sep, hint);
+    }
+
+    const crumb = document.createElement('span');
+    crumb.className = 'crumb' + (crumbs[i].current ? ' current' : '');
+    crumb.textContent = crumbs[i].label;
+
+    if (!crumbs[i].current) {
+      const c = crumbs[i];
+      crumb.addEventListener('click', () => navigateTo(c.level, c.parent));
+    }
+
+    bar.insertBefore(crumb, hint);
+  }
+
+  // Update level hint
+  const levelLabels = { crate: 'crate level', module: 'module level', function: 'function level' };
+  if (viewMode === 'detail' && currentLevel === 'crate') {
+    hint.textContent = 'full graph';
+  } else {
+    hint.textContent = levelLabels[currentLevel] || currentLevel;
+  }
+}
+
+// Back button handler
+document.getElementById('breadcrumb-back').addEventListener('click', () => {
+  sendDrillUp();
+});
 
 // === WebSocket ===
 let ws;
@@ -1686,9 +2611,36 @@ function handleEvent(event) {
           const bTyped = b.edge_type !== 'CO_OCCURS' ? 0 : 1;
           return aTyped - bTyped;
         });
+      // Track total graph size for display
+      if (event.total_nodes != null) {
+        window._totalNodes = event.total_nodes;
+        window._totalEdges = event.total_edges;
+      }
+      // Update hierarchical navigation state from server
+      if (event.level === 'neighborhood') {
+        isExploring = true;
+        const backBar = document.getElementById('explore-back-bar');
+        backBar.style.display = 'flex';
+        const entityNode = allNodes.find(n => n.id === event.parent);
+        const entityLabel = entityNode ? entityNode.label : (event.parent || '').slice(0, 12);
+        document.getElementById('explore-label').textContent =
+          `Neighborhood of "${entityLabel}" (${allNodes.length} nodes, ${allEdges.length} edges)`;
+      } else {
+        if (!isExploring) {
+          document.getElementById('explore-back-bar').style.display = 'none';
+        }
+      }
+      if (event.level != null && event.level !== 'neighborhood') {
+        updateBreadcrumbs(event.level, event.parent || null);
+      } else if (event.level == null) {
+        updateBreadcrumbs(null, null);
+      }
+      selectedNode = null;
       rebuildFilters();
       applyFilters();
       render();
+      // Zoom to fit after receiving a new drill-down snapshot
+      zoomToFit();
       if (infoPanelOpen) {
         renderInfoPanel();
       }
@@ -1813,6 +2765,34 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
+function zoomToFit() {
+  // After simulation settles a bit, zoom to fit all nodes
+  setTimeout(() => {
+    if (nodes.length === 0) return;
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    nodes.forEach(n => {
+      if (n.x != null && n.y != null) {
+        minX = Math.min(minX, n.x);
+        maxX = Math.max(maxX, n.x);
+        minY = Math.min(minY, n.y);
+        maxY = Math.max(maxY, n.y);
+      }
+    });
+    if (!isFinite(minX)) return;
+    const padding = 80;
+    const dx = maxX - minX + padding * 2;
+    const dy = maxY - minY + padding * 2;
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+    const scale = Math.min(width / dx, height / dy, 2.0);
+    const transform = d3.zoomIdentity
+      .translate(width / 2, height / 2)
+      .scale(scale)
+      .translate(-cx, -cy);
+    svg.transition().duration(500).call(zoom.transform, transform);
+  }, 800);
+}
+
 // === Window resize ===
 window.addEventListener('resize', () => {
   width = container.clientWidth;
@@ -1825,10 +2805,22 @@ window.addEventListener('resize', () => {
 let allNodes = []; // keep a reference for node filtering
 
 function applyFilters() {
+  // Start with all nodes, then apply filters progressively
+  let filtered = allNodes.slice();
+
+  // Project filter
+  if (activeProjects.size > 0) {
+    filtered = filtered.filter(n => activeProjects.has(getProject(n)));
+  }
+
   // Node type filter
   if (activeNodeTypes.size > 0) {
-    const visibleIds = new Set(allNodes.filter(n => activeNodeTypes.has(n.entity_type || n.node_type)).map(n => n.id));
-    nodes = allNodes.filter(n => visibleIds.has(n.id));
+    filtered = filtered.filter(n => activeNodeTypes.has(n.entity_type || n.node_type));
+  }
+
+  if (activeProjects.size > 0 || activeNodeTypes.size > 0) {
+    const visibleIds = new Set(filtered.map(n => n.id));
+    nodes = filtered;
     // Edge filter: only show edges where both endpoints are visible
     let filtered = allEdges.filter(e => {
       const src = e.source.id || e.source;
@@ -1847,8 +2839,11 @@ function applyFilters() {
       edges = allEdges.slice();
     }
   }
+  const totalInfo = (window._totalNodes != null)
+    ? ` / ${window._totalNodes}n ${window._totalEdges}e total`
+    : '';
   document.getElementById('edge-count').textContent =
-    `${nodes.length}n ${edges.length}e`;
+    `${nodes.length}n ${edges.length}e${totalInfo}`;
 }
 
 function buildFilterMenu(menuId, btnCountId, items, activeSet, colorMap, onChange) {
@@ -1903,6 +2898,18 @@ function buildFilterMenu(menuId, btnCountId, items, activeSet, colorMap, onChang
 }
 
 function rebuildFilters() {
+  // Project filter
+  const projects = new Set(allNodes.map(n => getProject(n)).filter(Boolean));
+  const projectColors = {};
+  const palette = ['#e2725b', '#5ba3e2', '#5be27b', '#c95be2', '#e2c45b', '#5be2c4', '#e25b8a', '#8ae25b'];
+  let pi = 0;
+  for (const p of [...projects].sort()) { projectColors[p] = palette[pi++ % palette.length]; }
+  buildFilterMenu('project-menu', 'project-count', projects, activeProjects, projectColors, () => {
+    rebuildFilters();
+    applyFilters();
+    render();
+  });
+
   const nodeTypes = new Set(allNodes.map(n => n.entity_type || n.node_type).filter(Boolean));
   const edgeTypes = new Set(allEdges.map(e => e.edge_type));
   buildFilterMenu('node-type-menu', 'node-type-count', nodeTypes, activeNodeTypes, entityColors, () => {
@@ -1915,17 +2922,96 @@ function rebuildFilters() {
     applyFilters();
     render();
   });
+
+  // --- Project quick-filter pills ---
+  const pillContainer = document.getElementById('project-pills');
+  pillContainer.innerHTML = '';
+
+  // Count nodes per project
+  const projectCounts = {};
+  for (const n of allNodes) {
+    const p = getProject(n);
+    if (p) projectCounts[p] = (projectCounts[p] || 0) + 1;
+  }
+  const sortedProjects = Object.keys(projectCounts).sort();
+
+  // Only show pills if there are 2+ projects
+  if (sortedProjects.length < 2) return;
+
+  // "All" button (hidden when no filter is active)
+  const allPill = document.createElement('button');
+  allPill.className = 'project-pill pill-all' + (activeProjects.size === 0 ? ' hidden' : '');
+  allPill.textContent = 'All';
+  allPill.addEventListener('click', () => {
+    activeProjects.clear();
+    rebuildFilters();
+    applyFilters();
+    render();
+  });
+  pillContainer.appendChild(allPill);
+
+  // One pill per project
+  for (const name of sortedProjects) {
+    const color = projectColors[name] || '#888';
+    const count = projectCounts[name];
+    const isActive = activeProjects.size === 1 && activeProjects.has(name);
+
+    const pill = document.createElement('button');
+    pill.className = 'project-pill' + (isActive ? ' active' : '');
+    pill.style.background = isActive ? color : hexToRgba(color, 0.25);
+    pill.style.color = isActive ? '#fff' : color;
+
+    const nameSpan = document.createElement('span');
+    nameSpan.textContent = name;
+    const countSpan = document.createElement('span');
+    countSpan.className = 'pill-count';
+    countSpan.textContent = `(${count})`;
+
+    pill.appendChild(nameSpan);
+    pill.appendChild(countSpan);
+
+    pill.addEventListener('click', () => {
+      if (activeProjects.size === 1 && activeProjects.has(name)) {
+        // Clicking the already-active pill clears the filter
+        activeProjects.clear();
+      } else {
+        activeProjects.clear();
+        activeProjects.add(name);
+      }
+      rebuildFilters();
+      applyFilters();
+      render();
+    });
+
+    pillContainer.appendChild(pill);
+  }
+}
+
+// Helper: hex color to rgba string
+function hexToRgba(hex, alpha) {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
 }
 
 // Toggle dropdown menus
+document.getElementById('project-btn').addEventListener('click', (e) => {
+  e.stopPropagation();
+  document.getElementById('project-menu').classList.toggle('open');
+  document.getElementById('node-type-menu').classList.remove('open');
+  document.getElementById('edge-type-menu').classList.remove('open');
+});
 document.getElementById('node-type-btn').addEventListener('click', (e) => {
   e.stopPropagation();
   document.getElementById('node-type-menu').classList.toggle('open');
+  document.getElementById('project-menu').classList.remove('open');
   document.getElementById('edge-type-menu').classList.remove('open');
 });
 document.getElementById('edge-type-btn').addEventListener('click', (e) => {
   e.stopPropagation();
   document.getElementById('edge-type-menu').classList.toggle('open');
+  document.getElementById('project-menu').classList.remove('open');
   document.getElementById('node-type-menu').classList.remove('open');
 });
 document.addEventListener('click', () => {
@@ -1961,6 +3047,82 @@ document.getElementById('btn-consolidate').addEventListener('click', async () =>
   btn.disabled = false;
   setTimeout(() => { btn.title = 'Dream Consolidation'; }, 5000);
 });
+
+// === Settings panel ===
+let settingsPanelOpen = false;
+const settingsPanel = document.getElementById('settings-panel');
+
+function openSettingsPanel() {
+  if (searchPanelOpen) closeSearchPanel();
+  if (infoPanelOpen) closeInfoPanel();
+  if (derivedFactsPanelOpen) closeDerivedFactsPanel();
+  settingsPanelOpen = true;
+  settingsPanel.classList.add('open');
+  settingsPanel.style.width = '1px';
+  setTimeout(() => {
+    const targetWidth = Math.min(window.innerWidth * 0.5, 500);
+    settingsPanel.style.width = targetWidth + 'px';
+  }, 10);
+}
+
+function closeSettingsPanel() {
+  settingsPanelOpen = false;
+  settingsPanel.classList.remove('open');
+  settingsPanel.style.width = '0';
+}
+
+document.getElementById('btn-settings').addEventListener('click', () => {
+  if (settingsPanelOpen) {
+    closeSettingsPanel();
+  } else {
+    openSettingsPanel();
+  }
+});
+document.getElementById('settings-close').addEventListener('click', closeSettingsPanel);
+
+document.getElementById('btn-fetch-models').addEventListener('click', async () => {
+  const url = document.getElementById('llm-url').value.trim();
+  const status = document.getElementById('models-status');
+  const select = document.getElementById('llm-model');
+  status.textContent = 'Fetching models...';
+  try {
+    const resp = await fetch(`/viz/api/enrich/models?url=${encodeURIComponent(url)}`);
+    const data = await resp.json();
+    if (data.error) {
+      status.textContent = `Error: ${data.error}`;
+      return;
+    }
+    const models = (data.data || []).map(m => m.id);
+    select.innerHTML = '';
+    models.forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = m;
+      opt.textContent = m;
+      select.appendChild(opt);
+    });
+    status.textContent = `${models.length} models found`;
+    // Save to localStorage
+    localStorage.setItem('fmem-llm-url', url);
+    if (models.length > 0) localStorage.setItem('fmem-llm-model', models[0]);
+  } catch (e) {
+    status.textContent = `Failed: ${e.message}`;
+  }
+});
+
+document.getElementById('llm-model').addEventListener('change', (e) => {
+  localStorage.setItem('fmem-llm-model', e.target.value);
+});
+
+// Restore saved LLM settings
+(function() {
+  const savedUrl = localStorage.getItem('fmem-llm-url');
+  const savedModel = localStorage.getItem('fmem-llm-model');
+  if (savedUrl) document.getElementById('llm-url').value = savedUrl;
+  if (savedModel) {
+    const select = document.getElementById('llm-model');
+    select.innerHTML = `<option value="${savedModel}">${savedModel}</option>`;
+  }
+})();
 
 // === Initialize panels ===
 searchResultsEl.innerHTML = '<div class="search-empty">Type to search...</div>';

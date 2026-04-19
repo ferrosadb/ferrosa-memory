@@ -31,6 +31,7 @@ pub mod dedup;
 pub mod dispatch;
 pub mod dream;
 pub mod embedding;
+pub mod enrich;
 pub mod entity;
 pub mod feedback;
 pub mod fold;

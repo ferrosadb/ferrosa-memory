@@ -1,0 +1,67 @@
+# Level 2 DIKW: Knowledge -> Wisdom via smart_ingest prediction error gating
+#
+# The canonical example from overview.md section 6.1: CREATE -> UPDATE -> SUPERSEDE.
+# Smart_ingest demonstrates wisdom by making contextually appropriate decisions
+# about whether content is novel, reinforcing, or contradictory.
+
+[scenario]
+id = "dikw-smart-ingest-decisions"
+name = "Smart Ingest: CREATE -> UPDATE -> SUPERSEDE Lifecycle"
+description = """
+Tests the Knowledge->Wisdom DIKW transition. Smart_ingest demonstrates \
+wisdom-level processing by making correct ingestion decisions based on \
+prediction error gating: CREATE for novel content, UPDATE for reinforcing \
+content (high similarity, consistent), SUPERSEDE for contradictory content \
+(high similarity, conflicting facts). This is the canonical example from \
+the eval framework specification."""
+level = 2
+dikw_transition = "knowledge_wisdom"
+tags = ["dikw", "smart_ingest", "prediction_error", "entity_lifecycle", "knowledge_wisdom"]
+timeout_ms = 30000
+
+# Step 1: CREATE -- novel content, no prior knowledge
+[[steps]]
+tool = "smart_ingest"
+expect_in_response = ["Created", "entity_id"]
+expect_action = "Created"
+arguments = { content = "Alice Chen is a senior engineer at Acme Corp working on distributed systems.", entity_type = "person", entity_name = "Alice Chen" }
+
+# Step 2: UPDATE -- reinforcing content (adds detail, no contradiction)
+[[steps]]
+tool = "smart_ingest"
+expect_in_response = ["Updated", "similarity"]
+expect_action = "Updated"
+arguments = { content = "Alice Chen is a senior engineer at Acme Corp who leads the backend team and specializes in distributed consensus algorithms.", entity_type = "person", entity_name = "Alice Chen" }
+
+# Step 3: SUPERSEDE -- contradictory content (left Acme, joined Ferrosa)
+[[steps]]
+tool = "smart_ingest"
+expect_in_response = ["Superseded"]
+expect_action = "Superseded"
+arguments = { content = "Alice Chen left Acme Corp and joined Ferrosa Inc as VP of Engineering, transitioning from individual contributor to executive leadership.", entity_type = "person", entity_name = "Alice Chen" }
+
+[grading]
+methods = ["programmatic", "claim_rubric", "llm_judge"]
+
+[grading.claim_rubric]
+claims = [
+    "First ingest creates a new entity (novel content)",
+    "Second ingest updates existing entity (high similarity, consistent content)",
+    "Third ingest supersedes (contradictory: 'left Acme' vs 'at Acme')",
+    "Entity history is preserved through the supersession chain",
+]
+passing_threshold = 0.75
+
+[grading.llm_judge]
+rubric = """
+Evaluate whether smart_ingest correctly distinguished between:
+1. Novel content (CREATE) -- content unlike any existing memory
+2. Reinforcing content (UPDATE) -- similar and consistent, adding detail
+3. Contradictory content (SUPERSEDE) -- similar but conflicts with stored facts
+Judge PASS if all three decisions are correct.
+"""
+
+[dikw]
+expect_entity_count_gte = 2
+expect_edge_types = ["SUPERSEDES"]
+expect_temporal_chain = true

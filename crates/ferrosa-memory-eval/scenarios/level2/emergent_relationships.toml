@@ -1,0 +1,78 @@
+# Level 2 DIKW: Emergence -- relationship discovery via consolidation + Datalog
+#
+# Measures graph density growth as the system autonomously discovers
+# relationships. Creates entities, runs consolidation for CO_OCCURS edges,
+# adds Datalog rules for transitive inference, then measures how many
+# new edges and derived facts emerge.
+
+[scenario]
+id = "dikw-emergent-relationships"
+name = "Emergent Relationships: Density Growth via Consolidation + Datalog"
+description = """
+Tests DIKW emergence -- the system autonomously discovers relationships \
+that were not explicitly stated. Creates a set of related entities, runs \
+dream consolidation to discover CO_OCCURS edges, then adds a Datalog \
+transitivity rule and queries for derived facts. Measures graph density \
+growth as a proxy for emergent knowledge."""
+level = 2
+dikw_transition = "emergence"
+tags = ["dikw", "emergence", "consolidation", "datalog", "density", "graph_growth"]
+timeout_ms = 45000
+
+# Step 1-5: Create a cluster of related entities
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "Ferrosa DB", entity_type = "project", context_snippet = "Ferrosa DB is a distributed database engine with CQL protocol, graph traversal, and vector search capabilities." }
+
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "CQL Protocol", entity_type = "concept", context_snippet = "CQL protocol is the query language used by Ferrosa DB for data manipulation and schema operations." }
+
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "Graph Engine", entity_type = "concept", context_snippet = "The graph engine in Ferrosa DB enables typed edges, traversals, and spreading activation over entity relationships." }
+
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "Vector Search", entity_type = "concept", context_snippet = "Vector search in Ferrosa DB uses HNSW approximate nearest neighbor indexing for semantic similarity queries." }
+
+[[steps]]
+tool = "upsert_entity"
+arguments = { entity_name = "Ben Kearns", entity_type = "person", context_snippet = "Ben Kearns is the primary developer of Ferrosa DB, responsible for the CQL protocol, graph engine, and vector search subsystems." }
+
+# Step 6: Run consolidation to discover CO_OCCURS edges
+[[steps]]
+tool = "run_consolidation"
+arguments = {}
+
+# Step 7: Add a Datalog transitivity rule
+[[steps]]
+tool = "manage_rules"
+arguments = { action = "put", rule_id = "transitive_related", family = "graph", name = "Transitive Relatedness", rule_body = "related(X, Z) :- related(X, Y), related(Y, Z)" }
+
+# Step 8: Query for derived transitive relationships
+[[steps]]
+tool = "query_derived"
+arguments = { predicate = "related" }
+
+# Step 9: Explore the resulting graph
+[[steps]]
+tool = "explore_connections"
+arguments = { traversal = "related_entities", max_depth = 3, limit = 20 }
+
+[grading]
+methods = ["programmatic", "claim_rubric"]
+
+[grading.claim_rubric]
+claims = [
+    "Five entities are created across person, project, and concept types",
+    "Consolidation discovers CO_OCCURS edges between contextually related entities",
+    "Datalog transitivity rule is registered successfully",
+    "Derived facts expand the relationship graph beyond explicit edges",
+    "Graph density increases after consolidation and inference",
+]
+passing_threshold = 0.75
+
+[dikw]
+expect_entity_count_gte = 5
+expect_edge_types = ["CO_OCCURS"]

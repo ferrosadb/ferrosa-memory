@@ -58,5 +58,8 @@ futures-util = "0.3"
 # Ordered floats for Eq/Hash on f64
 ordered-float = { version = "4", features = ["serde"] }
 
+# Test helpers
+tempfile = "3"
+
 # neo4rs removed — Ferrosa's Bolt is v5, neo4rs 0.8 only supports v4
 # Graph queries go through Ferrosa's HTTP /graph/query endpoint via reqwest

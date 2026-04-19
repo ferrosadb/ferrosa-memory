@@ -124,6 +124,7 @@ pub async fn explore(
             rmh_config.max_explore_entities.min(50), // hybrid_search caps at 50
             warmth_ref,
             None,
+            None,
             &fusion_config,
         )
         .await?;

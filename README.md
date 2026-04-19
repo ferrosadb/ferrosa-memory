@@ -84,8 +84,36 @@ cargo run --bin ferrosa-memory-mcp
 ### Run (HTTP mode)
 
 ```sh
-FERROSA_MEMORY_CONFIG=./ferrosa-memory.toml cargo run --bin ferrosa-memory-mcp
-# Listens on port 8765 by default
+cp examples/ferrosa-memory-http.toml ./ferrosa-memory-http.toml
+cp examples/http-auth.toml ./http-auth.toml
+# Update TLS paths, contact points, graph URL, and auth principals
+
+FERROSA_MEMORY_CONFIG=./ferrosa-memory-http.toml cargo run --bin ferrosa-memory-mcp
+# Listens on port 8765 by default and exposes:
+#   GET /healthz/live
+#   GET /healthz/ready
+#   POST /mcp
+```
+
+For Podman-based container startup on macOS, prefer `PODMAN_COMPOSE_PROVIDER=podman-compose`
+so `podman compose` does not delegate to Docker Desktop's `docker-compose`.
+
+### Start On Login (macOS)
+
+```sh
+./scripts/install-launch-agent.sh
+```
+
+This installs a per-user `launchd` agent that, at login:
+
+- starts the Podman machine if needed
+- runs `podman compose up -d` from this repo
+- brings up the Ferrosa stack defined in [docker-compose.yml](docker-compose.yml)
+
+To remove it later:
+
+```sh
+./scripts/uninstall-launch-agent.sh
 ```
 
 ### Claude Code Integration
@@ -126,6 +154,20 @@ See [`examples/ferrosa-memory.toml`](examples/ferrosa-memory.toml) for all optio
 | `[embeddings]` | Provider (Ollama/OpenAI), model, dimensions |
 | `[security]` | Audit log, anomaly detection, sigma threshold |
 | `[routing]` | Guideline version, feedback export schedule |
+
+For shared deployments, use:
+
+- [`examples/ferrosa-memory-http.toml`](examples/ferrosa-memory-http.toml) for the HTTP server
+- [`examples/http-auth.toml`](examples/http-auth.toml) for principal-to-tenant auth mapping
+
+Shared HTTP mode requires:
+
+- `server.require_tls = true`
+- `server.cert_path` and `server.key_path`
+- `server.auth_file`
+- no `server.tenant_id` fallback
+
+`viz` is disabled by default for the shared HTTP template. Keep stdio mode for local fallback and local visualization.
 
 ## Project Structure
 

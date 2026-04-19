@@ -43,6 +43,7 @@ pub async fn boost_on_access(
             session_id,
             warmth: config.warmth_boost_amount,
             pagerank: 0.0,
+            reputation: 0.0,
             last_accessed_at: now,
             access_count: 1,
             decay_zone: decay_zone.clone(),

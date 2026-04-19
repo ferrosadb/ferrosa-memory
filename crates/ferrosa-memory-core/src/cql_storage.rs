@@ -443,9 +443,9 @@ impl CqlStorage {
             warmth_put: session
                 .prepare(format!(
                     "INSERT INTO {ks}.entity_warmth \
-                     (tenant_id, entity_id, session_id, warmth, pagerank, last_accessed_at, \
+                     (tenant_id, entity_id, session_id, warmth, pagerank, reputation, last_accessed_at, \
                       access_count, decay_zone, updated_at) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 ))
                 .await?,
             warmth_list_session: session
@@ -501,7 +501,7 @@ impl CqlStorage {
                 .prepare(format!(
                     "INSERT INTO {ks}.derived_cache_by_query \
                      (tenant_id, cache_key, seq, src_id, pred, dst_id, confidence, rule_id, computed_at) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL 3600"
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 ))
                 .await?,
             derived_cache_clear: session
@@ -1213,6 +1213,81 @@ impl Storage for CqlStorage {
         } else {
             Ok(None)
         }
+    }
+
+    async fn entity_get_batch(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        entity_ids: &[Uuid],
+    ) -> anyhow::Result<Vec<EntityEntry>> {
+        if entity_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders: Vec<String> = entity_ids.iter().map(|_| "?".to_string()).collect();
+        let query = format!(
+            "SELECT entity_id, entity_name, entity_type, source_fold_id, \
+                 context_snippet, confidence, state, created_at \
+                 FROM {}.entity_store WHERE tenant_id = ? AND session_id = ? AND entity_id IN ({})",
+            self.keyspace,
+            placeholders.join(", ")
+        );
+
+        // Prepare and bind values using SimpleValues
+        let prepared = self.session.prepare(query).await?;
+        let values: Vec<cdrs_tokio::types::value::Value> = std::iter::once(ctx.tenant_id)
+            .chain(std::iter::once(session_id))
+            .chain(entity_ids.iter().copied())
+            .map(cdrs_tokio::types::value::Value::from)
+            .collect();
+
+        let envelope = self
+            .session
+            .exec_with_values(
+                &prepared,
+                cdrs_tokio::query::QueryValues::SimpleValues(values),
+            )
+            .await?;
+        let rows = envelope.response_body()?.into_rows().unwrap_or_default();
+
+        let mut results = Vec::new();
+        for row in rows {
+            let Ok(entity_id) = row.r_by_name::<Uuid>("entity_id") else {
+                continue;
+            };
+            let Ok(entity_name) = row.r_by_name::<String>("entity_name") else {
+                continue;
+            };
+            let Ok(entity_type) = row.r_by_name::<String>("entity_type") else {
+                continue;
+            };
+            let context_snippet = row
+                .r_by_name::<String>("context_snippet")
+                .unwrap_or_default();
+            let created = row
+                .r_by_name::<chrono::NaiveDateTime>("created_at")
+                .unwrap_or_default();
+            let state = row
+                .r_by_name::<String>("state")
+                .ok()
+                .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
+                .unwrap_or_default();
+            results.push(EntityEntry {
+                tenant_id: ctx.tenant_id,
+                entity_id,
+                session_id,
+                entity_name,
+                entity_type,
+                source_fold_id: row.r_by_name::<Uuid>("source_fold_id").ok(),
+                context_snippet,
+                entity_embedding: None,
+                confidence: f64::from(row.r_by_name::<f32>("confidence").unwrap_or(1.0)),
+                state,
+                created_at: created.and_utc(),
+            });
+        }
+        Ok(results)
     }
 
     async fn entity_search_ann(
@@ -2173,7 +2248,7 @@ impl Storage for CqlStorage {
         }
 
         // Typed edges (contains, references, calls, depends_on, etc.)
-        // Query the nil session (used by skilltools ingest) and the default session.
+        // Query the nil session (used by frg ingest) and the default session.
         let nil_session = Uuid::nil();
         let query = "SELECT src_id, edge_type, dst_id FROM agent_memory.typed_edges \
                      WHERE tenant_id = ? AND session_id = ?";
@@ -2479,6 +2554,7 @@ impl Storage for CqlStorage {
                 session_id: row.r_by_name("session_id")?,
                 warmth: row.r_by_name("warmth")?,
                 pagerank: row.r_by_name::<f64>("pagerank").unwrap_or(0.0),
+                reputation: row.r_by_name::<f64>("reputation").unwrap_or(0.0),
                 last_accessed_at: last_accessed.and_utc(),
                 access_count: i64::from(row.r_by_name::<i32>("access_count").unwrap_or(0)),
                 decay_zone: parse_decay_zone(&zone_str),
@@ -2499,6 +2575,7 @@ impl Storage for CqlStorage {
                     entry.session_id,
                     entry.warmth,
                     entry.pagerank,
+                    entry.reputation,
                     entry.last_accessed_at.naive_utc(),
                     entry.access_count as i32,
                     entry.decay_zone.to_string(),
@@ -2532,6 +2609,7 @@ impl Storage for CqlStorage {
                 session_id,
                 warmth: amount,
                 pagerank: 0.0,
+                reputation: 0.0,
                 last_accessed_at: now,
                 access_count: 1,
                 decay_zone: DecayZone::Knowledge,
@@ -2566,6 +2644,7 @@ impl Storage for CqlStorage {
                 session_id,
                 warmth: row.r_by_name("warmth")?,
                 pagerank: row.r_by_name::<f64>("pagerank").unwrap_or(0.0),
+                reputation: row.r_by_name::<f64>("reputation").unwrap_or(0.0),
                 last_accessed_at: last_accessed.and_utc(),
                 access_count: i64::from(row.r_by_name::<i32>("access_count").unwrap_or(0)),
                 decay_zone: parse_decay_zone(&zone_str),
@@ -2700,7 +2779,7 @@ impl Storage for CqlStorage {
         }
 
         // Sort by version descending (CQL clustering is per-partition only)
-        results.sort_by(|a, b| b.version.cmp(&a.version));
+        results.sort_by_key(|r| std::cmp::Reverse(r.version));
         Ok(results)
     }
 
@@ -2768,8 +2847,8 @@ impl Storage for CqlStorage {
                 dst_id: dst_id.to_string(),
                 confidence: row.r_by_name::<f64>("confidence").unwrap_or(1.0),
                 rule_id: row.r_by_name("rule_id").unwrap_or_default(),
-                support_count: 1,   // Not stored in CQL; default to 1
-                provenance: vec![], // Loaded separately via provenance_get
+                support_count: 1,
+                provenance: vec![],
             });
         }
         Ok(facts)
