@@ -109,11 +109,7 @@ pub struct SearchFilter {
 
 /// Resolve the list of session partitions to query given the caller's session
 /// and the filter scope.
-fn sessions_to_query(
-    caller_session: Uuid,
-    tenant_id: Uuid,
-    scope: SearchScope,
-) -> Vec<Uuid> {
+fn sessions_to_query(caller_session: Uuid, tenant_id: Uuid, scope: SearchScope) -> Vec<Uuid> {
     match scope {
         SearchScope::SessionOnly => vec![caller_session],
         SearchScope::GlobalOnly => vec![crate::scope::tenant_global_session_uuid(tenant_id)],

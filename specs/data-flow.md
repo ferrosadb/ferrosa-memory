@@ -1,8 +1,17 @@
 # Data Flow Diagrams
 
+## Boundary Correction
+
+These diagrams distinguish between:
+
+- **current implementation** — where `ferrosa-memory` has completed public CQL/SPARQL/Cypher adaptation in operator surfaces, but still needs graph-boundary cleanup in serving-path writes
+- **target implementation** — where `ferrosa-memory` uses public protocols/contracts at the right abstraction level
+
+The target boundary is defined in [ADR-005](./decisions/adr-005-endpoint-only-ferrosa-client.md). Direct CQL is acceptable where `ferrosa-memory` is acting as an application client over app-owned tables. The remaining boundary gap is direct mutation of graph-owned backing tables from serving-path writes. If Ferrosa public query interfaces do not satisfy the required semantics, that is a Ferrosa bug and `ferrosa-memory` should fail loudly instead of papering over behavior locally.
+
 ## 1. Tool Call Flow (All Tools)
 
-Every MCP tool call follows this path:
+Target MCP tool flow:
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'actorBkg':'#16161f','actorTextColor':'#e8e8ed','actorBorder':'#e2725b','signalColor':'#9494a3','signalTextColor':'#e8e8ed','labelBoxBkgColor':'#16161f','labelBoxBorderColor':'#e2725b','labelTextColor':'#e8e8ed','loopTextColor':'#e8e8ed','noteBkgColor':'#1c1c28','noteBorderColor':'#d4a574','noteTextColor':'#e8e8ed','activationBkgColor':'#1c1c28','activationBorderColor':'#e2725b'}}}%%
@@ -13,7 +22,7 @@ sequenceDiagram
     participant A as auth
     participant R as tool_router
     participant H as Tool Handler
-    participant S as cql_client
+    participant F as Ferrosa public interface
     participant M as metrics
 
     C->>T: JSON-RPC tools/call
@@ -23,13 +32,53 @@ sequenceDiagram
     D->>R: route(query_context)
     R-->>D: Strategy
     D->>H: handle(params, tenant_ctx, strategy)
-    H->>S: CQL query (tenant-scoped)
-    S-->>H: Result rows
+    H->>F: CQL / SPARQL / Cypher request
+    F-->>H: Result rows / graph answers / derived facts
     H->>M: emit_metric(operation, latency)
     H-->>D: tool result
     D-->>T: JSON-RPC response
     T-->>C: result
 ```
+
+Current implementation note: the serving path still includes graph-table writes through direct `CqlStorage` access while Datalog remains an explicit local inference layer.
+
+Unless otherwise labeled as target-state, the remaining diagrams document the current implementation paths that still need to be refactored behind graph/public interfaces. They should not be read as the desired long-term architecture.
+
+## 1b. Bulk `ingest_entities` Flow
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'actorBkg':'#16161f','actorTextColor':'#e8e8ed','actorBorder':'#e2725b','signalColor':'#9494a3','signalTextColor':'#e8e8ed','labelBoxBkgColor':'#16161f','labelBoxBorderColor':'#e2725b','labelTextColor':'#e8e8ed','loopTextColor':'#e8e8ed','noteBkgColor':'#1c1c28','noteBorderColor':'#d4a574','noteTextColor':'#e8e8ed','activationBkgColor':'#1c1c28','activationBorderColor':'#e2725b'}}}%%
+sequenceDiagram
+    participant C as MCP Client
+    participant D as tool_dispatch
+    participant A as auth
+    participant BI as bulk_ingest
+    participant E as embedding_client
+    participant DB as Ferrosa app tables
+    participant G as Ferrosa graph interface
+
+    C->>D: ingest_entities(batch)
+    D->>A: authenticate(request)
+    A-->>D: TenantContext
+    D->>BI: validate + execute(batch, tenant_ctx)
+    BI->>BI: validate attrs, conflict mode, edge refs
+
+    alt dry_run = true
+        BI->>BI: compute write plan only
+        BI-->>D: counts + failed[] + schema_version
+    else dry_run = false
+        alt missing embeddings and embed_missing = true
+            BI->>E: embed(missing contexts)
+            E-->>BI: vectors or per-row failures
+        end
+        BI->>DB: UPSERT app-owned entity rows
+        BI->>G: write typed edges / graph-owned mutations
+        BI-->>D: inserted/updated/skipped + failed[] + duration_ms
+    end
+    D-->>C: MCP result + progress notifications
+```
+
+Current implementation note: this is target-state architecture. The current codebase has adjacent ingest tools, but not yet a single server-owned `ingest_entities` contract with structured batch failure semantics.
 
 ## 2. Memoization Write Path
 
@@ -258,24 +307,19 @@ graph LR
 
 ## 9. Type Registry and Tool Schema Generation
 
-At MCP server startup, the type registry is loaded from CQL and used to build dynamic tool schemas. New entity or edge types can be added by inserting rows into the registry tables — no recompile required.
+Current implementation note: startup still loads type metadata through direct CQL storage bindings. That is acceptable only if those remain app-owned tables compatible with the `app_reader` role boundary; it should not require graph-table mutation or privileged graph ownership.
+
+Target behavior: type/system metadata should come from Ferrosa public interfaces or an explicitly versioned metadata contract where possible, but direct CQL reads remain acceptable if they stay within supported app-table scope.
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'actorBkg':'#16161f','actorTextColor':'#e8e8ed','actorBorder':'#e2725b','signalColor':'#9494a3','signalTextColor':'#e8e8ed','labelBoxBkgColor':'#16161f','labelBoxBorderColor':'#e2725b','labelTextColor':'#e8e8ed','loopTextColor':'#e8e8ed','noteBkgColor':'#1c1c28','noteBorderColor':'#d4a574','noteTextColor':'#e8e8ed','activationBkgColor':'#1c1c28','activationBorderColor':'#e2725b'}}}%%
 sequenceDiagram
-    participant MCP as ferrosa-memory-mcp
-    participant CQL as CqlStorage
-    participant DB as Ferrosa DB
+    participant MCP as ferrosa-memory
+    participant API as Ferrosa public interface
 
-    MCP->>CQL: connect(config)
-    CQL->>DB: Prepare 44 statements
-    DB-->>CQL: PreparedStatements
-    MCP->>CQL: load_entity_types()
-    CQL->>DB: SELECT type_name FROM entity_types
-    DB-->>CQL: [person, place, bug, document, ...]
-    MCP->>CQL: load_edge_types()
-    CQL->>DB: SELECT type_name FROM edge_types
-    DB-->>CQL: [depends_on, contains, calls, ...]
+    MCP->>API: connect(auth, tenant)
+    MCP->>API: read type / schema metadata
+    API-->>MCP: entity + edge types / query capabilities
     Note over MCP: Build tool schemas with<br/>dynamic entity_type enums
     MCP->>MCP: tool_definitions(entity_types)
 ```
@@ -288,24 +332,102 @@ Every MCP tool call is logged to the `tool_usage_log` table for token usage anal
 
 **Write path:** After each tool handler returns, `tool_dispatch` writes a row to `tool_usage_log` with the call metrics. This is fire-and-forget (does not block the tool response).
 
-**Read path:** Analytics queries aggregate by day and tool name for cost attribution and usage trending. Not exposed as an MCP tool — queried via direct CQL.
+**Read path:** Analytics queries aggregate by day and tool name for cost attribution and usage trending. Not exposed as an MCP tool — queried via Ferrosa's public CQL interface.
 
 ## 11. External Codebase Ingestion (via forge)
 
-The `frg ingest` CLI/MCP tool extracts codebase structure and documentation into the fmem knowledge graph via direct CQL inserts. This is external to the MCP server process.
+Current implementation note: external ingestion still uses direct CQL/table ownership. The corrected architecture should treat graph publication as another Ferrosa client and target graph/public write interfaces instead of direct graph-table inserts.
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'actorBkg':'#16161f','actorTextColor':'#e8e8ed','actorBorder':'#e2725b','signalColor':'#9494a3','signalTextColor':'#e8e8ed','labelBoxBkgColor':'#16161f','labelBoxBorderColor':'#e2725b','labelTextColor':'#e8e8ed','loopTextColor':'#e8e8ed','noteBkgColor':'#1c1c28','noteBorderColor':'#d4a574','noteTextColor':'#e8e8ed','activationBkgColor':'#1c1c28','activationBorderColor':'#e2725b'}}}%%
 sequenceDiagram
     participant ST as frg ingest
-    participant PY as Python CQL loader
-    participant DB as Ferrosa DB
+    participant API as Ferrosa public interface
     participant VIZ as Viz Server
 
     ST->>ST: extract(dir) → entities + edges
     Note over ST: Rust: crates, modules, deps<br/>Markdown: documents, sections<br/>Cross-refs: section→code entity
-    ST->>PY: write entities.json + edges.json
-    PY->>DB: INSERT INTO entity_store (batch)
-    PY->>DB: INSERT INTO typed_edges (batch)
+    ST->>API: publish entities + edges
     Note over VIZ: Next browser connect<br/>sees new entities in snapshot
+```
+
+## 12. Expert-System Knowledge Plane Flow
+
+The expert-system path extends the existing Datalog layer with an explicit effective-rule-set loader, governance-backed symbolic artifacts, and explanation queries. Backend convergence is implemented: the effective loader is the active source for runtime rule evaluation in registry-facing paths.
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'actorBkg':'#16161f','actorTextColor':'#e8e8ed','actorBorder':'#e2725b','signalColor':'#9494a3','signalTextColor':'#e8e8ed','labelBoxBkgColor':'#16161f','labelBoxBorderColor':'#e2725b','labelTextColor':'#e8e8ed','loopTextColor':'#e8e8ed','noteBkgColor':'#1c1c28','noteBorderColor':'#d4a574','noteTextColor':'#e8e8ed','activationBkgColor':'#1c1c28','activationBorderColor':'#e2725b'}}}%%
+sequenceDiagram
+    participant C as MCP / Workbench Client
+    participant D as dispatch
+    participant E as EffectiveRuleSet
+    participant R as RuleRegistry
+    participant CL as ClaimStore
+    participant AP as ApprovalStore
+    participant AL as AliasStore
+    participant DL as datalog / provenance
+    participant DB as Ferrosa DB
+
+    C->>D: manage_rules / manage_claims / manage_approvals / manage_aliases
+    D->>R: load active stored rules
+    D->>CL: read/write symbolic claims
+    D->>AP: read/write reviewer decisions
+    D->>AL: exact alias lookup / update
+
+    C->>D: query_derived / recursive_explore / explain_derived
+    D->>E: load_effective_rules(scope, family?)
+    E->>R: list active stored rules
+    E->>DB: load built-in baseline metadata
+    E-->>D: merged effective rule set
+    D->>DL: evaluate(rules, facts) or reconstruct support chain
+    DL->>DB: derived cache + provenance + supporting facts
+    DL-->>D: derived facts / explanation payload
+    D-->>C: effective rules, claim state, approvals, aliases, explanations
+
+    Note over E,DL: `manage_rules`, `query_derived`, `recursive_explore`, and `promotion` all call<br/>the same effective-rule loader today.
+```
+
+## 13. Operator Workbench
+
+The operator surface should stop treating `/viz` as the de facto home page. Instead, expose an integrated workbench that links the operator workflows together and makes raw data exploration explicit.
+
+Current implementation note: backend convergence and governance APIs are implemented in MCP/core, and the operator workbench is now rooted at `/` with API-backed CQL, Datalog, rules, approvals, and summary routes. The remaining architectural correction is to keep CQL/SPARQL on Ferrosa public APIs while documenting Datalog honestly as a local ferrosa-memory engine over Ferrosa-backed state.
+
+```mermaid
+%%{init: {'theme':'dark','themeVariables':{'actorBkg':'#16161f','actorTextColor':'#e8e8ed','actorBorder':'#e2725b','signalColor':'#9494a3','signalTextColor':'#e8e8ed','labelBoxBkgColor':'#16161f','labelBoxBorderColor':'#e2725b','labelTextColor':'#e8e8ed','loopTextColor':'#e8e8ed','noteBkgColor':'#1c1c28','noteBorderColor':'#d4a574','noteTextColor':'#e8e8ed','activationBkgColor':'#1c1c28','activationBorderColor':'#e2725b'}}}%%
+sequenceDiagram
+    participant O as Operator Browser
+    participant UI as Workbench Home (/)
+    participant V as Viz (/viz)
+    participant CQ as CQL Explorer
+    participant DQ as Datalog Explorer
+    participant RM as Rules Manager
+    participant API as Operator APIs
+    participant FE as Ferrosa public APIs
+
+    O->>UI: GET /
+    UI-->>O: Home page with system status + nav
+
+    alt Explore raw data
+        O->>CQ: Open CQL explorer
+        CQ->>API: submit CQL passthrough query
+        API->>FE: forward CQL request
+        FE-->>API: rows + errors
+        API-->>CQ: rows + timing + surfaced errors
+    else Explore derived knowledge
+        O->>DQ: Open Datalog explorer
+        DQ->>API: submit local Datalog query
+        API->>API: evaluate repo-owned Datalog engine over scoped data
+        API-->>DQ: derived facts + provenance + surfaced errors
+    else Manage rule base
+        O->>RM: Open rules manager
+        RM->>API: list builtin / registry / effective rules
+        API-->>RM: rules + activation state + diff
+    else Visualize graph
+        O->>V: Open viz
+        V->>API: snapshot / ws / derived facts
+        API-->>V: graph + live updates
+    end
+
+    Note over UI,API: The home page becomes the workbench root.<br/>Viz remains one mode, not the only one.
 ```

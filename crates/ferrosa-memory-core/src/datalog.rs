@@ -22,8 +22,22 @@ use uuid::Uuid;
 use crate::config::DatalogConfig;
 use crate::storage::Storage;
 use crate::types::{
-    Atom, BuiltinFilter, DatalogRule, DerivedFact, FactSet, ProvenanceStep, TenantContext, Term,
+    Atom, BuiltinFilter, DatalogRule, DerivedFact, FactSet, ProvenanceStep, RuleEntry, RuleState,
+    TenantContext, Term,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleSource {
+    Builtin,
+    Registry,
+}
+
+#[derive(Debug, Clone)]
+pub struct EffectiveRuleEntry {
+    pub source: RuleSource,
+    pub entry: RuleEntry,
+}
 
 // ─── Rule Parser ──────────────────────────────────────────────────
 
@@ -430,22 +444,100 @@ fn format_rule_id(rule: &DatalogRule) -> String {
 ///
 /// These rules derive transitive relationships, clusters, reachability,
 /// taxonomy hierarchies, and part-of ancestry from base graph predicates.
+const BUILTIN_RULES_TEXT: [&str; 10] = [
+    "related(X, Z) :- co_occurs(X, Y), co_occurs(Y, Z), X != Z.",
+    "cluster(X, Y) :- related(X, Y), related(Y, X).",
+    "reachable(X, Z) :- edge(X, _, Z).",
+    "reachable(X, Z) :- reachable(X, Y), edge(Y, _, Z), X != Z.",
+    "class_ancestor(C, P) :- subclass_of(C, P).",
+    "class_ancestor(C, P) :- subclass_of(C, M), class_ancestor(M, P).",
+    "isa(E, C) :- instance_of(E, C).",
+    "isa(E, P) :- instance_of(E, C), class_ancestor(C, P).",
+    "ancestor_part(X, Y) :- part_of(X, Y).",
+    "ancestor_part(X, Z) :- part_of(X, Y), ancestor_part(Y, Z).",
+];
+
 pub fn builtin_rules() -> Vec<DatalogRule> {
-    let rules_text = [
-        "related(X, Z) :- co_occurs(X, Y), co_occurs(Y, Z), X != Z.",
-        "cluster(X, Y) :- related(X, Y), related(Y, X).",
-        "reachable(X, Z) :- edge(X, _, Z).",
-        "reachable(X, Z) :- reachable(X, Y), edge(Y, _, Z), X != Z.",
-        "class_ancestor(C, P) :- subclass_of(C, P).",
-        "class_ancestor(C, P) :- subclass_of(C, M), class_ancestor(M, P).",
-        "isa(E, C) :- instance_of(E, C).",
-        "isa(E, P) :- instance_of(E, C), class_ancestor(C, P).",
-        "ancestor_part(X, Y) :- part_of(X, Y).",
-        "ancestor_part(X, Z) :- part_of(X, Y), ancestor_part(Y, Z).",
-    ];
-    rules_text
+    BUILTIN_RULES_TEXT
         .iter()
         .filter_map(|r| parse_rule(r).ok())
+        .collect()
+}
+
+pub fn synthetic_builtin_rule_entries(tenant_id: Uuid) -> Vec<RuleEntry> {
+    let now = chrono::Utc::now();
+    BUILTIN_RULES_TEXT
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, rule_body)| {
+            let parsed = parse_rule(rule_body).ok()?;
+            Some(RuleEntry {
+                tenant_id,
+                rule_id: format!("builtin:{}:{}", parsed.head.predicate, idx + 1),
+                version: 0,
+                name: format!("builtin-{}-{}", parsed.head.predicate, idx + 1),
+                family: parsed.head.predicate.clone(),
+                state: RuleState::Active,
+                rule_body: (*rule_body).to_string(),
+                rule_weight: 1.0,
+                incremental: false,
+                created_at: now,
+                updated_at: now,
+            })
+        })
+        .collect()
+}
+
+pub async fn load_effective_rule_entries(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    family: Option<&str>,
+) -> anyhow::Result<Vec<EffectiveRuleEntry>> {
+    let family = family.filter(|value| !value.is_empty() && *value != "*");
+    let mut rules: Vec<EffectiveRuleEntry> = synthetic_builtin_rule_entries(ctx.tenant_id)
+        .into_iter()
+        .filter(|entry| family.is_none_or(|value| entry.family == value))
+        .map(|entry| EffectiveRuleEntry {
+            source: RuleSource::Builtin,
+            entry,
+        })
+        .collect();
+
+    let stored = if let Some(family) = family {
+        storage
+            .rule_list_family(ctx, family, RuleState::Active)
+            .await?
+    } else {
+        storage.rule_list_active(ctx, RuleState::Active).await?
+    };
+    for entry in stored {
+        if crate::expert_system::is_artifact_approved(
+            storage,
+            ctx,
+            crate::types::ArtifactKind::Rule,
+            &entry.rule_id,
+        )
+        .await?
+        {
+            rules.push(EffectiveRuleEntry {
+                source: RuleSource::Registry,
+                entry,
+            });
+        }
+    }
+
+    Ok(rules)
+}
+
+pub async fn load_effective_rules(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    family: Option<&str>,
+) -> anyhow::Result<Vec<DatalogRule>> {
+    load_effective_rule_entries(storage, ctx, family)
+        .await?
+        .into_iter()
+        .map(|rule| parse_rule(&rule.entry.rule_body))
         .collect()
 }
 
@@ -574,7 +666,7 @@ pub async fn query_predicate(
     // 2. Load facts and evaluate
     let start = std::time::Instant::now();
     let facts = load_session_facts(storage, ctx, session_id).await?;
-    let rules = builtin_rules();
+    let rules = load_effective_rules(storage, ctx, Some(predicate)).await?;
     let (_, derived) = evaluate(&rules, &facts, config.max_iterations, config.max_facts);
 
     // 3. Filter to requested predicate

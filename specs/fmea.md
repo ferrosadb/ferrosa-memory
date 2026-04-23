@@ -1,7 +1,7 @@
 # Failure Mode and Effects Analysis — ferrosa-memory-mcp
 
-> Last updated: 2026-04-10
-> Status: Updated — shared HTTP deployment failure modes added for auth, probes, secrets, and viz exposure.
+> Last updated: 2026-04-22
+> Status: Updated — shared HTTP deployment failure modes added for auth, probes, secrets, and viz exposure. The April 19 update adds the planned expert-system knowledge plane and its failure modes. The April 20 architecture correction narrows the concern: direct CQL use is acceptable for app-owned tables, but graph-table writes and local operator-query emulation remain serving-path failures to remove. The April 22 update adds `ingest_entities` batch failure modes around silent drops, conflict semantics, dry-run safety, and graph-boundary regression risk.
 
 ## Scoring Criteria
 
@@ -256,6 +256,35 @@
 | F60 | Viz exposed on shared deployment without equivalent auth boundary | Cross-tenant snapshot/event leakage and operator surface exposed to end users | 8 | 3 | 6 | **144** | Disable viz by default in shared deployments. If enabled, require same auth/TLS posture or internal-only exposure. |
 | F61 | Shared HTTP starts with fixed/default tenant fallback enabled | Multiple users silently share one tenant namespace | 9 | 3 | 7 | **189** | In HTTP mode, fail startup when auth mapping is absent and disallow random/fixed tenant fallback. |
 
+### Component: bulk_ingest / `ingest_entities`
+
+| ID | Failure Mode | Effect | S | O | D | RPN | Recommended Action |
+|----|-------------|--------|---|---|---|-----|-------------------|
+| F70 | Row-level exceptions are swallowed and omitted from the response | Caller believes ingest succeeded while entities or edges were silently dropped | 10 | 4 | 8 | **320** | No silent catch-and-continue path. Every failed entity/edge must produce a structured `failed[]` entry. Add regression tests that inject storage, schema, and endpoint failures. |
+| F71 | `on_conflict` semantics are inconsistent across rows | Re-ingest is not idempotent; retries corrupt or duplicate state | 8 | 4 | 6 | **192** | Define and test exact `update`, `skip`, and `error` semantics. Include duplicate-input and retry integration tests. |
+| F72 | `strict_edges=true` fails to validate endpoints correctly | Orphan edges are inserted or valid edges are rejected incorrectly | 8 | 4 | 5 | **160** | Resolve endpoints against batch rows and already-resident rows in the same tenant/session only. Add dry-run and live validation tests. |
+| F73 | Missing embeddings stall the whole batch | Large ingest hangs on Ollama instead of reporting partial embedding failures | 6 | 5 | 5 | **150** | Bound embedding concurrency, time out per embed call, and report `embeddings.failed[]` without blocking unrelated rows forever. |
+| F74 | `dry_run=true` performs writes or mutates resident state indirectly | Validation mode is unsafe; callers cannot trust preview results | 9 | 2 | 6 | **108** | Separate planning from execution. Add tests proving no app-table or graph writes occur under dry-run. |
+| F75 | Bulk edge path reintroduces direct graph-table writes | Ingest works only by bypassing the public graph interface, breaking the architecture boundary | 9 | 3 | 7 | **189** | Reuse the public graph write seam. Static guardrails must ban new direct graph-table mutations in the ingest path. |
+
+### Component: expert-system knowledge plane — planned rule, claim, approval, alias, and explanation surface
+
+| ID | Failure Mode | Effect | S | O | D | RPN | Recommended Action |
+|----|-------------|--------|---|---|---|-----|-------------------|
+| F62 | Effective rule set diverges from runtime evaluator | Stored rules appear active in admin surfaces, but `recursive_explore`/`promotion` still compute with built-ins only. Operators trust results that do not reflect the configured rule registry. | 8 | 5 | 7 | **280** | Introduce one `EffectiveRuleSet` loader shared by all inference entry points. Remove direct runtime `builtin_rules()` calls outside that loader. |
+| F63 | Approval state is advisory only | Unapproved claims or rules participate in retrieval or inference, undermining the human-review contract and making rollback ambiguous. | 9 | 4 | 6 | **216** | Approval filtering must happen in the loader/query layer, not just in UI code. Add integration tests for proposed vs approved artifacts. |
+| F64 | Alias lookup depends on fuzzy retrieval instead of exact scoped resolution | Wrong tool remap fires, arguments are rewritten incorrectly, or a low-confidence semantic match changes runtime behavior. | 7 | 4 | 6 | **168** | Store aliases in an exact-lookup structure with scope precedence. Semantic retrieval is optional browse support, not the execution path. |
+| F65 | Explanation reconstruction is incomplete or too expensive | Workbench shows partial support chains, or explanation calls become slow enough that operators stop trusting/using them. | 6 | 4 | 7 | **168** | Define a bounded explanation contract, add support indexes for the common path, and test reconstruction against multi-step derivations and supersession cases. |
+
+### Component: graph boundary and operator-query passthrough
+
+| ID | Failure Mode | Effect | S | O | D | RPN | Recommended Action |
+|----|-------------|--------|---|---|---|-----|-------------------|
+| F66 | Graph writes bypass the public graph API and target graph-owned backing tables directly | Graph-engine invariants, audit hooks, and schema evolution are bypassed. Writes may appear successful at the protocol layer while silently corrupting graph assumptions. | 9 | 4 | 7 | **252** | Route all graph mutations through the public Cypher/graph interface. Remove serving-path `INSERT`/`UPDATE`/`DELETE` statements that name graph-owned tables directly. |
+| F67 | Workbench query surfaces emulate public CQL/Datalog semantics locally | Operator tooling hides public API bugs, drifts from Ferrosa behavior, and returns misleading results that cannot be trusted as a contract check. | 8 | 4 | 7 | **224** | Replace local query interpreters with authenticated passthrough adapters. Fail loudly on unsupported or incorrect Ferrosa public behavior. |
+| F68 | Serving path requires graph-table MODIFY privileges or startup behavior incompatible with the `app_reader` role rollout | Auth rollout blocks deployment or forces over-privileged credentials for an otherwise ordinary client. | 8 | 4 | 6 | **192** | Make runtime writes compatible with `app_reader`: graph tables are read-only from `ferrosa-memory`; graph mutations flow through graph interfaces; startup/bootstrap must not require graph-table MODIFY. |
+| F69 | Health/readiness semantics remain tied to raw storage assumptions instead of supported client capabilities | Shared deployments report misleading readiness and route traffic to instances that cannot actually serve through the supported auth/query surfaces. | 6 | 4 | 6 | **144** | Define readiness in terms of supported client health, auth backend health, and contract reachability rather than privileged storage capabilities. |
+
 ### New Test Cases
 
 | Test ID | For FMEA | Test Description | Type |
@@ -288,3 +317,11 @@
 | TC50 | F59 | Build/start production container config from repo examples; verify required secrets are mounted/injected and no plaintext credentials live in tracked config | Manual |
 | TC51 | F60 | Start shared deployment defaults; verify viz listener is disabled or unreachable from the public endpoint | Integration |
 | TC52 | F61 | Attempt shared HTTP startup with only fixed/default tenant configured and no auth mapping source; verify startup fails fast | Unit + Integration |
+| TC53 | F62 | Store an active rule in `rules_by_id`; run `manage_rules`, `query_derived`, `recursive_explore`, and promotion loading; verify all report/use the same merged effective rule set | Integration |
+| TC54 | F63 | Seed proposed and approved claims/rules; verify only approved artifacts participate in default explanation and inference paths | Integration |
+| TC55 | F64 | Seed two aliases with overlapping names in different scopes; verify exact scoped lookup wins and fuzzy search is not used for execution | Unit + Integration |
+| TC56 | F65 | Request explanation for a derived fact with a 3-step support chain and supersession edge; verify complete, ordered support output within bounded latency | Integration |
+| TC57 | F66 | Trigger representative edge writes from fold/entity/temporal paths; verify all graph mutations traverse the public Cypher/graph interface and no serving-path write names graph-owned tables directly | Integration + Static verification |
+| TC58 | F67 | Run representative workbench CQL and Datalog queries against a Ferrosa endpoint returning a contract error; verify `ferrosa-memory` surfaces the error instead of substituting local semantics | Integration |
+| TC59 | F68 | Start the service against a Ferrosa instance with schema/bootstrap divergence; verify the serving path fails cleanly without attempting runtime migrations or seed writes | Integration |
+| TC60 | F69 | Simulate public-endpoint failure with direct storage still reachable; verify readiness is not reported healthy | Integration |

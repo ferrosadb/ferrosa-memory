@@ -57,7 +57,7 @@ pub async fn batch_materialize(
 
     // Load and evaluate
     let facts = datalog::load_session_facts(storage, ctx, session_id).await?;
-    let rules = datalog::builtin_rules();
+    let rules = datalog::load_effective_rules(storage, ctx, None).await?;
     let (_all_facts, derived) = datalog::evaluate(
         &rules,
         &facts,

@@ -126,7 +126,7 @@ pub async fn run_consolidation(
         .await
     {
         Ok(facts) => {
-            let rules = crate::datalog::builtin_rules();
+            let rules = crate::datalog::load_effective_rules(storage, ctx, None).await?;
             let datalog_config = crate::config::DatalogConfig::default();
             let (_all_facts, derived) = crate::datalog::evaluate(
                 &rules,
@@ -232,9 +232,10 @@ async fn create_edges_for_groups<'a, I, S>(
                 if sim >= CO_OCCURS_THRESHOLD {
                     let a = group[i].entity_id;
                     let b = group[j].entity_id;
-                    match storage
-                        .edge_co_occurs(ctx, a, b, session_id, sim as f32)
-                        .await
+                    match crate::graph_write::reinforce_co_occurs_edge(
+                        storage, ctx, a, b, session_id, sim as f32,
+                    )
+                    .await
                     {
                         Ok(()) => {
                             edges.push((a, b));

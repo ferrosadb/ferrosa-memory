@@ -1,3 +1,11 @@
+---
+type: feat
+priority: P2
+status: draft
+created: 2026-04-16
+updated: 2026-04-20
+---
+
 # feat: support tools for `frg fmem-skill-ingest`
 
 **Status:** todo

@@ -630,9 +630,7 @@ pub async fn run_enrichment(
 
         // Optional embedding client for populating description_embedding
         // alongside each LLM-generated description.
-        let embed_client = if !config.ollama_base_url.is_empty()
-            && !config.embed_model.is_empty()
-        {
+        let embed_client = if !config.ollama_base_url.is_empty() && !config.embed_model.is_empty() {
             Some(crate::embedding::EmbeddingClient::new(
                 &crate::config::EmbeddingConfig {
                     provider: "ollama".into(),
@@ -664,7 +662,8 @@ pub async fn run_enrichment(
                                         // configured. Falls back to None on error — we still
                                         // want the description written even if embedding fails.
                                         let desc_embedding = match &embed_client {
-                                            Some(c) => match c.embed(&enrichment.description).await {
+                                            Some(c) => match c.embed(&enrichment.description).await
+                                            {
                                                 Ok(v) => Some(v),
                                                 Err(e) => {
                                                     tracing::debug!(
@@ -766,8 +765,17 @@ pub async fn run_enrichment(
                                             created_at: chrono::Utc::now(),
                                             ..edge.clone()
                                         };
-                                        if let Err(e) =
-                                            storage.typed_edge_put(ctx, &annotated).await
+                                        if let Err(e) = crate::graph_write::create_typed_edge(
+                                            storage,
+                                            ctx,
+                                            annotated.session_id,
+                                            annotated.src_id,
+                                            annotated.edge_type.clone(),
+                                            annotated.dst_id,
+                                            annotated.weight,
+                                            annotated.metadata.clone(),
+                                        )
+                                        .await
                                         {
                                             result.errors.push(format!("typed_edge_put: {e}"));
                                         } else {

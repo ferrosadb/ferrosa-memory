@@ -1,3 +1,11 @@
+---
+type: feat
+priority: P2
+status: implemented
+created: 2026-04-11
+updated: 2026-04-20
+---
+
 # Auth File Hot-Reload
 
 ## Problem

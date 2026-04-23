@@ -14,8 +14,9 @@
 use ferrosa_memory_core::config::{EmbeddingConfig, FerrosaCqlConfig};
 use ferrosa_memory_core::cql_storage::CqlStorage;
 use ferrosa_memory_core::embedding::EmbeddingClient;
+use ferrosa_memory_core::graph::{GraphClient, GraphConfig};
 use ferrosa_memory_core::migration::run_migrations;
-use ferrosa_memory_core::smart_ingest::{smart_ingest, IngestConfig, IngestDecision};
+use ferrosa_memory_core::smart_ingest::{IngestConfig, IngestDecision, smart_ingest};
 use ferrosa_memory_core::storage::Storage;
 use ferrosa_memory_core::test_cluster::TestClusterConfig;
 use ferrosa_memory_core::types::{EntityEntry, EntityScope, MemoryState, TenantContext, TypedEdge};
@@ -27,6 +28,10 @@ fn base_cfg(test: &TestClusterConfig) -> FerrosaCqlConfig {
         keyspace: test.keyspace.clone(),
         replication_factor: 1,
         consistency: "ONE".into(),
+        username: "ferrosa_user".into(),
+        password: "ferrosa_user".into(),
+        admin_username: None,
+        admin_password: None,
     }
 }
 
@@ -35,6 +40,17 @@ fn test_ctx() -> TenantContext {
         tenant_id: Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
         session_origin: "launch-g3-g4".into(),
     }
+}
+
+async fn graph_client(test: &TestClusterConfig) -> GraphClient {
+    GraphClient::connect(&GraphConfig {
+        http_url: test.graph_url.clone(),
+        username: "ferrosa_user".into(),
+        password: "ferrosa_user".into(),
+        keyspace: test.keyspace.clone(),
+    })
+    .await
+    .expect("graph connect")
 }
 
 // --- G3: backfill -----------------------------------------------------
@@ -73,7 +89,10 @@ async fn g3_backfill_migrates_enriched_prefix_and_populates_description_embeddin
         created_at: chrono::Utc::now(),
         ..Default::default()
     };
-    storage.entity_put(&ctx, &entity).await.expect("seed entity");
+    storage
+        .entity_put(&ctx, &entity)
+        .await
+        .expect("seed entity");
 
     // Emulate the batch's Phase 1 + Phase 2 logic inline. We can't shell
     // out to the batch binary from a test cleanly; invoking the core
@@ -123,7 +142,10 @@ async fn g3_backfill_migrates_enriched_prefix_and_populates_description_embeddin
         }
     }
 
-    assert!(p1_migrated >= 1, "Phase 1 must migrate the seeded legacy entity");
+    assert!(
+        p1_migrated >= 1,
+        "Phase 1 must migrate the seeded legacy entity"
+    );
     if embed_ok {
         assert!(
             p2_embedded >= 1,
@@ -210,6 +232,7 @@ async fn g4_typed_edge_round_trip_still_works_against_new_keyspace_qualification
     let storage = CqlStorage::connect(&base_cfg(&test_cfg))
         .await
         .expect("connect");
+    let graph = graph_client(&test_cfg).await;
     run_migrations(storage.session(), storage.keyspace())
         .await
         .expect("migrate");
@@ -228,7 +251,18 @@ async fn g4_typed_edge_round_trip_still_works_against_new_keyspace_qualification
         metadata: Some("g4-regression".into()),
         created_at: chrono::Utc::now(),
     };
-    storage.typed_edge_put(&ctx, &edge).await.expect("put edge");
+    graph
+        .put_typed_edge(
+            ctx.tenant_id,
+            edge.session_id,
+            edge.src_id,
+            &edge.edge_type,
+            edge.dst_id,
+            edge.weight,
+            edge.metadata.as_deref(),
+        )
+        .await
+        .expect("put edge");
 
     let from_src = storage
         .typed_edge_list_from(&ctx, session_id, src_id)

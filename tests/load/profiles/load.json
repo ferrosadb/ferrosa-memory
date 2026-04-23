@@ -1,0 +1,7 @@
+{
+  "users": 100,
+  "spawn-rate": 10,
+  "run-time": "10m",
+  "host": "http://127.0.0.1:8766"
+}
+

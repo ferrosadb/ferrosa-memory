@@ -11,10 +11,11 @@ use uuid::Uuid;
 
 use crate::embedding::EmbeddingClient;
 use crate::storage::Storage;
-use crate::types::{EntityEntry, EntityScope, TenantContext, TypedEdge};
+use crate::types::{EntityEntry, EntityScope, TenantContext};
 
 /// One step of a skill's instructions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Step {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
@@ -23,6 +24,7 @@ pub struct Step {
 
 /// Caller-provided skill definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IngestSkillParams {
     pub name: String,
     pub category: String,
@@ -185,21 +187,20 @@ pub async fn ingest_skill(
         ctx.tenant_id,
     );
 
-    // Look up any existing skill with this exact name in the global partition.
-    let mut existing_matches = storage
-        .entity_find_phonetic(ctx, storage_session, &params.name)
+    // Idempotency key = (tenant, session, entity_name, entity_type=skill).
+    // An exact lookup is used here instead of the fuzzy phonetic scan:
+    // the phonetic path was reproducibly stale under bulk writes
+    // (bug-ingest-skill-bulk-nondeterminism), which caused ingest_skill
+    // to allocate duplicate entity_ids on re-runs and left later
+    // verify_skill reads without visible TAGGED_AS edges.
+    // Propagate storage errors — swallowing them here caused
+    // bug-ingest-skill-swallows-lookup-errors (a transient CQL error was
+    // treated as "skill doesn't exist", which created duplicates on retry
+    // and falsely populated `missing_prerequisites`).
+    let existing = storage
+        .entity_find_by_exact_name(ctx, storage_session, &params.name, "skill")
         .await
-        .unwrap_or_default();
-    existing_matches.retain(|e| e.entity_name == params.name && e.entity_type == "skill");
-    let existing = if let Some(head) = existing_matches.first() {
-        // Fetch full entity for property comparison.
-        storage
-            .entity_get_by_id(ctx, storage_session, head.entity_id)
-            .await
-            .unwrap_or(None)
-    } else {
-        None
-    };
+        .map_err(|e| anyhow::anyhow!("skill name lookup failed for {:?}: {e}", params.name))?;
 
     // Idempotent skip: same content_hash → no work.
     if let (Some(existing), Some(new_hash)) = (existing.as_ref(), params.content_hash.as_ref())
@@ -218,12 +219,14 @@ pub async fn ingest_skill(
         });
     }
 
-    // Build the new version string.
+    // Build the new version string. If we can't list existing skills we
+    // can't compute the next NN suffix correctly — better to fail than to
+    // collide with an existing version.
     let today = today_yyyymmdd();
     let all_skills = storage
         .entity_list_session(ctx, storage_session)
         .await
-        .unwrap_or_default();
+        .map_err(|e| anyhow::anyhow!("skill version scan failed: {e}"))?;
     let today_versions: Vec<&str> = all_skills
         .iter()
         .filter(|e| e.entity_type == "skill")
@@ -301,26 +304,55 @@ pub async fn ingest_skill(
     storage.entity_put(ctx, &entry).await?;
 
     // --- Tag resolution + TAGGED_AS edges ---
+    //
+    // The tag's entity_id is a deterministic UUIDv5 of
+    // `(tenant_id, normalized_tag_name)` — see
+    // `scope::tenant_tag_entity_uuid`. That decouples the edge write
+    // from the tag entity upsert:
+    //
+    //   - Compute tag_id locally, no lookup, no race.
+    //   - Best-effort upsert the tag entity (idempotent). If this
+    //     fails (e.g., CQL lane reconnect under bulk contention), a
+    //     concurrent sibling ingest or a later retry will have
+    //     written the row — the edge still references the right id.
+    //   - Always write the TAGGED_AS edge.
+    //
+    // Pre-fix behavior skipped the edge when the tag upsert errored,
+    // which caused bug-ingest-skill-cluster-tag-dropped: 5 concurrent
+    // ingests racing on the same "analysis" tag upsert would lose
+    // the edge on 4 of 5 skills.
     for tag_name in &tag_names {
-        match ensure_tag_entity(storage, ctx, storage_session, tag_name, ingested_by, now).await {
-            Ok(tag_id) => {
-                let edge = TypedEdge {
-                    tenant_id: ctx.tenant_id,
-                    session_id: storage_session,
-                    src_id: entity_id,
-                    edge_type: "TAGGED_AS".into(),
-                    dst_id: tag_id,
-                    weight: 1.0,
-                    metadata: None,
-                    created_at: now,
-                };
-                if let Err(e) = storage.typed_edge_put(ctx, &edge).await {
-                    tracing::warn!(skill = %params.name, tag = %tag_name, error = %e, "TAGGED_AS edge write failed");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(skill = %params.name, tag = %tag_name, error = %e, "tag entity resolution failed");
-            }
+        let tag_id = crate::scope::tenant_tag_entity_uuid(ctx.tenant_id, tag_name);
+        if let Err(e) =
+            ensure_tag_entity(storage, ctx, storage_session, tag_name, ingested_by, now).await
+        {
+            tracing::warn!(
+                skill = %params.name,
+                tag = %tag_name,
+                error = %e,
+                "tag entity upsert failed; writing TAGGED_AS edge against \
+                 deterministic tag id anyway — sibling or later ingest is \
+                 expected to materialize the tag row"
+            );
+        }
+        if let Err(e) = crate::graph_write::create_typed_edge(
+            storage,
+            ctx,
+            storage_session,
+            entity_id,
+            "TAGGED_AS",
+            tag_id,
+            1.0,
+            None,
+        )
+        .await
+        {
+            tracing::warn!(
+                skill = %params.name,
+                tag = %tag_name,
+                error = %e,
+                "TAGGED_AS edge write failed"
+            );
         }
     }
 
@@ -337,12 +369,16 @@ pub async fn ingest_skill(
     // a separate verify_skill round-trip to notice.
     let mut missing_prereqs: Vec<String> = Vec::new();
     for prereq_name in &params.prerequisites {
-        let mut matches = storage
-            .entity_find_phonetic(ctx, storage_session, prereq_name)
+        // Fail loud on storage errors. A transient CQL failure used to be
+        // silently converted to "prereq doesn't exist" and surfaced as
+        // `missing_prerequisites` — the caller couldn't tell whether the
+        // prereq was truly missing or the lookup just failed, and retried
+        // ingests produced duplicate entities.
+        let Some(prereq) = storage
+            .entity_find_by_exact_name(ctx, storage_session, prereq_name, "skill")
             .await
-            .unwrap_or_default();
-        matches.retain(|e| e.entity_name == *prereq_name && e.entity_type == "skill");
-        let Some(prereq) = matches.first() else {
+            .map_err(|e| anyhow::anyhow!("prereq lookup failed for {prereq_name:?}: {e}"))?
+        else {
             tracing::info!(
                 skill = %params.name,
                 prereq = %prereq_name,
@@ -387,17 +423,18 @@ pub async fn ingest_skill(
             );
         }
 
-        let edge = TypedEdge {
-            tenant_id: ctx.tenant_id,
-            session_id: storage_session,
-            src_id: entity_id,
-            edge_type: "REQUIRES".into(),
-            dst_id: prereq.entity_id,
-            weight: 1.0,
-            metadata: None,
-            created_at: now,
-        };
-        if let Err(e) = storage.typed_edge_put(ctx, &edge).await {
+        if let Err(e) = crate::graph_write::create_typed_edge(
+            storage,
+            ctx,
+            storage_session,
+            entity_id,
+            "REQUIRES",
+            prereq.entity_id,
+            1.0,
+            None,
+        )
+        .await
+        {
             tracing::warn!(skill = %params.name, prereq = %prereq_name, error = %e, "REQUIRES edge write failed");
             missing_prereqs.push(prereq_name.clone());
         }
@@ -461,10 +498,12 @@ pub async fn retrieve_skills_for_context(
     let _ = caller_session_id; // reserved for session-scope skills in a future pass
 
     let global_session = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
+    // Caller needs a deterministic empty-vs-error signal. If CQL fails,
+    // returning Ok([]) would look like "no skills" — worse than Err.
     let all = storage
         .entity_list_session(ctx, global_session)
         .await
-        .unwrap_or_default();
+        .map_err(|e| anyhow::anyhow!("skill catalog list failed: {e}"))?;
 
     let context_lower = context.to_lowercase();
     let context_tokens: std::collections::HashSet<String> = context_lower
@@ -477,12 +516,8 @@ pub async fn retrieve_skills_for_context(
         .into_iter()
         .filter(|e| e.entity_type == "skill")
         .filter_map(|e| {
-            let score = score_skill_against_context(
-                &e,
-                &context_lower,
-                &context_tokens,
-                query_embedding,
-            );
+            let score =
+                score_skill_against_context(&e, &context_lower, &context_tokens, query_embedding);
             if score < min_score {
                 return None;
             }
@@ -545,11 +580,7 @@ fn score_skill_against_context(
         .properties
         .get("trigger_keywords")
         .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str())
-                .collect::<Vec<_>>()
-        })
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
         .unwrap_or_default();
     // Trigger keywords are often multi-word phrases ("red-green-refactor",
     // "kent beck"). Check substring against the full lowercased context,
@@ -558,8 +589,7 @@ fn score_skill_against_context(
         .iter()
         .filter(|t| {
             let lowered = t.to_lowercase();
-            context_lower.contains(&lowered)
-                || context_tokens.contains(&lowered)
+            context_lower.contains(&lowered) || context_tokens.contains(&lowered)
         })
         .count();
     if !triggers.is_empty() {
@@ -613,19 +643,13 @@ pub async fn get_skill_by_name(
     name: &str,
 ) -> anyhow::Result<Option<EntityEntry>> {
     let global_session = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
-    let mut matches = storage
-        .entity_find_phonetic(ctx, global_session, name)
+    // Exact lookup, same key ingest_skill uses — keeps verify_skill and
+    // invoke_skill from disagreeing with the write path on which row is
+    // "the" skill with this name.
+    storage
+        .entity_find_by_exact_name(ctx, global_session, name, "skill")
         .await
-        .unwrap_or_default();
-    matches.retain(|e| e.entity_name == name && e.entity_type == "skill");
-    if let Some(head) = matches.first() {
-        // entity_find_phonetic is lightweight — fetch the full entity for the steps.
-        storage
-            .entity_get_by_id(ctx, global_session, head.entity_id)
-            .await
-    } else {
-        Ok(None)
-    }
+        .map_err(|e| anyhow::anyhow!("skill lookup by name {name:?} failed: {e}"))
 }
 
 /// Closest skill names (phonetic-match top-K) for did_you_mean hints on a
@@ -637,16 +661,26 @@ pub async fn similar_skill_names(
     k: usize,
 ) -> Vec<String> {
     let global_session = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
-    let mut matches = storage
+    // This feeds the "did_you_mean" hint on a missed invoke_skill. It is
+    // decorative, not load-bearing — a hint failure must not cascade into
+    // the caller's error. But the failure still needs to be SEEN: logging
+    // (not silent drop) so an operator can spot a partial outage.
+    let mut matches = match storage
         .entity_find_phonetic(ctx, global_session, name)
         .await
-        .unwrap_or_default();
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                skill = %name,
+                error = %e,
+                "similar_skill_names lookup failed; returning empty hints"
+            );
+            return Vec::new();
+        }
+    };
     matches.retain(|e| e.entity_type == "skill");
-    matches
-        .into_iter()
-        .take(k)
-        .map(|e| e.entity_name)
-        .collect()
+    matches.into_iter().take(k).map(|e| e.entity_name).collect()
 }
 
 /// Structured response returned by `invoke_skill`. Purely data — no tool
@@ -711,10 +745,15 @@ pub async fn ensure_parent_tag(
         ensure_tag_entity(storage, ctx, global_session, &parent_tag, ingested_by, now).await?;
 
     // Idempotency: check for existing PARENT_TAG edge.
+    // A failed read here used to be silently treated as "no existing edge",
+    // which would then try to create a duplicate — masking quorum /
+    // consistency issues and producing duplicate edges on retry.
     let existing = storage
         .typed_edge_list_from(ctx, global_session, child_id)
         .await
-        .unwrap_or_default();
+        .map_err(|e| {
+            anyhow::anyhow!("PARENT_TAG idempotency check failed for child {child_id}: {e}")
+        })?;
     if existing
         .iter()
         .any(|e| e.edge_type == "PARENT_TAG" && e.dst_id == parent_id)
@@ -749,17 +788,17 @@ pub async fn ensure_parent_tag(
         }
     }
 
-    let edge = TypedEdge {
-        tenant_id: ctx.tenant_id,
-        session_id: global_session,
-        src_id: child_id,
-        edge_type: "PARENT_TAG".into(),
-        dst_id: parent_id,
-        weight: 1.0,
-        metadata: None,
-        created_at: now,
-    };
-    storage.typed_edge_put(ctx, &edge).await?;
+    crate::graph_write::create_typed_edge(
+        storage,
+        ctx,
+        global_session,
+        child_id,
+        "PARENT_TAG",
+        parent_id,
+        1.0,
+        None,
+    )
+    .await?;
 
     Ok(EnsureParentTagAction::Created {
         child_id,
@@ -810,25 +849,36 @@ pub async fn verify_skill(
     let global_session = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
 
     // Outgoing edges → TAGGED_AS tags + REQUIRES prerequisites.
+    // Fail loud on storage errors — verify_skill is used by audit
+    // pipelines; a silent partial view of the graph would be worse than
+    // no view at all.
     let outgoing = storage
         .typed_edge_list_from(ctx, global_session, entity.entity_id)
         .await
-        .unwrap_or_default();
+        .map_err(|e| {
+            anyhow::anyhow!("verify_skill outgoing-edge scan failed for {skill_name:?}: {e}")
+        })?;
     let mut tags: Vec<String> = Vec::new();
     let mut prerequisites: Vec<String> = Vec::new();
     for edge in &outgoing {
-        let Some(target) = storage
+        // A missing target here is a genuine dangling edge (safe to skip);
+        // an error fetching the target is a real problem worth surfacing.
+        let target = match storage
             .entity_get_by_id(ctx, global_session, edge.dst_id)
             .await
-            .unwrap_or(None)
-        else {
-            continue;
+        {
+            Ok(Some(t)) => t,
+            Ok(None) => continue,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "verify_skill edge target fetch failed for {}: {e}",
+                    edge.dst_id
+                ));
+            }
         };
         match edge.edge_type.as_str() {
             "TAGGED_AS" if target.entity_type == "tag" => tags.push(target.entity_name),
-            "REQUIRES" if target.entity_type == "skill" => {
-                prerequisites.push(target.entity_name)
-            }
+            "REQUIRES" if target.entity_type == "skill" => prerequisites.push(target.entity_name),
             _ => {}
         }
     }
@@ -840,18 +890,28 @@ pub async fn verify_skill(
     let all_edges = storage
         .typed_edge_list_session(ctx, global_session)
         .await
-        .unwrap_or_default();
+        .map_err(|e| {
+            anyhow::anyhow!("verify_skill incoming-edge scan failed for {skill_name:?}: {e}")
+        })?;
     let mut required_by: Vec<String> = Vec::new();
     for edge in &all_edges {
         if edge.edge_type != "REQUIRES" || edge.dst_id != entity.entity_id {
             continue;
         }
-        if let Some(source) = storage
+        let source = match storage
             .entity_get_by_id(ctx, global_session, edge.src_id)
             .await
-            .unwrap_or(None)
-            && source.entity_type == "skill"
         {
+            Ok(Some(s)) => s,
+            Ok(None) => continue,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "verify_skill required_by source fetch failed for {}: {e}",
+                    edge.src_id
+                ));
+            }
+        };
+        if source.entity_type == "skill" {
             required_by.push(source.entity_name);
         }
     }
@@ -955,6 +1015,18 @@ pub fn build_invoke_result(entity: &EntityEntry) -> InvokeSkillResult {
 }
 
 /// Resolve or create a tag entity (entity_type="tag", scope=Global) by name.
+///
+/// The tag's `entity_id` is deterministic: `UUIDv5((tenant_id, tag_name))`.
+/// This replaces the previous read-then-maybe-create flow, which had a
+/// lookup race under concurrent bulk ingest (see
+/// bug-ingest-skill-tag-crosstalk): two ingests racing on the phonetic
+/// scan could each create their own tag entity with a fresh random id,
+/// and later `TAGGED_AS` writes could end up referencing the wrong one.
+///
+/// With a name-derived id, every caller computes the same id for the same
+/// name. `entity_put` is an upsert on the primary key `(tenant_id,
+/// session_id, entity_id)`, so re-writing the same row is safe; if the
+/// tag already exists the write is a no-op content-wise.
 async fn ensure_tag_entity(
     storage: &(impl Storage + ?Sized),
     ctx: &TenantContext,
@@ -963,16 +1035,7 @@ async fn ensure_tag_entity(
     ingested_by: Option<Uuid>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<Uuid> {
-    let mut matches = storage
-        .entity_find_phonetic(ctx, storage_session, tag_name)
-        .await
-        .unwrap_or_default();
-    matches.retain(|e| e.entity_name == tag_name && e.entity_type == "tag");
-    if let Some(head) = matches.first() {
-        return Ok(head.entity_id);
-    }
-
-    let entity_id = Uuid::new_v4();
+    let entity_id = crate::scope::tenant_tag_entity_uuid(ctx.tenant_id, tag_name);
     let tag_entry = EntityEntry {
         tenant_id: ctx.tenant_id,
         entity_id,
@@ -1027,6 +1090,137 @@ mod tests {
             content_hash: None,
             caller_session_id: Uuid::new_v4(),
         }
+    }
+
+    #[tokio::test]
+    async fn ingest_skill_propagates_prereq_lookup_error() {
+        // Regression for bug-ingest-skill-swallows-lookup-errors: if the
+        // storage layer errors during a prereq lookup, ingest_skill must
+        // surface the error, NOT silently mark the prereq as missing.
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+        // Arm the forced-error hook BEFORE calling ingest. Any
+        // entity_find_by_exact_name call is now guaranteed to error,
+        // which is what ingest_skill now uses for both the self lookup
+        // and the prereq lookup.
+        *storage.force_exact_name_error.lock().await =
+            Some("simulated CQL transport failure".into());
+        let result = ingest_skill(
+            &storage,
+            &ctx,
+            IngestSkillParams {
+                name: "child-skill".into(),
+                category: "testing".into(),
+                description: "a child skill with a prereq".into(),
+                trigger_keywords: vec![],
+                tags: vec![],
+                prerequisites: vec!["parent-skill".into()],
+                steps: vec![],
+                output_artifacts: vec![],
+                completion_criteria: None,
+                content_hash: None,
+                caller_session_id: Uuid::nil(),
+            },
+            None,
+            None,
+        )
+        .await;
+        let err = result.expect_err("ingest_skill must surface storage errors");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("simulated CQL transport failure"),
+            "error must name the underlying storage failure, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_skill_is_idempotent_without_phonetic_lookup() {
+        // Regression for bug-ingest-skill-bulk-nondeterminism. Under bulk
+        // load the phonetic scan (full-partition ALLOW FILTERING) returned
+        // stale / empty results, causing ingest_skill to allocate a fresh
+        // entity_id for a skill that already existed. The idempotency
+        // check must instead go through an exact-name lookup that doesn't
+        // depend on the fuzzy scan. Simulate the stale phonetic view by
+        // forcing `entity_find_phonetic` to error — if ingest still
+        // short-circuits to Skipped on matching content_hash, the
+        // idempotency path is independent of the phonetic scan.
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+
+        // First ingest lays down the skill with a known content_hash.
+        let mut p = base_params("tdd");
+        p.content_hash = Some("sha256:abc".into());
+        let first = ingest_skill(&storage, &ctx, p.clone(), None, None)
+            .await
+            .unwrap();
+        let first_id = match first {
+            SkillIngestAction::Created { entity_id, .. } => entity_id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        // Now break phonetic. The exact-name idempotency check must not
+        // rely on it.
+        *storage.force_phonetic_error.lock().await = Some("simulated CQL phonetic failure".into());
+
+        let second = ingest_skill(&storage, &ctx, p, None, None).await.unwrap();
+        match second {
+            SkillIngestAction::Skipped { entity_id, .. } => {
+                assert_eq!(
+                    entity_id, first_id,
+                    "idempotent skip must reuse the original entity_id"
+                );
+            }
+            other => panic!("expected Skipped on unchanged content_hash, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_deserialization_rejects_unknown_fields() {
+        let json = r#"{"title": "Step one", "body": "Verify the thing"}"#;
+        let err = serde_json::from_str::<Step>(json).unwrap_err().to_string();
+        assert!(
+            err.contains("unknown field") && err.contains("title"),
+            "expected deny_unknown_fields error naming `title`, got: {err}"
+        );
+    }
+
+    #[test]
+    fn step_deserialization_accepts_known_fields() {
+        let json = r#"{"phase": "Red", "instruction": "write a failing test"}"#;
+        let s: Step = serde_json::from_str(json).unwrap();
+        assert_eq!(s.phase.as_deref(), Some("Red"));
+        assert_eq!(s.instruction, "write a failing test");
+    }
+
+    #[test]
+    fn ingest_skill_params_rejects_unknown_top_level_field() {
+        let json = serde_json::json!({
+            "name": "foo",
+            "category": "testing",
+            "description": "d",
+            "caller_session_id": "00000000-0000-0000-0000-000000000000",
+            "spurious_field": 1
+        });
+        let err = serde_json::from_value::<IngestSkillParams>(json)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown field") && err.contains("spurious_field"),
+            "expected deny_unknown_fields error naming `spurious_field`, got: {err}"
+        );
+    }
+
+    #[test]
+    fn ingest_skill_params_accepts_minimum_valid_payload() {
+        let json = serde_json::json!({
+            "name": "foo",
+            "category": "testing",
+            "description": "d",
+            "caller_session_id": "00000000-0000-0000-0000-000000000000"
+        });
+        let p: IngestSkillParams = serde_json::from_value(json).unwrap();
+        assert_eq!(p.name, "foo");
+        assert!(p.steps.is_empty());
     }
 
     #[test]
@@ -1131,7 +1325,10 @@ mod tests {
             SkillIngestAction::Skipped { reason, .. } => {
                 assert_eq!(reason, "content_hash unchanged");
             }
-            other => panic!("expected Skipped on identical content_hash, got {:?}", other),
+            other => panic!(
+                "expected Skipped on identical content_hash, got {:?}",
+                other
+            ),
         }
     }
 
@@ -1173,6 +1370,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ensure_tag_entity_is_deterministic_across_stores() {
+        // Regression for bug-ingest-skill-tag-crosstalk. Under bulk ingest,
+        // concurrent `ensure_tag_entity` calls produced non-deterministic
+        // tag entity_ids and TAGGED_AS edges sometimes pointed at tags
+        // belonging to other skills. Deriving the id deterministically
+        // from (tenant, normalized_name) removes the lookup race entirely:
+        // every caller computes the same id for the same tag, no matter
+        // the storage state or concurrent activity.
+        let ctx = test_ctx();
+        let storage_a = MockStorage::new();
+        let storage_b = MockStorage::new();
+        let session_id = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
+        let now = chrono::Utc::now();
+
+        let id_a = ensure_tag_entity(&storage_a, &ctx, session_id, "architecture", None, now)
+            .await
+            .unwrap();
+        let id_b = ensure_tag_entity(&storage_b, &ctx, session_id, "architecture", None, now)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            id_a, id_b,
+            "ensure_tag_entity must derive its UUID from (tenant_id, tag_name) \
+             so two callers always agree — no lookup race can produce a wrong id"
+        );
+
+        // Different tenant → different id (no cross-tenant leakage).
+        let ctx_other = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "test".into(),
+        };
+        let other_session = crate::scope::tenant_global_session_uuid(ctx_other.tenant_id);
+        let id_other = ensure_tag_entity(
+            &storage_a,
+            &ctx_other,
+            other_session,
+            "architecture",
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            id_a, id_other,
+            "ensure_tag_entity must scope by tenant_id; otherwise two tenants' \
+             tags with the same name would collide on the same partition"
+        );
+    }
+
+    #[tokio::test]
     async fn ingest_skill_creates_tag_entities_for_additional_tags() {
         let storage = MockStorage::new();
         let ctx = test_ctx();
@@ -1192,6 +1440,211 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_ingest_of_distinct_skills_does_not_crosslink_tags() {
+        // Acceptance invariant for bug-ingest-skill-tag-crosstalk.
+        //
+        // Every TAGGED_AS edge out of a skill must point at a tag entity
+        // whose name is in that skill's declared `category` + `tags`.
+        // Bulk ingest previously violated this — two skills ingested
+        // back-to-back could end up cross-linked: compile-project's
+        // "architecture" edge became "analysis" (complexity-audit's
+        // tag) and vice versa.
+        //
+        // This test exercises the happy path under concurrent
+        // ingest_skill calls via `tokio::join!`. MockStorage serializes
+        // writes under its Mutex, so the race window is narrower than
+        // against live CQL — but the same code path runs, and any
+        // shared mutable state or non-deterministic id allocation in
+        // ensure_tag_entity would fail this invariant.
+        use std::sync::Arc;
+
+        let storage = Arc::new(MockStorage::new());
+        let ctx = Arc::new(test_ctx());
+
+        let make_params = |name: &str, category: &str, extra: &str| {
+            let mut p = base_params(name);
+            p.category = category.into();
+            p.tags = vec![extra.into()];
+            p
+        };
+
+        let s1 = Arc::clone(&storage);
+        let c1 = Arc::clone(&ctx);
+        let p1 = make_params("compile-project", "architecture", "task-level");
+        let s2 = Arc::clone(&storage);
+        let c2 = Arc::clone(&ctx);
+        let p2 = make_params("complexity-audit", "analysis", "task-level");
+        let s3 = Arc::clone(&storage);
+        let c3 = Arc::clone(&ctx);
+        let p3 = make_params("cloud-architect", "cloud", "task-level");
+
+        let (r1, r2, r3) = tokio::join!(
+            async move { ingest_skill(s1.as_ref(), c1.as_ref(), p1, None, None).await },
+            async move { ingest_skill(s2.as_ref(), c2.as_ref(), p2, None, None).await },
+            async move { ingest_skill(s3.as_ref(), c3.as_ref(), p3, None, None).await },
+        );
+        r1.unwrap();
+        r2.unwrap();
+        r3.unwrap();
+
+        let gs = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
+        let cases = [
+            ("compile-project", vec!["architecture", "task-level"]),
+            ("complexity-audit", vec!["analysis", "task-level"]),
+            ("cloud-architect", vec!["cloud", "task-level"]),
+        ];
+        for (skill_name, expected_tags) in &cases {
+            let skill = get_skill_by_name(storage.as_ref(), ctx.as_ref(), skill_name)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("skill {skill_name} must exist"));
+            let edges = storage
+                .typed_edge_list_from(ctx.as_ref(), gs, skill.entity_id)
+                .await
+                .unwrap();
+            let tag_edges: Vec<_> = edges
+                .iter()
+                .filter(|e| e.edge_type == "TAGGED_AS")
+                .collect();
+            assert_eq!(
+                tag_edges.len(),
+                expected_tags.len(),
+                "{skill_name}: expected {} TAGGED_AS edges, got {}",
+                expected_tags.len(),
+                tag_edges.len()
+            );
+            for edge in &tag_edges {
+                let tag = storage
+                    .entity_get_by_id(ctx.as_ref(), gs, edge.dst_id)
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("TAGGED_AS dst {} must resolve", edge.dst_id));
+                assert!(
+                    expected_tags.contains(&tag.entity_name.as_str()),
+                    "{skill_name} TAGGED_AS edge points at tag {:?} which is not in declared tags {:?}",
+                    tag.entity_name,
+                    expected_tags
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_ingest_sharing_a_cluster_tag_every_skill_gets_the_edge() {
+        // Regression for bug-ingest-skill-cluster-tag-dropped. Under
+        // concurrent bulk ingest, 5 skills all declaring the same
+        // cluster tag ("analysis" in the field report) lost that tag
+        // on 4 of 5 skills — the category tag survived, the shared
+        // frontmatter cluster tag didn't. Acceptance #3 in the spec:
+        // "ingest 5 skills that all declare the same cluster tag;
+        // verify all 5 have that tag after concurrent ingest."
+        use std::sync::Arc;
+
+        let storage = Arc::new(MockStorage::new());
+        let ctx = Arc::new(test_ctx());
+
+        let names = [
+            "code-audit",
+            "dsm-analysis",
+            "fmea",
+            "database-consistency-audit",
+            "complexity-audit",
+        ];
+        let futs: Vec<_> = names
+            .iter()
+            .map(|n| {
+                let s = Arc::clone(&storage);
+                let c = Arc::clone(&ctx);
+                let mut p = base_params(n);
+                // category "testing" (from base_params) becomes one tag;
+                // the frontmatter cluster tag is "analysis", the one
+                // the bug dropped.
+                p.tags = vec!["analysis".into()];
+                async move { ingest_skill(s.as_ref(), c.as_ref(), p, None, None).await }
+            })
+            .collect();
+        let results = futures_util::future::join_all(futs).await;
+        for (name, r) in names.iter().zip(results.iter()) {
+            r.as_ref()
+                .unwrap_or_else(|e| panic!("{name} ingest failed: {e}"));
+        }
+
+        let gs = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
+        let analysis_tag_id = crate::scope::tenant_tag_entity_uuid(ctx.tenant_id, "analysis");
+
+        for name in &names {
+            let skill = get_skill_by_name(storage.as_ref(), ctx.as_ref(), name)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("skill {name} must exist"));
+            let edges = storage
+                .typed_edge_list_from(ctx.as_ref(), gs, skill.entity_id)
+                .await
+                .unwrap();
+            let to_analysis: Vec<_> = edges
+                .iter()
+                .filter(|e| e.edge_type == "TAGGED_AS" && e.dst_id == analysis_tag_id)
+                .collect();
+            assert_eq!(
+                to_analysis.len(),
+                1,
+                "{name} must have exactly one TAGGED_AS edge to the shared \
+                 'analysis' cluster tag, got {} edges",
+                to_analysis.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tagged_as_edge_persists_when_tag_entity_upsert_fails() {
+        // Regression for bug-ingest-skill-cluster-tag-dropped. In the
+        // field, the tag-entity upsert for a shared cluster tag would
+        // fail under CQL contention (lane reconnect / write timeout)
+        // and the old code would also skip the TAGGED_AS edge, so the
+        // skill silently lost its link to the tag. With deterministic
+        // tag ids this is recoverable: the edge points at a stable
+        // UUID, and a concurrent or later ingest will have written
+        // (or will write) the tag row. `ingest_skill` must not gate
+        // the edge write on the tag upsert's success.
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+        let gs = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
+
+        // Fail every tag-entity upsert this ingest attempts.
+        *storage.force_entity_put_error.lock().await = Some((
+            "tag".into(),
+            "simulated CQL write timeout on tag row".into(),
+        ));
+
+        let mut p = base_params("code-audit");
+        p.tags = vec!["analysis".into()];
+        ingest_skill(&storage, &ctx, p, None, None).await.unwrap();
+
+        let skill = get_skill_by_name(&storage, &ctx, "code-audit")
+            .await
+            .unwrap()
+            .expect("skill row must exist (skill entity_put was not armed to fail)");
+        let edges = storage
+            .typed_edge_list_from(&ctx, gs, skill.entity_id)
+            .await
+            .unwrap();
+        let expected_tag_id = crate::scope::tenant_tag_entity_uuid(ctx.tenant_id, "analysis");
+        let to_analysis: Vec<_> = edges
+            .iter()
+            .filter(|e| e.edge_type == "TAGGED_AS" && e.dst_id == expected_tag_id)
+            .collect();
+        assert_eq!(
+            to_analysis.len(),
+            1,
+            "TAGGED_AS edge to the deterministic 'analysis' tag id must be \
+             written even when the tag-entity upsert transiently failed; \
+             a concurrent sibling ingest (or a later retry) will have \
+             written the tag row. Got {} edges.",
+            to_analysis.len()
+        );
+    }
+
+    #[tokio::test]
     async fn ingest_skill_emits_requires_edge_when_prereq_exists() {
         let storage = MockStorage::new();
         let ctx = test_ctx();
@@ -1205,11 +1658,8 @@ mod tests {
         let tdd = ingest_skill(&storage, &ctx, p, None, None).await.unwrap();
 
         let global = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
-        let edges = storage
-            .typed_edge_list_session(&ctx, global)
-            .await
-            .unwrap();
-        let requires: Vec<&TypedEdge> = edges
+        let edges = storage.typed_edge_list_session(&ctx, global).await.unwrap();
+        let requires: Vec<&crate::types::TypedEdge> = edges
             .iter()
             .filter(|e| e.edge_type == "REQUIRES" && e.src_id == tdd.entity_id())
             .collect();
@@ -1288,18 +1738,9 @@ mod tests {
         let caller = Uuid::new_v4();
         let mut used = std::collections::HashSet::new();
         used.insert(action.entity_id());
-        let hits = retrieve_skills_for_context(
-            &storage,
-            &ctx,
-            caller,
-            "tdd",
-            None,
-            5,
-            0.0,
-            &used,
-        )
-        .await
-        .unwrap();
+        let hits = retrieve_skills_for_context(&storage, &ctx, caller, "tdd", None, 5, 0.0, &used)
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].used_in_session);
     }
@@ -1389,12 +1830,11 @@ mod tests {
 
         // Only one edge landed despite two calls.
         let global = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
-        let edges = storage
-            .typed_edge_list_session(&ctx, global)
-            .await
-            .unwrap();
-        let parent_edges: Vec<&TypedEdge> =
-            edges.iter().filter(|e| e.edge_type == "PARENT_TAG").collect();
+        let edges = storage.typed_edge_list_session(&ctx, global).await.unwrap();
+        let parent_edges: Vec<&crate::types::TypedEdge> = edges
+            .iter()
+            .filter(|e| e.edge_type == "PARENT_TAG")
+            .collect();
         assert_eq!(parent_edges.len(), 1);
     }
 
@@ -1430,7 +1870,9 @@ mod tests {
     async fn verify_skill_reports_exists_false_for_missing() {
         let storage = MockStorage::new();
         let ctx = test_ctx();
-        let result = verify_skill(&storage, &ctx, "does-not-exist").await.unwrap();
+        let result = verify_skill(&storage, &ctx, "does-not-exist")
+            .await
+            .unwrap();
         assert!(!result.exists);
         assert!(result.tags.is_empty());
         assert!(result.prerequisites.is_empty());

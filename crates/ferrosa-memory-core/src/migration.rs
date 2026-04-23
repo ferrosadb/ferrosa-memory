@@ -49,11 +49,33 @@ pub const PRE_VERSIONING_BASELINE: u32 = 19;
 /// Ordered registry of migrations. Append only. Never edit an existing
 /// entry's `ddl` — that would produce divergent schemas across
 /// deployments. Bump the version and add a new migration instead.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 20,
-    description: "rich entity schema (Sprint 1 of skills layer)",
-    ddl: include_str!("../../../ddl/020_rich_entity_schema.cql"),
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 20,
+        description: "rich entity schema (Sprint 1 of skills layer)",
+        ddl: include_str!("../../../ddl/020_rich_entity_schema.cql"),
+    },
+    Migration {
+        version: 21,
+        description: "derived cache TTL tracking table",
+        ddl: include_str!("../../../ddl/021_derived_cache_ttl.cql"),
+    },
+    Migration {
+        version: 22,
+        description: "approval log store",
+        ddl: include_str!("../../../ddl/022_approval_store.cql"),
+    },
+    Migration {
+        version: 23,
+        description: "exact alias registry store",
+        ddl: include_str!("../../../ddl/023_alias_store.cql"),
+    },
+    Migration {
+        version: 24,
+        description: "active rule index for wildcard rule listing",
+        ddl: include_str!("../../../ddl/024_rules_active_index.cql"),
+    },
+];
 
 /// Pre-versioning DDLs. Applied in order when `run_migrations` detects a
 /// greenfield keyspace (no keyspace row in `system_schema.keyspaces`).
@@ -86,16 +108,50 @@ pub const BOOTSTRAP_DDLS: &[&str] = &[
     include_str!("../../../ddl/017_typed_edges.cql"),
     include_str!("../../../ddl/018_edge_session_indexes.cql"),
     include_str!("../../../ddl/019_type_registry.cql"),
+    include_str!("../../../ddl/020_rich_entity_schema.cql"),
+    include_str!("../../../ddl/021_derived_cache_ttl.cql"),
+    include_str!("../../../ddl/022_approval_store.cql"),
+    include_str!("../../../ddl/023_alias_store.cql"),
+    include_str!("../../../ddl/024_rules_active_index.cql"),
 ];
 
+/// Role-auth seed DDL — creates `ferrosa_admin` (superuser) and
+/// `ferrosa_user` (LOGIN), plus the keyspace/table-level grants that
+/// give `ferrosa_user` SELECT on everything in `agent_memory` and
+/// MODIFY only on application-owned tables.
+///
+/// Applied by `apply_bootstrap` ONLY when `FERROSA_AUTH_ENABLED=true`.
+/// When auth is disabled, `system_auth` keyspace doesn't contain the
+/// role tables and the DDL would fail — the guard prevents that
+/// failure for operators who haven't flipped auth on yet.
+///
+/// See specs/decisions/design-cql-role-auth-rollout.md Sprint B.
+pub const ROLES_DDL: &str = include_str!("../../../ddl/100_roles.cql");
+
+/// Returns true if the migration runner should apply `ROLES_DDL`.
+///
+/// Gated on `FERROSA_AUTH_ENABLED=true` so a cluster with auth disabled
+/// never tries to create roles against a non-existent `system_auth`
+/// keyspace. Matches the shape of `ferrosa_storage::StorageEngineConfig`'s
+/// `auth_enabled` plumbing — a single env var flips both sides.
+pub fn should_apply_roles_ddl() -> bool {
+    matches!(
+        std::env::var("FERROSA_AUTH_ENABLED").ok().as_deref(),
+        Some("true" | "1" | "on" | "yes")
+    )
+}
 
 /// Error type for migration failures. Every variant carries enough context
 /// for an operator to triage and reach for the backup.
 #[derive(Debug, thiserror::Error)]
 pub enum MigrationError {
-    #[error("schema downgrade detected: keyspace at v{keyspace}, this build only supports up to v{code}. Restore from backup or upgrade the binary.")]
+    #[error(
+        "schema downgrade detected: keyspace at v{keyspace}, this build only supports up to v{code}. Restore from backup or upgrade the binary."
+    )]
     Downgrade { keyspace: u32, code: u32 },
-    #[error("migration {version} failed on statement {stmt_index}: {source}. Schema remains at v{last_good}.")]
+    #[error(
+        "migration {version} failed on statement {stmt_index}: {source}. Schema remains at v{last_good}."
+    )]
     Statement {
         version: u32,
         stmt_index: usize,
@@ -121,10 +177,7 @@ pub enum MigrationError {
 ///
 /// Runs `schema_version` table creation and adoption-seed logic first.
 /// Safe to run on every boot — the check is a single query when up to date.
-pub async fn run_migrations(
-    session: &CqlSession,
-    keyspace: &str,
-) -> Result<usize, MigrationError> {
+pub async fn run_migrations(session: &CqlSession, keyspace: &str) -> Result<usize, MigrationError> {
     // If the keyspace doesn't exist yet, this is a greenfield install.
     // Apply the historic DDLs (001-019) first so pre-versioning state
     // is in place before modern migrations (20+) run.
@@ -193,10 +246,7 @@ pub async fn run_migrations(
         });
     }
 
-    let pending: Vec<&Migration> = MIGRATIONS
-        .iter()
-        .filter(|m| m.version > current)
-        .collect();
+    let pending: Vec<&Migration> = MIGRATIONS.iter().filter(|m| m.version > current).collect();
 
     if pending.is_empty() {
         tracing::debug!(current, "schema up to date");
@@ -223,7 +273,11 @@ pub async fn run_migrations(
     let mut applied = 0usize;
     let mut last_good = current;
     for m in pending {
-        tracing::info!(version = m.version, description = m.description, "applying migration");
+        tracing::info!(
+            version = m.version,
+            description = m.description,
+            "applying migration"
+        );
         for (i, stmt) in split_cql(m.ddl).iter().enumerate() {
             if let Err(source) = session.query(stmt.as_str()).await {
                 return Err(MigrationError::Statement {
@@ -275,6 +329,17 @@ async fn apply_bootstrap(session: &CqlSession, keyspace: &str) -> anyhow::Result
                 anyhow::bail!(
                     "bootstrap DDL[{file_idx}] statement {i} failed: {e}\n--- statement ---\n{stmt}"
                 );
+            }
+        }
+    }
+
+    // Role/grant DDL is gated — see ROLES_DDL doc comment. Running it
+    // without auth enabled would fail because system_auth isn't usable.
+    if should_apply_roles_ddl() {
+        let rewritten = qualify_ddl(ROLES_DDL, keyspace);
+        for (i, stmt) in split_cql(&rewritten).iter().enumerate() {
+            if let Err(e) = session.query(stmt.as_str()).await {
+                anyhow::bail!("roles DDL statement {i} failed: {e}\n--- statement ---\n{stmt}");
             }
         }
     }
@@ -380,9 +445,11 @@ fn qualify_stmt(stmt: &str, keyspace: &str) -> String {
             None => continue,
         };
         return if *is_create_index {
-            qualify_create_index_stmt(stmt, prefix_end_in_stmt, keyspace).unwrap_or_else(|| stmt.to_string())
+            qualify_create_index_stmt(stmt, prefix_end_in_stmt, keyspace)
+                .unwrap_or_else(|| stmt.to_string())
         } else {
-            qualify_target_ident(stmt, prefix_end_in_stmt, keyspace).unwrap_or_else(|| stmt.to_string())
+            qualify_target_ident(stmt, prefix_end_in_stmt, keyspace)
+                .unwrap_or_else(|| stmt.to_string())
         };
     }
     stmt.to_string()
@@ -486,10 +553,7 @@ async fn keyspace_exists(session: &CqlSession, keyspace: &str) -> anyhow::Result
     Ok(false)
 }
 
-async fn ensure_schema_version_table(
-    session: &CqlSession,
-    keyspace: &str,
-) -> anyhow::Result<()> {
+async fn ensure_schema_version_table(session: &CqlSession, keyspace: &str) -> anyhow::Result<()> {
     let ddl = format!(
         "CREATE TABLE IF NOT EXISTS {keyspace}.schema_version (\
             version int PRIMARY KEY,\
@@ -501,10 +565,7 @@ async fn ensure_schema_version_table(
     Ok(())
 }
 
-async fn current_version(
-    session: &CqlSession,
-    keyspace: &str,
-) -> anyhow::Result<Option<u32>> {
+async fn current_version(session: &CqlSession, keyspace: &str) -> anyhow::Result<Option<u32>> {
     let q = format!("SELECT version FROM {keyspace}.schema_version");
     let envelope = session.query(q).await?;
     let rows = envelope.response_body()?.into_rows().unwrap_or_default();
@@ -533,16 +594,11 @@ async fn record_version(
     session
         .query_with_values(
             q,
-            query_values!(
-                version as i32,
-                description.to_string(),
-                host
-            ),
+            query_values!(version as i32, description.to_string(), host),
         )
         .await?;
     Ok(())
 }
-
 
 fn hostname() -> Option<String> {
     std::env::var("HOSTNAME")
@@ -668,7 +724,10 @@ mod tests {
     #[test]
     fn migration_020_embeds_the_rich_entity_ddl() {
         // Sanity: ensure include_str! picked up the expected DDL content.
-        let m20 = MIGRATIONS.iter().find(|m| m.version == 20).expect("v20 present");
+        let m20 = MIGRATIONS
+            .iter()
+            .find(|m| m.version == 20)
+            .expect("v20 present");
         assert!(m20.ddl.contains("ALTER TABLE entity_store ADD description"));
         assert!(m20.ddl.contains("ALTER TABLE entity_store ADD scope"));
     }
@@ -712,7 +771,8 @@ mod tests {
     fn qualify_ddl_handles_multi_line_create_index() {
         // DDL 009 wraps the ON clause onto the next line. Per-line
         // parsing would miss it; statement-level parsing must catch it.
-        let ddl = "CREATE INDEX IF NOT EXISTS idx_entity_by_tenant\n    ON entity_store (tenant_id);";
+        let ddl =
+            "CREATE INDEX IF NOT EXISTS idx_entity_by_tenant\n    ON entity_store (tenant_id);";
         let rewritten = qualify_ddl(ddl, "agent_memory_test");
         assert!(
             rewritten.contains("agent_memory_test.entity_store"),
@@ -819,8 +879,10 @@ mod tests {
         let ddl = "-- some comment\nINSERT INTO agent_memory.entity_types VALUES ('x');";
         let rewritten = qualify_ddl(ddl, "agent_memory_test");
         assert!(rewritten.contains("INSERT INTO agent_memory_test.entity_types"));
-        assert!(!rewritten.contains("-- some comment"),
-            "comments should be stripped so embedded `;` can't fake-split statements");
+        assert!(
+            !rewritten.contains("-- some comment"),
+            "comments should be stripped so embedded `;` can't fake-split statements"
+        );
     }
 
     #[test]
@@ -848,6 +910,9 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("v25"));
         assert!(msg.contains("v20"));
-        assert!(msg.contains("backup"), "error must point the operator at backup recovery");
+        assert!(
+            msg.contains("backup"),
+            "error must point the operator at backup recovery"
+        );
     }
 }

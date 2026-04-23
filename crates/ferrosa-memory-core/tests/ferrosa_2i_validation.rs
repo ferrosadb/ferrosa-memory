@@ -68,24 +68,31 @@ async fn setup_sandbox(session: &CqlSession, ks: &str, table: &str) {
     );
     session.query(create).await.expect("create table");
 
-    let idx = format!(
-        "CREATE INDEX IF NOT EXISTS {table}_label_idx ON {ks}.{table} (label)"
-    );
+    let idx = format!("CREATE INDEX IF NOT EXISTS {table}_label_idx ON {ks}.{table} (label)");
     session.query(idx).await.expect("create 2i");
 }
 
-async fn insert_row(session: &CqlSession, ks: &str, table: &str, id: uuid::Uuid, label: &str, value: &str) {
+async fn insert_row(
+    session: &CqlSession,
+    ks: &str,
+    table: &str,
+    id: uuid::Uuid,
+    label: &str,
+    value: &str,
+) {
     let q = format!("INSERT INTO {ks}.{table} (id, label, value) VALUES (?, ?, ?)");
     session
-        .query_with_values(
-            q,
-            query_values!(id, label.to_string(), value.to_string()),
-        )
+        .query_with_values(q, query_values!(id, label.to_string(), value.to_string()))
         .await
         .expect("insert");
 }
 
-async fn lookup_by_label(session: &CqlSession, ks: &str, table: &str, label: &str) -> Vec<uuid::Uuid> {
+async fn lookup_by_label(
+    session: &CqlSession,
+    ks: &str,
+    table: &str,
+    label: &str,
+) -> Vec<uuid::Uuid> {
     let q = format!("SELECT id FROM {ks}.{table} WHERE label = ?");
     let envelope = session
         .query_with_values(q, query_values!(label.to_string()))
@@ -174,7 +181,10 @@ async fn c3_update_refreshes_index() {
     let id = uuid::Uuid::new_v4();
     insert_row(&session, &cfg.keyspace, table, id, "tdd", "v1").await;
     // Update the label.
-    let q = format!("UPDATE {ks}.{table} SET label = ? WHERE id = ?", ks = cfg.keyspace);
+    let q = format!(
+        "UPDATE {ks}.{table} SET label = ? WHERE id = ?",
+        ks = cfg.keyspace
+    );
     session
         .query_with_values(q, query_values!("tdd-v2".to_string(), id))
         .await
@@ -257,7 +267,11 @@ async fn c6_index_lookup_is_not_full_scan() {
     const N: usize = 1_000;
     let target = uuid::Uuid::new_v4();
     for i in 0..N {
-        let id = if i == N / 2 { target } else { uuid::Uuid::new_v4() };
+        let id = if i == N / 2 {
+            target
+        } else {
+            uuid::Uuid::new_v4()
+        };
         let label = if i == N / 2 {
             "needle".to_string()
         } else {

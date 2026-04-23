@@ -119,9 +119,10 @@ pub async fn complete_fold(
 
     // Create FOLDED_INTO edge if this fold has a parent
     if let Some(parent_id) = fold.parent_fold_id
-        && let Err(e) = storage
-            .edge_folded_into(ctx, fold_id, parent_id, session_id)
-            .await
+        && let Err(e) = crate::graph_write::create_folded_into_edge(
+            storage, ctx, fold_id, parent_id, session_id,
+        )
+        .await
     {
         tracing::warn!(%fold_id, %parent_id, error = %e, "failed to create FOLDED_INTO edge");
     }

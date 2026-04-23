@@ -12,8 +12,14 @@ use cdrs_tokio::types::blob::Blob;
 use ferrosa_memory_core::vector;
 
 #[tokio::test]
-#[ignore]
 async fn vector_blob_workaround_roundtrip() {
+    if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
+        panic!(
+            "set FERROSA_TEST_CONTAINERS=1 and run `podman compose up -d` in \
+             /Users/bkearns/src/ferrosa-memory — this test needs a live Ferrosa \
+             cluster on port 19042"
+        );
+    }
     let nc = NodeTcpConfigBuilder::new()
         .with_contact_point("127.0.0.1:19042".into())
         .with_authenticator_provider(Arc::new(NoneAuthenticatorProvider))

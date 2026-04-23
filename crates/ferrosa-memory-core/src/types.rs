@@ -398,6 +398,134 @@ impl std::fmt::Display for RuleState {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimStatus {
+    Proposed,
+    Approved,
+    Rejected,
+}
+
+impl std::fmt::Display for ClaimStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Proposed => write!(f, "proposed"),
+            Self::Approved => write!(f, "approved"),
+            Self::Rejected => write!(f, "rejected"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactKind {
+    Rule,
+    Claim,
+    Alias,
+    Skill,
+}
+
+impl std::fmt::Display for ArtifactKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rule => write!(f, "rule"),
+            Self::Claim => write!(f, "claim"),
+            Self::Alias => write!(f, "alias"),
+            Self::Skill => write!(f, "skill"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDecision {
+    Proposed,
+    Approved,
+    Rejected,
+}
+
+impl std::fmt::Display for ApprovalDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Proposed => write!(f, "proposed"),
+            Self::Approved => write!(f, "approved"),
+            Self::Rejected => write!(f, "rejected"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalEntry {
+    pub tenant_id: Uuid,
+    pub approval_id: Uuid,
+    pub artifact_kind: ArtifactKind,
+    pub artifact_ref: String,
+    pub decision: ApprovalDecision,
+    pub review_note: Option<String>,
+    pub reviewer: String,
+    pub scope: String,
+    pub workspace_scope: Option<String>,
+    pub session_scope: Option<Uuid>,
+    pub mirror_entity_id: Uuid,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AliasScopeKind {
+    Global,
+    Workspace,
+    Session,
+}
+
+impl std::fmt::Display for AliasScopeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Global => write!(f, "global"),
+            Self::Workspace => write!(f, "workspace"),
+            Self::Session => write!(f, "session"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AliasEntry {
+    pub tenant_id: Uuid,
+    pub alias_id: Uuid,
+    pub alias_name: String,
+    pub scope_kind: AliasScopeKind,
+    pub scope_ref: String,
+    pub canonical_tool: String,
+    pub parameter_map: serde_json::Value,
+    pub fixed_arguments: serde_json::Value,
+    pub args_templates: serde_json::Value,
+    pub status: ClaimStatus,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExplanationNode {
+    pub parent_src: String,
+    pub parent_pred: String,
+    pub parent_dst: String,
+    pub parent_kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DerivedExplanation {
+    pub predicate: String,
+    pub src_id: String,
+    pub dst_id: String,
+    pub rule_id: String,
+    pub support_count: i32,
+    pub support_chain: Vec<ExplanationNode>,
+    pub approval_state: Option<ApprovalDecision>,
+    pub latency_ms: i64,
+    pub fanout: usize,
+    pub truncated: bool,
+}
+
 // ─── Sprint 5: Fact set and derived facts ──────────────────────
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -457,6 +585,30 @@ pub struct ProvenanceStep {
     pub parent_pred: String,
     pub parent_dst: String,
     pub parent_kind: String,
+}
+
+/// A single row from the derived cache (bulk listing).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DerivedFactRow {
+    pub source_id: String,
+    pub predicate: String,
+    pub target_id: String,
+    pub confidence: f64,
+    pub rule_id: String,
+    pub cache_key: Option<String>,
+    pub computed_at: String,
+}
+
+/// Entry for TTL tracking table (maps a cache row to its TTL rule).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TtlTrackEntry {
+    pub seq: i32,
+    pub src_id: String,
+    pub pred: String,
+    pub dst_id: String,
+    pub ttl_seconds: i32,
+    pub rule_id: String,
+    pub next_maintenance: String,
 }
 
 // ─── Sprint 5: Recursive exploration types ─────────────────────
@@ -704,9 +856,15 @@ mod tests {
         let json = serde_json::to_string(&original).unwrap();
         let back: EntityEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(back.entity_name, "tdd");
-        assert_eq!(back.description.as_deref(), Some("Guides red-green-refactor cycles."));
+        assert_eq!(
+            back.description.as_deref(),
+            Some("Guides red-green-refactor cycles.")
+        );
         assert_eq!(back.tags, vec!["testing".to_string(), "quality".into()]);
-        assert_eq!(back.properties, serde_json::json!({"category": "task-level"}));
+        assert_eq!(
+            back.properties,
+            serde_json::json!({"category": "task-level"})
+        );
         assert_eq!(back.content_hash.as_deref(), Some("sha256:abc"));
         assert_eq!(back.scope, EntityScope::Global);
         assert_eq!(back.ingested_by_session, Some(ingester));

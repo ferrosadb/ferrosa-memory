@@ -365,6 +365,10 @@ async fn ghost_rows_do_not_crash_queries() {
         keyspace: "agent_memory".into(),
         replication_factor: 3,
         consistency: "ONE".into(),
+        username: "ferrosa_user".into(),
+        password: "ferrosa_user".into(),
+        admin_username: None,
+        admin_password: None,
     };
     let storage = match CqlStorage::connect(&config).await {
         Ok(s) => s,

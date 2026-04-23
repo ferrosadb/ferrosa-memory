@@ -257,9 +257,14 @@ pub async fn smart_ingest(
         };
         storage.entity_put(ctx, &entry).await?;
         // Create supersession edge
-        let _ = storage
-            .edge_supersedes(ctx, new_id, best_match.entity_id, new_id)
-            .await;
+        let _ = crate::graph_write::create_supersedes_edge(
+            storage,
+            ctx,
+            new_id,
+            best_match.entity_id,
+            new_id,
+        )
+        .await;
         tracing::info!(
             new_id = %new_id,
             old_id = %best_match.entity_id,

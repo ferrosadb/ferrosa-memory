@@ -1,13 +1,10 @@
 ---
 type: feat
 priority: P2
-reported-by: user
-implemented-by: ""
-verified-by: ""
+status: implemented
 created: 2026-04-16
-updated: 2026-04-16
-source: ferrosa-memory skills-layer design session
-source-location: "specs/skills-layer-design.md#viz-cross-session-support"
+updated: 2026-04-20
+reported-by: user
 ---
 
 # Viz should visualize across sessions, not just one

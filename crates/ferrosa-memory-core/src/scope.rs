@@ -22,8 +22,7 @@ use crate::types::EntityScope;
 /// Random once, embedded forever — every fmem build uses the same namespace
 /// so sentinels are stable across deployments. Changing this value would
 /// invalidate every existing global-scope entity's partition.
-const FMEM_GLOBAL_SESSION_NS: Uuid =
-    Uuid::from_u128(0xfe77_05a6_ec0a_4611_bd8c_64fd_3c3f_8faa);
+const FMEM_GLOBAL_SESSION_NS: Uuid = Uuid::from_u128(0xfe77_05a6_ec0a_4611_bd8c_64fd_3c3f_8faa);
 
 /// Deterministic per-tenant session UUID under which global-scope entities
 /// are stored.
@@ -33,6 +32,26 @@ const FMEM_GLOBAL_SESSION_NS: Uuid =
 /// "global" partition).
 pub fn tenant_global_session_uuid(tenant_id: Uuid) -> Uuid {
     Uuid::new_v5(&FMEM_GLOBAL_SESSION_NS, tenant_id.as_bytes())
+}
+
+/// Namespace UUID for deriving tag entity_ids (UUID v5) from
+/// `(tenant_id, normalized_tag_name)`.
+///
+/// Using a deterministic id for every tag kills the "which id is `cloud`?"
+/// lookup race in `ensure_tag_entity`: two concurrent ingests computing
+/// `tenant_tag_entity_uuid(t, "cloud")` always get the same UUID, so their
+/// TAGGED_AS writes can't end up pointing at the wrong tag entity.
+const FMEM_TAG_ENTITY_NS: Uuid = Uuid::from_u128(0x4b1c_82a5_6f9e_4b2d_8c31_d9a0_1e7f_5cd2);
+
+/// Deterministic entity_id for a global-scope tag, derived from the owning
+/// tenant and the tag's normalized name. Caller is responsible for passing
+/// the already-normalized name (see `skill::normalize_tag`) so that
+/// equivalent-but-differently-cased inputs hash to the same id.
+pub fn tenant_tag_entity_uuid(tenant_id: Uuid, normalized_tag_name: &str) -> Uuid {
+    let mut bytes: Vec<u8> = Vec::with_capacity(16 + normalized_tag_name.len());
+    bytes.extend_from_slice(tenant_id.as_bytes());
+    bytes.extend_from_slice(normalized_tag_name.as_bytes());
+    Uuid::new_v5(&FMEM_TAG_ENTITY_NS, &bytes)
 }
 
 /// Default scope for a given `entity_type`.
@@ -142,9 +161,11 @@ mod tests {
     fn resolve_session_scope_is_transparent() {
         let caller = Uuid::new_v4();
         let tenant = Uuid::new_v4();
-        let (storage, ingester) =
-            resolve_storage_session(caller, EntityScope::Session, tenant);
-        assert_eq!(storage, caller, "session scope stores under caller's session");
+        let (storage, ingester) = resolve_storage_session(caller, EntityScope::Session, tenant);
+        assert_eq!(
+            storage, caller,
+            "session scope stores under caller's session"
+        );
         assert_eq!(
             ingester, None,
             "session scope does not record ingested_by_session"
@@ -155,8 +176,7 @@ mod tests {
     fn resolve_global_scope_routes_to_sentinel() {
         let caller = Uuid::new_v4();
         let tenant = Uuid::new_v4();
-        let (storage, ingester) =
-            resolve_storage_session(caller, EntityScope::Global, tenant);
+        let (storage, ingester) = resolve_storage_session(caller, EntityScope::Global, tenant);
         assert_eq!(
             storage,
             tenant_global_session_uuid(tenant),

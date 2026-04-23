@@ -1,13 +1,10 @@
 ---
 type: feat
 priority: P1
-reported-by: user
-implemented-by: ""
-verified-by: ""
+status: implemented
 created: 2026-04-16
-updated: 2026-04-16
-source: skills-layer Sprint 1 planning
-source-location: "specs/skills-layer-design.md"
+updated: 2026-04-20
+reported-by: user
 ---
 
 # Test cluster harness on port offset +500

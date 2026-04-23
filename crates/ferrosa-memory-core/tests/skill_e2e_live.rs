@@ -10,16 +10,16 @@
 //!   cargo test -p ferrosa-memory-core --test skill_e2e_live \
 //!     -- --ignored --nocapture
 //!
-//! Skipped on plain `cargo test` via `#[ignore]`; also self-skips with a
-//! helpful message when the env is unset.
+//! Requires `FERROSA_TEST_CONTAINERS=1`; panics with setup instructions when
+//! the env var is unset so failures are loud and diagnosable.
 
 use ferrosa_memory_core::config::{EmbeddingConfig, FerrosaCqlConfig};
 use ferrosa_memory_core::cql_storage::CqlStorage;
 use ferrosa_memory_core::embedding::EmbeddingClient;
 use ferrosa_memory_core::migration::run_migrations;
 use ferrosa_memory_core::skill::{
-    ensure_parent_tag, get_skill_by_name, ingest_skill, retrieve_skills_for_context,
-    verify_skill, EnsureParentTagAction, IngestSkillParams, SkillIngestAction, Step,
+    EnsureParentTagAction, IngestSkillParams, SkillIngestAction, Step, ensure_parent_tag,
+    get_skill_by_name, ingest_skill, retrieve_skills_for_context, verify_skill,
 };
 use ferrosa_memory_core::test_cluster::TestClusterConfig;
 use ferrosa_memory_core::types::TenantContext;
@@ -31,6 +31,10 @@ fn base_cfg(test: &TestClusterConfig) -> FerrosaCqlConfig {
         keyspace: test.keyspace.clone(),
         replication_factor: 1,
         consistency: "ONE".into(),
+        username: "ferrosa_user".into(),
+        password: "ferrosa_user".into(),
+        admin_username: None,
+        admin_password: None,
     }
 }
 
@@ -42,10 +46,19 @@ async fn tenant() -> TenantContext {
 }
 
 #[tokio::test]
-#[ignore]
 async fn skill_round_trip_on_live_cluster() {
+    if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
+        panic!(
+            "set FERROSA_TEST_CONTAINERS=1 and run `podman compose up -d` in \
+             /Users/bkearns/src/ferrosa-memory — this test needs a live Ferrosa \
+             cluster on port 19042"
+        );
+    }
     let Some(test_cfg) = TestClusterConfig::from_env_or_skip() else {
-        return;
+        panic!(
+            "TestClusterConfig not found in environment — run \
+             `scripts/start-test-cluster.sh` and export the env vars it prints"
+        );
     };
     let storage = CqlStorage::connect(&base_cfg(&test_cfg))
         .await
@@ -193,8 +206,7 @@ async fn skill_round_trip_on_live_cluster() {
         .expect("get missing");
     assert!(miss.is_none(), "non-existent skill must not match");
     let similar =
-        ferrosa_memory_core::skill::similar_skill_names(&storage, &ctx, "nonexistent-xyz", 3)
-            .await;
+        ferrosa_memory_core::skill::similar_skill_names(&storage, &ctx, "nonexistent-xyz", 3).await;
     eprintln!("did_you_mean for 'nonexistent-xyz': {similar:?}");
 
     // Step 5: idempotent re-ingest with identical content_hash returns
@@ -228,7 +240,9 @@ async fn skill_round_trip_on_live_cluster() {
         .expect("testing->quality");
 
     // Step 7: verify_skill surfaces the full neighborhood.
-    let verify = verify_skill(&storage, &ctx, "tdd").await.expect("verify tdd");
+    let verify = verify_skill(&storage, &ctx, "tdd")
+        .await
+        .expect("verify tdd");
     assert!(verify.exists);
     assert!(
         verify.tags.contains(&"testing".to_string()),

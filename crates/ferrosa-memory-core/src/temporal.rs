@@ -57,9 +57,9 @@ pub async fn write_temporal_fact(
 
     // Create SUPERSEDES edge if this fact replaces an older one
     if let Some(old_id) = supersedes_id
-        && let Err(e) = storage
-            .edge_supersedes(ctx, event_id, old_id, entity_id)
-            .await
+        && let Err(e) =
+            crate::graph_write::create_supersedes_edge(storage, ctx, event_id, old_id, entity_id)
+                .await
     {
         tracing::warn!(%event_id, %old_id, error = %e, "failed to create SUPERSEDES edge");
     }

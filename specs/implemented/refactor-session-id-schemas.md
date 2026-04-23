@@ -1,13 +1,11 @@
 ---
-type: refactor
+type: todo
 priority: P2
+status: implemented
+created: 2026-04-16
+updated: 2026-04-20
 reported-by: agent
 implemented-by: claude-opus-4-7
-verified-by: ""
-created: 2026-04-16
-updated: 2026-04-16
-source: ferrosa-memory session_id UX bug
-source-location: "crates/ferrosa-memory-core/src/dispatch.rs"
 ---
 
 # Relax session_id tool schemas for config fallback

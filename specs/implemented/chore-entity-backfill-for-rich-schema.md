@@ -1,13 +1,10 @@
 ---
-type: chore
+type: todo
 priority: P2
-reported-by: user
-implemented-by: ""
-verified-by: ""
+status: implemented
 created: 2026-04-16
-updated: 2026-04-16
-source: skills-layer-design session
-source-location: "specs/skills-layer-design.md"
+updated: 2026-04-23
+reported-by: user
 ---
 
 # Backfill existing entities for the rich entity schema
@@ -130,4 +127,7 @@ Per-entity progress at `debug` level; per-phase summary at `info`.
 
 ## Implementation Notes
 
-_To be filled in by implementer._
+- Live runtime now uses `nomic-embed-text-v2-moe` on the managed `18765` server, and fresh `ingest_entities` writes with `embed_missing=true` verify end-to-end via ANN retrieval.
+- `ferrosa-memory-batch backfill-rich-entities` now runs phase 0 with bounded concurrency and a targeted `entity_embedding + updated_at` update path instead of the broader `entity_put` upsert path. This avoids rewriting later schema fields from stale entity snapshots.
+- Dry-run and live tenant-wide phase 0 reruns completed with `p0_entities_embedded=7466` and `p0_failed=0`.
+- The checklist is not fully checked off yet. Existing-row verification is still blocked by a Ferrosa-side issue: targeted updates appear to succeed, but older rows still read back with stale `updated_at` values and ANN lookups for known older entities stay empty.

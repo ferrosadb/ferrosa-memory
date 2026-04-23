@@ -26,8 +26,7 @@ impl TestClusterConfig {
     pub fn from_env() -> Option<Self> {
         let port: u16 = std::env::var("FERROSA_TEST_CQL_PORT").ok()?.parse().ok()?;
         Some(Self {
-            cql_host: std::env::var("FERROSA_TEST_CQL_HOST")
-                .unwrap_or_else(|_| "localhost".into()),
+            cql_host: std::env::var("FERROSA_TEST_CQL_HOST").unwrap_or_else(|_| "localhost".into()),
             cql_port: port,
             graph_url: std::env::var("FERROSA_TEST_GRAPH_URL")
                 .unwrap_or_else(|_| "http://localhost:17974".into()),

@@ -19,3 +19,4 @@ chrono = { workspace = true }
 anyhow = { workspace = true }
 cdrs-tokio = { workspace = true }
 sha2 = { workspace = true }
+reqwest = { workspace = true }

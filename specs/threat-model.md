@@ -1,11 +1,11 @@
 # STRIDE Threat Model — ferrosa-memory-mcp
 
-> Last updated: 2026-04-10
-> Status: Updated — shared HTTP deployment review added for auth boundary, probe semantics, secret handling, and viz exposure.
+> Last updated: 2026-04-22
+> Status: Updated — shared HTTP deployment review added for auth boundary, probe semantics, secret handling, and viz exposure. The April 19 update adds expert-system knowledge-plane risks around effective rule loading, approvals, aliases, and explanation queries. The April 20 architecture correction narrows the boundary: direct CQL is acceptable for app-owned tables, but graph-owned table writes and local operator-query emulation are not acceptable serving-path behavior. The April 22 update adds `ingest_entities` bulk-ingest threats around silent row drops, schema drift, embedding exhaustion, and tenant enforcement.
 
 ## Scope
 
-Full system: MCP clients -> ferrosa-memory-mcp -> Ferrosa DB. Includes stdio and HTTP transports, all MCP tools, graph layer, Datalog inference engine, embedding endpoint, viz dashboard surface, and nightly batch job. This update focuses on the shared HTTP deployment boundary rather than new tool families.
+Full system: MCP clients -> ferrosa-memory-mcp -> Ferrosa DB. Includes stdio and HTTP transports, all MCP tools, graph layer, Datalog inference engine, embedding endpoint, viz dashboard surface, and nightly batch job. This update retains the shared HTTP deployment review and adds the planned expert-system knowledge plane: effective rule loading, symbolic claims, approvals, alias persistence, and explanation queries.
 
 ## Data Flow Diagram
 
@@ -128,7 +128,7 @@ graph TB
 |----|--------|-----------|------|------------|
 | R1 | Deny having written a poisoned entity or memo entry | entity_tools, memo_tools | **Medium** (L:3 x I:3 = 9) | Append-only audit log with `tenant_id`, `session_id`, timestamp, operation type. Audit rows cannot be deleted via MCP tools. **Status: PARTIAL** — CQL persistence added, but writes are best-effort (see R3). |
 | R2 | Deny having submitted false feedback outcomes | feedback_tools | **Low** (L:2 x I:2 = 4) | `feedback_outcomes` is write-only via MCP, with `tenant_id` and `session_id` from auth context. |
-| R3 | Audit log bypass via direct CQL — if audit writes are best-effort (fire-and-forget), failed audit writes are invisible | audit_log | **Medium** (L:3 x I:3 = 9) | Audit writes must be synchronous or use a write-ahead log. Monitor audit write failure rate. Alert on gaps in audit sequence. |
+| R3 | Audit log bypass via Ferrosa public CQL access outside the approved service path — if audit writes are best-effort (fire-and-forget), failed audit writes are invisible | audit_log | **Medium** (L:3 x I:3 = 9) | Audit writes must be synchronous or use a write-ahead log. Monitor audit write failure rate. Alert on gaps in audit sequence. |
 
 ### I — Information Disclosure
 
@@ -167,6 +167,31 @@ graph TB
 | E4 | Session deletion without ownership verification — any authenticated tenant could delete another tenant's session | delete_session | **Critical** (L:2 x I:5 = 10) | `delete_session` must enforce `tenant_id` scoping — verify session belongs to requesting tenant before deletion. Return error if session not found within tenant scope. |
 | E5 | `manage_rules` allows arbitrary Datalog execution — custom rules could access data outside session scope, enabling cross-session or cross-tenant fact inference | datalog / manage_rules (TB1) | **High** (L:2 x I:4 = 8) | Rules only operate on session-scoped fact sets loaded by `load_session_facts()`. No cross-session or cross-tenant fact loading — the evaluator receives a closed `FactSet`, not a storage handle. Rule body validation rejects predicates that don't match the canonical schema. |
 
+## Expert-System Knowledge Plane Addendum
+
+These are the new threats introduced by the planned rule/claim/approval/alias/explanation surface. They are not separate trust boundaries, but they do add new ways for symbolic state to be tampered with or surfaced incorrectly.
+
+| ID | STRIDE | Threat | Component | Risk | Mitigation |
+|----|--------|--------|-----------|------|------------|
+| ES-S1 | Spoofing | Reviewer identity for approvals is caller-supplied instead of auth-derived, allowing fabricated human sign-off | approval store / MCP approval tools | **High** (L:3 x I:4 = 12) | Reviewer principal must come from authenticated context only. Approval rows are append-only and attributable. |
+| ES-T1 | Tampering | Effective-rule-set drift: operators believe a stored rule is active, but runtime inference still evaluates only built-ins on some paths | rule registry / effective rule loader | **High** (L:4 x I:4 = 16) | One `EffectiveRuleSet` loader must back `manage_rules`, `query_derived`, `recursive_explore`, and `promotion`. No direct `builtin_rules()` runtime calls outside the loader. |
+| ES-T2 | Tampering | Alias registry changes silently redirect tool calls or inject fixed arguments across the wrong scope | alias store | **High** (L:3 x I:4 = 12) | Exact scoped lookup first, approval gate for promoted aliases, audit trail on every alias mutation, and shadow-mode preview before activation. |
+| ES-R1 | Repudiation | Approval and rejection decisions are not durable or immutable enough for audit and replay | approval store | **High** (L:3 x I:4 = 12) | Dedicated append-only approval/event log with reviewer, scope, decision, and timestamp. |
+| ES-I1 | Information Disclosure | Explanation queries leak rejected claims, reviewer notes, or supporting facts outside the request scope | explanation API / provenance | **High** (L:2 x I:5 = 10) | Scope explanation reads exactly like fact/rule reads; redact reviewer-only fields unless explicitly authorized. |
+| ES-D1 | Denial of Service | Explanation reconstruction walks large support chains on demand, causing unbounded query cost | explanation API | **Medium** (L:3 x I:3 = 9) | Bound chain depth and support count, cache hot explanations, and precompute indexes for the common workbench views. |
+| ES-E1 | Elevation of Privilege | Unapproved claims or rules are treated as active inference inputs because approval state is not enforced at load time | claim / approval / effective rule integration | **Critical** (L:2 x I:5 = 10) | Loaders must filter to approved or explicitly-requested draft artifacts. Approval state is part of the runtime selection contract, not just UI metadata. |
+
+## Endpoint-Only Client Boundary Addendum
+
+These threats are introduced by the architectural correction itself: `ferrosa-memory` must act as a client at the correct abstraction boundary instead of treating graph-owned storage tables as a public API or hiding public query bugs behind local emulation.
+
+| ID | STRIDE | Threat | Component | Risk | Mitigation |
+|----|--------|--------|-----------|------|------------|
+| EO-T1 | Tampering | Graph writes bypass the public Cypher/graph API and write directly into graph-owned backing tables, bypassing graph-engine invariants and audit hooks | graph write path / `cql_storage` | **Critical** (L:3 x I:5 = 15) | Route all graph mutations through the public Cypher/graph interface. No serving-path write may name graph-owned backing tables directly. |
+| EO-T2 | Tampering | Workbench CQL or Datalog paths emulate Ferrosa semantics locally, masking public API bugs and returning misleading operator results | workbench query surfaces / `expert_system` | **High** (L:4 x I:4 = 16) | Replace local emulation with authenticated passthrough adapters. If the public API is wrong, surface the failure and fix Ferrosa. |
+| EO-R1 | Repudiation | Direct writes to graph-owned backing tables bypass graph-interface telemetry and make it impossible to reason about who mutated graph state through the supported surface | serving-path graph/storage code | **High** (L:3 x I:4 = 12) | Constrain graph writes to public graph interfaces that carry auth, logging, and audit context. Move graph-table maintenance code out of the serving path. |
+| EO-E1 | Elevation of Privilege | The service requires privileges beyond the planned `app_reader` role because startup or write paths still depend on graph-table MODIFY access | runtime storage/bootstrap | **Critical** (L:3 x I:5 = 15) | Make the serving path compatible with role-auth rollout: `app_reader` may read graph tables and read/write app tables, but graph mutations must go through graph-engine interfaces. |
+
 ## Risk Summary
 
 ```mermaid
@@ -200,6 +225,23 @@ quadrantChart
     I2-Raw-Trajectory: [0.4, 0.8]
     I4-Ollama-Logs: [0.4, 0.6]
 ```
+
+The matrix above captures the established core system risks. The highest-priority expert-system and architecture-correction items are `ES-T1` (effective-rule-set drift), `ES-I1` (scope leaks through explanations), `ES-E1` (approval bypass on runtime loading), `EO-T1` (graph-write invariant bypass), and `EO-E1` (direct-storage privilege bypass).
+
+## Bulk Ingest Addendum
+
+These threats are introduced by the planned `ingest_entities` surface: one batch MCP call that owns schema mapping, embedding policy, and row-level failure semantics for application data.
+
+| ID | STRIDE | Threat | Component | Risk | Mitigation |
+|----|--------|--------|-----------|------|------------|
+| BI-S1 | Spoofing | Caller supplies a `tenant_id` or `session_id` outside its authenticated scope and the server trusts it as routing input | bulk ingest auth / validation | **Critical** (L:3 x I:5 = 15) | Validate request tenant/session against authenticated context. `tenant_id` may be echoed in the payload for diagnostics, but it is not authoritative over auth context. |
+| BI-T1 | Tampering | Row validation reproduces the old loader behavior of swallowing exceptions, causing silent entity or edge drops | bulk ingest execution | **Critical** (L:4 x I:5 = 20) | Every row failure must appear in `failed[]`. No catch-and-continue path may suppress row-level reasons. |
+| BI-T2 | Tampering | Client schema drift causes fields or attrs to be written to the wrong columns or ignored silently | bulk ingest schema mapping | **High** (L:4 x I:4 = 16) | Server owns schema mapping and advertises `schema_version`. Unknown attrs fail loudly with structured reasons. |
+| BI-T3 | Tampering | `on_conflict=update` overwrites resident data incorrectly or `skip` mutates data despite caller intent | conflict handling | **High** (L:3 x I:4 = 12) | Explicit per-mode tests. Response distinguishes inserted, updated, skipped, and failed rows. |
+| BI-I1 | Information Disclosure | Batch failure details or progress notifications leak other-tenant entity existence through endpoint validation | bulk ingest response/progress | **High** (L:2 x I:5 = 10) | Scope endpoint resolution to the authenticated tenant/session only. Failure reasons must not disclose other-tenant residents. |
+| BI-D1 | Denial of Service | `embed_missing=true` on large batches overwhelms Ollama or blocks all write progress | embedding pipeline | **High** (L:3 x I:4 = 12) | Bound batch size, rate limit embedding calls, emit progress, and report per-row embedding failures without hanging the batch indefinitely. |
+| BI-R1 | Repudiation | Partial-ingest outcomes are ambiguous, so callers cannot prove what was or was not written | batch result/audit | **Medium** (L:3 x I:3 = 9) | Return structured counters plus `failed[]`. Add audit/event logging for batch id, tenant, and per-row outcomes. |
+| BI-E1 | Elevation of Privilege | Bulk ingest bypasses graph-write boundary and directly mutates graph-owned tables for typed edges | bulk ingest edge path | **Critical** (L:3 x I:5 = 15) | Edge writes follow the same public-graph boundary as the rest of the serving path. No direct graph-table write path is introduced for ingest convenience. |
 
 ## Critical Threats (Must mitigate before v1.0)
 

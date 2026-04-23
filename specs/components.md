@@ -1,7 +1,7 @@
 # Component Architecture
 
-> Last updated: 2026-04-10
-> Status: 38 modules plus deployment blueprint update. Shared HTTP posture now explicitly distinguishes local stdio trust from production HTTP requirements.
+> Last updated: 2026-04-22
+> Status: 38 modules plus graph-boundary correction. Shared HTTP and expert-system work are real, but the runtime still mutates graph-owned backing tables directly.
 
 ## Module Map
 
@@ -43,9 +43,19 @@ graph TB
     P --> Q[http]
 ```
 
-**Note:** Shows main call flow. Full 38-module dependency matrix in `dsm-analysis.md`.
+**Note:** Shows the current code path, not the desired final boundary. Full dependency analysis and refactor direction are in `dsm-analysis.md`.
 
-**Note:** `graph_client` (M11) uses the HTTP Cypher endpoint, which is working. Graph writes go through CQL (vertex/edge table INSERTs via `CqlStorage`), and graph reads/traversals go through HTTP POST against `/graph/query` via `reqwest`.
+**Boundary correction:** `graph_client` (M11) already uses a public Ferrosa query interface. The main remaining violation is direct mutation of graph-owned backing tables. Direct CQL for app-owned tables remains acceptable, and operator query surfaces should remain passthroughs for public query APIs.
+
+## Target Module Boundary
+
+The runtime should converge on three public-interface adapters for operator query surfaces and graph mutations:
+
+- `public_cql_client`
+- `public_sparql_client`
+- `public_cypher_client`
+
+The workbench and MCP layers should orchestrate auth, tenant mapping, request shaping, and presentation on top of those clients, but not implement substitute query semantics locally. App-table CQL access may remain direct in the serving path where it matches the supported role boundary. The Datalog evaluator remains an explicit local engine in `ferrosa-memory`.
 
 ## Components
 
@@ -91,7 +101,7 @@ graph TB
 - HTTP mode: must validate a real principal and map it to a tenant
 - Rejects tool calls from unrecognized session origins (MCPShield pattern)
 
-**Current gap:** the live HTTP path is still wired to a permissive validator in `ferrosa-memory-mcp/src/main.rs` that returns the configured tenant for any username/password pair. This is acceptable for local testing only.
+**Current state:** the live HTTP path now uses `auth::FileAuthValidator` from `ferrosa-memory-mcp/src/main.rs`, mapping one principal to one tenant through a file-backed auth database with SIGHUP reload support.
 
 **Blueprint requirement:** shared HTTP mode must fail startup unless an auth backend is configured. One principal maps to exactly one tenant; `tenant_id` remains server-derived only.
 
@@ -191,6 +201,28 @@ graph TB
 
 ---
 
+### 8b. `bulk_ingest` — Server-Owned Entity + Edge Batch Ingest
+
+**Responsibility:** Accept one semantic batch of entities and typed edges, validate it, optionally compute missing embeddings, persist app-owned rows, and route graph-owned mutations through the supported boundary.
+
+**Tools exposed:**
+- `ingest_entities { session_id, entities[], edges[], options }` -> `{ entities, edges, embeddings, schema_version, duration_ms }`
+
+**Contract rules:**
+- request rows are validated before any write-side success is reported
+- failures are row-granular and explicit; no silent drop path is allowed
+- `on_conflict` controls `update`, `skip`, or `error`
+- `strict_edges=true` resolves endpoints against batch rows plus already-resident rows in the same `(tenant, session)`
+- `dry_run=true` performs validation, endpoint resolution, and embedding planning without writes
+
+**Boundary note:** clients do not own CQL column mapping or embedding policy. `bulk_ingest` is the compatibility seam that absorbs app-table schema drift so forge and future ingestors remain semantic clients instead of storage clients.
+
+**Dependencies:** `cql_client`, `graph_client`, `embedding_client`, `auth`, `metrics`
+
+**Size estimate:** ~450 lines plus validation/types
+
+---
+
 ### 9. `feedback_tools` — Feedback Loop Tools
 
 **Responsibility:** Records retrieval strategy outcomes for offline guideline refinement (ACON/SRLM).
@@ -198,7 +230,7 @@ graph TB
 **Tools exposed:**
 - `record_outcome { session_id, query_id, program_type, task_complexity, succeeded, latency_ms, token_cost }` -> `{ recorded }`
 
-**Constraint:** Write-only via MCP. The feedback store cannot be queried through MCP tools — only via direct CQL by the batch job with separate credentials.
+**Constraint:** Write-only via MCP. The feedback store cannot be queried through MCP tools; analytics and batch refinement should read it through Ferrosa's public CQL interface with separate credentials.
 
 **Dependencies:** `cql_client`, `metrics`
 
@@ -206,9 +238,11 @@ graph TB
 
 ---
 
-### 10. `cql_client` — CQL Storage Client
+### 10. `cql_client` — Current Direct Storage Coupling
 
-**Responsibility:** Manages CQL connection pool, prepared statements, and query execution against Ferrosa. Loads dynamic type registry at startup.
+**Current responsibility:** Manages a direct CQL connection pool, prepared statements, and table-level query execution against Ferrosa. Loads dynamic type registry at startup.
+
+**Architectural problem:** this module makes `ferrosa-memory` act like an embedded Ferrosa storage implementation rather than a client to Ferrosa public interfaces.
 
 **Interface:**
 - `connect(config) -> Result<CqlClient>`
@@ -225,6 +259,8 @@ graph TB
 
 **Dependencies:** `cdrs-tokio`, `vector`, `metrics`
 
+**Target correction:** keep direct prepared statements where they operate on app-owned tables under the supported CQL role boundary, but remove any serving-path reliance on graph-owned table mutations and local operator-query emulation.
+
 **Size estimate:** ~1,680 lines
 
 ---
@@ -233,7 +269,7 @@ graph TB
 
 **Responsibility:** Executes Cypher MATCH queries against Ferrosa's HTTP graph endpoint for multi-hop traversals.
 
-**Implementation note (updated 2026-03-21):** Switched from neo4rs (Bolt v4) to HTTP POST against `/graph/query` in commit de901d1. Ferrosa's Bolt endpoint is v5, which neo4rs 0.8 does not support. The HTTP Cypher approach is working. Graph writes (vertex/edge creation) go through CQL INSERTs into graph-annotated tables via `CqlStorage`, not through this client.
+**Implementation note (updated 2026-04-20):** This module is only partially at the intended boundary. Graph reads already use Ferrosa's public HTTP graph API, but graph writes still bypass that interface elsewhere in the serving path and target graph-owned backing tables through direct CQL. The correction is to route all graph mutations through the public Cypher/graph interface as well.
 
 **Interface:**
 - `connect(config) -> Result<GraphClient>` — HTTP connection with Basic auth
@@ -515,6 +551,8 @@ graph TB
 
 **Responsibility:** Typed event system for the memory graph dashboard. Provides a broadcast channel that tool handlers emit events to and the WebSocket endpoint subscribes from. Events include full `Snapshot` on connect, then incremental deltas (`NodeAdded`, `EdgeAdded`, `NodeUpdated`) as the graph mutates.
 
+**Current shipped surface:** Viz is the only operator-facing UI shipped today. It is still served from `/viz` on a dedicated listener rather than from a workbench rooted at `/`.
+
 **Interface:**
 - `VizBus::new() -> VizBus` — creates broadcast channel
 - `VizBus::send(event)` — emit a `VizEvent` to all subscribers
@@ -530,17 +568,24 @@ graph TB
 
 ### 31. `http` — HTTP Server and WebSocket Endpoint
 
-**Responsibility:** HTTP+SSE transport for remote MCP clients. Serves JSON-RPC via POST, Prometheus metrics scrape, health check, and the memory graph visualizer dashboard with live WebSocket updates. TLS support for production.
+**Responsibility:** HTTP+SSE transport for remote MCP clients. The main shared listener serves JSON-RPC via POST, Prometheus metrics scrape, and health probes. Viz and anomaly routes are served from the separate viz listener. TLS support exists for production.
 
 **Endpoints:**
 - `POST /mcp` — JSON-RPC request/response
 - `GET /metrics` — Prometheus metrics scrape
-- `GET /health` — health check
+- `GET /healthz/live` — liveness probe
+- `GET /healthz/ready` — readiness probe
 - `GET /viz` — memory graph visualizer HTML (viz port)
 - `GET /viz/ws` — WebSocket for live graph events (viz port)
+- `GET /viz/snapshot` — graph snapshot (viz port)
+- `GET /viz/api/derived_facts` — derived-fact side panel data (viz port)
+- `GET /viz/api/enrich/models` — enrichment model proxy (viz port)
+- `POST /consolidate` — consolidation trigger (viz port)
 - `GET /subscribe/anomalies` — SSE stream of anomaly alerts (viz port, Sprint 4.9)
 
 **Security:** TLS required in production, HTTP Basic auth, per-IP connection limits (FMEA F30), idle connection timeout.
+
+**Current state:** the main HTTP surface now serves an authenticated operator workbench at `/` plus `/workbench/api/cql/query`, `/workbench/api/datalog/query`, `/workbench/api/rules`, `/workbench/api/approvals`, and `/workbench/api/summary`. CQL/SPARQL query routes are now wired as public-pass-through clients; Datalog remains a local ferrosa-memory engine and should stay explicitly documented that way.
 
 **Dependencies:** `viz`, `auth`, `metrics`, `tokio`, `tokio-tungstenite`
 
@@ -548,9 +593,11 @@ graph TB
 
 ---
 
-### 32. `datalog` — Semi-Naive Datalog Evaluator
+### 32. `datalog` — Transition-State Local Datalog Evaluator
 
-**Responsibility:** Semi-naive Datalog evaluator with rule parsing, canonical fact extraction, query-time derivation, provenance tracking, and ephemeral cache integration. Normalizes existing storage edges into canonical predicates (`edge(Src, Pred, Dst)`, `node(Id)`) at query time. Supports built-in rule families for taxonomy closure, part-of closure, transitive co-occurrence, and multi-edge-type reachability.
+**Current responsibility:** Semi-naive Datalog evaluator with rule parsing, canonical fact extraction, query-time derivation, provenance tracking, and ephemeral cache integration. It normalizes storage edges into canonical predicates (`edge(Src, Pred, Dst)`, `node(Id)`) at query time to drive local inference. Supports built-in rule families for taxonomy closure, part-of closure, transitive co-occurrence, and multi-edge-type reachability.
+
+**Architectural role:** this module is intentionally repo-owned. Ferrosa exposes public query protocols like CQL and SPARQL for contract-level access; this Datalog layer is a ferrosa-memory-owned feature implemented over Ferrosa-backed graph/app data.
 
 **Interface:**
 - `load_session_facts(storage, ctx, session_id) -> FactSet` — normalize storage into canonical predicates
@@ -558,7 +605,9 @@ graph TB
 - `parse_rule(text) -> Result<DatalogRule>` — parse Datalog syntax into rule AST
 - `query_predicate(storage, ctx, session_id, predicate, params) -> Vec<DerivedFact>` — query-time derivation with cache check
 
-**Dependencies:** `cql_client`, `types`, `config`
+**Current dependencies:** `cql_client`, `types`, `config`
+
+**Target shape:** keep derivation semantics here, but ensure the surrounding operator surfaces and docs distinguish local Datalog from public Ferrosa query protocols.
 
 **Size estimate:** ~800 lines
 
@@ -640,6 +689,28 @@ graph TB
 **Dependencies:** `reqwest` (HTTP to Ollama), `smart_ingest` (for `infer_entity_type` and `extract_entity_candidates` heuristics)
 
 **Size estimate:** ~315 lines (logic), ~560 lines (tests), ~877 lines total
+
+---
+
+## Expert-System Knowledge Plane Status
+
+The expert-system runtime seams are implemented in core and wired through `dispatch`; the list below remains useful for ownership and test-surface boundaries.
+
+| Planned seam | Placement | Why it belongs here |
+|--------------|-----------|---------------------|
+| `EffectiveRuleSet` loader | core inference layer (`datalog` + `storage`) | Runtime inference now uses one merged effective-set path for `manage_rules`, `query_derived`, `recursive_explore`, and `promotion`. |
+| `manage_claims` / `manage_approvals` / `manage_aliases` | core storage + `dispatch` tool surface | Governance operations are entity-backed claims plus dual-write approvals plus exact alias operations, with MCP as transport. |
+| `explain_derived` | core provenance query path + tool surface | Binds approval state, rule source, and provenance support chain for operator diagnostics. |
+| Operator workbench | HTTP/operator UI layer above viz | Implemented as an authenticated `/` shell with shared navigation; still in progress for deeper UX and remaining governance views. |
+| CQL / Datalog / Rules explorers | operator UI backed by authenticated query services | CQL/SPARQL should be public passthroughs; Datalog remains a local ferrosa-memory capability and should be labeled that way in UI/docs/tests. |
+
+### Knowledge-Plane Placement Notes
+
+- The MCP layer remains transport and schema only; core owns symbolic governance state and effective-rule loading.
+- `dispatch.rs` routes to core service boundaries and does not own business rules for claims, approvals, aliases, or loader semantics.
+- Today, `cql_storage.rs` and `storage.rs` are the integration points for durable claim, approval, alias, and explanation reads/writes. The target architecture is to keep those seams thin and move serving-path semantics behind Ferrosa public interfaces.
+- Backend surfaces now use the converged effective-rule path across `manage_rules`, `query_derived`, `recursive_explore`, and `promotion`.
+- The operator workbench and query explorers are now shipped through HTTP assets/routes, even though they are not modeled as separate Rust modules in `lib.rs`.
 
 ---
 

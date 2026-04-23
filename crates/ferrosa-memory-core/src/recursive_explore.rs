@@ -145,7 +145,7 @@ pub async fn explore(
 
         // Load session facts and evaluate Datalog rules
         let facts = datalog::load_session_facts(storage, ctx, session_id).await?;
-        let rules = datalog::builtin_rules();
+        let rules = datalog::load_effective_rules(storage, ctx, None).await?;
         let (all_facts, derived) = datalog::evaluate(
             &rules,
             &facts,

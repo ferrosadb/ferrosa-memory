@@ -1,13 +1,10 @@
 ---
-type: chore
+type: todo
 priority: P2
-reported-by: user
-implemented-by: ""
-verified-by: ""
+status: implemented
 created: 2026-04-16
-updated: 2026-04-16
-source: skills-layer-design Sprint 2 prereq
-source-location: "specs/skills-layer-design.md#skill-name-lookup--secondary-index-with-ferrosa-2i-validation"
+updated: 2026-04-20
+reported-by: user
 ---
 
 # Validate Ferrosa CQL secondary index (2i) correctness before relying on it

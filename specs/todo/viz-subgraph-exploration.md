@@ -1,3 +1,11 @@
+---
+type: feat
+priority: P2
+status: draft
+created: 2026-04-06
+updated: 2026-04-20
+---
+
 # Viz: Subgraph Exploration Mode
 
 ## Goal

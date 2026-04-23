@@ -1,0 +1,16 @@
+duration_minutes: 240
+warmup_minutes: 10
+sample_interval_seconds: 10
+operator_base_url: "http://127.0.0.1:8766"
+monitors:
+  memory:
+    slope_mb_per_hour_threshold: 32
+  disk:
+    slope_mb_per_hour_threshold: 128
+    path: "."
+  connections:
+    slope_per_hour_threshold: 1
+  logs:
+    slope_mb_per_hour_threshold: 64
+    path: "logs"
+

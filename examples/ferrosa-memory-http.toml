@@ -1,5 +1,10 @@
-# Shared HTTP configuration for ferrosa-memory-mcp
+# Shared HTTP configuration for ferrosa-memory-mcp.
 # Use for a shared endpoint, not local stdio development.
+# In HTTP mode startup fails unless:
+# - require_tls = true
+# - cert_path and key_path are set
+# - auth_file is set
+# - server.tenant_id is omitted
 
 [server]
 transport = "http"
@@ -9,12 +14,19 @@ require_tls = true
 cert_path = "/run/secrets/ferrosa-memory/tls.crt"
 key_path = "/run/secrets/ferrosa-memory/tls.key"
 auth_file = "/run/secrets/ferrosa-memory/http-auth.toml"
+# tenant_id intentionally omitted in shared HTTP mode
 
 [ferrosa]
 contact_points = ["ferrosa-node1:9042", "ferrosa-node2:9042", "ferrosa-node3:9042"]
 keyspace = "agent_memory"
 replication_factor = 3
 consistency = "LOCAL_QUORUM"
+username = "ferrosa_user"
+password = "ferrosa_user"
+# Admin credentials used only for schema migrations (DDL). Runtime
+# queries still run as ferrosa_user.
+admin_username = "ferrosa_admin"
+admin_password = "ferrosa_admin"
 
 [embeddings]
 provider = "ollama"
@@ -24,8 +36,15 @@ dimensions = 768
 
 [graph]
 http_url = "http://ferrosa-node1:7474"
-username = "neo4j"
-password = "neo4j"
+username = "ferrosa_admin"
+password = "ferrosa_admin"
+
+[sparql]
+enabled = true
+http_url = "http://ferrosa-node1:8080"
 
 [viz]
 enabled = false
+# If you enable viz under HTTP mode, you must also set:
+# tenant_id = "00000000-0000-0000-0000-000000000001"
+# Viz binds loopback only in HTTP mode and is intended for operator use.
