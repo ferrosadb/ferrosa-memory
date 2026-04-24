@@ -5,6 +5,7 @@ ferrosa-memory.toml
 .fastembed_cache/
 .superpowers/
 .claude/worktrees/
+.claude/scheduled_tasks.lock
 .opencode/
 opencode.json
 .runtime/

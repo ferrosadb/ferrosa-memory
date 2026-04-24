@@ -15,7 +15,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Intention {
     pub id: Uuid,
-    /// Repository path this intention is scoped to (e.g. "/Users/ben/src/ferrosa-memory").
+    /// Repository path this intention is scoped to (e.g. "<repo_root>").
     pub repo: String,
     pub description: String,
     pub trigger: IntentionTrigger,

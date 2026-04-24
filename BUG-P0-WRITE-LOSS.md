@@ -12,7 +12,7 @@ A second identical restore succeeded permanently.
 
 1. Stop podman machine (crash or `podman machine stop`)
 2. `podman machine start`
-3. `podman compose up -d` in `/Users/bkearns/src/ferrosa-memory`
+3. `podman compose up -d` in `the ferrosa-memory repo root`
    - node1 starts as `standalone`
    - node2 joins as `pair` (seeds from node1, waits for node1 healthy)
    - node3 joins as `cluster` (seeds from node1, waits for node1+node2 healthy)
@@ -43,10 +43,10 @@ After ingesting a bug entity via `smart_ingest`, the entity (id `046819a9-15f0-4
 
 ## Files to look at
 
-- `/Users/bkearns/src/ferrosa-memory/docker-compose.yml` — cluster topology config
-- `/Users/bkearns/src/ferrosa/ferrosa-cluster/src/` — join logic, mode transitions
-- `/Users/bkearns/src/ferrosa/ferrosa-storage/src/` — commit log, memtable, flush
-- `/Users/bkearns/src/ferrosa/ferrosa-cql/src/` — write acknowledgement path
+- `the ferrosa-memory repo root/docker-compose.yml` — cluster topology config
+- `the ferrosa repo root/ferrosa-cluster/src/` — join logic, mode transitions
+- `the ferrosa repo root/ferrosa-storage/src/` — commit log, memtable, flush
+- `the ferrosa repo root/ferrosa-cql/src/` — write acknowledgement path
 
 ## Environment
 

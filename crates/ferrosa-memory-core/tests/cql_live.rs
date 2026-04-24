@@ -26,7 +26,7 @@ async fn cdrs_connect_and_query() {
     if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
         panic!(
             "set FERROSA_TEST_CONTAINERS=1 and run `podman compose up -d` in \
-             /Users/bkearns/src/ferrosa-memory — this test needs a live Ferrosa \
+             the ferrosa-memory repo root — this test needs a live Ferrosa \
              cluster on port 19042"
         );
     }
@@ -64,7 +64,7 @@ async fn cdrs_prepare_statement() {
     if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
         panic!(
             "set FERROSA_TEST_CONTAINERS=1 and run `podman compose up -d` in \
-             /Users/bkearns/src/ferrosa-memory — this test needs a live Ferrosa \
+             the ferrosa-memory repo root — this test needs a live Ferrosa \
              cluster on port 19042"
         );
     }
@@ -98,7 +98,7 @@ async fn prepare_vector_column() {
     if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
         panic!(
             "set FERROSA_TEST_CONTAINERS=1 and run `podman compose up -d` in \
-             /Users/bkearns/src/ferrosa-memory — this test needs a live Ferrosa \
+             the ferrosa-memory repo root — this test needs a live Ferrosa \
              cluster on port 19042"
         );
     }
@@ -141,7 +141,7 @@ async fn auth_enabled_multipoint_cql_storage_connect_matches_fmem_runtime_path()
     if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
         panic!(
             "set FERROSA_TEST_CONTAINERS=1 and run `podman compose up -d` in \
-             /Users/bkearns/src/ferrosa-memory — this test needs a live Ferrosa \
+             the ferrosa-memory repo root — this test needs a live Ferrosa \
              cluster on ports 19042/19043/19044"
         );
     }
@@ -191,7 +191,7 @@ async fn auth_enabled_multipoint_cdrs_session_build_succeeds() {
     if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
         panic!(
             "set FERROSA_TEST_CONTAINERS=1 and run `podman compose up -d` in \
-             /Users/bkearns/src/ferrosa-memory — this test needs a live Ferrosa \
+             the ferrosa-memory repo root — this test needs a live Ferrosa \
              cluster on ports 19042/19043/19044"
         );
     }

@@ -26,7 +26,7 @@ async fn graph_health_check() {
     if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
         panic!(
             "set FERROSA_TEST_CONTAINERS=1 and run `podman compose up -d` in \
-             /Users/bkearns/src/ferrosa-memory — this test needs a live Ferrosa \
+             the ferrosa-memory repo root — this test needs a live Ferrosa \
              cluster on ports 19042 (CQL) and 17474 (graph HTTP)"
         );
     }
@@ -39,7 +39,7 @@ async fn match_empty_returns_no_rows() {
     if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
         panic!(
             "set FERROSA_TEST_CONTAINERS=1 and run `podman compose up -d` in \
-             /Users/bkearns/src/ferrosa-memory — this test needs a live Ferrosa \
+             the ferrosa-memory repo root — this test needs a live Ferrosa \
              cluster on ports 19042 (CQL) and 17474 (graph HTTP)"
         );
     }
@@ -57,7 +57,7 @@ async fn public_graph_write_round_trip_for_co_occurs_edges() {
     if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
         panic!(
             "set FERROSA_TEST_CONTAINERS=1 and run `podman compose up -d` in \
-             /Users/bkearns/src/ferrosa-memory — this test needs a live Ferrosa \
+             the ferrosa-memory repo root — this test needs a live Ferrosa \
              cluster on ports 19042 (CQL) and 17474 (graph HTTP)"
         );
     }
@@ -119,7 +119,7 @@ async fn ferrosa_user_is_denied_direct_graph_mutations() {
     if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
         panic!(
             "set FERROSA_TEST_CONTAINERS=1 and run `podman compose up -d` in \
-             /Users/bkearns/src/ferrosa-memory — this test needs a live Ferrosa \
+             the ferrosa-memory repo root — this test needs a live Ferrosa \
              cluster on ports 19042 (CQL) and 17474 (graph HTTP)"
         );
     }

@@ -50,7 +50,7 @@ async fn skill_round_trip_on_live_cluster() {
     if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
         panic!(
             "set FERROSA_TEST_CONTAINERS=1 and run `podman compose up -d` in \
-             /Users/bkearns/src/ferrosa-memory — this test needs a live Ferrosa \
+             the ferrosa-memory repo root — this test needs a live Ferrosa \
              cluster on port 19042"
         );
     }

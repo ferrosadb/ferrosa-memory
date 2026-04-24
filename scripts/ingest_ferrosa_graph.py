@@ -31,7 +31,7 @@ from cassandra.cluster import Cluster
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-FERROSA_ROOT = Path(os.path.expanduser("~/src/ferrosa"))
+FERROSA_ROOT = Path(__file__).resolve().parents[2] / "ferrosa"
 KEYSPACE = "agent_memory"
 CQL_HOST = "127.0.0.1"
 CQL_PORT = 19042
