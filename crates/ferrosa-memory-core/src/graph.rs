@@ -226,6 +226,7 @@ impl GraphClient {
         Ok(extract_string_column(&resp))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn put_typed_edge(
         &self,
         tenant_id: Uuid,
@@ -474,17 +475,22 @@ fn build_typed_edge_merge_query(
     edge_type: &str,
     dst_id: Uuid,
     weight: f64,
-    _metadata: Option<&str>,
+    metadata: Option<&str>,
 ) -> String {
+    let metadata_clause = match metadata {
+        Some(value) => format!(", r.metadata = {}", quote_cypher(value)),
+        None => String::new(),
+    };
     format!(
         "MERGE (a:Entity {{entity_id: {}}})\
          MERGE (b:Entity {{entity_id: {}}})\
          MERGE (a)-[r:TYPED_EDGE {{edge_type: {}}}]->(b) \
-         SET r.weight = {} RETURN r",
+         SET r.weight = {}{} RETURN r",
         quote_cypher(&src_id.to_string()),
         quote_cypher(&dst_id.to_string()),
         quote_cypher(edge_type),
         weight,
+        metadata_clause,
     )
 }
 
