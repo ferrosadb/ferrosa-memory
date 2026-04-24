@@ -24,6 +24,19 @@ use futures_util::future::join_all;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
+fn batch_cql_config(
+    config: &ferrosa_memory_core::config::Config,
+) -> ferrosa_memory_core::config::FerrosaCqlConfig {
+    let mut cql = config.ferrosa.clone();
+    if let (Some(admin_username), Some(admin_password)) =
+        (cql.admin_username.clone(), cql.admin_password.clone())
+    {
+        cql.username = admin_username;
+        cql.password = admin_password;
+    }
+    cql
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -81,7 +94,7 @@ async fn migrate_session(config: &ferrosa_memory_core::config::Config) -> anyhow
         "starting session migration"
     );
 
-    let storage = CqlStorage::connect(&config.ferrosa).await?;
+    let storage = CqlStorage::connect(&batch_cql_config(config)).await?;
     tracing::info!("connected to CQL cluster");
 
     // Read all entities for this tenant
@@ -150,7 +163,7 @@ async fn retype_entities(config: &ferrosa_memory_core::config::Config) -> anyhow
         session_origin: "batch-retype".into(),
     };
 
-    let storage = CqlStorage::connect(&config.ferrosa).await?;
+    let storage = CqlStorage::connect(&batch_cql_config(config)).await?;
     tracing::info!("connected to CQL cluster");
 
     let entities = storage.entity_list_all(&ctx).await?;
@@ -233,7 +246,7 @@ async fn rename_entities(config: &ferrosa_memory_core::config::Config) -> anyhow
         session_origin: "batch-rename".into(),
     };
 
-    let storage = CqlStorage::connect(&config.ferrosa).await?;
+    let storage = CqlStorage::connect(&batch_cql_config(config)).await?;
     tracing::info!("connected to CQL cluster");
 
     let entities = storage.entity_list_all(&ctx).await?;
@@ -305,7 +318,7 @@ async fn run_guidelines(config: &ferrosa_memory_core::config::Config) -> anyhow:
         "current guideline version"
     );
 
-    let storage = CqlStorage::connect(&config.ferrosa).await?;
+    let storage = CqlStorage::connect(&batch_cql_config(config)).await?;
     tracing::info!("connected to CQL cluster");
 
     let outcomes = storage.feedback_list_all().await?;
@@ -429,7 +442,7 @@ async fn backfill_rich_entities(
         "backfill-rich-entities starting"
     );
 
-    let storage = CqlStorage::connect(&config.ferrosa).await?;
+    let storage = CqlStorage::connect(&batch_cql_config(config)).await?;
     let mut entities = storage.entity_list_all(&ctx).await?;
     let folds = storage.fold_list_all(&ctx).await?;
     let memos = storage.memo_list_all(&ctx).await?;
