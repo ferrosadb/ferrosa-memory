@@ -9,7 +9,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ferrosa_memory_core::http::{HttpConfig, serve_http};
+use ferrosa_memory_core::dispatch;
+use ferrosa_memory_core::http::{HttpConfig, ShellRouteConfig, serve_http};
 use ferrosa_memory_core::metrics::MemoryMetrics;
 use ferrosa_memory_core::storage::mock::MockStorage;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -27,11 +28,14 @@ async fn free_port() -> u16 {
 async fn start_server() -> u16 {
     let port = free_port().await;
     let config = HttpConfig {
+        bind_addr: "127.0.0.1".into(),
         port,
         require_tls: false,
         cert_path: None,
         key_path: None,
         readiness_checker: Arc::new(|| true),
+        shell_routes: ShellRouteConfig::default(),
+        session: Arc::new(dispatch::SessionState::default()),
     };
     let storage = Arc::new(MockStorage::new());
     let metrics = Arc::new(MemoryMetrics::new().unwrap());
@@ -152,11 +156,14 @@ async fn https_split_send_post_gets_response() {
 
     let port = free_port().await;
     let config = HttpConfig {
+        bind_addr: "127.0.0.1".into(),
         port,
         require_tls: true,
         cert_path: Some(cert_file.path().to_string_lossy().into_owned()),
         key_path: Some(key_file.path().to_string_lossy().into_owned()),
         readiness_checker: Arc::new(|| true),
+        shell_routes: ShellRouteConfig::default(),
+        session: Arc::new(dispatch::SessionState::default()),
     };
     let storage = Arc::new(MockStorage::new());
     let metrics = Arc::new(MemoryMetrics::new().unwrap());
@@ -311,11 +318,14 @@ async fn https_initialize_then_initialized_notification_same_connection() {
 
     let port = free_port().await;
     let config = HttpConfig {
+        bind_addr: "127.0.0.1".into(),
         port,
         require_tls: true,
         cert_path: Some(cert_file.path().to_string_lossy().into_owned()),
         key_path: Some(key_file.path().to_string_lossy().into_owned()),
         readiness_checker: Arc::new(|| true),
+        shell_routes: ShellRouteConfig::default(),
+        session: Arc::new(dispatch::SessionState::default()),
     };
     let storage = Arc::new(MockStorage::new());
     let metrics = Arc::new(MemoryMetrics::new().unwrap());
