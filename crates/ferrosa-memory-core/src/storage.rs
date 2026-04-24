@@ -1834,7 +1834,7 @@ pub mod mock {
                 .filter(|entry| entry.alias_name == alias_name)
                 .cloned()
                 .collect();
-            matched.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+            matched.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
             Ok(matched)
         }
 
@@ -1878,7 +1878,7 @@ pub mod mock {
             let cache = self.derived_cache.lock().await;
             let mut all_rows: Vec<crate::types::DerivedFactRow> = Vec::new();
             for (cache_key, facts) in cache.iter() {
-                for (_idx, fact) in facts.iter().enumerate() {
+                for fact in facts.iter() {
                     all_rows.push(crate::types::DerivedFactRow {
                         source_id: fact.src_id.clone(),
                         predicate: fact.pred.clone(),

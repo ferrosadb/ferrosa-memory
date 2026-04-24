@@ -3722,7 +3722,7 @@ impl Storage for CqlStorage {
                     .and_utc(),
             });
         }
-        results.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        results.sort_by_key(|row| std::cmp::Reverse(row.updated_at));
         Ok(results)
     }
 

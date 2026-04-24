@@ -470,7 +470,7 @@ async fn backfill_rich_entities(
                     .map(|entity| embed_client.embed(&entity.entity_name)),
             )
             .await;
-            for (entity, result) in chunk.iter().zip(results.into_iter()) {
+            for (entity, result) in chunk.iter().zip(results) {
                 match result {
                     Ok(embedding) => {
                         if !dry_run {
@@ -532,7 +532,7 @@ async fn backfill_rich_entities(
                 embed_client.embed(summary).await.map(Some)
             }))
             .await;
-            for (fold, result) in chunk.iter().zip(results.into_iter()) {
+            for (fold, result) in chunk.iter().zip(results) {
                 match result {
                     Ok(Some(embedding)) => {
                         if !dry_run
@@ -582,7 +582,7 @@ async fn backfill_rich_entities(
         let memo_batches = memos.len().max(1).div_ceil(concurrency);
         for (batch_index, chunk) in memos.chunks(concurrency).enumerate() {
             let results = join_all(chunk.iter().map(|memo| embed_client.embed(&memo.result))).await;
-            for (memo, result) in chunk.iter().zip(results.into_iter()) {
+            for (memo, result) in chunk.iter().zip(results) {
                 match result {
                     Ok(embedding) => {
                         if !dry_run

@@ -9,6 +9,7 @@ use uuid::Uuid;
 use crate::storage::Storage;
 use crate::types::{TenantContext, TypedEdge};
 
+#[allow(clippy::too_many_arguments)]
 pub async fn create_typed_edge<S: Storage + ?Sized>(
     storage: &S,
     ctx: &TenantContext,

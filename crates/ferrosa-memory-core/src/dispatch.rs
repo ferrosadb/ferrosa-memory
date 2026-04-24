@@ -2371,14 +2371,14 @@ async fn handle_ingest_entities<S: crate::storage::Storage>(
                 .or(Some(request.session_id)),
         };
 
-        if !request.options.dry_run {
-            if let Err(err) = storage.entity_put(ctx, &entry).await {
-                entity_failed.push(serde_json::json!({
-                    "id": entity.id.to_string(),
-                    "reason": err.to_string()
-                }));
-                continue;
-            }
+        if !request.options.dry_run
+            && let Err(err) = storage.entity_put(ctx, &entry).await
+        {
+            entity_failed.push(serde_json::json!({
+                "id": entity.id.to_string(),
+                "reason": err.to_string()
+            }));
+            continue;
         }
 
         if existing.is_some() {

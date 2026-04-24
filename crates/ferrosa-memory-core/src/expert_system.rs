@@ -123,6 +123,7 @@ pub fn approval_entity(entry: &ApprovalEntry) -> EntityEntry {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn claim_entity(
     ctx: &TenantContext,
     claim_id: &str,
@@ -220,6 +221,7 @@ pub async fn is_artifact_approved(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn record_approval(
     storage: &(impl Storage + ?Sized),
     ctx: &TenantContext,
@@ -324,9 +326,4 @@ impl FromStr for ArtifactKind {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         parse_artifact_kind(s)
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 }

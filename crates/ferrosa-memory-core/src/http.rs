@@ -412,6 +412,7 @@ async fn write_rate_limit_response(stream: &mut tokio::net::TcpStream) {
 /// so the client can distinguish "server took too long" from TLS or
 /// transport-level failures. Any error reading/writing the stream is
 /// propagated to the caller for logging.
+#[cfg(test)]
 async fn serve_one_connection<S, T>(
     stream: &mut T,
     storage: &S,
@@ -534,6 +535,7 @@ async fn handle_connection_rw<
     Ok(!close_requested)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn handle_http_request<S: Storage + OperatorQuerySurface>(
     method: &str,
@@ -562,6 +564,7 @@ async fn handle_http_request<S: Storage + OperatorQuerySurface>(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_http_request_with_session<S: Storage + OperatorQuerySurface>(
     method: &str,
     path: &str,
@@ -772,7 +775,7 @@ fn operator_error_response(error: &anyhow::Error) -> String {
     )
 }
 
-fn request_hostname<'a>(headers: &'a [(String, String)]) -> Option<&'a str> {
+fn request_hostname(headers: &[(String, String)]) -> Option<&str> {
     headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("host"))
