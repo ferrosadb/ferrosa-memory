@@ -34,7 +34,7 @@ admin_password = "ferrosa_admin"
 
 [embeddings]
 provider = "ollama"
-ollama_base_url = "http://localhost:11434"
+ollama_base_url = "http://127.0.0.1:11434"
 model = "nomic-embed-text"
 dimensions = 768
 

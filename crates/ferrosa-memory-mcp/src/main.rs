@@ -1651,7 +1651,7 @@ async fn main() -> anyhow::Result<()> {
     let shared_event_bus = Arc::new(ferrosa_memory_core::viz::EventBus::new());
     if config.viz.enabled {
         let transport = config.server.transport.as_str();
-        let (viz_bind, viz_tenant_id) = match transport {
+        let (default_bind, viz_tenant_id) = match transport {
             "stdio" => ("0.0.0.0", tenant_id),
             "http" => {
                 let raw = config.viz.tenant_id.as_deref().ok_or_else(|| {
@@ -1665,6 +1665,11 @@ async fn main() -> anyhow::Result<()> {
             }
             _ => ("0.0.0.0", tenant_id),
         };
+        let viz_bind: String = config
+            .viz
+            .bind_addr
+            .clone()
+            .unwrap_or_else(|| default_bind.to_string());
         let viz_bus = Arc::clone(&shared_event_bus);
         let viz_port = config.viz.port;
         let viz_storage = Arc::clone(&storage);
@@ -1676,13 +1681,14 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 "http".into()
             },
-            workbench_port: config.server.http_port,
+            workbench_port: config.server.public_port.unwrap_or(config.server.http_port),
             viz_scheme: "http".into(),
-            viz_port,
+            viz_port: config.viz.public_port.unwrap_or(viz_port),
         };
+        let viz_bind_for_log = viz_bind.clone();
         tokio::spawn(async move {
             if let Err(e) = http::serve_viz(
-                viz_bind,
+                &viz_bind,
                 viz_port,
                 viz_bus,
                 viz_storage,
@@ -1697,10 +1703,10 @@ async fn main() -> anyhow::Result<()> {
         });
         tracing::info!(
             "viz dashboard at http://{}:{}/viz",
-            if viz_bind == "0.0.0.0" {
-                "localhost"
+            if viz_bind_for_log == "0.0.0.0" {
+                "localhost".to_string()
             } else {
-                viz_bind
+                viz_bind_for_log
             },
             config.viz.port
         );

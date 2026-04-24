@@ -97,6 +97,11 @@ pub struct VizConfig {
     pub enabled: bool,
     #[serde(default = "default_viz_port")]
     pub port: u16,
+    /// Port to embed in rendered HTML for links pointing at viz (workbench → viz).
+    /// Set when the viz listener sits behind a port mapping (e.g. podman 18766:8766).
+    /// Defaults to `port` when unset.
+    #[serde(default)]
+    pub public_port: Option<u16>,
     /// Tenant UUID viz should read under when running in HTTP transport mode.
     ///
     /// Viz is unauthenticated (loopback-only), so the tenant cannot come from
@@ -104,6 +109,12 @@ pub struct VizConfig {
     /// stdio tenant. In HTTP mode this is required if `enabled = true`.
     #[serde(default)]
     pub tenant_id: Option<String>,
+    /// Explicit bind address for the viz listener. When unset the runtime picks
+    /// a safe default (0.0.0.0 under stdio, 127.0.0.1 under HTTP). Override to
+    /// 0.0.0.0 only when the container/host port mapping already constrains
+    /// exposure (e.g. podman forwarding host 127.0.0.1:X → container 0.0.0.0:Y).
+    #[serde(default)]
+    pub bind_addr: Option<String>,
 }
 
 impl Default for VizConfig {
@@ -111,7 +122,9 @@ impl Default for VizConfig {
         Self {
             enabled: default_viz_enabled(),
             port: default_viz_port(),
+            public_port: None,
             tenant_id: None,
+            bind_addr: None,
         }
     }
 }
@@ -259,6 +272,12 @@ pub struct ServerConfig {
     pub bind_addr: String,
     #[serde(default = "default_http_port")]
     pub http_port: u16,
+    /// Port to embed in rendered HTML for cross-page links (workbench ⇄ viz).
+    /// Set when the server sits behind a port mapping (e.g. podman 18765:8765):
+    /// the process listens on `http_port` inside the container, but the browser
+    /// needs `public_port` on the host. Defaults to `http_port` when unset.
+    #[serde(default)]
+    pub public_port: Option<u16>,
     #[serde(default = "default_log_level")]
     pub log_level: String,
     #[serde(default)]
@@ -296,6 +315,7 @@ impl Default for ServerConfig {
             transport: default_transport(),
             bind_addr: default_bind_addr(),
             http_port: default_http_port(),
+            public_port: None,
             log_level: default_log_level(),
             require_tls: false,
             cert_path: None,
@@ -481,7 +501,7 @@ fn default_provider() -> String {
     "ollama".into()
 }
 fn default_ollama_url() -> String {
-    "http://localhost:11434".into()
+    "http://127.0.0.1:11434".into()
 }
 fn default_embed_model() -> String {
     "nomic-embed-text-v2-moe".into()
@@ -1051,7 +1071,7 @@ port = 9999
     fn embedding_config_defaults() {
         let cfg = EmbeddingConfig::default();
         assert_eq!(cfg.provider, "ollama");
-        assert_eq!(cfg.ollama_base_url, "http://localhost:11434");
+        assert_eq!(cfg.ollama_base_url, "http://127.0.0.1:11434");
         assert_eq!(cfg.model, "nomic-embed-text-v2-moe");
         assert_eq!(cfg.dimensions, 768);
     }
