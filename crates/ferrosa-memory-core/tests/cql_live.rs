@@ -22,6 +22,7 @@ fn init_test_tracing() {
 }
 
 #[tokio::test]
+#[ignore = "requires live Ferrosa cluster; run with --ignored and FERROSA_TEST_CONTAINERS=1"]
 async fn cdrs_connect_and_query() {
     if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
         panic!(
@@ -60,6 +61,7 @@ async fn cdrs_connect_and_query() {
 }
 
 #[tokio::test]
+#[ignore = "requires live Ferrosa cluster; run with --ignored and FERROSA_TEST_CONTAINERS=1"]
 async fn cdrs_prepare_statement() {
     if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
         panic!(
@@ -94,6 +96,7 @@ async fn cdrs_prepare_statement() {
 }
 
 #[tokio::test]
+#[ignore = "requires live Ferrosa cluster; run with --ignored and FERROSA_TEST_CONTAINERS=1"]
 async fn prepare_vector_column() {
     if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
         panic!(

@@ -8,6 +8,7 @@ use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
 use std::sync::Arc;
 
 #[tokio::test]
+#[ignore = "requires live Ferrosa cluster; run with --ignored and FERROSA_TEST_CONTAINERS=1"]
 async fn prepare_each_statement() {
     if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
         panic!(

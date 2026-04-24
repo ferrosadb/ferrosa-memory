@@ -12,6 +12,7 @@ use cdrs_tokio::types::blob::Blob;
 use ferrosa_memory_core::vector;
 
 #[tokio::test]
+#[ignore = "requires live Ferrosa cluster; run with --ignored and FERROSA_TEST_CONTAINERS=1"]
 async fn vector_blob_workaround_roundtrip() {
     if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
         panic!(

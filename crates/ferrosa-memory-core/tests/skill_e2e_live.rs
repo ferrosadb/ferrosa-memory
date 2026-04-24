@@ -46,6 +46,7 @@ async fn tenant() -> TenantContext {
 }
 
 #[tokio::test]
+#[ignore = "requires live Ferrosa cluster; run with --ignored and FERROSA_TEST_CONTAINERS=1"]
 async fn skill_round_trip_on_live_cluster() {
     if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
         panic!(

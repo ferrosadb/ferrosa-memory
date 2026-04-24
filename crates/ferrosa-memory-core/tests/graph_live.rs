@@ -22,6 +22,7 @@ async fn connect_graph(username: &str, password: &str) -> GraphClient {
 
 /// Insert a fold vertex and edge via CQL, then traverse via graph.
 #[tokio::test]
+#[ignore = "requires live Ferrosa cluster; run with --ignored and FERROSA_TEST_CONTAINERS=1"]
 async fn graph_health_check() {
     if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
         panic!(
@@ -35,6 +36,7 @@ async fn graph_health_check() {
 }
 
 #[tokio::test]
+#[ignore = "requires live Ferrosa cluster; run with --ignored and FERROSA_TEST_CONTAINERS=1"]
 async fn match_empty_returns_no_rows() {
     if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
         panic!(
@@ -53,6 +55,7 @@ async fn match_empty_returns_no_rows() {
 }
 
 #[tokio::test]
+#[ignore = "requires live Ferrosa cluster; run with --ignored and FERROSA_TEST_CONTAINERS=1"]
 async fn public_graph_write_round_trip_for_co_occurs_edges() {
     if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
         panic!(
@@ -115,6 +118,7 @@ async fn public_graph_write_round_trip_for_co_occurs_edges() {
 }
 
 #[tokio::test]
+#[ignore = "requires live Ferrosa cluster; run with --ignored and FERROSA_TEST_CONTAINERS=1"]
 async fn ferrosa_user_is_denied_direct_graph_mutations() {
     if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
         panic!(

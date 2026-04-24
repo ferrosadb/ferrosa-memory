@@ -5,6 +5,7 @@ use ferrosa_memory_core::graph::{GraphClient, GraphConfig};
 use uuid::Uuid;
 
 #[tokio::test]
+#[ignore = "requires live Ferrosa cluster; run with --ignored and FERROSA_TEST_CONTAINERS=1"]
 async fn graph_health_and_match() {
     if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
         panic!(
