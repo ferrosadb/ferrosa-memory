@@ -29,7 +29,7 @@ def test_t_pf_002_workbench_home_loads_without_blocking_on_slow_views():
     html = _read(WORKBENCH_HTML)
 
     assert 'include_str!("../assets/workbench.html")' in http
-    assert '("GET", "/") => Ok(html_response("200 OK", WORKBENCH_HTML))' in http
+    assert '("GET", "/") => Ok(html_response("200 OK", workbench_html))' in http
     assert "loadHomeSummary" in html
     assert "switchSection" in html
 
