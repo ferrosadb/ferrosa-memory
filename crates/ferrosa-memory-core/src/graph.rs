@@ -250,7 +250,8 @@ impl GraphClient {
         edge_type: &str,
         dst_id: Uuid,
     ) -> anyhow::Result<()> {
-        let cypher = build_typed_edge_delete_query(tenant_id, session_id, src_id, edge_type, dst_id);
+        let cypher =
+            build_typed_edge_delete_query(tenant_id, session_id, src_id, edge_type, dst_id);
         self.execute_mutation(&cypher).await
     }
 
