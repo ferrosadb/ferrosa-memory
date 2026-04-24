@@ -79,20 +79,19 @@ The server-owned bulk ingest workstream is underway:
 - server-owned schema mapping and `schema_version` advertisement
 - structured row-level failures instead of subprocess exit-code diagnostics
 - optional server-side embedding for missing vectors
-- strict edge validation, dry-run support, and MCP progress notifications
+- strict edge validation and dry-run support, with MCP progress notifications still open
 - tenant enforcement and graph-boundary compliance on the ingest path
 - batch update/delete tools for entities and typed edges now use real hard-delete/update-capable backends instead of soft-delete / unsupported placeholders
 - live `ingest_entities` + `retrieve_entities` verification is green for fresh v2-embedded rows on `http://127.0.0.1:18765/mcp`
-- tenant-wide v2 backfill reruns cleanly, but older-row verification is still blocked by a Ferrosa issue: targeted updates appear to succeed yet older rows still read back with stale `updated_at` values and ANN lookups stay empty
+- tenant-wide v2 backfill verification is green: phase 0 reran cleanly for `7555` rows with zero failures, representative old rows now read back with fresh `updated_at` values, and managed-server `hybrid_search` returns `entity_ann` hits from the old partition
 
 ## Open Workstreams
 
 1. Close the Ferrosa bug where canonical public `TYPED_EDGE` MERGE does not materialize a row.
 2. Re-run live graph-write verification once that Ferrosa fix lands.
 3. Finish Sprint 10 progress notifications and workflow/system coverage for `ingest_entities`.
-4. Diagnose the Ferrosa-side existing-row backfill visibility / ANN issue before marking the v2 re-embed checklist complete.
-5. Keep readiness/auth hardening aligned to least-privilege role assumptions.
-6. Keep Datalog clearly documented and tested as ferrosa-memory-owned.
+4. Keep readiness/auth hardening aligned to least-privilege role assumptions.
+5. Keep Datalog clearly documented and tested as ferrosa-memory-owned.
 
 ## Verification Notes
 

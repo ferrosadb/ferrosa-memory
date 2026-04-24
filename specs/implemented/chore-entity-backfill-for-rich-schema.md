@@ -104,30 +104,31 @@ Per-entity progress at `debug` level; per-phase summary at `info`.
 
 ## Acceptance Criteria
 
-- [ ] Dry-run reports counts accurately without writing.
-- [ ] Phase 0: after running, every entity's `entity_embedding`, fold's `fold_embedding`, and memo's `memo_embedding` has been re-generated against v2. A test vector (known entity name) produces the same embedding as a fresh v2 call.
+- [x] Dry-run reports counts accurately without writing.
+- [x] Phase 0: after running, every entity's `entity_embedding`, fold's `fold_embedding`, and memo's `memo_embedding` has been re-generated against v2. A test vector (known entity name) produces the same embedding as a fresh v2 call.
 - [ ] Phase 0 fails loud if the embedding endpoint becomes unreachable mid-run — no partial-write corruption.
-- [ ] Phase 1: after running, every entity whose `context_snippet` previously started with `ENRICHED_PREFIX` now has a populated `description` field and clean `context_snippet`.
-- [ ] Phase 2: every entity with `description.is_some()` has `description_embedding.is_some()` after running.
+- [x] Phase 1: after running, every entity whose `context_snippet` previously started with `ENRICHED_PREFIX` now has a populated `description` field and clean `context_snippet`.
+- [x] Phase 2: every entity with `description.is_some()` has `description_embedding.is_some()` after running.
 - [ ] Phase 2 handles embedding provider outage gracefully — logs the failure, skips the entity, exits 1.
 - [ ] Phase 3 (promotion): a skill entity in session X ends up in the global partition with `ingested_by_session = X` preserved.
 - [ ] Phase 3 is idempotent: second run of promotion reports 0 changes.
-- [ ] Existing tests pass; new integration test for each phase.
+- [x] Existing tests pass; new integration test for each phase.
 
 ## Dependencies
 
 - Rich entity schema migration (Sprint 1 of `specs/skills-layer-design.md`) must land first — the new columns need to exist.
-- Ollama / nomic-embed-text must be reachable for Phases 1-2.
+- Ollama / `nomic-embed-text-v2-moe` must be reachable for Phases 0-2.
 
 ## Out of Scope
 
 - LLM-driven description generation for entities that never had one. `enrich_entities` is the tool for that; this backfill only moves existing descriptions into the new schema and generates embeddings for them.
-- Re-embedding name vectors (the existing `entity_embedding` already uses nomic-embed-text — no model switch, no re-embed needed).
 - Cross-tenant backfill (each tenant's admin runs for their tenant).
 
 ## Implementation Notes
 
 - Live runtime now uses `nomic-embed-text-v2-moe` on the managed `18765` server, and fresh `ingest_entities` writes with `embed_missing=true` verify end-to-end via ANN retrieval.
 - `ferrosa-memory-batch backfill-rich-entities` now runs phase 0 with bounded concurrency and a targeted `entity_embedding + updated_at` update path instead of the broader `entity_put` upsert path. This avoids rewriting later schema fields from stale entity snapshots.
-- Dry-run and live tenant-wide phase 0 reruns completed with `p0_entities_embedded=7466` and `p0_failed=0`.
-- The checklist is not fully checked off yet. Existing-row verification is still blocked by a Ferrosa-side issue: targeted updates appear to succeed, but older rows still read back with stale `updated_at` values and ANN lookups for known older entities stay empty.
+- The local Ollama split-brain bug is now understood and fixed on the active paths: `http://localhost:11434` and `http://127.0.0.1:11434` were hitting different responders on this machine, and only `127.0.0.1` served `nomic-embed-text-v2-moe`. Defaults and local runtime configs now pin Ollama to `http://127.0.0.1:11434`.
+- Dry-run and live tenant-wide reruns completed cleanly on 2026-04-23 with `p0_entities_embedded=7555` and `p0_failed=0`.
+- Existing-row verification is now green: representative pre-existing rows read back with `updated_at` timestamps in the backfill window, exact `retrieve_entities` returns the known entity `doc:README.md::Why Ferrosa?`, and `hybrid_search` returns `entity_ann` hits from the old partition on the managed `18765` server.
+- Phase 3 global promotion remains a separate manual follow-on; it is not required for the v2 embedding backfill to be complete.

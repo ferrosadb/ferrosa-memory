@@ -1,7 +1,7 @@
 # Project Plan — ferrosa-memory-mcp
 
 > Last updated: 2026-04-23
-> Status: Sprints 1-8 are complete. Sprint 9 code-side cutover is largely landed, but final completion is still blocked by a Ferrosa public-graph readback issue on the current local cluster. Sprint 10 is now in progress: `ingest_entities` and batch entity/edge CRUD are landed in `ferrosa-memory`, while progress notifications and existing-row embedding backfill verification remain open.
+> Status: Sprints 1-8 are complete. Sprint 9 code-side cutover is largely landed, but final completion is still blocked by a Ferrosa public-graph readback issue on the current local cluster. Sprint 10 is now in progress: `ingest_entities`, batch entity/edge CRUD, and the tenant-wide `nomic-embed-text-v2-moe` backfill are landed in `ferrosa-memory`; remaining work is progress notifications and additional workflow/system coverage.
 
 ## Overview
 
@@ -31,7 +31,7 @@ As of 2026-04-20, the plan has an additional architectural constraint:
 | Sprint 7 | **COMPLETE** | Shared HTTP auth/startup guardrails, probe/system coverage, secret-wiring verification, and viz-boundary rollout landed |
 | Sprint 8 | **COMPLETE** | Expert-system knowledge plane, operator workbench, CQL/SPARQL passthrough, local Datalog ownership, and live summary/query fixes are landed |
 | Sprint 9 | **IN PROGRESS** | Graph-boundary and role-auth cutover is implemented in `ferrosa-memory`, but live completion is blocked by Ferrosa not materializing public `TYPED_EDGE` MERGE writes |
-| Sprint 10 | **IN PROGRESS** | `ingest_entities` bulk ingest is landed, batch entity/edge CRUD now uses the real storage/graph delete paths, and live fresh-row embedding works; remaining work is progress notifications plus closing the Ferrosa-side old-row backfill verification gap |
+| Sprint 10 | **IN PROGRESS** | `ingest_entities` bulk ingest is landed, batch entity/edge CRUD now uses the real storage/graph delete paths, and tenant-wide v2 embedding backfill is verified; remaining work is progress notifications and broader workflow/system coverage |
 
 ---
 
@@ -375,7 +375,7 @@ As of 2026-04-20, the plan has an additional architectural constraint:
 |---|------|------|--------|-------|
 | B1 | OpenTelemetry trace export | M | spec Section 11 | v2 item per spec |
 | B2 | Model-perplexity-based compression scoring | L | ADR-001 | Enhances compression quality by calling embedding endpoint for perplexity estimates |
-| B3 | Embedding migration tool (re-embed on model change) | M | FMEA F26 | Semi-automated: enumerate rows with old model, re-embed, update |
+| B3 | Embedding migration tool (re-embed on model change) | M | FMEA F26 | **DONE (2026-04-23):** tenant-wide `nomic-embed-text-v2-moe` backfill completed and verified against live retrieval |
 | B4 | Online RL training loop for routing guidelines | XL | spec Section 11 | Replaces nightly batch with online ACON-style RL |
 | B5 | Web dashboard for memory observability | L | spec Section 11 | Beyond Ferrosa console + Prometheus |
 | B6 | WASM UDF for in-database compression | M | spec Section 4.3 | Moves compression into Ferrosa SSTable flush path |
