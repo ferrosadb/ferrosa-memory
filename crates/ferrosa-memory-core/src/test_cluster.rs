@@ -37,7 +37,7 @@ impl TestClusterConfig {
         })
     }
 
-    /// Same as [`from_env`], but prints a skip message to stderr when the
+    /// Same as [`Self::from_env`], but prints a skip message to stderr when the
     /// cluster isn't wired. Call from the top of an `#[ignore]`d integration
     /// test body.
     pub fn from_env_or_skip() -> Option<Self> {
