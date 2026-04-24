@@ -148,7 +148,7 @@ impl Default for SessionState {
             repo: std::sync::OnceLock::new(),
             last_activity: Arc::new(tokio::sync::Notify::new()),
             dirty: Arc::new(AtomicBool::new(false)),
-            ollama_base_url: "http://localhost:11434".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434".to_string(),
             ner_model: "qwen3.5:27b".to_string(),
             embed_model: "nomic-embed-text-v2-moe".to_string(),
             embed_dimensions: 768,
@@ -828,6 +828,17 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                 "required": []
             }),
         },
+        ToolDef {
+            name: "count_entities_by_type".into(),
+            description: "Return a per-session entity histogram broken down by entity_type, by state, and by the joint (type,state) buckets.\n\nCALL WHEN: You need status/diagnostic counts like 'how many bugs are active in this session?' without coupling the client to entity_store columns.\nCost: ~5-10ms.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" }
+                },
+                "required": []
+            }),
+        },
         // --- Memory state management ---
         ToolDef {
             name: "promote_memory".into(),
@@ -1378,6 +1389,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "run_consolidation" => handle_run_consolidation(args, storage, ctx, session).await,
         "enrich_entities" => handle_enrich_entities(args, storage, ctx, session).await,
         "get_stats" => handle_get_stats(args, storage, ctx, session).await,
+        "count_entities_by_type" => handle_count_entities_by_type(args, storage, ctx).await,
         "promote_memory" => handle_promote_memory(args, storage, ctx, session).await,
         "demote_memory" => handle_demote_memory(args, storage, ctx, session).await,
         "importance_score" => handle_importance_score(args, storage, ctx, session).await,
@@ -1498,6 +1510,7 @@ fn is_tier1(name: &str) -> bool {
             | "set_intention"
             | "complete_intention"
             | "get_stats"
+            | "count_entities_by_type"
             | "write_temporal_fact"
             | "get_temporal_chain"
             | "retrieve_entities"
@@ -4391,6 +4404,86 @@ async fn handle_get_stats<S: crate::storage::Storage>(
     Ok(response)
 }
 
+async fn handle_count_entities_by_type<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let start = std::time::Instant::now();
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+    let rows = storage
+        .entity_counts_by_type_and_state(ctx, session_id)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    let mut total = 0usize;
+    let mut by_entity_type = serde_json::Map::new();
+    let mut by_state = serde_json::Map::new();
+    let mut by_type_and_state: std::collections::BTreeMap<String, serde_json::Map<String, Value>> =
+        std::collections::BTreeMap::new();
+
+    for row in rows {
+        total += row.count;
+
+        let type_entry = by_entity_type
+            .entry(row.entity_type.clone())
+            .or_insert_with(|| serde_json::json!(0));
+        let type_total = type_entry.as_u64().unwrap_or(0) + row.count as u64;
+        *type_entry = serde_json::json!(type_total);
+
+        let state_key = row.state.to_string();
+        let state_entry = by_state
+            .entry(state_key.clone())
+            .or_insert_with(|| serde_json::json!(0));
+        let state_total = state_entry.as_u64().unwrap_or(0) + row.count as u64;
+        *state_entry = serde_json::json!(state_total);
+
+        by_type_and_state
+            .entry(row.entity_type)
+            .or_default()
+            .insert(state_key, serde_json::json!(row.count));
+    }
+
+    let sum_by_type: usize = by_entity_type
+        .values()
+        .map(|v| v.as_u64().unwrap_or(0) as usize)
+        .sum();
+    let sum_by_state: usize = by_state
+        .values()
+        .map(|v| v.as_u64().unwrap_or(0) as usize)
+        .sum();
+    let sum_joint: usize = by_type_and_state
+        .values()
+        .flat_map(|inner| inner.values())
+        .map(|v| v.as_u64().unwrap_or(0) as usize)
+        .sum();
+
+    if total != sum_by_type || total != sum_by_state || total != sum_joint {
+        tracing::error!(
+            total,
+            sum_by_type,
+            sum_by_state,
+            sum_joint,
+            "count_entities_by_type invariant mismatch"
+        );
+        return Err((
+            INTERNAL_ERROR,
+            "count_entities_by_type invariant mismatch".to_string(),
+        ));
+    }
+    debug_assert_eq!(total, sum_by_type);
+    debug_assert_eq!(total, sum_by_state);
+    debug_assert_eq!(total, sum_joint);
+
+    Ok(serde_json::json!({
+        "total": total,
+        "by_entity_type": by_entity_type,
+        "by_state": by_state,
+        "by_type_and_state": by_type_and_state,
+        "duration_ms": start.elapsed().as_millis() as u64,
+    }))
+}
+
 // --- Spreading activation handler ---
 
 async fn handle_find_memory_chain<S: crate::storage::Storage>(
@@ -6218,6 +6311,7 @@ mod tests {
         assert!(names.contains(&"set_intention"));
         assert!(names.contains(&"complete_intention"));
         assert!(names.contains(&"get_stats"));
+        assert!(names.contains(&"count_entities_by_type"));
         assert!(names.contains(&"write_temporal_fact"));
         assert!(names.contains(&"get_temporal_chain"));
         assert!(names.contains(&"retrieve_entities"));
@@ -6285,6 +6379,7 @@ mod tests {
         assert!(names.contains(&"batch_delete_entities"));
         assert!(names.contains(&"batch_update_edges"));
         assert!(names.contains(&"batch_delete_edges"));
+        assert!(names.contains(&"count_entities_by_type"));
     }
 
     #[tokio::test]
@@ -7276,6 +7371,209 @@ mod tests {
         assert_eq!(result["temporal_fact_count"], 0);
         assert_eq!(result["edge_count"], 0);
         assert_eq!(result["intention_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn count_entities_by_type_returns_empty_breakdowns_for_empty_session() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+
+        let params = serde_json::json!({
+            "name": "count_entities_by_type",
+            "arguments": {
+                "session_id": sid.to_string()
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["total"], 0);
+        assert_eq!(result["by_entity_type"], serde_json::json!({}));
+        assert_eq!(result["by_state"], serde_json::json!({}));
+        assert_eq!(result["by_type_and_state"], serde_json::json!({}));
+        assert!(result["duration_ms"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn count_entities_by_type_buckets_known_fixture() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+
+        let mut entities = store.entities.lock().await;
+        entities.push(crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "Bug A".into(),
+            entity_type: "bug".into(),
+            context_snippet: "a".into(),
+            confidence: 0.9,
+            state: crate::types::MemoryState::Active,
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        });
+        entities.push(crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "Bug B".into(),
+            entity_type: "bug".into(),
+            context_snippet: "b".into(),
+            confidence: 0.9,
+            state: crate::types::MemoryState::Dormant,
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        });
+        entities.push(crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "Doc".into(),
+            entity_type: "document".into(),
+            context_snippet: "c".into(),
+            confidence: 0.9,
+            state: crate::types::MemoryState::Active,
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        });
+        entities.push(crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "Fn".into(),
+            entity_type: "function".into(),
+            context_snippet: "d".into(),
+            confidence: 0.9,
+            state: crate::types::MemoryState::Active,
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        });
+        entities.push(crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "Fn 2".into(),
+            entity_type: "function".into(),
+            context_snippet: "e".into(),
+            confidence: 0.9,
+            state: crate::types::MemoryState::Silent,
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        });
+        entities.push(crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "Fn 3".into(),
+            entity_type: "function".into(),
+            context_snippet: "f".into(),
+            confidence: 0.9,
+            state: crate::types::MemoryState::Active,
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        });
+        drop(entities);
+
+        let params = serde_json::json!({
+            "name": "count_entities_by_type",
+            "arguments": {
+                "session_id": sid.to_string()
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+
+        assert_eq!(result["total"], 6);
+        assert_eq!(result["by_entity_type"]["bug"], 2);
+        assert_eq!(result["by_entity_type"]["document"], 1);
+        assert_eq!(result["by_entity_type"]["function"], 3);
+        assert_eq!(result["by_state"]["active"], 4);
+        assert_eq!(result["by_state"]["dormant"], 1);
+        assert_eq!(result["by_state"]["silent"], 1);
+        assert_eq!(result["by_type_and_state"]["bug"]["active"], 1);
+        assert_eq!(result["by_type_and_state"]["bug"]["dormant"], 1);
+        assert_eq!(result["by_type_and_state"]["document"]["active"], 1);
+        assert_eq!(result["by_type_and_state"]["function"]["active"], 2);
+        assert_eq!(result["by_type_and_state"]["function"]["silent"], 1);
+    }
+
+    #[tokio::test]
+    async fn count_entities_by_type_respects_tenant_isolation() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let other_ctx = crate::types::TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "other".into(),
+        };
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+
+        let mut entities = store.entities.lock().await;
+        entities.push(crate::types::EntityEntry {
+            tenant_id: other_ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "Other Tenant Bug".into(),
+            entity_type: "bug".into(),
+            context_snippet: "other".into(),
+            confidence: 0.9,
+            state: crate::types::MemoryState::Active,
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        });
+        drop(entities);
+
+        let params = serde_json::json!({
+            "name": "count_entities_by_type",
+            "arguments": {
+                "session_id": sid.to_string()
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["total"], 0);
+        assert_eq!(result["by_entity_type"], serde_json::json!({}));
+    }
+
+    #[tokio::test]
+    async fn count_entities_by_type_defaults_to_nil_session_without_dirtying_session() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+
+        store.entities.lock().await.push(crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: Uuid::nil(),
+            entity_name: "Nil Session Bug".into(),
+            entity_type: "bug".into(),
+            context_snippet: "nil".into(),
+            confidence: 0.9,
+            state: crate::types::MemoryState::Active,
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        });
+
+        let params = serde_json::json!({
+            "name": "count_entities_by_type",
+            "arguments": {}
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["total"], 1);
+        assert_eq!(result["by_entity_type"]["bug"], 1);
+        assert!(!session.dirty.load(Ordering::Relaxed));
     }
 
     #[tokio::test]

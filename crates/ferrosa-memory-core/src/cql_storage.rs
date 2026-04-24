@@ -2164,6 +2164,40 @@ impl Storage for CqlStorage {
         Ok(results)
     }
 
+    async fn entity_counts_by_type_and_state(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<EntityTypeStateCount>> {
+        let query = format!(
+            "SELECT entity_type, state FROM {}.entity_store WHERE tenant_id = ? AND session_id = ?",
+            self.keyspace
+        );
+        let envelope = self
+            .session
+            .query_with_values(query, query_values!(ctx.tenant_id, session_id))
+            .await?;
+        let rows = envelope.response_body()?.into_rows().unwrap_or_default();
+        let mut counts: std::collections::BTreeMap<(String, String), usize> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            let entity_type = row.r_by_name::<String>("entity_type").unwrap_or_default();
+            let state = row
+                .r_by_name::<String>("state")
+                .unwrap_or_else(|_| MemoryState::default().to_string());
+            *counts.entry((entity_type, state)).or_insert(0) += 1;
+        }
+        Ok(counts
+            .into_iter()
+            .map(|((entity_type, state), count)| EntityTypeStateCount {
+                entity_type,
+                state: serde_json::from_str(&format!("\"{state}\""))
+                    .unwrap_or_else(|_| MemoryState::default()),
+                count,
+            })
+            .collect())
+    }
+
     async fn entity_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<EntityEntry>> {
         let rows = self
             .query_rows(&self.stmts.entity_list_all, query_values!(ctx.tenant_id))

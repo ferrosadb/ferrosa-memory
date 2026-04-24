@@ -546,6 +546,14 @@ impl Storage for ReconnectingStorage {
         delegate!(self, entity_list_session, ctx, session_id)
     }
 
+    async fn entity_counts_by_type_and_state(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<EntityTypeStateCount>> {
+        delegate!(self, entity_counts_by_type_and_state, ctx, session_id)
+    }
+
     async fn entity_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<EntityEntry>> {
         delegate!(self, entity_list_all, ctx)
     }

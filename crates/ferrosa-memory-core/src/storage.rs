@@ -14,10 +14,10 @@
 use uuid::Uuid;
 
 use crate::types::{
-    AliasEntry, ApprovalEntry, AuditEntry, DerivedFact, EntityEntry, FeedbackOutcome, FoldEntry,
-    FoldSummary, MaterializedEdge, MemoEntry, MemoryState, PlanNode, PlanStatus, PromotedPredicate,
-    ProvenanceStep, RuleEntry, RuleState, TemporalEvent, TenantContext, ToolUsageRow, TypedEdge,
-    WarmthEntry,
+    AliasEntry, ApprovalEntry, AuditEntry, DerivedFact, EntityEntry, EntityTypeStateCount,
+    FeedbackOutcome, FoldEntry, FoldSummary, MaterializedEdge, MemoEntry, MemoryState, PlanNode,
+    PlanStatus, PromotedPredicate, ProvenanceStep, RuleEntry, RuleState, TemporalEvent,
+    TenantContext, ToolUsageRow, TypedEdge, WarmthEntry,
 };
 
 /// Core storage operations for the memory system.
@@ -213,6 +213,13 @@ pub trait Storage: Send + Sync {
         ctx: &TenantContext,
         session_id: Uuid,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<EntityEntry>>> + Send;
+
+    /// Return a flat histogram over entity_type and state for one session.
+    fn entity_counts_by_type_and_state(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<EntityTypeStateCount>>> + Send;
 
     /// List all entities for a tenant (for viz snapshot).
     fn entity_list_all(
@@ -1200,14 +1207,41 @@ pub mod mock {
 
         async fn entity_list_session(
             &self,
-            _ctx: &TenantContext,
+            ctx: &TenantContext,
             session_id: Uuid,
         ) -> anyhow::Result<Vec<EntityEntry>> {
             let entities = self.entities.lock().await;
             Ok(entities
                 .iter()
-                .filter(|e| e.session_id == session_id)
+                .filter(|e| e.tenant_id == ctx.tenant_id && e.session_id == session_id)
                 .cloned()
+                .collect())
+        }
+
+        async fn entity_counts_by_type_and_state(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+        ) -> anyhow::Result<Vec<EntityTypeStateCount>> {
+            let entities = self.entities.lock().await;
+            let mut counts: std::collections::BTreeMap<(String, String), usize> =
+                std::collections::BTreeMap::new();
+            for entity in entities
+                .iter()
+                .filter(|e| e.tenant_id == ctx.tenant_id && e.session_id == session_id)
+            {
+                *counts
+                    .entry((entity.entity_type.clone(), entity.state.to_string()))
+                    .or_insert(0) += 1;
+            }
+            Ok(counts
+                .into_iter()
+                .map(|((entity_type, state), count)| EntityTypeStateCount {
+                    entity_type,
+                    state: serde_json::from_str(&format!("\"{state}\""))
+                        .expect("known MemoryState string"),
+                    count,
+                })
                 .collect())
         }
 

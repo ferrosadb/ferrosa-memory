@@ -206,6 +206,14 @@ pub struct EntityEntry {
     pub ingested_by_session: Option<Uuid>,
 }
 
+/// Flat histogram row for `(entity_type, state) -> count`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EntityTypeStateCount {
+    pub entity_type: String,
+    pub state: MemoryState,
+    pub count: usize,
+}
+
 impl Default for EntityEntry {
     fn default() -> Self {
         Self {
