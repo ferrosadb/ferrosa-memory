@@ -667,6 +667,89 @@ pub fn validate_shared_http_config(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// P0-11: process-wide counter of direct-loopback Ferrosa connections that
+/// fmem made instead of going through the DBaaS proxy. Non-zero values in
+/// production indicate the tenant connection path is bypassing the
+/// metering / rate-limit / auth surface. The validator below refuses to
+/// start with localhost contact points unless the operator has explicitly
+/// opted in via `FERROSA_MEMORY_ALLOW_LOCALHOST=true`.
+pub static LOOPBACK_CONNECTIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of the loopback-connection counter for tests and metrics scrape.
+pub fn loopback_connection_count() -> u64 {
+    LOOPBACK_CONNECTIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Returns true when *every* host portion of `endpoints` is a loopback
+/// address (`localhost`, `127.0.0.1`, `::1`).
+fn all_loopback(endpoints: &[String]) -> bool {
+    !endpoints.is_empty()
+        && endpoints.iter().all(|ep| {
+            let host = ep.rsplit_once(':').map(|(h, _)| h).unwrap_or(ep.as_str());
+            matches!(host.trim(), "localhost" | "127.0.0.1" | "::1" | "[::1]")
+        })
+}
+
+/// Returns true if any endpoint hostname looks like a loopback address.
+fn any_loopback(endpoints: &[String]) -> bool {
+    endpoints.iter().any(|ep| {
+        let host = ep.rsplit_once(':').map(|(h, _)| h).unwrap_or(ep.as_str());
+        matches!(host.trim(), "localhost" | "127.0.0.1" | "::1" | "[::1]")
+    })
+}
+
+/// P0-11: refuse to load a config that points fmem at a localhost Ferrosa
+/// cluster unless the operator has explicitly opted in via
+/// `FERROSA_MEMORY_ALLOW_LOCALHOST=true`. The literal "true" wins (typo
+/// defense matching P0-04/P0-05/P0-01).
+///
+/// In production, fmem must connect through the DBaaS proxy (which
+/// enforces tenant auth, rate limiting, and metering), not directly to
+/// loopback. The counter `LOOPBACK_CONNECTIONS` is incremented every
+/// time we accept a loopback config so dashboards can observe drift.
+pub fn validate_tenant_connection_path(config: &Config) -> anyhow::Result<()> {
+    let endpoints = &config.ferrosa.contact_points;
+    if endpoints.is_empty() {
+        anyhow::bail!(
+            "ferrosa.contact_points is empty — cannot connect to any Ferrosa node"
+        );
+    }
+    if !any_loopback(endpoints) {
+        return Ok(());
+    }
+
+    let allow = std::env::var("FERROSA_MEMORY_ALLOW_LOCALHOST")
+        .ok()
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !allow {
+        anyhow::bail!(
+            "ferrosa.contact_points contains loopback addresses ({:?}) and \
+             FERROSA_MEMORY_ALLOW_LOCALHOST is not set. Refusing to start: in production \
+             fmem must connect through the DBaaS proxy. Set FERROSA_MEMORY_ALLOW_LOCALHOST=true \
+             for local dev / CI.",
+            endpoints
+        );
+    }
+
+    LOOPBACK_CONNECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if all_loopback(endpoints) {
+        tracing::warn!(
+            ?endpoints,
+            "FERROSA_MEMORY_ALLOW_LOCALHOST=true and ALL contact_points are loopback — \
+             fmem is bypassing the DBaaS proxy entirely. Local dev only."
+        );
+    } else {
+        tracing::warn!(
+            ?endpoints,
+            "FERROSA_MEMORY_ALLOW_LOCALHOST=true and SOME contact_points are loopback — \
+             a subset of connections will bypass the DBaaS proxy."
+        );
+    }
+    Ok(())
+}
+
 fn is_loopback_bind_addr(bind_addr: &str) -> bool {
     matches!(
         bind_addr.trim(),
@@ -690,6 +773,112 @@ pub fn load_config() -> anyhow::Result<Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use serial_test::serial;
+
+    /// P0-11: tenant connection path counter must be exposed.
+    #[test]
+    fn loopback_connection_count_exposes_counter() {
+        let baseline = loopback_connection_count();
+        assert!(loopback_connection_count() >= baseline);
+    }
+
+    /// P0-11: localhost contact_points are refused without the explicit
+    /// dev opt-in.
+    #[test]
+    #[serial]
+    fn validate_tenant_path_refuses_localhost_without_opt_in() {
+        unsafe {
+            std::env::remove_var("FERROSA_MEMORY_ALLOW_LOCALHOST");
+        }
+        let toml = r#"
+[ferrosa]
+contact_points = ["localhost:19042"]
+"#;
+        let config = parse_config(toml).unwrap();
+        let res = validate_tenant_connection_path(&config);
+        assert!(
+            res.is_err(),
+            "loopback contact_points must refuse to start without opt-in: {res:?}"
+        );
+    }
+
+    /// P0-11: explicit dev opt-in lets localhost contact_points through
+    /// AND increments the counter.
+    #[test]
+    #[serial]
+    fn validate_tenant_path_dev_opt_in_increments_counter() {
+        unsafe {
+            std::env::set_var("FERROSA_MEMORY_ALLOW_LOCALHOST", "true");
+        }
+        let toml = r#"
+[ferrosa]
+contact_points = ["localhost:19042", "localhost:19043", "localhost:19044"]
+"#;
+        let config = parse_config(toml).unwrap();
+        let baseline = loopback_connection_count();
+        let res = validate_tenant_connection_path(&config);
+        unsafe {
+            std::env::remove_var("FERROSA_MEMORY_ALLOW_LOCALHOST");
+        }
+        assert!(res.is_ok(), "dev opt-in must allow localhost: {res:?}");
+        assert!(
+            loopback_connection_count() > baseline,
+            "loopback counter must advance when localhost is accepted"
+        );
+    }
+
+    /// P0-11: typo defense — non-"true" values must NOT trigger opt-in.
+    #[test]
+    #[serial]
+    fn validate_tenant_path_typo_does_not_opt_in() {
+        unsafe {
+            std::env::set_var("FERROSA_MEMORY_ALLOW_LOCALHOST", "yes");
+        }
+        let toml = r#"
+[ferrosa]
+contact_points = ["localhost:19042"]
+"#;
+        let config = parse_config(toml).unwrap();
+        let res = validate_tenant_connection_path(&config);
+        unsafe {
+            std::env::remove_var("FERROSA_MEMORY_ALLOW_LOCALHOST");
+        }
+        assert!(
+            res.is_err(),
+            "non-'true' values must not satisfy the opt-in: {res:?}"
+        );
+    }
+
+    /// P0-11: production-shape config (non-loopback contact_points) passes
+    /// validation regardless of the opt-in env.
+    #[test]
+    #[serial]
+    fn validate_tenant_path_proxy_config_passes() {
+        unsafe {
+            std::env::remove_var("FERROSA_MEMORY_ALLOW_LOCALHOST");
+        }
+        let toml = r#"
+[ferrosa]
+contact_points = ["proxy.dbaas.ferrosa.io:9042"]
+"#;
+        let config = parse_config(toml).unwrap();
+        let res = validate_tenant_connection_path(&config);
+        assert!(res.is_ok(), "proxy contact_points must pass: {res:?}");
+    }
+
+    /// P0-11: empty contact_points always fails.
+    #[test]
+    #[serial]
+    fn validate_tenant_path_empty_contact_points_fails() {
+        let toml = r#"
+[ferrosa]
+contact_points = []
+"#;
+        let config = parse_config(toml).unwrap();
+        let res = validate_tenant_connection_path(&config);
+        assert!(res.is_err(), "empty contact_points must fail: {res:?}");
+    }
 
     #[test]
     fn parse_minimal_config() {
