@@ -197,7 +197,7 @@ jobs:
         # ferrosa is the source of the Ferrosa server image used by the cluster.
         # Cloning at HEAD of main gives us the latest stable binary.
         run: |
-          git clone --depth=1 https://github.com/your-org/ferrosa.git /tmp/ferrosa-src
+          git clone --depth=1 https://github.com/bkearns/ferrosa.git /tmp/ferrosa-src
       - name: Bring up 3-node cluster on ports 19042-19044
         run: |
           # Write a CI compose that maps 9042→19042 etc. so tests that hardcode
