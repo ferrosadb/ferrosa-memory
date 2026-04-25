@@ -25,6 +25,14 @@ jobs:
         run: cargo fmt --check
       - name: Clippy (warnings as errors)
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # P0-11/W-01: no hardcoded loopback CQL addresses in non-test source
+      - name: No loopback CQL addresses in source (p0-11)
+        run: |
+          ! grep -rn "localhost:1904[2-4]\|127\.0\.0\.1:1904[2-4]" \
+            --include='*.rs' \
+            crates/ferrosa-memory-core/src \
+            crates/ferrosa-memory-mcp/src \
+            2>/dev/null || (echo "ERROR: hardcoded loopback CQL address found (p0-11)"; exit 1)
 
   # Stage 2: Build + Typecheck
   build:

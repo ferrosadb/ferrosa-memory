@@ -340,9 +340,14 @@ pub struct FerrosaCqlConfig {
     pub replication_factor: u8,
     #[serde(default = "default_consistency")]
     pub consistency: String,
-    #[serde(default = "default_ferrosa_user")]
+    /// P0-11/W-02: In DBaaS mode, credentials come from `FERROSA_TENANT_ID` /
+    /// `FERROSA_API_KEY` via `apply_dbaas_env_overrides`. In local-dev mode
+    /// the TOML value is used as-is; the legacy default_ferrosa_user /
+    /// default_ferrosa_password fns are removed — local configs must now
+    /// set explicit values.
+    #[serde(default = "default_cql_username")]
     pub username: String,
-    #[serde(default = "default_ferrosa_password")]
+    #[serde(default = "default_cql_password")]
     pub password: String,
     /// Optional admin credentials used for a short-lived session that runs
     /// schema migrations (CREATE KEYSPACE / CREATE TABLE / etc.). When set,
@@ -551,10 +556,16 @@ fn default_http_graph_url() -> String {
 fn default_sparql_url() -> String {
     "http://localhost:8080".into()
 }
-fn default_ferrosa_user() -> String {
+/// P0-11/W-02: default CQL username for local-dev / non-DBaaS installs.
+/// In production (FERROSA_DBAAS_MODE=true) `apply_dbaas_env_overrides`
+/// overwrites this with the value from FERROSA_TENANT_ID.
+fn default_cql_username() -> String {
     "ferrosa_user".into()
 }
-fn default_ferrosa_password() -> String {
+/// P0-11/W-02: default CQL password for local-dev / non-DBaaS installs.
+/// In production (FERROSA_DBAAS_MODE=true) `apply_dbaas_env_overrides`
+/// overwrites this with the value from FERROSA_API_KEY.
+fn default_cql_password() -> String {
     "ferrosa_user".into()
 }
 fn default_warmth_boost() -> f64 {
@@ -711,9 +722,7 @@ fn any_loopback(endpoints: &[String]) -> bool {
 pub fn validate_tenant_connection_path(config: &Config) -> anyhow::Result<()> {
     let endpoints = &config.ferrosa.contact_points;
     if endpoints.is_empty() {
-        anyhow::bail!(
-            "ferrosa.contact_points is empty — cannot connect to any Ferrosa node"
-        );
+        anyhow::bail!("ferrosa.contact_points is empty — cannot connect to any Ferrosa node");
     }
     if !any_loopback(endpoints) {
         return Ok(());
@@ -755,6 +764,107 @@ fn is_loopback_bind_addr(bind_addr: &str) -> bool {
         bind_addr.trim(),
         "127.0.0.1" | "localhost" | "::1" | "[::1]"
     )
+}
+
+/// P0-11/W-02: returns true when FERROSA_DBAAS_MODE=true (exact match,
+/// case-insensitive). When true, `apply_dbaas_env_overrides` must succeed
+/// at startup or the process exits with a clear error.
+pub fn is_dbaas_mode() -> bool {
+    std::env::var("FERROSA_DBAAS_MODE")
+        .ok()
+        .as_deref()
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// P0-11/W-02: Overwrite the CQL contact-points, graph URL, and
+/// credentials from DBaaS-specific env vars. Called at startup when
+/// `is_dbaas_mode()` is true. Fails loud if any required variable is absent.
+///
+/// Required env vars (all must be set in DBaaS mode):
+/// - `FERROSA_CQL_PROXY_ADDR`  — comma-separated `host:port` list
+/// - `FERROSA_GRAPH_PROXY_ADDR` — full URL, e.g. `http://proxy.dbaas.io:7474`
+/// - `FERROSA_TENANT_ID`        — used as CQL username
+/// - `FERROSA_API_KEY`          — used as CQL password
+pub fn apply_dbaas_env_overrides(config: &mut Config) -> anyhow::Result<()> {
+    let cql_addr = std::env::var("FERROSA_CQL_PROXY_ADDR").map_err(|_| {
+        anyhow::anyhow!(
+            "FERROSA_DBAAS_MODE=true but FERROSA_CQL_PROXY_ADDR is not set. \
+             Set it to the CQL proxy address (e.g. 'proxy.dbaas.ferrosa.io:9042')."
+        )
+    })?;
+    if cql_addr.trim().is_empty() {
+        anyhow::bail!(
+            "FERROSA_CQL_PROXY_ADDR is set but empty — cannot connect to any Ferrosa node"
+        );
+    }
+
+    let graph_addr = std::env::var("FERROSA_GRAPH_PROXY_ADDR").map_err(|_| {
+        anyhow::anyhow!(
+            "FERROSA_DBAAS_MODE=true but FERROSA_GRAPH_PROXY_ADDR is not set. \
+             Set it to the graph proxy URL (e.g. 'http://proxy.dbaas.ferrosa.io:7474')."
+        )
+    })?;
+    if graph_addr.trim().is_empty() {
+        anyhow::bail!(
+            "FERROSA_GRAPH_PROXY_ADDR is set but empty — cannot connect to the graph proxy"
+        );
+    }
+
+    let tenant_id = std::env::var("FERROSA_TENANT_ID").map_err(|_| {
+        anyhow::anyhow!(
+            "FERROSA_DBAAS_MODE=true but FERROSA_TENANT_ID is not set. \
+             Set it to the tenant UUID issued by the DBaaS control plane."
+        )
+    })?;
+    if tenant_id.trim().is_empty() {
+        anyhow::bail!("FERROSA_TENANT_ID is set but empty");
+    }
+
+    let api_key = std::env::var("FERROSA_API_KEY").map_err(|_| {
+        anyhow::anyhow!(
+            "FERROSA_DBAAS_MODE=true but FERROSA_API_KEY is not set. \
+             Set it to the API key issued by the DBaaS control plane."
+        )
+    })?;
+    if api_key.trim().is_empty() {
+        anyhow::bail!("FERROSA_API_KEY is set but empty");
+    }
+
+    // Rewrite contact_points from the env var (comma-separated).
+    config.ferrosa.contact_points = cql_addr
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if config.ferrosa.contact_points.is_empty() {
+        anyhow::bail!("FERROSA_CQL_PROXY_ADDR contained no valid addresses after parsing");
+    }
+
+    // Rewrite graph URL.
+    config.graph.http_url = graph_addr;
+
+    // Replace credentials with tenant identity.
+    config.ferrosa.username = tenant_id;
+    config.ferrosa.password = api_key;
+
+    tracing::info!(
+        contact_points = ?config.ferrosa.contact_points,
+        graph_http_url = %config.graph.http_url,
+        "DBaaS mode: CQL and graph addresses set from environment"
+    );
+    Ok(())
+}
+
+/// P0-11/W-02: Load config and, when FERROSA_DBAAS_MODE=true, apply the
+/// DBaaS env overrides. Exits with a clear error if required vars are absent
+/// in DBaaS mode.
+pub fn load_config_with_dbaas() -> anyhow::Result<Config> {
+    let mut config = load_config()?;
+    if is_dbaas_mode() {
+        apply_dbaas_env_overrides(&mut config)?;
+    }
+    Ok(config)
 }
 
 /// Load config from the resolved path, or return an error if not found.
@@ -1474,5 +1584,212 @@ reuse_factor = 1.5
         assert_eq!(config.promotion.size_budget_rows, 50000);
         assert_eq!(config.promotion.window_days, 14);
         assert!((config.promotion.reuse_factor - 1.5).abs() < f64::EPSILON);
+    }
+
+    // ── W-02 tests ───────────────────────────────────────────────────────────
+
+    /// P0-11/W-02: is_dbaas_mode returns true only on literal "true".
+    #[test]
+    #[serial]
+    fn dbaas_mode_requires_exact_true() {
+        unsafe { std::env::set_var("FERROSA_DBAAS_MODE", "true") }
+        assert!(
+            is_dbaas_mode(),
+            "FERROSA_DBAAS_MODE=true must enable DBaaS mode"
+        );
+
+        unsafe { std::env::set_var("FERROSA_DBAAS_MODE", "TRUE") }
+        assert!(
+            is_dbaas_mode(),
+            "case-insensitive TRUE must enable DBaaS mode"
+        );
+
+        unsafe { std::env::set_var("FERROSA_DBAAS_MODE", "yes") }
+        assert!(
+            !is_dbaas_mode(),
+            "non-'true' values must not enable DBaaS mode"
+        );
+
+        unsafe { std::env::remove_var("FERROSA_DBAAS_MODE") }
+        assert!(!is_dbaas_mode(), "absent var must not enable DBaaS mode");
+    }
+
+    fn minimal_config_with_proxy() -> Config {
+        let toml = r#"
+[ferrosa]
+contact_points = ["proxy.dbaas.ferrosa.io:9042"]
+"#;
+        parse_config(toml).expect("minimal proxy config must parse")
+    }
+
+    /// P0-11/W-02: apply_dbaas_env_overrides populates config from env vars.
+    #[test]
+    #[serial]
+    fn dbaas_env_overrides_populate_config() {
+        unsafe {
+            std::env::set_var("FERROSA_CQL_PROXY_ADDR", "proxy.dbaas.ferrosa.io:9042");
+            std::env::set_var(
+                "FERROSA_GRAPH_PROXY_ADDR",
+                "http://graph.dbaas.ferrosa.io:7474",
+            );
+            std::env::set_var("FERROSA_TENANT_ID", "tenant-abc-123");
+            std::env::set_var("FERROSA_API_KEY", "sk-test-key");
+        }
+        let mut config = minimal_config_with_proxy();
+        apply_dbaas_env_overrides(&mut config)
+            .expect("env overrides must succeed when all vars set");
+        unsafe {
+            std::env::remove_var("FERROSA_CQL_PROXY_ADDR");
+            std::env::remove_var("FERROSA_GRAPH_PROXY_ADDR");
+            std::env::remove_var("FERROSA_TENANT_ID");
+            std::env::remove_var("FERROSA_API_KEY");
+        }
+        assert_eq!(
+            config.ferrosa.contact_points,
+            vec!["proxy.dbaas.ferrosa.io:9042"]
+        );
+        assert_eq!(config.graph.http_url, "http://graph.dbaas.ferrosa.io:7474");
+        assert_eq!(config.ferrosa.username, "tenant-abc-123");
+        assert_eq!(config.ferrosa.password, "sk-test-key");
+    }
+
+    /// P0-11/W-02: apply_dbaas_env_overrides parses comma-separated CQL addrs.
+    #[test]
+    #[serial]
+    fn dbaas_env_overrides_multi_contact_points() {
+        unsafe {
+            std::env::set_var(
+                "FERROSA_CQL_PROXY_ADDR",
+                "proxy1.dbaas.ferrosa.io:9042, proxy2.dbaas.ferrosa.io:9042",
+            );
+            std::env::set_var(
+                "FERROSA_GRAPH_PROXY_ADDR",
+                "http://graph.dbaas.ferrosa.io:7474",
+            );
+            std::env::set_var("FERROSA_TENANT_ID", "tenant-multi");
+            std::env::set_var("FERROSA_API_KEY", "sk-multi-key");
+        }
+        let mut config = minimal_config_with_proxy();
+        apply_dbaas_env_overrides(&mut config).expect("multi-addr must succeed");
+        unsafe {
+            std::env::remove_var("FERROSA_CQL_PROXY_ADDR");
+            std::env::remove_var("FERROSA_GRAPH_PROXY_ADDR");
+            std::env::remove_var("FERROSA_TENANT_ID");
+            std::env::remove_var("FERROSA_API_KEY");
+        }
+        assert_eq!(config.ferrosa.contact_points.len(), 2);
+        assert_eq!(
+            config.ferrosa.contact_points[0],
+            "proxy1.dbaas.ferrosa.io:9042"
+        );
+        assert_eq!(
+            config.ferrosa.contact_points[1],
+            "proxy2.dbaas.ferrosa.io:9042"
+        );
+    }
+
+    /// P0-11/W-02: missing FERROSA_CQL_PROXY_ADDR causes clear startup failure.
+    #[test]
+    #[serial]
+    fn dbaas_env_overrides_missing_cql_addr_fails() {
+        unsafe {
+            std::env::remove_var("FERROSA_CQL_PROXY_ADDR");
+            std::env::set_var(
+                "FERROSA_GRAPH_PROXY_ADDR",
+                "http://graph.dbaas.ferrosa.io:7474",
+            );
+            std::env::set_var("FERROSA_TENANT_ID", "tenant-xyz");
+            std::env::set_var("FERROSA_API_KEY", "sk-xyz");
+        }
+        let mut config = minimal_config_with_proxy();
+        let err = apply_dbaas_env_overrides(&mut config).expect_err("missing CQL addr must fail");
+        unsafe {
+            std::env::remove_var("FERROSA_GRAPH_PROXY_ADDR");
+            std::env::remove_var("FERROSA_TENANT_ID");
+            std::env::remove_var("FERROSA_API_KEY");
+        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains("FERROSA_CQL_PROXY_ADDR"),
+            "error must name the missing variable, got: {msg}"
+        );
+    }
+
+    /// P0-11/W-02: missing FERROSA_GRAPH_PROXY_ADDR causes clear startup failure.
+    #[test]
+    #[serial]
+    fn dbaas_env_overrides_missing_graph_addr_fails() {
+        unsafe {
+            std::env::set_var("FERROSA_CQL_PROXY_ADDR", "proxy.dbaas.ferrosa.io:9042");
+            std::env::remove_var("FERROSA_GRAPH_PROXY_ADDR");
+            std::env::set_var("FERROSA_TENANT_ID", "tenant-xyz");
+            std::env::set_var("FERROSA_API_KEY", "sk-xyz");
+        }
+        let mut config = minimal_config_with_proxy();
+        let err = apply_dbaas_env_overrides(&mut config).expect_err("missing graph addr must fail");
+        unsafe {
+            std::env::remove_var("FERROSA_CQL_PROXY_ADDR");
+            std::env::remove_var("FERROSA_TENANT_ID");
+            std::env::remove_var("FERROSA_API_KEY");
+        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains("FERROSA_GRAPH_PROXY_ADDR"),
+            "error must name the missing variable, got: {msg}"
+        );
+    }
+
+    /// P0-11/W-02: missing FERROSA_TENANT_ID causes clear startup failure.
+    #[test]
+    #[serial]
+    fn dbaas_env_overrides_missing_tenant_id_fails() {
+        unsafe {
+            std::env::set_var("FERROSA_CQL_PROXY_ADDR", "proxy.dbaas.ferrosa.io:9042");
+            std::env::set_var(
+                "FERROSA_GRAPH_PROXY_ADDR",
+                "http://graph.dbaas.ferrosa.io:7474",
+            );
+            std::env::remove_var("FERROSA_TENANT_ID");
+            std::env::set_var("FERROSA_API_KEY", "sk-xyz");
+        }
+        let mut config = minimal_config_with_proxy();
+        let err = apply_dbaas_env_overrides(&mut config).expect_err("missing tenant id must fail");
+        unsafe {
+            std::env::remove_var("FERROSA_CQL_PROXY_ADDR");
+            std::env::remove_var("FERROSA_GRAPH_PROXY_ADDR");
+            std::env::remove_var("FERROSA_API_KEY");
+        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains("FERROSA_TENANT_ID"),
+            "error must name the missing variable, got: {msg}"
+        );
+    }
+
+    /// P0-11/W-02: missing FERROSA_API_KEY causes clear startup failure.
+    #[test]
+    #[serial]
+    fn dbaas_env_overrides_missing_api_key_fails() {
+        unsafe {
+            std::env::set_var("FERROSA_CQL_PROXY_ADDR", "proxy.dbaas.ferrosa.io:9042");
+            std::env::set_var(
+                "FERROSA_GRAPH_PROXY_ADDR",
+                "http://graph.dbaas.ferrosa.io:7474",
+            );
+            std::env::set_var("FERROSA_TENANT_ID", "tenant-xyz");
+            std::env::remove_var("FERROSA_API_KEY");
+        }
+        let mut config = minimal_config_with_proxy();
+        let err = apply_dbaas_env_overrides(&mut config).expect_err("missing api key must fail");
+        unsafe {
+            std::env::remove_var("FERROSA_CQL_PROXY_ADDR");
+            std::env::remove_var("FERROSA_GRAPH_PROXY_ADDR");
+            std::env::remove_var("FERROSA_TENANT_ID");
+        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains("FERROSA_API_KEY"),
+            "error must name the missing variable, got: {msg}"
+        );
     }
 }
