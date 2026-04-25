@@ -20,8 +20,22 @@ use ferrosa_memory_core::batch;
 use ferrosa_memory_core::cql_storage::CqlStorage;
 use ferrosa_memory_core::storage::Storage;
 use ferrosa_memory_core::types::TenantContext;
+use futures_util::future::join_all;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
+
+fn batch_cql_config(
+    config: &ferrosa_memory_core::config::Config,
+) -> ferrosa_memory_core::config::FerrosaCqlConfig {
+    let mut cql = config.ferrosa.clone();
+    if let (Some(admin_username), Some(admin_password)) =
+        (cql.admin_username.clone(), cql.admin_password.clone())
+    {
+        cql.username = admin_username;
+        cql.password = admin_password;
+    }
+    cql
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -45,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
         "migrate-session" => migrate_session(&config).await,
         "retype-entities" => retype_entities(&config).await,
         "rename-entities" => rename_entities(&config).await,
+        "backfill-rich-entities" => backfill_rich_entities(&config).await,
         _ => run_guidelines(&config).await,
     }
 }
@@ -79,7 +94,7 @@ async fn migrate_session(config: &ferrosa_memory_core::config::Config) -> anyhow
         "starting session migration"
     );
 
-    let storage = CqlStorage::connect(&config.ferrosa).await?;
+    let storage = CqlStorage::connect(&batch_cql_config(config)).await?;
     tracing::info!("connected to CQL cluster");
 
     // Read all entities for this tenant
@@ -148,7 +163,7 @@ async fn retype_entities(config: &ferrosa_memory_core::config::Config) -> anyhow
         session_origin: "batch-retype".into(),
     };
 
-    let storage = CqlStorage::connect(&config.ferrosa).await?;
+    let storage = CqlStorage::connect(&batch_cql_config(config)).await?;
     tracing::info!("connected to CQL cluster");
 
     let entities = storage.entity_list_all(&ctx).await?;
@@ -231,7 +246,7 @@ async fn rename_entities(config: &ferrosa_memory_core::config::Config) -> anyhow
         session_origin: "batch-rename".into(),
     };
 
-    let storage = CqlStorage::connect(&config.ferrosa).await?;
+    let storage = CqlStorage::connect(&batch_cql_config(config)).await?;
     tracing::info!("connected to CQL cluster");
 
     let entities = storage.entity_list_all(&ctx).await?;
@@ -303,7 +318,7 @@ async fn run_guidelines(config: &ferrosa_memory_core::config::Config) -> anyhow:
         "current guideline version"
     );
 
-    let storage = CqlStorage::connect(&config.ferrosa).await?;
+    let storage = CqlStorage::connect(&batch_cql_config(config)).await?;
     tracing::info!("connected to CQL cluster");
 
     let outcomes = storage.feedback_list_all().await?;
@@ -356,6 +371,372 @@ async fn run_guidelines(config: &ferrosa_memory_core::config::Config) -> anyhow:
     Ok(())
 }
 
+// --- Rich entity schema backfill -------------------------------------
+
+/// Parse the boundary between an ENRICHED_PREFIX'd context_snippet and the
+/// original content. Returns `(description, original_context)` when the
+/// input is in the legacy format, `None` otherwise.
+fn split_enriched_context(raw: &str) -> Option<(String, String)> {
+    const PREFIX: &str = "[enriched] ";
+    const SEPARATOR: &str = "\n---\n";
+    let tail = raw.strip_prefix(PREFIX)?;
+    match tail.split_once(SEPARATOR) {
+        Some((desc, orig)) => Some((desc.to_string(), orig.to_string())),
+        // Prefix present but no separator — treat everything after the
+        // prefix as the description and leave original blank.
+        None => Some((tail.to_string(), String::new())),
+    }
+}
+
+/// Backfill the rich entity schema columns on existing rows.
+///
+/// Phases:
+/// - 0: regenerate `entity_embedding`, `fold_embedding`, and
+///   `memo_embedding`/`result_embedding` with the configured embedding model.
+/// - 1: migrate legacy ENRICHED_PREFIX context_snippet into the dedicated
+///   `description` field, restoring the original extraction text to
+///   `context_snippet`.
+/// - 2: generate `description_embedding` for any entity with a populated
+///   `description` but no embedding.
+/// - 4: compute `content_hash = sha256(name || description ||
+///   properties_json)` for entities that have a description but no stored
+///   hash.
+///
+/// Flags (all via env because the batch binary is minimal):
+/// - `BACKFILL_PHASES=0,1,2,4` — comma-separated phase list (default 0,1,2,4)
+/// - `BACKFILL_DRY_RUN=1` — don't write
+/// - `BACKFILL_FORCE=1` — re-generate description_embedding even when present
+async fn backfill_rich_entities(
+    config: &ferrosa_memory_core::config::Config,
+) -> anyhow::Result<()> {
+    let tenant_id = config
+        .server
+        .tenant_id
+        .as_ref()
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(|| anyhow::anyhow!("no tenant_id configured in [server]"))?;
+    let ctx = TenantContext {
+        tenant_id,
+        session_origin: "batch-backfill".into(),
+    };
+
+    let phases: std::collections::HashSet<u8> = std::env::var("BACKFILL_PHASES")
+        .unwrap_or_else(|_| "0,1,2,4".into())
+        .split(',')
+        .filter_map(|s| s.trim().parse::<u8>().ok())
+        .collect();
+    let dry_run = std::env::var("BACKFILL_DRY_RUN").is_ok();
+    let force = std::env::var("BACKFILL_FORCE").is_ok();
+    let concurrency = std::env::var("BACKFILL_CONCURRENCY")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(8);
+
+    tracing::info!(
+        tenant_id = %tenant_id,
+        phases = ?phases,
+        dry_run,
+        force,
+        concurrency,
+        "backfill-rich-entities starting"
+    );
+
+    let storage = CqlStorage::connect(&batch_cql_config(config)).await?;
+    let mut entities = storage.entity_list_all(&ctx).await?;
+    let folds = storage.fold_list_all(&ctx).await?;
+    let memos = storage.memo_list_all(&ctx).await?;
+    tracing::info!(count = entities.len(), "loaded entities for backfill");
+    tracing::info!(count = folds.len(), "loaded folds for backfill");
+    tracing::info!(count = memos.len(), "loaded memos for backfill");
+
+    let embed_client = ferrosa_memory_core::embedding::EmbeddingClient::new(&config.embeddings);
+
+    let mut p0_entities_embedded = 0usize;
+    let mut p0_folds_embedded = 0usize;
+    let mut p0_memos_embedded = 0usize;
+    let mut p0_failed = 0usize;
+    let mut p1_migrated = 0usize;
+    let mut p2_embedded = 0usize;
+    let mut p2_failed = 0usize;
+    let mut p4_hashed = 0usize;
+
+    if phases.contains(&0) {
+        let entity_batches = entities.len().div_ceil(concurrency);
+        for (batch_index, chunk) in entities.chunks(concurrency).enumerate() {
+            let results = join_all(
+                chunk
+                    .iter()
+                    .map(|entity| embed_client.embed(&entity.entity_name)),
+            )
+            .await;
+            for (entity, result) in chunk.iter().zip(results) {
+                match result {
+                    Ok(embedding) => {
+                        if !dry_run {
+                            let now = chrono::Utc::now();
+                            if let Err(e) = storage
+                                .entity_update_embedding(
+                                    &ctx,
+                                    entity.session_id,
+                                    entity.entity_id,
+                                    &embedding,
+                                    now,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    entity = %entity.entity_name,
+                                    error = %e,
+                                    "Phase 0: entity embedding update failed"
+                                );
+                                p0_failed += 1;
+                                continue;
+                            }
+                        }
+                        p0_entities_embedded += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            entity = %entity.entity_name,
+                            error = %e,
+                            "Phase 0: entity embedding failed"
+                        );
+                        p0_failed += 1;
+                    }
+                }
+            }
+            if (batch_index + 1) % 25 == 0 || batch_index + 1 == entity_batches {
+                tracing::info!(
+                    phase = "0/entities",
+                    processed = ((batch_index + 1) * concurrency).min(entities.len()),
+                    total = entities.len(),
+                    succeeded = p0_entities_embedded,
+                    failed = p0_failed,
+                    "phase progress"
+                );
+            }
+        }
+
+        let fold_batches = folds.len().max(1).div_ceil(concurrency);
+        for (batch_index, chunk) in folds.chunks(concurrency).enumerate() {
+            let results = join_all(chunk.iter().map(|fold| async {
+                let Some(summary) = fold.fold_summary.as_deref() else {
+                    return Ok::<Option<Vec<f32>>, ferrosa_memory_core::embedding::EmbeddingError>(
+                        None,
+                    );
+                };
+                if summary.trim().is_empty() {
+                    return Ok(None);
+                }
+                embed_client.embed(summary).await.map(Some)
+            }))
+            .await;
+            for (fold, result) in chunk.iter().zip(results) {
+                match result {
+                    Ok(Some(embedding)) => {
+                        if !dry_run
+                            && let Err(e) = storage
+                                .fold_update_embedding(
+                                    &ctx,
+                                    fold.session_id,
+                                    fold.fold_id,
+                                    &embedding,
+                                )
+                                .await
+                        {
+                            tracing::warn!(
+                                fold_id = %fold.fold_id,
+                                error = %e,
+                                "Phase 0: fold embedding update failed"
+                            );
+                            p0_failed += 1;
+                            continue;
+                        }
+                        p0_folds_embedded += 1;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            fold_id = %fold.fold_id,
+                            error = %e,
+                            "Phase 0: fold embedding failed"
+                        );
+                        p0_failed += 1;
+                    }
+                }
+            }
+            if !folds.is_empty() && ((batch_index + 1) % 25 == 0 || batch_index + 1 == fold_batches)
+            {
+                tracing::info!(
+                    phase = "0/folds",
+                    processed = ((batch_index + 1) * concurrency).min(folds.len()),
+                    total = folds.len(),
+                    succeeded = p0_folds_embedded,
+                    failed = p0_failed,
+                    "phase progress"
+                );
+            }
+        }
+
+        let memo_batches = memos.len().max(1).div_ceil(concurrency);
+        for (batch_index, chunk) in memos.chunks(concurrency).enumerate() {
+            let results = join_all(chunk.iter().map(|memo| embed_client.embed(&memo.result))).await;
+            for (memo, result) in chunk.iter().zip(results) {
+                match result {
+                    Ok(embedding) => {
+                        if !dry_run
+                            && let Err(e) = storage
+                                .memo_update_embedding(
+                                    &ctx,
+                                    &memo.content_hash,
+                                    &memo.model_version,
+                                    &embedding,
+                                )
+                                .await
+                        {
+                            tracing::warn!(
+                                content_hash = %memo.content_hash,
+                                model_version = %memo.model_version,
+                                error = %e,
+                                "Phase 0: memo embedding update failed"
+                            );
+                            p0_failed += 1;
+                            continue;
+                        }
+                        p0_memos_embedded += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            content_hash = %memo.content_hash,
+                            model_version = %memo.model_version,
+                            error = %e,
+                            "Phase 0: memo embedding failed"
+                        );
+                        p0_failed += 1;
+                    }
+                }
+            }
+            if !memos.is_empty() && ((batch_index + 1) % 25 == 0 || batch_index + 1 == memo_batches)
+            {
+                tracing::info!(
+                    phase = "0/memos",
+                    processed = ((batch_index + 1) * concurrency).min(memos.len()),
+                    total = memos.len(),
+                    succeeded = p0_memos_embedded,
+                    failed = p0_failed,
+                    "phase progress"
+                );
+            }
+        }
+
+        // Phase 0 writes entity embeddings back through entity_put. Refresh the
+        // in-memory snapshot before later phases so phase 1/2/4 do not
+        // overwrite newly written embeddings with stale pre-phase-0 rows.
+        if !dry_run && (phases.contains(&1) || phases.contains(&2) || phases.contains(&4)) {
+            entities = storage.entity_list_all(&ctx).await?;
+            tracing::info!(
+                count = entities.len(),
+                "reloaded entities after phase 0 to preserve freshly written embeddings"
+            );
+        }
+    }
+
+    for entity in &entities {
+        let mut working = entity.clone();
+        let mut changed = false;
+
+        // Phase 1: split ENRICHED_PREFIX into description + clean context.
+        if phases.contains(&1)
+            && working.description.is_none()
+            && let Some((desc, orig)) = split_enriched_context(&working.context_snippet)
+        {
+            working.description = Some(desc);
+            working.context_snippet = orig;
+            working.updated_at = Some(chrono::Utc::now());
+            changed = true;
+            p1_migrated += 1;
+        }
+
+        // Phase 2: generate description_embedding when missing (or --force).
+        if phases.contains(&2)
+            && let Some(ref desc) = working.description
+            && (working.description_embedding.is_none() || force)
+        {
+            match embed_client.embed(desc).await {
+                Ok(v) => {
+                    working.description_embedding = Some(v);
+                    working.updated_at = Some(chrono::Utc::now());
+                    changed = true;
+                    p2_embedded += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        entity = %working.entity_name,
+                        error = %e,
+                        "Phase 2: description embedding failed; skipping entity"
+                    );
+                    p2_failed += 1;
+                }
+            }
+        }
+
+        // Phase 4: content_hash backfill.
+        if phases.contains(&4) && working.description.is_some() && working.content_hash.is_none() {
+            let props_json = serde_json::to_string(&working.properties).unwrap_or_default();
+            let hash = sha256_hex(&format!(
+                "{}|{}|{}",
+                working.entity_name,
+                working.description.as_deref().unwrap_or(""),
+                props_json
+            ));
+            working.content_hash = Some(format!("sha256:{hash}"));
+            changed = true;
+            p4_hashed += 1;
+        }
+
+        if changed
+            && !dry_run
+            && let Err(e) = storage.entity_put(&ctx, &working).await
+        {
+            tracing::warn!(
+                entity = %working.entity_name,
+                error = %e,
+                "entity_put failed during backfill"
+            );
+        }
+    }
+
+    tracing::info!(
+        p0_entities_embedded,
+        p0_folds_embedded,
+        p0_memos_embedded,
+        p0_failed,
+        p1_migrated,
+        p2_embedded,
+        p2_failed,
+        p4_hashed,
+        dry_run,
+        "backfill-rich-entities complete"
+    );
+
+    if (p0_failed > 0 || p2_failed > 0) && !dry_run {
+        anyhow::bail!(
+            "{p0_failed} Phase 0 embeddings and {p2_failed} Phase 2 embeddings failed — check embedding provider and re-run"
+        );
+    }
+
+    Ok(())
+}
+
+fn sha256_hex(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(input.as_bytes());
+    let out = h.finalize();
+    out.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 /// Increment a version string like "v1" -> "v2", "v42" -> "v43".
 fn next_guideline_version(current: &str) -> String {
     if let Some(num_str) = current.strip_prefix('v')
@@ -382,5 +763,43 @@ mod tests {
         assert_eq!(next_guideline_version(""), "v1");
         assert_eq!(next_guideline_version("latest"), "v1");
         assert_eq!(next_guideline_version("abc"), "v1");
+    }
+
+    #[test]
+    fn split_enriched_parses_legacy_format() {
+        let raw = "[enriched] Foo manages bar state.\n---\nstruct `Foo` @ src/lib.rs:42";
+        let (desc, orig) = split_enriched_context(raw).unwrap();
+        assert_eq!(desc, "Foo manages bar state.");
+        assert_eq!(orig, "struct `Foo` @ src/lib.rs:42");
+    }
+
+    #[test]
+    fn split_enriched_returns_none_on_plain_context() {
+        assert!(split_enriched_context("struct `Foo` @ src/lib.rs:42").is_none());
+        assert!(split_enriched_context("").is_none());
+    }
+
+    #[test]
+    fn split_enriched_handles_prefix_without_separator() {
+        // Edge case: prefix present but no separator — treat the rest as the
+        // description and leave original context blank. Not ideal but the
+        // migration is still safe to run.
+        let (desc, orig) = split_enriched_context("[enriched] just a description").unwrap();
+        assert_eq!(desc, "just a description");
+        assert!(orig.is_empty());
+    }
+
+    #[test]
+    fn sha256_hex_is_deterministic() {
+        let a = sha256_hex("hello");
+        let b = sha256_hex("hello");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn sha256_hex_differs_for_different_inputs() {
+        assert_ne!(sha256_hex("a"), sha256_hex("b"));
     }
 }

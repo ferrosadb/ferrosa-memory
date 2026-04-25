@@ -28,3 +28,16 @@ tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 ordered-float = { workspace = true }
 tempfile = { workspace = true }
+
+# Integration tests under `tests/` compile against the public crate
+# surface, which means `mod mock` must be gated on a feature (not
+# `cfg(test)` alone). Turning `mock-storage` on for our own dev tests
+# keeps the gate in place for downstream consumers.
+[dev-dependencies]
+ferrosa-memory-core = { path = ".", features = ["mock-storage"] }
+tracing-subscriber = { workspace = true }
+# Self-signed cert generation for HTTPS integration tests — the
+# bug-http-parser-rejects-split-send spec's acceptance criterion
+# is a Python http.client POST over HTTPS, so we need a throwaway
+# cert to exercise the TLS path end-to-end.
+rcgen = "0.13"

@@ -1,12 +1,21 @@
 # File-backed HTTP auth database for shared deployments.
-# Passwords are SHA-256 hex digests of the cleartext password.
+# Passwords are lowercase SHA-256 hex digests of the cleartext password.
+# Generate one with:
+#   python3 - <<'PY'
+#   import hashlib
+#   print(hashlib.sha256(b"replace-me").hexdigest())
+#   PY
+# Seeded pairs are:
+#   username=ferrosa_admin / password=ferrosa_admin
+#   username=ferrosa_user / password=ferrosa_user
+# Reload the file on a running server with: kill -HUP <pid>
 
 [[principal]]
-username = "codex"
-password_sha256 = "4e738ca5563c06cfd0018299933d58db1dd8bf97f6973dc99bf6cdc64b5550bd"
+username = "ferrosa_admin"
+password_sha256 = "81bb7395304581f309e65f2f787e7055a360c71838436d98986e661ea655d90e"
 tenant_id = "11111111-1111-1111-1111-111111111111"
 
 [[principal]]
-username = "claude"
-password_sha256 = "1c8bfe8f801d79745c4631d09fff36c82d9ef3a5d4f6f8e4f6a94b0c7a6f6b0b"
+username = "ferrosa_user"
+password_sha256 = "13f073c47057958ae2bcee1b01a51469d147a5db1fa437aa934090b996285bde"
 tenant_id = "22222222-2222-2222-2222-222222222222"

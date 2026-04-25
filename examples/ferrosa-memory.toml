@@ -14,6 +14,15 @@ contact_points = ["localhost:19042", "localhost:19043", "localhost:19044"]
 keyspace = "agent_memory"
 # replication_factor = 3
 # consistency = "LOCAL_QUORUM"
+username = "ferrosa_user"
+password = "ferrosa_user"
+# Admin credentials used only for schema migrations (CREATE KEYSPACE /
+# CREATE TABLE / ALTER TABLE). The runtime session still connects as
+# `username`/`password` above; only the short-lived migration session
+# uses these. Required on auth-enabled clusters where `ferrosa_user`
+# lacks CREATE on the keyspace. Omit on auth-disabled dev clusters.
+admin_username = "ferrosa_admin"
+admin_password = "ferrosa_admin"
 
 [memory]
 # default_ttl_days = 7
@@ -25,15 +34,19 @@ keyspace = "agent_memory"
 
 [embeddings]
 provider = "ollama"
-ollama_base_url = "http://localhost:11434"
+ollama_base_url = "http://127.0.0.1:11434"
 model = "nomic-embed-text"
 dimensions = 768
 
 [graph]
 bolt_uri = "bolt://localhost:17687"
-username = "neo4j"
-password = "neo4j"
+username = "ferrosa_user"
+password = "ferrosa_user"
 http_url = "http://localhost:17474"
+
+[sparql]
+enabled = true
+http_url = "http://localhost:18080"
 
 [security]
 # audit_log_enabled = true
@@ -44,3 +57,9 @@ http_url = "http://localhost:17474"
 [routing]
 # guideline_version = "v1"
 # feedback_export_cron = "0 2 * * *"
+
+[datalog]
+# ferrosa-memory owns Datalog evaluation locally; this section controls local inference limits.
+# max_iterations = 8
+# max_facts = 10000
+# cache_ttl_seconds = 300

@@ -126,15 +126,17 @@ pub async fn upsert_entity_with_limit(
         confidence,
         state: crate::types::MemoryState::default(),
         created_at: chrono::Utc::now(),
+        ..Default::default()
     };
 
     storage.entity_put(ctx, &entry).await?;
 
     // Create MENTIONED_IN edge if entity was found in a fold
     if let Some(fold_id) = source_fold_id
-        && let Err(e) = storage
-            .edge_mentioned_in(ctx, entity_id, fold_id, session_id)
-            .await
+        && let Err(e) = crate::graph_write::create_mentioned_in_edge(
+            storage, ctx, entity_id, fold_id, session_id,
+        )
+        .await
     {
         tracing::warn!(%entity_id, %fold_id, error = %e, "failed to create MENTIONED_IN edge");
     }

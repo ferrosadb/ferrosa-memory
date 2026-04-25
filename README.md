@@ -4,7 +4,7 @@ A structured memory backend for LLM agent trajectories, exposed as an [MCP](http
 
 LLM agents running inside Claude Code (and other MCP-compatible clients) currently lose all working context between sessions. Sub-calls re-derive results the parent already computed. Plans evaporate when the REPL tears down. Entities discovered in one trajectory are invisible to the next.
 
-ferrosa-memory-mcp fixes this by providing durable, typed memory tools backed by Ferrosa's CQL tables, HNSW vector indexes, phonetic indexes, and property graph:
+ferrosa-memory-mcp fixes this by providing durable, typed memory tools over Ferrosa's public query interfaces and indexed storage capabilities:
 
 - **Memoization** — cache sub-call results by content hash, skip redundant LLM invocations
 - **Plan state** — hierarchical plan trees with O(depth) range scans for structured re-injection
@@ -48,7 +48,28 @@ graph TD
     KS --- ST
 ```
 
-The server is a thin adapter (~3,200 lines of Rust) that translates MCP tool calls into CQL and Cypher queries. All intelligence stays in the LLM; all durability stays in Ferrosa.
+The server should be a thin adapter that maps MCP and operator-console requests onto Ferrosa at the right abstraction level. All intelligence stays in the LLM; durability and query semantics stay in Ferrosa. If a Ferrosa public interface misbehaves, `ferrosa-memory` should surface the error rather than emulate alternate semantics locally.
+
+What is public vs internal here:
+
+| Layer | What `ferrosa-memory` does | Classification |
+|-------|-----------------------------|----------------|
+| Wire protocol | CQL over port `9042` via `cdrs-tokio` | Public protocol |
+| Graph storage tables | `typed_edges`, `folded_into`, `mentioned_in`, `co_occurs_with`, `supersedes`, `derived_edges_by_pred`, `derived_edges_by_src`, ... | Internal schema owned by `ferrosa-graph` |
+
+CQL itself is not the problem. The problem is crossing the graph-engine boundary and treating graph-owned tables like a public API. The rule is:
+
+- direct CQL usage for app tables is allowed
+- graph reads and writes should go through graph interfaces, not direct table mutation
+- workbench CQL and SPARQL surfaces should be passthrough/fail-loud contract checks
+- Datalog is owned by `ferrosa-memory` and executes locally over Ferrosa-backed graph/app data; it is not a Ferrosa wire-protocol contract
+
+Workbench query contract surfaces are explicit:
+
+- `/workbench/api/cql/query` and `/workbench/api/sparql/query` are authenticated pass-through contracts to Ferrosa public query endpoints.
+- `/workbench/api/datalog/query` is a local ferrosa-memory inference service and remains repo-owned.
+
+Analogy: talking to PostgreSQL over its wire protocol is fine; writing directly to `pg_index` instead of running `CREATE INDEX` is not. Same protocol, wrong abstraction level.
 
 ## Tools
 
@@ -81,7 +102,7 @@ cp examples/ferrosa-memory.toml ./ferrosa-memory.toml
 cargo run --bin ferrosa-memory-mcp
 ```
 
-### Run (HTTP mode)
+### Run (Shared HTTP mode)
 
 ```sh
 cp examples/ferrosa-memory-http.toml ./ferrosa-memory-http.toml
@@ -94,6 +115,25 @@ FERROSA_MEMORY_CONFIG=./ferrosa-memory-http.toml cargo run --bin ferrosa-memory-
 #   GET /healthz/ready
 #   POST /mcp
 ```
+
+Shared HTTP startup is fail-closed. The binary refuses to bind the listener unless all of the following are true:
+
+- `server.require_tls = true`
+- `server.cert_path` and `server.key_path` are set
+- `server.auth_file` is set
+- `server.tenant_id` is omitted
+
+Probe semantics differ on purpose:
+
+- `GET /healthz/live` reports process liveness only
+- `GET /healthz/ready` reports whether the Ferrosa-facing data-plane clients are currently ready for MCP traffic. Under the role-aware boundary, that means auth + app-table CQL + enabled public query endpoints are healthy. It must not require graph-table `MODIFY` to report ready.
+
+```sh
+curl -sk https://127.0.0.1:8765/healthz/live
+curl -sk https://127.0.0.1:8765/healthz/ready
+```
+
+The shared HTTP template keeps `viz` disabled. If you enable it under HTTP mode, the viz listener stays loopback-only and requires an explicit `[viz].tenant_id`.
 
 For Podman-based container startup on macOS, prefer `PODMAN_COMPOSE_PROVIDER=podman-compose`
 so `podman compose` does not delegate to Docker Desktop's `docker-compose`.
@@ -116,7 +156,21 @@ To remove it later:
 ./scripts/uninstall-launch-agent.sh
 ```
 
-### Claude Code Integration
+### Client Configs
+
+Shared HTTP example for Codex-compatible remote MCP clients:
+
+```toml
+[mcp_servers.ferrosa-memory]
+url = "https://ferrosa_user:ferrosa_user@memory.example.com:8765/mcp"
+```
+
+Use [`examples/codex-shared-http.toml`](examples/codex-shared-http.toml) as the copy-pasteable template. The URL encodes one seeded principal from [`examples/http-auth.toml`](examples/http-auth.toml), and it must point at `/mcp`.
+
+- `ferrosa_user / ferrosa_user`: standard/shared operator client
+- `ferrosa_admin / ferrosa_admin`: admin-capable operator client for readiness or bootstrap checks
+
+Local stdio fallback for Claude Code:
 
 Add to `~/.claude/settings.json`:
 
@@ -132,6 +186,8 @@ Add to `~/.claude/settings.json`:
   }
 }
 ```
+
+Use [`examples/claude-code-settings.json`](examples/claude-code-settings.json) with [`examples/ferrosa-memory.toml`](examples/ferrosa-memory.toml) for that local fallback path.
 
 ### Database Setup
 
@@ -149,7 +205,10 @@ See [`examples/ferrosa-memory.toml`](examples/ferrosa-memory.toml) for all optio
 | Section | Controls |
 |---------|----------|
 | `[server]` | Transport (stdio/http), port, log level |
-| `[ferrosa]` | CQL contact points, keyspace, replication, consistency |
+| `[ferrosa]` | CQL contact points, keyspace, replication, consistency, seeded Ferrosa credentials |
+| `[graph]` | Public graph endpoint location and Ferrosa graph credentials |
+| `[sparql]` | Public SPARQL endpoint enablement and URL |
+| `[datalog]` | Local ferrosa-memory Datalog engine limits and cache behavior |
 | `[memory]` | TTL, compression threshold, confidence gate, memo limits |
 | `[embeddings]` | Provider (Ollama/OpenAI), model, dimensions |
 | `[security]` | Audit log, anomaly detection, sigma threshold |
@@ -167,7 +226,7 @@ Shared HTTP mode requires:
 - `server.auth_file`
 - no `server.tenant_id` fallback
 
-`viz` is disabled by default for the shared HTTP template. Keep stdio mode for local fallback and local visualization.
+`http-auth.toml` currently stores lowercase SHA-256 password digests. `viz` is disabled by default for the shared HTTP template; if you enable it under HTTP mode, set `[viz].tenant_id` and keep it on the loopback-only listener.
 
 ## Project Structure
 

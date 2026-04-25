@@ -1,0 +1,18 @@
+{
+  "smoke": {
+    "p99_latency_ms": 1500,
+    "error_rate_pct": 1.0,
+    "min_rps": 5
+  },
+  "load": {
+    "p99_latency_ms": 2500,
+    "error_rate_pct": 1.0,
+    "min_rps": 20
+  },
+  "stress": {
+    "p99_latency_ms": 5000,
+    "error_rate_pct": 5.0,
+    "min_rps": 10
+  }
+}
+

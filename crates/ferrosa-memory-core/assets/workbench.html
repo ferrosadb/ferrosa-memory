@@ -1,0 +1,2356 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ferrosa Memory Operator Workbench</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='fg' x1='0%25' y1='0%25' x2='100%25' y2='100%25'%3E%3Cstop offset='0%25' stop-color='%23e2725b'/%3E%3Cstop offset='100%25' stop-color='%23d4a574'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='7' fill='%230a0a0f'/%3E%3Crect x='3' y='3' width='26' height='26' rx='5.5' fill='none' stroke='url(%23fg)' stroke-width='1.5'/%3E%3Ctext x='16' y='21.5' text-anchor='middle' font-family='Georgia,serif' font-size='15' font-weight='700' fill='url(%23fg)'%3EFe%3C/text%3E%3Ctext x='7.5' y='10.5' font-family='sans-serif' font-size='5' font-weight='600' fill='%236b6b7a'%3E26%3C/text%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-primary: #0a0a0f;
+      --bg-secondary: #111118;
+      --bg-card: #16161f;
+      --bg-card-hover: #1c1c28;
+      --text-primary: #e8e8ed;
+      --text-secondary: #9494a3;
+      --text-muted: #6b6b7a;
+      --accent: #e2725b;
+      --accent-warm: #d4a574;
+      --accent-green: #6bc9a0;
+      --accent-cool: #7c9cf5;
+      --accent-purple: #c882f0;
+      --warn: #f4a261;
+      --danger: #e25b5b;
+      --border: #1e1e2a;
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      --font-serif: 'Georgia', 'Times New Roman', serif;
+      --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+      --bg: var(--bg-primary);
+      --bg-soft: var(--bg-secondary);
+      --panel: var(--bg-card);
+      --panel-2: var(--bg-card-hover);
+      --text: var(--text-primary);
+      --subtle: var(--text-secondary);
+      --muted: var(--text-muted);
+      --line: var(--border);
+      --accent-2: var(--accent-warm);
+      --success: var(--accent-green);
+      --focus: var(--accent-cool);
+      --mono: var(--font-mono);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      margin: 0;
+      min-height: 100%;
+      background:
+        radial-gradient(circle at top left, rgba(226, 114, 91, 0.16), transparent 32%),
+        radial-gradient(circle at top right, rgba(124, 156, 245, 0.12), transparent 26%),
+        linear-gradient(180deg, #0e0e14 0%, var(--bg) 42%, #07070b 100%);
+      color: var(--text);
+      font-family: var(--font-sans);
+      -webkit-font-smoothing: antialiased;
+    }
+
+    body {
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    a {
+      color: inherit;
+      text-decoration: none;
+    }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 12;
+      backdrop-filter: blur(14px);
+      background:
+        radial-gradient(circle at top left, rgba(226, 114, 91, 0.18), transparent 38%),
+        linear-gradient(180deg, #111118, #0d0d14);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .topbar-inner {
+      max-width: 1320px;
+      margin: 0 auto;
+      padding: 12px 20px;
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      justify-content: space-between;
+      flex-wrap: wrap;
+    }
+
+    .shell-brand,
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 220px;
+    }
+
+    .shell-brand-mark,
+    .brand-mark {
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      display: grid;
+      place-items: center;
+      background: linear-gradient(150deg, #11162a, #0c1120);
+      color: var(--accent);
+      font-family: var(--font-serif);
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+    }
+
+    .shell-brand-copy,
+    .brand-copy {
+      display: flex;
+      flex-direction: column;
+      line-height: 1.15;
+    }
+
+    .shell-brand-copy b,
+    .brand-copy b {
+      font-size: 0.98rem;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+    }
+
+    .shell-brand-copy span,
+    .brand-copy span {
+      font-size: 0.8rem;
+      color: var(--subtle);
+    }
+
+    .top-nav,
+    .nav {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      flex: 1;
+    }
+
+    .top-nav a,
+    .nav a {
+      padding: 8px 12px;
+      border-radius: 999px;
+      border: 1px solid transparent;
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 0.9rem;
+      font-weight: 600;
+      transition: 0.18s ease;
+      white-space: nowrap;
+    }
+
+    .top-nav a:hover,
+    .nav a:hover {
+      color: var(--text);
+      border-color: var(--line);
+      background: rgba(255, 255, 255, 0.05);
+    }
+
+    .top-nav a.active,
+    .nav a.active {
+      color: var(--accent-2);
+      background: linear-gradient(110deg, rgba(226, 114, 91, 0.15), rgba(212, 165, 116, 0.15));
+      border-color: rgba(212, 165, 116, 0.4);
+    }
+
+    .topbar-meta,
+    .toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 10px;
+      min-width: 180px;
+    }
+
+    .topbar-chip,
+    .chip {
+      padding: 7px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--subtle);
+      font-size: 0.78rem;
+      white-space: nowrap;
+    }
+
+    .chip.live {
+      color: var(--success);
+    }
+
+    .btn {
+      border: 1px solid var(--line);
+      background: linear-gradient(180deg, rgba(36, 39, 58, 0.96), rgba(22, 24, 36, 0.98));
+      color: var(--text);
+      padding: 7px 13px;
+      border-radius: 999px;
+      font-size: 0.82rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .btn:hover {
+      transform: translateY(-1px);
+      border-color: rgba(212, 165, 116, 0.72);
+    }
+
+    .btn:disabled {
+      opacity: 0.48;
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    .btn.secondary {
+      background: rgba(255, 255, 255, 0.03);
+    }
+
+    main {
+      max-width: 1320px;
+      margin: 18px auto;
+      padding: 0 18px 24px;
+      display: grid;
+      gap: 14px;
+      width: 100%;
+      flex: 1;
+    }
+
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: linear-gradient(180deg, rgba(22, 22, 31, 0.98), rgba(13, 13, 20, 0.98));
+      box-shadow: 0 18px 40px rgba(0, 0, 0, 0.28);
+      overflow: hidden;
+      display: none;
+      opacity: 0;
+      transform: translateY(10px);
+      animation: rise 0.2s ease forwards;
+    }
+
+    .panel.active {
+      display: block;
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    .panel-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 14px;
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line);
+      background:
+        radial-gradient(circle at top right, rgba(124, 156, 245, 0.08), transparent 28%),
+        linear-gradient(180deg, rgba(18, 18, 28, 0.96), rgba(15, 15, 23, 0.84));
+    }
+
+    .panel-head h2 {
+      margin: 0;
+      font-size: 1.12rem;
+      letter-spacing: 0.01em;
+    }
+
+    .panel-head p {
+      margin: 6px 0 0;
+      color: var(--subtle);
+      font-size: 0.84rem;
+    }
+
+    .panel-body {
+      padding: 16px;
+    }
+
+    .grid {
+      display: grid;
+      gap: 14px;
+    }
+
+    .grid.cols-2 {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 14px;
+      background: linear-gradient(180deg, rgba(22, 22, 31, 0.98), rgba(17, 17, 24, 0.94));
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02);
+    }
+
+    .card h3 {
+      margin: 0 0 8px;
+      font-size: 1.04rem;
+      color: var(--accent-2);
+      font-family: var(--font-serif);
+      text-transform: none;
+      letter-spacing: 0.01em;
+      line-height: 1.2;
+    }
+
+    .muted {
+      color: var(--subtle);
+      font-size: 0.86rem;
+      line-height: 1.45;
+    }
+
+    .query-form label {
+      display: block;
+      margin-bottom: 4px;
+      font-size: 0.84rem;
+      color: var(--subtle);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+
+    .input,
+    textarea,
+    select {
+      width: 100%;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      background: rgba(11, 11, 17, 0.92);
+      color: var(--text);
+      padding: 10px 11px;
+      font: inherit;
+      outline: none;
+      transition: border 0.2s ease;
+    }
+
+    textarea {
+      min-height: 120px;
+      resize: vertical;
+      line-height: 1.4;
+      font-family: var(--mono);
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    .input:focus,
+    textarea:focus,
+    select:focus {
+      border-color: var(--focus);
+      box-shadow: 0 0 0 1px var(--focus);
+    }
+
+    .inline {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      margin-top: 8px;
+      flex-wrap: wrap;
+    }
+
+    .inline .field {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 38px;
+      flex-wrap: wrap;
+    }
+
+    .field input[type="number"] {
+      width: 96px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: rgba(11, 11, 17, 0.92);
+      color: var(--text);
+      padding: 7px;
+      font: inherit;
+    }
+
+    .output-box {
+      margin-top: 10px;
+      border: 1px dashed var(--line);
+      border-radius: 10px;
+      background: rgba(9, 9, 14, 0.96);
+      min-height: 140px;
+      padding: 12px;
+      font-size: 0.84rem;
+      color: #cfe7ff;
+      overflow-x: auto;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+      font-family: var(--mono);
+    }
+
+    .status {
+      margin-top: 10px;
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+
+    .status.ok {
+      color: var(--success);
+    }
+
+    .status.warn {
+      color: var(--warn);
+    }
+
+    .status.err {
+      color: var(--danger);
+    }
+
+    .toolbar-row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 10px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.84rem;
+      min-width: 690px;
+    }
+
+    th,
+    td {
+      text-align: left;
+      border-bottom: 1px solid var(--line);
+      padding: 10px;
+      vertical-align: top;
+    }
+
+    th {
+      color: var(--accent-2);
+      position: sticky;
+      top: 0;
+      background: rgba(12, 12, 18, 0.98);
+      z-index: 1;
+    }
+
+    .table-wrap {
+      max-height: 420px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(11, 11, 17, 0.92);
+    }
+
+    .badge {
+      font-size: 0.75rem;
+      border-radius: 999px;
+      padding: 3px 8px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.03);
+      white-space: nowrap;
+      line-height: 1.2;
+    }
+
+    .badge.good {
+      color: var(--success);
+      border-color: rgba(124, 207, 159, 0.4);
+      background: rgba(124, 207, 159, 0.08);
+    }
+
+    .badge.warn {
+      color: var(--warn);
+      border-color: rgba(244, 162, 97, 0.45);
+      background: rgba(244, 162, 97, 0.08);
+    }
+
+    .badge.bad {
+      color: var(--danger);
+      border-color: rgba(230, 95, 106, 0.45);
+      background: rgba(230, 95, 106, 0.08);
+    }
+
+    .row-actions {
+      display: flex;
+      gap: 7px;
+      flex-wrap: wrap;
+    }
+
+    .action {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 4px 8px;
+      background: rgba(22, 22, 31, 0.96);
+      color: var(--subtle);
+      cursor: pointer;
+      font-size: 0.76rem;
+      font-weight: 700;
+      transition: 0.2s ease;
+    }
+
+    .action:hover {
+      color: var(--text);
+      border-color: var(--line-hover, var(--accent));
+    }
+
+    .action.warn {
+      color: var(--warn);
+    }
+
+    .hero-kpi {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .hero-kpi .kpi {
+      background: linear-gradient(180deg, rgba(22, 22, 31, 0.98), rgba(16, 16, 24, 0.94));
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 12px 14px;
+      box-shadow: 0 10px 24px rgba(0, 0, 0, 0.2);
+    }
+
+    .hero-kpi .kpi b {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--accent);
+      font-size: 0.72rem;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .hero-kpi .kpi span {
+      display: block;
+      font-size: 1.35rem;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      color: var(--text);
+      font-family: var(--mono);
+    }
+
+    .home-meta {
+      margin-top: 12px;
+      margin-bottom: 0;
+    }
+
+    .tiny-note {
+      margin: 6px 0 0;
+      font-size: 0.74rem;
+      color: var(--muted);
+    }
+
+    .console-strip {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+
+    .pill-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 10px 0 12px;
+    }
+
+    .pill {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 5px 10px;
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--subtle);
+      font-size: 0.75rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+
+    .form-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .rule-stack {
+      display: grid;
+      gap: 4px;
+    }
+
+    .rule-stack strong {
+      color: var(--text);
+    }
+
+    .split {
+      display: grid;
+      grid-template-columns: 1.25fr 1fr;
+      gap: 12px;
+    }
+
+    .detail-grid {
+      display: grid;
+      grid-template-columns: 1.15fr 0.85fr;
+      gap: 12px;
+    }
+
+    .stack {
+      display: grid;
+      gap: 12px;
+    }
+
+    .query-row {
+      margin-top: 14px;
+      display: grid;
+      gap: 10px;
+    }
+
+    tr.is-selected td {
+      background: rgba(111, 137, 248, 0.08);
+    }
+
+    .table-summary {
+      display: block;
+      max-width: 460px;
+      color: var(--subtle);
+      line-height: 1.45;
+      white-space: normal;
+      overflow-wrap: anywhere;
+    }
+
+    .mono {
+      font-family: var(--mono);
+    }
+
+    footer {
+      padding: 10px 20px 16px;
+      color: var(--muted);
+      font-size: 0.74rem;
+      text-align: center;
+    }
+
+    .foot-inner {
+      max-width: 1320px;
+      margin: 0 auto;
+      display: flex;
+      justify-content: center;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    @media (max-width: 1100px) {
+      .grid.cols-2,
+      .hero-kpi,
+      .split,
+      .detail-grid,
+      .form-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .topbar-inner {
+        gap: 10px;
+      }
+
+      .toolbar {
+        width: 100%;
+        min-width: 0;
+      }
+    }
+
+    @media (max-width: 680px) {
+      .topbar-inner {
+        padding: 10px 12px;
+      }
+
+      main {
+        margin-top: 8px;
+        padding: 0 12px 20px;
+      }
+
+      .top-nav a,
+      .nav a {
+        padding: 6px 10px;
+        font-size: 0.82rem;
+      }
+
+      .panel-head {
+        padding: 14px;
+        flex-direction: column;
+        align-items: flex-start;
+      }
+
+      .toolbar-row {
+        width: 100%;
+      }
+
+      .toolbar-row .btn {
+        flex: 1;
+      }
+
+      .console-strip {
+        flex-direction: column;
+        align-items: flex-start;
+      }
+    }
+
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="shell-brand">
+        <div class="shell-brand-mark">Fe</div>
+        <div class="shell-brand-copy">
+          <b>Ferrosa Memory</b>
+          <span>Knowledge Graph Console</span>
+        </div>
+      </div>
+      <nav class="top-nav nav" aria-label="Primary">
+        <a href="/#home" data-section="home" class="active">Home</a>
+        <a href="/viz" id="link-viz">Viz</a>
+        <a href="/#cql" data-section="cql">CQL Explorer</a>
+        <a href="/#sparql" data-section="sparql">SPARQL Explorer</a>
+        <a href="/#datalog" data-section="datalog">Datalog Explorer</a>
+        <a href="/#aliases" data-section="aliases">Aliases</a>
+        <a href="/#rules" data-section="rules">Rules</a>
+        <a href="/#approvals" data-section="approvals">Approvals / Explanations</a>
+      </nav>
+      <div class="topbar-meta toolbar">
+        <div id="authChip" class="topbar-chip chip">Auth: checking…</div>
+        <button id="refreshBtn" class="btn secondary" type="button">Refresh</button>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section id="home" class="panel active" data-panel="home">
+      <div class="panel-head">
+        <div>
+          <h2>Home</h2>
+          <p>Operator workbench for graph inspection, rule governance, and derived-fact analysis.</p>
+        </div>
+        <div class="badge good" id="homeStatus">ready</div>
+      </div>
+      <div class="panel-body">
+        <div class="hero-kpi">
+          <div class="kpi" data-kpi="nodes">
+            <b>Nodes</b>
+            <span id="kpiNodes">0</span>
+          </div>
+          <div class="kpi" data-kpi="edges">
+            <b>Edges</b>
+            <span id="kpiEdges">0</span>
+          </div>
+          <div class="kpi" data-kpi="derived-facts">
+            <b>Derived Facts</b>
+            <span id="kpiDerivedFacts">0</span>
+          </div>
+          <div class="kpi" data-kpi="rules">
+            <b>Active Rules</b>
+            <span id="kpiRules">0</span>
+          </div>
+        </div>
+        <div class="console-strip home-meta">
+          <span id="homeApprovals" class="badge">Pending approvals: 0</span>
+          <span id="homeQueryRate" class="badge">Interactive queries: 0</span>
+        </div>
+        <div class="grid cols-2" style="margin-top:14px;">
+          <article class="card">
+            <h3>Quick Actions</h3>
+            <p class="muted">Use quick entry points when you just need one command without opening a full explorer.</p>
+            <div class="toolbar-row" style="margin-top:10px;">
+              <button class="btn" data-open="cql" type="button">Open CQL</button>
+              <button class="btn" data-open="sparql" type="button">Open SPARQL</button>
+              <button class="btn" data-open="datalog" type="button">Open Datalog</button>
+              <button class="btn secondary" data-open="aliases" type="button">Open Aliases</button>
+              <button class="btn secondary" data-open="rules" type="button">Review Rules</button>
+            </div>
+            <p class="tiny-note">Navigation is internal for query/workbench areas; visualization remains available via /viz.</p>
+          </article>
+          <article class="card">
+            <h3>System Integration</h3>
+            <p class="muted">This shell sits above the same authenticated operator APIs as viz, using the Ferrosa console chrome for every surface instead of a separate admin theme.</p>
+            <ul class="muted" style="padding-left:18px;margin:10px 0 0;line-height:1.6;">
+              <li>CQL passthrough endpoint: <code>/workbench/api/cql/query</code> (read-only)</li>
+              <li>SPARQL passthrough endpoint: <code>/workbench/api/sparql/query</code> (wire contract forwarded)</li>
+              <li>Local Datalog inference endpoint: <code>/workbench/api/datalog/query</code> (ferrosa-memory engine)</li>
+              <li>Aliases endpoint: <code>/workbench/api/aliases</code></li>
+              <li>Explanation drilldown: <code>/workbench/api/explanations/query</code></li>
+              <li>Rules endpoint: <code>/workbench/api/rules</code></li>
+              <li>Approvals endpoint: <code>/workbench/api/approvals</code></li>
+            </ul>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="cql" class="panel" data-panel="cql">
+      <div class="panel-head">
+        <div>
+          <h2>CQL Explorer</h2>
+          <p>Run read-only storage inspection queries through the CQL passthrough contract. The workbench forwards the payload without SQL translation, so request and response contract errors are surfaced directly.</p>
+        </div>
+        <a class="chip" href="/viz">Open Viz →</a>
+      </div>
+      <div class="panel-body">
+        <div class="grid split">
+          <form id="cqlForm" class="card query-form">
+            <h3>Run CQL</h3>
+            <p class="muted">The CQL surface sends a passthrough payload to <code>/workbench/api/cql/query</code> with <code>query</code> and <code>limit</code> fields. Ferrosa contract errors are returned directly, so keyspace qualification and filtering rules must match the public CQL behavior.</p>
+            <div class="pill-row">
+              <button class="action" type="button" data-template-target="cqlQuery" data-template="SELECT * FROM agent_memory.entity_store LIMIT 25">Entities</button>
+              <button class="action" type="button" data-template-target="cqlQuery" data-template="SELECT * FROM agent_memory.rules_by_id LIMIT 25">Rules</button>
+              <button class="action" type="button" data-template-target="cqlQuery" data-template="SELECT * FROM agent_memory.aliases_by_name WHERE alias_name = 'query_derived' LIMIT 25">Aliases</button>
+              <button class="action" type="button" data-template-target="cqlQuery" data-template="SELECT * FROM agent_memory.derived_cache_by_pred LIMIT 25">Derived Cache</button>
+            </div>
+            <label for="cqlQuery">CQL Text</label>
+            <textarea id="cqlQuery" class="input" placeholder="SELECT * FROM agent_memory.entity_store WHERE entity_type = 'concept' LIMIT 40" required></textarea>
+            <div class="inline">
+              <div class="field">
+                <label for="cqlLimit">Row Cap</label>
+                <input class="input" id="cqlLimit" type="number" min="1" max="5000" value="200">
+              </div>
+              <span class="pill">Read-only passthrough</span>
+              <span class="pill">Common app tables: agent_memory.entity_store, agent_memory.rules_by_id, agent_memory.rules_by_family, agent_memory.aliases_by_name, agent_memory.approvals_by_target, agent_memory.derived_cache_by_pred</span>
+            </div>
+            <p class="tiny-note">Operator note: qualify app tables explicitly with <code>agent_memory.</code>. Ferrosa/Cassandra enforces real partition-key semantics here, so query <code>rules_by_family</code> or <code>derived_cache_by_pred</code> with their keyed access patterns, or add <code>ALLOW FILTERING</code> only if that contract is intentional.</p>
+            <div class="toolbar-row">
+              <button class="btn" type="submit">Execute CQL</button>
+              <button class="btn secondary" id="cqlClear" type="button">Clear</button>
+            </div>
+            <div class="status" id="cqlStatus">Ready.</div>
+          </form>
+          <div class="card">
+            <h3>Result Stream</h3>
+            <div class="console-strip">
+              <p class="muted" style="margin:0;">Raw JSON from <code>/workbench/api/cql/query</code>. API success and error responses remain in-place and keep original contract fields.</p>
+              <span id="cqlResultMeta" class="badge">idle</span>
+            </div>
+            <div id="cqlOutput" class="output-box">No results yet.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="sparql" class="panel" data-panel="sparql">
+      <div class="panel-head">
+        <div>
+          <h2>SPARQL Explorer</h2>
+          <p>Use the public SPARQL passthrough contract for RDF-like query paths. No SPARQL rewrite is performed in the shell, so malformed input and API failures surface immediately.</p>
+        </div>
+        <a class="chip" href="/viz">Open Viz →</a>
+      </div>
+      <div class="panel-body">
+        <div class="grid split">
+          <form id="sparqlForm" class="card query-form">
+            <h3>Run SPARQL</h3>
+            <p class="muted">The panel forwards payload directly to <code>/workbench/api/sparql/query</code> with passthrough behavior; the workbench only renders request output.</p>
+            <div class="pill-row">
+              <button class="action" type="button" data-template-target="sparqlQuery" data-template="SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 25">Generic Select</button>
+              <button class="action" type="button" data-template-target="sparqlQuery" data-template="SELECT ?entity WHERE { ?entity a &lt;urn:ferrosa:Concept&gt; } LIMIT 25">Entity Select</button>
+              <button class="action" type="button" data-template-target="sparqlQuery" data-template="SELECT ?edge ?from ?to WHERE { ?from ?edge ?to } LIMIT 25">Edge Browse</button>
+            </div>
+            <label for="sparqlQuery">SPARQL Text</label>
+            <textarea id="sparqlQuery" class="input" placeholder="SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 25" required></textarea>
+            <div class="inline">
+              <div class="field">
+                <label for="sparqlLimit">Row Cap</label>
+                <input class="input" id="sparqlLimit" type="number" min="1" max="5000" value="200">
+              </div>
+              <span class="pill">Public passthrough</span>
+              <span class="pill">SPARQL-only surface</span>
+            </div>
+            <div class="toolbar-row">
+              <button class="btn" type="submit">Execute SPARQL</button>
+              <button class="btn secondary" id="sparqlClear" type="button">Clear</button>
+            </div>
+            <div class="status" id="sparqlStatus">Ready.</div>
+          </form>
+          <div class="card">
+            <h3>Result Stream</h3>
+            <div class="console-strip">
+              <p class="muted" style="margin:0;">Raw JSON from <code>/workbench/api/sparql/query</code>, including result bindings and response-level status fields.</p>
+              <span id="sparqlResultMeta" class="badge">idle</span>
+            </div>
+            <div id="sparqlOutput" class="output-box">No results yet.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="datalog" class="panel" data-panel="datalog">
+      <div class="panel-head">
+        <div>
+          <h2>Datalog Explorer</h2>
+          <p>Run inference through ferrosa-memory's local Datalog engine over Ferrosa-backed graph and app data, then pivot concrete rows directly into explanation drilldown.</p>
+        </div>
+        <a class="chip" href="/viz">Open Viz →</a>
+      </div>
+      <div class="panel-body">
+        <div class="grid split">
+          <form id="datalogForm" class="card query-form">
+            <h3>Run Datalog</h3>
+            <p class="muted">The endpoint accepts <code>predicate</code> and optional <code>session_id</code>. This is the local Datalog inference contract in ferrosa-memory; selected rows are reused automatically in explanation payloads.</p>
+            <div class="pill-row">
+              <button class="action" type="button" data-template-target="datalogPredicate" data-template="reachable(Src, Dst)">reachable()</button>
+              <button class="action" type="button" data-template-target="datalogPredicate" data-template="related(Src, Dst)">related()</button>
+              <button class="action" type="button" data-template-target="datalogPredicate" data-template="ancestor(Src, Dst)">ancestor()</button>
+            </div>
+            <label for="datalogPredicate">Predicate Query</label>
+            <textarea id="datalogPredicate" class="input" placeholder="reachable(Src, Dst)" required></textarea>
+            <div class="inline">
+              <div class="field" style="flex:1;min-width:220px;">
+                <label for="datalogSessionId">Session Scope</label>
+                <input class="input mono" id="datalogSessionId" type="text" placeholder="optional UUID; blank uses nil/global session">
+              </div>
+              <div class="field">
+                <button class="btn secondary" id="datalogUseActiveSession" type="button">Use Active Session</button>
+              </div>
+            </div>
+            <p class="tiny-note">Selected rows automatically supply <code>src_id</code> and <code>dst_id</code> to the explanation endpoint. Manual drilldown remains available for ad hoc payloads.</p>
+            <div class="toolbar-row">
+              <button class="btn" type="submit">Evaluate</button>
+              <button class="btn secondary" id="datalogClear" type="button">Clear</button>
+            </div>
+            <div class="status" id="datalogStatus">Ready.</div>
+          </form>
+          <div class="card">
+            <h3>Result Stream</h3>
+            <div class="console-strip">
+              <p class="muted" style="margin:0;">Safe JSON render of <code>/workbench/api/datalog/query</code> with row payload and local inference metadata.</p>
+              <span id="datalogResultMeta" class="badge">idle</span>
+            </div>
+            <div id="datalogOutput" class="output-box">No results yet.</div>
+          </div>
+        </div>
+        <div class="detail-grid" style="margin-top:14px;">
+          <div class="card">
+            <div class="panel-head" style="padding:0 0 12px;border:none;background:none;">
+              <div>
+                <h3 style="margin:0;">Derived Results</h3>
+                <p class="muted" style="margin-top:6px;">Select a Datalog row to bind the explanation drilldown to a concrete inference result.</p>
+              </div>
+              <span id="datalogResultsCount" class="badge">0 rows</span>
+            </div>
+            <div class="table-wrap">
+              <table aria-label="Datalog result table">
+                <thead>
+                  <tr>
+                    <th style="width: 70px;">Row</th>
+                    <th>Bindings</th>
+                    <th style="width: 170px;">Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="datalogResultsTable">
+                  <tr>
+                    <td colspan="3" style="text-align:center;color:var(--subtle)">Run a Datalog query to populate derived rows.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div class="stack">
+            <form id="explanationForm" class="card query-form">
+              <div class="panel-head" style="padding:0 0 12px;border:none;background:none;">
+                <div>
+                  <h3 style="margin:0;">Explanation Drilldown</h3>
+                  <p class="muted" style="margin-top:6px;">The drilldown tracks the current Datalog query and selected row, while still allowing manual <code>src_id</code>/<code>dst_id</code> requests.</p>
+                </div>
+                <span id="explanationSelection" class="badge warn">Awaiting selection</span>
+              </div>
+              <label for="explanationQuery">Datalog Query</label>
+              <textarea id="explanationQuery" class="input" placeholder="Current predicate query will appear here."></textarea>
+              <label for="explanationResultPayload">Result Payload (JSON)</label>
+              <textarea id="explanationResultPayload" class="input" placeholder='Select a derived row or paste JSON with src_id and/or dst_id, e.g. {"src_id":"...","dst_id":"..."}'></textarea>
+              <div class="inline">
+                <div class="field">
+                  <label for="explanationRowIndex">Row #</label>
+                  <input class="input" id="explanationRowIndex" type="number" min="0" step="1" placeholder="0">
+                </div>
+                <div class="field">
+                  <label for="explanationLimit">Support Limit</label>
+                  <input class="input" id="explanationLimit" type="number" min="1" max="64" step="1" value="16">
+                </div>
+              </div>
+              <p class="tiny-note">Manual payloads only need the entity IDs you want to constrain; selected rows fill them automatically.</p>
+              <div class="toolbar-row">
+                <button class="btn" type="submit">Query Explanation</button>
+                <button class="btn secondary" id="explanationUseCurrent" type="button">Use Current Query</button>
+                <button class="btn secondary" id="explanationClear" type="button">Clear</button>
+              </div>
+              <div class="status" id="explanationStatus">Select a Datalog result or paste a payload to request an explanation.</div>
+            </form>
+            <div class="card">
+              <h3>Explanation Response</h3>
+              <p class="muted" id="explanationMeta">No explanation requested yet.</p>
+              <div id="explanationOutput" class="output-box">No explanation yet.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="aliases" class="panel" data-panel="aliases">
+      <div class="panel-head">
+        <div>
+          <h2>Aliases</h2>
+          <p>Search and register alias mappings without leaving the operator shell.</p>
+        </div>
+        <div class="toolbar-row">
+          <button class="btn secondary" id="aliasesRefresh" type="button">Refresh aliases</button>
+        </div>
+      </div>
+      <div class="panel-body query-row">
+        <div class="grid cols-2">
+          <form id="aliasSearchForm" class="card query-form">
+            <h3>Lookup Alias</h3>
+            <label for="aliasSearchName">Alias name</label>
+            <input id="aliasSearchName" class="input" type="text" placeholder="Acme / acme-inc / @acme">
+            <div class="toolbar-row">
+              <button class="btn" type="submit">Search</button>
+              <button class="btn secondary" id="aliasSearchClear" type="button">Clear Filter</button>
+            </div>
+            <div class="status" id="aliasSearchStatus">Ready.</div>
+          </form>
+          <form id="aliasCreateForm" class="card query-form">
+            <h3>Create Alias</h3>
+            <label for="aliasCreateName">Alias name</label>
+            <input id="aliasCreateName" class="input" type="text" placeholder="alias_name" required>
+            <label for="aliasCanonicalTool">Canonical tool</label>
+            <input id="aliasCanonicalTool" class="input" type="text" placeholder="query_derived" required>
+            <div class="inline">
+              <div class="field" style="flex:1;">
+                <label for="aliasScopeKind">Scope</label>
+                <select id="aliasScopeKind">
+                  <option value="global">Global</option>
+                  <option value="workspace">Workspace</option>
+                  <option value="session">Session</option>
+                </select>
+              </div>
+              <div class="field" style="flex:1;">
+                <label for="aliasStatus">Status</label>
+                <select id="aliasStatus">
+                  <option value="proposed">Proposed</option>
+                  <option value="approved">Approved</option>
+                  <option value="rejected">Rejected</option>
+                </select>
+              </div>
+            </div>
+            <label for="aliasScopeRef">Scope Ref</label>
+            <input id="aliasScopeRef" class="input mono" type="text" placeholder="* or workspace/session id as needed">
+            <div class="toolbar-row">
+              <button class="btn" type="submit">Create Alias</button>
+            </div>
+            <div class="status" id="aliasFormStatus">Ready.</div>
+          </form>
+        </div>
+        <div class="card">
+          <div class="toolbar-row" style="justify-content:space-between;margin-bottom:10px;">
+            <span class="muted">Alias mappings returned by <code>/workbench/api/aliases</code>.</span>
+            <span id="aliasesCount" class="badge">0 rows</span>
+          </div>
+          <div class="table-wrap">
+            <table aria-label="Aliases table">
+              <thead>
+                <tr>
+                  <th>Alias</th>
+                  <th>Tool</th>
+                  <th style="width: 120px;">Scope</th>
+                  <th style="width: 210px;">Scope Ref</th>
+                  <th style="width: 120px;">Status</th>
+                  <th style="width: 170px;">Updated</th>
+                </tr>
+              </thead>
+              <tbody id="aliasesTable">
+                <tr>
+                  <td colspan="6" style="text-align:center;color:var(--subtle)">Loading aliases…</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="tiny-note" id="aliasesEmptyNote" style="display:none;">No aliases returned by endpoint.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="rules" class="panel" data-panel="rules">
+      <div class="panel-head">
+        <div>
+          <h2>Rules</h2>
+          <p>Inspect builtin, registry, and effective rule sets with family-aware filtering and inline governance actions.</p>
+        </div>
+        <div class="toolbar-row">
+          <button class="btn secondary" id="rulesRefresh" type="button">Refresh rules</button>
+        </div>
+      </div>
+      <div class="panel-body query-row">
+        <div class="grid cols-2">
+          <form id="ruleForm" class="card query-form">
+            <h3>Compose Rule</h3>
+            <p class="muted">Create a registry rule by supplying a family, condition, and optional full rule body. Custom bodies override the generated head.</p>
+            <label for="ruleName">Rule name</label>
+            <input id="ruleName" class="input" type="text" placeholder="reachable-via-team-links" required>
+            <div class="form-grid">
+              <div>
+                <label for="ruleFamily">Family</label>
+                <input id="ruleFamily" class="input mono" type="text" list="ruleFamilyOptions" placeholder="reachable" required>
+              </div>
+              <div>
+                <label for="rulePredicate">Head predicate</label>
+                <input id="rulePredicate" class="input mono" type="text" placeholder="reachable(Src, Dst)">
+              </div>
+            </div>
+            <label for="ruleCondition">Condition</label>
+            <textarea id="ruleCondition" class="input" placeholder="edge(Src, Mid), edge(Mid, Dst)" required></textarea>
+            <label for="ruleBody">Rule body override</label>
+            <textarea id="ruleBody" class="input" placeholder="Optional exact rule body. If blank, the console composes &quot;family :- condition.&quot;"></textarea>
+            <div class="inline">
+              <div class="field">
+                <label for="ruleWeight">Rule weight</label>
+                <input class="input" id="ruleWeight" type="number" min="0" step="0.1" value="1.0">
+              </div>
+              <button class="btn" type="submit">Submit Rule</button>
+            </div>
+            <div class="status" id="ruleFormStatus">Ready.</div>
+          </form>
+          <form id="rulesFilterForm" class="card query-form">
+            <h3>Rule Control Plane</h3>
+            <p class="muted">Switch between builtin, registry, and effective sources. Family filters are sent directly to the endpoint so you can inspect the active rule surface without leaving the workbench.</p>
+            <div class="form-grid">
+              <div>
+                <label for="rulesSourceFilter">Source</label>
+                <select id="rulesSourceFilter">
+                  <option value="effective" selected>Effective</option>
+                  <option value="builtin">Builtin</option>
+                  <option value="registry">Registry</option>
+                </select>
+              </div>
+              <div>
+                <label for="rulesFamilyFilter">Family</label>
+                <input id="rulesFamilyFilter" class="input mono" type="text" list="ruleFamilyOptions" placeholder="* or predicate family like reachable">
+              </div>
+            </div>
+            <div class="toolbar-row">
+              <button class="btn" type="submit">Apply Filters</button>
+              <button class="btn secondary" id="rulesClearFilters" type="button">Clear</button>
+            </div>
+            <div class="pill-row" style="margin-top:4px;">
+              <span id="rulesSourceBadge" class="badge">source: effective</span>
+              <span id="rulesFamilyBadge" class="badge">family: *</span>
+              <span id="rulesCountBadge" class="badge">0 rows</span>
+            </div>
+            <div class="status" id="rulesFilterStatus">Ready.</div>
+          </form>
+        </div>
+        <datalist id="ruleFamilyOptions"></datalist>
+        <div class="card">
+          <div class="console-strip">
+            <div>
+              <h3 style="margin:0 0 4px;">Rule Table</h3>
+              <p class="muted" style="margin:0;">Loaded from <code>/workbench/api/rules</code> with source and family filters preserved in the operator console.</p>
+            </div>
+            <span id="rulesTableMeta" class="badge">idle</span>
+          </div>
+          <div class="table-wrap">
+            <table aria-label="Rules table">
+              <thead>
+                <tr>
+                  <th>Rule</th>
+                  <th style="width: 130px;">Family</th>
+                  <th style="width: 100px;">Source</th>
+                  <th style="width: 80px;">Version</th>
+                  <th style="width: 110px;">Approval</th>
+                  <th style="width: 90px;">State</th>
+                  <th style="width: 260px;">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="rulesTable">
+                <tr>
+                  <td colspan="7" style="text-align:center;color:var(--subtle)">Loading rules…</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="tiny-note" id="rulesEmptyNote" style="display:none;">No rules returned by endpoint.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="approvals" class="panel" data-panel="approvals">
+      <div class="panel-head">
+        <div>
+          <h2>Approvals / Explanations</h2>
+          <p>Inspect pending requests and provide operator approvals with commentary.</p>
+        </div>
+        <div class="toolbar-row">
+          <button class="btn secondary" id="approvalsRefresh" type="button">Refresh approvals</button>
+        </div>
+      </div>
+      <div class="panel-body query-row">
+        <div class="card">
+          <div class="toolbar-row" style="justify-content:space-between; margin-bottom:10px;">
+            <span class="muted">Filter state:</span>
+            <div class="inline">
+              <select id="approvalFilter">
+                <option value="all">All</option>
+                <option value="pending" selected>Pending</option>
+                <option value="approved">Approved</option>
+                <option value="rejected">Rejected</option>
+              </select>
+              <button class="btn secondary" id="approvalClearFilter" type="button">Clear</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table aria-label="Approvals table">
+              <thead>
+                <tr>
+                  <th style="width: 90px;">Request</th>
+                  <th>Requester</th>
+                  <th>Type</th>
+                  <th>Target</th>
+                  <th style="width: 120px;">State</th>
+                  <th>Explanation</th>
+                  <th style="width: 180px;">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="approvalsTable">
+                <tr>
+                  <td colspan="7" style="text-align:center;color:var(--subtle)">Loading approvals…</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="tiny-note" id="approvalsEmptyNote" style="display:none;">No approvals available.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="foot-inner">
+      <span>All operations are issued to <strong>/workbench/api</strong> and expect authentication.</span>
+      <span>Built as a no-build single-page asset for the operator console.</span>
+    </div>
+  </footer>
+
+  <script>
+    window.__FMEM_VIZ_SCHEME__ = '@@FMEM_VIZ_SCHEME@@';
+    window.__FMEM_VIZ_PORT__ = @@FMEM_VIZ_PORT@@;
+    const state = {
+      authToken: localStorage.getItem('ferrosa_memory_auth_token') || '',
+      currentSection: 'home',
+      rules: [],
+      approvals: [],
+      aliases: [],
+      sessionId: localStorage.getItem('ferrosa_memory_session') || '',
+      queryCount: 0,
+      lastCqlPayload: null,
+      lastSparqlPayload: null,
+      datalogResults: [],
+      lastDatalogPayload: null,
+      lastDatalogQuery: '',
+      selectedDatalogResult: null,
+      selectedDatalogIndex: null,
+      ruleFilters: {
+        requestedSource: 'effective',
+        endpointSource: 'effective',
+        family: '',
+      },
+    };
+
+    const API_BASE = '/workbench/api';
+    const sections = ['home', 'cql', 'sparql', 'datalog', 'aliases', 'rules', 'approvals'];
+
+    const selectors = {
+      navLinks: [...document.querySelectorAll('.nav a[data-section]')],
+      panels: new Map([...document.querySelectorAll('[data-panel]')].map((el) => [el.dataset.panel, el])),
+      linkViz: document.getElementById('link-viz'),
+      authChip: document.getElementById('authChip'),
+      homeStatus: document.getElementById('homeStatus'),
+      homeApprovals: document.getElementById('homeApprovals'),
+      homeQueryRate: document.getElementById('homeQueryRate'),
+      refreshBtn: document.getElementById('refreshBtn'),
+      kpis: {
+        nodes: document.getElementById('kpiNodes'),
+        edges: document.getElementById('kpiEdges'),
+        derivedFacts: document.getElementById('kpiDerivedFacts'),
+        rules: document.getElementById('kpiRules'),
+      },
+      cqlForm: document.getElementById('cqlForm'),
+      sparqlForm: document.getElementById('sparqlForm'),
+      datalogForm: document.getElementById('datalogForm'),
+      cqlQuery: document.getElementById('cqlQuery'),
+      cqlOutput: document.getElementById('cqlOutput'),
+      cqlStatus: document.getElementById('cqlStatus'),
+      cqlLimit: document.getElementById('cqlLimit'),
+      cqlResultMeta: document.getElementById('cqlResultMeta'),
+      sparqlQuery: document.getElementById('sparqlQuery'),
+      sparqlOutput: document.getElementById('sparqlOutput'),
+      sparqlStatus: document.getElementById('sparqlStatus'),
+      sparqlLimit: document.getElementById('sparqlLimit'),
+      sparqlResultMeta: document.getElementById('sparqlResultMeta'),
+      datalogPredicate: document.getElementById('datalogPredicate'),
+      datalogOutput: document.getElementById('datalogOutput'),
+      datalogStatus: document.getElementById('datalogStatus'),
+      datalogSessionId: document.getElementById('datalogSessionId'),
+      datalogUseActiveSession: document.getElementById('datalogUseActiveSession'),
+      datalogResultMeta: document.getElementById('datalogResultMeta'),
+      datalogResultsTable: document.getElementById('datalogResultsTable'),
+      datalogResultsCount: document.getElementById('datalogResultsCount'),
+      explanationForm: document.getElementById('explanationForm'),
+      explanationQuery: document.getElementById('explanationQuery'),
+      explanationResultPayload: document.getElementById('explanationResultPayload'),
+      explanationRowIndex: document.getElementById('explanationRowIndex'),
+      explanationLimit: document.getElementById('explanationLimit'),
+      explanationSelection: document.getElementById('explanationSelection'),
+      explanationStatus: document.getElementById('explanationStatus'),
+      explanationMeta: document.getElementById('explanationMeta'),
+      explanationOutput: document.getElementById('explanationOutput'),
+      explanationUseCurrent: document.getElementById('explanationUseCurrent'),
+      explanationClear: document.getElementById('explanationClear'),
+      aliasSearchForm: document.getElementById('aliasSearchForm'),
+      aliasSearchName: document.getElementById('aliasSearchName'),
+      aliasSearchStatus: document.getElementById('aliasSearchStatus'),
+      aliasSearchClear: document.getElementById('aliasSearchClear'),
+      aliasCreateForm: document.getElementById('aliasCreateForm'),
+      aliasFormStatus: document.getElementById('aliasFormStatus'),
+      aliasCreateName: document.getElementById('aliasCreateName'),
+      aliasCanonicalTool: document.getElementById('aliasCanonicalTool'),
+      aliasScopeKind: document.getElementById('aliasScopeKind'),
+      aliasStatus: document.getElementById('aliasStatus'),
+      aliasScopeRef: document.getElementById('aliasScopeRef'),
+      aliasesTable: document.getElementById('aliasesTable'),
+      aliasesEmptyNote: document.getElementById('aliasesEmptyNote'),
+      aliasesCount: document.getElementById('aliasesCount'),
+      aliasesRefresh: document.getElementById('aliasesRefresh'),
+      ruleForm: document.getElementById('ruleForm'),
+      ruleFormStatus: document.getElementById('ruleFormStatus'),
+      ruleName: document.getElementById('ruleName'),
+      ruleFamily: document.getElementById('ruleFamily'),
+      rulePredicate: document.getElementById('rulePredicate'),
+      ruleCondition: document.getElementById('ruleCondition'),
+      ruleBody: document.getElementById('ruleBody'),
+      ruleWeight: document.getElementById('ruleWeight'),
+      rulesFilterForm: document.getElementById('rulesFilterForm'),
+      rulesSourceFilter: document.getElementById('rulesSourceFilter'),
+      rulesFamilyFilter: document.getElementById('rulesFamilyFilter'),
+      rulesClearFilters: document.getElementById('rulesClearFilters'),
+      rulesFilterStatus: document.getElementById('rulesFilterStatus'),
+      rulesSourceBadge: document.getElementById('rulesSourceBadge'),
+      rulesFamilyBadge: document.getElementById('rulesFamilyBadge'),
+      rulesCountBadge: document.getElementById('rulesCountBadge'),
+      rulesTableMeta: document.getElementById('rulesTableMeta'),
+      ruleFamilyOptions: document.getElementById('ruleFamilyOptions'),
+      rulesTable: document.getElementById('rulesTable'),
+      rulesEmptyNote: document.getElementById('rulesEmptyNote'),
+      approvalsTable: document.getElementById('approvalsTable'),
+      approvalsEmptyNote: document.getElementById('approvalsEmptyNote'),
+      approvalsFilter: document.getElementById('approvalFilter'),
+      approvalClearFilter: document.getElementById('approvalClearFilter'),
+      rulesRefresh: document.getElementById('rulesRefresh'),
+      approvalsRefresh: document.getElementById('approvalsRefresh'),
+    };
+
+    const configureShellLinks = () => {
+      const vizScheme = window.__FMEM_VIZ_SCHEME__ || location.protocol.replace(':', '');
+      const vizPort = Number(window.__FMEM_VIZ_PORT__ || 0);
+      const vizHref =
+        vizPort > 0
+          ? `${vizScheme}://${location.hostname}:${vizPort}/viz`
+          : '/viz';
+      if (selectors.linkViz) {
+        selectors.linkViz.href = vizHref;
+      }
+    };
+
+    const ensureAuthToken = async () => {
+      if (state.authToken) {
+        selectors.authChip.textContent = state.authToken.includes(':') ? 'Auth: credentials loaded' : 'Auth: token loaded';
+        selectors.authChip.className = 'chip live';
+        return;
+      }
+
+      const header = await fetch('/workbench/api/auth/whoami', {
+        method: 'GET',
+        credentials: 'include',
+      }).catch(() => null);
+
+      if (header && header.status === 200) {
+        selectors.authChip.textContent = 'Auth: session cookie';
+        selectors.authChip.className = 'chip live';
+        return;
+      }
+
+      selectors.authChip.textContent = 'Auth: not detected';
+      selectors.authChip.className = 'chip';
+    };
+
+    const request = async (path, init = {}) => {
+      const headers = {
+        'Accept': 'application/json',
+        ...(init.headers || {}),
+      };
+      if (state.authToken) {
+        if (state.authToken.startsWith('Basic ') || state.authToken.startsWith('Bearer ')) {
+          headers.Authorization = state.authToken;
+        } else if (state.authToken.includes(':')) {
+          headers.Authorization = `Basic ${btoa(state.authToken)}`;
+        } else {
+          headers.Authorization = `Bearer ${state.authToken}`;
+        }
+      }
+      if (init.body && !headers['Content-Type'] && !headers['content-type']) {
+        headers['Content-Type'] = 'application/json';
+      }
+
+      const response = await fetch(`${API_BASE}${path}`, {
+        credentials: 'include',
+        ...init,
+        headers,
+      });
+
+      const text = await response.text();
+      let payload;
+      try {
+        payload = text ? JSON.parse(text) : {};
+      } catch (e) {
+        payload = { message: text };
+      }
+
+      if (!response.ok) {
+        const msg = payload?.error || payload?.message || `Request failed (${response.status})`;
+        const err = new Error(msg);
+        err.status = response.status;
+        err.payload = payload;
+        throw err;
+      }
+
+      return payload;
+    };
+
+    const renderStatus = (el, message, level = 'ok') => {
+      el.textContent = message;
+      el.className = `status ${level}`;
+    };
+
+    const safeJson = (value) => JSON.stringify(value, null, 2);
+
+    const toFiniteInt = (value, fallback = 0) => {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? Math.max(0, Math.trunc(parsed)) : fallback;
+    };
+
+    const formatQueryMeta = (rowCount, table = 'query', latencyMs) => {
+      const count = toFiniteInt(rowCount, 0);
+      const latency = toFiniteInt(latencyMs);
+      const base = `${String(table)} · ${count} row${count === 1 ? '' : 's'}`;
+      return latency > 0 ? `${base} · ${latency} ms` : base;
+    };
+
+    const resetQueryState = (statusEl, outputEl, metaEl) => {
+      outputEl.textContent = 'No results yet.';
+      metaEl.textContent = 'ready';
+      statusEl.textContent = 'Ready.';
+      statusEl.className = 'status ok';
+    };
+
+    const normalizeRuleSource = (value, fallback = 'effective') => {
+      const text = String(value || fallback || 'effective').toLowerCase();
+      if (text.includes('builtin')) return 'builtin';
+      if (text.includes('registry')) return 'registry';
+      return 'effective';
+    };
+
+    const normalizeRuleState = (rule) => {
+      const text = String(rule?.state || '').toLowerCase();
+      if (text) return text;
+      return rule?.enabled === false ? 'inactive' : 'active';
+    };
+
+    const switchSection = (section) => {
+      if (!sections.includes(section)) {
+        section = 'home';
+      }
+      state.currentSection = section;
+      selectors.navLinks.forEach((link) => {
+        link.classList.toggle('active', link.dataset.section === section);
+      });
+      selectors.panels.forEach((panel, key) => {
+        panel.classList.toggle('active', key === section);
+      });
+      location.hash = section;
+      if (section === 'rules') {
+        loadRules();
+      } else if (section === 'aliases') {
+        loadAliases();
+      } else if (section === 'approvals') {
+        loadApprovals();
+      }
+    };
+
+    const formatTime = (value) => {
+      if (!value) return 'n/a';
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+    };
+
+    const updateRuleFamilyOptions = () => {
+      const families = [...new Set(state.rules.map((rule) => rule.family).filter(Boolean))].sort();
+      selectors.ruleFamilyOptions.innerHTML = families
+        .map((family) => `<option value="${escapeAttr(family)}"></option>`)
+        .join('');
+    };
+
+    const renderRuleFilterState = () => {
+      const requestedSource = selectors.rulesSourceFilter.value || 'effective';
+      const family = selectors.rulesFamilyFilter.value.trim();
+      selectors.rulesSourceBadge.textContent = `source: ${requestedSource}`;
+      selectors.rulesFamilyBadge.textContent = `family: ${family || '*'}`;
+      selectors.rulesCountBadge.textContent = `${state.rules.length} row${state.rules.length === 1 ? '' : 's'}`;
+      selectors.rulesTableMeta.textContent =
+        state.ruleFilters.endpointSource !== requestedSource
+          ? `via ${state.ruleFilters.endpointSource}`
+          : requestedSource;
+    };
+
+    const activeSessionId = () => {
+      const explicit = selectors.datalogSessionId.value.trim();
+      return explicit || state.sessionId || '';
+    };
+
+    const renderRules = () => {
+      selectors.rulesTable.innerHTML = '';
+      renderRuleFilterState();
+      updateRuleFamilyOptions();
+      if (!state.rules.length) {
+        selectors.rulesEmptyNote.style.display = 'block';
+        const row = document.createElement('tr');
+        row.innerHTML = '<td colspan="7" style="text-align:center;color:var(--subtle)">No rules returned.</td>';
+        selectors.rulesTable.appendChild(row);
+        selectors.kpis.rules.textContent = '0';
+        return;
+      }
+
+      selectors.rulesEmptyNote.style.display = 'none';
+      selectors.kpis.rules.textContent = String(state.rules.length);
+      updateRuleFamilyOptions();
+      for (const rule of state.rules) {
+        const row = document.createElement('tr');
+        const source = normalizeRuleSource(rule.source || rule.scope, state.ruleFilters.requestedSource);
+        const stateLabel = normalizeRuleState(rule);
+        const stateClass =
+          stateLabel === 'active'
+            ? 'good'
+            : stateLabel === 'deprecated'
+              ? 'warn'
+              : 'bad';
+        const approvalText = String(rule.approval_state || 'n/a');
+        const approvalClass =
+          approvalText === 'approved'
+            ? 'good'
+            : approvalText === 'rejected'
+              ? 'bad'
+              : approvalText === 'proposed'
+                ? 'warn'
+                : '';
+        const canGovern = source !== 'builtin';
+        const canDeprecate = canGovern && stateLabel !== 'deprecated';
+        row.innerHTML = `
+          <td>
+            <div class="rule-stack">
+              <strong>${escapeHtml(rule.name || '(unnamed)')}</strong>
+              <span class="mono muted">${escapeHtml(String(rule.rule_id || rule.id || '—'))}</span>
+              <span class="table-summary mono">${escapeHtml(truncate(rule.rule_body || rule.condition || '', 240))}</span>
+            </div>
+          </td>
+          <td><span class="badge">${escapeHtml(rule.family || 'unknown')}</span></td>
+          <td><span class="badge">${escapeHtml(source)}</span></td>
+          <td>${escapeHtml(String(rule.version ?? rule.priority ?? '0'))}</td>
+          <td><span class="badge ${approvalClass}">${escapeHtml(approvalText)}</span></td>
+          <td><span class="badge ${stateClass}">${escapeHtml(stateLabel)}</span></td>
+          <td>
+            <div class="row-actions">
+              <button class="action" type="button" data-rule-family="${escapeAttr(rule.family || '')}">Focus</button>
+              <button class="action" type="button" data-rule-approve="${escapeAttr(rule.rule_id || rule.id || '')}" ${canGovern ? '' : 'disabled'}>Approve</button>
+              <button class="action warn" type="button" data-rule-reject="${escapeAttr(rule.rule_id || rule.id || '')}" ${canGovern ? '' : 'disabled'}>Reject</button>
+              <button class="action warn" type="button" data-rule-deprecate="${escapeAttr(rule.rule_id || rule.id || '')}" ${canDeprecate ? '' : 'disabled'}>Deprecate</button>
+            </div>
+          </td>
+        `;
+
+        row.querySelector('[data-rule-family]')?.addEventListener('click', async () => {
+          selectors.rulesFamilyFilter.value = rule.family || '';
+          if (source === 'registry') {
+            selectors.rulesSourceFilter.value = 'registry';
+          }
+          await loadRules();
+        });
+        row.querySelector('[data-rule-deprecate]')?.addEventListener('click', async () => {
+          const ruleId = rule.rule_id || rule.id;
+          if (!ruleId || !canDeprecate) return;
+          await deprecateRule(ruleId, rule.family || '');
+        });
+        row.querySelector('[data-rule-approve]')?.addEventListener('click', async () => {
+          const ruleId = rule.rule_id || rule.id;
+          if (!ruleId || !canGovern) return;
+          await reviewRule(ruleId, 'approve');
+        });
+        row.querySelector('[data-rule-reject]')?.addEventListener('click', async () => {
+          const ruleId = rule.rule_id || rule.id;
+          if (!ruleId || !canGovern) return;
+          await reviewRule(ruleId, 'reject');
+        });
+        selectors.rulesTable.appendChild(row);
+      }
+    };
+
+    const extractArray = (payload, keys = []) => {
+      if (Array.isArray(payload)) {
+        return payload;
+      }
+      if (!payload || typeof payload !== 'object') {
+        return [];
+      }
+      for (const key of keys) {
+        if (Array.isArray(payload[key])) {
+          return payload[key];
+        }
+      }
+      if (payload.result && Array.isArray(payload.result)) {
+        return payload.result;
+      }
+      if (payload.result && typeof payload.result === 'object') {
+        for (const key of keys) {
+          if (Array.isArray(payload.result[key])) {
+            return payload.result[key];
+          }
+        }
+      }
+      return [];
+    };
+
+    const truncate = (value, max = 180) => {
+      const text = String(value ?? '');
+      return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+    };
+
+    const summarizeValue = (value) => {
+      if (value === null) return 'null';
+      if (value === undefined) return 'undefined';
+      if (typeof value === 'string') return value;
+      if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+      if (Array.isArray(value)) return `[${value.map((item) => summarizeValue(item)).join(', ')}]`;
+      if (typeof value === 'object') {
+        return Object.entries(value)
+          .slice(0, 4)
+          .map(([key, entry]) => `${key}=${summarizeValue(entry)}`)
+          .join(', ');
+      }
+      return String(value);
+    };
+
+    const setExplanationSelection = (result, index) => {
+      state.selectedDatalogResult = result;
+      state.selectedDatalogIndex = Number.isInteger(index) ? index : null;
+      selectors.explanationQuery.value = state.lastDatalogQuery || selectors.datalogPredicate.value.trim();
+      selectors.explanationResultPayload.value = result ? safeJson(result) : '';
+      selectors.explanationRowIndex.value = Number.isInteger(index) ? String(index) : '';
+      selectors.explanationSelection.textContent = Number.isInteger(index) ? `Row ${index + 1}` : 'Manual';
+      selectors.explanationSelection.className = Number.isInteger(index) ? 'badge good' : 'badge warn';
+      renderDatalogResults();
+    };
+
+    const resetExplanationPanel = (keepQuery = false) => {
+      state.selectedDatalogResult = null;
+      state.selectedDatalogIndex = null;
+      selectors.explanationSelection.textContent = 'Awaiting selection';
+      selectors.explanationSelection.className = 'badge warn';
+      selectors.explanationResultPayload.value = '';
+      selectors.explanationRowIndex.value = '';
+      selectors.explanationOutput.textContent = 'No explanation yet.';
+      selectors.explanationMeta.textContent = 'No explanation requested yet.';
+      if (!keepQuery) {
+        selectors.explanationQuery.value = '';
+      }
+      renderStatus(selectors.explanationStatus, 'Select a Datalog result or paste a payload to request an explanation.', 'warn');
+      renderDatalogResults();
+    };
+
+    const renderDatalogResults = () => {
+      selectors.datalogResultsTable.innerHTML = '';
+      const rows = state.datalogResults;
+      selectors.datalogResultsCount.textContent = `${rows.length} row${rows.length === 1 ? '' : 's'}`;
+
+      if (!rows.length) {
+        const row = document.createElement('tr');
+        row.innerHTML = '<td colspan="3" style="text-align:center;color:var(--subtle)">Run a Datalog query to populate derived rows.</td>';
+        selectors.datalogResultsTable.appendChild(row);
+        return;
+      }
+
+      rows.forEach((item, index) => {
+        const row = document.createElement('tr');
+        if (state.selectedDatalogIndex === index) {
+          row.classList.add('is-selected');
+        }
+        row.innerHTML = `
+          <td><span class="badge">${index + 1}</span></td>
+          <td>
+            <strong>${escapeHtml(truncate(summarizeValue(item), 120) || 'result')}</strong>
+            <span class="table-summary mono">${escapeHtml(truncate(safeJson(item) || '', 260))}</span>
+          </td>
+          <td>
+            <div class="row-actions">
+              <button class="action" type="button" data-row-select="${index}">Select</button>
+              <button class="action" type="button" data-row-explain="${index}">Explain</button>
+            </div>
+          </td>
+        `;
+
+        row.querySelector('[data-row-select]').addEventListener('click', () => {
+          setExplanationSelection(item, index);
+          renderStatus(selectors.explanationStatus, `Row ${index + 1} bound for explanation.`, 'ok');
+        });
+        row.querySelector('[data-row-explain]').addEventListener('click', async () => {
+          setExplanationSelection(item, index);
+          await queryExplanation();
+        });
+        selectors.datalogResultsTable.appendChild(row);
+      });
+    };
+
+    const renderAliases = () => {
+      selectors.aliasesTable.innerHTML = '';
+      selectors.aliasesCount.textContent = `${state.aliases.length} row${state.aliases.length === 1 ? '' : 's'}`;
+
+      if (!state.aliases.length) {
+        selectors.aliasesEmptyNote.style.display = 'block';
+        const row = document.createElement('tr');
+        row.innerHTML = '<td colspan="6" style="text-align:center;color:var(--subtle)">No aliases found.</td>';
+        selectors.aliasesTable.appendChild(row);
+        return;
+      }
+
+      selectors.aliasesEmptyNote.style.display = 'none';
+      state.aliases.forEach((entry) => {
+        const aliasName = entry.alias_name || entry.alias || entry.name || '—';
+        const canonicalTool = entry.canonical_tool || entry.canonical_name || entry.canonical || '—';
+        const scopeKind = entry.scope_kind || entry.scope || 'global';
+        const scopeRef = entry.scope_ref || entry.workspace_scope || entry.session_scope || '—';
+        const status = entry.status || entry.state || 'proposed';
+        const updated = entry.updated_at || entry.updated || entry.created_at || '';
+
+        const row = document.createElement('tr');
+        row.innerHTML = `
+          <td><strong>${escapeHtml(aliasName)}</strong></td>
+          <td class="mono">${escapeHtml(canonicalTool)}</td>
+          <td>${escapeHtml(scopeKind)}</td>
+          <td class="mono">${escapeHtml(scopeRef)}</td>
+          <td>${escapeHtml(status)}</td>
+          <td>${escapeHtml(updated ? formatTime(updated) : 'n/a')}</td>
+        `;
+        selectors.aliasesTable.appendChild(row);
+      });
+    };
+
+    const renderApprovals = () => {
+      selectors.approvalsTable.innerHTML = '';
+      const filterValue = selectors.approvalsFilter.value || 'all';
+      const rows = state.approvals.filter((approval) => filterValue === 'all' || approval.state === filterValue);
+
+      if (!rows.length) {
+        selectors.approvalsEmptyNote.style.display = 'block';
+        const row = document.createElement('tr');
+        row.innerHTML = '<td colspan="7" style="text-align:center;color:var(--subtle)">No approvals found.</td>';
+        selectors.approvalsTable.appendChild(row);
+        selectors.homeApprovals.textContent = 'Pending approvals: 0';
+        return;
+      }
+
+      selectors.approvalsEmptyNote.style.display = 'none';
+      const pendingCount = state.approvals.filter((a) => (a.state || 'pending') === 'pending').length;
+      selectors.homeApprovals.textContent = `Pending approvals: ${pendingCount}`;
+
+      for (const item of rows) {
+        const row = document.createElement('tr');
+        const stateClass =
+          item.state === 'approved' ? 'good' : item.state === 'rejected' ? 'bad' : 'warn';
+
+        row.innerHTML = `
+          <td>${escapeHtml(item.id || item.request_id || '—')}</td>
+          <td>${escapeHtml(item.requester || item.actor || 'system')}</td>
+          <td>${escapeHtml(item.kind || item.type || 'general')}</td>
+          <td>${escapeHtml(item.target || '')}</td>
+          <td><span class="badge ${stateClass}">${escapeHtml(item.state || 'pending')}</span></td>
+          <td>${escapeHtml(item.explanation || 'No explanation attached')}</td>
+          <td>
+            <div class="row-actions">
+              <button class="action" data-approve="${escapeAttr(item.id || item.request_id || '')}" type="button">Approve</button>
+              <button class="action warn" data-reject="${escapeAttr(item.id || item.request_id || '')}" type="button">Reject</button>
+            </div>
+          </td>
+        `;
+
+        const [approveBtn, rejectBtn] = row.querySelectorAll('button');
+        approveBtn.addEventListener('click', () => handleApproval(item.id || item.request_id, 'approved'));
+        rejectBtn.addEventListener('click', () => handleApproval(item.id || item.request_id, 'rejected'));
+        selectors.approvalsTable.appendChild(row);
+      }
+    };
+
+    const loadAliases = async (aliasName = selectors.aliasSearchName.value.trim()) => {
+      try {
+        renderStatus(
+          selectors.aliasSearchStatus,
+          aliasName ? `Searching aliases for "${aliasName}"…` : 'Loading aliases…',
+          'warn'
+        );
+        const suffix = aliasName ? `?alias_name=${encodeURIComponent(aliasName)}` : '';
+        const payload = await request(`/aliases${suffix}`, { method: 'GET' });
+        state.aliases = extractArray(payload, ['aliases', 'items', 'rows', 'results']);
+        renderAliases();
+        renderStatus(
+          selectors.aliasSearchStatus,
+          state.aliases.length ? `Loaded ${state.aliases.length} alias row${state.aliases.length === 1 ? '' : 's'}.` : 'No aliases matched the current filter.',
+          'ok'
+        );
+      } catch (error) {
+        selectors.aliasesEmptyNote.style.display = 'block';
+        selectors.aliasesTable.innerHTML = `<tr><td colspan="6" class="status err">${escapeHtml(error.message)}</td></tr>`;
+        selectors.aliasesCount.textContent = '0 rows';
+        renderStatus(selectors.aliasSearchStatus, error.message || 'Failed to load aliases.', 'err');
+      }
+    };
+
+    const loadRules = async () => {
+      const requestedSource = selectors.rulesSourceFilter.value || 'effective';
+      const family = selectors.rulesFamilyFilter.value.trim();
+      state.ruleFilters.requestedSource = requestedSource;
+      state.ruleFilters.endpointSource = requestedSource;
+      state.ruleFilters.family = family;
+      try {
+        renderStatus(
+          selectors.rulesFilterStatus,
+          `Loading ${requestedSource} rules${family ? ` for ${family}` : ''}…`,
+          'warn'
+        );
+        const params = new URLSearchParams({ source: requestedSource });
+        if (family) {
+          params.set('family', family);
+        }
+        const payload = await request(`/rules?${params.toString()}`, { method: 'GET' });
+        state.rules = Array.isArray(payload.rules) ? payload.rules : (Array.isArray(payload) ? payload : []);
+        renderRules();
+        renderStatus(
+          selectors.rulesFilterStatus,
+          state.rules.length
+            ? `Loaded ${state.rules.length} ${requestedSource} rule row${state.rules.length === 1 ? '' : 's'}.`
+            : `No ${requestedSource} rules matched the current filter.`,
+          'ok'
+        );
+      } catch (error) {
+        selectors.rulesEmptyNote.style.display = 'block';
+        selectors.rulesTable.innerHTML = `<tr><td colspan="7" class="status err">${escapeHtml(error.message)}</td></tr>`;
+        selectors.rulesCountBadge.textContent = '0 rows';
+        selectors.rulesTableMeta.textContent = 'error';
+        renderStatus(selectors.rulesFilterStatus, error.message || 'Failed to load rules.', 'err');
+      }
+    };
+
+    const loadApprovals = async () => {
+      try {
+        const payload = await request('/approvals', { method: 'GET' });
+        state.approvals = Array.isArray(payload.approvals)
+          ? payload.approvals
+          : (Array.isArray(payload) ? payload : []);
+        renderApprovals();
+      } catch (error) {
+        selectors.approvalsEmptyNote.style.display = 'block';
+        selectors.approvalsTable.innerHTML = `<tr><td colspan="7" class="status err">${escapeHtml(error.message)}</td></tr>`;
+      }
+    };
+
+    const loadHomeSummary = async () => {
+      try {
+        const summary = await request('/summary', { method: 'GET' });
+        selectors.kpis.nodes.textContent = String(summary.node_count ?? '0');
+        selectors.kpis.edges.textContent = String(summary.edge_count ?? '0');
+        selectors.kpis.derivedFacts.textContent = String(summary.derived_fact_count ?? '0');
+        selectors.kpis.rules.textContent = String(summary.rule_count ?? state.rules.length);
+        selectors.homeApprovals.textContent = `Pending approvals: ${summary.pending_approvals ?? 0}`;
+        selectors.homeQueryRate.textContent = `Interactive queries: ${summary.query_rate_1m ?? state.queryCount}`;
+        selectors.homeStatus.textContent = summary.status || 'ready';
+      } catch (error) {
+        selectors.homeStatus.textContent = 'offline';
+        selectors.homeStatus.className = 'badge bad';
+      }
+    };
+
+    const runCql = async (event) => {
+      event.preventDefault();
+      const query = selectors.cqlQuery.value.trim();
+      if (!query) {
+        renderStatus(selectors.cqlStatus, 'CQL query is required.', 'warn');
+        return;
+      }
+
+      try {
+        renderStatus(selectors.cqlStatus, 'Submitting CQL to /workbench/api/cql/query…', 'warn');
+        const payload = await request('/cql/query', {
+          method: 'POST',
+          body: JSON.stringify({
+            query,
+            limit: Number(selectors.cqlLimit.value || 200),
+          }),
+        });
+        state.lastCqlPayload = payload;
+        selectors.cqlOutput.textContent = safeJson(payload);
+        const rowCount = toFiniteInt(payload.count, extractArray(payload, ['rows']).length);
+        selectors.cqlResultMeta.textContent = formatQueryMeta(rowCount, payload.table, payload.latency_ms);
+        renderStatus(
+          selectors.cqlStatus,
+          `CQL passthrough completed with ${rowCount} row${rowCount === 1 ? '' : 's'}.`,
+          'ok'
+        );
+        selectors.homeQueryRate.textContent = `Interactive queries: ${++state.queryCount}`;
+      } catch (error) {
+        selectors.cqlOutput.textContent = safeJson({ error: error.message });
+        selectors.cqlResultMeta.textContent = 'error';
+        renderStatus(selectors.cqlStatus, error.message || 'CQL passthrough failed.', 'err');
+      }
+    };
+
+    const runSparql = async (event) => {
+      event.preventDefault();
+      const query = selectors.sparqlQuery.value.trim();
+      if (!query) {
+        renderStatus(selectors.sparqlStatus, 'SPARQL query is required.', 'warn');
+        return;
+      }
+
+      try {
+        renderStatus(selectors.sparqlStatus, 'Submitting SPARQL to /workbench/api/sparql/query…', 'warn');
+        const payload = await request('/sparql/query', {
+          method: 'POST',
+          body: JSON.stringify({
+            query,
+            limit: Number(selectors.sparqlLimit.value || 200),
+          }),
+        });
+        state.lastSparqlPayload = payload;
+        selectors.sparqlOutput.textContent = safeJson(payload);
+        const rowCount = toFiniteInt(payload.count, extractArray(payload, ['rows']).length);
+        selectors.sparqlResultMeta.textContent = formatQueryMeta(rowCount, payload.table, payload.latency_ms);
+        renderStatus(
+          selectors.sparqlStatus,
+          `SPARQL passthrough completed with ${rowCount} row${rowCount === 1 ? '' : 's'}.`,
+          'ok'
+        );
+        selectors.homeQueryRate.textContent = `Interactive queries: ${++state.queryCount}`;
+      } catch (error) {
+        selectors.sparqlOutput.textContent = safeJson({ error: error.message });
+        selectors.sparqlResultMeta.textContent = 'error';
+        renderStatus(selectors.sparqlStatus, error.message || 'SPARQL passthrough failed.', 'err');
+      }
+    };
+
+    const runDatalog = async (event) => {
+      event.preventDefault();
+      const query = selectors.datalogPredicate.value.trim();
+      if (!query) {
+        renderStatus(selectors.datalogStatus, 'Datalog predicate is required.', 'warn');
+        return;
+      }
+
+      try {
+        renderStatus(selectors.datalogStatus, 'Evaluating Datalog predicate locally…', 'warn');
+        const payload = await request('/datalog/query', {
+          method: 'POST',
+          body: JSON.stringify({
+            predicate: query,
+            session_id: activeSessionId() || undefined,
+          }),
+        });
+        state.lastDatalogPayload = payload;
+        state.lastDatalogQuery = query;
+        state.datalogResults = extractArray(payload, ['results', 'rows', 'bindings', 'answers', 'tuples', 'items']);
+        selectors.datalogOutput.textContent = safeJson(payload);
+        selectors.datalogResultMeta.textContent = formatQueryMeta(
+          state.datalogResults.length,
+          'datalog',
+          payload.latency_ms
+        );
+        selectors.explanationQuery.value = query;
+        if (state.datalogResults.length) {
+          setExplanationSelection(state.datalogResults[0], 0);
+          renderStatus(
+            selectors.explanationStatus,
+            `Loaded ${state.datalogResults.length} Datalog row${state.datalogResults.length === 1 ? '' : 's'} for drilldown.`,
+            'ok'
+          );
+        } else {
+          resetExplanationPanel(true);
+        }
+        renderStatus(
+          selectors.datalogStatus,
+          `Datalog completed locally. ${state.datalogResults.length} row${state.datalogResults.length === 1 ? '' : 's'} available for explanation.`,
+          'ok'
+        );
+        selectors.homeQueryRate.textContent = `Interactive queries: ${++state.queryCount}`;
+      } catch (error) {
+        state.lastDatalogPayload = null;
+        state.lastDatalogQuery = query;
+        state.datalogResults = [];
+        selectors.datalogOutput.textContent = safeJson({ error: error.message });
+        selectors.datalogResultMeta.textContent = 'error';
+        resetExplanationPanel(true);
+        renderStatus(selectors.datalogStatus, error.message || 'Local Datalog failed.', 'err');
+      }
+    };
+
+    const submitAlias = async (event) => {
+      event.preventDefault();
+      try {
+        renderStatus(selectors.aliasFormStatus, 'Submitting alias…', 'warn');
+        const scopeKind = selectors.aliasScopeKind.value || 'global';
+        const scopeRef = selectors.aliasScopeRef.value.trim();
+        await request('/aliases', {
+          method: 'POST',
+          body: JSON.stringify({
+            alias_name: selectors.aliasCreateName.value.trim(),
+            canonical_tool: selectors.aliasCanonicalTool.value.trim(),
+            scope_kind: scopeKind,
+            status: selectors.aliasStatus.value || 'proposed',
+            scope_ref: scopeRef || undefined,
+            workspace_scope: scopeKind === 'workspace' ? (scopeRef || undefined) : undefined,
+            session_scope: scopeKind === 'session' ? (scopeRef || state.sessionId || undefined) : undefined,
+          }),
+        });
+        selectors.aliasCreateName.value = '';
+        selectors.aliasCanonicalTool.value = '';
+        selectors.aliasScopeKind.value = 'global';
+        selectors.aliasStatus.value = 'proposed';
+        selectors.aliasScopeRef.value = '';
+        renderStatus(selectors.aliasFormStatus, 'Alias submitted.', 'ok');
+        await loadAliases(selectors.aliasSearchName.value.trim());
+      } catch (error) {
+        renderStatus(selectors.aliasFormStatus, error.message || 'Failed to submit alias.', 'err');
+      }
+    };
+
+    const queryExplanation = async (event) => {
+      if (event) {
+        event.preventDefault();
+      }
+
+      const query = selectors.explanationQuery.value.trim() || state.lastDatalogQuery;
+      const resultPayloadText = selectors.explanationResultPayload.value.trim();
+      let resultPayload = state.selectedDatalogResult;
+
+      if (resultPayloadText) {
+        try {
+          resultPayload = JSON.parse(resultPayloadText);
+        } catch (error) {
+          renderStatus(selectors.explanationStatus, 'Result payload must be valid JSON.', 'err');
+          return;
+        }
+      }
+
+      if (!query) {
+        renderStatus(selectors.explanationStatus, 'Explanation query requires a Datalog query.', 'warn');
+        return;
+      }
+
+      try {
+        renderStatus(selectors.explanationStatus, 'Requesting explanation from /workbench/api/explanations/query…', 'warn');
+        const selectedSrcId = resultPayload && typeof resultPayload === 'object'
+          ? (resultPayload.src_id || resultPayload.src || resultPayload.source_id)
+          : undefined;
+        const selectedDstId = resultPayload && typeof resultPayload === 'object'
+          ? (resultPayload.dst_id || resultPayload.dst || resultPayload.target_id)
+          : undefined;
+        const payload = await request('/explanations/query', {
+          method: 'POST',
+          body: JSON.stringify({
+            predicate: query,
+            session_id: activeSessionId() || undefined,
+            src_id: selectedSrcId || undefined,
+            dst_id: selectedDstId || undefined,
+            limit: Number(selectors.explanationLimit.value || 16),
+          }),
+        });
+        selectors.explanationOutput.textContent = safeJson(payload);
+        const supportChain = Array.isArray(payload.support_chain) ? payload.support_chain.length : 0;
+        selectors.explanationMeta.textContent = Number.isInteger(state.selectedDatalogIndex)
+          ? `Explanation response for Datalog row ${state.selectedDatalogIndex + 1}.`
+          : 'Explanation response for manual payload.';
+        if (supportChain > 0) {
+          selectors.explanationMeta.textContent = `${selectors.explanationMeta.textContent} ${supportChain} support link${supportChain === 1 ? '' : 's'} returned.`;
+        }
+        renderStatus(selectors.explanationStatus, 'Explanation request complete.', 'ok');
+      } catch (error) {
+        selectors.explanationOutput.textContent = safeJson({ error: error.message });
+        selectors.explanationMeta.textContent = 'Explanation request failed.';
+        renderStatus(selectors.explanationStatus, error.message || 'Explanation query failed.', 'err');
+      }
+    };
+
+    const submitRule = async (event) => {
+      event.preventDefault();
+      try {
+        renderStatus(selectors.ruleFormStatus, 'Submitting rule…', 'warn');
+        const family = selectors.ruleFamily.value.trim();
+        const predicate = selectors.rulePredicate.value.trim();
+        const condition = selectors.ruleCondition.value.trim();
+        const ruleBody = selectors.ruleBody.value.trim();
+        await request('/rules', {
+          method: 'POST',
+          body: JSON.stringify({
+            name: selectors.ruleName.value.trim(),
+            family,
+            predicate: predicate || undefined,
+            condition,
+            rule_body: ruleBody || undefined,
+            rule_weight: Number(selectors.ruleWeight.value || 1.0),
+          }),
+        });
+        selectors.ruleName.value = '';
+        selectors.ruleFamily.value = '';
+        selectors.rulePredicate.value = '';
+        selectors.ruleCondition.value = '';
+        selectors.ruleBody.value = '';
+        selectors.ruleWeight.value = '1.0';
+        renderStatus(selectors.ruleFormStatus, 'Rule submitted.', 'ok');
+        await loadRules();
+      } catch (error) {
+        renderStatus(selectors.ruleFormStatus, error.message || 'Failed to submit rule.', 'err');
+      }
+    };
+
+    const reviewRule = async (ruleId, action) => {
+      if (!ruleId) return;
+      const label = action === 'approve' ? 'Approving' : 'Rejecting';
+      const outcome = action === 'approve' ? 'approved' : 'rejected';
+      try {
+        renderStatus(selectors.rulesFilterStatus, `${label} ${ruleId}…`, 'warn');
+        await request('/rules', {
+          method: 'POST',
+          body: JSON.stringify({
+            action,
+            rule_id: ruleId,
+            review_note: `Workbench ${outcome} ${ruleId}.`,
+          }),
+        });
+        renderStatus(selectors.rulesFilterStatus, `${ruleId} ${outcome}.`, 'ok');
+        await Promise.all([loadRules(), loadApprovals()]);
+      } catch (error) {
+        renderStatus(selectors.rulesFilterStatus, error.message || `Failed to ${action} ${ruleId}.`, 'err');
+      }
+    };
+
+    const deprecateRule = async (ruleId, family = '') => {
+      if (!ruleId) return;
+      try {
+        renderStatus(selectors.rulesFilterStatus, `Deprecating ${ruleId}…`, 'warn');
+        await request('/rules', {
+          method: 'POST',
+          body: JSON.stringify({
+            action: 'deprecate',
+            rule_id: ruleId,
+          }),
+        });
+        if (family && !selectors.rulesFamilyFilter.value.trim()) {
+          selectors.rulesFamilyFilter.value = family;
+        }
+        renderStatus(selectors.rulesFilterStatus, `${ruleId} deprecated.`, 'ok');
+        await loadRules();
+      } catch (error) {
+        renderStatus(selectors.rulesFilterStatus, error.message || `Failed to deprecate ${ruleId}.`, 'err');
+      }
+    };
+
+    const handleApproval = async (id, decision) => {
+      if (!id) return;
+      try {
+        const encodedId = encodeURIComponent(id);
+        const endpoint = decision === 'approved'
+          ? `/approvals/${encodedId}/approve`
+          : `/approvals/${encodedId}/reject`;
+        await request(endpoint, {
+          method: 'POST',
+          body: JSON.stringify({ decision }),
+        });
+        await loadApprovals();
+      } catch (error) {
+        selectors.homeStatus.textContent = `Approval failed: ${error.message}`;
+        selectors.homeStatus.className = 'badge bad';
+      }
+    };
+
+    const escapeHtml = (value) => {
+      return String(value)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
+    };
+
+    const escapeAttr = (value) => String(value).replaceAll('"', '&quot;');
+
+    selectors.cqlForm.addEventListener('submit', runCql);
+    selectors.sparqlForm.addEventListener('submit', runSparql);
+    selectors.datalogForm.addEventListener('submit', runDatalog);
+    selectors.explanationForm.addEventListener('submit', queryExplanation);
+    selectors.aliasSearchForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      await loadAliases(selectors.aliasSearchName.value.trim());
+    });
+    selectors.aliasCreateForm.addEventListener('submit', submitAlias);
+    selectors.ruleForm.addEventListener('submit', submitRule);
+    selectors.rulesFilterForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      await loadRules();
+    });
+    selectors.rulesClearFilters.addEventListener('click', async () => {
+      selectors.rulesSourceFilter.value = 'effective';
+      selectors.rulesFamilyFilter.value = '';
+      await loadRules();
+    });
+    document.getElementById('cqlClear').addEventListener('click', () => {
+      selectors.cqlQuery.value = '';
+      resetQueryState(selectors.cqlStatus, selectors.cqlOutput, selectors.cqlResultMeta);
+    });
+    document.getElementById('sparqlClear').addEventListener('click', () => {
+      selectors.sparqlQuery.value = '';
+      resetQueryState(selectors.sparqlStatus, selectors.sparqlOutput, selectors.sparqlResultMeta);
+    });
+    document.getElementById('datalogClear').addEventListener('click', () => {
+      selectors.datalogPredicate.value = '';
+      resetQueryState(selectors.datalogStatus, selectors.datalogOutput, selectors.datalogResultMeta);
+      state.lastDatalogPayload = null;
+      state.lastDatalogQuery = '';
+      state.datalogResults = [];
+      renderDatalogResults();
+      resetExplanationPanel(false);
+    });
+    selectors.explanationUseCurrent.addEventListener('click', () => {
+      selectors.explanationQuery.value = state.lastDatalogQuery || selectors.datalogPredicate.value.trim();
+      if (state.selectedDatalogResult) {
+        selectors.explanationResultPayload.value = safeJson(state.selectedDatalogResult);
+      }
+      renderStatus(selectors.explanationStatus, 'Drilldown synced with current Datalog context.', 'ok');
+    });
+    selectors.explanationClear.addEventListener('click', () => resetExplanationPanel(true));
+    selectors.datalogUseActiveSession.addEventListener('click', () => {
+      selectors.datalogSessionId.value = state.sessionId || '';
+      renderStatus(
+        selectors.datalogStatus,
+        state.sessionId ? 'Bound Datalog scope to active session.' : 'No active session is stored.',
+        state.sessionId ? 'ok' : 'warn'
+      );
+    });
+    selectors.aliasSearchClear.addEventListener('click', async () => {
+      selectors.aliasSearchName.value = '';
+      await loadAliases('');
+    });
+    selectors.aliasesRefresh.addEventListener('click', async () => {
+      await loadAliases(selectors.aliasSearchName.value.trim());
+    });
+    selectors.rulesRefresh.addEventListener('click', loadRules);
+    selectors.approvalsRefresh.addEventListener('click', loadApprovals);
+    selectors.approvalsFilter.addEventListener('change', renderApprovals);
+    selectors.approvalClearFilter.addEventListener('click', () => {
+      selectors.approvalsFilter.value = 'all';
+      renderApprovals();
+    });
+    selectors.refreshBtn.addEventListener('click', async () => {
+      await refreshCurrent();
+    });
+
+    selectors.navLinks.forEach((link) => {
+      link.addEventListener('click', (event) => {
+        event.preventDefault();
+        switchSection(link.dataset.section);
+      });
+    });
+
+    document.querySelectorAll('[data-open]').forEach((button) => {
+      button.addEventListener('click', () => switchSection(button.dataset.open));
+    });
+
+    document.querySelectorAll('[data-template-target]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const target = selectors[button.dataset.templateTarget];
+        if (!target) return;
+        target.value = button.dataset.template || '';
+        target.focus();
+      });
+    });
+
+    const refreshCurrent = async () => {
+      await ensureAuthToken();
+      await loadHomeSummary();
+      if (state.currentSection === 'aliases') {
+        await loadAliases();
+      } else if (state.currentSection === 'rules') {
+        await loadRules();
+      } else if (state.currentSection === 'approvals') {
+        await loadApprovals();
+      }
+    };
+
+    const boot = async () => {
+      configureShellLinks();
+      const startSection = (location.hash || '#home').replace('#', '');
+      switchSection(sections.includes(startSection) ? startSection : 'home');
+      selectors.datalogSessionId.value = state.sessionId;
+      await ensureAuthToken();
+      await loadHomeSummary();
+      await loadAliases();
+      await loadRules();
+      await loadApprovals();
+    };
+
+    window.addEventListener('hashchange', () => {
+      const hash = location.hash.replace('#', '');
+      if (hash && sections.includes(hash)) {
+        switchSection(hash);
+      }
+    });
+
+    window.addEventListener('keydown', (event) => {
+      if (event.key === '/') {
+        event.preventDefault();
+        if (state.currentSection === 'cql') {
+          selectors.cqlQuery.focus();
+        } else {
+          selectors.cqlQuery.focus();
+          switchSection('cql');
+        }
+      }
+    });
+
+    boot().catch(() => {
+      selectors.homeStatus.textContent = 'boot issue';
+      selectors.homeStatus.className = 'badge warn';
+    });
+  </script>
+</body>
+</html>

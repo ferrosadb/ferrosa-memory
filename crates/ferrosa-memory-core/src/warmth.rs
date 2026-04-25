@@ -362,8 +362,7 @@ mod tests {
         let neighbor = Uuid::new_v4();
 
         // Create an edge: eid --co_occurs_with--> neighbor
-        storage
-            .edge_co_occurs(&ctx, eid, neighbor, sid, 1.0)
+        crate::graph_write::reinforce_co_occurs_edge(&storage, &ctx, eid, neighbor, sid, 1.0)
             .await
             .unwrap();
 

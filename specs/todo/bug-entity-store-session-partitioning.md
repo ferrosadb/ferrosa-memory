@@ -1,13 +1,10 @@
 ---
 type: bug
 priority: P0
-reported-by: human
-implemented-by: ""
-verified-by: ""
+status: draft
 created: 2026-04-05
-updated: 2026-04-05
-source: manual
-source-location: "tools/forge/specs/bug-ingest-dangling-edge-references.md"
+updated: 2026-04-20
+reported-by: human
 ---
 
 # Entity store loses entities from prior ingests

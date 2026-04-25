@@ -8,8 +8,15 @@ use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
 use std::sync::Arc;
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live Ferrosa cluster; run with --ignored and FERROSA_TEST_CONTAINERS=1"]
 async fn prepare_each_statement() {
+    if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
+        panic!(
+            "set FERROSA_TEST_CONTAINERS=1 and run `podman compose up -d` in \
+             the ferrosa-memory repo root — this test needs a live Ferrosa \
+             cluster on port 19042"
+        );
+    }
     let node_config = NodeTcpConfigBuilder::new()
         .with_contact_point("127.0.0.1:19042".into())
         .with_authenticator_provider(Arc::new(NoneAuthenticatorProvider))

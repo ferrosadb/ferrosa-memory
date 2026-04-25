@@ -126,6 +126,7 @@ pub async fn explore(
             None,
             None,
             &fusion_config,
+            None,
         )
         .await?;
 
@@ -144,7 +145,7 @@ pub async fn explore(
 
         // Load session facts and evaluate Datalog rules
         let facts = datalog::load_session_facts(storage, ctx, session_id).await?;
-        let rules = datalog::builtin_rules();
+        let rules = datalog::load_effective_rules(storage, ctx, None).await?;
         let (all_facts, derived) = datalog::evaluate(
             &rules,
             &facts,
@@ -363,6 +364,7 @@ mod tests {
                     confidence: 0.9,
                     state: MemoryState::Active,
                     created_at: chrono::Utc::now(),
+                    ..Default::default()
                 },
             )
             .await

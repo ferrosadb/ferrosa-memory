@@ -1,0 +1,20 @@
+{
+  "generated_at": "2026-04-19T00:00:00Z",
+  "status": "placeholder",
+  "notes": "Initial blueprint harness baseline. Replace with measured values after first live harness run.",
+  "memory_idle_mb": 256,
+  "memory_loaded_mb": 512,
+  "latency_p50_ms": 100,
+  "latency_p99_ms": 1000,
+  "throughput_max_rps": 25,
+  "disk_growth_mb_per_hour": 32,
+  "thresholds": {
+    "memory_idle_mb": 384,
+    "memory_loaded_mb": 666,
+    "latency_p50_ms": 120,
+    "latency_p99_ms": 1500,
+    "throughput_min_rps": 20,
+    "disk_growth_mb_per_hour": 64
+  }
+}
+

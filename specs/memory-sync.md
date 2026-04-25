@@ -2,9 +2,11 @@
 
 ## Overview
 
-`memory-sync` is a CLI binary that replicates the memory contents of one Ferrosa CQL cluster
+`memory-sync` is a CLI binary that replicates the memory contents of one Ferrosa environment
 into another. Primary use case: pull memories from a remote server (e.g., a production node) into
-a local development cluster, or migrate between environments.
+a local development environment, or migrate between environments.
+
+This document describes the current admin-path implementation, which still uses direct CQL storage bindings. Per ADR-005, the desired runtime architecture for `ferrosa-memory` is public-API-only; this sync tool should eventually move to Ferrosa public interfaces as well.
 
 ## Usage
 
@@ -50,10 +52,10 @@ a known limitation — edge timestamps are used only for pruning, not for memory
 ## Data Flow
 
 ```
-Source Ferrosa cluster                         Destination Ferrosa cluster
+Source Ferrosa environment                     Destination Ferrosa environment
   192.168.202.88:19042                           localhost:19042
         │                                               │
-   CqlStorage (src)                             CqlStorage (dst)
+   current CqlStorage (src)                     current CqlStorage (dst)
         │                                               │
         └──── fold_list_all ──────────────────────────► fold_put / fold_complete
         └──── entity_list_all ────────────────────────► entity_put

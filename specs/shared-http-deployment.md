@@ -1,41 +1,35 @@
-# Shared HTTP Deployment Blueprint
+# Shared HTTP Deployment Rollout
 
-> Last updated: 2026-04-10
-> Status: Blueprint update for shared-service deployment of `ferrosa-memory-mcp`
+> Last updated: 2026-04-19
+> Status: Rollout docs aligned to the current shared-service behavior of `ferrosa-memory-mcp`, with the graph-boundary and query-passthrough correction called out explicitly
 
 ## Goal
 
-Define a production-oriented deployment model for exposing `ferrosa-memory-mcp` over HTTP to multiple users while keeping stdio available for local development and fallback.
+Define a production-oriented deployment model for exposing `ferrosa-memory-mcp` over HTTP to multiple users while keeping stdio available for local development and fallback. The serving path should treat `ferrosa-memory` as a role-scoped client to Ferrosa rather than as an embedded table-level storage service.
 
-## Current Gaps
+## Current Code Reality
 
-The current codebase is close to a deployable HTTP service, but the deployment boundary is not yet production-safe:
+The shared HTTP boundary is now implemented with explicit startup validation and principal-scoped tenant routing:
 
-- `crates/ferrosa-memory-mcp/src/main.rs` currently accepts any HTTP username/password pair and maps it to the configured tenant.
-- The viz server runs on a separate listener with a stdio-style tenant context rather than per-request authentication.
-- `/health` reports process liveness only; there is no readiness signal for CQL connectivity or auth backend availability.
-- TLS support exists, but secret sourcing and operational guidance are not defined.
-- Multi-tenant behavior is implicit rather than documented as a strict policy.
+- `validate_shared_http_config()` fails startup unless HTTP mode has TLS enabled, `cert_path`, `key_path`, and `auth_file` configured, and `server.tenant_id` omitted.
+- HTTP authentication is file-backed Basic auth. `examples/http-auth.toml` maps one principal to one tenant, and the current on-disk password format is lowercase SHA-256 hex.
+- `POST /mcp`, `GET /healthz/live`, `GET /healthz/ready`, and `GET /metrics` are served from the shared listener.
+- Readiness is distinct from liveness. `/healthz/live` reports that the process is up; `/healthz/ready` reports role-aware Ferrosa client health for MCP serving (auth + app-table CQL + public query endpoints required by enabled features).
+- Viz remains a separate surface. In HTTP mode it is unauthenticated, binds loopback only, and requires an explicit `[viz].tenant_id` if enabled.
+- The auth file can be reloaded with `SIGHUP` without restarting the process.
 
-## Deployment Decision
+The remaining rollout work is no longer operator query plumbing. CQL/SPARQL passthrough is now in place; the remaining correction is graph-table write cutover plus readiness/read-only gating under least-privilege `app_reader`.
 
-### Decision 1: Real auth for shared HTTP
+## Boundary Rule
 
-Adopt per-principal HTTP authentication with explicit tenant mapping.
+- Shared HTTP is an authenticated client boundary over Ferrosa at the supported abstraction level.
+- Workbench CQL and SPARQL query surfaces should be authenticated passthroughs to Ferrosa public interfaces. Datalog remains a ferrosa-memory-owned query layer over Ferrosa-backed graph/app data.
+- Direct CQL in the service is compatible with this deployment as long as it stays within app-table permissions; graph-table writes must not be required by the shared service.
+- If a Ferrosa public API does not satisfy the required contract, `ferrosa-memory` should surface the failure clearly rather than emulate or patch around it locally.
 
-Baseline design:
+## Deployment Rules
 
-- HTTP clients authenticate with Basic auth over TLS.
-- Credentials are validated against a mounted auth file or env-configured secret source.
-- Passwords are stored as hashes (`argon2id` preferred, `bcrypt` acceptable).
-- Each principal maps to exactly one `tenant_id`.
-- The service never derives `tenant_id` from request payloads, query strings, or default config in shared HTTP mode.
-
-### Decision 2: Multi-tenant policy is principal-scoped
-
-Shared HTTP mode is multi-tenant by credential principal, not by client-supplied `tenant_id`.
-
-Rules:
+### Rule 1: Shared HTTP is principal-scoped multi-tenant
 
 - One authenticated principal maps to one tenant.
 - All reads and writes remain scoped by the authenticated tenant context.
@@ -43,41 +37,32 @@ Rules:
 - Default/random tenant generation is allowed only in local stdio mode.
 - Shared HTTP mode must fail startup if no auth mapping source is configured.
 
-### Decision 3: Viz is not part of the public shared endpoint
+### Rule 2: Shared HTTP startup is fail-closed
 
-Keep viz code in the repo and binary for now, but treat it as a separate operational surface.
+- `transport = "http"` requires `require_tls = true`.
+- `cert_path`, `key_path`, and `auth_file` must all be present before startup succeeds.
+- `server.tenant_id` must be absent in shared HTTP mode.
+- Startup validation happens before the listener binds.
 
-Short-term decision:
-
-- Shared MCP HTTP endpoint exposes only MCP, liveness, readiness, and metrics.
-- Viz is disabled by default in shared deployments.
-- If viz is enabled, it binds to a separate listener and requires the same auth boundary as MCP or internal-network-only exposure behind an operator-controlled proxy.
-
-### Decision 4: Health must distinguish liveness from readiness
-
-Expose separate probe semantics:
+### Rule 3: Health probes have different meanings
 
 - `/healthz/live` — process is running and request loop is responsive.
-- `/healthz/ready` — service is ready to serve MCP traffic.
+- `/healthz/ready` — Ferrosa data-plane readiness. It should reflect auth, app-table CQL, and required public endpoints for the enabled features, and must not require graph-table `MODIFY`.
+- TLS material and the auth file are startup prerequisites, not dynamic readiness inputs. If they are missing or unreadable at startup, the service does not start.
 
-Readiness should require:
+### Rule 4: Viz stays operator-only in HTTP deployments
 
-- CQL connection established.
-- Auth backend loaded successfully.
-- Config validation complete.
-- If TLS is required, certificate and key loaded successfully.
+- The public shared listener exposes MCP, probes, and metrics only.
+- `viz.enabled = false` remains the default shared-service posture.
+- If viz is enabled under HTTP mode, it binds `127.0.0.1` and requires `[viz].tenant_id`.
+- Treat viz as a local/operator surface or keep it behind an operator-managed proxy. It is not covered by the per-request Basic-auth boundary.
 
-Optional dependencies such as graph or enrichment endpoints should degrade readiness only if configured as required.
+### Rule 5: Secret handling remains file-first
 
-### Decision 5: Secret handling is file-first
-
-Do not embed production secrets in `docker-compose.yml`, example configs, or committed env files.
-
-Production secret sources:
-
-- TLS cert/key mounted as files.
-- Auth user database mounted as a file.
-- Ferrosa credentials injected via environment or mounted config outside git.
+- Mount TLS cert/key as files.
+- Mount the auth principal database as a file.
+- Keep Ferrosa credentials in non-git config or environment injection.
+- Do not commit real credentials into repo examples or compose files.
 
 ## Recommended Runtime Modes
 
@@ -120,9 +105,10 @@ graph TB
         MT[Metrics]
     end
 
-    subgraph DB["Ferrosa DB"]
-        CQL[CQL]
-        GR[Graph HTTP]
+    subgraph API["Ferrosa public interfaces"]
+        CQL[CQL API]
+        SPQ[SPARQL API]
+        GR[Cypher / Graph API]
     end
 
     CC -->|stdio or HTTPS| LB
@@ -131,16 +117,26 @@ graph TB
     LB --> RP
     LB --> MCP
     MCP --> CQL
+    MCP --> SPQ
     MCP --> GR
+    MCP --> DAT
     OP -->|internal access| VZ
     OP -->|scrape| MT
 ```
 
-## Implementation Priorities
+## Rollout Artifacts
 
-1. Replace permissive HTTP validator with real principal validation and tenant mapping.
-2. Add startup validation for shared HTTP mode: auth source present, TLS configured, tenant fallback disabled.
-3. Split probes into liveness and readiness.
-4. Disable viz by default for shared HTTP and document safe operator-only exposure.
-5. Add production container wiring for TLS/auth secret mounts.
-6. Document client configs for Codex/Claude against the shared endpoint while preserving stdio fallback.
+These repo artifacts now carry the documented shared-HTTP posture:
+
+- `examples/ferrosa-memory-http.toml` — shared HTTP server config with TLS/auth requirements and viz disabled by default
+- `examples/http-auth.toml` — principal-to-tenant mapping file using the current SHA-256 digest format
+- `examples/codex-shared-http.toml` — copy-pasteable remote MCP client config pointing at `https://.../mcp`
+- `examples/claude-code-settings.json` — local stdio fallback client config
+- `README.md` — operator guidance, probe semantics, and client snippets
+
+## Remaining Operator Responsibilities
+
+1. Replace placeholder certificates, keys, contact points, and principal entries before rollout.
+2. Keep shared HTTP credentials and TLS materials mounted from outside git.
+3. Trust the server certificate on clients before using the HTTPS endpoint.
+4. Keep stdio config available as the fallback path for local development and debugging.

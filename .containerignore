@@ -1,0 +1,59 @@
+# Exclude large directories from the build context. The Containerfile
+# only needs `target-podman-linux/release/ferrosa-memory-mcp` (~17 MB).
+# Without this file, compose sends ~24 GB (the Rust target/ trees) over
+# the daemon socket every build.
+#
+# legacy docker-compose v1 (podman's compose delegates to it on macOS)
+# does not honour `**`/whitelist patterns reliably, so enumerate the
+# big dirs explicitly.
+
+# Rust build artifacts — THREE variants, all huge. Keep only the one
+# binary the Containerfile needs.
+target/
+target-*/deps/
+target-*/build/
+target-*/incremental/
+target-*/examples/
+target-*/debug/
+target-*/*/deps/
+target-*/*/build/
+target-*/*/incremental/
+target-*/*/examples/
+target-*/**/*.rmeta
+target-*/**/*.rlib
+target-*/**/*.d
+
+# The `target-podman/` dir is a legacy artifact — nothing in the
+# Containerfile references it.
+target-podman/
+
+# VCS + editor state
+.git/
+.github/
+.idea/
+.vscode/
+.DS_Store
+
+# Local data + runtime state (bind-mounted at runtime, not copied in)
+data/
+.runtime/tls.*
+.runtime/*.sock
+
+# Test fixtures + backups
+backups/
+**/fixtures/
+**/*.bak
+**/*.log
+
+# Node/python tooling
+node_modules/
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Documentation + specs don't go in the image
+docs/
+specs/
+superpowers/
+internal-marketing/
+*.md

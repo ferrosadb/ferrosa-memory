@@ -1,0 +1,46 @@
+.PHONY: test-unit test-contracts test-integration test-system test-property \
+	test-security test-load test-load-smoke test-duration test-baseline \
+	test-live test-all test-coverage-gap
+
+PYTHON ?= python3
+PIP ?= $(PYTHON) -m pip
+PYTEST ?= $(PYTHON) -m pytest
+
+test-unit:
+	cargo test --workspace --lib
+
+test-contracts:
+	cargo test --workspace --test shared_http_deployment_spec --test expert_system_rules_spec --test expert_system_governance_spec
+
+test-live:
+	./scripts/start-test-cluster.sh
+	cargo test --workspace -- --ignored
+
+test-integration:
+	$(PYTEST) tests/integration -v
+
+test-system:
+	$(PYTEST) tests/system -v
+
+test-property:
+	$(PYTEST) tests/property -v
+
+test-security:
+	$(PYTEST) tests/system/test_shared_http_workbench.py -v -k "t_s_007 or t_s_008"
+
+test-load-smoke:
+	locust -f tests/load/locustfile.py --headless --config tests/load/profiles/smoke.json
+
+test-load:
+	locust -f tests/load/locustfile.py --headless --config tests/load/profiles/load.json
+
+test-duration:
+	cd tests/duration && $(PYTHON) run_duration_test.py --config config.yaml
+
+test-baseline:
+	cd tests/duration && $(PYTHON) run_duration_test.py --baseline --config config.yaml
+
+test-all: test-unit test-contracts test-integration test-system test-property test-security
+
+test-coverage-gap:
+	$(PYTHON) scripts/coverage_gap.py specs/test-specification.md crates/ferrosa-memory-core/tests tests

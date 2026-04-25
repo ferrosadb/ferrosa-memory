@@ -13,6 +13,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::Mutex;
 
@@ -117,10 +118,14 @@ pub struct SessionState {
     pub last_activity: Arc<tokio::sync::Notify>,
     /// Set to true when a write tool succeeds; cleared by idle consolidation.
     pub dirty: Arc<AtomicBool>,
-    /// Base URL for the Ollama API (used for NER extraction).
+    /// Base URL for the Ollama API (used for embeddings and NER extraction).
     pub ollama_base_url: String,
     /// Model name for NER entity extraction via Ollama.
     pub ner_model: String,
+    /// Model name for text embedding via Ollama (default nomic-embed-text-v2-moe).
+    pub embed_model: String,
+    /// Expected embedding dimensions (default 768).
+    pub embed_dimensions: u32,
     /// Dynamic entity types loaded from the type registry table.
     pub entity_types: Vec<String>,
     /// Dynamic edge types loaded from the type registry table.
@@ -143,8 +148,10 @@ impl Default for SessionState {
             repo: std::sync::OnceLock::new(),
             last_activity: Arc::new(tokio::sync::Notify::new()),
             dirty: Arc::new(AtomicBool::new(false)),
-            ollama_base_url: "http://localhost:11434".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434".to_string(),
             ner_model: "qwen3.5:27b".to_string(),
+            embed_model: "nomic-embed-text-v2-moe".to_string(),
+            embed_dimensions: 768,
             entity_types: vec![
                 "person",
                 "place",
@@ -218,13 +225,13 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "depth": { "type": "integer", "minimum": 0, "maximum": 100 },
                     "subtask_id": { "type": "string", "maxLength": 256 },
                     "parent_subtask": { "type": "string", "maxLength": 256 },
                     "goal_text": { "type": "string", "maxLength": 4096 }
                 },
-                "required": ["session_id", "depth", "subtask_id", "goal_text"]
+                "required": ["depth", "subtask_id", "goal_text"]
             }),
         },
         ToolDef {
@@ -233,10 +240,10 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "max_depth": { "type": "integer", "minimum": 0, "maximum": 100 }
                 },
-                "required": ["session_id"]
+                "required": []
             }),
         },
         ToolDef {
@@ -245,13 +252,13 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "depth": { "type": "integer", "minimum": 0, "maximum": 100 },
                     "subtask_id": { "type": "string", "maxLength": 256 },
                     "status": { "type": "string", "enum": ["pending", "active", "complete", "failed"] },
                     "outcome_summary": { "type": "string", "maxLength": 4096 }
                 },
-                "required": ["session_id", "depth", "subtask_id", "status"]
+                "required": ["depth", "subtask_id", "status"]
             }),
         },
         // --- Fold tools (Sprint 2) ---
@@ -261,12 +268,12 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "depth": { "type": "integer", "minimum": 0, "maximum": 100 },
                     "parent_fold_id": { "type": "string", "format": "uuid" },
                     "initial_context": { "type": "string", "maxLength": 131072 }
                 },
-                "required": ["session_id", "depth", "initial_context"]
+                "required": ["depth", "initial_context"]
             }),
         },
         ToolDef {
@@ -276,10 +283,10 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "fold_id": { "type": "string", "format": "uuid" },
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "repl_turn": { "type": "string", "maxLength": 131072 }
                 },
-                "required": ["fold_id", "session_id", "repl_turn"]
+                "required": ["fold_id", "repl_turn"]
             }),
         },
         ToolDef {
@@ -289,11 +296,11 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "fold_id": { "type": "string", "format": "uuid" },
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "summary": { "type": "string", "maxLength": 131072 },
                     "embedding": { "type": "array", "items": { "type": "number" } }
                 },
-                "required": ["fold_id", "session_id", "summary", "embedding"]
+                "required": ["fold_id", "summary", "embedding"]
             }),
         },
         ToolDef {
@@ -302,13 +309,13 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "query_embedding": { "type": "array", "items": { "type": "number" } },
                     "query": { "type": "string", "maxLength": 4096, "description": "Optional text query for routing optimization. If provided, the router selects optimal k and include_raw." },
                     "k": { "type": "integer", "minimum": 1, "maximum": 100 },
                     "include_raw": { "type": "boolean" }
                 },
-                "required": ["session_id", "query_embedding"]
+                "required": ["query_embedding"]
             }),
         },
         // --- Entity tools (Sprint 3) ---
@@ -318,7 +325,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "entity_name": { "type": "string", "maxLength": 512 },
                     "entity_type": { "type": "string", "enum": entity_type_enum },
                     "context_snippet": { "type": "string", "maxLength": 4096 },
@@ -326,7 +333,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                     "source_fold_id": { "type": "string", "format": "uuid", "description": "Optional: fold UUID from start_fold. Omit if not in a fold context." },
                     "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
                 },
-                "required": ["session_id", "entity_name", "entity_type", "context_snippet"]
+                "required": ["entity_name", "entity_type", "context_snippet"]
             }),
         },
         ToolDef {
@@ -340,7 +347,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid", "description": "Session UUID" },
+                    "session_id": { "type": "string", "description": "Session UUID" },
                     "entities": {
                         "type": "array",
                         "description": "Array of entities to ingest",
@@ -357,7 +364,123 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                         "maxItems": 100
                     }
                 },
-                "required": ["session_id", "entities"]
+                "required": ["entities"]
+            }),
+        },
+        ToolDef {
+            name: "batch_update_entities".into(),
+            description: "Batch update entities by entity_id with explicit patch fields.\n\nReturns per-row success/failure and supports partial update.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "entities": {
+                        "type": "array",
+                        "description": "Array of entity patches keyed by entity_id",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "entity_id": { "type": "string" },
+                                "entity_name": { "type": "string", "maxLength": 512 },
+                                "entity_type": { "type": "string" },
+                                "context_snippet": { "type": "string", "maxLength": 4096 },
+                                "source_fold_id": { "type": "string" },
+                                "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+                                "state": { "type": "string", "enum": ["active", "dormant", "silent", "unavailable"] },
+                                "description": { "type": "string", "maxLength": 4096 },
+                                "tags": {
+                                    "type": "array",
+                                    "items": { "type": "string" }
+                                },
+                                "properties": { "type": "object" },
+                                "embedding": {
+                                    "type": "array",
+                                    "items": { "type": "number" },
+                                    "description": "Replacement embedding vector"
+                                }
+                            },
+                            "required": ["entity_id"]
+                        },
+                        "maxItems": 100
+                    }
+                },
+                "required": ["entities"]
+            }),
+        },
+        ToolDef {
+            name: "batch_delete_entities".into(),
+            description: "Batch delete entities by id with per-row success/failure reporting. Existing rows are hard-deleted from ferrosa-memory owned storage.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "entities": {
+                        "type": "array",
+                        "description": "Entity IDs to delete",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "entity_id": { "type": "string", "description": "Target entity UUID" }
+                            },
+                            "required": ["entity_id"]
+                        },
+                        "maxItems": 100
+                    }
+                },
+                "required": ["entities"]
+            }),
+        },
+        ToolDef {
+            name: "ingest_entities".into(),
+            description: "Bulk-ingest entities and typed edges in a single call. The server owns schema mapping, conflict semantics, optional embedding generation, and structured per-row failures.\n\nCALL WHEN: You already have a batch of stable entity IDs and typed edges and want one fail-loud ingest call instead of direct CQL writes or multiple tool calls.\nRETURNS: counts plus structured failed[] arrays for entities, edges, and embeddings. dry_run validates without writing.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tenant_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
+                    "entities": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string", "format": "uuid" },
+                                "name": { "type": "string", "maxLength": 512 },
+                                "entity_type": { "type": "string", "enum": entity_type_enum },
+                                "context": { "type": "string", "maxLength": 16384 },
+                                "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+                                "state": { "type": "string" },
+                                "embedding": { "type": "array", "items": { "type": "number" } },
+                                "attrs": { "type": "object" }
+                            },
+                            "required": ["id", "name", "entity_type", "context"]
+                        }
+                    },
+                    "edges": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "src_id": { "type": "string", "format": "uuid" },
+                                "dst_id": { "type": "string", "format": "uuid" },
+                                "edge_type": { "type": "string" },
+                                "weight": { "type": "number" },
+                                "metadata": { "type": "object" }
+                            },
+                            "required": ["src_id", "dst_id", "edge_type"]
+                        }
+                    },
+                    "options": {
+                        "type": "object",
+                        "properties": {
+                            "embed_missing": { "type": "boolean" },
+                            "embedding_model": { "type": "string" },
+                            "on_conflict": { "type": "string", "enum": ["update", "skip", "error"] },
+                            "strict_edges": { "type": "boolean" },
+                            "dry_run": { "type": "boolean" }
+                        }
+                    }
+                },
+                "required": ["tenant_id", "entities"]
             }),
         },
         ToolDef {
@@ -366,7 +489,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "query": { "type": "string", "maxLength": 4096 },
                     "embedding": { "type": "array", "items": { "type": "number" } },
                     "strategy": { "type": "string", "enum": ["ann", "phonetic", "both"] },
@@ -382,7 +505,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "query_id": { "type": "string", "format": "uuid" },
                     "program_type": { "type": "string", "enum": ["hnsw_ann", "phonetic", "cypher_hop", "btree_range", "memo_hit"] },
                     "task_complexity": { "type": "string", "enum": ["simple", "linear", "quadratic"] },
@@ -390,7 +513,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                     "latency_ms": { "type": "integer", "minimum": 0 },
                     "token_cost": { "type": "integer", "minimum": 0 }
                 },
-                "required": ["session_id", "query_id", "program_type", "task_complexity", "succeeded", "latency_ms", "token_cost"]
+                "required": ["query_id", "program_type", "task_complexity", "succeeded", "latency_ms", "token_cost"]
             }),
         },
         // --- Session lifecycle ---
@@ -412,7 +535,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "content": { "type": "string", "maxLength": 8192, "description": "The content to ingest" },
                     "entity_type": { "type": "string", "enum": entity_type_enum },
                     "entity_name": { "type": "string", "maxLength": 256, "description": "Clean entity name (e.g. 'Ben Kearns', 'Ferrosa'). If omitted, extracted automatically from content via LLM or heuristic." },
@@ -420,6 +543,92 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                     "source_fold_id": { "type": "string", "format": "uuid", "description": "Optional: UUID of the fold (conversation thread) that produced this content. Omit or pass null if not in a fold context. DO NOT pass a file path — this field expects a fold UUID from start_fold, or null." }
                 },
                 "required": ["content", "entity_type"]
+            }),
+        },
+        // --- Skills layer ---
+        ToolDef {
+            name: "ingest_skill".into(),
+            description: "Ingest a methodology into the global skill catalog. Skills are shared across all sessions and tenants' queries.\n\nCALL WHEN: You encounter or refine a reusable methodology — TDD, STRIDE threat modeling, debugging process, refactoring pattern, etc.\n\nThe server generates the version (YYYYMMDDNN) — do not pass it. Pass content_hash for idempotent re-ingest; re-running with an unchanged hash is a no-op.\n\nSkills are stored with entity_type='skill', scope='global'. Category and additional tags become tag entities + TAGGED_AS edges. Prerequisites become REQUIRES edges. If a prerequisite skill doesn't exist yet, its name is recorded in `missing_prerequisites` on the response — the skill itself still lands. Either ingest the missing prereqs and re-run this skill, or accept the partial graph.\n\nTAG NORMALIZATION: category and tags are normalized to lowercase, alphanumeric + dash only. Any other character (including underscore, space, slash) becomes `-`; consecutive dashes collapse and leading/trailing dashes are stripped. Example: 'Chaos Engineering' → 'chaos-engineering', 'unit_testing' → 'unit-testing', 'foo/bar/baz' → 'foo-bar-baz'. Use the same normalized form when calling retrieve_skills_for_context or ensure_parent_tag.\n\nLEARN AND REFINE: If you use a skill and discover a better step, a missing prerequisite, or a clearer description, call ingest_skill again to refine it. Your changes persist across all sessions.\nCost: ~20ms + one embed call for description.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Caller's session UUID (optional, recorded for audit). Omit or pass 'default' to use the configured default session." },
+                    "name": { "type": "string", "maxLength": 256, "description": "Unique skill identifier (e.g., 'tdd', 'threat-model')" },
+                    "category": { "type": "string", "maxLength": 128, "description": "Primary tag (e.g., 'testing', 'security'). Becomes a tag entity + TAGGED_AS edge." },
+                    "description": { "type": "string", "maxLength": 4096, "description": "2-4 sentence description of what the skill does and when to use it. Embedded for retrieval." },
+                    "trigger_keywords": { "type": "array", "items": { "type": "string" }, "description": "Keywords that indicate this skill is relevant." },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Additional tags beyond category." },
+                    "prerequisites": { "type": "array", "items": { "type": "string" }, "description": "Names of other skills this requires." },
+                    "steps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "phase": { "type": "string" },
+                                "instruction": { "type": "string" }
+                            },
+                            "required": ["instruction"]
+                        },
+                        "description": "Ordered steps to follow when invoking the skill."
+                    },
+                    "output_artifacts": { "type": "array", "items": { "type": "string" }, "description": "Artifacts the skill produces (e.g., 'checklist', 'diagram')." },
+                    "completion_criteria": { "type": "string", "maxLength": 1024, "description": "How to tell when the skill's work is done." },
+                    "content_hash": { "type": "string", "maxLength": 128, "description": "Caller-computed content hash for idempotent re-ingest. Passing the same hash as the stored skill is a no-op." }
+                },
+                "required": ["name", "category", "description"]
+            }),
+        },
+        ToolDef {
+            name: "retrieve_skills_for_context".into(),
+            description: "Find methodologies relevant to your current task from the global skill catalog.\n\nCALL AT TASK START or whenever you encounter a problem you've solved before — 'how do I test this?', 'how should I refactor this?', 'what's the threat model here?'\n\nReturns ranked skills with description, category, version, and a used_in_session flag. Match scoring combines description-embedding similarity, trigger_keyword overlap, tag overlap, and name hits.\n\nThese skills are GLOBAL — shared across every session. If a result is marked used_in_session=true, you've already touched it this session, which is a strong relevance signal.\nCost: O(catalog size) — typically <20ms for 100s of skills.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Caller's session UUID (optional, used for the used_in_session flag)." },
+                    "context": { "type": "string", "maxLength": 8192, "description": "Current task context — what you're working on, the problem statement, or a natural-language question." },
+                    "embedding": { "type": "array", "items": { "type": "number" }, "description": "Optional context embedding. When present, enables semantic matching against skill description_embeddings." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 20, "description": "Max results (default 5)." },
+                    "min_score": { "type": "number", "minimum": 0.0, "maximum": 2.0, "description": "Minimum score threshold (default 0.0 returns all)." }
+                },
+                "required": ["context"]
+            }),
+        },
+        ToolDef {
+            name: "invoke_skill".into(),
+            description: "Fetch the structured steps for a named skill. Returns {description, steps, first_step_prompt, completion_criteria, output_artifacts}.\n\nCALL WHEN: You've decided to apply a skill by name (e.g., after retrieve_skills_for_context returned it, or the user explicitly asked 'use TDD').\n\nThe response is pure data. Execute the steps yourself — invoke_skill does not orchestrate tool calls. Start with first_step_prompt. Check completion_criteria when you finish.\n\nMissed skill returns INVALID_PARAMS with a did_you_mean list of similar skill names (phonetic match). Ingest the skill with ingest_skill if it genuinely doesn't exist yet.\nCost: ~5ms.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Caller's session UUID (optional; used for prerequisite-satisfaction tracking)." },
+                    "skill_name": { "type": "string", "maxLength": 256, "description": "Exact name of the skill to invoke (case-sensitive)." },
+                    "current_context": { "type": "string", "maxLength": 4096, "description": "Optional context hint — what you're working on right now." }
+                },
+                "required": ["skill_name"]
+            }),
+        },
+        ToolDef {
+            name: "ensure_parent_tag".into(),
+            description: "Idempotently create a PARENT_TAG edge between two tags in the global taxonomy, resolving tags by name (creating them if missing).\n\nCALL WHEN: Building or extending the tag hierarchy — e.g. declaring that 'tdd' is a sub-category of 'testing', or that 'testing' is a sub-category of 'quality'. forge's fmem-skill-ingest uses this when ingesting `tag-hierarchy.yaml`.\n\nTAG NORMALIZATION: names are normalized to lowercase, alphanumeric + dash only. Any other character (underscore, space, slash, etc.) becomes `-`; consecutive dashes collapse, leading/trailing dashes strip. 'Chaos Engineering' → 'chaos-engineering', 'unit_testing' → 'unit-testing'. Pre-normalize on the caller side if you want full control; otherwise the server's normalization is deterministic.\n\nReturns action=Created on first call, action=Skipped on subsequent identical calls. Cycles are rejected via the graph client's DAG check.\nCost: ~5ms for idempotent re-runs, ~20ms when creating both tags + edge.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Caller session UUID (optional; used for ingested_by_session audit)." },
+                    "child_tag": { "type": "string", "maxLength": 256, "description": "Narrower tag name (e.g. 'tdd')." },
+                    "parent_tag": { "type": "string", "maxLength": 256, "description": "Broader tag name (e.g. 'testing')." }
+                },
+                "required": ["child_tag", "parent_tag"]
+            }),
+        },
+        ToolDef {
+            name: "verify_skill".into(),
+            description: "Verify a skill's graph neighborhood for ingest pipelines and audits. Returns resolved tags, prerequisites (outgoing REQUIRES), required_by (incoming REQUIRES), and missing_prerequisites (raw names declared at ingest that never landed as edges).\n\nCALL WHEN: A bulk ingest finishes and the caller wants to confirm every skill's edges are intact. Safe to call for unknown skill names — returns {exists: false} cleanly, not an error.\n\nThis is an administrative read. For executing a skill, use invoke_skill.\nCost: ~10ms (one entity lookup + two edge scans).".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Caller session UUID (optional)." },
+                    "skill_name": { "type": "string", "maxLength": 256, "description": "Exact skill name (case-sensitive)." }
+                },
+                "required": ["skill_name"]
             }),
         },
         // --- Intention tools (prospective memory, repo-scoped) ---
@@ -499,7 +708,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "entity_id": { "type": "string", "format": "uuid" },
                     "fact_text": { "type": "string", "maxLength": 4096, "description": "The fact to record" },
                     "confidence": { "type": "number", "minimum": 0, "maximum": 1, "description": "Confidence score (default: 1.0)" }
@@ -513,7 +722,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "entity_id": { "type": "string", "format": "uuid" }
                 },
                 "required": ["entity_id"]
@@ -533,7 +742,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                     },
                     "entity_id": { "type": "string", "format": "uuid", "description": "Entity or event ID (required for related_entities, supersession_chain)" },
                     "fold_id": { "type": "string", "format": "uuid", "description": "Fold ID (required for fold_ancestors, entities_in_fold)" },
-                    "session_id": { "type": "string", "format": "uuid", "description": "Session ID (required for fold_ancestors, related_entities, entities_in_fold)" },
+                    "session_id": { "type": "string", "description": "Session ID (required for fold_ancestors, related_entities, entities_in_fold)" },
                     "max_depth": { "type": "integer", "minimum": 1, "maximum": 5, "description": "Maximum traversal depth (default: 2)" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum results to return (default: 10)" }
                 },
@@ -547,7 +756,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "query": { "type": "string", "maxLength": 4096, "description": "Search query text (used for phonetic matching)" },
                     "embedding": {
                         "type": "array",
@@ -566,9 +775,9 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" }
+                    "session_id": { "type": "string" }
                 },
-                "required": ["session_id"]
+                "required": []
             }),
         },
         // --- Enrichment pipeline ---
@@ -584,7 +793,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "operations": {
                         "type": "array",
                         "items": { "type": "string", "enum": ["enrich", "annotate", "lint"] },
@@ -604,7 +813,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                         "description": "Lint only, don't write changes. Default: false."
                     }
                 },
-                "required": ["session_id"]
+                "required": []
             }),
         },
         // --- Stats tool ---
@@ -614,9 +823,20 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" }
+                    "session_id": { "type": "string" }
                 },
-                "required": ["session_id"]
+                "required": []
+            }),
+        },
+        ToolDef {
+            name: "count_entities_by_type".into(),
+            description: "Return a per-session entity histogram broken down by entity_type, by state, and by the joint (type,state) buckets.\n\nCALL WHEN: You need status/diagnostic counts like 'how many bugs are active in this session?' without coupling the client to entity_store columns.\nCost: ~5-10ms.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" }
+                },
+                "required": []
             }),
         },
         // --- Memory state management ---
@@ -626,7 +846,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "entity_id": { "type": "string", "format": "uuid" }
                 },
                 "required": ["entity_id"]
@@ -638,7 +858,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "entity_id": { "type": "string", "format": "uuid" }
                 },
                 "required": ["entity_id"]
@@ -651,7 +871,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "entity_id": { "type": "string", "format": "uuid" }
                 },
                 "required": ["entity_id"]
@@ -664,12 +884,12 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "source": { "type": "string", "format": "uuid", "description": "Entity ID to start from" },
                     "destination": { "type": "string", "format": "uuid", "description": "Entity ID to find path to" },
                     "max_hops": { "type": "integer", "minimum": 1, "maximum": 10, "description": "Maximum path length (default: 5)" }
                 },
-                "required": ["session_id", "source", "destination"]
+                "required": ["source", "destination"]
             }),
         },
         // --- Speculative retrieval ---
@@ -679,7 +899,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "threshold": {
                         "type": "number",
                         "minimum": 0.0,
@@ -693,7 +913,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                         "description": "Maximum predictions to return (default: 10)"
                     }
                 },
-                "required": ["session_id"]
+                "required": []
             }),
         },
         // --- Spreading activation ---
@@ -703,7 +923,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "seeds": {
                         "type": "array",
                         "items": { "type": "string", "format": "uuid" },
@@ -714,7 +934,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                     "decay": { "type": "number", "minimum": 0.01, "maximum": 1.0, "description": "Activation decay per hop (default: 0.7)" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Max results to return (default: 10)" }
                 },
-                "required": ["session_id", "seeds"]
+                "required": ["seeds"]
             }),
         },
         // --- Duplicate detection ---
@@ -724,7 +944,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "threshold": {
                         "type": "number",
                         "minimum": 0,
@@ -732,7 +952,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                         "description": "Similarity threshold (0-1). Default: 0.7. Higher = fewer, more confident matches."
                     }
                 },
-                "required": ["session_id"]
+                "required": []
             }),
         },
         // --- Recursive exploration ---
@@ -802,6 +1022,93 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                 "required": ["action"]
             }),
         },
+        ToolDef {
+            name: "manage_claims".into(),
+            description: "Manage expert-system claims stored as entity-backed review artifacts.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list", "get", "put"] },
+                    "claim_id": { "type": "string" },
+                    "claim_text": { "type": "string" },
+                    "domain": { "type": "string" },
+                    "status": { "type": "string", "enum": ["proposed", "approved", "rejected"] },
+                    "confidence": { "type": "number" },
+                    "source_ref": { "type": "string" },
+                    "support_count": { "type": "integer" },
+                    "workspace_scope": { "type": "string" },
+                    "session_id": { "type": "string" },
+                    "include_unapproved": { "type": "boolean" }
+                },
+                "required": ["action"]
+            }),
+        },
+        ToolDef {
+            name: "manage_approvals".into(),
+            description: "Append and inspect approval decisions for rules, claims, aliases, and other governed artifacts.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list", "record", "latest"] },
+                    "artifact_kind": { "type": "string", "enum": ["rule", "claim", "alias", "skill"] },
+                    "artifact_ref": { "type": "string" },
+                    "decision": { "type": "string", "enum": ["proposed", "approved", "rejected"] },
+                    "review_note": { "type": "string" },
+                    "scope": { "type": "string" },
+                    "workspace_scope": { "type": "string" },
+                    "session_scope": { "type": "string" },
+                    "reviewer": { "type": "string", "description": "Ignored; reviewer is always auth-derived." }
+                },
+                "required": ["action", "artifact_kind", "artifact_ref"]
+            }),
+        },
+        ToolDef {
+            name: "manage_aliases".into(),
+            description: "Manage exact-scope tool aliases for deterministic execution-time rewrites.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list", "put", "resolve"] },
+                    "alias_name": { "type": "string" },
+                    "scope_kind": { "type": "string", "enum": ["global", "workspace", "session"] },
+                    "scope_ref": { "type": "string" },
+                    "canonical_tool": { "type": "string" },
+                    "parameter_map": { "type": "object" },
+                    "fixed_arguments": { "type": "object" },
+                    "args_templates": { "type": "object" },
+                    "status": { "type": "string", "enum": ["proposed", "approved", "rejected"] },
+                    "workspace_scope": { "type": "string" },
+                    "session_scope": { "type": "string" }
+                },
+                "required": ["action", "alias_name"]
+            }),
+        },
+        ToolDef {
+            name: "explain_derived".into(),
+            description: "Return a bounded explanation for derived facts, including support chain and approval metadata.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "predicate": { "type": "string" },
+                    "session_id": { "type": "string" },
+                    "src_id": { "type": "string" },
+                    "dst_id": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 64 }
+                },
+                "required": ["predicate"]
+            }),
+        },
+        ToolDef {
+            name: "get_effective_rule_set".into(),
+            description: "Inspect the merged runtime-effective rule set, including synthetic built-ins and approved registry rules.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "family": { "type": "string" }
+                },
+                "required": []
+            }),
+        },
         // --- Predicate promotion ---
         ToolDef {
             name: "promote_predicate".into(),
@@ -832,14 +1139,14 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "src_entity_id": { "type": "string", "format": "uuid", "description": "Source entity UUID" },
                     "dst_entity_id": { "type": "string", "format": "uuid", "description": "Destination entity UUID" },
                     "edge_type": { "type": "string", "description": "Relationship type (depends_on, contains, part_of, subclass_of, calls, implements, uses)" },
                     "weight": { "type": "number", "minimum": 0, "maximum": 1, "description": "Edge strength (default 1.0)" },
                     "metadata": { "type": "string", "description": "Optional metadata about the relationship" }
                 },
-                "required": ["session_id", "src_entity_id", "dst_entity_id", "edge_type"]
+                "required": ["src_entity_id", "dst_entity_id", "edge_type"]
             }),
         },
         ToolDef {
@@ -849,7 +1156,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid" },
+                    "session_id": { "type": "string" },
                     "edges": {
                         "type": "array",
                         "items": {
@@ -865,7 +1172,77 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                         "maxItems": 200
                     }
                 },
-                "required": ["session_id", "edges"]
+                "required": ["edges"]
+            }),
+        },
+        ToolDef {
+            name: "batch_update_edges".into(),
+            description: "Update typed edges in bulk by (src_entity_id, dst_entity_id, edge_type).\n\n\
+                Current storage semantics write through `typed_edge_put`; this is treated as upsert/update-compatible where supported."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "edges": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "src_entity_id": { "type": "string", "format": "uuid" },
+                                "dst_entity_id": { "type": "string", "format": "uuid" },
+                                "edge_type": { "type": "string" },
+                                "weight": { "type": "number" },
+                                "metadata": { "type": "string" }
+                            },
+                            "required": ["src_entity_id", "dst_entity_id", "edge_type"]
+                        },
+                        "maxItems": 200
+                    }
+                },
+                "required": ["edges"]
+            }),
+        },
+        ToolDef {
+            name: "batch_delete_edges".into(),
+            description: "Delete typed edges in bulk.\n\n\
+                Uses the current graph-backed delete path and returns structured per-row success/failure results."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "edges": {
+                        "type": "array",
+                        "description": "Typed edges to delete",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "src_entity_id": { "type": "string", "format": "uuid" },
+                                "dst_entity_id": { "type": "string", "format": "uuid" },
+                                "edge_type": { "type": "string" }
+                            },
+                            "required": ["src_entity_id", "dst_entity_id", "edge_type"]
+                        },
+                        "maxItems": 200
+                    }
+                },
+                "required": ["edges"]
+            }),
+        },
+        // --- Derived cache listing ---
+        ToolDef {
+            name: "list_derived_cache".into(),
+            description: "List all derived cache entries for inspection/debugging.\n\n\
+                Returns up to `limit` rows sorted by computed_at DESC.\n\n\
+                Use for: audit trail, debugging derivation results, reviewing cache state.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tenant_id": { "type": "string", "description": "Tenant UUID" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Max rows to return (default 100)" }
+                },
+                "required": ["tenant_id"]
             }),
         },
     ]
@@ -971,13 +1348,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         .cloned()
         .unwrap_or(Value::Object(serde_json::Map::new()));
 
-    // Inject configured default session_id when caller omits it.
-    if args.get("session_id").and_then(|v| v.as_str()).is_none()
-        && let Some(default_sid) = session.default_session_id
-        && let Some(obj) = args.as_object_mut()
-    {
-        obj.insert("session_id".into(), Value::String(default_sid.to_string()));
-    }
+    resolve_session_id(&mut args, session.default_session_id)?;
 
     tracing::debug!(tool = name, "dispatching tool call");
     let input_bytes = serde_json::to_string(&args).map(|s| s.len()).unwrap_or(0) as i32;
@@ -994,10 +1365,18 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "retrieve_fold_context" => handle_retrieve_fold(args, storage, ctx).await,
         "upsert_entity" => handle_upsert_entity(args, storage, ctx, session).await,
         "batch_ingest" => handle_batch_ingest(args, storage, ctx, session).await,
+        "ingest_entities" => handle_ingest_entities(args, storage, ctx, session).await,
         "retrieve_entities" => handle_retrieve_entities(args, storage, ctx, session).await,
         "record_outcome" => handle_record_outcome(args, storage, ctx).await,
         "delete_session" => handle_delete_session(args, storage, ctx).await,
         "smart_ingest" => handle_smart_ingest(args, storage, ctx, session).await,
+        "ingest_skill" => handle_ingest_skill(args, storage, ctx, session).await,
+        "retrieve_skills_for_context" => {
+            handle_retrieve_skills_for_context(args, storage, ctx, session).await
+        }
+        "invoke_skill" => handle_invoke_skill(args, storage, ctx, session).await,
+        "ensure_parent_tag" => handle_ensure_parent_tag(args, storage, ctx, session).await,
+        "verify_skill" => handle_verify_skill(args, storage, ctx, session).await,
         "set_intention" => handle_set_intention(args, storage, ctx, session).await,
         "check_intentions" => handle_check_intentions(args, storage, ctx, session).await,
         "complete_intention" => handle_complete_intention(args, storage, ctx, session).await,
@@ -1010,6 +1389,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "run_consolidation" => handle_run_consolidation(args, storage, ctx, session).await,
         "enrich_entities" => handle_enrich_entities(args, storage, ctx, session).await,
         "get_stats" => handle_get_stats(args, storage, ctx, session).await,
+        "count_entities_by_type" => handle_count_entities_by_type(args, storage, ctx).await,
         "promote_memory" => handle_promote_memory(args, storage, ctx, session).await,
         "demote_memory" => handle_demote_memory(args, storage, ctx, session).await,
         "importance_score" => handle_importance_score(args, storage, ctx, session).await,
@@ -1020,9 +1400,19 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "recursive_explore" => handle_recursive_explore(args, storage, ctx, session).await,
         "query_derived" => handle_query_derived(args, storage, ctx).await,
         "manage_rules" => handle_manage_rules(args, storage, ctx).await,
+        "manage_claims" => handle_manage_claims(args, storage, ctx).await,
+        "manage_approvals" => handle_manage_approvals(args, storage, ctx).await,
+        "manage_aliases" => handle_manage_aliases(args, storage, ctx).await,
+        "explain_derived" => handle_explain_derived(args, storage, ctx).await,
+        "get_effective_rule_set" => handle_get_effective_rule_set(args, storage, ctx).await,
         "promote_predicate" => handle_promote_predicate(args, storage, ctx).await,
+        "batch_update_entities" => handle_batch_update_entities(args, storage, ctx, session).await,
+        "batch_delete_entities" => handle_batch_delete_entities(args, storage, ctx, session).await,
         "create_edge" => handle_create_edge(args, storage, ctx, session).await,
         "batch_create_edges" => handle_batch_create_edges(args, storage, ctx, session).await,
+        "batch_update_edges" => handle_batch_update_edges(args, storage, ctx, session).await,
+        "batch_delete_edges" => handle_batch_delete_edges(args, storage, ctx, session).await,
+        "list_derived_cache" => handle_list_derived_cache(args, storage, ctx).await,
         _ => Err((METHOD_NOT_FOUND, format!("unknown tool: {name}"))),
     };
     let elapsed = start.elapsed();
@@ -1102,14 +1492,25 @@ fn is_tier1(name: &str) -> bool {
     matches!(
         name,
         "smart_ingest"
+            | "ingest_entities"
+            | "ingest_skill"
+            | "retrieve_skills_for_context"
+            | "invoke_skill"
+            | "ensure_parent_tag"
+            | "verify_skill"
             | "hybrid_search"
             | "create_edge"
             | "batch_create_edges"
+            | "batch_update_edges"
+            | "batch_delete_edges"
+            | "batch_update_entities"
+            | "batch_delete_entities"
             | "explore_connections"
             | "check_intentions"
             | "set_intention"
             | "complete_intention"
             | "get_stats"
+            | "count_entities_by_type"
             | "write_temporal_fact"
             | "get_temporal_chain"
             | "retrieve_entities"
@@ -1132,6 +1533,7 @@ fn is_write_tool(name: &str) -> bool {
             | "complete_fold"
             | "upsert_entity"
             | "batch_ingest"
+            | "ingest_entities"
             | "record_outcome"
             | "delete_session"
             | "smart_ingest"
@@ -1145,6 +1547,10 @@ fn is_write_tool(name: &str) -> bool {
             | "promote_predicate"
             | "create_edge"
             | "batch_create_edges"
+            | "batch_update_edges"
+            | "batch_delete_edges"
+            | "batch_update_entities"
+            | "batch_delete_entities"
             | "enrich_entities"
     )
 }
@@ -1444,8 +1850,8 @@ async fn handle_upsert_entity<S: crate::storage::Storage>(
         let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
             provider: "ollama".into(),
             ollama_base_url: session.ollama_base_url.clone(),
-            model: "nomic-embed-text".into(),
-            dimensions: 768,
+            model: session.embed_model.clone(),
+            dimensions: session.embed_dimensions,
             ner_model: String::new(),
         });
         match client.embed(context_snippet).await {
@@ -1493,6 +1899,7 @@ async fn handle_upsert_entity<S: crate::storage::Storage>(
             created_at: chrono::Utc::now().to_rfc3339(),
             context: context_snippet.to_string(),
             child_count: None,
+            ..Default::default()
         },
         action: action.into(),
     });
@@ -1594,6 +2001,7 @@ async fn handle_batch_ingest<S: crate::storage::Storage>(
                         created_at: chrono::Utc::now().to_rfc3339(),
                         context: context.to_string(),
                         child_count: None,
+                        ..Default::default()
                     },
                     action: status.into(),
                 });
@@ -1637,6 +2045,1020 @@ async fn handle_batch_ingest<S: crate::storage::Storage>(
     }))
 }
 
+fn default_ingest_confidence() -> f64 {
+    0.9
+}
+
+fn default_edge_weight() -> f64 {
+    1.0
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum IngestOnConflict {
+    #[default]
+    Update,
+    Skip,
+    Error,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct IngestEntitiesOptions {
+    embed_missing: bool,
+    embedding_model: Option<String>,
+    on_conflict: IngestOnConflict,
+    strict_edges: bool,
+    dry_run: bool,
+}
+
+impl Default for IngestEntitiesOptions {
+    fn default() -> Self {
+        Self {
+            embed_missing: true,
+            embedding_model: None,
+            on_conflict: IngestOnConflict::Update,
+            strict_edges: true,
+            dry_run: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IngestEntityInput {
+    id: uuid::Uuid,
+    name: String,
+    entity_type: String,
+    context: String,
+    #[serde(default = "default_ingest_confidence")]
+    confidence: f64,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    embedding: Option<Vec<f32>>,
+    #[serde(default)]
+    attrs: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IngestEdgeInput {
+    src_id: uuid::Uuid,
+    dst_id: uuid::Uuid,
+    edge_type: String,
+    #[serde(default = "default_edge_weight")]
+    weight: f64,
+    #[serde(default)]
+    metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IngestEntitiesRequest {
+    tenant_id: uuid::Uuid,
+    session_id: uuid::Uuid,
+    entities: Vec<IngestEntityInput>,
+    #[serde(default)]
+    edges: Vec<IngestEdgeInput>,
+    #[serde(default)]
+    options: IngestEntitiesOptions,
+}
+
+fn parse_ingest_state(state: Option<&str>) -> Result<crate::types::MemoryState, String> {
+    match state {
+        Some(raw) => serde_json::from_value::<crate::types::MemoryState>(Value::String(raw.into()))
+            .map_err(|_| {
+                format!(
+                    "invalid_state: expected one of active|dormant|silent|unavailable, got {raw}"
+                )
+            }),
+        None => Ok(crate::types::MemoryState::Active),
+    }
+}
+
+fn validate_json_object(value: Option<&Value>, field: &str) -> Result<(), String> {
+    match value {
+        None => Ok(()),
+        Some(Value::Object(_)) => Ok(()),
+        Some(Value::Null) => Ok(()),
+        Some(_) => Err(format!("{field} must be an object")),
+    }
+}
+
+fn build_ingest_embedding_client(
+    session: &SessionState,
+    override_model: Option<&str>,
+) -> Option<crate::embedding::EmbeddingClient> {
+    if session.ollama_base_url.is_empty() {
+        return None;
+    }
+    let model = override_model
+        .filter(|m| !m.is_empty())
+        .unwrap_or(&session.embed_model)
+        .to_string();
+    if model.is_empty() {
+        return None;
+    }
+    Some(crate::embedding::EmbeddingClient::new(
+        &crate::config::EmbeddingConfig {
+            provider: "ollama".into(),
+            ollama_base_url: session.ollama_base_url.clone(),
+            model,
+            dimensions: session.embed_dimensions,
+            ner_model: String::new(),
+        },
+    ))
+}
+
+async fn handle_ingest_entities<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let request: IngestEntitiesRequest = serde_json::from_value(args).map_err(|e| {
+        (
+            INVALID_PARAMS,
+            format!("invalid ingest_entities request: {e}"),
+        )
+    })?;
+    if request.tenant_id != ctx.tenant_id {
+        return Err((
+            INVALID_PARAMS,
+            format!(
+                "tenant_id {} does not match authenticated tenant {}",
+                request.tenant_id, ctx.tenant_id
+            ),
+        ));
+    }
+
+    let started = std::time::Instant::now();
+    let embedding_client =
+        build_ingest_embedding_client(session, request.options.embedding_model.as_deref());
+
+    let mut entity_inserted = 0usize;
+    let mut entity_updated = 0usize;
+    let mut entity_skipped = 0usize;
+    let mut entity_failed = Vec::new();
+    let mut edge_inserted = 0usize;
+    let mut edge_skipped_duplicate = 0usize;
+    let mut edge_failed = Vec::new();
+    let mut embeddings_computed = 0usize;
+    let mut embeddings_received = 0usize;
+    let mut embeddings_failed = Vec::new();
+
+    let mut available_entities = std::collections::HashSet::new();
+    let mut seen_entity_ids = std::collections::HashSet::new();
+
+    for entity in &request.entities {
+        if !seen_entity_ids.insert(entity.id) {
+            entity_failed.push(serde_json::json!({
+                "id": entity.id.to_string(),
+                "reason": "duplicate_entity_id_in_batch"
+            }));
+            continue;
+        }
+
+        if !(0.0..=1.0).contains(&entity.confidence) {
+            entity_failed.push(serde_json::json!({
+                "id": entity.id.to_string(),
+                "reason": format!("invalid_confidence: {}", entity.confidence)
+            }));
+            continue;
+        }
+        if entity.name.trim().is_empty() {
+            entity_failed.push(serde_json::json!({
+                "id": entity.id.to_string(),
+                "reason": "missing_name"
+            }));
+            continue;
+        }
+        if entity.context.trim().is_empty() {
+            entity_failed.push(serde_json::json!({
+                "id": entity.id.to_string(),
+                "reason": "missing_context"
+            }));
+            continue;
+        }
+        if let Err(reason) = validate_json_object(entity.attrs.as_ref(), "attrs") {
+            entity_failed.push(serde_json::json!({
+                "id": entity.id.to_string(),
+                "reason": reason
+            }));
+            continue;
+        }
+        let state = match parse_ingest_state(entity.state.as_deref()) {
+            Ok(state) => state,
+            Err(reason) => {
+                entity_failed.push(serde_json::json!({
+                    "id": entity.id.to_string(),
+                    "reason": reason
+                }));
+                continue;
+            }
+        };
+
+        let existing = storage
+            .entity_get_by_id(ctx, request.session_id, entity.id)
+            .await
+            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+        if existing.is_some() {
+            match request.options.on_conflict {
+                IngestOnConflict::Skip => {
+                    entity_skipped += 1;
+                    available_entities.insert(entity.id);
+                    continue;
+                }
+                IngestOnConflict::Error => {
+                    entity_failed.push(serde_json::json!({
+                        "id": entity.id.to_string(),
+                        "reason": "conflict: entity already exists"
+                    }));
+                    continue;
+                }
+                IngestOnConflict::Update => {}
+            }
+        }
+
+        let resolved_embedding = if let Some(embedding) = entity.embedding.clone() {
+            embeddings_received += 1;
+            Some(embedding)
+        } else if let Some(existing) = existing.as_ref().and_then(|e| e.entity_embedding.clone()) {
+            Some(existing)
+        } else if request.options.embed_missing {
+            match &embedding_client {
+                Some(client) => match client.embed(&entity.context).await {
+                    Ok(embedding) => {
+                        embeddings_computed += 1;
+                        Some(embedding)
+                    }
+                    Err(err) => {
+                        let reason = format!("embedding_failed: {err}");
+                        embeddings_failed.push(serde_json::json!({
+                            "id": entity.id.to_string(),
+                            "reason": reason
+                        }));
+                        entity_failed.push(serde_json::json!({
+                            "id": entity.id.to_string(),
+                            "reason": "embedding_failed"
+                        }));
+                        continue;
+                    }
+                },
+                None => {
+                    embeddings_failed.push(serde_json::json!({
+                        "id": entity.id.to_string(),
+                        "reason": "embedding_unavailable: embed_missing requested but embedding endpoint is not configured"
+                    }));
+                    entity_failed.push(serde_json::json!({
+                        "id": entity.id.to_string(),
+                        "reason": "embedding_unavailable"
+                    }));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
+        let now = chrono::Utc::now();
+        let entry = crate::types::EntityEntry {
+            tenant_id: request.tenant_id,
+            entity_id: entity.id,
+            session_id: request.session_id,
+            entity_name: entity.name.clone(),
+            entity_type: entity.entity_type.clone(),
+            source_fold_id: existing.as_ref().and_then(|e| e.source_fold_id),
+            context_snippet: entity.context.clone(),
+            entity_embedding: resolved_embedding,
+            confidence: entity.confidence,
+            state: existing
+                .as_ref()
+                .map(|e| {
+                    if entity.state.is_some() {
+                        state.clone()
+                    } else {
+                        e.state.clone()
+                    }
+                })
+                .unwrap_or(state),
+            created_at: existing.as_ref().map(|e| e.created_at).unwrap_or(now),
+            description: existing.as_ref().and_then(|e| e.description.clone()),
+            description_embedding: existing
+                .as_ref()
+                .and_then(|e| e.description_embedding.clone()),
+            tags: existing
+                .as_ref()
+                .map(|e| e.tags.clone())
+                .unwrap_or_default(),
+            properties: entity.attrs.clone().unwrap_or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|e| e.properties.clone())
+                    .unwrap_or_else(|| serde_json::json!({}))
+            }),
+            content_hash: existing.as_ref().and_then(|e| e.content_hash.clone()),
+            updated_at: Some(now),
+            scope: existing
+                .as_ref()
+                .map(|e| e.scope)
+                .unwrap_or(crate::types::EntityScope::Session),
+            ingested_by_session: existing
+                .as_ref()
+                .and_then(|e| e.ingested_by_session)
+                .or(Some(request.session_id)),
+        };
+
+        if !request.options.dry_run
+            && let Err(err) = storage.entity_put(ctx, &entry).await
+        {
+            entity_failed.push(serde_json::json!({
+                "id": entity.id.to_string(),
+                "reason": err.to_string()
+            }));
+            continue;
+        }
+
+        if existing.is_some() {
+            entity_updated += 1;
+        } else {
+            entity_inserted += 1;
+        }
+        available_entities.insert(entity.id);
+    }
+
+    let mut resident_cache = std::collections::HashMap::<uuid::Uuid, bool>::new();
+    let mut existing_edge_cache =
+        std::collections::HashMap::<uuid::Uuid, Vec<crate::types::TypedEdge>>::new();
+    let mut seen_edges = std::collections::HashSet::<(uuid::Uuid, uuid::Uuid, String)>::new();
+
+    for edge in &request.edges {
+        if edge.edge_type.trim().is_empty() {
+            edge_failed.push(serde_json::json!({
+                "src_id": edge.src_id.to_string(),
+                "dst_id": edge.dst_id.to_string(),
+                "edge_type": edge.edge_type,
+                "reason": "missing_edge_type"
+            }));
+            continue;
+        }
+        if let Err(reason) = validate_json_object(edge.metadata.as_ref(), "metadata") {
+            edge_failed.push(serde_json::json!({
+                "src_id": edge.src_id.to_string(),
+                "dst_id": edge.dst_id.to_string(),
+                "edge_type": edge.edge_type,
+                "reason": reason
+            }));
+            continue;
+        }
+        let dedupe_key = (edge.src_id, edge.dst_id, edge.edge_type.clone());
+        if !seen_edges.insert(dedupe_key) {
+            edge_skipped_duplicate += 1;
+            continue;
+        }
+
+        if request.options.strict_edges {
+            let src_ok = if available_entities.contains(&edge.src_id) {
+                true
+            } else if let Some(found) = resident_cache.get(&edge.src_id) {
+                *found
+            } else {
+                let found = storage
+                    .entity_get_by_id(ctx, request.session_id, edge.src_id)
+                    .await
+                    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+                    .is_some();
+                resident_cache.insert(edge.src_id, found);
+                found
+            };
+            if !src_ok {
+                edge_failed.push(serde_json::json!({
+                    "src_id": edge.src_id.to_string(),
+                    "dst_id": edge.dst_id.to_string(),
+                    "edge_type": edge.edge_type,
+                    "reason": "endpoint_not_found: src_id not resident and not in batch"
+                }));
+                continue;
+            }
+
+            let dst_ok = if available_entities.contains(&edge.dst_id) {
+                true
+            } else if let Some(found) = resident_cache.get(&edge.dst_id) {
+                *found
+            } else {
+                let found = storage
+                    .entity_get_by_id(ctx, request.session_id, edge.dst_id)
+                    .await
+                    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+                    .is_some();
+                resident_cache.insert(edge.dst_id, found);
+                found
+            };
+            if !dst_ok {
+                edge_failed.push(serde_json::json!({
+                    "src_id": edge.src_id.to_string(),
+                    "dst_id": edge.dst_id.to_string(),
+                    "edge_type": edge.edge_type,
+                    "reason": "endpoint_not_found: dst_id not resident and not in batch"
+                }));
+                continue;
+            }
+        }
+
+        let existing_edges = if let Some(edges) = existing_edge_cache.get(&edge.src_id) {
+            edges.clone()
+        } else {
+            let edges = storage
+                .typed_edge_list_from(ctx, request.session_id, edge.src_id)
+                .await
+                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+            existing_edge_cache.insert(edge.src_id, edges.clone());
+            edges
+        };
+        if existing_edges
+            .iter()
+            .any(|existing| existing.dst_id == edge.dst_id && existing.edge_type == edge.edge_type)
+        {
+            edge_skipped_duplicate += 1;
+            continue;
+        }
+
+        if !request.options.dry_run {
+            let metadata = edge.metadata.as_ref().map(|value| value.to_string());
+            match crate::graph_write::create_typed_edge(
+                storage,
+                ctx,
+                request.session_id,
+                edge.src_id,
+                edge.edge_type.clone(),
+                edge.dst_id,
+                edge.weight,
+                metadata,
+            )
+            .await
+            {
+                Ok(created) => {
+                    existing_edge_cache
+                        .entry(edge.src_id)
+                        .or_default()
+                        .push(created);
+                }
+                Err(err) => {
+                    edge_failed.push(serde_json::json!({
+                        "src_id": edge.src_id.to_string(),
+                        "dst_id": edge.dst_id.to_string(),
+                        "edge_type": edge.edge_type,
+                        "reason": err.to_string()
+                    }));
+                    continue;
+                }
+            }
+        }
+
+        edge_inserted += 1;
+    }
+
+    let _ = crate::audit::log_write(
+        storage,
+        ctx,
+        "ingest_entities",
+        "entity_store",
+        &format!(
+            "{} entities, {} edges",
+            request.entities.len(),
+            request.edges.len()
+        ),
+        request.session_id,
+    )
+    .await;
+
+    Ok(serde_json::json!({
+        "entities": {
+            "inserted": entity_inserted,
+            "updated": entity_updated,
+            "skipped": entity_skipped,
+            "failed": entity_failed,
+        },
+        "edges": {
+            "inserted": edge_inserted,
+            "skipped_duplicate": edge_skipped_duplicate,
+            "failed": edge_failed,
+        },
+        "embeddings": {
+            "computed": embeddings_computed,
+            "received": embeddings_received,
+            "failed": embeddings_failed,
+        },
+        "schema_version": "2026-03-01",
+        "duration_ms": started.elapsed().as_millis() as u64,
+    }))
+}
+
+async fn handle_batch_update_entities<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+    let entities = args
+        .get("entities")
+        .and_then(|v| v.as_array())
+        .ok_or((INVALID_PARAMS, "entities must be an array".to_string()))?;
+
+    if entities.len() > 100 {
+        return Err((
+            INVALID_PARAMS,
+            format!(
+                "entities array length {} exceeds maximum of 100",
+                entities.len()
+            ),
+        ));
+    }
+
+    let mut updated: usize = 0;
+    let mut unchanged: usize = 0;
+    let mut not_found: usize = 0;
+    let mut errors: usize = 0;
+    let mut results = Vec::with_capacity(entities.len());
+
+    for entity_json in entities {
+        let idx = results.len();
+        let Some(row) = entity_json.as_object() else {
+            errors += 1;
+            results.push(serde_json::json!({
+                "index": idx,
+                "status": "error",
+                "reason": format!("batch_update_entities[{idx}] must be an object")
+            }));
+            continue;
+        };
+
+        let entity_id = match row
+            .get("entity_id")
+            .and_then(|v| v.as_str())
+            .and_then(|v| uuid::Uuid::parse_str(v).ok())
+        {
+            Some(id) => id,
+            None => {
+                errors += 1;
+                results.push(serde_json::json!({
+                    "index": idx,
+                    "status": "error",
+                    "reason": format!("batch_update_entities[{idx}] missing/invalid entity_id")
+                }));
+                continue;
+            }
+        };
+
+        let mut entity = match storage
+            .entity_get_by_id(ctx, session_id, entity_id)
+            .await
+            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+        {
+            Some(entity) => entity,
+            None => {
+                not_found += 1;
+                results.push(serde_json::json!({
+                    "index": idx,
+                    "entity_id": entity_id.to_string(),
+                    "status": "not_found"
+                }));
+                continue;
+            }
+        };
+
+        let mut mutated = false;
+        if let Some(v) = row.get("entity_name") {
+            match v.as_str() {
+                Some(v) => {
+                    entity.entity_name = v.to_string();
+                    mutated = true;
+                }
+                None => {
+                    errors += 1;
+                    results.push(serde_json::json!({
+                        "index": idx,
+                        "entity_id": entity_id.to_string(),
+                        "status": "error",
+                        "reason": "entity_name must be a string"
+                    }));
+                    continue;
+                }
+            }
+        }
+        if let Some(v) = row.get("entity_type") {
+            match v.as_str() {
+                Some(v) => {
+                    entity.entity_type = v.to_string();
+                    mutated = true;
+                }
+                None => {
+                    errors += 1;
+                    results.push(serde_json::json!({
+                        "index": idx,
+                        "entity_id": entity_id.to_string(),
+                        "status": "error",
+                        "reason": "entity_type must be a string"
+                    }));
+                    continue;
+                }
+            }
+        }
+        if let Some(v) = row.get("context_snippet") {
+            match v.as_str() {
+                Some(v) => {
+                    entity.context_snippet = v.to_string();
+                    mutated = true;
+                }
+                None => {
+                    errors += 1;
+                    results.push(serde_json::json!({
+                        "index": idx,
+                        "entity_id": entity_id.to_string(),
+                        "status": "error",
+                        "reason": "context_snippet must be a string"
+                    }));
+                    continue;
+                }
+            }
+        }
+
+        if let Some(v) = row.get("source_fold_id") {
+            if v.is_null() {
+                entity.source_fold_id = None;
+                mutated = true;
+            } else if let Some(raw) = v.as_str() {
+                entity.source_fold_id = match uuid::Uuid::parse_str(raw) {
+                    Ok(id) => {
+                        mutated = true;
+                        Some(id)
+                    }
+                    Err(err) => {
+                        errors += 1;
+                        results.push(serde_json::json!({
+                            "index": idx,
+                            "entity_id": entity_id.to_string(),
+                            "status": "error",
+                            "reason": format!("source_fold_id invalid uuid: {err}")
+                        }));
+                        continue;
+                    }
+                };
+            } else {
+                errors += 1;
+                results.push(serde_json::json!({
+                    "index": idx,
+                    "entity_id": entity_id.to_string(),
+                    "status": "error",
+                    "reason": "source_fold_id must be string UUID or null"
+                }));
+                continue;
+            }
+        }
+
+        if let Some(v) = row.get("confidence") {
+            let confidence = match v.as_f64() {
+                Some(value) => value,
+                None => {
+                    errors += 1;
+                    results.push(serde_json::json!({
+                        "index": idx,
+                        "entity_id": entity_id.to_string(),
+                        "status": "error",
+                        "reason": "confidence must be a number"
+                    }));
+                    continue;
+                }
+            };
+            if !(0.0..=1.0).contains(&confidence) {
+                errors += 1;
+                results.push(serde_json::json!({
+                    "index": idx,
+                    "entity_id": entity_id.to_string(),
+                    "status": "error",
+                    "reason": "confidence must be between 0 and 1"
+                }));
+                continue;
+            }
+            entity.confidence = confidence;
+            mutated = true;
+        }
+
+        if let Some(v) = row.get("state") {
+            let state = match v.as_str() {
+                Some(state) => state,
+                None => {
+                    errors += 1;
+                    results.push(serde_json::json!({
+                        "index": idx,
+                        "entity_id": entity_id.to_string(),
+                        "status": "error",
+                        "reason": format!("batch_update_entities[{idx}] state must be a string")
+                    }));
+                    continue;
+                }
+            };
+            let state = match parse_ingest_state(Some(state)) {
+                Ok(state) => state,
+                Err(reason) => {
+                    errors += 1;
+                    results.push(serde_json::json!({
+                        "index": idx,
+                        "entity_id": entity_id.to_string(),
+                        "status": "error",
+                        "reason": reason
+                    }));
+                    continue;
+                }
+            };
+            if entity.state != state {
+                entity.state = state;
+                mutated = true;
+            }
+        }
+
+        if row.contains_key("description") {
+            match row.get("description") {
+                Some(value) if value.is_null() => {
+                    entity.description = None;
+                    mutated = true;
+                }
+                Some(value) => match value.as_str() {
+                    Some(value) => {
+                        entity.description = Some(value.to_string());
+                        mutated = true;
+                    }
+                    None => {
+                        errors += 1;
+                        results.push(serde_json::json!({
+                            "index": idx,
+                            "entity_id": entity_id.to_string(),
+                            "status": "error",
+                            "reason": "description must be a string or null"
+                        }));
+                        continue;
+                    }
+                },
+                None => {}
+            }
+        }
+
+        if row.contains_key("tags") {
+            let tags = row.get("tags").unwrap();
+            match tags {
+                Value::Array(values) => {
+                    let mut parsed_tags = Vec::with_capacity(values.len());
+                    let mut invalid = false;
+                    for v in values {
+                        match v.as_str() {
+                            Some(tag) => parsed_tags.push(tag.to_string()),
+                            None => {
+                                errors += 1;
+                                results.push(serde_json::json!({
+                                    "index": idx,
+                                    "entity_id": entity_id.to_string(),
+                                    "status": "error",
+                                    "reason": "tags must be an array of strings"
+                                }));
+                                invalid = true;
+                                break;
+                            }
+                        }
+                    }
+                    if invalid {
+                        continue;
+                    }
+                    entity.tags = parsed_tags;
+                    mutated = true;
+                }
+                Value::Null => {
+                    entity.tags = Vec::new();
+                    mutated = true;
+                }
+                _ => {
+                    errors += 1;
+                    results.push(serde_json::json!({
+                        "index": idx,
+                        "entity_id": entity_id.to_string(),
+                        "status": "error",
+                        "reason": "tags must be an array of strings"
+                    }));
+                    continue;
+                }
+            }
+        }
+
+        if row.contains_key("properties") {
+            match row.get("properties") {
+                Some(value) if value.is_object() || value.is_null() => {
+                    entity.properties = value.clone();
+                    mutated = true;
+                }
+                _ => {
+                    errors += 1;
+                    results.push(serde_json::json!({
+                        "index": idx,
+                        "entity_id": entity_id.to_string(),
+                        "status": "error",
+                        "reason": "properties must be an object"
+                    }));
+                    continue;
+                }
+            }
+        }
+
+        if row.contains_key("embedding") {
+            match row.get("embedding") {
+                Some(value) if value.is_null() => {
+                    entity.entity_embedding = None;
+                    mutated = true;
+                }
+                Some(value) => match value.as_array() {
+                    Some(values) => {
+                        let mut embedding = Vec::with_capacity(values.len());
+                        let mut invalid = false;
+                        for value in values {
+                            match value.as_f64() {
+                                Some(v) => embedding.push(v as f32),
+                                None => {
+                                    invalid = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if invalid {
+                            errors += 1;
+                            results.push(serde_json::json!({
+                                "index": idx,
+                                "entity_id": entity_id.to_string(),
+                                "status": "error",
+                                "reason": "embedding must be a number array"
+                            }));
+                            continue;
+                        }
+                        entity.entity_embedding = Some(embedding);
+                        mutated = true;
+                    }
+                    None => {
+                        errors += 1;
+                        results.push(serde_json::json!({
+                            "index": idx,
+                            "entity_id": entity_id.to_string(),
+                            "status": "error",
+                            "reason": "embedding must be an array"
+                        }));
+                        continue;
+                    }
+                },
+                None => {}
+            }
+        }
+
+        if !mutated {
+            unchanged += 1;
+            results.push(serde_json::json!({
+                "index": idx,
+                "entity_id": entity_id.to_string(),
+                "status": "unchanged"
+            }));
+            continue;
+        }
+
+        entity.updated_at = Some(chrono::Utc::now());
+        match storage.entity_put(ctx, &entity).await {
+            Ok(_) => {
+                updated += 1;
+                session.dirty.store(true, Ordering::Relaxed);
+                session.last_activity.notify_waiters();
+                results.push(serde_json::json!({
+                    "index": idx,
+                    "entity_id": entity_id.to_string(),
+                    "status": "updated"
+                }));
+            }
+            Err(err) => {
+                errors += 1;
+                results.push(serde_json::json!({
+                    "index": idx,
+                    "entity_id": entity_id.to_string(),
+                    "status": "error",
+                    "reason": err.to_string()
+                }));
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "updated": updated,
+        "unchanged": unchanged,
+        "not_found": not_found,
+        "errors": errors,
+        "total": entities.len(),
+        "results": results,
+    }))
+}
+
+async fn handle_batch_delete_entities<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+    let entities = args
+        .get("entities")
+        .and_then(|v| v.as_array())
+        .ok_or((INVALID_PARAMS, "entities must be an array".to_string()))?;
+
+    if entities.len() > 100 {
+        return Err((
+            INVALID_PARAMS,
+            format!(
+                "entities array length {} exceeds maximum of 100",
+                entities.len()
+            ),
+        ));
+    }
+
+    let mut deleted: usize = 0;
+    let mut not_found: usize = 0;
+    let mut errors: usize = 0;
+    let mut results = Vec::with_capacity(entities.len());
+
+    for entity_json in entities {
+        let idx = results.len();
+        let Some(row) = entity_json.as_object() else {
+            errors += 1;
+            results.push(serde_json::json!({
+                "index": idx,
+                "status": "error",
+                "reason": format!("batch_delete_entities[{idx}] must be an object")
+            }));
+            continue;
+        };
+
+        let entity_id = match row
+            .get("entity_id")
+            .and_then(|v| v.as_str())
+            .and_then(|v| uuid::Uuid::parse_str(v).ok())
+        {
+            Some(id) => id,
+            None => {
+                errors += 1;
+                results.push(serde_json::json!({
+                    "index": idx,
+                    "status": "error",
+                    "reason": format!(
+                        "batch_delete_entities[{idx}] missing/invalid entity_id"
+                    )
+                }));
+                continue;
+            }
+        };
+
+        match storage.entity_delete(ctx, session_id, entity_id).await {
+            Ok(true) => {
+                deleted += 1;
+                session.dirty.store(true, Ordering::Relaxed);
+                session.last_activity.notify_waiters();
+                results.push(serde_json::json!({
+                    "index": idx,
+                    "entity_id": entity_id.to_string(),
+                    "status": "deleted"
+                }));
+            }
+            Ok(false) => {
+                not_found += 1;
+                results.push(serde_json::json!({
+                    "index": idx,
+                    "entity_id": entity_id.to_string(),
+                    "status": "not_found"
+                }));
+            }
+            Err(err) => {
+                errors += 1;
+                results.push(serde_json::json!({
+                    "index": idx,
+                    "entity_id": entity_id.to_string(),
+                    "status": "error",
+                    "reason": err.to_string()
+                }));
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "deleted": deleted,
+        "not_found": not_found,
+        "errors": errors,
+        "total": entities.len(),
+        "results": results,
+    }))
+}
+
 async fn handle_retrieve_entities<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
@@ -1652,8 +3074,8 @@ async fn handle_retrieve_entities<S: crate::storage::Storage>(
         let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
             provider: "ollama".into(),
             ollama_base_url: session.ollama_base_url.clone(),
-            model: "nomic-embed-text".into(),
-            dimensions: 768,
+            model: session.embed_model.clone(),
+            dimensions: session.embed_dimensions,
             ner_model: String::new(),
         });
         match client.embed(query).await {
@@ -1952,8 +3374,8 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
         let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
             provider: "ollama".into(),
             ollama_base_url: session.ollama_base_url.clone(),
-            model: "nomic-embed-text".into(),
-            dimensions: 768,
+            model: session.embed_model.clone(),
+            dimensions: session.embed_dimensions,
             ner_model: String::new(),
         });
         match client.embed(content).await {
@@ -2019,6 +3441,7 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
                 created_at: chrono::Utc::now().to_rfc3339(),
                 context: content.chars().take(256).collect(),
                 child_count: None,
+                ..Default::default()
             },
             action: action.clone(),
         });
@@ -2074,6 +3497,300 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
         }
     }
     Ok(result)
+}
+
+// --- Skills handlers ---
+
+async fn handle_ingest_skill<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    // Reject unknown top-level keys. Fail-loud per the project rule: silent
+    // field drops hide schema drift for weeks. Every key a caller passes must
+    // be one the server recognizes, or the caller needs to learn about the
+    // mismatch the first time they make it.
+    const KNOWN_KEYS: &[&str] = &[
+        "name",
+        "category",
+        "description",
+        "session_id",
+        "trigger_keywords",
+        "tags",
+        "prerequisites",
+        "steps",
+        "output_artifacts",
+        "completion_criteria",
+        "content_hash",
+    ];
+    if let Some(obj) = args.as_object() {
+        let unknown: Vec<&str> = obj
+            .keys()
+            .map(|s| s.as_str())
+            .filter(|k| !KNOWN_KEYS.contains(k))
+            .collect();
+        if !unknown.is_empty() {
+            return Err((
+                -32602,
+                format!(
+                    "unknown field(s) on ingest_skill: {}. Known: {}",
+                    unknown.join(", "),
+                    KNOWN_KEYS.join(", ")
+                ),
+            ));
+        }
+    }
+
+    let name = require_str(&args, "name")?.to_string();
+    let category = require_str(&args, "category")?.to_string();
+    let description = require_str(&args, "description")?.to_string();
+    let caller_session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+
+    let trigger_keywords = args
+        .get("trigger_keywords")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let tags = args
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let prerequisites = args
+        .get("prerequisites")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    // Propagate serde errors — never default-on-failure. A malformed step
+    // array with keys like {title, body} instead of {phase, instruction}
+    // must surface as an error, not a silently empty `steps: []`.
+    let steps: Vec<crate::skill::Step> = match args.get("steps").cloned() {
+        Some(v) => serde_json::from_value(v)
+            .map_err(|e| (-32602, format!("invalid `steps` payload: {e}")))?,
+        None => Vec::new(),
+    };
+    let output_artifacts = args
+        .get("output_artifacts")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let completion_criteria = args
+        .get("completion_criteria")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let content_hash = args
+        .get("content_hash")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let params = crate::skill::IngestSkillParams {
+        name,
+        category,
+        description,
+        trigger_keywords,
+        tags,
+        prerequisites,
+        steps,
+        output_artifacts,
+        completion_criteria,
+        content_hash,
+        caller_session_id,
+    };
+
+    // Build an embedding client from session config so description_embedding
+    // is populated alongside the skill entity.
+    let embed_client = if !session.ollama_base_url.is_empty() {
+        Some(crate::embedding::EmbeddingClient::new(
+            &crate::config::EmbeddingConfig {
+                provider: "ollama".into(),
+                ollama_base_url: session.ollama_base_url.clone(),
+                model: session.embed_model.clone(),
+                dimensions: session.embed_dimensions,
+                ner_model: String::new(),
+            },
+        ))
+    } else {
+        None
+    };
+
+    let action = crate::skill::ingest_skill(
+        storage,
+        ctx,
+        params,
+        embed_client.as_ref(),
+        session.graph.as_deref(),
+    )
+    .await
+    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    let mut result = serde_json::to_value(&action).map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert(
+            "_hint".into(),
+            Value::String(
+                "Skills are global knowledge shared across every session. If you \
+                 use this skill and learn something new — a better step, a missing \
+                 prerequisite, a clearer description — call ingest_skill again with \
+                 the refinement. Your changes persist."
+                    .into(),
+            ),
+        );
+    }
+    Ok(result)
+}
+
+async fn handle_retrieve_skills_for_context<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let context = require_str(&args, "context")?.to_string();
+    let caller_session = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(5)
+        .clamp(1, 20);
+    let min_score = args
+        .get("min_score")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+
+    let mut query_embedding = args.get("embedding").and_then(|v| v.as_array()).map(|arr| {
+        arr.iter()
+            .filter_map(|n| n.as_f64().map(|f| f as f32))
+            .collect::<Vec<f32>>()
+    });
+    if query_embedding.is_none() && !session.ollama_base_url.is_empty() {
+        let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
+            provider: "ollama".into(),
+            ollama_base_url: session.ollama_base_url.clone(),
+            model: session.embed_model.clone(),
+            dimensions: session.embed_dimensions,
+            ner_model: String::new(),
+        });
+        if let Ok(emb) = client.embed(&context).await {
+            query_embedding = Some(emb);
+        }
+    }
+
+    // Used-in-session signal — retrieval_tracker records which entity_ids
+    // have been touched in this session.
+    let used_ids: std::collections::HashSet<uuid::Uuid> = {
+        let tracker = session.retrieval_tracker.lock().await;
+        tracker.recent_ids(50).into_iter().collect()
+    };
+
+    let hits = crate::skill::retrieve_skills_for_context(
+        storage,
+        ctx,
+        caller_session,
+        &context,
+        query_embedding.as_deref(),
+        limit,
+        min_score,
+        &used_ids,
+    )
+    .await
+    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    let hint = if hits.is_empty() {
+        "No skills matched. Ingest one with ingest_skill, or broaden the context."
+    } else {
+        "These skills are shared across all sessions. If you successfully apply one, \
+         remember it. If you discover a refinement, call ingest_skill to persist it."
+    };
+
+    Ok(serde_json::json!({
+        "results": hits,
+        "_hint": hint,
+    }))
+}
+
+async fn handle_invoke_skill<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    _session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let name = require_str(&args, "skill_name")?.to_string();
+
+    let entity = crate::skill::get_skill_by_name(storage, ctx, &name)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    let entity = match entity {
+        Some(e) => e,
+        None => {
+            let similar = crate::skill::similar_skill_names(storage, ctx, &name, 3).await;
+            let payload = serde_json::json!({
+                "error": format!("skill not found: '{}'", name),
+                "did_you_mean": similar,
+                "hint": "Call retrieve_skills_for_context to discover available skills, \
+                        or ingest_skill to add this one.",
+            });
+            return Err((INVALID_PARAMS, payload.to_string()));
+        }
+    };
+
+    let result = crate::skill::build_invoke_result(&entity);
+    serde_json::to_value(&result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
+async fn handle_ensure_parent_tag<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let child_tag = require_str(&args, "child_tag")?.to_string();
+    let parent_tag = require_str(&args, "parent_tag")?.to_string();
+    let caller_session = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+
+    let action = crate::skill::ensure_parent_tag(
+        storage,
+        ctx,
+        caller_session,
+        &child_tag,
+        &parent_tag,
+        session.graph.as_deref(),
+    )
+    .await
+    .map_err(|e| (INVALID_PARAMS, e.to_string()))?;
+
+    serde_json::to_value(&action).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
+async fn handle_verify_skill<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    _session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let name = require_str(&args, "skill_name")?.to_string();
+    let result = crate::skill::verify_skill(storage, ctx, &name)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    serde_json::to_value(&result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
 }
 
 // --- Intention handlers ---
@@ -2338,13 +4055,26 @@ async fn handle_explore_connections<S: crate::storage::Storage>(
         "related_entities" => {
             let entity_id = require_uuid(&args, "entity_id")?;
             let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
-            // Try graph backend first, fall back to CQL typed_edges if empty
+            // Try graph backend first, fall back to CQL typed_edges if empty.
+            // A graph error is a DESIGNED fallback (the graph client may be
+            // disabled, unreachable, or temporarily degraded) — but it must
+            // be logged so operators can see silent fall-through.
             let graph_results = if let Some(graph) = session.graph.as_ref() {
-                graph
+                match graph
                     .find_related_entities(entity_id, session_id, max_depth)
                     .await
-                    .ok()
-                    .unwrap_or_default()
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            %entity_id,
+                            %session_id,
+                            error = %e,
+                            "related_entities: graph backend failed; falling back to CQL typed_edges"
+                        );
+                        Vec::new()
+                    }
+                }
             } else {
                 Vec::new()
             };
@@ -2446,8 +4176,8 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
             provider: "ollama".into(),
             ollama_base_url: session.ollama_base_url.clone(),
-            model: "nomic-embed-text".into(),
-            dimensions: 768,
+            model: session.embed_model.clone(),
+            dimensions: session.embed_dimensions,
             ner_model: String::new(),
         });
         match client.embed(query).await {
@@ -2467,6 +4197,7 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         None,
         None,
         &crate::hybrid_search::FusionConfig::default(),
+        None,
     )
     .await
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
@@ -2581,6 +4312,9 @@ async fn handle_enrich_entities<S: crate::storage::Storage>(
         force,
         dry_run,
         batch_size: 10,
+        ollama_base_url: session.ollama_base_url.clone(),
+        embed_model: session.embed_model.clone(),
+        embed_dimensions: session.embed_dimensions,
     };
 
     let result = crate::enrich::run_enrichment(storage, ctx, session_id, &enrich_config)
@@ -2668,6 +4402,86 @@ async fn handle_get_stats<S: crate::storage::Storage>(
         );
     }
     Ok(response)
+}
+
+async fn handle_count_entities_by_type<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let start = std::time::Instant::now();
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+    let rows = storage
+        .entity_counts_by_type_and_state(ctx, session_id)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    let mut total = 0usize;
+    let mut by_entity_type = serde_json::Map::new();
+    let mut by_state = serde_json::Map::new();
+    let mut by_type_and_state: std::collections::BTreeMap<String, serde_json::Map<String, Value>> =
+        std::collections::BTreeMap::new();
+
+    for row in rows {
+        total += row.count;
+
+        let type_entry = by_entity_type
+            .entry(row.entity_type.clone())
+            .or_insert_with(|| serde_json::json!(0));
+        let type_total = type_entry.as_u64().unwrap_or(0) + row.count as u64;
+        *type_entry = serde_json::json!(type_total);
+
+        let state_key = row.state.to_string();
+        let state_entry = by_state
+            .entry(state_key.clone())
+            .or_insert_with(|| serde_json::json!(0));
+        let state_total = state_entry.as_u64().unwrap_or(0) + row.count as u64;
+        *state_entry = serde_json::json!(state_total);
+
+        by_type_and_state
+            .entry(row.entity_type)
+            .or_default()
+            .insert(state_key, serde_json::json!(row.count));
+    }
+
+    let sum_by_type: usize = by_entity_type
+        .values()
+        .map(|v| v.as_u64().unwrap_or(0) as usize)
+        .sum();
+    let sum_by_state: usize = by_state
+        .values()
+        .map(|v| v.as_u64().unwrap_or(0) as usize)
+        .sum();
+    let sum_joint: usize = by_type_and_state
+        .values()
+        .flat_map(|inner| inner.values())
+        .map(|v| v.as_u64().unwrap_or(0) as usize)
+        .sum();
+
+    if total != sum_by_type || total != sum_by_state || total != sum_joint {
+        tracing::error!(
+            total,
+            sum_by_type,
+            sum_by_state,
+            sum_joint,
+            "count_entities_by_type invariant mismatch"
+        );
+        return Err((
+            INTERNAL_ERROR,
+            "count_entities_by_type invariant mismatch".to_string(),
+        ));
+    }
+    debug_assert_eq!(total, sum_by_type);
+    debug_assert_eq!(total, sum_by_state);
+    debug_assert_eq!(total, sum_joint);
+
+    Ok(serde_json::json!({
+        "total": total,
+        "by_entity_type": by_entity_type,
+        "by_state": by_state,
+        "by_type_and_state": by_type_and_state,
+        "duration_ms": start.elapsed().as_millis() as u64,
+    }))
 }
 
 // --- Spreading activation handler ---
@@ -2949,39 +4763,100 @@ async fn handle_manage_rules<S: crate::storage::Storage>(
     match action {
         "list" => {
             let family = args.get("family").and_then(|v| v.as_str()).unwrap_or("*");
-            if family == "*" {
-                // List all active rules -- return built-in rules
-                let builtins = crate::datalog::builtin_rules();
-                return Ok(serde_json::json!({
-                    "action": "list",
-                    "rules": builtins.iter().map(|r| {
-                        serde_json::json!({ "head": r.head.predicate, "body_count": r.body.len() })
-                    }).collect::<Vec<_>>(),
-                    "count": builtins.len(),
-                    "hint": "Showing built-in rules. Use family parameter to filter stored rules."
-                }));
-            }
-            let rules = storage
-                .rule_list_family(ctx, family, crate::types::RuleState::Active)
-                .await
-                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+            let source = args
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or(if family == "*" { "builtin" } else { "registry" });
 
-            let results: Vec<Value> = rules
-                .iter()
-                .map(|r| {
-                    serde_json::json!({
-                        "rule_id": r.rule_id,
-                        "version": r.version,
-                        "name": r.name,
-                        "family": r.family,
-                        "state": r.state.to_string(),
-                        "rule_body": r.rule_body,
-                        "rule_weight": r.rule_weight,
+            let results: Vec<Value> = match source {
+                "builtin" => crate::datalog::synthetic_builtin_rule_entries(ctx.tenant_id)
+                    .into_iter()
+                    .filter(|r| family == "*" || r.family == family)
+                    .map(|r| {
+                        serde_json::json!({
+                            "source": "builtin",
+                            "rule_id": r.rule_id,
+                            "version": r.version,
+                            "name": r.name,
+                            "family": r.family,
+                            "state": r.state.to_string(),
+                            "rule_body": r.rule_body,
+                            "rule_weight": r.rule_weight,
+                        })
                     })
-                })
-                .collect();
+                    .collect(),
+                "registry" => {
+                    let stored_rules = if family == "*" {
+                        storage
+                            .rule_list_active(ctx, crate::types::RuleState::Active)
+                            .await
+                            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+                    } else {
+                        storage
+                            .rule_list_family(ctx, family, crate::types::RuleState::Active)
+                            .await
+                            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+                    };
+                    let mut rows = Vec::with_capacity(stored_rules.len());
+                    for r in stored_rules {
+                        let approval_state = crate::expert_system::approval_state(
+                            storage,
+                            ctx,
+                            crate::types::ArtifactKind::Rule,
+                            &r.rule_id,
+                        )
+                        .await
+                        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+                        rows.push(serde_json::json!({
+                            "source": "registry",
+                            "rule_id": r.rule_id,
+                            "version": r.version,
+                            "name": r.name,
+                            "family": r.family,
+                            "state": r.state.to_string(),
+                            "approval_state": approval_state.map(|state| state.to_string()),
+                            "rule_body": r.rule_body,
+                            "rule_weight": r.rule_weight,
+                        }));
+                    }
+                    rows
+                }
+                "effective" => {
+                    crate::datalog::load_effective_rule_entries(storage, ctx, Some(family))
+                        .await
+                        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+                        .into_iter()
+                        .map(|rule| {
+                            serde_json::json!({
+                                "source": match rule.source {
+                                    crate::datalog::RuleSource::Builtin => "builtin",
+                                    crate::datalog::RuleSource::Registry => "registry",
+                                },
+                                "rule_id": rule.entry.rule_id,
+                                "version": rule.entry.version,
+                                "name": rule.entry.name,
+                                "family": rule.entry.family,
+                                "state": rule.entry.state.to_string(),
+                                "rule_body": rule.entry.rule_body,
+                                "rule_weight": rule.entry.rule_weight,
+                            })
+                        })
+                        .collect()
+                }
+                _ => {
+                    return Err((
+                        INVALID_PARAMS,
+                        "Unknown source. Use builtin, registry, or effective.".into(),
+                    ));
+                }
+            };
 
-            Ok(serde_json::json!({ "action": "list", "rules": results, "count": results.len() }))
+            Ok(serde_json::json!({
+                "action": "list",
+                "source": source,
+                "rules": results,
+                "count": results.len()
+            }))
         }
         "get" => {
             let rule_id = require_str(&args, "rule_id")?;
@@ -3004,14 +4879,12 @@ async fn handle_manage_rules<S: crate::storage::Storage>(
             let rule_id = require_str(&args, "rule_id")?;
             let rule_body = require_str(&args, "rule_body")?;
 
-            // Validate rule parses (STRIDE S7 -- reject malformed rules)
-            crate::datalog::parse_rule(rule_body)
+            let parsed = crate::datalog::parse_rule(rule_body)
                 .map_err(|e| (INVALID_PARAMS, format!("Invalid rule syntax: {e}")))?;
-
             let family = args
                 .get("family")
                 .and_then(|v| v.as_str())
-                .unwrap_or("custom");
+                .unwrap_or(&parsed.head.predicate);
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or(rule_id);
             let weight = args
                 .get("rule_weight")
@@ -3047,16 +4920,27 @@ async fn handle_manage_rules<S: crate::storage::Storage>(
                 .await
                 .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
-            // Invalidate derived cache for affected predicates
-            let parsed = crate::datalog::parse_rule(rule_body).unwrap();
-            let _ = storage
-                .derived_cache_clear(ctx, &parsed.head.predicate)
-                .await;
+            let approval = crate::expert_system::record_approval(
+                storage,
+                ctx,
+                crate::types::ArtifactKind::Rule,
+                rule_id,
+                crate::types::ApprovalDecision::Proposed,
+                Some("rule submitted for review".to_string()),
+                "rule".to_string(),
+                None,
+                None,
+            )
+            .await
+            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+            invalidate_predicate_cache(storage, ctx, &parsed.head.predicate).await;
 
             Ok(serde_json::json!({
                 "action": "put",
                 "rule_id": rule_id,
                 "version": version,
+                "approval": approval_json(&approval),
                 "hint": "Rule stored. Derived cache invalidated for affected predicate."
             }))
         }
@@ -3088,6 +4972,579 @@ async fn handle_manage_rules<S: crate::storage::Storage>(
             format!("Unknown action: {action}. Use list/get/put/deprecate."),
         )),
     }
+}
+
+async fn invalidate_predicate_cache<S: crate::storage::Storage>(
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    predicate: &str,
+) {
+    let mut keys_to_clear = std::collections::BTreeSet::new();
+    keys_to_clear.insert(predicate.to_string());
+
+    if let Ok(rows) = storage.derived_cache_list_all(ctx, 10_000).await {
+        for row in rows {
+            if row.predicate == predicate
+                && let Some(key) = row.cache_key
+            {
+                keys_to_clear.insert(key);
+            }
+        }
+    }
+
+    for key in keys_to_clear {
+        let _ = storage.derived_cache_clear(ctx, &key).await;
+    }
+}
+
+fn approval_json(entry: &crate::types::ApprovalEntry) -> Value {
+    serde_json::json!({
+        "approval_id": entry.approval_id,
+        "artifact_kind": entry.artifact_kind,
+        "artifact_ref": entry.artifact_ref,
+        "decision": entry.decision,
+        "review_note": entry.review_note,
+        "reviewer": entry.reviewer,
+        "scope": entry.scope,
+        "workspace_scope": entry.workspace_scope,
+        "session_scope": entry.session_scope,
+        "mirror_entity_id": entry.mirror_entity_id,
+        "created_at": entry.created_at,
+    })
+}
+
+fn claim_json(entry: &crate::types::EntityEntry) -> Value {
+    serde_json::json!({
+        "claim_id": entry.entity_name,
+        "claim_entity_id": entry.entity_id,
+        "claim_text": entry.properties.get("claim_text").and_then(|v| v.as_str()).unwrap_or(&entry.context_snippet),
+        "domain": entry.properties.get("domain").and_then(|v| v.as_str()),
+        "status": crate::expert_system::claim_status_from_entity(entry).to_string(),
+        "confidence": entry.properties.get("confidence").and_then(|v| v.as_f64()).unwrap_or(entry.confidence),
+        "source_ref": entry.properties.get("source_ref"),
+        "support_count": entry.properties.get("support_count").and_then(|v| v.as_i64()).unwrap_or_default(),
+        "workspace_scope": entry.properties.get("workspace_scope"),
+        "session_scope": entry.properties.get("session_scope"),
+        "updated_at": entry.updated_at.unwrap_or(entry.created_at),
+    })
+}
+
+fn alias_json(entry: &crate::types::AliasEntry) -> Value {
+    serde_json::json!({
+        "alias_id": entry.alias_id,
+        "alias_name": entry.alias_name,
+        "scope_kind": entry.scope_kind,
+        "scope_ref": entry.scope_ref,
+        "canonical_tool": entry.canonical_tool,
+        "parameter_map": entry.parameter_map,
+        "fixed_arguments": entry.fixed_arguments,
+        "args_templates": entry.args_templates,
+        "status": entry.status,
+        "created_at": entry.created_at,
+        "updated_at": entry.updated_at,
+    })
+}
+
+async fn handle_manage_claims<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let action = require_str(&args, "action")?;
+    match action {
+        "list" => {
+            let include_unapproved = args
+                .get("include_unapproved")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let session_id = optional_uuid(&args, "session_id")?;
+            let mut claims: Vec<crate::types::EntityEntry> = storage
+                .entity_list_all(ctx)
+                .await
+                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+                .into_iter()
+                .filter(|entry| entry.entity_type == crate::expert_system::CLAIM_ENTITY_TYPE)
+                .filter(|entry| session_id.is_none_or(|session_id| entry.session_id == session_id))
+                .filter(|entry| {
+                    include_unapproved
+                        || matches!(
+                            crate::expert_system::claim_status_from_entity(entry),
+                            crate::types::ClaimStatus::Approved
+                        )
+                })
+                .collect();
+            claims.sort_by(|left, right| {
+                right
+                    .updated_at
+                    .unwrap_or(right.created_at)
+                    .cmp(&left.updated_at.unwrap_or(left.created_at))
+            });
+            let rows: Vec<Value> = claims.iter().map(claim_json).collect();
+            Ok(serde_json::json!({
+                "action": "list",
+                "claims": rows,
+                "count": rows.len(),
+            }))
+        }
+        "get" => {
+            let claim_id = require_str(&args, "claim_id")?;
+            let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+            let claim = storage
+                .entity_get_by_id(
+                    ctx,
+                    session_id,
+                    crate::expert_system::claim_entity_id(claim_id),
+                )
+                .await
+                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+            Ok(serde_json::json!({
+                "action": "get",
+                "claim": claim.as_ref().map(claim_json),
+            }))
+        }
+        "put" => {
+            let claim_id = require_str(&args, "claim_id")?;
+            let claim_text = require_str(&args, "claim_text")?;
+            let domain = args
+                .get("domain")
+                .and_then(|value| value.as_str())
+                .unwrap_or("general");
+            let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+            let status = args
+                .get("status")
+                .and_then(|value| value.as_str())
+                .map(crate::expert_system::parse_claim_status)
+                .transpose()
+                .map_err(|e| (INVALID_PARAMS, e.to_string()))?
+                .unwrap_or(crate::types::ClaimStatus::Proposed);
+            let confidence = args
+                .get("confidence")
+                .and_then(|value| value.as_f64())
+                .unwrap_or(1.0);
+            let support_count = args
+                .get("support_count")
+                .and_then(|value| value.as_i64())
+                .unwrap_or(0) as i32;
+            let source_ref = args.get("source_ref").and_then(|value| value.as_str());
+            let workspace_scope = args.get("workspace_scope").and_then(|value| value.as_str());
+
+            let claim = crate::expert_system::claim_entity(
+                ctx,
+                claim_id,
+                session_id,
+                claim_text,
+                domain,
+                status,
+                confidence,
+                source_ref,
+                support_count,
+                workspace_scope,
+            );
+
+            storage
+                .entity_put(ctx, &claim)
+                .await
+                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+            let decision = match status {
+                crate::types::ClaimStatus::Proposed => crate::types::ApprovalDecision::Proposed,
+                crate::types::ClaimStatus::Approved => crate::types::ApprovalDecision::Approved,
+                crate::types::ClaimStatus::Rejected => crate::types::ApprovalDecision::Rejected,
+            };
+            let approval = crate::expert_system::record_approval(
+                storage,
+                ctx,
+                crate::types::ArtifactKind::Claim,
+                claim_id,
+                decision,
+                Some(format!("claim status set to {status}")),
+                "claim".to_string(),
+                workspace_scope.map(str::to_string),
+                Some(session_id),
+            )
+            .await
+            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+            Ok(serde_json::json!({
+                "action": "put",
+                "claim": claim_json(&claim),
+                "approval": approval_json(&approval),
+            }))
+        }
+        _ => Err((
+            INVALID_PARAMS,
+            format!("Unknown action: {action}. Use list/get/put."),
+        )),
+    }
+}
+
+async fn handle_manage_approvals<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let action = require_str(&args, "action")?;
+    let artifact_kind =
+        crate::expert_system::parse_artifact_kind(require_str(&args, "artifact_kind")?)
+            .map_err(|e| (INVALID_PARAMS, e.to_string()))?;
+    let artifact_ref = require_str(&args, "artifact_ref")?;
+
+    match action {
+        "list" => {
+            let rows = storage
+                .approval_list(ctx, &artifact_kind.to_string(), artifact_ref)
+                .await
+                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+            let rows: Vec<Value> = rows.iter().map(approval_json).collect();
+            Ok(serde_json::json!({
+                "action": "list",
+                "approvals": rows,
+                "count": rows.len(),
+            }))
+        }
+        "latest" => {
+            let latest = storage
+                .approval_latest(ctx, &artifact_kind.to_string(), artifact_ref)
+                .await
+                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+            Ok(serde_json::json!({
+                "action": "latest",
+                "approval": latest.as_ref().map(approval_json),
+            }))
+        }
+        "record" => {
+            let decision = args
+                .get("decision")
+                .and_then(|value| value.as_str())
+                .ok_or((INVALID_PARAMS, "missing required string: decision".into()))
+                .and_then(|value| {
+                    crate::expert_system::parse_approval_decision(value)
+                        .map_err(|e| (INVALID_PARAMS, e.to_string()))
+                })?;
+            let review_note = args
+                .get("review_note")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            let scope = args
+                .get("scope")
+                .and_then(|value| value.as_str())
+                .unwrap_or("operator")
+                .to_string();
+            let workspace_scope = args
+                .get("workspace_scope")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            let session_scope = optional_uuid(&args, "session_scope")?;
+
+            let approval = crate::expert_system::record_approval(
+                storage,
+                ctx,
+                artifact_kind,
+                artifact_ref,
+                decision,
+                review_note,
+                scope,
+                workspace_scope,
+                session_scope,
+            )
+            .await
+            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+            if matches!(artifact_kind, crate::types::ArtifactKind::Claim)
+                && let Some(session_id) = session_scope
+                && let Some(mut claim) = storage
+                    .entity_get_by_id(
+                        ctx,
+                        session_id,
+                        crate::expert_system::claim_entity_id(artifact_ref),
+                    )
+                    .await
+                    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+            {
+                if let Some(properties) = claim.properties.as_object_mut() {
+                    properties.insert("status".into(), Value::String(decision.to_string()));
+                }
+                claim.updated_at = Some(chrono::Utc::now());
+                storage
+                    .entity_put(ctx, &claim)
+                    .await
+                    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+            }
+
+            Ok(serde_json::json!({
+                "action": "record",
+                "approval": approval_json(&approval),
+            }))
+        }
+        _ => Err((
+            INVALID_PARAMS,
+            format!("Unknown action: {action}. Use list/latest/record."),
+        )),
+    }
+}
+
+async fn handle_manage_aliases<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let action = require_str(&args, "action")?;
+    let alias_name = require_str(&args, "alias_name")?;
+    match action {
+        "list" => {
+            let aliases = storage
+                .alias_list(ctx, alias_name)
+                .await
+                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+            let rows: Vec<Value> = aliases.iter().map(alias_json).collect();
+            Ok(serde_json::json!({
+                "action": "list",
+                "aliases": rows,
+                "count": rows.len(),
+            }))
+        }
+        "resolve" => {
+            let workspace_scope = args.get("workspace_scope").and_then(|value| value.as_str());
+            let session_scope = optional_uuid(&args, "session_scope")?;
+            let alias = crate::expert_system::resolve_alias(
+                storage,
+                ctx,
+                alias_name,
+                workspace_scope,
+                session_scope,
+            )
+            .await
+            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+            Ok(serde_json::json!({
+                "action": "resolve",
+                "alias": alias.as_ref().map(alias_json),
+            }))
+        }
+        "put" => {
+            let canonical_tool = require_str(&args, "canonical_tool")?;
+            let scope_kind = crate::expert_system::parse_alias_scope_kind(
+                args.get("scope_kind")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("global"),
+            )
+            .map_err(|e| (INVALID_PARAMS, e.to_string()))?;
+            let session_scope = optional_uuid(&args, "session_scope")?;
+            let workspace_scope = args
+                .get("workspace_scope")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            let scope_ref = match scope_kind {
+                crate::types::AliasScopeKind::Global => args
+                    .get("scope_ref")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("*")
+                    .to_string(),
+                crate::types::AliasScopeKind::Workspace => workspace_scope
+                    .clone()
+                    .or_else(|| {
+                        args.get("scope_ref")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string)
+                    })
+                    .ok_or((
+                        INVALID_PARAMS,
+                        "workspace alias requires workspace_scope".into(),
+                    ))?,
+                crate::types::AliasScopeKind::Session => session_scope
+                    .map(|value| value.to_string())
+                    .or_else(|| {
+                        args.get("scope_ref")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string)
+                    })
+                    .ok_or((
+                        INVALID_PARAMS,
+                        "session alias requires session_scope".into(),
+                    ))?,
+            };
+            let status = args
+                .get("status")
+                .and_then(|value| value.as_str())
+                .map(crate::expert_system::parse_claim_status)
+                .transpose()
+                .map_err(|e| (INVALID_PARAMS, e.to_string()))?
+                .unwrap_or(crate::types::ClaimStatus::Proposed);
+            let now = chrono::Utc::now();
+            let alias = crate::types::AliasEntry {
+                tenant_id: ctx.tenant_id,
+                alias_id: uuid::Uuid::now_v7(),
+                alias_name: alias_name.to_string(),
+                scope_kind,
+                scope_ref,
+                canonical_tool: canonical_tool.to_string(),
+                parameter_map: args
+                    .get("parameter_map")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
+                fixed_arguments: args
+                    .get("fixed_arguments")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
+                args_templates: args
+                    .get("args_templates")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
+                status,
+                created_at: now,
+                updated_at: now,
+            };
+
+            storage
+                .alias_put(ctx, &alias)
+                .await
+                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+            storage
+                .entity_put(
+                    ctx,
+                    &crate::expert_system::alias_mirror_entity(&alias, session_scope),
+                )
+                .await
+                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+            let artifact_ref = format!("{alias_name}:{}:{}", alias.scope_kind, alias.scope_ref);
+            let decision = match status {
+                crate::types::ClaimStatus::Proposed => crate::types::ApprovalDecision::Proposed,
+                crate::types::ClaimStatus::Approved => crate::types::ApprovalDecision::Approved,
+                crate::types::ClaimStatus::Rejected => crate::types::ApprovalDecision::Rejected,
+            };
+            let approval = crate::expert_system::record_approval(
+                storage,
+                ctx,
+                crate::types::ArtifactKind::Alias,
+                &artifact_ref,
+                decision,
+                Some(format!("alias status set to {status}")),
+                "alias".to_string(),
+                workspace_scope.clone(),
+                session_scope,
+            )
+            .await
+            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+            Ok(serde_json::json!({
+                "action": "put",
+                "alias": alias_json(&alias),
+                "approval": approval_json(&approval),
+            }))
+        }
+        _ => Err((
+            INVALID_PARAMS,
+            format!("Unknown action: {action}. Use list/put/resolve."),
+        )),
+    }
+}
+
+async fn handle_explain_derived<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let predicate = require_str(&args, "predicate")?;
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+    let src_id = args.get("src_id").and_then(|value| value.as_str());
+    let dst_id = args.get("dst_id").and_then(|value| value.as_str());
+    let limit = args
+        .get("limit")
+        .and_then(|value| value.as_u64())
+        .map(|value| value as usize)
+        .unwrap_or(16)
+        .clamp(1, 64);
+
+    let start = std::time::Instant::now();
+    let derived = crate::datalog::query_predicate(
+        storage,
+        ctx,
+        session_id,
+        predicate,
+        &crate::config::DatalogConfig::default(),
+    )
+    .await
+    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    let explanations: Vec<Value> = derived
+        .iter()
+        .filter(|fact| src_id.is_none_or(|src| fact.src_id == src))
+        .filter(|fact| dst_id.is_none_or(|dst| fact.dst_id == dst))
+        .map(|fact| {
+            let truncated = fact.provenance.len() > limit;
+            let chain: Vec<Value> = fact
+                .provenance
+                .iter()
+                .take(limit)
+                .map(|step| {
+                    serde_json::json!({
+                        "parent_src": step.parent_src,
+                        "parent_pred": step.parent_pred,
+                        "parent_dst": step.parent_dst,
+                        "parent_kind": step.parent_kind,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "predicate": fact.pred,
+                "src_id": fact.src_id,
+                "dst_id": fact.dst_id,
+                "rule_id": fact.rule_id,
+                "support_count": fact.support_count,
+                "support_chain": chain,
+                "approval_state": Value::Null,
+                "fanout": fact.provenance.len(),
+                "truncated": truncated,
+            })
+        })
+        .collect();
+    let elapsed_ms = start.elapsed().as_millis() as i64;
+    let metric_predicate = format!("explain:{predicate}");
+    storage
+        .heat_record(ctx, &metric_predicate, false, Some(elapsed_ms))
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    Ok(serde_json::json!({
+        "predicate": predicate,
+        "explanations": explanations,
+        "count": explanations.len(),
+        "latency_ms": elapsed_ms,
+        "limit": limit,
+    }))
+}
+
+async fn handle_get_effective_rule_set<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let family = args.get("family").and_then(|value| value.as_str());
+    let rules = crate::datalog::load_effective_rule_entries(storage, ctx, family)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    let rows: Vec<Value> = rules
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "source": match entry.source {
+                    crate::datalog::RuleSource::Builtin => "builtin",
+                    crate::datalog::RuleSource::Registry => "registry",
+                },
+                "rule_id": entry.entry.rule_id,
+                "family": entry.entry.family,
+                "name": entry.entry.name,
+                "version": entry.entry.version,
+                "state": entry.entry.state,
+                "rule_body": entry.entry.rule_body,
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({
+        "family": family,
+        "rules": rows,
+        "count": rows.len(),
+    }))
 }
 
 async fn handle_promote_predicate<S: crate::storage::Storage>(
@@ -3134,21 +5591,11 @@ async fn handle_create_edge<S: crate::storage::Storage>(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let edge = crate::types::TypedEdge {
-        tenant_id: ctx.tenant_id,
-        session_id,
-        src_id,
-        edge_type: edge_type.to_string(),
-        dst_id,
-        weight,
-        metadata,
-        created_at: chrono::Utc::now(),
-    };
-
-    storage
-        .typed_edge_put(ctx, &edge)
-        .await
-        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    crate::graph_write::create_typed_edge(
+        storage, ctx, session_id, src_id, edge_type, dst_id, weight, metadata,
+    )
+    .await
+    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
     session.dirty.store(true, Ordering::Relaxed);
     session.last_activity.notify_waiters();
@@ -3219,19 +5666,12 @@ async fn handle_batch_create_edges<S: crate::storage::Storage>(
             .and_then(|v| v.as_f64())
             .unwrap_or(1.0);
 
-        let edge = crate::types::TypedEdge {
-            tenant_id: ctx.tenant_id,
-            session_id,
-            src_id,
-            edge_type: edge_type.to_string(),
-            dst_id,
-            weight,
-            metadata: None,
-            created_at: chrono::Utc::now(),
-        };
-
-        match storage.typed_edge_put(ctx, &edge).await {
-            Ok(()) => created += 1,
+        match crate::graph_write::create_typed_edge(
+            storage, ctx, session_id, src_id, edge_type, dst_id, weight, None,
+        )
+        .await
+        {
+            Ok(_) => created += 1,
             Err(_) => errors += 1,
         }
     }
@@ -3243,6 +5683,401 @@ async fn handle_batch_create_edges<S: crate::storage::Storage>(
         "created": created,
         "errors": errors,
         "total": edges.len(),
+    }))
+}
+
+async fn handle_batch_update_edges<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let session_id = require_uuid(&args, "session_id")?;
+    let edges = args
+        .get("edges")
+        .and_then(|v| v.as_array())
+        .ok_or((INVALID_PARAMS, "edges must be an array".to_string()))?;
+
+    if edges.len() > 200 {
+        return Err((
+            INVALID_PARAMS,
+            format!("edges array length {} exceeds maximum of 200", edges.len()),
+        ));
+    }
+
+    let mut upserted: usize = 0;
+    let mut unchanged: usize = 0;
+    let mut errors: usize = 0;
+    let mut results = Vec::with_capacity(edges.len());
+
+    for edge_json in edges {
+        let idx = results.len();
+        let Some(edge_row) = edge_json.as_object() else {
+            errors += 1;
+            results.push(serde_json::json!({
+                "index": idx,
+                "status": "error",
+                "reason": format!("batch_update_edges[{idx}] must be an object")
+            }));
+            continue;
+        };
+
+        let src_id = match edge_row
+            .get("src_entity_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        {
+            Some(id) => id,
+            None => {
+                errors += 1;
+                results.push(serde_json::json!({
+                    "index": idx,
+                    "status": "error",
+                    "reason": "invalid or missing src_entity_id"
+                }));
+                continue;
+            }
+        };
+        let dst_id = match edge_json
+            .get("dst_entity_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        {
+            Some(id) => id,
+            None => {
+                errors += 1;
+                results.push(serde_json::json!({
+                    "index": idx,
+                    "status": "error",
+                    "reason": "invalid or missing dst_entity_id"
+                }));
+                continue;
+            }
+        };
+        let edge_type = match edge_row.get("edge_type").and_then(|v| v.as_str()) {
+            Some(t) => t,
+            None => {
+                errors += 1;
+                results.push(serde_json::json!({
+                    "index": idx,
+                    "status": "error",
+                    "reason": "missing edge_type"
+                }));
+                continue;
+            }
+        };
+
+        let metadata_override_set = edge_row.contains_key("metadata");
+        let weight_override_set = edge_row.contains_key("weight");
+
+        let weight_override = if weight_override_set {
+            match edge_row.get("weight").and_then(|v| v.as_f64()) {
+                Some(weight) => Some(weight),
+                None => {
+                    errors += 1;
+                    results.push(serde_json::json!({
+                        "index": idx,
+                        "status": "error",
+                        "reason": "weight must be a number"
+                    }));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
+        let metadata_override = if metadata_override_set {
+            match edge_row.get("metadata").unwrap() {
+                Value::String(value) => Some(value.to_string()),
+                Value::Null => None,
+                _ => {
+                    errors += 1;
+                    results.push(serde_json::json!({
+                        "index": idx,
+                        "status": "error",
+                        "reason": "metadata must be a string"
+                    }));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
+        if weight_override_set && !weight_override.unwrap().is_finite() {
+            errors += 1;
+            results.push(serde_json::json!({
+                "index": idx,
+                "status": "error",
+                "reason": "weight must be finite"
+            }));
+            continue;
+        }
+
+        let existing = storage
+            .typed_edge_list_from(ctx, session_id, src_id)
+            .await
+            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+            .into_iter()
+            .find(|edge| edge.dst_id == dst_id && edge.edge_type == edge_type);
+
+        let Some(existing_edge) = existing else {
+            let final_weight = weight_override.unwrap_or(1.0);
+            if !weight_override_set && !metadata_override_set {
+                // No existing edge and no replacement data => we can only upsert defaults.
+                // Preserve current semantics and allow this path to act as a create.
+            }
+            let final_metadata = metadata_override;
+
+            match crate::graph_write::create_typed_edge(
+                storage,
+                ctx,
+                session_id,
+                src_id,
+                edge_type,
+                dst_id,
+                final_weight,
+                final_metadata,
+            )
+            .await
+            {
+                Ok(created) => {
+                    upserted += 1;
+                    session.dirty.store(true, Ordering::Relaxed);
+                    session.last_activity.notify_waiters();
+                    results.push(serde_json::json!({
+                        "index": idx,
+                        "status": "upserted",
+                        "created_at": created.created_at.to_rfc3339(),
+                        "weight": created.weight,
+                    }));
+                }
+                Err(err) => {
+                    errors += 1;
+                    results.push(serde_json::json!({
+                        "index": idx,
+                        "status": "error",
+                        "reason": err.to_string()
+                    }));
+                }
+            }
+            continue;
+        };
+
+        let final_weight = weight_override.unwrap_or(existing_edge.weight);
+        let final_metadata = if metadata_override_set {
+            metadata_override
+        } else {
+            existing_edge.metadata.clone()
+        };
+
+        let unchanged_weight = !weight_override_set || final_weight == existing_edge.weight;
+        let unchanged_metadata = !metadata_override_set || final_metadata == existing_edge.metadata;
+        if unchanged_weight && unchanged_metadata {
+            unchanged += 1;
+            results.push(serde_json::json!({
+                "index": idx,
+                "status": "unchanged"
+            }));
+            continue;
+        }
+
+        match crate::graph_write::create_typed_edge(
+            storage,
+            ctx,
+            session_id,
+            src_id,
+            edge_type,
+            dst_id,
+            final_weight,
+            final_metadata,
+        )
+        .await
+        {
+            Ok(updated) => {
+                upserted += 1;
+                session.dirty.store(true, Ordering::Relaxed);
+                session.last_activity.notify_waiters();
+                results.push(serde_json::json!({
+                    "index": idx,
+                    "status": "updated",
+                    "weight": updated.weight
+                }));
+            }
+            Err(err) => {
+                errors += 1;
+                results.push(serde_json::json!({
+                    "index": idx,
+                    "status": "error",
+                    "reason": err.to_string()
+                }));
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "upserted": upserted,
+        "unchanged": unchanged,
+        "errors": errors,
+        "total": edges.len(),
+        "results": results,
+    }))
+}
+
+async fn handle_batch_delete_edges<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let session_id = require_uuid(&args, "session_id")?;
+    let edges = args
+        .get("edges")
+        .and_then(|v| v.as_array())
+        .ok_or((INVALID_PARAMS, "edges must be an array".to_string()))?;
+
+    if edges.len() > 200 {
+        return Err((
+            INVALID_PARAMS,
+            format!("edges array length {} exceeds maximum of 200", edges.len()),
+        ));
+    }
+
+    let mut deleted = 0usize;
+    let mut missing = 0usize;
+    let mut invalid = 0usize;
+    let mut errors = 0usize;
+    let mut results = Vec::with_capacity(edges.len());
+
+    for edge_json in edges {
+        let idx = results.len();
+        let Some(edge_row) = edge_json.as_object() else {
+            invalid += 1;
+            results.push(serde_json::json!({
+                "index": idx,
+                "status": "error",
+                "reason": format!("batch_delete_edges[{idx}] must be an object")
+            }));
+            continue;
+        };
+
+        let src_id = match edge_row
+            .get("src_entity_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        {
+            Some(id) => id,
+            None => {
+                invalid += 1;
+                results.push(serde_json::json!({
+                    "index": idx,
+                    "status": "error",
+                    "reason": "invalid or missing src_entity_id"
+                }));
+                continue;
+            }
+        };
+        let dst_id = match edge_row
+            .get("dst_entity_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        {
+            Some(id) => id,
+            None => {
+                invalid += 1;
+                results.push(serde_json::json!({
+                    "index": idx,
+                    "status": "error",
+                    "reason": "invalid or missing dst_entity_id"
+                }));
+                continue;
+            }
+        };
+        let edge_type = match edge_row.get("edge_type").and_then(|v| v.as_str()) {
+            Some(t) => t,
+            None => {
+                invalid += 1;
+                results.push(serde_json::json!({
+                    "index": idx,
+                    "status": "error",
+                    "reason": "missing edge_type"
+                }));
+                continue;
+            }
+        };
+
+        match storage
+            .typed_edge_delete(ctx, session_id, src_id, edge_type, dst_id)
+            .await
+        {
+            Ok(true) => {
+                deleted += 1;
+                session.dirty.store(true, Ordering::Relaxed);
+                session.last_activity.notify_waiters();
+                results.push(serde_json::json!({
+                    "index": idx,
+                    "src_id": src_id.to_string(),
+                    "dst_id": dst_id.to_string(),
+                    "edge_type": edge_type,
+                    "status": "deleted"
+                }));
+            }
+            Ok(false) => {
+                missing += 1;
+                results.push(serde_json::json!({
+                    "index": idx,
+                    "src_id": src_id.to_string(),
+                    "dst_id": dst_id.to_string(),
+                    "edge_type": edge_type,
+                    "status": "not_found"
+                }));
+            }
+            Err(err) => {
+                errors += 1;
+                results.push(serde_json::json!({
+                    "index": idx,
+                    "src_id": src_id.to_string(),
+                    "dst_id": dst_id.to_string(),
+                    "edge_type": edge_type,
+                    "status": "error",
+                    "reason": err.to_string()
+                }));
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "deleted": deleted,
+        "missing": missing,
+        "invalid": invalid,
+        "errors": errors,
+        "total": edges.len(),
+        "results": results,
+    }))
+}
+
+async fn handle_list_derived_cache<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|l| l as usize)
+        .unwrap_or(100)
+        .clamp(1, 500);
+
+    let rows = storage
+        .derived_cache_list_all(ctx, limit)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    Ok(serde_json::json!({
+        "count": rows.len(),
+        "limit": limit,
+        "entries": rows,
     }))
 }
 
@@ -3277,6 +6112,73 @@ async fn handle_find_duplicates<S: crate::storage::Storage>(
 }
 
 // --- Parameter extraction helpers ---
+
+/// Resolve `session_id` in tool-call arguments using the configured default.
+///
+/// Without this, the dispatcher only treated a *missing* `session_id` as a
+/// fallback trigger — so callers passing `"default"`, `""`, `null`, or an
+/// invalid UUID would either hit MCP client-side schema rejection or land in
+/// the nil-UUID scope (silent wrong-session bug).
+///
+/// Rules:
+/// - missing / null / empty / `"default"` / non-UUID string → inject the
+///   configured default when one exists
+/// - valid UUID string → passthrough
+/// - non-UUID input AND no configured default → `INVALID_PARAMS` with a
+///   message naming the field and the offending value (fail loud)
+/// - missing AND no configured default → leave alone; downstream handler
+///   decides whether the field was required
+fn resolve_session_id(args: &mut Value, default: Option<uuid::Uuid>) -> Result<(), (i32, String)> {
+    let Some(obj) = args.as_object_mut() else {
+        return Ok(());
+    };
+
+    let caller_value = obj.get("session_id").cloned();
+    let needs_fallback = match &caller_value {
+        None => true,
+        Some(Value::Null) => true,
+        Some(Value::String(s)) => {
+            s.is_empty() || s.eq_ignore_ascii_case("default") || uuid::Uuid::parse_str(s).is_err()
+        }
+        Some(_) => true,
+    };
+
+    if !needs_fallback {
+        return Ok(());
+    }
+
+    // Observability: if the caller provided a non-empty value that failed to
+    // parse, warn. Missing/null is the common, intentional path and stays
+    // silent. Per the fail-loud rules, fallbacks must be observable.
+    let caller_explicitly_bad = matches!(
+        &caller_value,
+        Some(Value::String(s)) if !s.is_empty()
+    ) || matches!(&caller_value, Some(v) if !v.is_null() && !v.is_string());
+
+    if let Some(sid) = default {
+        if caller_explicitly_bad {
+            tracing::warn!(
+                provided = %caller_value.as_ref().unwrap(),
+                default = %sid,
+                "substituted configured default for caller-provided session_id"
+            );
+        }
+        obj.insert("session_id".into(), Value::String(sid.to_string()));
+        return Ok(());
+    }
+
+    match caller_value {
+        None | Some(Value::Null) => Ok(()),
+        Some(v) => Err((
+            INVALID_PARAMS,
+            format!(
+                "session_id {} is not a valid UUID and no default session is configured; \
+                 pass a valid UUID or configure server.default_session_id",
+                v
+            ),
+        )),
+    }
+}
 
 fn optional_uuid(args: &Value, field: &str) -> Result<Option<uuid::Uuid>, (i32, String)> {
     match args.get(field).and_then(|v| v.as_str()) {
@@ -3384,10 +6286,14 @@ mod tests {
             .await
             .unwrap();
         let tools = result["tools"].as_array().unwrap();
+        let expected_tier1 = tool_definitions(&session.entity_types)
+            .iter()
+            .filter(|tool| is_tier1(&tool.name))
+            .count();
         assert_eq!(
             tools.len(),
-            15,
-            "default tools/list should return 15 tier-1 tools"
+            expected_tier1,
+            "default tools/list should return all tier-1 tools"
         );
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -3396,11 +6302,16 @@ mod tests {
         assert!(names.contains(&"hybrid_search"));
         assert!(names.contains(&"create_edge"));
         assert!(names.contains(&"batch_create_edges"));
+        assert!(names.contains(&"batch_update_entities"));
+        assert!(names.contains(&"batch_delete_entities"));
+        assert!(names.contains(&"batch_update_edges"));
+        assert!(names.contains(&"batch_delete_edges"));
         assert!(names.contains(&"explore_connections"));
         assert!(names.contains(&"check_intentions"));
         assert!(names.contains(&"set_intention"));
         assert!(names.contains(&"complete_intention"));
         assert!(names.contains(&"get_stats"));
+        assert!(names.contains(&"count_entities_by_type"));
         assert!(names.contains(&"write_temporal_fact"));
         assert!(names.contains(&"get_temporal_chain"));
         assert!(names.contains(&"retrieve_entities"));
@@ -3413,6 +6324,7 @@ mod tests {
         assert!(!names.contains(&"spread_activation"));
         assert!(!names.contains(&"recursive_explore"));
         assert!(!names.contains(&"promote_memory"));
+        assert!(!names.contains(&"list_derived_cache"));
     }
 
     #[tokio::test]
@@ -3425,7 +6337,11 @@ mod tests {
             .await
             .unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 40, "include_all should return all 40 tools");
+        assert_eq!(
+            tools.len(),
+            tool_definitions(&session.entity_types).len(),
+            "include_all should return all tools"
+        );
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         // Check tier-1 tools still present
@@ -3434,6 +6350,7 @@ mod tests {
         // Check tier-2 tools now included
         assert!(names.contains(&"check_memo_cache"));
         assert!(names.contains(&"batch_ingest"));
+        assert!(names.contains(&"ingest_entities"));
         assert!(names.contains(&"store_memo_result"));
         assert!(names.contains(&"write_plan_node"));
         assert!(names.contains(&"get_plan_context"));
@@ -3445,13 +6362,588 @@ mod tests {
         assert!(names.contains(&"importance_score"));
         assert!(names.contains(&"predict_needed"));
         assert!(names.contains(&"spread_activation"));
+        assert!(names.contains(&"list_derived_cache"));
         assert!(names.contains(&"find_duplicates"));
         assert!(names.contains(&"recursive_explore"));
         assert!(names.contains(&"query_derived"));
         assert!(names.contains(&"manage_rules"));
+        assert!(names.contains(&"manage_claims"));
+        assert!(names.contains(&"manage_approvals"));
+        assert!(names.contains(&"manage_aliases"));
+        assert!(names.contains(&"explain_derived"));
+        assert!(names.contains(&"get_effective_rule_set"));
         assert!(names.contains(&"promote_predicate"));
         assert!(names.contains(&"create_edge"));
         assert!(names.contains(&"batch_create_edges"));
+        assert!(names.contains(&"batch_update_entities"));
+        assert!(names.contains(&"batch_delete_entities"));
+        assert!(names.contains(&"batch_update_edges"));
+        assert!(names.contains(&"batch_delete_edges"));
+        assert!(names.contains(&"count_entities_by_type"));
+    }
+
+    #[tokio::test]
+    async fn batch_update_entities_updates_rows_and_reports_counts() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+        let update_id = Uuid::new_v4();
+        let unchanged_id = Uuid::new_v4();
+        let missing_id = Uuid::new_v4();
+
+        store.entities.lock().await.push(crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: update_id,
+            session_id: sid,
+            entity_name: "Original".into(),
+            entity_type: "person".into(),
+            source_fold_id: Some(Uuid::new_v4()),
+            context_snippet: "original context".into(),
+            entity_embedding: Some(vec![0.2, 0.4]),
+            confidence: 0.7,
+            state: crate::types::MemoryState::Active,
+            created_at: chrono::Utc::now(),
+            description: Some("old desc".into()),
+            tags: vec!["old".into()],
+            properties: serde_json::json!({"legacy": true}),
+            ..Default::default()
+        });
+
+        store.entities.lock().await.push(crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: unchanged_id,
+            session_id: sid,
+            entity_name: "NoChange".into(),
+            entity_type: "person".into(),
+            context_snippet: "same".into(),
+            confidence: 0.5,
+            state: crate::types::MemoryState::Active,
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        });
+
+        let result = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "batch_update_entities",
+                "arguments": {
+                    "session_id": sid.to_string(),
+                    "entities": [
+                        {
+                            "entity_id": update_id.to_string(),
+                            "entity_name": "Updated Name",
+                            "context_snippet": "updated context",
+                            "confidence": 0.9,
+                            "state": "silent",
+                            "description": "new description",
+                            "tags": ["tag-a", "tag-b"],
+                            "properties": {"score": 42},
+                            "embedding": [0.9, 0.8, 0.7],
+                            "source_fold_id": null
+                        },
+                        {
+                            "entity_id": unchanged_id.to_string()
+                        },
+                        {
+                            "entity_id": "not-a-uuid"
+                        },
+                        {
+                            "entity_id": missing_id.to_string()
+                        }
+                    ]
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["updated"], 1);
+        assert_eq!(result["unchanged"], 1);
+        assert_eq!(result["not_found"], 1);
+        assert_eq!(result["errors"], 1);
+
+        let updated = store
+            .entity_get_by_id(&ctx, sid, update_id)
+            .await
+            .unwrap()
+            .expect("updated entity should exist");
+        assert_eq!(updated.entity_name, "Updated Name");
+        assert_eq!(updated.state, crate::types::MemoryState::Silent);
+        assert_eq!(updated.description.as_deref(), Some("new description"));
+        assert_eq!(updated.tags, vec!["tag-a", "tag-b"]);
+        assert_eq!(updated.properties["score"], 42);
+        assert_eq!(updated.source_fold_id, None);
+    }
+
+    #[tokio::test]
+    async fn batch_delete_entities_hard_deletes_and_reports_counts() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+        let deleted_id = Uuid::new_v4();
+        let already_unavailable_id = Uuid::new_v4();
+        let missing_id = Uuid::new_v4();
+
+        store.entities.lock().await.push(crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: deleted_id,
+            session_id: sid,
+            entity_name: "ToDelete".into(),
+            entity_type: "person".into(),
+            context_snippet: "to delete".into(),
+            confidence: 0.9,
+            state: crate::types::MemoryState::Active,
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        });
+        store.entities.lock().await.push(crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: already_unavailable_id,
+            session_id: sid,
+            entity_name: "AlreadyGone".into(),
+            entity_type: "person".into(),
+            context_snippet: "already gone".into(),
+            confidence: 0.8,
+            state: crate::types::MemoryState::Unavailable,
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        });
+
+        let result = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "batch_delete_entities",
+                "arguments": {
+                    "session_id": sid.to_string(),
+                    "entities": [
+                        { "entity_id": deleted_id.to_string() },
+                        { "entity_id": already_unavailable_id.to_string() },
+                        { "entity_id": missing_id.to_string() },
+                        { "entity_id": "invalid" }
+                    ]
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["deleted"], 2);
+        assert_eq!(result["not_found"], 1);
+        assert_eq!(result["errors"], 1);
+
+        let after_delete = store.entity_get_by_id(&ctx, sid, deleted_id).await.unwrap();
+        assert!(after_delete.is_none());
+        let after_unavailable_delete = store
+            .entity_get_by_id(&ctx, sid, already_unavailable_id)
+            .await
+            .unwrap();
+        assert!(after_unavailable_delete.is_none());
+    }
+
+    #[tokio::test]
+    async fn batch_update_edges_reports_upsert_and_update_statuses() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+        let existing_src = Uuid::new_v4();
+        let existing_dst = Uuid::new_v4();
+        let missing_src = Uuid::new_v4();
+        let missing_dst = Uuid::new_v4();
+
+        let _ = crate::graph_write::create_typed_edge(
+            &store,
+            &ctx,
+            sid,
+            existing_src,
+            "references",
+            existing_dst,
+            1.5,
+            Some("start".into()),
+        )
+        .await
+        .unwrap();
+
+        let result = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "batch_update_edges",
+                "arguments": {
+                    "session_id": sid.to_string(),
+                    "edges": [
+                        {
+                            "src_entity_id": existing_src.to_string(),
+                            "dst_entity_id": existing_dst.to_string(),
+                            "edge_type": "references",
+                            "weight": 1.5,
+                            "metadata": "start"
+                        },
+                        {
+                            "src_entity_id": existing_src.to_string(),
+                            "dst_entity_id": existing_dst.to_string(),
+                            "edge_type": "references",
+                            "weight": 2.2
+                        },
+                        {
+                            "src_entity_id": missing_src.to_string(),
+                            "dst_entity_id": missing_dst.to_string(),
+                            "edge_type": "references",
+                            "weight": 0.5
+                        },
+                        {
+                            "src_entity_id": "not-a-uuid",
+                            "dst_entity_id": missing_dst.to_string(),
+                            "edge_type": "references"
+                        }
+                    ]
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["upserted"], 2);
+        assert_eq!(result["unchanged"], 1);
+        assert_eq!(result["errors"], 1);
+
+        let results = result["results"].as_array().unwrap();
+        assert_eq!(results[0]["status"], "unchanged");
+        assert_eq!(results[1]["status"], "updated");
+        assert_eq!(results[2]["status"], "upserted");
+        assert_eq!(results[3]["status"], "error");
+    }
+
+    #[tokio::test]
+    async fn batch_delete_edges_hard_deletes_and_reports_missing() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+        let existing_src = Uuid::new_v4();
+        let existing_dst = Uuid::new_v4();
+
+        let _ = crate::graph_write::create_typed_edge(
+            &store,
+            &ctx,
+            sid,
+            existing_src,
+            "references",
+            existing_dst,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "batch_delete_edges",
+                "arguments": {
+                    "session_id": sid.to_string(),
+                    "edges": [
+                        {
+                            "src_entity_id": existing_src.to_string(),
+                            "dst_entity_id": existing_dst.to_string(),
+                            "edge_type": "references"
+                        },
+                        {
+                            "src_entity_id": Uuid::new_v4().to_string(),
+                            "dst_entity_id": Uuid::new_v4().to_string(),
+                            "edge_type": "references"
+                        },
+                        {
+                            "src_entity_id": "invalid",
+                            "dst_entity_id": existing_dst.to_string(),
+                            "edge_type": "references"
+                        }
+                    ]
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["deleted"], 1);
+        assert_eq!(result["missing"], 1);
+        assert_eq!(result["invalid"], 1);
+        assert_eq!(result["errors"], 0);
+
+        let remaining = store
+            .typed_edge_list_from(&ctx, sid, existing_src)
+            .await
+            .unwrap();
+        assert!(remaining.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ingest_entities_upserts_entities_and_skips_duplicate_edges() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            ollama_base_url: String::new(),
+            entity_types: vec!["bug".into(), "document".into()],
+            ..SessionState::default()
+        };
+        let sid = Uuid::new_v4();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+
+        let first = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "ingest_entities",
+                "arguments": {
+                    "tenant_id": ctx.tenant_id.to_string(),
+                    "session_id": sid.to_string(),
+                    "entities": [
+                        {
+                            "id": a.to_string(),
+                            "name": "Bug A",
+                            "entity_type": "bug",
+                            "context": "first bug",
+                            "attrs": {"severity": "high"}
+                        },
+                        {
+                            "id": b.to_string(),
+                            "name": "Doc B",
+                            "entity_type": "document",
+                            "context": "supporting doc"
+                        }
+                    ],
+                    "edges": [
+                        {
+                            "src_id": a.to_string(),
+                            "dst_id": b.to_string(),
+                            "edge_type": "references",
+                            "metadata": {"source": "batch"}
+                        }
+                    ],
+                    "options": {
+                        "embed_missing": false
+                    }
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let first = unwrap_tool_result(first);
+        assert_eq!(first["entities"]["inserted"], 2);
+        assert_eq!(first["entities"]["updated"], 0);
+        assert_eq!(first["edges"]["inserted"], 1);
+        assert_eq!(store.entities.lock().await.len(), 2);
+        assert_eq!(store.typed_edges.lock().await.len(), 1);
+
+        let second = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "ingest_entities",
+                "arguments": {
+                    "tenant_id": ctx.tenant_id.to_string(),
+                    "session_id": sid.to_string(),
+                    "entities": [
+                        {
+                            "id": a.to_string(),
+                            "name": "Bug A",
+                            "entity_type": "bug",
+                            "context": "updated bug context",
+                            "confidence": 0.5,
+                            "attrs": {"severity": "critical"}
+                        },
+                        {
+                            "id": b.to_string(),
+                            "name": "Doc B",
+                            "entity_type": "document",
+                            "context": "supporting doc updated"
+                        }
+                    ],
+                    "edges": [
+                        {
+                            "src_id": a.to_string(),
+                            "dst_id": b.to_string(),
+                            "edge_type": "references"
+                        }
+                    ],
+                    "options": {
+                        "embed_missing": false,
+                        "on_conflict": "update"
+                    }
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let second = unwrap_tool_result(second);
+        assert_eq!(second["entities"]["inserted"], 0);
+        assert_eq!(second["entities"]["updated"], 2);
+        assert_eq!(second["edges"]["inserted"], 0);
+        assert_eq!(second["edges"]["skipped_duplicate"], 1);
+
+        let stored = store
+            .entity_get_by_id(&ctx, sid, a)
+            .await
+            .unwrap()
+            .expect("entity a should exist");
+        assert_eq!(stored.context_snippet, "updated bug context");
+        assert_eq!(stored.properties["severity"], "critical");
+        assert_eq!(store.typed_edges.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ingest_entities_dry_run_validates_without_writing() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            ollama_base_url: String::new(),
+            entity_types: vec!["bug".into()],
+            ..SessionState::default()
+        };
+        let sid = Uuid::new_v4();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+
+        let result = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "ingest_entities",
+                "arguments": {
+                    "tenant_id": ctx.tenant_id.to_string(),
+                    "session_id": sid.to_string(),
+                    "entities": [
+                        {
+                            "id": a.to_string(),
+                            "name": "Bug A",
+                            "entity_type": "bug",
+                            "context": "dry run entity"
+                        },
+                        {
+                            "id": b.to_string(),
+                            "name": "Bug B",
+                            "entity_type": "bug",
+                            "context": "dry run entity two"
+                        }
+                    ],
+                    "edges": [
+                        {
+                            "src_id": a.to_string(),
+                            "dst_id": b.to_string(),
+                            "edge_type": "references"
+                        }
+                    ],
+                    "options": {
+                        "embed_missing": false,
+                        "dry_run": true
+                    }
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["entities"]["inserted"], 2);
+        assert_eq!(result["edges"]["inserted"], 1);
+        assert_eq!(store.entities.lock().await.len(), 0);
+        assert_eq!(store.typed_edges.lock().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn ingest_entities_strict_edges_fail_loudly_for_missing_endpoints() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            ollama_base_url: String::new(),
+            entity_types: vec!["bug".into()],
+            ..SessionState::default()
+        };
+        let sid = Uuid::new_v4();
+
+        let result = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "ingest_entities",
+                "arguments": {
+                    "tenant_id": ctx.tenant_id.to_string(),
+                    "session_id": sid.to_string(),
+                    "entities": [],
+                    "edges": [
+                        {
+                            "src_id": Uuid::new_v4().to_string(),
+                            "dst_id": Uuid::new_v4().to_string(),
+                            "edge_type": "references"
+                        }
+                    ],
+                    "options": {
+                        "embed_missing": false,
+                        "strict_edges": true
+                    }
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let result = unwrap_tool_result(result);
+        let failed = result["edges"]["failed"].as_array().unwrap();
+        assert_eq!(result["edges"]["inserted"], 0);
+        assert_eq!(failed.len(), 1);
+        assert!(
+            failed[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("endpoint_not_found"),
+            "expected endpoint_not_found failure, got: {}",
+            failed[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_entities_rejects_tenant_mismatch() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let err = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "ingest_entities",
+                "arguments": {
+                    "tenant_id": Uuid::new_v4().to_string(),
+                    "session_id": Uuid::new_v4().to_string(),
+                    "entities": []
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, INVALID_PARAMS);
+        assert!(err.1.contains("tenant_id"));
     }
 
     #[tokio::test]
@@ -3755,6 +7247,7 @@ mod tests {
             confidence: 0.9,
             state: Default::default(),
             created_at: chrono::Utc::now(),
+            ..Default::default()
         };
         store.entities.lock().await.push(entity.clone());
 
@@ -3797,6 +7290,7 @@ mod tests {
             confidence: 0.95,
             state: Default::default(),
             created_at: chrono::Utc::now(),
+            ..Default::default()
         };
         store.entities.lock().await.push(entity);
 
@@ -3877,6 +7371,209 @@ mod tests {
         assert_eq!(result["temporal_fact_count"], 0);
         assert_eq!(result["edge_count"], 0);
         assert_eq!(result["intention_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn count_entities_by_type_returns_empty_breakdowns_for_empty_session() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+
+        let params = serde_json::json!({
+            "name": "count_entities_by_type",
+            "arguments": {
+                "session_id": sid.to_string()
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["total"], 0);
+        assert_eq!(result["by_entity_type"], serde_json::json!({}));
+        assert_eq!(result["by_state"], serde_json::json!({}));
+        assert_eq!(result["by_type_and_state"], serde_json::json!({}));
+        assert!(result["duration_ms"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn count_entities_by_type_buckets_known_fixture() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+
+        let mut entities = store.entities.lock().await;
+        entities.push(crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "Bug A".into(),
+            entity_type: "bug".into(),
+            context_snippet: "a".into(),
+            confidence: 0.9,
+            state: crate::types::MemoryState::Active,
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        });
+        entities.push(crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "Bug B".into(),
+            entity_type: "bug".into(),
+            context_snippet: "b".into(),
+            confidence: 0.9,
+            state: crate::types::MemoryState::Dormant,
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        });
+        entities.push(crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "Doc".into(),
+            entity_type: "document".into(),
+            context_snippet: "c".into(),
+            confidence: 0.9,
+            state: crate::types::MemoryState::Active,
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        });
+        entities.push(crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "Fn".into(),
+            entity_type: "function".into(),
+            context_snippet: "d".into(),
+            confidence: 0.9,
+            state: crate::types::MemoryState::Active,
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        });
+        entities.push(crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "Fn 2".into(),
+            entity_type: "function".into(),
+            context_snippet: "e".into(),
+            confidence: 0.9,
+            state: crate::types::MemoryState::Silent,
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        });
+        entities.push(crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "Fn 3".into(),
+            entity_type: "function".into(),
+            context_snippet: "f".into(),
+            confidence: 0.9,
+            state: crate::types::MemoryState::Active,
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        });
+        drop(entities);
+
+        let params = serde_json::json!({
+            "name": "count_entities_by_type",
+            "arguments": {
+                "session_id": sid.to_string()
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+
+        assert_eq!(result["total"], 6);
+        assert_eq!(result["by_entity_type"]["bug"], 2);
+        assert_eq!(result["by_entity_type"]["document"], 1);
+        assert_eq!(result["by_entity_type"]["function"], 3);
+        assert_eq!(result["by_state"]["active"], 4);
+        assert_eq!(result["by_state"]["dormant"], 1);
+        assert_eq!(result["by_state"]["silent"], 1);
+        assert_eq!(result["by_type_and_state"]["bug"]["active"], 1);
+        assert_eq!(result["by_type_and_state"]["bug"]["dormant"], 1);
+        assert_eq!(result["by_type_and_state"]["document"]["active"], 1);
+        assert_eq!(result["by_type_and_state"]["function"]["active"], 2);
+        assert_eq!(result["by_type_and_state"]["function"]["silent"], 1);
+    }
+
+    #[tokio::test]
+    async fn count_entities_by_type_respects_tenant_isolation() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let other_ctx = crate::types::TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "other".into(),
+        };
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+
+        let mut entities = store.entities.lock().await;
+        entities.push(crate::types::EntityEntry {
+            tenant_id: other_ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "Other Tenant Bug".into(),
+            entity_type: "bug".into(),
+            context_snippet: "other".into(),
+            confidence: 0.9,
+            state: crate::types::MemoryState::Active,
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        });
+        drop(entities);
+
+        let params = serde_json::json!({
+            "name": "count_entities_by_type",
+            "arguments": {
+                "session_id": sid.to_string()
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["total"], 0);
+        assert_eq!(result["by_entity_type"], serde_json::json!({}));
+    }
+
+    #[tokio::test]
+    async fn count_entities_by_type_defaults_to_nil_session_without_dirtying_session() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+
+        store.entities.lock().await.push(crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: Uuid::nil(),
+            entity_name: "Nil Session Bug".into(),
+            entity_type: "bug".into(),
+            context_snippet: "nil".into(),
+            confidence: 0.9,
+            state: crate::types::MemoryState::Active,
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        });
+
+        let params = serde_json::json!({
+            "name": "count_entities_by_type",
+            "arguments": {}
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["total"], 1);
+        assert_eq!(result["by_entity_type"]["bug"], 1);
+        assert!(!session.dirty.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
@@ -4169,6 +7866,7 @@ mod tests {
             confidence: 0.9,
             state: Default::default(),
             created_at: chrono::Utc::now(),
+            ..Default::default()
         };
         store.entities.lock().await.push(entity);
 
@@ -4295,6 +7993,7 @@ mod tests {
                 confidence: 0.9,
                 state: Default::default(),
                 created_at: chrono::Utc::now(),
+                ..Default::default()
             };
             store.entities.lock().await.push(entity);
         }
@@ -4751,5 +8450,180 @@ mod speculative_tests {
             }
         }
         assert!(found_anomaly, "expected AnomalyDetected event on bus");
+    }
+
+    // --- Session ID resolution (bug: explore_connections rejects non-UUID session_id) ---
+    //
+    // The dispatcher injects the configured default_session_id when the caller
+    // passes a placeholder (missing, null, empty, literal "default") or an
+    // invalid UUID. Callers should never silently get Uuid::nil() scope.
+
+    #[test]
+    fn resolve_session_id_injects_default_when_absent() {
+        let default_sid = Uuid::new_v4();
+        let mut args = serde_json::json!({});
+        resolve_session_id(&mut args, Some(default_sid)).unwrap();
+        assert_eq!(args["session_id"], default_sid.to_string());
+    }
+
+    #[test]
+    fn resolve_session_id_injects_default_when_null() {
+        let default_sid = Uuid::new_v4();
+        let mut args = serde_json::json!({ "session_id": null });
+        resolve_session_id(&mut args, Some(default_sid)).unwrap();
+        assert_eq!(args["session_id"], default_sid.to_string());
+    }
+
+    #[test]
+    fn resolve_session_id_injects_default_when_empty_string() {
+        let default_sid = Uuid::new_v4();
+        let mut args = serde_json::json!({ "session_id": "" });
+        resolve_session_id(&mut args, Some(default_sid)).unwrap();
+        assert_eq!(args["session_id"], default_sid.to_string());
+    }
+
+    #[test]
+    fn resolve_session_id_injects_default_when_literal_default() {
+        let default_sid = Uuid::new_v4();
+        let mut args = serde_json::json!({ "session_id": "default" });
+        resolve_session_id(&mut args, Some(default_sid)).unwrap();
+        assert_eq!(args["session_id"], default_sid.to_string());
+    }
+
+    #[test]
+    fn resolve_session_id_injects_default_when_invalid_uuid() {
+        let default_sid = Uuid::new_v4();
+        let mut args = serde_json::json!({ "session_id": "not-a-uuid" });
+        resolve_session_id(&mut args, Some(default_sid)).unwrap();
+        assert_eq!(args["session_id"], default_sid.to_string());
+    }
+
+    #[test]
+    fn resolve_session_id_passes_through_valid_uuid() {
+        let default_sid = Uuid::new_v4();
+        let caller_sid = Uuid::new_v4();
+        let mut args = serde_json::json!({ "session_id": caller_sid.to_string() });
+        resolve_session_id(&mut args, Some(default_sid)).unwrap();
+        assert_eq!(args["session_id"], caller_sid.to_string());
+    }
+
+    #[test]
+    fn resolve_session_id_fails_loud_when_invalid_and_no_default() {
+        let mut args = serde_json::json!({ "session_id": "default" });
+        let err = resolve_session_id(&mut args, None).unwrap_err();
+        assert_eq!(err.0, INVALID_PARAMS);
+        assert!(
+            err.1.contains("session_id") && err.1.contains("default"),
+            "error should name the field and bad value, got: {}",
+            err.1
+        );
+    }
+
+    #[test]
+    fn resolve_session_id_leaves_absent_alone_when_no_default() {
+        // No default and no caller value — let the handler decide whether to
+        // error on missing session_id. (Some tools don't need one.)
+        let mut args = serde_json::json!({});
+        resolve_session_id(&mut args, None).unwrap();
+        assert!(args.get("session_id").is_none());
+    }
+
+    #[test]
+    fn resolve_session_id_handles_non_object_args() {
+        // Defensive: some tool calls arrive with Value::Null as arguments.
+        let mut args = Value::Null;
+        resolve_session_id(&mut args, Some(Uuid::new_v4())).unwrap();
+    }
+
+    // Schema invariants: after the refactor-session-id-schemas sweep, only
+    // delete_session (destructive) may keep `format:uuid` and `required: session_id`.
+    // Every other tool must advertise session_id as a plain optional string so
+    // the dispatcher's resolve_session_id fallback can fire for "default", "",
+    // or omitted values.
+
+    const STRICT_SESSION_TOOLS: &[&str] = &["delete_session"];
+
+    #[test]
+    fn tool_schemas_do_not_require_uuid_format_on_session_id() {
+        let tools = tool_definitions(&["person".to_string()]);
+        for tool in &tools {
+            if STRICT_SESSION_TOOLS.contains(&tool.name.as_str()) {
+                continue;
+            }
+            let sid = &tool.input_schema["properties"]["session_id"];
+            if sid.is_null() {
+                continue;
+            }
+            assert_ne!(
+                sid.get("format"),
+                Some(&serde_json::json!("uuid")),
+                "tool {}: session_id must not carry format:uuid — blocks config fallback in strict MCP clients",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn tool_schemas_do_not_list_session_id_as_required() {
+        let tools = tool_definitions(&["person".to_string()]);
+        for tool in &tools {
+            if STRICT_SESSION_TOOLS.contains(&tool.name.as_str()) {
+                continue;
+            }
+            let required = tool
+                .input_schema
+                .get("required")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                !required.iter().any(|v| v == "session_id"),
+                "tool {}: session_id must not be in required — server falls back to default_session_id",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn delete_session_schema_stays_strict() {
+        let tools = tool_definitions(&["person".to_string()]);
+        let tool = tools.iter().find(|t| t.name == "delete_session").unwrap();
+        let sid = &tool.input_schema["properties"]["session_id"];
+        assert_eq!(
+            sid.get("format"),
+            Some(&serde_json::json!("uuid")),
+            "delete_session must keep format:uuid to prevent accidental fallback to default on typo"
+        );
+        let required = tool.input_schema["required"].as_array().unwrap();
+        assert!(
+            required.iter().any(|v| v == "session_id"),
+            "delete_session must keep session_id as required"
+        );
+    }
+
+    #[tokio::test]
+    async fn explore_connections_accepts_default_string_when_session_configured() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let default_sid = Uuid::new_v4();
+        let session = SessionState {
+            default_session_id: Some(default_sid),
+            ..SessionState::default()
+        };
+        let params = serde_json::json!({
+            "name": "explore_connections",
+            "arguments": {
+                "session_id": "default",
+                "traversal": "related_entities",
+                "entity_id": Uuid::new_v4().to_string(),
+                "max_depth": 1
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session).await;
+        assert!(
+            result.is_ok(),
+            "expected 'default' to resolve to configured session, got: {:?}",
+            result
+        );
     }
 }

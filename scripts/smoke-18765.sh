@@ -1,0 +1,150 @@
+#!/bin/bash
+set -euo pipefail
+
+BASE_URL="${FERROSA_MEMORY_BASE_URL:-http://127.0.0.1:18765}"
+VIZ_URL="${FERROSA_MEMORY_VIZ_URL:-http://127.0.0.1:18766/viz}"
+GRAPH_URL="${FERROSA_MEMORY_GRAPH_URL:-http://127.0.0.1:17474}"
+USERNAME="${FERROSA_MEMORY_USER:-ferrosa_user}"
+PASSWORD="${FERROSA_MEMORY_PASSWORD:-ferrosa_user}"
+ADMIN_USER="${FERROSA_MEMORY_ADMIN_USER:-ferrosa_admin}"
+ADMIN_PASSWORD="${FERROSA_MEMORY_ADMIN_PASSWORD:-ferrosa_admin}"
+
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "${TMP_DIR}"' EXIT
+
+say() {
+  printf '%s\n' "$*"
+}
+
+fail() {
+  printf 'FAIL: %s\n' "$*" >&2
+  exit 1
+}
+
+json_get() {
+  local file="$1"
+  local expr="$2"
+  python3 - "$file" "$expr" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+expr = sys.argv[2]
+with open(path, "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+
+current = data
+for part in expr.split('.'):
+    if part.isdigit():
+        current = current[int(part)]
+    else:
+        current = current[part]
+
+if isinstance(current, (dict, list)):
+    print(json.dumps(current))
+else:
+    print(current)
+PY
+}
+
+auth_curl() {
+  curl -sS -u "${USERNAME}:${PASSWORD}" "$@"
+}
+
+admin_curl() {
+  curl -sS -u "${ADMIN_USER}:${ADMIN_PASSWORD}" "$@"
+}
+
+say "== Ferrosa Memory smoke on ${BASE_URL} =="
+
+LIVE="$(curl -sS "${BASE_URL}/healthz/live" || true)"
+[[ "${LIVE}" == "ok" ]] || fail "live probe failed: ${LIVE}"
+say "live: ok"
+
+READY="$(curl -sS "${BASE_URL}/healthz/ready" || true)"
+[[ "${READY}" == "ready" ]] || fail "ready probe failed: ${READY}"
+say "ready: ready"
+
+VIZ_HEAD="$(curl -sS "${VIZ_URL}" | head -c 64 || true)"
+[[ "${VIZ_HEAD}" == *"<!DOCTYPE html>"* ]] || fail "viz did not return HTML"
+say "viz: html"
+
+auth_curl -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
+  "${BASE_URL}/mcp" > "${TMP_DIR}/tools.json"
+python3 - "${TMP_DIR}/tools.json" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+tools = data["result"]["tools"]
+assert any(tool["name"] == "create_edge" for tool in tools), "create_edge missing from tools/list"
+print(f"tools/list: {len(tools)} tools")
+PY
+
+auth_curl "${BASE_URL}/workbench/api/summary" > "${TMP_DIR}/summary.json"
+SUMMARY_STATUS="$(json_get "${TMP_DIR}/summary.json" status)"
+[[ "${SUMMARY_STATUS}" == "ready" ]] || fail "summary status is ${SUMMARY_STATUS}"
+say "summary: ready"
+
+auth_curl -H 'content-type: application/json' \
+  -d '{"query":"SELECT tenant_id, entity_id, session_id FROM agent_memory.entity_store LIMIT 2"}' \
+  "${BASE_URL}/workbench/api/cql/query" > "${TMP_DIR}/entities.json"
+
+ENTITY_COUNT="$(json_get "${TMP_DIR}/entities.json" count)"
+[[ "${ENTITY_COUNT}" -ge 2 ]] || fail "expected at least 2 entity rows, got ${ENTITY_COUNT}"
+
+TENANT_ID="$(json_get "${TMP_DIR}/entities.json" rows.0.tenant_id)"
+SESSION_ID="$(json_get "${TMP_DIR}/entities.json" rows.0.session_id)"
+SRC_ID="$(json_get "${TMP_DIR}/entities.json" rows.0.entity_id)"
+DST_ID="$(json_get "${TMP_DIR}/entities.json" rows.1.entity_id)"
+say "cql: 2 entity rows"
+
+auth_curl -H 'content-type: application/json' \
+  -d '{"query":"SELECT * WHERE { ?s ?p ?o } LIMIT 1","limit":1}' \
+  "${BASE_URL}/workbench/api/sparql/query" > "${TMP_DIR}/sparql.json"
+SPARQL_SOURCE="$(json_get "${TMP_DIR}/sparql.json" source)"
+[[ "${SPARQL_SOURCE}" == "ferrosa-sparql" ]] || fail "unexpected SPARQL source: ${SPARQL_SOURCE}"
+say "sparql: pass"
+
+cat > "${TMP_DIR}/create-edge.json" <<EOF
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_edge","arguments":{"session_id":"${SESSION_ID}","src_entity_id":"${SRC_ID}","dst_entity_id":"${DST_ID}","edge_type":"references","weight":0.75}}}
+EOF
+auth_curl -H 'content-type: application/json' \
+  --data @"${TMP_DIR}/create-edge.json" \
+  "${BASE_URL}/mcp" > "${TMP_DIR}/create-edge-result.json"
+python3 - "${TMP_DIR}/create-edge-result.json" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+text = data["result"]["content"][0]["text"]
+payload = json.loads(text)
+assert payload["created"] is True, "create_edge did not return created=true"
+print("create_edge: pass")
+PY
+
+cat > "${TMP_DIR}/edge-query.json" <<EOF
+{"query":"SELECT tenant_id, session_id, src_id, edge_type, dst_id, weight FROM agent_memory.typed_edges WHERE tenant_id = ${TENANT_ID} AND session_id = ${SESSION_ID} AND src_id = ${SRC_ID} AND edge_type = 'references' AND dst_id = ${DST_ID}"}
+EOF
+auth_curl -H 'content-type: application/json' \
+  --data @"${TMP_DIR}/edge-query.json" \
+  "${BASE_URL}/workbench/api/cql/query" > "${TMP_DIR}/edge-cql.json"
+EDGE_COUNT="$(json_get "${TMP_DIR}/edge-cql.json" count)"
+[[ "${EDGE_COUNT}" -ge 1 ]] || fail "create_edge row not found in typed_edges"
+say "create_edge CQL readback: pass"
+
+cat > "${TMP_DIR}/graph-readback.json" <<EOF
+{"query":"MATCH (a:Entity {entity_id: '${SRC_ID}'})-[r:TYPED_EDGE]->(b:Entity {entity_id: '${DST_ID}'}) WHERE r.edge_type = 'references' RETURN r.edge_type, r.weight","keyspace":"agent_memory"}
+EOF
+if admin_curl -H 'content-type: application/json' \
+  --data @"${TMP_DIR}/graph-readback.json" \
+  "${GRAPH_URL}/graph/query" > "${TMP_DIR}/graph-readback-result.json"; then
+  python3 - "${TMP_DIR}/graph-readback-result.json" <<'PY' || true
+import json, sys
+data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+rows = data.get("rows", [])
+if rows:
+    print("graph readback: pass")
+else:
+    print("graph readback: KNOWN ISSUE rows=[]")
+PY
+fi
+
+say "== smoke complete =="

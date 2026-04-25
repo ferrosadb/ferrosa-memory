@@ -1,11 +1,20 @@
 # Project Plan — ferrosa-memory-mcp
 
-> Last updated: 2026-04-10
-> Status: Sprints 1-6 complete. Sprint 7 added for shared HTTP deployment hardening.
+> Last updated: 2026-04-23
+> Status: Sprints 1-8 are complete. Sprint 9 code-side cutover is largely landed, but final completion is still blocked by a Ferrosa public-graph readback issue on the current local cluster. Sprint 10 is now in progress: `ingest_entities`, batch entity/edge CRUD, and the tenant-wide `nomic-embed-text-v2-moe` backfill are landed in `ferrosa-memory`; remaining work is progress notifications and additional workflow/system coverage.
 
 ## Overview
 
-4 sprints (2 weeks each) + backlog. Prioritized by risk: FMEA RPN scores and STRIDE threat ratings determine sprint ordering.
+8 planned sprint increments plus backlog. Prioritized by risk: FMEA RPN scores and STRIDE threat ratings determine sprint ordering.
+
+As of 2026-04-20, the plan has an additional architectural constraint:
+
+- `ferrosa-memory` is a client to Ferrosa
+- direct CQL usage is acceptable for app-owned tables
+- graph-owned backing tables are not a public API
+- query consoles in the workbench should be passthrough surfaces, not local emulators
+- if Ferrosa public semantics are wrong, `ferrosa-memory` should fail loudly and the defect is treated as a Ferrosa bug
+- the serving path must be compatible with the `app_reader` role rollout
 
 ## Progress Summary
 
@@ -19,6 +28,10 @@
 | Sprint 5 | **COMPLETE** | RMH + Datalog + Promotion (12+4 tasks) |
 | Sprint 5b | **COMPLETE** | Durable materialization pipeline (4 tasks) |
 | Sprint 6 | **COMPLETE** | Production hardening, type registry, infra (14 items) |
+| Sprint 7 | **COMPLETE** | Shared HTTP auth/startup guardrails, probe/system coverage, secret-wiring verification, and viz-boundary rollout landed |
+| Sprint 8 | **COMPLETE** | Expert-system knowledge plane, operator workbench, CQL/SPARQL passthrough, local Datalog ownership, and live summary/query fixes are landed |
+| Sprint 9 | **IN PROGRESS** | Graph-boundary and role-auth cutover is implemented in `ferrosa-memory`, but live completion is blocked by Ferrosa not materializing public `TYPED_EDGE` MERGE writes |
+| Sprint 10 | **IN PROGRESS** | `ingest_entities` bulk ingest is landed, batch entity/edge CRUD now uses the real storage/graph delete paths, and tenant-wide v2 embedding backfill is verified; remaining work is progress notifications and broader workflow/system coverage |
 
 ---
 
@@ -260,7 +273,7 @@
 | 6.17 | LSP-based code indexing spec (specs/lsp-code-indexing.md) | M | Research | **DONE** (70f4cb7) |
 | 6.18 | "No Workarounds for Ferrosa Bugs" policy added to CLAUDE.md | S | Policy | **DONE** |
 
-**Sprint 6 exit criteria:** Production cluster stable with auto-restart. Dynamic type registry operational. CQL fallback paths functional for graph-less deployments. Viz usable on mobile. Backup/restore tested. **MET.**
+**Sprint 6 exit criteria:** Production cluster stable with auto-restart. Dynamic type registry operational. CQL compatibility fallback paths functional for graph-less deployments, but not the serving-path target under the later graph-boundary correction. Viz usable on mobile. Backup/restore tested. **MET.**
 
 ---
 
@@ -268,7 +281,7 @@
 
 **Goal:** Make the HTTP transport safe for a real shared service without regressing local stdio workflows.
 
-**Status: PLANNED**
+**Status: PARTIALLY COMPLETE (backend convergence implemented)**
 
 | # | Task | Size | Source | Success Criteria | Tests |
 |---|------|------|--------|-----------------|-------|
@@ -283,13 +296,86 @@
 
 ---
 
+## Sprint 8: Expert-System Knowledge Plane
+
+**Goal:** Turn the existing Datalog/provenance substrate into a human-reviewable symbolic knowledge plane with a single effective-rule runtime surface, scoped claims/approvals/aliases, and explanation queries suitable for external workbenches.
+
+**Status: COMPLETE**
+
+**Dependencies:** Requires Sprint 5 (rule registry, provenance, derived cache, recursive exploration) and should follow the shared-deployment guardrails from Sprint 7 before exposing reviewer-facing HTTP surfaces.
+
+| # | Task | Size | Source | Success Criteria | Tests |
+|---|------|------|--------|-----------------|-------|
+| 8.1 | **DONE**: Move all rules into the database and introduce `EffectiveRuleSet` loader shared by `manage_rules`, `query_derived`, `recursive_explore`, and `promotion` | L | expert-system-knowledge-plane.md, ADR-004, threat ES-T1, FMEA F62 | Synthetic built-ins and stored rules are loaded from one canonical registry path. No inference path evaluates `builtin_rules()` directly outside the loader. | Unit: loader merge order. Integration: stored/synthetic rule changes affect all four entry points uniformly. |
+| 8.2 | **DONE**: Revise `manage_rules` to expose `source = builtin|registry|effective` and loaded-rule diagnostics | M | expert-system-knowledge-plane.md, ADR-004 | Tool response distinguishes synthetic built-ins, stored rules, and the effective runtime set in one call. | Unit: JSON shape and filters. Integration: mixed synthetic + stored rules render correctly. |
+| 8.3 | **DONE**: Add claim persistence model with scoped status (`proposed`, `approved`, `rejected`) and provenance hooks | L | expert-system-knowledge-plane.md, threat ES-E1, FMEA F63 | Claims can be created, listed, approved, rejected, and filtered by scope. Default inference/explanation paths ignore unapproved claims. | Unit: status transitions. Integration: proposed claims excluded from default runtime loads. |
+| 8.4 | **DONE**: Add dual-write approval storage with reviewer identity from auth context | L | expert-system-knowledge-plane.md, ADR-004, threat ES-S1, ES-R1 | Decisions on rules/claims/aliases are durable, attributable, and replayable. Reviewer is server-derived, never client-supplied. Append-only table remains authoritative; entity mirror supports retrieval/workbench UX. | Unit: auth-derived reviewer field. Integration: approval history round-trip and mirror consistency. |
+| 8.5 | **DONE**: Add alias persistence with exact scoped lookup and optional semantic mirror | M | expert-system-knowledge-plane.md, threat ES-T2, FMEA F64 | Runtime alias lookup is deterministic and scoped. Semantic retrieval is browse-only and cannot override exact execution behavior. | Unit: scope precedence. Integration: exact alias lookup rewrites calls predictably. |
+| 8.6 | **DONE**: Add explanation query surface for derived facts, rule provenance, approvals, and supersession, plus latency/fan-out statistics | L | expert-system-knowledge-plane.md, ADR-004, threat ES-I1, ES-D1, FMEA F65 | Workbench can request a derived fact explanation and receive bounded, ordered support chains with rule source and approval state. Explanation metrics capture latency and support depth for future precompute decisions. | Integration: 3-step derivation + supersession explanation. Performance: bounded latency under configured cap. |
+| 8.7 | **DONE**: Add schema/storage support only where entity-backed reuse is insufficient | M | expert-system-knowledge-plane.md | Claims remain entity-backed; approvals/aliases use dedicated storage where exact lookup/audit needs require it. Schema choice is documented in an ADR before migration lands. | Design review + migration test if new DDL added. |
+| 8.8 | **DONE**: Expand regression suite for rule drift, approval gating, alias precedence, and explanation completeness | M | threat-model addendum, FMEA F62-F65 | New tests fail on direct `builtin_rules()` bypasses, approval bypass, fuzzy alias execution, and truncated explanations. | `cargo test --workspace` with dedicated expert-system integration cases. |
+| 8.9 | **DONE**: Design and ship an integrated operator workbench rooted at `/` | L | user request, expert-system-knowledge-plane.md, ADR-004 | `/` becomes an operator workbench with shared navigation, status, scope filters, and linked views for Viz, CQL Explorer, SPARQL Explorer, Datalog Explorer, Rules Manager, and approvals/explanations. | Manual: navigation and shared filters work across views. Integration: status widgets load without blocking. |
+| 8.10 | **DONE**: Add a public-CQL passthrough query interface for operator data exploration | M | user request | Operators can run scoped CQL `SELECT` queries against Ferrosa's public CQL interface, inspect result tables, and see timing/errors. The workbench does not emulate missing semantics locally; unsupported behavior should fail loudly so contract bugs are fixed in Ferrosa. | Integration: representative queries over entity, edge, rule, and provenance tables via the public CQL path. Security: write statements rejected in UI path unless an explicit operator-write surface is designed later. |
+| 8.11 | **DONE**: Add a ferrosa-memory-owned Datalog query interface with derived-fact and provenance rendering | M | user request, expert-system-knowledge-plane.md | Operators can query predicates through the local ferrosa-memory Datalog engine, inspect derived tuples, and drill into explanation chains over Ferrosa-backed graph/app data without dropping to MCP or ad hoc scripts. This is a repo-owned capability, not a Ferrosa public protocol surface. | Integration: query `reachable`/`related` through the local Datalog path and inspect ordered provenance. |
+| 8.12 | **DONE**: Add a rules-management interface that shows synthetic built-ins, registry, and effective rule sets side by side | M | user request, task 8.2, ADR-004 | Operators can inspect active rules, compare synthetic built-ins vs registry vs effective views, and perform approval-aware activation/deprecation flows. | Manual + integration: mixed rule set renders correctly and updates after activation changes. |
+
+**Sprint 8 status:** exit criteria are met. The integrated operator workbench is landed at `/`, viz and workbench navigation are aligned, CQL/SPARQL passthrough surfaces are live, the local Datalog explorer is explicit, and the summary/status widgets now load quickly with real aggregate counts on the rebuilt `28765/28766` stack.
+
+---
+
+## Sprint 9: Role-Auth Rollout — Graph Write Cutover + Workbench Passthrough
+
+**Goal:** Keep direct CQL for app-owned tables, eliminate direct graph-table writes, finish workbench CQL/SPARQL passthrough, preserve local Datalog ownership, and ensure startup/readiness succeed under the least-privilege serving role without graph-table `MODIFY`.
+
+**Status: IN PROGRESS**
+
+**Dependencies:** Builds on the shared HTTP guardrails from Sprint 7 and the operator/workbench surfaces from Sprint 8. This sprint aligns the service with the Ferrosa CQL role-auth rollout, where `ferrosa-memory` runs as `app_reader`: app-table writes via CQL remain valid, graph-table writes do not.
+
+| # | Task | Size | Source | Success Criteria | Tests |
+|---|------|------|--------|-----------------|-------|
+| 9.1 | **IN PROGRESS**: Route all graph mutations through the public Cypher/graph interface and remove serving-path graph-table writes | L | bug-ferrosa-memory-bypasses-graph-api-for-writes.md, todo-extend-ferrosa-memory-graph-client-with-cypher-writes.md, F66, EO-T1 | No serving-path `INSERT`/`UPDATE`/`DELETE` names graph-owned backing tables. The code-side cutover is landed, but live completion is blocked until Ferrosa materializes canonical public `TYPED_EDGE` MERGE writes. | Integration: edge writes visible via public graph API. Static: grep verifies no direct graph-table mutations remain in serving code. |
+| 9.2 | **DONE**: Replace local workbench CQL interpretation with authenticated passthrough to Ferrosa public CQL | M | feat-endpoint-only-ferrosa-client.md, F67, EO-T2 | `/workbench/api/cql/query` forwards requests to Ferrosa public CQL, preserves scope/auth context, and fails loudly on public API errors or unsupported behavior. This is a workbench/operator path only; app-table CQL storage remains direct. | Integration: representative passthrough queries. Negative: Ferrosa contract errors surface unchanged. |
+| 9.3 | **DONE**: Add a public-SPARQL passthrough surface for operator graph/RDF inspection | M | feat-endpoint-only-ferrosa-client.md, feat-operator-console-query-surfaces.md, ADR-005 | The operator console exposes SPARQL through an authenticated passthrough surface and returns Ferrosa public-SPARQL results/errors without local semantic substitution. | Integration: representative SPARQL queries. Negative: Ferrosa contract errors surface unchanged. |
+| 9.4 | **DONE**: Re-scope the operator Datalog surface as ferrosa-memory-owned and remove public-protocol drift from docs/tests/UI | S | user clarification, F67 | `/workbench/api/datalog/query` remains a local ferrosa-memory capability over Ferrosa-backed graph/app state. Docs, UI copy, and tests stop describing it as a Ferrosa public protocol or passthrough surface. | Integration: predicate query + provenance drill-down still work locally. Static: no high-signal docs describe Datalog as a Ferrosa public passthrough. |
+| 9.5 | **DONE**: Decouple startup/bootstrap from graph-table `MODIFY` privileges and graph-owned bootstrap side effects | M | dsm-analysis.md, overview.md, F68, EO-E1 | Service startup succeeds under the least-privilege serving role without graph-table writes. If migrations or seed writes remain, they move to an explicit admin path/role. | Integration: boot under restricted role, remain ready, and perform representative app-table writes while graph writes flow through Cypher. |
+| 9.6 | **DONE**: Re-define shared HTTP readiness around least-privilege serving prerequisites | S | shared-http-deployment.md, F69 | `/healthz/ready` returns success only when auth is ready, app-table CQL access is healthy, and required public graph/query endpoints for enabled features are reachable. Graph-table `MODIFY` grants are not a readiness prerequisite. | Integration: public-endpoint outage => not-ready even if raw storage is reachable. |
+| 9.7 | **IN PROGRESS**: Expand contract, integration, and system coverage for role-auth behavior and fail-loud semantics | M | test-specification.md, F66-F69, EO-T1/EO-T2/EO-E1 | Tests explicitly cover graph-write cutover, query passthrough error propagation, boot/readiness under least privilege, and proof that direct CQL remains allowed for app-owned tables. Existing focused verification is green; the remaining missing live pass is blocked by the Ferrosa typed-edge mutation bug. | `make test-contracts`, `make test-integration`, `make test-system`, coverage gap scan. |
+| 9.8 | **DONE**: Refresh docs, examples, and rollout artifacts to describe the hybrid role-scoped boundary accurately | S | README.md, shared-http-deployment.md, overview.md, components.md, data-flow.md | Examples, operator docs, and deployment guidance describe a role-scoped client boundary: app-table CQL allowed, graph-table writes forbidden, workbench query paths passthrough/fail-loud. | Manual review + grep verification of high-signal docs. |
+
+**Sprint 9 exit criteria:** the serving role can run without graph-table `MODIFY`; all graph writes go through Cypher; workbench raw-query surfaces are passthroughs; readiness reflects least-privilege serving prerequisites; app-owned tables continue to use the CQL driver.
+
+**Current blocker:** Ferrosa's public graph mutation path still acknowledges the canonical `MERGE (a)-[r:TYPED_EDGE {edge_type: ...}]->(b)` shape without materializing a row in `agent_memory.typed_edges`. That bug is tracked in [bug-public-cypher-typed-edge-merge-does-not-materialize.md](/Users/bkearns/src/ferrosa/specs/in-process/bug-public-cypher-typed-edge-merge-does-not-materialize.md).
+
+---
+
+## Sprint 10: Server-Owned Bulk Ingest
+
+**Goal:** Add an `ingest_entities` MCP surface that lets clients bulk-ingest semantic entities and typed edges in one call while keeping schema mapping, conflict semantics, embedding ownership, and row-level failure reporting on the server.
+
+**Status: PLANNED**
+
+| # | Task | Size | Source | Success Criteria | Tests |
+|---|------|------|--------|-----------------|-------|
+| 10.1 | Contract + types for `ingest_entities` request/response/options | M | `feat-ingest-entities`, BI-T1, F70 | Tool schema matches the bulk-ingest contract including `on_conflict`, `strict_edges`, and `dry_run` | Unit: serde round-trip, schema validation |
+| 10.2 | Server-owned entity schema mapping + `schema_version` advertisement | L | Invariant 1, BI-T2, F71 | Semantic fields map to current app-table schema without client-owned column knowledge | Unit + integration: unknown attrs fail loudly, schema version returned |
+| 10.3 | Conflict handling: `update`, `skip`, `error` | L | Invariants 3-4, F71 | Retries are idempotent under `update`; `skip` preserves resident rows; `error` surfaces conflicts | Integration: duplicate batch replay, conflict-mode matrix |
+| 10.4 | Optional server-side embeddings for missing vectors | M | Invariant 5, BI-D1, F73 | Missing embeddings can be computed server-side with bounded failures and clear counters | Integration: mixed client-supplied + server-computed vectors |
+| 10.5 | Strict edge validation + dry-run planning | L | Invariants 6 and 9, F72, F74 | Endpoint validation works against batch + resident rows; dry-run mutates nothing | Unit: orphan-edge matrix. System: dry-run leaves tables unchanged |
+| 10.6 | Progress notifications and batch diagnostics | M | Invariant 8, BI-R1 | Large batches emit bounded MCP progress notifications and final row-level diagnostics | System: progress observed on representative batch |
+| 10.7 | Tenant/auth enforcement and graph-boundary compliance | M | Invariant 7, BI-S1, BI-E1, F75 | Caller cannot widen tenant scope; ingest does not introduce direct graph-table writes | Contract + static guardrail tests |
+| 10.8 | Forge migration path and operator docs | S | consumer fit | Forge can replace client-owned loader path with MCP call semantics; docs describe dry-run and schema drift behavior | System smoke + docs review |
+
+**Sprint 10 exit criteria:** `ingest_entities` is discoverable via `tools/list`, supports dry-run and progress, surfaces all row failures structurally, keeps client code out of CQL details, and preserves the existing graph-write boundary.
+
+---
+
 ## Backlog (Post-v1.0)
 
 | # | Task | Size | Source | Notes |
 |---|------|------|--------|-------|
 | B1 | OpenTelemetry trace export | M | spec Section 11 | v2 item per spec |
 | B2 | Model-perplexity-based compression scoring | L | ADR-001 | Enhances compression quality by calling embedding endpoint for perplexity estimates |
-| B3 | Embedding migration tool (re-embed on model change) | M | FMEA F26 | Semi-automated: enumerate rows with old model, re-embed, update |
+| B3 | Embedding migration tool (re-embed on model change) | M | FMEA F26 | **DONE (2026-04-23):** tenant-wide `nomic-embed-text-v2-moe` backfill completed and verified against live retrieval |
 | B4 | Online RL training loop for routing guidelines | XL | spec Section 11 | Replaces nightly batch with online ACON-style RL |
 | B5 | Web dashboard for memory observability | L | spec Section 11 | Beyond Ferrosa console + Prometheus |
 | B6 | WASM UDF for in-database compression | M | spec Section 4.3 | Moves compression into Ferrosa SSTable flush path |
@@ -303,6 +389,7 @@
 | B15 | BM25 full-text search signal | L | RMH/Ori Mnemos | TF-IDF ranking. Blocked on Ferrosa full-text index support. |
 | B16 | LLM-powered query decomposition | M | RMH/RLM paper | Optional LLM-assisted sub-query generation for recursive_explore |
 | B17 | LSP-based code indexing | XL | specs/lsp-code-indexing.md | Multi-language code intelligence via LSP servers. Spec written (Sprint 6). |
+| B19 | Precomputed explanation indexes for workbench-heavy views | M | threat ES-D1, FMEA F65 | Defer until real explanation query patterns justify dedicated storage. |
 
 ---
 
@@ -323,7 +410,15 @@
 | **Warmth runaway feedback loop** (FMEA F46, RPN 120) | Medium | Medium | Max warmth cap 10.0. Ebbinghaus decay in consolidation. Monitor warmth distribution in get_stats. | **Open** |
 | **Derived cache staleness after rule change** (FMEA F45, RPN 140) | Medium | High | Invalidate cache for affected predicate families on rule change. Include rule_version in cache key. Cache invalidation implemented in manage_rules put action. | **Mitigated** |
 | **Rule injection via manage_rules** (STRIDE S7) | Medium | High | Rule body validation (parse before storing). Rule family isolation. Audit log for all rule changes. | **Open** |
-| **Permissive shared HTTP auth validator** (FMEA F57, STRIDE S1) | High | Critical | Replace validator with real principal mapping before exposing shared endpoint. | **Open** |
+| **Effective rule set drift between registry and evaluator** (FMEA F62, threat ES-T1) | High | Critical | One shared effective-rule loader is now the only backend route for rule-driven inference. | **Resolved** |
+| **Approval bypass in runtime loading** (FMEA F63, threat ES-E1) | Medium | Critical | Runtime loaders enforce approval status; unapproved artifacts are excluded from default paths. | **Mitigated** |
+| **Alias execution depends on fuzzy lookup** (FMEA F64, threat ES-T2) | Medium | High | Exact scoped alias lookup is authoritative for execution semantics. | **Mitigated** |
+| **Explanation chain incompleteness or scope leak** (FMEA F65, threats ES-I1/ES-D1) | Medium | High | Bound explanation reconstruction is implemented; remaining validation effort is tied to operator surface rollout. | **In Progress** |
+| **Graph writes bypass public graph API** (FMEA F66, threat EO-T1) | High | Critical | Route all serving-path graph mutations through the public Cypher/graph interface; remove direct graph-table writes. | **Open** |
+| **Workbench query surfaces emulate public semantics locally** (FMEA F67, threat EO-T2) | High | Critical | Replace local CQL interpreters with authenticated passthrough adapters and fail-loud error handling; keep Datalog explicitly local so the contract boundary stays honest. | **Open** |
+| **Serving path owns migration/schema bootstrap behavior** (FMEA F68, threat EO-E1) | Medium | High | Move migrations and schema seeding out of startup; rely on public contracts only. | **Open** |
+| **Readiness tied to direct storage instead of public-client health** (FMEA F69) | Medium | Medium | Re-define readiness around Ferrosa public endpoints and auth health. | **Open** |
+| **Permissive shared HTTP auth validator** (FMEA F57, STRIDE S1) | High | Critical | Replaced with file-backed principal mapping; remaining work is broader live/system verification before exposing the shared endpoint. | **Mitigated in code; verification in progress** |
 | **Shared HTTP tenant fallback misconfiguration** (FMEA F61, STRIDE T10) | Medium | High | Fail startup if HTTP mode lacks explicit auth backend or relies on fixed/default tenant behavior. | **Open** |
 | **Public viz exposure without shared auth boundary** (FMEA F60, STRIDE S5) | Medium | High | Disable viz by default on shared deployments. If enabled, restrict to internal or equivalently authenticated surface. | **Open** |
 | Query decomposition quality without LLM | Medium | Medium | Heuristic v1. Always includes original query. Backlog B16: optional LLM-powered decomposition. | Accepted |
@@ -343,6 +438,8 @@ graph LR
     S4 --> S5[Sprint 5]
     S5 --> S6[Sprint 6]
     S6 --> S7[Sprint 7]
+    S5 --> S8[Sprint 8]
+    S7 --> S8
 
     S1 --- note1["Foundation: cql_client, auth, transport, memo, plan"]
     S2 --- note2["Folds: compression, graph, fold lifecycle"]
@@ -351,6 +448,7 @@ graph LR
     S5 --- note5["RMH + Datalog: inference, warmth, PPR, recursive explore"]
     S6 --- note6["Production: type registry, CQL fallbacks, ops tooling, viz"]
     S7 --- note7["Shared HTTP: auth, TLS, probes, secret wiring, viz boundary"]
+    S8 --- note8["Expert system: effective rules, claims, approvals, aliases, explanations"]
 ```
 
-Sprint 2 and Sprint 3 can run in parallel after Sprint 1 completes — they share infrastructure (cql_client, auth, metrics) but don't depend on each other's tool implementations. Sprint 4 requires both. Sprint 5 requires Sprint 4 (builds on entity graph, routing, feedback loop, and consolidation pipeline). Sprint 6 is production hardening work that spans the full stack.
+Sprint 2 and Sprint 3 can run in parallel after Sprint 1 completes — they share infrastructure (cql_client, auth, metrics) but don't depend on each other's tool implementations. Sprint 4 requires both. Sprint 5 requires Sprint 4 (builds on entity graph, routing, feedback loop, and consolidation pipeline). Sprint 6 is production hardening work that spans the full stack. Sprint 8 builds on Sprint 5's inference substrate and should not be exposed broadly over HTTP until Sprint 7's auth and startup guardrails are in place.

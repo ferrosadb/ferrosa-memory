@@ -16,7 +16,7 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>FERROSA_MEMORY_CONFIG</key>
-    <string>__REPO_ROOT__/.runtime/ferrosa-memory-http.toml</string>
+    <string>__CONFIG_PATH__</string>
     <key>CLAUDE_PROJECT_DIR</key>
     <string>__REPO_ROOT__</string>
     <key>PATH</key>

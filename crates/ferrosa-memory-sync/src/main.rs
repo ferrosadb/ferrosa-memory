@@ -17,6 +17,7 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use ferrosa_memory_core::cql_storage::CqlStorage;
+use ferrosa_memory_core::graph::{GraphClient, GraphConfig};
 use ferrosa_memory_core::storage::Storage;
 use ferrosa_memory_core::types::{FoldStatus, TenantContext};
 use tracing_subscriber::EnvFilter;
@@ -115,12 +116,20 @@ async fn cmd_sync(
     let dst = CqlStorage::connect(&dst_config.ferrosa)
         .await
         .context("connecting to destination cluster")?;
+    let dst_graph = GraphClient::connect(&GraphConfig {
+        http_url: dst_config.graph.http_url.clone(),
+        username: dst_config.graph.username.clone(),
+        password: dst_config.graph.password.clone(),
+        keyspace: dst_config.ferrosa.keyspace.clone(),
+    })
+    .await
+    .context("connecting to destination graph endpoint")?;
 
     let ctx = TenantContext {
         tenant_id,
         session_origin: "memory-sync".into(),
     };
-    let stats = sync_all(&src, &dst, &ctx, dry_run).await?;
+    let stats = sync_all(&src, &dst, &dst_graph, &ctx, dry_run).await?;
 
     tracing::info!(
         entities = stats.entities,
@@ -207,6 +216,7 @@ async fn cmd_discover(config_path: &std::path::Path) -> anyhow::Result<()> {
 async fn sync_all(
     src: &CqlStorage,
     dst: &CqlStorage,
+    dst_graph: &GraphClient,
     ctx: &TenantContext,
     dry_run: bool,
 ) -> anyhow::Result<SyncStats> {
@@ -302,7 +312,7 @@ async fn sync_all(
     }
 
     // --- Edges ---
-    sync_edges(src, dst, ctx, dry_run, &mut stats).await?;
+    sync_edges(src, dst_graph, ctx, dry_run, &mut stats).await?;
 
     Ok(stats)
 }
@@ -339,7 +349,7 @@ async fn sync_fold(
 /// not memory recall, so this is acceptable).
 async fn sync_edges(
     src: &CqlStorage,
-    dst: &CqlStorage,
+    dst_graph: &GraphClient,
     ctx: &TenantContext,
     dry_run: bool,
     stats: &mut SyncStats,
@@ -362,7 +372,10 @@ async fn sync_edges(
                 let src_id: Uuid = row.r_by_name("source_fold_id")?;
                 let tgt_id: Uuid = row.r_by_name("target_fold_id")?;
                 let sid: Uuid = row.r_by_name("session_id")?;
-                if let Err(err) = dst.edge_folded_into(ctx, src_id, tgt_id, sid).await {
+                if let Err(err) = dst_graph
+                    .put_folded_into_edge(ctx.tenant_id, sid, src_id, tgt_id)
+                    .await
+                {
                     tracing::warn!(%err, "folded_into edge sync failed");
                     stats.errors += 1;
                 }
@@ -384,7 +397,10 @@ async fn sync_edges(
                 let entity_id: Uuid = row.r_by_name("entity_id")?;
                 let fold_id: Uuid = row.r_by_name("fold_id")?;
                 let sid: Uuid = row.r_by_name("session_id")?;
-                if let Err(err) = dst.edge_mentioned_in(ctx, entity_id, fold_id, sid).await {
+                if let Err(err) = dst_graph
+                    .put_mentioned_in_edge(ctx.tenant_id, sid, entity_id, fold_id)
+                    .await
+                {
                     tracing::warn!(%err, "mentioned_in edge sync failed");
                     stats.errors += 1;
                 }
@@ -407,7 +423,10 @@ async fn sync_edges(
                 let b: Uuid = row.r_by_name("entity_b")?;
                 let sid: Uuid = row.r_by_name("session_id")?;
                 let strength: f32 = row.r_by_name("strength").unwrap_or(1.0);
-                if let Err(err) = dst.edge_co_occurs(ctx, a, b, sid, strength).await {
+                if let Err(err) = dst_graph
+                    .put_co_occurs_edge(ctx.tenant_id, sid, a, b, strength)
+                    .await
+                {
                     tracing::warn!(%err, "co_occurs_with edge sync failed");
                     stats.errors += 1;
                 }
@@ -429,7 +448,10 @@ async fn sync_edges(
                 let new_id: Uuid = row.r_by_name("new_event_id")?;
                 let old_id: Uuid = row.r_by_name("old_event_id")?;
                 let entity_id: Uuid = row.r_by_name("entity_id")?;
-                if let Err(err) = dst.edge_supersedes(ctx, new_id, old_id, entity_id).await {
+                if let Err(err) = dst_graph
+                    .put_supersedes_edge(ctx.tenant_id, entity_id, new_id, old_id)
+                    .await
+                {
                     tracing::warn!(%err, "supersedes edge sync failed");
                     stats.errors += 1;
                 }

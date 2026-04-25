@@ -36,6 +36,8 @@ pub struct Config {
     #[serde(default)]
     pub graph: GraphDbConfig,
     #[serde(default)]
+    pub sparql: SparqlConfig,
+    #[serde(default)]
     pub viz: VizConfig,
     #[serde(default)]
     pub rmh: RmhConfig,
@@ -70,6 +72,24 @@ impl Default for GraphDbConfig {
     }
 }
 
+/// Public SPARQL endpoint configuration.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SparqlConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_sparql_url")]
+    pub http_url: String,
+}
+
+impl Default for SparqlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            http_url: default_sparql_url(),
+        }
+    }
+}
+
 /// Visualization dashboard configuration.
 #[derive(Debug, Deserialize, Clone)]
 pub struct VizConfig {
@@ -77,6 +97,11 @@ pub struct VizConfig {
     pub enabled: bool,
     #[serde(default = "default_viz_port")]
     pub port: u16,
+    /// Port to embed in rendered HTML for links pointing at viz (workbench → viz).
+    /// Set when the viz listener sits behind a port mapping (e.g. podman 18766:8766).
+    /// Defaults to `port` when unset.
+    #[serde(default)]
+    pub public_port: Option<u16>,
     /// Tenant UUID viz should read under when running in HTTP transport mode.
     ///
     /// Viz is unauthenticated (loopback-only), so the tenant cannot come from
@@ -84,6 +109,12 @@ pub struct VizConfig {
     /// stdio tenant. In HTTP mode this is required if `enabled = true`.
     #[serde(default)]
     pub tenant_id: Option<String>,
+    /// Explicit bind address for the viz listener. When unset the runtime picks
+    /// a safe default (0.0.0.0 under stdio, 127.0.0.1 under HTTP). Override to
+    /// 0.0.0.0 only when the container/host port mapping already constrains
+    /// exposure (e.g. podman forwarding host 127.0.0.1:X → container 0.0.0.0:Y).
+    #[serde(default)]
+    pub bind_addr: Option<String>,
 }
 
 impl Default for VizConfig {
@@ -91,7 +122,9 @@ impl Default for VizConfig {
         Self {
             enabled: default_viz_enabled(),
             port: default_viz_port(),
+            public_port: None,
             tenant_id: None,
+            bind_addr: None,
         }
     }
 }
@@ -235,8 +268,16 @@ fn default_enrich_max_tokens() -> u32 {
 pub struct ServerConfig {
     #[serde(default = "default_transport")]
     pub transport: String,
+    #[serde(default = "default_bind_addr")]
+    pub bind_addr: String,
     #[serde(default = "default_http_port")]
     pub http_port: u16,
+    /// Port to embed in rendered HTML for cross-page links (workbench ⇄ viz).
+    /// Set when the server sits behind a port mapping (e.g. podman 18765:8765):
+    /// the process listens on `http_port` inside the container, but the browser
+    /// needs `public_port` on the host. Defaults to `http_port` when unset.
+    #[serde(default)]
+    pub public_port: Option<u16>,
     #[serde(default = "default_log_level")]
     pub log_level: String,
     #[serde(default)]
@@ -272,7 +313,9 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             transport: default_transport(),
+            bind_addr: default_bind_addr(),
             http_port: default_http_port(),
+            public_port: None,
             log_level: default_log_level(),
             require_tls: false,
             cert_path: None,
@@ -297,6 +340,19 @@ pub struct FerrosaCqlConfig {
     pub replication_factor: u8,
     #[serde(default = "default_consistency")]
     pub consistency: String,
+    #[serde(default = "default_ferrosa_user")]
+    pub username: String,
+    #[serde(default = "default_ferrosa_password")]
+    pub password: String,
+    /// Optional admin credentials used for a short-lived session that runs
+    /// schema migrations (CREATE KEYSPACE / CREATE TABLE / etc.). When set,
+    /// the runtime session still connects as `username`/`password` — only
+    /// migration DDL uses the admin pair. Leave unset on auth-disabled
+    /// clusters or when `username` already has DDL privileges.
+    #[serde(default)]
+    pub admin_username: Option<String>,
+    #[serde(default)]
+    pub admin_password: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -402,6 +458,9 @@ impl Default for RoutingConfig {
 fn default_transport() -> String {
     "stdio".into()
 }
+fn default_bind_addr() -> String {
+    "0.0.0.0".into()
+}
 fn default_http_port() -> u16 {
     8765
 }
@@ -442,10 +501,10 @@ fn default_provider() -> String {
     "ollama".into()
 }
 fn default_ollama_url() -> String {
-    "http://localhost:11434".into()
+    "http://127.0.0.1:11434".into()
 }
 fn default_embed_model() -> String {
-    "nomic-embed-text".into()
+    "nomic-embed-text-v2-moe".into()
 }
 fn default_dimensions() -> u32 {
     768
@@ -481,13 +540,22 @@ fn default_bolt_uri() -> String {
     "bolt://localhost:7687".into()
 }
 fn default_graph_user() -> String {
-    "neo4j".into()
+    "ferrosa_admin".into()
 }
 fn default_graph_pass() -> String {
-    "neo4j".into()
+    "ferrosa_admin".into()
 }
 fn default_http_graph_url() -> String {
     "http://localhost:7474".into()
+}
+fn default_sparql_url() -> String {
+    "http://localhost:8080".into()
+}
+fn default_ferrosa_user() -> String {
+    "ferrosa_user".into()
+}
+fn default_ferrosa_password() -> String {
+    "ferrosa_user".into()
 }
 fn default_warmth_boost() -> f64 {
     0.3
@@ -581,10 +649,12 @@ pub fn validate_shared_http_config(config: &Config) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if !config.server.require_tls {
-        anyhow::bail!("HTTP transport requires TLS in shared mode");
+    if !config.server.require_tls && !is_loopback_bind_addr(&config.server.bind_addr) {
+        anyhow::bail!("HTTP transport requires TLS unless server.bind_addr is loopback-only");
     }
-    if config.server.cert_path.is_none() || config.server.key_path.is_none() {
+    if config.server.require_tls
+        && (config.server.cert_path.is_none() || config.server.key_path.is_none())
+    {
         anyhow::bail!("HTTP transport requires cert_path and key_path");
     }
     if config.server.auth_file.is_none() {
@@ -595,6 +665,13 @@ pub fn validate_shared_http_config(config: &Config) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn is_loopback_bind_addr(bind_addr: &str) -> bool {
+    matches!(
+        bind_addr.trim(),
+        "127.0.0.1" | "localhost" | "::1" | "[::1]"
+    )
 }
 
 /// Load config from the resolved path, or return an error if not found.
@@ -667,6 +744,7 @@ feedback_export_cron = "0 3 * * *"
 "#;
         let config = parse_config(toml).expect("should parse full config");
         assert_eq!(config.server.transport, "http");
+        assert_eq!(config.server.bind_addr, "0.0.0.0");
         assert_eq!(config.server.http_port, 9999);
         assert_eq!(config.ferrosa.contact_points.len(), 2);
         assert_eq!(config.ferrosa.keyspace, "test_memory");
@@ -789,6 +867,12 @@ contact_points = "not_an_array"
     }
 
     #[test]
+    fn server_config_default_bind_addr() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.bind_addr, "0.0.0.0");
+    }
+
+    #[test]
     fn server_config_default_log_level() {
         let cfg = ServerConfig::default();
         assert_eq!(cfg.log_level, "info");
@@ -861,6 +945,37 @@ auth_file = "/etc/ferrosa/auth.toml"
     }
 
     #[test]
+    fn validate_shared_http_accepts_loopback_without_tls() {
+        let toml = r#"
+[ferrosa]
+contact_points = ["localhost:19042"]
+[server]
+transport = "http"
+bind_addr = "127.0.0.1"
+require_tls = false
+auth_file = "/etc/ferrosa/auth.toml"
+"#;
+        let config = parse_config(toml).unwrap();
+        validate_shared_http_config(&config).expect("loopback-only http config should validate");
+    }
+
+    #[test]
+    fn validate_shared_http_rejects_non_loopback_without_tls() {
+        let toml = r#"
+[ferrosa]
+contact_points = ["localhost:19042"]
+[server]
+transport = "http"
+bind_addr = "0.0.0.0"
+require_tls = false
+auth_file = "/etc/ferrosa/auth.toml"
+"#;
+        let config = parse_config(toml).unwrap();
+        let err = validate_shared_http_config(&config).unwrap_err();
+        assert!(err.to_string().contains("loopback-only"));
+    }
+
+    #[test]
     fn parse_toml_with_stale_edge_and_decay() {
         let toml = r#"
 [server]
@@ -913,8 +1028,8 @@ http_url = "http://remote:7474"
     fn graph_config_defaults() {
         let cfg = GraphDbConfig::default();
         assert_eq!(cfg.bolt_uri, "bolt://localhost:7687");
-        assert_eq!(cfg.username, "neo4j");
-        assert_eq!(cfg.password, "neo4j");
+        assert_eq!(cfg.username, "ferrosa_admin");
+        assert_eq!(cfg.password, "ferrosa_admin");
         assert_eq!(cfg.http_url, "http://localhost:7474");
     }
 
@@ -956,8 +1071,8 @@ port = 9999
     fn embedding_config_defaults() {
         let cfg = EmbeddingConfig::default();
         assert_eq!(cfg.provider, "ollama");
-        assert_eq!(cfg.ollama_base_url, "http://localhost:11434");
-        assert_eq!(cfg.model, "nomic-embed-text");
+        assert_eq!(cfg.ollama_base_url, "http://127.0.0.1:11434");
+        assert_eq!(cfg.model, "nomic-embed-text-v2-moe");
         assert_eq!(cfg.dimensions, 768);
     }
 

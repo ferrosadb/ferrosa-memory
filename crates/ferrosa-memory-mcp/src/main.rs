@@ -11,11 +11,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use cdrs_tokio::frame::message_result::{ColType, RowsMetadata};
+use cdrs_tokio::types::ByIndex;
+use cdrs_tokio::types::blob::Blob;
+use cdrs_tokio::types::prelude::Row;
 use ferrosa_memory_core::auth;
 use ferrosa_memory_core::config::FerrosaCqlConfig;
 use ferrosa_memory_core::config::{Config, validate_shared_http_config};
 use ferrosa_memory_core::cql_storage::CqlStorage;
 use ferrosa_memory_core::dispatch;
+use ferrosa_memory_core::graph::GraphClient;
 use ferrosa_memory_core::http;
 use ferrosa_memory_core::storage::Storage;
 use ferrosa_memory_core::transport;
@@ -49,26 +54,68 @@ struct ReconnectingStorage {
     reconnect_signal: tokio::sync::Notify,
     /// Config needed to reconnect (stashed at creation time).
     cql_config: FerrosaCqlConfig,
+    graph: Option<Arc<GraphClient>>,
+    sparql: Option<SparqlPassthrough>,
+}
+
+#[derive(Clone)]
+struct SparqlPassthrough {
+    http_url: String,
+    username: String,
+    password: String,
+    client: reqwest::Client,
+}
+
+impl SparqlPassthrough {
+    fn new(http_url: String, username: String, password: String) -> Self {
+        Self {
+            http_url,
+            username,
+            password,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    fn query_url(&self) -> String {
+        if self.http_url.ends_with("/sparql") {
+            self.http_url.clone()
+        } else {
+            format!("{}/sparql", self.http_url.trim_end_matches('/'))
+        }
+    }
 }
 
 impl ReconnectingStorage {
     /// Create with an already-connected CQL backend.
-    fn connected(cql: CqlStorage, config: FerrosaCqlConfig) -> Self {
+    fn connected(
+        cql: CqlStorage,
+        config: FerrosaCqlConfig,
+        graph: Option<Arc<GraphClient>>,
+        sparql: Option<SparqlPassthrough>,
+    ) -> Self {
         Self {
             inner: RwLock::new(Some(cql)),
             generation: AtomicU64::new(1),
             reconnect_signal: tokio::sync::Notify::new(),
             cql_config: config,
+            graph,
+            sparql,
         }
     }
 
     /// Create in "reconnecting" state — no backend available yet.
-    fn disconnected(config: FerrosaCqlConfig) -> Self {
+    fn disconnected(
+        config: FerrosaCqlConfig,
+        graph: Option<Arc<GraphClient>>,
+        sparql: Option<SparqlPassthrough>,
+    ) -> Self {
         Self {
             inner: RwLock::new(None),
             generation: AtomicU64::new(0),
             reconnect_signal: tokio::sync::Notify::new(),
             cql_config: config,
+            graph,
+            sparql,
         }
     }
 
@@ -82,6 +129,12 @@ impl ReconnectingStorage {
     /// Read the current generation (captured before a query, checked after).
     fn current_generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
+    }
+
+    fn graph_client(&self) -> anyhow::Result<&Arc<GraphClient>> {
+        self.graph
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("graph client is not configured"))
     }
 
     fn is_ready(&self) -> bool {
@@ -120,7 +173,7 @@ const NOT_CONNECTED_MSG: &str = "CQL connection not yet established, retrying in
 
 /// Returns true if the error looks like a connection / transport failure
 /// (as opposed to a query-level error like "table not found").
-fn is_connection_error(err: &anyhow::Error) -> bool {
+fn is_connection_error(err: impl std::fmt::Display) -> bool {
     let msg = err.to_string().to_lowercase();
     msg.contains("broken pipe")
         || msg.contains("connection reset")
@@ -134,6 +187,76 @@ fn is_connection_error(err: &anyhow::Error) -> bool {
         // Stale prepared statements after node restart — need full reconnect
         // to re-prepare all statements.
         || msg.contains("column or udt property")
+}
+
+fn cql_cell_to_json(row: &Row, metadata: &RowsMetadata, index: usize) -> serde_json::Value {
+    let col_type = metadata
+        .col_specs
+        .get(index)
+        .map(|spec| spec.col_type.id)
+        .unwrap_or(ColType::Varchar);
+
+    match col_type {
+        ColType::Ascii | ColType::Varchar | ColType::Custom => row
+            .r_by_index::<String>(index)
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+        ColType::Bigint | ColType::Counter | ColType::Time => row
+            .r_by_index::<i64>(index)
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null),
+        ColType::Int | ColType::Date => row
+            .r_by_index::<i32>(index)
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null),
+        ColType::Smallint => row
+            .r_by_index::<i16>(index)
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null),
+        ColType::Tinyint => row
+            .r_by_index::<i8>(index)
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null),
+        ColType::Boolean => row
+            .r_by_index::<bool>(index)
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null),
+        ColType::Double => row
+            .r_by_index::<f64>(index)
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null),
+        ColType::Float => row
+            .r_by_index::<f32>(index)
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null),
+        ColType::Uuid | ColType::Timeuuid => row
+            .r_by_index::<uuid::Uuid>(index)
+            .map(|value| serde_json::Value::String(value.to_string()))
+            .unwrap_or(serde_json::Value::Null),
+        ColType::Timestamp => row
+            .r_by_index::<chrono::NaiveDateTime>(index)
+            .map(|value| serde_json::Value::String(value.and_utc().to_rfc3339()))
+            .unwrap_or(serde_json::Value::Null),
+        ColType::Blob => row
+            .r_by_index::<Blob>(index)
+            .map(|value| {
+                serde_json::Value::String(format!("<blob:{} bytes>", value.into_vec().len()))
+            })
+            .unwrap_or(serde_json::Value::Null),
+        other => serde_json::Value::String(format!("<unsupported:{other:?}>")),
+    }
+}
+
+fn normalize_public_query(query: &str) -> anyhow::Result<String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("query must not be empty");
+    }
+    if trimmed.ends_with(';') {
+        Ok(trimmed.to_string())
+    } else {
+        Ok(format!("{trimmed};"))
+    }
 }
 
 fn stdio_tenant_id(config: &Config) -> uuid::Uuid {
@@ -318,6 +441,23 @@ impl Storage for ReconnectingStorage {
         delegate!(self, entity_find_phonetic, ctx, session_id, name)
     }
 
+    async fn entity_find_by_exact_name(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        name: &str,
+        entity_type: &str,
+    ) -> anyhow::Result<Option<EntityEntry>> {
+        delegate!(
+            self,
+            entity_find_by_exact_name,
+            ctx,
+            session_id,
+            name,
+            entity_type
+        )
+    }
+
     async fn entity_get_by_id(
         &self,
         ctx: &TenantContext,
@@ -389,12 +529,29 @@ impl Storage for ReconnectingStorage {
         delegate!(self, entity_update_state, ctx, entity_id, state)
     }
 
+    async fn entity_delete(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        entity_id: uuid::Uuid,
+    ) -> anyhow::Result<bool> {
+        delegate!(self, entity_delete, ctx, session_id, entity_id)
+    }
+
     async fn entity_list_session(
         &self,
         ctx: &TenantContext,
         session_id: uuid::Uuid,
     ) -> anyhow::Result<Vec<EntityEntry>> {
         delegate!(self, entity_list_session, ctx, session_id)
+    }
+
+    async fn entity_counts_by_type_and_state(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<EntityTypeStateCount>> {
+        delegate!(self, entity_counts_by_type_and_state, ctx, session_id)
     }
 
     async fn entity_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<EntityEntry>> {
@@ -467,7 +624,9 @@ impl Storage for ReconnectingStorage {
         target: uuid::Uuid,
         session: uuid::Uuid,
     ) -> anyhow::Result<()> {
-        delegate!(self, edge_folded_into, ctx, source, target, session)
+        self.graph_client()?
+            .put_folded_into_edge(ctx.tenant_id, session, source, target)
+            .await
     }
 
     async fn edge_mentioned_in(
@@ -477,7 +636,9 @@ impl Storage for ReconnectingStorage {
         fold: uuid::Uuid,
         session: uuid::Uuid,
     ) -> anyhow::Result<()> {
-        delegate!(self, edge_mentioned_in, ctx, entity, fold, session)
+        self.graph_client()?
+            .put_mentioned_in_edge(ctx.tenant_id, session, entity, fold)
+            .await
     }
 
     async fn edge_co_occurs(
@@ -488,7 +649,9 @@ impl Storage for ReconnectingStorage {
         session: uuid::Uuid,
         strength: f32,
     ) -> anyhow::Result<()> {
-        delegate!(self, edge_co_occurs, ctx, a, b, session, strength)
+        self.graph_client()?
+            .put_co_occurs_edge(ctx.tenant_id, session, a, b, strength)
+            .await
     }
 
     async fn edge_prune_stale(
@@ -496,11 +659,38 @@ impl Storage for ReconnectingStorage {
         ctx: &TenantContext,
         cutoff: chrono::DateTime<chrono::Utc>,
     ) -> anyhow::Result<usize> {
-        delegate!(self, edge_prune_stale, ctx, cutoff)
+        let graph = self.graph_client()?;
+        let edges = graph.list_co_occurs_edges(ctx.tenant_id).await?;
+        let mut pruned = 0;
+        for edge in edges {
+            let is_stale = edge.last_reinforced.is_none_or(|ts| ts < cutoff);
+            if !is_stale {
+                continue;
+            }
+            graph
+                .delete_co_occurs_edge(ctx.tenant_id, edge.src_id, edge.dst_id)
+                .await?;
+            pruned += 1;
+        }
+        Ok(pruned)
     }
 
     async fn edge_decay_weights(&self, ctx: &TenantContext, factor: f64) -> anyhow::Result<usize> {
-        delegate!(self, edge_decay_weights, ctx, factor)
+        let graph = self.graph_client()?;
+        let edges = graph.list_co_occurs_edges(ctx.tenant_id).await?;
+        let mut decayed = 0;
+        for edge in edges {
+            graph
+                .set_co_occurs_strength(
+                    ctx.tenant_id,
+                    edge.src_id,
+                    edge.dst_id,
+                    (f64::from(edge.strength) * factor) as f32,
+                )
+                .await?;
+            decayed += 1;
+        }
+        Ok(decayed)
     }
 
     async fn edge_supersedes(
@@ -510,7 +700,9 @@ impl Storage for ReconnectingStorage {
         old_id: uuid::Uuid,
         entity: uuid::Uuid,
     ) -> anyhow::Result<()> {
-        delegate!(self, edge_supersedes, ctx, new_id, old_id, entity)
+        self.graph_client()?
+            .put_supersedes_edge(ctx.tenant_id, entity, new_id, old_id)
+            .await
     }
 
     async fn edge_list_session(
@@ -705,12 +897,62 @@ impl Storage for ReconnectingStorage {
         delegate!(self, rule_list_family, ctx, family, state)
     }
 
+    async fn rule_list_active(
+        &self,
+        ctx: &TenantContext,
+        state: ferrosa_memory_core::types::RuleState,
+    ) -> anyhow::Result<Vec<ferrosa_memory_core::types::RuleEntry>> {
+        delegate!(self, rule_list_active, ctx, state)
+    }
+
     async fn rule_get(
         &self,
         ctx: &TenantContext,
         rule_id: &str,
     ) -> anyhow::Result<Option<ferrosa_memory_core::types::RuleEntry>> {
         delegate!(self, rule_get, ctx, rule_id)
+    }
+
+    async fn approval_append(
+        &self,
+        ctx: &TenantContext,
+        entry: &ferrosa_memory_core::types::ApprovalEntry,
+    ) -> anyhow::Result<()> {
+        delegate!(self, approval_append, ctx, entry)
+    }
+
+    async fn approval_list(
+        &self,
+        ctx: &TenantContext,
+        artifact_kind: &str,
+        artifact_ref: &str,
+    ) -> anyhow::Result<Vec<ferrosa_memory_core::types::ApprovalEntry>> {
+        delegate!(self, approval_list, ctx, artifact_kind, artifact_ref)
+    }
+
+    async fn approval_latest(
+        &self,
+        ctx: &TenantContext,
+        artifact_kind: &str,
+        artifact_ref: &str,
+    ) -> anyhow::Result<Option<ferrosa_memory_core::types::ApprovalEntry>> {
+        delegate!(self, approval_latest, ctx, artifact_kind, artifact_ref)
+    }
+
+    async fn alias_put(
+        &self,
+        ctx: &TenantContext,
+        entry: &ferrosa_memory_core::types::AliasEntry,
+    ) -> anyhow::Result<()> {
+        delegate!(self, alias_put, ctx, entry)
+    }
+
+    async fn alias_list(
+        &self,
+        ctx: &TenantContext,
+        alias_name: &str,
+    ) -> anyhow::Result<Vec<ferrosa_memory_core::types::AliasEntry>> {
+        delegate!(self, alias_list, ctx, alias_name)
     }
 
     // --- Derived cache operations (Sprint 5) ---
@@ -734,6 +976,31 @@ impl Storage for ReconnectingStorage {
 
     async fn derived_cache_clear(&self, ctx: &TenantContext, pred: &str) -> anyhow::Result<()> {
         delegate!(self, derived_cache_clear, ctx, pred)
+    }
+
+    async fn derived_cache_list_all(
+        &self,
+        ctx: &TenantContext,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ferrosa_memory_core::types::DerivedFactRow>> {
+        delegate!(self, derived_cache_list_all, ctx, limit)
+    }
+
+    async fn derived_cache_ttl_track_put(
+        &self,
+        ctx: &TenantContext,
+        cache_key: &str,
+        facts: &[ferrosa_memory_core::types::TtlTrackEntry],
+    ) -> anyhow::Result<()> {
+        delegate!(self, derived_cache_ttl_track_put, ctx, cache_key, facts)
+    }
+
+    async fn derived_cache_ttl_track_get(
+        &self,
+        ctx: &TenantContext,
+        cache_key: &str,
+    ) -> anyhow::Result<Vec<(i32, i32)>> {
+        delegate!(self, derived_cache_ttl_track_get, ctx, cache_key)
     }
 
     // --- Provenance operations (Sprint 5) ---
@@ -829,7 +1096,17 @@ impl Storage for ReconnectingStorage {
     // --- Typed edge operations ---
 
     async fn typed_edge_put(&self, ctx: &TenantContext, edge: &TypedEdge) -> anyhow::Result<()> {
-        delegate!(self, typed_edge_put, ctx, edge)
+        self.graph_client()?
+            .put_typed_edge(
+                ctx.tenant_id,
+                edge.session_id,
+                edge.src_id,
+                &edge.edge_type,
+                edge.dst_id,
+                edge.weight,
+                edge.metadata.as_deref(),
+            )
+            .await
     }
 
     async fn typed_edge_list_session(
@@ -840,6 +1117,10 @@ impl Storage for ReconnectingStorage {
         delegate!(self, typed_edge_list_session, ctx, session_id)
     }
 
+    async fn typed_edge_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<TypedEdge>> {
+        delegate!(self, typed_edge_list_all, ctx)
+    }
+
     async fn typed_edge_list_from(
         &self,
         ctx: &TenantContext,
@@ -847,6 +1128,154 @@ impl Storage for ReconnectingStorage {
         src_id: uuid::Uuid,
     ) -> anyhow::Result<Vec<TypedEdge>> {
         delegate!(self, typed_edge_list_from, ctx, session_id, src_id)
+    }
+
+    async fn typed_edge_delete(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        src_id: uuid::Uuid,
+        edge_type: &str,
+        dst_id: uuid::Uuid,
+    ) -> anyhow::Result<bool> {
+        let exists = self
+            .typed_edge_list_from(ctx, session_id, src_id)
+            .await?
+            .into_iter()
+            .any(|edge| edge.dst_id == dst_id && edge.edge_type == edge_type);
+        if !exists {
+            return Ok(false);
+        }
+        self.graph_client()?
+            .delete_typed_edge(ctx.tenant_id, session_id, src_id, edge_type, dst_id)
+            .await?;
+        Ok(true)
+    }
+}
+
+impl http::OperatorQuerySurface for ReconnectingStorage {
+    async fn cql_query_passthrough(
+        &self,
+        _ctx: &TenantContext,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<serde_json::Value> {
+        let conn_gen = self.current_generation();
+        let guard = self.inner.read().await;
+        let cql = guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!(NOT_CONNECTED_MSG))?;
+
+        let normalized = normalize_public_query(query)?;
+        let envelope = cql.session().query(normalized.clone()).await;
+        let envelope = match envelope {
+            Ok(envelope) => envelope,
+            Err(err) => {
+                if is_connection_error(&err) {
+                    drop(guard);
+                    self.mark_disconnected(conn_gen).await;
+                }
+                return Err(err.into());
+            }
+        };
+
+        let body = envelope.response_body()?;
+        let metadata = body
+            .as_rows_metadata()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("CQL query did not return rows"))?;
+        let columns: Vec<String> = metadata
+            .col_specs
+            .iter()
+            .map(|spec| spec.name.clone())
+            .collect();
+        let rows = body.into_rows().unwrap_or_default();
+        let total_rows = rows.len();
+        let truncated = total_rows > limit;
+        let rendered_rows: Vec<serde_json::Value> = rows
+            .iter()
+            .take(limit)
+            .map(|row| {
+                let mut object = serde_json::Map::new();
+                for (index, name) in columns.iter().enumerate() {
+                    object.insert(name.clone(), cql_cell_to_json(row, &metadata, index));
+                }
+                serde_json::Value::Object(object)
+            })
+            .collect();
+
+        Ok(serde_json::json!({
+            "query": query,
+            "columns": columns,
+            "rows": rendered_rows,
+            "count": rendered_rows.len(),
+            "total_rows": total_rows,
+            "truncated": truncated,
+            "source": "ferrosa-cql",
+        }))
+    }
+
+    async fn sparql_query_passthrough(
+        &self,
+        _ctx: &TenantContext,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<serde_json::Value> {
+        let sparql = self
+            .sparql
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("SPARQL passthrough is not configured"))?;
+        let response = sparql
+            .client
+            .post(sparql.query_url())
+            .basic_auth(&sparql.username, Some(&sparql.password))
+            .header("Content-Type", "application/sparql-query")
+            .header("Accept", "application/sparql-results+json")
+            .body(query.to_string())
+            .send()
+            .await?;
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let body = response.text().await?;
+        if !status.is_success() {
+            anyhow::bail!(
+                "SPARQL passthrough failed: {} {}",
+                status.as_u16(),
+                body.trim()
+            );
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&body)?;
+        let bindings = parsed
+            .get("results")
+            .and_then(|value| value.get("bindings"))
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let total_rows = bindings.len();
+        let truncated = total_rows > limit;
+        let rows = bindings.into_iter().take(limit).collect::<Vec<_>>();
+        let columns = parsed
+            .get("head")
+            .and_then(|value| value.get("vars"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([]));
+
+        Ok(serde_json::json!({
+            "query": query,
+            "columns": columns,
+            "rows": rows,
+            "count": total_rows.min(limit),
+            "total_rows": total_rows,
+            "truncated": truncated,
+            "content_type": content_type,
+            "source": "ferrosa-sparql",
+        }))
     }
 }
 
@@ -1051,68 +1480,15 @@ async fn main() -> anyhow::Result<()> {
     }
     let metrics = Arc::new(ferrosa_memory_core::metrics::MemoryMetrics::new()?);
     tracing::info!("metrics registered");
+    let sparql = config.sparql.enabled.then(|| {
+        SparqlPassthrough::new(
+            config.sparql.http_url.clone(),
+            config.ferrosa.username.clone(),
+            config.ferrosa.password.clone(),
+        )
+    });
 
-    // Connect to real Ferrosa — retry in background if initial connect fails.
-    // Never fall back to mock storage (mock silently loses data).
-    let storage: Arc<ReconnectingStorage> = match CqlStorage::connect(&config.ferrosa).await {
-        Ok(cql) => {
-            tracing::info!("connected to Ferrosa CQL cluster");
-            Arc::new(ReconnectingStorage::connected(cql, config.ferrosa.clone()))
-        }
-        Err(e) => {
-            tracing::warn!(
-                "CQL connection failed ({e}), starting in reconnecting mode — \
-                 tools will return errors until connection is established"
-            );
-            let storage = Arc::new(ReconnectingStorage::disconnected(config.ferrosa.clone()));
-            // Signal immediately so the watcher starts its first attempt.
-            storage.reconnect_signal.notify_one();
-            storage
-        }
-    };
-
-    // Always spawn the reconnect watcher — it handles both initial failure
-    // and mid-operation connection loss (rolling restarts, network blips).
-    tokio::spawn(cql_reconnect_watcher(Arc::clone(&storage)));
-
-    // Load dynamic type registry from the database (falls back to defaults).
-    // Timeout after 3s to avoid blocking startup on slow/empty tables.
-    let (entity_types, edge_types) = {
-        let guard = storage.inner.read().await;
-        if let Some(ref cql) = *guard {
-            let load_result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-                let et = cql.load_entity_types().await;
-                let edg = cql.load_edge_types().await;
-                (et, edg)
-            })
-            .await;
-            match load_result {
-                Ok((et, edg)) => {
-                    tracing::info!(
-                        entity_types = et.len(),
-                        edge_types = edg.len(),
-                        "loaded type registry"
-                    );
-                    (et, edg)
-                }
-                Err(_) => {
-                    tracing::warn!("type registry load timed out (3s), using defaults");
-                    (
-                        ferrosa_memory_core::cql_storage::CqlStorage::default_entity_types(),
-                        Vec::new(),
-                    )
-                }
-            }
-        } else {
-            tracing::info!("no CQL connection yet, using default type registry");
-            (
-                ferrosa_memory_core::cql_storage::CqlStorage::default_entity_types(),
-                Vec::new(),
-            )
-        }
-    };
-
-    // Connect graph client via HTTP (non-fatal if it fails)
+    // Connect graph client via HTTP (non-fatal if it fails).
     let graph_client = match ferrosa_memory_core::graph::GraphClient::connect(
         &ferrosa_memory_core::graph::GraphConfig {
             http_url: config.graph.http_url.clone(),
@@ -1133,6 +1509,140 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Connect to real Ferrosa — retry in background if initial connect fails.
+    // Never fall back to mock storage (mock silently loses data).
+    let storage: Arc<ReconnectingStorage> = match CqlStorage::connect(&config.ferrosa).await {
+        Ok(cql) => {
+            tracing::info!("connected to Ferrosa CQL cluster");
+            Arc::new(ReconnectingStorage::connected(
+                cql,
+                config.ferrosa.clone(),
+                graph_client.clone(),
+                sparql.clone(),
+            ))
+        }
+        Err(e) => {
+            tracing::warn!(
+                "CQL connection failed ({e}), starting in reconnecting mode — \
+                 tools will return errors until connection is established"
+            );
+            let storage = Arc::new(ReconnectingStorage::disconnected(
+                config.ferrosa.clone(),
+                graph_client.clone(),
+                sparql.clone(),
+            ));
+            // Signal immediately so the watcher starts its first attempt.
+            storage.reconnect_signal.notify_one();
+            storage
+        }
+    };
+
+    // Always spawn the reconnect watcher — it handles both initial failure
+    // and mid-operation connection loss (rolling restarts, network blips).
+    tokio::spawn(cql_reconnect_watcher(Arc::clone(&storage)));
+
+    // Run schema migrations before loading the type registry — migration
+    // 020 adds columns that later queries assume. Failure is fatal: partial
+    // migrations leave the keyspace in a half-upgraded state and the
+    // operator's recovery path is a backup restore.
+    //
+    // Migrations open a *separate* session using `admin_username` /
+    // `admin_password` when configured, so CREATE KEYSPACE/TABLE can run
+    // as ferrosa_admin while the runtime session stays scoped to
+    // ferrosa_user. When admin creds aren't set the helper falls back to
+    // the runtime creds (auth-disabled dev clusters).
+    if storage.inner.read().await.is_some() {
+        let keyspace = config.ferrosa.keyspace.clone();
+        let admin_session =
+            ferrosa_memory_core::cql_storage::connect_admin_session(&config.ferrosa)
+                .await
+                .map_err(|e| anyhow::anyhow!("admin CQL session for migrations failed: {e}"))?;
+        match ferrosa_memory_core::migration::run_migrations(&admin_session, &keyspace).await {
+            Ok(0) => tracing::debug!("schema up to date"),
+            Ok(n) => tracing::info!(applied = n, "schema migrations applied"),
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "schema migration failed, aborting startup: {e}"
+                ));
+            }
+        }
+    }
+
+    // Load dynamic type registry from the database (falls back to defaults).
+    //
+    // The 3s budget was burning on cold-cluster startups: seed ran as 5
+    // sequential INSERTs outside the timeout, then the two loads ran
+    // serially inside it. Now seed (parallelized, see
+    // `CqlStorage::seed_sprint1_types`) runs *concurrently* with both
+    // loads under a single 10s budget. A fresh install may race — seed
+    // lands after the loads read — but the next startup sees the
+    // seeded rows, and defaults are safe in the meantime.
+    let (entity_types, edge_types) = {
+        let guard = storage.inner.read().await;
+        if let Some(ref cql) = *guard {
+            let load_result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                let (seed_res, et, edg) = tokio::join!(
+                    cql.seed_sprint1_types(),
+                    cql.load_entity_types(),
+                    cql.load_edge_types(),
+                );
+                if let Err(e) = seed_res {
+                    tracing::warn!(error = %e, "type registry seed failed (non-fatal)");
+                }
+                (et, edg)
+            })
+            .await;
+            match load_result {
+                Ok((et, edg)) => {
+                    tracing::info!(
+                        entity_types = et.len(),
+                        edge_types = edg.len(),
+                        "loaded type registry"
+                    );
+                    (et, edg)
+                }
+                Err(_) => {
+                    tracing::warn!("type registry load timed out (10s), using defaults");
+                    (
+                        ferrosa_memory_core::cql_storage::CqlStorage::default_entity_types(),
+                        Vec::new(),
+                    )
+                }
+            }
+        } else {
+            tracing::info!("no CQL connection yet, using default type registry");
+            (
+                ferrosa_memory_core::cql_storage::CqlStorage::default_entity_types(),
+                Vec::new(),
+            )
+        }
+    };
+
+    // Embedding provider health check (non-fatal). Many tools require
+    // embeddings; failing here warns loudly at startup rather than surfacing
+    // later as per-request failures.
+    let embed_health = ferrosa_memory_core::embedding::EmbeddingClient::new(&config.embeddings);
+    match embed_health.health_check().await {
+        Ok(()) => tracing::info!(
+            provider = %config.embeddings.provider,
+            url = %config.embeddings.ollama_base_url,
+            model = %config.embeddings.model,
+            "embedding provider reachable and model loaded"
+        ),
+        Err(e) => tracing::warn!(
+            provider = %config.embeddings.provider,
+            url = %config.embeddings.ollama_base_url,
+            model = %config.embeddings.model,
+            error = %e,
+            "embedding provider check failed — tools that require embeddings \
+             (smart_ingest, hybrid_search, retrieve_fold_context, retrieve_entities) \
+             will fail at call time. Start Ollama and ensure '{}' is pulled: \
+             `ollama pull {}`",
+            config.embeddings.model,
+            config.embeddings.model
+        ),
+    }
+
     // Start visualization server if enabled.
     //
     // Viz is unauthenticated. Under stdio transport we bind 0.0.0.0 (local trust
@@ -1141,7 +1651,7 @@ async fn main() -> anyhow::Result<()> {
     let shared_event_bus = Arc::new(ferrosa_memory_core::viz::EventBus::new());
     if config.viz.enabled {
         let transport = config.server.transport.as_str();
-        let (viz_bind, viz_tenant_id) = match transport {
+        let (default_bind, viz_tenant_id) = match transport {
             "stdio" => ("0.0.0.0", tenant_id),
             "http" => {
                 let raw = config.viz.tenant_id.as_deref().ok_or_else(|| {
@@ -1155,19 +1665,36 @@ async fn main() -> anyhow::Result<()> {
             }
             _ => ("0.0.0.0", tenant_id),
         };
+        let viz_bind: String = config
+            .viz
+            .bind_addr
+            .clone()
+            .unwrap_or_else(|| default_bind.to_string());
         let viz_bus = Arc::clone(&shared_event_bus);
         let viz_port = config.viz.port;
         let viz_storage = Arc::clone(&storage);
         let viz_ctx = Arc::new(auth::authenticate_stdio(viz_tenant_id));
         let viz_session_id = default_session_id.unwrap_or_else(uuid::Uuid::nil);
+        let shell_routes = http::ShellRouteConfig {
+            workbench_scheme: if config.server.require_tls {
+                "https".into()
+            } else {
+                "http".into()
+            },
+            workbench_port: config.server.public_port.unwrap_or(config.server.http_port),
+            viz_scheme: "http".into(),
+            viz_port: config.viz.public_port.unwrap_or(viz_port),
+        };
+        let viz_bind_for_log = viz_bind.clone();
         tokio::spawn(async move {
             if let Err(e) = http::serve_viz(
-                viz_bind,
+                &viz_bind,
                 viz_port,
                 viz_bus,
                 viz_storage,
                 viz_ctx,
                 viz_session_id,
+                shell_routes,
             )
             .await
             {
@@ -1176,10 +1703,10 @@ async fn main() -> anyhow::Result<()> {
         });
         tracing::info!(
             "viz dashboard at http://{}:{}/viz",
-            if viz_bind == "0.0.0.0" {
-                "localhost"
+            if viz_bind_for_log == "0.0.0.0" {
+                "localhost".to_string()
             } else {
-                viz_bind
+                viz_bind_for_log
             },
             config.viz.port
         );
@@ -1202,6 +1729,8 @@ async fn main() -> anyhow::Result<()> {
                 repo: repo_lock,
                 ollama_base_url: config.embeddings.ollama_base_url.clone(),
                 ner_model: config.embeddings.ner_model.clone(),
+                embed_model: config.embeddings.model.clone(),
+                embed_dimensions: config.embeddings.dimensions,
                 entity_types: entity_types.clone(),
                 edge_types: edge_types.clone(),
                 graph: graph_client.clone(),
@@ -1304,14 +1833,45 @@ async fn main() -> anyhow::Result<()> {
             });
 
             let readiness_storage = Arc::clone(&storage);
+            let repo_lock = std::sync::OnceLock::new();
+            if !repo.is_empty() {
+                let _ = repo_lock.set(repo.clone());
+            }
+            let session = Arc::new(dispatch::SessionState {
+                event_bus: Arc::clone(&shared_event_bus),
+                default_session_id,
+                repo: repo_lock,
+                ollama_base_url: config.embeddings.ollama_base_url.clone(),
+                ner_model: config.embeddings.ner_model.clone(),
+                embed_model: config.embeddings.model.clone(),
+                embed_dimensions: config.embeddings.dimensions,
+                entity_types: entity_types.clone(),
+                edge_types: edge_types.clone(),
+                graph: graph_client.clone(),
+                enrich_llm_url: config.enrich.llm_base_url.clone(),
+                enrich_llm_model: config.enrich.llm_model.clone(),
+                ..dispatch::SessionState::default()
+            });
 
             http::serve_http(
                 http::HttpConfig {
+                    bind_addr: config.server.bind_addr.clone(),
                     port: config.server.http_port,
                     require_tls: config.server.require_tls,
                     cert_path: config.server.cert_path.clone(),
                     key_path: config.server.key_path.clone(),
                     readiness_checker: Arc::new(move || readiness_storage.is_ready()),
+                    shell_routes: http::ShellRouteConfig {
+                        workbench_scheme: if config.server.require_tls {
+                            "https".into()
+                        } else {
+                            "http".into()
+                        },
+                        workbench_port: config.server.http_port,
+                        viz_scheme: "http".into(),
+                        viz_port: config.viz.port,
+                    },
+                    session,
                 },
                 storage,
                 metrics,
@@ -1368,6 +1928,24 @@ mod tests {
     fn is_connection_error_io_error() {
         let err = anyhow::anyhow!("IO error: something went wrong");
         assert!(is_connection_error(&err));
+    }
+
+    #[test]
+    fn normalize_public_query_rejects_empty_input() {
+        let err = normalize_public_query("   ").unwrap_err();
+        assert!(err.to_string().contains("query must not be empty"));
+    }
+
+    #[test]
+    fn normalize_public_query_appends_semicolon_once() {
+        assert_eq!(
+            normalize_public_query("SELECT * FROM agent_memory.entity_store LIMIT 1").unwrap(),
+            "SELECT * FROM agent_memory.entity_store LIMIT 1;"
+        );
+        assert_eq!(
+            normalize_public_query("SELECT * FROM agent_memory.entity_store LIMIT 1;").unwrap(),
+            "SELECT * FROM agent_memory.entity_store LIMIT 1;"
+        );
     }
 
     #[test]
@@ -1485,8 +2063,12 @@ auth_file = "{}"
             keyspace: "agent_memory".into(),
             replication_factor: 3,
             consistency: "LOCAL_QUORUM".into(),
+            username: "ferrosa_user".into(),
+            password: "ferrosa_user".into(),
+            admin_username: None,
+            admin_password: None,
         };
-        let storage = ReconnectingStorage::disconnected(cfg);
+        let storage = ReconnectingStorage::disconnected(cfg, None, None);
         assert!(!storage.is_ready());
     }
 

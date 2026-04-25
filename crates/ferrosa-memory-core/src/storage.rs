@@ -14,10 +14,10 @@
 use uuid::Uuid;
 
 use crate::types::{
-    AuditEntry, DerivedFact, EntityEntry, FeedbackOutcome, FoldEntry, FoldSummary,
-    MaterializedEdge, MemoEntry, MemoryState, PlanNode, PlanStatus, PromotedPredicate,
-    ProvenanceStep, RuleEntry, RuleState, TemporalEvent, TenantContext, ToolUsageRow, TypedEdge,
-    WarmthEntry,
+    AliasEntry, ApprovalEntry, AuditEntry, DerivedFact, EntityEntry, EntityTypeStateCount,
+    FeedbackOutcome, FoldEntry, FoldSummary, MaterializedEdge, MemoEntry, MemoryState, PlanNode,
+    PlanStatus, PromotedPredicate, ProvenanceStep, RuleEntry, RuleState, TemporalEvent,
+    TenantContext, ToolUsageRow, TypedEdge, WarmthEntry,
 };
 
 /// Core storage operations for the memory system.
@@ -27,40 +27,54 @@ use crate::types::{
 ///
 /// Every method that accesses tenant data requires a [`TenantContext`] to
 /// enforce tenant isolation at the trait boundary.
-#[allow(async_fn_in_trait)]
+///
+/// Futures are `Send` so `tokio::spawn` can move a storage call to a
+/// worker thread — the HTTP accept loop depends on this to handle
+/// connections concurrently. `async fn` in trait position would not
+/// imply `Send`; the explicit `impl Future + Send` form is what the
+/// spawn site needs.
+#[allow(clippy::manual_async_fn)]
 pub trait Storage: Send + Sync {
     /// Check memo cache by content hash.
-    async fn memo_get(
+    fn memo_get(
         &self,
         ctx: &TenantContext,
         content_hash: &str,
         model_version: &str,
-    ) -> anyhow::Result<Option<MemoEntry>>;
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<MemoEntry>>> + Send;
 
     /// Increment hit count and update last_hit_at on cache hit.
-    async fn memo_touch(
+    fn memo_touch(
         &self,
         ctx: &TenantContext,
         content_hash: &str,
         model_version: &str,
-    ) -> anyhow::Result<()>;
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     /// Store a new memo cache entry.
-    async fn memo_put(&self, ctx: &TenantContext, entry: &MemoEntry) -> anyhow::Result<()>;
+    fn memo_put(
+        &self,
+        ctx: &TenantContext,
+        entry: &MemoEntry,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     /// Write a plan node.
-    async fn plan_put(&self, ctx: &TenantContext, node: &PlanNode) -> anyhow::Result<()>;
+    fn plan_put(
+        &self,
+        ctx: &TenantContext,
+        node: &PlanNode,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     /// Get all plan nodes for a session up to max_depth.
-    async fn plan_get(
+    fn plan_get(
         &self,
         ctx: &TenantContext,
         session_id: Uuid,
         max_depth: Option<i32>,
-    ) -> anyhow::Result<Vec<PlanNode>>;
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<PlanNode>>> + Send;
 
     /// Update a plan node's status and optional outcome summary.
-    async fn plan_update_status(
+    fn plan_update_status(
         &self,
         ctx: &TenantContext,
         session_id: Uuid,
@@ -68,32 +82,36 @@ pub trait Storage: Send + Sync {
         subtask_id: &str,
         status: PlanStatus,
         outcome_summary: Option<&str>,
-    ) -> anyhow::Result<()>;
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     // --- Fold operations (Sprint 2) ---
 
     /// Create a new active fold.
-    async fn fold_put(&self, ctx: &TenantContext, entry: &FoldEntry) -> anyhow::Result<()>;
+    fn fold_put(
+        &self,
+        ctx: &TenantContext,
+        entry: &FoldEntry,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     /// Get a fold by ID.
-    async fn fold_get(
+    fn fold_get(
         &self,
         ctx: &TenantContext,
         session_id: Uuid,
         fold_id: Uuid,
-    ) -> anyhow::Result<Option<FoldEntry>>;
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<FoldEntry>>> + Send;
 
     /// Append text to a fold's raw_trajectory.
-    async fn fold_append(
+    fn fold_append(
         &self,
         ctx: &TenantContext,
         session_id: Uuid,
         fold_id: Uuid,
         text: &str,
-    ) -> anyhow::Result<()>;
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     /// Update fold status, summary, embedding, and compression info.
-    async fn fold_complete(
+    fn fold_complete(
         &self,
         ctx: &TenantContext,
         session_id: Uuid,
@@ -101,31 +119,48 @@ pub trait Storage: Send + Sync {
         summary: &str,
         embedding: Vec<f32>,
         compression_ratio: f64,
-    ) -> anyhow::Result<()>;
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     /// Retrieve fold summaries by embedding similarity (ANN search).
-    async fn fold_search(
+    fn fold_search(
         &self,
         ctx: &TenantContext,
         session_id: Uuid,
         query_embedding: &[f32],
         k: usize,
         include_raw: bool,
-    ) -> anyhow::Result<Vec<FoldSummary>>;
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<FoldSummary>>> + Send;
 
     // --- Entity operations (Sprint 3) ---
 
     /// Store a new entity.
-    async fn entity_put(&self, ctx: &TenantContext, entry: &EntityEntry) -> anyhow::Result<()>;
+    fn entity_put(
+        &self,
+        ctx: &TenantContext,
+        entry: &EntityEntry,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     /// Find entities by name match, ranked by relevance.
     /// Matches on exact name, :: segment, and substring (in that priority order).
-    async fn entity_find_phonetic(
+    fn entity_find_phonetic(
         &self,
         ctx: &TenantContext,
         session_id: Uuid,
         name: &str,
-    ) -> anyhow::Result<Vec<EntityEntry>>;
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<EntityEntry>>> + Send;
+
+    /// Exact `(entity_name, entity_type)` lookup inside a session. Returns
+    /// the fully-populated entity or `None`. Used as the idempotency key for
+    /// by-name writers like `ingest_skill`: a substring/fuzzy scan cannot
+    /// distinguish a skill from a like-named tag and must not be used to
+    /// decide create-vs-update.
+    fn entity_find_by_exact_name(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        name: &str,
+        entity_type: &str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<EntityEntry>>> + Send;
 
     /// Get a single entity by primary key (targeted lookup, no scan).
     fn entity_get_by_id(
@@ -144,205 +179,265 @@ pub trait Storage: Send + Sync {
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<EntityEntry>>> + Send;
 
     /// Search entities by embedding similarity.
-    async fn entity_search_ann(
+    fn entity_search_ann(
         &self,
         ctx: &TenantContext,
         session_id: Uuid,
         query_embedding: &[f32],
         k: usize,
-    ) -> anyhow::Result<Vec<EntityEntry>>;
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<EntityEntry>>> + Send;
 
     /// Count entities in a session (for rate limiting).
-    async fn entity_count(&self, ctx: &TenantContext, session_id: Uuid) -> anyhow::Result<usize>;
-
-    /// Count folds in a session.
-    async fn fold_count(&self, ctx: &TenantContext, session_id: Uuid) -> anyhow::Result<usize>;
-
-    /// Count memo cache entries for the tenant.
-    async fn memo_count(&self, ctx: &TenantContext) -> anyhow::Result<usize>;
-
-    /// List all entities for a session (for consolidation).
-    async fn entity_list_session(
+    fn entity_count(
         &self,
         ctx: &TenantContext,
         session_id: Uuid,
-    ) -> anyhow::Result<Vec<EntityEntry>>;
+    ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send;
+
+    /// Count folds in a session.
+    fn fold_count(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send;
+
+    /// Count memo cache entries for the tenant.
+    fn memo_count(
+        &self,
+        ctx: &TenantContext,
+    ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send;
+
+    /// List all entities for a session (for consolidation).
+    fn entity_list_session(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<EntityEntry>>> + Send;
+
+    /// Return a flat histogram over entity_type and state for one session.
+    fn entity_counts_by_type_and_state(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<EntityTypeStateCount>>> + Send;
 
     /// List all entities for a tenant (for viz snapshot).
-    async fn entity_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<EntityEntry>>;
+    fn entity_list_all(
+        &self,
+        ctx: &TenantContext,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<EntityEntry>>> + Send;
 
     /// List all folds for a tenant (sync/export use only — uses ALLOW FILTERING).
-    async fn fold_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<FoldEntry>>;
+    fn fold_list_all(
+        &self,
+        ctx: &TenantContext,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<FoldEntry>>> + Send;
 
     /// List all temporal events for a tenant (sync/export use only — uses ALLOW FILTERING).
-    async fn temporal_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<TemporalEvent>>;
+    fn temporal_list_all(
+        &self,
+        ctx: &TenantContext,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<TemporalEvent>>> + Send;
 
     /// Update an entity's memory state (promote/demote lifecycle).
-    async fn entity_update_state(
+    fn entity_update_state(
         &self,
         ctx: &TenantContext,
         entity_id: Uuid,
         state: MemoryState,
-    ) -> anyhow::Result<()>;
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// Delete a single entity row by primary key.
+    fn entity_delete(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        entity_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send;
 
     // --- Temporal event operations (Sprint 3) ---
 
     /// Store a temporal event.
-    async fn temporal_put(&self, ctx: &TenantContext, event: &TemporalEvent) -> anyhow::Result<()>;
+    fn temporal_put(
+        &self,
+        ctx: &TenantContext,
+        event: &TemporalEvent,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     /// Get the current (valid_until IS NULL) fact for an entity.
-    async fn temporal_get_current(
+    fn temporal_get_current(
         &self,
         ctx: &TenantContext,
         entity_id: Uuid,
-    ) -> anyhow::Result<Option<TemporalEvent>>;
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<TemporalEvent>>> + Send;
 
     /// Invalidate a temporal event (set valid_until).
-    async fn temporal_invalidate(
+    fn temporal_invalidate(
         &self,
         ctx: &TenantContext,
         entity_id: Uuid,
         event_id: Uuid,
-    ) -> anyhow::Result<()>;
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     // --- Feedback operations (Sprint 3) ---
 
     /// Record a feedback outcome.
-    async fn feedback_put(
+    fn feedback_put(
         &self,
         ctx: &TenantContext,
         outcome: &FeedbackOutcome,
-    ) -> anyhow::Result<()>;
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     /// List all feedback outcomes across tenants (batch job use only).
     ///
     /// Returns all rows from `feedback_outcomes`. In production this would
     /// use token-range scanning; the current implementation issues a single
     /// full-table query suitable for moderate data volumes.
-    async fn feedback_list_all(&self) -> anyhow::Result<Vec<FeedbackOutcome>>;
+    fn feedback_list_all(
+        &self,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<FeedbackOutcome>>> + Send;
 
     // --- Session lifecycle ---
 
     /// Delete all data for a session (right-to-deletion).
-    async fn delete_session(&self, ctx: &TenantContext, session_id: Uuid) -> anyhow::Result<usize>;
+    fn delete_session(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send;
 
     // --- Graph edge operations ---
 
     /// Create a FOLDED_INTO edge (child fold -> parent fold).
-    async fn edge_folded_into(
+    fn edge_folded_into(
         &self,
         ctx: &TenantContext,
         source_fold_id: Uuid,
         target_fold_id: Uuid,
         session_id: Uuid,
-    ) -> anyhow::Result<()>;
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     /// Create a MENTIONED_IN edge (entity -> fold).
-    async fn edge_mentioned_in(
+    fn edge_mentioned_in(
         &self,
         ctx: &TenantContext,
         entity_id: Uuid,
         fold_id: Uuid,
         session_id: Uuid,
-    ) -> anyhow::Result<()>;
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     /// Create or reinforce a CO_OCCURS_WITH edge (entity <-> entity).
     /// `strength` is the similarity score (0.0-1.0).
-    async fn edge_co_occurs(
+    fn edge_co_occurs(
         &self,
         ctx: &TenantContext,
         entity_a: Uuid,
         entity_b: Uuid,
         session_id: Uuid,
         strength: f32,
-    ) -> anyhow::Result<()>;
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     /// Delete CO_OCCURS edges not reinforced since `cutoff`.
-    async fn edge_prune_stale(
+    fn edge_prune_stale(
         &self,
         ctx: &TenantContext,
         cutoff: chrono::DateTime<chrono::Utc>,
-    ) -> anyhow::Result<usize>;
+    ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send;
 
     /// Multiply all CO_OCCURS edge weights by `factor` (0.0–1.0).
     /// Returns the number of edges decayed.
-    async fn edge_decay_weights(&self, ctx: &TenantContext, factor: f64) -> anyhow::Result<usize>;
+    fn edge_decay_weights(
+        &self,
+        ctx: &TenantContext,
+        factor: f64,
+    ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send;
 
     /// Create a SUPERSEDES edge (new fact -> old fact).
-    async fn edge_supersedes(
+    fn edge_supersedes(
         &self,
         ctx: &TenantContext,
         new_event_id: Uuid,
         old_event_id: Uuid,
         entity_id: Uuid,
-    ) -> anyhow::Result<()>;
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     /// List all edges for a session as (source, target, edge_type) triples.
     ///
     /// Queries all four edge tables (folded_into, mentioned_in, co_occurs_with,
     /// supersedes) and returns a unified list for visualization snapshots.
-    async fn edge_list_session(
+    fn edge_list_session(
         &self,
         ctx: &TenantContext,
         session_id: Uuid,
-    ) -> anyhow::Result<Vec<(Uuid, Uuid, String)>>;
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<(Uuid, Uuid, String)>>> + Send;
 
     /// List all edges for a tenant (for viz snapshot when session is unknown).
-    async fn edge_list_all(&self, ctx: &TenantContext)
-    -> anyhow::Result<Vec<(Uuid, Uuid, String)>>;
+    fn edge_list_all(
+        &self,
+        ctx: &TenantContext,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<(Uuid, Uuid, String)>>> + Send;
 
     /// List all neighbors of an entity as (neighbor_id, edge_type) pairs.
     ///
     /// Searches mentioned_in, co_occurs_with, and supersedes edges where the
     /// given entity_id appears as source or target. Used for spreading activation.
-    async fn edge_list_for_entity(
+    fn edge_list_for_entity(
         &self,
         ctx: &TenantContext,
         entity_id: Uuid,
-    ) -> anyhow::Result<Vec<(Uuid, String)>>;
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<(Uuid, String)>>> + Send;
 
     // --- Observability operations (Sprint 4) ---
 
     /// Sum of hit_count across all memos for this tenant.
-    async fn memo_total_hits(&self, ctx: &TenantContext) -> anyhow::Result<i64>;
+    fn memo_total_hits(
+        &self,
+        ctx: &TenantContext,
+    ) -> impl std::future::Future<Output = anyhow::Result<i64>> + Send;
 
     /// Count folds by status for a tenant.
-    async fn fold_count_by_status(
+    fn fold_count_by_status(
         &self,
         ctx: &TenantContext,
         status: crate::types::FoldStatus,
-    ) -> anyhow::Result<usize>;
+    ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send;
 
     /// Count temporal events for a tenant.
-    async fn temporal_count(&self, ctx: &TenantContext) -> anyhow::Result<usize>;
+    fn temporal_count(
+        &self,
+        ctx: &TenantContext,
+    ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send;
 
     /// Count graph edges for a tenant (0 if graph backend not connected).
-    async fn edge_count(&self, ctx: &TenantContext) -> anyhow::Result<usize>;
+    fn edge_count(
+        &self,
+        ctx: &TenantContext,
+    ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send;
 
     // --- Intention operations ---
 
     /// Store a new intention (repo is on the Intention struct).
-    async fn intention_put(
+    fn intention_put(
         &self,
         ctx: &TenantContext,
         intention: &crate::intention::Intention,
-    ) -> anyhow::Result<()>;
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     /// List intentions for a tenant, scoped to a specific repo.
-    async fn intention_list(
+    fn intention_list(
         &self,
         ctx: &TenantContext,
         repo: &str,
-    ) -> anyhow::Result<Vec<crate::intention::Intention>>;
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<crate::intention::Intention>>> + Send;
 
     /// List all intentions for a tenant across all repos (for sync/admin).
-    async fn intention_list_all(
+    fn intention_list_all(
         &self,
         ctx: &TenantContext,
-    ) -> anyhow::Result<Vec<crate::intention::Intention>>;
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<crate::intention::Intention>>> + Send;
 
     /// Update an intention's status and optional timestamps.
-    async fn intention_update_status(
+    fn intention_update_status(
         &self,
         ctx: &TenantContext,
         repo: &str,
@@ -350,13 +445,13 @@ pub trait Storage: Send + Sync {
         status: &str,
         triggered_at: Option<chrono::DateTime<chrono::Utc>>,
         completed_at: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> anyhow::Result<()>;
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     // --- Tool usage logging ---
 
     /// Log a tool call's token usage (fire-and-forget, best-effort).
     #[allow(clippy::too_many_arguments)]
-    async fn tool_usage_put(
+    fn tool_usage_put(
         &self,
         ctx: &TenantContext,
         tool_name: &str,
@@ -366,76 +461,136 @@ pub trait Storage: Send + Sync {
         estimated_tokens: i32,
         latency_ms: i32,
         error: bool,
-    ) -> anyhow::Result<()>;
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     /// Query tool usage for a given day (YYYY-MM-DD string).
-    async fn tool_usage_query(
+    fn tool_usage_query(
         &self,
         ctx: &TenantContext,
         day: &str,
-    ) -> anyhow::Result<Vec<ToolUsageRow>>;
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<ToolUsageRow>>> + Send;
 
     // --- Audit log operations ---
 
     /// Persist an audit log entry (append-only, STRIDE R1).
-    async fn audit_put(&self, ctx: &TenantContext, entry: &AuditEntry) -> anyhow::Result<()>;
+    fn audit_put(
+        &self,
+        ctx: &TenantContext,
+        entry: &AuditEntry,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     // --- Warmth operations (Sprint 5) ---
 
     /// Get the warmth entry for an entity.
-    async fn warmth_get(
+    fn warmth_get(
         &self,
         ctx: &TenantContext,
         entity_id: Uuid,
-    ) -> anyhow::Result<Option<WarmthEntry>>;
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<WarmthEntry>>> + Send;
 
     /// Store or replace a warmth entry.
-    async fn warmth_put(&self, ctx: &TenantContext, entry: &WarmthEntry) -> anyhow::Result<()>;
+    fn warmth_put(
+        &self,
+        ctx: &TenantContext,
+        entry: &WarmthEntry,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     /// Boost an entity's warmth score by `amount`, creating the entry if needed.
-    async fn warmth_boost(
+    fn warmth_boost(
         &self,
         ctx: &TenantContext,
         entity_id: Uuid,
         amount: f64,
         session_id: Uuid,
-    ) -> anyhow::Result<()>;
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     /// List all warmth entries for a session.
-    async fn warmth_list_session(
+    fn warmth_list_session(
         &self,
         ctx: &TenantContext,
         session_id: Uuid,
-    ) -> anyhow::Result<Vec<WarmthEntry>>;
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<WarmthEntry>>> + Send;
 
     /// Apply time-based decay to all warmth entries in a session.
     /// Returns the number of entries pruned (dropped below threshold).
-    async fn warmth_decay_all(
+    fn warmth_decay_all(
         &self,
         ctx: &TenantContext,
         session_id: Uuid,
         elapsed_hours: f64,
-    ) -> anyhow::Result<usize>;
+    ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send;
 
     // --- Rule registry operations (Sprint 5) ---
 
     /// Store a rule entry.
-    async fn rule_put(&self, ctx: &TenantContext, entry: &RuleEntry) -> anyhow::Result<()>;
+    fn rule_put(
+        &self,
+        ctx: &TenantContext,
+        entry: &RuleEntry,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     /// List rules matching a family and state, sorted by version descending.
-    async fn rule_list_family(
+    fn rule_list_family(
         &self,
         ctx: &TenantContext,
         family: &str,
         state: RuleState,
-    ) -> anyhow::Result<Vec<RuleEntry>>;
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<RuleEntry>>> + Send;
+
+    /// List all rules matching a state across families, sorted by family then version descending.
+    fn rule_list_active(
+        &self,
+        ctx: &TenantContext,
+        state: RuleState,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<RuleEntry>>> + Send;
 
     /// Get the highest-version rule entry by rule_id.
-    async fn rule_get(
+    fn rule_get(
         &self,
         ctx: &TenantContext,
         rule_id: &str,
-    ) -> anyhow::Result<Option<RuleEntry>>;
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<RuleEntry>>> + Send;
+
+    // --- Approval log operations (Sprint 8) ---
+
+    /// Append an approval decision for an artifact. Append-only authority.
+    fn approval_append(
+        &self,
+        ctx: &TenantContext,
+        entry: &ApprovalEntry,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// List approval decisions for one artifact, newest first.
+    fn approval_list(
+        &self,
+        ctx: &TenantContext,
+        artifact_kind: &str,
+        artifact_ref: &str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<ApprovalEntry>>> + Send;
+
+    /// Get the latest approval decision for one artifact.
+    fn approval_latest(
+        &self,
+        ctx: &TenantContext,
+        artifact_kind: &str,
+        artifact_ref: &str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<ApprovalEntry>>> + Send;
+
+    // --- Alias registry operations (Sprint 8) ---
+
+    /// Upsert one alias row for an exact alias + scope pair.
+    fn alias_put(
+        &self,
+        ctx: &TenantContext,
+        entry: &AliasEntry,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// List all alias rows for one alias name across scopes.
+    fn alias_list(
+        &self,
+        ctx: &TenantContext,
+        alias_name: &str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<AliasEntry>>> + Send;
 
     // --- Derived cache operations (Sprint 5) ---
 
@@ -447,122 +602,177 @@ pub trait Storage: Send + Sync {
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<DerivedFact>>> + Send;
 
     /// Store derived facts under a cache key.
-    async fn derived_cache_put(
+    fn derived_cache_put(
         &self,
         ctx: &TenantContext,
         cache_key: &str,
         facts: &[DerivedFact],
-    ) -> anyhow::Result<()>;
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     /// Clear derived cache entries whose key starts with `pred`.
-    async fn derived_cache_clear(&self, ctx: &TenantContext, pred: &str) -> anyhow::Result<()>;
+    fn derived_cache_clear(
+        &self,
+        ctx: &TenantContext,
+        pred: &str,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// List all derived cache facts for a tenant (used for inspection/debugging).
+    /// Returns up to `limit` rows sorted by computed_at DESC.
+    fn derived_cache_list_all(
+        &self,
+        ctx: &TenantContext,
+        limit: usize,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<crate::types::DerivedFactRow>>> + Send;
+
+    /// Store TTL tracking entries for derived facts.
+    /// Called when facts are written to record their TTL rule and next maintenance window.
+    fn derived_cache_ttl_track_put(
+        &self,
+        ctx: &TenantContext,
+        cache_key: &str,
+        facts: &[crate::types::TtlTrackEntry],
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// Get TTL tracking entries for a cache key.
+    /// Returns (seq, ttl_seconds) tuples.
+    fn derived_cache_ttl_track_get(
+        &self,
+        ctx: &TenantContext,
+        cache_key: &str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<(i32, i32)>>> + Send;
 
     // --- Provenance operations (Sprint 5) ---
 
     /// Store provenance steps for a derived edge.
-    async fn provenance_put(
+    fn provenance_put(
         &self,
         ctx: &TenantContext,
         derived_edge_id: &str,
         steps: &[ProvenanceStep],
-    ) -> anyhow::Result<()>;
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     /// Get provenance steps for a derived edge.
-    async fn provenance_get(
+    fn provenance_get(
         &self,
         ctx: &TenantContext,
         derived_edge_id: &str,
-    ) -> anyhow::Result<Vec<ProvenanceStep>>;
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<ProvenanceStep>>> + Send;
 
     // --- Heat telemetry operations (Sprint 5) ---
 
     /// Record a heat telemetry event for a predicate.
-    async fn heat_record(
+    fn heat_record(
         &self,
         ctx: &TenantContext,
         pred: &str,
         hit: bool,
         compute_ms: Option<i64>,
-    ) -> anyhow::Result<()>;
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     /// Get aggregated heat telemetry for a predicate over `days`.
     /// Returns (count_of_hits, sum_of_compute_ms).
-    async fn heat_get(
+    fn heat_get(
         &self,
         ctx: &TenantContext,
         pred: &str,
         days: u32,
-    ) -> anyhow::Result<(i64, i64)>;
+    ) -> impl std::future::Future<Output = anyhow::Result<(i64, i64)>> + Send;
 
     // --- Typed edge operations ---
 
     /// Create a typed, labeled edge between two entities.
-    async fn typed_edge_put(&self, ctx: &TenantContext, edge: &TypedEdge) -> anyhow::Result<()>;
+    fn typed_edge_put(
+        &self,
+        ctx: &TenantContext,
+        edge: &TypedEdge,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     /// List all typed edges for a session.
-    async fn typed_edge_list_session(
+    fn typed_edge_list_session(
         &self,
         ctx: &TenantContext,
         session_id: Uuid,
-    ) -> anyhow::Result<Vec<TypedEdge>>;
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<TypedEdge>>> + Send;
+
+    /// List every typed edge across all sessions for the tenant. Used by viz
+    /// so skills (tenant-global-session), codebase ingests (nil session), and
+    /// per-session runs all appear together without the caller having to
+    /// enumerate every session_id.
+    fn typed_edge_list_all(
+        &self,
+        ctx: &TenantContext,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<TypedEdge>>> + Send;
 
     /// List typed edges from a specific source entity.
-    async fn typed_edge_list_from(
+    fn typed_edge_list_from(
         &self,
         ctx: &TenantContext,
         session_id: Uuid,
         src_id: Uuid,
-    ) -> anyhow::Result<Vec<TypedEdge>>;
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<TypedEdge>>> + Send;
+
+    /// Delete a typed edge by composite key.
+    fn typed_edge_delete(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        src_id: Uuid,
+        edge_type: &str,
+        dst_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send;
 
     // --- Durable materialization operations (B10) ---
 
     /// Store a materialized edge (durable).
-    async fn materialized_edge_put(
+    fn materialized_edge_put(
         &self,
         ctx: &TenantContext,
         edge: &MaterializedEdge,
-    ) -> anyhow::Result<()>;
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     /// Query materialized edges by source ID.
-    async fn materialized_edges_by_src(
+    fn materialized_edges_by_src(
         &self,
         ctx: &TenantContext,
         src_id: &str,
         pred: Option<&str>,
-    ) -> anyhow::Result<Vec<MaterializedEdge>>;
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MaterializedEdge>>> + Send;
 
     /// Query materialized edges by predicate.
-    async fn materialized_edges_by_pred(
+    fn materialized_edges_by_pred(
         &self,
         ctx: &TenantContext,
         pred: &str,
-    ) -> anyhow::Result<Vec<MaterializedEdge>>;
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MaterializedEdge>>> + Send;
 
     /// Delete all materialized edges for a predicate (for rematerialization).
-    async fn materialized_edges_clear(&self, ctx: &TenantContext, pred: &str)
-    -> anyhow::Result<()>;
+    fn materialized_edges_clear(
+        &self,
+        ctx: &TenantContext,
+        pred: &str,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     // --- Promotion registry operations (B10) ---
 
     /// Get promotion status for a predicate.
-    async fn promoted_predicate_get(
+    fn promoted_predicate_get(
         &self,
         ctx: &TenantContext,
         pred: &str,
-    ) -> anyhow::Result<Option<PromotedPredicate>>;
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<PromotedPredicate>>> + Send;
 
     /// Set promotion status for a predicate.
-    async fn promoted_predicate_put(
+    fn promoted_predicate_put(
         &self,
         ctx: &TenantContext,
         entry: &PromotedPredicate,
-    ) -> anyhow::Result<()>;
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     /// List all promoted predicates.
-    async fn promoted_predicate_list(
+    fn promoted_predicate_list(
         &self,
         ctx: &TenantContext,
-    ) -> anyhow::Result<Vec<PromotedPredicate>>;
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<PromotedPredicate>>> + Send;
 }
 
 /// In-memory mock storage for unit tests.
@@ -571,6 +781,7 @@ pub trait Storage: Send + Sync {
 #[cfg(any(test, feature = "mock-storage"))]
 pub mod mock {
     use super::*;
+    use crate::http::OperatorQuerySurface;
     use crate::types::{DecayZone, FoldStatus};
     use std::collections::HashMap;
     use tokio::sync::Mutex;
@@ -597,17 +808,78 @@ pub mod mock {
         pub audit_entries: Mutex<Vec<AuditEntry>>,
         pub warmth_entries: Mutex<Vec<WarmthEntry>>,
         pub rules: Mutex<Vec<RuleEntry>>,
+        pub approvals: Mutex<Vec<ApprovalEntry>>,
+        pub aliases: Mutex<Vec<AliasEntry>>,
         pub derived_cache: Mutex<HashMap<String, Vec<DerivedFact>>>,
+        pub ttl_track: Mutex<HashMap<String, Vec<crate::types::TtlTrackEntry>>>,
         pub provenance: Mutex<HashMap<String, Vec<ProvenanceStep>>>,
         pub heat_records: Mutex<Vec<(String, bool, Option<i64>)>>,
         pub materialized_edges: Mutex<Vec<MaterializedEdge>>,
         pub promoted_predicates: Mutex<Vec<PromotedPredicate>>,
         pub typed_edges: Mutex<Vec<TypedEdge>>,
+        /// Test hook: when Some, `entity_find_phonetic` returns Err with
+        /// this message. Used to verify callers propagate phonetic-scan
+        /// errors instead of fail-quieting them into empty results, and
+        /// to verify that read paths which shouldn't depend on the fuzzy
+        /// scan don't route through it.
+        pub force_phonetic_error: Mutex<Option<String>>,
+        /// Test hook: when Some, `entity_find_by_exact_name` returns Err
+        /// with this message. Parallel to `force_phonetic_error` so a
+        /// test can target one lookup path without disabling the other.
+        pub force_exact_name_error: Mutex<Option<String>>,
+        /// Test hook: when Some((entity_type, msg)), `entity_put` returns
+        /// Err(msg) for any entry whose `entity_type` matches. Lets a
+        /// test simulate transient CQL write failures targeting a
+        /// specific kind of entity (e.g., tag upserts failing under
+        /// concurrent contention) without breaking unrelated writes.
+        pub force_entity_put_error: Mutex<Option<(String, String)>>,
     }
 
     impl MockStorage {
         pub fn new() -> Self {
             Self::default()
+        }
+    }
+
+    impl OperatorQuerySurface for MockStorage {
+        async fn cql_query_passthrough(
+            &self,
+            _ctx: &TenantContext,
+            query: &str,
+            limit: usize,
+        ) -> anyhow::Result<serde_json::Value> {
+            if query.trim().is_empty() {
+                anyhow::bail!("query must not be empty");
+            }
+            Ok(serde_json::json!({
+                "query": query,
+                "columns": ["value"],
+                "rows": [{"value": format!("limit:{limit}")}],
+                "count": 1,
+                "total_rows": 1,
+                "truncated": false,
+                "source": "mock-cql",
+            }))
+        }
+
+        async fn sparql_query_passthrough(
+            &self,
+            _ctx: &TenantContext,
+            query: &str,
+            limit: usize,
+        ) -> anyhow::Result<serde_json::Value> {
+            if query.trim().is_empty() {
+                anyhow::bail!("query must not be empty");
+            }
+            Ok(serde_json::json!({
+                "query": query,
+                "columns": ["value"],
+                "rows": [{"value": format!("limit:{limit}")}],
+                "count": 1,
+                "total_rows": 1,
+                "truncated": false,
+                "source": "mock-sparql",
+            }))
         }
     }
 
@@ -790,7 +1062,25 @@ pub mod mock {
             _ctx: &TenantContext,
             entry: &EntityEntry,
         ) -> anyhow::Result<()> {
-            self.entities.lock().await.push(entry.clone());
+            if let Some((target_type, msg)) = self.force_entity_put_error.lock().await.as_ref()
+                && entry.entity_type == *target_type
+            {
+                anyhow::bail!("{msg}");
+            }
+            let mut entities = self.entities.lock().await;
+            // Upsert by (session_id, entity_id) — CQL INSERT on the same
+            // primary key replaces the row, so the mock should mirror that.
+            // Previously this pushed unconditionally, leaving stale entries
+            // behind after updates and causing `entity_get_by_id` to
+            // return the pre-update value.
+            if let Some(pos) = entities
+                .iter()
+                .position(|e| e.session_id == entry.session_id && e.entity_id == entry.entity_id)
+            {
+                entities[pos] = entry.clone();
+            } else {
+                entities.push(entry.clone());
+            }
             Ok(())
         }
 
@@ -800,6 +1090,9 @@ pub mod mock {
             session_id: Uuid,
             name: &str,
         ) -> anyhow::Result<Vec<EntityEntry>> {
+            if let Some(msg) = self.force_phonetic_error.lock().await.as_ref() {
+                anyhow::bail!("{msg}");
+            }
             let entities = self.entities.lock().await;
             let lower = name.to_lowercase();
             let mut scored: Vec<(u8, &EntityEntry)> = entities
@@ -820,6 +1113,27 @@ pub mod mock {
                 .collect();
             scored.sort_by_key(|(rank, _)| *rank);
             Ok(scored.into_iter().map(|(_, e)| e.clone()).collect())
+        }
+
+        async fn entity_find_by_exact_name(
+            &self,
+            _ctx: &TenantContext,
+            session_id: Uuid,
+            name: &str,
+            entity_type: &str,
+        ) -> anyhow::Result<Option<EntityEntry>> {
+            if let Some(msg) = self.force_exact_name_error.lock().await.as_ref() {
+                anyhow::bail!("{msg}");
+            }
+            let entities = self.entities.lock().await;
+            Ok(entities
+                .iter()
+                .find(|e| {
+                    e.session_id == session_id
+                        && e.entity_name == name
+                        && e.entity_type == entity_type
+                })
+                .cloned())
         }
 
         async fn entity_get_by_id(
@@ -893,14 +1207,41 @@ pub mod mock {
 
         async fn entity_list_session(
             &self,
-            _ctx: &TenantContext,
+            ctx: &TenantContext,
             session_id: Uuid,
         ) -> anyhow::Result<Vec<EntityEntry>> {
             let entities = self.entities.lock().await;
             Ok(entities
                 .iter()
-                .filter(|e| e.session_id == session_id)
+                .filter(|e| e.tenant_id == ctx.tenant_id && e.session_id == session_id)
                 .cloned()
+                .collect())
+        }
+
+        async fn entity_counts_by_type_and_state(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+        ) -> anyhow::Result<Vec<EntityTypeStateCount>> {
+            let entities = self.entities.lock().await;
+            let mut counts: std::collections::BTreeMap<(String, String), usize> =
+                std::collections::BTreeMap::new();
+            for entity in entities
+                .iter()
+                .filter(|e| e.tenant_id == ctx.tenant_id && e.session_id == session_id)
+            {
+                *counts
+                    .entry((entity.entity_type.clone(), entity.state.to_string()))
+                    .or_insert(0) += 1;
+            }
+            Ok(counts
+                .into_iter()
+                .map(|((entity_type, state), count)| EntityTypeStateCount {
+                    entity_type,
+                    state: serde_json::from_str(&format!("\"{state}\""))
+                        .expect("known MemoryState string"),
+                    count,
+                })
                 .collect())
         }
 
@@ -974,6 +1315,22 @@ pub mod mock {
                 e.valid_until = Some(chrono::Utc::now());
             }
             Ok(())
+        }
+
+        async fn entity_delete(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+            entity_id: Uuid,
+        ) -> anyhow::Result<bool> {
+            let mut entities = self.entities.lock().await;
+            let before = entities.len();
+            entities.retain(|entry| {
+                !(entry.tenant_id == ctx.tenant_id
+                    && entry.session_id == session_id
+                    && entry.entity_id == entity_id)
+            });
+            Ok(entities.len() != before)
         }
 
         // --- Feedback operations ---
@@ -1377,6 +1734,23 @@ pub mod mock {
             Ok(matched)
         }
 
+        async fn rule_list_active(
+            &self,
+            _ctx: &TenantContext,
+            state: RuleState,
+        ) -> anyhow::Result<Vec<RuleEntry>> {
+            let rules = self.rules.lock().await;
+            let mut matched: Vec<RuleEntry> =
+                rules.iter().filter(|r| r.state == state).cloned().collect();
+            matched.sort_by(|a, b| {
+                a.family
+                    .cmp(&b.family)
+                    .then_with(|| b.version.cmp(&a.version))
+                    .then_with(|| a.rule_id.cmp(&b.rule_id))
+            });
+            Ok(matched)
+        }
+
         async fn rule_get(
             &self,
             _ctx: &TenantContext,
@@ -1387,6 +1761,81 @@ pub mod mock {
                 rules.iter().filter(|r| r.rule_id == rule_id).collect();
             matched.sort_by_key(|r| std::cmp::Reverse(r.version));
             Ok(matched.first().cloned().cloned())
+        }
+
+        async fn approval_append(
+            &self,
+            _ctx: &TenantContext,
+            entry: &ApprovalEntry,
+        ) -> anyhow::Result<()> {
+            self.approvals.lock().await.push(entry.clone());
+            Ok(())
+        }
+
+        async fn approval_list(
+            &self,
+            _ctx: &TenantContext,
+            artifact_kind: &str,
+            artifact_ref: &str,
+        ) -> anyhow::Result<Vec<ApprovalEntry>> {
+            let approvals = self.approvals.lock().await;
+            let mut matched: Vec<ApprovalEntry> = approvals
+                .iter()
+                .filter(|entry| {
+                    entry.artifact_kind.to_string() == artifact_kind
+                        && entry.artifact_ref == artifact_ref
+                })
+                .cloned()
+                .collect();
+            matched.sort_by(|left, right| {
+                right
+                    .created_at
+                    .cmp(&left.created_at)
+                    .then_with(|| right.approval_id.cmp(&left.approval_id))
+            });
+            Ok(matched)
+        }
+
+        async fn approval_latest(
+            &self,
+            ctx: &TenantContext,
+            artifact_kind: &str,
+            artifact_ref: &str,
+        ) -> anyhow::Result<Option<ApprovalEntry>> {
+            Ok(self
+                .approval_list(ctx, artifact_kind, artifact_ref)
+                .await?
+                .into_iter()
+                .next())
+        }
+
+        async fn alias_put(&self, _ctx: &TenantContext, entry: &AliasEntry) -> anyhow::Result<()> {
+            let mut aliases = self.aliases.lock().await;
+            if let Some(pos) = aliases.iter().position(|existing| {
+                existing.alias_name == entry.alias_name
+                    && existing.scope_kind == entry.scope_kind
+                    && existing.scope_ref == entry.scope_ref
+            }) {
+                aliases[pos] = entry.clone();
+            } else {
+                aliases.push(entry.clone());
+            }
+            Ok(())
+        }
+
+        async fn alias_list(
+            &self,
+            _ctx: &TenantContext,
+            alias_name: &str,
+        ) -> anyhow::Result<Vec<AliasEntry>> {
+            let aliases = self.aliases.lock().await;
+            let mut matched: Vec<AliasEntry> = aliases
+                .iter()
+                .filter(|entry| entry.alias_name == alias_name)
+                .cloned()
+                .collect();
+            matched.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
+            Ok(matched)
         }
 
         // --- Derived cache operations ---
@@ -1419,6 +1868,53 @@ pub mod mock {
             let mut cache = self.derived_cache.lock().await;
             cache.retain(|k, _| !k.starts_with(pred));
             Ok(())
+        }
+
+        async fn derived_cache_list_all(
+            &self,
+            _ctx: &TenantContext,
+            limit: usize,
+        ) -> anyhow::Result<Vec<crate::types::DerivedFactRow>> {
+            let cache = self.derived_cache.lock().await;
+            let mut all_rows: Vec<crate::types::DerivedFactRow> = Vec::new();
+            for (cache_key, facts) in cache.iter() {
+                for fact in facts.iter() {
+                    all_rows.push(crate::types::DerivedFactRow {
+                        source_id: fact.src_id.clone(),
+                        predicate: fact.pred.clone(),
+                        target_id: fact.dst_id.clone(),
+                        confidence: fact.confidence,
+                        rule_id: fact.rule_id.clone(),
+                        cache_key: Some(cache_key.clone()),
+                        computed_at: chrono::Utc::now().to_string(),
+                    });
+                }
+            }
+            all_rows.truncate(limit);
+            Ok(all_rows)
+        }
+
+        async fn derived_cache_ttl_track_put(
+            &self,
+            _ctx: &TenantContext,
+            cache_key: &str,
+            facts: &[crate::types::TtlTrackEntry],
+        ) -> anyhow::Result<()> {
+            let mut track = self.ttl_track.lock().await;
+            track.insert(cache_key.to_string(), facts.to_vec());
+            Ok(())
+        }
+
+        async fn derived_cache_ttl_track_get(
+            &self,
+            _ctx: &TenantContext,
+            cache_key: &str,
+        ) -> anyhow::Result<Vec<(i32, i32)>> {
+            let track = self.ttl_track.lock().await;
+            Ok(track
+                .get(cache_key)
+                .map(|entries| entries.iter().map(|e| (e.seq, e.ttl_seconds)).collect())
+                .unwrap_or_default())
         }
 
         // --- Provenance operations ---
@@ -1595,6 +2091,15 @@ pub mod mock {
                 .collect())
         }
 
+        async fn typed_edge_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<TypedEdge>> {
+            let edges = self.typed_edges.lock().await;
+            Ok(edges
+                .iter()
+                .filter(|e| e.tenant_id == ctx.tenant_id)
+                .cloned()
+                .collect())
+        }
+
         async fn typed_edge_list_from(
             &self,
             ctx: &TenantContext,
@@ -1609,6 +2114,26 @@ pub mod mock {
                 })
                 .cloned()
                 .collect())
+        }
+
+        async fn typed_edge_delete(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+            src_id: Uuid,
+            edge_type: &str,
+            dst_id: Uuid,
+        ) -> anyhow::Result<bool> {
+            let mut edges = self.typed_edges.lock().await;
+            let before = edges.len();
+            edges.retain(|edge| {
+                !(edge.tenant_id == ctx.tenant_id
+                    && edge.session_id == session_id
+                    && edge.src_id == src_id
+                    && edge.edge_type == edge_type
+                    && edge.dst_id == dst_id)
+            });
+            Ok(edges.len() != before)
         }
     }
 
@@ -1922,6 +2447,128 @@ pub mod mock {
             assert_eq!(list.len(), 1);
             assert_eq!(list[0].status, PromotionStatus::Promoted);
             assert!(list[0].batch_id.is_some());
+        }
+
+        // --- entity_find_by_exact_name ---
+        //
+        // Regression for bug-ingest-skill-bulk-nondeterminism: the phonetic
+        // scan did substring/type-blind matching, which meant
+        // `ingest_skill` could allocate a duplicate entity_id when the
+        // existing row's name collided with another entity type or when
+        // the scan's filtering view was stale. The exact-name path takes
+        // `entity_type` as part of the key so no tag/skill crosstalk can
+        // happen, and keeps the lookup to a single logical row.
+        async fn put_named_entity(
+            storage: &MockStorage,
+            ctx: &TenantContext,
+            session_id: Uuid,
+            name: &str,
+            entity_type: &str,
+        ) -> Uuid {
+            let entity_id = Uuid::new_v4();
+            let entry = EntityEntry {
+                tenant_id: ctx.tenant_id,
+                entity_id,
+                session_id,
+                entity_name: name.into(),
+                entity_type: entity_type.into(),
+                source_fold_id: None,
+                context_snippet: String::new(),
+                entity_embedding: None,
+                confidence: 1.0,
+                state: crate::types::MemoryState::default(),
+                created_at: chrono::Utc::now(),
+                description: None,
+                description_embedding: None,
+                tags: Vec::new(),
+                properties: serde_json::json!({}),
+                content_hash: None,
+                updated_at: None,
+                scope: crate::types::EntityScope::Global,
+                ingested_by_session: None,
+            };
+            storage.entity_put(ctx, &entry).await.unwrap();
+            entity_id
+        }
+
+        #[tokio::test]
+        async fn entity_find_by_exact_name_returns_hit() {
+            let storage = MockStorage::new();
+            let ctx = TenantContext {
+                tenant_id: Uuid::new_v4(),
+                session_origin: "test".into(),
+            };
+            let session_id = Uuid::new_v4();
+            let id = put_named_entity(&storage, &ctx, session_id, "tdd", "skill").await;
+
+            let found = storage
+                .entity_find_by_exact_name(&ctx, session_id, "tdd", "skill")
+                .await
+                .unwrap()
+                .expect("skill must be returned");
+            assert_eq!(found.entity_id, id);
+        }
+
+        #[tokio::test]
+        async fn entity_find_by_exact_name_returns_none_on_miss() {
+            let storage = MockStorage::new();
+            let ctx = TenantContext {
+                tenant_id: Uuid::new_v4(),
+                session_origin: "test".into(),
+            };
+            let session_id = Uuid::new_v4();
+            let found = storage
+                .entity_find_by_exact_name(&ctx, session_id, "never-ingested", "skill")
+                .await
+                .unwrap();
+            assert!(found.is_none());
+        }
+
+        #[tokio::test]
+        async fn entity_find_by_exact_name_filters_by_entity_type() {
+            // Same name, two types. Exact lookup must not cross types;
+            // otherwise the skill/tag auto-created by ingest_skill can be
+            // confused for the skill itself.
+            let storage = MockStorage::new();
+            let ctx = TenantContext {
+                tenant_id: Uuid::new_v4(),
+                session_origin: "test".into(),
+            };
+            let session_id = Uuid::new_v4();
+            let tag_id = put_named_entity(&storage, &ctx, session_id, "refactor", "tag").await;
+            let skill_id = put_named_entity(&storage, &ctx, session_id, "refactor", "skill").await;
+
+            let as_skill = storage
+                .entity_find_by_exact_name(&ctx, session_id, "refactor", "skill")
+                .await
+                .unwrap()
+                .expect("skill row");
+            let as_tag = storage
+                .entity_find_by_exact_name(&ctx, session_id, "refactor", "tag")
+                .await
+                .unwrap()
+                .expect("tag row");
+            assert_eq!(as_skill.entity_id, skill_id);
+            assert_eq!(as_tag.entity_id, tag_id);
+        }
+
+        #[tokio::test]
+        async fn entity_find_by_exact_name_ignores_substring_matches() {
+            // Phonetic scan matched on substring, which could return the
+            // wrong entity under bulk load. Exact match must be exact.
+            let storage = MockStorage::new();
+            let ctx = TenantContext {
+                tenant_id: Uuid::new_v4(),
+                session_origin: "test".into(),
+            };
+            let session_id = Uuid::new_v4();
+            put_named_entity(&storage, &ctx, session_id, "tdd-extended", "skill").await;
+
+            let miss = storage
+                .entity_find_by_exact_name(&ctx, session_id, "tdd", "skill")
+                .await
+                .unwrap();
+            assert!(miss.is_none(), "substring match must not count as exact");
         }
     }
 }

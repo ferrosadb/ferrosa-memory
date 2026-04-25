@@ -1,7 +1,63 @@
 # Design Structure Matrix — ferrosa-memory-mcp
 
-> Last updated: 2026-04-10
-> Status: Full inventory plus shared-HTTP deployment review. The main new concern is not a new module but an overloaded deployment boundary around `main.rs`, `http`, and `viz`.
+> Last updated: 2026-04-20
+> Status: Full inventory plus graph-boundary correction. The dominant architectural problem is no longer just overloaded runtime orchestration; it is tight coupling between `ferrosa-memory` and Ferrosa graph/query internals.
+
+## DSM Summary (2026-04-20)
+
+Forge crate-level DSM on the current workspace reports:
+
+- **Propagation cost:** `43.8%` (`critical`)
+- **Cluster quality:** `33.3%` (`critical`)
+- **Cycles:** `0`
+
+The cycle count is fine. The real issue is concentration: `ferrosa-memory-core` acts as a large, sticky hub while also embedding direct Ferrosa graph/storage ownership. That makes changes to Ferrosa graph schema/query behavior propagate into this repo instead of staying behind supported boundaries.
+
+## Endpoint Boundary Violations
+
+Concrete coupling points found in the current codebase:
+
+1. `ferrosa-memory-mcp/src/main.rs` constructs `CqlStorage` directly and treats it as the serving backend.
+2. `ferrosa-memory-core/src/cql_storage.rs` embeds `cdrs-tokio`, prepared statements, and table-level Ferrosa knowledge throughout the runtime path.
+3. `ferrosa-memory-core/src/expert_system.rs` implements a local read-only query interpreter for the workbench "CQL" surface.
+4. `ferrosa-memory-core/src/graph.rs` correctly uses the HTTP Cypher endpoint for reads, but the serving path still writes graph edges via direct CQL into graph-owned backing tables rather than through the public graph interface.
+5. Existing specs and UI text still describe local query/storage ownership as normal behavior.
+
+This is the wrong abstraction boundary. `ferrosa-memory` should be a role-scoped client to Ferrosa, not an alternate graph storage implementation.
+
+## Target Refactor Direction
+
+Target modules for the serving path:
+
+- `app_cql_client` for app-owned tables under the serving role
+- `graph_client` for graph reads and writes through public graph interfaces
+- `public_sparql_client`
+- `public_datalog_client`
+- `query_passthrough` adapters in the workbench/MCP HTTP layer
+
+Recommended layering:
+
+1. `ferrosa-memory-mcp` / HTTP transport: startup, auth binding, readiness, and protocol envelopes only
+2. `ferrosa-memory-core` orchestration plane: dispatch, tool/domain logic, governance, and result shaping
+3. `ferrosa-client` plane: role-aware adapters for supported Ferrosa contracts, with no graph-table ownership or local query emulation
+
+The key DSM objective is to stop graph storage/query changes in Ferrosa from propagating through `ferrosa-memory-core`. The only place allowed to absorb Ferrosa contract change should be the client adapter layer.
+
+Modules that should leave the serving path or be reduced to transitional tooling:
+
+- `cql_storage`
+- local read-only CQL parsing in `expert_system.rs`
+- direct table-shaped storage semantics embedded in handlers and startup
+- direct graph-table writes that bypass the public Cypher/graph API
+
+Suggested migration order:
+
+1. Introduce public-endpoint client traits and DTOs without changing MCP/workbench contracts
+2. Move `/workbench/api/cql/query` and `/workbench/api/datalog/query` to passthrough adapters
+3. Move graph writes onto the public Cypher/graph API so reads and writes share one graph boundary
+4. Make startup/readiness succeed under the least-privilege serving role without graph-table `MODIFY`
+5. Push graph-table bootstrap or maintenance scripts out of the serving path
+6. Retire local query emulators and direct graph-table runtime code after contract coverage is in place
 
 ## Module Inventory
 
@@ -325,6 +381,8 @@ Compared to the 34-module analysis (29%), the average propagation cost *decrease
 
 8. **`config` (M18) fan-in increased from 4 to 8.** The three inference modules (`datalog`, `warmth`, `pagerank`) and the promotion pipeline each depend on config for tuning parameters (`[rmh]`, `[datalog]`, and `[promotion]` sections). This is healthy — config is designed to be a shared foundation module, and the increase reflects proper externalization of tuning knobs.
 
+9. **The planned expert-system knowledge plane should extend the existing core cluster, not create a new transport-owned subsystem.** The right placement is `ferrosa-memory-core` on top of `storage`, `types`, `datalog`, and provenance. `dispatch` should remain a thin shell over that functionality. This matters because the current hotspots (`dispatch.rs`, `cql_storage.rs`, `http.rs`, MCP main) already carry the highest churn and bug density; adding more business logic there would worsen the existing concentration risk.
+
 ### Module Clusters
 
 The DSM reveals six natural clusters:
@@ -354,6 +412,13 @@ Cluster 4: Inference & Cognitive (M35, M36, M37, M38, M39)
   - promotion additionally depends on datalog for derived fact evaluation
   - recursive_explore orchestrates datalog + warmth + hybrid_search + spreading
   - Testable against MockStorage
+
+Planned extension inside Cluster 4 / Shared Foundation:
+  - effective rule-set loading, claim storage, approval storage, alias registry,
+    and explanation queries should all attach here rather than to `http` or
+    MCP bootstrap code
+  - these seams should reuse `storage` + `types` + provenance, with `dispatch`
+    only routing requests
 
 Cluster 5: Infrastructure (M10, M11, M12, M13, M14, M33)
   - cql_storage, graph, compression, embedding, metrics, vector
@@ -408,3 +473,4 @@ Phase 6: Orchestration
 1. `crates/ferrosa-memory-mcp/src/main.rs` is now the highest-risk deployment hotspot. Git churn and bug-fix history both concentrate there because it owns transport selection, tenant defaults, viz startup, and the HTTP validator wiring.
 2. Module coupling does not require an immediate viz crate split. The stronger requirement is deployment separation: `http` and `viz` may stay code-coupled, but they should not remain equally exposed surfaces in a shared service.
 3. The recommended next refactor is to move shared-HTTP bootstrap rules into a dedicated deployment config path so auth/TLS/probe policy stops living as ad hoc wiring in `main.rs`.
+4. The expert-system knowledge plane should be implemented as a core-layer extension, not as new behavior embedded directly into MCP transport handlers. The current DSM already shows why: `dispatch` and the storage seam are the stable integration points, while `main.rs` and HTTP bootstrap are the highest-risk ownership hotspots.

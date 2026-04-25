@@ -325,7 +325,7 @@ pub struct ScenarioResult {
 |---|---|---|
 | Tool schemas | Compile-time dep on ferrosa-memory-core, calls `tool_definitions()` | dispatch.rs:174-829 |
 | MCP protocol | JSON-RPC over stdio (spawn child) or HTTP+SSE | transport.rs types |
-| Storage queries (DIKW/Semantic) | Direct CQL via `CqlStorage` impl of `Storage` trait | storage.rs:31-558 |
+| Storage queries (DIKW/Semantic) | Ferrosa public query interfaces; current runtime still contains direct `CqlStorage` coupling that should be removed | storage.rs:31-558 |
 | Prometheus metrics | Scrape `/metrics` (HTTP) or query `tool_usage_daily` table | metrics.rs |
 | Session isolation | Fresh `session_id` per scenario, `delete_session` on cleanup | dispatch.rs |
 

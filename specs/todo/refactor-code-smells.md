@@ -1,3 +1,11 @@
+---
+type: todo
+priority: P2
+status: draft
+created: 2026-04-06
+updated: 2026-04-20
+---
+
 # Refactor: Code Smell Cleanup
 
 **Status**: Blocked on P0 data loss fix verification

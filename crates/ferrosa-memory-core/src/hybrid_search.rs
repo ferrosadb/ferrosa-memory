@@ -79,10 +79,60 @@ fn rrf_merge(lists: Vec<Vec<SearchResult>>, k: f64, weights: &[f64]) -> Vec<Sear
     merged
 }
 
+/// Which partitions to query. Defaults to `SessionOnly` for backward compat
+/// with existing callers that pass `None` for the filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchScope {
+    #[default]
+    SessionOnly,
+    GlobalOnly,
+    Both,
+}
+
+/// Optional filter applied to hybrid search.
+///
+/// - `scope`: which partitions to query (session, global, or both)
+/// - `entity_types`: reserved for post-filter; to be applied by callers that
+///   also enrich candidates with entity metadata (Sprint 2 work will add
+///   automatic enrichment + filtering inside hybrid_search)
+/// - `tags`: reserved for post-filter, same treatment
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SearchFilter {
+    #[serde(default)]
+    pub scope: SearchScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity_types: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+}
+
+/// Resolve the list of session partitions to query given the caller's session
+/// and the filter scope.
+fn sessions_to_query(caller_session: Uuid, tenant_id: Uuid, scope: SearchScope) -> Vec<Uuid> {
+    match scope {
+        SearchScope::SessionOnly => vec![caller_session],
+        SearchScope::GlobalOnly => vec![crate::scope::tenant_global_session_uuid(tenant_id)],
+        SearchScope::Both => {
+            let global = crate::scope::tenant_global_session_uuid(tenant_id);
+            if caller_session == global {
+                vec![global]
+            } else {
+                vec![caller_session, global]
+            }
+        }
+    }
+}
+
 /// Run a hybrid search combining up to 6 signals: phonetic entity lookup,
 /// ANN entity search, ANN fold search, warmth scores, pagerank scores,
 /// and reputation scores.
 /// Results are fused via weighted Reciprocal Rank Fusion.
+///
+/// The optional `filter` argument controls partition scope (session vs
+/// global vs both) and reserves fields for downstream entity-type / tag
+/// filtering. When `None`, behavior matches the pre-filter API: query the
+/// caller's session only.
 #[allow(clippy::too_many_arguments)]
 pub async fn hybrid_search(
     storage: &(impl Storage + ?Sized),
@@ -95,76 +145,77 @@ pub async fn hybrid_search(
     pagerank_scores: Option<&HashMap<Uuid, f64>>,
     reputation_scores: Option<&HashMap<Uuid, f64>>,
     config: &FusionConfig,
+    filter: Option<&SearchFilter>,
 ) -> anyhow::Result<Vec<SearchResult>> {
     anyhow::ensure!(!query.is_empty(), "query must not be empty");
     anyhow::ensure!(limit > 0 && limit <= 50, "limit must be between 1 and 50");
 
-    let mut lists = Vec::new();
+    let scope = filter.map(|f| f.scope).unwrap_or_default();
+    let sessions = sessions_to_query(session_id, ctx.tenant_id, scope);
 
-    // Strategy 1: Phonetic entity search (ranked by match quality)
-    if let Ok(entities) = storage.entity_find_phonetic(ctx, session_id, query).await
-        && !entities.is_empty()
-    {
-        lists.push(
-            entities
-                .into_iter()
-                .take(limit)
-                .enumerate()
-                .map(|(i, e)| SearchResult {
-                    id: e.entity_id,
-                    source: "entity_phonetic".into(),
-                    content: e.context_snippet.clone(),
-                    score: 1.0 - (i as f64 * 0.1), // rank decay
-                    result_type: "entity".into(),
-                })
-                .collect(),
-        );
+    let mut lists: Vec<Vec<SearchResult>> = Vec::new();
+    let mut weights: Vec<f64> = Vec::new();
+
+    for &sid in &sessions {
+        // Strategy 1: Phonetic entity search (ranked by match quality)
+        if let Ok(entities) = storage.entity_find_phonetic(ctx, sid, query).await
+            && !entities.is_empty()
+        {
+            lists.push(
+                entities
+                    .into_iter()
+                    .take(limit)
+                    .enumerate()
+                    .map(|(i, e)| SearchResult {
+                        id: e.entity_id,
+                        source: "entity_phonetic".into(),
+                        content: e.context_snippet.clone(),
+                        score: 1.0 - (i as f64 * 0.1), // rank decay
+                        result_type: "entity".into(),
+                    })
+                    .collect(),
+            );
+            weights.push(config.phonetic_weight);
+        }
+
+        // Strategy 2: ANN entity search
+        if let Some(emb) = embedding
+            && let Ok(entities) = storage.entity_search_ann(ctx, sid, emb, limit).await
+        {
+            lists.push(
+                entities
+                    .into_iter()
+                    .map(|e| SearchResult {
+                        id: e.entity_id,
+                        source: "entity_ann".into(),
+                        content: e.context_snippet,
+                        score: 1.0,
+                        result_type: "entity".into(),
+                    })
+                    .collect(),
+            );
+            weights.push(config.ann_weight);
+        }
+
+        // Strategy 3: ANN fold search
+        if let Some(emb) = embedding
+            && let Ok(folds) = storage.fold_search(ctx, sid, emb, limit, false).await
+        {
+            lists.push(
+                folds
+                    .into_iter()
+                    .map(|f| SearchResult {
+                        id: f.fold_id,
+                        source: "fold_ann".into(),
+                        content: f.fold_summary,
+                        score: f.similarity.unwrap_or(0.0),
+                        result_type: "fold".into(),
+                    })
+                    .collect(),
+            );
+            weights.push(config.fold_weight);
+        }
     }
-
-    // Strategy 2: ANN entity search
-    if let Some(emb) = embedding
-        && let Ok(entities) = storage.entity_search_ann(ctx, session_id, emb, limit).await
-    {
-        lists.push(
-            entities
-                .into_iter()
-                .map(|e| SearchResult {
-                    id: e.entity_id,
-                    source: "entity_ann".into(),
-                    content: e.context_snippet,
-                    score: 1.0,
-                    result_type: "entity".into(),
-                })
-                .collect(),
-        );
-    }
-
-    // Strategy 3: ANN fold search
-    if let Some(emb) = embedding
-        && let Ok(folds) = storage
-            .fold_search(ctx, session_id, emb, limit, false)
-            .await
-    {
-        lists.push(
-            folds
-                .into_iter()
-                .map(|f| SearchResult {
-                    id: f.fold_id,
-                    source: "fold_ann".into(),
-                    content: f.fold_summary,
-                    score: f.similarity.unwrap_or(0.0),
-                    result_type: "fold".into(),
-                })
-                .collect(),
-        );
-    }
-
-    // Build weights for the initial 3 signals
-    let mut weights = vec![
-        config.phonetic_weight,
-        config.ann_weight,
-        config.fold_weight,
-    ];
 
     // Strategy 4: Warmth signal — rank existing candidates by warmth score
     if let Some(warmth) = warmth_scores {
@@ -259,6 +310,64 @@ mod tests {
             score,
             result_type: "entity".into(),
         }
+    }
+
+    #[test]
+    fn sessions_to_query_session_only_returns_caller() {
+        let caller = Uuid::new_v4();
+        let tenant = Uuid::new_v4();
+        let sessions = sessions_to_query(caller, tenant, SearchScope::SessionOnly);
+        assert_eq!(sessions, vec![caller]);
+    }
+
+    #[test]
+    fn sessions_to_query_global_only_returns_sentinel() {
+        let caller = Uuid::new_v4();
+        let tenant = Uuid::new_v4();
+        let sessions = sessions_to_query(caller, tenant, SearchScope::GlobalOnly);
+        assert_eq!(
+            sessions,
+            vec![crate::scope::tenant_global_session_uuid(tenant)]
+        );
+    }
+
+    #[test]
+    fn sessions_to_query_both_returns_caller_and_sentinel() {
+        let caller = Uuid::new_v4();
+        let tenant = Uuid::new_v4();
+        let sessions = sessions_to_query(caller, tenant, SearchScope::Both);
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.contains(&caller));
+        assert!(sessions.contains(&crate::scope::tenant_global_session_uuid(tenant)));
+    }
+
+    #[test]
+    fn sessions_to_query_both_dedups_when_caller_is_sentinel() {
+        // If a caller happens to pass the global sentinel as their session,
+        // don't query the same partition twice.
+        let tenant = Uuid::new_v4();
+        let sentinel = crate::scope::tenant_global_session_uuid(tenant);
+        let sessions = sessions_to_query(sentinel, tenant, SearchScope::Both);
+        assert_eq!(sessions, vec![sentinel]);
+    }
+
+    #[test]
+    fn search_scope_default_is_session_only() {
+        assert_eq!(SearchScope::default(), SearchScope::SessionOnly);
+    }
+
+    #[test]
+    fn search_filter_serde_round_trip() {
+        let filter = SearchFilter {
+            scope: SearchScope::Both,
+            entity_types: Some(vec!["skill".into()]),
+            tags: Some(vec!["testing".into(), "quality".into()]),
+        };
+        let json = serde_json::to_string(&filter).unwrap();
+        let back: SearchFilter = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.scope, SearchScope::Both);
+        assert_eq!(back.entity_types, Some(vec!["skill".into()]));
+        assert_eq!(back.tags, Some(vec!["testing".into(), "quality".into()]));
     }
 
     #[test]
@@ -590,6 +699,7 @@ mod tests {
                         confidence: 1.0,
                         state: MemoryState::Active,
                         created_at: chrono::Utc::now(),
+                        ..Default::default()
                     },
                 )
                 .await
@@ -613,6 +723,7 @@ mod tests {
             None,
             Some(&reputation),
             &config,
+            None,
         )
         .await
         .unwrap();
