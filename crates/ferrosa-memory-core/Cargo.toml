@@ -36,6 +36,7 @@ tempfile = { workspace = true }
 [dev-dependencies]
 ferrosa-memory-core = { path = ".", features = ["mock-storage"] }
 tracing-subscriber = { workspace = true }
+serial_test = "3.2"
 # Self-signed cert generation for HTTPS integration tests — the
 # bug-http-parser-rejects-split-send spec's acceptance criterion
 # is a Python http.client POST over HTTPS, so we need a throwaway

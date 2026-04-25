@@ -1,13 +1,37 @@
 #!/bin/bash
 set -euo pipefail
 
-BASE_URL="${FERROSA_MEMORY_BASE_URL:-http://127.0.0.1:18765}"
+BASE_URL="${FERROSA_MEMORY_BASE_URL:-https://127.0.0.1:18765}"
+# Viz is unauthenticated and loopback-only; it stays plaintext HTTP by design
+# (see VizConfig: no TLS fields, comment in config.rs).
 VIZ_URL="${FERROSA_MEMORY_VIZ_URL:-http://127.0.0.1:18766/viz}"
 GRAPH_URL="${FERROSA_MEMORY_GRAPH_URL:-http://127.0.0.1:17474}"
 USERNAME="${FERROSA_MEMORY_USER:-ferrosa_user}"
 PASSWORD="${FERROSA_MEMORY_PASSWORD:-ferrosa_user}"
 ADMIN_USER="${FERROSA_MEMORY_ADMIN_USER:-ferrosa_admin}"
 ADMIN_PASSWORD="${FERROSA_MEMORY_ADMIN_PASSWORD:-ferrosa_admin}"
+
+# TLS: HTTP transport is disabled in production-shaped local stacks; the
+# fmem-mcp container terminates TLS on 18765/18766 with the cert pair under
+# .runtime/. Default to that cert; override via FERROSA_MEMORY_TLS_CACERT
+# (set to "insecure" to skip verification, only for ad-hoc debugging).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+FERROSA_MEMORY_TLS_CACERT="${FERROSA_MEMORY_TLS_CACERT:-${REPO_ROOT}/.runtime/tls.crt}"
+
+CURL_TLS_OPTS=()
+if [[ "${BASE_URL}" == https://* ]]; then
+  if [[ "${FERROSA_MEMORY_TLS_CACERT}" == "insecure" ]]; then
+    CURL_TLS_OPTS=(-k)
+  else
+    [[ -r "${FERROSA_MEMORY_TLS_CACERT}" ]] || {
+      printf 'FAIL: TLS cert not readable: %s\n' "${FERROSA_MEMORY_TLS_CACERT}" >&2
+      exit 1
+    }
+    CURL_TLS_OPTS=(--cacert "${FERROSA_MEMORY_TLS_CACERT}")
+  fi
+fi
+# Viz is plaintext by design — never apply TLS opts to it.
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "${TMP_DIR}"' EXIT
@@ -48,20 +72,20 @@ PY
 }
 
 auth_curl() {
-  curl -sS -u "${USERNAME}:${PASSWORD}" "$@"
+  curl -sS "${CURL_TLS_OPTS[@]}" -u "${USERNAME}:${PASSWORD}" "$@"
 }
 
 admin_curl() {
-  curl -sS -u "${ADMIN_USER}:${ADMIN_PASSWORD}" "$@"
+  curl -sS "${CURL_TLS_OPTS[@]}" -u "${ADMIN_USER}:${ADMIN_PASSWORD}" "$@"
 }
 
 say "== Ferrosa Memory smoke on ${BASE_URL} =="
 
-LIVE="$(curl -sS "${BASE_URL}/healthz/live" || true)"
+LIVE="$(curl -sS "${CURL_TLS_OPTS[@]}" "${BASE_URL}/healthz/live" || true)"
 [[ "${LIVE}" == "ok" ]] || fail "live probe failed: ${LIVE}"
 say "live: ok"
 
-READY="$(curl -sS "${BASE_URL}/healthz/ready" || true)"
+READY="$(curl -sS "${CURL_TLS_OPTS[@]}" "${BASE_URL}/healthz/ready" || true)"
 [[ "${READY}" == "ready" ]] || fail "ready probe failed: ${READY}"
 say "ready: ready"
 
@@ -98,12 +122,26 @@ SRC_ID="$(json_get "${TMP_DIR}/entities.json" rows.0.entity_id)"
 DST_ID="$(json_get "${TMP_DIR}/entities.json" rows.1.entity_id)"
 say "cql: 2 entity rows"
 
+# SPARQL passthrough is opt-in: only required when the fmem config defines
+# `[sparql] enabled = true`. When the endpoint reports "not configured",
+# log loudly and skip — never silently treat the feature as absent when it
+# was expected. Set FERROSA_MEMORY_SMOKE_REQUIRE_SPARQL=1 to make the skip
+# fail loud (use this when you've enabled SPARQL and want the gate to
+# enforce it).
 auth_curl -H 'content-type: application/json' \
   -d '{"query":"SELECT * WHERE { ?s ?p ?o } LIMIT 1","limit":1}' \
   "${BASE_URL}/workbench/api/sparql/query" > "${TMP_DIR}/sparql.json"
-SPARQL_SOURCE="$(json_get "${TMP_DIR}/sparql.json" source)"
-[[ "${SPARQL_SOURCE}" == "ferrosa-sparql" ]] || fail "unexpected SPARQL source: ${SPARQL_SOURCE}"
-say "sparql: pass"
+SPARQL_ERROR="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("error",""))' "${TMP_DIR}/sparql.json")"
+if [[ "${SPARQL_ERROR}" == "SPARQL passthrough is not configured" ]]; then
+  if [[ "${FERROSA_MEMORY_SMOKE_REQUIRE_SPARQL:-0}" == "1" ]]; then
+    fail "SPARQL passthrough not configured but FERROSA_MEMORY_SMOKE_REQUIRE_SPARQL=1"
+  fi
+  say "sparql: SKIP (passthrough not configured; set FERROSA_MEMORY_SMOKE_REQUIRE_SPARQL=1 to enforce)"
+else
+  SPARQL_SOURCE="$(json_get "${TMP_DIR}/sparql.json" source)"
+  [[ "${SPARQL_SOURCE}" == "ferrosa-sparql" ]] || fail "unexpected SPARQL source: ${SPARQL_SOURCE}"
+  say "sparql: pass"
+fi
 
 cat > "${TMP_DIR}/create-edge.json" <<EOF
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_edge","arguments":{"session_id":"${SESSION_ID}","src_entity_id":"${SRC_ID}","dst_entity_id":"${DST_ID}","edge_type":"references","weight":0.75}}}
