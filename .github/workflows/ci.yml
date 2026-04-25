@@ -178,6 +178,184 @@ jobs:
           pytest tests/property -v
           pytest tests/duration/test_duration_specs.py -v
 
+  # Stage 7: Cluster-backed integration tests (--ignored, Docker)
+  # Cross-repo dependency: clones ferrosa to build the cluster image.
+  # Tests hardcode ports 19042-19044; CI runners are isolated so this is safe.
+  integration:
+    name: Cluster integration tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    needs: build
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          cache-on-failure: false
+      - name: Clone ferrosa for cluster image
+        # ferrosa is the source of the Ferrosa server image used by the cluster.
+        # Cloning at HEAD of main gives us the latest stable binary.
+        run: |
+          git clone --depth=1 https://github.com/your-org/ferrosa.git /tmp/ferrosa-src
+      - name: Bring up 3-node cluster on ports 19042-19044
+        run: |
+          # Write a CI compose that maps 9042→19042 etc. so tests that hardcode
+          # 127.0.0.1:19042-19044 connect correctly.
+          cat > /tmp/docker-compose.memory-ci.yml <<'CEOF'
+          services:
+            rustfs:
+              image: rustfs/rustfs:latest
+              environment:
+                RUSTFS_VOLUMES: /data/rustfs0
+                RUSTFS_ADDRESS: "0.0.0.0:9000"
+                RUSTFS_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
+                RUSTFS_SECRET_KEY: rustfsadmin  # pragma: allowlist secret
+              healthcheck:
+                test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
+                interval: 5s
+                timeout: 5s
+                retries: 10
+                start_period: 10s
+            rustfs-init:
+              image: minio/mc
+              depends_on:
+                rustfs:
+                  condition: service_healthy
+              entrypoint: >
+                sh -c "mc alias set local http://rustfs:9000 rustfsadmin rustfsadmin &&
+                       mc mb local/ferrosa-test --ignore-existing &&
+                       echo 'bucket ferrosa-test ready'"
+              restart: "no"
+            node1:
+              build:
+                context: /tmp/ferrosa-src
+                dockerfile: Dockerfile
+              depends_on:
+                rustfs-init:
+                  condition: service_completed_successfully
+              ports:
+                - "19042:9042"
+                - "19090:9090"
+              environment:
+                FERROSA_HOST_ID: "11111111-1111-1111-1111-111111111111"
+                FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+                FERROSA_INTERNODE_BROADCAST: "node1:7000"
+                FERROSA_CQL_BIND: "0.0.0.0:9042"
+                FERROSA_WEB_BIND: "0.0.0.0:9090"
+                FERROSA_CLUSTER_NAME: "ferrosa-memory-ci"
+                FERROSA_DATA_DIR: "/var/lib/ferrosa"
+                FERROSA_AUTH_DISABLED: "true"
+                FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+                FERROSA_S3_BUCKET: "ferrosa-test"
+                FERROSA_S3_ALLOW_HTTP: "true"
+                FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
+                FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+              healthcheck:
+                test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9042' || exit 1"]
+                interval: 5s
+                timeout: 5s
+                retries: 30
+                start_period: 20s
+            node2:
+              build:
+                context: /tmp/ferrosa-src
+                dockerfile: Dockerfile
+              depends_on:
+                node1:
+                  condition: service_healthy
+              ports:
+                - "19043:9042"
+              environment:
+                FERROSA_HOST_ID: "22222222-2222-2222-2222-222222222222"
+                FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+                FERROSA_INTERNODE_BROADCAST: "node2:7000"
+                FERROSA_SEED: "node1:7000"
+                FERROSA_CQL_BIND: "0.0.0.0:9042"
+                FERROSA_WEB_BIND: "0.0.0.0:9090"
+                FERROSA_CLUSTER_NAME: "ferrosa-memory-ci"
+                FERROSA_DATA_DIR: "/var/lib/ferrosa"
+                FERROSA_AUTH_DISABLED: "true"
+                FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+                FERROSA_S3_BUCKET: "ferrosa-test"
+                FERROSA_S3_ALLOW_HTTP: "true"
+                FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
+                FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+              healthcheck:
+                test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9042' || exit 1"]
+                interval: 5s
+                timeout: 5s
+                retries: 30
+                start_period: 20s
+            node3:
+              build:
+                context: /tmp/ferrosa-src
+                dockerfile: Dockerfile
+              depends_on:
+                node1:
+                  condition: service_healthy
+                node2:
+                  condition: service_healthy
+              ports:
+                - "19044:9042"
+              environment:
+                FERROSA_HOST_ID: "33333333-3333-3333-3333-333333333333"
+                FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+                FERROSA_INTERNODE_BROADCAST: "node3:7000"
+                FERROSA_SEED: "node1:7000"
+                FERROSA_CQL_BIND: "0.0.0.0:9042"
+                FERROSA_WEB_BIND: "0.0.0.0:9090"
+                FERROSA_CLUSTER_NAME: "ferrosa-memory-ci"
+                FERROSA_DATA_DIR: "/var/lib/ferrosa"
+                FERROSA_AUTH_DISABLED: "true"
+                FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+                FERROSA_S3_BUCKET: "ferrosa-test"
+                FERROSA_S3_ALLOW_HTTP: "true"
+                FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
+                FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+              healthcheck:
+                test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9042' || exit 1"]
+                interval: 5s
+                timeout: 5s
+                retries: 30
+                start_period: 20s
+          CEOF
+          docker compose -f /tmp/docker-compose.memory-ci.yml up -d --build
+      - name: Wait for all 3 nodes on 19042-19044
+        run: |
+          for port in 19042 19043 19044; do
+            echo "Waiting for CQL on port ${port}..."
+            for i in $(seq 1 60); do
+              if bash -c "</dev/tcp/127.0.0.1/${port}" 2>/dev/null; then
+                echo "  port ${port} ready after ${i}s"
+                break
+              fi
+              if [ "$i" -eq 60 ]; then
+                echo "::error::Port ${port} did not become ready within 60s"
+                docker compose -f /tmp/docker-compose.memory-ci.yml logs 2>/dev/null | tail -100
+                exit 1
+              fi
+              sleep 2
+            done
+          done
+      - name: Run ignored (cluster-gated) Rust tests
+        env:
+          FERROSA_TEST_CONTAINERS: "1"
+        run: cargo test --workspace -- --ignored
+      - name: Run system pytest suite against live cluster
+        env:
+          FERROSA_BASE_URL: "http://127.0.0.1:19090"
+        run: |
+          python -m pip install -r tests/requirements.txt
+          pytest tests/system -v
+      - name: Collect cluster logs on failure
+        if: failure()
+        run: |
+          docker compose -f /tmp/docker-compose.memory-ci.yml logs --no-color 2>/dev/null | tail -200 || true
+      - name: Tear down cluster
+        if: always()
+        run: docker compose -f /tmp/docker-compose.memory-ci.yml down -v --remove-orphans 2>/dev/null || true
+
   # Final gate: all checks must pass
   ci-pass:
     name: CI Pass
