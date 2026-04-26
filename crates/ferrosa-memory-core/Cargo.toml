@@ -5,6 +5,9 @@ edition.workspace = true
 
 [features]
 mock-storage = []
+# p1-22: enable after cdrs-tokio → scylla migration to unlock T-01 and T-08
+# tests that call scylla::Session::query_unpaged directly.
+scylla-driver = []
 
 [dependencies]
 serde = { workspace = true }
