@@ -43,7 +43,6 @@ repos:
         name: cargo clippy (pre-push, all-targets)
         entry: cargo clippy --workspace --all-targets -- -D warnings
         language: system
-        types: [rust]
         pass_filenames: false
         stages: [pre-push]
 
@@ -51,7 +50,6 @@ repos:
         name: cargo fmt --check (pre-push)
         entry: cargo fmt --check
         language: system
-        types: [rust]
         pass_filenames: false
         stages: [pre-push]
 
@@ -65,6 +63,5 @@ repos:
         name: cargo test
         entry: cargo test --workspace
         language: system
-        types: [rust]
         pass_filenames: false
         stages: [pre-push]
