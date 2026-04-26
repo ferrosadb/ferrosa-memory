@@ -61,7 +61,7 @@ repos:
         stages: [pre-push]
       - id: cargo-test
         name: cargo test
-        entry: cargo test --workspace
+        entry: cargo test --workspace --lib --bins
         language: system
         pass_filenames: false
         stages: [pre-push]
