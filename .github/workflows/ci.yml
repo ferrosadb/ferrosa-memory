@@ -194,8 +194,27 @@ jobs:
       - name: Clone ferrosa for cluster image
         # ferrosa is the source of the Ferrosa server image used by the cluster.
         # Cloning at HEAD of main gives us the latest stable binary.
+        #
+        # bkearns/ferrosa is private. Anonymous HTTPS clone fails with
+        # "could not read Username for 'https://github.com'". We need a
+        # token. The repo-default GITHUB_TOKEN can't read sibling repos,
+        # so this step requires FERROSA_REPO_TOKEN — a fine-grained PAT
+        # with `Contents: Read` on bkearns/ferrosa, set via repo secrets.
+        # See p1-33 for the operator-side setup. If the secret is missing
+        # we fail loud here so the operator notices, instead of getting
+        # a confusing "could not read Username" further down.
+        env:
+          FERROSA_REPO_TOKEN: ${{ secrets.FERROSA_REPO_TOKEN }}
         run: |
-          git clone --depth=1 https://github.com/bkearns/ferrosa.git /tmp/ferrosa-src
+          if [ -z "${FERROSA_REPO_TOKEN:-}" ]; then
+            echo "ERROR: secret FERROSA_REPO_TOKEN is not set." >&2
+            echo "Add a fine-grained PAT with 'Contents: Read' on bkearns/ferrosa." >&2
+            echo "See ferrosa_docs/specs/todo/p1-33-fmem-ci-cross-repo-clone-needs-token.md" >&2
+            exit 1
+          fi
+          git clone --depth=1 \
+            "https://x-access-token:${FERROSA_REPO_TOKEN}@github.com/bkearns/ferrosa.git" \
+            /tmp/ferrosa-src
       - name: Bring up 3-node cluster on ports 19042-19044
         run: |
           # Write a CI compose that maps 9042→19042 etc. so tests that hardcode
