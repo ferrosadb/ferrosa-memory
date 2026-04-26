@@ -358,12 +358,10 @@ async fn run_guidelines(config: &ferrosa_memory_core::config::Config) -> anyhow:
     let query = format!(
         "INSERT INTO {ks}.routing_guidelines (version, rules, created_at) VALUES (?, ?, toTimestamp(now()))"
     );
+    #[allow(deprecated)]
     storage
         .session()
-        .query_with_values(
-            query.as_str(),
-            cdrs_tokio::query_values!(next_version.clone(), guidelines.clone()),
-        )
+        .query_unpaged(query, (next_version.clone(), guidelines.clone()))
         .await?;
 
     tracing::info!(version = %next_version, "routing guidelines written to CQL");

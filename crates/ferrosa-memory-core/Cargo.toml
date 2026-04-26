@@ -5,6 +5,9 @@ edition.workspace = true
 
 [features]
 mock-storage = []
+# p1-22: enable after cdrs-tokio → scylla migration to unlock T-01 and T-08
+# tests that call scylla::Session::query_unpaged directly.
+scylla-driver = []
 
 [dependencies]
 serde = { workspace = true }
@@ -21,7 +24,7 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 dirs = { workspace = true }
-cdrs-tokio = { workspace = true }
+scylla = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 tokio-tungstenite = { workspace = true }
@@ -34,7 +37,7 @@ tempfile = { workspace = true }
 # `cfg(test)` alone). Turning `mock-storage` on for our own dev tests
 # keeps the gate in place for downstream consumers.
 [dev-dependencies]
-ferrosa-memory-core = { path = ".", features = ["mock-storage"] }
+ferrosa-memory-core = { path = ".", features = ["mock-storage", "scylla-driver"] }
 tracing-subscriber = { workspace = true }
 serial_test = "3.2"
 # Self-signed cert generation for HTTPS integration tests — the

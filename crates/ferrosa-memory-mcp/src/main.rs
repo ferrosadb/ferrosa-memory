@@ -11,10 +11,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use cdrs_tokio::frame::message_result::{ColType, RowsMetadata};
-use cdrs_tokio::types::ByIndex;
-use cdrs_tokio::types::blob::Blob;
-use cdrs_tokio::types::prelude::Row;
 use ferrosa_memory_core::auth;
 use ferrosa_memory_core::config::FerrosaCqlConfig;
 use ferrosa_memory_core::config::{Config, validate_shared_http_config};
@@ -25,6 +21,7 @@ use ferrosa_memory_core::http;
 use ferrosa_memory_core::storage::Storage;
 use ferrosa_memory_core::transport;
 use ferrosa_memory_core::types::*;
+use scylla::frame::response::result::{CqlValue, Row};
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 
@@ -189,61 +186,73 @@ fn is_connection_error(err: impl std::fmt::Display) -> bool {
         || msg.contains("column or udt property")
 }
 
-fn cql_cell_to_json(row: &Row, metadata: &RowsMetadata, index: usize) -> serde_json::Value {
-    let col_type = metadata
-        .col_specs
-        .get(index)
-        .map(|spec| spec.col_type.id)
-        .unwrap_or(ColType::Varchar);
+fn cql_cell_to_json(row: &Row, index: usize) -> serde_json::Value {
+    let cell = match row.columns.get(index) {
+        Some(c) => c,
+        None => return serde_json::Value::Null,
+    };
+    match cell {
+        None => serde_json::Value::Null,
+        Some(CqlValue::Text(s)) | Some(CqlValue::Ascii(s)) => serde_json::Value::String(s.clone()),
+        Some(CqlValue::BigInt(n)) => serde_json::Value::from(*n),
+        Some(CqlValue::Counter(c)) => serde_json::Value::from(c.0),
+        Some(CqlValue::Int(n)) => serde_json::Value::from(*n),
+        Some(CqlValue::SmallInt(n)) => serde_json::Value::from(*n),
+        Some(CqlValue::TinyInt(n)) => serde_json::Value::from(*n),
+        Some(CqlValue::Boolean(b)) => serde_json::Value::Bool(*b),
+        Some(CqlValue::Double(f)) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Some(CqlValue::Float(f)) => serde_json::Number::from_f64(f64::from(*f))
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Some(CqlValue::Uuid(u)) => serde_json::Value::String(u.to_string()),
+        Some(CqlValue::Timeuuid(u)) => serde_json::Value::String(u.to_string()),
+        Some(CqlValue::Timestamp(ts)) => {
+            // ts.0 is milliseconds since epoch (CqlTimestamp wraps i64)
+            let millis = ts.0;
+            serde_json::Value::String(
+                chrono::DateTime::from_timestamp_millis(millis)
+                    .map(|dt| dt.to_rfc3339())
+                    .unwrap_or_else(|| format!("<ts:{millis}>")),
+            )
+        }
+        Some(CqlValue::Blob(bytes)) => {
+            serde_json::Value::String(format!("<blob:{} bytes>", bytes.len()))
+        }
+        other => serde_json::Value::String(format!("<{}>", cql_value_type_name(other))),
+    }
+}
 
-    match col_type {
-        ColType::Ascii | ColType::Varchar | ColType::Custom => row
-            .r_by_index::<String>(index)
-            .map(serde_json::Value::String)
-            .unwrap_or(serde_json::Value::Null),
-        ColType::Bigint | ColType::Counter | ColType::Time => row
-            .r_by_index::<i64>(index)
-            .map(serde_json::Value::from)
-            .unwrap_or(serde_json::Value::Null),
-        ColType::Int | ColType::Date => row
-            .r_by_index::<i32>(index)
-            .map(serde_json::Value::from)
-            .unwrap_or(serde_json::Value::Null),
-        ColType::Smallint => row
-            .r_by_index::<i16>(index)
-            .map(serde_json::Value::from)
-            .unwrap_or(serde_json::Value::Null),
-        ColType::Tinyint => row
-            .r_by_index::<i8>(index)
-            .map(serde_json::Value::from)
-            .unwrap_or(serde_json::Value::Null),
-        ColType::Boolean => row
-            .r_by_index::<bool>(index)
-            .map(serde_json::Value::from)
-            .unwrap_or(serde_json::Value::Null),
-        ColType::Double => row
-            .r_by_index::<f64>(index)
-            .map(serde_json::Value::from)
-            .unwrap_or(serde_json::Value::Null),
-        ColType::Float => row
-            .r_by_index::<f32>(index)
-            .map(serde_json::Value::from)
-            .unwrap_or(serde_json::Value::Null),
-        ColType::Uuid | ColType::Timeuuid => row
-            .r_by_index::<uuid::Uuid>(index)
-            .map(|value| serde_json::Value::String(value.to_string()))
-            .unwrap_or(serde_json::Value::Null),
-        ColType::Timestamp => row
-            .r_by_index::<chrono::NaiveDateTime>(index)
-            .map(|value| serde_json::Value::String(value.and_utc().to_rfc3339()))
-            .unwrap_or(serde_json::Value::Null),
-        ColType::Blob => row
-            .r_by_index::<Blob>(index)
-            .map(|value| {
-                serde_json::Value::String(format!("<blob:{} bytes>", value.into_vec().len()))
-            })
-            .unwrap_or(serde_json::Value::Null),
-        other => serde_json::Value::String(format!("<unsupported:{other:?}>")),
+fn cql_value_type_name(v: &Option<CqlValue>) -> &'static str {
+    match v {
+        None => "null",
+        Some(CqlValue::Ascii(_)) => "ascii",
+        Some(CqlValue::Boolean(_)) => "boolean",
+        Some(CqlValue::Blob(_)) => "blob",
+        Some(CqlValue::Counter(_)) => "counter",
+        Some(CqlValue::Decimal(_)) => "decimal",
+        Some(CqlValue::Double(_)) => "double",
+        Some(CqlValue::Float(_)) => "float",
+        Some(CqlValue::Int(_)) => "int",
+        Some(CqlValue::BigInt(_)) => "bigint",
+        Some(CqlValue::Text(_)) => "text",
+        Some(CqlValue::Timestamp(_)) => "timestamp",
+        Some(CqlValue::Uuid(_)) => "uuid",
+        Some(CqlValue::Varint(_)) => "varint",
+        Some(CqlValue::Timeuuid(_)) => "timeuuid",
+        Some(CqlValue::Inet(_)) => "inet",
+        Some(CqlValue::Date(_)) => "date",
+        Some(CqlValue::Time(_)) => "time",
+        Some(CqlValue::SmallInt(_)) => "smallint",
+        Some(CqlValue::TinyInt(_)) => "tinyint",
+        Some(CqlValue::Duration(_)) => "duration",
+        Some(CqlValue::List(_)) => "list",
+        Some(CqlValue::Map(_)) => "map",
+        Some(CqlValue::Set(_)) => "set",
+        Some(CqlValue::UserDefinedType { .. }) => "udt",
+        Some(CqlValue::Tuple(_)) => "tuple",
+        Some(CqlValue::Empty) => "empty",
     }
 }
 
@@ -1167,9 +1176,10 @@ impl http::OperatorQuerySurface for ReconnectingStorage {
             .ok_or_else(|| anyhow::anyhow!(NOT_CONNECTED_MSG))?;
 
         let normalized = normalize_public_query(query)?;
-        let envelope = cql.session().query(normalized.clone()).await;
-        let envelope = match envelope {
-            Ok(envelope) => envelope,
+        #[allow(deprecated)]
+        let result = cql.session().query_unpaged(normalized.clone(), ()).await;
+        let result = match result {
+            Ok(r) => r,
             Err(err) => {
                 if is_connection_error(&err) {
                     drop(guard);
@@ -1179,17 +1189,12 @@ impl http::OperatorQuerySurface for ReconnectingStorage {
             }
         };
 
-        let body = envelope.response_body()?;
-        let metadata = body
-            .as_rows_metadata()
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("CQL query did not return rows"))?;
-        let columns: Vec<String> = metadata
-            .col_specs
+        let columns: Vec<String> = result
+            .col_specs()
             .iter()
-            .map(|spec| spec.name.clone())
+            .map(|spec| spec.name().to_string())
             .collect();
-        let rows = body.into_rows().unwrap_or_default();
+        let rows = result.rows_or_empty();
         let total_rows = rows.len();
         let truncated = total_rows > limit;
         let rendered_rows: Vec<serde_json::Value> = rows
@@ -1198,7 +1203,7 @@ impl http::OperatorQuerySurface for ReconnectingStorage {
             .map(|row| {
                 let mut object = serde_json::Map::new();
                 for (index, name) in columns.iter().enumerate() {
-                    object.insert(name.clone(), cql_cell_to_json(row, &metadata, index));
+                    object.insert(name.clone(), cql_cell_to_json(row, index));
                 }
                 serde_json::Value::Object(object)
             })
@@ -1434,7 +1439,7 @@ async fn main() -> anyhow::Result<()> {
     let debug = std::env::args().any(|a| a == "--debug");
 
     let default_filter = if debug {
-        "debug,cdrs_tokio=debug,hyper=info,reqwest=info"
+        "debug,scylla=warn,hyper=info,reqwest=info"
     } else {
         "ferrosa_memory_core=warn,ferrosa_memory_mcp=warn"
     };

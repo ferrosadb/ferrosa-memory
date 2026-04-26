@@ -1,15 +1,20 @@
+// Intentionally uses the scylla 0.15 LegacySession API — deprecated but stable for this migration.
+#![allow(deprecated)]
 //! Live test: vector INSERT/SELECT via blob workaround.
 //! Run: cargo test -p ferrosa-memory-core --test vector_live -- --ignored --nocapture
 
-use std::sync::Arc;
-
-use cdrs_tokio::authenticators::NoneAuthenticatorProvider;
-use cdrs_tokio::cluster::NodeTcpConfigBuilder;
-use cdrs_tokio::cluster::session::{SessionBuilder, TcpSessionBuilder};
-use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
-use cdrs_tokio::query_values;
-use cdrs_tokio::types::blob::Blob;
+use ferrosa_memory_core::cql_storage::build_col_map;
 use ferrosa_memory_core::vector;
+use scylla::{LegacySession, SessionBuilder};
+
+async fn connect_plain(contact_point: &str) -> LegacySession {
+    #[allow(deprecated)]
+    SessionBuilder::new()
+        .known_node(contact_point)
+        .build_legacy()
+        .await
+        .expect("session build failed")
+}
 
 #[tokio::test]
 #[ignore = "requires live Ferrosa cluster; run with --ignored and FERROSA_TEST_CONTAINERS=1"]
@@ -21,29 +26,22 @@ async fn vector_blob_workaround_roundtrip() {
              cluster on port 19042"
         );
     }
-    let nc = NodeTcpConfigBuilder::new()
-        .with_contact_point("127.0.0.1:19042".into())
-        .with_authenticator_provider(Arc::new(NoneAuthenticatorProvider))
-        .build()
-        .await
-        .unwrap();
-    let session = TcpSessionBuilder::new(RoundRobinLoadBalancingStrategy::new(), nc)
-        .build()
-        .await
-        .unwrap();
+    let session = connect_plain("127.0.0.1:19042").await;
 
     // Create table with vector column
+    #[allow(deprecated)]
     session
-        .query(
+        .query_unpaged(
             "CREATE TABLE IF NOT EXISTS agent_memory.test_vector_blob \
              (id uuid PRIMARY KEY, embedding vector<float, 4>)",
+            (),
         )
         .await
         .expect("CREATE TABLE");
 
-    // Encode vector as raw bytes wrapped in Blob
+    // Encode vector as raw bytes — scylla accepts Vec<u8> for blob columns
     let embedding = vec![0.1_f32, 0.2, 0.3, 0.4];
-    let blob = Blob::new(vector::encode_vector(&embedding));
+    let blob_bytes: Vec<u8> = vector::encode_vector(&embedding);
     let id = uuid::Uuid::new_v4();
 
     // INSERT using blob bytes — the VECTOR column should accept raw bytes
@@ -52,8 +50,9 @@ async fn vector_blob_workaround_roundtrip() {
         .await
         .expect("PREPARE INSERT");
 
+    #[allow(deprecated)]
     session
-        .exec_with_values(&prepared, query_values!(id, blob))
+        .execute_unpaged(&prepared, (id, blob_bytes))
         .await
         .expect("INSERT with vector as blob");
 
@@ -65,18 +64,18 @@ async fn vector_blob_workaround_roundtrip() {
         .await
         .expect("PREPARE SELECT");
 
-    let envelope = session
-        .exec_with_values(&read, query_values!(id))
-        .await
-        .expect("SELECT");
+    #[allow(deprecated)]
+    let result = session.execute_unpaged(&read, (id,)).await.expect("SELECT");
 
-    let rows = envelope.response_body().unwrap().into_rows().unwrap();
+    let col_map = build_col_map(result.col_specs());
+    let rows = result.rows_or_empty();
     assert_eq!(rows.len(), 1);
 
-    // Read vector using ByIndex — column 0 is embedding (only column selected)
-    use cdrs_tokio::types::ByIndex;
-    let raw: Blob = rows[0].r_by_index(0).expect("read vector by index as blob");
-    let decoded = vector::decode_vector(&raw.into_vec());
+    // Read vector as blob bytes — column 0 is embedding (only column selected)
+    let raw: Vec<u8> =
+        ferrosa_memory_core::cql_storage::cql_get::<Vec<u8>>(&rows[0], &col_map, "embedding")
+            .expect("read vector by name as blob");
+    let decoded = vector::decode_vector(&raw);
 
     eprintln!("Decoded: {:?}", decoded);
     assert_eq!(decoded.len(), 4);

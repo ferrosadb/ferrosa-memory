@@ -22,11 +22,7 @@
 //! aborts with a clear "downgrade detected" error. Restore from backup to
 //! recover.
 
-use cdrs_tokio::query::QueryValues;
-use cdrs_tokio::query_values;
-use cdrs_tokio::types::ByName;
-
-use crate::cql_storage::CqlSession;
+use crate::cql_storage::{CqlSession, build_col_map, cql_get};
 
 /// A single schema change wired into the server binary.
 #[derive(Debug)]
@@ -304,8 +300,9 @@ pub async fn run_migrations(session: &CqlSession, keyspace: &str) -> Result<usiz
     // they're deployable into any keyspace (dev, test, per-tenant). The
     // split_cql helper strips any stray USE statements defensively.
     let use_ks = format!("USE {keyspace}");
+    #[allow(deprecated)]
     session
-        .query(&use_ks)
+        .query_unpaged(use_ks, ())
         .await
         .map_err(|e| MigrationError::Setup { source: e.into() })?;
 
@@ -318,7 +315,8 @@ pub async fn run_migrations(session: &CqlSession, keyspace: &str) -> Result<usiz
             "applying migration"
         );
         for (i, stmt) in split_cql(m.ddl).iter().enumerate() {
-            if let Err(source) = session.query(stmt.as_str()).await {
+            #[allow(deprecated)]
+            if let Err(source) = session.query_unpaged(stmt.as_str(), ()).await {
                 return Err(MigrationError::Statement {
                     version: m.version,
                     stmt_index: i,
@@ -364,7 +362,8 @@ async fn apply_bootstrap(session: &CqlSession, keyspace: &str) -> anyhow::Result
     for (file_idx, ddl) in BOOTSTRAP_DDLS.iter().enumerate() {
         let rewritten = qualify_ddl(ddl, keyspace);
         for (i, stmt) in split_cql(&rewritten).iter().enumerate() {
-            if let Err(e) = session.query(stmt.as_str()).await {
+            #[allow(deprecated)]
+            if let Err(e) = session.query_unpaged(stmt.as_str(), ()).await {
                 anyhow::bail!(
                     "bootstrap DDL[{file_idx}] statement {i} failed: {e}\n--- statement ---\n{stmt}"
                 );
@@ -377,7 +376,8 @@ async fn apply_bootstrap(session: &CqlSession, keyspace: &str) -> anyhow::Result
     if should_apply_roles_ddl() {
         let rewritten = qualify_ddl(ROLES_DDL, keyspace);
         for (i, stmt) in split_cql(&rewritten).iter().enumerate() {
-            if let Err(e) = session.query(stmt.as_str()).await {
+            #[allow(deprecated)]
+            if let Err(e) = session.query_unpaged(stmt.as_str(), ()).await {
                 anyhow::bail!("roles DDL statement {i} failed: {e}\n--- statement ---\n{stmt}");
             }
         }
@@ -578,12 +578,14 @@ fn split_at_first_paren_or_whitespace(s: &str) -> (&str, &str) {
 /// `WHERE keyspace_name = '...'` on `system_schema.keyspaces`, so we pull
 /// all rows and match the `keyspace_name` column ourselves.
 async fn keyspace_exists(session: &CqlSession, keyspace: &str) -> anyhow::Result<bool> {
-    let envelope = session
-        .query("SELECT keyspace_name FROM system_schema.keyspaces")
+    #[allow(deprecated)]
+    let result = session
+        .query_unpaged("SELECT keyspace_name FROM system_schema.keyspaces", ())
         .await?;
-    let rows = envelope.response_body()?.into_rows().unwrap_or_default();
+    let col_map = build_col_map(result.col_specs());
+    let rows = result.rows_or_empty();
     for row in rows {
-        if let Ok(name) = row.r_by_name::<String>("keyspace_name")
+        if let Ok(name) = cql_get::<String>(&row, &col_map, "keyspace_name")
             && name == keyspace
         {
             return Ok(true);
@@ -600,17 +602,20 @@ async fn ensure_schema_version_table(session: &CqlSession, keyspace: &str) -> an
             description text,\
             applied_by text)"
     );
-    session.query(ddl).await?;
+    #[allow(deprecated)]
+    session.query_unpaged(ddl, ()).await?;
     Ok(())
 }
 
 async fn current_version(session: &CqlSession, keyspace: &str) -> anyhow::Result<Option<u32>> {
     let q = format!("SELECT version FROM {keyspace}.schema_version");
-    let envelope = session.query(q).await?;
-    let rows = envelope.response_body()?.into_rows().unwrap_or_default();
+    #[allow(deprecated)]
+    let result = session.query_unpaged(q, ()).await?;
+    let col_map = build_col_map(result.col_specs());
+    let rows = result.rows_or_empty();
     let mut max: Option<u32> = None;
     for row in rows {
-        if let Ok(v) = row.r_by_name::<i32>("version") {
+        if let Ok(v) = cql_get::<i32>(&row, &col_map, "version") {
             let v = v as u32;
             max = Some(max.map_or(v, |m| m.max(v)));
         }
@@ -630,11 +635,9 @@ async fn record_version(
          (version, applied_at, description, applied_by) \
          VALUES (?, toTimestamp(now()), ?, ?)"
     );
+    #[allow(deprecated)]
     session
-        .query_with_values(
-            q,
-            query_values!(version as i32, description.to_string(), host),
-        )
+        .query_unpaged(q, (version as i32, description.to_string(), host))
         .await?;
     Ok(())
 }
@@ -643,12 +646,6 @@ fn hostname() -> Option<String> {
     std::env::var("HOSTNAME")
         .ok()
         .or_else(|| std::env::var("COMPUTERNAME").ok())
-}
-
-// Suppress the unused warning while only query_values is used via macro.
-#[allow(dead_code)]
-fn _assert_query_values_type_used() {
-    let _: QueryValues = query_values!("dummy".to_string());
 }
 
 /// Split a CQL DDL script into individual statements.
