@@ -38,6 +38,29 @@ repos:
         types: [rust]
         pass_filenames: false
 
+
+      - id: cargo-clippy-prepush
+        name: cargo clippy (pre-push, all-targets)
+        entry: cargo clippy --workspace --all-targets -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: cargo-fmt-prepush
+        name: cargo fmt --check (pre-push)
+        entry: cargo fmt --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: no-prod-loopback-prepush
+        name: no hardcoded loopback CQL in prod source (p0-11 W-01)
+        entry: ./.github/scripts/check-no-prod-loopback.sh
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
       - id: cargo-test
         name: cargo test
         entry: cargo test --workspace
