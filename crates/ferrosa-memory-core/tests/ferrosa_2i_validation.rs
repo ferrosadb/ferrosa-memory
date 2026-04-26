@@ -1,3 +1,5 @@
+// Intentionally uses the scylla 0.15 LegacySession API — deprecated but stable for this migration.
+#![allow(deprecated)]
 //! Ferrosa secondary-index (2i) correctness suite.
 //!
 //! Validates the behaviors Sprint 2 relies on before committing to a 2i on
@@ -14,32 +16,17 @@
 //! harness. Inside every test we also check the env and early-return, which
 //! keeps explicit `--ignored` invocations helpful when the cluster isn't up.
 
-use cdrs_tokio::authenticators::NoneAuthenticatorProvider;
-use cdrs_tokio::cluster::NodeTcpConfigBuilder;
-use cdrs_tokio::cluster::session::{Session, SessionBuilder, TcpSessionBuilder};
-use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
-use cdrs_tokio::query_values;
-use cdrs_tokio::transport::TransportTcp;
-use cdrs_tokio::types::ByName;
-use std::sync::Arc;
-
+use ferrosa_memory_core::cql_storage::{build_col_map, cql_get};
 use ferrosa_memory_core::test_cluster::TestClusterConfig;
+use scylla::{LegacySession, SessionBuilder};
+use std::sync::Arc;
+use uuid::Uuid;
 
-type CqlSession = Session<
-    TransportTcp,
-    cdrs_tokio::cluster::TcpConnectionManager,
-    RoundRobinLoadBalancingStrategy<TransportTcp, cdrs_tokio::cluster::TcpConnectionManager>,
->;
-
-async fn connect(cfg: &TestClusterConfig) -> CqlSession {
-    let node_config = NodeTcpConfigBuilder::new()
-        .with_contact_point(cfg.contact_point().into())
-        .with_authenticator_provider(Arc::new(NoneAuthenticatorProvider))
-        .build()
-        .await
-        .expect("test cluster node config");
-    TcpSessionBuilder::new(RoundRobinLoadBalancingStrategy::new(), node_config)
-        .build()
+async fn connect(cfg: &TestClusterConfig) -> LegacySession {
+    #[allow(deprecated)]
+    SessionBuilder::new()
+        .known_node(cfg.contact_point())
+        .build_legacy()
         .await
         .expect("test cluster session")
 }
@@ -48,15 +35,20 @@ async fn connect(cfg: &TestClusterConfig) -> CqlSession {
 /// `label`. Dropping and recreating isolates each test from the last run —
 /// cheaper than TRUNCATE across compactions and safer than relying on
 /// leftover state.
-async fn setup_sandbox(session: &CqlSession, ks: &str, table: &str) {
+async fn setup_sandbox(session: &LegacySession, ks: &str, table: &str) {
     let ksc = format!(
         "CREATE KEYSPACE IF NOT EXISTS {ks} \
          WITH replication = {{ 'class': 'SimpleStrategy', 'replication_factor': 1 }}"
     );
-    session.query(ksc).await.expect("create keyspace");
+    #[allow(deprecated)]
+    session
+        .query_unpaged(ksc, ())
+        .await
+        .expect("create keyspace");
 
+    #[allow(deprecated)]
     let _ = session
-        .query(format!("DROP TABLE IF EXISTS {ks}.{table}"))
+        .query_unpaged(format!("DROP TABLE IF EXISTS {ks}.{table}"), ())
         .await;
 
     let create = format!(
@@ -66,43 +58,45 @@ async fn setup_sandbox(session: &CqlSession, ks: &str, table: &str) {
             value text\
          )"
     );
-    session.query(create).await.expect("create table");
+    #[allow(deprecated)]
+    session
+        .query_unpaged(create, ())
+        .await
+        .expect("create table");
 
     let idx = format!("CREATE INDEX IF NOT EXISTS {table}_label_idx ON {ks}.{table} (label)");
-    session.query(idx).await.expect("create 2i");
+    #[allow(deprecated)]
+    session.query_unpaged(idx, ()).await.expect("create 2i");
 }
 
 async fn insert_row(
-    session: &CqlSession,
+    session: &LegacySession,
     ks: &str,
     table: &str,
-    id: uuid::Uuid,
+    id: Uuid,
     label: &str,
     value: &str,
 ) {
     let q = format!("INSERT INTO {ks}.{table} (id, label, value) VALUES (?, ?, ?)");
+    #[allow(deprecated)]
     session
-        .query_with_values(q, query_values!(id, label.to_string(), value.to_string()))
+        .query_unpaged(q, (id, label.to_string(), value.to_string()))
         .await
         .expect("insert");
 }
 
-async fn lookup_by_label(
-    session: &CqlSession,
-    ks: &str,
-    table: &str,
-    label: &str,
-) -> Vec<uuid::Uuid> {
+async fn lookup_by_label(session: &LegacySession, ks: &str, table: &str, label: &str) -> Vec<Uuid> {
     let q = format!("SELECT id FROM {ks}.{table} WHERE label = ?");
-    let envelope = session
-        .query_with_values(q, query_values!(label.to_string()))
+    #[allow(deprecated)]
+    let result = session
+        .query_unpaged(q, (label.to_string(),))
         .await
         .expect("lookup");
-    let body = envelope.response_body().expect("body");
-    body.into_rows()
-        .unwrap_or_default()
+    let col_map = build_col_map(result.col_specs());
+    result
+        .rows_or_empty()
         .into_iter()
-        .filter_map(|row| row.r_by_name::<uuid::Uuid>("id").ok())
+        .filter_map(|row| cql_get::<Uuid>(&row, &col_map, "id").ok())
         .collect()
 }
 
@@ -117,7 +111,7 @@ async fn c1_index_visibility_after_write() {
     let table = "idx_c1";
     setup_sandbox(&session, &cfg.keyspace, table).await;
 
-    let id = uuid::Uuid::new_v4();
+    let id = Uuid::new_v4();
     insert_row(&session, &cfg.keyspace, table, id, "tdd", "v1").await;
     let hits = lookup_by_label(&session, &cfg.keyspace, table, "tdd").await;
     assert_eq!(
@@ -145,7 +139,7 @@ async fn c2_concurrent_writers() {
         let s = Arc::clone(&session);
         let ks = ks.clone();
         handles.push(tokio::spawn(async move {
-            let id = uuid::Uuid::new_v4();
+            let id = Uuid::new_v4();
             let label = format!("label-{i}");
             insert_row(&s, &ks, "idx_c2", id, &label, "v").await;
             (label, id)
@@ -178,15 +172,16 @@ async fn c3_update_refreshes_index() {
     let table = "idx_c3";
     setup_sandbox(&session, &cfg.keyspace, table).await;
 
-    let id = uuid::Uuid::new_v4();
+    let id = Uuid::new_v4();
     insert_row(&session, &cfg.keyspace, table, id, "tdd", "v1").await;
     // Update the label.
     let q = format!(
         "UPDATE {ks}.{table} SET label = ? WHERE id = ?",
         ks = cfg.keyspace
     );
+    #[allow(deprecated)]
     session
-        .query_with_values(q, query_values!("tdd-v2".to_string(), id))
+        .query_unpaged(q, ("tdd-v2".to_string(), id))
         .await
         .expect("update");
 
@@ -210,13 +205,11 @@ async fn c4_delete_purges_index() {
     let table = "idx_c4";
     setup_sandbox(&session, &cfg.keyspace, table).await;
 
-    let id = uuid::Uuid::new_v4();
+    let id = Uuid::new_v4();
     insert_row(&session, &cfg.keyspace, table, id, "doomed", "v").await;
     let q = format!("DELETE FROM {ks}.{table} WHERE id = ?", ks = cfg.keyspace);
-    session
-        .query_with_values(q, query_values!(id))
-        .await
-        .expect("delete");
+    #[allow(deprecated)]
+    session.query_unpaged(q, (id,)).await.expect("delete");
 
     let hits = lookup_by_label(&session, &cfg.keyspace, table, "doomed").await;
     assert!(
@@ -239,7 +232,7 @@ async fn c5_index_returns_all_matches() {
     const M: usize = 8;
     let mut expected = std::collections::HashSet::new();
     for _ in 0..M {
-        let id = uuid::Uuid::new_v4();
+        let id = Uuid::new_v4();
         insert_row(&session, &cfg.keyspace, table, id, "shared", "v").await;
         expected.insert(id);
     }
@@ -265,13 +258,9 @@ async fn c6_index_lookup_is_not_full_scan() {
 
     // Seed ~1k rows; one with a unique target label buried in the middle.
     const N: usize = 1_000;
-    let target = uuid::Uuid::new_v4();
+    let target = Uuid::new_v4();
     for i in 0..N {
-        let id = if i == N / 2 {
-            target
-        } else {
-            uuid::Uuid::new_v4()
-        };
+        let id = if i == N / 2 { target } else { Uuid::new_v4() };
         let label = if i == N / 2 {
             "needle".to_string()
         } else {

@@ -43,9 +43,11 @@ anyhow = "1"
 # Config
 dirs = "6"
 
-# CQL driver (Ferrosa/Cassandra) — using fork with VECTOR type support
-# PR: https://github.com/krojew/cdrs-tokio/pull/221
-cdrs-tokio = { git = "https://github.com/bkearns/cdrs-tokio.git", branch = "feature/vector-type", features = ["derive"] }
+# CQL driver (Ferrosa/Cassandra) — canonical ScyllaDB Rust driver (p1-22).
+# Replaces the personal cdrs-tokio fork (bkearns/cdrs-tokio, branch feature/vector-type).
+# The fork existed only for VECTOR type support; scylla 0.15 supports bytes/blob
+# round-trips which we use for vector embedding storage (encode_vector/decode_vector).
+scylla = { version = "0.15", features = ["chrono-04"] }
 
 # TLS
 tokio-rustls = "0.26"

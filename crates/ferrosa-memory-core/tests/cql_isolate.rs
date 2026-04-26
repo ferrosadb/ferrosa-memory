@@ -1,25 +1,23 @@
+// Intentionally uses the scylla 0.15 LegacySession API — deprecated but stable for this migration.
+#![allow(deprecated)]
 //! Isolate which column types cause PREPARE to fail.
 //! Run: cargo test -p ferrosa-memory-core --test cql_isolate -- --ignored --nocapture
 
-use cdrs_tokio::authenticators::NoneAuthenticatorProvider;
-use cdrs_tokio::cluster::NodeTcpConfigBuilder;
-use cdrs_tokio::cluster::session::{SessionBuilder, TcpSessionBuilder};
-use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
-use std::sync::Arc;
+use scylla::{LegacySession, SessionBuilder};
+
+async fn connect_plain(contact_point: &str) -> LegacySession {
+    #[allow(deprecated)]
+    SessionBuilder::new()
+        .known_node(contact_point)
+        .build_legacy()
+        .await
+        .expect("session build failed")
+}
 
 #[tokio::test]
 #[ignore]
 async fn isolate_column_types() {
-    let nc = NodeTcpConfigBuilder::new()
-        .with_contact_point("127.0.0.1:19042".into())
-        .with_authenticator_provider(Arc::new(NoneAuthenticatorProvider))
-        .build()
-        .await
-        .unwrap();
-    let s = TcpSessionBuilder::new(RoundRobinLoadBalancingStrategy::new(), nc)
-        .build()
-        .await
-        .unwrap();
+    let session = connect_plain("127.0.0.1:19042").await;
 
     // Test order: entity_store FIRST to see if it fails independently
     let tests: Vec<(&str, &str)> = vec![
@@ -50,7 +48,7 @@ async fn isolate_column_types() {
     ];
 
     for (name, stmt) in tests {
-        match s.prepare(stmt).await {
+        match session.prepare(stmt).await {
             Ok(_) => eprintln!("  ok: {name}"),
             Err(e) => eprintln!("FAIL: {name} — {e}"),
         }

@@ -9,10 +9,9 @@
 //!   cargo run --bin fix_edge_sessions -- --dry-run    # inspect only
 //!   cargo run --bin fix_edge_sessions                 # fix data
 
-use cdrs_tokio::query_values;
-use cdrs_tokio::types::ByName;
 use ferrosa_memory_core::config::load_config;
 use ferrosa_memory_core::cql_storage::CqlStorage;
+use ferrosa_memory_core::cql_storage::{build_col_map, cql_get};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -52,22 +51,22 @@ async fn main() -> anyhow::Result<()> {
 
         let query =
             format!("SELECT {src_col}, {dst_col}, session_id, tenant_id FROM agent_memory.{table}");
-        let rows = session
-            .query(query)
-            .await?
-            .response_body()?
-            .into_rows()
-            .unwrap_or_default();
+        #[allow(deprecated)]
+        let _qr = session.query_unpaged(query, ()).await?;
+        let col_map = build_col_map(_qr.col_specs());
+        let rows = _qr.rows_or_empty();
 
         let mut distribution: std::collections::HashMap<(uuid::Uuid, uuid::Uuid), usize> =
             std::collections::HashMap::new();
         let mut edges_to_fix: Vec<(uuid::Uuid, uuid::Uuid)> = Vec::new();
 
         for row in &rows {
-            let src: uuid::Uuid = row.r_by_name(src_col).unwrap_or_default();
-            let dst: uuid::Uuid = row.r_by_name(dst_col).unwrap_or_default();
-            let tid: uuid::Uuid = row.r_by_name("tenant_id").unwrap_or_default();
-            let sid: uuid::Uuid = row.r_by_name("session_id").unwrap_or_default();
+            let src: uuid::Uuid = cql_get(row, &col_map, src_col).unwrap_or_default();
+            let dst: uuid::Uuid = cql_get(row, &col_map, dst_col).unwrap_or_default();
+            let tid: uuid::Uuid =
+                cql_get::<uuid::Uuid>(row, &col_map, "tenant_id").unwrap_or_default();
+            let sid: uuid::Uuid =
+                cql_get::<uuid::Uuid>(row, &col_map, "session_id").unwrap_or_default();
 
             *distribution.entry((tid, sid)).or_default() += 1;
 
@@ -110,11 +109,9 @@ async fn main() -> anyhow::Result<()> {
 
         let mut fixed = 0;
         for (src, dst) in &edges_to_fix {
+            #[allow(deprecated)]
             match session
-                .query_with_values(
-                    update_query.clone(),
-                    query_values!(target_session, *src, *dst),
-                )
+                .query_unpaged(update_query.clone(), (target_session, *src, *dst))
                 .await
             {
                 Ok(_) => fixed += 1,
@@ -128,12 +125,10 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("--- Scanning typed_edges ---");
     let query = "SELECT src_id, edge_type, dst_id, session_id, tenant_id, weight, metadata, created_at \
                  FROM agent_memory.typed_edges";
-    let rows = session
-        .query(query)
-        .await?
-        .response_body()?
-        .into_rows()
-        .unwrap_or_default();
+    #[allow(deprecated)]
+    let _qr = session.query_unpaged(query, ()).await?;
+    let col_map = build_col_map(_qr.col_specs());
+    let rows = _qr.rows_or_empty();
 
     let mut te_distribution: std::collections::HashMap<(uuid::Uuid, uuid::Uuid), usize> =
         std::collections::HashMap::new();
@@ -146,27 +141,27 @@ async fn main() -> anyhow::Result<()> {
         sid: uuid::Uuid,
         weight: f64,
         metadata: String,
-        created_at: chrono::NaiveDateTime,
+        created_at: chrono::DateTime<chrono::Utc>,
     }
 
     let mut te_rows: Vec<TypedEdgeRow> = Vec::new();
     for row in &rows {
-        let tid: uuid::Uuid = row.r_by_name("tenant_id").unwrap_or_default();
-        let sid: uuid::Uuid = row.r_by_name("session_id").unwrap_or_default();
+        let tid: uuid::Uuid = cql_get::<uuid::Uuid>(row, &col_map, "tenant_id").unwrap_or_default();
+        let sid: uuid::Uuid =
+            cql_get::<uuid::Uuid>(row, &col_map, "session_id").unwrap_or_default();
 
         *te_distribution.entry((tid, sid)).or_default() += 1;
 
         if tid == tenant_id && sid != target_session {
             te_rows.push(TypedEdgeRow {
-                src: row.r_by_name("src_id").unwrap_or_default(),
-                etype: row.r_by_name::<String>("edge_type").unwrap_or_default(),
-                dst: row.r_by_name("dst_id").unwrap_or_default(),
+                src: cql_get::<uuid::Uuid>(row, &col_map, "src_id").unwrap_or_default(),
+                etype: cql_get::<String>(row, &col_map, "edge_type").unwrap_or_default(),
+                dst: cql_get::<uuid::Uuid>(row, &col_map, "dst_id").unwrap_or_default(),
                 tid,
                 sid,
-                weight: row.r_by_name::<f64>("weight").unwrap_or(1.0),
-                metadata: row.r_by_name::<String>("metadata").unwrap_or_default(),
-                created_at: row
-                    .r_by_name::<chrono::NaiveDateTime>("created_at")
+                weight: cql_get::<f64>(row, &col_map, "weight").unwrap_or(1.0),
+                metadata: cql_get::<String>(row, &col_map, "metadata").unwrap_or_default(),
+                created_at: cql_get::<chrono::DateTime<chrono::Utc>>(row, &col_map, "created_at")
                     .unwrap_or_default(),
             });
         }
@@ -197,14 +192,15 @@ async fn main() -> anyhow::Result<()> {
             te_rows.len()
         );
         let mut fixed = 0;
-        for te in &te_rows {
+        for edge in &te_rows {
             // Delete old row
             let del = "DELETE FROM agent_memory.typed_edges \
                        WHERE tenant_id = ? AND session_id = ? AND src_id = ? AND edge_type = ? AND dst_id = ?";
+            #[allow(deprecated)]
             let _ = session
-                .query_with_values(
+                .query_unpaged(
                     del,
-                    query_values!(te.tid, te.sid, te.src, te.etype.clone(), te.dst),
+                    (edge.tid, edge.sid, edge.src, edge.etype.clone(), edge.dst),
                 )
                 .await;
 
@@ -212,24 +208,25 @@ async fn main() -> anyhow::Result<()> {
             let ins = "INSERT INTO agent_memory.typed_edges \
                        (tenant_id, session_id, src_id, edge_type, dst_id, weight, metadata, created_at) \
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+            #[allow(deprecated)]
             match session
-                .query_with_values(
+                .query_unpaged(
                     ins,
-                    query_values!(
-                        te.tid,
+                    (
+                        edge.tid,
                         target_session,
-                        te.src,
-                        te.etype.clone(),
-                        te.dst,
-                        te.weight,
-                        te.metadata.clone(),
-                        te.created_at
+                        edge.src,
+                        edge.etype.clone(),
+                        edge.dst,
+                        edge.weight,
+                        edge.metadata.clone(),
+                        edge.created_at,
                     ),
                 )
                 .await
             {
                 Ok(_) => fixed += 1,
-                Err(e) => tracing::warn!(src=%te.src, dst=%te.dst, error=%e, "insert failed"),
+                Err(e) => tracing::warn!(src=%edge.src, dst=%edge.dst, error=%e, "insert failed"),
             }
         }
         tracing::info!("typed_edges: fixed {fixed}/{}", te_rows.len());
@@ -243,7 +240,8 @@ async fn main() -> anyhow::Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_folded_into_by_session ON agent_memory.folded_into (session_id)",
     ];
     for stmt in &index_stmts {
-        match session.query(stmt.to_string()).await {
+        #[allow(deprecated)]
+        match session.query_unpaged(stmt.to_string(), ()).await {
             Ok(_) => tracing::info!("  OK: {stmt}"),
             Err(e) => tracing::warn!("  FAILED: {stmt} — {e}"),
         }

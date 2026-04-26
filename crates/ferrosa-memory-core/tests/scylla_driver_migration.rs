@@ -1,3 +1,5 @@
+// Intentionally uses the scylla 0.15 LegacySession API — deprecated but stable for this migration.
+#![allow(deprecated)]
 //! TDD integration tests for the cdrs-tokio → scylla driver migration (p1-22).
 //!
 //! ## RED PHASE
@@ -134,22 +136,24 @@ async fn t01_connect_session_succeeds() {
         .await
         .expect("connect_session must succeed against the test cluster");
 
-    // scylla driver: session.query_unpaged("...", &[]).await
+    // scylla LegacySession: session.query_unpaged("...", ()).await
+    #[allow(deprecated)]
     let result = session
-        .query_unpaged("SELECT keyspace_name FROM system_schema.keyspaces", &[])
+        .query_unpaged("SELECT keyspace_name FROM system_schema.keyspaces", ())
         .await
         .expect("system query must succeed on a connected session");
 
-    let rows = result
-        .into_rows_result()
-        .expect("query result must be row-typed")
-        .rows::<(String,)>()
-        .expect("keyspace_name must deserialize as String")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("all rows must deserialize");
+    let col_map = ferrosa_memory_core::cql_storage::build_col_map(result.col_specs());
+    let rows = result.rows_or_empty();
+    let keyspaces: Vec<String> = rows
+        .iter()
+        .filter_map(|row| {
+            ferrosa_memory_core::cql_storage::cql_get::<String>(row, &col_map, "keyspace_name").ok()
+        })
+        .collect();
 
     assert!(
-        !rows.is_empty(),
+        !keyspaces.is_empty(),
         "system_schema.keyspaces must not be empty"
     );
 }
@@ -405,23 +409,29 @@ async fn t08_session_accessor_allows_raw_query() {
         .await
         .expect("CqlStorage::connect");
 
-    // After migration: storage.session() must return &scylla::Session.
-    // The query_unpaged method is part of the scylla::Session API.
+    // After migration: storage.session() returns &LegacySession.
+    // The query_unpaged method is part of the scylla LegacySession API.
+    #[allow(deprecated)]
     let result = storage
         .session()
-        .query_unpaged("SELECT release_version FROM system.local", &[])
+        .query_unpaged("SELECT release_version FROM system.local", ())
         .await
         .expect("raw query through session() accessor must succeed");
 
-    let rows = result
-        .into_rows_result()
-        .expect("must be row result")
-        .rows::<(Option<String>,)>()
-        .expect("release_version must be Option<String>")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("rows must deserialize");
+    let col_map = ferrosa_memory_core::cql_storage::build_col_map(result.col_specs());
+    let rows = result.rows_or_empty();
+    let versions: Vec<Option<String>> = rows
+        .iter()
+        .map(|row| {
+            ferrosa_memory_core::cql_storage::cql_get::<String>(row, &col_map, "release_version")
+                .ok()
+        })
+        .collect();
 
-    assert!(!rows.is_empty(), "system.local must return exactly one row");
+    assert!(
+        !versions.is_empty(),
+        "system.local must return exactly one row"
+    );
 }
 
 // ---------------------------------------------------------------------------

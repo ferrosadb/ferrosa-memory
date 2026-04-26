@@ -155,7 +155,7 @@ async fn cmd_sync(
 
 /// Discover tenant IDs present on a cluster.
 async fn cmd_discover(config_path: &std::path::Path) -> anyhow::Result<()> {
-    use cdrs_tokio::types::ByName;
+    use ferrosa_memory_core::cql_storage::{build_col_map, cql_get};
     use std::collections::BTreeSet;
 
     let config = ferrosa_memory_core::config::parse_config(
@@ -180,17 +180,13 @@ async fn cmd_discover(config_path: &std::path::Path) -> anyhow::Result<()> {
     ];
 
     for query in &queries {
-        let rows = storage
-            .session()
-            .query_with_values(query, cdrs_tokio::query::QueryValues::SimpleValues(vec![]))
-            .await;
-        match rows {
-            Ok(env) => {
-                if let Ok(body) = env.response_body() {
-                    for row in body.into_rows().unwrap_or_default() {
-                        if let Ok(tid) = row.r_by_name::<Uuid>("tenant_id") {
-                            tenants.insert(tid);
-                        }
+        #[allow(deprecated)]
+        match storage.session().query_unpaged(query.to_owned(), ()).await {
+            Ok(result) => {
+                let col_map = build_col_map(result.col_specs());
+                for row in result.rows_or_empty() {
+                    if let Ok(tid) = cql_get::<Uuid>(&row, &col_map, "tenant_id") {
+                        tenants.insert(tid);
                     }
                 }
             }
@@ -354,7 +350,7 @@ async fn sync_edges(
     dry_run: bool,
     stats: &mut SyncStats,
 ) -> anyhow::Result<()> {
-    use cdrs_tokio::types::ByName;
+    use ferrosa_memory_core::cql_storage::cql_get;
 
     let keyspace = src.keyspace();
 
@@ -364,14 +360,14 @@ async fn sync_edges(
             "SELECT source_fold_id, target_fold_id, session_id \
              FROM {keyspace}.folded_into WHERE tenant_id = ? ALLOW FILTERING"
         );
-        let rows = raw_query(src, &query, ctx.tenant_id).await?;
+        let (col_map, rows) = raw_query(src, &query, ctx.tenant_id).await?;
         stats.edges_folded_into = rows.len();
         tracing::info!(count = rows.len(), "syncing folded_into edges");
         if !dry_run {
             for row in &rows {
-                let src_id: Uuid = row.r_by_name("source_fold_id")?;
-                let tgt_id: Uuid = row.r_by_name("target_fold_id")?;
-                let sid: Uuid = row.r_by_name("session_id")?;
+                let src_id: Uuid = cql_get::<Uuid>(row, &col_map, "source_fold_id")?;
+                let tgt_id: Uuid = cql_get::<Uuid>(row, &col_map, "target_fold_id")?;
+                let sid: Uuid = cql_get::<Uuid>(row, &col_map, "session_id")?;
                 if let Err(err) = dst_graph
                     .put_folded_into_edge(ctx.tenant_id, sid, src_id, tgt_id)
                     .await
@@ -389,14 +385,14 @@ async fn sync_edges(
             "SELECT entity_id, fold_id, session_id \
              FROM {keyspace}.mentioned_in WHERE tenant_id = ? ALLOW FILTERING"
         );
-        let rows = raw_query(src, &query, ctx.tenant_id).await?;
+        let (col_map, rows) = raw_query(src, &query, ctx.tenant_id).await?;
         stats.edges_mentioned_in = rows.len();
         tracing::info!(count = rows.len(), "syncing mentioned_in edges");
         if !dry_run {
             for row in &rows {
-                let entity_id: Uuid = row.r_by_name("entity_id")?;
-                let fold_id: Uuid = row.r_by_name("fold_id")?;
-                let sid: Uuid = row.r_by_name("session_id")?;
+                let entity_id: Uuid = cql_get::<Uuid>(row, &col_map, "entity_id")?;
+                let fold_id: Uuid = cql_get::<Uuid>(row, &col_map, "fold_id")?;
+                let sid: Uuid = cql_get::<Uuid>(row, &col_map, "session_id")?;
                 if let Err(err) = dst_graph
                     .put_mentioned_in_edge(ctx.tenant_id, sid, entity_id, fold_id)
                     .await
@@ -414,15 +410,15 @@ async fn sync_edges(
             "SELECT entity_a, entity_b, session_id, strength \
              FROM {keyspace}.co_occurs_with WHERE tenant_id = ? ALLOW FILTERING"
         );
-        let rows = raw_query(src, &query, ctx.tenant_id).await?;
+        let (col_map, rows) = raw_query(src, &query, ctx.tenant_id).await?;
         stats.edges_co_occurs = rows.len();
         tracing::info!(count = rows.len(), "syncing co_occurs_with edges");
         if !dry_run {
             for row in &rows {
-                let a: Uuid = row.r_by_name("entity_a")?;
-                let b: Uuid = row.r_by_name("entity_b")?;
-                let sid: Uuid = row.r_by_name("session_id")?;
-                let strength: f32 = row.r_by_name("strength").unwrap_or(1.0);
+                let a: Uuid = cql_get::<Uuid>(row, &col_map, "entity_a")?;
+                let b: Uuid = cql_get::<Uuid>(row, &col_map, "entity_b")?;
+                let sid: Uuid = cql_get::<Uuid>(row, &col_map, "session_id")?;
+                let strength: f32 = cql_get::<f32>(row, &col_map, "strength").unwrap_or(1.0);
                 if let Err(err) = dst_graph
                     .put_co_occurs_edge(ctx.tenant_id, sid, a, b, strength)
                     .await
@@ -440,14 +436,14 @@ async fn sync_edges(
             "SELECT new_event_id, old_event_id, entity_id \
              FROM {keyspace}.supersedes WHERE tenant_id = ? ALLOW FILTERING"
         );
-        let rows = raw_query(src, &query, ctx.tenant_id).await?;
+        let (col_map, rows) = raw_query(src, &query, ctx.tenant_id).await?;
         stats.edges_supersedes = rows.len();
         tracing::info!(count = rows.len(), "syncing supersedes edges");
         if !dry_run {
             for row in &rows {
-                let new_id: Uuid = row.r_by_name("new_event_id")?;
-                let old_id: Uuid = row.r_by_name("old_event_id")?;
-                let entity_id: Uuid = row.r_by_name("entity_id")?;
+                let new_id: Uuid = cql_get::<Uuid>(row, &col_map, "new_event_id")?;
+                let old_id: Uuid = cql_get::<Uuid>(row, &col_map, "old_event_id")?;
+                let entity_id: Uuid = cql_get::<Uuid>(row, &col_map, "entity_id")?;
                 if let Err(err) = dst_graph
                     .put_supersedes_edge(ctx.tenant_id, entity_id, new_id, old_id)
                     .await
@@ -462,21 +458,21 @@ async fn sync_edges(
     Ok(())
 }
 
-/// Execute a raw CQL query filtered by tenant_id and return rows.
+/// Execute a raw CQL query filtered by tenant_id and return (col_map, rows).
 async fn raw_query(
     storage: &CqlStorage,
     query: &str,
     tenant_id: Uuid,
-) -> anyhow::Result<Vec<cdrs_tokio::types::rows::Row>> {
-    use cdrs_tokio::query_values;
-    let envelope = storage
+) -> anyhow::Result<(
+    ferrosa_memory_core::cql_storage::ColMap,
+    Vec<scylla::frame::response::result::Row>,
+)> {
+    #[allow(deprecated)]
+    let result = storage
         .session()
-        .query_with_values(query, query_values!(tenant_id))
+        .query_unpaged(query.to_string(), (tenant_id,))
         .await
         .with_context(|| format!("raw query failed: {query}"))?;
-    Ok(envelope
-        .response_body()
-        .context("reading response body")?
-        .into_rows()
-        .unwrap_or_default())
+    let col_map = ferrosa_memory_core::cql_storage::build_col_map(result.col_specs());
+    Ok((col_map, result.rows_or_empty()))
 }

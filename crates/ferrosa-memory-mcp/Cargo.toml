@@ -17,6 +17,6 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }
-cdrs-tokio = { workspace = true }
+scylla = { workspace = true }
 sha2 = { workspace = true }
 reqwest = { workspace = true }
