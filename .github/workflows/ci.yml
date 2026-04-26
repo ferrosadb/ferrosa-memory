@@ -212,7 +212,20 @@ jobs:
             echo "See ferrosa_docs/specs/todo/p1-33-fmem-ci-cross-repo-clone-needs-token.md" >&2
             exit 1
           fi
+          # Clone the matching feature branch if it exists, otherwise main.
+          # During the ground-truth-p0-gap-1 PR cycle, bkearns/ferrosa's
+          # feature branch carries the Cargo.lock that the cluster image
+          # build needs (it's gitignored on main; will land via PR #114).
+          # Once that merges, this step degrades gracefully to main.
+          BRANCH="feature/ground-truth-p0-gap-1"
+          if ! git ls-remote --exit-code \
+              "https://x-access-token:${FERROSA_REPO_TOKEN}@github.com/bkearns/ferrosa.git" \
+              "refs/heads/${BRANCH}" >/dev/null 2>&1; then
+            BRANCH="main"
+          fi
+          echo "Cloning bkearns/ferrosa @ ${BRANCH}..."
           git clone --depth=1 \
+            --branch "${BRANCH}" \
             "https://x-access-token:${FERROSA_REPO_TOKEN}@github.com/bkearns/ferrosa.git" \
             /tmp/ferrosa-src
       - name: Bring up 3-node cluster on ports 19042-19044
