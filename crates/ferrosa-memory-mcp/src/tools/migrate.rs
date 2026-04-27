@@ -46,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
         "starting fmem migrate"
     );
 
-    let session = connect_with_retry(&cli.contact_points).await?;
+    let session = connect_with_retry(&cli.contact_points, cli.credentials.as_ref()).await?;
 
     // Read DDL files in lexicographic order (the prefix `001_keyspace.cql`
     // sequence already encodes the apply order).
@@ -75,12 +75,18 @@ async fn main() -> anyhow::Result<()> {
 }
 
 #[allow(deprecated)]
-async fn connect_with_retry(contact_points: &[String]) -> anyhow::Result<Arc<LegacySession>> {
+async fn connect_with_retry(
+    contact_points: &[String],
+    credentials: Option<&(String, String)>,
+) -> anyhow::Result<Arc<LegacySession>> {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 1..=30u32 {
         let mut builder = SessionBuilder::new();
         for cp in contact_points {
             builder = builder.known_node(cp.as_str());
+        }
+        if let Some((user, pass)) = credentials {
+            builder = builder.user(user.as_str(), pass.as_str());
         }
         match builder.build_legacy().await {
             Ok(s) => {
@@ -105,6 +111,16 @@ async fn apply_with_retry(session: &LegacySession, stmt: &str) -> anyhow::Result
             Ok(_) => return Ok(()),
             Err(e) => {
                 let msg = e.to_string();
+                // "Already exists" outcomes are benign for additive DDL: they
+                // mean the previous run (or a sibling node via schema gossip)
+                // already applied this statement. We log and treat as success
+                // so re-running migrate against a partially-migrated cluster
+                // does not refuse to make progress. This keeps every DDL file
+                // safely re-runnable.
+                if is_idempotent_already_exists(&msg) {
+                    tracing::info!(error = %e, "DDL no-op (already applied), continuing");
+                    return Ok(());
+                }
                 let retryable = msg.contains("schema may still be propagating")
                     || msg.contains("not found")
                     || msg.contains("Server is overloaded");
@@ -118,6 +134,17 @@ async fn apply_with_retry(session: &LegacySession, stmt: &str) -> anyhow::Result
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("DDL retry exhausted")))
+}
+
+/// Recognises ferrosa / scylla / cassandra error strings that mean
+/// "this DDL has already been applied; the post-condition is satisfied."
+/// Conservative: only matches additive-DDL outcomes (column / index / table
+/// already exists). Does NOT match drift in column type or other shape changes.
+fn is_idempotent_already_exists(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("already exists")
+        || m.contains("conflicts with an existing column")
+        || m.contains("duplicate column")
 }
 
 /// Split a multi-statement `.cql` file into individual statements. CQL
@@ -158,6 +185,7 @@ struct Args {
     contact_points: Vec<String>,
     keyspace: String,
     ddl_dir: PathBuf,
+    credentials: Option<(String, String)>,
 }
 
 fn parse_args() -> Args {
@@ -165,6 +193,8 @@ fn parse_args() -> Args {
     let mut contact_points: Vec<String> = vec![];
     let mut keyspace: Option<String> = None;
     let mut ddl_dir: Option<PathBuf> = None;
+    let mut user: Option<String> = None;
+    let mut password: Option<String> = None;
     while let Some(flag) = iter.next() {
         match flag.as_str() {
             "--contact-points" => {
@@ -178,9 +208,24 @@ fn parse_args() -> Args {
             }
             "--keyspace" => keyspace = iter.next(),
             "--ddl-dir" => ddl_dir = iter.next().map(PathBuf::from),
+            "--user" => user = iter.next(),
+            "--password" => password = iter.next(),
             other => panic!("unknown argument: {other}"),
         }
     }
+    let user = user.or_else(|| std::env::var("FERROSA_CQL_USER").ok());
+    let password = password.or_else(|| std::env::var("FERROSA_CQL_PASSWORD").ok());
+    let credentials = match (user, password) {
+        (Some(u), Some(p)) => Some((u, p)),
+        (None, None) => None,
+        _ => {
+            eprintln!(
+                "ERROR: --user and --password (or FERROSA_CQL_USER + FERROSA_CQL_PASSWORD) \
+                 must be supplied together, or both omitted."
+            );
+            std::process::exit(2);
+        }
+    };
     if contact_points.is_empty()
         && let Ok(v) = std::env::var("FERROSA_CQL_CONTACT_POINTS")
     {
@@ -205,5 +250,6 @@ fn parse_args() -> Args {
         ddl_dir: ddl_dir
             .or_else(|| std::env::var("FERROSA_DDL_DIR").ok().map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("ddl")),
+        credentials,
     }
 }
