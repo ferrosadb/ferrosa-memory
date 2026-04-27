@@ -67,9 +67,21 @@ jobs:
           # Exclude: test files, mock storage, infrastructure needing live services
           # (CQL storage, MCP/batch binaries, HTTP server, graph/embedding clients)
           EXCL='(tests/|test_|_test\.rs|mock|cql_storage\.rs|main\.rs|http\.rs|graph\.rs|embedding\.rs)'
+          # Skip integration test suites that panic-loud on missing
+          # FERROSA_TEST_CQL_PORT (per fmem CLAUDE.md policy). The
+          # cluster-gated tests run in the integration job instead.
           cargo llvm-cov --workspace \
             --lcov --output-path lcov.info \
-            --ignore-filename-regex "$EXCL"
+            --ignore-filename-regex "$EXCL" \
+            -- \
+            --skip scylla_driver_migration \
+            --skip ferrosa_bugs \
+            --skip cql_live \
+            --skip graph_live \
+            --skip vector_live \
+            --skip cql_storage_live \
+            --skip cql_isolate \
+            --skip expert_system_governance_spec
       - name: Coverage summary
         run: |
           EXCL='(tests/|test_|_test\.rs|mock|cql_storage\.rs|main\.rs|http\.rs|graph\.rs|embedding\.rs)'
@@ -388,26 +400,27 @@ jobs:
           done
       - name: Apply DDL + wait for schema propagation across all 3 nodes
         # p1-35: tests assume `agent_memory` keyspace + tables exist. The
-        # cluster bring-up only spins up empty nodes, so we must apply DDL
-        # before tests run, then wait for the schema to propagate to each
-        # contact point so that PREPARE doesn't return "keyspace not found"
-        # / `WrongColumnCount { cql_cols: 0 }` racing with replication.
+        # cluster bring-up only spins up empty nodes, so we apply DDL
+        # before tests run, then verify schema visibility on each node
+        # via a small SELECT against system_schema.keyspaces (avoiding
+        # the scylla driver's UDT metadata fetch path that errors against
+        # ferrosa's system_schema.types.field_names declaration).
         run: |
-          # Apply migrations against node1 — Raft replicates to nodes 2 + 3.
+          # Apply DDL files in order against node1 — Raft replicates them.
           cargo run --bin migrate -- \
             --contact-points 127.0.0.1:19042 \
-            --keyspace agent_memory
+            --keyspace agent_memory \
+            --ddl-dir ddl
 
-          # Propagation barrier: re-run the migration binary against each
-          # node — `run_migrations` is idempotent, so once it succeeds
-          # against a given contact point we know that node sees the
-          # keyspace + tables.
+          # Propagation barrier: re-run the same idempotent DDL bundle
+          # against each peer until the keyspace is visible.
           for port in 19043 19044; do
             echo "Waiting for keyspace propagation on port ${port}..."
             for i in $(seq 1 30); do
               if cargo run --quiet --bin migrate -- \
                   --contact-points 127.0.0.1:${port} \
-                  --keyspace agent_memory >/dev/null 2>&1; then
+                  --keyspace agent_memory \
+                  --ddl-dir ddl >/dev/null 2>&1; then
                 echo "  port ${port} sees agent_memory after ${i} attempts"
                 break
               fi
