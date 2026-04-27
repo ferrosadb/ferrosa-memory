@@ -7,6 +7,10 @@ edition.workspace = true
 name = "fix-edge-sessions"
 path = "src/tools/fix_edge_sessions.rs"
 
+[[bin]]
+name = "migrate"
+path = "src/tools/migrate.rs"
+
 [dependencies]
 ferrosa-memory-core = { path = "../ferrosa-memory-core" }
 tokio = { workspace = true }

@@ -49,6 +49,9 @@ jobs:
     name: Tests & Coverage
     runs-on: ubuntu-latest
     needs: build
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
@@ -185,6 +188,9 @@ jobs:
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     needs: build
     timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
@@ -374,6 +380,39 @@ jobs:
               fi
               if [ "$i" -eq 60 ]; then
                 echo "::error::Port ${port} did not become ready within 60s"
+                docker compose -f /tmp/docker-compose.memory-ci.yml logs 2>/dev/null | tail -100
+                exit 1
+              fi
+              sleep 2
+            done
+          done
+      - name: Apply DDL + wait for schema propagation across all 3 nodes
+        # p1-35: tests assume `agent_memory` keyspace + tables exist. The
+        # cluster bring-up only spins up empty nodes, so we must apply DDL
+        # before tests run, then wait for the schema to propagate to each
+        # contact point so that PREPARE doesn't return "keyspace not found"
+        # / `WrongColumnCount { cql_cols: 0 }` racing with replication.
+        run: |
+          # Apply migrations against node1 — Raft replicates to nodes 2 + 3.
+          cargo run --bin migrate -- \
+            --contact-points 127.0.0.1:19042 \
+            --keyspace agent_memory
+
+          # Propagation barrier: re-run the migration binary against each
+          # node — `run_migrations` is idempotent, so once it succeeds
+          # against a given contact point we know that node sees the
+          # keyspace + tables.
+          for port in 19043 19044; do
+            echo "Waiting for keyspace propagation on port ${port}..."
+            for i in $(seq 1 30); do
+              if cargo run --quiet --bin migrate -- \
+                  --contact-points 127.0.0.1:${port} \
+                  --keyspace agent_memory >/dev/null 2>&1; then
+                echo "  port ${port} sees agent_memory after ${i} attempts"
+                break
+              fi
+              if [ "$i" -eq 30 ]; then
+                echo "::error::Schema not visible on port ${port} within 60s"
                 docker compose -f /tmp/docker-compose.memory-ci.yml logs 2>/dev/null | tail -100
                 exit 1
               fi
