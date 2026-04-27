@@ -91,6 +91,19 @@ async fn prepare_vector_column() {
     }
     let session = connect_plain("127.0.0.1:19042").await;
 
+    // The `test_vector_blob` table is test-only (not in production DDL).
+    // Create it here so this test is self-contained and not order-dependent
+    // with `vector_live::vector_blob_workaround_roundtrip`, which also creates it.
+    #[allow(deprecated)]
+    session
+        .query_unpaged(
+            "CREATE TABLE IF NOT EXISTS agent_memory.test_vector_blob \
+             (id uuid PRIMARY KEY, embedding vector<float, 4>)",
+            (),
+        )
+        .await
+        .expect("CREATE TABLE test_vector_blob");
+
     eprintln!("PREPARE vector INSERT...");
     match session
         .prepare("INSERT INTO agent_memory.test_vector_blob (id, embedding) VALUES (?, ?)")

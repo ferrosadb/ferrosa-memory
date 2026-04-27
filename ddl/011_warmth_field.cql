@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS agent_memory.entity_warmth (
     session_id uuid,
     warmth double,
     pagerank double,
+    reputation double,
     last_accessed_at timestamp,
     access_count int,
     decay_zone text,
