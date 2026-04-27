@@ -392,21 +392,37 @@ jobs:
               sleep 2
             done
           done
-      - name: Apply DDL via migrate binary (best-effort; blocked by p1-37)
-        # The migrate binary uses scylla 0.15, which can't currently apply
-        # DDL against ferrosa due to a server-side schema-typing bug
-        # (`system_schema.types.field_names` declared as `Text` instead of
-        # `frozen<list<text>>`; see p1-37). We try anyway and let the
-        # actual integration tests report what they hit. The cluster-up
-        # phase is sound — only the migration step is blocked.
-        # Once p1-37 lands, this step can become a hard gate again.
-        continue-on-error: true
+      - name: Apply DDL + wait for schema propagation across all 3 nodes
+        # p1-37 (ferrosa) lifted the scylla 0.15 driver-compat block, so
+        # the migrate binary can now apply DDL against ferrosa via raw
+        # `session.query_unpaged`. Verified locally: all 28 fmem DDL
+        # files apply end-to-end ("migrations completed").
         run: |
           cargo run --bin migrate -- \
             --contact-points 127.0.0.1:19042 \
             --keyspace agent_memory \
-            --ddl-dir ddl || \
-              echo "::warning::migrate failed (likely p1-37 UDT type-check bug)"
+            --ddl-dir ddl
+
+          # Propagation barrier: re-run the same idempotent DDL against
+          # each peer until the keyspace is visible.
+          for port in 19043 19044; do
+            echo "Waiting for keyspace propagation on port ${port}..."
+            for i in $(seq 1 30); do
+              if cargo run --quiet --bin migrate -- \
+                  --contact-points 127.0.0.1:${port} \
+                  --keyspace agent_memory \
+                  --ddl-dir ddl >/dev/null 2>&1; then
+                echo "  port ${port} sees agent_memory after ${i} attempts"
+                break
+              fi
+              if [ "$i" -eq 30 ]; then
+                echo "::error::Schema not visible on port ${port} within 60s"
+                docker compose -f /tmp/docker-compose.memory-ci.yml logs 2>/dev/null | tail -100
+                exit 1
+              fi
+              sleep 2
+            done
+          done
       - name: Run ignored (cluster-gated) Rust tests
         env:
           FERROSA_TEST_CONTAINERS: "1"
