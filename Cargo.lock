@@ -1719,8 +1719,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "scylla"
 version = "0.15.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0408e59e11f589071d1cefc3928270aa8fe4d03f654cb118e0c24d16013ea82"
+source = "git+https://github.com/ferrosadb/scylla-rust-driver?rev=2c493e8cf9968d6c83d33a3dc36c3ef3da595f9a#2c493e8cf9968d6c83d33a3dc36c3ef3da595f9a"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1750,8 +1749,7 @@ dependencies = [
 [[package]]
 name = "scylla-cql"
 version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0cefd8b924bb8f67525937a811038d5662f9febc30c74c778a8205f63c4b365"
+source = "git+https://github.com/ferrosadb/scylla-rust-driver?rev=2c493e8cf9968d6c83d33a3dc36c3ef3da595f9a#2c493e8cf9968d6c83d33a3dc36c3ef3da595f9a"
 dependencies = [
  "async-trait",
  "byteorder",
@@ -1770,8 +1768,7 @@ dependencies = [
 [[package]]
 name = "scylla-macros"
 version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e878bfb8a235207864ac3fb0b51d7954c77fd38486e0e4fb4e037935ff7eb46c"
+source = "git+https://github.com/ferrosadb/scylla-rust-driver?rev=2c493e8cf9968d6c83d33a3dc36c3ef3da595f9a#2c493e8cf9968d6c83d33a3dc36c3ef3da595f9a"
 dependencies = [
  "darling",
  "proc-macro2",
