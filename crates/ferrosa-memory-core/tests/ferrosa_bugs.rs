@@ -20,10 +20,26 @@ async fn connect_plain(contact_point: &str) -> LegacySession {
 
 // ---- FIXED: Vector PREPARE + ANN ----
 
+/// Creates `agent_memory.test_vector_blob` if it does not exist. The table is
+/// test-only (not in production DDL), so each test that depends on it must
+/// bootstrap it. Using `IF NOT EXISTS` keeps this idempotent across the
+/// vector_live and ferrosa_bugs suites that share the table.
+async fn ensure_test_vector_blob(s: &LegacySession) {
+    #[allow(deprecated)]
+    s.query_unpaged(
+        "CREATE TABLE IF NOT EXISTS agent_memory.test_vector_blob \
+         (id uuid PRIMARY KEY, embedding vector<float, 4>)",
+        (),
+    )
+    .await
+    .expect("CREATE TABLE test_vector_blob");
+}
+
 #[tokio::test]
 #[ignore]
 async fn fixed_vector_prepare() {
     let s = connect_plain("127.0.0.1:19042").await;
+    ensure_test_vector_blob(&s).await;
     s.prepare("INSERT INTO agent_memory.test_vector_blob (id, embedding) VALUES (?, ?)")
         .await
         .expect("PREPARE on vector column");
@@ -33,6 +49,7 @@ async fn fixed_vector_prepare() {
 #[ignore]
 async fn fixed_vector_ann_query() {
     let s = connect_plain("127.0.0.1:19042").await;
+    ensure_test_vector_blob(&s).await;
     s.prepare("SELECT id FROM agent_memory.test_vector_blob ORDER BY embedding ANN OF ? LIMIT 5")
         .await
         .expect("ANN query PREPARE");
