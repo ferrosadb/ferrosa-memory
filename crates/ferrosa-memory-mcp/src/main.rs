@@ -1872,9 +1872,12 @@ async fn main() -> anyhow::Result<()> {
                         } else {
                             "http".into()
                         },
-                        workbench_port: config.server.http_port,
+                        workbench_port: config
+                            .server
+                            .public_port
+                            .unwrap_or(config.server.http_port),
                         viz_scheme: "http".into(),
-                        viz_port: config.viz.port,
+                        viz_port: config.viz.public_port.unwrap_or(config.viz.port),
                     },
                     session,
                 },
