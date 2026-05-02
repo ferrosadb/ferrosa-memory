@@ -87,6 +87,7 @@ pub fn parse_rule(text: &str) -> anyhow::Result<DatalogRule> {
         head,
         body,
         filters,
+        aggregates: Vec::new(),
     })
 }
 

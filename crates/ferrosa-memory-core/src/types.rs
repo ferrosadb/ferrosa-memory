@@ -408,11 +408,26 @@ pub enum ArithOp {
     Div,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AggregateKind {
+    Count,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Aggregate {
+    pub kind: AggregateKind,
+    pub inner: Atom,
+    pub group_vars: Vec<String>,
+    pub output_var: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DatalogRule {
     pub head: Atom,
     pub body: Vec<Atom>,
     pub filters: Vec<BuiltinFilter>,
+    #[serde(default)]
+    pub aggregates: Vec<Aggregate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -946,5 +961,35 @@ mod tests {
             let back: BuiltinFilter = serde_json::from_str(&json).unwrap();
             assert_eq!(back, f);
         }
+    }
+
+    #[test]
+    fn aggregate_round_trips_through_json() {
+        let a = Aggregate {
+            kind: AggregateKind::Count,
+            inner: Atom {
+                predicate: "user_corrected".into(),
+                args: vec![
+                    Term::Var("S".into()),
+                    Term::Var("X".into()),
+                ],
+            },
+            group_vars: vec!["X".into()],
+            output_var: "N".into(),
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        let back: Aggregate = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, a);
+    }
+
+    #[test]
+    fn datalog_rule_without_aggregates_field_deserializes_with_default() {
+        let json = r#"{
+            "head": {"predicate": "foo", "args": [{"type": "Var", "value": "X"}]},
+            "body": [{"predicate": "bar", "args": [{"type": "Var", "value": "X"}]}],
+            "filters": []
+        }"#;
+        let rule: DatalogRule = serde_json::from_str(json).unwrap();
+        assert!(rule.aggregates.is_empty());
     }
 }
