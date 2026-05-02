@@ -238,3 +238,15 @@ Following the project's TDD + CI gates:
 - Sweep `builtin_rules()` to use the cleaner operators where applicable.
 - Optional: deprecate the legacy `BuiltinFilter` variants once all CQL-stored rules have been re-emitted by the new parser. A migration tool would scan `RuleEntry` rows, re-parse, rewrite. Not part of this change.
 - Optional: extend the grammar with `length(X)`, `contains(X, "foo")`, or other unary built-ins. Would require revisiting the AST.
+- **Aggregation (`count`, `sum`, `min`, `max`, `avg`).** Rules like
+  `avoid_action(X) :- count(user_corrected(S, X), N), N >= 3.`
+  use an aggregate predicate that takes another atom as a sub-expression
+  and binds a numeric result. This is conceptually separate from
+  comparison/arithmetic on already-bound variables: it requires (a) a
+  new AST node for "aggregate over a goal", (b) a stratified evaluator
+  pass that runs the inner goal to fixpoint before computing the
+  aggregate, and (c) careful handling of recursion (most Datalog
+  variants disallow recursion through aggregation). The plan ships
+  `#[ignore]`-d test `user_example_count_aggregate_with_ge` as a
+  documented placeholder so the requirement stays visible. A separate
+  spec should drive that work.
