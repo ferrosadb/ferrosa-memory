@@ -46,7 +46,10 @@ fn string_lit(input: &str) -> IResult<&str, FilterExpr> {
 }
 
 fn identifier(input: &str) -> IResult<&str, FilterExpr> {
-    let head = satisfy(|c: char| c.is_ascii_uppercase() || c == '_');
+    // Accept both uppercase and lowercase identifiers to support variable names
+    // like 'name', 'x', 'X', etc. Datalog filters allow variable names starting
+    // with any ASCII letter or underscore.
+    let head = satisfy(|c: char| c.is_ascii_alphabetic() || c == '_');
     let tail = many0_count(satisfy(|c: char| c.is_ascii_alphanumeric() || c == '_'));
     let (i, name) = recognize(pair(head, tail))(input)?;
     Ok((i, FilterExpr::Var(name.to_string())))
@@ -230,5 +233,28 @@ mod tests {
             }
             other => panic!("expected LitNum(-1.5) on rhs, got {other:?}"),
         }
+    }
+
+    // Task 6: string equality + var-to-var comparison
+    #[test]
+    fn string_literal_equality() {
+        let f = parse_filter(r#"name == "alice""#).unwrap();
+        assert_eq!(
+            f,
+            BuiltinFilter::Compare {
+                op: CmpOp::Eq,
+                lhs: var("name"),
+                rhs: FilterExpr::LitStr("alice".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn variable_to_variable_ordered_comparison() {
+        let f = parse_filter("S >= T").unwrap();
+        assert_eq!(
+            f,
+            BuiltinFilter::Compare { op: CmpOp::Ge, lhs: var("S"), rhs: var("T") }
+        );
     }
 }
