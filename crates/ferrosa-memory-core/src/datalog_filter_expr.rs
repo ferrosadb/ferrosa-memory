@@ -144,4 +144,35 @@ mod tests {
             BuiltinFilter::Compare { op: CmpOp::Eq, lhs: lit(3.0), rhs: lit(3.0) }
         );
     }
+
+    // Task 4: comparison operators + whitespace tolerance
+    #[test]
+    fn parses_each_comparison_operator() {
+        let cases = [
+            ("X == Y", CmpOp::Eq),
+            ("X = Y", CmpOp::Eq),
+            ("X != Y", CmpOp::Ne),
+            ("X < Y", CmpOp::Lt),
+            ("X <= Y", CmpOp::Le),
+            ("X > Y", CmpOp::Gt),
+            ("X >= Y", CmpOp::Ge),
+        ];
+        for (src, want) in cases {
+            let got = parse_filter(src).expect(src);
+            match got {
+                BuiltinFilter::Compare { op, .. } => assert_eq!(op, want, "for {src}"),
+                other => panic!("expected Compare for {src}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn whitespace_does_not_matter() {
+        let a = parse_filter("X>=3").unwrap();
+        let b = parse_filter("X >= 3").unwrap();
+        let c = parse_filter("X  >=  3").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+    }
+
 }
