@@ -1584,4 +1584,36 @@ mod tests {
         let (hits, _compute) = store.heat_get(&ctx, "related", 7).await.unwrap();
         assert!(hits >= 1, "should have at least one cache hit recorded");
     }
+
+    #[test]
+    fn evaluate_full_rule_with_ge_filter() {
+        use ordered_float::OrderedFloat;
+
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+
+        let mut facts = FactSet::new();
+        // confidence(entity, score)
+        facts.insert("confidence", vec![Term::Const(a), Term::ConstFloat(OrderedFloat(0.85))]);
+        facts.insert("confidence", vec![Term::Const(b), Term::ConstFloat(OrderedFloat(0.65))]);
+        facts.insert("confidence", vec![Term::Const(c), Term::ConstFloat(OrderedFloat(0.7))]);
+
+        let rule = parse_rule("trusted(X) :- confidence(X, S), S >= 0.7.").unwrap();
+        let (derived_set, _provenance) = evaluate(&[rule], &facts, 100, 1000);
+
+        let trusted: std::collections::HashSet<Uuid> = derived_set
+            .get("trusted")
+            .into_iter()
+            .flatten()
+            .filter_map(|args| match args.first()? {
+                Term::Const(u) => Some(*u),
+                _ => None,
+            })
+            .collect();
+
+        assert!(trusted.contains(&a), "0.85 >= 0.7 should derive trusted(a)");
+        assert!(trusted.contains(&c), "0.7 >= 0.7 should derive trusted(c)");
+        assert!(!trusted.contains(&b), "0.65 >= 0.7 must not derive trusted(b)");
+    }
 }
