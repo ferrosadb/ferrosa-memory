@@ -257,4 +257,32 @@ mod tests {
             BuiltinFilter::Compare { op: CmpOp::Ge, lhs: var("S"), rhs: var("T") }
         );
     }
+
+    // Task 7: error paths
+    #[test]
+    fn rejects_trailing_junk() {
+        assert!(parse_filter("X >= 3 garbage").is_err());
+    }
+
+    #[test]
+    fn rejects_missing_rhs() {
+        assert!(parse_filter("X >=").is_err());
+    }
+
+    #[test]
+    fn rejects_unmatched_paren() {
+        assert!(parse_filter("(X + Y >= Z").is_err());
+    }
+
+    #[test]
+    fn rejects_missing_comparison_operator() {
+        // Bare expression with no comparison is not a filter.
+        assert!(parse_filter("X + Y").is_err());
+    }
+
+    #[test]
+    fn error_message_includes_offending_input() {
+        let err = parse_filter("X >>= 3").unwrap_err();
+        assert!(err.to_string().contains("X >>= 3"));
+    }
 }
