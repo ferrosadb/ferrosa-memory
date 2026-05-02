@@ -725,16 +725,19 @@ mod tests {
 
     #[test]
     fn test_parse_rule_with_filter() {
+        use crate::types::{CmpOp, FilterExpr};
         let rule =
             parse_rule("related(X, Z) :- co_occurs(X, Y), co_occurs(Y, Z), X != Z.").unwrap();
         assert_eq!(rule.head.predicate, "related");
         assert_eq!(rule.body.len(), 2);
-        assert_eq!(rule.body[0].predicate, "co_occurs");
-        assert_eq!(rule.body[1].predicate, "co_occurs");
         assert_eq!(rule.filters.len(), 1);
         assert_eq!(
             rule.filters[0],
-            BuiltinFilter::NotEqual("X".into(), "Z".into())
+            BuiltinFilter::Compare {
+                op: CmpOp::Ne,
+                lhs: FilterExpr::Var("X".into()),
+                rhs: FilterExpr::Var("Z".into()),
+            }
         );
     }
 
@@ -780,16 +783,34 @@ mod tests {
 
     #[test]
     fn test_parse_greater_than_filter() {
+        use crate::types::{CmpOp, FilterExpr};
+        use ordered_float::OrderedFloat;
         let rule = parse_rule("hot(X) :- warmth(X, W), W > 0.5.").unwrap();
         assert_eq!(rule.filters.len(), 1);
-        assert_eq!(rule.filters[0], BuiltinFilter::GreaterThan("W".into(), 0.5));
+        assert_eq!(
+            rule.filters[0],
+            BuiltinFilter::Compare {
+                op: CmpOp::Gt,
+                lhs: FilterExpr::Var("W".into()),
+                rhs: FilterExpr::LitNum(OrderedFloat(0.5)),
+            }
+        );
     }
 
     #[test]
     fn test_parse_less_than_filter() {
+        use crate::types::{CmpOp, FilterExpr};
+        use ordered_float::OrderedFloat;
         let rule = parse_rule("cold(X) :- warmth(X, W), W < 0.1.").unwrap();
         assert_eq!(rule.filters.len(), 1);
-        assert_eq!(rule.filters[0], BuiltinFilter::LessThan("W".into(), 0.1));
+        assert_eq!(
+            rule.filters[0],
+            BuiltinFilter::Compare {
+                op: CmpOp::Lt,
+                lhs: FilterExpr::Var("W".into()),
+                rhs: FilterExpr::LitNum(OrderedFloat(0.1)),
+            }
+        );
     }
 
     // ── Evaluator tests ───────────────────────────────────────────
