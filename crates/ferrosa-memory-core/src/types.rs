@@ -361,10 +361,40 @@ pub struct Atom {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum BuiltinFilter {
+    /// Legacy: variable greater than a literal float.
+    /// No longer emitted by the parser; preserved so already-persisted
+    /// `RuleEntry` rows in CQL still deserialize.
     GreaterThan(String, f64),
+    /// Legacy. See `GreaterThan` doc.
     LessThan(String, f64),
+    /// Legacy. See `GreaterThan` doc.
     NotEqual(String, String),
+    /// Full comparison filter — the only variant the parser emits.
+    Compare {
+        op: CmpOp,
+        lhs: FilterExpr,
+        rhs: FilterExpr,
+    },
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CmpOp { Eq, Ne, Lt, Le, Gt, Ge }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum FilterExpr {
+    Var(String),
+    LitNum(ordered_float::OrderedFloat<f64>),
+    LitStr(String),
+    BinOp {
+        op: ArithOp,
+        lhs: Box<FilterExpr>,
+        rhs: Box<FilterExpr>,
+    },
+    Neg(Box<FilterExpr>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ArithOp { Add, Sub, Mul, Div }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DatalogRule {
@@ -876,5 +906,33 @@ mod tests {
         assert_eq!(back.content_hash.as_deref(), Some("sha256:abc"));
         assert_eq!(back.scope, EntityScope::Global);
         assert_eq!(back.ingested_by_session, Some(ingester));
+    }
+
+    #[test]
+    fn builtin_filter_compare_round_trips_through_json() {
+        let f = BuiltinFilter::Compare {
+            op: CmpOp::Ge,
+            lhs: FilterExpr::Var("S".into()),
+            rhs: FilterExpr::BinOp {
+                op: ArithOp::Add,
+                lhs: Box::new(FilterExpr::Var("T".into())),
+                rhs: Box::new(FilterExpr::LitNum(ordered_float::OrderedFloat(1.0))),
+            },
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        let back: BuiltinFilter = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, f);
+    }
+
+    #[test]
+    fn legacy_builtin_filter_variants_still_round_trip() {
+        let g = BuiltinFilter::GreaterThan("X".into(), 0.5);
+        let l = BuiltinFilter::LessThan("X".into(), 0.5);
+        let n = BuiltinFilter::NotEqual("X".into(), "Y".into());
+        for f in [g, l, n] {
+            let json = serde_json::to_string(&f).unwrap();
+            let back: BuiltinFilter = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, f);
+        }
     }
 }

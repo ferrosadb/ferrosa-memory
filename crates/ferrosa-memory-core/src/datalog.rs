@@ -372,6 +372,8 @@ fn check_one_filter(filter: &BuiltinFilter, binding: &HashMap<String, Term>) -> 
                 true
             }
         }
+        // Full expression-based comparison; evaluation wired in Task 10.
+        BuiltinFilter::Compare { .. } => todo!("Compare filter evaluation not yet implemented"),
     }
 }
 
