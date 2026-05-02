@@ -1616,4 +1616,61 @@ mod tests {
         assert!(trusted.contains(&c), "0.7 >= 0.7 should derive trusted(c)");
         assert!(!trusted.contains(&b), "0.65 >= 0.7 must not derive trusted(b)");
     }
+
+    #[test]
+    fn user_example_var_to_var_inequality() {
+        // The user explicitly called this out as a target rule. After this
+        // change it parses to a Compare { op: Ne, … } and evaluates correctly.
+        use crate::types::{CmpOp, FilterExpr};
+
+        let rule = parse_rule(
+            "avoid_action(X) :- user_corrected(S1, X), user_corrected(S2, X), S1 != S2.",
+        )
+        .unwrap();
+        assert_eq!(rule.filters.len(), 1);
+        assert_eq!(
+            rule.filters[0],
+            BuiltinFilter::Compare {
+                op: CmpOp::Ne,
+                lhs: FilterExpr::Var("S1".into()),
+                rhs: FilterExpr::Var("S2".into()),
+            }
+        );
+
+        // End-to-end: two distinct sessions corrected the same target.
+        let s1 = Uuid::new_v4();
+        let s2 = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        let mut facts = FactSet::new();
+        facts.insert("user_corrected", vec![Term::Const(s1), Term::Const(target)]);
+        facts.insert("user_corrected", vec![Term::Const(s2), Term::Const(target)]);
+        let (derived, _) = evaluate(&[rule], &facts, 100, 1000);
+        let any_avoid = derived.get("avoid_action").is_some_and(|s| !s.is_empty());
+        assert!(any_avoid, "expected avoid_action to fire when two distinct sessions corrected the same target");
+    }
+
+    #[test]
+    #[ignore = "requires aggregation (count) support — see specs follow-up: \
+                count(predicate(...), N) is not in the arithmetic/comparison grammar. \
+                Tracking deliverable: extend the parser AST + evaluator with aggregate \
+                predicates. Removing #[ignore] without adding aggregation will fail \
+                with 'invalid filter' on the count(...) clause."]
+    fn user_example_count_aggregate_with_ge() {
+        // Target rule from the user:
+        //   avoid_action(X) :- count(user_corrected(S, X), N), N >= 3.
+        //
+        // The N >= 3 filter parses fine after this change. The blocker is
+        // count(user_corrected(S, X), N) — that's an aggregate predicate, not
+        // a plain atom or a filter. parse_rule currently has no notion of
+        // aggregation, so this rule fails at parse time on the count(...) body.
+        //
+        // When the aggregation feature lands, remove #[ignore] and assert the
+        // expected derivation:
+        //   3 distinct sessions corrected target T  ⇒  avoid_action(T) fires
+        //   2 distinct sessions corrected target U  ⇒  avoid_action(U) does NOT fire
+        let rule = parse_rule("avoid_action(X) :- count(user_corrected(S, X), N), N >= 3.")
+            .expect("aggregation-extended parser should accept this rule");
+        let _ = rule;
+        panic!("aggregation evaluator not implemented");
+    }
 }
