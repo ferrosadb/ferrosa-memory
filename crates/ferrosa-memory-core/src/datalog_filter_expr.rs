@@ -13,6 +13,7 @@
 
 use crate::types::{ArithOp, BuiltinFilter, CmpOp, FilterExpr};
 use nom::{
+    IResult,
     branch::alt,
     bytes::complete::{escaped, is_not, tag},
     character::complete::{char as ch, multispace0, one_of, satisfy},
@@ -20,7 +21,6 @@ use nom::{
     multi::{fold_many0, many0_count},
     number::complete::double,
     sequence::{delimited, pair, preceded, tuple},
-    IResult,
 };
 
 fn ws<'a, O, F>(mut inner: F) -> impl FnMut(&'a str) -> IResult<&'a str, O>
@@ -36,7 +36,9 @@ where
 }
 
 fn number(input: &str) -> IResult<&str, FilterExpr> {
-    map(double, |f| FilterExpr::LitNum(ordered_float::OrderedFloat(f)))(input)
+    map(double, |f| {
+        FilterExpr::LitNum(ordered_float::OrderedFloat(f))
+    })(input)
 }
 
 fn string_lit(input: &str) -> IResult<&str, FilterExpr> {
@@ -75,7 +77,11 @@ fn term(input: &str) -> IResult<&str, FilterExpr> {
         pair(ws(alt((ch('*'), ch('/')))), factor),
         move || init.clone(),
         |acc, (op, rhs)| FilterExpr::BinOp {
-            op: if op == '*' { ArithOp::Mul } else { ArithOp::Div },
+            op: if op == '*' {
+                ArithOp::Mul
+            } else {
+                ArithOp::Div
+            },
             lhs: Box::new(acc),
             rhs: Box::new(rhs),
         },
@@ -88,7 +94,11 @@ fn expr(input: &str) -> IResult<&str, FilterExpr> {
         pair(ws(alt((ch('+'), ch('-')))), term),
         move || init.clone(),
         |acc, (op, rhs)| FilterExpr::BinOp {
-            op: if op == '+' { ArithOp::Add } else { ArithOp::Sub },
+            op: if op == '+' {
+                ArithOp::Add
+            } else {
+                ArithOp::Sub
+            },
             lhs: Box::new(acc),
             rhs: Box::new(rhs),
         },
@@ -144,7 +154,11 @@ mod tests {
         let f = parse_filter("3 == 3").unwrap();
         assert_eq!(
             f,
-            BuiltinFilter::Compare { op: CmpOp::Eq, lhs: lit(3.0), rhs: lit(3.0) }
+            BuiltinFilter::Compare {
+                op: CmpOp::Eq,
+                lhs: lit(3.0),
+                rhs: lit(3.0)
+            }
         );
     }
 
@@ -203,10 +217,21 @@ mod tests {
         let f = parse_filter("(X + Y) * 2 < N").unwrap();
         match f {
             BuiltinFilter::Compare {
-                lhs: FilterExpr::BinOp { op: ArithOp::Mul, lhs, rhs },
+                lhs:
+                    FilterExpr::BinOp {
+                        op: ArithOp::Mul,
+                        lhs,
+                        rhs,
+                    },
                 ..
             } => {
-                assert!(matches!(*lhs, FilterExpr::BinOp { op: ArithOp::Add, .. }));
+                assert!(matches!(
+                    *lhs,
+                    FilterExpr::BinOp {
+                        op: ArithOp::Add,
+                        ..
+                    }
+                ));
                 assert_eq!(*rhs, lit(2.0));
             }
             other => panic!("expected (X+Y)*2 to parse as Mul at the top, got {other:?}"),
@@ -217,7 +242,10 @@ mod tests {
     fn unary_minus_on_variable() {
         let f = parse_filter("-X >= 0").unwrap();
         match f {
-            BuiltinFilter::Compare { lhs: FilterExpr::Neg(inner), .. } => {
+            BuiltinFilter::Compare {
+                lhs: FilterExpr::Neg(inner),
+                ..
+            } => {
                 assert_eq!(*inner, var("X"));
             }
             other => panic!("expected Neg(Var(X)) on lhs, got {other:?}"),
@@ -228,7 +256,10 @@ mod tests {
     fn negative_literal_parses_as_litnum_not_neg() {
         let f = parse_filter("X >= -1.5").unwrap();
         match f {
-            BuiltinFilter::Compare { rhs: FilterExpr::LitNum(OrderedFloat(v)), .. } => {
+            BuiltinFilter::Compare {
+                rhs: FilterExpr::LitNum(OrderedFloat(v)),
+                ..
+            } => {
                 assert_eq!(v, -1.5);
             }
             other => panic!("expected LitNum(-1.5) on rhs, got {other:?}"),
@@ -254,7 +285,11 @@ mod tests {
         let f = parse_filter("S >= T").unwrap();
         assert_eq!(
             f,
-            BuiltinFilter::Compare { op: CmpOp::Ge, lhs: var("S"), rhs: var("T") }
+            BuiltinFilter::Compare {
+                op: CmpOp::Ge,
+                lhs: var("S"),
+                rhs: var("T")
+            }
         );
     }
 

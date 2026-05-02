@@ -378,7 +378,14 @@ pub enum BuiltinFilter {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum CmpOp { Eq, Ne, Lt, Le, Gt, Ge }
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FilterExpr {
@@ -394,7 +401,12 @@ pub enum FilterExpr {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ArithOp { Add, Sub, Mul, Div }
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DatalogRule {

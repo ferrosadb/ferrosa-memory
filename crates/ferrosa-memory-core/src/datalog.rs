@@ -202,7 +202,6 @@ fn has_top_level_cmp(s: &str) -> bool {
     false
 }
 
-
 // ─── Semi-Naive Evaluator ─────────────────────────────────────────
 
 /// Run semi-naive fixpoint evaluation over a set of rules and initial facts.
@@ -416,7 +415,9 @@ fn apply_cmp(op: crate::types::CmpOp, l: &EvalValue, r: &EvalValue) -> bool {
     use std::cmp::Ordering;
     match (l, r) {
         (EvalValue::Num(a), EvalValue::Num(b)) => {
-            let Some(ord) = a.partial_cmp(b) else { return false; }; // NaN
+            let Some(ord) = a.partial_cmp(b) else {
+                return false;
+            }; // NaN
             match (op, ord) {
                 (CmpOp::Eq, Ordering::Equal) => true,
                 (CmpOp::Ne, ord) => ord != Ordering::Equal,
@@ -1451,7 +1452,7 @@ mod tests {
 
     #[test]
     fn evaluator_handles_ge_and_arithmetic() {
-        use crate::types::{CmpOp, FilterExpr, ArithOp};
+        use crate::types::{ArithOp, CmpOp, FilterExpr};
         use ordered_float::OrderedFloat;
         use std::collections::HashMap;
 
@@ -1505,19 +1506,28 @@ mod tests {
 
     #[test]
     fn legacy_filter_variants_still_evaluate() {
-        use std::collections::HashMap;
         use ordered_float::OrderedFloat;
+        use std::collections::HashMap;
 
         let mut binding: HashMap<String, Term> = HashMap::new();
         binding.insert("X".into(), Term::ConstFloat(OrderedFloat(0.7)));
 
-        assert!(check_one_filter(&BuiltinFilter::GreaterThan("X".into(), 0.5), &binding));
-        assert!(!check_one_filter(&BuiltinFilter::LessThan("X".into(), 0.5), &binding));
+        assert!(check_one_filter(
+            &BuiltinFilter::GreaterThan("X".into(), 0.5),
+            &binding
+        ));
+        assert!(!check_one_filter(
+            &BuiltinFilter::LessThan("X".into(), 0.5),
+            &binding
+        ));
 
         let mut b2: HashMap<String, Term> = HashMap::new();
         b2.insert("A".into(), Term::ConstStr("foo".into()));
         b2.insert("B".into(), Term::ConstStr("bar".into()));
-        assert!(check_one_filter(&BuiltinFilter::NotEqual("A".into(), "B".into()), &b2));
+        assert!(check_one_filter(
+            &BuiltinFilter::NotEqual("A".into(), "B".into()),
+            &b2
+        ));
     }
 
     #[tokio::test]
@@ -1595,9 +1605,18 @@ mod tests {
 
         let mut facts = FactSet::new();
         // confidence(entity, score)
-        facts.insert("confidence", vec![Term::Const(a), Term::ConstFloat(OrderedFloat(0.85))]);
-        facts.insert("confidence", vec![Term::Const(b), Term::ConstFloat(OrderedFloat(0.65))]);
-        facts.insert("confidence", vec![Term::Const(c), Term::ConstFloat(OrderedFloat(0.7))]);
+        facts.insert(
+            "confidence",
+            vec![Term::Const(a), Term::ConstFloat(OrderedFloat(0.85))],
+        );
+        facts.insert(
+            "confidence",
+            vec![Term::Const(b), Term::ConstFloat(OrderedFloat(0.65))],
+        );
+        facts.insert(
+            "confidence",
+            vec![Term::Const(c), Term::ConstFloat(OrderedFloat(0.7))],
+        );
 
         let rule = parse_rule("trusted(X) :- confidence(X, S), S >= 0.7.").unwrap();
         let (derived_set, _provenance) = evaluate(&[rule], &facts, 100, 1000);
@@ -1614,7 +1633,10 @@ mod tests {
 
         assert!(trusted.contains(&a), "0.85 >= 0.7 should derive trusted(a)");
         assert!(trusted.contains(&c), "0.7 >= 0.7 should derive trusted(c)");
-        assert!(!trusted.contains(&b), "0.65 >= 0.7 must not derive trusted(b)");
+        assert!(
+            !trusted.contains(&b),
+            "0.65 >= 0.7 must not derive trusted(b)"
+        );
     }
 
     #[test]
@@ -1646,7 +1668,10 @@ mod tests {
         facts.insert("user_corrected", vec![Term::Const(s2), Term::Const(target)]);
         let (derived, _) = evaluate(&[rule], &facts, 100, 1000);
         let any_avoid = derived.get("avoid_action").is_some_and(|s| !s.is_empty());
-        assert!(any_avoid, "expected avoid_action to fire when two distinct sessions corrected the same target");
+        assert!(
+            any_avoid,
+            "expected avoid_action to fire when two distinct sessions corrected the same target"
+        );
     }
 
     #[test]
