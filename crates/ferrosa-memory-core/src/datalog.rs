@@ -285,6 +285,12 @@ fn has_top_level_cmp(s: &str) -> bool {
 
 // ─── Semi-Naive Evaluator ─────────────────────────────────────────
 
+/// Raw variable binding produced during rule evaluation: variable name → ground term.
+type Binding = HashMap<String, Term>;
+
+/// A candidate row: binding paired with its provenance chain.
+type Candidate = (Binding, Vec<ProvenanceStep>);
+
 /// Run semi-naive fixpoint evaluation over a set of rules and initial facts.
 ///
 /// Returns the full derived fact set and a list of derived facts with provenance.
@@ -352,15 +358,25 @@ pub fn evaluate(
 
 /// Evaluate a single rule against the current fact set.
 ///
-/// Uses nested-loop join: for each body atom left-to-right, find all matching
-/// facts and extend the variable binding. After all atoms match, check builtin
-/// filters and instantiate the head.
+/// Dispatches to the two-phase aggregate evaluator when the rule contains
+/// aggregates; otherwise runs collect_bindings and instantiates the head.
 fn evaluate_rule(rule: &DatalogRule, all_facts: &FactSet) -> Vec<(Vec<Term>, Vec<ProvenanceStep>)> {
-    let mut results = Vec::new();
+    if !rule.aggregates.is_empty() {
+        return evaluate_rule_with_aggregates(rule, all_facts);
+    }
+    collect_bindings(rule, all_facts)
+        .into_iter()
+        .map(|(binding, prov)| (instantiate(&rule.head.args, &binding), prov))
+        .collect()
+}
 
+/// Run the body-unification + filter-check loop and return raw variable
+/// bindings. Identical semantics to the old `evaluate_rule` but stops just
+/// before instantiating the head, so callers can either instantiate
+/// (non-aggregate path) or feed bindings into the aggregate pipeline.
+fn collect_bindings(rule: &DatalogRule, all_facts: &FactSet) -> Vec<Candidate> {
     // Start with a single empty binding
-    let initial_bindings: Vec<(HashMap<String, Term>, Vec<ProvenanceStep>)> =
-        vec![(HashMap::new(), Vec::new())];
+    let initial_bindings: Vec<Candidate> = vec![(HashMap::new(), Vec::new())];
 
     let final_bindings = rule
         .body
@@ -369,7 +385,6 @@ fn evaluate_rule(rule: &DatalogRule, all_facts: &FactSet) -> Vec<(Vec<Term>, Vec
             let mut next_bindings = Vec::new();
 
             for (binding, provenance) in &current_bindings {
-                // Get matching facts for this predicate
                 if let Some(fact_set) = all_facts.get(&body_atom.predicate) {
                     for fact_args in fact_set {
                         if fact_args.len() != body_atom.args.len() {
@@ -387,15 +402,200 @@ fn evaluate_rule(rule: &DatalogRule, all_facts: &FactSet) -> Vec<(Vec<Term>, Vec
             next_bindings
         });
 
-    // Apply filters and instantiate head
-    for (binding, provenance) in final_bindings {
-        if check_filters(&rule.filters, &binding) {
-            let head_args = instantiate(&rule.head.args, &binding);
-            results.push((head_args, provenance));
-        }
+    // Apply filters and return bindings (head instantiation is the caller's job)
+    final_bindings
+        .into_iter()
+        .filter(|(binding, _)| check_filters(&rule.filters, binding))
+        .collect()
+}
+
+/// Two-phase aggregate evaluator.
+///
+/// Phase 1: collect candidate bindings from non-aggregate body atoms + pre-aggregate filters.
+/// Phase 2: for each aggregate, group candidates by group_vars, count inner-atom matches,
+///          bind output_var, then re-apply post-aggregate filters and instantiate the head.
+fn evaluate_rule_with_aggregates(
+    rule: &DatalogRule,
+    all_facts: &FactSet,
+) -> Vec<(Vec<Term>, Vec<ProvenanceStep>)> {
+    let agg_output_vars: std::collections::HashSet<&str> = rule
+        .aggregates
+        .iter()
+        .map(|a| a.output_var.as_str())
+        .collect();
+
+    let (phase1_filters, post_agg_filters): (Vec<_>, Vec<_>) = rule
+        .filters
+        .iter()
+        .cloned()
+        .partition(|f| !filter_references_any(f, &agg_output_vars));
+
+    let phase1_rule = DatalogRule {
+        head: rule.head.clone(),
+        body: rule.body.clone(),
+        filters: phase1_filters.clone(),
+        aggregates: Vec::new(),
+    };
+
+    // Phase 1: collect candidate bindings from non-aggregate body atoms.
+    // When body is empty we skip collect_bindings (it would return one
+    // vacuous empty binding that has no group_var values bound) and instead
+    // seed one binding per distinct group_vars tuple found in the first
+    // aggregate's inner predicate rows. For a global aggregate (no
+    // group_vars) we seed a single empty binding.
+    let mut bindings: Vec<Candidate> = if rule.body.is_empty() {
+            match rule.aggregates.first() {
+                Some(first_agg) if !first_agg.group_vars.is_empty() => {
+                    seed_bindings_from_inner(first_agg, all_facts)
+                }
+                _ => vec![(HashMap::new(), Vec::new())],
+            }
+        } else {
+            collect_bindings(&phase1_rule, all_facts)
+        };
+
+    // Apply phase1 filters to the seeded bindings (for the body-empty case
+    // the phase1_filters will be empty, so this is a no-op, but it keeps
+    // the logic symmetric).
+    bindings.retain(|(b, _)| phase1_filters.iter().all(|f| check_one_filter(f, b)));
+
+    for agg in &rule.aggregates {
+        bindings = apply_aggregate(agg, bindings, all_facts);
     }
 
+    let mut results = Vec::new();
+    for (binding, prov) in bindings {
+        if !post_agg_filters.iter().all(|f| check_one_filter(f, &binding)) {
+            continue;
+        }
+        let head_args = instantiate(&rule.head.args, &binding);
+        results.push((head_args, prov));
+    }
     results
+}
+
+/// Returns true if the filter references any variable in `vars`.
+fn filter_references_any(f: &BuiltinFilter, vars: &std::collections::HashSet<&str>) -> bool {
+    use crate::types::FilterExpr;
+    fn expr_refs(e: &FilterExpr, vars: &std::collections::HashSet<&str>) -> bool {
+        match e {
+            FilterExpr::Var(name) => vars.contains(name.as_str()),
+            FilterExpr::LitNum(_) | FilterExpr::LitStr(_) => false,
+            FilterExpr::Neg(inner) => expr_refs(inner, vars),
+            FilterExpr::BinOp { lhs, rhs, .. } => expr_refs(lhs, vars) || expr_refs(rhs, vars),
+        }
+    }
+    match f {
+        BuiltinFilter::NotEqual(a, b) => vars.contains(a.as_str()) || vars.contains(b.as_str()),
+        BuiltinFilter::GreaterThan(a, _) | BuiltinFilter::LessThan(a, _) => {
+            vars.contains(a.as_str())
+        }
+        BuiltinFilter::Compare { lhs, rhs, .. } => expr_refs(lhs, vars) || expr_refs(rhs, vars),
+    }
+}
+
+/// Enumerate one binding per distinct group_vars tuple found in the inner
+/// predicate's rows. Used when the rule body is empty and we need to seed
+/// candidate bindings for the aggregate phase.
+fn seed_bindings_from_inner(agg: &crate::types::Aggregate, all_facts: &FactSet) -> Vec<Candidate> {
+    let Some(rows) = all_facts.get(&agg.inner.predicate) else {
+        return Vec::new();
+    };
+
+    // Find the position of each group_var in inner.args so we can extract
+    // its bound value from each row.
+    let group_positions: Vec<(String, usize)> = agg
+        .group_vars
+        .iter()
+        .filter_map(|gv| {
+            agg.inner.args.iter().enumerate().find_map(|(i, arg)| {
+                if let Term::Var(name) = arg {
+                    if name == gv { Some((gv.clone(), i)) } else { None }
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+
+    let mut seen: std::collections::HashSet<Vec<Term>> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+
+    for row in rows {
+        if row.len() != agg.inner.args.len() {
+            continue;
+        }
+        let key: Vec<Term> = group_positions
+            .iter()
+            .map(|(_, pos)| row[*pos].clone())
+            .collect();
+        if seen.insert(key.clone()) {
+            let mut binding = HashMap::new();
+            for ((name, _), val) in group_positions.iter().zip(key.iter()) {
+                binding.insert(name.clone(), val.clone());
+            }
+            out.push((binding, Vec::new()));
+        }
+    }
+    out
+}
+
+/// Group candidates by aggregate group_vars, count inner-atom matches per
+/// group, bind output_var to the count, and return the augmented bindings.
+fn apply_aggregate(
+    agg: &crate::types::Aggregate,
+    candidates: Vec<Candidate>,
+    all_facts: &FactSet,
+) -> Vec<Candidate> {
+    let mut groups: HashMap<Vec<Term>, Vec<Candidate>> = HashMap::new();
+
+    for (binding, prov) in candidates {
+        let key: Vec<Term> = agg
+            .group_vars
+            .iter()
+            .map(|v| binding.get(v).cloned().unwrap_or_else(|| Term::Var(v.clone())))
+            .collect();
+        groups.entry(key).or_default().push((binding, prov));
+    }
+
+    let mut out = Vec::new();
+    for (_group_key, members) in groups {
+        let representative = match members.first() {
+            Some((b, _)) => b.clone(),
+            None => continue,
+        };
+        let count = count_inner_matches(&agg.inner, &representative, all_facts);
+
+        for (mut binding, mut prov) in members {
+            binding.insert(
+                agg.output_var.clone(),
+                Term::ConstFloat(OrderedFloat(count as f64)),
+            );
+            prov.push(make_provenance_step(
+                &format!("count({})", agg.inner.predicate),
+                &[Term::ConstFloat(OrderedFloat(count as f64))],
+            ));
+            out.push((binding, prov));
+        }
+    }
+    out
+}
+
+/// Count how many rows in `all_facts` for `inner.predicate` unify with the
+/// given binding (variables in `inner` not in the binding are wildcards).
+fn count_inner_matches(
+    inner: &Atom,
+    binding: &Binding,
+    all_facts: &FactSet,
+) -> usize {
+    let Some(rows) = all_facts.get(&inner.predicate) else {
+        return 0;
+    };
+    rows.iter()
+        .filter(|row| {
+            row.len() == inner.args.len() && try_unify(&inner.args, row, binding).is_some()
+        })
+        .count()
 }
 
 /// Try to unify atom arguments with fact arguments under an existing binding.
@@ -1793,6 +1993,38 @@ mod tests {
             msg.contains("output_var") || msg.contains("variable") || msg.contains("Var"),
             "expected output-var-must-be-Var error, got: {msg}"
         );
+    }
+
+    #[test]
+    fn evaluator_count_aggregate_groups_and_counts() {
+        let s1 = Uuid::new_v4();
+        let s2 = Uuid::new_v4();
+        let s3 = Uuid::new_v4();
+        let target_t = Uuid::new_v4(); // 3 distinct correctors
+        let target_u = Uuid::new_v4(); // 2 distinct correctors
+
+        let mut facts = FactSet::new();
+        facts.insert("user_corrected", vec![Term::Const(s1), Term::Const(target_t)]);
+        facts.insert("user_corrected", vec![Term::Const(s2), Term::Const(target_t)]);
+        facts.insert("user_corrected", vec![Term::Const(s3), Term::Const(target_t)]);
+        facts.insert("user_corrected", vec![Term::Const(s1), Term::Const(target_u)]);
+        facts.insert("user_corrected", vec![Term::Const(s2), Term::Const(target_u)]);
+
+        let rule = parse_rule("avoid_action(X) :- count(user_corrected(S, X), N), N >= 3.").unwrap();
+        let (derived, _) = evaluate(&[rule], &facts, 100, 1000);
+
+        let avoided: std::collections::HashSet<Uuid> = derived
+            .get("avoid_action")
+            .into_iter()
+            .flatten()
+            .filter_map(|args| match args.first()? {
+                Term::Const(u) => Some(*u),
+                _ => None,
+            })
+            .collect();
+
+        assert!(avoided.contains(&target_t), "3 distinct correctors should fire avoid_action");
+        assert!(!avoided.contains(&target_u), "2 distinct correctors should NOT fire avoid_action");
     }
 
     #[test]
