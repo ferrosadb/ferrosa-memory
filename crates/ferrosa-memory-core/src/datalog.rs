@@ -355,6 +355,105 @@ fn try_unify(
     Some(new_binding)
 }
 
+/// Runtime value produced by `eval_expr`. Strings, numbers, and UUIDs
+/// each have their own arm so type mismatches surface clearly.
+enum EvalValue {
+    Num(f64),
+    Str(String),
+    Uuid(uuid::Uuid),
+}
+
+fn eval_expr(
+    e: &crate::types::FilterExpr,
+    binding: &std::collections::HashMap<String, Term>,
+) -> Option<EvalValue> {
+    use crate::types::{ArithOp, FilterExpr};
+    use ordered_float::OrderedFloat;
+    match e {
+        FilterExpr::Var(name) => match binding.get(name)? {
+            Term::ConstFloat(OrderedFloat(f)) => Some(EvalValue::Num(*f)),
+            Term::ConstStr(s) => Some(EvalValue::Str(s.clone())),
+            Term::Const(u) => Some(EvalValue::Uuid(*u)),
+            Term::Var(_) => None,
+        },
+        FilterExpr::LitNum(OrderedFloat(f)) => Some(EvalValue::Num(*f)),
+        FilterExpr::LitStr(s) => Some(EvalValue::Str(s.clone())),
+        FilterExpr::Neg(inner) => match eval_expr(inner, binding)? {
+            EvalValue::Num(x) => Some(EvalValue::Num(-x)),
+            _ => {
+                tracing::warn!("datalog: unary minus on non-numeric value");
+                None
+            }
+        },
+        FilterExpr::BinOp { op, lhs, rhs } => {
+            let l = eval_expr(lhs, binding)?;
+            let r = eval_expr(rhs, binding)?;
+            match (l, r) {
+                (EvalValue::Num(a), EvalValue::Num(b)) => match op {
+                    ArithOp::Add => Some(EvalValue::Num(a + b)),
+                    ArithOp::Sub => Some(EvalValue::Num(a - b)),
+                    ArithOp::Mul => Some(EvalValue::Num(a * b)),
+                    ArithOp::Div => {
+                        if b == 0.0 {
+                            tracing::warn!("datalog: division by zero in filter");
+                            None
+                        } else {
+                            Some(EvalValue::Num(a / b))
+                        }
+                    }
+                },
+                _ => {
+                    tracing::warn!("datalog: arithmetic on non-numeric values");
+                    None
+                }
+            }
+        }
+    }
+}
+
+fn apply_cmp(op: crate::types::CmpOp, l: &EvalValue, r: &EvalValue) -> bool {
+    use crate::types::CmpOp;
+    use std::cmp::Ordering;
+    match (l, r) {
+        (EvalValue::Num(a), EvalValue::Num(b)) => {
+            let Some(ord) = a.partial_cmp(b) else { return false; }; // NaN
+            match (op, ord) {
+                (CmpOp::Eq, Ordering::Equal) => true,
+                (CmpOp::Ne, ord) => ord != Ordering::Equal,
+                (CmpOp::Lt, Ordering::Less) => true,
+                (CmpOp::Le, ord) => ord != Ordering::Greater,
+                (CmpOp::Gt, Ordering::Greater) => true,
+                (CmpOp::Ge, ord) => ord != Ordering::Less,
+                _ => false,
+            }
+        }
+        (EvalValue::Str(a), EvalValue::Str(b)) => {
+            let ord = a.cmp(b);
+            match (op, ord) {
+                (CmpOp::Eq, Ordering::Equal) => true,
+                (CmpOp::Ne, ord) => ord != Ordering::Equal,
+                (CmpOp::Lt, Ordering::Less) => true,
+                (CmpOp::Le, ord) => ord != Ordering::Greater,
+                (CmpOp::Gt, Ordering::Greater) => true,
+                (CmpOp::Ge, ord) => ord != Ordering::Less,
+                _ => false,
+            }
+        }
+        (EvalValue::Uuid(a), EvalValue::Uuid(b)) => match op {
+            CmpOp::Eq => a == b,
+            CmpOp::Ne => a != b,
+            _ => {
+                tracing::warn!(?op, "datalog: ordered comparison on UUID; returning false");
+                false
+            }
+        },
+        _ => {
+            tracing::warn!(?op, "datalog: type mismatch in filter; returning false");
+            false
+        }
+    }
+}
+
 /// Check all builtin filters against a variable binding.
 fn check_filters(filters: &[BuiltinFilter], binding: &HashMap<String, Term>) -> bool {
     filters.iter().all(|f| check_one_filter(f, binding))
@@ -385,8 +484,14 @@ fn check_one_filter(filter: &BuiltinFilter, binding: &HashMap<String, Term>) -> 
                 true
             }
         }
-        // Full expression-based comparison; evaluation wired in Task 10.
-        BuiltinFilter::Compare { .. } => todo!("Compare filter evaluation not yet implemented"),
+        BuiltinFilter::Compare { op, lhs, rhs } => {
+            let (Some(l), Some(r)) = (eval_expr(lhs, binding), eval_expr(rhs, binding)) else {
+                // Unbound or type-mismatch (already warned). Match legacy
+                // semantics: partial bindings pass the filter.
+                return true;
+            };
+            apply_cmp(*op, &l, &r)
+        }
     }
 }
 
@@ -1342,6 +1447,77 @@ mod tests {
                 Term::Const(e2)
             ]
         ));
+    }
+
+    #[test]
+    fn evaluator_handles_ge_and_arithmetic() {
+        use crate::types::{CmpOp, FilterExpr, ArithOp};
+        use ordered_float::OrderedFloat;
+        use std::collections::HashMap;
+
+        let mut binding: HashMap<String, Term> = HashMap::new();
+        binding.insert("S".into(), Term::ConstFloat(OrderedFloat(0.7)));
+        binding.insert("T".into(), Term::ConstFloat(OrderedFloat(0.5)));
+
+        // S >= T
+        let f1 = BuiltinFilter::Compare {
+            op: CmpOp::Ge,
+            lhs: FilterExpr::Var("S".into()),
+            rhs: FilterExpr::Var("T".into()),
+        };
+        assert!(check_one_filter(&f1, &binding));
+
+        // S < T (false)
+        let f2 = BuiltinFilter::Compare {
+            op: CmpOp::Lt,
+            lhs: FilterExpr::Var("S".into()),
+            rhs: FilterExpr::Var("T".into()),
+        };
+        assert!(!check_one_filter(&f2, &binding));
+
+        // T + 0.1 == 0.6
+        let f3 = BuiltinFilter::Compare {
+            op: CmpOp::Eq,
+            lhs: FilterExpr::BinOp {
+                op: ArithOp::Add,
+                lhs: Box::new(FilterExpr::Var("T".into())),
+                rhs: Box::new(FilterExpr::LitNum(OrderedFloat(0.1))),
+            },
+            rhs: FilterExpr::LitNum(OrderedFloat(0.6)),
+        };
+        assert!(check_one_filter(&f3, &binding));
+    }
+
+    #[test]
+    fn evaluator_unbound_var_passes_compare_filter() {
+        use crate::types::{CmpOp, FilterExpr};
+        use std::collections::HashMap;
+
+        let binding: HashMap<String, Term> = HashMap::new();
+        let f = BuiltinFilter::Compare {
+            op: CmpOp::Gt,
+            lhs: FilterExpr::Var("UNBOUND".into()),
+            rhs: FilterExpr::LitNum(ordered_float::OrderedFloat(3.0)),
+        };
+        // Unbound vars pass — same semantics as legacy GreaterThan.
+        assert!(check_one_filter(&f, &binding));
+    }
+
+    #[test]
+    fn legacy_filter_variants_still_evaluate() {
+        use std::collections::HashMap;
+        use ordered_float::OrderedFloat;
+
+        let mut binding: HashMap<String, Term> = HashMap::new();
+        binding.insert("X".into(), Term::ConstFloat(OrderedFloat(0.7)));
+
+        assert!(check_one_filter(&BuiltinFilter::GreaterThan("X".into(), 0.5), &binding));
+        assert!(!check_one_filter(&BuiltinFilter::LessThan("X".into(), 0.5), &binding));
+
+        let mut b2: HashMap<String, Term> = HashMap::new();
+        b2.insert("A".into(), Term::ConstStr("foo".into()));
+        b2.insert("B".into(), Term::ConstStr("bar".into()));
+        assert!(check_one_filter(&BuiltinFilter::NotEqual("A".into(), "B".into()), &b2));
     }
 
     #[tokio::test]
