@@ -175,4 +175,60 @@ mod tests {
         assert_eq!(b, c);
     }
 
+    // Task 5: arithmetic precedence, parens, unary minus
+    #[test]
+    fn arithmetic_precedence_mul_binds_tighter_than_add() {
+        let f = parse_filter("X + 2 * Y >= Z").unwrap();
+        let want = BuiltinFilter::Compare {
+            op: CmpOp::Ge,
+            lhs: FilterExpr::BinOp {
+                op: ArithOp::Add,
+                lhs: Box::new(var("X")),
+                rhs: Box::new(FilterExpr::BinOp {
+                    op: ArithOp::Mul,
+                    lhs: Box::new(lit(2.0)),
+                    rhs: Box::new(var("Y")),
+                }),
+            },
+            rhs: var("Z"),
+        };
+        assert_eq!(f, want);
+    }
+
+    #[test]
+    fn parens_override_precedence() {
+        let f = parse_filter("(X + Y) * 2 < N").unwrap();
+        match f {
+            BuiltinFilter::Compare {
+                lhs: FilterExpr::BinOp { op: ArithOp::Mul, lhs, rhs },
+                ..
+            } => {
+                assert!(matches!(*lhs, FilterExpr::BinOp { op: ArithOp::Add, .. }));
+                assert_eq!(*rhs, lit(2.0));
+            }
+            other => panic!("expected (X+Y)*2 to parse as Mul at the top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unary_minus_on_variable() {
+        let f = parse_filter("-X >= 0").unwrap();
+        match f {
+            BuiltinFilter::Compare { lhs: FilterExpr::Neg(inner), .. } => {
+                assert_eq!(*inner, var("X"));
+            }
+            other => panic!("expected Neg(Var(X)) on lhs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn negative_literal_parses_as_litnum_not_neg() {
+        let f = parse_filter("X >= -1.5").unwrap();
+        match f {
+            BuiltinFilter::Compare { rhs: FilterExpr::LitNum(OrderedFloat(v)), .. } => {
+                assert_eq!(v, -1.5);
+            }
+            other => panic!("expected LitNum(-1.5) on rhs, got {other:?}"),
+        }
+    }
 }
