@@ -67,13 +67,25 @@ pub fn parse_rule(text: &str) -> anyhow::Result<DatalogRule> {
     let body_parts = split_top_level(body_str, ',')?;
     anyhow::ensure!(!body_parts.is_empty(), "rule body must not be empty");
 
+    let head_vars: std::collections::HashSet<String> = head
+        .args
+        .iter()
+        .filter_map(|t| match t {
+            Term::Var(name) => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+
     let mut body = Vec::new();
     let mut filters = Vec::new();
+    let mut aggregates: Vec<crate::types::Aggregate> = Vec::new();
     let mut anon_counter = 0usize;
 
     for part in &body_parts {
         let part = part.trim();
-        if has_top_level_cmp(part) {
+        if let Some(agg) = parse_aggregate(part, &head_vars)? {
+            aggregates.push(agg);
+        } else if has_top_level_cmp(part) {
             let f = crate::datalog_filter_expr::parse_filter(part)?;
             filters.push(f);
         } else {
@@ -81,13 +93,25 @@ pub fn parse_rule(text: &str) -> anyhow::Result<DatalogRule> {
         }
     }
 
-    anyhow::ensure!(!body.is_empty(), "rule must have at least one body atom");
+    anyhow::ensure!(
+        !body.is_empty() || !aggregates.is_empty(),
+        "rule must have at least one body atom"
+    );
+
+    for agg in &aggregates {
+        if agg.inner.predicate == head.predicate {
+            anyhow::bail!(
+                "aggregation through head predicate '{}' is not supported in v1",
+                head.predicate
+            );
+        }
+    }
 
     Ok(DatalogRule {
         head,
         body,
         filters,
-        aggregates: Vec::new(),
+        aggregates,
     })
 }
 
@@ -167,6 +191,62 @@ fn parse_term(s: &str, anon_counter: &mut usize) -> Term {
         return Term::ConstFloat(OrderedFloat(f));
     }
     Term::ConstStr(s.to_string())
+}
+
+/// Try to parse `s` as an aggregate body element.
+/// Returns `Ok(None)` if `s` is not aggregate-shaped (caller falls back to filter/atom),
+/// `Ok(Some(agg))` on success, `Err(...)` if shaped like an aggregate but malformed.
+fn parse_aggregate(
+    s: &str,
+    head_vars: &std::collections::HashSet<String>,
+) -> anyhow::Result<Option<crate::types::Aggregate>> {
+    let s = s.trim();
+    let Some(rest) = s.strip_prefix("count(") else {
+        return Ok(None);
+    };
+    let Some(inner_text) = rest.strip_suffix(')') else {
+        anyhow::bail!("aggregate '{s}' is missing closing ')'");
+    };
+    let parts = split_top_level(inner_text, ',')?;
+    if parts.len() < 2 {
+        anyhow::bail!("aggregate '{s}' must have an inner atom and an output var separated by ','");
+    }
+    let output = parts.last().unwrap().trim().to_string();
+    let inner_text = parts[..parts.len() - 1].join(",");
+
+    let mut anon = 0;
+    // If the inner text isn't a valid atom (e.g. `count(X, N)` where X has no
+    // parentheses), fall through to body-atom parsing rather than erroring.
+    let inner = match parse_atom(&inner_text, &mut anon) {
+        Ok(atom) => atom,
+        Err(_) => return Ok(None),
+    };
+
+    if !output
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_uppercase() || c == '_')
+        .unwrap_or(false)
+    {
+        anyhow::bail!("aggregate output_var '{output}' must be a variable (start with uppercase or '_')");
+    }
+
+    let mut group_vars = Vec::new();
+    for arg in &inner.args {
+        if let crate::types::Term::Var(name) = arg
+            && head_vars.contains(name)
+            && !group_vars.contains(name)
+        {
+            group_vars.push(name.clone());
+        }
+    }
+
+    Ok(Some(crate::types::Aggregate {
+        kind: crate::types::AggregateKind::Count,
+        inner,
+        group_vars,
+        output_var: output,
+    }))
 }
 
 /// True iff `s` contains a comparison operator at the top level — i.e.
@@ -1672,6 +1752,46 @@ mod tests {
         assert!(
             any_avoid,
             "expected avoid_action to fire when two distinct sessions corrected the same target"
+        );
+    }
+
+    #[test]
+    fn parse_rule_supports_count_aggregate() {
+        use crate::types::{Aggregate, AggregateKind};
+        let rule = parse_rule(
+            "avoid_action(X) :- count(user_corrected(S, X), N), N >= 3."
+        )
+        .unwrap();
+        assert_eq!(rule.aggregates.len(), 1);
+        let agg = &rule.aggregates[0];
+        assert_eq!(agg.kind, AggregateKind::Count);
+        assert_eq!(agg.inner.predicate, "user_corrected");
+        assert_eq!(agg.inner.args.len(), 2);
+        assert_eq!(agg.output_var, "N");
+        assert_eq!(agg.group_vars, vec!["X".to_string()]);
+        assert_eq!(rule.filters.len(), 1);
+    }
+
+    #[test]
+    fn parse_rule_rejects_intra_rule_recursion_through_count() {
+        let err = parse_rule(
+            "loop(X) :- count(loop(Y), N), N > 0."
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("aggregation through head predicate") || msg.contains("recursion"),
+            "expected recursion-through-aggregate error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_rule_rejects_count_with_non_var_output() {
+        let err = parse_rule("avoid_action(X) :- count(user_corrected(S, X), 3).").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("output_var") || msg.contains("variable") || msg.contains("Var"),
+            "expected output-var-must-be-Var error, got: {msg}"
         );
     }
 
