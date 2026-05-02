@@ -31,6 +31,8 @@ tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 ordered-float = { workspace = true }
 tempfile = { workspace = true }
+nom = "7"
+nom-supreme = "0.8"
 
 # Integration tests under `tests/` compile against the public crate
 # surface, which means `mod mock` must be gated on a feature (not
