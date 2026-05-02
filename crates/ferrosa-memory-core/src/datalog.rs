@@ -228,7 +228,9 @@ fn parse_aggregate(
         .map(|c| c.is_ascii_uppercase() || c == '_')
         .unwrap_or(false)
     {
-        anyhow::bail!("aggregate output_var '{output}' must be a variable (start with uppercase or '_')");
+        anyhow::bail!(
+            "aggregate output_var '{output}' must be a variable (start with uppercase or '_')"
+        );
     }
 
     let mut group_vars = Vec::new();
@@ -444,15 +446,15 @@ fn evaluate_rule_with_aggregates(
     // aggregate's inner predicate rows. For a global aggregate (no
     // group_vars) we seed a single empty binding.
     let mut bindings: Vec<Candidate> = if rule.body.is_empty() {
-            match rule.aggregates.first() {
-                Some(first_agg) if !first_agg.group_vars.is_empty() => {
-                    seed_bindings_from_inner(first_agg, all_facts)
-                }
-                _ => vec![(HashMap::new(), Vec::new())],
+        match rule.aggregates.first() {
+            Some(first_agg) if !first_agg.group_vars.is_empty() => {
+                seed_bindings_from_inner(first_agg, all_facts)
             }
-        } else {
-            collect_bindings(&phase1_rule, all_facts)
-        };
+            _ => vec![(HashMap::new(), Vec::new())],
+        }
+    } else {
+        collect_bindings(&phase1_rule, all_facts)
+    };
 
     // Apply phase1 filters to the seeded bindings (for the body-empty case
     // the phase1_filters will be empty, so this is a no-op, but it keeps
@@ -465,7 +467,10 @@ fn evaluate_rule_with_aggregates(
 
     let mut results = Vec::new();
     for (binding, prov) in bindings {
-        if !post_agg_filters.iter().all(|f| check_one_filter(f, &binding)) {
+        if !post_agg_filters
+            .iter()
+            .all(|f| check_one_filter(f, &binding))
+        {
             continue;
         }
         let head_args = instantiate(&rule.head.args, &binding);
@@ -510,7 +515,11 @@ fn seed_bindings_from_inner(agg: &crate::types::Aggregate, all_facts: &FactSet) 
         .filter_map(|gv| {
             agg.inner.args.iter().enumerate().find_map(|(i, arg)| {
                 if let Term::Var(name) = arg {
-                    if name == gv { Some((gv.clone(), i)) } else { None }
+                    if name == gv {
+                        Some((gv.clone(), i))
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -553,7 +562,12 @@ fn apply_aggregate(
         let key: Vec<Term> = agg
             .group_vars
             .iter()
-            .map(|v| binding.get(v).cloned().unwrap_or_else(|| Term::Var(v.clone())))
+            .map(|v| {
+                binding
+                    .get(v)
+                    .cloned()
+                    .unwrap_or_else(|| Term::Var(v.clone()))
+            })
             .collect();
         groups.entry(key).or_default().push((binding, prov));
     }
@@ -583,11 +597,7 @@ fn apply_aggregate(
 
 /// Count how many rows in `all_facts` for `inner.predicate` unify with the
 /// given binding (variables in `inner` not in the binding are wildcards).
-fn count_inner_matches(
-    inner: &Atom,
-    binding: &Binding,
-    all_facts: &FactSet,
-) -> usize {
+fn count_inner_matches(inner: &Atom, binding: &Binding, all_facts: &FactSet) -> usize {
     let Some(rows) = all_facts.get(&inner.predicate) else {
         return 0;
     };
@@ -1958,10 +1968,8 @@ mod tests {
     #[test]
     fn parse_rule_supports_count_aggregate() {
         use crate::types::{Aggregate, AggregateKind};
-        let rule = parse_rule(
-            "avoid_action(X) :- count(user_corrected(S, X), N), N >= 3."
-        )
-        .unwrap();
+        let rule =
+            parse_rule("avoid_action(X) :- count(user_corrected(S, X), N), N >= 3.").unwrap();
         assert_eq!(rule.aggregates.len(), 1);
         let agg = &rule.aggregates[0];
         assert_eq!(agg.kind, AggregateKind::Count);
@@ -1974,10 +1982,7 @@ mod tests {
 
     #[test]
     fn parse_rule_rejects_intra_rule_recursion_through_count() {
-        let err = parse_rule(
-            "loop(X) :- count(loop(Y), N), N > 0."
-        )
-        .unwrap_err();
+        let err = parse_rule("loop(X) :- count(loop(Y), N), N > 0.").unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("aggregation through head predicate") || msg.contains("recursion"),
@@ -2004,13 +2009,29 @@ mod tests {
         let target_u = Uuid::new_v4(); // 2 distinct correctors
 
         let mut facts = FactSet::new();
-        facts.insert("user_corrected", vec![Term::Const(s1), Term::Const(target_t)]);
-        facts.insert("user_corrected", vec![Term::Const(s2), Term::Const(target_t)]);
-        facts.insert("user_corrected", vec![Term::Const(s3), Term::Const(target_t)]);
-        facts.insert("user_corrected", vec![Term::Const(s1), Term::Const(target_u)]);
-        facts.insert("user_corrected", vec![Term::Const(s2), Term::Const(target_u)]);
+        facts.insert(
+            "user_corrected",
+            vec![Term::Const(s1), Term::Const(target_t)],
+        );
+        facts.insert(
+            "user_corrected",
+            vec![Term::Const(s2), Term::Const(target_t)],
+        );
+        facts.insert(
+            "user_corrected",
+            vec![Term::Const(s3), Term::Const(target_t)],
+        );
+        facts.insert(
+            "user_corrected",
+            vec![Term::Const(s1), Term::Const(target_u)],
+        );
+        facts.insert(
+            "user_corrected",
+            vec![Term::Const(s2), Term::Const(target_u)],
+        );
 
-        let rule = parse_rule("avoid_action(X) :- count(user_corrected(S, X), N), N >= 3.").unwrap();
+        let rule =
+            parse_rule("avoid_action(X) :- count(user_corrected(S, X), N), N >= 3.").unwrap();
         let (derived, _) = evaluate(&[rule], &facts, 100, 1000);
 
         let avoided: std::collections::HashSet<Uuid> = derived
@@ -2023,32 +2044,72 @@ mod tests {
             })
             .collect();
 
-        assert!(avoided.contains(&target_t), "3 distinct correctors should fire avoid_action");
-        assert!(!avoided.contains(&target_u), "2 distinct correctors should NOT fire avoid_action");
+        assert!(
+            avoided.contains(&target_t),
+            "3 distinct correctors should fire avoid_action"
+        );
+        assert!(
+            !avoided.contains(&target_u),
+            "2 distinct correctors should NOT fire avoid_action"
+        );
     }
 
     #[test]
-    #[ignore = "requires aggregation (count) support — see specs follow-up: \
-                count(predicate(...), N) is not in the arithmetic/comparison grammar. \
-                Tracking deliverable: extend the parser AST + evaluator with aggregate \
-                predicates. Removing #[ignore] without adding aggregation will fail \
-                with 'invalid filter' on the count(...) clause."]
     fn user_example_count_aggregate_with_ge() {
-        // Target rule from the user:
+        // The user's target rule:
         //   avoid_action(X) :- count(user_corrected(S, X), N), N >= 3.
         //
-        // The N >= 3 filter parses fine after this change. The blocker is
-        // count(user_corrected(S, X), N) — that's an aggregate predicate, not
-        // a plain atom or a filter. parse_rule currently has no notion of
-        // aggregation, so this rule fails at parse time on the count(...) body.
-        //
-        // When the aggregation feature lands, remove #[ignore] and assert the
-        // expected derivation:
-        //   3 distinct sessions corrected target T  ⇒  avoid_action(T) fires
-        //   2 distinct sessions corrected target U  ⇒  avoid_action(U) does NOT fire
-        let rule = parse_rule("avoid_action(X) :- count(user_corrected(S, X), N), N >= 3.")
-            .expect("aggregation-extended parser should accept this rule");
-        let _ = rule;
-        panic!("aggregation evaluator not implemented");
+        // 3 distinct sessions corrected target T  ⇒  avoid_action(T) fires
+        // 2 distinct sessions corrected target U  ⇒  avoid_action(U) does NOT fire
+        let s1 = Uuid::new_v4();
+        let s2 = Uuid::new_v4();
+        let s3 = Uuid::new_v4();
+        let target_t = Uuid::new_v4();
+        let target_u = Uuid::new_v4();
+
+        let mut facts = FactSet::new();
+        facts.insert(
+            "user_corrected",
+            vec![Term::Const(s1), Term::Const(target_t)],
+        );
+        facts.insert(
+            "user_corrected",
+            vec![Term::Const(s2), Term::Const(target_t)],
+        );
+        facts.insert(
+            "user_corrected",
+            vec![Term::Const(s3), Term::Const(target_t)],
+        );
+        facts.insert(
+            "user_corrected",
+            vec![Term::Const(s1), Term::Const(target_u)],
+        );
+        facts.insert(
+            "user_corrected",
+            vec![Term::Const(s2), Term::Const(target_u)],
+        );
+
+        let rule =
+            parse_rule("avoid_action(X) :- count(user_corrected(S, X), N), N >= 3.").unwrap();
+        let (derived, _) = evaluate(&[rule], &facts, 100, 1000);
+
+        let avoided: std::collections::HashSet<Uuid> = derived
+            .get("avoid_action")
+            .into_iter()
+            .flatten()
+            .filter_map(|args| match args.first()? {
+                Term::Const(u) => Some(*u),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            avoided.contains(&target_t),
+            "3 distinct correctors should derive avoid_action"
+        );
+        assert!(
+            !avoided.contains(&target_u),
+            "2 distinct correctors should NOT derive avoid_action"
+        );
     }
 }
