@@ -73,8 +73,9 @@ pub fn parse_rule(text: &str) -> anyhow::Result<DatalogRule> {
 
     for part in &body_parts {
         let part = part.trim();
-        if let Some(filter) = try_parse_filter(part) {
-            filters.push(filter);
+        if has_top_level_cmp(part) {
+            let f = crate::datalog_filter_expr::parse_filter(part)?;
+            filters.push(f);
         } else {
             body.push(parse_atom(part, &mut anon_counter)?);
         }
@@ -167,28 +168,40 @@ fn parse_term(s: &str, anon_counter: &mut usize) -> Term {
     Term::ConstStr(s.to_string())
 }
 
-/// Try to parse a filter expression like `X != Y`, `X > 3.0`, or `X < 3.0`.
-fn try_parse_filter(s: &str) -> Option<BuiltinFilter> {
-    let s = s.trim();
-    if let Some(pos) = s.find("!=") {
-        let lhs = s[..pos].trim().to_string();
-        let rhs = s[pos + 2..].trim().to_string();
-        return Some(BuiltinFilter::NotEqual(lhs, rhs));
-    }
-    if let Some(pos) = s.find('>') {
-        let lhs = s[..pos].trim().to_string();
-        if let Ok(val) = s[pos + 1..].trim().parse::<f64>() {
-            return Some(BuiltinFilter::GreaterThan(lhs, val));
+/// True iff `s` contains a comparison operator at the top level — i.e.
+/// outside string literals and outside parentheses. Used by `parse_rule`
+/// to decide whether a body element is a filter or a predicate atom.
+fn has_top_level_cmp(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_str = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            if c == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
         }
-    }
-    if let Some(pos) = s.find('<') {
-        let lhs = s[..pos].trim().to_string();
-        if let Ok(val) = s[pos + 1..].trim().parse::<f64>() {
-            return Some(BuiltinFilter::LessThan(lhs, val));
+        match c {
+            b'"' => in_str = true,
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'=' | b'<' | b'>' if depth == 0 => return true,
+            b'!' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'=' => return true,
+            _ => {}
         }
+        i += 1;
     }
-    None
+    false
 }
+
 
 // ─── Semi-Naive Evaluator ─────────────────────────────────────────
 
@@ -1161,6 +1174,51 @@ mod tests {
             all_facts.contains("cluster", &[Term::Const(a), Term::Const(c)]),
             "should derive cluster(a, c)"
         );
+    }
+
+    #[test]
+    fn parse_rule_supports_ge_and_le_via_compare_variant() {
+        use crate::types::{CmpOp, FilterExpr};
+        use ordered_float::OrderedFloat;
+
+        let rule = parse_rule("hot(X) :- warmth(X, W), W >= 0.5.").unwrap();
+        assert_eq!(rule.filters.len(), 1);
+        assert_eq!(
+            rule.filters[0],
+            BuiltinFilter::Compare {
+                op: CmpOp::Ge,
+                lhs: FilterExpr::Var("W".into()),
+                rhs: FilterExpr::LitNum(OrderedFloat(0.5)),
+            }
+        );
+
+        let rule = parse_rule("cold(X) :- warmth(X, W), W <= 0.1.").unwrap();
+        assert_eq!(
+            rule.filters[0],
+            BuiltinFilter::Compare {
+                op: CmpOp::Le,
+                lhs: FilterExpr::Var("W".into()),
+                rhs: FilterExpr::LitNum(OrderedFloat(0.1)),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_rule_supports_arithmetic_filter() {
+        use crate::types::{CmpOp, FilterExpr};
+        use ordered_float::OrderedFloat;
+
+        let rule = parse_rule("near(X) :- count(X, N), N + 1 < 5.").unwrap();
+        let want = BuiltinFilter::Compare {
+            op: CmpOp::Lt,
+            lhs: FilterExpr::BinOp {
+                op: crate::types::ArithOp::Add,
+                lhs: Box::new(FilterExpr::Var("N".into())),
+                rhs: Box::new(FilterExpr::LitNum(OrderedFloat(1.0))),
+            },
+            rhs: FilterExpr::LitNum(OrderedFloat(5.0)),
+        };
+        assert_eq!(rule.filters[0], want);
     }
 
     #[test]
