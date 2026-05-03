@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS temporal_events (
 CREATE TABLE IF NOT EXISTS feedback_outcomes (
     tenant_id        uuid,
     session_id       uuid,
-    query_id         timeuuid,
+    query_id         uuid,
     program_type     text,
     query_embedding  vector<float, 768>,
     task_complexity  text,
