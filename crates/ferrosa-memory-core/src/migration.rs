@@ -96,6 +96,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "domain schema bundles",
         ddl: include_str!("../../../ddl/029_domain_schema_bundles.cql"),
     },
+    Migration {
+        version: 30,
+        description: "fix temporal_events timeuuid → uuid columns",
+        ddl: include_str!("../../../ddl/030_temporal_events_uuid_columns.cql"),
+    },
 ];
 
 /// Pre-versioning DDLs. Applied in order when `run_migrations` detects a
