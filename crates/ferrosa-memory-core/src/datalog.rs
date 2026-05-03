@@ -246,6 +246,7 @@ fn parse_aggregate(
     Ok(Some(crate::types::Aggregate {
         kind: crate::types::AggregateKind::Count,
         inner,
+        inner_conjunction: vec![],
         group_vars,
         output_var: output,
     }))

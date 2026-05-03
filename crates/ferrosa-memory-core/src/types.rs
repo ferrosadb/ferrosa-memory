@@ -417,8 +417,15 @@ pub enum AggregateKind {
 pub struct Aggregate {
     pub kind: AggregateKind,
     pub inner: Atom,
+    #[serde(default)]
+    pub inner_conjunction: Vec<Atom>,
     pub group_vars: Vec<String>,
     pub output_var: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum StratifyError {
+    RecursionThroughAggregate { cycle: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -974,12 +981,74 @@ mod tests {
                     Term::Var("X".into()),
                 ],
             },
+            inner_conjunction: vec![],
             group_vars: vec!["X".into()],
             output_var: "N".into(),
         };
         let json = serde_json::to_string(&a).unwrap();
         let back: Aggregate = serde_json::from_str(&json).unwrap();
         assert_eq!(back, a);
+    }
+
+    #[test]
+    fn aggregate_v2_round_trips_through_json() {
+        let a = Aggregate {
+            kind: AggregateKind::Count,
+            inner: Atom {
+                predicate: "worked_well".into(),
+                args: vec![Term::Var("S".into()), Term::Var("Tool".into())],
+            },
+            inner_conjunction: vec![
+                Atom {
+                    predicate: "worked_well".into(),
+                    args: vec![Term::Var("S".into()), Term::Var("Tool".into())],
+                },
+                Atom {
+                    predicate: "session_context".into(),
+                    args: vec![Term::Var("S".into()), Term::Var("Ctx".into())],
+                },
+            ],
+            group_vars: vec!["Ctx".into(), "Tool".into()],
+            output_var: "N".into(),
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        let back: Aggregate = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, a);
+    }
+
+    #[test]
+    fn aggregate_v1_legacy_deserializes_with_empty_conjunction() {
+        // Use whatever Term::Var wire shape the existing tests use. Look
+        // at `datalog_rule_without_aggregates_field_deserializes_with_default`
+        // in this same file for the canonical Term tag format.
+        // What matters is `inner_conjunction` is absent and defaults to vec![].
+        // Build the JSON by serializing a v1-shaped aggregate, then strip the
+        // `inner_conjunction` key before deserializing — that guarantees the
+        // wire format matches what's actually persisted.
+        let v1_shape = Aggregate {
+            kind: AggregateKind::Count,
+            inner: Atom {
+                predicate: "user_corrected".into(),
+                args: vec![Term::Var("S".into()), Term::Var("X".into())],
+            },
+            inner_conjunction: vec![],
+            group_vars: vec!["X".into()],
+            output_var: "N".into(),
+        };
+        let mut json: serde_json::Value = serde_json::to_value(&v1_shape).unwrap();
+        // Simulate a pre-v2 wire row: drop the inner_conjunction key entirely.
+        json.as_object_mut().unwrap().remove("inner_conjunction");
+        let back: Aggregate = serde_json::from_value(json).unwrap();
+        assert!(back.inner_conjunction.is_empty());
+        assert_eq!(back.inner.predicate, "user_corrected");
+    }
+
+    #[test]
+    fn stratify_error_round_trips() {
+        let e = StratifyError::RecursionThroughAggregate { cycle: vec!["a".into(), "b".into()] };
+        let json = serde_json::to_string(&e).unwrap();
+        let back: StratifyError = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, e);
     }
 
     #[test]
