@@ -2638,7 +2638,7 @@ mod tests {
     // ─── M5: Acceptance tests ─────────────────────────────────────
 
     #[test]
-    fn acceptance_threshold_K_eq_3() {
+    fn acceptance_threshold_k_eq_3() {
         let rule = parse_rule(
             "preferred_tool(Ctx, Tool) :- count(worked_well(S, Tool), session_context(S, Ctx), N), N >= 3."
         ).unwrap();
