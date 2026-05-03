@@ -5,7 +5,15 @@
 
 **Goal:** Wire confidence scoring, automated decay, consolidation pipeline, contradiction detection, and schema co-evolution into ferrosa-memory.
 
-**Architecture:** Layer 4 new DDL tables + 3 new Rust modules onto existing `warmth.rs`, `temporal.rs`, `skill.rs` infrastructure. Batch job in `ferrosa-memory-batch` drives automation. No breaking changes to existing API.
+**Status:** Tasks 0-2 complete and committed. Task 3 (consolidation) and Task 4 (contradiction wiring) + Task 5 (schema bundles) remain. Subagents timed out on Tasks 3-4 due to Storage trait complexity.
+
+**Completed commits:**
+- `88f02d6` feat(kg-evolution): DDLs and types for confidence, contradiction, consolidation, schema bundles
+- `62e815d` feat(confidence): compute and store confidence scores per temporal fact  
+- `e551d94` feat(decay): automated decay pass + threshold-based forgetting in batch job
+- `cd8e9f8` feat(contradiction): core logic stub with tests (Task 4 partial)
+
+**Architecture:** Layer 4 new DDL tables + Rust modules onto existing `warmth.rs`, `temporal.rs`, `skill.rs` infrastructure. Batch job in `ferrosa-memory-batch` drives automation. No breaking changes to existing API.
 
 **Tech Stack:** Rust (Tokio), CQL (Ferrosa), scylla-rust-driver fork
 
