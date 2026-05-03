@@ -42,11 +42,21 @@ fn has_negation(text: &str) -> bool {
 }
 
 fn token_overlap(a: &str, b: &str) -> f64 {
+    let stop_words: HashSet<&str> = [
+        "does", "do", "did", "is", "are", "was", "were", "be", "been", "being", "have", "has",
+        "had", "the", "a", "an", "this", "that", "these", "those", "not", "no", "nor",
+    ]
+    .iter()
+    .cloned()
+    .collect();
+
     let normalize = |s: &str| {
         s.to_lowercase()
             .split_whitespace()
             .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
             .filter(|w| !w.is_empty() && w.len() > 2)
+            .map(|w| stem(&w))
+            .filter(|w| !stop_words.contains(w.as_str()))
             .collect::<HashSet<String>>()
     };
 
@@ -60,6 +70,36 @@ fn token_overlap(a: &str, b: &str) -> f64 {
     let intersection = a_tokens.intersection(&b_tokens).count();
     let union = a_tokens.union(&b_tokens).count();
     intersection as f64 / union as f64
+}
+
+/// Minimal English stemmer — strips common suffixes while avoiding over-stemming.
+fn stem(word: &str) -> String {
+    let mut w = word.to_string();
+    if w.ends_with("ies") || w.ends_with("ied") {
+        if w.len() > 4 {
+            w.truncate(w.len() - 3);
+            w.push('y');
+        }
+    } else if w.ends_with("ing") && w.len() > 4 {
+        w.truncate(w.len() - 3);
+    } else if w.ends_with("ly") && w.len() > 3 {
+        w.truncate(w.len() - 2);
+    } else if w == "uses" || w == "does" || w == "was" || w == "has" {
+        w.pop();
+    } else if w.ends_with("es") && w.len() >= 5 {
+        w.truncate(w.len() - 2);
+    } else if w.ends_with("ed") && w.len() > 4 {
+        w.truncate(w.len() - 2);
+    } else if w.ends_with('s')
+        && !w.ends_with("ss")
+        && !w.ends_with("us")
+        && !w.ends_with("is")
+        && !w.ends_with("os")
+        && w.len() > 3
+    {
+        w.pop();
+    }
+    w
 }
 
 /// Hash a fact text for deduplication.
@@ -96,6 +136,20 @@ mod tests {
     #[test]
     fn test_is_contradiction_negation_flip() {
         assert!(is_contradiction("Uses port 8080", "Does not use port 8080"));
+    }
+
+    #[test]
+    fn test_stem_variations() {
+        assert_eq!(stem("uses"), "use");
+        assert_eq!(stem("running"), "runn");
+        assert_eq!(stem("better"), "better"); // 3-char suffix not stripped
+    }
+
+    #[test]
+    fn test_token_overlap_with_stemming() {
+        let a = "Uses port 8080";
+        let b = "Does not use port 8080";
+        assert!(token_overlap(a, b) > 0.6);
     }
 
     #[test]
