@@ -164,13 +164,13 @@ fn count_triangles(edges: &[(String, String, String)]) -> usize {
     }
 
     let mut triangles = 0usize;
-    for (_etype, neighbors) in &adj {
+    for neighbors in adj.values() {
         let nodes: Vec<&str> = neighbors.keys().copied().collect();
         for i in 0..nodes.len() {
             for j in (i + 1)..nodes.len() {
                 let a = nodes[i];
                 let b = nodes[j];
-                if neighbors.get(a).map_or(false, |s| s.contains(b)) {
+                if neighbors.get(a).is_some_and(|s| s.contains(b)) {
                     // Check common neighbors of a and b
                     let na = neighbors.get(a).unwrap();
                     let nb = neighbors.get(b).unwrap();
@@ -203,8 +203,8 @@ fn count_two_paths(edges: &[(String, String, String)]) -> usize {
     }
 
     let mut two_paths = 0usize;
-    for (_etype, neighbors) in &adj {
-        for (_node, nbrs) in neighbors {
+    for neighbors in adj.values() {
+        for nbrs in neighbors.values() {
             let d = nbrs.len();
             if d >= 2 {
                 // Each pair of neighbors forms a 2-path through this node
@@ -500,7 +500,7 @@ mod tests {
     fn dedup_perfect_detection() {
         let id1 = Uuid::new_v4();
         let id2 = Uuid::new_v4();
-        let id3 = Uuid::new_v4();
+        let _id3 = Uuid::new_v4();
 
         let intentional: HashSet<(Uuid, Uuid)> = [(id1, id2)].into_iter().collect();
         let found: HashSet<(Uuid, Uuid)> = [(id1, id2)].into_iter().collect();

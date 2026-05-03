@@ -433,6 +433,7 @@ mod tests {
     // ── Ablation mechanics with mock runner ──────────────────────
 
     struct MockRunner {
+        #[allow(dead_code)]
         responses: Vec<AgentOutput>,
     }
 

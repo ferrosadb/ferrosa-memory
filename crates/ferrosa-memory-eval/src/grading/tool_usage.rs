@@ -42,11 +42,10 @@ fn extract_entity_ids(value: &Value) -> HashSet<String> {
 fn collect_entity_ids(value: &Value, ids: &mut HashSet<String>) {
     match value {
         Value::Object(map) => {
-            if let Some(id_val) = map.get("entity_id") {
-                if let Some(s) = id_val.as_str() {
+            if let Some(id_val) = map.get("entity_id")
+                && let Some(s) = id_val.as_str() {
                     ids.insert(s.to_string());
                 }
-            }
             // Also collect from entity_ids arrays
             if let Some(Value::Array(arr)) = map.get("entity_ids") {
                 for item in arr {
@@ -166,7 +165,7 @@ pub fn grade(traces: &[ToolCallTrace]) -> ToolUsageScore {
     let total_latency_ms: u64 = traces.iter().map(|t| t.latency_ms).sum();
 
     // Token estimation
-    let total_tokens: u64 = traces.iter().map(|t| estimate_tokens(t)).sum();
+    let total_tokens: u64 = traces.iter().map(estimate_tokens).sum();
 
     // Unnecessary call detection
     let unnecessary_flags = detect_unnecessary(traces);
@@ -215,7 +214,6 @@ mod tests {
         let arguments = match args {
             Value::Object(map) => map
                 .into_iter()
-                .map(|(k, v)| (k, v))
                 .collect::<HashMap<String, Value>>(),
             _ => HashMap::new(),
         };

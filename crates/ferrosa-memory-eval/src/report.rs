@@ -801,7 +801,7 @@ mod tests {
         // Verify the CLI output shows 1-5 scale but composite calc uses 0-1
         let composite = report.composite_score();
         assert!(
-            composite >= 0.0 && composite <= 1.0,
+            (0.0..=1.0).contains(&composite),
             "Composite must be 0-1: got {composite}"
         );
     }

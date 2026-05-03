@@ -80,8 +80,8 @@ pub fn parse_tool_calls(response: &str) -> Vec<ParsedToolCall> {
     let mut calls = Vec::new();
 
     // Try to parse as JSON
-    if let Ok(value) = serde_json::from_str::<Value>(response) {
-        if let Some(arr) = value.get("tool_calls").and_then(|v| v.as_array()) {
+    if let Ok(value) = serde_json::from_str::<Value>(response)
+        && let Some(arr) = value.get("tool_calls").and_then(|v| v.as_array()) {
             for item in arr {
                 if let (Some(name), Some(args)) = (
                     item.get("tool_name").and_then(|v| v.as_str()),
@@ -94,7 +94,6 @@ pub fn parse_tool_calls(response: &str) -> Vec<ParsedToolCall> {
                 }
             }
         }
-    }
 
     calls
 }
@@ -212,14 +211,13 @@ impl TaskAgent {
 
                 // Inject session_id into arguments
                 let mut args = call.arguments.clone();
-                if let Some(obj) = args.as_object_mut() {
-                    if !obj.contains_key("session_id") {
+                if let Some(obj) = args.as_object_mut()
+                    && !obj.contains_key("session_id") {
                         obj.insert(
                             "session_id".to_string(),
                             Value::String(self.session_id.to_string()),
                         );
                     }
-                }
 
                 let result = self
                     .mcp_client
@@ -237,15 +235,12 @@ impl TaskAgent {
                         });
 
                         // Extract findings from smart_ingest responses
-                        if call.tool_name == "smart_ingest" {
-                            if let Some(action) = tc.response.get("action").and_then(|v| v.as_str())
-                            {
-                                if let Some(name) = args.get("entity_name").and_then(|v| v.as_str())
+                        if call.tool_name == "smart_ingest"
+                            && let Some(action) = tc.response.get("action").and_then(|v| v.as_str())
+                                && let Some(name) = args.get("entity_name").and_then(|v| v.as_str())
                                 {
                                     findings.push(format!("{}: {}", action, name));
                                 }
-                            }
-                        }
                     }
                     Err(e) => {
                         tool_calls.push(ToolCallTrace {
@@ -443,7 +438,7 @@ mod tests {
 
         let mut transport = MockMcpTransport::new(canned);
 
-        let config = SessionConfig {
+        let _config = SessionConfig {
             prompt: "Test prompt".to_string(),
             tools_allowed: vec!["smart_ingest".to_string()],
             max_steps: 3,

@@ -113,15 +113,12 @@ impl GraphSnapshot {
     /// Extract the inner stats JSON from an MCP content array response.
     fn extract_stats_json(response: &Value) -> Value {
         // MCP responses wrap in: {"content": [{"type": "text", "text": "{...}"}]}
-        if let Some(content) = response.get("content").and_then(|c| c.as_array()) {
-            if let Some(first) = content.first() {
-                if let Some(text) = first.get("text").and_then(|t| t.as_str()) {
-                    if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+        if let Some(content) = response.get("content").and_then(|c| c.as_array())
+            && let Some(first) = content.first()
+                && let Some(text) = first.get("text").and_then(|t| t.as_str())
+                    && let Ok(parsed) = serde_json::from_str::<Value>(text) {
                         return parsed;
                     }
-                }
-            }
-        }
         // Fallback: the response itself might be the stats object directly
         response.clone()
     }
@@ -467,8 +464,8 @@ impl<T: McpTransport> EvalRunner<T> {
         }
 
         // Claim rubric grading
-        if methods.iter().any(|m| m == "claim_rubric") {
-            if let Some(ref rubric_cfg) = run.scenario.grading.claim_rubric {
+        if methods.iter().any(|m| m == "claim_rubric")
+            && let Some(ref rubric_cfg) = run.scenario.grading.claim_rubric {
                 // Concatenate all response texts for claim grading
                 let response_text = run
                     .traces
@@ -487,7 +484,6 @@ impl<T: McpTransport> EvalRunner<T> {
                     claim_score = Some(score);
                 }
             }
-        }
 
         GradeResult {
             programmatic: programmatic_score,
@@ -815,6 +811,7 @@ mod tests {
         }
 
         /// Get recorded calls.
+        #[allow(dead_code)]
         fn recorded_calls(&self) -> Vec<(String, Value)> {
             self.calls.lock().unwrap().clone()
         }

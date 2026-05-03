@@ -110,15 +110,12 @@ pub fn parse_temporal_facts(response: &Value) -> Vec<TemporalFact> {
 
 /// Extract inner JSON from MCP content wrapper.
 fn extract_inner_json(response: &Value) -> Value {
-    if let Some(content) = response.get("content").and_then(|c| c.as_array()) {
-        if let Some(first) = content.first() {
-            if let Some(text) = first.get("text").and_then(|t| t.as_str()) {
-                if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+    if let Some(content) = response.get("content").and_then(|c| c.as_array())
+        && let Some(first) = content.first()
+            && let Some(text) = first.get("text").and_then(|t| t.as_str())
+                && let Ok(parsed) = serde_json::from_str::<Value>(text) {
                     return parsed;
                 }
-            }
-        }
-    }
     response.clone()
 }
 
@@ -562,6 +559,7 @@ mod tests {
     // ---------------------------------------------------------------
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn settle_delay_within_spec_range() {
         // EF10: 50-200ms range
         assert!(

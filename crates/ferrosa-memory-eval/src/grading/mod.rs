@@ -256,7 +256,7 @@ mod tests {
 
         let display_composite = McpQualityScores::to_display_scale(scores.composite);
         assert!(
-            display_composite >= 1.0 && display_composite <= 5.0,
+            (1.0..=5.0).contains(&display_composite),
             "Display composite should be in 1-5 range, got {}",
             display_composite
         );
