@@ -887,6 +887,31 @@ impl Storage for ReconnectingStorage {
         delegate!(self, warmth_decay_all, ctx, session_id, elapsed_hours)
     }
 
+    async fn warmth_delete(
+        &self,
+        ctx: &TenantContext,
+        entity_id: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        delegate!(self, warmth_delete, ctx, entity_id)
+    }
+
+    async fn confidence_put(
+        &self,
+        ctx: &TenantContext,
+        score: &ferrosa_memory_core::types::ConfidenceScore,
+    ) -> anyhow::Result<()> {
+        delegate!(self, confidence_put, ctx, score)
+    }
+
+    async fn confidence_get(
+        &self,
+        ctx: &TenantContext,
+        entity_id: uuid::Uuid,
+        fact_hash: &str,
+    ) -> anyhow::Result<Option<ferrosa_memory_core::types::ConfidenceScore>> {
+        delegate!(self, confidence_get, ctx, entity_id, fact_hash)
+    }
+
     // --- Rule registry operations (Sprint 5) ---
 
     async fn rule_put(
@@ -1514,6 +1539,37 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Run schema migrations BEFORE opening the runtime CqlStorage session.
+    // CqlStorage::connect eagerly prepares every application statement
+    // on startup; if the tables those statements target don't exist yet
+    // (greenfield install or a new migration), the session fails to
+    // build and the MCP enters a reconnect loop.  By running migrations
+    // on a bare Scylla admin session (no prepared-statement bloat) first,
+    // we guarantee the DDL is in place before CqlStorage tries to use it.
+    let keyspace = config.ferrosa.keyspace.clone();
+    match ferrosa_memory_core::cql_storage::connect_admin_session(&config.ferrosa).await {
+        Ok(admin_session) => {
+            match ferrosa_memory_core::migration::run_migrations(&admin_session, &keyspace).await {
+                Ok(0) => tracing::debug!("schema up to date"),
+                Ok(n) => tracing::info!(applied = n, "schema migrations applied"),
+                Err(e) => {
+                    // Log but don't abort — CqlStorage::connect will
+                    // either succeed (tables exist from an earlier run) or
+                    // fail and enter the reconnect watcher.
+                    tracing::warn!(
+                        "schema migration failed: {e}. CqlStorage may enter reconnect mode."
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "admin CQL session unavailable ({e}), skipping migrations. \
+                 Migrations will retry on the next reconnect cycle."
+            );
+        }
+    }
+
     // Connect to real Ferrosa — retry in background if initial connect fails.
     // Never fall back to mock storage (mock silently loses data).
     let storage: Arc<ReconnectingStorage> = match CqlStorage::connect(&config.ferrosa).await {
@@ -1545,33 +1601,6 @@ async fn main() -> anyhow::Result<()> {
     // Always spawn the reconnect watcher — it handles both initial failure
     // and mid-operation connection loss (rolling restarts, network blips).
     tokio::spawn(cql_reconnect_watcher(Arc::clone(&storage)));
-
-    // Run schema migrations before loading the type registry — migration
-    // 020 adds columns that later queries assume. Failure is fatal: partial
-    // migrations leave the keyspace in a half-upgraded state and the
-    // operator's recovery path is a backup restore.
-    //
-    // Migrations open a *separate* session using `admin_username` /
-    // `admin_password` when configured, so CREATE KEYSPACE/TABLE can run
-    // as ferrosa_admin while the runtime session stays scoped to
-    // ferrosa_user. When admin creds aren't set the helper falls back to
-    // the runtime creds (auth-disabled dev clusters).
-    if storage.inner.read().await.is_some() {
-        let keyspace = config.ferrosa.keyspace.clone();
-        let admin_session =
-            ferrosa_memory_core::cql_storage::connect_admin_session(&config.ferrosa)
-                .await
-                .map_err(|e| anyhow::anyhow!("admin CQL session for migrations failed: {e}"))?;
-        match ferrosa_memory_core::migration::run_migrations(&admin_session, &keyspace).await {
-            Ok(0) => tracing::debug!("schema up to date"),
-            Ok(n) => tracing::info!(applied = n, "schema migrations applied"),
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "schema migration failed, aborting startup: {e}"
-                ));
-            }
-        }
-    }
 
     // Load dynamic type registry from the database (falls back to defaults).
     //

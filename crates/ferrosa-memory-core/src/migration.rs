@@ -355,6 +355,15 @@ pub async fn run_migrations(session: &CqlSession, keyspace: &str) -> Result<usiz
                 });
             }
         }
+        // Allow schema to settle across nodes before recording version.
+        if let Err(e) = session.await_schema_agreement().await {
+            return Err(MigrationError::Statement {
+                version: m.version,
+                stmt_index: split_cql(m.ddl).len(),
+                last_good,
+                source: e.into(),
+            });
+        }
         record_version(session, keyspace, m.version, m.description)
             .await
             .map_err(|source| MigrationError::BookkeepingWrite {
@@ -396,6 +405,13 @@ async fn apply_bootstrap(session: &CqlSession, keyspace: &str) -> anyhow::Result
             if let Err(e) = session.query_unpaged(stmt.as_str(), ()).await {
                 anyhow::bail!(
                     "bootstrap DDL[{file_idx}] statement {i} failed: {e}\n--- statement ---\n{stmt}"
+                );
+            }
+            // Wait for schema agreement so subsequent statements don't race
+            // against a not-yet-visible table on other nodes.
+            if let Err(e) = session.await_schema_agreement().await {
+                anyhow::bail!(
+                    "bootstrap DDL[{file_idx}] statement {i}: schema agreement timeout: {e}"
                 );
             }
         }

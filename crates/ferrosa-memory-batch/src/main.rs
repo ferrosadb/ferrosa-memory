@@ -329,7 +329,8 @@ async fn run_decay_and_forget(config: &ferrosa_memory_core::config::Config) -> a
     let decayed = warmth::run_decay_pass(&storage, &ctx, session_id, rmh).await?;
     tracing::info!(decayed, "warmth decay applied");
 
-    let pruned = warmth::prune_forgotten(&storage, &ctx, session_id, rmh.forget_threshold, rmh).await?;
+    let pruned =
+        warmth::prune_forgotten(&storage, &ctx, session_id, rmh.forget_threshold, rmh).await?;
     tracing::info!(pruned, "entities forgotten");
 
     Ok(())

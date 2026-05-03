@@ -8,5 +8,4 @@ CREATE TABLE IF NOT EXISTS agent_memory.confidence_scores (
     PRIMARY KEY ((entity_id), fact_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_confidence_high
-    ON agent_memory.confidence_scores (confidence)
-    WHERE confidence >= 0.8;
+    ON agent_memory.confidence_scores (confidence);

@@ -9,8 +9,8 @@
 //! - Similar semantic content (token overlap > 0.6)
 //! - Opposite polarity (detected via negation keywords)
 
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use sha2::{Sha256, Digest};
 
 /// Check if `new_fact` contradicts `old_fact`.
 /// Returns true if negation polarity flips and semantic overlap is high.
@@ -26,8 +26,16 @@ pub fn is_contradiction(old: &str, new: &str) -> bool {
 fn has_negation(text: &str) -> bool {
     let lower = text.to_lowercase();
     [
-        "not", "no longer", "deprecated", "removed", "false",
-        "does not", "isn't", "wasn't", "don't", "won't",
+        "not",
+        "no longer",
+        "deprecated",
+        "removed",
+        "false",
+        "does not",
+        "isn't",
+        "wasn't",
+        "don't",
+        "won't",
     ]
     .iter()
     .any(|w| lower.contains(w))
@@ -98,7 +106,10 @@ mod tests {
 
     #[test]
     fn test_is_contradiction_no_overlap() {
-        assert!(!is_contradiction("Database is PostgreSQL", "Server is not running"));
+        assert!(!is_contradiction(
+            "Database is PostgreSQL",
+            "Server is not running"
+        ));
     }
 
     #[test]

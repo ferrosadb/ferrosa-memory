@@ -3297,11 +3297,7 @@ impl Storage for CqlStorage {
         Ok(results)
     }
 
-    async fn warmth_delete(
-        &self,
-        ctx: &TenantContext,
-        entity_id: Uuid,
-    ) -> anyhow::Result<()> {
+    async fn warmth_delete(&self, ctx: &TenantContext, entity_id: Uuid) -> anyhow::Result<()> {
         self.session
             .execute_unpaged(&self.stmts.warmth_delete, (ctx.tenant_id, entity_id))
             .await?;

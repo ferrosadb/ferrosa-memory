@@ -1720,11 +1720,7 @@ pub mod mock {
                 .collect())
         }
 
-        async fn warmth_delete(
-            &self,
-            ctx: &TenantContext,
-            entity_id: Uuid,
-        ) -> anyhow::Result<()> {
+        async fn warmth_delete(&self, ctx: &TenantContext, entity_id: Uuid) -> anyhow::Result<()> {
             let mut entries = self.warmth_entries.lock().await;
             entries.retain(|e| !(e.tenant_id == ctx.tenant_id && e.entity_id == entity_id));
             Ok(())
