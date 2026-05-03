@@ -520,6 +520,13 @@ pub trait Storage: Send + Sync {
         elapsed_hours: f64,
     ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send;
 
+    /// Delete a warmth entry by entity_id.
+    fn warmth_delete(
+        &self,
+        ctx: &TenantContext,
+        entity_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
     // --- Rule registry operations (Sprint 5) ---
 
     /// Store a rule entry.
@@ -1711,6 +1718,16 @@ pub mod mock {
                 .filter(|e| e.tenant_id == ctx.tenant_id && e.session_id == session_id)
                 .cloned()
                 .collect())
+        }
+
+        async fn warmth_delete(
+            &self,
+            ctx: &TenantContext,
+            entity_id: Uuid,
+        ) -> anyhow::Result<()> {
+            let mut entries = self.warmth_entries.lock().await;
+            entries.retain(|e| !(e.tenant_id == ctx.tenant_id && e.entity_id == entity_id));
+            Ok(())
         }
 
         async fn warmth_decay_all(

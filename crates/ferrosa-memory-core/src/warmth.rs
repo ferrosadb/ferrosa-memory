@@ -135,6 +135,29 @@ pub async fn run_decay_pass(
     Ok(pruned)
 }
 
+/// Remove warmth entries below threshold (soft-delete).
+pub async fn prune_forgotten(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    session_id: Uuid,
+    threshold: f64,
+    config: &RmhConfig,
+) -> anyhow::Result<usize> {
+    let entries = storage.warmth_list_session(ctx, session_id).await?;
+    let mut pruned = 0;
+    for entry in entries {
+        let score = compute_warmth_score(storage, ctx, entry.entity_id, config).await?;
+        if score < threshold {
+            if let Err(e) = storage.warmth_delete(ctx, entry.entity_id).await {
+                tracing::warn!(entity_id=%entry.entity_id, error=%e, "failed to prune forgotten entity");
+            } else {
+                pruned += 1;
+            }
+        }
+    }
+    Ok(pruned)
+}
+
 /// Retrieve live warmth scores for all entities in a session.
 ///
 /// Lists warmth entries from storage and applies Ebbinghaus decay to each,

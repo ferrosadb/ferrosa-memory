@@ -152,6 +152,10 @@ pub struct RmhConfig {
     pub convergence_threshold: f64,
     #[serde(default = "default_max_explore_entities")]
     pub max_explore_entities: usize,
+    #[serde(default = "default_forget_threshold")]
+    pub forget_threshold: f64,
+    #[serde(default = "default_decay_interval_hours")]
+    pub decay_interval_hours: u32,
 }
 
 impl Default for RmhConfig {
@@ -167,6 +171,8 @@ impl Default for RmhConfig {
             max_explore_passes: default_max_passes(),
             convergence_threshold: default_convergence(),
             max_explore_entities: default_max_explore_entities(),
+            forget_threshold: default_forget_threshold(),
+            decay_interval_hours: default_decay_interval_hours(),
         }
     }
 }
@@ -597,6 +603,12 @@ fn default_convergence() -> f64 {
 }
 fn default_max_explore_entities() -> usize {
     50
+}
+fn default_forget_threshold() -> f64 {
+    0.05
+}
+fn default_decay_interval_hours() -> u32 {
+    24
 }
 fn default_max_iterations() -> usize {
     100
