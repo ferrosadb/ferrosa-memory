@@ -976,10 +976,7 @@ mod tests {
             kind: AggregateKind::Count,
             inner: Atom {
                 predicate: "user_corrected".into(),
-                args: vec![
-                    Term::Var("S".into()),
-                    Term::Var("X".into()),
-                ],
+                args: vec![Term::Var("S".into()), Term::Var("X".into())],
             },
             inner_conjunction: vec![],
             group_vars: vec!["X".into()],
@@ -1045,7 +1042,9 @@ mod tests {
 
     #[test]
     fn stratify_error_round_trips() {
-        let e = StratifyError::RecursionThroughAggregate { cycle: vec!["a".into(), "b".into()] };
+        let e = StratifyError::RecursionThroughAggregate {
+            cycle: vec!["a".into(), "b".into()],
+        };
         let json = serde_json::to_string(&e).unwrap();
         let back: StratifyError = serde_json::from_str(&json).unwrap();
         assert_eq!(back, e);
