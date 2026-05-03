@@ -118,3 +118,20 @@ Keep the current `worked_well` + `session_context` + `S != S2` duplication patte
   expresses the join inline.
 
 implemented-by: subagent-driven-development on feat/datalog-filter-grammar
+
+## Verification Notes
+
+verified-by: independent-verification-agent on feat/datalog-filter-grammar
+verified-at: 2026-05-02
+
+- All 4 acceptance criteria covered by the tests at
+  crates/ferrosa-memory-core/src/datalog.rs::tests::acceptance_*
+- Behavior covered end-to-end by evaluator_two_atom_conjunction_groups_correctly
+- Full ferrosa-memory-core lib suite: 718 passed, 0 failed, 0 ignored
+- Spot-check confirmed: parse_aggregate sets inner = atoms[0] and
+  inner_conjunction = full list when N>=2; stratify returns
+  RecursionThroughAggregate for cycles through Aggregate-labelled edges
+- Acceptance criterion 4 ("Recursion ... rejected at parse time") was
+  deliberately moved to evaluate time via stratify; the design rationale
+  (in the spec doc) is sound: stratify catches cross-rule cycles too,
+  which a parse-time guard cannot.
