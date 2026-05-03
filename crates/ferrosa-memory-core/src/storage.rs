@@ -14,10 +14,10 @@
 use uuid::Uuid;
 
 use crate::types::{
-    AliasEntry, ApprovalEntry, AuditEntry, DerivedFact, EntityEntry, EntityTypeStateCount,
-    FeedbackOutcome, FoldEntry, FoldSummary, MaterializedEdge, MemoEntry, MemoryState, PlanNode,
-    PlanStatus, PromotedPredicate, ProvenanceStep, RuleEntry, RuleState, TemporalEvent,
-    TenantContext, ToolUsageRow, TypedEdge, WarmthEntry,
+    AliasEntry, ApprovalEntry, AuditEntry, ConfidenceScore, DerivedFact, EntityEntry,
+    EntityTypeStateCount, FeedbackOutcome, FoldEntry, FoldSummary, MaterializedEdge, MemoEntry,
+    MemoryState, PlanNode, PlanStatus, PromotedPredicate, ProvenanceStep, RuleEntry, RuleState,
+    TemporalEvent, TenantContext, ToolUsageRow, TypedEdge, WarmthEntry,
 };
 
 /// Core storage operations for the memory system.
@@ -773,6 +773,23 @@ pub trait Storage: Send + Sync {
         &self,
         ctx: &TenantContext,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<PromotedPredicate>>> + Send;
+
+    // --- Confidence operations ---
+
+    /// Store or update a confidence score for a fact.
+    fn confidence_put(
+        &self,
+        ctx: &TenantContext,
+        score: &ConfidenceScore,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// Retrieve a confidence score by entity and fact hash.
+    fn confidence_get(
+        &self,
+        ctx: &TenantContext,
+        entity_id: Uuid,
+        fact_hash: &str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<ConfidenceScore>>> + Send;
 }
 
 /// In-memory mock storage for unit tests.
@@ -817,6 +834,7 @@ pub mod mock {
         pub materialized_edges: Mutex<Vec<MaterializedEdge>>,
         pub promoted_predicates: Mutex<Vec<PromotedPredicate>>,
         pub typed_edges: Mutex<Vec<TypedEdge>>,
+        pub confidence_scores: Mutex<Vec<ConfidenceScore>>,
         /// Test hook: when Some, `entity_find_phonetic` returns Err with
         /// this message. Used to verify callers propagate phonetic-scan
         /// errors instead of fail-quieting them into empty results, and
@@ -2134,6 +2152,36 @@ pub mod mock {
                     && edge.dst_id == dst_id)
             });
             Ok(edges.len() != before)
+        }
+
+        async fn confidence_put(
+            &self,
+            _ctx: &TenantContext,
+            score: &ConfidenceScore,
+        ) -> anyhow::Result<()> {
+            let mut scores = self.confidence_scores.lock().await;
+            if let Some(existing) = scores
+                .iter_mut()
+                .find(|s| s.entity_id == score.entity_id && s.fact_hash == score.fact_hash)
+            {
+                *existing = score.clone();
+            } else {
+                scores.push(score.clone());
+            }
+            Ok(())
+        }
+
+        async fn confidence_get(
+            &self,
+            _ctx: &TenantContext,
+            entity_id: Uuid,
+            fact_hash: &str,
+        ) -> anyhow::Result<Option<ConfidenceScore>> {
+            let scores = self.confidence_scores.lock().await;
+            Ok(scores
+                .iter()
+                .find(|s| s.entity_id == entity_id && s.fact_hash == fact_hash)
+                .cloned())
         }
     }
 

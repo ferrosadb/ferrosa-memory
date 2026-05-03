@@ -352,6 +352,9 @@ struct PreparedStatements {
     // Provenance (Sprint 5)
     provenance_put: PreparedStatement,
     provenance_get: PreparedStatement,
+    // Confidence scores
+    confidence_put: PreparedStatement,
+    confidence_get: PreparedStatement,
 }
 
 /// CQL storage backend.
@@ -750,6 +753,19 @@ impl CqlStorage {
                 .prepare(format!(
                     "SELECT seq, parent_src, parent_pred, parent_dst, parent_kind \
                      FROM {ks}.derivation_provenance WHERE tenant_id = ? AND derived_edge_id = ?"
+                ))
+                .await?,
+            confidence_put: session
+                .prepare(format!(
+                    "INSERT INTO {ks}.confidence_scores \
+                     (entity_id, fact_hash, confidence, source_count, last_confirmed_at, contradiction_count) \
+                     VALUES (?, ?, ?, ?, ?, ?)"
+                ))
+                .await?,
+            confidence_get: session
+                .prepare(format!(
+                    "SELECT confidence, source_count, last_confirmed_at, contradiction_count \
+                     FROM {ks}.confidence_scores WHERE entity_id = ? AND fact_hash = ?"
                 ))
                 .await?,
         };
@@ -4135,5 +4151,56 @@ impl Storage for CqlStorage {
         _dst_id: Uuid,
     ) -> anyhow::Result<bool> {
         Err(Self::graph_write_error("typed_edge_delete"))
+    }
+
+    async fn confidence_put(
+        &self,
+        _ctx: &TenantContext,
+        score: &crate::types::ConfidenceScore,
+    ) -> anyhow::Result<()> {
+        self.exec_prepared_rows(
+            &self.stmts.confidence_put,
+            (
+                score.entity_id,
+                score.fact_hash.clone(),
+                score.confidence,
+                score.source_count,
+                score.last_confirmed_at,
+                score.contradiction_count,
+            ),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn confidence_get(
+        &self,
+        _ctx: &TenantContext,
+        entity_id: Uuid,
+        fact_hash: &str,
+    ) -> anyhow::Result<Option<crate::types::ConfidenceScore>> {
+        let (col_map, rows) = self
+            .exec_prepared_rows(
+                &self.stmts.confidence_get,
+                (entity_id, fact_hash.to_string()),
+            )
+            .await?;
+        if let Some(row) = rows.into_iter().next() {
+            let confidence: f64 = cql_get(&row, &col_map, "confidence")?;
+            let source_count: i32 = cql_get(&row, &col_map, "source_count")?;
+            let last_confirmed_at: chrono::DateTime<chrono::Utc> =
+                cql_get(&row, &col_map, "last_confirmed_at")?;
+            let contradiction_count: i32 = cql_get(&row, &col_map, "contradiction_count")?;
+            Ok(Some(crate::types::ConfidenceScore {
+                entity_id,
+                fact_hash: fact_hash.to_string(),
+                confidence,
+                source_count,
+                last_confirmed_at,
+                contradiction_count,
+            }))
+        } else {
+            Ok(None)
+        }
     }
 }
