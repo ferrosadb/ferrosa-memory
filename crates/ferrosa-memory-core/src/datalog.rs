@@ -229,7 +229,9 @@ fn parse_aggregate(
     };
     let parts = split_top_level(inner_text, ',')?;
     if parts.len() < 2 {
-        anyhow::bail!("aggregate '{s}' must have at least one inner atom and an output var separated by ','");
+        anyhow::bail!(
+            "aggregate '{s}' must have at least one inner atom and an output var separated by ','"
+        );
     }
     let output = parts.last().unwrap().trim().to_string();
     if !output
@@ -262,7 +264,11 @@ fn parse_aggregate(
     }
 
     let inner = atoms[0].clone();
-    let inner_conjunction = if atoms.len() == 1 { Vec::new() } else { atoms.clone() };
+    let inner_conjunction = if atoms.len() == 1 {
+        Vec::new()
+    } else {
+        atoms.clone()
+    };
 
     let mut group_vars: Vec<String> = Vec::new();
     for atom in &atoms {
@@ -355,8 +361,12 @@ pub fn evaluate(
     for stratum_idxs in strata {
         let stratum_rules: Vec<DatalogRule> =
             stratum_idxs.iter().map(|i| rules[*i].clone()).collect();
-        let (next_facts, next_derived) =
-            evaluate_stratum(&stratum_rules, &all_facts, &mut budget_iter, &mut budget_facts);
+        let (next_facts, next_derived) = evaluate_stratum(
+            &stratum_rules,
+            &all_facts,
+            &mut budget_iter,
+            &mut budget_facts,
+        );
         all_facts = next_facts;
         derived.extend(next_derived);
         if budget_iter == 0 || budget_facts == 0 {
@@ -600,7 +610,12 @@ fn seed_bindings_from_inner(agg: &crate::types::Aggregate, all_facts: &FactSet) 
         let key: Vec<Term> = agg
             .group_vars
             .iter()
-            .map(|v| binding.get(v).cloned().unwrap_or_else(|| Term::Var(v.clone())))
+            .map(|v| {
+                binding
+                    .get(v)
+                    .cloned()
+                    .unwrap_or_else(|| Term::Var(v.clone()))
+            })
             .collect();
         if seen.insert(key.clone()) {
             let mut group_binding = HashMap::new();
@@ -2475,7 +2490,10 @@ mod tests {
         assert!(strata.len() >= 2);
         let r1_stratum = strata.iter().position(|s| s.contains(&0)).unwrap();
         let r2_stratum = strata.iter().position(|s| s.contains(&1)).unwrap();
-        assert!(r1_stratum < r2_stratum, "b's rule must come before c's rule");
+        assert!(
+            r1_stratum < r2_stratum,
+            "b's rule must come before c's rule"
+        );
     }
 
     #[test]
@@ -2553,14 +2571,25 @@ mod tests {
             .into_iter()
             .flatten()
             .filter_map(|args| {
-                let (Term::Const(c), Term::Const(t)) = (args.first()?, args.get(1)?) else { return None; };
+                let (Term::Const(c), Term::Const(t)) = (args.first()?, args.get(1)?) else {
+                    return None;
+                };
                 Some((*c, *t))
             })
             .collect();
 
-        assert!(pairs.contains(&(ca, t1)), "(cA, t1) with 3 distinct sessions must fire");
-        assert!(!pairs.contains(&(ca, t2)), "(cA, t2) with 2 sessions must NOT fire");
-        assert!(!pairs.contains(&(cb, t1)), "(cB, t1) with 2 sessions must NOT fire");
+        assert!(
+            pairs.contains(&(ca, t1)),
+            "(cA, t1) with 3 distinct sessions must fire"
+        );
+        assert!(
+            !pairs.contains(&(ca, t2)),
+            "(cA, t2) with 2 sessions must NOT fire"
+        );
+        assert!(
+            !pairs.contains(&(cb, t1)),
+            "(cB, t1) with 2 sessions must NOT fire"
+        );
     }
 
     #[test]
@@ -2584,7 +2613,11 @@ mod tests {
 
         let row = derived.get("preferred_tool").into_iter().flatten().next();
         let row = row.expect("expected one preferred_tool fact");
-        assert_eq!(row.len(), 2, "head has only Ctx and Tool; S must not appear");
+        assert_eq!(
+            row.len(),
+            2,
+            "head has only Ctx and Tool; S must not appear"
+        );
     }
 
     #[test]
@@ -2596,6 +2629,66 @@ mod tests {
 
         let (derived, _) = evaluate(&[rule], &facts, 100, 1000);
         let derived_loop_count = derived.get("loop").map(|v| v.len()).unwrap_or(0);
-        assert_eq!(derived_loop_count, 1, "stratification rejection must leave only the base fact");
+        assert_eq!(
+            derived_loop_count, 1,
+            "stratification rejection must leave only the base fact"
+        );
+    }
+
+    // ─── M5: Acceptance tests ─────────────────────────────────────
+
+    #[test]
+    fn acceptance_threshold_K_eq_3() {
+        let rule = parse_rule(
+            "preferred_tool(Ctx, Tool) :- count(worked_well(S, Tool), session_context(S, Ctx), N), N >= 3."
+        ).unwrap();
+        assert_eq!(rule.aggregates.len(), 1);
+        assert_eq!(rule.aggregates[0].inner_conjunction.len(), 2);
+    }
+
+    #[test]
+    fn acceptance_existential_quantification() {
+        let rule = parse_rule(
+            "preferred_tool(Ctx, Tool) :- count(worked_well(S, Tool), session_context(S, Ctx), N), N >= 3."
+        ).unwrap();
+        let agg = &rule.aggregates[0];
+        assert!(
+            !agg.group_vars.contains(&"S".to_string()),
+            "S must be existentially quantified"
+        );
+        assert!(agg.group_vars.contains(&"Ctx".to_string()));
+        assert!(agg.group_vars.contains(&"Tool".to_string()));
+    }
+
+    #[test]
+    fn acceptance_recursion_rejected_at_load_time() {
+        let rule = parse_rule("loop(X) :- count(loop(Y), N), N > 0.").unwrap();
+        let mut facts = FactSet::new();
+        let x = Uuid::new_v4();
+        facts.insert("loop", vec![Term::Const(x)]);
+        let (derived, _) = evaluate(&[rule], &facts, 100, 1000);
+        assert_eq!(derived.get("loop").map(|v| v.len()).unwrap_or(0), 1);
+        // No new facts should be derived from an unstratifiable rule set
+    }
+
+    #[test]
+    fn acceptance_no_regression_on_v1_aggregation() {
+        let s1 = Uuid::new_v4();
+        let s2 = Uuid::new_v4();
+        let s3 = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        let mut facts = FactSet::new();
+        facts.insert("user_corrected", vec![Term::Const(s1), Term::Const(target)]);
+        facts.insert("user_corrected", vec![Term::Const(s2), Term::Const(target)]);
+        facts.insert("user_corrected", vec![Term::Const(s3), Term::Const(target)]);
+        let rule =
+            parse_rule("avoid_action(X) :- count(user_corrected(S, X), N), N >= 3.").unwrap();
+        assert!(
+            rule.aggregates[0].inner_conjunction.is_empty(),
+            "v1 single-atom path"
+        );
+        let (derived, _) = evaluate(&[rule], &facts, 100, 1000);
+        let any = derived.get("avoid_action").map(|v| v.len()).unwrap_or(0);
+        assert_eq!(any, 1, "v1 single-atom aggregate must still fire");
     }
 }

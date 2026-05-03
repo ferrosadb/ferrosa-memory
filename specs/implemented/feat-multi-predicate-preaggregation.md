@@ -100,3 +100,21 @@ Keep the current `worked_well` + `session_context` + `S != S2` duplication patte
 
 - `datalog_learning_hook.py` — `prefer_working_tools` rule uses the workaround this FR would eliminate
 - `2026-05-02-datalog-aggregation-design.md` — the v1 spec that this FR extends
+
+## Implementation Notes
+
+- Implemented on branch `feat/datalog-filter-grammar` as part of the
+  multi-predicate aggregation rollout.
+- Spec: `docs/superpowers/specs/2026-05-02-datalog-multi-predicate-aggregation-design.md`
+- Plan: `docs/superpowers/plans/2026-05-02-datalog-multi-predicate-aggregation.md`
+- Acceptance tests: `crates/ferrosa-memory-core/src/datalog.rs::tests::acceptance_*`
+- Single-atom v1 path preserved verbatim; multi-atom path activates
+  when `inner_conjunction.len() >= 2`.
+- Recursion-through-aggregate enforcement moved from parse time (v1
+  intra-rule guard) to evaluate time via `stratify`. Cross-rule cycles
+  are now also caught.
+- `worked_in_context` (the FR's hypothesised join predicate) does not
+  need to exist as a base predicate — the conjunction inside `count(...)`
+  expresses the join inline.
+
+implemented-by: subagent-driven-development on feat/datalog-filter-grammar
