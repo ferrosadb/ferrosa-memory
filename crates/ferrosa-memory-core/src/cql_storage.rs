@@ -464,7 +464,7 @@ impl CqlStorage {
                 .prepare(format!(
                     "SELECT entity_id, entity_name, entity_type, source_fold_id, \
                      context_snippet, entity_embedding, confidence, state, created_at, \
-                     description, description_embedding, tags, properties, content_hash, \
+                     description, tags, properties, content_hash, \
                      updated_at, scope, ingested_by_session \
                      FROM {ks}.entity_store WHERE tenant_id = ? AND session_id = ?"
                 ))
@@ -473,7 +473,7 @@ impl CqlStorage {
                 .prepare(format!(
                     "SELECT entity_id, session_id, entity_name, entity_type, source_fold_id, \
                      context_snippet, entity_embedding, confidence, state, created_at, \
-                     description, description_embedding, tags, properties, content_hash, \
+                     description, tags, properties, content_hash, \
                      updated_at, scope, ingested_by_session \
                      FROM {ks}.entity_store WHERE tenant_id = ? ALLOW FILTERING"
                 ))
@@ -1865,7 +1865,7 @@ impl Storage for CqlStorage {
         let query = format!(
             "SELECT entity_id, entity_name, entity_type, source_fold_id, \
              context_snippet, confidence, state, created_at, \
-             description, description_embedding, tags, properties, content_hash, \
+             description, tags, properties, content_hash, \
              updated_at, scope, ingested_by_session \
              FROM {}.entity_store WHERE tenant_id = ? AND session_id = ? AND entity_id = ?",
             self.keyspace

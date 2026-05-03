@@ -67,25 +67,70 @@ pub fn parse_rule(text: &str) -> anyhow::Result<DatalogRule> {
     let body_parts = split_top_level(body_str, ',')?;
     anyhow::ensure!(!body_parts.is_empty(), "rule body must not be empty");
 
+    let head_vars: std::collections::HashSet<String> = head
+        .args
+        .iter()
+        .filter_map(|t| match t {
+            Term::Var(name) => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+
     let mut body = Vec::new();
     let mut filters = Vec::new();
+    let mut aggregates: Vec<crate::types::Aggregate> = Vec::new();
+    let mut deferred_aggregates: Vec<String> = Vec::new();
     let mut anon_counter = 0usize;
 
+    // Pass 1: classify each body part; defer aggregate parts for Pass 2
+    // (aggregates need body_vars which aren't known until atoms are parsed).
     for part in &body_parts {
         let part = part.trim();
-        if let Some(filter) = try_parse_filter(part) {
-            filters.push(filter);
+        if part.starts_with("count(") {
+            deferred_aggregates.push(part.to_string());
+        } else if has_top_level_cmp(part) {
+            let f = crate::datalog_filter_expr::parse_filter(part)?;
+            filters.push(f);
         } else {
             body.push(parse_atom(part, &mut anon_counter)?);
         }
     }
 
-    anyhow::ensure!(!body.is_empty(), "rule must have at least one body atom");
+    // Compute body_vars from the parsed non-aggregate body atoms.
+    let body_vars: std::collections::HashSet<String> = body
+        .iter()
+        .flat_map(|a| a.args.iter())
+        .filter_map(|t| match t {
+            Term::Var(name) => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+
+    // Pass 2: parse deferred aggregate parts now that body_vars is known.
+    for part in &deferred_aggregates {
+        if let Some(agg) = parse_aggregate(part, &head_vars, &body_vars)? {
+            aggregates.push(agg);
+        } else {
+            // parse_aggregate fell through (the `count(X, N)` legacy escape).
+            // Treat the part as a regular body atom.
+            body.push(parse_atom(part, &mut anon_counter)?);
+        }
+    }
+
+    anyhow::ensure!(
+        !body.is_empty() || !aggregates.is_empty(),
+        "rule must have at least one body atom"
+    );
+
+    // Note: the v1 intra-rule recursion guard was removed here.
+    // The stratify analyzer (Task M3) supersedes it and also catches
+    // cross-rule recursion through aggregates.
 
     Ok(DatalogRule {
         head,
         body,
         filters,
+        aggregates,
     })
 }
 
@@ -167,46 +212,185 @@ fn parse_term(s: &str, anon_counter: &mut usize) -> Term {
     Term::ConstStr(s.to_string())
 }
 
-/// Try to parse a filter expression like `X != Y`, `X > 3.0`, or `X < 3.0`.
-fn try_parse_filter(s: &str) -> Option<BuiltinFilter> {
+/// Try to parse `s` as an aggregate body element.
+/// Returns `Ok(None)` if `s` is not aggregate-shaped (caller falls back to filter/atom),
+/// `Ok(Some(agg))` on success, `Err(...)` if shaped like an aggregate but malformed.
+fn parse_aggregate(
+    s: &str,
+    head_vars: &std::collections::HashSet<String>,
+    body_vars: &std::collections::HashSet<String>,
+) -> anyhow::Result<Option<crate::types::Aggregate>> {
     let s = s.trim();
-    if let Some(pos) = s.find("!=") {
-        let lhs = s[..pos].trim().to_string();
-        let rhs = s[pos + 2..].trim().to_string();
-        return Some(BuiltinFilter::NotEqual(lhs, rhs));
+    let Some(rest) = s.strip_prefix("count(") else {
+        return Ok(None);
+    };
+    let Some(inner_text) = rest.strip_suffix(')') else {
+        anyhow::bail!("aggregate '{s}' is missing closing ')'");
+    };
+    let parts = split_top_level(inner_text, ',')?;
+    if parts.len() < 2 {
+        anyhow::bail!(
+            "aggregate '{s}' must have at least one inner atom and an output var separated by ','"
+        );
     }
-    if let Some(pos) = s.find('>') {
-        let lhs = s[..pos].trim().to_string();
-        if let Ok(val) = s[pos + 1..].trim().parse::<f64>() {
-            return Some(BuiltinFilter::GreaterThan(lhs, val));
+    let output = parts.last().unwrap().trim().to_string();
+    if !output
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_uppercase() || c == '_')
+        .unwrap_or(false)
+    {
+        anyhow::bail!(
+            "aggregate output_var '{output}' must be a variable (start with uppercase or '_')"
+        );
+    }
+
+    let atom_parts = &parts[..parts.len() - 1];
+    let mut atoms: Vec<Atom> = Vec::with_capacity(atom_parts.len());
+    let mut anon = 0;
+    for (i, part) in atom_parts.iter().enumerate() {
+        match parse_atom(part, &mut anon) {
+            Ok(atom) => atoms.push(atom),
+            Err(_) if atoms.is_empty() => {
+                // First arg isn't a compound atom — fall through to body-atom
+                // parsing (legacy escape: `count(X, N)` is a plain 2-arg
+                // predicate named `count`, not an aggregate).
+                return Ok(None);
+            }
+            Err(e) => {
+                anyhow::bail!("aggregate '{s}' atom #{} is malformed: {e}", i + 1);
+            }
         }
     }
-    if let Some(pos) = s.find('<') {
-        let lhs = s[..pos].trim().to_string();
-        if let Ok(val) = s[pos + 1..].trim().parse::<f64>() {
-            return Some(BuiltinFilter::LessThan(lhs, val));
+
+    let inner = atoms[0].clone();
+    let inner_conjunction = if atoms.len() == 1 {
+        Vec::new()
+    } else {
+        atoms.clone()
+    };
+
+    let mut group_vars: Vec<String> = Vec::new();
+    for atom in &atoms {
+        for arg in &atom.args {
+            if let crate::types::Term::Var(name) = arg
+                && (head_vars.contains(name) || body_vars.contains(name))
+                && !group_vars.contains(name)
+            {
+                group_vars.push(name.clone());
+            }
         }
     }
-    None
+
+    Ok(Some(crate::types::Aggregate {
+        kind: crate::types::AggregateKind::Count,
+        inner,
+        inner_conjunction,
+        group_vars,
+        output_var: output,
+    }))
+}
+
+/// True iff `s` contains a comparison operator at the top level — i.e.
+/// outside string literals and outside parentheses. Used by `parse_rule`
+/// to decide whether a body element is a filter or a predicate atom.
+fn has_top_level_cmp(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_str = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            if c == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' => in_str = true,
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'=' | b'<' | b'>' if depth == 0 => return true,
+            b'!' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'=' => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 // ─── Semi-Naive Evaluator ─────────────────────────────────────────
 
-/// Run semi-naive fixpoint evaluation over a set of rules and initial facts.
+/// Raw variable binding produced during rule evaluation: variable name → ground term.
+type Binding = HashMap<String, Term>;
+
+/// A candidate row: binding paired with its provenance chain.
+type Candidate = (Binding, Vec<ProvenanceStep>);
+
+/// Run semi-naive fixpoint evaluation over a set of rules and initial facts,
+/// stratum by stratum. Stratification ensures aggregates are always computed
+/// over fully-settled base relations. Unstratifiable rule sets (recursion through
+/// an aggregate) are rejected: the original fact set is returned unchanged.
 ///
 /// Returns the full derived fact set and a list of derived facts with provenance.
-/// Terminates when no new facts are derived (fixpoint), or when `max_iterations`
-/// or `max_facts` caps are reached.
 pub fn evaluate(
     rules: &[DatalogRule],
     initial_facts: &FactSet,
     max_iterations: usize,
     max_facts: usize,
 ) -> (FactSet, Vec<DerivedFact>) {
+    let strata = match stratify(rules) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = ?e, "datalog: rule set is unstratifiable; deriving nothing");
+            return (initial_facts.clone(), Vec::new());
+        }
+    };
+
+    let mut all_facts = initial_facts.clone();
+    let mut derived = Vec::new();
+    let mut budget_iter = max_iterations;
+    let mut budget_facts = max_facts;
+
+    for stratum_idxs in strata {
+        let stratum_rules: Vec<DatalogRule> =
+            stratum_idxs.iter().map(|i| rules[*i].clone()).collect();
+        let (next_facts, next_derived) = evaluate_stratum(
+            &stratum_rules,
+            &all_facts,
+            &mut budget_iter,
+            &mut budget_facts,
+        );
+        all_facts = next_facts;
+        derived.extend(next_derived);
+        if budget_iter == 0 || budget_facts == 0 {
+            break;
+        }
+    }
+    (all_facts, derived)
+}
+
+/// Inner fixpoint loop for a single stratum of rules.
+///
+/// Consumes from shared budget counters (`budget_iter`, `budget_facts`) and
+/// stops early if either reaches zero.
+fn evaluate_stratum(
+    rules: &[DatalogRule],
+    initial_facts: &FactSet,
+    budget_iter: &mut usize,
+    budget_facts: &mut usize,
+) -> (FactSet, Vec<DerivedFact>) {
     let mut all_facts = initial_facts.clone();
     let mut derived = Vec::new();
 
-    for _iteration in 0..max_iterations {
+    while *budget_iter > 0 {
+        *budget_iter -= 1;
         let mut new_delta = FactSet::new();
 
         for rule in rules {
@@ -236,22 +420,24 @@ pub fn evaluate(
             break;
         }
 
-        if all_facts.len() + new_delta.len() > max_facts {
+        if all_facts.len() + new_delta.len() > *budget_facts {
             tracing::warn!(
                 "Datalog max_facts cap reached ({} + {} > {})",
                 all_facts.len(),
                 new_delta.len(),
-                max_facts
+                *budget_facts
             );
+            *budget_facts = 0;
             break;
         }
 
-        // Merge new_delta into all_facts
+        // Merge new_delta into all_facts and deduct from fact budget.
         for (pred, fact_set) in &new_delta.facts {
             for args in fact_set {
                 all_facts.insert(pred, args.clone());
             }
         }
+        *budget_facts = budget_facts.saturating_sub(new_delta.len());
     }
 
     (all_facts, derived)
@@ -259,15 +445,25 @@ pub fn evaluate(
 
 /// Evaluate a single rule against the current fact set.
 ///
-/// Uses nested-loop join: for each body atom left-to-right, find all matching
-/// facts and extend the variable binding. After all atoms match, check builtin
-/// filters and instantiate the head.
+/// Dispatches to the two-phase aggregate evaluator when the rule contains
+/// aggregates; otherwise runs collect_bindings and instantiates the head.
 fn evaluate_rule(rule: &DatalogRule, all_facts: &FactSet) -> Vec<(Vec<Term>, Vec<ProvenanceStep>)> {
-    let mut results = Vec::new();
+    if !rule.aggregates.is_empty() {
+        return evaluate_rule_with_aggregates(rule, all_facts);
+    }
+    collect_bindings(rule, all_facts)
+        .into_iter()
+        .map(|(binding, prov)| (instantiate(&rule.head.args, &binding), prov))
+        .collect()
+}
 
+/// Run the body-unification + filter-check loop and return raw variable
+/// bindings. Identical semantics to the old `evaluate_rule` but stops just
+/// before instantiating the head, so callers can either instantiate
+/// (non-aggregate path) or feed bindings into the aggregate pipeline.
+fn collect_bindings(rule: &DatalogRule, all_facts: &FactSet) -> Vec<Candidate> {
     // Start with a single empty binding
-    let initial_bindings: Vec<(HashMap<String, Term>, Vec<ProvenanceStep>)> =
-        vec![(HashMap::new(), Vec::new())];
+    let initial_bindings: Vec<Candidate> = vec![(HashMap::new(), Vec::new())];
 
     let final_bindings = rule
         .body
@@ -276,7 +472,6 @@ fn evaluate_rule(rule: &DatalogRule, all_facts: &FactSet) -> Vec<(Vec<Term>, Vec
             let mut next_bindings = Vec::new();
 
             for (binding, provenance) in &current_bindings {
-                // Get matching facts for this predicate
                 if let Some(fact_set) = all_facts.get(&body_atom.predicate) {
                     for fact_args in fact_set {
                         if fact_args.len() != body_atom.args.len() {
@@ -294,15 +489,255 @@ fn evaluate_rule(rule: &DatalogRule, all_facts: &FactSet) -> Vec<(Vec<Term>, Vec
             next_bindings
         });
 
-    // Apply filters and instantiate head
-    for (binding, provenance) in final_bindings {
-        if check_filters(&rule.filters, &binding) {
-            let head_args = instantiate(&rule.head.args, &binding);
-            results.push((head_args, provenance));
+    // Apply filters and return bindings (head instantiation is the caller's job)
+    final_bindings
+        .into_iter()
+        .filter(|(binding, _)| check_filters(&rule.filters, binding))
+        .collect()
+}
+
+/// Two-phase aggregate evaluator.
+///
+/// Phase 1: collect candidate bindings from non-aggregate body atoms + pre-aggregate filters.
+/// Phase 2: for each aggregate, group candidates by group_vars, count inner-atom matches,
+///          bind output_var, then re-apply post-aggregate filters and instantiate the head.
+fn evaluate_rule_with_aggregates(
+    rule: &DatalogRule,
+    all_facts: &FactSet,
+) -> Vec<(Vec<Term>, Vec<ProvenanceStep>)> {
+    let agg_output_vars: std::collections::HashSet<&str> = rule
+        .aggregates
+        .iter()
+        .map(|a| a.output_var.as_str())
+        .collect();
+
+    let (phase1_filters, post_agg_filters): (Vec<_>, Vec<_>) = rule
+        .filters
+        .iter()
+        .cloned()
+        .partition(|f| !filter_references_any(f, &agg_output_vars));
+
+    let phase1_rule = DatalogRule {
+        head: rule.head.clone(),
+        body: rule.body.clone(),
+        filters: phase1_filters.clone(),
+        aggregates: Vec::new(),
+    };
+
+    // Phase 1: collect candidate bindings from non-aggregate body atoms.
+    // When body is empty we skip collect_bindings (it would return one
+    // vacuous empty binding that has no group_var values bound) and instead
+    // seed one binding per distinct group_vars tuple found in the first
+    // aggregate's inner predicate rows. For a global aggregate (no
+    // group_vars) we seed a single empty binding.
+    let mut bindings: Vec<Candidate> = if rule.body.is_empty() {
+        match rule.aggregates.first() {
+            Some(first_agg) if !first_agg.group_vars.is_empty() => {
+                seed_bindings_from_inner(first_agg, all_facts)
+            }
+            _ => vec![(HashMap::new(), Vec::new())],
         }
+    } else {
+        collect_bindings(&phase1_rule, all_facts)
+    };
+
+    // Apply phase1 filters to the seeded bindings (for the body-empty case
+    // the phase1_filters will be empty, so this is a no-op, but it keeps
+    // the logic symmetric).
+    bindings.retain(|(b, _)| phase1_filters.iter().all(|f| check_one_filter(f, b)));
+
+    for agg in &rule.aggregates {
+        bindings = apply_aggregate(agg, bindings, all_facts);
     }
 
+    let mut results = Vec::new();
+    for (binding, prov) in bindings {
+        if !post_agg_filters
+            .iter()
+            .all(|f| check_one_filter(f, &binding))
+        {
+            continue;
+        }
+        let head_args = instantiate(&rule.head.args, &binding);
+        results.push((head_args, prov));
+    }
     results
+}
+
+/// Returns true if the filter references any variable in `vars`.
+fn filter_references_any(f: &BuiltinFilter, vars: &std::collections::HashSet<&str>) -> bool {
+    use crate::types::FilterExpr;
+    fn expr_refs(e: &FilterExpr, vars: &std::collections::HashSet<&str>) -> bool {
+        match e {
+            FilterExpr::Var(name) => vars.contains(name.as_str()),
+            FilterExpr::LitNum(_) | FilterExpr::LitStr(_) => false,
+            FilterExpr::Neg(inner) => expr_refs(inner, vars),
+            FilterExpr::BinOp { lhs, rhs, .. } => expr_refs(lhs, vars) || expr_refs(rhs, vars),
+        }
+    }
+    match f {
+        BuiltinFilter::NotEqual(a, b) => vars.contains(a.as_str()) || vars.contains(b.as_str()),
+        BuiltinFilter::GreaterThan(a, _) | BuiltinFilter::LessThan(a, _) => {
+            vars.contains(a.as_str())
+        }
+        BuiltinFilter::Compare { lhs, rhs, .. } => expr_refs(lhs, vars) || expr_refs(rhs, vars),
+    }
+}
+
+/// Enumerate one binding per distinct group_vars tuple found in the inner
+/// conjunction's rows. Used when the rule body is empty and we need to seed
+/// candidate bindings for the aggregate phase.
+///
+/// For single-atom aggregates this looks only at `inner`; for conjunctions it
+/// backtracks over all atoms in `inner_conjunction` so that group vars spread
+/// across multiple atoms are all captured.
+fn seed_bindings_from_inner(agg: &crate::types::Aggregate, all_facts: &FactSet) -> Vec<Candidate> {
+    let atoms: Vec<&Atom> = if agg.inner_conjunction.is_empty() {
+        vec![&agg.inner]
+    } else {
+        agg.inner_conjunction.iter().collect()
+    };
+
+    // Collect all full bindings by backtracking over the conjunction.
+    let mut all_bindings: Vec<HashMap<String, Term>> = Vec::new();
+    collect_conjunction_bindings(&atoms, 0, HashMap::new(), all_facts, &mut all_bindings);
+
+    // Project each full binding down to only the group_vars, deduplicating.
+    let mut seen: std::collections::HashSet<Vec<Term>> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+
+    for binding in all_bindings {
+        let key: Vec<Term> = agg
+            .group_vars
+            .iter()
+            .map(|v| {
+                binding
+                    .get(v)
+                    .cloned()
+                    .unwrap_or_else(|| Term::Var(v.clone()))
+            })
+            .collect();
+        if seen.insert(key.clone()) {
+            let mut group_binding = HashMap::new();
+            for (name, val) in agg.group_vars.iter().zip(key.iter()) {
+                group_binding.insert(name.clone(), val.clone());
+            }
+            out.push((group_binding, Vec::new()));
+        }
+    }
+    out
+}
+
+/// Backtracker that collects every complete binding produced by unifying `atoms`
+/// in sequence. Used by `seed_bindings_from_inner` to enumerate group-var tuples.
+fn collect_conjunction_bindings(
+    atoms: &[&Atom],
+    i: usize,
+    binding: HashMap<String, Term>,
+    all_facts: &FactSet,
+    out: &mut Vec<HashMap<String, Term>>,
+) {
+    if i == atoms.len() {
+        out.push(binding);
+        return;
+    }
+    let atom = atoms[i];
+    let Some(rows) = all_facts.get(&atom.predicate) else {
+        return;
+    };
+    for row in rows {
+        if let Some(extended) = try_unify(&atom.args, row, &binding) {
+            collect_conjunction_bindings(atoms, i + 1, extended, all_facts, out);
+        }
+    }
+}
+
+/// Group candidates by aggregate group_vars, count inner-atom matches per
+/// group, bind output_var to the count, and return the augmented bindings.
+fn apply_aggregate(
+    agg: &crate::types::Aggregate,
+    candidates: Vec<Candidate>,
+    all_facts: &FactSet,
+) -> Vec<Candidate> {
+    let mut groups: HashMap<Vec<Term>, Vec<Candidate>> = HashMap::new();
+
+    for (binding, prov) in candidates {
+        let key: Vec<Term> = agg
+            .group_vars
+            .iter()
+            .map(|v| {
+                binding
+                    .get(v)
+                    .cloned()
+                    .unwrap_or_else(|| Term::Var(v.clone()))
+            })
+            .collect();
+        groups.entry(key).or_default().push((binding, prov));
+    }
+
+    let mut out = Vec::new();
+    for (_group_key, members) in groups {
+        let representative = match members.first() {
+            Some((b, _)) => b.clone(),
+            None => continue,
+        };
+        let count = count_inner_matches(agg, &representative, all_facts);
+
+        for (mut binding, mut prov) in members {
+            binding.insert(
+                agg.output_var.clone(),
+                Term::ConstFloat(OrderedFloat(count as f64)),
+            );
+            prov.push(make_provenance_step(
+                &format!("count({})", agg.inner.predicate),
+                &[Term::ConstFloat(OrderedFloat(count as f64))],
+            ));
+            out.push((binding, prov));
+        }
+    }
+    out
+}
+
+/// Count how many complete unifications exist for the aggregate's inner conjunction
+/// under the given binding. For single-atom aggregates this degenerates to counting
+/// matching rows; for multi-atom conjunctions it backtracks over all combinations.
+fn count_inner_matches(
+    agg: &crate::types::Aggregate,
+    binding: &std::collections::HashMap<String, Term>,
+    all_facts: &FactSet,
+) -> usize {
+    let atoms: Vec<&Atom> = if agg.inner_conjunction.is_empty() {
+        vec![&agg.inner]
+    } else {
+        agg.inner_conjunction.iter().collect()
+    };
+    let mut count = 0;
+    count_conjunction(&atoms, 0, binding.clone(), all_facts, &mut count);
+    count
+}
+
+/// Recursive conjunction backtracker: extends `binding` one atom at a time and
+/// increments `count` whenever all atoms are unified.
+fn count_conjunction(
+    atoms: &[&Atom],
+    i: usize,
+    binding: std::collections::HashMap<String, Term>,
+    all_facts: &FactSet,
+    count: &mut usize,
+) {
+    if i == atoms.len() {
+        *count += 1;
+        return;
+    }
+    let atom = atoms[i];
+    let Some(rows) = all_facts.get(&atom.predicate) else {
+        return;
+    };
+    for row in rows {
+        if let Some(extended) = try_unify(&atom.args, row, &binding) {
+            count_conjunction(atoms, i + 1, extended, all_facts, count);
+        }
+    }
 }
 
 /// Try to unify atom arguments with fact arguments under an existing binding.
@@ -342,6 +777,107 @@ fn try_unify(
     Some(new_binding)
 }
 
+/// Runtime value produced by `eval_expr`. Strings, numbers, and UUIDs
+/// each have their own arm so type mismatches surface clearly.
+enum EvalValue {
+    Num(f64),
+    Str(String),
+    Uuid(uuid::Uuid),
+}
+
+fn eval_expr(
+    e: &crate::types::FilterExpr,
+    binding: &std::collections::HashMap<String, Term>,
+) -> Option<EvalValue> {
+    use crate::types::{ArithOp, FilterExpr};
+    use ordered_float::OrderedFloat;
+    match e {
+        FilterExpr::Var(name) => match binding.get(name)? {
+            Term::ConstFloat(OrderedFloat(f)) => Some(EvalValue::Num(*f)),
+            Term::ConstStr(s) => Some(EvalValue::Str(s.clone())),
+            Term::Const(u) => Some(EvalValue::Uuid(*u)),
+            Term::Var(_) => None,
+        },
+        FilterExpr::LitNum(OrderedFloat(f)) => Some(EvalValue::Num(*f)),
+        FilterExpr::LitStr(s) => Some(EvalValue::Str(s.clone())),
+        FilterExpr::Neg(inner) => match eval_expr(inner, binding)? {
+            EvalValue::Num(x) => Some(EvalValue::Num(-x)),
+            _ => {
+                tracing::warn!("datalog: unary minus on non-numeric value");
+                None
+            }
+        },
+        FilterExpr::BinOp { op, lhs, rhs } => {
+            let l = eval_expr(lhs, binding)?;
+            let r = eval_expr(rhs, binding)?;
+            match (l, r) {
+                (EvalValue::Num(a), EvalValue::Num(b)) => match op {
+                    ArithOp::Add => Some(EvalValue::Num(a + b)),
+                    ArithOp::Sub => Some(EvalValue::Num(a - b)),
+                    ArithOp::Mul => Some(EvalValue::Num(a * b)),
+                    ArithOp::Div => {
+                        if b == 0.0 {
+                            tracing::warn!("datalog: division by zero in filter");
+                            None
+                        } else {
+                            Some(EvalValue::Num(a / b))
+                        }
+                    }
+                },
+                _ => {
+                    tracing::warn!("datalog: arithmetic on non-numeric values");
+                    None
+                }
+            }
+        }
+    }
+}
+
+fn apply_cmp(op: crate::types::CmpOp, l: &EvalValue, r: &EvalValue) -> bool {
+    use crate::types::CmpOp;
+    use std::cmp::Ordering;
+    match (l, r) {
+        (EvalValue::Num(a), EvalValue::Num(b)) => {
+            let Some(ord) = a.partial_cmp(b) else {
+                return false;
+            }; // NaN
+            match (op, ord) {
+                (CmpOp::Eq, Ordering::Equal) => true,
+                (CmpOp::Ne, ord) => ord != Ordering::Equal,
+                (CmpOp::Lt, Ordering::Less) => true,
+                (CmpOp::Le, ord) => ord != Ordering::Greater,
+                (CmpOp::Gt, Ordering::Greater) => true,
+                (CmpOp::Ge, ord) => ord != Ordering::Less,
+                _ => false,
+            }
+        }
+        (EvalValue::Str(a), EvalValue::Str(b)) => {
+            let ord = a.cmp(b);
+            match (op, ord) {
+                (CmpOp::Eq, Ordering::Equal) => true,
+                (CmpOp::Ne, ord) => ord != Ordering::Equal,
+                (CmpOp::Lt, Ordering::Less) => true,
+                (CmpOp::Le, ord) => ord != Ordering::Greater,
+                (CmpOp::Gt, Ordering::Greater) => true,
+                (CmpOp::Ge, ord) => ord != Ordering::Less,
+                _ => false,
+            }
+        }
+        (EvalValue::Uuid(a), EvalValue::Uuid(b)) => match op {
+            CmpOp::Eq => a == b,
+            CmpOp::Ne => a != b,
+            _ => {
+                tracing::warn!(?op, "datalog: ordered comparison on UUID; returning false");
+                false
+            }
+        },
+        _ => {
+            tracing::warn!(?op, "datalog: type mismatch in filter; returning false");
+            false
+        }
+    }
+}
+
 /// Check all builtin filters against a variable binding.
 fn check_filters(filters: &[BuiltinFilter], binding: &HashMap<String, Term>) -> bool {
     filters.iter().all(|f| check_one_filter(f, binding))
@@ -371,6 +907,14 @@ fn check_one_filter(filter: &BuiltinFilter, binding: &HashMap<String, Term>) -> 
             } else {
                 true
             }
+        }
+        BuiltinFilter::Compare { op, lhs, rhs } => {
+            let (Some(l), Some(r)) = (eval_expr(lhs, binding), eval_expr(rhs, binding)) else {
+                // Unbound or type-mismatch (already warned). Match legacy
+                // semantics: partial bindings pass the filter.
+                return true;
+            };
+            apply_cmp(*op, &l, &r)
         }
     }
 }
@@ -687,6 +1231,204 @@ pub async fn query_predicate(
     Ok(results)
 }
 
+// ─── Stratification Analyzer ─────────────────────────────────────
+
+/// Compute strata over a rule set.
+///
+/// Returns Err(StratifyError::RecursionThroughAggregate) if the
+/// predicate dependency graph has a strongly-connected component
+/// containing an Aggregate-labelled edge — meaning some predicate's
+/// derivation transitively requires aggregating over its own (or a
+/// peer's) result.
+///
+/// On success, returns rule indices grouped by ascending stratum.
+pub fn stratify(
+    rules: &[crate::types::DatalogRule],
+) -> Result<Vec<Vec<usize>>, crate::types::StratifyError> {
+    use std::collections::{BTreeMap, HashMap, HashSet};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Edge {
+        Plain,
+        Aggregate,
+    }
+
+    // Build predicate dep graph: head -> Vec<(dependency, edge_kind)>.
+    let mut graph: HashMap<String, Vec<(String, Edge)>> = HashMap::new();
+    let mut all_preds: HashSet<String> = HashSet::new();
+
+    for rule in rules {
+        let head = rule.head.predicate.clone();
+        all_preds.insert(head.clone());
+        let entry = graph.entry(head.clone()).or_default();
+        for atom in &rule.body {
+            entry.push((atom.predicate.clone(), Edge::Plain));
+            all_preds.insert(atom.predicate.clone());
+        }
+        for agg in &rule.aggregates {
+            let atoms: Vec<&Atom> = if agg.inner_conjunction.is_empty() {
+                vec![&agg.inner]
+            } else {
+                agg.inner_conjunction.iter().collect()
+            };
+            for atom in atoms {
+                entry.push((atom.predicate.clone(), Edge::Aggregate));
+                all_preds.insert(atom.predicate.clone());
+            }
+        }
+    }
+
+    // Iterative Tarjan SCC.
+    // Three work-item kinds:
+    //   Enter(v)            — assign index/lowlink, push onto SCC stack, schedule Continue.
+    //   Continue(v, idx)    — process the idx-th successor of v (or finalise if past the end).
+    //   Propagate(parent,child) — after child's subtree is done, pull child's lowlink into parent.
+    let mut index_counter: usize = 0;
+    let mut stack: Vec<String> = Vec::new();
+    let mut on_stack: HashSet<String> = HashSet::new();
+    let mut indices: HashMap<String, usize> = HashMap::new();
+    let mut lowlinks: HashMap<String, usize> = HashMap::new();
+    let mut sccs: Vec<Vec<String>> = Vec::new();
+
+    enum Step {
+        Enter(String),
+        Continue(String, usize),
+        Propagate(String, String), // (parent, child)
+    }
+
+    let nodes_to_visit: Vec<String> = all_preds.iter().cloned().collect();
+    for start in nodes_to_visit {
+        if indices.contains_key(&start) {
+            continue;
+        }
+        let mut work: Vec<Step> = vec![Step::Enter(start)];
+        while let Some(step) = work.pop() {
+            match step {
+                Step::Enter(node) => {
+                    indices.insert(node.clone(), index_counter);
+                    lowlinks.insert(node.clone(), index_counter);
+                    index_counter += 1;
+                    stack.push(node.clone());
+                    on_stack.insert(node.clone());
+                    work.push(Step::Continue(node, 0));
+                }
+                Step::Continue(node, succ_idx) => {
+                    let succs = graph.get(&node).cloned().unwrap_or_default();
+                    if succ_idx < succs.len() {
+                        let (succ, _) = succs[succ_idx].clone();
+                        // Come back to process the next successor after this one.
+                        work.push(Step::Continue(node.clone(), succ_idx + 1));
+                        if !indices.contains_key(&succ) {
+                            // Tree edge: recurse, then propagate lowlink back.
+                            work.push(Step::Propagate(node.clone(), succ.clone()));
+                            work.push(Step::Enter(succ));
+                        } else if on_stack.contains(&succ) {
+                            // Back edge: update lowlink immediately.
+                            let succ_index = *indices.get(&succ).unwrap();
+                            let cur = lowlinks.get_mut(&node).unwrap();
+                            if succ_index < *cur {
+                                *cur = succ_index;
+                            }
+                        }
+                        // Cross/forward edge (succ already fully processed, not on_stack): ignore.
+                    } else {
+                        // All successors done — check if this node is an SCC root.
+                        if lowlinks.get(&node) == indices.get(&node) {
+                            let mut scc = Vec::new();
+                            while let Some(w) = stack.pop() {
+                                on_stack.remove(&w);
+                                let done = w == node;
+                                scc.push(w);
+                                if done {
+                                    break;
+                                }
+                            }
+                            sccs.push(scc);
+                        }
+                    }
+                }
+                Step::Propagate(parent, child) => {
+                    // Pull child's lowlink into parent (tree-child propagation).
+                    let child_low = *lowlinks.get(&child).unwrap();
+                    let parent_low = *lowlinks.get(&parent).unwrap();
+                    if child_low < parent_low {
+                        *lowlinks.get_mut(&parent).unwrap() = child_low;
+                    }
+                }
+            }
+        }
+    }
+
+    // Map each predicate to its SCC index.
+    let mut node_to_scc: HashMap<String, usize> = HashMap::new();
+    for (i, scc) in sccs.iter().enumerate() {
+        for n in scc {
+            node_to_scc.insert(n.clone(), i);
+        }
+    }
+
+    // Reject any SCC that contains an Aggregate edge within the same SCC
+    // (i.e., a predicate depends on itself or a peer via aggregation).
+    for scc in &sccs {
+        let scc_set: HashSet<&str> = scc.iter().map(String::as_str).collect();
+        for node in scc {
+            if let Some(succs) = graph.get(node) {
+                for (succ, edge) in succs {
+                    if scc_set.contains(succ.as_str()) && *edge == Edge::Aggregate {
+                        return Err(crate::types::StratifyError::RecursionThroughAggregate {
+                            cycle: scc.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Assign a stratum to each SCC.
+    // Tarjan emits SCCs in reverse topological order (leaves first).
+    let mut scc_stratum: HashMap<usize, usize> = HashMap::new();
+    for (i, scc) in sccs.iter().enumerate() {
+        let mut max_dep_stratum: i64 = -1;
+        let mut had_aggregate_edge = false;
+        for node in scc {
+            if let Some(succs) = graph.get(node) {
+                for (succ, edge) in succs {
+                    let succ_scc = *node_to_scc.get(succ).unwrap();
+                    if succ_scc != i {
+                        let s = *scc_stratum.get(&succ_scc).unwrap_or(&0) as i64;
+                        if s > max_dep_stratum {
+                            max_dep_stratum = s;
+                        }
+                        if *edge == Edge::Aggregate {
+                            had_aggregate_edge = true;
+                        }
+                    }
+                }
+            }
+        }
+        // Plain edges: stratum = max_dep + 1 (derived predicates always lift one level).
+        // Aggregate edges: stratum = max_dep + 2 (extra lift ensures the aggregated relation
+        // is fully computed before aggregation runs).
+        let lift = if had_aggregate_edge { 2 } else { 1 };
+        let stratum = if max_dep_stratum < 0 {
+            0
+        } else {
+            (max_dep_stratum as usize) + lift
+        };
+        scc_stratum.insert(i, stratum);
+    }
+
+    // Group rule indices by ascending stratum.
+    let mut by_stratum: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (rule_idx, rule) in rules.iter().enumerate() {
+        let scc_idx = *node_to_scc.get(&rule.head.predicate).unwrap_or(&0);
+        let stratum = *scc_stratum.get(&scc_idx).unwrap_or(&0);
+        by_stratum.entry(stratum).or_default().push(rule_idx);
+    }
+
+    Ok(by_stratum.into_values().collect())
+}
+
 // ─── Tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -710,16 +1452,19 @@ mod tests {
 
     #[test]
     fn test_parse_rule_with_filter() {
+        use crate::types::{CmpOp, FilterExpr};
         let rule =
             parse_rule("related(X, Z) :- co_occurs(X, Y), co_occurs(Y, Z), X != Z.").unwrap();
         assert_eq!(rule.head.predicate, "related");
         assert_eq!(rule.body.len(), 2);
-        assert_eq!(rule.body[0].predicate, "co_occurs");
-        assert_eq!(rule.body[1].predicate, "co_occurs");
         assert_eq!(rule.filters.len(), 1);
         assert_eq!(
             rule.filters[0],
-            BuiltinFilter::NotEqual("X".into(), "Z".into())
+            BuiltinFilter::Compare {
+                op: CmpOp::Ne,
+                lhs: FilterExpr::Var("X".into()),
+                rhs: FilterExpr::Var("Z".into()),
+            }
         );
     }
 
@@ -765,16 +1510,34 @@ mod tests {
 
     #[test]
     fn test_parse_greater_than_filter() {
+        use crate::types::{CmpOp, FilterExpr};
+        use ordered_float::OrderedFloat;
         let rule = parse_rule("hot(X) :- warmth(X, W), W > 0.5.").unwrap();
         assert_eq!(rule.filters.len(), 1);
-        assert_eq!(rule.filters[0], BuiltinFilter::GreaterThan("W".into(), 0.5));
+        assert_eq!(
+            rule.filters[0],
+            BuiltinFilter::Compare {
+                op: CmpOp::Gt,
+                lhs: FilterExpr::Var("W".into()),
+                rhs: FilterExpr::LitNum(OrderedFloat(0.5)),
+            }
+        );
     }
 
     #[test]
     fn test_parse_less_than_filter() {
+        use crate::types::{CmpOp, FilterExpr};
+        use ordered_float::OrderedFloat;
         let rule = parse_rule("cold(X) :- warmth(X, W), W < 0.1.").unwrap();
         assert_eq!(rule.filters.len(), 1);
-        assert_eq!(rule.filters[0], BuiltinFilter::LessThan("W".into(), 0.1));
+        assert_eq!(
+            rule.filters[0],
+            BuiltinFilter::Compare {
+                op: CmpOp::Lt,
+                lhs: FilterExpr::Var("W".into()),
+                rhs: FilterExpr::LitNum(OrderedFloat(0.1)),
+            }
+        );
     }
 
     // ── Evaluator tests ───────────────────────────────────────────
@@ -1162,6 +1925,51 @@ mod tests {
     }
 
     #[test]
+    fn parse_rule_supports_ge_and_le_via_compare_variant() {
+        use crate::types::{CmpOp, FilterExpr};
+        use ordered_float::OrderedFloat;
+
+        let rule = parse_rule("hot(X) :- warmth(X, W), W >= 0.5.").unwrap();
+        assert_eq!(rule.filters.len(), 1);
+        assert_eq!(
+            rule.filters[0],
+            BuiltinFilter::Compare {
+                op: CmpOp::Ge,
+                lhs: FilterExpr::Var("W".into()),
+                rhs: FilterExpr::LitNum(OrderedFloat(0.5)),
+            }
+        );
+
+        let rule = parse_rule("cold(X) :- warmth(X, W), W <= 0.1.").unwrap();
+        assert_eq!(
+            rule.filters[0],
+            BuiltinFilter::Compare {
+                op: CmpOp::Le,
+                lhs: FilterExpr::Var("W".into()),
+                rhs: FilterExpr::LitNum(OrderedFloat(0.1)),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_rule_supports_arithmetic_filter() {
+        use crate::types::{CmpOp, FilterExpr};
+        use ordered_float::OrderedFloat;
+
+        let rule = parse_rule("near(X) :- count(X, N), N + 1 < 5.").unwrap();
+        let want = BuiltinFilter::Compare {
+            op: CmpOp::Lt,
+            lhs: FilterExpr::BinOp {
+                op: crate::types::ArithOp::Add,
+                lhs: Box::new(FilterExpr::Var("N".into())),
+                rhs: Box::new(FilterExpr::LitNum(OrderedFloat(1.0))),
+            },
+            rhs: FilterExpr::LitNum(OrderedFloat(5.0)),
+        };
+        assert_eq!(rule.filters[0], want);
+    }
+
+    #[test]
     fn test_edge_type_to_predicate() {
         assert_eq!(edge_type_to_predicate("CO_OCCURS"), "co_occurs");
         assert_eq!(edge_type_to_predicate("co_occurs"), "co_occurs");
@@ -1263,6 +2071,86 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn evaluator_handles_ge_and_arithmetic() {
+        use crate::types::{ArithOp, CmpOp, FilterExpr};
+        use ordered_float::OrderedFloat;
+        use std::collections::HashMap;
+
+        let mut binding: HashMap<String, Term> = HashMap::new();
+        binding.insert("S".into(), Term::ConstFloat(OrderedFloat(0.7)));
+        binding.insert("T".into(), Term::ConstFloat(OrderedFloat(0.5)));
+
+        // S >= T
+        let f1 = BuiltinFilter::Compare {
+            op: CmpOp::Ge,
+            lhs: FilterExpr::Var("S".into()),
+            rhs: FilterExpr::Var("T".into()),
+        };
+        assert!(check_one_filter(&f1, &binding));
+
+        // S < T (false)
+        let f2 = BuiltinFilter::Compare {
+            op: CmpOp::Lt,
+            lhs: FilterExpr::Var("S".into()),
+            rhs: FilterExpr::Var("T".into()),
+        };
+        assert!(!check_one_filter(&f2, &binding));
+
+        // T + 0.1 == 0.6
+        let f3 = BuiltinFilter::Compare {
+            op: CmpOp::Eq,
+            lhs: FilterExpr::BinOp {
+                op: ArithOp::Add,
+                lhs: Box::new(FilterExpr::Var("T".into())),
+                rhs: Box::new(FilterExpr::LitNum(OrderedFloat(0.1))),
+            },
+            rhs: FilterExpr::LitNum(OrderedFloat(0.6)),
+        };
+        assert!(check_one_filter(&f3, &binding));
+    }
+
+    #[test]
+    fn evaluator_unbound_var_passes_compare_filter() {
+        use crate::types::{CmpOp, FilterExpr};
+        use std::collections::HashMap;
+
+        let binding: HashMap<String, Term> = HashMap::new();
+        let f = BuiltinFilter::Compare {
+            op: CmpOp::Gt,
+            lhs: FilterExpr::Var("UNBOUND".into()),
+            rhs: FilterExpr::LitNum(ordered_float::OrderedFloat(3.0)),
+        };
+        // Unbound vars pass — same semantics as legacy GreaterThan.
+        assert!(check_one_filter(&f, &binding));
+    }
+
+    #[test]
+    fn legacy_filter_variants_still_evaluate() {
+        use ordered_float::OrderedFloat;
+        use std::collections::HashMap;
+
+        let mut binding: HashMap<String, Term> = HashMap::new();
+        binding.insert("X".into(), Term::ConstFloat(OrderedFloat(0.7)));
+
+        assert!(check_one_filter(
+            &BuiltinFilter::GreaterThan("X".into(), 0.5),
+            &binding
+        ));
+        assert!(!check_one_filter(
+            &BuiltinFilter::LessThan("X".into(), 0.5),
+            &binding
+        ));
+
+        let mut b2: HashMap<String, Term> = HashMap::new();
+        b2.insert("A".into(), Term::ConstStr("foo".into()));
+        b2.insert("B".into(), Term::ConstStr("bar".into()));
+        assert!(check_one_filter(
+            &BuiltinFilter::NotEqual("A".into(), "B".into()),
+            &b2
+        ));
+    }
+
     #[tokio::test]
     async fn test_query_predicate_caches_results() {
         use crate::storage::mock::MockStorage;
@@ -1326,5 +2214,481 @@ mod tests {
         // Check heat telemetry was recorded
         let (hits, _compute) = store.heat_get(&ctx, "related", 7).await.unwrap();
         assert!(hits >= 1, "should have at least one cache hit recorded");
+    }
+
+    #[test]
+    fn evaluate_full_rule_with_ge_filter() {
+        use ordered_float::OrderedFloat;
+
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+
+        let mut facts = FactSet::new();
+        // confidence(entity, score)
+        facts.insert(
+            "confidence",
+            vec![Term::Const(a), Term::ConstFloat(OrderedFloat(0.85))],
+        );
+        facts.insert(
+            "confidence",
+            vec![Term::Const(b), Term::ConstFloat(OrderedFloat(0.65))],
+        );
+        facts.insert(
+            "confidence",
+            vec![Term::Const(c), Term::ConstFloat(OrderedFloat(0.7))],
+        );
+
+        let rule = parse_rule("trusted(X) :- confidence(X, S), S >= 0.7.").unwrap();
+        let (derived_set, _provenance) = evaluate(&[rule], &facts, 100, 1000);
+
+        let trusted: std::collections::HashSet<Uuid> = derived_set
+            .get("trusted")
+            .into_iter()
+            .flatten()
+            .filter_map(|args| match args.first()? {
+                Term::Const(u) => Some(*u),
+                _ => None,
+            })
+            .collect();
+
+        assert!(trusted.contains(&a), "0.85 >= 0.7 should derive trusted(a)");
+        assert!(trusted.contains(&c), "0.7 >= 0.7 should derive trusted(c)");
+        assert!(
+            !trusted.contains(&b),
+            "0.65 >= 0.7 must not derive trusted(b)"
+        );
+    }
+
+    #[test]
+    fn user_example_var_to_var_inequality() {
+        // The user explicitly called this out as a target rule. After this
+        // change it parses to a Compare { op: Ne, … } and evaluates correctly.
+        use crate::types::{CmpOp, FilterExpr};
+
+        let rule = parse_rule(
+            "avoid_action(X) :- user_corrected(S1, X), user_corrected(S2, X), S1 != S2.",
+        )
+        .unwrap();
+        assert_eq!(rule.filters.len(), 1);
+        assert_eq!(
+            rule.filters[0],
+            BuiltinFilter::Compare {
+                op: CmpOp::Ne,
+                lhs: FilterExpr::Var("S1".into()),
+                rhs: FilterExpr::Var("S2".into()),
+            }
+        );
+
+        // End-to-end: two distinct sessions corrected the same target.
+        let s1 = Uuid::new_v4();
+        let s2 = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        let mut facts = FactSet::new();
+        facts.insert("user_corrected", vec![Term::Const(s1), Term::Const(target)]);
+        facts.insert("user_corrected", vec![Term::Const(s2), Term::Const(target)]);
+        let (derived, _) = evaluate(&[rule], &facts, 100, 1000);
+        let any_avoid = derived.get("avoid_action").is_some_and(|s| !s.is_empty());
+        assert!(
+            any_avoid,
+            "expected avoid_action to fire when two distinct sessions corrected the same target"
+        );
+    }
+
+    #[test]
+    fn parse_rule_supports_count_aggregate() {
+        use crate::types::AggregateKind;
+        let rule =
+            parse_rule("avoid_action(X) :- count(user_corrected(S, X), N), N >= 3.").unwrap();
+        assert_eq!(rule.aggregates.len(), 1);
+        let agg = &rule.aggregates[0];
+        assert_eq!(agg.kind, AggregateKind::Count);
+        assert_eq!(agg.inner.predicate, "user_corrected");
+        assert_eq!(agg.inner.args.len(), 2);
+        assert_eq!(agg.output_var, "N");
+        assert_eq!(agg.group_vars, vec!["X".to_string()]);
+        assert_eq!(rule.filters.len(), 1);
+    }
+
+    #[test]
+    fn intra_rule_recursion_through_count_now_rejected_at_evaluate_time() {
+        // The v1 parse-time guard was removed in favour of the stratify
+        // analyzer (Task M3) which catches cross-rule recursion too. The
+        // rule now parses cleanly; evaluate-time rejection is asserted in
+        // tests in Tasks M3 and M5.
+        let rule = parse_rule("loop(X) :- count(loop(Y), N), N > 0.").unwrap();
+        assert_eq!(rule.aggregates.len(), 1);
+    }
+
+    #[test]
+    fn parse_rule_rejects_count_with_non_var_output() {
+        let err = parse_rule("avoid_action(X) :- count(user_corrected(S, X), 3).").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("output_var") || msg.contains("variable") || msg.contains("Var"),
+            "expected output-var-must-be-Var error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn evaluator_count_aggregate_groups_and_counts() {
+        let s1 = Uuid::new_v4();
+        let s2 = Uuid::new_v4();
+        let s3 = Uuid::new_v4();
+        let target_t = Uuid::new_v4(); // 3 distinct correctors
+        let target_u = Uuid::new_v4(); // 2 distinct correctors
+
+        let mut facts = FactSet::new();
+        facts.insert(
+            "user_corrected",
+            vec![Term::Const(s1), Term::Const(target_t)],
+        );
+        facts.insert(
+            "user_corrected",
+            vec![Term::Const(s2), Term::Const(target_t)],
+        );
+        facts.insert(
+            "user_corrected",
+            vec![Term::Const(s3), Term::Const(target_t)],
+        );
+        facts.insert(
+            "user_corrected",
+            vec![Term::Const(s1), Term::Const(target_u)],
+        );
+        facts.insert(
+            "user_corrected",
+            vec![Term::Const(s2), Term::Const(target_u)],
+        );
+
+        let rule =
+            parse_rule("avoid_action(X) :- count(user_corrected(S, X), N), N >= 3.").unwrap();
+        let (derived, _) = evaluate(&[rule], &facts, 100, 1000);
+
+        let avoided: std::collections::HashSet<Uuid> = derived
+            .get("avoid_action")
+            .into_iter()
+            .flatten()
+            .filter_map(|args| match args.first()? {
+                Term::Const(u) => Some(*u),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            avoided.contains(&target_t),
+            "3 distinct correctors should fire avoid_action"
+        );
+        assert!(
+            !avoided.contains(&target_u),
+            "2 distinct correctors should NOT fire avoid_action"
+        );
+    }
+
+    #[test]
+    fn user_example_count_aggregate_with_ge() {
+        // The user's target rule:
+        //   avoid_action(X) :- count(user_corrected(S, X), N), N >= 3.
+        //
+        // 3 distinct sessions corrected target T  ⇒  avoid_action(T) fires
+        // 2 distinct sessions corrected target U  ⇒  avoid_action(U) does NOT fire
+        let s1 = Uuid::new_v4();
+        let s2 = Uuid::new_v4();
+        let s3 = Uuid::new_v4();
+        let target_t = Uuid::new_v4();
+        let target_u = Uuid::new_v4();
+
+        let mut facts = FactSet::new();
+        facts.insert(
+            "user_corrected",
+            vec![Term::Const(s1), Term::Const(target_t)],
+        );
+        facts.insert(
+            "user_corrected",
+            vec![Term::Const(s2), Term::Const(target_t)],
+        );
+        facts.insert(
+            "user_corrected",
+            vec![Term::Const(s3), Term::Const(target_t)],
+        );
+        facts.insert(
+            "user_corrected",
+            vec![Term::Const(s1), Term::Const(target_u)],
+        );
+        facts.insert(
+            "user_corrected",
+            vec![Term::Const(s2), Term::Const(target_u)],
+        );
+
+        let rule =
+            parse_rule("avoid_action(X) :- count(user_corrected(S, X), N), N >= 3.").unwrap();
+        let (derived, _) = evaluate(&[rule], &facts, 100, 1000);
+
+        let avoided: std::collections::HashSet<Uuid> = derived
+            .get("avoid_action")
+            .into_iter()
+            .flatten()
+            .filter_map(|args| match args.first()? {
+                Term::Const(u) => Some(*u),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            avoided.contains(&target_t),
+            "3 distinct correctors should derive avoid_action"
+        );
+        assert!(
+            !avoided.contains(&target_u),
+            "2 distinct correctors should NOT derive avoid_action"
+        );
+    }
+
+    #[test]
+    fn parse_rule_supports_two_atom_conjunction() {
+        use crate::types::AggregateKind;
+        let rule = parse_rule(
+            "preferred_tool(Ctx, Tool) :- count(worked_well(S, Tool), session_context(S, Ctx), N), N >= 3."
+        ).unwrap();
+        assert_eq!(rule.aggregates.len(), 1);
+        let agg = &rule.aggregates[0];
+        assert_eq!(agg.kind, AggregateKind::Count);
+        assert_eq!(agg.inner_conjunction.len(), 2);
+        assert_eq!(agg.inner_conjunction[0].predicate, "worked_well");
+        assert_eq!(agg.inner_conjunction[1].predicate, "session_context");
+        assert_eq!(agg.inner.predicate, "worked_well");
+        let mut sorted_groups = agg.group_vars.clone();
+        sorted_groups.sort();
+        assert_eq!(sorted_groups, vec!["Ctx".to_string(), "Tool".to_string()]);
+        assert_eq!(agg.output_var, "N");
+    }
+
+    #[test]
+    fn parse_rule_rejects_aggregate_with_no_atoms() {
+        let err = parse_rule("foo(X) :- count(N).").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("inner atom") || msg.contains("at least"),
+            "expected at-least-one-atom error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_rule_single_atom_aggregate_keeps_v1_shape() {
+        let rule = parse_rule("foo(X) :- count(bar(X), N), N > 0.").unwrap();
+        let agg = &rule.aggregates[0];
+        assert!(agg.inner_conjunction.is_empty());
+        assert_eq!(agg.inner.predicate, "bar");
+    }
+
+    // ─── M3: stratify tests ───────────────────────────────────────
+
+    #[test]
+    fn stratify_simple_chain_assigns_ascending_strata() {
+        let r1 = parse_rule("b(X) :- a(X).").unwrap();
+        let r2 = parse_rule("c(X) :- b(X).").unwrap();
+        let strata = stratify(&[r1, r2]).unwrap();
+        assert!(strata.len() >= 2);
+        let r1_stratum = strata.iter().position(|s| s.contains(&0)).unwrap();
+        let r2_stratum = strata.iter().position(|s| s.contains(&1)).unwrap();
+        assert!(
+            r1_stratum < r2_stratum,
+            "b's rule must come before c's rule"
+        );
+    }
+
+    #[test]
+    fn stratify_aggregate_lifts_one_level() {
+        let r = parse_rule("b(X) :- count(a(X), N), N > 0.").unwrap();
+        let strata = stratify(&[r]).unwrap();
+        assert!(strata.iter().any(|s| s.contains(&0)));
+    }
+
+    #[test]
+    fn stratify_rejects_intra_rule_recursion_through_aggregate() {
+        let r = parse_rule("loop(X) :- count(loop(Y), N), N > 0.").unwrap();
+        let err = stratify(&[r]).unwrap_err();
+        match err {
+            crate::types::StratifyError::RecursionThroughAggregate { cycle } => {
+                assert!(cycle.contains(&"loop".to_string()));
+            }
+        }
+    }
+
+    #[test]
+    fn stratify_rejects_cross_rule_recursion_through_aggregate() {
+        let r1 = parse_rule("a(X) :- b(X).").unwrap();
+        let r2 = parse_rule("b(X) :- count(a(Y), N), N > 0.").unwrap();
+        let err = stratify(&[r1, r2]).unwrap_err();
+        match err {
+            crate::types::StratifyError::RecursionThroughAggregate { cycle } => {
+                assert!(cycle.iter().any(|c| c == "a"));
+                assert!(cycle.iter().any(|c| c == "b"));
+            }
+        }
+    }
+
+    #[test]
+    fn stratify_allows_plain_recursion() {
+        // path(X, Z) :- edge(X, Y), path(Y, Z). is recursive but only via Plain edges.
+        let r = parse_rule("path(X, Z) :- edge(X, Y), path(Y, Z).").unwrap();
+        let strata = stratify(&[r]).unwrap();
+        assert!(strata.iter().any(|s| s.contains(&0)));
+    }
+
+    // ─── M4: stratum-by-stratum evaluator + conjunction backtracking ──
+
+    #[test]
+    fn evaluator_two_atom_conjunction_groups_correctly() {
+        let s1 = Uuid::new_v4();
+        let s2 = Uuid::new_v4();
+        let s3 = Uuid::new_v4();
+        let s4 = Uuid::new_v4();
+        let ca = Uuid::new_v4();
+        let cb = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+        let t2 = Uuid::new_v4();
+
+        let mut facts = FactSet::new();
+        facts.insert("worked_well", vec![Term::Const(s1), Term::Const(t1)]);
+        facts.insert("worked_well", vec![Term::Const(s2), Term::Const(t1)]);
+        facts.insert("worked_well", vec![Term::Const(s3), Term::Const(t1)]);
+        facts.insert("worked_well", vec![Term::Const(s1), Term::Const(t2)]);
+        facts.insert("worked_well", vec![Term::Const(s2), Term::Const(t2)]);
+        facts.insert("worked_well", vec![Term::Const(s4), Term::Const(t1)]);
+        facts.insert("session_context", vec![Term::Const(s1), Term::Const(ca)]);
+        facts.insert("session_context", vec![Term::Const(s2), Term::Const(ca)]);
+        facts.insert("session_context", vec![Term::Const(s3), Term::Const(ca)]);
+        facts.insert("session_context", vec![Term::Const(s1), Term::Const(cb)]);
+        facts.insert("session_context", vec![Term::Const(s4), Term::Const(cb)]);
+
+        let rule = parse_rule(
+            "preferred_tool(Ctx, Tool) :- count(worked_well(S, Tool), session_context(S, Ctx), N), N >= 3."
+        ).unwrap();
+        let (derived, _) = evaluate(&[rule], &facts, 100, 1000);
+
+        let pairs: std::collections::HashSet<(Uuid, Uuid)> = derived
+            .get("preferred_tool")
+            .into_iter()
+            .flatten()
+            .filter_map(|args| {
+                let (Term::Const(c), Term::Const(t)) = (args.first()?, args.get(1)?) else {
+                    return None;
+                };
+                Some((*c, *t))
+            })
+            .collect();
+
+        assert!(
+            pairs.contains(&(ca, t1)),
+            "(cA, t1) with 3 distinct sessions must fire"
+        );
+        assert!(
+            !pairs.contains(&(ca, t2)),
+            "(cA, t2) with 2 sessions must NOT fire"
+        );
+        assert!(
+            !pairs.contains(&(cb, t1)),
+            "(cB, t1) with 2 sessions must NOT fire"
+        );
+    }
+
+    #[test]
+    fn evaluator_existential_var_aggregated_over() {
+        let s1 = Uuid::new_v4();
+        let s2 = Uuid::new_v4();
+        let s3 = Uuid::new_v4();
+        let ca = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+
+        let mut facts = FactSet::new();
+        for s in [s1, s2, s3] {
+            facts.insert("worked_well", vec![Term::Const(s), Term::Const(t1)]);
+            facts.insert("session_context", vec![Term::Const(s), Term::Const(ca)]);
+        }
+
+        let rule = parse_rule(
+            "preferred_tool(Ctx, Tool) :- count(worked_well(S, Tool), session_context(S, Ctx), N), N >= 3."
+        ).unwrap();
+        let (derived, _) = evaluate(&[rule], &facts, 100, 1000);
+
+        let row = derived.get("preferred_tool").into_iter().flatten().next();
+        let row = row.expect("expected one preferred_tool fact");
+        assert_eq!(
+            row.len(),
+            2,
+            "head has only Ctx and Tool; S must not appear"
+        );
+    }
+
+    #[test]
+    fn evaluator_recursion_through_aggregate_emits_warn_and_no_facts() {
+        let rule = parse_rule("loop(X) :- count(loop(Y), N), N > 0.").unwrap();
+        let mut facts = FactSet::new();
+        let x = Uuid::new_v4();
+        facts.insert("loop", vec![Term::Const(x)]);
+
+        let (derived, _) = evaluate(&[rule], &facts, 100, 1000);
+        let derived_loop_count = derived.get("loop").map(|v| v.len()).unwrap_or(0);
+        assert_eq!(
+            derived_loop_count, 1,
+            "stratification rejection must leave only the base fact"
+        );
+    }
+
+    // ─── M5: Acceptance tests ─────────────────────────────────────
+
+    #[test]
+    fn acceptance_threshold_k_eq_3() {
+        let rule = parse_rule(
+            "preferred_tool(Ctx, Tool) :- count(worked_well(S, Tool), session_context(S, Ctx), N), N >= 3."
+        ).unwrap();
+        assert_eq!(rule.aggregates.len(), 1);
+        assert_eq!(rule.aggregates[0].inner_conjunction.len(), 2);
+    }
+
+    #[test]
+    fn acceptance_existential_quantification() {
+        let rule = parse_rule(
+            "preferred_tool(Ctx, Tool) :- count(worked_well(S, Tool), session_context(S, Ctx), N), N >= 3."
+        ).unwrap();
+        let agg = &rule.aggregates[0];
+        assert!(
+            !agg.group_vars.contains(&"S".to_string()),
+            "S must be existentially quantified"
+        );
+        assert!(agg.group_vars.contains(&"Ctx".to_string()));
+        assert!(agg.group_vars.contains(&"Tool".to_string()));
+    }
+
+    #[test]
+    fn acceptance_recursion_rejected_at_load_time() {
+        let rule = parse_rule("loop(X) :- count(loop(Y), N), N > 0.").unwrap();
+        let mut facts = FactSet::new();
+        let x = Uuid::new_v4();
+        facts.insert("loop", vec![Term::Const(x)]);
+        let (derived, _) = evaluate(&[rule], &facts, 100, 1000);
+        assert_eq!(derived.get("loop").map(|v| v.len()).unwrap_or(0), 1);
+        // No new facts should be derived from an unstratifiable rule set
+    }
+
+    #[test]
+    fn acceptance_no_regression_on_v1_aggregation() {
+        let s1 = Uuid::new_v4();
+        let s2 = Uuid::new_v4();
+        let s3 = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        let mut facts = FactSet::new();
+        facts.insert("user_corrected", vec![Term::Const(s1), Term::Const(target)]);
+        facts.insert("user_corrected", vec![Term::Const(s2), Term::Const(target)]);
+        facts.insert("user_corrected", vec![Term::Const(s3), Term::Const(target)]);
+        let rule =
+            parse_rule("avoid_action(X) :- count(user_corrected(S, X), N), N >= 3.").unwrap();
+        assert!(
+            rule.aggregates[0].inner_conjunction.is_empty(),
+            "v1 single-atom path"
+        );
+        let (derived, _) = evaluate(&[rule], &facts, 100, 1000);
+        let any = derived.get("avoid_action").map(|v| v.len()).unwrap_or(0);
+        assert_eq!(any, 1, "v1 single-atom aggregate must still fire");
     }
 }

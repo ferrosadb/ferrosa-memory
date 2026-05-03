@@ -27,6 +27,7 @@ pub mod compression;
 pub mod config;
 pub mod cql_storage;
 pub mod datalog;
+pub mod datalog_filter_expr;
 pub mod dedup;
 pub mod dispatch;
 pub mod dream;
