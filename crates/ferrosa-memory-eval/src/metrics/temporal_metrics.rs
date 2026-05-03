@@ -15,10 +15,10 @@ use serde::{Deserialize, Serialize};
 
 /// Expected Ebbinghaus warmth values at fixed checkpoints.
 pub const EBINGHAUS_CHECKPOINTS: &[(f64, f64)] = &[
-    (0.0, 1.0),       // t=0h
-    (1.0, 0.55),      // 1h
-    (24.0, 0.21),     // 24h
-    (168.0, 0.05),    // 7d
+    (0.0, 1.0),    // t=0h
+    (1.0, 0.55),   // 1h
+    (24.0, 0.21),  // 24h
+    (168.0, 0.05), // 7d
 ];
 
 /// Decay profile for a content category.
@@ -240,10 +240,7 @@ mod tests {
 
     #[test]
     fn forgetting_false_positive_fails() {
-        let entities = vec![
-            ("a".to_string(), 0.9),
-            ("b".to_string(), 0.1),
-        ];
+        let entities = vec![("a".to_string(), 0.9), ("b".to_string(), 0.1)];
         let pruned = vec!["a".to_string()]; // wrong: a is above threshold
         let score = forgetting_validation(&entities, 0.5, &pruned);
         assert!(!score.passed);
@@ -253,13 +250,19 @@ mod tests {
     fn category_decay_bug_faster_than_arch() {
         let bug = expected_warmth(1.0, 24.0, 24.0);
         let arch = expected_warmth(1.0, 168.0, 24.0);
-        assert!(bug < arch, "bug should decay faster than architecture over 24h");
+        assert!(
+            bug < arch,
+            "bug should decay faster than architecture over 24h"
+        );
     }
 
     #[test]
     fn category_decay_transient_fastest() {
         let transient = expected_warmth(1.0, 12.0, 12.0);
         let bug = expected_warmth(1.0, 24.0, 12.0);
-        assert!(transient < bug, "transient should decay faster than bug over 12h");
+        assert!(
+            transient < bug,
+            "transient should decay faster than bug over 12h"
+        );
     }
 }

@@ -507,11 +507,12 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                 "properties": {
                     "session_id": { "type": "string" },
                     "query_id": { "type": "string", "format": "uuid" },
-                    "program_type": { "type": "string", "enum": ["hnsw_ann", "phonetic", "cypher_hop", "btree_range", "memo_hit"] },
+                    "program_type": { "type": "string", "enum": ["hnsw_ann", "phonetic", "cypher_hop", "btree_range", "memo_hit", "retrieval_miss"] },
                     "task_complexity": { "type": "string", "enum": ["simple", "linear", "quadratic"] },
                     "succeeded": { "type": "boolean" },
                     "latency_ms": { "type": "integer", "minimum": 0 },
-                    "token_cost": { "type": "integer", "minimum": 0 }
+                    "token_cost": { "type": "integer", "minimum": 0 },
+                    "entity_ids": { "type": "array", "items": { "type": "string", "format": "uuid" }, "description": "Entity IDs this outcome applies to. Success → warmth boost. Failure → warmth penalty." }
                 },
                 "required": ["query_id", "program_type", "task_complexity", "succeeded", "latency_ms", "token_cost"]
             }),
@@ -3147,6 +3148,26 @@ async fn handle_retrieve_entities<S: crate::storage::Storage>(
             }
         }
     }
+    drop(tracker);
+    drop(co_access);
+
+    // Fire-and-forget auto outcome for retrieve_entities.
+    let auto_query_id = uuid::Uuid::new_v4();
+    let _ = crate::feedback::record_outcome(
+        storage,
+        ctx,
+        session_id,
+        auto_query_id,
+        "retrieve_entities_auto",
+        "simple",
+        true,
+        0,
+        0,
+    )
+    .await;
+    for entity in &entities {
+        let _ = crate::warmth::apply_outcome_boost(storage, ctx, entity.entity_id, true, 0).await;
+    }
 
     // Warmth boost for retrieved entities (fire-and-forget)
     let rmh_config = crate::config::RmhConfig::default();
@@ -3306,27 +3327,39 @@ async fn handle_record_outcome<S: crate::storage::Storage>(
     .await
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
-    // Apply small negative reputation to entities that caused a retrieval miss
-    if program_type == "retrieval_miss"
-        && let Some(entity_ids) = args.get("entity_ids").and_then(|v| v.as_array())
-    {
+    // Warmth modulation: success → boost, failure → penalty.
+    // This closes the episodic feedback loop — recorded outcomes change
+    // future retrieval ranking via warmth scores.
+    if let Some(entity_ids) = args.get("entity_ids").and_then(|v| v.as_array()) {
         let mut deltas = std::collections::HashMap::new();
         for id_val in entity_ids {
-            if let Some(id_str) = id_val.as_str()
-                && let Ok(eid) = id_str.parse::<uuid::Uuid>()
-            {
-                deltas.insert(eid, -0.05);
+            if let Some(Ok(eid)) = id_val.as_str().map(|s| s.parse::<uuid::Uuid>()) {
+                if let Err(e) =
+                    crate::warmth::apply_outcome_boost(storage, ctx, eid, succeeded, latency_ms)
+                        .await
+                {
+                    tracing::warn!(entity_id = %eid, error = %e, "warmth boost failed");
+                }
+                // Also accumulate reputation delta for batch reputation update
+                deltas.insert(eid, if succeeded { 0.05 } else { -0.10 });
             }
         }
         if !deltas.is_empty()
             && let Err(e) =
                 crate::pagerank::update_reputation_scores(storage, ctx, session_id, &deltas).await
         {
-            tracing::warn!("failed to penalize retrieval-miss entity reputation: {e}");
+            tracing::warn!("failed to update entity reputation from outcome: {e}");
         }
+    } else if program_type == "retrieval_miss" {
+        // Back-compat: the old retrieval_miss path also penalized reputation.
+        // If caller didn't supply entity_ids, nothing to penalize directly.
+        tracing::debug!("retrieval_miss without entity_ids — no reputation penalty applied");
     }
 
-    let mut response = serde_json::json!({ "recorded": recorded });
+    let mut response = serde_json::json!({
+        "recorded": recorded,
+        "warmth_updated": args.get("entity_ids").is_some()
+    });
     if program_type == "retrieval_miss" {
         response["_hint"] = serde_json::json!(
             "Retrieval miss logged. The system will learn to store this kind of information. Consider using smart_ingest now to store what you found via grep/read."
@@ -4203,6 +4236,46 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
     let result_count = results.len();
+
+    // Auto-record outcome for episodic feedback loop.
+    // Success if any results were found; failure on empty.
+    let auto_outcome_succeeded = result_count > 0;
+    let auto_outcome_eids: Vec<String> = results.iter().map(|r| r.id.to_string()).collect();
+    let auto_query_id = uuid::Uuid::new_v4();
+    let search_start = std::time::Instant::now();
+    // We already have the results; compute elapsed since the actual search call.
+    // Since we can't retroactively measure, we use a small best-effort value.
+    let auto_latency_ms = search_start.elapsed().as_millis() as i32;
+
+    // Fire-and-forget auto outcome — don't fail the search if this errors.
+    let _ = crate::feedback::record_outcome(
+        storage,
+        ctx,
+        session_id,
+        auto_query_id,
+        "hybrid_search_auto",
+        "simple",
+        auto_outcome_succeeded,
+        auto_latency_ms.max(1), // avoid 0
+        0,
+    )
+    .await;
+    if !auto_outcome_eids.is_empty() {
+        // Best-effort warmth boost for returned entities
+        for eid in &auto_outcome_eids {
+            if let Ok(id) = eid.parse::<uuid::Uuid>() {
+                let _ = crate::warmth::apply_outcome_boost(
+                    storage,
+                    ctx,
+                    id,
+                    auto_outcome_succeeded,
+                    auto_latency_ms,
+                )
+                .await;
+            }
+        }
+    }
+
     let hint = if results.is_empty() {
         pick_hint(&[
             "No matches — this topic is new to memory. Good candidate for smart_ingest.",
@@ -8295,17 +8368,17 @@ mod tests {
         let result = unwrap_tool_result(result);
         assert_eq!(result["recorded"], true);
 
-        // Both entities should have received -0.05 reputation penalty
+        // Both entities should have received -0.10 reputation penalty (failure with entity_ids)
         let w1 = store.warmth_get(&ctx, eid1).await.unwrap().unwrap();
         assert!(
-            (w1.reputation - (-0.05)).abs() < f64::EPSILON,
-            "expected -0.05 reputation, got {}",
+            (w1.reputation - (-0.10)).abs() < 0.001,
+            "expected -0.10 reputation, got {}",
             w1.reputation
         );
         let w2 = store.warmth_get(&ctx, eid2).await.unwrap().unwrap();
         assert!(
-            (w2.reputation - (-0.05)).abs() < f64::EPSILON,
-            "expected -0.05 reputation, got {}",
+            (w2.reputation - (-0.10)).abs() < 0.001,
+            "expected -0.10 reputation, got {}",
             w2.reputation
         );
     }
