@@ -38,7 +38,9 @@ pub enum RunnerError {
     #[error("Pre-flight failed: Ferrosa cluster unhealthy — {reason}")]
     PreflightFailed { reason: String },
 
-    #[error("CONTAMINATED: pre-scenario entity_count={entity_count} after delete_session (session {session_id})")]
+    #[error(
+        "CONTAMINATED: pre-scenario entity_count={entity_count} after delete_session (session {session_id})"
+    )]
     Contaminated {
         entity_count: usize,
         session_id: Uuid,
@@ -186,10 +188,7 @@ pub fn load_scenarios(dir: &Path) -> Result<Vec<EvalScenario>, RunnerError> {
             scenarios.extend(sub);
         } else if path.extension().is_some_and(|ext| ext == "toml") {
             let contents = std::fs::read_to_string(&path).map_err(|e| {
-                RunnerError::ScenarioLoad(format!(
-                    "cannot read {}: {e}",
-                    path.display()
-                ))
+                RunnerError::ScenarioLoad(format!("cannot read {}: {e}", path.display()))
             })?;
             let scenario: EvalScenario = toml::from_str(&contents)?;
             scenarios.push(scenario);
@@ -406,9 +405,7 @@ impl<T: McpTransport> EvalRunner<T> {
             Ok((_response, _latency)) => {
                 if elapsed > timeout {
                     return Err(RunnerError::PreflightFailed {
-                        reason: format!(
-                            "get_stats responded in {elapsed:?} (limit: {timeout:?})"
-                        ),
+                        reason: format!("get_stats responded in {elapsed:?} (limit: {timeout:?})"),
                     });
                 }
                 Ok(())
@@ -448,10 +445,7 @@ impl<T: McpTransport> EvalRunner<T> {
             "session_id": warmup_session.to_string(),
             "tenant_id": tenant_id.to_string(),
         });
-        let _ = self
-            .transport
-            .call_tool("hybrid_search", search_args)
-            .await;
+        let _ = self.transport.call_tool("hybrid_search", search_args).await;
 
         // Clean up warmup data
         self.delete_session(&warmup_session).await?;
@@ -468,11 +462,7 @@ impl<T: McpTransport> EvalRunner<T> {
 
         // Programmatic grading
         if methods.is_empty() || methods.iter().any(|m| m == "programmatic") {
-            let score = programmatic::grade(
-                &run.scenario.steps,
-                &run.traces,
-                &NoOpResolver,
-            );
+            let score = programmatic::grade(&run.scenario.steps, &run.traces, &NoOpResolver);
             programmatic_score = Some(score);
         }
 
@@ -487,8 +477,7 @@ impl<T: McpTransport> EvalRunner<T> {
                     .collect::<Vec<_>>()
                     .join(" ");
 
-                let claim_strs: Vec<&str> =
-                    rubric_cfg.claims.iter().map(|s| s.as_str()).collect();
+                let claim_strs: Vec<&str> = rubric_cfg.claims.iter().map(|s| s.as_str()).collect();
 
                 if let Ok(score) = claim_rubric::grade_claims(
                     &claim_strs,
@@ -596,9 +585,10 @@ where
         let config = config.clone();
 
         join_set.spawn(async move {
-            let _permit = sem.acquire().await.map_err(|_| {
-                RunnerError::McpClient("semaphore closed".to_string())
-            })?;
+            let _permit = sem
+                .acquire()
+                .await
+                .map_err(|_| RunnerError::McpClient("semaphore closed".to_string()))?;
 
             let transport = factory();
             let mut runner = EvalRunner::new(transport, (*config).clone());
@@ -611,9 +601,8 @@ where
 
     let mut results = Vec::new();
     while let Some(join_result) = join_set.join_next().await {
-        let run = join_result.map_err(|e| {
-            RunnerError::McpClient(format!("task join error: {e}"))
-        })??;
+        let run =
+            join_result.map_err(|e| RunnerError::McpClient(format!("task join error: {e}")))??;
         results.push(run);
     }
 
@@ -661,9 +650,8 @@ impl CleanupLedger {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let json = serde_json::to_string_pretty(self).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-        })?;
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         std::fs::write(path, json)
     }
 
@@ -673,9 +661,8 @@ impl CleanupLedger {
             return Ok(None);
         }
         let contents = std::fs::read_to_string(path)?;
-        let ledger: Self = serde_json::from_str(&contents).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-        })?;
+        let ledger: Self = serde_json::from_str(&contents)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         Ok(Some(ledger))
     }
 
@@ -695,10 +682,7 @@ impl CleanupLedger {
 
     /// Sweep all sessions in this ledger using the provided transport.
     /// Ignores errors from delete_session (sessions may not exist).
-    pub async fn sweep<T: McpTransport>(
-        &self,
-        transport: &mut T,
-    ) -> Result<(), RunnerError> {
+    pub async fn sweep<T: McpTransport>(&self, transport: &mut T) -> Result<(), RunnerError> {
         for session_str in &self.sessions {
             let args = serde_json::json!({
                 "session_id": session_str,
@@ -1074,11 +1058,13 @@ tool = "get_stats"
 
     #[tokio::test]
     async fn run_scenario_creates_fresh_session_id() {
-        let transport = MockTransport::new()
-            .on_tool("get_stats", vec![
+        let transport = MockTransport::new().on_tool(
+            "get_stats",
+            vec![
                 (stats_response(0, 0), Duration::from_millis(5)),
                 (stats_response(1, 0), Duration::from_millis(5)),
-            ]);
+            ],
+        );
 
         let scenario = make_scenario("test-session", vec![make_step("smart_ingest")]);
 
@@ -1091,11 +1077,13 @@ tool = "get_stats"
 
     #[tokio::test]
     async fn run_scenario_calls_delete_session_before_and_after() {
-        let transport = MockTransport::new()
-            .on_tool("get_stats", vec![
+        let transport = MockTransport::new().on_tool(
+            "get_stats",
+            vec![
                 (stats_response(0, 0), Duration::from_millis(5)),
                 (stats_response(1, 0), Duration::from_millis(5)),
-            ]);
+            ],
+        );
 
         let calls = transport.calls.clone();
         let scenario = make_scenario("cleanup-test", vec![make_step("smart_ingest")]);
@@ -1131,17 +1119,19 @@ tool = "get_stats"
     async fn run_scenario_snapshots_before_any_steps() {
         // The mock will return entity_count=0 for the first get_stats (before),
         // and entity_count=3 for the second (after).
-        let transport = MockTransport::new()
-            .on_tool("get_stats", vec![
+        let transport = MockTransport::new().on_tool(
+            "get_stats",
+            vec![
                 (stats_response(0, 0), Duration::from_millis(5)),
                 (stats_response(3, 2), Duration::from_millis(5)),
-            ]);
+            ],
+        );
 
         let calls = transport.calls.clone();
-        let scenario = make_scenario("snapshot-test", vec![
-            make_step("smart_ingest"),
-            make_step("hybrid_search"),
-        ]);
+        let scenario = make_scenario(
+            "snapshot-test",
+            vec![make_step("smart_ingest"), make_step("hybrid_search")],
+        );
 
         let mut runner = EvalRunner::new(transport, test_config());
         let run = runner.run_scenario(scenario).await.unwrap();
@@ -1169,21 +1159,32 @@ tool = "get_stats"
     #[tokio::test]
     async fn run_scenario_records_traces_per_step() {
         let transport = MockTransport::new()
-            .on_tool("get_stats", vec![
-                (stats_response(0, 0), Duration::from_millis(5)),
-                (stats_response(1, 0), Duration::from_millis(5)),
-            ])
-            .on_tool("smart_ingest", vec![
-                (json!({"action": "Created", "entity_id": "e1"}), Duration::from_millis(42)),
-            ])
-            .on_tool("hybrid_search", vec![
-                (json!({"results": [{"name": "Alice"}]}), Duration::from_millis(30)),
-            ]);
+            .on_tool(
+                "get_stats",
+                vec![
+                    (stats_response(0, 0), Duration::from_millis(5)),
+                    (stats_response(1, 0), Duration::from_millis(5)),
+                ],
+            )
+            .on_tool(
+                "smart_ingest",
+                vec![(
+                    json!({"action": "Created", "entity_id": "e1"}),
+                    Duration::from_millis(42),
+                )],
+            )
+            .on_tool(
+                "hybrid_search",
+                vec![(
+                    json!({"results": [{"name": "Alice"}]}),
+                    Duration::from_millis(30),
+                )],
+            );
 
-        let scenario = make_scenario("trace-test", vec![
-            make_step("smart_ingest"),
-            make_step("hybrid_search"),
-        ]);
+        let scenario = make_scenario(
+            "trace-test",
+            vec![make_step("smart_ingest"), make_step("hybrid_search")],
+        );
 
         let mut runner = EvalRunner::new(transport, test_config());
         let run = runner.run_scenario(scenario).await.unwrap();
@@ -1202,11 +1203,13 @@ tool = "get_stats"
 
     #[tokio::test]
     async fn run_scenario_injects_session_id_into_arguments() {
-        let transport = MockTransport::new()
-            .on_tool("get_stats", vec![
+        let transport = MockTransport::new().on_tool(
+            "get_stats",
+            vec![
                 (stats_response(0, 0), Duration::from_millis(5)),
                 (stats_response(0, 0), Duration::from_millis(5)),
-            ]);
+            ],
+        );
 
         let calls = transport.calls.clone();
         let scenario = make_scenario("inject-test", vec![make_step("smart_ingest")]);
@@ -1254,7 +1257,10 @@ tool = "get_stats"
         let run = runner.run_scenario(scenario).await.unwrap();
 
         assert_eq!(run.traces.len(), 1);
-        assert!(!run.traces[0].success, "failed call should have success=false");
+        assert!(
+            !run.traces[0].success,
+            "failed call should have success=false"
+        );
         assert!(
             run.traces[0].response["error"]
                 .as_str()
@@ -1267,10 +1273,10 @@ tool = "get_stats"
     #[tokio::test]
     async fn run_scenario_fails_on_dirty_state() {
         // Pre-snapshot returns entity_count=5 (dirty state)
-        let transport = MockTransport::new()
-            .on_tool("get_stats", vec![
-                (stats_response(5, 2), Duration::from_millis(5)),
-            ]);
+        let transport = MockTransport::new().on_tool(
+            "get_stats",
+            vec![(stats_response(5, 2), Duration::from_millis(5))],
+        );
 
         let scenario = make_scenario("dirty-test", vec![make_step("smart_ingest")]);
         let mut runner = EvalRunner::new(transport, test_config());
@@ -1291,11 +1297,13 @@ tool = "get_stats"
 
     #[tokio::test]
     async fn run_scenario_preserves_existing_session_id_in_args() {
-        let transport = MockTransport::new()
-            .on_tool("get_stats", vec![
+        let transport = MockTransport::new().on_tool(
+            "get_stats",
+            vec![
                 (stats_response(0, 0), Duration::from_millis(5)),
                 (stats_response(0, 0), Duration::from_millis(5)),
-            ]);
+            ],
+        );
 
         let calls = transport.calls.clone();
 
@@ -1328,8 +1336,9 @@ tool = "get_stats"
 
     #[tokio::test]
     async fn run_scenarios_executes_all_in_sequence() {
-        let transport = MockTransport::new()
-            .on_tool("get_stats", vec![
+        let transport = MockTransport::new().on_tool(
+            "get_stats",
+            vec![
                 // Preflight check (T-009)
                 (stats_response(0, 0), Duration::from_millis(5)),
                 // Scenario 1: before, after
@@ -1338,7 +1347,8 @@ tool = "get_stats"
                 // Scenario 2: before, after
                 (stats_response(0, 0), Duration::from_millis(5)),
                 (stats_response(2, 1), Duration::from_millis(5)),
-            ]);
+            ],
+        );
 
         let scenarios = vec![
             make_scenario("s1", vec![make_step("smart_ingest")]),
@@ -1366,13 +1376,20 @@ tool = "get_stats"
     #[tokio::test]
     async fn grade_run_programmatic_scores_correct_sequence() {
         let transport = MockTransport::new()
-            .on_tool("get_stats", vec![
-                (stats_response(0, 0), Duration::from_millis(5)),
-                (stats_response(1, 0), Duration::from_millis(5)),
-            ])
-            .on_tool("smart_ingest", vec![
-                (json!({"action": "Created", "entity_id": "e1"}), Duration::from_millis(20)),
-            ]);
+            .on_tool(
+                "get_stats",
+                vec![
+                    (stats_response(0, 0), Duration::from_millis(5)),
+                    (stats_response(1, 0), Duration::from_millis(5)),
+                ],
+            )
+            .on_tool(
+                "smart_ingest",
+                vec![(
+                    json!({"action": "Created", "entity_id": "e1"}),
+                    Duration::from_millis(20),
+                )],
+            );
 
         let mut step = make_step("smart_ingest");
         step.expect_in_response = vec!["Created".to_string(), "entity_id".to_string()];
@@ -1397,18 +1414,25 @@ tool = "get_stats"
         use crate::scenario::{ClaimRubricConfig, GradingConfig};
 
         let transport = MockTransport::new()
-            .on_tool("get_stats", vec![
-                (stats_response(0, 0), Duration::from_millis(5)),
-                (stats_response(1, 0), Duration::from_millis(5)),
-            ])
-            .on_tool("smart_ingest", vec![
-                (json!({
-                    "content": [{
-                        "type": "text",
-                        "text": "Created entity_id abc-123 for Alice of type person"
-                    }]
-                }), Duration::from_millis(20)),
-            ]);
+            .on_tool(
+                "get_stats",
+                vec![
+                    (stats_response(0, 0), Duration::from_millis(5)),
+                    (stats_response(1, 0), Duration::from_millis(5)),
+                ],
+            )
+            .on_tool(
+                "smart_ingest",
+                vec![(
+                    json!({
+                        "content": [{
+                            "type": "text",
+                            "text": "Created entity_id abc-123 for Alice of type person"
+                        }]
+                    }),
+                    Duration::from_millis(20),
+                )],
+            );
 
         let step = make_step("smart_ingest");
         let mut scenario = make_scenario("claim-test", vec![step]);
@@ -1549,10 +1573,10 @@ tool = "get_stats"
 
     #[tokio::test]
     async fn preflight_passes_when_get_stats_responds_fast() {
-        let transport = MockTransport::new()
-            .on_tool("get_stats", vec![
-                (stats_response(0, 0), Duration::from_millis(5)),
-            ]);
+        let transport = MockTransport::new().on_tool(
+            "get_stats",
+            vec![(stats_response(0, 0), Duration::from_millis(5))],
+        );
 
         let mut runner = EvalRunner::new(transport, test_config());
         let result = runner.preflight().await;
@@ -1657,11 +1681,13 @@ tool = "get_stats"
 
     #[tokio::test]
     async fn session_isolation_injects_tenant_id_into_steps() {
-        let transport = MockTransport::new()
-            .on_tool("get_stats", vec![
+        let transport = MockTransport::new().on_tool(
+            "get_stats",
+            vec![
                 (stats_response(0, 0), Duration::from_millis(5)),
                 (stats_response(1, 0), Duration::from_millis(5)),
-            ]);
+            ],
+        );
 
         let calls = transport.calls.clone();
         let scenario = make_scenario("tenant-test", vec![make_step("smart_ingest")]);
@@ -1689,11 +1715,13 @@ tool = "get_stats"
 
     #[tokio::test]
     async fn session_isolation_preserves_explicit_tenant_id() {
-        let transport = MockTransport::new()
-            .on_tool("get_stats", vec![
+        let transport = MockTransport::new().on_tool(
+            "get_stats",
+            vec![
                 (stats_response(0, 0), Duration::from_millis(5)),
                 (stats_response(0, 0), Duration::from_millis(5)),
-            ]);
+            ],
+        );
 
         let calls = transport.calls.clone();
         let mut step = make_step("smart_ingest");
@@ -1720,10 +1748,10 @@ tool = "get_stats"
     #[tokio::test]
     async fn session_isolation_contaminated_aborts_with_error() {
         // After delete_session, get_stats still shows entities — contamination
-        let transport = MockTransport::new()
-            .on_tool("get_stats", vec![
-                (stats_response(3, 1), Duration::from_millis(5)),
-            ]);
+        let transport = MockTransport::new().on_tool(
+            "get_stats",
+            vec![(stats_response(3, 1), Duration::from_millis(5))],
+        );
 
         let scenario = make_scenario("contaminated-test", vec![make_step("smart_ingest")]);
         let mut runner = EvalRunner::new(transport, test_config());
@@ -1752,8 +1780,9 @@ tool = "get_stats"
     #[ignore]
     async fn session_isolation_no_leakage_between_scenarios() {
         // Two sequential scenarios: verify second starts with entity_count=0
-        let transport = MockTransport::new()
-            .on_tool("get_stats", vec![
+        let transport = MockTransport::new().on_tool(
+            "get_stats",
+            vec![
                 // Preflight
                 (stats_response(0, 0), Duration::from_millis(5)),
                 // Scenario 1: before (clean), after
@@ -1762,7 +1791,8 @@ tool = "get_stats"
                 // Scenario 2: before (must be clean after s1 cleanup), after
                 (stats_response(0, 0), Duration::from_millis(5)),
                 (stats_response(1, 0), Duration::from_millis(5)),
-            ]);
+            ],
+        );
 
         let calls = transport.calls.clone();
         let scenarios = vec![
@@ -1855,14 +1885,16 @@ tool = "get_stats"
 
     #[tokio::test]
     async fn warmup_skipped_when_config_disabled() {
-        let transport = MockTransport::new()
-            .on_tool("get_stats", vec![
+        let transport = MockTransport::new().on_tool(
+            "get_stats",
+            vec![
                 // Preflight
                 (stats_response(0, 0), Duration::from_millis(5)),
                 // Scenario: before, after
                 (stats_response(0, 0), Duration::from_millis(5)),
                 (stats_response(0, 0), Duration::from_millis(5)),
-            ]);
+            ],
+        );
 
         let calls = transport.calls.clone();
         let config = EvalConfig {
@@ -1872,7 +1904,10 @@ tool = "get_stats"
 
         let mut runner = EvalRunner::new(transport, config);
         let _runs = runner
-            .run_scenarios(vec![make_scenario("no-warmup", vec![make_step("get_stats")])])
+            .run_scenarios(vec![make_scenario(
+                "no-warmup",
+                vec![make_step("get_stats")],
+            )])
             .await
             .unwrap();
 
@@ -1890,14 +1925,16 @@ tool = "get_stats"
 
     #[tokio::test]
     async fn warmup_runs_before_scored_scenarios() {
-        let transport = MockTransport::new()
-            .on_tool("get_stats", vec![
+        let transport = MockTransport::new().on_tool(
+            "get_stats",
+            vec![
                 // Preflight
                 (stats_response(0, 0), Duration::from_millis(5)),
                 // Scenario: before, after
                 (stats_response(0, 0), Duration::from_millis(5)),
                 (stats_response(0, 0), Duration::from_millis(5)),
-            ]);
+            ],
+        );
 
         let calls = transport.calls.clone();
         let config = EvalConfig {
@@ -1907,7 +1944,10 @@ tool = "get_stats"
 
         let mut runner = EvalRunner::new(transport, config);
         let _runs = runner
-            .run_scenarios(vec![make_scenario("after-warmup", vec![make_step("get_stats")])])
+            .run_scenarios(vec![make_scenario(
+                "after-warmup",
+                vec![make_step("get_stats")],
+            )])
             .await
             .unwrap();
 
@@ -1943,14 +1983,16 @@ tool = "get_stats"
     #[ignore]
     async fn warmup_results_not_in_scoring() {
         // Warm-up scenario runs but its results are not in the returned Vec<ScenarioRun>
-        let transport = MockTransport::new()
-            .on_tool("get_stats", vec![
+        let transport = MockTransport::new().on_tool(
+            "get_stats",
+            vec![
                 // Preflight
                 (stats_response(0, 0), Duration::from_millis(5)),
                 // Scenario: before, after
                 (stats_response(0, 0), Duration::from_millis(5)),
                 (stats_response(1, 0), Duration::from_millis(5)),
-            ]);
+            ],
+        );
 
         let config = EvalConfig {
             warmup: true,
@@ -1959,7 +2001,10 @@ tool = "get_stats"
 
         let mut runner = EvalRunner::new(transport, config);
         let runs = runner
-            .run_scenarios(vec![make_scenario("scored", vec![make_step("smart_ingest")])])
+            .run_scenarios(vec![make_scenario(
+                "scored",
+                vec![make_step("smart_ingest")],
+            )])
             .await
             .unwrap();
 
@@ -2018,9 +2063,7 @@ tool = "get_stats"
             .await
             .expect("notification failed");
 
-        let transport = LiveTransport {
-            client: mcp_client,
-        };
+        let transport = LiveTransport { client: mcp_client };
 
         let config = test_config();
         let mut runner = EvalRunner::new(transport, config);
@@ -2029,8 +2072,10 @@ tool = "get_stats"
         let steps = vec![
             {
                 let mut s = make_step("upsert_entity");
-                s.arguments.insert("entity_name".to_string(), json!("EvalTestAlice"));
-                s.arguments.insert("entity_type".to_string(), json!("person"));
+                s.arguments
+                    .insert("entity_name".to_string(), json!("EvalTestAlice"));
+                s.arguments
+                    .insert("entity_type".to_string(), json!("person"));
                 s.arguments.insert(
                     "observations".to_string(),
                     json!(["Alice is a test entity for eval"]),
@@ -2042,7 +2087,8 @@ tool = "get_stats"
             },
             {
                 let mut s = make_step("hybrid_search");
-                s.arguments.insert("query".to_string(), json!("EvalTestAlice"));
+                s.arguments
+                    .insert("query".to_string(), json!("EvalTestAlice"));
                 s.expect_in_response = vec!["EvalTestAlice".to_string()];
                 s
             },
@@ -2055,7 +2101,10 @@ tool = "get_stats"
 
         let scenario = make_scenario("live-3-step", steps);
 
-        let run = runner.run_scenario(scenario).await.expect("scenario failed");
+        let run = runner
+            .run_scenario(scenario)
+            .await
+            .expect("scenario failed");
 
         // AC2: traces recorded per step
         assert_eq!(
@@ -2067,11 +2116,7 @@ tool = "get_stats"
 
         // AC7: correct latencies
         for (i, trace) in run.traces.iter().enumerate() {
-            assert!(
-                trace.success,
-                "step {i} ({}) should succeed",
-                trace.tool
-            );
+            assert!(trace.success, "step {i} ({}) should succeed", trace.tool);
             assert!(
                 trace.latency_ms > 0,
                 "step {i} ({}) should have non-zero latency",
@@ -2286,8 +2331,8 @@ tool = "get_stats"
 
     #[tokio::test]
     async fn parallel_respects_semaphore_limit() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let max_concurrent = Arc::new(AtomicUsize::new(0));
         let peak_concurrent = Arc::new(AtomicUsize::new(0));
@@ -2367,8 +2412,7 @@ tool = "get_stats"
                 assert_ne!(
                     session_ids[i], session_ids[j],
                     "scenario {} and {} should have different session_ids",
-                    results[i].scenario.scenario.id,
-                    results[j].scenario.scenario.id
+                    results[i].scenario.scenario.id, results[j].scenario.scenario.id
                 );
             }
         }

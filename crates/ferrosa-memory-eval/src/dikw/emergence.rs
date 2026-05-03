@@ -190,15 +190,9 @@ pub fn parse_base_facts(response: &Value) -> Vec<FactKey> {
 /// Exclude derived facts that exactly match base facts (EF13).
 ///
 /// Returns the count of truly novel derived facts.
-pub fn count_novel_derived_facts(
-    derived: &[FactKey],
-    base: &[FactKey],
-) -> usize {
+pub fn count_novel_derived_facts(derived: &[FactKey], base: &[FactKey]) -> usize {
     let base_set: std::collections::HashSet<&FactKey> = base.iter().collect();
-    derived
-        .iter()
-        .filter(|d| !base_set.contains(d))
-        .count()
+    derived.iter().filter(|d| !base_set.contains(d)).count()
 }
 
 // ---------------------------------------------------------------------------
@@ -243,10 +237,7 @@ pub struct EdgeQualitySample {
 /// live cluster, this would use cosine similarity of embeddings.
 ///
 /// Flags poor quality if > 30% of sampled edges are meaningless (EF02).
-pub fn sample_edge_quality(
-    edges: &[AnnotatedEdge],
-    sample_size: usize,
-) -> EdgeQualitySample {
+pub fn sample_edge_quality(edges: &[AnnotatedEdge], sample_size: usize) -> EdgeQualitySample {
     if edges.is_empty() {
         return EdgeQualitySample {
             total_sampled: 0,
@@ -261,10 +252,7 @@ pub fn sample_edge_quality(
     // In production, this would use a seeded RNG.
     let sample = &edges[..sample_count];
 
-    let meaningful = sample
-        .iter()
-        .filter(|e| e.source_id != e.target_id)
-        .count();
+    let meaningful = sample.iter().filter(|e| e.source_id != e.target_id).count();
 
     let quality_ratio = meaningful as f64 / sample_count as f64;
     let meaningless_ratio = 1.0 - quality_ratio;
@@ -343,8 +331,7 @@ pub fn analyze(
     let delta = density_delta(before, after);
 
     // Edge quality sampling (EF02)
-    let emergent_owned: Vec<AnnotatedEdge> =
-        emergent_edges.iter().map(|e| (*e).clone()).collect();
+    let emergent_owned: Vec<AnnotatedEdge> = emergent_edges.iter().map(|e| (*e).clone()).collect();
     let quality = sample_edge_quality(&emergent_owned, 10);
 
     // Compute composite score
@@ -366,7 +353,11 @@ pub fn analyze(
         novel_derived as f64 / all_derived.len() as f64
     };
 
-    let density_score = if delta > 0.0 { (delta * 10.0).min(1.0) } else { 0.0 };
+    let density_score = if delta > 0.0 {
+        (delta * 10.0).min(1.0)
+    } else {
+        0.0
+    };
 
     let quality_score = if quality.poor_quality {
         quality.quality_ratio * 0.5 // penalize poor quality
@@ -374,8 +365,10 @@ pub fn analyze(
         quality.quality_ratio
     };
 
-    let composite =
-        edge_growth_score * 0.30 + derived_score * 0.25 + density_score * 0.20 + quality_score * 0.25;
+    let composite = edge_growth_score * 0.30
+        + derived_score * 0.25
+        + density_score * 0.20
+        + quality_score * 0.25;
 
     EmergenceScore {
         entities_before: before.entity_count,
@@ -514,7 +507,11 @@ mod tests {
         }];
 
         let emergent = filter_emergent_edges(&edges);
-        assert_eq!(emergent.len(), 1, "provenance check should be case-insensitive");
+        assert_eq!(
+            emergent.len(),
+            1,
+            "provenance check should be case-insensitive"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -648,7 +645,10 @@ mod tests {
             },
         ];
         let quality = sample_edge_quality(&edges, 10);
-        assert!(!quality.poor_quality, "good edges should not flag poor quality");
+        assert!(
+            !quality.poor_quality,
+            "good edges should not flag poor quality"
+        );
         assert!(
             (quality.quality_ratio - 1.0).abs() < 0.01,
             "all distinct src/dst should have ratio 1.0"
@@ -722,7 +722,10 @@ mod tests {
     #[test]
     fn empty_edges_not_poor_quality() {
         let quality = sample_edge_quality(&[], 10);
-        assert!(!quality.poor_quality, "empty edges should not flag poor quality");
+        assert!(
+            !quality.poor_quality,
+            "empty edges should not flag poor quality"
+        );
         assert_eq!(quality.total_sampled, 0);
     }
 
@@ -758,7 +761,10 @@ mod tests {
             "edges": [{"source_id": "A", "target_id": "B", "edge_type": "unknown"}]
         });
         let edges = parse_annotated_edges(&response);
-        assert_eq!(edges[0].created_by, "explicit", "missing provenance defaults to explicit");
+        assert_eq!(
+            edges[0].created_by, "explicit",
+            "missing provenance defaults to explicit"
+        );
     }
 
     #[test]
@@ -838,10 +844,7 @@ mod tests {
             !result.new_edge_types.is_empty(),
             "should have emergent edge types"
         );
-        assert!(
-            result.density_delta > 0.0,
-            "density should increase"
-        );
+        assert!(result.density_delta > 0.0, "density should increase");
         assert!(
             result.score > 0.0,
             "should have positive emergence score, got {}",

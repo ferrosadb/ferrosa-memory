@@ -246,8 +246,7 @@ pub fn analyze(
     expected_predictions: &[String],
 ) -> TransitionScore {
     // 1. Intention trigger verification
-    let (intention_score, intention_detail) =
-        score_intentions(traces, expected_trigger_context);
+    let (intention_score, intention_detail) = score_intentions(traces, expected_trigger_context);
 
     // 2. Smart ingest decision scoring
     let (ingest_correct, ingest_total) = score_smart_ingest_decisions(steps, traces);
@@ -256,20 +255,15 @@ pub fn analyze(
     } else {
         ingest_correct as f64 / ingest_total as f64
     };
-    let ingest_detail = format!(
-        "smart_ingest: {ingest_correct}/{ingest_total} decisions correct"
-    );
+    let ingest_detail = format!("smart_ingest: {ingest_correct}/{ingest_total} decisions correct");
 
     // 3. predict_needed accuracy
-    let (predict_score, predict_detail) =
-        score_predict_needed(traces, expected_predictions);
+    let (predict_score, predict_detail) = score_predict_needed(traces, expected_predictions);
 
     // Weighted composite
     let composite = intention_score * 0.40 + ingest_score * 0.35 + predict_score * 0.25;
 
-    let detail = format!(
-        "{intention_detail}; {ingest_detail}; {predict_detail}"
-    );
+    let detail = format!("{intention_detail}; {ingest_detail}; {predict_detail}");
 
     TransitionScore {
         label: "knowledge_to_wisdom".to_string(),
@@ -279,20 +273,14 @@ pub fn analyze(
 }
 
 /// Score intention triggers across all check_intentions traces.
-fn score_intentions(
-    traces: &[ToolCallTrace],
-    expected_context: Option<&str>,
-) -> (f64, String) {
+fn score_intentions(traces: &[ToolCallTrace], expected_context: Option<&str>) -> (f64, String) {
     let check_traces: Vec<&ToolCallTrace> = traces
         .iter()
         .filter(|t| t.tool == "check_intentions")
         .collect();
 
     if check_traces.is_empty() {
-        return (
-            0.0,
-            "no check_intentions calls found".to_string(),
-        );
+        return (0.0, "no check_intentions calls found".to_string());
     }
 
     match expected_context {
@@ -365,9 +353,8 @@ fn score_predict_needed(
         0.0
     };
 
-    let detail = format!(
-        "predict_needed: precision={precision:.2}, recall={recall:.2}, F1={f1:.2}"
-    );
+    let detail =
+        format!("predict_needed: precision={precision:.2}, recall={recall:.2}, F1={f1:.2}");
     (f1, detail)
 }
 
@@ -433,10 +420,7 @@ mod tests {
 
         let result = verify_intention_trigger(&response, "branch:feature/xyz");
         assert!(result.triggered, "intention should have triggered");
-        assert!(
-            result.context_correct,
-            "context should match ground truth"
-        );
+        assert!(result.context_correct, "context should match ground truth");
     }
 
     #[test]
@@ -708,12 +692,7 @@ mod tests {
             }),
         )];
 
-        let result = analyze(
-            &steps,
-            &traces,
-            Some("branch:feature/xyz"),
-            &[],
-        );
+        let result = analyze(&steps, &traces, Some("branch:feature/xyz"), &[]);
 
         // Intention triggered but wrong context => intention_score = 0.0
         // No smart_ingest => 1.0 (trivial), no predictions => 1.0

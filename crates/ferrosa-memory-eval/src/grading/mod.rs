@@ -107,11 +107,7 @@ fn weighted_mean(values: &[f64], weights: &[f64]) -> f64 {
         return 0.0;
     }
 
-    let weighted_sum: f64 = values
-        .iter()
-        .zip(weights.iter())
-        .map(|(v, w)| v * w)
-        .sum();
+    let weighted_sum: f64 = values.iter().zip(weights.iter()).map(|(v, w)| v * w).sum();
 
     weighted_sum / total_weight
 }

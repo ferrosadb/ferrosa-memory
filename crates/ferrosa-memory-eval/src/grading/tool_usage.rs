@@ -331,7 +331,10 @@ mod tests {
         ];
 
         let flags = detect_unnecessary(&traces);
-        assert!(flags[0], "Call 0 should be unnecessary (ent-001 never referenced later)");
+        assert!(
+            flags[0],
+            "Call 0 should be unnecessary (ent-001 never referenced later)"
+        );
         // Call 1 is the last call -- its output can't be referenced by anything
         // so it has entity_ids but no subsequent calls. Still flagged.
     }
@@ -357,7 +360,10 @@ mod tests {
         ];
 
         let flags = detect_unnecessary(&traces);
-        assert!(!flags[0], "Call 0 should be necessary (ent-001 is referenced in call 1)");
+        assert!(
+            !flags[0],
+            "Call 0 should be necessary (ent-001 is referenced in call 1)"
+        );
     }
 
     // ── Token estimation ─────────────────────────────────────────
@@ -538,18 +544,8 @@ mod tests {
     fn tool_usage_calls_without_entity_ids_not_flagged() {
         // Both calls return no entity_ids -- neither can be flagged
         let traces = vec![
-            make_trace(
-                "get_stats",
-                json!({}),
-                json!({"entity_count": 10}),
-                20,
-            ),
-            make_trace(
-                "get_stats",
-                json!({}),
-                json!({"entity_count": 10}),
-                20,
-            ),
+            make_trace("get_stats", json!({}), json!({"entity_count": 10}), 20),
+            make_trace("get_stats", json!({}), json!({"entity_count": 10}), 20),
         ];
 
         let score = grade(&traces);

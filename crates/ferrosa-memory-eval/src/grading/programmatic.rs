@@ -139,9 +139,9 @@ fn check_sequence(steps: &[EvalStep], traces: &[ToolCallTrace]) -> bool {
 /// Validate that all responses have valid JSON structure.
 /// A response is valid if it is a non-null JSON object or array.
 fn check_schemas(traces: &[ToolCallTrace]) -> bool {
-    traces.iter().all(|trace| {
-        trace.success && !trace.response.is_null()
-    })
+    traces
+        .iter()
+        .all(|trace| trace.success && !trace.response.is_null())
 }
 
 /// Convert a response Value to a flat searchable string.
@@ -235,10 +235,7 @@ fn compute_score(
     match entity_identity_valid {
         Some(valid) => {
             let entity_score = if valid { 1.0 } else { 0.0 };
-            0.20 * schema_score
-                + 0.30 * sequence_score
-                + 0.30 * field_score
-                + 0.20 * entity_score
+            0.20 * schema_score + 0.30 * sequence_score + 0.30 * field_score + 0.20 * entity_score
         }
         None => {
             // Redistribute entity weight proportionally
@@ -306,7 +303,10 @@ mod tests {
             make_step("retrieve_entities"),
         ];
         let traces = vec![
-            make_trace("smart_ingest", json!({"action": "Created", "entity_id": "abc"})),
+            make_trace(
+                "smart_ingest",
+                json!({"action": "Created", "entity_id": "abc"}),
+            ),
             make_trace("hybrid_search", json!({"results": []})),
             make_trace("retrieve_entities", json!({"entities": []})),
         ];
@@ -323,10 +323,7 @@ mod tests {
 
     #[test]
     fn wrong_sequence_fails() {
-        let steps = vec![
-            make_step("smart_ingest"),
-            make_step("hybrid_search"),
-        ];
+        let steps = vec![make_step("smart_ingest"), make_step("hybrid_search")];
         // Traces are in wrong order
         let traces = vec![
             make_trace("hybrid_search", json!({"results": []})),
@@ -348,7 +345,10 @@ mod tests {
         let traces = vec![make_trace("smart_ingest", json!({"ok": true}))];
 
         let score = grade(&steps, &traces, &NoOpResolver);
-        assert!(!score.sequence_match, "length mismatch should fail sequence");
+        assert!(
+            !score.sequence_match,
+            "length mismatch should fail sequence"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -543,10 +543,7 @@ mod tests {
     #[test]
     fn entity_identity_uuid_normalization() {
         // Entity stored with hyphenated UUID, response has non-hyphenated
-        let resolver = StubResolver::new(vec![(
-            "550E8400-E29B-41D4-A716-446655440000",
-            "Alice",
-        )]);
+        let resolver = StubResolver::new(vec![("550E8400-E29B-41D4-A716-446655440000", "Alice")]);
 
         let mut step = make_step("smart_ingest");
         step.expect_entity_name = Some("Alice".to_string());
@@ -597,10 +594,7 @@ mod tests {
                 }
             }
         });
-        assert_eq!(
-            extract_entity_id(&response),
-            Some("abc-123".to_string())
-        );
+        assert_eq!(extract_entity_id(&response), Some("abc-123".to_string()));
     }
 
     // ---------------------------------------------------------------
@@ -642,11 +636,7 @@ mod tests {
         // schema pass, sequence pass, 2/4 fields, entity pass
         let score = compute_score(true, true, 2, 4, Some(true));
         // 0.20 * 1.0 + 0.30 * 1.0 + 0.30 * 0.5 + 0.20 * 1.0 = 0.85
-        assert!(
-            floats_equal(score, 0.85),
-            "expected 0.85, got {}",
-            score
-        );
+        assert!(floats_equal(score, 0.85), "expected 0.85, got {}", score);
     }
 
     // ---------------------------------------------------------------
@@ -671,8 +661,7 @@ mod tests {
             },
             {
                 let mut s = make_step("smart_ingest");
-                s.expect_in_response =
-                    vec!["Superseded".to_string(), "old_entity_id".to_string()];
+                s.expect_in_response = vec!["Superseded".to_string(), "old_entity_id".to_string()];
                 s.expect_action = Some("Superseded".to_string());
                 s
             },
@@ -741,10 +730,7 @@ mod tests {
             Some(false),
             "should detect wrong entity"
         );
-        assert!(
-            score.score < 1.0,
-            "wrong entity should reduce score"
-        );
+        assert!(score.score < 1.0, "wrong entity should reduce score");
     }
 
     // ---------------------------------------------------------------

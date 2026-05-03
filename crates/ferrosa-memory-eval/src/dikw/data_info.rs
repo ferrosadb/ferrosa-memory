@@ -142,28 +142,26 @@ fn score_entity_types(entities: &[EntityEntry]) -> (f64, String) {
     let total = entities.len();
     let ratio = typed_count as f64 / total as f64;
 
-    let detail = format!(
-        "{typed_count}/{total} entities have non-default types (score: {ratio:.2})"
-    );
+    let detail =
+        format!("{typed_count}/{total} entities have non-default types (score: {ratio:.2})");
     (ratio, detail)
 }
 
 /// Score temporal scoping: proportion of temporal facts with valid event_time.
 fn score_temporal_scoping(facts: &[TemporalFact]) -> (f64, String) {
     if facts.is_empty() {
-        return (1.0, "no temporal facts to evaluate (trivially valid)".to_string());
+        return (
+            1.0,
+            "no temporal facts to evaluate (trivially valid)".to_string(),
+        );
     }
 
-    let valid_count = facts
-        .iter()
-        .filter(|f| f.event_time.is_some())
-        .count();
+    let valid_count = facts.iter().filter(|f| f.event_time.is_some()).count();
     let total = facts.len();
     let ratio = valid_count as f64 / total as f64;
 
-    let detail = format!(
-        "{valid_count}/{total} temporal facts have valid event_time (score: {ratio:.2})"
-    );
+    let detail =
+        format!("{valid_count}/{total} temporal facts have valid event_time (score: {ratio:.2})");
     (ratio, detail)
 }
 
@@ -194,10 +192,7 @@ fn score_session_isolation(entities: &[EntityEntry], expected_session: &str) -> 
 /// Analyze scenario traces to produce a Data-to-Information TransitionScore.
 ///
 /// Weights: entity types 50%, temporal scoping 25%, session isolation 25%.
-pub fn analyze(
-    traces: &[ToolCallTrace],
-    expected_session_id: &Uuid,
-) -> TransitionScore {
+pub fn analyze(traces: &[ToolCallTrace], expected_session_id: &Uuid) -> TransitionScore {
     let mut all_entities: Vec<EntityEntry> = Vec::new();
     let mut all_temporal: Vec<TemporalFact> = Vec::new();
 
@@ -221,9 +216,8 @@ pub fn analyze(
     // Weighted composite: entity types 50%, temporal 25%, session 25%
     let composite = type_score * 0.50 + temporal_score * 0.25 + session_score * 0.25;
 
-    let detail = format!(
-        "types: {type_detail}; temporal: {temporal_detail}; session: {session_detail}"
-    );
+    let detail =
+        format!("types: {type_detail}; temporal: {temporal_detail}; session: {session_detail}");
 
     TransitionScore {
         label: "data_to_info".to_string(),
@@ -375,13 +369,11 @@ mod tests {
 
     #[test]
     fn temporal_facts_without_event_time_score_low() {
-        let facts = vec![
-            TemporalFact {
-                entity_id: "e1".into(),
-                event_time: None,
-                valid_until: None,
-            },
-        ];
+        let facts = vec![TemporalFact {
+            entity_id: "e1".into(),
+            event_time: None,
+            valid_until: None,
+        }];
         let (score, _) = score_temporal_scoping(&facts);
         assert!(
             score < 0.01,
@@ -426,18 +418,13 @@ mod tests {
 
     #[test]
     fn entities_in_wrong_session_score_low() {
-        let entities = vec![
-            EntityEntry {
-                entity_id: "e1".into(),
-                entity_type: "person".into(),
-                session_id: Some("wrong-session".into()),
-            },
-        ];
+        let entities = vec![EntityEntry {
+            entity_id: "e1".into(),
+            entity_type: "person".into(),
+            session_id: Some("wrong-session".into()),
+        }];
         let (score, _) = score_session_isolation(&entities, "expected-session");
-        assert!(
-            score < 0.01,
-            "wrong session should score 0.0, got {score}"
-        );
+        assert!(score < 0.01, "wrong session should score 0.0, got {score}");
     }
 
     // ---------------------------------------------------------------
@@ -467,12 +454,10 @@ mod tests {
             }),
         ]);
 
-        let temporal_response = make_temporal_response(vec![
-            json!({
-                "entity_id": "e1",
-                "event_time": "2026-01-01T00:00:00Z"
-            }),
-        ]);
+        let temporal_response = make_temporal_response(vec![json!({
+            "entity_id": "e1",
+            "event_time": "2026-01-01T00:00:00Z"
+        })]);
 
         let traces = vec![
             make_trace("retrieve_entities", entities_response),

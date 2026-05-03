@@ -253,17 +253,12 @@ pub fn analyze(
     );
 
     let reach_score = if max_expected_reach == 0 {
-        if spread_reach > 0 {
-            1.0
-        } else {
-            0.0
-        }
+        if spread_reach > 0 { 1.0 } else { 0.0 }
     } else {
         (spread_reach as f64 / max_expected_reach as f64).min(1.0)
     };
-    let reach_detail = format!(
-        "spread reach: {spread_reach} nodes (expected up to {max_expected_reach})"
-    );
+    let reach_detail =
+        format!("spread reach: {spread_reach} nodes (expected up to {max_expected_reach})");
 
     // Weighted composite
     let composite = edge_score * 0.40 + recall * 0.35 + reach_score * 0.25;
@@ -439,10 +434,7 @@ mod tests {
         let known = vec!["Alice".into(), "Bob".into()];
         let found: Vec<String> = vec!["Unknown".into()];
         let recall = recall_at_k(&known, &found);
-        assert!(
-            recall < 0.01,
-            "none found => recall 0.0, got {recall}"
-        );
+        assert!(recall < 0.01, "none found => recall 0.0, got {recall}");
     }
 
     #[test]
