@@ -1133,6 +1133,204 @@ pub async fn query_predicate(
     Ok(results)
 }
 
+// ─── Stratification Analyzer ─────────────────────────────────────
+
+/// Compute strata over a rule set.
+///
+/// Returns Err(StratifyError::RecursionThroughAggregate) if the
+/// predicate dependency graph has a strongly-connected component
+/// containing an Aggregate-labelled edge — meaning some predicate's
+/// derivation transitively requires aggregating over its own (or a
+/// peer's) result.
+///
+/// On success, returns rule indices grouped by ascending stratum.
+pub fn stratify(
+    rules: &[crate::types::DatalogRule],
+) -> Result<Vec<Vec<usize>>, crate::types::StratifyError> {
+    use std::collections::{BTreeMap, HashMap, HashSet};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Edge {
+        Plain,
+        Aggregate,
+    }
+
+    // Build predicate dep graph: head -> Vec<(dependency, edge_kind)>.
+    let mut graph: HashMap<String, Vec<(String, Edge)>> = HashMap::new();
+    let mut all_preds: HashSet<String> = HashSet::new();
+
+    for rule in rules {
+        let head = rule.head.predicate.clone();
+        all_preds.insert(head.clone());
+        let entry = graph.entry(head.clone()).or_default();
+        for atom in &rule.body {
+            entry.push((atom.predicate.clone(), Edge::Plain));
+            all_preds.insert(atom.predicate.clone());
+        }
+        for agg in &rule.aggregates {
+            let atoms: Vec<&Atom> = if agg.inner_conjunction.is_empty() {
+                vec![&agg.inner]
+            } else {
+                agg.inner_conjunction.iter().collect()
+            };
+            for atom in atoms {
+                entry.push((atom.predicate.clone(), Edge::Aggregate));
+                all_preds.insert(atom.predicate.clone());
+            }
+        }
+    }
+
+    // Iterative Tarjan SCC.
+    // Three work-item kinds:
+    //   Enter(v)            — assign index/lowlink, push onto SCC stack, schedule Continue.
+    //   Continue(v, idx)    — process the idx-th successor of v (or finalise if past the end).
+    //   Propagate(parent,child) — after child's subtree is done, pull child's lowlink into parent.
+    let mut index_counter: usize = 0;
+    let mut stack: Vec<String> = Vec::new();
+    let mut on_stack: HashSet<String> = HashSet::new();
+    let mut indices: HashMap<String, usize> = HashMap::new();
+    let mut lowlinks: HashMap<String, usize> = HashMap::new();
+    let mut sccs: Vec<Vec<String>> = Vec::new();
+
+    enum Step {
+        Enter(String),
+        Continue(String, usize),
+        Propagate(String, String), // (parent, child)
+    }
+
+    let nodes_to_visit: Vec<String> = all_preds.iter().cloned().collect();
+    for start in nodes_to_visit {
+        if indices.contains_key(&start) {
+            continue;
+        }
+        let mut work: Vec<Step> = vec![Step::Enter(start)];
+        while let Some(step) = work.pop() {
+            match step {
+                Step::Enter(node) => {
+                    indices.insert(node.clone(), index_counter);
+                    lowlinks.insert(node.clone(), index_counter);
+                    index_counter += 1;
+                    stack.push(node.clone());
+                    on_stack.insert(node.clone());
+                    work.push(Step::Continue(node, 0));
+                }
+                Step::Continue(node, succ_idx) => {
+                    let succs = graph.get(&node).cloned().unwrap_or_default();
+                    if succ_idx < succs.len() {
+                        let (succ, _) = succs[succ_idx].clone();
+                        // Come back to process the next successor after this one.
+                        work.push(Step::Continue(node.clone(), succ_idx + 1));
+                        if !indices.contains_key(&succ) {
+                            // Tree edge: recurse, then propagate lowlink back.
+                            work.push(Step::Propagate(node.clone(), succ.clone()));
+                            work.push(Step::Enter(succ));
+                        } else if on_stack.contains(&succ) {
+                            // Back edge: update lowlink immediately.
+                            let succ_index = *indices.get(&succ).unwrap();
+                            let cur = lowlinks.get_mut(&node).unwrap();
+                            if succ_index < *cur {
+                                *cur = succ_index;
+                            }
+                        }
+                        // Cross/forward edge (succ already fully processed, not on_stack): ignore.
+                    } else {
+                        // All successors done — check if this node is an SCC root.
+                        if lowlinks.get(&node) == indices.get(&node) {
+                            let mut scc = Vec::new();
+                            while let Some(w) = stack.pop() {
+                                on_stack.remove(&w);
+                                let done = w == node;
+                                scc.push(w);
+                                if done {
+                                    break;
+                                }
+                            }
+                            sccs.push(scc);
+                        }
+                    }
+                }
+                Step::Propagate(parent, child) => {
+                    // Pull child's lowlink into parent (tree-child propagation).
+                    let child_low = *lowlinks.get(&child).unwrap();
+                    let parent_low = *lowlinks.get(&parent).unwrap();
+                    if child_low < parent_low {
+                        *lowlinks.get_mut(&parent).unwrap() = child_low;
+                    }
+                }
+            }
+        }
+    }
+
+    // Map each predicate to its SCC index.
+    let mut node_to_scc: HashMap<String, usize> = HashMap::new();
+    for (i, scc) in sccs.iter().enumerate() {
+        for n in scc {
+            node_to_scc.insert(n.clone(), i);
+        }
+    }
+
+    // Reject any SCC that contains an Aggregate edge within the same SCC
+    // (i.e., a predicate depends on itself or a peer via aggregation).
+    for scc in &sccs {
+        let scc_set: HashSet<&str> = scc.iter().map(String::as_str).collect();
+        for node in scc {
+            if let Some(succs) = graph.get(node) {
+                for (succ, edge) in succs {
+                    if scc_set.contains(succ.as_str()) && *edge == Edge::Aggregate {
+                        return Err(crate::types::StratifyError::RecursionThroughAggregate {
+                            cycle: scc.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Assign a stratum to each SCC.
+    // Tarjan emits SCCs in reverse topological order (leaves first).
+    let mut scc_stratum: HashMap<usize, usize> = HashMap::new();
+    for (i, scc) in sccs.iter().enumerate() {
+        let mut max_dep_stratum: i64 = -1;
+        let mut had_aggregate_edge = false;
+        for node in scc {
+            if let Some(succs) = graph.get(node) {
+                for (succ, edge) in succs {
+                    let succ_scc = *node_to_scc.get(succ).unwrap();
+                    if succ_scc != i {
+                        let s = *scc_stratum.get(&succ_scc).unwrap_or(&0) as i64;
+                        if s > max_dep_stratum {
+                            max_dep_stratum = s;
+                        }
+                        if *edge == Edge::Aggregate {
+                            had_aggregate_edge = true;
+                        }
+                    }
+                }
+            }
+        }
+        // Plain edges: stratum = max_dep + 1 (derived predicates always lift one level).
+        // Aggregate edges: stratum = max_dep + 2 (extra lift ensures the aggregated relation
+        // is fully computed before aggregation runs).
+        let lift = if had_aggregate_edge { 2 } else { 1 };
+        let stratum = if max_dep_stratum < 0 {
+            0
+        } else {
+            (max_dep_stratum as usize) + lift
+        };
+        scc_stratum.insert(i, stratum);
+    }
+
+    // Group rule indices by ascending stratum.
+    let mut by_stratum: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (rule_idx, rule) in rules.iter().enumerate() {
+        let scc_idx = *node_to_scc.get(&rule.head.predicate).unwrap_or(&0);
+        let stratum = *scc_stratum.get(&scc_idx).unwrap_or(&0);
+        by_stratum.entry(stratum).or_default().push(rule_idx);
+    }
+
+    Ok(by_stratum.into_values().collect())
+}
+
 // ─── Tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2001,7 +2199,7 @@ mod tests {
 
     #[test]
     fn parse_rule_supports_count_aggregate() {
-        use crate::types::{Aggregate, AggregateKind};
+        use crate::types::AggregateKind;
         let rule =
             parse_rule("avoid_action(X) :- count(user_corrected(S, X), N), N >= 3.").unwrap();
         assert_eq!(rule.aggregates.len(), 1);
@@ -2182,5 +2380,57 @@ mod tests {
         let agg = &rule.aggregates[0];
         assert!(agg.inner_conjunction.is_empty());
         assert_eq!(agg.inner.predicate, "bar");
+    }
+
+    // ─── M3: stratify tests ───────────────────────────────────────
+
+    #[test]
+    fn stratify_simple_chain_assigns_ascending_strata() {
+        let r1 = parse_rule("b(X) :- a(X).").unwrap();
+        let r2 = parse_rule("c(X) :- b(X).").unwrap();
+        let strata = stratify(&[r1, r2]).unwrap();
+        assert!(strata.len() >= 2);
+        let r1_stratum = strata.iter().position(|s| s.contains(&0)).unwrap();
+        let r2_stratum = strata.iter().position(|s| s.contains(&1)).unwrap();
+        assert!(r1_stratum < r2_stratum, "b's rule must come before c's rule");
+    }
+
+    #[test]
+    fn stratify_aggregate_lifts_one_level() {
+        let r = parse_rule("b(X) :- count(a(X), N), N > 0.").unwrap();
+        let strata = stratify(&[r]).unwrap();
+        assert!(strata.iter().any(|s| s.contains(&0)));
+    }
+
+    #[test]
+    fn stratify_rejects_intra_rule_recursion_through_aggregate() {
+        let r = parse_rule("loop(X) :- count(loop(Y), N), N > 0.").unwrap();
+        let err = stratify(&[r]).unwrap_err();
+        match err {
+            crate::types::StratifyError::RecursionThroughAggregate { cycle } => {
+                assert!(cycle.contains(&"loop".to_string()));
+            }
+        }
+    }
+
+    #[test]
+    fn stratify_rejects_cross_rule_recursion_through_aggregate() {
+        let r1 = parse_rule("a(X) :- b(X).").unwrap();
+        let r2 = parse_rule("b(X) :- count(a(Y), N), N > 0.").unwrap();
+        let err = stratify(&[r1, r2]).unwrap_err();
+        match err {
+            crate::types::StratifyError::RecursionThroughAggregate { cycle } => {
+                assert!(cycle.iter().any(|c| c == "a"));
+                assert!(cycle.iter().any(|c| c == "b"));
+            }
+        }
+    }
+
+    #[test]
+    fn stratify_allows_plain_recursion() {
+        // path(X, Z) :- edge(X, Y), path(Y, Z). is recursive but only via Plain edges.
+        let r = parse_rule("path(X, Z) :- edge(X, Y), path(Y, Z).").unwrap();
+        let strata = stratify(&[r]).unwrap();
+        assert!(strata.iter().any(|s| s.contains(&0)));
     }
 }
