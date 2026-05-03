@@ -327,21 +327,60 @@ type Binding = HashMap<String, Term>;
 /// A candidate row: binding paired with its provenance chain.
 type Candidate = (Binding, Vec<ProvenanceStep>);
 
-/// Run semi-naive fixpoint evaluation over a set of rules and initial facts.
+/// Run semi-naive fixpoint evaluation over a set of rules and initial facts,
+/// stratum by stratum. Stratification ensures aggregates are always computed
+/// over fully-settled base relations. Unstratifiable rule sets (recursion through
+/// an aggregate) are rejected: the original fact set is returned unchanged.
 ///
 /// Returns the full derived fact set and a list of derived facts with provenance.
-/// Terminates when no new facts are derived (fixpoint), or when `max_iterations`
-/// or `max_facts` caps are reached.
 pub fn evaluate(
     rules: &[DatalogRule],
     initial_facts: &FactSet,
     max_iterations: usize,
     max_facts: usize,
 ) -> (FactSet, Vec<DerivedFact>) {
+    let strata = match stratify(rules) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = ?e, "datalog: rule set is unstratifiable; deriving nothing");
+            return (initial_facts.clone(), Vec::new());
+        }
+    };
+
+    let mut all_facts = initial_facts.clone();
+    let mut derived = Vec::new();
+    let mut budget_iter = max_iterations;
+    let mut budget_facts = max_facts;
+
+    for stratum_idxs in strata {
+        let stratum_rules: Vec<DatalogRule> =
+            stratum_idxs.iter().map(|i| rules[*i].clone()).collect();
+        let (next_facts, next_derived) =
+            evaluate_stratum(&stratum_rules, &all_facts, &mut budget_iter, &mut budget_facts);
+        all_facts = next_facts;
+        derived.extend(next_derived);
+        if budget_iter == 0 || budget_facts == 0 {
+            break;
+        }
+    }
+    (all_facts, derived)
+}
+
+/// Inner fixpoint loop for a single stratum of rules.
+///
+/// Consumes from shared budget counters (`budget_iter`, `budget_facts`) and
+/// stops early if either reaches zero.
+fn evaluate_stratum(
+    rules: &[DatalogRule],
+    initial_facts: &FactSet,
+    budget_iter: &mut usize,
+    budget_facts: &mut usize,
+) -> (FactSet, Vec<DerivedFact>) {
     let mut all_facts = initial_facts.clone();
     let mut derived = Vec::new();
 
-    for _iteration in 0..max_iterations {
+    while *budget_iter > 0 {
+        *budget_iter -= 1;
         let mut new_delta = FactSet::new();
 
         for rule in rules {
@@ -371,22 +410,24 @@ pub fn evaluate(
             break;
         }
 
-        if all_facts.len() + new_delta.len() > max_facts {
+        if all_facts.len() + new_delta.len() > *budget_facts {
             tracing::warn!(
                 "Datalog max_facts cap reached ({} + {} > {})",
                 all_facts.len(),
                 new_delta.len(),
-                max_facts
+                *budget_facts
             );
+            *budget_facts = 0;
             break;
         }
 
-        // Merge new_delta into all_facts
+        // Merge new_delta into all_facts and deduct from fact budget.
         for (pred, fact_set) in &new_delta.facts {
             for args in fact_set {
                 all_facts.insert(pred, args.clone());
             }
         }
+        *budget_facts = budget_facts.saturating_sub(new_delta.len());
     }
 
     (all_facts, derived)
@@ -534,53 +575,66 @@ fn filter_references_any(f: &BuiltinFilter, vars: &std::collections::HashSet<&st
 }
 
 /// Enumerate one binding per distinct group_vars tuple found in the inner
-/// predicate's rows. Used when the rule body is empty and we need to seed
+/// conjunction's rows. Used when the rule body is empty and we need to seed
 /// candidate bindings for the aggregate phase.
+///
+/// For single-atom aggregates this looks only at `inner`; for conjunctions it
+/// backtracks over all atoms in `inner_conjunction` so that group vars spread
+/// across multiple atoms are all captured.
 fn seed_bindings_from_inner(agg: &crate::types::Aggregate, all_facts: &FactSet) -> Vec<Candidate> {
-    let Some(rows) = all_facts.get(&agg.inner.predicate) else {
-        return Vec::new();
+    let atoms: Vec<&Atom> = if agg.inner_conjunction.is_empty() {
+        vec![&agg.inner]
+    } else {
+        agg.inner_conjunction.iter().collect()
     };
 
-    // Find the position of each group_var in inner.args so we can extract
-    // its bound value from each row.
-    let group_positions: Vec<(String, usize)> = agg
-        .group_vars
-        .iter()
-        .filter_map(|gv| {
-            agg.inner.args.iter().enumerate().find_map(|(i, arg)| {
-                if let Term::Var(name) = arg {
-                    if name == gv {
-                        Some((gv.clone(), i))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-        })
-        .collect();
+    // Collect all full bindings by backtracking over the conjunction.
+    let mut all_bindings: Vec<HashMap<String, Term>> = Vec::new();
+    collect_conjunction_bindings(&atoms, 0, HashMap::new(), all_facts, &mut all_bindings);
 
+    // Project each full binding down to only the group_vars, deduplicating.
     let mut seen: std::collections::HashSet<Vec<Term>> = std::collections::HashSet::new();
     let mut out = Vec::new();
 
-    for row in rows {
-        if row.len() != agg.inner.args.len() {
-            continue;
-        }
-        let key: Vec<Term> = group_positions
+    for binding in all_bindings {
+        let key: Vec<Term> = agg
+            .group_vars
             .iter()
-            .map(|(_, pos)| row[*pos].clone())
+            .map(|v| binding.get(v).cloned().unwrap_or_else(|| Term::Var(v.clone())))
             .collect();
         if seen.insert(key.clone()) {
-            let mut binding = HashMap::new();
-            for ((name, _), val) in group_positions.iter().zip(key.iter()) {
-                binding.insert(name.clone(), val.clone());
+            let mut group_binding = HashMap::new();
+            for (name, val) in agg.group_vars.iter().zip(key.iter()) {
+                group_binding.insert(name.clone(), val.clone());
             }
-            out.push((binding, Vec::new()));
+            out.push((group_binding, Vec::new()));
         }
     }
     out
+}
+
+/// Backtracker that collects every complete binding produced by unifying `atoms`
+/// in sequence. Used by `seed_bindings_from_inner` to enumerate group-var tuples.
+fn collect_conjunction_bindings(
+    atoms: &[&Atom],
+    i: usize,
+    binding: HashMap<String, Term>,
+    all_facts: &FactSet,
+    out: &mut Vec<HashMap<String, Term>>,
+) {
+    if i == atoms.len() {
+        out.push(binding);
+        return;
+    }
+    let atom = atoms[i];
+    let Some(rows) = all_facts.get(&atom.predicate) else {
+        return;
+    };
+    for row in rows {
+        if let Some(extended) = try_unify(&atom.args, row, &binding) {
+            collect_conjunction_bindings(atoms, i + 1, extended, all_facts, out);
+        }
+    }
 }
 
 /// Group candidates by aggregate group_vars, count inner-atom matches per
@@ -612,7 +666,7 @@ fn apply_aggregate(
             Some((b, _)) => b.clone(),
             None => continue,
         };
-        let count = count_inner_matches(&agg.inner, &representative, all_facts);
+        let count = count_inner_matches(agg, &representative, all_facts);
 
         for (mut binding, mut prov) in members {
             binding.insert(
@@ -629,17 +683,46 @@ fn apply_aggregate(
     out
 }
 
-/// Count how many rows in `all_facts` for `inner.predicate` unify with the
-/// given binding (variables in `inner` not in the binding are wildcards).
-fn count_inner_matches(inner: &Atom, binding: &Binding, all_facts: &FactSet) -> usize {
-    let Some(rows) = all_facts.get(&inner.predicate) else {
-        return 0;
+/// Count how many complete unifications exist for the aggregate's inner conjunction
+/// under the given binding. For single-atom aggregates this degenerates to counting
+/// matching rows; for multi-atom conjunctions it backtracks over all combinations.
+fn count_inner_matches(
+    agg: &crate::types::Aggregate,
+    binding: &std::collections::HashMap<String, Term>,
+    all_facts: &FactSet,
+) -> usize {
+    let atoms: Vec<&Atom> = if agg.inner_conjunction.is_empty() {
+        vec![&agg.inner]
+    } else {
+        agg.inner_conjunction.iter().collect()
     };
-    rows.iter()
-        .filter(|row| {
-            row.len() == inner.args.len() && try_unify(&inner.args, row, binding).is_some()
-        })
-        .count()
+    let mut count = 0;
+    count_conjunction(&atoms, 0, binding.clone(), all_facts, &mut count);
+    count
+}
+
+/// Recursive conjunction backtracker: extends `binding` one atom at a time and
+/// increments `count` whenever all atoms are unified.
+fn count_conjunction(
+    atoms: &[&Atom],
+    i: usize,
+    binding: std::collections::HashMap<String, Term>,
+    all_facts: &FactSet,
+    count: &mut usize,
+) {
+    if i == atoms.len() {
+        *count += 1;
+        return;
+    }
+    let atom = atoms[i];
+    let Some(rows) = all_facts.get(&atom.predicate) else {
+        return;
+    };
+    for row in rows {
+        if let Some(extended) = try_unify(&atom.args, row, &binding) {
+            count_conjunction(atoms, i + 1, extended, all_facts, count);
+        }
+    }
 }
 
 /// Try to unify atom arguments with fact arguments under an existing binding.
@@ -2432,5 +2515,87 @@ mod tests {
         let r = parse_rule("path(X, Z) :- edge(X, Y), path(Y, Z).").unwrap();
         let strata = stratify(&[r]).unwrap();
         assert!(strata.iter().any(|s| s.contains(&0)));
+    }
+
+    // ─── M4: stratum-by-stratum evaluator + conjunction backtracking ──
+
+    #[test]
+    fn evaluator_two_atom_conjunction_groups_correctly() {
+        let s1 = Uuid::new_v4();
+        let s2 = Uuid::new_v4();
+        let s3 = Uuid::new_v4();
+        let s4 = Uuid::new_v4();
+        let ca = Uuid::new_v4();
+        let cb = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+        let t2 = Uuid::new_v4();
+
+        let mut facts = FactSet::new();
+        facts.insert("worked_well", vec![Term::Const(s1), Term::Const(t1)]);
+        facts.insert("worked_well", vec![Term::Const(s2), Term::Const(t1)]);
+        facts.insert("worked_well", vec![Term::Const(s3), Term::Const(t1)]);
+        facts.insert("worked_well", vec![Term::Const(s1), Term::Const(t2)]);
+        facts.insert("worked_well", vec![Term::Const(s2), Term::Const(t2)]);
+        facts.insert("worked_well", vec![Term::Const(s4), Term::Const(t1)]);
+        facts.insert("session_context", vec![Term::Const(s1), Term::Const(ca)]);
+        facts.insert("session_context", vec![Term::Const(s2), Term::Const(ca)]);
+        facts.insert("session_context", vec![Term::Const(s3), Term::Const(ca)]);
+        facts.insert("session_context", vec![Term::Const(s1), Term::Const(cb)]);
+        facts.insert("session_context", vec![Term::Const(s4), Term::Const(cb)]);
+
+        let rule = parse_rule(
+            "preferred_tool(Ctx, Tool) :- count(worked_well(S, Tool), session_context(S, Ctx), N), N >= 3."
+        ).unwrap();
+        let (derived, _) = evaluate(&[rule], &facts, 100, 1000);
+
+        let pairs: std::collections::HashSet<(Uuid, Uuid)> = derived
+            .get("preferred_tool")
+            .into_iter()
+            .flatten()
+            .filter_map(|args| {
+                let (Term::Const(c), Term::Const(t)) = (args.first()?, args.get(1)?) else { return None; };
+                Some((*c, *t))
+            })
+            .collect();
+
+        assert!(pairs.contains(&(ca, t1)), "(cA, t1) with 3 distinct sessions must fire");
+        assert!(!pairs.contains(&(ca, t2)), "(cA, t2) with 2 sessions must NOT fire");
+        assert!(!pairs.contains(&(cb, t1)), "(cB, t1) with 2 sessions must NOT fire");
+    }
+
+    #[test]
+    fn evaluator_existential_var_aggregated_over() {
+        let s1 = Uuid::new_v4();
+        let s2 = Uuid::new_v4();
+        let s3 = Uuid::new_v4();
+        let ca = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+
+        let mut facts = FactSet::new();
+        for s in [s1, s2, s3] {
+            facts.insert("worked_well", vec![Term::Const(s), Term::Const(t1)]);
+            facts.insert("session_context", vec![Term::Const(s), Term::Const(ca)]);
+        }
+
+        let rule = parse_rule(
+            "preferred_tool(Ctx, Tool) :- count(worked_well(S, Tool), session_context(S, Ctx), N), N >= 3."
+        ).unwrap();
+        let (derived, _) = evaluate(&[rule], &facts, 100, 1000);
+
+        let row = derived.get("preferred_tool").into_iter().flatten().next();
+        let row = row.expect("expected one preferred_tool fact");
+        assert_eq!(row.len(), 2, "head has only Ctx and Tool; S must not appear");
+    }
+
+    #[test]
+    fn evaluator_recursion_through_aggregate_emits_warn_and_no_facts() {
+        let rule = parse_rule("loop(X) :- count(loop(Y), N), N > 0.").unwrap();
+        let mut facts = FactSet::new();
+        let x = Uuid::new_v4();
+        facts.insert("loop", vec![Term::Const(x)]);
+
+        let (derived, _) = evaluate(&[rule], &facts, 100, 1000);
+        let derived_loop_count = derived.get("loop").map(|v| v.len()).unwrap_or(0);
+        assert_eq!(derived_loop_count, 1, "stratification rejection must leave only the base fact");
     }
 }
