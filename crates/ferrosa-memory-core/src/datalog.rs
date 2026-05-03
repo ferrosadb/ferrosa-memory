@@ -79,16 +79,40 @@ pub fn parse_rule(text: &str) -> anyhow::Result<DatalogRule> {
     let mut body = Vec::new();
     let mut filters = Vec::new();
     let mut aggregates: Vec<crate::types::Aggregate> = Vec::new();
+    let mut deferred_aggregates: Vec<String> = Vec::new();
     let mut anon_counter = 0usize;
 
+    // Pass 1: classify each body part; defer aggregate parts for Pass 2
+    // (aggregates need body_vars which aren't known until atoms are parsed).
     for part in &body_parts {
         let part = part.trim();
-        if let Some(agg) = parse_aggregate(part, &head_vars)? {
-            aggregates.push(agg);
+        if part.starts_with("count(") {
+            deferred_aggregates.push(part.to_string());
         } else if has_top_level_cmp(part) {
             let f = crate::datalog_filter_expr::parse_filter(part)?;
             filters.push(f);
         } else {
+            body.push(parse_atom(part, &mut anon_counter)?);
+        }
+    }
+
+    // Compute body_vars from the parsed non-aggregate body atoms.
+    let body_vars: std::collections::HashSet<String> = body
+        .iter()
+        .flat_map(|a| a.args.iter())
+        .filter_map(|t| match t {
+            Term::Var(name) => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+
+    // Pass 2: parse deferred aggregate parts now that body_vars is known.
+    for part in &deferred_aggregates {
+        if let Some(agg) = parse_aggregate(part, &head_vars, &body_vars)? {
+            aggregates.push(agg);
+        } else {
+            // parse_aggregate fell through (the `count(X, N)` legacy escape).
+            // Treat the part as a regular body atom.
             body.push(parse_atom(part, &mut anon_counter)?);
         }
     }
@@ -98,14 +122,9 @@ pub fn parse_rule(text: &str) -> anyhow::Result<DatalogRule> {
         "rule must have at least one body atom"
     );
 
-    for agg in &aggregates {
-        if agg.inner.predicate == head.predicate {
-            anyhow::bail!(
-                "aggregation through head predicate '{}' is not supported in v1",
-                head.predicate
-            );
-        }
-    }
+    // Note: the v1 intra-rule recursion guard was removed here.
+    // The stratify analyzer (Task M3) supersedes it and also catches
+    // cross-rule recursion through aggregates.
 
     Ok(DatalogRule {
         head,
@@ -199,6 +218,7 @@ fn parse_term(s: &str, anon_counter: &mut usize) -> Term {
 fn parse_aggregate(
     s: &str,
     head_vars: &std::collections::HashSet<String>,
+    body_vars: &std::collections::HashSet<String>,
 ) -> anyhow::Result<Option<crate::types::Aggregate>> {
     let s = s.trim();
     let Some(rest) = s.strip_prefix("count(") else {
@@ -209,19 +229,9 @@ fn parse_aggregate(
     };
     let parts = split_top_level(inner_text, ',')?;
     if parts.len() < 2 {
-        anyhow::bail!("aggregate '{s}' must have an inner atom and an output var separated by ','");
+        anyhow::bail!("aggregate '{s}' must have at least one inner atom and an output var separated by ','");
     }
     let output = parts.last().unwrap().trim().to_string();
-    let inner_text = parts[..parts.len() - 1].join(",");
-
-    let mut anon = 0;
-    // If the inner text isn't a valid atom (e.g. `count(X, N)` where X has no
-    // parentheses), fall through to body-atom parsing rather than erroring.
-    let inner = match parse_atom(&inner_text, &mut anon) {
-        Ok(atom) => atom,
-        Err(_) => return Ok(None),
-    };
-
     if !output
         .chars()
         .next()
@@ -233,20 +243,43 @@ fn parse_aggregate(
         );
     }
 
-    let mut group_vars = Vec::new();
-    for arg in &inner.args {
-        if let crate::types::Term::Var(name) = arg
-            && head_vars.contains(name)
-            && !group_vars.contains(name)
-        {
-            group_vars.push(name.clone());
+    let atom_parts = &parts[..parts.len() - 1];
+    let mut atoms: Vec<Atom> = Vec::with_capacity(atom_parts.len());
+    let mut anon = 0;
+    for (i, part) in atom_parts.iter().enumerate() {
+        match parse_atom(part, &mut anon) {
+            Ok(atom) => atoms.push(atom),
+            Err(_) if atoms.is_empty() => {
+                // First arg isn't a compound atom — fall through to body-atom
+                // parsing (legacy escape: `count(X, N)` is a plain 2-arg
+                // predicate named `count`, not an aggregate).
+                return Ok(None);
+            }
+            Err(e) => {
+                anyhow::bail!("aggregate '{s}' atom #{} is malformed: {e}", i + 1);
+            }
+        }
+    }
+
+    let inner = atoms[0].clone();
+    let inner_conjunction = if atoms.len() == 1 { Vec::new() } else { atoms.clone() };
+
+    let mut group_vars: Vec<String> = Vec::new();
+    for atom in &atoms {
+        for arg in &atom.args {
+            if let crate::types::Term::Var(name) = arg
+                && (head_vars.contains(name) || body_vars.contains(name))
+                && !group_vars.contains(name)
+            {
+                group_vars.push(name.clone());
+            }
         }
     }
 
     Ok(Some(crate::types::Aggregate {
         kind: crate::types::AggregateKind::Count,
         inner,
-        inner_conjunction: vec![],
+        inner_conjunction,
         group_vars,
         output_var: output,
     }))
@@ -1982,13 +2015,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_rule_rejects_intra_rule_recursion_through_count() {
-        let err = parse_rule("loop(X) :- count(loop(Y), N), N > 0.").unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("aggregation through head predicate") || msg.contains("recursion"),
-            "expected recursion-through-aggregate error, got: {msg}"
-        );
+    fn intra_rule_recursion_through_count_now_rejected_at_evaluate_time() {
+        // The v1 parse-time guard was removed in favour of the stratify
+        // analyzer (Task M3) which catches cross-rule recursion too. The
+        // rule now parses cleanly; evaluate-time rejection is asserted in
+        // tests in Tasks M3 and M5.
+        let rule = parse_rule("loop(X) :- count(loop(Y), N), N > 0.").unwrap();
+        assert_eq!(rule.aggregates.len(), 1);
     }
 
     #[test]
@@ -2112,5 +2145,42 @@ mod tests {
             !avoided.contains(&target_u),
             "2 distinct correctors should NOT derive avoid_action"
         );
+    }
+
+    #[test]
+    fn parse_rule_supports_two_atom_conjunction() {
+        use crate::types::AggregateKind;
+        let rule = parse_rule(
+            "preferred_tool(Ctx, Tool) :- count(worked_well(S, Tool), session_context(S, Ctx), N), N >= 3."
+        ).unwrap();
+        assert_eq!(rule.aggregates.len(), 1);
+        let agg = &rule.aggregates[0];
+        assert_eq!(agg.kind, AggregateKind::Count);
+        assert_eq!(agg.inner_conjunction.len(), 2);
+        assert_eq!(agg.inner_conjunction[0].predicate, "worked_well");
+        assert_eq!(agg.inner_conjunction[1].predicate, "session_context");
+        assert_eq!(agg.inner.predicate, "worked_well");
+        let mut sorted_groups = agg.group_vars.clone();
+        sorted_groups.sort();
+        assert_eq!(sorted_groups, vec!["Ctx".to_string(), "Tool".to_string()]);
+        assert_eq!(agg.output_var, "N");
+    }
+
+    #[test]
+    fn parse_rule_rejects_aggregate_with_no_atoms() {
+        let err = parse_rule("foo(X) :- count(N).").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("inner atom") || msg.contains("at least"),
+            "expected at-least-one-atom error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_rule_single_atom_aggregate_keeps_v1_shape() {
+        let rule = parse_rule("foo(X) :- count(bar(X), N), N > 0.").unwrap();
+        let agg = &rule.aggregates[0];
+        assert!(agg.inner_conjunction.is_empty());
+        assert_eq!(agg.inner.predicate, "bar");
     }
 }
