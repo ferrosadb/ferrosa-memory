@@ -86,9 +86,7 @@ fn stem(word: &str) -> String {
         w.truncate(w.len() - 2);
     } else if w == "uses" || w == "does" || w == "was" || w == "has" {
         w.pop();
-    } else if w.ends_with("es") && w.len() >= 5 {
-        w.truncate(w.len() - 2);
-    } else if w.ends_with("ed") && w.len() > 4 {
+    } else if (w.ends_with("es") && w.len() >= 5) || (w.ends_with("ed") && w.len() > 4) {
         w.truncate(w.len() - 2);
     } else if w.ends_with('s')
         && !w.ends_with("ss")
