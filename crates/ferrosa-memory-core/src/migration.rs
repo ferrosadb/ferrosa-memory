@@ -71,6 +71,31 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "active rule index for wildcard rule listing",
         ddl: include_str!("../../../ddl/024_rules_active_index.cql"),
     },
+    Migration {
+        version: 25,
+        description: "warmth reputation backfill",
+        ddl: include_str!("../../../ddl/025_warmth_reputation.cql"),
+    },
+    Migration {
+        version: 26,
+        description: "confidence scoring table",
+        ddl: include_str!("../../../ddl/026_confidence_scoring.cql"),
+    },
+    Migration {
+        version: 27,
+        description: "contradiction registry",
+        ddl: include_str!("../../../ddl/027_contradiction_registry.cql"),
+    },
+    Migration {
+        version: 28,
+        description: "consolidation pipeline tables",
+        ddl: include_str!("../../../ddl/028_consolidation_pipeline.cql"),
+    },
+    Migration {
+        version: 29,
+        description: "domain schema bundles",
+        ddl: include_str!("../../../ddl/029_domain_schema_bundles.cql"),
+    },
 ];
 
 /// Pre-versioning DDLs. Applied in order when `run_migrations` detects a
@@ -109,6 +134,11 @@ pub const BOOTSTRAP_DDLS: &[&str] = &[
     include_str!("../../../ddl/022_approval_store.cql"),
     include_str!("../../../ddl/023_alias_store.cql"),
     include_str!("../../../ddl/024_rules_active_index.cql"),
+    include_str!("../../../ddl/025_warmth_reputation.cql"),
+    include_str!("../../../ddl/026_confidence_scoring.cql"),
+    include_str!("../../../ddl/027_contradiction_registry.cql"),
+    include_str!("../../../ddl/028_consolidation_pipeline.cql"),
+    include_str!("../../../ddl/029_domain_schema_bundles.cql"),
 ];
 
 /// Role-auth seed DDL — creates `ferrosa_admin` (superuser) and

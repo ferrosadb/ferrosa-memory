@@ -715,6 +715,64 @@ pub struct TypedEdge {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+// ─── Sprint 6: Confidence, Contradiction, Consolidation, Schema ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfidenceScore {
+    pub entity_id: Uuid,
+    pub fact_hash: String,
+    pub confidence: f64,
+    pub source_count: i32,
+    pub last_confirmed_at: chrono::DateTime<chrono::Utc>,
+    pub contradiction_count: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContradictionEntry {
+    pub tenant_id: Uuid,
+    pub entity_id: Uuid,
+    pub old_fact_hash: String,
+    pub new_fact_hash: String,
+    pub old_fact_text: String,
+    pub new_fact_text: String,
+    pub detected_at: chrono::DateTime<chrono::Utc>,
+    pub resolved_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub resolution: Option<String>,
+    pub resolver: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsolidationStage {
+    FoldRaw,
+    FoldCompressed,
+    EntityExtracted,
+    SkillCandidate,
+}
+
+impl std::fmt::Display for ConsolidationStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FoldRaw => write!(f, "fold_raw"),
+            Self::FoldCompressed => write!(f, "fold_compressed"),
+            Self::EntityExtracted => write!(f, "entity_extracted"),
+            Self::SkillCandidate => write!(f, "skill_candidate"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainSchema {
+    pub schema_id: Uuid,
+    pub schema_name: String,
+    pub version: i32,
+    pub description: Option<String>,
+    pub skill_names: Vec<String>,
+    pub routing_guidelines: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
 // ─── B10: Materialization + Promotion types ────────────────────
 
 /// A durably materialized derived edge.
