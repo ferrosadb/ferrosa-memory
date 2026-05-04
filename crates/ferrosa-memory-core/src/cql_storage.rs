@@ -67,6 +67,18 @@ where
     T::from_cql(val).map_err(|e| anyhow::anyhow!("column '{}': {}", name, e))
 }
 
+fn sprint1_seed_insert_statements(ks: &str) -> (String, String) {
+    let entity_q = format!(
+        "INSERT INTO {ks}.entity_types (type_name, description, created_at) \
+         VALUES (?, ?, ?)"
+    );
+    let edge_q = format!(
+        "INSERT INTO {ks}.edge_types (type_name, description, src_types, dst_types, created_at) \
+         VALUES (?, ?, ?, ?, ?)"
+    );
+    (entity_q, edge_q)
+}
+
 /// Execute a SELECT or DML and return `(col_map, rows)`.
 ///
 /// Convenience wrapper around `execute_unpaged` + col_map extraction.
@@ -867,7 +879,6 @@ impl CqlStorage {
     /// via that edge type.
     pub async fn seed_sprint1_types(&self) -> anyhow::Result<()> {
         let ks = &self.keyspace;
-        let now = "toTimestamp(now())";
 
         // Entity types (upsert).
         let entity_seeds: &[(&str, &str)] = &[
@@ -880,19 +891,17 @@ impl CqlStorage {
                 "A classification label. Tags form a hierarchy via PARENT_TAG edges; entities attach via TAGGED_AS.",
             ),
         ];
-        let entity_q = format!(
-            "INSERT INTO {ks}.entity_types (type_name, description, created_at) \
-             VALUES (?, ?, {now})"
-        );
+        let (entity_q, edge_q) = sprint1_seed_insert_statements(ks);
         let entity_writes = entity_seeds.iter().map(|(name, desc)| {
             let q = entity_q.clone();
             let name = name.to_string();
             let desc = desc.to_string();
             async move {
+                let created_at = chrono::Utc::now();
                 #[allow(deprecated)]
                 let res = self
                     .session
-                    .query_unpaged(q, (name.clone(), desc))
+                    .query_unpaged(q, (name.clone(), desc, created_at))
                     .await;
                 if let Err(e) = res {
                     tracing::warn!(type_name = %name, error = %e, "seed_sprint1_types: entity insert failed");
@@ -921,10 +930,6 @@ impl CqlStorage {
                 "skill",
             ),
         ];
-        let edge_q = format!(
-            "INSERT INTO {ks}.edge_types (type_name, description, src_types, dst_types, created_at) \
-             VALUES (?, ?, ?, ?, {now})"
-        );
         let edge_writes = edge_seeds.iter().map(|(name, desc, src, dst)| {
             let q = edge_q.clone();
             let name = name.to_string();
@@ -932,10 +937,11 @@ impl CqlStorage {
             let src = src.to_string();
             let dst = dst.to_string();
             async move {
+                let created_at = chrono::Utc::now();
                 #[allow(deprecated)]
                 let res = self
                     .session
-                    .query_unpaged(q, (name.clone(), desc, src, dst))
+                    .query_unpaged(q, (name.clone(), desc, src, dst, created_at))
                     .await;
                 if let Err(e) = res {
                     tracing::warn!(edge_type = %name, error = %e, "seed_sprint1_types: edge insert failed");
@@ -4206,5 +4212,32 @@ impl Storage for CqlStorage {
         } else {
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod cql_storage_tests {
+    use super::*;
+
+    #[test]
+    fn sprint1_seed_insert_statements_bind_created_at_timestamp() {
+        let (entity_q, edge_q) = sprint1_seed_insert_statements("agent_memory");
+
+        assert!(
+            entity_q.contains("created_at)"),
+            "entity seed query should write created_at: {entity_q}"
+        );
+        assert!(
+            entity_q.contains("VALUES (?, ?, ?)"),
+            "entity seed query should bind created_at as a timestamp parameter: {entity_q}"
+        );
+        assert!(
+            edge_q.contains("VALUES (?, ?, ?, ?, ?)"),
+            "edge seed query should bind created_at as a timestamp parameter: {edge_q}"
+        );
+        assert!(
+            !entity_q.contains("now()") && !edge_q.contains("now()"),
+            "seed queries must not rely on Ferrosa CQL now() coercion"
+        );
     }
 }

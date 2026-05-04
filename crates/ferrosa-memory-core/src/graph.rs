@@ -469,14 +469,15 @@ fn quote_cypher(value: &str) -> String {
 }
 
 fn build_typed_edge_merge_query(
-    _tenant_id: Uuid,
-    _session_id: Uuid,
+    tenant_id: Uuid,
+    session_id: Uuid,
     src_id: Uuid,
     edge_type: &str,
     dst_id: Uuid,
     weight: f64,
     metadata: Option<&str>,
 ) -> String {
+    let created_at = Utc::now().to_rfc3339();
     let metadata_clause = match metadata {
         Some(value) => format!(", r.metadata = {}", quote_cypher(value)),
         None => String::new(),
@@ -485,11 +486,14 @@ fn build_typed_edge_merge_query(
         "MERGE (a:Entity {{entity_id: {}}})\
          MERGE (b:Entity {{entity_id: {}}})\
          MERGE (a)-[r:TYPED_EDGE {{edge_type: {}}}]->(b) \
-         SET r.weight = {}{} RETURN r",
+         SET r.tenant_id = {}, r.session_id = {}, r.weight = {}, r.created_at = {}{} RETURN r",
         quote_cypher(&src_id.to_string()),
         quote_cypher(&dst_id.to_string()),
         quote_cypher(edge_type),
+        quote_cypher(&tenant_id.to_string()),
+        quote_cypher(&session_id.to_string()),
         weight,
+        quote_cypher(&created_at),
         metadata_clause,
     )
 }
@@ -570,12 +574,13 @@ fn build_co_occurs_merge_query(
         "MERGE (a:Entity {{entity_id: {}}})\
          MERGE (b:Entity {{entity_id: {}}})\
          MERGE (a)-[r:CO_OCCURS_WITH]->(b) \
-         SET r.tenant_id = {}, r.session_id = {}, r.strength = {}, r.first_seen = {}, r.last_reinforced = {} RETURN r",
+         SET r.tenant_id = {}, r.session_id = {}, r.strength = {}, r.created_at = {}, r.first_seen = {}, r.last_reinforced = {} RETURN r",
         quote_cypher(&entity_a.to_string()),
         quote_cypher(&entity_b.to_string()),
         quote_cypher(&tenant_id.to_string()),
         quote_cypher(&session_id.to_string()),
         strength,
+        quote_cypher(&now),
         quote_cypher(&now),
         quote_cypher(&now),
     )
@@ -752,6 +757,12 @@ mod tests {
         assert!(query.contains("edge_type: 'related'"));
         assert!(query.contains("r.weight = 0.75"));
         assert!(query.contains("r.metadata = 'probe'"));
+        assert!(query.contains("r.tenant_id = '00000000-0000-0000-0000-000000000001'"));
+        assert!(query.contains("r.session_id = '00000000-0000-0000-0000-000000000002'"));
+        assert!(
+            query.contains("r.created_at = "),
+            "typed edge writes must populate created_at at the source: {query}"
+        );
     }
 
     #[test]
@@ -782,6 +793,12 @@ mod tests {
         assert!(mentioned.contains(":MENTIONED_IN"));
         assert!(co_occurs.contains(":CO_OCCURS_WITH"));
         assert!(co_occurs.contains("r.strength = 0.5"));
+        assert!(
+            co_occurs.contains("r.created_at = "),
+            "co-occurrence writes must populate created_at at the source: {co_occurs}"
+        );
+        assert!(co_occurs.contains("r.first_seen = "));
+        assert!(co_occurs.contains("r.last_reinforced = "));
         assert!(supersedes.contains(":SUPERSEDES"));
     }
 }
