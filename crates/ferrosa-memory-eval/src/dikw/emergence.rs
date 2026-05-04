@@ -93,9 +93,10 @@ pub fn parse_annotated_edges(response: &Value) -> Vec<AnnotatedEdge> {
 fn extract_created_by(edge: &Value) -> String {
     // Try annotations object
     if let Some(annotations) = edge.get("annotations")
-        && let Some(cb) = annotations.get("created_by").and_then(|v| v.as_str()) {
-            return cb.to_string();
-        }
+        && let Some(cb) = annotations.get("created_by").and_then(|v| v.as_str())
+    {
+        return cb.to_string();
+    }
     // Try top-level
     if let Some(cb) = edge.get("created_by").and_then(|v| v.as_str()) {
         return cb.to_string();
@@ -268,10 +269,11 @@ pub fn sample_edge_quality(edges: &[AnnotatedEdge], sample_size: usize) -> EdgeQ
 fn extract_inner_json(response: &Value) -> Value {
     if let Some(content) = response.get("content").and_then(|c| c.as_array())
         && let Some(first) = content.first()
-            && let Some(text) = first.get("text").and_then(|t| t.as_str())
-                && let Ok(parsed) = serde_json::from_str::<Value>(text) {
-                    return parsed;
-                }
+        && let Some(text) = first.get("text").and_then(|t| t.as_str())
+        && let Ok(parsed) = serde_json::from_str::<Value>(text)
+    {
+        return parsed;
+    }
     response.clone()
 }
 

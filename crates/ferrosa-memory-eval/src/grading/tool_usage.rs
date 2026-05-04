@@ -43,9 +43,10 @@ fn collect_entity_ids(value: &Value, ids: &mut HashSet<String>) {
     match value {
         Value::Object(map) => {
             if let Some(id_val) = map.get("entity_id")
-                && let Some(s) = id_val.as_str() {
-                    ids.insert(s.to_string());
-                }
+                && let Some(s) = id_val.as_str()
+            {
+                ids.insert(s.to_string());
+            }
             // Also collect from entity_ids arrays
             if let Some(Value::Array(arr)) = map.get("entity_ids") {
                 for item in arr {
@@ -212,9 +213,7 @@ mod tests {
 
     fn make_trace(tool: &str, args: Value, response: Value, latency_ms: u64) -> ToolCallTrace {
         let arguments = match args {
-            Value::Object(map) => map
-                .into_iter()
-                .collect::<HashMap<String, Value>>(),
+            Value::Object(map) => map.into_iter().collect::<HashMap<String, Value>>(),
             _ => HashMap::new(),
         };
         ToolCallTrace {

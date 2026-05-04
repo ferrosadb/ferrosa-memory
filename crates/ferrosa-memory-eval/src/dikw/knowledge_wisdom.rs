@@ -143,9 +143,10 @@ pub fn score_smart_ingest_decisions(
         if let Some(ref expected_action) = step.expect_action {
             total += 1;
             if let Some(actual_action) = parse_smart_ingest_action(&trace.response)
-                && actual_action.to_lowercase() == expected_action.to_lowercase() {
-                    correct += 1;
-                }
+                && actual_action.to_lowercase() == expected_action.to_lowercase()
+            {
+                correct += 1;
+            }
         }
     }
 
@@ -215,10 +216,11 @@ pub fn score_predictions(predicted: &[String], actual_accessed: &[String]) -> (f
 fn extract_inner_json(response: &Value) -> Value {
     if let Some(content) = response.get("content").and_then(|c| c.as_array())
         && let Some(first) = content.first()
-            && let Some(text) = first.get("text").and_then(|t| t.as_str())
-                && let Ok(parsed) = serde_json::from_str::<Value>(text) {
-                    return parsed;
-                }
+        && let Some(text) = first.get("text").and_then(|t| t.as_str())
+        && let Ok(parsed) = serde_json::from_str::<Value>(text)
+    {
+        return parsed;
+    }
     response.clone()
 }
 

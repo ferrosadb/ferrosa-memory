@@ -81,19 +81,20 @@ pub fn parse_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 
     // Try to parse as JSON
     if let Ok(value) = serde_json::from_str::<Value>(response)
-        && let Some(arr) = value.get("tool_calls").and_then(|v| v.as_array()) {
-            for item in arr {
-                if let (Some(name), Some(args)) = (
-                    item.get("tool_name").and_then(|v| v.as_str()),
-                    item.get("arguments"),
-                ) {
-                    calls.push(ParsedToolCall {
-                        tool_name: name.to_string(),
-                        arguments: args.clone(),
-                    });
-                }
+        && let Some(arr) = value.get("tool_calls").and_then(|v| v.as_array())
+    {
+        for item in arr {
+            if let (Some(name), Some(args)) = (
+                item.get("tool_name").and_then(|v| v.as_str()),
+                item.get("arguments"),
+            ) {
+                calls.push(ParsedToolCall {
+                    tool_name: name.to_string(),
+                    arguments: args.clone(),
+                });
             }
         }
+    }
 
     calls
 }
@@ -212,12 +213,13 @@ impl TaskAgent {
                 // Inject session_id into arguments
                 let mut args = call.arguments.clone();
                 if let Some(obj) = args.as_object_mut()
-                    && !obj.contains_key("session_id") {
-                        obj.insert(
-                            "session_id".to_string(),
-                            Value::String(self.session_id.to_string()),
-                        );
-                    }
+                    && !obj.contains_key("session_id")
+                {
+                    obj.insert(
+                        "session_id".to_string(),
+                        Value::String(self.session_id.to_string()),
+                    );
+                }
 
                 let result = self
                     .mcp_client
@@ -237,10 +239,10 @@ impl TaskAgent {
                         // Extract findings from smart_ingest responses
                         if call.tool_name == "smart_ingest"
                             && let Some(action) = tc.response.get("action").and_then(|v| v.as_str())
-                                && let Some(name) = args.get("entity_name").and_then(|v| v.as_str())
-                                {
-                                    findings.push(format!("{}: {}", action, name));
-                                }
+                            && let Some(name) = args.get("entity_name").and_then(|v| v.as_str())
+                        {
+                            findings.push(format!("{}: {}", action, name));
+                        }
                     }
                     Err(e) => {
                         tool_calls.push(ToolCallTrace {

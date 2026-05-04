@@ -115,10 +115,11 @@ impl GraphSnapshot {
         // MCP responses wrap in: {"content": [{"type": "text", "text": "{...}"}]}
         if let Some(content) = response.get("content").and_then(|c| c.as_array())
             && let Some(first) = content.first()
-                && let Some(text) = first.get("text").and_then(|t| t.as_str())
-                    && let Ok(parsed) = serde_json::from_str::<Value>(text) {
-                        return parsed;
-                    }
+            && let Some(text) = first.get("text").and_then(|t| t.as_str())
+            && let Ok(parsed) = serde_json::from_str::<Value>(text)
+        {
+            return parsed;
+        }
         // Fallback: the response itself might be the stats object directly
         response.clone()
     }
@@ -465,25 +466,26 @@ impl<T: McpTransport> EvalRunner<T> {
 
         // Claim rubric grading
         if methods.iter().any(|m| m == "claim_rubric")
-            && let Some(ref rubric_cfg) = run.scenario.grading.claim_rubric {
-                // Concatenate all response texts for claim grading
-                let response_text = run
-                    .traces
-                    .iter()
-                    .map(|t| response_to_text(&t.response))
-                    .collect::<Vec<_>>()
-                    .join(" ");
+            && let Some(ref rubric_cfg) = run.scenario.grading.claim_rubric
+        {
+            // Concatenate all response texts for claim grading
+            let response_text = run
+                .traces
+                .iter()
+                .map(|t| response_to_text(&t.response))
+                .collect::<Vec<_>>()
+                .join(" ");
 
-                let claim_strs: Vec<&str> = rubric_cfg.claims.iter().map(|s| s.as_str()).collect();
+            let claim_strs: Vec<&str> = rubric_cfg.claims.iter().map(|s| s.as_str()).collect();
 
-                if let Ok(score) = claim_rubric::grade_claims(
-                    &claim_strs,
-                    &response_text,
-                    rubric_cfg.passing_threshold,
-                ) {
-                    claim_score = Some(score);
-                }
+            if let Ok(score) = claim_rubric::grade_claims(
+                &claim_strs,
+                &response_text,
+                rubric_cfg.passing_threshold,
+            ) {
+                claim_score = Some(score);
             }
+        }
 
         GradeResult {
             programmatic: programmatic_score,
