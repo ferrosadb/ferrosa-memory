@@ -101,6 +101,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "fix temporal_events timeuuid → uuid columns",
         ddl: include_str!("../../../ddl/030_temporal_events_uuid_columns.cql"),
     },
+    Migration {
+        version: 31,
+        description: "add first_seen timestamp to co_occurs_with edge table",
+        ddl: include_str!("../../../ddl/031_co_occurs_first_seen.cql"),
+    },
 ];
 
 /// Pre-versioning DDLs. Applied in order when `run_migrations` detects a
