@@ -2696,33 +2696,30 @@ impl Storage for CqlStorage {
 
         for (table, src_col, tgt_col, label) in edge_queries {
             let query = format!(
-                "SELECT {src_col}, {tgt_col} FROM {}.{table} \
-                 WHERE session_id = ? AND tenant_id = ? ALLOW FILTERING",
+                "SELECT {src_col}, {tgt_col}, tenant_id, session_id FROM {}.{table}",
                 self.keyspace
             );
             match self.session.prepare(query).await {
-                Ok(prepared) => {
-                    #[allow(deprecated)]
-                    match self
-                        .session
-                        .execute_unpaged(&prepared, (session_id, ctx.tenant_id))
-                        .await
-                    {
-                        Ok(result) => {
-                            let col_map = build_col_map(result.col_specs());
-                            let rows = result.rows_or_empty();
-                            for row in rows {
-                                if let (Ok(src), Ok(tgt)) = (
-                                    cql_get::<Uuid>(&row, &col_map, src_col),
-                                    cql_get::<Uuid>(&row, &col_map, tgt_col),
-                                ) {
-                                    edges.push((src, tgt, label.to_string()));
-                                }
+                Ok(prepared) => match self.exec_prepared_rows(&prepared, ()).await {
+                    Ok((col_map, rows)) => {
+                        for row in rows {
+                            let row_tenant = cql_get::<Uuid>(&row, &col_map, "tenant_id");
+                            let row_session = cql_get::<Uuid>(&row, &col_map, "session_id");
+                            if row_tenant.as_ref().ok() != Some(&ctx.tenant_id)
+                                || row_session.as_ref().ok() != Some(&session_id)
+                            {
+                                continue;
+                            }
+                            if let (Ok(src), Ok(tgt)) = (
+                                cql_get::<Uuid>(&row, &col_map, src_col),
+                                cql_get::<Uuid>(&row, &col_map, tgt_col),
+                            ) {
+                                edges.push((src, tgt, label.to_string()));
                             }
                         }
-                        Err(e) => tracing::warn!(table, error = %e, "edge query failed"),
                     }
-                }
+                    Err(e) => tracing::warn!(table, error = %e, "edge query failed"),
+                },
                 Err(e) => tracing::warn!(table, error = %e, "edge query prepare failed"),
             }
         }

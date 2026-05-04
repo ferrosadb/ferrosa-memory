@@ -4676,9 +4676,17 @@ async fn handle_spread_activation<S: crate::storage::Storage>(
         .map(|v| v as usize)
         .unwrap_or(10);
 
-    let results = crate::spreading::spread(storage, ctx, &seeds, max_hops, decay, limit)
-        .await
-        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    let results = crate::spreading::spread(
+        storage,
+        ctx,
+        &seeds,
+        Some(session_id),
+        max_hops,
+        decay,
+        limit,
+    )
+    .await
+    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
     // Warmth boost for seeds and top activated results (fire-and-forget)
     let rmh_config = crate::config::RmhConfig::default();

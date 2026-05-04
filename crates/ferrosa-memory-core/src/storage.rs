@@ -808,6 +808,7 @@ pub mod mock {
     use crate::http::OperatorQuerySurface;
     use crate::types::{DecayZone, FoldStatus};
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex;
 
     /// An edge stored in mock storage: (source, target, edge_type, session_id).
@@ -842,6 +843,9 @@ pub mod mock {
         pub promoted_predicates: Mutex<Vec<PromotedPredicate>>,
         pub typed_edges: Mutex<Vec<TypedEdge>>,
         pub confidence_scores: Mutex<Vec<ConfidenceScore>>,
+        pub edge_list_all_calls: AtomicUsize,
+        pub edge_list_session_calls: AtomicUsize,
+        pub edge_list_for_entity_calls: AtomicUsize,
         /// Test hook: when Some, `entity_find_phonetic` returns Err with
         /// this message. Used to verify callers propagate phonetic-scan
         /// errors instead of fail-quieting them into empty results, and
@@ -1502,6 +1506,7 @@ pub mod mock {
             _ctx: &TenantContext,
             session_id: Uuid,
         ) -> anyhow::Result<Vec<(Uuid, Uuid, String)>> {
+            self.edge_list_session_calls.fetch_add(1, Ordering::Relaxed);
             let edges = self.edges.lock().await;
             Ok(edges
                 .iter()
@@ -1514,6 +1519,7 @@ pub mod mock {
             &self,
             _ctx: &TenantContext,
         ) -> anyhow::Result<Vec<(Uuid, Uuid, String)>> {
+            self.edge_list_all_calls.fetch_add(1, Ordering::Relaxed);
             let edges = self.edges.lock().await;
             Ok(edges
                 .iter()
@@ -1526,6 +1532,8 @@ pub mod mock {
             _ctx: &TenantContext,
             entity_id: Uuid,
         ) -> anyhow::Result<Vec<(Uuid, String)>> {
+            self.edge_list_for_entity_calls
+                .fetch_add(1, Ordering::Relaxed);
             let edges = self.edges.lock().await;
             let mut neighbors = Vec::new();
             for e in edges.iter() {
