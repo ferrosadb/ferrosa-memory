@@ -408,13 +408,15 @@ pub async fn run_migrations(session: &CqlSession, keyspace: &str) -> Result<usiz
 ///    unqualified `CREATE TABLE`, `CREATE INDEX ... ON <table>`, and
 ///    `ALTER TABLE <table>` with the keyspace.
 async fn apply_bootstrap(session: &CqlSession, keyspace: &str) -> anyhow::Result<()> {
+    let applied_at = chrono::Utc::now();
     for (file_idx, ddl) in BOOTSTRAP_DDLS.iter().enumerate() {
         let rewritten = qualify_ddl(ddl, keyspace);
         for (i, stmt) in split_cql(&rewritten).iter().enumerate() {
+            let prepared = prepare_bootstrap_statement(stmt, applied_at);
             #[allow(deprecated)]
-            if let Err(e) = session.query_unpaged(stmt.as_str(), ()).await {
+            if let Err(e) = session.query_unpaged(prepared.as_str(), ()).await {
                 anyhow::bail!(
-                    "bootstrap DDL[{file_idx}] statement {i} failed: {e}\n--- statement ---\n{stmt}"
+                    "bootstrap DDL[{file_idx}] statement {i} failed: {e}\n--- statement ---\n{prepared}"
                 );
             }
             // Wait for schema agreement so subsequent statements don't race
@@ -439,6 +441,18 @@ async fn apply_bootstrap(session: &CqlSession, keyspace: &str) -> anyhow::Result
         }
     }
     Ok(())
+}
+
+pub fn prepare_bootstrap_statement(
+    stmt: &str,
+    applied_at: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let timestamp_literal = format!(
+        "'{}'",
+        applied_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    );
+    stmt.replace("toTimestamp(now())", &timestamp_literal)
+        .replace("now()", &timestamp_literal)
 }
 
 /// Substitute the hardcoded `agent_memory` keyspace with the configured
@@ -990,6 +1004,26 @@ mod tests {
         assert!(
             rewritten.contains("agent_memory_test.co_occurs_with"),
             "CREATE INDEX must be qualified even when preceded by a `;`-containing comment, got:\n{rewritten}"
+        );
+    }
+
+    #[test]
+    fn prepare_bootstrap_statement_rewrites_now_to_apply_time_timestamp_literal() {
+        let stmt = "INSERT INTO agent_memory.entity_types (type_name, description, created_at)\n\
+                    VALUES ('person', 'desc', toTimestamp(now()))";
+        let applied_at = chrono::DateTime::parse_from_rfc3339("2026-05-04T22:53:21.123Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let prepared = prepare_bootstrap_statement(stmt, applied_at);
+
+        assert!(
+            !prepared.contains("toTimestamp(now())") && !prepared.contains("now()"),
+            "prepared bootstrap statement must not send Ferrosa a server-side now() expression: {prepared}"
+        );
+        assert!(
+            prepared.contains("'2026-05-04T22:53:21.123Z'"),
+            "prepared bootstrap statement must preserve current apply-time timestamp semantics, got: {prepared}"
         );
     }
 

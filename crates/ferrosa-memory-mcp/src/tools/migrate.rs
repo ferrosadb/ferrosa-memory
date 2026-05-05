@@ -24,6 +24,7 @@
 
 #![allow(deprecated)]
 use anyhow::Context;
+use ferrosa_memory_core::migration::{prepare_bootstrap_statement, qualify_ddl};
 use scylla::{LegacySession, SessionBuilder};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -57,16 +58,17 @@ async fn main() -> anyhow::Result<()> {
         .collect();
     entries.sort_by_key(|e| e.file_name());
 
+    let applied_at = chrono::Utc::now();
     for entry in entries {
         let path = entry.path();
         let body = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
-        let stmts = split_cql_statements(&body);
+        let stmts = prepare_statements_for_keyspace(&body, &cli.keyspace, applied_at);
         tracing::info!(file = %path.display(), stmts = stmts.len(), "applying DDL");
-        for stmt in stmts {
-            apply_with_retry(&session, &stmt)
+        for prepared in stmts {
+            apply_with_retry(&session, &prepared)
                 .await
-                .with_context(|| format!("apply {}: {}", path.display(), preview(&stmt)))?;
+                .with_context(|| format!("apply {}: {}", path.display(), preview(&prepared)))?;
         }
     }
 
@@ -145,6 +147,18 @@ fn is_idempotent_already_exists(msg: &str) -> bool {
     m.contains("already exists")
         || m.contains("conflicts with an existing column")
         || m.contains("duplicate column")
+}
+
+fn prepare_statements_for_keyspace(
+    body: &str,
+    keyspace: &str,
+    applied_at: chrono::DateTime<chrono::Utc>,
+) -> Vec<String> {
+    let qualified = qualify_ddl(body, keyspace);
+    split_cql_statements(&qualified)
+        .into_iter()
+        .map(|stmt| prepare_bootstrap_statement(&stmt, applied_at))
+        .collect()
 }
 
 /// Split a multi-statement `.cql` file into individual statements. CQL
@@ -251,5 +265,48 @@ fn parse_args() -> Args {
             .or_else(|| std::env::var("FERROSA_DDL_DIR").ok().map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("ddl")),
         credentials,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_then_prepare_rewrites_timestamp_functions_before_apply() {
+        let body = "INSERT INTO agent_memory.entity_types (type_name, created_at) VALUES ('person', toTimestamp(now()));";
+        let applied_at = chrono::DateTime::parse_from_rfc3339("2026-05-04T22:53:21.123Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let prepared = prepare_statements_for_keyspace(body, "agent_memory", applied_at)
+            .pop()
+            .expect("statement");
+        assert!(!prepared.contains("toTimestamp(now())"));
+        assert!(prepared.contains("'2026-05-04T22:53:21.123Z'"));
+    }
+
+    #[test]
+    fn split_then_prepare_honors_requested_keyspace_before_apply() {
+        let body = "CREATE KEYSPACE IF NOT EXISTS agent_memory WITH replication = {};\n\
+                    USE agent_memory;\n\
+                    CREATE TABLE IF NOT EXISTS agent_memory.entity_types (type_name text PRIMARY KEY);\n\
+                    INSERT INTO agent_memory.entity_types (type_name, created_at) VALUES ('person', toTimestamp(now()));";
+        let applied_at = chrono::DateTime::parse_from_rfc3339("2026-05-04T22:53:21.123Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let prepared =
+            prepare_statements_for_keyspace(body, "agent_memory_pr12_keyspace", applied_at);
+
+        assert!(
+            prepared
+                .iter()
+                .any(|stmt| stmt.contains("agent_memory_pr12_keyspace")),
+            "migrate --keyspace must rewrite raw DDL to the requested keyspace before apply: {prepared:#?}"
+        );
+        assert!(
+            prepared.iter().all(|stmt| !stmt.contains("agent_memory.")),
+            "migrate --keyspace must not apply raw production-keyspace table references: {prepared:#?}"
+        );
     }
 }
