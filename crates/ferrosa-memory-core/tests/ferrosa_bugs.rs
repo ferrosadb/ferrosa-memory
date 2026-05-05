@@ -377,13 +377,14 @@ async fn ghost_rows_do_not_crash_queries() {
     // Insert a valid entity
     let valid_id = Uuid::new_v4();
     let session = storage.session();
+    let inserted_at = chrono::Utc::now();
     #[allow(deprecated)]
     session
         .query_unpaged(
             "INSERT INTO agent_memory.entity_store \
              (tenant_id, session_id, entity_id, entity_name, entity_type, \
               context_snippet, confidence, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, toTimestamp(now()))",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 tenant_id,
                 session_id,
@@ -392,6 +393,7 @@ async fn ghost_rows_do_not_crash_queries() {
                 "concept".to_string(),
                 "a real entity".to_string(),
                 1.0_f32,
+                inserted_at,
             ),
         )
         .await
@@ -403,8 +405,8 @@ async fn ghost_rows_do_not_crash_queries() {
         .query_unpaged(
             "INSERT INTO agent_memory.entity_store \
              (tenant_id, session_id, entity_id, confidence, created_at) \
-             VALUES (?, ?, ?, ?, toTimestamp(now()))",
-            (tenant_id, session_id, Uuid::new_v4(), 0.5_f32),
+             VALUES (?, ?, ?, ?, ?)",
+            (tenant_id, session_id, Uuid::new_v4(), 0.5_f32, inserted_at),
         )
         .await
         .expect("insert ghost entity");
@@ -415,7 +417,7 @@ async fn ghost_rows_do_not_crash_queries() {
         .query_unpaged(
             "INSERT INTO agent_memory.typed_edges \
              (tenant_id, session_id, src_id, edge_type, dst_id, weight, metadata, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, toTimestamp(now()))",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 tenant_id,
                 session_id,
@@ -424,6 +426,7 @@ async fn ghost_rows_do_not_crash_queries() {
                 Uuid::new_v4(),
                 0.9_f64,
                 "".to_string(),
+                inserted_at,
             ),
         )
         .await
@@ -435,7 +438,7 @@ async fn ghost_rows_do_not_crash_queries() {
         .query_unpaged(
             "INSERT INTO agent_memory.typed_edges \
              (tenant_id, session_id, src_id, edge_type, dst_id, weight, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, toTimestamp(now()))",
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 tenant_id,
                 session_id,
@@ -443,6 +446,7 @@ async fn ghost_rows_do_not_crash_queries() {
                 "".to_string(),
                 Uuid::new_v4(),
                 0.0_f64,
+                inserted_at,
             ),
         )
         .await
