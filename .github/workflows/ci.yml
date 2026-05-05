@@ -313,8 +313,7 @@ jobs:
                 FERROSA_GRAPH_ENABLED: "true"
                 FERROSA_CLUSTER_NAME: "ferrosa-memory-ci"
                 FERROSA_DATA_DIR: "/var/lib/ferrosa"
-                FERROSA_AUTH_ENABLED: "true"
-                FERROSA_AUTH_DISABLED: "false"
+                FERROSA_AUTH_DISABLED: "true"
                 FERROSA_S3_ENDPOINT: "http://rustfs:9000"
                 FERROSA_S3_BUCKET: "ferrosa-test"
                 FERROSA_S3_ALLOW_HTTP: "true"
@@ -344,8 +343,7 @@ jobs:
                 FERROSA_WEB_BIND: "0.0.0.0:9090"
                 FERROSA_CLUSTER_NAME: "ferrosa-memory-ci"
                 FERROSA_DATA_DIR: "/var/lib/ferrosa"
-                FERROSA_AUTH_ENABLED: "true"
-                FERROSA_AUTH_DISABLED: "false"
+                FERROSA_AUTH_DISABLED: "true"
                 FERROSA_S3_ENDPOINT: "http://rustfs:9000"
                 FERROSA_S3_BUCKET: "ferrosa-test"
                 FERROSA_S3_ALLOW_HTTP: "true"
@@ -377,8 +375,7 @@ jobs:
                 FERROSA_WEB_BIND: "0.0.0.0:9090"
                 FERROSA_CLUSTER_NAME: "ferrosa-memory-ci"
                 FERROSA_DATA_DIR: "/var/lib/ferrosa"
-                FERROSA_AUTH_ENABLED: "true"
-                FERROSA_AUTH_DISABLED: "false"
+                FERROSA_AUTH_DISABLED: "true"
                 FERROSA_S3_ENDPOINT: "http://rustfs:9000"
                 FERROSA_S3_BUCKET: "ferrosa-test"
                 FERROSA_S3_ALLOW_HTTP: "true"
@@ -431,9 +428,7 @@ jobs:
           cargo run --bin migrate -- \
             --contact-points 127.0.0.1:19042 \
             --keyspace agent_memory \
-            --ddl-dir ddl \
-            --user ferrosa_admin \
-            --password ferrosa_admin
+            --ddl-dir ddl
 
           # Propagation barrier: re-run the same idempotent DDL against
           # each peer until the keyspace is visible.
@@ -443,9 +438,7 @@ jobs:
               if cargo run --quiet --bin migrate -- \
                   --contact-points 127.0.0.1:${port} \
                   --keyspace agent_memory \
-                  --ddl-dir ddl \
-                  --user ferrosa_admin \
-                  --password ferrosa_admin >/dev/null 2>&1; then
+                  --ddl-dir ddl >/dev/null 2>&1; then
                 echo "  port ${port} sees agent_memory after ${i} attempts"
                 break
               fi
