@@ -571,11 +571,15 @@ fn build_co_occurs_merge_query(
 ) -> String {
     let now = Utc::now().to_rfc3339();
     format!(
-        "MERGE (a:Entity {{entity_id: {}}})\
-         MERGE (b:Entity {{entity_id: {}}})\
-         MERGE (a)-[r:CO_OCCURS_WITH]->(b) \
-         SET r.tenant_id = {}, r.session_id = {}, r.strength = {}, r.created_at = {}, r.first_seen = {}, r.last_reinforced = {} RETURN r",
+        "MERGE (a:Entity {{tenant_id: {}, session_id: {}, entity_id: {}}})\
+         MERGE (b:Entity {{tenant_id: {}, session_id: {}, entity_id: {}}})\
+         MERGE (a)-[r:CO_OCCURS_WITH {{tenant_id: {}, session_id: {}}}]->(b) \
+         SET r.strength = {}, r.created_at = {}, r.first_seen = {}, r.last_reinforced = {} RETURN r",
+        quote_cypher(&tenant_id.to_string()),
+        quote_cypher(&session_id.to_string()),
         quote_cypher(&entity_a.to_string()),
+        quote_cypher(&tenant_id.to_string()),
+        quote_cypher(&session_id.to_string()),
         quote_cypher(&entity_b.to_string()),
         quote_cypher(&tenant_id.to_string()),
         quote_cypher(&session_id.to_string()),
@@ -792,6 +796,18 @@ mod tests {
         assert!(folded.contains(":FOLDED_INTO"));
         assert!(mentioned.contains(":MENTIONED_IN"));
         assert!(co_occurs.contains(":CO_OCCURS_WITH"));
+        assert!(
+            co_occurs.contains("MERGE (a:Entity {tenant_id: "),
+            "Entity MERGE must include scoped key columns: {co_occurs}"
+        );
+        assert!(
+            co_occurs.contains("session_id: "),
+            "Entity/relationship MERGE must include session scope: {co_occurs}"
+        );
+        assert!(
+            co_occurs.contains("-[r:CO_OCCURS_WITH {tenant_id: "),
+            "Relationship MERGE must include scoped key columns: {co_occurs}"
+        );
         assert!(co_occurs.contains("r.strength = 0.5"));
         assert!(
             co_occurs.contains("r.created_at = "),
