@@ -224,22 +224,34 @@ jobs:
             echo "See ferrosa_docs/specs/todo/p1-33-fmem-ci-cross-repo-clone-needs-token.md" >&2
             exit 1
           fi
-          # Clone the matching feature branch — falls back to main if the
-          # explicit-branch clone errors. During the ground-truth-p0-gap-1
-          # PR cycle, the feature branch on bkearns/ferrosa carries the
-          # Cargo.lock that the cluster image build needs (it's gitignored
-          # on main historically; commits via PR #114 will land it on main).
-          # Once #114 merges, the feature-branch clone will simply not exist
-          # and fall back to main, which by then will also work.
-          BRANCH="feature/ground-truth-p0-gap-1"
-          echo "Trying to clone bkearns/ferrosa @ ${BRANCH}..."
-          if git clone --depth=1 \
-              --branch "${BRANCH}" \
-              "https://x-access-token:${FERROSA_REPO_TOKEN}@github.com/bkearns/ferrosa.git" \
-              /tmp/ferrosa-src; then
-            echo "Cloned ${BRANCH}."
-          else
-            echo "Feature branch not available; falling back to main..."
+          # Try the ferrosa branch matching this PR/branch, then a small set
+          # of historical fallbacks, then main. Cross-repo work that needs an
+          # unreleased ferrosa change can push a matching branch on bkearns/
+          # ferrosa and CI will pick it up automatically.
+          CANDIDATES=(
+            "${GITHUB_HEAD_REF:-}"
+            "${GITHUB_REF_NAME:-}"
+            # Carries the toTimestamp(now()) typing fix needed by
+            # ddl/019_type_registry.cql. Drop this entry once
+            # bkearns/ferrosa#148 merges to main.
+            "fix/cql-totimestamp-now-typing"
+            "feature/ground-truth-p0-gap-1"
+          )
+          CLONED=""
+          for BRANCH in "${CANDIDATES[@]}"; do
+            [ -z "${BRANCH}" ] && continue
+            echo "Trying to clone bkearns/ferrosa @ ${BRANCH}..."
+            if git clone --depth=1 \
+                --branch "${BRANCH}" \
+                "https://x-access-token:${FERROSA_REPO_TOKEN}@github.com/bkearns/ferrosa.git" \
+                /tmp/ferrosa-src 2>/dev/null; then
+              echo "Cloned ${BRANCH}."
+              CLONED="${BRANCH}"
+              break
+            fi
+          done
+          if [ -z "${CLONED}" ]; then
+            echo "No matching feature branch on bkearns/ferrosa; falling back to main..."
             git clone --depth=1 \
               "https://x-access-token:${FERROSA_REPO_TOKEN}@github.com/bkearns/ferrosa.git" \
               /tmp/ferrosa-src
