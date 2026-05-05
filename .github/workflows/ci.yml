@@ -302,6 +302,7 @@ jobs:
                   condition: service_completed_successfully
               ports:
                 - "19042:9042"
+                - "17474:7474"
                 - "19090:9090"
               environment:
                 FERROSA_HOST_ID: "11111111-1111-1111-1111-111111111111"
@@ -309,6 +310,7 @@ jobs:
                 FERROSA_INTERNODE_BROADCAST: "node1:7000"
                 FERROSA_CQL_BIND: "0.0.0.0:9042"
                 FERROSA_WEB_BIND: "0.0.0.0:9090"
+                FERROSA_GRAPH_ENABLED: "true"
                 FERROSA_CLUSTER_NAME: "ferrosa-memory-ci"
                 FERROSA_DATA_DIR: "/var/lib/ferrosa"
                 FERROSA_AUTH_DISABLED: "true"
@@ -403,6 +405,19 @@ jobs:
               fi
               sleep 2
             done
+          done
+          echo "Waiting for graph HTTP on port 17474..."
+          for i in $(seq 1 60); do
+            if bash -c "</dev/tcp/127.0.0.1/17474" 2>/dev/null; then
+              echo "  graph HTTP ready after ${i}s"
+              break
+            fi
+            if [ "$i" -eq 60 ]; then
+              echo "::error::Graph HTTP did not become ready within 60s"
+              docker compose -f /tmp/docker-compose.memory-ci.yml logs 2>/dev/null | tail -100
+              exit 1
+            fi
+            sleep 2
           done
       - name: Apply DDL + wait for schema propagation across all 3 nodes
         # p1-37 (ferrosa) lifted the scylla 0.15 driver-compat block, so
