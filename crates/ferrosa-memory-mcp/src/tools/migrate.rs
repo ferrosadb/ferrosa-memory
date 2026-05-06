@@ -284,7 +284,8 @@ where
     let env_user = env_value("FERROSA_CQL_USER");
     let env_password = env_value("FERROSA_CQL_PASSWORD");
     let credentials =
-        credentials_from_sources(user, password, env_user, env_password, config.as_ref());
+        credentials_from_sources(user, password, env_user, env_password, config.as_ref())
+            .or_else(|| local_loopback_migration_credentials(&contact_points));
 
     Args {
         contact_points,
@@ -338,6 +339,28 @@ fn credentials_from_sources(
 fn exit_incomplete_credentials(left: &str, right: &str) -> ! {
     eprintln!("ERROR: {left} and {right} must be supplied together, or both omitted.");
     std::process::exit(2);
+}
+
+fn local_loopback_migration_credentials(contact_points: &[String]) -> Option<(String, String)> {
+    if contact_points
+        .iter()
+        .all(|cp| is_loopback_contact_point(cp))
+    {
+        Some(("ferrosa_admin".to_string(), "ferrosa_admin".to_string()))
+    } else {
+        None
+    }
+}
+
+fn is_loopback_contact_point(contact_point: &str) -> bool {
+    let host = contact_point
+        .rsplit_once('@')
+        .map_or(contact_point, |(_, host_port)| host_port)
+        .rsplit_once(':')
+        .map_or(contact_point, |(host, _)| host)
+        .trim_matches(['[', ']']);
+
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
 #[cfg(test)]
@@ -445,5 +468,22 @@ password = "ferrosa_admin"
             args.credentials,
             Some(("cli_user".to_string(), "cli_pass".to_string()))
         );
+    }
+
+    #[test]
+    fn parse_args_uses_local_admin_credentials_for_loopback_without_config() {
+        let args = parse_args_from(["--contact-points", "127.0.0.1:19042"], [], None);
+
+        assert_eq!(
+            args.credentials,
+            Some(("ferrosa_admin".to_string(), "ferrosa_admin".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_args_does_not_use_local_defaults_for_remote_contact_points() {
+        let args = parse_args_from(["--contact-points", "ferrosa.example.com:9042"], [], None);
+
+        assert_eq!(args.credentials, None);
     }
 }
