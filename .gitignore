@@ -9,3 +9,12 @@ ferrosa-memory.toml
 .opencode/
 opencode.json
 .runtime/
+
+# Python test/build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Coverage artifacts
+lcov.info
+coverage/
