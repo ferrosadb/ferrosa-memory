@@ -24,6 +24,7 @@
 
 #![allow(deprecated)]
 use anyhow::Context;
+use ferrosa_memory_core::config::{parse_config, resolve_config_path};
 use ferrosa_memory_core::migration::{prepare_bootstrap_statement, qualify_ddl};
 use scylla::{LegacySession, SessionBuilder};
 use std::path::PathBuf;
@@ -203,14 +204,35 @@ struct Args {
 }
 
 fn parse_args() -> Args {
-    let mut iter = std::env::args().skip(1);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    let config_toml = resolve_config_path().and_then(|path| std::fs::read_to_string(path).ok());
+    parse_args_from(
+        args.iter().map(String::as_str),
+        env.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        config_toml.as_deref(),
+    )
+}
+
+fn parse_args_from<'a, A, E>(args: A, env: E, config_toml: Option<&str>) -> Args
+where
+    A: IntoIterator<Item = &'a str>,
+    E: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let env: std::collections::HashMap<&str, &str> = env.into_iter().collect();
+    let config = config_toml.map(|toml| {
+        parse_config(toml).unwrap_or_else(|e| panic!("failed to parse migrate config: {e}"))
+    });
+
+    let mut iter = args.into_iter();
     let mut contact_points: Vec<String> = vec![];
     let mut keyspace: Option<String> = None;
     let mut ddl_dir: Option<PathBuf> = None;
     let mut user: Option<String> = None;
     let mut password: Option<String> = None;
+    let mut config_path: Option<PathBuf> = None;
     while let Some(flag) = iter.next() {
-        match flag.as_str() {
+        match flag {
             "--contact-points" => {
                 contact_points = iter
                     .next()
@@ -220,52 +242,102 @@ fn parse_args() -> Args {
                     .filter(|s| !s.is_empty())
                     .collect();
             }
-            "--keyspace" => keyspace = iter.next(),
+            "--keyspace" => keyspace = iter.next().map(str::to_string),
             "--ddl-dir" => ddl_dir = iter.next().map(PathBuf::from),
-            "--user" => user = iter.next(),
-            "--password" => password = iter.next(),
+            "--user" => user = iter.next().map(str::to_string),
+            "--password" => password = iter.next().map(str::to_string),
+            "--config" => config_path = iter.next().map(PathBuf::from),
             other => panic!("unknown argument: {other}"),
         }
     }
-    let user = user.or_else(|| std::env::var("FERROSA_CQL_USER").ok());
-    let password = password.or_else(|| std::env::var("FERROSA_CQL_PASSWORD").ok());
-    let credentials = match (user, password) {
-        (Some(u), Some(p)) => Some((u, p)),
-        (None, None) => None,
-        _ => {
-            eprintln!(
-                "ERROR: --user and --password (or FERROSA_CQL_USER + FERROSA_CQL_PASSWORD) \
-                 must be supplied together, or both omitted."
-            );
-            std::process::exit(2);
-        }
+
+    let config = if let Some(path) = config_path {
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read migrate config at {}: {e}", path.display()));
+        Some(parse_config(&content).unwrap_or_else(|e| {
+            panic!("failed to parse migrate config at {}: {e}", path.display())
+        }))
+    } else {
+        config
     };
+
+    let env_value = |name: &str| env.get(name).map(|v| (*v).to_string());
+
     if contact_points.is_empty()
-        && let Ok(v) = std::env::var("FERROSA_CQL_CONTACT_POINTS")
+        && let Some(v) = env_value("FERROSA_CQL_CONTACT_POINTS")
     {
-        contact_points = v
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        contact_points = parse_contact_points(&v);
+    }
+    if contact_points.is_empty()
+        && let Some(cfg) = config.as_ref()
+    {
+        contact_points = cfg.ferrosa.contact_points.clone();
     }
     if contact_points.is_empty() {
         eprintln!(
-            "ERROR: contact points unset. Pass --contact-points <host:port>[,…] or set \
-             FERROSA_CQL_CONTACT_POINTS env var. (No fallback default per p0-11 W-01.)"
+            "ERROR: contact points unset. Pass --contact-points <host:port>[,…], set \
+             FERROSA_CQL_CONTACT_POINTS, or provide [ferrosa].contact_points in ferrosa-memory.toml."
         );
         std::process::exit(2);
     }
+
+    let env_user = env_value("FERROSA_CQL_USER");
+    let env_password = env_value("FERROSA_CQL_PASSWORD");
+    let credentials =
+        credentials_from_sources(user, password, env_user, env_password, config.as_ref());
+
     Args {
         contact_points,
         keyspace: keyspace
-            .or_else(|| std::env::var("FERROSA_KEYSPACE").ok())
+            .or_else(|| env_value("FERROSA_KEYSPACE"))
+            .or_else(|| config.as_ref().map(|cfg| cfg.ferrosa.keyspace.clone()))
             .unwrap_or_else(|| "agent_memory".to_string()),
         ddl_dir: ddl_dir
-            .or_else(|| std::env::var("FERROSA_DDL_DIR").ok().map(PathBuf::from))
+            .or_else(|| env_value("FERROSA_DDL_DIR").map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("ddl")),
         credentials,
     }
+}
+
+fn parse_contact_points(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn credentials_from_sources(
+    cli_user: Option<String>,
+    cli_password: Option<String>,
+    env_user: Option<String>,
+    env_password: Option<String>,
+    config: Option<&ferrosa_memory_core::config::Config>,
+) -> Option<(String, String)> {
+    match (cli_user, cli_password) {
+        (Some(u), Some(p)) => return Some((u, p)),
+        (None, None) => {}
+        _ => exit_incomplete_credentials("--user", "--password"),
+    }
+
+    match (env_user, env_password) {
+        (Some(u), Some(p)) => return Some((u, p)),
+        (None, None) => {}
+        _ => exit_incomplete_credentials("FERROSA_CQL_USER", "FERROSA_CQL_PASSWORD"),
+    }
+
+    config.map(
+        |cfg| match (&cfg.ferrosa.admin_username, &cfg.ferrosa.admin_password) {
+            (Some(u), Some(p)) => (u.clone(), p.clone()),
+            (None, None) => (cfg.ferrosa.username.clone(), cfg.ferrosa.password.clone()),
+            _ => exit_incomplete_credentials("admin_username", "admin_password"),
+        },
+    )
+}
+
+fn exit_incomplete_credentials(left: &str, right: &str) -> ! {
+    eprintln!("ERROR: {left} and {right} must be supplied together, or both omitted.");
+    std::process::exit(2);
 }
 
 #[cfg(test)]
@@ -307,6 +379,71 @@ mod tests {
         assert!(
             prepared.iter().all(|stmt| !stmt.contains("agent_memory.")),
             "migrate --keyspace must not apply raw production-keyspace table references: {prepared:#?}"
+        );
+    }
+
+    #[test]
+    fn parse_args_loads_local_config_credentials_when_cli_omits_auth() {
+        let config_toml = r#"
+[ferrosa]
+contact_points = ["localhost:19042", "localhost:19043"]
+keyspace = "agent_memory"
+username = "ferrosa_admin"
+password = "ferrosa_admin"
+"#;
+
+        let args = parse_args_from(
+            ["--contact-points", "127.0.0.1:19042"],
+            [],
+            Some(config_toml),
+        );
+
+        assert_eq!(args.contact_points, vec!["127.0.0.1:19042"]);
+        assert_eq!(args.keyspace, "agent_memory");
+        assert_eq!(
+            args.credentials,
+            Some(("ferrosa_admin".to_string(), "ferrosa_admin".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_args_prefers_admin_config_credentials_for_migrations() {
+        let config_toml = r#"
+[ferrosa]
+contact_points = ["localhost:19042"]
+username = "ferrosa_user"
+password = "ferrosa_user"
+admin_username = "ferrosa_admin"
+admin_password = "ferrosa_admin"
+"#;
+
+        let args = parse_args_from(std::iter::empty::<&str>(), [], Some(config_toml));
+
+        assert_eq!(args.contact_points, vec!["localhost:19042"]);
+        assert_eq!(
+            args.credentials,
+            Some(("ferrosa_admin".to_string(), "ferrosa_admin".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_args_cli_credentials_override_local_config() {
+        let config_toml = r#"
+[ferrosa]
+contact_points = ["localhost:19042"]
+username = "ferrosa_admin"
+password = "ferrosa_admin"
+"#;
+
+        let args = parse_args_from(
+            ["--user", "cli_user", "--password", "cli_pass"],
+            [],
+            Some(config_toml),
+        );
+
+        assert_eq!(
+            args.credentials,
+            Some(("cli_user".to_string(), "cli_pass".to_string()))
         );
     }
 }
