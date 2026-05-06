@@ -8,6 +8,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::memory_quality::{ChunkingPolicy, RetrievalMode};
 use crate::task_agent::AgentOutput;
 
 // ---------------------------------------------------------------------------
@@ -115,6 +116,10 @@ pub struct AblationConfig {
     pub datalog_enabled: bool,
     /// Enable dream consolidation.
     pub consolidation_enabled: bool,
+    /// Retrieval baseline/mode for this run.
+    pub retrieval_mode: RetrievalMode,
+    /// Chunking policy under evaluation.
+    pub chunking_policy: ChunkingPolicy,
 }
 
 impl AblationConfig {
@@ -125,6 +130,8 @@ impl AblationConfig {
             confidence_enabled: true,
             datalog_enabled: true,
             consolidation_enabled: true,
+            retrieval_mode: RetrievalMode::ActualHybrid,
+            chunking_policy: ChunkingPolicy::EvidencePacket,
         }
     }
 
@@ -156,6 +163,30 @@ impl AblationConfig {
     pub fn no_consolidation() -> Self {
         Self {
             consolidation_enabled: false,
+            ..Self::full()
+        }
+    }
+
+    /// No retrieved memory supplied to the generator.
+    pub fn no_memory() -> Self {
+        Self {
+            retrieval_mode: RetrievalMode::NoMemory,
+            ..Self::full()
+        }
+    }
+
+    /// Random retrieved memory baseline.
+    pub fn random_retrieval() -> Self {
+        Self {
+            retrieval_mode: RetrievalMode::RandomRetrieval,
+            ..Self::full()
+        }
+    }
+
+    /// Oracle evidence baseline for estimating retrieval/packing headroom.
+    pub fn oracle_evidence() -> Self {
+        Self {
+            retrieval_mode: RetrievalMode::OracleEvidence,
             ..Self::full()
         }
     }

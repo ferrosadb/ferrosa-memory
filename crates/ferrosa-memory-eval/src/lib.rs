@@ -1,5 +1,6 @@
 pub mod config;
 pub mod mcp_client;
+pub mod memory_quality;
 pub mod metrics;
 pub mod report;
 pub mod runner;

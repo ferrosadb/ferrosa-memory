@@ -2,6 +2,7 @@
 name = "ferrosa-memory-mcp"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "fix-edge-sessions"

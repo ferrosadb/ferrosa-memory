@@ -2,6 +2,7 @@
 name = "ferrosa-memory-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [features]
 mock-storage = []

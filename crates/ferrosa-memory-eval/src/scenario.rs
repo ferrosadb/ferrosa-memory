@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+use crate::memory_quality::EvidenceGroundTruth;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -11,6 +13,8 @@ pub struct EvalScenario {
     pub steps: Vec<EvalStep>,
     #[serde(default)]
     pub grading: GradingConfig,
+    #[serde(default)]
+    pub retrieval_ground_truth: Option<EvidenceGroundTruth>,
     #[serde(default)]
     pub dikw: Option<DikwConfig>,
     #[serde(default)]

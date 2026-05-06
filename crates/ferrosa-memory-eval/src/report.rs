@@ -4,6 +4,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::memory_quality::MemoryQualityScore;
+
 // ---------------------------------------------------------------------------
 // ANSI helpers
 // ---------------------------------------------------------------------------
@@ -130,6 +132,8 @@ pub struct ScenarioResult {
     pub tool_usage: ToolUsageScore,
     pub dikw: Option<DIKWScore>,
     pub semantic: Option<SemanticRepoScore>,
+    #[serde(default)]
+    pub memory_quality: Option<MemoryQualityScore>,
     pub passed: bool,
     pub duration: Duration,
 }
@@ -289,6 +293,8 @@ impl EvalReport {
         self.render_level2(&mut out);
         // Level 3
         self.render_level3(&mut out);
+        // Memory quality
+        self.render_memory_quality(&mut out);
         // Aggregate
         self.render_aggregate(&mut out);
 
@@ -402,6 +408,34 @@ impl EvalReport {
         out.push_str(&format!("  Multi-hop:     {:.2}\n", avg(&multi_hop)));
         out.push_str(&format!("  Dedup:         {:.2}\n", avg(&dedup)));
         out.push_str(&format!("  Semantic Composite: {:.2}\n", avg(&composites)));
+    }
+
+    fn render_memory_quality(&self, out: &mut String) {
+        let results: Vec<_> = self
+            .results
+            .iter()
+            .filter_map(|r| r.memory_quality.as_ref().map(|mq| (r, mq)))
+            .collect();
+        if results.is_empty() {
+            return;
+        }
+
+        out.push_str("\n--- Memory Quality: Retrieval Evidence Metrics ---\n");
+        for (r, mq) in results {
+            out.push_str(&format!(
+                "  {} {} mode={:?} chunk={:?} recall={:.2} precision={:.2} mrr={:.2} ndcg={:.2} distractors={} failure={:?}\n",
+                r.scenario_id,
+                dots_pad(&r.scenario_id, 25),
+                mq.retrieval_mode,
+                mq.chunking_policy,
+                mq.metrics.recall_at_k,
+                mq.metrics.precision_at_k,
+                mq.metrics.mrr,
+                mq.metrics.ndcg,
+                mq.metrics.distractor_hits,
+                mq.failure_kind,
+            ));
+        }
     }
 
     fn render_aggregate(&self, out: &mut String) {
@@ -569,6 +603,7 @@ mod tests {
             },
             dikw: None,
             semantic: None,
+            memory_quality: None,
             passed: true,
             duration: Duration::from_secs(3),
         }
@@ -606,6 +641,7 @@ mod tests {
             },
             dikw: None,
             semantic: None,
+            memory_quality: None,
             passed: false,
             duration: Duration::from_secs(5),
         }
@@ -667,6 +703,7 @@ mod tests {
                 composite: 0.75,
             }),
             semantic: None,
+            memory_quality: None,
             passed: true,
             duration: Duration::from_secs(8),
         }
@@ -707,6 +744,7 @@ mod tests {
                 dedup_accuracy: 0.75,
                 composite: 0.76,
             }),
+            memory_quality: None,
             passed: true,
             duration: Duration::from_secs(10),
         }
@@ -1036,6 +1074,34 @@ mod tests {
         assert!((McpQualityScores::to_display_scale(0.5) - 3.0).abs() < f64::EPSILON);
         assert!((McpQualityScores::to_display_scale(0.75) - 4.0).abs() < f64::EPSILON);
         assert!((McpQualityScores::to_display_scale(1.0) - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_render_cli_includes_memory_quality_section() {
+        let mut result = mock_l1_pass("memory_grounded", 0.90);
+        result.memory_quality = Some(crate::memory_quality::MemoryQualityScore {
+            retrieval_mode: crate::memory_quality::RetrievalMode::ActualHybrid,
+            chunking_policy: crate::memory_quality::ChunkingPolicy::EvidencePacket,
+            metrics: crate::memory_quality::MemoryEvalMetrics {
+                required_total: 2,
+                required_hits: 2,
+                recall_at_k: 1.0,
+                precision_at_k: 0.67,
+                mrr: 0.5,
+                ndcg: 0.8,
+                distractor_hits: 1,
+            },
+            failure_kind: crate::memory_quality::MemoryFailureKind::Passed,
+        });
+        let report = EvalReport::new(test_timestamp(), vec![result], Duration::from_secs(5));
+        let output = report.render_cli();
+
+        assert!(output.contains("Memory Quality: Retrieval Evidence Metrics"));
+        assert!(output.contains("mode=ActualHybrid"));
+        assert!(output.contains("chunk=EvidencePacket"));
+        assert!(output.contains("recall=1.00"));
+        assert!(output.contains("distractors=1"));
+        assert!(output.contains("failure=Passed"));
     }
 
     #[test]

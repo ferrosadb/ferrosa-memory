@@ -17,6 +17,10 @@ use uuid::Uuid;
 use crate::config::EvalConfig;
 use crate::grading::claim_rubric;
 use crate::grading::programmatic::{self, NoOpResolver};
+use crate::memory_quality::{
+    ChunkingPolicy, EvidenceHit, MemoryQualityScore, RetrievalMode, classify_failure,
+    evaluate_retrieval,
+};
 use crate::scenario::{EvalScenario, EvalStep, ToolCallTrace};
 
 // ---------------------------------------------------------------------------
@@ -487,10 +491,38 @@ impl<T: McpTransport> EvalRunner<T> {
             }
         }
 
-        GradeResult {
+        let mut result = GradeResult {
             programmatic: programmatic_score,
             claims: claim_score,
+            memory_quality: None,
+        };
+
+        if let Some(ref truth) = run.scenario.retrieval_ground_truth {
+            let hits = extract_evidence_hits(&run.traces);
+            let metrics = evaluate_retrieval(truth, &hits, hits.len());
+            let actual_score = result.composite_score();
+            let stale_temporal_evidence_present = run.traces.iter().any(|trace| {
+                response_to_text(&trace.response)
+                    .to_lowercase()
+                    .contains("superseded")
+            });
+            let failure_kind = classify_failure(
+                &metrics,
+                actual_score,
+                actual_score,
+                actual_score,
+                stale_temporal_evidence_present,
+            );
+
+            result.memory_quality = Some(MemoryQualityScore {
+                retrieval_mode: RetrievalMode::ActualHybrid,
+                chunking_policy: ChunkingPolicy::EvidencePacket,
+                metrics,
+                failure_kind,
+            });
         }
+
+        result
     }
 
     // -----------------------------------------------------------------------
@@ -715,6 +747,7 @@ pub async fn sweep_stale_ledger<T: McpTransport>(
 pub struct GradeResult {
     pub programmatic: Option<programmatic::ProgrammaticScore>,
     pub claims: Option<claim_rubric::ClaimScore>,
+    pub memory_quality: Option<MemoryQualityScore>,
 }
 
 impl GradeResult {
@@ -765,6 +798,43 @@ fn response_to_text(value: &Value) -> String {
             serde_json::to_string(value).unwrap_or_default()
         }
         other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+fn extract_evidence_hits(traces: &[ToolCallTrace]) -> Vec<EvidenceHit> {
+    let mut hits = Vec::new();
+    for trace in traces.iter().filter(|trace| trace.tool == "hybrid_search") {
+        collect_evidence_ids(&trace.response, &mut hits);
+    }
+    hits
+}
+
+fn collect_evidence_ids(value: &Value, hits: &mut Vec<EvidenceHit>) {
+    match value {
+        Value::Object(map) => {
+            for key in [
+                "id",
+                "entity_id",
+                "fold_id",
+                "fact_id",
+                "event_id",
+                "edge_id",
+                "source_fold_id",
+            ] {
+                if let Some(id) = map.get(key).and_then(|v| v.as_str()) {
+                    hits.push(EvidenceHit::new(id));
+                }
+            }
+            for nested in map.values() {
+                collect_evidence_ids(nested, hits);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_evidence_ids(item, hits);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -882,6 +952,7 @@ mod tests {
             },
             steps,
             grading: GradingConfig::default(),
+            retrieval_ground_truth: None,
             dikw: None,
             semantic: None,
         }
@@ -1462,6 +1533,78 @@ tool = "get_stats"
     }
 
     #[tokio::test]
+    async fn grade_run_populates_memory_quality_when_ground_truth_is_present() {
+        let transport = MockTransport::new().on_tool(
+            "hybrid_search",
+            vec![(
+                json!({
+                    "results": [
+                        {"entity_id": "entity:noise"},
+                        {"entity_id": "entity:a"},
+                        {"fold_id": "fold:root"}
+                    ]
+                }),
+                Duration::from_millis(25),
+            )],
+        );
+        let mut runner = EvalRunner::new(transport, test_config());
+        let mut scenario = make_scenario("memory-quality", vec![make_step("hybrid_search")]);
+        scenario.retrieval_ground_truth = Some(crate::memory_quality::EvidenceGroundTruth {
+            required_entities: vec!["entity:a".to_string()],
+            required_folds: vec!["fold:root".to_string()],
+            required_facts: vec![],
+            required_edges: vec![],
+            distractor_entities: vec!["entity:noise".to_string()],
+        });
+
+        let run = runner.run_scenario(scenario).await.unwrap();
+        let grade = runner.grade_run(&run);
+        let memory = grade.memory_quality.expect("memory-quality score");
+
+        assert_eq!(
+            memory.retrieval_mode,
+            crate::memory_quality::RetrievalMode::ActualHybrid
+        );
+        assert_eq!(
+            memory.chunking_policy,
+            crate::memory_quality::ChunkingPolicy::EvidencePacket
+        );
+        assert_eq!(memory.metrics.required_total, 2);
+        assert_eq!(memory.metrics.required_hits, 2);
+        assert_eq!(memory.metrics.distractor_hits, 1);
+        assert_eq!(
+            memory.failure_kind,
+            crate::memory_quality::MemoryFailureKind::Passed
+        );
+    }
+
+    #[test]
+    fn scenario_toml_parses_retrieval_ground_truth_ids() {
+        let toml = r#"
+steps = []
+
+[scenario]
+id = "gt"
+name = "Ground Truth"
+
+[retrieval_ground_truth]
+required_entities = ["entity:a"]
+required_folds = ["fold:root"]
+required_facts = ["fact:current"]
+required_edges = ["edge:a->b"]
+distractor_entities = ["entity:noise"]
+"#;
+
+        let scenario: EvalScenario = toml::from_str(toml).unwrap();
+        let truth = scenario.retrieval_ground_truth.expect("ground truth");
+        assert_eq!(truth.required_entities, vec!["entity:a"]);
+        assert_eq!(truth.required_folds, vec!["fold:root"]);
+        assert_eq!(truth.required_facts, vec!["fact:current"]);
+        assert_eq!(truth.required_edges, vec!["edge:a->b"]);
+        assert_eq!(truth.distractor_entities, vec!["entity:noise"]);
+    }
+
+    #[tokio::test]
     async fn grade_result_composite_averages_methods() {
         let grade = GradeResult {
             programmatic: Some(programmatic::ProgrammaticScore {
@@ -1473,6 +1616,7 @@ tool = "get_stats"
                 score: 0.8,
             }),
             claims: None,
+            memory_quality: None,
         };
 
         assert!(
@@ -1500,6 +1644,7 @@ tool = "get_stats"
                 passed: false,
                 threshold: 0.75,
             }),
+            memory_quality: None,
         };
 
         let composite = grade.composite_score();
