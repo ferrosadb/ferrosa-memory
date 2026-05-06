@@ -18,8 +18,8 @@ use crate::config::EvalConfig;
 use crate::grading::claim_rubric;
 use crate::grading::programmatic::{self, NoOpResolver};
 use crate::memory_quality::{
-    ChunkingPolicy, EvidenceHit, MemoryQualityScore, RetrievalMode, classify_failure,
-    evaluate_retrieval,
+    ChunkingPolicy, EvidenceHit, MemoryEvalMetrics, MemoryFailureKind, MemoryQualityScore,
+    RetrievalMode, evaluate_retrieval,
 };
 use crate::scenario::{EvalScenario, EvalStep, ToolCallTrace};
 
@@ -506,13 +506,8 @@ impl<T: McpTransport> EvalRunner<T> {
                     .to_lowercase()
                     .contains("superseded")
             });
-            let failure_kind = classify_failure(
-                &metrics,
-                actual_score,
-                actual_score,
-                actual_score,
-                stale_temporal_evidence_present,
-            );
+            let failure_kind =
+                classify_observed_failure(&metrics, actual_score, stale_temporal_evidence_present);
 
             result.memory_quality = Some(MemoryQualityScore {
                 retrieval_mode: RetrievalMode::ActualHybrid,
@@ -836,6 +831,27 @@ fn collect_evidence_ids(value: &Value, hits: &mut Vec<EvidenceHit>) {
         }
         _ => {}
     }
+}
+
+fn classify_observed_failure(
+    retrieval: &MemoryEvalMetrics,
+    actual_score: f64,
+    stale_temporal_evidence_present: bool,
+) -> MemoryFailureKind {
+    if stale_temporal_evidence_present {
+        return MemoryFailureKind::StaleTemporalFact;
+    }
+    if actual_score >= 0.8 {
+        return MemoryFailureKind::Passed;
+    }
+    if retrieval.required_total > 0 && retrieval.required_hits == 0 {
+        return MemoryFailureKind::RetrievalMiss;
+    }
+
+    // The runner only observes the actual run. Oracle/packing/chunking ablation
+    // scores are computed by dedicated sweeps, so avoid pretending we can
+    // distinguish chunking loss from packing loss here.
+    MemoryFailureKind::GeneratorReasoningFailure
 }
 
 // ===========================================================================

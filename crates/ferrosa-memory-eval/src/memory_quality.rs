@@ -159,8 +159,7 @@ pub fn evaluate_retrieval(
 
     for (idx, hit) in top_k.iter().enumerate() {
         let rank = idx + 1;
-        if required.contains(hit.id.as_str()) {
-            seen_required.insert(hit.id.as_str());
+        if required.contains(hit.id.as_str()) && seen_required.insert(hit.id.as_str()) {
             if reciprocal_rank == 0.0 {
                 reciprocal_rank = 1.0 / rank as f64;
             }

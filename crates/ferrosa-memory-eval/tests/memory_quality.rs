@@ -44,6 +44,27 @@ fn evidence_ground_truth_scores_recall_precision_mrr_and_ndcg() {
 }
 
 #[test]
+fn duplicate_required_hits_do_not_inflate_ndcg_above_one() {
+    let truth = EvidenceGroundTruth {
+        required_entities: vec!["entity:a".into()],
+        required_folds: vec![],
+        required_facts: vec![],
+        required_edges: vec![],
+        distractor_entities: vec![],
+    };
+    let retrieved = vec![
+        EvidenceHit::new("entity:a"),
+        EvidenceHit::new("entity:a"),
+        EvidenceHit::new("entity:a"),
+    ];
+
+    let metrics = evaluate_retrieval(&truth, &retrieved, 3);
+
+    assert_eq!(metrics.required_hits, 1);
+    assert!((metrics.ndcg - 1.0).abs() < 1e-10);
+}
+
+#[test]
 fn chunking_policy_suite_covers_the_five_experiment_families() {
     let policies = ChunkingPolicy::sweep_suite();
 
