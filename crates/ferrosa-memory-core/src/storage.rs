@@ -2344,7 +2344,7 @@ pub mod mock {
                     })
                 })
                 .collect();
-            scored.sort_by(|a, b| b.0.cmp(&a.0));
+            scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
             Ok(scored.into_iter().take(k).map(|(_, s)| s).collect())
         }
 
