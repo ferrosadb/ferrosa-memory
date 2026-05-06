@@ -26,6 +26,7 @@ pub mod chains;
 pub mod compression;
 pub mod confidence;
 pub mod config;
+pub mod context_segment;
 pub mod contradiction;
 pub mod cql_storage;
 pub mod datalog;

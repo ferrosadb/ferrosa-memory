@@ -13,6 +13,7 @@
 
 use uuid::Uuid;
 
+use crate::context_segment::{ContextSegment, TemporalEdge};
 use crate::types::{
     AliasEntry, ApprovalEntry, AuditEntry, ConfidenceScore, DerivedFact, EntityEntry,
     EntityTypeStateCount, FeedbackOutcome, FoldEntry, FoldSummary, MaterializedEdge, MemoEntry,
@@ -781,6 +782,65 @@ pub trait Storage: Send + Sync {
         ctx: &TenantContext,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<PromotedPredicate>>> + Send;
 
+    // --- Context segment operations ---
+
+    /// Store a raw, ordered context segment.
+    fn context_segment_put(
+        &self,
+        ctx: &TenantContext,
+        segment: &ContextSegment,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// Get a context segment by ID.
+    fn context_segment_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        segment_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<ContextSegment>>> + Send;
+
+    /// Get a context segment by stable content hash.
+    fn context_segment_get_by_hash(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        content_hash: &str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<ContextSegment>>> + Send;
+
+    /// Lexical/BM25-style context segment search.
+    fn context_segment_search_bm25(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        query: &str,
+        k: usize,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<ContextSegment>>> + Send;
+
+    /// ANN context segment search.
+    fn context_segment_search_ann(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        query_embedding: &[f32],
+        k: usize,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<ContextSegment>>> + Send;
+
+    /// Store a temporal edge between two context artifacts.
+    fn temporal_edge_put(
+        &self,
+        ctx: &TenantContext,
+        edge: &TemporalEdge,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// List temporal edges of a type from a source ID.
+    fn temporal_edge_list_from(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        src_id: Uuid,
+        edge_type: &str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<TemporalEdge>>> + Send;
+
     // --- Confidence operations ---
 
     /// Store or update a confidence score for a fact.
@@ -843,6 +903,8 @@ pub mod mock {
         pub promoted_predicates: Mutex<Vec<PromotedPredicate>>,
         pub typed_edges: Mutex<Vec<TypedEdge>>,
         pub confidence_scores: Mutex<Vec<ConfidenceScore>>,
+        pub context_segments: Mutex<Vec<ContextSegment>>,
+        pub temporal_edges: Mutex<Vec<TemporalEdge>>,
         pub edge_list_all_calls: AtomicUsize,
         pub edge_list_session_calls: AtomicUsize,
         pub edge_list_for_entity_calls: AtomicUsize,
@@ -2173,6 +2235,157 @@ pub mod mock {
                     && edge.dst_id == dst_id)
             });
             Ok(edges.len() != before)
+        }
+
+        async fn context_segment_put(
+            &self,
+            ctx: &TenantContext,
+            segment: &ContextSegment,
+        ) -> anyhow::Result<()> {
+            let mut segments = self.context_segments.lock().await;
+            if let Some(existing) = segments.iter_mut().find(|s| {
+                s.tenant_id == ctx.tenant_id
+                    && s.session_id == segment.session_id
+                    && s.segment_id == segment.segment_id
+            }) {
+                *existing = segment.clone();
+            } else {
+                segments.push(segment.clone());
+            }
+            Ok(())
+        }
+
+        async fn context_segment_get(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+            segment_id: Uuid,
+        ) -> anyhow::Result<Option<ContextSegment>> {
+            let segments = self.context_segments.lock().await;
+            Ok(segments
+                .iter()
+                .find(|s| {
+                    s.tenant_id == ctx.tenant_id
+                        && s.session_id == session_id
+                        && s.segment_id == segment_id
+                })
+                .cloned())
+        }
+
+        async fn context_segment_get_by_hash(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+            content_hash: &str,
+        ) -> anyhow::Result<Option<ContextSegment>> {
+            let segments = self.context_segments.lock().await;
+            Ok(segments
+                .iter()
+                .find(|s| {
+                    s.tenant_id == ctx.tenant_id
+                        && s.session_id == session_id
+                        && s.content_hash == content_hash
+                })
+                .cloned())
+        }
+
+        async fn context_segment_search_bm25(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+            query: &str,
+            k: usize,
+        ) -> anyhow::Result<Vec<ContextSegment>> {
+            let q_terms: Vec<String> = query
+                .split_whitespace()
+                .map(|s| s.to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let segments = self.context_segments.lock().await;
+            let mut scored: Vec<(usize, ContextSegment)> = segments
+                .iter()
+                .filter(|s| s.tenant_id == ctx.tenant_id && s.session_id == session_id)
+                .filter_map(|s| {
+                    let text = s.bm25_text.to_lowercase();
+                    let score = q_terms
+                        .iter()
+                        .filter(|term| text.contains(term.as_str()))
+                        .count();
+                    (score > 0).then(|| (score, s.clone()))
+                })
+                .collect();
+            scored.sort_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| a.1.segment_index.cmp(&b.1.segment_index))
+            });
+            Ok(scored.into_iter().take(k).map(|(_, s)| s).collect())
+        }
+
+        async fn context_segment_search_ann(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+            query_embedding: &[f32],
+            k: usize,
+        ) -> anyhow::Result<Vec<ContextSegment>> {
+            let segments = self.context_segments.lock().await;
+            let mut scored: Vec<(ordered_float::OrderedFloat<f64>, ContextSegment)> = segments
+                .iter()
+                .filter(|s| s.tenant_id == ctx.tenant_id && s.session_id == session_id)
+                .filter_map(|s| {
+                    s.segment_embedding.as_ref().map(|embedding| {
+                        (
+                            ordered_float::OrderedFloat(crate::context_segment::cosine(
+                                query_embedding,
+                                embedding,
+                            )),
+                            s.clone(),
+                        )
+                    })
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.cmp(&a.0));
+            Ok(scored.into_iter().take(k).map(|(_, s)| s).collect())
+        }
+
+        async fn temporal_edge_put(
+            &self,
+            ctx: &TenantContext,
+            edge: &TemporalEdge,
+        ) -> anyhow::Result<()> {
+            let mut edges = self.temporal_edges.lock().await;
+            if !edges.iter().any(|e| {
+                e.tenant_id == ctx.tenant_id
+                    && e.session_id == edge.session_id
+                    && e.src_id == edge.src_id
+                    && e.edge_type == edge.edge_type
+                    && e.dst_id == edge.dst_id
+            }) {
+                edges.push(edge.clone());
+            }
+            Ok(())
+        }
+
+        async fn temporal_edge_list_from(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+            src_id: Uuid,
+            edge_type: &str,
+        ) -> anyhow::Result<Vec<TemporalEdge>> {
+            let edges = self.temporal_edges.lock().await;
+            let mut found: Vec<_> = edges
+                .iter()
+                .filter(|e| {
+                    e.tenant_id == ctx.tenant_id
+                        && e.session_id == session_id
+                        && e.src_id == src_id
+                        && e.edge_type == edge_type
+                })
+                .cloned()
+                .collect();
+            found.sort_by_key(|e| e.ordinal);
+            Ok(found)
         }
 
         async fn confidence_put(

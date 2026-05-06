@@ -106,6 +106,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "add first_seen timestamp to co_occurs_with edge table",
         ddl: include_str!("../../../ddl/031_co_occurs_first_seen.cql"),
     },
+    Migration {
+        version: 32,
+        description: "temporal semantic context segments",
+        ddl: include_str!("../../../ddl/032_context_segments.cql"),
+    },
 ];
 
 /// Pre-versioning DDLs. Applied in order when `run_migrations` detects a

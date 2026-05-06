@@ -14,6 +14,7 @@ use std::time::Duration;
 use ferrosa_memory_core::auth;
 use ferrosa_memory_core::config::FerrosaCqlConfig;
 use ferrosa_memory_core::config::{Config, validate_shared_http_config};
+use ferrosa_memory_core::context_segment::{ContextSegment, TemporalEdge};
 use ferrosa_memory_core::cql_storage::CqlStorage;
 use ferrosa_memory_core::dispatch;
 use ferrosa_memory_core::graph::GraphClient;
@@ -893,6 +894,90 @@ impl Storage for ReconnectingStorage {
         entity_id: uuid::Uuid,
     ) -> anyhow::Result<()> {
         delegate!(self, warmth_delete, ctx, entity_id)
+    }
+
+    async fn context_segment_put(
+        &self,
+        ctx: &TenantContext,
+        segment: &ContextSegment,
+    ) -> anyhow::Result<()> {
+        delegate!(self, context_segment_put, ctx, segment)
+    }
+
+    async fn context_segment_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        segment_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<ContextSegment>> {
+        delegate!(self, context_segment_get, ctx, session_id, segment_id)
+    }
+
+    async fn context_segment_get_by_hash(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        content_hash: &str,
+    ) -> anyhow::Result<Option<ContextSegment>> {
+        delegate!(
+            self,
+            context_segment_get_by_hash,
+            ctx,
+            session_id,
+            content_hash
+        )
+    }
+
+    async fn context_segment_search_bm25(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        query: &str,
+        k: usize,
+    ) -> anyhow::Result<Vec<ContextSegment>> {
+        delegate!(self, context_segment_search_bm25, ctx, session_id, query, k)
+    }
+
+    async fn context_segment_search_ann(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        query_embedding: &[f32],
+        k: usize,
+    ) -> anyhow::Result<Vec<ContextSegment>> {
+        delegate!(
+            self,
+            context_segment_search_ann,
+            ctx,
+            session_id,
+            query_embedding,
+            k
+        )
+    }
+
+    async fn temporal_edge_put(
+        &self,
+        ctx: &TenantContext,
+        edge: &TemporalEdge,
+    ) -> anyhow::Result<()> {
+        delegate!(self, temporal_edge_put, ctx, edge)
+    }
+
+    async fn temporal_edge_list_from(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        src_id: uuid::Uuid,
+        edge_type: &str,
+    ) -> anyhow::Result<Vec<TemporalEdge>> {
+        delegate!(
+            self,
+            temporal_edge_list_from,
+            ctx,
+            session_id,
+            src_id,
+            edge_type
+        )
     }
 
     async fn confidence_put(

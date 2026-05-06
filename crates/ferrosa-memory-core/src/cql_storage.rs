@@ -23,6 +23,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::config::FerrosaCqlConfig;
+use crate::context_segment::{ContextSegment, TemporalEdge};
 use crate::storage::Storage;
 use crate::types::*;
 
@@ -154,6 +155,68 @@ fn render_vector_literal(values: &[f32]) -> String {
             .collect::<Vec<_>>()
             .join(",")
     )
+}
+
+fn tokenize_context_terms(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter_map(|part| {
+            let term = part.trim().to_ascii_lowercase();
+            if term.len() >= 3 { Some(term) } else { None }
+        })
+        .collect()
+}
+
+fn context_segment_from_row(
+    ctx: &TenantContext,
+    row: &Row,
+    col_map: &ColMap,
+) -> anyhow::Result<ContextSegment> {
+    let embedding = cql_get::<Vec<u8>>(row, col_map, "segment_embedding")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(|v| crate::vector::decode_vector(&v));
+    Ok(ContextSegment {
+        tenant_id: cql_get(row, col_map, "tenant_id").unwrap_or(ctx.tenant_id),
+        session_id: cql_get(row, col_map, "session_id")?,
+        segment_id: cql_get(row, col_map, "segment_id")?,
+        source_session: cql_get(row, col_map, "source_session")?,
+        source_fold_id: cql_get::<Uuid>(row, col_map, "source_fold_id").ok(),
+        conversation_id: cql_get(row, col_map, "conversation_id")?,
+        segment_index: cql_get(row, col_map, "segment_index")?,
+        start_turn: cql_get(row, col_map, "start_turn")?,
+        end_turn: cql_get(row, col_map, "end_turn")?,
+        start_time: cql_get::<chrono::DateTime<chrono::Utc>>(row, col_map, "start_time").ok(),
+        end_time: cql_get::<chrono::DateTime<chrono::Utc>>(row, col_map, "end_time").ok(),
+        segment_text: cql_get(row, col_map, "segment_text")?,
+        segment_summary: cql_get::<String>(row, col_map, "segment_summary").ok(),
+        bm25_text: cql_get(row, col_map, "bm25_text")?,
+        segment_embedding: embedding,
+        token_count: cql_get(row, col_map, "token_count")?,
+        content_hash: cql_get(row, col_map, "content_hash")?,
+        prev_segment_id: cql_get::<Uuid>(row, col_map, "prev_segment_id").ok(),
+        next_segment_id: cql_get::<Uuid>(row, col_map, "next_segment_id").ok(),
+        created_at: cql_get::<chrono::DateTime<chrono::Utc>>(row, col_map, "created_at")
+            .unwrap_or_else(|_| chrono::Utc::now()),
+    })
+}
+
+fn temporal_edge_from_row(
+    ctx: &TenantContext,
+    row: &Row,
+    col_map: &ColMap,
+) -> anyhow::Result<TemporalEdge> {
+    Ok(TemporalEdge {
+        tenant_id: cql_get(row, col_map, "tenant_id").unwrap_or(ctx.tenant_id),
+        session_id: cql_get(row, col_map, "session_id")?,
+        src_id: cql_get(row, col_map, "src_id")?,
+        edge_type: cql_get(row, col_map, "edge_type")?,
+        dst_id: cql_get(row, col_map, "dst_id")?,
+        relation_time: cql_get(row, col_map, "relation_time")?,
+        ordinal: cql_get(row, col_map, "ordinal")?,
+        metadata: cql_get(row, col_map, "metadata").unwrap_or_default(),
+        created_at: cql_get::<chrono::DateTime<chrono::Utc>>(row, col_map, "created_at")
+            .unwrap_or_else(|_| chrono::Utc::now()),
+    })
 }
 
 fn rule_entry_from_row(
@@ -4161,6 +4224,295 @@ impl Storage for CqlStorage {
         _dst_id: Uuid,
     ) -> anyhow::Result<bool> {
         Err(Self::graph_write_error("typed_edge_delete"))
+    }
+
+    async fn context_segment_put(
+        &self,
+        ctx: &TenantContext,
+        segment: &ContextSegment,
+    ) -> anyhow::Result<()> {
+        let q = format!(
+            "INSERT INTO {ks}.context_segments (tenant_id, session_id, segment_id, \
+             source_session, source_fold_id, conversation_id, segment_index, start_turn, \
+             end_turn, start_time, end_time, segment_text, bm25_text, token_count, \
+             content_hash, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ks = self.keyspace
+        );
+        self.session
+            .query_unpaged(
+                q,
+                (
+                    ctx.tenant_id,
+                    segment.session_id,
+                    segment.segment_id,
+                    segment.source_session,
+                    segment.source_fold_id,
+                    segment.conversation_id.clone(),
+                    segment.segment_index,
+                    segment.start_turn,
+                    segment.end_turn,
+                    segment.start_time,
+                    segment.end_time,
+                    segment.segment_text.clone(),
+                    segment.bm25_text.clone(),
+                    segment.token_count,
+                    segment.content_hash.clone(),
+                    segment.created_at,
+                ),
+            )
+            .await?;
+
+        if segment.segment_summary.is_some()
+            || segment.prev_segment_id.is_some()
+            || segment.next_segment_id.is_some()
+        {
+            let q = format!(
+                "UPDATE {ks}.context_segments SET segment_summary = ?, \
+                 prev_segment_id = ?, next_segment_id = ? \
+                 WHERE tenant_id = ? AND session_id = ? AND segment_id = ?",
+                ks = self.keyspace
+            );
+            self.session
+                .query_unpaged(
+                    q,
+                    (
+                        segment.segment_summary.clone(),
+                        segment.prev_segment_id,
+                        segment.next_segment_id,
+                        ctx.tenant_id,
+                        segment.session_id,
+                        segment.segment_id,
+                    ),
+                )
+                .await?;
+        }
+
+        if let Some(embedding) = &segment.segment_embedding {
+            let vec_literal = render_vector_literal(embedding);
+            let q = format!(
+                "UPDATE {ks}.context_segments SET segment_embedding = {vec_literal} \
+                 WHERE tenant_id = ? AND session_id = ? AND segment_id = ?",
+                ks = self.keyspace
+            );
+            self.session
+                .query_unpaged(q, (ctx.tenant_id, segment.session_id, segment.segment_id))
+                .await?;
+        }
+
+        let terms = tokenize_context_terms(&segment.bm25_text);
+        let doc_len = terms.len() as i32;
+        let mut counts: HashMap<String, i32> = HashMap::new();
+        for term in terms {
+            *counts.entry(term).or_insert(0) += 1;
+        }
+        let q = format!(
+            "INSERT INTO {ks}.context_segment_terms \
+             (tenant_id, session_id, term, segment_id, tf, doc_len) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+            ks = self.keyspace
+        );
+        for (term, tf) in counts {
+            self.session
+                .query_unpaged(
+                    q.clone(),
+                    (
+                        ctx.tenant_id,
+                        segment.session_id,
+                        term,
+                        segment.segment_id,
+                        tf,
+                        doc_len,
+                    ),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn context_segment_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        segment_id: Uuid,
+    ) -> anyhow::Result<Option<ContextSegment>> {
+        let q = format!(
+            "SELECT * FROM {ks}.context_segments \
+             WHERE tenant_id = ? AND session_id = ? AND segment_id = ?",
+            ks = self.keyspace
+        );
+        let result = self
+            .session
+            .query_unpaged(q, (ctx.tenant_id, session_id, segment_id))
+            .await?;
+        let col_map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
+        rows.first()
+            .map(|row| context_segment_from_row(ctx, row, &col_map))
+            .transpose()
+    }
+
+    async fn context_segment_get_by_hash(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        content_hash: &str,
+    ) -> anyhow::Result<Option<ContextSegment>> {
+        let q = format!(
+            "SELECT * FROM {ks}.context_segments \
+             WHERE tenant_id = ? AND session_id = ? AND content_hash = ? \
+             ALLOW FILTERING LIMIT 1",
+            ks = self.keyspace
+        );
+        let result = self
+            .session
+            .query_unpaged(q, (ctx.tenant_id, session_id, content_hash.to_string()))
+            .await?;
+        let col_map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
+        rows.first()
+            .map(|row| context_segment_from_row(ctx, row, &col_map))
+            .transpose()
+    }
+
+    async fn context_segment_search_bm25(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        query: &str,
+        k: usize,
+    ) -> anyhow::Result<Vec<ContextSegment>> {
+        let mut scores: HashMap<Uuid, i32> = HashMap::new();
+        let term_q = format!(
+            "SELECT segment_id, tf FROM {ks}.context_segment_terms \
+             WHERE tenant_id = ? AND session_id = ? AND term = ?",
+            ks = self.keyspace
+        );
+        for term in tokenize_context_terms(query) {
+            let result = self
+                .session
+                .query_unpaged(term_q.clone(), (ctx.tenant_id, session_id, term))
+                .await?;
+            let col_map = build_col_map(result.col_specs());
+            for row in result.rows_or_empty() {
+                let id: Uuid = cql_get(&row, &col_map, "segment_id")?;
+                let tf: i32 = cql_get(&row, &col_map, "tf").unwrap_or(1);
+                *scores.entry(id).or_insert(0) += tf;
+            }
+        }
+        let mut ranked: Vec<(Uuid, i32)> = scores.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let mut segments = Vec::new();
+        for (segment_id, _) in ranked.into_iter().take(k) {
+            if let Some(segment) = self
+                .context_segment_get(ctx, session_id, segment_id)
+                .await?
+            {
+                segments.push(segment);
+            }
+        }
+        Ok(segments)
+    }
+
+    async fn context_segment_search_ann(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        query_embedding: &[f32],
+        k: usize,
+    ) -> anyhow::Result<Vec<ContextSegment>> {
+        let query_bytes = crate::vector::encode_vector(query_embedding);
+        let q = format!(
+            "SELECT * FROM {ks}.context_segments \
+             WHERE tenant_id = ? AND session_id = ? \
+             ORDER BY segment_embedding ANN OF ? LIMIT {k}",
+            ks = self.keyspace,
+            k = k
+        );
+        let result = match self
+            .session
+            .query_unpaged(q, (ctx.tenant_id, session_id, query_bytes))
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::warn!(error = %e, "context segment ANN query failed, falling back to session scan");
+                let fallback = format!(
+                    "SELECT * FROM {ks}.context_segments \
+                     WHERE tenant_id = ? AND session_id = ? LIMIT {k}",
+                    ks = self.keyspace,
+                    k = k
+                );
+                self.session
+                    .query_unpaged(fallback, (ctx.tenant_id, session_id))
+                    .await?
+            }
+        };
+        let col_map = build_col_map(result.col_specs());
+        result
+            .rows_or_empty()
+            .into_iter()
+            .map(|row| context_segment_from_row(ctx, &row, &col_map))
+            .collect()
+    }
+
+    async fn temporal_edge_put(
+        &self,
+        ctx: &TenantContext,
+        edge: &TemporalEdge,
+    ) -> anyhow::Result<()> {
+        let q = format!(
+            "INSERT INTO {ks}.temporal_edges \
+             (tenant_id, session_id, src_id, edge_type, dst_id, relation_time, ordinal, metadata, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ks = self.keyspace
+        );
+        self.session
+            .query_unpaged(
+                q,
+                (
+                    ctx.tenant_id,
+                    edge.session_id,
+                    edge.src_id,
+                    edge.edge_type.clone(),
+                    edge.dst_id,
+                    edge.relation_time,
+                    edge.ordinal,
+                    edge.metadata.clone(),
+                    edge.created_at,
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn temporal_edge_list_from(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        src_id: Uuid,
+        edge_type: &str,
+    ) -> anyhow::Result<Vec<TemporalEdge>> {
+        let q = format!(
+            "SELECT * FROM {ks}.temporal_edges \
+             WHERE tenant_id = ? AND session_id = ? AND src_id = ? AND edge_type = ?",
+            ks = self.keyspace
+        );
+        let result = self
+            .session
+            .query_unpaged(
+                q,
+                (ctx.tenant_id, session_id, src_id, edge_type.to_string()),
+            )
+            .await?;
+        let col_map = build_col_map(result.col_specs());
+        let mut edges: Vec<TemporalEdge> = result
+            .rows_or_empty()
+            .into_iter()
+            .map(|row| temporal_edge_from_row(ctx, &row, &col_map))
+            .collect::<anyhow::Result<_>>()?;
+        edges.sort_by_key(|edge| edge.ordinal);
+        Ok(edges)
     }
 
     async fn confidence_put(
