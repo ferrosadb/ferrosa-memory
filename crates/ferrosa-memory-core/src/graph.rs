@@ -19,6 +19,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+const GRAPH_HTTP_TIMEOUT_SECS: u64 = 60;
+
+fn graph_http_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(GRAPH_HTTP_TIMEOUT_SECS)
+}
+
 /// Graph client wrapping an HTTP connection to Ferrosa's graph endpoint.
 pub struct GraphClient {
     client: reqwest::Client,
@@ -74,7 +80,7 @@ impl GraphClient {
     /// Connect to Ferrosa's graph HTTP endpoint.
     pub async fn connect(config: &GraphConfig) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(graph_http_timeout())
             .build()?;
 
         let auth = base64_encode(&format!("{}:{}", config.username, config.password));
@@ -644,6 +650,11 @@ mod tests {
             base64_encode("cassandra:cassandra"),
             "Y2Fzc2FuZHJhOmNhc3NhbmRyYQ=="
         );
+    }
+
+    #[test]
+    fn graph_http_timeout_allows_cluster_graph_mutation_latency() {
+        assert_eq!(graph_http_timeout(), std::time::Duration::from_secs(60));
     }
 
     #[test]
