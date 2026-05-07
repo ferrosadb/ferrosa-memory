@@ -2014,12 +2014,10 @@ async fn handle_search_context_segments<S: crate::storage::Storage>(
             dimensions: session.embed_dimensions,
             ner_model: String::new(),
         });
-        query_embedding = Some(
-            client
-                .embed(&query)
-                .await
-                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?,
-        );
+        match client.embed(&query).await {
+            Ok(embedding) => query_embedding = Some(embedding),
+            Err(e) => tracing::debug!("context segment query embedding skipped: {e}"),
+        };
     }
     let expand = args.get("expand").cloned().unwrap_or(Value::Null);
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
