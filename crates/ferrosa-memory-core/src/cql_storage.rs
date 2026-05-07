@@ -4361,7 +4361,7 @@ impl Storage for CqlStorage {
         let q = format!(
             "SELECT * FROM {ks}.context_segments \
              WHERE tenant_id = ? AND session_id = ? AND content_hash = ? \
-             ALLOW FILTERING LIMIT 1",
+             LIMIT 1 ALLOW FILTERING",
             ks = self.keyspace
         );
         let result = self
@@ -4421,17 +4421,17 @@ impl Storage for CqlStorage {
         query_embedding: &[f32],
         k: usize,
     ) -> anyhow::Result<Vec<ContextSegment>> {
-        let query_bytes = crate::vector::encode_vector(query_embedding);
+        let vec_literal = render_vector_literal(query_embedding);
         let q = format!(
             "SELECT * FROM {ks}.context_segments \
              WHERE tenant_id = ? AND session_id = ? \
-             ORDER BY segment_embedding ANN OF ? LIMIT {k}",
+             ORDER BY segment_embedding ANN OF {vec_literal} LIMIT {k}",
             ks = self.keyspace,
             k = k
         );
         let result = match self
             .session
-            .query_unpaged(q, (ctx.tenant_id, session_id, query_bytes))
+            .query_unpaged(q, (ctx.tenant_id, session_id))
             .await
         {
             Ok(result) => result,

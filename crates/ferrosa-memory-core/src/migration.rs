@@ -698,6 +698,14 @@ async fn current_version(session: &CqlSession, keyspace: &str) -> anyhow::Result
     Ok(max)
 }
 
+fn schema_version_insert_query(keyspace: &str) -> String {
+    format!(
+        "INSERT INTO {keyspace}.schema_version \
+         (version, applied_at, description, applied_by) \
+         VALUES (?, ?, ?, ?)"
+    )
+}
+
 async fn record_version(
     session: &CqlSession,
     keyspace: &str,
@@ -705,14 +713,14 @@ async fn record_version(
     description: &str,
 ) -> anyhow::Result<()> {
     let host = hostname().unwrap_or_else(|| "unknown".into());
-    let q = format!(
-        "INSERT INTO {keyspace}.schema_version \
-         (version, applied_at, description, applied_by) \
-         VALUES (?, toTimestamp(now()), ?, ?)"
-    );
+    let applied_at = chrono::Utc::now();
+    let q = schema_version_insert_query(keyspace);
     #[allow(deprecated)]
     session
-        .query_unpaged(q, (version as i32, description.to_string(), host))
+        .query_unpaged(
+            q,
+            (version as i32, applied_at, description.to_string(), host),
+        )
         .await?;
     Ok(())
 }
@@ -1029,6 +1037,20 @@ mod tests {
         assert!(
             prepared.contains("'2026-05-04T22:53:21.123Z'"),
             "prepared bootstrap statement must preserve current apply-time timestamp semantics, got: {prepared}"
+        );
+    }
+
+    #[test]
+    fn schema_version_bookkeeping_binds_timestamp_instead_of_server_now_expression() {
+        let q = schema_version_insert_query("agent_memory");
+
+        assert!(
+            !q.contains("now()") && !q.contains("toTimestamp"),
+            "schema_version bookkeeping must bind a timestamp value because FerrosaDB returns timeuuid for now(): {q}"
+        );
+        assert!(
+            q.contains("VALUES (?, ?, ?, ?)"),
+            "schema_version bookkeeping must bind version, applied_at, description, and applied_by: {q}"
         );
     }
 
