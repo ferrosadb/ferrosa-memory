@@ -1492,13 +1492,25 @@ async fn idle_consolidation_loop<S: Storage + Send + Sync + 'static>(
             continue;
         }
 
-        let sid = match session.default_session_id {
-            Some(id) => id,
-            None => continue,
+        let session_ids = drain_consolidation_queue(&session).await;
+        let session_ids = if session_ids.is_empty() {
+            match session.default_session_id {
+                Some(id) => vec![id],
+                None => continue,
+            }
+        } else {
+            session_ids
         };
 
-        run_idle_consolidation(storage.as_ref(), &ctx, sid, &cfg).await;
+        for sid in session_ids {
+            run_idle_consolidation(storage.as_ref(), &ctx, sid, &cfg).await;
+        }
     }
+}
+
+async fn drain_consolidation_queue(session: &dispatch::SessionState) -> Vec<uuid::Uuid> {
+    let mut queue = session.consolidation_queue.lock().await;
+    queue.drain(..).collect()
 }
 
 /// Executes consolidation, edge weight decay, and optional stale-edge pruning.
@@ -2192,6 +2204,24 @@ auth_file = "{}"
         assert_eq!(validator("alice", "wrong"), None);
 
         let _ = fs::remove_file(auth_path);
+    }
+
+    #[tokio::test]
+    async fn idle_queue_drain_returns_explicit_sessions_and_clears_queue() {
+        let session = dispatch::SessionState::default();
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        {
+            let mut queue = session.consolidation_queue.lock().await;
+            queue.push_back(first);
+            queue.push_back(second);
+        }
+
+        assert_eq!(
+            drain_consolidation_queue(&session).await,
+            vec![first, second]
+        );
+        assert!(drain_consolidation_queue(&session).await.is_empty());
     }
 
     #[tokio::test]

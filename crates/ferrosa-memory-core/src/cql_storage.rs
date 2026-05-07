@@ -157,6 +157,22 @@ fn render_vector_literal(values: &[f32]) -> String {
     )
 }
 
+fn build_fold_ann_search_query(
+    keyspace: &str,
+    query_embedding: &[f32],
+    k: usize,
+) -> (String, usize) {
+    let vec_literal = render_vector_literal(query_embedding);
+    (
+        format!(
+            "SELECT fold_id, depth, fold_summary, token_count, raw_trajectory \
+             FROM {keyspace}.trajectory_folds WHERE session_id = ? AND tenant_id = ? \
+             ORDER BY fold_embedding ANN OF {vec_literal} LIMIT {k}"
+        ),
+        2,
+    )
+}
+
 fn tokenize_context_terms(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter_map(|part| {
@@ -1533,20 +1549,14 @@ impl Storage for CqlStorage {
         k: usize,
         include_raw: bool,
     ) -> anyhow::Result<Vec<FoldSummary>> {
-        // ANN query using ORDER BY fold_embedding ANN OF ? LIMIT {k}
-        // CQL does not support bound parameters in LIMIT (except ANN top-k).
-        // Ferrosa does not support LIMIT ? even with ANN, so we embed k as literal.
-        let query_bytes = crate::vector::encode_vector(query_embedding);
-        let query = format!(
-            "SELECT fold_id, depth, fold_summary, token_count, raw_trajectory \
-             FROM {}.trajectory_folds WHERE session_id = ? AND tenant_id = ? \
-             ORDER BY fold_embedding ANN OF ? LIMIT {}",
-            self.keyspace, k
-        );
+        // ANN query using ORDER BY fold_embedding ANN OF [..] LIMIT {k}.
+        // Ferrosa vector ANN expects a vector literal; binding Vec<u8> serializes
+        // as Blob and produces warning-noisy fallback on live smoke tests.
+        let (query, _bind_count) = build_fold_ann_search_query(&self.keyspace, query_embedding, k);
         #[allow(deprecated)]
         let (col_map, rows) = match self
             .session
-            .query_unpaged(query, (session_id, ctx.tenant_id, query_bytes))
+            .query_unpaged(query, (session_id, ctx.tenant_id))
             .await
         {
             Ok(result) => {
@@ -4590,6 +4600,24 @@ mod cql_storage_tests {
         assert!(
             !entity_q.contains("now()") && !edge_q.contains("now()"),
             "seed queries must not rely on Ferrosa CQL now() coercion"
+        );
+    }
+
+    #[test]
+    fn fold_ann_search_query_uses_vector_literal_not_blob_parameter() {
+        let (query, bind_count) = build_fold_ann_search_query("agent_memory", &[0.25, -1.5], 7);
+
+        assert!(
+            query.contains("ORDER BY fold_embedding ANN OF [0.25000000,-1.50000000] LIMIT 7"),
+            "fold ANN query should render a vector literal: {query}"
+        );
+        assert!(
+            !query.contains("ANN OF ?"),
+            "fold ANN query must not bind the vector as a blob: {query}"
+        );
+        assert_eq!(
+            bind_count, 2,
+            "only session_id and tenant_id should be bound after rendering the vector literal"
         );
     }
 }

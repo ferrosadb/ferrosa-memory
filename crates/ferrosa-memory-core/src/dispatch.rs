@@ -10,6 +10,7 @@
 //! - `tools/call` — dispatches to the named tool handler
 //! - `notifications/initialized` — client acknowledgment (no-op)
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -122,6 +123,8 @@ pub struct SessionState {
     pub last_activity: Arc<tokio::sync::Notify>,
     /// Set to true when a write tool succeeds; cleared by idle consolidation.
     pub dirty: Arc<AtomicBool>,
+    /// Session IDs explicitly queued for background consolidation.
+    pub consolidation_queue: Arc<Mutex<VecDeque<uuid::Uuid>>>,
     /// Base URL for the Ollama API (used for embeddings and NER extraction).
     pub ollama_base_url: String,
     /// Model name for NER entity extraction via Ollama.
@@ -152,6 +155,7 @@ impl Default for SessionState {
             repo: std::sync::OnceLock::new(),
             last_activity: Arc::new(tokio::sync::Notify::new()),
             dirty: Arc::new(AtomicBool::new(false)),
+            consolidation_queue: Arc::new(Mutex::new(VecDeque::new())),
             ollama_base_url: "http://127.0.0.1:11434".to_string(),
             ner_model: "qwen3.5:27b".to_string(),
             embed_model: "nomic-embed-text-v2-moe".to_string(),
@@ -4555,38 +4559,29 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
 
 async fn handle_run_consolidation<S: crate::storage::Storage>(
     args: Value,
-    storage: &S,
-    ctx: &crate::types::TenantContext,
+    _storage: &S,
+    _ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
     let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
 
-    let result = crate::dream::run_consolidation(storage, ctx, session_id)
-        .await
-        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
-
-    // Emit viz events with actual entity pairs
-    for (src, tgt) in &result.edges {
-        session.event_bus.emit(crate::viz::VizEvent::EdgeCreated {
-            edge: crate::viz::VizEdge {
-                source: src.to_string(),
-                target: tgt.to_string(),
-                edge_type: "CO_OCCURS".into(),
-                strength: None,
-            },
-        });
+    {
+        let mut queue = session.consolidation_queue.lock().await;
+        if !queue.contains(&session_id) {
+            queue.push_back(session_id);
+        }
     }
+    session
+        .dirty
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    session.last_activity.notify_waiters();
 
-    let mut json = serde_json::to_value(&result).map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
-    if let Some(obj) = json.as_object_mut() {
-        obj.insert(
-            "hint".into(),
-            Value::String(
-                "Consolidation complete. New connections are visible in the viz dashboard. Continue ingesting new learnings.".into(),
-            ),
-        );
-    }
-    Ok(json)
+    Ok(serde_json::json!({
+        "queued": true,
+        "session_id": session_id.to_string(),
+        "run_when": "idle_or_nightly",
+        "hint": "Consolidation queued for the background idle/nightly worker; request path is non-blocking."
+    }))
 }
 
 // --- Enrichment handler ---
@@ -6602,6 +6597,38 @@ mod tests {
             .unwrap();
         assert_eq!(result["serverInfo"]["name"], "ferrosa-memory-mcp");
         assert!(result["capabilities"]["tools"].is_object());
+    }
+
+    #[tokio::test]
+    async fn run_consolidation_tool_queues_idle_work_instead_of_running_inline() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let session_id = Uuid::new_v4();
+        let params = serde_json::json!({
+            "name": "run_consolidation",
+            "arguments": {"session_id": session_id.to_string()}
+        });
+
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let body = unwrap_tool_result(result);
+
+        assert_eq!(body["queued"], true);
+        assert_eq!(body["session_id"], session_id.to_string());
+        assert_eq!(body["run_when"], "idle_or_nightly");
+        assert!(session.dirty.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(
+            session
+                .consolidation_queue
+                .lock()
+                .await
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![session_id]
+        );
     }
 
     #[tokio::test]

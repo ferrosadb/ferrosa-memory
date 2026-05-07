@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::storage::Storage;
-use crate::types::TenantContext;
+use crate::types::{FoldEntry, FoldStatus, TenantContext};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ContextMessage {
@@ -424,6 +424,16 @@ pub async fn search_context_segments<S: Storage + ?Sized>(
         } else {
             Vec::new()
         };
+        let segment = promote_segment_on_retrieval(
+            storage,
+            ctx,
+            params.session_id,
+            segment,
+            &params.query,
+            params.query_embedding.as_deref(),
+            &expanded_context,
+        )
+        .await?;
         results.push(ContextSegmentSearchHit {
             segment,
             score,
@@ -432,6 +442,74 @@ pub async fn search_context_segments<S: Storage + ?Sized>(
         });
     }
     Ok(ContextSegmentSearchResult { results })
+}
+
+async fn promote_segment_on_retrieval<S: Storage + ?Sized>(
+    storage: &S,
+    ctx: &TenantContext,
+    session_id: Uuid,
+    mut segment: ContextSegment,
+    query: &str,
+    query_embedding: Option<&[f32]>,
+    expanded_context: &[ContextWindowSegment],
+) -> anyhow::Result<ContextSegment> {
+    if segment
+        .segment_summary
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        return Ok(segment);
+    }
+
+    let summary_source = if expanded_context.is_empty() {
+        segment.segment_text.clone()
+    } else {
+        expanded_context
+            .iter()
+            .map(|window| window.segment.segment_text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let summary = retrieval_summary(query, &summary_source);
+    let fold_id = Uuid::now_v7();
+    let raw_tokens = segment.token_count.max(1) as f64;
+    let summary_tokens = estimate_tokens(&summary).max(1) as f64;
+    let embedding = segment
+        .segment_embedding
+        .clone()
+        .or_else(|| query_embedding.map(|e| e.to_vec()))
+        .unwrap_or_else(|| vec![0.0; 768]);
+
+    segment.segment_summary = Some(summary.clone());
+    segment.source_fold_id = Some(fold_id);
+    storage.context_segment_put(ctx, &segment).await?;
+
+    let fold = FoldEntry {
+        session_id,
+        fold_id,
+        tenant_id: ctx.tenant_id,
+        depth: 0,
+        parent_fold_id: None,
+        raw_trajectory: summary_source,
+        fold_summary: Some(summary),
+        fold_embedding: Some(embedding),
+        token_count: segment.token_count,
+        compression_ratio: Some(summary_tokens / raw_tokens),
+        status: FoldStatus::Folded,
+        created_at: Utc::now(),
+        folded_at: Some(Utc::now()),
+    };
+    storage.fold_put(ctx, &fold).await?;
+    Ok(segment)
+}
+
+fn retrieval_summary(query: &str, text: &str) -> String {
+    let compact = text
+        .split_whitespace()
+        .take(80)
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("Retrieval summary for `{}`: {}", query.trim(), compact)
 }
 
 fn add_ranked(

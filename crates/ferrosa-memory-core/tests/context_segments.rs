@@ -4,7 +4,7 @@ use ferrosa_memory_core::context_segment::{
     SegmentationConfig, get_context_window, ingest_context_segments, search_context_segments,
     segment_messages,
 };
-use ferrosa_memory_core::storage::mock::MockStorage;
+use ferrosa_memory_core::storage::{Storage, mock::MockStorage};
 use ferrosa_memory_core::types::TenantContext;
 use uuid::Uuid;
 
@@ -219,4 +219,80 @@ async fn get_context_window_returns_ordered_prev_hit_next_pages() {
     assert_eq!(window.segments[2].direction, "next");
     assert!(window.segments[0].segment.segment_text.contains("before"));
     assert!(window.segments[2].segment.segment_text.contains("after"));
+}
+
+#[tokio::test]
+async fn search_context_segments_promotes_unsummarized_hit_into_fold() {
+    let storage = MockStorage::new();
+    let ctx = ctx();
+    let session_id = Uuid::new_v4();
+    let params = IngestContextSegmentsParams {
+        session_id,
+        conversation_id: "discord:long-running-orchestration".into(),
+        messages: vec![
+            msg(
+                0,
+                "user",
+                "ferrosa memory should own folding for every harness",
+            ),
+            msg(
+                1,
+                "assistant",
+                "retrieval summaries promote useful context into longer term memory",
+            ),
+        ],
+        segmentation: SegmentationConfig::default(),
+        embed_missing: false,
+    };
+    ingest_context_segments(&storage, &ctx, params, None)
+        .await
+        .expect("ingest should succeed");
+
+    let results = search_context_segments(
+        &storage,
+        &ctx,
+        ContextSegmentSearchParams {
+            session_id,
+            query: "folding retrieval summaries".into(),
+            query_embedding: None,
+            limit: 5,
+            expand_prev: 0,
+            expand_next: 0,
+            max_expanded_tokens: 4000,
+        },
+    )
+    .await
+    .expect("search should promote useful hits");
+
+    let hit = results.results.first().expect("expected a search hit");
+    let summary = hit
+        .segment
+        .segment_summary
+        .as_ref()
+        .expect("retrieved hit should include a generated summary");
+    assert!(
+        summary.contains("folding"),
+        "summary should preserve salient query terms: {summary}"
+    );
+
+    let persisted = storage
+        .context_segment_get(&ctx, session_id, hit.segment.segment_id)
+        .await
+        .expect("storage read should succeed")
+        .expect("promoted segment should still exist");
+    assert_eq!(persisted.segment_summary.as_deref(), Some(summary.as_str()));
+
+    let folds = storage.folds.lock().await;
+    assert_eq!(
+        folds.len(),
+        1,
+        "retrieval-time promotion should create an fmem fold"
+    );
+    assert_eq!(folds[0].parent_fold_id, None);
+    assert_eq!(folds[0].session_id, session_id);
+    assert_eq!(folds[0].fold_summary.as_deref(), Some(summary.as_str()));
+    assert_eq!(
+        folds[0].status,
+        ferrosa_memory_core::types::FoldStatus::Folded
+    );
 }
