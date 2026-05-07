@@ -18,6 +18,15 @@ use ferrosa_memory_core::migration::{
 };
 use ferrosa_memory_core::test_cluster::TestClusterConfig;
 
+fn trajectory_folds_ddl_columns_are_uuid_compatible(ddl: &str) -> bool {
+    let ddl_lower = ddl.to_lowercase();
+    ddl_lower.contains("trajectory_folds")
+        && ddl_lower.contains("fold_id          uuid")
+        && ddl_lower.contains("parent_fold_id   uuid")
+        && !ddl_lower.contains("fold_id          timeuuid")
+        && !ddl_lower.contains("parent_fold_id   timeuuid")
+}
+
 fn test_cfg(test: &TestClusterConfig) -> FerrosaCqlConfig {
     FerrosaCqlConfig {
         contact_points: vec![test.contact_point()],
@@ -85,10 +94,49 @@ fn t02_migration_31_is_additive() {
 }
 
 // ---------------------------------------------------------------------------
-// T-03: Old-schema keyspace (v30, missing first_seen) auto-upgrades to v31
+// T-03: trajectory_folds UUID compatibility for Rust uuid::Uuid bindings
 // ---------------------------------------------------------------------------
 
-/// T-03: Simulate a keyspace at version 30 (pre-first_seen fix), run
+/// T-03: Greenfield bootstrap DDL must create trajectory_folds with UUID fold
+/// identifiers because storage binds Rust `uuid::Uuid`, not a CQL timeuuid.
+#[test]
+fn t03_bootstrap_trajectory_folds_uses_uuid_fold_ids() {
+    let bootstrap_ddl = include_str!("../../../ddl/002_folds_entities.cql");
+    assert!(
+        trajectory_folds_ddl_columns_are_uuid_compatible(bootstrap_ddl),
+        "trajectory_folds bootstrap DDL must use uuid for fold_id and parent_fold_id, not timeuuid. Got:\n{}",
+        bootstrap_ddl
+    );
+}
+
+/// T-04: Existing keyspaces need an explicit migration that recreates the empty
+/// trajectory_folds table with UUID-compatible fold identifiers.
+#[test]
+fn t04_migration_33_recreates_trajectory_folds_with_uuid_fold_ids() {
+    let m33: &Migration = MIGRATIONS
+        .iter()
+        .find(|m| m.version == 33)
+        .expect("migration 33 must exist for trajectory_folds uuid fold ids");
+
+    assert!(
+        trajectory_folds_ddl_columns_are_uuid_compatible(m33.ddl),
+        "migration 33 DDL must recreate trajectory_folds with uuid fold_id and parent_fold_id. Got:\n{}",
+        m33.ddl
+    );
+    let ddl_lower = m33.ddl.to_lowercase();
+    assert!(
+        ddl_lower.contains("drop table if exists trajectory_folds")
+            && ddl_lower.contains("create table trajectory_folds"),
+        "migration 33 must drop/recreate trajectory_folds because CQL cannot alter primary-key types. Got:\n{}",
+        m33.ddl
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T-05: Old-schema keyspace (v30, missing first_seen) auto-upgrades to v31
+// ---------------------------------------------------------------------------
+
+/// T-05: Simulate a keyspace at version 30 (pre-first_seen fix), run
 /// migrations, and assert the column exists and the graph MERGE path
 /// no longer errors on "unknown property 'first_seen'".
 #[tokio::test]

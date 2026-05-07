@@ -111,6 +111,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "temporal semantic context segments",
         ddl: include_str!("../../../ddl/032_context_segments.cql"),
     },
+    Migration {
+        version: 33,
+        description: "fix trajectory_folds timeuuid → uuid fold identifiers",
+        ddl: include_str!("../../../ddl/033_trajectory_folds_uuid_columns.cql"),
+    },
 ];
 
 /// Pre-versioning DDLs. Applied in order when `run_migrations` detects a
