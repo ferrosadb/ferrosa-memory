@@ -36,9 +36,10 @@ jobs:
           file target/x86_64-unknown-linux-musl/release/ferrosa-memory-mcp
 
       - name: Stage tarball
-        run: bash .github/scripts/stage-release-tarball.sh \
-               x86_64-unknown-linux-musl \
-               target/x86_64-unknown-linux-musl/release
+        run: |
+          bash .github/scripts/stage-release-tarball.sh \
+            x86_64-unknown-linux-musl \
+            target/x86_64-unknown-linux-musl/release
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -76,9 +77,10 @@ jobs:
           fi
 
       - name: Stage tarball
-        run: bash .github/scripts/stage-release-tarball.sh \
-               aarch64-unknown-linux-musl \
-               target/aarch64-unknown-linux-musl/release
+        run: |
+          bash .github/scripts/stage-release-tarball.sh \
+            aarch64-unknown-linux-musl \
+            target/aarch64-unknown-linux-musl/release
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -106,9 +108,10 @@ jobs:
           strip target/aarch64-apple-darwin/release/ferrosa-memory-mcp
 
       - name: Stage tarball
-        run: bash .github/scripts/stage-release-tarball.sh \
-               aarch64-apple-darwin \
-               target/aarch64-apple-darwin/release
+        run: |
+          bash .github/scripts/stage-release-tarball.sh \
+            aarch64-apple-darwin \
+            target/aarch64-apple-darwin/release
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
