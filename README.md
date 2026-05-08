@@ -283,6 +283,17 @@ cargo doc --workspace --no-deps
 
 CI runs on every PR: format, clippy, build, test + coverage (80% gate), complexity analysis, and doc generation.
 
+## Contributing
+
+Contributions welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the development
+workflow and what we accept. By contributing, you agree to the
+[Code of Conduct](CODE_OF_CONDUCT.md).
+
+Security issues should be reported privately — see [SECURITY.md](SECURITY.md).
+
 ## License
 
-MIT
+Ferrosa Memory is licensed under the Apache License, Version 2.0.
+See [LICENSE](LICENSE) and [NOTICE](NOTICE) for details.
+
+Copyright 2026 Ferrosa, Inc.

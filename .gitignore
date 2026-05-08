@@ -9,3 +9,7 @@ ferrosa-memory.toml
 .opencode/
 opencode.json
 .runtime/
+
+# Developer-local agent state — do not commit.
+.claude/
+.forge/
