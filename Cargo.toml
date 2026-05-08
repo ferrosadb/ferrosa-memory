@@ -17,7 +17,7 @@ serde_json = "1"
 toml = "0.8"
 
 # HTTP client (embedding endpoint)
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Logging
 tracing = "0.1"

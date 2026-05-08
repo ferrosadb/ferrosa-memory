@@ -1,0 +1,159 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  # ── Linux x86_64 (musl) ──────────────────────────────────────────────
+  build-linux-x86_64:
+    name: Build Linux x86_64 (musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Clippy
+        run: cargo clippy --all-targets --target x86_64-unknown-linux-musl -- -D warnings
+
+      - name: Build
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl -p ferrosa-memory-mcp
+          strip target/x86_64-unknown-linux-musl/release/ferrosa-memory-mcp
+          file target/x86_64-unknown-linux-musl/release/ferrosa-memory-mcp
+
+      - name: Stage tarball
+        run: bash .github/scripts/stage-release-tarball.sh \
+               x86_64-unknown-linux-musl \
+               target/x86_64-unknown-linux-musl/release
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tarball-x86_64-unknown-linux-musl
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # ── Linux aarch64 (musl, cross) ──────────────────────────────────────
+  build-linux-aarch64:
+    name: Build Linux aarch64 (musl, cross)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+        with:
+          targets: aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: aarch64-musl
+
+      - name: Install cross
+        run: cargo install cross --locked --version 0.2.5
+
+      - name: Clippy
+        run: cross clippy --all-targets --target aarch64-unknown-linux-musl -- -D warnings
+
+      - name: Build
+        run: |
+          cross build --release --target aarch64-unknown-linux-musl -p ferrosa-memory-mcp
+          if command -v aarch64-linux-gnu-strip >/dev/null 2>&1; then
+            aarch64-linux-gnu-strip target/aarch64-unknown-linux-musl/release/ferrosa-memory-mcp
+          else
+            sudo apt-get update && sudo apt-get install -y binutils-aarch64-linux-gnu
+            aarch64-linux-gnu-strip target/aarch64-unknown-linux-musl/release/ferrosa-memory-mcp
+          fi
+
+      - name: Stage tarball
+        run: bash .github/scripts/stage-release-tarball.sh \
+               aarch64-unknown-linux-musl \
+               target/aarch64-unknown-linux-musl/release
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tarball-aarch64-unknown-linux-musl
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # ── macOS aarch64 (Apple Silicon) ────────────────────────────────────
+  build-macos-aarch64:
+    name: Build macOS aarch64
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Clippy
+        run: cargo clippy --all-targets --target aarch64-apple-darwin -- -D warnings
+
+      - name: Build
+        run: |
+          cargo build --release --target aarch64-apple-darwin -p ferrosa-memory-mcp
+          strip target/aarch64-apple-darwin/release/ferrosa-memory-mcp
+
+      - name: Stage tarball
+        run: bash .github/scripts/stage-release-tarball.sh \
+               aarch64-apple-darwin \
+               target/aarch64-apple-darwin/release
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tarball-aarch64-apple-darwin
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # ── Aggregate: SHA256SUMS + GitHub Release ───────────────────────────
+  release:
+    name: Create Release
+    needs:
+      - build-linux-x86_64
+      - build-linux-aarch64
+      - build-macos-aarch64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts into dist/
+        run: |
+          mkdir -p dist
+          find artifacts -type f -name 'ferrosa-memory-*.tar.gz' \
+            -exec cp -v {} dist/ \;
+          ls -la dist/
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          (for f in $(ls ferrosa-memory-*.tar.gz | sort); do
+             sha256sum "$f"
+           done) > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${{ github.repository }}" \
+            --title "Ferrosa Memory ${GITHUB_REF_NAME}" \
+            --draft \
+            --notes "Automated release. Verify SHA256SUMS before installing." \
+            dist/ferrosa-memory-*.tar.gz dist/SHA256SUMS

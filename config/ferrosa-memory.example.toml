@@ -1,0 +1,75 @@
+# ferrosa-memory-mcp — default configuration (single-node, localhost).
+#
+# Installed to ~/.ferrosa/config/ferrosa-memory.toml on first install.
+# Read via the FERROSA_MEMORY_CONFIG environment variable (set by the
+# launchd plist / systemd unit).
+#
+# Assumes a Ferrosa instance is running at localhost:9042 — the default
+# from `curl -fsSL https://ferrosadb.com/install.sh | bash`. If your
+# Ferrosa is elsewhere, adjust contact_points + bolt_uri + http_url.
+#
+# Auth: the default ferrosa seed roles (ferrosa_user / ferrosa_admin) are
+# used. Rotate via `ferrosa-ctl auth set-password` on your Ferrosa node,
+# then update the matching entries here.
+#
+# For a multi-tenant HTTP deployment, see examples/ferrosa-memory-http.toml
+# and examples/http-auth.toml.
+
+[server]
+transport = "stdio"          # "stdio" for Claude Code/Desktop, "http" for remote
+# http_port = 8765           # only used in http mode
+# log_level = "info"
+tenant_id = "00000000-0000-0000-0000-000000000001"
+
+[ferrosa]
+contact_points = ["localhost:9042"]
+keyspace = "agent_memory"
+# replication_factor = 1     # single-node default
+# consistency = "ONE"
+username = "ferrosa_user"
+password = "ferrosa_user"
+# Admin credentials are used only for schema migrations (CREATE KEYSPACE /
+# CREATE TABLE / ALTER TABLE) on first start. The runtime session uses
+# `username`/`password` above.
+admin_username = "ferrosa_admin"
+admin_password = "ferrosa_admin"
+
+[memory]
+# default_ttl_days = 7
+# fold_ttl_days = 30
+# archive_after_days = 30
+# compression_threshold_tokens = 512
+# confidence_gate = 0.7
+# max_memo_results = 50
+
+[embeddings]
+provider = "ollama"
+ollama_base_url = "http://127.0.0.1:11434"
+model = "nomic-embed-text"
+dimensions = 768
+
+[graph]
+bolt_uri = "bolt://localhost:7687"
+username = "ferrosa_user"
+password = "ferrosa_user"
+http_url = "http://localhost:7474"
+
+[sparql]
+enabled = true
+http_url = "http://localhost:9090"
+
+[security]
+# audit_log_enabled = true
+# anomaly_detection_enabled = true
+# anomaly_sigma_threshold = 3.0
+# anomaly_alerts_enabled = true    # emit AnomalyDetected events via EventBus/SSE
+
+[routing]
+# guideline_version = "v1"
+# feedback_export_cron = "0 2 * * *"
+
+[datalog]
+# ferrosa-memory owns Datalog evaluation locally; this section controls local inference limits.
+# max_iterations = 8
+# max_facts = 10000
+# cache_ttl_seconds = 300
