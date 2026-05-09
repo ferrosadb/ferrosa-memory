@@ -218,45 +218,22 @@ jobs:
           cache-on-failure: false
       - name: Clone ferrosa for cluster image
         # ferrosa is the source of the Ferrosa server image used by the cluster.
-        # Cloning at HEAD of main gives us the latest stable binary.
-        #
-        # bkearns/ferrosa is private. Anonymous HTTPS clone fails with
-        # "could not read Username for 'https://github.com'". We need a
-        # token. The repo-default GITHUB_TOKEN can't read sibling repos,
-        # so this step requires FERROSA_REPO_TOKEN — a fine-grained PAT
-        # with `Contents: Read` on bkearns/ferrosa, set via repo secrets.
-        # See p1-33 for the operator-side setup. If the secret is missing
-        # we fail loud here so the operator notices, instead of getting
-        # a confusing "could not read Username" further down.
-        env:
-          FERROSA_REPO_TOKEN: ${{ secrets.FERROSA_REPO_TOKEN }}
+        # ferrosadb/ferrosa is public — anonymous HTTPS clone works without a
+        # token. Try a branch matching this PR/branch first, then fall back
+        # to main. Cross-repo work that needs an unreleased ferrosa change
+        # can push a matching branch on ferrosadb/ferrosa and CI picks it up.
         run: |
-          if [ -z "${FERROSA_REPO_TOKEN:-}" ]; then
-            echo "ERROR: secret FERROSA_REPO_TOKEN is not set." >&2
-            echo "Add a fine-grained PAT with 'Contents: Read' on bkearns/ferrosa." >&2
-            echo "See ferrosa_docs/specs/todo/p1-33-fmem-ci-cross-repo-clone-needs-token.md" >&2
-            exit 1
-          fi
-          # Try the ferrosa branch matching this PR/branch, then a small set
-          # of historical fallbacks, then main. Cross-repo work that needs an
-          # unreleased ferrosa change can push a matching branch on bkearns/
-          # ferrosa and CI will pick it up automatically.
           CANDIDATES=(
             "${GITHUB_HEAD_REF:-}"
             "${GITHUB_REF_NAME:-}"
-            # Carries the toTimestamp(now()) typing fix needed by
-            # ddl/019_type_registry.cql. Drop this entry once
-            # bkearns/ferrosa#148 merges to main.
-            "fix/cql-totimestamp-now-typing"
-            "feature/ground-truth-p0-gap-1"
           )
           CLONED=""
           for BRANCH in "${CANDIDATES[@]}"; do
             [ -z "${BRANCH}" ] && continue
-            echo "Trying to clone bkearns/ferrosa @ ${BRANCH}..."
+            echo "Trying to clone ferrosadb/ferrosa @ ${BRANCH}..."
             if git clone --depth=1 \
                 --branch "${BRANCH}" \
-                "https://x-access-token:${FERROSA_REPO_TOKEN}@github.com/bkearns/ferrosa.git" \
+                "https://github.com/ferrosadb/ferrosa.git" \
                 /tmp/ferrosa-src 2>/dev/null; then
               echo "Cloned ${BRANCH}."
               CLONED="${BRANCH}"
@@ -264,17 +241,15 @@ jobs:
             fi
           done
           if [ -z "${CLONED}" ]; then
-            echo "No matching feature branch on bkearns/ferrosa; falling back to main..."
+            echo "No matching feature branch on ferrosadb/ferrosa; falling back to main..."
             git clone --depth=1 \
-              "https://x-access-token:${FERROSA_REPO_TOKEN}@github.com/bkearns/ferrosa.git" \
+              "https://github.com/ferrosadb/ferrosa.git" \
               /tmp/ferrosa-src
           fi
           # Sanity check: the cluster image build will COPY Cargo.lock; fail
           # loud here if the cloned source doesn't have it.
           if [ ! -f /tmp/ferrosa-src/Cargo.lock ]; then
             echo "ERROR: /tmp/ferrosa-src/Cargo.lock missing — cluster image build will fail." >&2
-            echo "       This means bkearns/ferrosa's chosen branch does not track Cargo.lock." >&2
-            echo "       See ferrosa_docs/specs/todo/p1-33-fmem-ci-cross-repo-clone-needs-token.md." >&2
             exit 1
           fi
       - name: Bring up 3-node cluster on ports 19042-19044
