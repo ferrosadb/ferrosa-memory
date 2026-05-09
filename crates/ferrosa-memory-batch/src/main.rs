@@ -20,6 +20,7 @@ use ferrosa_memory_core::batch;
 use ferrosa_memory_core::cql_storage::CqlStorage;
 use ferrosa_memory_core::storage::Storage;
 use ferrosa_memory_core::types::TenantContext;
+use ferrosa_memory_core::warmth;
 use futures_util::future::join_all;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -60,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
         "retype-entities" => retype_entities(&config).await,
         "rename-entities" => rename_entities(&config).await,
         "backfill-rich-entities" => backfill_rich_entities(&config).await,
+        "decay-forget" => run_decay_and_forget(&config).await,
         _ => run_guidelines(&config).await,
     }
 }
@@ -309,6 +311,31 @@ async fn rename_entities(config: &ferrosa_memory_core::config::Config) -> anyhow
     Ok(())
 }
 
+/// Run automated decay pass + threshold-based forgetting.
+async fn run_decay_and_forget(config: &ferrosa_memory_core::config::Config) -> anyhow::Result<()> {
+    let storage = CqlStorage::connect(&batch_cql_config(config)).await?;
+    let ctx = TenantContext {
+        tenant_id: Uuid::new_v4(),
+        session_origin: "batch-decay-forget".into(),
+    };
+    let rmh = &config.rmh;
+    let session_id = config
+        .server
+        .session_id
+        .as_ref()
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .unwrap_or_else(Uuid::new_v4);
+
+    let decayed = warmth::run_decay_pass(&storage, &ctx, session_id, rmh).await?;
+    tracing::info!(decayed, "warmth decay applied");
+
+    let pruned =
+        warmth::prune_forgotten(&storage, &ctx, session_id, rmh.forget_threshold, rmh).await?;
+    tracing::info!(pruned, "entities forgotten");
+
+    Ok(())
+}
+
 /// Run the nightly guideline refinement job.
 async fn run_guidelines(config: &ferrosa_memory_core::config::Config) -> anyhow::Result<()> {
     tracing::info!("ferrosa-memory-batch starting");
@@ -358,12 +385,10 @@ async fn run_guidelines(config: &ferrosa_memory_core::config::Config) -> anyhow:
     let query = format!(
         "INSERT INTO {ks}.routing_guidelines (version, rules, created_at) VALUES (?, ?, toTimestamp(now()))"
     );
+    #[allow(deprecated)]
     storage
         .session()
-        .query_with_values(
-            query.as_str(),
-            cdrs_tokio::query_values!(next_version.clone(), guidelines.clone()),
-        )
+        .query_unpaged(query, (next_version.clone(), guidelines.clone()))
         .await?;
 
     tracing::info!(version = %next_version, "routing guidelines written to CQL");

@@ -1,0 +1,54 @@
+# Level 4 Task: Cross-project pattern transfer
+#
+# Tests whether knowledge from one project domain transfers to a new domain
+# when the underlying pattern is the same.
+
+[scenario]
+id = "l4-cross-project"
+name = "Cross-project pattern transfer"
+description = """
+Agent debugs an auth service (2 sessions), then encounters a similar problem
+in a payment service. Must recall the auth-domain pattern and apply it to the
+new domain. Tests cross-domain knowledge transfer."""
+level = 4
+tags = ["task-level", "transfer", "cross-domain"]
+timeout_ms = 60000
+
+# Domain A: Auth service (session 1)
+[[sessions]]
+name = "auth-s1"
+domain = "auth"
+prompt = "Debug OAuth token refresh race condition. Store findings."
+expected_findings = ["token expiry", "redis lock contention"]
+tools_allowed = ["smart_ingest", "hybrid_search", "create_edge"]
+max_steps = 4
+
+# Domain A: Auth service (session 2)
+[[sessions]]
+name = "auth-s2"
+domain = "auth"
+depends_on = ["auth-s1"]
+prompt = "User reports 401s after 5 minutes. What did we find last time?"
+expected_findings = ["token expiry", "redis lock contention"]
+tools_allowed = ["smart_ingest", "hybrid_search", "create_edge", "get_temporal_chain"]
+max_steps = 4
+
+# Domain B: Payment service (new domain, same pattern)
+[[sessions]]
+name = "payment-s1"
+domain = "payment"
+depends_on = ["auth-s1", "auth-s2"]
+prompt = "Payment webhook timing out after 5 minutes. Any patterns from past projects that might apply?"
+expected_findings = ["timeout pattern", "token expiry analogy", "redis lock contention analogy"]
+tools_allowed = ["smart_ingest", "hybrid_search", "create_edge", "explore_connections"]
+max_steps = 5
+
+[grading]
+type = "transfer_score"
+subtasks = [
+    "Auth domain: identify token expiry",
+    "Auth domain: identify redis lock contention",
+    "Payment domain: retrieve auth patterns",
+    "Payment domain: map pattern to new domain",
+]
+passing_threshold = 0.75

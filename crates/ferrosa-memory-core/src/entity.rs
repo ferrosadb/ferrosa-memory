@@ -350,10 +350,13 @@ mod tests {
         let store = MockStorage::new();
         let ctx = test_ctx();
         let sid = Uuid::new_v4();
+        let max_entities = 3;
 
-        // Fill to limit
-        for i in 0..DEFAULT_MAX_ENTITIES_PER_SESSION {
-            upsert_entity(
+        // Fill to the configured limit. The quota behavior is independent of
+        // the production default (50k); using the configurable seam keeps this
+        // unit test fast while still exercising the real quota check.
+        for i in 0..max_entities {
+            upsert_entity_with_limit(
                 &store,
                 &ctx,
                 sid,
@@ -363,13 +366,23 @@ mod tests {
                 None,
                 None,
                 None,
+                max_entities,
             )
             .await
             .unwrap();
         }
 
-        let result = upsert_entity(
-            &store, &ctx, sid, "one_more", "thing", "ctx", None, None, None,
+        let result = upsert_entity_with_limit(
+            &store,
+            &ctx,
+            sid,
+            "one_more",
+            "thing",
+            "ctx",
+            None,
+            None,
+            None,
+            max_entities,
         )
         .await;
         assert!(result.is_err());

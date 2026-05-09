@@ -10,6 +10,7 @@
 //! - `tools/call` — dispatches to the named tool handler
 //! - `notifications/initialized` — client acknowledgment (no-op)
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -17,6 +18,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::Mutex;
 
+use crate::context_segment::{
+    ContextMessage, ContextSegmentSearchParams, ContextWindowParams, IngestContextSegmentsParams,
+    SegmentationConfig,
+};
 use crate::transport::{INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND};
 
 /// Rotating hint counter for memory formation encouragement.
@@ -118,6 +123,8 @@ pub struct SessionState {
     pub last_activity: Arc<tokio::sync::Notify>,
     /// Set to true when a write tool succeeds; cleared by idle consolidation.
     pub dirty: Arc<AtomicBool>,
+    /// Session IDs explicitly queued for background consolidation.
+    pub consolidation_queue: Arc<Mutex<VecDeque<uuid::Uuid>>>,
     /// Base URL for the Ollama API (used for embeddings and NER extraction).
     pub ollama_base_url: String,
     /// Model name for NER entity extraction via Ollama.
@@ -148,6 +155,7 @@ impl Default for SessionState {
             repo: std::sync::OnceLock::new(),
             last_activity: Arc::new(tokio::sync::Notify::new()),
             dirty: Arc::new(AtomicBool::new(false)),
+            consolidation_queue: Arc::new(Mutex::new(VecDeque::new())),
             ollama_base_url: "http://127.0.0.1:11434".to_string(),
             ner_model: "qwen3.5:27b".to_string(),
             embed_model: "nomic-embed-text-v2-moe".to_string(),
@@ -187,6 +195,72 @@ pub struct ToolDef {
 pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
     let entity_type_enum: Value = serde_json::json!(entity_types);
     vec![
+        ToolDef {
+            name: "ingest_context_segments".into(),
+            description: "Persist raw pre-compaction conversation context as deterministic semantic segments, with Nomic embeddings when configured and temporal prev/next links for later expansion.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "conversation_id": { "type": "string", "maxLength": 512 },
+                    "messages": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "role": { "type": "string" },
+                                "content": { "type": "string", "maxLength": 131072 },
+                                "turn_index": { "type": "integer" },
+                                "created_at": { "type": "string", "description": "Optional RFC3339 timestamp" },
+                                "metadata": { "type": "object" }
+                            },
+                            "required": ["role", "content", "turn_index"]
+                        },
+                        "minItems": 1
+                    },
+                    "segmentation": { "type": "object" },
+                    "embed_missing": { "type": "boolean" }
+                },
+                "required": ["conversation_id", "messages"]
+            }),
+        },
+        ToolDef {
+            name: "search_context_segments".into(),
+            description: "Hybrid-search raw context segments with lexical BM25 fallback plus Nomic vector ANN, optionally returning bounded prev/next temporal expansion windows.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "query": { "type": "string", "maxLength": 4096 },
+                    "query_embedding": { "type": "array", "items": { "type": "number" } },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 50 },
+                    "expand": {
+                        "type": "object",
+                        "properties": {
+                            "prev": { "type": "integer", "minimum": 0, "maximum": 10 },
+                            "next": { "type": "integer", "minimum": 0, "maximum": 10 },
+                            "max_tokens": { "type": "integer", "minimum": 1, "maximum": 50000 }
+                        }
+                    }
+                },
+                "required": ["query"]
+            }),
+        },
+        ToolDef {
+            name: "get_context_window".into(),
+            description: "Return ordered previous/hit/next context segment pages around a retrieved segment using temporal edges, bounded by token budget.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "segment_id": { "type": "string", "format": "uuid" },
+                    "prev": { "type": "integer", "minimum": 0, "maximum": 20 },
+                    "next": { "type": "integer", "minimum": 0, "maximum": 20 },
+                    "max_tokens": { "type": "integer", "minimum": 1, "maximum": 100000 }
+                },
+                "required": ["segment_id"]
+            }),
+        },
         ToolDef {
             name: "check_memo_cache".into(),
             description: "Looks up a prior sub-call result by content hash. Returns cached result if found, or miss signal if not.\n\nCALL WHEN: Before every sub-LLM invocation within a long-horizon task. This is the first step in the usage loop.\nDO NOT CALL: For top-level queries or tasks where you are not making sub-calls. Do not call more than once per sub-call.\nON HIT: Use the cached result directly. Do not invoke the sub-LLM. Call record_outcome with program_type='memo_hit'.\nON MISS: Proceed with the sub-call. After it completes, call store_memo_result.\nCost: ~1ms. Zero token cost.".into(),
@@ -507,11 +581,12 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                 "properties": {
                     "session_id": { "type": "string" },
                     "query_id": { "type": "string", "format": "uuid" },
-                    "program_type": { "type": "string", "enum": ["hnsw_ann", "phonetic", "cypher_hop", "btree_range", "memo_hit"] },
+                    "program_type": { "type": "string", "enum": ["hnsw_ann", "phonetic", "cypher_hop", "btree_range", "memo_hit", "retrieval_miss"] },
                     "task_complexity": { "type": "string", "enum": ["simple", "linear", "quadratic"] },
                     "succeeded": { "type": "boolean" },
                     "latency_ms": { "type": "integer", "minimum": 0 },
-                    "token_cost": { "type": "integer", "minimum": 0 }
+                    "token_cost": { "type": "integer", "minimum": 0 },
+                    "entity_ids": { "type": "array", "items": { "type": "string", "format": "uuid" }, "description": "Entity IDs this outcome applies to. Success → warmth boost. Failure → warmth penalty." }
                 },
                 "required": ["query_id", "program_type", "task_complexity", "succeeded", "latency_ms", "token_cost"]
             }),
@@ -1353,6 +1428,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
     tracing::debug!(tool = name, "dispatching tool call");
     let input_bytes = serde_json::to_string(&args).map(|s| s.len()).unwrap_or(0) as i32;
     let start = std::time::Instant::now();
+    tracing::info!(tool = name, input_bytes, "tool call started");
     let result = match name {
         "check_memo_cache" => handle_check_memo(args, storage, ctx).await,
         "store_memo_result" => handle_store_memo(args, storage, ctx).await,
@@ -1363,6 +1439,13 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "append_to_fold" => handle_append_fold(args, storage, ctx).await,
         "complete_fold" => handle_complete_fold(args, storage, ctx, session).await,
         "retrieve_fold_context" => handle_retrieve_fold(args, storage, ctx).await,
+        "ingest_context_segments" => {
+            handle_ingest_context_segments(args, storage, ctx, session).await
+        }
+        "search_context_segments" => {
+            handle_search_context_segments(args, storage, ctx, session).await
+        }
+        "get_context_window" => handle_get_context_window(args, storage, ctx).await,
         "upsert_entity" => handle_upsert_entity(args, storage, ctx, session).await,
         "batch_ingest" => handle_batch_ingest(args, storage, ctx, session).await,
         "ingest_entities" => handle_ingest_entities(args, storage, ctx, session).await,
@@ -1419,6 +1502,12 @@ async fn dispatch_tool<S: crate::storage::Storage>(
     match &result {
         Ok(v) => {
             let bytes = serde_json::to_string(&v).map(|s| s.len()).unwrap_or(0);
+            tracing::info!(
+                tool = name,
+                elapsed_ms = elapsed.as_millis() as u64,
+                response_bytes = bytes,
+                "tool call completed"
+            );
             tracing::debug!(
                 tool = name,
                 elapsed_ms = elapsed.as_millis() as u64,
@@ -1454,8 +1543,14 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         } else {
             serde_json::to_string(&value).unwrap_or_else(|_| value.to_string())
         };
+        let duration_ms = elapsed.as_millis() as u64;
         serde_json::json!({
-            "content": [{"type": "text", "text": text}]
+            "content": [{"type": "text", "text": text}],
+            "structuredContent": {
+                "tool": name,
+                "duration_ms": duration_ms,
+                "is_error": false
+            }
         })
     });
 
@@ -1498,6 +1593,9 @@ fn is_tier1(name: &str) -> bool {
             | "invoke_skill"
             | "ensure_parent_tag"
             | "verify_skill"
+            | "ingest_context_segments"
+            | "search_context_segments"
+            | "get_context_window"
             | "hybrid_search"
             | "create_edge"
             | "batch_create_edges"
@@ -1531,6 +1629,7 @@ fn is_write_tool(name: &str) -> bool {
             | "start_fold"
             | "append_to_fold"
             | "complete_fold"
+            | "ingest_context_segments"
             | "upsert_entity"
             | "batch_ingest"
             | "ingest_entities"
@@ -1827,6 +1926,156 @@ async fn handle_retrieve_fold<S: crate::storage::Storage>(
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
     serde_json::to_value(&folds).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
+async fn handle_ingest_context_segments<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+    let conversation_id = require_str(&args, "conversation_id")?.to_string();
+    let messages_value = args
+        .get("messages")
+        .cloned()
+        .ok_or((INVALID_PARAMS, "missing required array: messages".into()))?;
+    let messages: Vec<ContextMessage> = serde_json::from_value(messages_value)
+        .map_err(|e| (INVALID_PARAMS, format!("invalid messages: {e}")))?;
+    if messages.is_empty() {
+        return Err((INVALID_PARAMS, "messages must not be empty".into()));
+    }
+    let segmentation: SegmentationConfig = match args.get("segmentation") {
+        Some(v) if !v.is_null() => serde_json::from_value(v.clone())
+            .map_err(|e| (INVALID_PARAMS, format!("invalid segmentation: {e}")))?,
+        _ => SegmentationConfig::default(),
+    };
+    let embed_missing = args
+        .get("embed_missing")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let embeddings = if embed_missing && !session.ollama_base_url.is_empty() {
+        let preview = crate::context_segment::segment_messages(
+            session_id,
+            &conversation_id,
+            &messages,
+            &segmentation,
+        )
+        .map_err(|e| (INVALID_PARAMS, e.to_string()))?;
+        let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
+            provider: "ollama".into(),
+            ollama_base_url: session.ollama_base_url.clone(),
+            model: session.embed_model.clone(),
+            dimensions: session.embed_dimensions,
+            ner_model: String::new(),
+        });
+        let mut vectors = Vec::with_capacity(preview.len());
+        for segment in preview {
+            vectors.push(
+                client
+                    .embed(&segment.segment_text)
+                    .await
+                    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?,
+            );
+        }
+        Some(vectors)
+    } else {
+        None
+    };
+
+    let result = crate::context_segment::ingest_context_segments(
+        storage,
+        ctx,
+        IngestContextSegmentsParams {
+            session_id,
+            conversation_id,
+            messages,
+            segmentation,
+            embed_missing,
+        },
+        embeddings,
+    )
+    .await
+    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
+async fn handle_search_context_segments<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+    let query = require_str(&args, "query")?.to_string();
+    let mut query_embedding = optional_f32_array(&args, "query_embedding")?;
+    if query_embedding.is_none() && !session.ollama_base_url.is_empty() {
+        let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
+            provider: "ollama".into(),
+            ollama_base_url: session.ollama_base_url.clone(),
+            model: session.embed_model.clone(),
+            dimensions: session.embed_dimensions,
+            ner_model: String::new(),
+        });
+        match client.embed(&query).await {
+            Ok(embedding) => query_embedding = Some(embedding),
+            Err(e) => tracing::debug!("context segment query embedding skipped: {e}"),
+        };
+    }
+    let expand = args.get("expand").cloned().unwrap_or(Value::Null);
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    let expand_prev = expand.get("prev").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let expand_next = expand.get("next").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let max_expanded_tokens = expand
+        .get("max_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(8000) as i32;
+    let result = crate::context_segment::search_context_segments(
+        storage,
+        ctx,
+        ContextSegmentSearchParams {
+            session_id,
+            query,
+            query_embedding,
+            limit,
+            expand_prev,
+            expand_next,
+            max_expanded_tokens,
+        },
+    )
+    .await
+    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
+async fn handle_get_context_window<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+    let segment_id = require_uuid(&args, "segment_id")?;
+    let prev = args.get("prev").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+    let next = args.get("next").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+    let max_tokens = args
+        .get("max_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(8000) as i32;
+    let result = crate::context_segment::get_context_window(
+        storage,
+        ctx,
+        ContextWindowParams {
+            session_id,
+            segment_id,
+            prev,
+            next,
+            max_tokens,
+        },
+    )
+    .await
+    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
 }
 
 // --- Entity handlers ---
@@ -3147,6 +3396,26 @@ async fn handle_retrieve_entities<S: crate::storage::Storage>(
             }
         }
     }
+    drop(tracker);
+    drop(co_access);
+
+    // Fire-and-forget auto outcome for retrieve_entities.
+    let auto_query_id = uuid::Uuid::new_v4();
+    let _ = crate::feedback::record_outcome(
+        storage,
+        ctx,
+        session_id,
+        auto_query_id,
+        "retrieve_entities_auto",
+        "simple",
+        true,
+        0,
+        0,
+    )
+    .await;
+    for entity in &entities {
+        let _ = crate::warmth::apply_outcome_boost(storage, ctx, entity.entity_id, true, 0).await;
+    }
 
     // Warmth boost for retrieved entities (fire-and-forget)
     let rmh_config = crate::config::RmhConfig::default();
@@ -3306,27 +3575,39 @@ async fn handle_record_outcome<S: crate::storage::Storage>(
     .await
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
-    // Apply small negative reputation to entities that caused a retrieval miss
-    if program_type == "retrieval_miss"
-        && let Some(entity_ids) = args.get("entity_ids").and_then(|v| v.as_array())
-    {
+    // Warmth modulation: success → boost, failure → penalty.
+    // This closes the episodic feedback loop — recorded outcomes change
+    // future retrieval ranking via warmth scores.
+    if let Some(entity_ids) = args.get("entity_ids").and_then(|v| v.as_array()) {
         let mut deltas = std::collections::HashMap::new();
         for id_val in entity_ids {
-            if let Some(id_str) = id_val.as_str()
-                && let Ok(eid) = id_str.parse::<uuid::Uuid>()
-            {
-                deltas.insert(eid, -0.05);
+            if let Some(Ok(eid)) = id_val.as_str().map(|s| s.parse::<uuid::Uuid>()) {
+                if let Err(e) =
+                    crate::warmth::apply_outcome_boost(storage, ctx, eid, succeeded, latency_ms)
+                        .await
+                {
+                    tracing::warn!(entity_id = %eid, error = %e, "warmth boost failed");
+                }
+                // Also accumulate reputation delta for batch reputation update
+                deltas.insert(eid, if succeeded { 0.05 } else { -0.10 });
             }
         }
         if !deltas.is_empty()
             && let Err(e) =
                 crate::pagerank::update_reputation_scores(storage, ctx, session_id, &deltas).await
         {
-            tracing::warn!("failed to penalize retrieval-miss entity reputation: {e}");
+            tracing::warn!("failed to update entity reputation from outcome: {e}");
         }
+    } else if program_type == "retrieval_miss" {
+        // Back-compat: the old retrieval_miss path also penalized reputation.
+        // If caller didn't supply entity_ids, nothing to penalize directly.
+        tracing::debug!("retrieval_miss without entity_ids — no reputation penalty applied");
     }
 
-    let mut response = serde_json::json!({ "recorded": recorded });
+    let mut response = serde_json::json!({
+        "recorded": recorded,
+        "warmth_updated": args.get("entity_ids").is_some()
+    });
     if program_type == "retrieval_miss" {
         response["_hint"] = serde_json::json!(
             "Retrieval miss logged. The system will learn to store this kind of information. Consider using smart_ingest now to store what you found via grep/read."
@@ -4203,6 +4484,46 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
     let result_count = results.len();
+
+    // Auto-record outcome for episodic feedback loop.
+    // Success if any results were found; failure on empty.
+    let auto_outcome_succeeded = result_count > 0;
+    let auto_outcome_eids: Vec<String> = results.iter().map(|r| r.id.to_string()).collect();
+    let auto_query_id = uuid::Uuid::new_v4();
+    let search_start = std::time::Instant::now();
+    // We already have the results; compute elapsed since the actual search call.
+    // Since we can't retroactively measure, we use a small best-effort value.
+    let auto_latency_ms = search_start.elapsed().as_millis() as i32;
+
+    // Fire-and-forget auto outcome — don't fail the search if this errors.
+    let _ = crate::feedback::record_outcome(
+        storage,
+        ctx,
+        session_id,
+        auto_query_id,
+        "hybrid_search_auto",
+        "simple",
+        auto_outcome_succeeded,
+        auto_latency_ms.max(1), // avoid 0
+        0,
+    )
+    .await;
+    if !auto_outcome_eids.is_empty() {
+        // Best-effort warmth boost for returned entities
+        for eid in &auto_outcome_eids {
+            if let Ok(id) = eid.parse::<uuid::Uuid>() {
+                let _ = crate::warmth::apply_outcome_boost(
+                    storage,
+                    ctx,
+                    id,
+                    auto_outcome_succeeded,
+                    auto_latency_ms,
+                )
+                .await;
+            }
+        }
+    }
+
     let hint = if results.is_empty() {
         pick_hint(&[
             "No matches — this topic is new to memory. Good candidate for smart_ingest.",
@@ -4238,38 +4559,29 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
 
 async fn handle_run_consolidation<S: crate::storage::Storage>(
     args: Value,
-    storage: &S,
-    ctx: &crate::types::TenantContext,
+    _storage: &S,
+    _ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
     let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
 
-    let result = crate::dream::run_consolidation(storage, ctx, session_id)
-        .await
-        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
-
-    // Emit viz events with actual entity pairs
-    for (src, tgt) in &result.edges {
-        session.event_bus.emit(crate::viz::VizEvent::EdgeCreated {
-            edge: crate::viz::VizEdge {
-                source: src.to_string(),
-                target: tgt.to_string(),
-                edge_type: "CO_OCCURS".into(),
-                strength: None,
-            },
-        });
+    {
+        let mut queue = session.consolidation_queue.lock().await;
+        if !queue.contains(&session_id) {
+            queue.push_back(session_id);
+        }
     }
+    session
+        .dirty
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    session.last_activity.notify_waiters();
 
-    let mut json = serde_json::to_value(&result).map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
-    if let Some(obj) = json.as_object_mut() {
-        obj.insert(
-            "hint".into(),
-            Value::String(
-                "Consolidation complete. New connections are visible in the viz dashboard. Continue ingesting new learnings.".into(),
-            ),
-        );
-    }
-    Ok(json)
+    Ok(serde_json::json!({
+        "queued": true,
+        "session_id": session_id.to_string(),
+        "run_when": "idle_or_nightly",
+        "hint": "Consolidation queued for the background idle/nightly worker; request path is non-blocking."
+    }))
 }
 
 // --- Enrichment handler ---
@@ -4332,7 +4644,12 @@ async fn handle_get_stats<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    let session_id = optional_uuid(&args, "session_id")?;
+    // Default to the nil UUID session — this matches what smart_ingest /
+    // hybrid_search / retrieve_entities use when session_id is omitted, so
+    // get_stats reports the same data those tools see. Returning 0 here
+    // (the prior behavior) made default-session entities look like
+    // phantoms even when they were correctly persisted.
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
 
     let memo_count = storage.memo_count(ctx).await.unwrap_or(0);
     let memo_total_hits = storage.memo_total_hits(ctx).await.unwrap_or(0);
@@ -4342,10 +4659,7 @@ async fn handle_get_stats<S: crate::storage::Storage>(
         0.0
     };
 
-    let entity_count = match session_id {
-        Some(sid) => storage.entity_count(ctx, sid).await.unwrap_or(0),
-        None => 0,
-    };
+    let entity_count = storage.entity_count(ctx, session_id).await.unwrap_or(0);
 
     let active_fold_count = storage
         .fold_count_by_status(ctx, crate::types::FoldStatus::Active)
@@ -4601,9 +4915,17 @@ async fn handle_spread_activation<S: crate::storage::Storage>(
         .map(|v| v as usize)
         .unwrap_or(10);
 
-    let results = crate::spreading::spread(storage, ctx, &seeds, max_hops, decay, limit)
-        .await
-        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    let results = crate::spreading::spread(
+        storage,
+        ctx,
+        &seeds,
+        Some(session_id),
+        max_hops,
+        decay,
+        limit,
+    )
+    .await
+    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
     // Warmth boost for seeds and top activated results (fire-and-forget)
     let rmh_config = crate::config::RmhConfig::default();
@@ -6278,6 +6600,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_consolidation_tool_queues_idle_work_instead_of_running_inline() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let session_id = Uuid::new_v4();
+        let params = serde_json::json!({
+            "name": "run_consolidation",
+            "arguments": {"session_id": session_id.to_string()}
+        });
+
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let body = unwrap_tool_result(result);
+
+        assert_eq!(body["queued"], true);
+        assert_eq!(body["session_id"], session_id.to_string());
+        assert_eq!(body["run_when"], "idle_or_nightly");
+        assert!(session.dirty.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(
+            session
+                .consolidation_queue
+                .lock()
+                .await
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![session_id]
+        );
+    }
+
+    #[tokio::test]
     async fn tools_list_returns_tier1_by_default() {
         let store = MockStorage::new();
         let ctx = test_ctx();
@@ -6299,6 +6653,9 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         // All tier-1 tools must be present
         assert!(names.contains(&"smart_ingest"));
+        assert!(names.contains(&"ingest_context_segments"));
+        assert!(names.contains(&"search_context_segments"));
+        assert!(names.contains(&"get_context_window"));
         assert!(names.contains(&"hybrid_search"));
         assert!(names.contains(&"create_edge"));
         assert!(names.contains(&"batch_create_edges"));
@@ -6328,6 +6685,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_segment_tools_round_trip_through_dispatch() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+
+        let ingest = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "ingest_context_segments",
+                "arguments": {
+                    "session_id": sid.to_string(),
+                    "conversation_id": "discord-thread-123",
+                    "embed_missing": false,
+                    "segmentation": {"target_tokens": 4, "max_tokens": 8, "time_gap_seconds": 900, "strategy": "deterministic_v1", "semantic_drift_threshold": 0.72},
+                    "messages": [
+                        {"role": "user", "content": "alpha beta", "turn_index": 0},
+                        {"role": "assistant", "content": "gamma delta", "turn_index": 1},
+                        {"role": "user", "content": "memory segment retrieval", "turn_index": 2}
+                    ]
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let ingest = unwrap_tool_result(ingest);
+        assert!(ingest["segments_created"].as_u64().unwrap() >= 2);
+
+        let search = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "search_context_segments",
+                "arguments": {
+                    "session_id": sid.to_string(),
+                    "query": "memory retrieval",
+                    "limit": 1,
+                    "expand": {"prev": 1, "next": 1, "max_tokens": 100}
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let search = unwrap_tool_result(search);
+        let hits = search["results"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(!hits[0]["expanded_context"].as_array().unwrap().is_empty());
+
+        let segment_id = hits[0]["segment"]["segment_id"].as_str().unwrap();
+        let window = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "get_context_window",
+                "arguments": {
+                    "session_id": sid.to_string(),
+                    "segment_id": segment_id,
+                    "prev": 1,
+                    "next": 1,
+                    "max_tokens": 100
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let window = unwrap_tool_result(window);
+        assert!(!window["segments"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn tools_list_returns_all_with_include_all() {
         let store = MockStorage::new();
         let ctx = test_ctx();
@@ -6346,6 +6780,9 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         // Check tier-1 tools still present
         assert!(names.contains(&"smart_ingest"));
+        assert!(names.contains(&"ingest_context_segments"));
+        assert!(names.contains(&"search_context_segments"));
+        assert!(names.contains(&"get_context_window"));
         assert!(names.contains(&"hybrid_search"));
         // Check tier-2 tools now included
         assert!(names.contains(&"check_memo_cache"));
@@ -7374,6 +7811,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_stats_without_session_id_counts_default_session_entities() {
+        // Regression: get_stats previously returned entity_count=0 hardcoded
+        // when session_id was omitted, instead of querying the default
+        // (nil) session that smart_ingest writes to when session_id is
+        // omitted from its arguments. The two tools must agree on the
+        // implicit session — otherwise ingested entities look like phantoms.
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+
+        for i in 0..2 {
+            let entity = crate::types::EntityEntry {
+                tenant_id: ctx.tenant_id,
+                entity_id: Uuid::new_v4(),
+                session_id: Uuid::nil(),
+                entity_name: format!("DefaultSessionEntity{i}"),
+                entity_type: "concept".into(),
+                source_fold_id: None,
+                context_snippet: format!("entity {i}"),
+                entity_embedding: None,
+                confidence: 0.9,
+                state: Default::default(),
+                created_at: chrono::Utc::now(),
+                ..Default::default()
+            };
+            store.entities.lock().await.push(entity);
+        }
+
+        let params = serde_json::json!({
+            "name": "get_stats",
+            "arguments": {}
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(
+            result["entity_count"], 2,
+            "get_stats with no session_id should count default-session entities, not return 0"
+        );
+    }
+
+    #[tokio::test]
     async fn count_entities_by_type_returns_empty_breakdowns_for_empty_session() {
         let store = MockStorage::new();
         let ctx = test_ctx();
@@ -8250,17 +8730,17 @@ mod tests {
         let result = unwrap_tool_result(result);
         assert_eq!(result["recorded"], true);
 
-        // Both entities should have received -0.05 reputation penalty
+        // Both entities should have received -0.10 reputation penalty (failure with entity_ids)
         let w1 = store.warmth_get(&ctx, eid1).await.unwrap().unwrap();
         assert!(
-            (w1.reputation - (-0.05)).abs() < f64::EPSILON,
-            "expected -0.05 reputation, got {}",
+            (w1.reputation - (-0.10)).abs() < 0.001,
+            "expected -0.10 reputation, got {}",
             w1.reputation
         );
         let w2 = store.warmth_get(&ctx, eid2).await.unwrap().unwrap();
         assert!(
-            (w2.reputation - (-0.05)).abs() < f64::EPSILON,
-            "expected -0.05 reputation, got {}",
+            (w2.reputation - (-0.10)).abs() < 0.001,
+            "expected -0.10 reputation, got {}",
             w2.reputation
         );
     }

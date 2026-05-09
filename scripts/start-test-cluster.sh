@@ -18,8 +18,26 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-PODMAN="${PODMAN:-/opt/homebrew/bin/podman}"
-export PODMAN_COMPOSE_PROVIDER="${PODMAN_COMPOSE_PROVIDER:-podman-compose}"
+
+# --- container engine detection ---
+PODMAN="${PODMAN:-$(command -v podman 2>/dev/null || true)}"
+if [[ -z "${PODMAN}" ]]; then
+    PODMAN="${PODMAN:-$(command -v docker 2>/dev/null || true)}"
+fi
+if [[ -z "${PODMAN}" ]]; then
+    echo "ERROR: no container engine found (tried podman, docker)" >&2
+    exit 1
+fi
+
+# --- compose provider detection ---
+if command -v podman-compose &>/dev/null; then
+    COMPOSE_CMD=(podman-compose)
+elif command -v docker &>/dev/null; then
+    COMPOSE_CMD=(docker compose)
+else
+    COMPOSE_CMD=("${PODMAN}" compose)
+fi
+
 COMPOSE_FILE="${REPO_ROOT}/docker-compose.test.yml"
 
 if [[ "${1:-}" == "--env" ]]; then
@@ -35,7 +53,7 @@ fi
 
 echo "starting test cluster via ${COMPOSE_FILE}"
 cd "${REPO_ROOT}"
-"${PODMAN}" compose -f docker-compose.test.yml up -d
+"${COMPOSE_CMD[@]}" -f docker-compose.test.yml up -d
 
 echo "waiting for CQL on localhost:19542 ..."
 for _ in $(seq 1 60); do
@@ -47,7 +65,7 @@ for _ in $(seq 1 60); do
 done
 
 if ! bash -c '</dev/tcp/localhost/19542' 2>/dev/null; then
-    echo "CQL port 19542 did not come up in 120s — check podman logs" >&2
+    echo "CQL port 19542 did not come up in 120s — check container logs" >&2
     exit 1
 fi
 

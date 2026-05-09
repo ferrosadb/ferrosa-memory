@@ -57,6 +57,7 @@ services:
 
   node1:
     image: ferrosa-memory-node
+    user: "1000:1000"
     # 2G cap per Ferrosa node. Historical steady-state is ~1-2GB under
     # dev load (13.9k entities, 68k edges). The 2G ceiling covers
     # compaction + SSTable cache headroom and lets 3 nodes + MinIO fit
@@ -124,6 +125,7 @@ services:
 
   node2:
     image: ferrosa-memory-node
+    user: "1000:1000"
     # 2G cap per Ferrosa node. Historical steady-state is ~1-2GB under
     # dev load (13.9k entities, 68k edges). The 2G ceiling covers
     # compaction + SSTable cache headroom and lets 3 nodes + MinIO fit
@@ -191,6 +193,7 @@ services:
 
   node3:
     image: ferrosa-memory-node
+    user: "1000:1000"
     # 2G cap per Ferrosa node. Historical steady-state is ~1-2GB under
     # dev load (13.9k entities, 68k edges). The 2G ceiling covers
     # compaction + SSTable cache headroom and lets 3 nodes + MinIO fit
@@ -274,7 +277,7 @@ services:
       FERROSA_MEMORY_CONFIG: /run/secrets/ferrosa-memory/ferrosa-memory-http-podman.toml
     ports:
       - "18765:8765"
-      - "127.0.0.1:18766:8766"
+      - "18766:8766"
     volumes:
       - ./.runtime:/run/secrets/ferrosa-memory:ro
     healthcheck:

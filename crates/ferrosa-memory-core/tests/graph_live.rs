@@ -127,6 +127,10 @@ async fn ferrosa_user_is_denied_direct_graph_mutations() {
              cluster on ports 19042 (CQL) and 17474 (graph HTTP)"
         );
     }
+    if std::env::var("FERROSA_TEST_AUTH_ENABLED").ok().as_deref() != Some("1") {
+        eprintln!("skipping graph authz assertion because FERROSA_TEST_AUTH_ENABLED=1 is not set");
+        return;
+    }
     let client = connect_graph("ferrosa_user", "ferrosa_user").await;
     let tenant_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();

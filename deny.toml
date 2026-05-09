@@ -1,0 +1,62 @@
+# cargo-deny configuration for ferrosa-memory.
+#
+# Runs in CI via `.github/workflows/ci.yml` (advisories job).
+# Enforces:
+#
+# - no crates with unpatched security advisories (deny by default)
+# - license allowlist so we don't accidentally pull in GPL/AGPL
+# - no duplicate versions of the same crate (warn) — usually harmless
+#   but surfaces dependency churn before it becomes a real problem
+# - crates.io is the only source (no git/path deps from third parties)
+
+[graph]
+targets = []
+
+[output]
+feature-depth = 1
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "warn"
+ignore = [
+    # rustls-pemfile is unmaintained but no safe upgrade exists yet — upstream
+    # rustls-pki-types since 1.9.0 replaces it, but our transitive deps still pull it in.
+    { id = "RUSTSEC-2025-0134", reason = "No safe upgrade path yet" },
+]
+[licenses]
+# Workspace crates don't declare `license = ...` individually — they're
+# private. Skip license checks on them.
+private = { ignore = true }
+# The allowlist is intentionally defensive — covers licenses we expect
+# to run into over time as deps churn. `license-not-encountered` on an
+# unused entry is just "no dep happens to use it yet"; not a failure.
+unused-allowed-license = "allow"
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "Zlib",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = [
+    "https://github.com/ferrosadb/scylla-rust-driver",
+]

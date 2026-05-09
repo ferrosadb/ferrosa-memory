@@ -1,6 +1,8 @@
-use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+use crate::memory_quality::EvidenceGroundTruth;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -11,6 +13,8 @@ pub struct EvalScenario {
     pub steps: Vec<EvalStep>,
     #[serde(default)]
     pub grading: GradingConfig,
+    #[serde(default)]
+    pub retrieval_ground_truth: Option<EvidenceGroundTruth>,
     #[serde(default)]
     pub dikw: Option<DikwConfig>,
     #[serde(default)]
@@ -149,9 +153,7 @@ impl ScenarioManifest {
             return Ok(());
         }
 
-        let mut dir_entries: Vec<_> = std::fs::read_dir(dir)?
-            .filter_map(|e| e.ok())
-            .collect();
+        let mut dir_entries: Vec<_> = std::fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
         dir_entries.sort_by_key(|e| e.file_name());
 
         for entry in dir_entries {
@@ -232,16 +234,14 @@ impl ScenarioManifest {
     /// Load a manifest from a JSON file.
     pub fn load_from_file(path: &Path) -> Result<Self, std::io::Error> {
         let contents = std::fs::read_to_string(path)?;
-        serde_json::from_str(&contents).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-        })
+        serde_json::from_str(&contents)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
     }
 
     /// Save this manifest to a JSON file.
     pub fn save_to_file(&self, path: &Path) -> Result<(), std::io::Error> {
-        let json = serde_json::to_string_pretty(self).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-        })?;
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         std::fs::write(path, json)
     }
 }
@@ -285,13 +285,21 @@ mod tests {
         let manifest = ScenarioManifest::compute(dir.path()).unwrap();
         assert_eq!(manifest.entries.len(), 1);
         assert_eq!(manifest.entries[0].file, "test.toml");
-        assert_eq!(manifest.entries[0].sha256.len(), 64, "SHA-256 hex = 64 chars");
+        assert_eq!(
+            manifest.entries[0].sha256.len(),
+            64,
+            "SHA-256 hex = 64 chars"
+        );
     }
 
     #[test]
     fn manifest_computes_hashes_for_json_files() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("ground_truth.json"), r#"{"expected": true}"#).unwrap();
+        std::fs::write(
+            dir.path().join("ground_truth.json"),
+            r#"{"expected": true}"#,
+        )
+        .unwrap();
 
         let manifest = ScenarioManifest::compute(dir.path()).unwrap();
         assert_eq!(manifest.entries.len(), 1);
@@ -347,8 +355,7 @@ mod tests {
         let manifest_after = ScenarioManifest::compute(dir.path()).unwrap();
 
         assert_ne!(
-            manifest_before.entries[0].sha256,
-            manifest_after.entries[0].sha256,
+            manifest_before.entries[0].sha256, manifest_after.entries[0].sha256,
             "hash should change when file is modified"
         );
     }
@@ -372,7 +379,10 @@ mod tests {
         assert_eq!(mismatches.len(), 1);
         assert_eq!(mismatches[0].file, "test.toml");
         match &mismatches[0].kind {
-            MismatchKind::Modified { expected: e, actual: a } => {
+            MismatchKind::Modified {
+                expected: e,
+                actual: a,
+            } => {
                 assert_eq!(e, "aaa");
                 assert_eq!(a, "bbb");
             }

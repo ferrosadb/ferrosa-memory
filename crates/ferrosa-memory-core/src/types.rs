@@ -361,9 +361,71 @@ pub struct Atom {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum BuiltinFilter {
+    /// Legacy: variable greater than a literal float.
+    /// No longer emitted by the parser; preserved so already-persisted
+    /// `RuleEntry` rows in CQL still deserialize.
     GreaterThan(String, f64),
+    /// Legacy. See `GreaterThan` doc.
     LessThan(String, f64),
+    /// Legacy. See `GreaterThan` doc.
     NotEqual(String, String),
+    /// Full comparison filter — the only variant the parser emits.
+    Compare {
+        op: CmpOp,
+        lhs: FilterExpr,
+        rhs: FilterExpr,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum FilterExpr {
+    Var(String),
+    LitNum(ordered_float::OrderedFloat<f64>),
+    LitStr(String),
+    BinOp {
+        op: ArithOp,
+        lhs: Box<FilterExpr>,
+        rhs: Box<FilterExpr>,
+    },
+    Neg(Box<FilterExpr>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AggregateKind {
+    Count,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Aggregate {
+    pub kind: AggregateKind,
+    pub inner: Atom,
+    #[serde(default)]
+    pub inner_conjunction: Vec<Atom>,
+    pub group_vars: Vec<String>,
+    pub output_var: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum StratifyError {
+    RecursionThroughAggregate { cycle: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -371,6 +433,8 @@ pub struct DatalogRule {
     pub head: Atom,
     pub body: Vec<Atom>,
     pub filters: Vec<BuiltinFilter>,
+    #[serde(default)]
+    pub aggregates: Vec<Aggregate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -651,6 +715,64 @@ pub struct TypedEdge {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+// ─── Sprint 6: Confidence, Contradiction, Consolidation, Schema ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfidenceScore {
+    pub entity_id: Uuid,
+    pub fact_hash: String,
+    pub confidence: f64,
+    pub source_count: i32,
+    pub last_confirmed_at: chrono::DateTime<chrono::Utc>,
+    pub contradiction_count: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContradictionEntry {
+    pub tenant_id: Uuid,
+    pub entity_id: Uuid,
+    pub old_fact_hash: String,
+    pub new_fact_hash: String,
+    pub old_fact_text: String,
+    pub new_fact_text: String,
+    pub detected_at: chrono::DateTime<chrono::Utc>,
+    pub resolved_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub resolution: Option<String>,
+    pub resolver: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsolidationStage {
+    FoldRaw,
+    FoldCompressed,
+    EntityExtracted,
+    SkillCandidate,
+}
+
+impl std::fmt::Display for ConsolidationStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FoldRaw => write!(f, "fold_raw"),
+            Self::FoldCompressed => write!(f, "fold_compressed"),
+            Self::EntityExtracted => write!(f, "entity_extracted"),
+            Self::SkillCandidate => write!(f, "skill_candidate"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainSchema {
+    pub schema_id: Uuid,
+    pub schema_name: String,
+    pub version: i32,
+    pub description: Option<String>,
+    pub skill_names: Vec<String>,
+    pub routing_guidelines: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
 // ─── B10: Materialization + Promotion types ────────────────────
 
 /// A durably materialized derived edge.
@@ -876,5 +998,124 @@ mod tests {
         assert_eq!(back.content_hash.as_deref(), Some("sha256:abc"));
         assert_eq!(back.scope, EntityScope::Global);
         assert_eq!(back.ingested_by_session, Some(ingester));
+    }
+
+    #[test]
+    fn builtin_filter_compare_round_trips_through_json() {
+        let f = BuiltinFilter::Compare {
+            op: CmpOp::Ge,
+            lhs: FilterExpr::Var("S".into()),
+            rhs: FilterExpr::BinOp {
+                op: ArithOp::Add,
+                lhs: Box::new(FilterExpr::Var("T".into())),
+                rhs: Box::new(FilterExpr::LitNum(ordered_float::OrderedFloat(1.0))),
+            },
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        let back: BuiltinFilter = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, f);
+    }
+
+    #[test]
+    fn legacy_builtin_filter_variants_still_round_trip() {
+        let g = BuiltinFilter::GreaterThan("X".into(), 0.5);
+        let l = BuiltinFilter::LessThan("X".into(), 0.5);
+        let n = BuiltinFilter::NotEqual("X".into(), "Y".into());
+        for f in [g, l, n] {
+            let json = serde_json::to_string(&f).unwrap();
+            let back: BuiltinFilter = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, f);
+        }
+    }
+
+    #[test]
+    fn aggregate_round_trips_through_json() {
+        let a = Aggregate {
+            kind: AggregateKind::Count,
+            inner: Atom {
+                predicate: "user_corrected".into(),
+                args: vec![Term::Var("S".into()), Term::Var("X".into())],
+            },
+            inner_conjunction: vec![],
+            group_vars: vec!["X".into()],
+            output_var: "N".into(),
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        let back: Aggregate = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, a);
+    }
+
+    #[test]
+    fn aggregate_v2_round_trips_through_json() {
+        let a = Aggregate {
+            kind: AggregateKind::Count,
+            inner: Atom {
+                predicate: "worked_well".into(),
+                args: vec![Term::Var("S".into()), Term::Var("Tool".into())],
+            },
+            inner_conjunction: vec![
+                Atom {
+                    predicate: "worked_well".into(),
+                    args: vec![Term::Var("S".into()), Term::Var("Tool".into())],
+                },
+                Atom {
+                    predicate: "session_context".into(),
+                    args: vec![Term::Var("S".into()), Term::Var("Ctx".into())],
+                },
+            ],
+            group_vars: vec!["Ctx".into(), "Tool".into()],
+            output_var: "N".into(),
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        let back: Aggregate = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, a);
+    }
+
+    #[test]
+    fn aggregate_v1_legacy_deserializes_with_empty_conjunction() {
+        // Use whatever Term::Var wire shape the existing tests use. Look
+        // at `datalog_rule_without_aggregates_field_deserializes_with_default`
+        // in this same file for the canonical Term tag format.
+        // What matters is `inner_conjunction` is absent and defaults to vec![].
+        // Build the JSON by serializing a v1-shaped aggregate, then strip the
+        // `inner_conjunction` key before deserializing — that guarantees the
+        // wire format matches what's actually persisted.
+        let v1_shape = Aggregate {
+            kind: AggregateKind::Count,
+            inner: Atom {
+                predicate: "user_corrected".into(),
+                args: vec![Term::Var("S".into()), Term::Var("X".into())],
+            },
+            inner_conjunction: vec![],
+            group_vars: vec!["X".into()],
+            output_var: "N".into(),
+        };
+        let mut json: serde_json::Value = serde_json::to_value(&v1_shape).unwrap();
+        // Simulate a pre-v2 wire row: drop the inner_conjunction key entirely.
+        json.as_object_mut().unwrap().remove("inner_conjunction");
+        let back: Aggregate = serde_json::from_value(json).unwrap();
+        assert!(back.inner_conjunction.is_empty());
+        assert_eq!(back.inner.predicate, "user_corrected");
+    }
+
+    #[test]
+    fn stratify_error_round_trips() {
+        let e = StratifyError::RecursionThroughAggregate {
+            cycle: vec!["a".into(), "b".into()],
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        let back: StratifyError = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, e);
+    }
+
+    #[test]
+    fn datalog_rule_without_aggregates_field_deserializes_with_default() {
+        let json = r#"{
+            "head": {"predicate": "foo", "args": [{"type": "Var", "value": "X"}]},
+            "body": [{"predicate": "bar", "args": [{"type": "Var", "value": "X"}]}],
+            "filters": []
+        }"#;
+        let rule: DatalogRule = serde_json::from_str(json).unwrap();
+        assert!(rule.aggregates.is_empty());
     }
 }

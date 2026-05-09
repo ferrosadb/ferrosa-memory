@@ -2,10 +2,11 @@
 name = "ferrosa-memory-sync"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 ferrosa-memory-core = { path = "../ferrosa-memory-core" }
-cdrs-tokio = { workspace = true }
+scylla = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -1,38 +1,45 @@
-//! Ferrosa/cdrs-tokio compatibility tests.
+// Intentionally uses the scylla 0.15 LegacySession API — deprecated but stable for this migration.
+#![allow(deprecated)]
+//! Ferrosa/scylla compatibility tests.
 //!
 //! Fixed tests and remaining open issues.
 //! Run: cargo test -p ferrosa-memory-core --test ferrosa_bugs -- --ignored --nocapture
 
-use std::sync::Arc;
+use ferrosa_memory_core::cql_storage::build_col_map;
+use scylla::{LegacySession, SessionBuilder};
+use uuid::Uuid;
 
-use cdrs_tokio::authenticators::NoneAuthenticatorProvider;
-use cdrs_tokio::cluster::NodeTcpConfigBuilder;
-use cdrs_tokio::cluster::session::{SessionBuilder, TcpSessionBuilder};
-use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
-use cdrs_tokio::query_values;
-use cdrs_tokio::types::ByName;
-
-macro_rules! connect {
-    () => {{
-        let nc = NodeTcpConfigBuilder::new()
-            .with_contact_point("127.0.0.1:19042".into())
-            .with_authenticator_provider(Arc::new(NoneAuthenticatorProvider))
-            .build()
-            .await
-            .unwrap();
-        TcpSessionBuilder::new(RoundRobinLoadBalancingStrategy::new(), nc)
-            .build()
-            .await
-            .unwrap()
-    }};
+async fn connect_plain(contact_point: &str) -> LegacySession {
+    #[allow(deprecated)]
+    SessionBuilder::new()
+        .known_node(contact_point)
+        .build_legacy()
+        .await
+        .expect("session build failed")
 }
 
 // ---- FIXED: Vector PREPARE + ANN ----
 
+/// Creates `agent_memory.test_vector_blob` if it does not exist. The table is
+/// test-only (not in production DDL), so each test that depends on it must
+/// bootstrap it. Using `IF NOT EXISTS` keeps this idempotent across the
+/// vector_live and ferrosa_bugs suites that share the table.
+async fn ensure_test_vector_blob(s: &LegacySession) {
+    #[allow(deprecated)]
+    s.query_unpaged(
+        "CREATE TABLE IF NOT EXISTS agent_memory.test_vector_blob \
+         (id uuid PRIMARY KEY, embedding vector<float, 4>)",
+        (),
+    )
+    .await
+    .expect("CREATE TABLE test_vector_blob");
+}
+
 #[tokio::test]
 #[ignore]
 async fn fixed_vector_prepare() {
-    let s = connect!();
+    let s = connect_plain("127.0.0.1:19042").await;
+    ensure_test_vector_blob(&s).await;
     s.prepare("INSERT INTO agent_memory.test_vector_blob (id, embedding) VALUES (?, ?)")
         .await
         .expect("PREPARE on vector column");
@@ -41,7 +48,8 @@ async fn fixed_vector_prepare() {
 #[tokio::test]
 #[ignore]
 async fn fixed_vector_ann_query() {
-    let s = connect!();
+    let s = connect_plain("127.0.0.1:19042").await;
+    ensure_test_vector_blob(&s).await;
     s.prepare("SELECT id FROM agent_memory.test_vector_blob ORDER BY embedding ANN OF ? LIMIT 5")
         .await
         .expect("ANN query PREPARE");
@@ -52,23 +60,21 @@ async fn fixed_vector_ann_query() {
 #[tokio::test]
 #[ignore]
 async fn open_count_column_name() {
-    let s = connect!();
+    let s = connect_plain("127.0.0.1:19042").await;
     let prepared = s
         .prepare(
             "SELECT COUNT(*) FROM agent_memory.entity_store WHERE tenant_id = ? AND session_id = ?",
         )
         .await
         .expect("PREPARE");
-    let envelope = s
-        .exec_with_values(
-            &prepared,
-            query_values!(uuid::Uuid::new_v4(), uuid::Uuid::new_v4()),
-        )
+    #[allow(deprecated)]
+    let result = s
+        .execute_unpaged(&prepared, (Uuid::new_v4(), Uuid::new_v4()))
         .await
         .expect("EXECUTE");
-    let rows = envelope.response_body().unwrap().into_rows().unwrap();
-    let count: i64 = rows[0]
-        .r_by_name("count")
+    let col_map = build_col_map(result.col_specs());
+    let rows = result.rows_or_empty();
+    let count: i64 = ferrosa_memory_core::cql_storage::cql_get::<i64>(&rows[0], &col_map, "count")
         .expect("column should be 'count'");
     assert_eq!(count, 0);
 }
@@ -78,10 +84,14 @@ async fn open_count_column_name() {
 #[tokio::test]
 #[ignore]
 async fn open_subscribe() {
-    let s = connect!();
-    s.query("SUBSCRIBE SELECT * FROM agent_memory.memo_cache EVERY '5s'")
-        .await
-        .expect("SUBSCRIBE should work");
+    let s = connect_plain("127.0.0.1:19042").await;
+    #[allow(deprecated)]
+    s.query_unpaged(
+        "SUBSCRIBE SELECT * FROM agent_memory.memo_cache EVERY '5s'",
+        (),
+    )
+    .await
+    .expect("SUBSCRIBE should work");
 }
 
 // ---- DEBUG: retrieve_entities dynamic QUERY path ----
@@ -89,10 +99,10 @@ async fn open_subscribe() {
 #[tokio::test]
 #[ignore]
 async fn debug_dynamic_query_with_bind_values() {
-    let s = connect!();
-    let tid = uuid::Uuid::new_v4();
-    let sid = uuid::Uuid::new_v4();
-    let eid = uuid::Uuid::new_v4();
+    let s = connect_plain("127.0.0.1:19042").await;
+    let tid = Uuid::new_v4();
+    let sid = Uuid::new_v4();
+    let eid = Uuid::new_v4();
 
     // Insert via prepared (known working)
     let ins = s
@@ -104,9 +114,10 @@ async fn debug_dynamic_query_with_bind_values() {
         )
         .await
         .expect("PREPARE insert");
-    s.exec_with_values(
+    #[allow(deprecated)]
+    s.execute_unpaged(
         &ins,
-        query_values!(
+        (
             tid,
             sid,
             eid,
@@ -114,7 +125,7 @@ async fn debug_dynamic_query_with_bind_values() {
             "concept".to_string(),
             "test context".to_string(),
             1.0_f32,
-            chrono::Utc::now().naive_utc()
+            chrono::Utc::now(),
         ),
     )
     .await
@@ -127,22 +138,20 @@ async fn debug_dynamic_query_with_bind_values() {
                  context_snippet, confidence, created_at \
                  FROM agent_memory.entity_store WHERE tenant_id = ? AND session_id = ? ALLOW FILTERING";
     eprintln!("  sending dynamic QUERY with positional bind values...");
-    let envelope = s
-        .query_with_values(query, query_values!(tid, sid))
+    #[allow(deprecated)]
+    let result = s
+        .query_unpaged(query, (tid, sid))
         .await
         .expect("dynamic QUERY with bind values should work");
 
-    let rows = envelope
-        .response_body()
-        .unwrap()
-        .into_rows()
-        .unwrap_or_default();
+    let col_map = build_col_map(result.col_specs());
+    let rows = result.rows_or_empty();
     eprintln!("  got {} rows", rows.len());
     assert!(!rows.is_empty(), "should find the inserted entity");
 
-    let name: String = rows[0]
-        .r_by_name("entity_name")
-        .expect("entity_name column");
+    let name: String =
+        ferrosa_memory_core::cql_storage::cql_get::<String>(&rows[0], &col_map, "entity_name")
+            .expect("entity_name column");
     assert_eq!(name, "test-entity");
     eprintln!("  entity_name = {name} — dynamic QUERY path works!");
 }
@@ -150,54 +159,50 @@ async fn debug_dynamic_query_with_bind_values() {
 #[tokio::test]
 #[ignore]
 async fn debug_query_bind_values_vs_inline() {
-    let s = connect!();
-    let tid = uuid::Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
-    let sid = uuid::Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
-    let _eid = uuid::Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap();
+    let s = connect_plain("127.0.0.1:19042").await;
+    let tid = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
+    let sid = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
 
     // Insert with inline values (no bind markers)
-    s.query(
+    #[allow(deprecated)]
+    s.query_unpaged(
         "INSERT INTO agent_memory.entity_store \
          (tenant_id, session_id, entity_id, entity_name, entity_type, \
           context_snippet, confidence, created_at) \
          VALUES (aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee, 11111111-2222-3333-4444-555555555555, \
                  66666666-7777-8888-9999-aaaaaaaaaaaa, 'inline-test', 'concept', \
                  'ctx', 1.0, 1711036800000)",
+        (),
     )
     .await
     .expect("INSERT with inline values");
     eprintln!("  inserted with inline values");
 
     // 1) Read back with inline values (no bind markers)
-    let envelope = s
-        .query(
+    #[allow(deprecated)]
+    let result = s
+        .query_unpaged(
             "SELECT entity_name FROM agent_memory.entity_store \
              WHERE tenant_id = aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee \
              AND session_id = 11111111-2222-3333-4444-555555555555",
+            (),
         )
         .await
         .expect("inline QUERY");
-    let rows = envelope
-        .response_body()
-        .unwrap()
-        .into_rows()
-        .unwrap_or_default();
+    let rows = result.rows_or_empty();
     eprintln!("  inline query: {} rows", rows.len());
 
     // 2) Read back with bind values
-    let envelope2 = s
-        .query_with_values(
+    #[allow(deprecated)]
+    let result2 = s
+        .query_unpaged(
             "SELECT entity_name FROM agent_memory.entity_store \
              WHERE tenant_id = ? AND session_id = ?",
-            query_values!(tid, sid),
+            (tid, sid),
         )
         .await
         .expect("bind value QUERY");
-    let rows2 = envelope2
-        .response_body()
-        .unwrap()
-        .into_rows()
-        .unwrap_or_default();
+    let rows2 = result2.rows_or_empty();
     eprintln!("  bind value query: {} rows", rows2.len());
 
     // 3) Read back via prepared + execute
@@ -208,15 +213,9 @@ async fn debug_query_bind_values_vs_inline() {
         )
         .await
         .expect("PREPARE");
-    let envelope3 = s
-        .exec_with_values(&prep, query_values!(tid, sid))
-        .await
-        .expect("EXECUTE");
-    let rows3 = envelope3
-        .response_body()
-        .unwrap()
-        .into_rows()
-        .unwrap_or_default();
+    #[allow(deprecated)]
+    let result3 = s.execute_unpaged(&prep, (tid, sid)).await.expect("EXECUTE");
+    let rows3 = result3.rows_or_empty();
     eprintln!("  prepared+execute: {} rows", rows3.len());
 
     assert!(!rows.is_empty(), "inline query should find data");
@@ -232,10 +231,9 @@ async fn debug_query_bind_values_vs_inline() {
 // On a table with ~20K rows, secondary index queries return only ~3,500 rows
 // (first result page) instead of all matching rows. Full table scan returns all.
 //
-// Observed on Ferrosa with cdrs-tokio. May be:
+// Observed on Ferrosa. May be:
 // a) Ferrosa not auto-paging secondary index queries
-// b) cdrs-tokio not following paging state from RESULT frames
-// c) Interaction between ALLOW FILTERING and secondary index result sets
+// b) Interaction between ALLOW FILTERING and secondary index result sets
 //
 // Impact: edge_list_all returned 3,521/17,604 rows, causing the viz to show
 // a sparse graph. edge_list_session returned 0/17,604 before adding a
@@ -247,21 +245,17 @@ async fn debug_query_bind_values_vs_inline() {
 #[tokio::test]
 #[ignore]
 async fn open_secondary_index_paging() {
-    let s = connect!();
-    let tid = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
-    let sid = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+    let s = connect_plain("127.0.0.1:19042").await;
+    let tid = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+    let sid = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
 
     // Full table scan — ground truth
+    #[allow(deprecated)]
     let r_all = s
-        .query("SELECT entity_a FROM agent_memory.co_occurs_with")
+        .query_unpaged("SELECT entity_a FROM agent_memory.co_occurs_with", ())
         .await
         .expect("full scan");
-    let total = r_all
-        .response_body()
-        .unwrap()
-        .into_rows()
-        .unwrap_or_default()
-        .len();
+    let total = r_all.rows_or_empty().len();
     eprintln!("  full scan (no WHERE): {total} rows");
     if total < 5000 {
         eprintln!("  SKIP: need >5000 rows to trigger paging. Run consolidation first.");
@@ -269,37 +263,29 @@ async fn open_secondary_index_paging() {
     }
 
     // Query 1: secondary index on tenant_id (idx_co_occurs_by_tenant)
+    #[allow(deprecated)]
     let r_tenant = s
-        .query_with_values(
+        .query_unpaged(
             "SELECT entity_a FROM agent_memory.co_occurs_with \
              WHERE tenant_id = ? ALLOW FILTERING",
-            query_values!(tid),
+            (tid,),
         )
         .await
         .expect("tenant filter");
-    let tenant_rows = r_tenant
-        .response_body()
-        .unwrap()
-        .into_rows()
-        .unwrap_or_default()
-        .len();
+    let tenant_rows = r_tenant.rows_or_empty().len();
     eprintln!("  WHERE tenant_id (indexed): {tenant_rows} rows");
 
     // Query 2: secondary indexes on both columns
+    #[allow(deprecated)]
     let r_both = s
-        .query_with_values(
+        .query_unpaged(
             "SELECT entity_a FROM agent_memory.co_occurs_with \
              WHERE session_id = ? AND tenant_id = ? ALLOW FILTERING",
-            query_values!(sid, tid),
+            (sid, tid),
         )
         .await
         .expect("session+tenant filter");
-    let both_rows = r_both
-        .response_body()
-        .unwrap()
-        .into_rows()
-        .unwrap_or_default()
-        .len();
+    let both_rows = r_both.rows_or_empty().len();
     eprintln!("  WHERE session_id + tenant_id (both indexed): {both_rows} rows");
 
     // BUG: tenant_id-only query returns first page (~3500 rows) instead of all
@@ -316,26 +302,30 @@ async fn open_secondary_index_paging() {
 #[tokio::test]
 #[ignore]
 async fn open_phonetic_match() {
-    let s = connect!();
-    s.query(
+    let s = connect_plain("127.0.0.1:19042").await;
+    #[allow(deprecated)]
+    s.query_unpaged(
         "INSERT INTO agent_memory.entity_store \
          (tenant_id, session_id, entity_id, entity_name, entity_type, context_snippet, confidence, created_at) \
          VALUES (550e8400-e29b-41d4-a716-446655440000, d855258d-c5b7-41be-bf28-e8cfa0fc6b9e, \
                  11111111-1111-1111-1111-111111111111, 'John Smith', 'person', 'test', 0.9, 1711036800000)",
+        (),
     )
     .await
     .expect("INSERT");
 
-    let envelope = s
-        .query(
+    #[allow(deprecated)]
+    let result = s
+        .query_unpaged(
             "SELECT entity_name FROM agent_memory.entity_store \
              WHERE tenant_id = 550e8400-e29b-41d4-a716-446655440000 \
              AND session_id = d855258d-c5b7-41be-bf28-e8cfa0fc6b9e \
              AND entity_name = 'Jon Smyth'",
+            (),
         )
         .await
         .expect("phonetic query");
-    let rows = envelope.response_body().unwrap().into_rows().unwrap();
+    let rows = result.rows_or_empty();
     assert!(
         !rows.is_empty(),
         "phonetic match should find 'John Smith' for 'Jon Smyth'"
@@ -358,7 +348,6 @@ async fn ghost_rows_do_not_crash_queries() {
     use ferrosa_memory_core::cql_storage::CqlStorage;
     use ferrosa_memory_core::storage::Storage;
     use ferrosa_memory_core::types::TenantContext;
-    use uuid::Uuid;
 
     let config = FerrosaCqlConfig {
         contact_points: vec!["localhost:19042".into()],
@@ -388,72 +377,76 @@ async fn ghost_rows_do_not_crash_queries() {
     // Insert a valid entity
     let valid_id = Uuid::new_v4();
     let session = storage.session();
+    let inserted_at = chrono::Utc::now();
+    #[allow(deprecated)]
     session
-        .query_with_values(
+        .query_unpaged(
             "INSERT INTO agent_memory.entity_store \
              (tenant_id, session_id, entity_id, entity_name, entity_type, \
               context_snippet, confidence, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, toTimestamp(now()))"
-                .to_string(),
-            query_values!(
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
                 tenant_id,
                 session_id,
                 valid_id,
                 "valid-entity".to_string(),
                 "concept".to_string(),
                 "a real entity".to_string(),
-                1.0_f32
+                1.0_f32,
+                inserted_at,
             ),
         )
         .await
         .expect("insert valid entity");
 
     // Insert a ghost entity row (NULL entity_name via incomplete insert)
+    #[allow(deprecated)]
     session
-        .query_with_values(
+        .query_unpaged(
             "INSERT INTO agent_memory.entity_store \
              (tenant_id, session_id, entity_id, confidence, created_at) \
-             VALUES (?, ?, ?, ?, toTimestamp(now()))"
-                .to_string(),
-            query_values!(tenant_id, session_id, Uuid::new_v4(), 0.5_f32),
+             VALUES (?, ?, ?, ?, ?)",
+            (tenant_id, session_id, Uuid::new_v4(), 0.5_f32, inserted_at),
         )
         .await
         .expect("insert ghost entity");
 
     // Insert a valid typed edge
+    #[allow(deprecated)]
     session
-        .query_with_values(
+        .query_unpaged(
             "INSERT INTO agent_memory.typed_edges \
              (tenant_id, session_id, src_id, edge_type, dst_id, weight, metadata, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, toTimestamp(now()))"
-                .to_string(),
-            query_values!(
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
                 tenant_id,
                 session_id,
                 valid_id,
                 "contains".to_string(),
                 Uuid::new_v4(),
                 0.9_f64,
-                "".to_string()
+                "".to_string(),
+                inserted_at,
             ),
         )
         .await
         .expect("insert valid edge");
 
     // Insert a ghost typed edge (NULL edge_type)
+    #[allow(deprecated)]
     session
-        .query_with_values(
+        .query_unpaged(
             "INSERT INTO agent_memory.typed_edges \
              (tenant_id, session_id, src_id, edge_type, dst_id, weight, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, toTimestamp(now()))"
-                .to_string(),
-            query_values!(
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
                 tenant_id,
                 session_id,
                 Uuid::new_v4(),
                 "".to_string(),
                 Uuid::new_v4(),
-                0.0_f64
+                0.0_f64,
+                inserted_at,
             ),
         )
         .await
@@ -494,10 +487,22 @@ async fn ghost_rows_do_not_crash_queries() {
     assert_eq!(edges[0].edge_type, "contains");
 
     // Cleanup
-    let _ = session.query(format!(
-        "DELETE FROM agent_memory.entity_store WHERE tenant_id = {tenant_id} AND session_id = {session_id}"
-    )).await;
-    let _ = session.query(format!(
-        "DELETE FROM agent_memory.typed_edges WHERE tenant_id = {tenant_id} AND session_id = {session_id}"
-    )).await;
+    #[allow(deprecated)]
+    let _ = session
+        .query_unpaged(
+            format!(
+                "DELETE FROM agent_memory.entity_store WHERE tenant_id = {tenant_id} AND session_id = {session_id}"
+            ),
+            (),
+        )
+        .await;
+    #[allow(deprecated)]
+    let _ = session
+        .query_unpaged(
+            format!(
+                "DELETE FROM agent_memory.typed_edges WHERE tenant_id = {tenant_id} AND session_id = {session_id}"
+            ),
+            (),
+        )
+        .await;
 }
