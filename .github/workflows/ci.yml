@@ -413,7 +413,7 @@ jobs:
         # `session.query_unpaged`. Verified locally: all 28 fmem DDL
         # files apply end-to-end ("migrations completed").
         run: |
-          cargo run --bin migrate -- \
+          timeout 180s cargo run --bin migrate -- \
             --contact-points 127.0.0.1:19042 \
             --keyspace agent_memory \
             --ddl-dir ddl
@@ -423,7 +423,9 @@ jobs:
           for port in 19043 19044; do
             echo "Waiting for keyspace propagation on port ${port}..."
             for i in $(seq 1 30); do
-              if cargo run --quiet --bin migrate -- \
+              # Keep each probe bounded. A wedged peer must fail this attempt
+              # and surface diagnostics instead of hanging the cluster job.
+              if timeout 20s cargo run --quiet --bin migrate -- \
                   --contact-points 127.0.0.1:${port} \
                   --keyspace agent_memory \
                   --ddl-dir ddl >/dev/null 2>&1; then
@@ -431,7 +433,7 @@ jobs:
                 break
               fi
               if [ "$i" -eq 30 ]; then
-                echo "::error::Schema not visible on port ${port} within 60s"
+                echo "::error::Schema not visible on port ${port} within bounded retries"
                 docker compose -f /tmp/docker-compose.memory-ci.yml logs 2>/dev/null | tail -100
                 exit 1
               fi
@@ -460,7 +462,7 @@ jobs:
   ci-pass:
     name: CI Pass
     runs-on: ubuntu-latest
-    needs: [fmt-lint, build, test-coverage, complexity, docs, python-harness]
+    needs: [fmt-lint, build, test-coverage, complexity, docs, python-harness, cluster-integration]
     if: always()
     steps:
       - name: Check all jobs passed
@@ -470,7 +472,8 @@ jobs:
              [ "${{ needs.test-coverage.result }}" != "success" ] || \
              [ "${{ needs.complexity.result }}" != "success" ] || \
              [ "${{ needs.docs.result }}" != "success" ] || \
-             [ "${{ needs.python-harness.result }}" != "success" ]; then
+             [ "${{ needs.python-harness.result }}" != "success" ] || \
+             [ "${{ needs.cluster-integration.result }}" != "success" ]; then
             echo "::error::One or more CI stages failed"
             exit 1
           fi
