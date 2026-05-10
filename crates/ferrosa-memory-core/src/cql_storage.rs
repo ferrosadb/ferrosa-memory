@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use futures_util::StreamExt;
 use scylla::frame::response::cql_to_rust::FromCqlVal;
 use scylla::frame::response::result::{CqlValue, Row};
 use scylla::prepared_statement::PreparedStatement;
@@ -78,6 +79,29 @@ fn sprint1_seed_insert_statements(ks: &str) -> (String, String) {
          VALUES (?, ?, ?, ?, ?)"
     );
     (entity_q, edge_q)
+}
+
+fn entity_list_all_query(ks: &str) -> String {
+    format!(
+        "SELECT entity_id, session_id, entity_name, entity_type, source_fold_id, \
+         confidence, state, created_at, description, tags, properties, content_hash, \
+         updated_at, scope, ingested_by_session \
+         FROM {ks}.entity_store WHERE tenant_id = ? ALLOW FILTERING"
+    )
+}
+
+fn edge_count_query(ks: &str, table: &str) -> anyhow::Result<String> {
+    let count_column = match table {
+        "co_occurs_with" => "entity_a",
+        "mentioned_in" => "entity_id",
+        "folded_into" => "source_fold_id",
+        "supersedes" => "new_event_id",
+        "typed_edges" => "src_id",
+        other => anyhow::bail!("unsupported edge table for count: {other}"),
+    };
+    Ok(format!(
+        "SELECT {count_column} FROM {ks}.{table} WHERE tenant_id = ? ALLOW FILTERING"
+    ))
 }
 
 /// Execute a SELECT or DML and return `(col_map, rows)`.
@@ -324,6 +348,58 @@ fn extract_rich_entity_fields(
     )
 }
 
+fn row_to_entity_entry(
+    ctx: &TenantContext,
+    row: &Row,
+    col_map: &ColMap,
+) -> anyhow::Result<EntityEntry> {
+    let created = cql_get::<chrono::DateTime<chrono::Utc>>(row, col_map, "created_at")
+        .unwrap_or_else(|e| {
+            tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
+            Default::default()
+        });
+    let state = cql_get::<String>(row, col_map, "state")
+        .ok()
+        .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
+        .unwrap_or_default();
+    let (
+        description,
+        description_embedding,
+        tags,
+        properties,
+        content_hash,
+        updated_at,
+        scope,
+        ingested_by_session,
+    ) = extract_rich_entity_fields(row, col_map);
+    Ok(EntityEntry {
+        tenant_id: ctx.tenant_id,
+        entity_id: cql_get(row, col_map, "entity_id")?,
+        session_id: cql_get(row, col_map, "session_id")?,
+        entity_name: cql_get(row, col_map, "entity_name")?,
+        entity_type: cql_get(row, col_map, "entity_type")?,
+        source_fold_id: cql_get::<Uuid>(row, col_map, "source_fold_id").ok(),
+        context_snippet: cql_get(row, col_map, "context_snippet").unwrap_or_default(),
+        entity_embedding: cql_get::<Vec<u8>>(row, col_map, "entity_embedding")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(|v| crate::vector::decode_vector(&v)),
+        confidence: cql_get::<f32>(row, col_map, "confidence")
+            .map(f64::from)
+            .unwrap_or(1.0),
+        state,
+        created_at: created,
+        description,
+        description_embedding,
+        tags,
+        properties,
+        content_hash,
+        updated_at,
+        scope,
+        ingested_by_session,
+    })
+}
+
 /// Type alias for the scylla legacy session used throughout this crate.
 ///
 /// `LegacySession` provides `execute_unpaged` / `query_unpaged` that return
@@ -563,15 +639,7 @@ impl CqlStorage {
                      FROM {ks}.entity_store WHERE tenant_id = ? AND session_id = ?"
                 ))
                 .await?,
-            entity_list_all: session
-                .prepare(format!(
-                    "SELECT entity_id, session_id, entity_name, entity_type, source_fold_id, \
-                     context_snippet, entity_embedding, confidence, state, created_at, \
-                     description, tags, properties, content_hash, \
-                     updated_at, scope, ingested_by_session \
-                     FROM {ks}.entity_store WHERE tenant_id = ? ALLOW FILTERING"
-                ))
-                .await?,
+            entity_list_all: session.prepare(entity_list_all_query(ks)).await?,
             entity_update_state: session
                 .prepare(format!(
                     "UPDATE {ks}.entity_store SET state = ? \
@@ -1051,34 +1119,6 @@ impl CqlStorage {
         let col_map = build_col_map(result.col_specs());
         let rows = result.rows_or_empty();
         Ok((col_map, rows))
-    }
-
-    async fn query_count_allow_filtering(
-        &self,
-        table: &str,
-        ctx: &TenantContext,
-    ) -> anyhow::Result<usize> {
-        let query = format!(
-            "SELECT COUNT(*) FROM {}.{} WHERE tenant_id = ? ALLOW FILTERING",
-            self.keyspace, table
-        );
-        #[allow(deprecated)]
-        let result = self
-            .session
-            .query_unpaged(query.clone(), (ctx.tenant_id,))
-            .await?;
-        let col_map = build_col_map(result.col_specs());
-        let rows = result.rows_or_empty();
-        let Some(row) = rows.first() else {
-            return Ok(0);
-        };
-        if let Ok(count) = cql_get::<i64>(row, &col_map, "count") {
-            return Ok(count as usize);
-        }
-        if let Ok(count) = cql_get::<i64>(row, &col_map, "system.count") {
-            return Ok(count as usize);
-        }
-        anyhow::bail!("COUNT(*) response for {table} did not expose a readable count column");
     }
 
     /// Update only the entity embedding + updated_at for an existing row.
@@ -2264,53 +2304,54 @@ impl Storage for CqlStorage {
 
         let mut results = Vec::with_capacity(rows.len());
         for row in rows {
-            let created = cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
-                .unwrap_or_else(|e| {
-                    tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
-                    Default::default()
-                });
-            let state = cql_get::<String>(&row, &col_map, "state")
-                .ok()
-                .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
-                .unwrap_or_default();
-            let (
-                description,
-                description_embedding,
-                tags,
-                properties,
-                content_hash,
-                updated_at,
-                scope,
-                ingested_by_session,
-            ) = extract_rich_entity_fields(&row, &col_map);
-            results.push(EntityEntry {
-                tenant_id: ctx.tenant_id,
-                entity_id: cql_get(&row, &col_map, "entity_id")?,
-                session_id: cql_get(&row, &col_map, "session_id")?,
-                entity_name: cql_get(&row, &col_map, "entity_name")?,
-                entity_type: cql_get(&row, &col_map, "entity_type")?,
-                source_fold_id: cql_get::<Uuid>(&row, &col_map, "source_fold_id").ok(),
-                context_snippet: cql_get(&row, &col_map, "context_snippet")?,
-                entity_embedding: cql_get::<Vec<u8>>(&row, &col_map, "entity_embedding")
-                    .ok()
-                    .filter(|v| !v.is_empty())
-                    .map(|v| crate::vector::decode_vector(&v)),
-                confidence: cql_get::<f32>(&row, &col_map, "confidence")
-                    .map(f64::from)
-                    .unwrap_or(1.0),
-                state,
-                created_at: created,
-                description,
-                description_embedding,
-                tags,
-                properties,
-                content_hash,
-                updated_at,
-                scope,
-                ingested_by_session,
-            });
+            results.push(row_to_entity_entry(ctx, &row, &col_map)?);
         }
         Ok(results)
+    }
+
+    async fn entity_stream_all(
+        &self,
+        ctx: TenantContext,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<EntityEntry>>>,
+    ) {
+        let chunk_size = chunk_size.max(1);
+        let mut iter = match self
+            .session
+            .execute_iter(self.stmts.entity_list_all.clone(), (ctx.tenant_id,))
+            .await
+        {
+            Ok(iter) => iter,
+            Err(e) => {
+                let _ = tx.send(Err(e.into())).await;
+                return;
+            }
+        };
+        let col_map = build_col_map(iter.get_column_specs());
+        let mut chunk = Vec::with_capacity(chunk_size);
+        while let Some(row) = iter.next().await {
+            match row
+                .map_err(anyhow::Error::from)
+                .and_then(|row| row_to_entity_entry(&ctx, &row, &col_map))
+            {
+                Ok(entry) => {
+                    chunk.push(entry);
+                    if chunk.len() >= chunk_size {
+                        let out = std::mem::take(&mut chunk);
+                        if tx.send(Ok(out)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            }
+        }
+        if !chunk.is_empty() {
+            let _ = tx.send(Ok(chunk)).await;
+        }
     }
 
     async fn fold_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<FoldEntry>> {
@@ -2649,7 +2690,10 @@ impl Storage for CqlStorage {
             "supersedes",
             "typed_edges",
         ] {
-            total += self.query_count_allow_filtering(table, ctx).await?;
+            let query = edge_count_query(&self.keyspace, table)?;
+            #[allow(deprecated)]
+            let result = self.session.query_unpaged(query, (ctx.tenant_id,)).await?;
+            total += result.rows_or_empty().len();
         }
         Ok(total)
     }
@@ -2880,6 +2924,69 @@ impl Storage for CqlStorage {
         } // end for
 
         Ok(edges)
+    }
+
+    async fn edge_stream_all(
+        &self,
+        ctx: TenantContext,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<(Uuid, Uuid, String)>>>,
+    ) {
+        let chunk_size = chunk_size.max(1);
+        let queries: &[(&str, &str, &str, &str)] = &[
+            ("co_occurs_with", "entity_a", "entity_b", "CO_OCCURS"),
+            ("mentioned_in", "entity_id", "fold_id", "MENTIONED_IN"),
+            (
+                "folded_into",
+                "source_fold_id",
+                "target_fold_id",
+                "FOLDED_INTO",
+            ),
+            ("supersedes", "new_event_id", "old_event_id", "SUPERSEDES"),
+        ];
+
+        for &(table, src_col, tgt_col, edge_type) in queries {
+            let query = format!(
+                "SELECT {src_col}, {tgt_col} FROM {}.{table} WHERE tenant_id = ? ALLOW FILTERING",
+                self.keyspace
+            );
+            let mut iter = match self.session.query_iter(query, (ctx.tenant_id,)).await {
+                Ok(iter) => iter,
+                Err(e) => {
+                    let _ = tx.send(Err(e.into())).await;
+                    return;
+                }
+            };
+            let col_map = build_col_map(iter.get_column_specs());
+            let mut chunk = Vec::with_capacity(chunk_size);
+            while let Some(row) = iter.next().await {
+                match row.map_err(anyhow::Error::from).and_then(|row| {
+                    let src = cql_get::<Uuid>(&row, &col_map, src_col)?;
+                    let tgt = cql_get::<Uuid>(&row, &col_map, tgt_col)?;
+                    Ok((src, tgt, edge_type.to_string()))
+                }) {
+                    Ok(edge) => {
+                        chunk.push(edge);
+                        if chunk.len() >= chunk_size {
+                            let out = std::mem::take(&mut chunk);
+                            if tx.send(Ok(out)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                }
+            }
+            if !chunk.is_empty() {
+                let out = std::mem::take(&mut chunk);
+                if tx.send(Ok(out)).await.is_err() {
+                    return;
+                }
+            }
+        }
     }
 
     async fn edge_list_for_entity(
@@ -4181,6 +4288,72 @@ impl Storage for CqlStorage {
         Ok(edges)
     }
 
+    async fn typed_edge_stream_all(
+        &self,
+        ctx: TenantContext,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<TypedEdge>>>,
+    ) {
+        let chunk_size = chunk_size.max(1);
+        let query = format!(
+            "SELECT src_id, edge_type, dst_id, weight, metadata, created_at, session_id \
+             FROM {}.typed_edges WHERE tenant_id = ? ALLOW FILTERING",
+            self.keyspace
+        );
+        let mut iter = match self.session.query_iter(query, (ctx.tenant_id,)).await {
+            Ok(iter) => iter,
+            Err(e) => {
+                let _ = tx.send(Err(e.into())).await;
+                return;
+            }
+        };
+        let col_map = build_col_map(iter.get_column_specs());
+        let mut chunk = Vec::with_capacity(chunk_size);
+        while let Some(row) = iter.next().await {
+            match row.map_err(anyhow::Error::from).and_then(|row| {
+                let src_id = cql_get::<Uuid>(&row, &col_map, "src_id")?;
+                let dst_id = cql_get::<Uuid>(&row, &col_map, "dst_id")?;
+                let edge_type = cql_get::<String>(&row, &col_map, "edge_type").unwrap_or_default();
+                if edge_type.is_empty() {
+                    anyhow::bail!("typed edge row has empty edge_type");
+                }
+                let session_id =
+                    cql_get::<Uuid>(&row, &col_map, "session_id").unwrap_or(Uuid::nil());
+                let created_at =
+                    cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
+                        .unwrap_or_default();
+                Ok(TypedEdge {
+                    tenant_id: ctx.tenant_id,
+                    session_id,
+                    src_id,
+                    edge_type,
+                    dst_id,
+                    weight: cql_get::<f64>(&row, &col_map, "weight").unwrap_or(1.0),
+                    metadata: cql_get::<String>(&row, &col_map, "metadata")
+                        .ok()
+                        .filter(|s| !s.is_empty()),
+                    created_at,
+                })
+            }) {
+                Ok(edge) => {
+                    chunk.push(edge);
+                    if chunk.len() >= chunk_size {
+                        let out = std::mem::take(&mut chunk);
+                        if tx.send(Ok(out)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "typed_edge_stream_all skipped malformed row");
+                }
+            }
+        }
+        if !chunk.is_empty() {
+            let _ = tx.send(Ok(chunk)).await;
+        }
+    }
+
     async fn typed_edge_list_from(
         &self,
         ctx: &TenantContext,
@@ -4600,6 +4773,24 @@ mod cql_storage_tests {
         assert!(
             !entity_q.contains("now()") && !edge_q.contains("now()"),
             "seed queries must not rely on Ferrosa CQL now() coercion"
+        );
+    }
+
+    #[test]
+    fn entity_list_all_query_avoids_large_blob_columns_during_allow_filtering_scan() {
+        let query = entity_list_all_query("agent_memory");
+
+        assert!(
+            query.contains("FROM agent_memory.entity_store WHERE tenant_id = ? ALLOW FILTERING"),
+            "regression guard should cover tenant-wide ALLOW FILTERING scan: {query}"
+        );
+        assert!(
+            !query.contains("context_snippet"),
+            "tenant-wide entity scans must not fetch multi-KB context snippets: {query}"
+        );
+        assert!(
+            !query.contains("entity_embedding"),
+            "tenant-wide entity scans must not fetch vector blobs: {query}"
         );
     }
 

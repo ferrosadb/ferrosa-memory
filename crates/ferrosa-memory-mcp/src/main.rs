@@ -180,6 +180,7 @@ fn is_connection_error(err: impl std::fmt::Display) -> bool {
         || msg.contains("channel closed")
         || msg.contains("io error")
         || msg.contains("timed out")
+        || msg.contains("read timeout")
         || msg.contains("not connected")
         || msg.contains("eof")
         // Stale prepared statements after node restart — need full reconnect
@@ -568,6 +569,21 @@ impl Storage for ReconnectingStorage {
         delegate!(self, entity_list_all, ctx)
     }
 
+    async fn entity_stream_all(
+        &self,
+        ctx: TenantContext,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<EntityEntry>>>,
+    ) {
+        let guard = self.inner.read().await;
+        match guard.as_ref() {
+            Some(cql) => cql.entity_stream_all(ctx, chunk_size, tx).await,
+            None => {
+                let _ = tx.send(Err(anyhow::anyhow!(NOT_CONNECTED_MSG))).await;
+            }
+        }
+    }
+
     async fn fold_list_all(
         &self,
         ctx: &TenantContext,
@@ -728,6 +744,21 @@ impl Storage for ReconnectingStorage {
         ctx: &TenantContext,
     ) -> anyhow::Result<Vec<(uuid::Uuid, uuid::Uuid, String)>> {
         delegate!(self, edge_list_all, ctx)
+    }
+
+    async fn edge_stream_all(
+        &self,
+        ctx: TenantContext,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<(uuid::Uuid, uuid::Uuid, String)>>>,
+    ) {
+        let guard = self.inner.read().await;
+        match guard.as_ref() {
+            Some(cql) => cql.edge_stream_all(ctx, chunk_size, tx).await,
+            None => {
+                let _ = tx.send(Err(anyhow::anyhow!(NOT_CONNECTED_MSG))).await;
+            }
+        }
     }
 
     async fn edge_list_for_entity(
@@ -1238,6 +1269,21 @@ impl Storage for ReconnectingStorage {
 
     async fn typed_edge_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<TypedEdge>> {
         delegate!(self, typed_edge_list_all, ctx)
+    }
+
+    async fn typed_edge_stream_all(
+        &self,
+        ctx: TenantContext,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<TypedEdge>>>,
+    ) {
+        let guard = self.inner.read().await;
+        match guard.as_ref() {
+            Some(cql) => cql.typed_edge_stream_all(ctx, chunk_size, tx).await,
+            None => {
+                let _ = tx.send(Err(anyhow::anyhow!(NOT_CONNECTED_MSG))).await;
+            }
+        }
     }
 
     async fn typed_edge_list_from(
@@ -2101,6 +2147,14 @@ mod tests {
     #[test]
     fn is_connection_error_timed_out() {
         let err = anyhow::anyhow!("Request timed out");
+        assert!(is_connection_error(&err));
+    }
+
+    #[test]
+    fn is_connection_error_read_timeout() {
+        let err = anyhow::anyhow!(
+            "server error: storage error: invalid data: cluster: read timeout: CL=LOCAL_QUORUM, received=1, required=2, data_present=true"
+        );
         assert!(is_connection_error(&err));
     }
 

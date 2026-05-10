@@ -228,6 +228,35 @@ pub trait Storage: Send + Sync {
         ctx: &TenantContext,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<EntityEntry>>> + Send;
 
+    /// Stream all entities for a tenant in bounded chunks.
+    ///
+    /// The default implementation preserves compatibility for non-CQL test
+    /// backends by chunking `entity_list_all()`. CQL storage overrides this
+    /// with a paged driver iterator so tenant-wide viz SELECT rows can flow to
+    /// the websocket without waiting for a full in-memory result set first.
+    fn entity_stream_all(
+        &self,
+        ctx: TenantContext,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<EntityEntry>>>,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        async move {
+            let chunk_size = chunk_size.max(1);
+            match self.entity_list_all(&ctx).await {
+                Ok(entities) => {
+                    for chunk in entities.chunks(chunk_size) {
+                        if tx.send(Ok(chunk.to_vec())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                }
+            }
+        }
+    }
+
     /// List all folds for a tenant (sync/export use only — uses ALLOW FILTERING).
     fn fold_list_all(
         &self,
@@ -377,6 +406,33 @@ pub trait Storage: Send + Sync {
         &self,
         ctx: &TenantContext,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<(Uuid, Uuid, String)>>> + Send;
+
+    /// Stream all graph edges for a tenant in bounded chunks.
+    ///
+    /// The default implementation chunks `edge_list_all()` for in-memory test
+    /// backends. CQL storage overrides this with paged driver iteration.
+    fn edge_stream_all(
+        &self,
+        ctx: TenantContext,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<(Uuid, Uuid, String)>>>,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        async move {
+            let chunk_size = chunk_size.max(1);
+            match self.edge_list_all(&ctx).await {
+                Ok(edges) => {
+                    for chunk in edges.chunks(chunk_size) {
+                        if tx.send(Ok(chunk.to_vec())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                }
+            }
+        }
+    }
 
     /// List all neighbors of an entity as (neighbor_id, edge_type) pairs.
     ///
@@ -710,6 +766,33 @@ pub trait Storage: Send + Sync {
         &self,
         ctx: &TenantContext,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<TypedEdge>>> + Send;
+
+    /// Stream all typed edges for a tenant in bounded chunks.
+    ///
+    /// The default implementation chunks `typed_edge_list_all()` for in-memory
+    /// test backends. CQL storage overrides this with paged driver iteration.
+    fn typed_edge_stream_all(
+        &self,
+        ctx: TenantContext,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<TypedEdge>>>,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        async move {
+            let chunk_size = chunk_size.max(1);
+            match self.typed_edge_list_all(&ctx).await {
+                Ok(edges) => {
+                    for chunk in edges.chunks(chunk_size) {
+                        if tx.send(Ok(chunk.to_vec())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                }
+            }
+        }
+    }
 
     /// List typed edges from a specific source entity.
     fn typed_edge_list_from(

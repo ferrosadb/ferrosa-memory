@@ -1885,9 +1885,15 @@ async fn handle_viz_connection<S: crate::storage::Storage + 'static>(
             )
             .await;
 
-            let snapshot =
-                build_snapshot(&*storage, &ctx, effective_session, VizSnapshotScope::All).await;
-            handle_viz_ws(ws_stream, event_bus, snapshot).await;
+            handle_viz_ws(
+                ws_stream,
+                event_bus,
+                &*storage,
+                (*ctx).clone(),
+                effective_session,
+                VizSnapshotScope::All,
+            )
+            .await;
         }
         _ => {
             let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
@@ -1904,166 +1910,435 @@ async fn handle_viz_connection<S: crate::storage::Storage + 'static>(
 /// listens for both event bus broadcasts and client drill-down messages.
 /// The full flat node/edge data is kept in memory so drill-down requests
 /// can be served without re-querying storage.
-async fn handle_viz_ws(
+async fn handle_viz_ws<S: Storage>(
     ws_stream: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     event_bus: Arc<EventBus>,
-    snapshot: VizEvent,
+    storage: &S,
+    ctx: TenantContext,
+    session_id: Uuid,
+    scope: VizSnapshotScope,
 ) {
     use futures_util::StreamExt;
 
+    const VIZ_CHUNK_SIZE: usize = 500;
+
     let (mut write, mut read) = futures_util::StreamExt::split(ws_stream);
 
-    // Extract the full flat data from the snapshot for clustering.
-    let (full_nodes, full_edges) = match &snapshot {
-        VizEvent::Snapshot { nodes, edges, .. } => (nodes.clone(), edges.clone()),
-        _ => (vec![], vec![]),
-    };
+    async fn send_viz_event(
+        write: &mut futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+            Message,
+        >,
+        event: &VizEvent,
+    ) -> bool {
+        let json = match serde_json::to_string(event) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!("viz: failed to serialize event: {e}");
+                return false;
+            }
+        };
+        write.send(Message::Text(json)).await.is_ok()
+    }
 
-    // Track navigation state for drill_up support.
-    let mut nav_stack: Vec<(viz::VizLevel, Option<String>)> = Vec::new();
-    let mut current_level = viz::VizLevel::Crate;
-    let mut current_parent: Option<String> = None;
-
-    // Default to clustered overview when graph is large (>2000 nodes).
-    let large_graph = full_nodes.len() > 2000;
-
-    // Send initial snapshot — clustered for large graphs, flat for small.
-    let initial = if large_graph {
-        current_level = viz::VizLevel::Crate;
-        cluster_snapshot(&full_nodes, &full_edges, &viz::VizLevel::Crate, None)
-    } else {
-        snapshot
-    };
-    if let Ok(json) = serde_json::to_string(&initial)
-        && write.send(Message::Text(json)).await.is_err()
+    if !send_viz_event(
+        &mut write,
+        &VizEvent::SnapshotStreamStart {
+            level: None,
+            parent: None,
+        },
+    )
+    .await
     {
         return;
     }
 
-    // Subscribe to incremental events (after snapshot to avoid race)
+    let mut full_nodes: Vec<viz::VizNode> = Vec::new();
+    let mut node_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    match scope {
+        VizSnapshotScope::All => {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            let producer = storage.entity_stream_all(ctx.clone(), VIZ_CHUNK_SIZE, tx);
+            tokio::pin!(producer);
+            let mut producer_done = false;
+            loop {
+                tokio::select! {
+                    _ = &mut producer, if !producer_done => {
+                        producer_done = true;
+                    }
+                    chunk = rx.recv() => {
+                        match chunk {
+                            Some(Ok(entities)) => {
+                                let nodes: Vec<_> = entities.iter().map(viz::entity_to_viz_node).collect();
+                                for node in &nodes {
+                                    node_ids.insert(node.id.clone());
+                                }
+                                full_nodes.extend(nodes.iter().cloned());
+                                if !nodes.is_empty()
+                                    && !send_viz_event(&mut write, &VizEvent::SnapshotStreamChunk { nodes, edges: Vec::new() }).await
+                                {
+                                    return;
+                                }
+                            }
+                            Some(Err(e)) => {
+                                tracing::warn!("viz: failed to stream entities for snapshot: {e}");
+                                break;
+                            }
+                            None if producer_done => break,
+                            None => {}
+                        }
+                    }
+                }
+                if producer_done && rx.is_empty() {
+                    break;
+                }
+            }
+        }
+        VizSnapshotScope::SessionOnly | VizSnapshotScope::GlobalOnly => {
+            let entities_result = match scope {
+                VizSnapshotScope::SessionOnly => {
+                    storage.entity_list_session(&ctx, session_id).await
+                }
+                VizSnapshotScope::GlobalOnly => {
+                    let global = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
+                    storage.entity_list_session(&ctx, global).await
+                }
+                VizSnapshotScope::All => unreachable!(),
+            };
+            match entities_result {
+                Ok(entities) => {
+                    for chunk in entities.chunks(VIZ_CHUNK_SIZE) {
+                        let nodes: Vec<_> = chunk.iter().map(viz::entity_to_viz_node).collect();
+                        for node in &nodes {
+                            node_ids.insert(node.id.clone());
+                        }
+                        full_nodes.extend(nodes.iter().cloned());
+                        if !nodes.is_empty()
+                            && !send_viz_event(
+                                &mut write,
+                                &VizEvent::SnapshotStreamChunk {
+                                    nodes,
+                                    edges: Vec::new(),
+                                },
+                            )
+                            .await
+                        {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("viz: failed to load scoped entities for snapshot stream: {e}")
+                }
+            }
+        }
+    }
+
+    match storage.fold_list_all(&ctx).await {
+        Ok(folds) => {
+            for chunk in folds.chunks(VIZ_CHUNK_SIZE) {
+                let nodes: Vec<_> = chunk.iter().map(viz::fold_to_viz_node).collect();
+                for node in &nodes {
+                    node_ids.insert(node.id.clone());
+                }
+                full_nodes.extend(nodes.iter().cloned());
+                if !nodes.is_empty()
+                    && !send_viz_event(
+                        &mut write,
+                        &VizEvent::SnapshotStreamChunk {
+                            nodes,
+                            edges: Vec::new(),
+                        },
+                    )
+                    .await
+                {
+                    return;
+                }
+            }
+        }
+        Err(e) => tracing::warn!("viz: failed to load folds for snapshot stream: {e}"),
+    }
+
+    let mut full_edges: Vec<VizEdge> = Vec::new();
+    let swapped_ctx = TenantContext {
+        tenant_id: session_id,
+        session_origin: ctx.session_origin.clone(),
+    };
+    let mut edge_chunk = Vec::with_capacity(VIZ_CHUNK_SIZE);
+
+    for stream_ctx in [swapped_ctx.clone(), ctx.clone()] {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let producer = storage.edge_stream_all(stream_ctx.clone(), VIZ_CHUNK_SIZE, tx);
+        tokio::pin!(producer);
+        let mut producer_done = false;
+        loop {
+            tokio::select! {
+                _ = &mut producer, if !producer_done => {
+                    producer_done = true;
+                }
+                chunk = rx.recv() => {
+                    match chunk {
+                        Some(Ok(raw_edges)) => {
+                            for (src, tgt, etype) in raw_edges {
+                                let src_s = src.to_string();
+                                let tgt_s = tgt.to_string();
+                                if node_ids.contains(&src_s) && node_ids.contains(&tgt_s) {
+                                    let mut edge = VizEdge {
+                                        source: src_s,
+                                        target: tgt_s,
+                                        edge_type: etype,
+                                        strength: None,
+                                    };
+                                    if edge.edge_type == "CO_OCCURS" {
+                                        edge.strength = Some(0.5);
+                                    }
+                                    full_edges.push(edge.clone());
+                                    edge_chunk.push(edge);
+                                    if edge_chunk.len() >= VIZ_CHUNK_SIZE {
+                                        let edges = std::mem::take(&mut edge_chunk);
+                                        if !send_viz_event(
+                                            &mut write,
+                                            &VizEvent::SnapshotStreamChunk {
+                                                nodes: Vec::new(),
+                                                edges,
+                                            },
+                                        )
+                                        .await
+                                        {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Some(Err(e)) => {
+                            tracing::warn!(error = %e, tenant_id = %stream_ctx.tenant_id, "viz: edge_stream_all failed");
+                            break;
+                        }
+                        None if producer_done => break,
+                        None => {}
+                    }
+                }
+            }
+            if producer_done && rx.is_empty() {
+                break;
+            }
+        }
+    }
+
+    match scope {
+        VizSnapshotScope::All => {
+            for stream_ctx in [ctx.clone(), swapped_ctx.clone()] {
+                let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+                let producer =
+                    storage.typed_edge_stream_all(stream_ctx.clone(), VIZ_CHUNK_SIZE, tx);
+                tokio::pin!(producer);
+                let mut producer_done = false;
+                loop {
+                    tokio::select! {
+                        _ = &mut producer, if !producer_done => {
+                            producer_done = true;
+                        }
+                        chunk = rx.recv() => {
+                            match chunk {
+                                Some(Ok(typed_edges)) => {
+                                    for te in typed_edges {
+                                        let src_s = te.src_id.to_string();
+                                        let dst_s = te.dst_id.to_string();
+                                        if node_ids.contains(&src_s) && node_ids.contains(&dst_s) {
+                                            let edge = VizEdge {
+                                                source: src_s,
+                                                target: dst_s,
+                                                edge_type: te.edge_type,
+                                                strength: Some(te.weight as f32),
+                                            };
+                                            full_edges.push(edge.clone());
+                                            edge_chunk.push(edge);
+                                            if edge_chunk.len() >= VIZ_CHUNK_SIZE {
+                                                let edges = std::mem::take(&mut edge_chunk);
+                                                if !send_viz_event(
+                                                    &mut write,
+                                                    &VizEvent::SnapshotStreamChunk {
+                                                        nodes: Vec::new(),
+                                                        edges,
+                                                    },
+                                                )
+                                                .await
+                                                {
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Some(Err(e)) => {
+                                    tracing::warn!(error = %e, tenant_id = %stream_ctx.tenant_id, "viz: typed_edge_stream_all failed");
+                                    break;
+                                }
+                                None if producer_done => break,
+                                None => {}
+                            }
+                        }
+                    }
+                    if producer_done && rx.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+        _ => {
+            let mut probe = vec![session_id, Uuid::nil()];
+            if matches!(scope, VizSnapshotScope::GlobalOnly) {
+                probe.push(crate::scope::tenant_global_session_uuid(ctx.tenant_id));
+            }
+            probe.sort_unstable();
+            probe.dedup();
+            for probe_ctx in [&ctx, &swapped_ctx] {
+                for sid in &probe {
+                    match storage.typed_edge_list_session(probe_ctx, *sid).await {
+                        Ok(typed_edges) => {
+                            for te in typed_edges {
+                                let src_s = te.src_id.to_string();
+                                let dst_s = te.dst_id.to_string();
+                                if node_ids.contains(&src_s) && node_ids.contains(&dst_s) {
+                                    let edge = VizEdge {
+                                        source: src_s,
+                                        target: dst_s,
+                                        edge_type: te.edge_type,
+                                        strength: Some(te.weight as f32),
+                                    };
+                                    full_edges.push(edge.clone());
+                                    edge_chunk.push(edge);
+                                    if edge_chunk.len() >= VIZ_CHUNK_SIZE {
+                                        let edges = std::mem::take(&mut edge_chunk);
+                                        if !send_viz_event(
+                                            &mut write,
+                                            &VizEvent::SnapshotStreamChunk {
+                                                nodes: Vec::new(),
+                                                edges,
+                                            },
+                                        )
+                                        .await
+                                        {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, session_id = %sid, "viz: typed_edge_list_session failed")
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !edge_chunk.is_empty()
+        && !send_viz_event(
+            &mut write,
+            &VizEvent::SnapshotStreamChunk {
+                nodes: Vec::new(),
+                edges: edge_chunk,
+            },
+        )
+        .await
+    {
+        return;
+    }
+    if !send_viz_event(
+        &mut write,
+        &VizEvent::SnapshotStreamEnd {
+            total_nodes: full_nodes.len(),
+            total_edges: full_edges.len(),
+        },
+    )
+    .await
+    {
+        return;
+    }
+
+    // Track navigation state for drill_up support.
+    let mut nav_stack: Vec<(viz::VizLevel, Option<String>)> = Vec::new();
+    let mut current_level = viz::VizLevel::Function;
+    let mut current_parent: Option<String> = None;
+
+    // Subscribe to incremental events after the streamed initial snapshot.
     let mut rx = event_bus.subscribe();
 
     // Multiplex: listen for both broadcast events and client messages.
     loop {
         tokio::select! {
-            // Broadcast event from the event bus
             result = rx.recv() => {
                 match result {
                     Ok(event) => {
-                        // Only forward incremental events when at the flat
-                        // (function) level — clustered levels get full
-                        // snapshots on drill-down so incrementals would be
-                        // confusing.
-                        if current_level == viz::VizLevel::Function {
-                            let json = match serde_json::to_string(&event) {
-                                Ok(j) => j,
-                                Err(e) => {
-                                    tracing::warn!("viz: failed to serialize event: {e}");
-                                    continue;
-                                }
-                            };
-                            if write.send(Message::Text(json)).await.is_err() {
-                                break;
-                            }
+                        if current_level == viz::VizLevel::Function
+                            && !send_viz_event(&mut write, &event).await
+                        {
+                            break;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("viz: WebSocket client lagged by {n} events");
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        break;
-                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
-            // Client message (drill_down / drill_up)
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(client_msg) = serde_json::from_str::<viz::VizClientMessage>(&text) {
                             let new_snapshot = match client_msg {
                                 viz::VizClientMessage::DrillDown { level, parent } => {
-                                    // Push current state onto nav stack
                                     nav_stack.push((current_level.clone(), current_parent.clone()));
                                     current_level = level.clone();
                                     current_parent = parent.clone();
-                                    cluster_snapshot(
-                                        &full_nodes,
-                                        &full_edges,
-                                        &level,
-                                        parent.as_deref(),
-                                    )
+                                    cluster_snapshot(&full_nodes, &full_edges, &level, parent.as_deref())
                                 }
                                 viz::VizClientMessage::DrillUp => {
                                     if let Some((prev_level, prev_parent)) = nav_stack.pop() {
                                         current_level = prev_level.clone();
                                         current_parent = prev_parent.clone();
-                                        cluster_snapshot(
-                                            &full_nodes,
-                                            &full_edges,
-                                            &prev_level,
-                                            prev_parent.as_deref(),
-                                        )
+                                        cluster_snapshot(&full_nodes, &full_edges, &prev_level, prev_parent.as_deref())
                                     } else {
-                                        // Already at top — send crate level
                                         current_level = viz::VizLevel::Crate;
                                         current_parent = None;
-                                        cluster_snapshot(
-                                            &full_nodes,
-                                            &full_edges,
-                                            &viz::VizLevel::Crate,
-                                            None,
-                                        )
+                                        cluster_snapshot(&full_nodes, &full_edges, &viz::VizLevel::Crate, None)
                                     }
                                 }
                                 viz::VizClientMessage::ToggleView { mode } => {
                                     if mode == "overview" {
-                                        // Reset to crate-level clustered view
                                         nav_stack.clear();
                                         current_level = viz::VizLevel::Crate;
                                         current_parent = None;
-                                        cluster_snapshot(
-                                            &full_nodes,
-                                            &full_edges,
-                                            &viz::VizLevel::Crate,
-                                            None,
-                                        )
+                                        cluster_snapshot(&full_nodes, &full_edges, &viz::VizLevel::Crate, None)
                                     } else {
-                                        // "detail" — send full flat snapshot
                                         nav_stack.clear();
                                         current_level = viz::VizLevel::Function;
                                         current_parent = None;
-                                        let total_n = full_nodes.len();
-                                        let total_e = full_edges.len();
                                         VizEvent::Snapshot {
                                             nodes: full_nodes.clone(),
                                             edges: full_edges.clone(),
                                             level: None,
                                             parent: None,
-                                            total_nodes: Some(total_n),
-                                            total_edges: Some(total_e),
+                                            total_nodes: Some(full_nodes.len()),
+                                            total_edges: Some(full_edges.len()),
                                         }
                                     }
                                 }
                                 viz::VizClientMessage::ExploreNeighborhood { entity_id, hops } => {
-                                    let hops = hops.min(3); // cap at 3
-                                    neighborhood_snapshot(
-                                        &full_nodes,
-                                        &full_edges,
-                                        &entity_id,
-                                        hops,
-                                    )
+                                    neighborhood_snapshot(&full_nodes, &full_edges, &entity_id, hops.min(3))
                                 }
                             };
-                            if let Ok(json) = serde_json::to_string(&new_snapshot)
-                                && write.send(Message::Text(json)).await.is_err()
-                            {
+                            if !send_viz_event(&mut write, &new_snapshot).await {
                                 break;
                             }
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Err(_)) => break,
-                    _ => {} // Ignore ping/pong/binary
+                    _ => {}
                 }
             }
         }
@@ -2266,7 +2541,7 @@ async fn build_snapshot<S: Storage>(
     // forge ingest, tenant-global-session for skills/tags, per-session for
     // user work) all have their edges rendered. When a specific scope is
     // requested, probe only the sessions that scope covers.
-    let typed_edges = match scope {
+    let mut typed_edges = match scope {
         VizSnapshotScope::All => match storage.typed_edge_list_all(ctx).await {
             Ok(te) => {
                 tracing::info!(
@@ -2311,7 +2586,53 @@ async fn build_snapshot<S: Storage>(
             acc
         }
     };
+
+    // Legacy recovery path: older data could be written with tenant_id and
+    // session_id swapped. Non-typed graph edges already probe `swapped_ctx`;
+    // typed_edges need the same fallback or the viz can show zero edges while
+    // the rows still exist on disk under the legacy tenant key.
+    if swapped_ctx.tenant_id != ctx.tenant_id {
+        match scope {
+            VizSnapshotScope::All => match storage.typed_edge_list_all(&swapped_ctx).await {
+                Ok(mut legacy) => {
+                    tracing::info!(
+                        count = legacy.len(),
+                        "viz: loaded legacy swapped typed edges across all sessions"
+                    );
+                    typed_edges.append(&mut legacy);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "viz: typed_edge_list_all(swapped_ctx) failed")
+                }
+            },
+            _ => {
+                let mut legacy_probe = vec![ctx.tenant_id, session_id];
+                legacy_probe.sort_unstable();
+                legacy_probe.dedup();
+                for sid in legacy_probe {
+                    match storage.typed_edge_list_session(&swapped_ctx, sid).await {
+                        Ok(mut legacy) => {
+                            tracing::info!(
+                                session_id = %sid,
+                                count = legacy.len(),
+                                "viz: loaded legacy swapped typed edges for session"
+                            );
+                            typed_edges.append(&mut legacy);
+                        }
+                        Err(e) => {
+                            tracing::warn!(session_id = %sid, error = %e, "viz: typed_edge_list_session(swapped_ctx) failed")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut seen_typed_edges = std::collections::HashSet::new();
     for te in typed_edges {
+        if !seen_typed_edges.insert((te.src_id, te.edge_type.clone(), te.dst_id)) {
+            continue;
+        }
         let src_s = te.src_id.to_string();
         let dst_s = te.dst_id.to_string();
         if node_ids.contains(src_s.as_str()) && node_ids.contains(dst_s.as_str()) {
@@ -3240,6 +3561,110 @@ mod tests {
     fn viz_html_is_embedded() {
         assert!(VIZ_HTML.contains("Ferrosa Memory"));
         assert!(VIZ_HTML.contains("WebSocket"));
+    }
+
+    #[test]
+    fn rendered_viz_html_points_websocket_at_public_viz_port() {
+        let routes = ShellRouteConfig {
+            workbench_scheme: "http".into(),
+            workbench_port: 18765,
+            viz_scheme: "http".into(),
+            viz_port: 18766,
+        };
+        let html = render_viz_html(&routes);
+        assert!(
+            html.contains("window.__FMEM_VIZ_PORT__ = 18766;"),
+            "viz html must embed public viz port so pages served through the workbench port do not websocket to /viz/ws on 18765"
+        );
+        assert!(
+            html.contains("new WebSocket(`${protocol}//${location.hostname}:${window.__FMEM_VIZ_PORT__}/viz/ws`)")
+                || html.contains("new WebSocket(wsUrl)"),
+            "viz html must construct websocket URL from public viz port; got snippet around websocket: {:?}",
+            html.find("new WebSocket").map(|idx| &html[idx.saturating_sub(120)..html.len().min(idx + 220)])
+        );
+    }
+
+    #[test]
+    fn viz_html_renders_snapshot_stream_chunks_incrementally() {
+        let chunk_case = VIZ_HTML
+            .split("case 'SnapshotStreamChunk':")
+            .nth(1)
+            .and_then(|rest| rest.split("case 'SnapshotStreamEnd':").next())
+            .expect("viz html must handle SnapshotStreamChunk events");
+        assert!(
+            chunk_case.contains("renderStreamChunk")
+                || chunk_case.contains("applySnapshotStreamChunk"),
+            "SnapshotStreamChunk handler must render incrementally instead of waiting for SnapshotStreamEnd; handler was: {chunk_case}"
+        );
+    }
+
+    #[tokio::test]
+    async fn viz_snapshot_includes_legacy_swapped_tenant_typed_edges() {
+        // Regression guard for live data recovered from the historical
+        // tenant/session swap bug. The viz snapshot already probes
+        // edge_list_all(swapped_ctx) for legacy co-occurs-style edges, but
+        // typed_edges must get the same treatment or the graph appears to
+        // have lost all labeled edges even though the rows are still on disk.
+        let storage = MockStorage::new();
+        let tenant_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let ctx = TenantContext {
+            tenant_id,
+            session_origin: "test".into(),
+        };
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let now = chrono::Utc::now();
+
+        for (entity_id, entity_name) in [(a, "alpha"), (b, "beta")] {
+            storage
+                .entity_put(
+                    &ctx,
+                    &crate::types::EntityEntry {
+                        tenant_id,
+                        session_id,
+                        entity_id,
+                        entity_name: entity_name.into(),
+                        entity_type: "concept".into(),
+                        confidence: 1.0,
+                        created_at: now,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        storage
+            .typed_edge_put(
+                &ctx,
+                &crate::types::TypedEdge {
+                    // Legacy swapped-key rows have the viz session in tenant_id.
+                    tenant_id: session_id,
+                    session_id,
+                    src_id: a,
+                    edge_type: "TAGGED_AS".into(),
+                    dst_id: b,
+                    weight: 0.75,
+                    metadata: None,
+                    created_at: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        let snapshot = build_snapshot(&storage, &ctx, session_id, VizSnapshotScope::All).await;
+        let VizEvent::Snapshot { edges, .. } = snapshot else {
+            panic!("expected snapshot event");
+        };
+        assert!(
+            edges.iter().any(|edge| {
+                edge.source == a.to_string()
+                    && edge.target == b.to_string()
+                    && edge.edge_type == "TAGGED_AS"
+            }),
+            "viz snapshot must include typed edges stored under legacy swapped tenant_id; got {edges:?}"
+        );
     }
 
     #[test]

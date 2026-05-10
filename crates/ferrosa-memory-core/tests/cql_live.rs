@@ -4,9 +4,13 @@
 //! Run with: cargo test -p ferrosa-memory-core --test cql_live -- --ignored --nocapture
 
 use ferrosa_memory_core::config::FerrosaCqlConfig;
-use ferrosa_memory_core::cql_storage::{CqlStorage, build_col_map};
+use ferrosa_memory_core::cql_storage::{CqlStorage, build_col_map, cql_get};
+use ferrosa_memory_core::storage::Storage;
+use ferrosa_memory_core::types::{EntityEntry, TenantContext, TypedEdge};
 use scylla::{LegacySession, SessionBuilder};
+use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
 fn init_test_tracing() {
     let filter = std::env::var("RUST_LOG")
@@ -22,6 +26,7 @@ async fn connect_plain(contact_point: &str) -> LegacySession {
     #[allow(deprecated)]
     SessionBuilder::new()
         .known_node(contact_point)
+        .user("ferrosa_admin", "ferrosa_admin")
         .build_legacy()
         .await
         .expect("session build failed")
@@ -195,4 +200,135 @@ async fn auth_enabled_multipoint_scylla_session_build_succeeds() {
         .await
         .expect("prepare should succeed after authenticated multi-point session build");
     drop(prepared);
+}
+
+#[tokio::test]
+#[ignore]
+async fn confidence_scores_prepares_on_each_live_node() {
+    init_test_tracing();
+
+    if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
+        panic!(
+            "set FERROSA_TEST_CONTAINERS=1 and run `podman compose up -d` in \
+             the ferrosa-memory repo root — this test needs a live Ferrosa \
+             cluster on ports 19042/19043/19044"
+        );
+    }
+
+    for contact_point in ["127.0.0.1:19042", "127.0.0.1:19043", "127.0.0.1:19044"] {
+        #[allow(deprecated)]
+        let session = SessionBuilder::new()
+            .known_node(contact_point)
+            .user("ferrosa_admin", "ferrosa_admin")
+            .build_legacy()
+            .await
+            .unwrap_or_else(|e| panic!("session build failed for {contact_point}: {e}"));
+
+        for statement in [
+            "SELECT confidence, source_count, last_confirmed_at, contradiction_count \
+             FROM agent_memory.confidence_scores WHERE entity_id = ? AND fact_hash = ?",
+            "INSERT INTO agent_memory.confidence_scores \
+             (entity_id, fact_hash, confidence, source_count, last_confirmed_at, contradiction_count) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        ] {
+            session
+                .prepare(statement)
+                .await
+                .unwrap_or_else(|e| panic!("prepare failed for {contact_point}: {statement}: {e}"));
+        }
+
+        for table in ["confidence_scores", "typed_edges", "co_occurs_with"] {
+            #[allow(deprecated)]
+            let result = session
+                .query_unpaged(format!("SELECT COUNT(*) FROM agent_memory.{table}"), ())
+                .await
+                .unwrap_or_else(|e| panic!("{table} count query failed for {contact_point}: {e}"));
+            let col_map = build_col_map(result.col_specs());
+            let rows = result.rows_or_empty();
+            assert_eq!(
+                rows.len(),
+                1,
+                "{table} count query should return one row for {contact_point}"
+            );
+            let count: i64 = cql_get(&rows[0], &col_map, "count")
+                .unwrap_or_else(|e| panic!("{table} count decode failed for {contact_point}: {e}"));
+            eprintln!("{contact_point} {table} rows={count}");
+            if table != "confidence_scores" {
+                assert!(
+                    count > 0,
+                    "{table} should have restored rows on {contact_point}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn viz_streaming_queries_return_live_nodes_and_edges() {
+    init_test_tracing();
+
+    if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
+        panic!(
+            "set FERROSA_TEST_CONTAINERS=1 and run `podman compose up -d` in \
+             the ferrosa-memory repo root — this test needs a live Ferrosa \
+             cluster on ports 19042/19043/19044"
+        );
+    }
+
+    let cfg = FerrosaCqlConfig {
+        contact_points: vec![
+            "127.0.0.1:19042".into(),
+            "127.0.0.1:19043".into(),
+            "127.0.0.1:19044".into(),
+        ],
+        keyspace: "agent_memory".into(),
+        replication_factor: 3,
+        consistency: "LOCAL_QUORUM".into(),
+        username: "ferrosa_admin".into(),
+        password: "ferrosa_admin".into(),
+        admin_username: None,
+        admin_password: None,
+    };
+
+    let storage = Arc::new(
+        CqlStorage::connect(&cfg)
+            .await
+            .expect("CqlStorage::connect should succeed on the auth-enabled local cluster"),
+    );
+    let ctx = TenantContext {
+        tenant_id: Uuid::parse_str("9a5f8fbf-d842-4d30-8ea5-1aa931e618a8").unwrap(),
+        session_origin: "viz-live-test".to_string(),
+    };
+
+    let (node_tx, mut node_rx) = tokio::sync::mpsc::channel::<anyhow::Result<Vec<EntityEntry>>>(4);
+    let node_storage = storage.clone();
+    let node_ctx = ctx.clone();
+    tokio::spawn(async move {
+        node_storage.entity_stream_all(node_ctx, 128, node_tx).await;
+    });
+    let mut nodes = 0usize;
+    while let Some(chunk) = node_rx.recv().await {
+        let chunk = chunk.expect("entity stream chunk should decode");
+        nodes += chunk.len();
+        if nodes > 0 {
+            break;
+        }
+    }
+    assert!(nodes > 0, "viz entity stream should return live nodes");
+
+    let (edge_tx, mut edge_rx) = tokio::sync::mpsc::channel::<anyhow::Result<Vec<TypedEdge>>>(4);
+    let edge_storage = storage.clone();
+    tokio::spawn(async move {
+        edge_storage.typed_edge_stream_all(ctx, 128, edge_tx).await;
+    });
+    let mut edges = 0usize;
+    while let Some(chunk) = edge_rx.recv().await {
+        let chunk = chunk.expect("typed-edge stream chunk should decode");
+        edges += chunk.len();
+        if edges > 0 {
+            break;
+        }
+    }
+    assert!(edges > 0, "viz typed-edge stream should return live edges");
 }

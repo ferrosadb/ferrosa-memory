@@ -1904,6 +1904,8 @@
 <script>
 window.__FMEM_WORKBENCH_SCHEME__ = '@@FMEM_WORKBENCH_SCHEME@@';
 window.__FMEM_WORKBENCH_PORT__ = @@FMEM_WORKBENCH_PORT@@;
+window.__FMEM_VIZ_SCHEME__ = '@@FMEM_VIZ_SCHEME@@';
+window.__FMEM_VIZ_PORT__ = @@FMEM_VIZ_PORT@@;
 window._totalNodes = window._totalNodes || 0;
 window._totalEdges = window._totalEdges || 0;
 function configureShellNav() {
@@ -3023,8 +3025,12 @@ function updateConnectionStatus(status, isLive) {
 }
 
 function connect() {
-  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(`${protocol}//${location.host}/viz/ws`);
+  const configuredScheme = window.__FMEM_VIZ_SCHEME__ || location.protocol.replace(':', '');
+  const protocol = configuredScheme === 'https' ? 'wss:' : 'ws:';
+  const configuredPort = Number(window.__FMEM_VIZ_PORT__ || 0);
+  const wsHost = configuredPort > 0 ? `${location.hostname}:${configuredPort}` : location.host;
+  const wsUrl = `${protocol}//${wsHost}/viz/ws`;
+  ws = new WebSocket(wsUrl);
 
   ws.onopen = () => {
     updateConnectionStatus('LIVE', true);
@@ -3046,50 +3052,127 @@ function connect() {
   };
 }
 
+function applySnapshotEvent(event) {
+  allNodes = event.nodes || [];
+  nodes = allNodes.slice();
+  allEdges = (event.edges || []).map(e => ({...e}))
+    .sort((a, b) => {
+      const aTyped = a.edge_type !== 'CO_OCCURS' ? 0 : 1;
+      const bTyped = b.edge_type !== 'CO_OCCURS' ? 0 : 1;
+      return aTyped - bTyped;
+    });
+  // Track total graph size for display
+  if (event.total_nodes != null) {
+    window._totalNodes = event.total_nodes;
+    window._totalEdges = event.total_edges;
+  }
+  // Update hierarchical navigation state from server
+  if (event.level === 'neighborhood') {
+    isExploring = true;
+    const backBar = document.getElementById('explore-back-bar');
+    backBar.style.display = 'flex';
+    const entityNode = allNodes.find(n => n.id === event.parent);
+    const entityLabel = entityNode ? entityNode.label : (event.parent || '').slice(0, 12);
+    document.getElementById('explore-label').textContent =
+      `Neighborhood of "${entityLabel}" (${allNodes.length} nodes, ${allEdges.length} edges)`;
+  } else {
+    if (!isExploring) {
+      document.getElementById('explore-back-bar').style.display = 'none';
+    }
+  }
+  if (event.level != null && event.level !== 'neighborhood') {
+    updateBreadcrumbs(event.level, event.parent || null);
+  } else if (event.level == null) {
+    updateBreadcrumbs(null, null);
+  }
+  selectedNode = null;
+  rebuildFilters();
+  applyFilters();
+  render();
+  // Zoom to fit after receiving a new drill-down snapshot
+  zoomToFit();
+  if (infoPanelOpen) {
+    renderInfoPanel();
+  }
+}
+
+let snapshotStream = null;
+function streamSnapshotEvent() {
+  if (!snapshotStream) return null;
+  return {
+    type: 'Snapshot',
+    nodes: snapshotStream.nodes,
+    edges: snapshotStream.edges,
+    level: snapshotStream.level,
+    parent: snapshotStream.parent,
+    total_nodes: snapshotStream.total_nodes ?? snapshotStream.nodes.length,
+    total_edges: snapshotStream.total_edges ?? snapshotStream.edges.length,
+  };
+}
+
+function applySnapshotStreamChunk(event) {
+  if (!snapshotStream) {
+    snapshotStream = { nodes: [], edges: [], level: null, parent: null, nodeIds: new Set(), edgeIds: new Set() };
+  }
+  if (event.total_nodes != null) snapshotStream.total_nodes = event.total_nodes;
+  if (event.total_edges != null) snapshotStream.total_edges = event.total_edges;
+  for (const node of event.nodes || []) {
+    if (!snapshotStream.nodeIds.has(node.id)) {
+      snapshotStream.nodeIds.add(node.id);
+      snapshotStream.nodes.push(node);
+    }
+  }
+  for (const edge of event.edges || []) {
+    const source = edge.source && edge.source.id ? edge.source.id : edge.source;
+    const target = edge.target && edge.target.id ? edge.target.id : edge.target;
+    const key = `${source}|${target}|${edge.edge_type || ''}`;
+    if (!snapshotStream.edgeIds.has(key)) {
+      snapshotStream.edgeIds.add(key);
+      snapshotStream.edges.push({...edge, source, target});
+    }
+  }
+}
+
+function renderStreamChunk(event) {
+  applySnapshotStreamChunk(event);
+  const partial = streamSnapshotEvent();
+  if (partial) {
+    applySnapshotEvent(partial);
+    updateConnectionStatus(`streaming ${snapshotStream.nodes.length}/${snapshotStream.edges.length}`, true);
+  }
+}
+
 function handleEvent(event) {
   switch (event.type) {
     case 'Snapshot':
-      allNodes = event.nodes || [];
-      nodes = allNodes.slice();
-      allEdges = (event.edges || []).map(e => ({...e}))
-        .sort((a, b) => {
-          const aTyped = a.edge_type !== 'CO_OCCURS' ? 0 : 1;
-          const bTyped = b.edge_type !== 'CO_OCCURS' ? 0 : 1;
-          return aTyped - bTyped;
-        });
-      // Track total graph size for display
-      if (event.total_nodes != null) {
-        window._totalNodes = event.total_nodes;
-        window._totalEdges = event.total_edges;
+      snapshotStream = null;
+      applySnapshotEvent(event);
+      break;
+
+    case 'SnapshotStreamStart':
+      snapshotStream = {
+        nodes: [],
+        edges: [],
+        level: event.level || null,
+        parent: event.parent || null,
+        nodeIds: new Set(),
+        edgeIds: new Set(),
+      };
+      updateConnectionStatus('streaming', true);
+      break;
+
+    case 'SnapshotStreamChunk':
+      renderStreamChunk(event);
+      break;
+
+    case 'SnapshotStreamEnd':
+      if (snapshotStream) {
+        snapshotStream.total_nodes = event.total_nodes;
+        snapshotStream.total_edges = event.total_edges;
+        applySnapshotEvent(streamSnapshotEvent());
       }
-      // Update hierarchical navigation state from server
-      if (event.level === 'neighborhood') {
-        isExploring = true;
-        const backBar = document.getElementById('explore-back-bar');
-        backBar.style.display = 'flex';
-        const entityNode = allNodes.find(n => n.id === event.parent);
-        const entityLabel = entityNode ? entityNode.label : (event.parent || '').slice(0, 12);
-        document.getElementById('explore-label').textContent =
-          `Neighborhood of "${entityLabel}" (${allNodes.length} nodes, ${allEdges.length} edges)`;
-      } else {
-        if (!isExploring) {
-          document.getElementById('explore-back-bar').style.display = 'none';
-        }
-      }
-      if (event.level != null && event.level !== 'neighborhood') {
-        updateBreadcrumbs(event.level, event.parent || null);
-      } else if (event.level == null) {
-        updateBreadcrumbs(null, null);
-      }
-      selectedNode = null;
-      rebuildFilters();
-      applyFilters();
-      render();
-      // Zoom to fit after receiving a new drill-down snapshot
-      zoomToFit();
-      if (infoPanelOpen) {
-        renderInfoPanel();
-      }
+      snapshotStream = null;
+      updateConnectionStatus('LIVE', true);
       break;
 
     case 'EntityChanged':
