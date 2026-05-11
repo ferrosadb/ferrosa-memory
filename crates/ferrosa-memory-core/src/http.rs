@@ -2156,7 +2156,7 @@ async fn send_streaming_viz_snapshot<S: Storage>(
                 }
                 VizSnapshotScope::All => unreachable!(),
             };
-            for probe_ctx in [&ctx, &swapped_ctx] {
+            for probe_ctx in [ctx, &swapped_ctx] {
                 for sid in &probe {
                     match storage.typed_edge_list_session(probe_ctx, *sid).await {
                         Ok(typed_edges) => {
