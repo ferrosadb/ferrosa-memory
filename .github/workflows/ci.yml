@@ -469,18 +469,25 @@ jobs:
             sleep 2
           done
 
-          # Read warms up fast; write path (MERGE) often takes longer on
-          # first use — index/buffer init, write-quorum negotiation, etc.
-          # The 10s reqwest timeout in GraphClient bites here, so warm
-          # the write path here under a longer bounded retry. The MERGE
-          # uses the real `Entity` label (so it maps to entity_store,
-          # which is graph-annotated) with fixed all-zero-ish UUIDs that
-          # won't collide with any real test data the cluster ever sees.
-          echo "Waiting for graph /graph/query MERGE (write path) to succeed..."
+          # Read warms up fast; write path (MERGE + edge SET) often takes
+          # longer on first use — index/buffer init, write-quorum
+          # negotiation, S3 first-write, etc. The 10s reqwest timeout in
+          # GraphClient bites here. Mirror the exact shape the failing
+          # test uses (public_graph_write_round_trip_for_co_occurs_edges):
+          # two Entity MERGEs + a CO_OCCURS_WITH edge MERGE + SET. Use
+          # fresh UUIDs per attempt so each iteration actually exercises
+          # the create-write path rather than a no-op match.
+          gen_uuid() { python3 -c 'import uuid;print(uuid.uuid4())'; }
+          echo "Waiting for graph /graph/query MERGE+edge (write path) to succeed..."
           for i in $(seq 1 60); do
+            T=$(gen_uuid); S=$(gen_uuid); A=$(gen_uuid); B=$(gen_uuid)
+            Q="MERGE (a:Entity {tenant_id: '${T}', session_id: '${S}', entity_id: '${A}'}) \
+               MERGE (b:Entity {tenant_id: '${T}', session_id: '${S}', entity_id: '${B}'}) \
+               MERGE (a)-[r:CO_OCCURS_WITH {tenant_id: '${T}', session_id: '${S}'}]->(b) \
+               SET r.strength = 0.5 RETURN r"
             if curl -fsS -m 15 -X POST http://127.0.0.1:17474/graph/query \
                 -H "Content-Type: application/json" \
-                -d "{\"query\":\"MERGE (n:Entity {tenant_id: '00000000-0000-0000-0000-000000000001', session_id: '00000000-0000-0000-0000-000000000001', entity_id: '00000000-0000-0000-0000-000000000001'}) RETURN n\",\"keyspace\":\"agent_memory\"}" \
+                -d "{\"query\":\"${Q}\",\"keyspace\":\"agent_memory\"}" \
                 >/dev/null 2>&1; then
               echo "  /graph/query (write) live after ${i} attempts"
               break
