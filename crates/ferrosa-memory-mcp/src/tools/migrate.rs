@@ -89,7 +89,16 @@ async fn connect_with_retry(
 ) -> anyhow::Result<Arc<LegacySession>> {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 1..=30u32 {
-        let mut builder = SessionBuilder::new();
+        let mut builder = SessionBuilder::new()
+            // Keep auto schema-agreement (good — guarantees the cluster has
+            // converged before the next DDL fires), but skip the post-agreement
+            // metadata refresh: that refresh reads `system_schema.views`, which
+            // since ferrosa fce7a13 ("system_schema boolean columns") returns
+            // the Cassandra-5.0 10-column shape and trips the scylla driver
+            // fork's type-checker (it still expects the 3-column shape). We
+            // don't need the refresh — migrate is a one-shot DDL applier and
+            // never queries local metadata.
+            .refresh_metadata_on_auto_schema_agreement(false);
         for cp in contact_points {
             builder = builder.known_node(cp.as_str());
         }
