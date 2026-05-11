@@ -473,12 +473,14 @@ jobs:
           # first use — index/buffer init, write-quorum negotiation, etc.
           # The 10s reqwest timeout in GraphClient bites here, so warm
           # the write path here under a longer bounded retry. The MERGE
-          # creates a CI-only label so it doesn't collide with real data.
+          # uses the real `Entity` label (so it maps to entity_store,
+          # which is graph-annotated) with fixed all-zero-ish UUIDs that
+          # won't collide with any real test data the cluster ever sees.
           echo "Waiting for graph /graph/query MERGE (write path) to succeed..."
           for i in $(seq 1 60); do
             if curl -fsS -m 15 -X POST http://127.0.0.1:17474/graph/query \
                 -H "Content-Type: application/json" \
-                -d '{"query":"MERGE (n:__CI_Probe__ {id: \"warmup\"}) RETURN n","keyspace":"agent_memory"}' \
+                -d "{\"query\":\"MERGE (n:Entity {tenant_id: '00000000-0000-0000-0000-000000000001', session_id: '00000000-0000-0000-0000-000000000001', entity_id: '00000000-0000-0000-0000-000000000001'}) RETURN n\",\"keyspace\":\"agent_memory\"}" \
                 >/dev/null 2>&1; then
               echo "  /graph/query (write) live after ${i} attempts"
               break
