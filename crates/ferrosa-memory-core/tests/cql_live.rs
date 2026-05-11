@@ -32,6 +32,100 @@ async fn connect_plain(contact_point: &str) -> LegacySession {
         .expect("session build failed")
 }
 
+/// Insert one entity, one typed_edge, and one co-occurrence edge so
+/// downstream count/stream assertions have rows to find. RF=3 +
+/// LOCAL_QUORUM means every coordinator will see the rows; tenant_id and
+/// session_id are fresh UUIDs so concurrent runs don't collide on PKs.
+///
+/// `entity_put` and `edge_co_occurs` go through the Storage trait.
+/// `typed_edges` is graph-annotated, so the Storage adapter rejects
+/// direct writes by design — but a *test fixture* legitimately needs the
+/// rows on disk for the streaming read path to have something to yield.
+/// Use a raw CQL INSERT via an admin session for that one table only.
+async fn seed_minimal_fixture(session_origin: &str) -> (Uuid, Uuid, Uuid, Uuid) {
+    let cfg = FerrosaCqlConfig {
+        contact_points: vec![
+            "127.0.0.1:19042".into(),
+            "127.0.0.1:19043".into(),
+            "127.0.0.1:19044".into(),
+        ],
+        keyspace: "agent_memory".into(),
+        replication_factor: 3,
+        consistency: "LOCAL_QUORUM".into(),
+        username: "ferrosa_admin".into(),
+        password: "ferrosa_admin".into(),
+        admin_username: None,
+        admin_password: None,
+    };
+    let storage = CqlStorage::connect(&cfg)
+        .await
+        .expect("seed_minimal_fixture: CqlStorage::connect");
+    let ctx = TenantContext {
+        tenant_id: Uuid::new_v4(),
+        session_origin: session_origin.into(),
+    };
+    let session_id = Uuid::new_v4();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let now = chrono::Utc::now();
+    for (entity_id, name) in [(a, "seed-a"), (b, "seed-b")] {
+        storage
+            .entity_put(
+                &ctx,
+                &EntityEntry {
+                    tenant_id: ctx.tenant_id,
+                    session_id,
+                    entity_id,
+                    entity_name: name.into(),
+                    entity_type: "concept".into(),
+                    confidence: 1.0,
+                    created_at: now,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed_minimal_fixture: entity_put");
+    }
+    // typed_edges and co_occurs_with are graph-annotated; the Storage
+    // trait blocks direct writes by design. For a *fixture* the rows
+    // legitimately need to exist on disk so the streaming/count paths
+    // have something to read — issue them via raw CQL on the admin
+    // session, matching the schema the graph engine would persist.
+    let admin = connect_plain("127.0.0.1:19042").await;
+    let created_ts = scylla::frame::value::CqlTimestamp(now.timestamp_millis());
+    #[allow(deprecated)]
+    admin
+        .query_unpaged(
+            "INSERT INTO agent_memory.typed_edges \
+             (tenant_id, session_id, src_id, edge_type, dst_id, weight, metadata, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                ctx.tenant_id,
+                session_id,
+                a,
+                "TAGGED_AS",
+                b,
+                0.5f64,
+                None::<String>,
+                created_ts,
+            ),
+        )
+        .await
+        .expect("seed_minimal_fixture: typed_edges raw insert");
+    #[allow(deprecated)]
+    admin
+        .query_unpaged(
+            "INSERT INTO agent_memory.co_occurs_with \
+             (entity_a, entity_b, session_id, tenant_id, created_at) \
+             VALUES (?, ?, ?, ?, ?)",
+            (a, b, session_id, ctx.tenant_id, created_ts),
+        )
+        .await
+        .expect("seed_minimal_fixture: co_occurs_with raw insert");
+
+    (ctx.tenant_id, session_id, a, b)
+}
+
 #[tokio::test]
 #[ignore = "requires live Ferrosa cluster; run with --ignored and FERROSA_TEST_CONTAINERS=1"]
 async fn scylla_connect_and_query() {
@@ -215,6 +309,8 @@ async fn confidence_scores_prepares_on_each_live_node() {
         );
     }
 
+    let _ = seed_minimal_fixture("confidence-prepare-live-test").await;
+
     for contact_point in ["127.0.0.1:19042", "127.0.0.1:19043", "127.0.0.1:19044"] {
         #[allow(deprecated)]
         let session = SessionBuilder::new()
@@ -290,6 +386,11 @@ async fn viz_streaming_queries_return_live_nodes_and_edges() {
         admin_username: None,
         admin_password: None,
     };
+
+    // Seed before opening the streams — entity_stream_all and
+    // typed_edge_stream_all are tenant-agnostic full-keyspace scans, so
+    // it's sufficient that the rows exist somewhere on disk.
+    let _ = seed_minimal_fixture("viz-stream-live-test").await;
 
     let storage = Arc::new(
         CqlStorage::connect(&cfg)
