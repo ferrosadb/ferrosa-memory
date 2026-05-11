@@ -397,7 +397,7 @@ jobs:
           echo "Waiting for graph HTTP on port 17474..."
           for i in $(seq 1 60); do
             if bash -c "</dev/tcp/127.0.0.1/17474" 2>/dev/null; then
-              echo "  graph HTTP ready after ${i}s"
+              echo "  graph HTTP TCP listener up after ${i}s"
               break
             fi
             if [ "$i" -eq 60 ]; then
@@ -444,6 +444,29 @@ jobs:
               fi
               sleep 2
             done
+          done
+
+          # The graph engine's TCP listener comes up well before the engine
+          # can answer queries — /graph/health passes ~1s in, but /graph/query
+          # for a real keyspace takes longer (schema discovery, prepared-
+          # statement setup, etc.). Probe the actual query endpoint with a
+          # trivial RETURN, so cluster-gated graph_live tests don't race the
+          # engine's warm-up.
+          echo "Waiting for graph /graph/query to serve a trivial RETURN..."
+          for i in $(seq 1 60); do
+            if curl -fsS -m 5 -X POST http://127.0.0.1:17474/graph/query \
+                -H "Content-Type: application/json" \
+                -d '{"query":"RETURN 1 AS x","keyspace":"agent_memory"}' \
+                >/dev/null 2>&1; then
+              echo "  /graph/query live after ${i} attempts"
+              break
+            fi
+            if [ "$i" -eq 60 ]; then
+              echo "::error::/graph/query did not respond within 120s"
+              docker compose -f /tmp/docker-compose.memory-ci.yml logs 2>/dev/null | tail -100
+              exit 1
+            fi
+            sleep 2
           done
       - name: Run ignored (cluster-gated) Rust tests
         env:
