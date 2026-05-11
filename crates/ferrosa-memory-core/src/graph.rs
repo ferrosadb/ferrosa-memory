@@ -337,18 +337,7 @@ impl GraphClient {
         entity_b: Uuid,
         strength: f32,
     ) -> anyhow::Result<()> {
-        let cypher = format!(
-            "MATCH (a:Entity {{tenant_id: {}, entity_id: {}}})\
-             -[r:CO_OCCURS_WITH {{tenant_id: {}}}]->\
-             (b:Entity {{tenant_id: {}, entity_id: {}}}) \
-             SET r.strength = {} RETURN r",
-            quote_cypher(&tenant_id.to_string()),
-            quote_cypher(&entity_a.to_string()),
-            quote_cypher(&tenant_id.to_string()),
-            quote_cypher(&tenant_id.to_string()),
-            quote_cypher(&entity_b.to_string()),
-            strength,
-        );
+        let cypher = build_co_occurs_strength_update_query(tenant_id, entity_a, entity_b, strength);
         self.execute_mutation(&cypher).await
     }
 
@@ -358,17 +347,7 @@ impl GraphClient {
         entity_a: Uuid,
         entity_b: Uuid,
     ) -> anyhow::Result<()> {
-        let cypher = format!(
-            "MATCH (a:Entity {{tenant_id: {}, entity_id: {}}})\
-             -[r:CO_OCCURS_WITH {{tenant_id: {}}}]->\
-             (b:Entity {{tenant_id: {}, entity_id: {}}}) \
-             DELETE r RETURN 1",
-            quote_cypher(&tenant_id.to_string()),
-            quote_cypher(&entity_a.to_string()),
-            quote_cypher(&tenant_id.to_string()),
-            quote_cypher(&tenant_id.to_string()),
-            quote_cypher(&entity_b.to_string()),
-        );
+        let cypher = build_co_occurs_delete_query(tenant_id, entity_a, entity_b);
         self.execute_mutation(&cypher).await
     }
 
@@ -587,6 +566,42 @@ fn build_co_occurs_merge_query(
         quote_cypher(&now),
         quote_cypher(&now),
         quote_cypher(&now),
+    )
+}
+
+fn build_co_occurs_strength_update_query(
+    tenant_id: Uuid,
+    entity_a: Uuid,
+    entity_b: Uuid,
+    strength: f32,
+) -> String {
+    // IMPORTANT: update by the CO_OCCURS_WITH edge identity properties.
+    // Ferrosa's graph storage exposes persisted co-occurrence identity on the
+    // relationship (`entity_a`, `entity_b`); matching only endpoint
+    // `entity_id`s has repeatedly been reverted into a no-op against live data.
+    format!(
+        "MATCH (a:Entity)\
+         -[r:CO_OCCURS_WITH {{tenant_id: {}, entity_a: {}, entity_b: {}}}]->\
+         (b:Entity) \
+         SET r.strength = {}",
+        quote_cypher(&tenant_id.to_string()),
+        quote_cypher(&entity_a.to_string()),
+        quote_cypher(&entity_b.to_string()),
+        strength,
+    )
+}
+
+fn build_co_occurs_delete_query(tenant_id: Uuid, entity_a: Uuid, entity_b: Uuid) -> String {
+    // Keep this paired with build_co_occurs_strength_update_query; do not
+    // simplify it to node-only entity_id predicates.
+    format!(
+        "MATCH (a:Entity)\
+         -[r:CO_OCCURS_WITH {{tenant_id: {}, entity_a: {}, entity_b: {}}}]->\
+         (b:Entity) \
+         DELETE r",
+        quote_cypher(&tenant_id.to_string()),
+        quote_cypher(&entity_a.to_string()),
+        quote_cypher(&entity_b.to_string()),
     )
 }
 
@@ -816,5 +831,46 @@ mod tests {
         assert!(co_occurs.contains("r.first_seen = "));
         assert!(co_occurs.contains("r.last_reinforced = "));
         assert!(supersedes.contains(":SUPERSEDES"));
+    }
+
+    #[test]
+    fn co_occurs_update_and_delete_match_edge_identity_properties() {
+        let tenant_id = Uuid::from_u128(0x1);
+        let entity_a = Uuid::from_u128(0x2);
+        let entity_b = Uuid::from_u128(0x3);
+
+        let update = build_co_occurs_strength_update_query(tenant_id, entity_a, entity_b, 0.25);
+        let delete = build_co_occurs_delete_query(tenant_id, entity_a, entity_b);
+
+        for query in [&update, &delete] {
+            assert!(
+                query.contains("MATCH (a:Entity)"),
+                "must keep public Entity labels: {query}"
+            );
+            assert!(
+                query.contains("-[r:CO_OCCURS_WITH {tenant_id: "),
+                "must match the CO_OCCURS_WITH relationship itself: {query}"
+            );
+            assert!(
+                query.contains("entity_a: '00000000-0000-0000-0000-000000000002'"),
+                "must use edge entity_a identity property: {query}"
+            );
+            assert!(
+                query.contains("entity_b: '00000000-0000-0000-0000-000000000003'"),
+                "must use edge entity_b identity property: {query}"
+            );
+            assert!(
+                !query.contains("entity_id: '00000000-0000-0000-0000-000000000002'"),
+                "do not revert to source-node identity matching for this mutation: {query}"
+            );
+            assert!(
+                !query.contains("entity_id: '00000000-0000-0000-0000-000000000003'"),
+                "do not revert to target-node identity matching for this mutation: {query}"
+            );
+        }
+
+        assert!(update.contains("SET r.strength = 0.25"));
+        assert!(delete.contains("DELETE r"));
+        assert!(!delete.contains("RETURN"));
     }
 }

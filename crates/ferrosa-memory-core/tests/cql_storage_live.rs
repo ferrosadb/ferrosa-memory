@@ -9,6 +9,7 @@ async fn connect_plain(contact_point: &str) -> LegacySession {
     #[allow(deprecated)]
     SessionBuilder::new()
         .known_node(contact_point)
+        .user("ferrosa_admin", "ferrosa_admin")
         .build_legacy()
         .await
         .expect("session build failed")

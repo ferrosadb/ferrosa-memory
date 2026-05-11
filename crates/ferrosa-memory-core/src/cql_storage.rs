@@ -90,6 +90,20 @@ fn entity_list_all_query(ks: &str) -> String {
     )
 }
 
+fn edge_list_all_query(ks: &str, table: &str, src_col: &str, tgt_col: &str) -> String {
+    format!(
+        "SELECT {src_col}, {tgt_col} FROM {ks}.{table} \
+         WHERE tenant_id = ? ALLOW FILTERING"
+    )
+}
+
+fn typed_edge_list_all_query(ks: &str) -> String {
+    format!(
+        "SELECT src_id, edge_type, dst_id, weight, metadata, created_at, session_id \
+         FROM {ks}.typed_edges WHERE tenant_id = ? ALLOW FILTERING"
+    )
+}
+
 fn edge_count_query(ks: &str, table: &str) -> anyhow::Result<String> {
     let count_column = match table {
         "co_occurs_with" => "entity_a",
@@ -2392,6 +2406,74 @@ impl Storage for CqlStorage {
         Ok(results)
     }
 
+    async fn fold_stream_all(
+        &self,
+        ctx: TenantContext,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<FoldEntry>>>,
+    ) {
+        let chunk_size = chunk_size.max(1);
+        let query = format!(
+            "SELECT session_id, fold_id, depth, parent_fold_id, fold_summary, \
+             token_count, compression_ratio, status, created_at, folded_at \
+             FROM {}.trajectory_folds WHERE tenant_id = ? ALLOW FILTERING",
+            self.keyspace
+        );
+        let mut iter = match self.session.query_iter(query, (ctx.tenant_id,)).await {
+            Ok(iter) => iter,
+            Err(e) => {
+                let _ = tx.send(Err(e.into())).await;
+                return;
+            }
+        };
+        let col_map = build_col_map(iter.get_column_specs());
+        let mut chunk = Vec::with_capacity(chunk_size);
+        while let Some(row) = iter.next().await {
+            match row.map_err(anyhow::Error::from).and_then(|row| {
+                let status_str: String = cql_get(&row, &col_map, "status").unwrap_or_default();
+                let status: FoldStatus = serde_json::from_str(&format!("\"{status_str}\""))
+                    .unwrap_or(FoldStatus::Active);
+                let created_at =
+                    cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
+                        .unwrap_or_default();
+                Ok(FoldEntry {
+                    session_id: cql_get(&row, &col_map, "session_id")?,
+                    fold_id: cql_get(&row, &col_map, "fold_id")?,
+                    tenant_id: ctx.tenant_id,
+                    depth: cql_get(&row, &col_map, "depth")?,
+                    parent_fold_id: cql_get::<Uuid>(&row, &col_map, "parent_fold_id").ok(),
+                    raw_trajectory: String::new(),
+                    fold_summary: cql_get::<String>(&row, &col_map, "fold_summary").ok(),
+                    fold_embedding: None,
+                    token_count: cql_get(&row, &col_map, "token_count")?,
+                    compression_ratio: cql_get::<f64>(&row, &col_map, "compression_ratio").ok(),
+                    status,
+                    created_at,
+                    folded_at: cql_get::<chrono::DateTime<chrono::Utc>>(
+                        &row,
+                        &col_map,
+                        "folded_at",
+                    )
+                    .ok(),
+                })
+            }) {
+                Ok(fold) => {
+                    chunk.push(fold);
+                    if chunk.len() >= chunk_size {
+                        let out = std::mem::take(&mut chunk);
+                        if tx.send(Ok(out)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "fold_stream_all skipped malformed row"),
+            }
+        }
+        if !chunk.is_empty() {
+            let _ = tx.send(Ok(chunk)).await;
+        }
+    }
+
     async fn temporal_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<TemporalEvent>> {
         let (col_map, rows) = self
             .exec_prepared_rows(&self.stmts.temporal_list_all, (ctx.tenant_id,))
@@ -2897,10 +2979,7 @@ impl Storage for CqlStorage {
         ];
 
         for &(table, src_col, tgt_col, edge_type) in queries {
-            let query = format!(
-                "SELECT {src_col}, {tgt_col} FROM {}.{table} WHERE tenant_id = ? ALLOW FILTERING",
-                self.keyspace
-            );
+            let query = edge_list_all_query(&self.keyspace, table, src_col, tgt_col);
             #[allow(deprecated)]
             if let Ok(prepared) = self.session.prepare(query).await {
                 #[allow(deprecated)]
@@ -2946,10 +3025,7 @@ impl Storage for CqlStorage {
         ];
 
         for &(table, src_col, tgt_col, edge_type) in queries {
-            let query = format!(
-                "SELECT {src_col}, {tgt_col} FROM {}.{table} WHERE tenant_id = ? ALLOW FILTERING",
-                self.keyspace
-            );
+            let query = edge_list_all_query(&self.keyspace, table, src_col, tgt_col);
             let mut iter = match self.session.query_iter(query, (ctx.tenant_id,)).await {
                 Ok(iter) => iter,
                 Err(e) => {
@@ -4240,11 +4316,7 @@ impl Storage for CqlStorage {
     }
 
     async fn typed_edge_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<TypedEdge>> {
-        let query = format!(
-            "SELECT src_id, edge_type, dst_id, weight, metadata, created_at, session_id \
-             FROM {}.typed_edges WHERE tenant_id = ? ALLOW FILTERING",
-            self.keyspace
-        );
+        let query = typed_edge_list_all_query(&self.keyspace);
         let prepared = self.session.prepare(query).await?;
         #[allow(deprecated)]
         let _qr = self
@@ -4295,11 +4367,7 @@ impl Storage for CqlStorage {
         tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<TypedEdge>>>,
     ) {
         let chunk_size = chunk_size.max(1);
-        let query = format!(
-            "SELECT src_id, edge_type, dst_id, weight, metadata, created_at, session_id \
-             FROM {}.typed_edges WHERE tenant_id = ? ALLOW FILTERING",
-            self.keyspace
-        );
+        let query = typed_edge_list_all_query(&self.keyspace);
         let mut iter = match self.session.query_iter(query, (ctx.tenant_id,)).await {
             Ok(iter) => iter,
             Err(e) => {
@@ -4777,20 +4845,30 @@ mod cql_storage_tests {
     }
 
     #[test]
-    fn entity_list_all_query_avoids_large_blob_columns_during_allow_filtering_scan() {
-        let query = entity_list_all_query("agent_memory");
+    fn tenant_wide_viz_snapshot_queries_are_uncapped_and_exclude_heavy_blobs() {
+        let entity_query = entity_list_all_query("agent_memory");
+        let edge_query =
+            edge_list_all_query("agent_memory", "co_occurs_with", "entity_a", "entity_b");
+        let typed_edge_query = typed_edge_list_all_query("agent_memory");
+
+        for query in [&entity_query, &edge_query, &typed_edge_query] {
+            assert!(
+                query.contains(" WHERE tenant_id = ? ALLOW FILTERING"),
+                "tenant-wide viz scans must be tenant-scoped and uncapped so /viz/ws can stream the full browser stress-test dataset: {query}"
+            );
+            assert!(
+                !query.contains(" LIMIT "),
+                "tenant-wide viz scans must not silently cap the all-node browser stream: {query}"
+            );
+        }
 
         assert!(
-            query.contains("FROM agent_memory.entity_store WHERE tenant_id = ? ALLOW FILTERING"),
-            "regression guard should cover tenant-wide ALLOW FILTERING scan: {query}"
+            !entity_query.contains("context_snippet"),
+            "tenant-wide entity scans must not fetch multi-KB context snippets: {entity_query}"
         );
         assert!(
-            !query.contains("context_snippet"),
-            "tenant-wide entity scans must not fetch multi-KB context snippets: {query}"
-        );
-        assert!(
-            !query.contains("entity_embedding"),
-            "tenant-wide entity scans must not fetch vector blobs: {query}"
+            !entity_query.contains("entity_embedding"),
+            "tenant-wide entity scans must not fetch vector blobs: {entity_query}"
         );
     }
 

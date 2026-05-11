@@ -1,16 +1,22 @@
 // Intentionally uses the scylla 0.15 LegacySession API — deprecated but stable for this migration.
 #![allow(deprecated)]
-//! Live test: vector INSERT/SELECT via blob workaround.
+//! Live test: vector DDL/PREPARE compatibility.
 //! Run: cargo test -p ferrosa-memory-core --test vector_live -- --ignored --nocapture
+//!
+//! The scylla 0.15 driver used by ferrosa-memory can prepare vector statements
+//! but does not expose a Rust value serializer for `vector<float, N>`; a
+//! `Vec<u8>` is correctly rejected because the live prepared column type is
+//! VectorType, not Blob. This smoke verifies Ferrosa's vector table,
+//! insert-prepare, ANN prepare, and type-checking surface without pretending
+//! blob serialization is a vector roundtrip.
 
-use ferrosa_memory_core::cql_storage::build_col_map;
-use ferrosa_memory_core::vector;
 use scylla::{LegacySession, SessionBuilder};
 
 async fn connect_plain(contact_point: &str) -> LegacySession {
     #[allow(deprecated)]
     SessionBuilder::new()
         .known_node(contact_point)
+        .user("ferrosa_admin", "ferrosa_admin")
         .build_legacy()
         .await
         .expect("session build failed")
@@ -18,7 +24,7 @@ async fn connect_plain(contact_point: &str) -> LegacySession {
 
 #[tokio::test]
 #[ignore = "requires live Ferrosa cluster; run with --ignored and FERROSA_TEST_CONTAINERS=1"]
-async fn vector_blob_workaround_roundtrip() {
+async fn vector_prepare_and_typecheck_smoke() {
     if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
         panic!(
             "set FERROSA_TEST_CONTAINERS=1 and run `podman compose up -d` in \
@@ -28,7 +34,6 @@ async fn vector_blob_workaround_roundtrip() {
     }
     let session = connect_plain("127.0.0.1:19042").await;
 
-    // Create table with vector column
     #[allow(deprecated)]
     session
         .query_unpaged(
@@ -39,49 +44,25 @@ async fn vector_blob_workaround_roundtrip() {
         .await
         .expect("CREATE TABLE");
 
-    // Encode vector as raw bytes — scylla accepts Vec<u8> for blob columns
-    let embedding = vec![0.1_f32, 0.2, 0.3, 0.4];
-    let blob_bytes: Vec<u8> = vector::encode_vector(&embedding);
-    let id = uuid::Uuid::new_v4();
-
-    // INSERT using blob bytes — the VECTOR column should accept raw bytes
-    let prepared = session
+    let insert = session
         .prepare("INSERT INTO agent_memory.test_vector_blob (id, embedding) VALUES (?, ?)")
         .await
-        .expect("PREPARE INSERT");
+        .expect("PREPARE vector INSERT");
 
-    #[allow(deprecated)]
     session
-        .execute_unpaged(&prepared, (id, blob_bytes))
+        .prepare("SELECT id FROM agent_memory.test_vector_blob ORDER BY embedding ANN OF ? LIMIT 5")
         .await
-        .expect("INSERT with vector as blob");
+        .expect("PREPARE ANN SELECT");
 
-    eprintln!("INSERT succeeded");
+    let blob_insert = session
+        .execute_unpaged(&insert, (uuid::Uuid::new_v4(), vec![0_u8; 16]))
+        .await;
+    let err = blob_insert.expect_err("Vec<u8> must not serialize as vector<float, 4>");
+    let err_text = err.to_string();
+    assert!(
+        err_text.contains("VectorType") && err_text.contains("Blob"),
+        "expected vector/blob type mismatch, got {err_text}"
+    );
 
-    // Read back
-    let read = session
-        .prepare("SELECT embedding FROM agent_memory.test_vector_blob WHERE id = ?")
-        .await
-        .expect("PREPARE SELECT");
-
-    #[allow(deprecated)]
-    let result = session.execute_unpaged(&read, (id,)).await.expect("SELECT");
-
-    let col_map = build_col_map(result.col_specs());
-    let rows = result.rows_or_empty();
-    assert_eq!(rows.len(), 1);
-
-    // Read vector as blob bytes — column 0 is embedding (only column selected)
-    let raw: Vec<u8> =
-        ferrosa_memory_core::cql_storage::cql_get::<Vec<u8>>(&rows[0], &col_map, "embedding")
-            .expect("read vector by name as blob");
-    let decoded = vector::decode_vector(&raw);
-
-    eprintln!("Decoded: {:?}", decoded);
-    assert_eq!(decoded.len(), 4);
-    for (a, b) in embedding.iter().zip(decoded.iter()) {
-        assert!((a - b).abs() < 1e-6, "mismatch: {} vs {}", a, b);
-    }
-
-    eprintln!("Vector blob roundtrip PASSED!");
+    eprintln!("Vector prepare/typecheck smoke PASSED");
 }

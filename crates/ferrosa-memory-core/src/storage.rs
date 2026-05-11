@@ -263,6 +263,34 @@ pub trait Storage: Send + Sync {
         ctx: &TenantContext,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<FoldEntry>>> + Send;
 
+    /// Stream all folds for a tenant in bounded chunks.
+    ///
+    /// The default implementation chunks `fold_list_all()` for in-memory test
+    /// backends. CQL storage overrides this with paged driver iteration and a
+    /// viz-safe projection that omits heavy raw trajectory/embedding columns.
+    fn fold_stream_all(
+        &self,
+        ctx: TenantContext,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<FoldEntry>>>,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        async move {
+            let chunk_size = chunk_size.max(1);
+            match self.fold_list_all(&ctx).await {
+                Ok(folds) => {
+                    for chunk in folds.chunks(chunk_size) {
+                        if tx.send(Ok(chunk.to_vec())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                }
+            }
+        }
+    }
+
     /// List all temporal events for a tenant (sync/export use only — uses ALLOW FILTERING).
     fn temporal_list_all(
         &self,
