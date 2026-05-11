@@ -462,18 +462,19 @@ jobs:
   ci-pass:
     name: CI Pass
     runs-on: ubuntu-latest
-    needs: [fmt-lint, build, test-coverage, complexity, docs, python-harness, cluster-integration]
+    needs: [fmt-lint, advisories, build, test-coverage, complexity, docs, python-harness, integration]
     if: always()
     steps:
       - name: Check all jobs passed
         run: |
           if [ "${{ needs.fmt-lint.result }}" != "success" ] || \
+             [ "${{ needs.advisories.result }}" != "success" ] || \
              [ "${{ needs.build.result }}" != "success" ] || \
              [ "${{ needs.test-coverage.result }}" != "success" ] || \
              [ "${{ needs.complexity.result }}" != "success" ] || \
              [ "${{ needs.docs.result }}" != "success" ] || \
              [ "${{ needs.python-harness.result }}" != "success" ] || \
-             [ "${{ needs.cluster-integration.result }}" != "success" ]; then
+             [ "${{ needs.integration.result }}" != "success" ]; then
             echo "::error::One or more CI stages failed"
             exit 1
           fi
