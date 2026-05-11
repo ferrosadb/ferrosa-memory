@@ -418,8 +418,13 @@ jobs:
             --keyspace agent_memory \
             --ddl-dir ddl
 
-          # Propagation barrier: re-run the same idempotent DDL against
-          # each peer until the keyspace is visible.
+          # Propagation barrier: SELECT-only probe against each peer until the
+          # agent_memory keyspace is visible in system_schema.keyspaces. We
+          # cannot re-run the migrate DDL here — the scylla driver's auto
+          # schema-agreement metadata fetch (triggered by any DDL once schema
+          # exists) currently fails against ferrosa's system_schema.views
+          # column shape. The --probe-only path issues a single SELECT only,
+          # which sidesteps that path.
           for port in 19043 19044; do
             echo "Waiting for keyspace propagation on port ${port}..."
             for i in $(seq 1 30); do
@@ -428,7 +433,7 @@ jobs:
               if timeout 20s cargo run --quiet --bin migrate -- \
                   --contact-points 127.0.0.1:${port} \
                   --keyspace agent_memory \
-                  --ddl-dir ddl >/dev/null 2>&1; then
+                  --probe-only >/dev/null 2>&1; then
                 echo "  port ${port} sees agent_memory after ${i} attempts"
                 break
               fi

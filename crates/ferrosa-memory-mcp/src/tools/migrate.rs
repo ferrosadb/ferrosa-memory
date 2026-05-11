@@ -50,6 +50,11 @@ async fn main() -> anyhow::Result<()> {
 
     let session = connect_with_retry(&cli.contact_points, cli.credentials.as_ref()).await?;
 
+    if cli.probe_only {
+        probe_keyspace(&session, &cli.keyspace).await?;
+        return Ok(());
+    }
+
     // Read DDL files in lexicographic order (the prefix `001_keyspace.cql`
     // sequence already encodes the apply order).
     let mut entries: Vec<_> = std::fs::read_dir(&cli.ddl_dir)
@@ -104,6 +109,36 @@ async fn connect_with_retry(
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("session builder failed without error")))
+}
+
+/// SELECT-only probe: confirm `keyspace` is visible in `system_schema.keyspaces`.
+/// Avoids any DDL so the scylla driver's auto schema-agreement metadata fetch
+/// is never triggered — that path currently fails against Ferrosa's
+/// `system_schema.views` column shape (10 cols vs. driver's expected 3).
+///
+/// Reads the full keyspace list (a handful of rows) and matches client-side
+/// rather than using a `?` bind marker; Ferrosa's CQL PREPARE for
+/// `WHERE keyspace_name = ?` currently fails with "expected 1 bind-marker
+/// column spec(s) but resolved only 0".
+#[allow(deprecated)]
+async fn probe_keyspace(session: &LegacySession, keyspace: &str) -> anyhow::Result<()> {
+    let result = session
+        .query_unpaged("SELECT keyspace_name FROM system_schema.keyspaces", ())
+        .await
+        .with_context(|| format!("probing system_schema.keyspaces for `{keyspace}`"))?;
+    let rows = result.rows_or_empty();
+    let visible = rows.iter().any(|row| {
+        row.columns
+            .first()
+            .and_then(|col| col.as_ref())
+            .and_then(|val| val.as_text())
+            .is_some_and(|name| name == keyspace)
+    });
+    if !visible {
+        anyhow::bail!("keyspace `{keyspace}` not visible in system_schema.keyspaces");
+    }
+    tracing::info!(keyspace, "keyspace visible");
+    Ok(())
 }
 
 #[allow(deprecated)]
@@ -201,6 +236,12 @@ struct Args {
     keyspace: String,
     ddl_dir: PathBuf,
     credentials: Option<(String, String)>,
+    /// SELECT-only probe mode: connect, check that the keyspace is visible in
+    /// `system_schema.keyspaces`, exit. Does not issue any DDL. Used by the CI
+    /// cluster-propagation barrier to avoid triggering the scylla driver's
+    /// auto schema-agreement metadata fetch (which currently fails against
+    /// Ferrosa's `system_schema.views` column shape; tracked upstream).
+    probe_only: bool,
 }
 
 fn parse_args() -> Args {
@@ -231,6 +272,7 @@ where
     let mut user: Option<String> = None;
     let mut password: Option<String> = None;
     let mut config_path: Option<PathBuf> = None;
+    let mut probe_only = false;
     while let Some(flag) = iter.next() {
         match flag {
             "--contact-points" => {
@@ -247,6 +289,7 @@ where
             "--user" => user = iter.next().map(str::to_string),
             "--password" => password = iter.next().map(str::to_string),
             "--config" => config_path = iter.next().map(PathBuf::from),
+            "--probe-only" => probe_only = true,
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -297,6 +340,7 @@ where
             .or_else(|| env_value("FERROSA_DDL_DIR").map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("ddl")),
         credentials,
+        probe_only,
     }
 }
 
@@ -485,5 +529,21 @@ password = "ferrosa_admin"
         let args = parse_args_from(["--contact-points", "ferrosa.example.com:9042"], [], None);
 
         assert_eq!(args.credentials, None);
+    }
+
+    #[test]
+    fn parse_args_probe_only_defaults_off() {
+        let args = parse_args_from(["--contact-points", "127.0.0.1:19042"], [], None);
+        assert!(!args.probe_only);
+    }
+
+    #[test]
+    fn parse_args_probe_only_flag_sets_it() {
+        let args = parse_args_from(
+            ["--contact-points", "127.0.0.1:19043", "--probe-only"],
+            [],
+            None,
+        );
+        assert!(args.probe_only);
     }
 }
