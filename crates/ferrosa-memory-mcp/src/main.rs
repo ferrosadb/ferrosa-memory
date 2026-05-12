@@ -1495,6 +1495,15 @@ async fn cql_reconnect_watcher(storage: Arc<ReconnectingStorage>) {
             );
             tokio::time::sleep(delay).await;
 
+            if let Err(e) = run_startup_migrations(&storage.cql_config).await {
+                attempt = attempt.saturating_add(1);
+                tracing::warn!(
+                    attempt,
+                    "schema migration retry failed before CQL reconnect: {e}"
+                );
+                continue;
+            }
+
             match CqlStorage::connect(&storage.cql_config).await {
                 Ok(cql) => {
                     tracing::info!("CQL reconnection successful");
@@ -1508,6 +1517,33 @@ async fn cql_reconnect_watcher(storage: Arc<ReconnectingStorage>) {
             }
         }
     }
+}
+
+async fn run_startup_migrations(config: &FerrosaCqlConfig) -> anyhow::Result<()> {
+    let migrations_enabled = matches!(
+        std::env::var("FERROSA_MIGRATIONS_ENABLED").ok().as_deref(),
+        None | Some("true" | "1" | "on" | "yes")
+    );
+
+    if !migrations_enabled {
+        tracing::info!(
+            "FERROSA_MIGRATIONS_ENABLED is disabled; skipping schema migrations. \
+             Ensure the keyspace schema is managed externally (DBaaS mode) or manually applied."
+        );
+        return Ok(());
+    }
+
+    let admin_session = ferrosa_memory_core::cql_storage::connect_admin_session(config).await?;
+    match ferrosa_memory_core::migration::run_migrations(&admin_session, &config.keyspace).await {
+        Ok(0) => tracing::debug!("schema up to date"),
+        Ok(n) => tracing::info!(applied = n, "schema migrations applied"),
+        Err(e) => anyhow::bail!(
+            "schema migration failed: {e}. The keyspace may be out of sync with this binary. \
+             Investigate the failing DDL and restart. CqlStorage will not connect until schema is complete."
+        ),
+    }
+
+    Ok(())
 }
 
 /// Idle-consolidation configuration passed from `main()`.
@@ -1608,6 +1644,8 @@ async fn run_idle_consolidation<S: Storage>(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let debug = std::env::args().any(|a| a == "--debug");
 
     let default_filter = if debug {
@@ -1693,43 +1731,9 @@ async fn main() -> anyhow::Result<()> {
     // build and the MCP enters a reconnect loop.  By running migrations
     // on a bare Scylla admin session (no prepared-statement bloat) first,
     // we guarantee the DDL is in place before CqlStorage tries to use it.
-    let keyspace = config.ferrosa.keyspace.clone();
-    let migrations_enabled = matches!(
-        std::env::var("FERROSA_MIGRATIONS_ENABLED").ok().as_deref(),
-        None | Some("true" | "1" | "on" | "yes")
-    );
-    if migrations_enabled {
-        match ferrosa_memory_core::cql_storage::connect_admin_session(&config.ferrosa).await {
-            Ok(admin_session) => {
-                match ferrosa_memory_core::migration::run_migrations(&admin_session, &keyspace)
-                    .await
-                {
-                    Ok(0) => tracing::debug!("schema up to date"),
-                    Ok(n) => tracing::info!(applied = n, "schema migrations applied"),
-                    Err(e) => {
-                        // Migration failures are not recoverable by retry. The
-                        // schema is in an unknown state. Log at ERROR so
-                        // operators see it immediately, and do not mask the
-                        // failure as a warning.
-                        tracing::error!(
-                            "schema migration failed: {e}. The keyspace may be out of sync with this binary. \
-                             Investigate the failing DDL and restart. CqlStorage will attempt to connect, \
-                             but runtime queries may fail if the schema is incomplete."
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "admin CQL session unavailable ({e}), skipping migrations. \
-                     Migrations will retry on the next reconnect cycle."
-                );
-            }
-        }
-    } else {
-        tracing::info!(
-            "FERROSA_MIGRATIONS_ENABLED is disabled; skipping schema migrations. \
-             Ensure the keyspace schema is managed externally (DBaaS mode) or manually applied."
+    if let Err(e) = run_startup_migrations(&config.ferrosa).await {
+        tracing::warn!(
+            "startup migrations did not complete ({e}); CQL runtime connection may fail and the reconnect watcher will retry"
         );
     }
 

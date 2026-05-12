@@ -1,10 +1,17 @@
-.PHONY: test-unit test-contracts test-integration test-system test-property \
+.PHONY: build-podman-binary init-runtime test-unit test-contracts test-integration test-system test-property \
 	test-security test-load test-load-smoke test-duration test-baseline \
 	test-live test-all test-coverage-gap
 
 PYTHON ?= python3
 PIP ?= $(PYTHON) -m pip
 PYTEST ?= $(PYTHON) -m pytest
+CARGO ?= cargo
+
+build-podman-binary:
+	$(CARGO) build --release -p ferrosa-memory-mcp --target-dir target-podman-linux
+
+init-runtime:
+	./scripts/init-runtime.sh
 
 test-unit:
 	cargo test --workspace --lib
