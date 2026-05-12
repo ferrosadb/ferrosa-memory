@@ -296,6 +296,35 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "pull_preview".into(),
+            description: "Learner-side remote memory pull preview. Verifies a signed teaching packet, evaluates dry-run import policy, and reports duplicate/conflict candidates without mutating local storage.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "remote_id": { "type": "string", "format": "uuid" },
+                    "remote_name": { "type": "string", "maxLength": 256 },
+                    "query": { "type": "string", "maxLength": 4096 },
+                    "public_identity": { "type": "object", "description": "Teacher InstancePublicIdentity used to verify signed_packet" },
+                    "signed_packet": { "type": "object", "description": "SignedEnvelope<TeachingPacket> from teach_query_stream or remote transport" },
+                    "local_applicability": { "type": "object" },
+                    "preview_ttl_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 }
+                },
+                "required": ["remote_id", "remote_name", "query", "public_identity", "signed_packet"]
+            }),
+        },
+        ToolDef {
+            name: "pull_commit".into(),
+            description: "Commit an accepted learner-side remote memory pull preview. Writes active imports with provenance, persists stubs/quarantine decisions, and records an import batch.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "preview": { "type": "object", "description": "PullPreviewPlan returned by pull_preview" },
+                    "learner_decision": { "type": "object", "description": "SignedEnvelope<ImportDecisionPayload> authorizing this commit" }
+                },
+                "required": ["preview", "learner_decision"]
+            }),
+        },
+        ToolDef {
             name: "search_context_segments".into(),
             description: "Hybrid-search raw context segments with lexical BM25 fallback plus Nomic vector ANN, optionally returning bounded prev/next temporal expansion windows.".into(),
             input_schema: serde_json::json!({
@@ -1517,6 +1546,8 @@ async fn dispatch_tool<S: crate::storage::Storage>(
             handle_search_context_segments(args, storage, ctx, session).await
         }
         "teach_query_stream" => handle_teach_query_stream(args, storage, ctx).await,
+        "pull_preview" => handle_pull_preview(args, storage, ctx).await,
+        "pull_commit" => handle_pull_commit(args, storage, ctx).await,
         "get_context_window" => handle_get_context_window(args, storage, ctx).await,
         "upsert_entity" => handle_upsert_entity(args, storage, ctx, session).await,
         "batch_ingest" => handle_batch_ingest(args, storage, ctx, session).await,
@@ -1670,6 +1701,8 @@ fn is_tier1(name: &str) -> bool {
             | "verify_skill"
             | "ingest_context_segments"
             | "teach_query_stream"
+            | "pull_preview"
+            | "pull_commit"
             | "search_context_segments"
             | "get_context_window"
             | "hybrid_search"
@@ -1709,6 +1742,7 @@ fn is_write_tool(name: &str) -> bool {
             | "append_to_fold"
             | "complete_fold"
             | "ingest_context_segments"
+            | "pull_commit"
             | "upsert_entity"
             | "batch_ingest"
             | "ingest_entities"
@@ -2355,6 +2389,71 @@ async fn handle_teach_query_stream<S: crate::storage::Storage>(
         .await
         .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
     serde_json::to_value(events).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
+async fn handle_pull_preview<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let mut request = crate::remotes::pull::PullPreviewRequest::new(
+        require_uuid(&args, "remote_id")?,
+        require_str(&args, "remote_name")?.to_string(),
+        require_str(&args, "query")?.to_string(),
+    )
+    .with_public_identity(
+        serde_json::from_value(
+            args.get("public_identity")
+                .cloned()
+                .ok_or((INVALID_PARAMS, "missing public_identity".into()))?,
+        )
+        .map_err(|e| (INVALID_PARAMS, format!("invalid public_identity: {e}")))?,
+    );
+    if let Some(value) = args.get("local_applicability") {
+        request = request.with_local_applicability(
+            serde_json::from_value(value.clone())
+                .map_err(|e| (INVALID_PARAMS, format!("invalid local_applicability: {e}")))?,
+        );
+    }
+    if let Some(ttl) = args.get("preview_ttl_seconds").and_then(|v| v.as_i64()) {
+        request.preview_ttl = chrono::Duration::seconds(ttl.clamp(1, 86400));
+    }
+    let client = crate::remotes::pull::json_remote_client_from_args(&args)
+        .map_err(|e| (INVALID_PARAMS, e.to_string()))?;
+    let preview = crate::remotes::pull::pull_preview(&client, storage, ctx, request)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    serde_json::to_value(preview).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
+async fn handle_pull_commit<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let preview: crate::remotes::pull::PullPreviewPlan = serde_json::from_value(
+        args.get("preview")
+            .cloned()
+            .ok_or((INVALID_PARAMS, "missing preview".into()))?,
+    )
+    .map_err(|e| (INVALID_PARAMS, format!("invalid preview: {e}")))?;
+    let learner_decision = serde_json::from_value(
+        args.get("learner_decision")
+            .cloned()
+            .ok_or((INVALID_PARAMS, "missing learner_decision".into()))?,
+    )
+    .map_err(|e| (INVALID_PARAMS, format!("invalid learner_decision: {e}")))?;
+    let receipt = crate::remotes::pull::pull_commit(
+        storage,
+        ctx,
+        crate::remotes::pull::PullCommitRequest {
+            preview,
+            learner_decision,
+        },
+    )
+    .await
+    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    serde_json::to_value(receipt).map_err(|e| (INTERNAL_ERROR, e.to_string()))
 }
 
 async fn handle_search_context_segments<S: crate::storage::Storage>(
