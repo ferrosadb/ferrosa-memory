@@ -116,6 +116,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "fix trajectory_folds timeuuid → uuid fold identifiers",
         ddl: include_str!("../../../ddl/033_trajectory_folds_uuid_columns.cql"),
     },
+    Migration {
+        version: 34,
+        description: "remote teacher learner memory transfer tables",
+        ddl: include_str!("../../../ddl/034_memory_remotes.cql"),
+    },
 ];
 
 /// Pre-versioning DDLs. Applied in order when `run_migrations` detects a
@@ -843,6 +848,40 @@ mod tests {
             );
             prev = m.version;
         }
+    }
+
+    #[test]
+    fn migration_034_embeds_remote_memory_tables_without_destructive_statements() {
+        let m34 = MIGRATIONS
+            .iter()
+            .find(|m| m.version == 34)
+            .expect("v34 present");
+        for table in [
+            "memory_remotes",
+            "remote_policy_facts",
+            "teaching_packets",
+            "teaching_items",
+            "remote_stubs",
+            "memory_provenance",
+            "memory_conflicts",
+            "memory_feedback",
+            "import_batches",
+        ] {
+            assert!(
+                m34.ddl
+                    .contains(&format!("CREATE TABLE IF NOT EXISTS agent_memory.{table}")),
+                "remote migration should create {table}"
+            );
+        }
+        let ddl_upper = m34.ddl.to_ascii_uppercase();
+        assert!(
+            !ddl_upper.contains("DROP "),
+            "remote migration must be additive only"
+        );
+        assert!(
+            !ddl_upper.contains("ALTER TABLE") || ddl_upper.contains(" ADD "),
+            "remote migration must not narrow or rewrite existing tables"
+        );
     }
 
     #[test]

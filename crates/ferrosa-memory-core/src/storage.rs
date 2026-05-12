@@ -14,6 +14,10 @@
 use uuid::Uuid;
 
 use crate::context_segment::{ContextSegment, TemporalEdge};
+use crate::remotes::types::{
+    ImportBatch, ImportState, MemoryConflict, MemoryFeedback, MemoryProvenance, MemoryRemote,
+    RemotePolicyFact, RemoteStub, TeachingItem, TeachingPacket,
+};
 use crate::types::{
     AliasEntry, ApprovalEntry, AuditEntry, ConfidenceScore, DerivedFact, EntityEntry,
     EntityTypeStateCount, FeedbackOutcome, FoldEntry, FoldSummary, MaterializedEdge, MemoEntry,
@@ -354,6 +358,146 @@ pub trait Storage: Send + Sync {
     fn feedback_list_all(
         &self,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<FeedbackOutcome>>> + Send;
+
+    // --- Remote teacher/learner storage operations ---
+
+    fn remote_put(
+        &self,
+        ctx: &TenantContext,
+        remote: &MemoryRemote,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    fn remote_get(
+        &self,
+        ctx: &TenantContext,
+        remote_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<MemoryRemote>>> + Send;
+
+    fn remote_list(
+        &self,
+        ctx: &TenantContext,
+        limit: usize,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MemoryRemote>>> + Send;
+
+    fn remote_policy_put(
+        &self,
+        ctx: &TenantContext,
+        fact: &RemotePolicyFact,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    fn remote_policy_list(
+        &self,
+        ctx: &TenantContext,
+        remote_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<RemotePolicyFact>>> + Send;
+
+    fn teaching_packet_put(
+        &self,
+        ctx: &TenantContext,
+        remote_id: Uuid,
+        packet: &TeachingPacket,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    fn teaching_packet_get(
+        &self,
+        ctx: &TenantContext,
+        remote_id: Uuid,
+        packet_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<TeachingPacket>>> + Send;
+
+    fn teaching_items_put(
+        &self,
+        ctx: &TenantContext,
+        remote_id: Uuid,
+        items: &[TeachingItem],
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    fn teaching_items_list_by_packet(
+        &self,
+        ctx: &TenantContext,
+        packet_id: Uuid,
+        limit: usize,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<TeachingItem>>> + Send;
+
+    fn remote_stub_put(
+        &self,
+        ctx: &TenantContext,
+        stub: &RemoteStub,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    fn remote_stub_list_by_state(
+        &self,
+        ctx: &TenantContext,
+        remote_id: Uuid,
+        state: ImportState,
+        limit: usize,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<RemoteStub>>> + Send;
+
+    fn remote_stub_update_state(
+        &self,
+        ctx: &TenantContext,
+        remote_id: Uuid,
+        stub_id: Uuid,
+        old_state: ImportState,
+        new_state: ImportState,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    fn memory_provenance_put(
+        &self,
+        ctx: &TenantContext,
+        provenance: &MemoryProvenance,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    fn memory_provenance_list_by_entity(
+        &self,
+        ctx: &TenantContext,
+        local_entity_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MemoryProvenance>>> + Send;
+
+    fn memory_conflict_put(
+        &self,
+        ctx: &TenantContext,
+        conflict: &MemoryConflict,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    fn memory_conflict_list_by_entity(
+        &self,
+        ctx: &TenantContext,
+        local_entity_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MemoryConflict>>> + Send;
+
+    fn memory_conflict_resolve(
+        &self,
+        ctx: &TenantContext,
+        local_entity_id: Uuid,
+        conflict_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    fn memory_feedback_put(
+        &self,
+        ctx: &TenantContext,
+        feedback: &MemoryFeedback,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    fn memory_feedback_list_by_target(
+        &self,
+        ctx: &TenantContext,
+        remote_id: Uuid,
+        target_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MemoryFeedback>>> + Send;
+
+    fn import_batch_put(
+        &self,
+        ctx: &TenantContext,
+        batch: &ImportBatch,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    fn import_batch_get(
+        &self,
+        ctx: &TenantContext,
+        remote_id: Uuid,
+        batch_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<ImportBatch>>> + Send;
 
     // --- Session lifecycle ---
 
@@ -1016,6 +1160,15 @@ pub mod mock {
         pub confidence_scores: Mutex<Vec<ConfidenceScore>>,
         pub context_segments: Mutex<Vec<ContextSegment>>,
         pub temporal_edges: Mutex<Vec<TemporalEdge>>,
+        pub memory_remotes: Mutex<Vec<MemoryRemote>>,
+        pub remote_policy_facts: Mutex<Vec<RemotePolicyFact>>,
+        pub teaching_packets: Mutex<Vec<(Uuid, TeachingPacket)>>,
+        pub teaching_items: Mutex<Vec<TeachingItem>>,
+        pub remote_stubs: Mutex<Vec<RemoteStub>>,
+        pub memory_provenance: Mutex<Vec<MemoryProvenance>>,
+        pub memory_conflicts: Mutex<Vec<MemoryConflict>>,
+        pub memory_feedback: Mutex<Vec<MemoryFeedback>>,
+        pub import_batches: Mutex<Vec<ImportBatch>>,
         pub edge_list_all_calls: AtomicUsize,
         pub edge_list_session_calls: AtomicUsize,
         pub edge_list_for_entity_calls: AtomicUsize,
@@ -1086,6 +1239,280 @@ pub mod mock {
     }
 
     impl Storage for MockStorage {
+        // --- Remote teacher/learner storage operations ---
+
+        async fn remote_put(
+            &self,
+            _ctx: &TenantContext,
+            remote: &MemoryRemote,
+        ) -> anyhow::Result<()> {
+            let mut remotes = self.memory_remotes.lock().await;
+            if let Some(existing) = remotes.iter_mut().find(|r| r.remote_id == remote.remote_id) {
+                *existing = remote.clone();
+            } else {
+                remotes.push(remote.clone());
+            }
+            Ok(())
+        }
+        async fn remote_get(
+            &self,
+            _ctx: &TenantContext,
+            remote_id: Uuid,
+        ) -> anyhow::Result<Option<MemoryRemote>> {
+            Ok(self
+                .memory_remotes
+                .lock()
+                .await
+                .iter()
+                .find(|r| r.remote_id == remote_id)
+                .cloned())
+        }
+        async fn remote_list(
+            &self,
+            _ctx: &TenantContext,
+            limit: usize,
+        ) -> anyhow::Result<Vec<MemoryRemote>> {
+            Ok(self
+                .memory_remotes
+                .lock()
+                .await
+                .iter()
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+        async fn remote_policy_put(
+            &self,
+            _ctx: &TenantContext,
+            fact: &RemotePolicyFact,
+        ) -> anyhow::Result<()> {
+            self.remote_policy_facts.lock().await.push(fact.clone());
+            Ok(())
+        }
+        async fn remote_policy_list(
+            &self,
+            _ctx: &TenantContext,
+            remote_id: Uuid,
+        ) -> anyhow::Result<Vec<RemotePolicyFact>> {
+            Ok(self
+                .remote_policy_facts
+                .lock()
+                .await
+                .iter()
+                .filter(|f| f.remote_id == remote_id)
+                .cloned()
+                .collect())
+        }
+        async fn teaching_packet_put(
+            &self,
+            _ctx: &TenantContext,
+            remote_id: Uuid,
+            packet: &TeachingPacket,
+        ) -> anyhow::Result<()> {
+            self.teaching_packets
+                .lock()
+                .await
+                .push((remote_id, packet.clone()));
+            Ok(())
+        }
+        async fn teaching_packet_get(
+            &self,
+            _ctx: &TenantContext,
+            remote_id: Uuid,
+            packet_id: Uuid,
+        ) -> anyhow::Result<Option<TeachingPacket>> {
+            Ok(self
+                .teaching_packets
+                .lock()
+                .await
+                .iter()
+                .find(|(r, p)| *r == remote_id && p.packet_id == packet_id)
+                .map(|(_, p)| p.clone()))
+        }
+        async fn teaching_items_put(
+            &self,
+            _ctx: &TenantContext,
+            _remote_id: Uuid,
+            items: &[TeachingItem],
+        ) -> anyhow::Result<()> {
+            self.teaching_items
+                .lock()
+                .await
+                .extend(items.iter().cloned());
+            Ok(())
+        }
+        async fn teaching_items_list_by_packet(
+            &self,
+            _ctx: &TenantContext,
+            packet_id: Uuid,
+            limit: usize,
+        ) -> anyhow::Result<Vec<TeachingItem>> {
+            Ok(self
+                .teaching_items
+                .lock()
+                .await
+                .iter()
+                .filter(|i| i.packet_id == packet_id)
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+        async fn remote_stub_put(
+            &self,
+            _ctx: &TenantContext,
+            stub: &RemoteStub,
+        ) -> anyhow::Result<()> {
+            let mut stubs = self.remote_stubs.lock().await;
+            if let Some(existing) = stubs.iter_mut().find(|s| s.stub_id == stub.stub_id) {
+                *existing = stub.clone();
+            } else {
+                stubs.push(stub.clone());
+            }
+            Ok(())
+        }
+        async fn remote_stub_list_by_state(
+            &self,
+            _ctx: &TenantContext,
+            remote_id: Uuid,
+            state: ImportState,
+            limit: usize,
+        ) -> anyhow::Result<Vec<RemoteStub>> {
+            Ok(self
+                .remote_stubs
+                .lock()
+                .await
+                .iter()
+                .filter(|s| s.remote_id == remote_id && s.state == state)
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+        async fn remote_stub_update_state(
+            &self,
+            _ctx: &TenantContext,
+            remote_id: Uuid,
+            stub_id: Uuid,
+            old_state: ImportState,
+            new_state: ImportState,
+        ) -> anyhow::Result<()> {
+            let mut stubs = self.remote_stubs.lock().await;
+            if let Some(stub) = stubs
+                .iter_mut()
+                .find(|s| s.remote_id == remote_id && s.stub_id == stub_id && s.state == old_state)
+            {
+                stub.state = new_state;
+                stub.updated_at = chrono::Utc::now();
+            }
+            Ok(())
+        }
+        async fn memory_provenance_put(
+            &self,
+            _ctx: &TenantContext,
+            provenance: &MemoryProvenance,
+        ) -> anyhow::Result<()> {
+            self.memory_provenance.lock().await.push(provenance.clone());
+            Ok(())
+        }
+        async fn memory_provenance_list_by_entity(
+            &self,
+            _ctx: &TenantContext,
+            local_entity_id: Uuid,
+        ) -> anyhow::Result<Vec<MemoryProvenance>> {
+            Ok(self
+                .memory_provenance
+                .lock()
+                .await
+                .iter()
+                .filter(|p| p.local_entity_id == local_entity_id)
+                .cloned()
+                .collect())
+        }
+        async fn memory_conflict_put(
+            &self,
+            _ctx: &TenantContext,
+            conflict: &MemoryConflict,
+        ) -> anyhow::Result<()> {
+            self.memory_conflicts.lock().await.push(conflict.clone());
+            Ok(())
+        }
+        async fn memory_conflict_list_by_entity(
+            &self,
+            _ctx: &TenantContext,
+            local_entity_id: Uuid,
+        ) -> anyhow::Result<Vec<MemoryConflict>> {
+            Ok(self
+                .memory_conflicts
+                .lock()
+                .await
+                .iter()
+                .filter(|c| c.local_entity_id == local_entity_id)
+                .cloned()
+                .collect())
+        }
+        async fn memory_conflict_resolve(
+            &self,
+            _ctx: &TenantContext,
+            local_entity_id: Uuid,
+            conflict_id: Uuid,
+        ) -> anyhow::Result<()> {
+            if let Some(conflict) = self
+                .memory_conflicts
+                .lock()
+                .await
+                .iter_mut()
+                .find(|c| c.local_entity_id == local_entity_id && c.conflict_id == conflict_id)
+            {
+                conflict.resolved = true;
+                conflict.resolved_at = Some(chrono::Utc::now());
+            }
+            Ok(())
+        }
+        async fn memory_feedback_put(
+            &self,
+            _ctx: &TenantContext,
+            feedback: &MemoryFeedback,
+        ) -> anyhow::Result<()> {
+            self.memory_feedback.lock().await.push(feedback.clone());
+            Ok(())
+        }
+        async fn memory_feedback_list_by_target(
+            &self,
+            _ctx: &TenantContext,
+            remote_id: Uuid,
+            target_id: Uuid,
+        ) -> anyhow::Result<Vec<MemoryFeedback>> {
+            Ok(self
+                .memory_feedback
+                .lock()
+                .await
+                .iter()
+                .filter(|f| f.remote_id == remote_id && f.target_id == target_id)
+                .cloned()
+                .collect())
+        }
+        async fn import_batch_put(
+            &self,
+            _ctx: &TenantContext,
+            batch: &ImportBatch,
+        ) -> anyhow::Result<()> {
+            self.import_batches.lock().await.push(batch.clone());
+            Ok(())
+        }
+        async fn import_batch_get(
+            &self,
+            _ctx: &TenantContext,
+            remote_id: Uuid,
+            batch_id: Uuid,
+        ) -> anyhow::Result<Option<ImportBatch>> {
+            Ok(self
+                .import_batches
+                .lock()
+                .await
+                .iter()
+                .find(|b| b.remote_id == remote_id && b.batch_id == batch_id)
+                .cloned())
+        }
+
         async fn memo_get(
             &self,
             ctx: &TenantContext,
@@ -2963,5 +3390,268 @@ pub mod mock {
                 .unwrap();
             assert!(miss.is_none(), "substring match must not count as exact");
         }
+    }
+}
+
+#[cfg(test)]
+mod remote_storage_mock_tests {
+    use super::Storage;
+    use super::mock::MockStorage;
+    use crate::remote_identity::{ContentHash, InstanceId, PublicKeyFingerprint};
+    use crate::remotes::types::*;
+    use crate::types::TenantContext;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    fn ctx() -> TenantContext {
+        TenantContext {
+            tenant_id: Uuid::from_u128(1),
+            session_origin: "test".into(),
+        }
+    }
+    fn id(n: u128) -> Uuid {
+        Uuid::from_u128(n)
+    }
+
+    fn remote() -> MemoryRemote {
+        MemoryRemote {
+            remote_id: id(2),
+            instance_id: InstanceId(id(3)),
+            name: "gpu".into(),
+            endpoint: "https://gpu.example".into(),
+            trust_class: RemoteTrustClass::Team,
+            public_key_fingerprint: PublicKeyFingerprint("fp".into()),
+            enabled: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn item(packet_id: Uuid) -> TeachingItem {
+        TeachingItem {
+            item_id: id(4),
+            packet_id,
+            kind: TeachingKind::Fact,
+            title: "title".into(),
+            summary: "summary".into(),
+            body: None,
+            content_hash: ContentHash("hash".into()),
+            applicability: ApplicabilityFrame {
+                namespaces: vec!["gpu".into()],
+                host_os: None,
+                container_runtime: None,
+                hardware: vec![],
+                required_tags: vec![],
+                excluded_tags: vec![],
+                confidence: 1.0,
+            },
+            safety: SafetyClassification {
+                risk: SafetyRisk::None,
+                reasons: vec![],
+                redacted: false,
+                requires_human: false,
+            },
+            detail_ref: None,
+            metadata: json!({}),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_storage_mock_families_round_trip_and_update_state() {
+        let storage = MockStorage::new();
+        let ctx = ctx();
+        let remote = remote();
+        storage.remote_put(&ctx, &remote).await.unwrap();
+        assert_eq!(
+            storage
+                .remote_get(&ctx, remote.remote_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .name,
+            "gpu"
+        );
+        assert_eq!(storage.remote_list(&ctx, 10).await.unwrap().len(), 1);
+
+        let fact = RemotePolicyFact {
+            fact_id: id(5),
+            remote_id: remote.remote_id,
+            kind: RemotePolicyKind::Grant(RemoteGrant {
+                namespace: "gpu".into(),
+                grant: "query".into(),
+            }),
+            created_at: chrono::Utc::now(),
+            expires_at: None,
+        };
+        storage.remote_policy_put(&ctx, &fact).await.unwrap();
+        assert_eq!(
+            storage
+                .remote_policy_list(&ctx, remote.remote_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let packet = TeachingPacket {
+            packet_id: id(6),
+            teacher_instance_id: remote.instance_id,
+            request_id: None,
+            source_namespace: "gpu".into(),
+            query: "q".into(),
+            items: vec![],
+            expires_at: None,
+            created_at: chrono::Utc::now(),
+        };
+        storage
+            .teaching_packet_put(&ctx, remote.remote_id, &packet)
+            .await
+            .unwrap();
+        assert!(
+            storage
+                .teaching_packet_get(&ctx, remote.remote_id, packet.packet_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let item = item(packet.packet_id);
+        storage
+            .teaching_items_put(&ctx, remote.remote_id, std::slice::from_ref(&item))
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .teaching_items_list_by_packet(&ctx, packet.packet_id, 5)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let stub = RemoteStub {
+            stub_id: id(7),
+            remote_id: remote.remote_id,
+            packet_id: packet.packet_id,
+            item_id: item.item_id,
+            local_entity_id: None,
+            title: "title".into(),
+            summary: "summary".into(),
+            state: ImportState::ActiveStub,
+            detail_ref: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        storage.remote_stub_put(&ctx, &stub).await.unwrap();
+        assert_eq!(
+            storage
+                .remote_stub_list_by_state(&ctx, remote.remote_id, ImportState::ActiveStub, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        storage
+            .remote_stub_update_state(
+                &ctx,
+                remote.remote_id,
+                stub.stub_id,
+                ImportState::ActiveStub,
+                ImportState::Archived,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .remote_stub_list_by_state(&ctx, remote.remote_id, ImportState::Archived, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let prov = MemoryProvenance {
+            provenance_id: id(8),
+            local_entity_id: id(9),
+            remote_id: remote.remote_id,
+            packet_id: packet.packet_id,
+            item_id: item.item_id,
+            content_hash: ContentHash("hash".into()),
+            signature_hash: ContentHash("sig".into()),
+            imported_at: chrono::Utc::now(),
+        };
+        storage.memory_provenance_put(&ctx, &prov).await.unwrap();
+        assert_eq!(
+            storage
+                .memory_provenance_list_by_entity(&ctx, prov.local_entity_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let conflict = MemoryConflict {
+            conflict_id: id(10),
+            local_entity_id: prov.local_entity_id,
+            remote_id: remote.remote_id,
+            item_id: item.item_id,
+            reason: "different fact".into(),
+            resolved: false,
+            created_at: chrono::Utc::now(),
+            resolved_at: None,
+        };
+        storage.memory_conflict_put(&ctx, &conflict).await.unwrap();
+        storage
+            .memory_conflict_resolve(&ctx, conflict.local_entity_id, conflict.conflict_id)
+            .await
+            .unwrap();
+        assert!(
+            storage
+                .memory_conflict_list_by_entity(&ctx, conflict.local_entity_id)
+                .await
+                .unwrap()[0]
+                .resolved
+        );
+
+        let feedback = MemoryFeedback {
+            feedback_id: id(11),
+            remote_id: remote.remote_id,
+            target_id: item.item_id,
+            feedback_type: FeedbackType::WrongScope,
+            note: Some("mac".into()),
+            created_at: chrono::Utc::now(),
+        };
+        storage.memory_feedback_put(&ctx, &feedback).await.unwrap();
+        assert_eq!(
+            storage
+                .memory_feedback_list_by_target(&ctx, remote.remote_id, item.item_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let batch = ImportBatch {
+            batch_id: id(12),
+            remote_id: remote.remote_id,
+            packet_id: packet.packet_id,
+            state: ImportState::NeedsActivation,
+            imported_count: 1,
+            rejected_count: 0,
+            conflict_count: 0,
+            explanation: "activation required".into(),
+            created_at: chrono::Utc::now(),
+            completed_at: None,
+        };
+        storage.import_batch_put(&ctx, &batch).await.unwrap();
+        assert_eq!(
+            storage
+                .import_batch_get(&ctx, remote.remote_id, batch.batch_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            ImportState::NeedsActivation
+        );
     }
 }
