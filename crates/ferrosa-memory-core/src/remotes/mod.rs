@@ -4,6 +4,7 @@
 //! Last changed: Added Packet C policy and Packet D applicability/safety modules.
 
 pub mod applicability;
+pub mod feedback;
 pub mod policy;
 pub mod safety;
 pub mod types;
