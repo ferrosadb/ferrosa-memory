@@ -224,6 +224,7 @@ jobs:
         # can push a matching branch on ferrosadb/ferrosa and CI picks it up.
         run: |
           CANDIDATES=(
+            "debug/adjacency-replication-trace"
             "${GITHUB_HEAD_REF:-}"
             "${GITHUB_REF_NAME:-}"
           )
