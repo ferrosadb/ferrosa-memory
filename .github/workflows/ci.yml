@@ -534,9 +534,16 @@ jobs:
             sleep 2
           done
           echo "Applying DDL to test cluster..."
+          # Test cluster doesn't reliably reach full cluster-mode quorum
+          # readiness within the migrate window — writes at CL=QUORUM with
+          # the production RF=3 DDL fail with received=0/required=2 even
+          # after schema is visible. The test cluster is ephemeral, so
+          # drop to RF=1 (single replica per write) for the test keyspace.
+          # This is exactly what --replication-factor was added for.
           timeout 180s cargo run --bin migrate -- \
             --contact-points 127.0.0.1:19542 \
             --keyspace agent_memory_test \
+            --replication-factor 1 \
             --ddl-dir ddl
 
           # Warm up the test cluster's graph /graph/query endpoint, both
