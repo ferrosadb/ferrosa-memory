@@ -375,7 +375,13 @@ pub async fn run_migrations(session: &CqlSession, keyspace: &str) -> Result<usiz
             description = m.description,
             "applying migration"
         );
-        for (i, stmt) in split_cql(m.ddl).iter().enumerate() {
+        // Some DDL files in MIGRATIONS hardcode `agent_memory.<table>`
+        // qualified references — `USE keyspace` only helps unqualified
+        // names. Run the same qualify_ddl rewrite the bootstrap path
+        // uses so the modern migrations are deployable into any
+        // configured keyspace (agent_memory_test, per-tenant ks, etc.).
+        let qualified = qualify_ddl(m.ddl, keyspace);
+        for (i, stmt) in split_cql(&qualified).iter().enumerate() {
             #[allow(deprecated)]
             if let Err(source) = session.query_unpaged(stmt.as_str(), ()).await {
                 return Err(MigrationError::Statement {
@@ -685,7 +691,10 @@ async fn keyspace_exists(session: &CqlSession, keyspace: &str) -> anyhow::Result
     Ok(false)
 }
 
-async fn ensure_schema_version_table(session: &CqlSession, keyspace: &str) -> anyhow::Result<()> {
+pub async fn ensure_schema_version_table(
+    session: &CqlSession,
+    keyspace: &str,
+) -> anyhow::Result<()> {
     let ddl = format!(
         "CREATE TABLE IF NOT EXISTS {keyspace}.schema_version (\
             version int PRIMARY KEY,\
@@ -747,7 +756,7 @@ fn schema_version_insert_query(keyspace: &str) -> String {
     )
 }
 
-async fn record_version(
+pub async fn record_version(
     session: &CqlSession,
     keyspace: &str,
     version: u32,

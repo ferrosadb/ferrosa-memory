@@ -25,7 +25,10 @@
 #![allow(deprecated)]
 use anyhow::Context;
 use ferrosa_memory_core::config::{parse_config, resolve_config_path};
-use ferrosa_memory_core::migration::{prepare_bootstrap_statement, qualify_ddl};
+use ferrosa_memory_core::migration::{
+    MIGRATIONS, PRE_VERSIONING_BASELINE, ensure_schema_version_table, prepare_bootstrap_statement,
+    qualify_ddl, record_version,
+};
 use scylla::{LegacySession, SessionBuilder};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -81,6 +84,33 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .with_context(|| format!("apply {}: {}", path.display(), preview(&prepared)))?;
         }
+    }
+
+    // Populate schema_version so subsequent run_migrations() calls (in
+    // tests or runtime startup) see this keyspace as up to date and don't
+    // re-apply the same DDLs. Without this the library's migration runner
+    // restarts from the baseline and trips on already-existing tables
+    // (e.g. migration 30's `CREATE TABLE temporal_events`).
+    //
+    // We mirror the MIGRATIONS registry rather than parsing filenames so a
+    // non-versioned DDL like `100_roles.cql` (auth setup, not a migration)
+    // doesn't bump schema_version above what the code knows about and
+    // trip the downgrade guard.
+    ensure_schema_version_table(&session, &cli.keyspace)
+        .await
+        .context("ensure schema_version table after DDL apply")?;
+    record_version(
+        &session,
+        &cli.keyspace,
+        PRE_VERSIONING_BASELINE,
+        "pre-versioning baseline (migrate binary adoption seed)",
+    )
+    .await
+    .context("record pre-versioning baseline in schema_version")?;
+    for m in MIGRATIONS {
+        record_version(&session, &cli.keyspace, m.version, m.description)
+            .await
+            .with_context(|| format!("record schema_version v{}", m.version))?;
     }
 
     tracing::info!("migrations completed");
