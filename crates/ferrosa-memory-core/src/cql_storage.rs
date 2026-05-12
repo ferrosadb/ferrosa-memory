@@ -432,11 +432,36 @@ fn extract_rich_entity_fields(
     )
 }
 
+/// Decode a row into an [`EntityEntry`], returning `Ok(None)` for ghost
+/// rows where a required column is NULL.
+///
+/// Ghost rows surface when bulk loaders (notably the legacy Python CQL
+/// path) insert without all NOT-NULL-ish columns set — see the test
+/// `ghost_rows_do_not_crash_queries`. Callers that iterate
+/// `entity_store` (notably `entity_list_all` and `entity_stream_all`)
+/// must skip them; otherwise a single ghost row produced by an
+/// unrelated test or pipeline poisons the entire listing with
+/// `column 'entity_name': Value is null`.
 fn row_to_entity_entry(
     ctx: &TenantContext,
     row: &Row,
     col_map: &ColMap,
-) -> anyhow::Result<EntityEntry> {
+) -> anyhow::Result<Option<EntityEntry>> {
+    // Required columns first — ghost rows are skipped here, matching
+    // entity_list_session's filter.
+    let Ok(entity_id) = cql_get::<Uuid>(row, col_map, "entity_id") else {
+        return Ok(None);
+    };
+    let Ok(session_id) = cql_get::<Uuid>(row, col_map, "session_id") else {
+        return Ok(None);
+    };
+    let Ok(entity_name) = cql_get::<String>(row, col_map, "entity_name") else {
+        return Ok(None);
+    };
+    let Ok(entity_type) = cql_get::<String>(row, col_map, "entity_type") else {
+        return Ok(None);
+    };
+
     let created = cql_get::<chrono::DateTime<chrono::Utc>>(row, col_map, "created_at")
         .unwrap_or_else(|e| {
             tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
@@ -456,12 +481,12 @@ fn row_to_entity_entry(
         scope,
         ingested_by_session,
     ) = extract_rich_entity_fields(row, col_map);
-    Ok(EntityEntry {
+    Ok(Some(EntityEntry {
         tenant_id: ctx.tenant_id,
-        entity_id: cql_get(row, col_map, "entity_id")?,
-        session_id: cql_get(row, col_map, "session_id")?,
-        entity_name: cql_get(row, col_map, "entity_name")?,
-        entity_type: cql_get(row, col_map, "entity_type")?,
+        entity_id,
+        session_id,
+        entity_name,
+        entity_type,
         source_fold_id: cql_get::<Uuid>(row, col_map, "source_fold_id").ok(),
         context_snippet: cql_get(row, col_map, "context_snippet").unwrap_or_default(),
         entity_embedding: cql_get::<Vec<u8>>(row, col_map, "entity_embedding")
@@ -481,7 +506,7 @@ fn row_to_entity_entry(
         updated_at,
         scope,
         ingested_by_session,
-    })
+    }))
 }
 
 /// Type alias for the scylla legacy session used throughout this crate.
@@ -2053,7 +2078,7 @@ impl Storage for CqlStorage {
         let query = format!(
             "SELECT entity_id, entity_name, entity_type, source_fold_id, \
              context_snippet, confidence, state, created_at, \
-             description, tags, properties, content_hash, \
+             description, description_embedding, tags, properties, content_hash, \
              updated_at, scope, ingested_by_session \
              FROM {}.entity_store WHERE tenant_id = ? AND session_id = ? AND entity_id = ?",
             self.keyspace
@@ -2351,7 +2376,9 @@ impl Storage for CqlStorage {
 
         let mut results = Vec::with_capacity(rows.len());
         for row in rows {
-            results.push(row_to_entity_entry(ctx, &row, &col_map)?);
+            if let Some(entry) = row_to_entity_entry(ctx, &row, &col_map)? {
+                results.push(entry);
+            }
         }
         Ok(results)
     }
@@ -2381,7 +2408,10 @@ impl Storage for CqlStorage {
                 .map_err(anyhow::Error::from)
                 .and_then(|row| row_to_entity_entry(&ctx, &row, &col_map))
             {
-                Ok(entry) => {
+                // Ghost rows (NULL required fields) are skipped silently —
+                // the row_to_entity_entry docstring captures the rationale.
+                Ok(None) => continue,
+                Ok(Some(entry)) => {
                     chunk.push(entry);
                     if chunk.len() >= chunk_size {
                         let out = std::mem::take(&mut chunk);

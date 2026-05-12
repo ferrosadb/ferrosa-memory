@@ -107,13 +107,27 @@ async fn g3_backfill_migrates_enriched_prefix_and_populates_description_embeddin
         );
     }
 
-    let entities = storage.entity_list_all(&ctx).await.expect("list");
+    // `entity_list_all` omits `context_snippet` from its SELECT for
+    // performance (~4KB/row), but the backfill below needs the full
+    // record. Walk the list to get (session_id, entity_id) pairs, then
+    // fetch each entity's full record via `entity_get_by_id`. This
+    // mirrors what the production backfill batch does — it scans IDs
+    // then loads each row individually so it can rewrite
+    // `context_snippet` / `description`.
+    let summary = storage.entity_list_all(&ctx).await.expect("list");
     let mut p1_migrated = 0;
     let mut p2_embedded = 0;
-    for e in &entities {
-        if e.description.is_some() {
+    for stub in &summary {
+        if stub.description.is_some() {
             continue;
         }
+        let Some(e) = storage
+            .entity_get_by_id(&ctx, stub.session_id, stub.entity_id)
+            .await
+            .expect("entity_get_by_id")
+        else {
+            continue;
+        };
         // Phase 1: strip ENRICHED_PREFIX from context_snippet, move into
         // description.
         const PREFIX: &str = "[enriched] ";

@@ -462,11 +462,21 @@ fn build_typed_edge_merge_query(
         None => String::new(),
     };
     format!(
-        "MERGE (a:Entity {{entity_id: {}}})\
-         MERGE (b:Entity {{entity_id: {}}})\
+        // entity_store's primary key is ((tenant_id, session_id), entity_id).
+        // The graph engine rejects MERGEs on scoped tables that omit any
+        // scoped key — without tenant_id + session_id on the Entity
+        // MERGE patterns, the validator returns "missing required
+        // scoped key columns". This mirrors `build_co_occurs_merge_query`
+        // which faces the same constraint.
+        "MERGE (a:Entity {{tenant_id: {}, session_id: {}, entity_id: {}}})\
+         MERGE (b:Entity {{tenant_id: {}, session_id: {}, entity_id: {}}})\
          MERGE (a)-[r:TYPED_EDGE {{edge_type: {}}}]->(b) \
          SET r.tenant_id = {}, r.session_id = {}, r.weight = {}, r.created_at = {}{} RETURN r",
+        quote_cypher(&tenant_id.to_string()),
+        quote_cypher(&session_id.to_string()),
         quote_cypher(&src_id.to_string()),
+        quote_cypher(&tenant_id.to_string()),
+        quote_cypher(&session_id.to_string()),
         quote_cypher(&dst_id.to_string()),
         quote_cypher(edge_type),
         quote_cypher(&tenant_id.to_string()),

@@ -69,7 +69,12 @@ async fn main() -> anyhow::Result<()> {
         let path = entry.path();
         let body = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
-        let stmts = prepare_statements_for_keyspace(&body, &cli.keyspace, applied_at);
+        let stmts = prepare_statements_for_keyspace(
+            &body,
+            &cli.keyspace,
+            applied_at,
+            cli.replication_factor,
+        );
         tracing::info!(file = %path.display(), stmts = stmts.len(), "applying DDL");
         for prepared in stmts {
             apply_with_retry(&session, &prepared)
@@ -198,12 +203,48 @@ fn prepare_statements_for_keyspace(
     body: &str,
     keyspace: &str,
     applied_at: chrono::DateTime<chrono::Utc>,
+    replication_factor: Option<u32>,
 ) -> Vec<String> {
     let qualified = qualify_ddl(body, keyspace);
+    let qualified = match replication_factor {
+        Some(rf) => override_replication_factor(&qualified, rf),
+        None => qualified,
+    };
     split_cql_statements(&qualified)
         .into_iter()
         .map(|stmt| prepare_bootstrap_statement(&stmt, applied_at))
         .collect()
+}
+
+/// Rewrite NetworkTopologyStrategy `'datacenter1': N` (the form the
+/// bootstrap DDL hardcodes) to the operator-supplied `N`. Single-node
+/// test clusters need RF=1 because LOCAL_QUORUM against RF=3 with one
+/// node receives 0 acks and times out.
+fn override_replication_factor(qualified: &str, rf: u32) -> String {
+    let mut out = String::with_capacity(qualified.len());
+    let pattern = "'datacenter1':";
+    let mut i = 0;
+    let bytes = qualified.as_bytes();
+    while i < bytes.len() {
+        if qualified[i..].starts_with(pattern) {
+            out.push_str(pattern);
+            i += pattern.len();
+            // Skip whitespace.
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+            // Skip the existing integer digits.
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            out.push_str(&rf.to_string());
+        } else {
+            out.push(qualified[i..].chars().next().unwrap());
+            i += qualified[i..].chars().next().unwrap().len_utf8();
+        }
+    }
+    out
 }
 
 /// Split a multi-statement `.cql` file into individual statements. CQL
@@ -251,6 +292,12 @@ struct Args {
     /// auto schema-agreement metadata fetch (which currently fails against
     /// Ferrosa's `system_schema.views` column shape; tracked upstream).
     probe_only: bool,
+    /// Override the replication factor used in the keyspace `CREATE`
+    /// statement. The bootstrap DDL hardcodes RF=3 because production
+    /// runs against a 3-node cluster; CI's isolated test cluster
+    /// (`docker-compose.test.yml`) is single-node and any quorum write
+    /// blocks forever at "received=0 required=2" without this override.
+    replication_factor: Option<u32>,
 }
 
 fn parse_args() -> Args {
@@ -282,6 +329,7 @@ where
     let mut password: Option<String> = None;
     let mut config_path: Option<PathBuf> = None;
     let mut probe_only = false;
+    let mut replication_factor: Option<u32> = None;
     while let Some(flag) = iter.next() {
         match flag {
             "--contact-points" => {
@@ -299,6 +347,15 @@ where
             "--password" => password = iter.next().map(str::to_string),
             "--config" => config_path = iter.next().map(PathBuf::from),
             "--probe-only" => probe_only = true,
+            "--replication-factor" => {
+                replication_factor = iter
+                    .next()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .filter(|&n| n > 0);
+                if replication_factor.is_none() {
+                    panic!("--replication-factor needs a positive integer");
+                }
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -350,6 +407,11 @@ where
             .unwrap_or_else(|| PathBuf::from("ddl")),
         credentials,
         probe_only,
+        replication_factor: replication_factor.or_else(|| {
+            env_value("FERROSA_MIGRATE_REPLICATION_FACTOR")
+                .and_then(|s| s.parse::<u32>().ok())
+                .filter(|&n| n > 0)
+        }),
     }
 }
 
@@ -426,7 +488,7 @@ mod tests {
         let applied_at = chrono::DateTime::parse_from_rfc3339("2026-05-04T22:53:21.123Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        let prepared = prepare_statements_for_keyspace(body, "agent_memory", applied_at)
+        let prepared = prepare_statements_for_keyspace(body, "agent_memory", applied_at, None)
             .pop()
             .expect("statement");
         assert!(!prepared.contains("toTimestamp(now())"));
@@ -444,7 +506,7 @@ mod tests {
             .with_timezone(&chrono::Utc);
 
         let prepared =
-            prepare_statements_for_keyspace(body, "agent_memory_pr12_keyspace", applied_at);
+            prepare_statements_for_keyspace(body, "agent_memory_pr12_keyspace", applied_at, None);
 
         assert!(
             prepared

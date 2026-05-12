@@ -32,6 +32,105 @@ async fn connect_plain(contact_point: &str) -> LegacySession {
         .expect("session build failed")
 }
 
+/// Insert one entity, one typed_edge, and one co-occurrence edge so
+/// downstream count/stream assertions have rows to find. RF=3 +
+/// LOCAL_QUORUM means every coordinator will see the rows.
+///
+/// `tenant_id` matters for tenant-scoped reads: entity_stream_all,
+/// typed_edge_stream_all, edge_list_all all bind `ctx.tenant_id`. Pass
+/// the tenant the test will read under. Pass `Uuid::new_v4()` if the
+/// assertion is unscoped (e.g. `COUNT(*)`).
+///
+/// `entity_put` goes through the Storage trait. `typed_edges` and
+/// `co_occurs_with` are graph-annotated, so the Storage adapter
+/// rejects direct writes by design — but a *test fixture* legitimately
+/// needs the rows on disk for the streaming-read path to yield. Use
+/// raw CQL INSERTs on an admin session for those two, matching the row
+/// shape the graph engine would persist.
+async fn seed_minimal_fixture(tenant_id: Uuid, session_origin: &str) -> (Uuid, Uuid, Uuid, Uuid) {
+    let cfg = FerrosaCqlConfig {
+        contact_points: vec![
+            "127.0.0.1:19042".into(),
+            "127.0.0.1:19043".into(),
+            "127.0.0.1:19044".into(),
+        ],
+        keyspace: "agent_memory".into(),
+        replication_factor: 3,
+        consistency: "LOCAL_QUORUM".into(),
+        username: "ferrosa_admin".into(),
+        password: "ferrosa_admin".into(),
+        admin_username: None,
+        admin_password: None,
+    };
+    let storage = CqlStorage::connect(&cfg)
+        .await
+        .expect("seed_minimal_fixture: CqlStorage::connect");
+    let ctx = TenantContext {
+        tenant_id,
+        session_origin: session_origin.into(),
+    };
+    let session_id = Uuid::new_v4();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let now = chrono::Utc::now();
+    for (entity_id, name) in [(a, "seed-a"), (b, "seed-b")] {
+        storage
+            .entity_put(
+                &ctx,
+                &EntityEntry {
+                    tenant_id: ctx.tenant_id,
+                    session_id,
+                    entity_id,
+                    entity_name: name.into(),
+                    entity_type: "concept".into(),
+                    confidence: 1.0,
+                    created_at: now,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed_minimal_fixture: entity_put");
+    }
+    // typed_edges and co_occurs_with are graph-annotated; the Storage
+    // trait blocks direct writes by design. For a *fixture* the rows
+    // legitimately need to exist on disk so the streaming/count paths
+    // have something to read — issue them via raw CQL on the admin
+    // session, matching the schema the graph engine would persist.
+    let admin = connect_plain("127.0.0.1:19042").await;
+    let created_ts = scylla::frame::value::CqlTimestamp(now.timestamp_millis());
+    #[allow(deprecated)]
+    admin
+        .query_unpaged(
+            "INSERT INTO agent_memory.typed_edges \
+             (tenant_id, session_id, src_id, edge_type, dst_id, weight, metadata, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                ctx.tenant_id,
+                session_id,
+                a,
+                "TAGGED_AS",
+                b,
+                0.5f64,
+                None::<String>,
+                created_ts,
+            ),
+        )
+        .await
+        .expect("seed_minimal_fixture: typed_edges raw insert");
+    #[allow(deprecated)]
+    admin
+        .query_unpaged(
+            "INSERT INTO agent_memory.co_occurs_with \
+             (entity_a, entity_b, session_id, tenant_id, created_at) \
+             VALUES (?, ?, ?, ?, ?)",
+            (a, b, session_id, ctx.tenant_id, created_ts),
+        )
+        .await
+        .expect("seed_minimal_fixture: co_occurs_with raw insert");
+
+    (ctx.tenant_id, session_id, a, b)
+}
+
 #[tokio::test]
 #[ignore = "requires live Ferrosa cluster; run with --ignored and FERROSA_TEST_CONTAINERS=1"]
 async fn scylla_connect_and_query() {
@@ -215,6 +314,10 @@ async fn confidence_scores_prepares_on_each_live_node() {
         );
     }
 
+    // confidence_scores/typed_edges/co_occurs_with COUNT(*)s are unscoped,
+    // so the tenant_id doesn't have to match anything specific.
+    let _ = seed_minimal_fixture(Uuid::new_v4(), "confidence-prepare-live-test").await;
+
     for contact_point in ["127.0.0.1:19042", "127.0.0.1:19043", "127.0.0.1:19044"] {
         #[allow(deprecated)]
         let session = SessionBuilder::new()
@@ -291,44 +394,65 @@ async fn viz_streaming_queries_return_live_nodes_and_edges() {
         admin_password: None,
     };
 
+    // entity_stream_all and typed_edge_stream_all bind ctx.tenant_id, so
+    // the fixture's rows MUST live under the same tenant the test reads.
+    let viz_tenant = Uuid::parse_str("9a5f8fbf-d842-4d30-8ea5-1aa931e618a8").unwrap();
+    let (_, _, seed_a, seed_b) = seed_minimal_fixture(viz_tenant, "viz-stream-live-test").await;
+
     let storage = Arc::new(
         CqlStorage::connect(&cfg)
             .await
             .expect("CqlStorage::connect should succeed on the auth-enabled local cluster"),
     );
     let ctx = TenantContext {
-        tenant_id: Uuid::parse_str("9a5f8fbf-d842-4d30-8ea5-1aa931e618a8").unwrap(),
+        tenant_id: viz_tenant,
         session_origin: "viz-live-test".to_string(),
     };
 
+    // Assert the *specific* seeded entities and edge are visible — not
+    // just "some row exists". A bare `count > 0` would silently pass on
+    // a cluster that already has unrelated rows under this tenant, which
+    // is exactly how an earlier fixture mismatch slipped past local runs.
     let (node_tx, mut node_rx) = tokio::sync::mpsc::channel::<anyhow::Result<Vec<EntityEntry>>>(4);
     let node_storage = storage.clone();
     let node_ctx = ctx.clone();
     tokio::spawn(async move {
         node_storage.entity_stream_all(node_ctx, 128, node_tx).await;
     });
-    let mut nodes = 0usize;
+    let mut seen_ids: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     while let Some(chunk) = node_rx.recv().await {
         let chunk = chunk.expect("entity stream chunk should decode");
-        nodes += chunk.len();
-        if nodes > 0 {
+        for e in chunk {
+            seen_ids.insert(e.entity_id);
+        }
+        if seen_ids.contains(&seed_a) && seen_ids.contains(&seed_b) {
             break;
         }
     }
-    assert!(nodes > 0, "viz entity stream should return live nodes");
+    assert!(
+        seen_ids.contains(&seed_a) && seen_ids.contains(&seed_b),
+        "viz entity stream must yield the seeded entities ({seed_a}, {seed_b}); saw {} ids",
+        seen_ids.len(),
+    );
 
     let (edge_tx, mut edge_rx) = tokio::sync::mpsc::channel::<anyhow::Result<Vec<TypedEdge>>>(4);
     let edge_storage = storage.clone();
     tokio::spawn(async move {
         edge_storage.typed_edge_stream_all(ctx, 128, edge_tx).await;
     });
-    let mut edges = 0usize;
+    let mut seen_edge = false;
     while let Some(chunk) = edge_rx.recv().await {
         let chunk = chunk.expect("typed-edge stream chunk should decode");
-        edges += chunk.len();
-        if edges > 0 {
+        if chunk
+            .iter()
+            .any(|e| e.src_id == seed_a && e.dst_id == seed_b)
+        {
+            seen_edge = true;
             break;
         }
     }
-    assert!(edges > 0, "viz typed-edge stream should return live edges");
+    assert!(
+        seen_edge,
+        "viz typed-edge stream must yield the seeded edge ({seed_a} -> {seed_b})",
+    );
 }

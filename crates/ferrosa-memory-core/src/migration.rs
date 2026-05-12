@@ -331,7 +331,18 @@ pub async fn run_migrations(session: &CqlSession, keyspace: &str) -> Result<usiz
         });
     }
 
-    let pending: Vec<&Migration> = MIGRATIONS.iter().filter(|m| m.version > current).collect();
+    // Gap detection: re-fetch the full applied set so that any registered
+    // migration *not* present in `schema_version` is treated as pending —
+    // even if `current` (MAX) sits above it. Closes the window where a
+    // single bookkeeping row goes missing (manual rollback, partial
+    // restore) and the runner silently never re-applies it.
+    let applied = applied_versions(session, keyspace)
+        .await
+        .map_err(|e| MigrationError::Setup { source: e })?;
+    let pending: Vec<&Migration> = MIGRATIONS
+        .iter()
+        .filter(|m| !applied.contains(&m.version))
+        .collect();
 
     if pending.is_empty() {
         tracing::debug!(current, "schema up to date");
@@ -685,6 +696,31 @@ async fn ensure_schema_version_table(session: &CqlSession, keyspace: &str) -> an
     #[allow(deprecated)]
     session.query_unpaged(ddl, ()).await?;
     Ok(())
+}
+
+/// Set of every version currently recorded in `schema_version`. The runner
+/// uses this for gap detection: it applies any registered migration whose
+/// version is **not** in the applied set, not just `version > max(applied)`.
+/// Without this, an out-of-band rollback of a single intermediate row
+/// (or a corrupted bookkeeping table that lost a row) would never be
+/// repaired — every subsequent run would compute `current = MAX(...)` and
+/// see nothing pending. Matches industry-standard runners (Flyway, Alembic).
+async fn applied_versions(
+    session: &CqlSession,
+    keyspace: &str,
+) -> anyhow::Result<std::collections::HashSet<u32>> {
+    let q = format!("SELECT version FROM {keyspace}.schema_version");
+    #[allow(deprecated)]
+    let result = session.query_unpaged(q, ()).await?;
+    let col_map = build_col_map(result.col_specs());
+    let rows = result.rows_or_empty();
+    let mut set = std::collections::HashSet::new();
+    for row in rows {
+        if let Ok(v) = cql_get::<i32>(&row, &col_map, "version") {
+            set.insert(v as u32);
+        }
+    }
+    Ok(set)
 }
 
 async fn current_version(session: &CqlSession, keyspace: &str) -> anyhow::Result<Option<u32>> {

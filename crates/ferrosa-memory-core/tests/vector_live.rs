@@ -3,12 +3,13 @@
 //! Live test: vector DDL/PREPARE compatibility.
 //! Run: cargo test -p ferrosa-memory-core --test vector_live -- --ignored --nocapture
 //!
-//! The scylla 0.15 driver used by ferrosa-memory can prepare vector statements
-//! but does not expose a Rust value serializer for `vector<float, N>`; a
-//! `Vec<u8>` is correctly rejected because the live prepared column type is
-//! VectorType, not Blob. This smoke verifies Ferrosa's vector table,
-//! insert-prepare, ANN prepare, and type-checking surface without pretending
-//! blob serialization is a vector roundtrip.
+//! The ferrosadb scylla 0.15 fork accepts `Vec<u8>` / `&[u8]` bindings against
+//! Cassandra 5.0 `vector<inner, dim>` columns (CEP-30 advertises them as
+//! `Custom("...VectorType(...)")`). The wire format is exactly `dim`
+//! fixed-size big-endian elements with no per-element length prefix, which is
+//! the same byte layout an application produces when it packs an embedding
+//! into a `Vec<u8>`. This smoke verifies the table DDL, INSERT/ANN PREPARE,
+//! and end-to-end byte-aligned INSERT against a real `vector<float, 4>`.
 
 use scylla::{LegacySession, SessionBuilder};
 
@@ -54,14 +55,24 @@ async fn vector_prepare_and_typecheck_smoke() {
         .await
         .expect("PREPARE ANN SELECT");
 
-    let blob_insert = session
+    // 4 dims × 4 bytes per float = 16 byte payload aligned with the column
+    // declaration. The fork accepts Vec<u8> as a binding for VectorType; the
+    // server rejects mismatched sizes, so we cover both arms below.
+    session
         .execute_unpaged(&insert, (uuid::Uuid::new_v4(), vec![0_u8; 16]))
+        .await
+        .expect("Vec<u8> with dim*sizeof(float) bytes must serialize as vector<float, 4>");
+
+    // Mismatched length: 12 bytes != 4 floats. Server-side validation must
+    // reject — the driver type-check is intentionally permissive (no
+    // per-binding dim-aware length check), so the failure surfaces from
+    // ferrosa, not the client.
+    let wrong_len = session
+        .execute_unpaged(&insert, (uuid::Uuid::new_v4(), vec![0_u8; 12]))
         .await;
-    let err = blob_insert.expect_err("Vec<u8> must not serialize as vector<float, 4>");
-    let err_text = err.to_string();
     assert!(
-        err_text.contains("VectorType") && err_text.contains("Blob"),
-        "expected vector/blob type mismatch, got {err_text}"
+        wrong_len.is_err(),
+        "12-byte payload must be rejected against vector<float, 4>; got Ok"
     );
 
     eprintln!("Vector prepare/typecheck smoke PASSED");

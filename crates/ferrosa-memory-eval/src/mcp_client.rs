@@ -896,10 +896,20 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires an HTTP-bound MCP server; set FERROSA_MCP_HTTP_URL=http://host:port to opt in"]
     async fn http_client_live_initialize_and_get_stats() {
-        // Requires a live MCP server running on HTTP
-        let mut client = HttpMcpClient::new("http://localhost:8080");
+        // Skip cleanly when the harness URL isn't set. The default workspace
+        // --ignored sweep (local + CI) doesn't spin up an HTTP-bound MCP
+        // server — only contributors testing that surface specifically do.
+        let Ok(url) = std::env::var("FERROSA_MCP_HTTP_URL") else {
+            eprintln!(
+                "skip: FERROSA_MCP_HTTP_URL unset — set to an HTTP-bound MCP \
+                 server URL (e.g. http://localhost:8080) to exercise the \
+                 HttpMcpClient initialize/get_stats round-trip"
+            );
+            return;
+        };
+        let mut client = HttpMcpClient::new(&url);
 
         let init = client.initialize().await.expect("initialize failed");
         assert!(init.response["serverInfo"]["name"].is_string());
