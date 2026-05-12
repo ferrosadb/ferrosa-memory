@@ -2,17 +2,32 @@
 #![allow(deprecated)]
 //! Ferrosa/scylla compatibility tests.
 //!
-//! Fixed tests and remaining open issues.
-//! Run: cargo test -p ferrosa-memory-core --test ferrosa_bugs -- --ignored --nocapture
+//! Fixed tests and remaining open issues. All cases target the isolated
+//! test cluster (FERROSA_TEST_CQL_PORT / FERROSA_TEST_KEYSPACE) so the
+//! suite behaves identically whether the local main cluster has auth
+//! enabled or not. CI exports the same envs.
+//!
+//! Run:
+//!   scripts/start-test-cluster.sh
+//!   export $(scripts/start-test-cluster.sh --env)
+//!   cargo test -p ferrosa-memory-core --test ferrosa_bugs -- --ignored --nocapture
 
 use ferrosa_memory_core::cql_storage::build_col_map;
+use ferrosa_memory_core::test_cluster::TestClusterConfig;
 use scylla::{LegacySession, SessionBuilder};
 use uuid::Uuid;
 
-async fn connect_plain(contact_point: &str) -> LegacySession {
+/// Returns the test cluster config or `None` when the harness env isn't
+/// wired. Callers should early-return when `None` so the suite stays
+/// useful for explicit `--ignored` invocations without a live cluster.
+fn test_cluster() -> Option<TestClusterConfig> {
+    TestClusterConfig::from_env_or_skip()
+}
+
+async fn connect_test_cluster(cfg: &TestClusterConfig) -> LegacySession {
     #[allow(deprecated)]
     SessionBuilder::new()
-        .known_node(contact_point)
+        .known_node(cfg.contact_point())
         .build_legacy()
         .await
         .expect("session build failed")
@@ -20,15 +35,17 @@ async fn connect_plain(contact_point: &str) -> LegacySession {
 
 // ---- FIXED: Vector PREPARE + ANN ----
 
-/// Creates `agent_memory.test_vector_blob` if it does not exist. The table is
+/// Creates `<ks>.test_vector_blob` if it does not exist. The table is
 /// test-only (not in production DDL), so each test that depends on it must
 /// bootstrap it. Using `IF NOT EXISTS` keeps this idempotent across the
 /// vector_live and ferrosa_bugs suites that share the table.
-async fn ensure_test_vector_blob(s: &LegacySession) {
+async fn ensure_test_vector_blob(s: &LegacySession, ks: &str) {
     #[allow(deprecated)]
     s.query_unpaged(
-        "CREATE TABLE IF NOT EXISTS agent_memory.test_vector_blob \
-         (id uuid PRIMARY KEY, embedding vector<float, 4>)",
+        format!(
+            "CREATE TABLE IF NOT EXISTS {ks}.test_vector_blob \
+             (id uuid PRIMARY KEY, embedding vector<float, 4>)"
+        ),
         (),
     )
     .await
@@ -38,21 +55,29 @@ async fn ensure_test_vector_blob(s: &LegacySession) {
 #[tokio::test]
 #[ignore]
 async fn fixed_vector_prepare() {
-    let s = connect_plain("127.0.0.1:19042").await;
-    ensure_test_vector_blob(&s).await;
-    s.prepare("INSERT INTO agent_memory.test_vector_blob (id, embedding) VALUES (?, ?)")
-        .await
-        .expect("PREPARE on vector column");
+    let Some(cfg) = test_cluster() else { return };
+    let s = connect_test_cluster(&cfg).await;
+    let ks = &cfg.keyspace;
+    ensure_test_vector_blob(&s, ks).await;
+    s.prepare(format!(
+        "INSERT INTO {ks}.test_vector_blob (id, embedding) VALUES (?, ?)"
+    ))
+    .await
+    .expect("PREPARE on vector column");
 }
 
 #[tokio::test]
 #[ignore]
 async fn fixed_vector_ann_query() {
-    let s = connect_plain("127.0.0.1:19042").await;
-    ensure_test_vector_blob(&s).await;
-    s.prepare("SELECT id FROM agent_memory.test_vector_blob ORDER BY embedding ANN OF ? LIMIT 5")
-        .await
-        .expect("ANN query PREPARE");
+    let Some(cfg) = test_cluster() else { return };
+    let s = connect_test_cluster(&cfg).await;
+    let ks = &cfg.keyspace;
+    ensure_test_vector_blob(&s, ks).await;
+    s.prepare(format!(
+        "SELECT id FROM {ks}.test_vector_blob ORDER BY embedding ANN OF ? LIMIT 5"
+    ))
+    .await
+    .expect("ANN query PREPARE");
 }
 
 // ---- OPEN: COUNT(*) column name ----
@@ -60,11 +85,13 @@ async fn fixed_vector_ann_query() {
 #[tokio::test]
 #[ignore]
 async fn open_count_column_name() {
-    let s = connect_plain("127.0.0.1:19042").await;
+    let Some(cfg) = test_cluster() else { return };
+    let s = connect_test_cluster(&cfg).await;
+    let ks = &cfg.keyspace;
     let prepared = s
-        .prepare(
-            "SELECT COUNT(*) FROM agent_memory.entity_store WHERE tenant_id = ? AND session_id = ?",
-        )
+        .prepare(format!(
+            "SELECT COUNT(*) FROM {ks}.entity_store WHERE tenant_id = ? AND session_id = ?"
+        ))
         .await
         .expect("PREPARE");
     #[allow(deprecated)]
@@ -84,10 +111,12 @@ async fn open_count_column_name() {
 #[tokio::test]
 #[ignore]
 async fn open_subscribe() {
-    let s = connect_plain("127.0.0.1:19042").await;
+    let Some(cfg) = test_cluster() else { return };
+    let s = connect_test_cluster(&cfg).await;
+    let ks = &cfg.keyspace;
     #[allow(deprecated)]
     s.query_unpaged(
-        "SUBSCRIBE SELECT * FROM agent_memory.memo_cache EVERY '5s'",
+        format!("SUBSCRIBE SELECT * FROM {ks}.memo_cache EVERY '5s'"),
         (),
     )
     .await
@@ -99,19 +128,21 @@ async fn open_subscribe() {
 #[tokio::test]
 #[ignore]
 async fn debug_dynamic_query_with_bind_values() {
-    let s = connect_plain("127.0.0.1:19042").await;
+    let Some(cfg) = test_cluster() else { return };
+    let s = connect_test_cluster(&cfg).await;
+    let ks = &cfg.keyspace;
     let tid = Uuid::new_v4();
     let sid = Uuid::new_v4();
     let eid = Uuid::new_v4();
 
     // Insert via prepared (known working)
     let ins = s
-        .prepare(
-            "INSERT INTO agent_memory.entity_store \
+        .prepare(format!(
+            "INSERT INTO {ks}.entity_store \
              (tenant_id, session_id, entity_id, entity_name, entity_type, \
               context_snippet, confidence, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        )
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        ))
         .await
         .expect("PREPARE insert");
     #[allow(deprecated)]
@@ -134,9 +165,11 @@ async fn debug_dynamic_query_with_bind_values() {
     eprintln!("  inserted entity {eid} in partition ({tid}, {sid})");
 
     // Now try the EXACT query that entity_find_phonetic uses (dynamic QUERY + bind values)
-    let query = "SELECT entity_id, entity_name, entity_type, source_fold_id, \
-                 context_snippet, confidence, created_at \
-                 FROM agent_memory.entity_store WHERE tenant_id = ? AND session_id = ? ALLOW FILTERING";
+    let query = format!(
+        "SELECT entity_id, entity_name, entity_type, source_fold_id, \
+         context_snippet, confidence, created_at \
+         FROM {ks}.entity_store WHERE tenant_id = ? AND session_id = ? ALLOW FILTERING"
+    );
     eprintln!("  sending dynamic QUERY with positional bind values...");
     #[allow(deprecated)]
     let result = s
@@ -159,19 +192,23 @@ async fn debug_dynamic_query_with_bind_values() {
 #[tokio::test]
 #[ignore]
 async fn debug_query_bind_values_vs_inline() {
-    let s = connect_plain("127.0.0.1:19042").await;
+    let Some(cfg) = test_cluster() else { return };
+    let s = connect_test_cluster(&cfg).await;
+    let ks = &cfg.keyspace;
     let tid = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
     let sid = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
 
     // Insert with inline values (no bind markers)
     #[allow(deprecated)]
     s.query_unpaged(
-        "INSERT INTO agent_memory.entity_store \
-         (tenant_id, session_id, entity_id, entity_name, entity_type, \
-          context_snippet, confidence, created_at) \
-         VALUES (aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee, 11111111-2222-3333-4444-555555555555, \
-                 66666666-7777-8888-9999-aaaaaaaaaaaa, 'inline-test', 'concept', \
-                 'ctx', 1.0, 1711036800000)",
+        format!(
+            "INSERT INTO {ks}.entity_store \
+             (tenant_id, session_id, entity_id, entity_name, entity_type, \
+              context_snippet, confidence, created_at) \
+             VALUES (aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee, 11111111-2222-3333-4444-555555555555, \
+                     66666666-7777-8888-9999-aaaaaaaaaaaa, 'inline-test', 'concept', \
+                     'ctx', 1.0, 1711036800000)"
+        ),
         (),
     )
     .await
@@ -182,9 +219,11 @@ async fn debug_query_bind_values_vs_inline() {
     #[allow(deprecated)]
     let result = s
         .query_unpaged(
-            "SELECT entity_name FROM agent_memory.entity_store \
-             WHERE tenant_id = aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee \
-             AND session_id = 11111111-2222-3333-4444-555555555555",
+            format!(
+                "SELECT entity_name FROM {ks}.entity_store \
+                 WHERE tenant_id = aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee \
+                 AND session_id = 11111111-2222-3333-4444-555555555555"
+            ),
             (),
         )
         .await
@@ -196,8 +235,10 @@ async fn debug_query_bind_values_vs_inline() {
     #[allow(deprecated)]
     let result2 = s
         .query_unpaged(
-            "SELECT entity_name FROM agent_memory.entity_store \
-             WHERE tenant_id = ? AND session_id = ?",
+            format!(
+                "SELECT entity_name FROM {ks}.entity_store \
+                 WHERE tenant_id = ? AND session_id = ?"
+            ),
             (tid, sid),
         )
         .await
@@ -207,10 +248,10 @@ async fn debug_query_bind_values_vs_inline() {
 
     // 3) Read back via prepared + execute
     let prep = s
-        .prepare(
-            "SELECT entity_name FROM agent_memory.entity_store \
-             WHERE tenant_id = ? AND session_id = ?",
-        )
+        .prepare(format!(
+            "SELECT entity_name FROM {ks}.entity_store \
+             WHERE tenant_id = ? AND session_id = ?"
+        ))
         .await
         .expect("PREPARE");
     #[allow(deprecated)]
@@ -245,14 +286,16 @@ async fn debug_query_bind_values_vs_inline() {
 #[tokio::test]
 #[ignore]
 async fn open_secondary_index_paging() {
-    let s = connect_plain("127.0.0.1:19042").await;
+    let Some(cfg) = test_cluster() else { return };
+    let s = connect_test_cluster(&cfg).await;
+    let ks = &cfg.keyspace;
     let tid = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
     let sid = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
 
     // Full table scan — ground truth
     #[allow(deprecated)]
     let r_all = s
-        .query_unpaged("SELECT entity_a FROM agent_memory.co_occurs_with", ())
+        .query_unpaged(format!("SELECT entity_a FROM {ks}.co_occurs_with"), ())
         .await
         .expect("full scan");
     let total = r_all.rows_or_empty().len();
@@ -266,8 +309,10 @@ async fn open_secondary_index_paging() {
     #[allow(deprecated)]
     let r_tenant = s
         .query_unpaged(
-            "SELECT entity_a FROM agent_memory.co_occurs_with \
-             WHERE tenant_id = ? ALLOW FILTERING",
+            format!(
+                "SELECT entity_a FROM {ks}.co_occurs_with \
+                 WHERE tenant_id = ? ALLOW FILTERING"
+            ),
             (tid,),
         )
         .await
@@ -279,8 +324,10 @@ async fn open_secondary_index_paging() {
     #[allow(deprecated)]
     let r_both = s
         .query_unpaged(
-            "SELECT entity_a FROM agent_memory.co_occurs_with \
-             WHERE session_id = ? AND tenant_id = ? ALLOW FILTERING",
+            format!(
+                "SELECT entity_a FROM {ks}.co_occurs_with \
+                 WHERE session_id = ? AND tenant_id = ? ALLOW FILTERING"
+            ),
             (sid, tid),
         )
         .await
@@ -302,13 +349,17 @@ async fn open_secondary_index_paging() {
 #[tokio::test]
 #[ignore]
 async fn open_phonetic_match() {
-    let s = connect_plain("127.0.0.1:19042").await;
+    let Some(cfg) = test_cluster() else { return };
+    let s = connect_test_cluster(&cfg).await;
+    let ks = &cfg.keyspace;
     #[allow(deprecated)]
     s.query_unpaged(
-        "INSERT INTO agent_memory.entity_store \
-         (tenant_id, session_id, entity_id, entity_name, entity_type, context_snippet, confidence, created_at) \
-         VALUES (550e8400-e29b-41d4-a716-446655440000, d855258d-c5b7-41be-bf28-e8cfa0fc6b9e, \
-                 11111111-1111-1111-1111-111111111111, 'John Smith', 'person', 'test', 0.9, 1711036800000)",
+        format!(
+            "INSERT INTO {ks}.entity_store \
+             (tenant_id, session_id, entity_id, entity_name, entity_type, context_snippet, confidence, created_at) \
+             VALUES (550e8400-e29b-41d4-a716-446655440000, d855258d-c5b7-41be-bf28-e8cfa0fc6b9e, \
+                     11111111-1111-1111-1111-111111111111, 'John Smith', 'person', 'test', 0.9, 1711036800000)"
+        ),
         (),
     )
     .await
@@ -317,10 +368,12 @@ async fn open_phonetic_match() {
     #[allow(deprecated)]
     let result = s
         .query_unpaged(
-            "SELECT entity_name FROM agent_memory.entity_store \
-             WHERE tenant_id = 550e8400-e29b-41d4-a716-446655440000 \
-             AND session_id = d855258d-c5b7-41be-bf28-e8cfa0fc6b9e \
-             AND entity_name = 'Jon Smyth'",
+            format!(
+                "SELECT entity_name FROM {ks}.entity_store \
+                 WHERE tenant_id = 550e8400-e29b-41d4-a716-446655440000 \
+                 AND session_id = d855258d-c5b7-41be-bf28-e8cfa0fc6b9e \
+                 AND entity_name = 'Jon Smyth'"
+            ),
             (),
         )
         .await
@@ -342,17 +395,18 @@ async fn open_phonetic_match() {
 /// This test inserts ghost rows into both entity_store and typed_edges,
 /// then verifies that CqlStorage methods skip them gracefully.
 #[tokio::test]
-#[ignore] // Requires live Ferrosa cluster on port 19042
+#[ignore = "requires live Ferrosa test cluster; run with --ignored and FERROSA_TEST_CQL_PORT set"]
 async fn ghost_rows_do_not_crash_queries() {
     use ferrosa_memory_core::config::FerrosaCqlConfig;
     use ferrosa_memory_core::cql_storage::CqlStorage;
     use ferrosa_memory_core::storage::Storage;
     use ferrosa_memory_core::types::TenantContext;
 
+    let Some(cfg) = test_cluster() else { return };
     let config = FerrosaCqlConfig {
-        contact_points: vec!["localhost:19042".into()],
-        keyspace: "agent_memory".into(),
-        replication_factor: 3,
+        contact_points: vec![cfg.contact_point()],
+        keyspace: cfg.keyspace.clone(),
+        replication_factor: 1,
         consistency: "ONE".into(),
         username: "ferrosa_user".into(),
         password: "ferrosa_user".into(),
@@ -366,6 +420,7 @@ async fn ghost_rows_do_not_crash_queries() {
             return;
         }
     };
+    let ks = &cfg.keyspace;
 
     let tenant_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
@@ -381,10 +436,12 @@ async fn ghost_rows_do_not_crash_queries() {
     #[allow(deprecated)]
     session
         .query_unpaged(
-            "INSERT INTO agent_memory.entity_store \
-             (tenant_id, session_id, entity_id, entity_name, entity_type, \
-              context_snippet, confidence, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            format!(
+                "INSERT INTO {ks}.entity_store \
+                 (tenant_id, session_id, entity_id, entity_name, entity_type, \
+                  context_snippet, confidence, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            ),
             (
                 tenant_id,
                 session_id,
@@ -403,9 +460,11 @@ async fn ghost_rows_do_not_crash_queries() {
     #[allow(deprecated)]
     session
         .query_unpaged(
-            "INSERT INTO agent_memory.entity_store \
-             (tenant_id, session_id, entity_id, confidence, created_at) \
-             VALUES (?, ?, ?, ?, ?)",
+            format!(
+                "INSERT INTO {ks}.entity_store \
+                 (tenant_id, session_id, entity_id, confidence, created_at) \
+                 VALUES (?, ?, ?, ?, ?)"
+            ),
             (tenant_id, session_id, Uuid::new_v4(), 0.5_f32, inserted_at),
         )
         .await
@@ -415,9 +474,11 @@ async fn ghost_rows_do_not_crash_queries() {
     #[allow(deprecated)]
     session
         .query_unpaged(
-            "INSERT INTO agent_memory.typed_edges \
-             (tenant_id, session_id, src_id, edge_type, dst_id, weight, metadata, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            format!(
+                "INSERT INTO {ks}.typed_edges \
+                 (tenant_id, session_id, src_id, edge_type, dst_id, weight, metadata, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            ),
             (
                 tenant_id,
                 session_id,
@@ -436,9 +497,11 @@ async fn ghost_rows_do_not_crash_queries() {
     #[allow(deprecated)]
     session
         .query_unpaged(
-            "INSERT INTO agent_memory.typed_edges \
-             (tenant_id, session_id, src_id, edge_type, dst_id, weight, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            format!(
+                "INSERT INTO {ks}.typed_edges \
+                 (tenant_id, session_id, src_id, edge_type, dst_id, weight, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)"
+            ),
             (
                 tenant_id,
                 session_id,
@@ -491,7 +554,7 @@ async fn ghost_rows_do_not_crash_queries() {
     let _ = session
         .query_unpaged(
             format!(
-                "DELETE FROM agent_memory.entity_store WHERE tenant_id = {tenant_id} AND session_id = {session_id}"
+                "DELETE FROM {ks}.entity_store WHERE tenant_id = {tenant_id} AND session_id = {session_id}"
             ),
             (),
         )
@@ -500,7 +563,7 @@ async fn ghost_rows_do_not_crash_queries() {
     let _ = session
         .query_unpaged(
             format!(
-                "DELETE FROM agent_memory.typed_edges WHERE tenant_id = {tenant_id} AND session_id = {session_id}"
+                "DELETE FROM {ks}.typed_edges WHERE tenant_id = {tenant_id} AND session_id = {session_id}"
             ),
             (),
         )
