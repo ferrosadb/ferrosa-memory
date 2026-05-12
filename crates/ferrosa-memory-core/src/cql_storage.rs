@@ -2014,7 +2014,7 @@ impl Storage for CqlStorage {
         let query = format!(
             "SELECT entity_id, entity_name, entity_type, source_fold_id, \
              context_snippet, confidence, state, created_at, \
-             description, tags, properties, content_hash, \
+             description, description_embedding, tags, properties, content_hash, \
              updated_at, scope, ingested_by_session \
              FROM {}.entity_store WHERE tenant_id = ? AND session_id = ? AND entity_id = ?",
             self.keyspace
