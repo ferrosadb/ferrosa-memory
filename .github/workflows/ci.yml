@@ -539,6 +539,13 @@ jobs:
             --keyspace agent_memory_test \
             --ddl-dir ddl
 
+      - name: Build ferrosa-memory-mcp binary for eval tests
+        # ferrosa-memory-eval's live tests spawn the MCP server via
+        # McpClient::spawn(), which expects the binary at
+        # target/{debug,release}/ferrosa-memory-mcp. The default
+        # `cargo test --workspace -- --ignored` doesn't build binaries
+        # for non-test targets, so we pre-build here.
+        run: cargo build -p ferrosa-memory-mcp
       - name: Run ignored (cluster-gated) Rust tests
         env:
           FERROSA_TEST_CONTAINERS: "1"
