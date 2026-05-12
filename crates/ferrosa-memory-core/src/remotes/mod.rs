@@ -7,4 +7,5 @@ pub mod applicability;
 pub mod feedback;
 pub mod policy;
 pub mod safety;
+pub mod teach;
 pub mod types;

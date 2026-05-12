@@ -276,6 +276,26 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "teach_query_stream".into(),
+            description: "Teacher-side remote memory query stream. Returns a transport-neutral JSON event array beginning with a start event before retrieval completion; raw context/detail/skill output requires explicit grants.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "remote_id": { "type": "string", "format": "uuid" },
+                    "learner_instance_id": { "type": "string", "format": "uuid" },
+                    "query": { "type": "string", "maxLength": 4096 },
+                    "namespaces": { "type": "array", "items": { "type": "string" } },
+                    "max_items": { "type": "integer", "minimum": 1, "maximum": 50 },
+                    "query_embedding": { "type": "array", "items": { "type": "number" } },
+                    "grants": { "type": "array", "items": { "type": "string", "enum": ["raw_context", "detail", "skill"] } },
+                    "include_raw_context": { "type": "boolean" },
+                    "include_detail": { "type": "boolean" },
+                    "include_skill": { "type": "boolean" }
+                },
+                "required": ["remote_id", "query"]
+            }),
+        },
+        ToolDef {
             name: "search_context_segments".into(),
             description: "Hybrid-search raw context segments with lexical BM25 fallback plus Nomic vector ANN, optionally returning bounded prev/next temporal expansion windows.".into(),
             input_schema: serde_json::json!({
@@ -1496,6 +1516,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "search_context_segments" => {
             handle_search_context_segments(args, storage, ctx, session).await
         }
+        "teach_query_stream" => handle_teach_query_stream(args, storage, ctx).await,
         "get_context_window" => handle_get_context_window(args, storage, ctx).await,
         "upsert_entity" => handle_upsert_entity(args, storage, ctx, session).await,
         "batch_ingest" => handle_batch_ingest(args, storage, ctx, session).await,
@@ -1648,6 +1669,7 @@ fn is_tier1(name: &str) -> bool {
             | "ensure_parent_tag"
             | "verify_skill"
             | "ingest_context_segments"
+            | "teach_query_stream"
             | "search_context_segments"
             | "get_context_window"
             | "hybrid_search"
@@ -2294,6 +2316,45 @@ async fn handle_ingest_context_segments<S: crate::storage::Storage>(
     .await
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
     serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
+async fn handle_teach_query_stream<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+    let request = crate::remotes::teach::TeachQueryRequest {
+        remote_id: require_uuid(&args, "remote_id")?,
+        learner_instance_id: crate::remote_identity::InstanceId(
+            optional_uuid(&args, "learner_instance_id")?.unwrap_or(uuid::Uuid::nil()),
+        ),
+        query: require_str(&args, "query")?.to_string(),
+        namespaces: optional_string_array(&args, "namespaces")?,
+        max_items: args
+            .get("max_items")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(8)
+            .clamp(1, 50) as i32,
+        query_embedding: optional_f32_array(&args, "query_embedding")?,
+        grants: optional_string_array(&args, "grants")?,
+        include_raw_context: args
+            .get("include_raw_context")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        include_detail: args
+            .get("include_detail")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        include_skill: args
+            .get("include_skill")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    };
+    let events = crate::remotes::teach::teach_query_stream(storage, ctx, session_id, request)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    serde_json::to_value(events).map_err(|e| (INTERNAL_ERROR, e.to_string()))
 }
 
 async fn handle_search_context_segments<S: crate::storage::Storage>(
@@ -6846,6 +6907,24 @@ fn optional_f32_array(args: &Value, field: &str) -> Result<Option<Vec<f32>>, (i3
         Some(_) => Err((INVALID_PARAMS, format!("{field} must be an array"))),
         None => Ok(None),
     }
+}
+
+fn optional_string_array(args: &Value, field: &str) -> Result<Vec<String>, (i32, String)> {
+    let Some(value) = args.get(field) else {
+        return Ok(Vec::new());
+    };
+    let array = value
+        .as_array()
+        .ok_or((INVALID_PARAMS, format!("{field} must be array")))?;
+    array
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or((INVALID_PARAMS, format!("{field} must contain strings")))
+        })
+        .collect()
 }
 
 fn require_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, (i32, String)> {
