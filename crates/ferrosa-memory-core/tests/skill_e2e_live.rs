@@ -247,17 +247,38 @@ async fn skill_round_trip_on_live_cluster() {
 
     // Step 6: ensure_parent_tag — build the taxonomy tdd→testing→quality.
     // First call creates, second is idempotent.
-    let t1 = ensure_parent_tag(&storage, &ctx, caller_session, "tdd", "testing", Some(&graph))
-        .await
-        .expect("tdd->testing");
-    let t2 = ensure_parent_tag(&storage, &ctx, caller_session, "tdd", "testing", Some(&graph))
-        .await
-        .expect("tdd->testing rerun");
+    let t1 = ensure_parent_tag(
+        &storage,
+        &ctx,
+        caller_session,
+        "tdd",
+        "testing",
+        Some(&graph),
+    )
+    .await
+    .expect("tdd->testing");
+    let t2 = ensure_parent_tag(
+        &storage,
+        &ctx,
+        caller_session,
+        "tdd",
+        "testing",
+        Some(&graph),
+    )
+    .await
+    .expect("tdd->testing rerun");
     assert!(matches!(t1, EnsureParentTagAction::Created { .. }));
     assert!(matches!(t2, EnsureParentTagAction::Skipped { .. }));
-    ensure_parent_tag(&storage, &ctx, caller_session, "testing", "quality", Some(&graph))
-        .await
-        .expect("testing->quality");
+    ensure_parent_tag(
+        &storage,
+        &ctx,
+        caller_session,
+        "testing",
+        "quality",
+        Some(&graph),
+    )
+    .await
+    .expect("testing->quality");
 
     // Step 7: verify_skill surfaces the full neighborhood.
     let verify = verify_skill(&storage, &ctx, "tdd")
