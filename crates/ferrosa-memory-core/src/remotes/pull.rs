@@ -309,6 +309,16 @@ pub async fn pull_commit<S: Storage>(
     if request.preview.expires_at <= Utc::now() {
         bail!("preview is stale or expired; refresh pull_preview before commit");
     }
+    if request.preview.items.iter().any(|preview_item| {
+        matches!(
+            preview_item.item.kind,
+            TeachingKind::SkillStub | TeachingKind::ProcedureStub
+        )
+    }) {
+        bail!(
+            "skill teaching items must use skill_pull_preview and skill_commit, not normal memory pull_commit"
+        );
+    }
 
     let batch_id = Uuid::new_v4();
     let mut imported = 0;
@@ -971,5 +981,43 @@ mod tests {
         );
         assert_eq!(storage.memory_provenance.lock().await.len(), 1);
         assert_eq!(storage.import_batches.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn normal_memory_pull_commit_rejects_skill_teaching_items() {
+        let storage = MockStorage::new();
+        let learner = InstanceSigningIdentity::generate(InstanceId(id(30)));
+        let teacher = InstanceSigningIdentity::generate(InstanceId(id(10)));
+        let public = teacher.public_identity();
+        let mut skill_stub = item(31, "skills", "TDD skill", "Use RED GREEN REFACTOR");
+        skill_stub.kind = TeachingKind::SkillStub;
+        skill_stub.applicability.namespaces = vec!["skills".into()];
+        let signed = teacher.sign(packet(vec![skill_stub])).unwrap();
+        let preview = pull_preview(
+            &MockRemoteClient::new(signed),
+            &storage,
+            &ctx(),
+            PullPreviewRequest::new(id(3), "personal", "teach tdd")
+                .with_policy(RemotePolicy::from_facts([
+                    PolicyFact::remote("personal"),
+                    PolicyFact::trusted_for("personal", "skills"),
+                    PolicyFact::grant("personal", PolicyAction::Autocommit, "knowledge"),
+                ]))
+                .with_public_identity(public),
+        )
+        .await
+        .unwrap();
+
+        let err = pull_commit(
+            &storage,
+            &ctx(),
+            PullCommitRequest::from_preview(preview, &learner),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("skill teaching items must use skill_pull_preview")
+        );
     }
 }

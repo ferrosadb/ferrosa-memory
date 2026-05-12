@@ -485,6 +485,91 @@ impl RemotePolicy {
         self.decision(allowed, PolicyAction::Autocommit, reasons)
     }
 
+    /// Separate autocommit policy for skill teaching.
+    ///
+    /// Skill proposals never reuse the normal `knowledge` autocommit grant. A personal remote
+    /// must have `grant(remote, autocommit, skills)`, be `trusted_for(remote, skills)`, and the
+    /// skill item must be safe/non-conflicting.
+    pub fn can_autocommit_skill(&self, remote: &str, item: &PolicyItem) -> PolicyDecision {
+        let mut reasons = Vec::new();
+        self.push_deny_reasons(
+            &mut reasons,
+            remote,
+            PolicyAction::Autocommit,
+            &["skills", &item.namespace],
+        );
+        if item.namespace != "skills" {
+            reasons.push(PolicyReason::new(
+                "wrong_namespace",
+                format!("item_namespace({}, {})", item.item_id, item.namespace),
+                "skill autocommit only applies to the skills namespace",
+            ));
+        }
+        if !self.has_policy_fact(
+            "grant",
+            &[remote, PolicyAction::Autocommit.as_fact_atom(), "skills"],
+        ) {
+            reasons.push(PolicyReason::new(
+                "missing_grant",
+                format!("grant({remote}, autocommit, skills)"),
+                "no explicit skill autocommit grant matched",
+            ));
+        }
+        if !self.has_policy_fact("trusted_for", &[remote, "skills"]) {
+            reasons.push(PolicyReason::new(
+                "not_trusted_for_skills",
+                format!("trusted_for({remote}, skills)"),
+                "remote is not trusted for skill teaching",
+            ));
+        }
+        if !item.safe {
+            reasons.push(PolicyReason::new(
+                "unsafe_item",
+                format!("unsafe_item({})", item.item_id),
+                "unsafe skills cannot become active candidates",
+            ));
+        }
+        if item.conflict {
+            reasons.push(PolicyReason::new(
+                "conflict",
+                format!("conflict({})", item.item_id),
+                "local skill conflicts require review",
+            ));
+        }
+        if item.prompt_injection_risk {
+            reasons.push(PolicyReason::new(
+                "prompt_injection_risk",
+                format!("prompt_injection_risk({})", item.item_id),
+                "prompt-injection risk blocks skill autocommit",
+            ));
+        }
+        if item.secret_risk {
+            reasons.push(PolicyReason::new(
+                "secret_risk",
+                format!("secret_risk({})", item.item_id),
+                "secret risk blocks skill autocommit",
+            ));
+        }
+
+        if reasons.is_empty() {
+            reasons.extend([
+                self.reason_for_fact(
+                    "grant",
+                    [remote, PolicyAction::Autocommit.as_fact_atom(), "skills"],
+                    "explicit skill autocommit grant permits an active candidate",
+                ),
+                self.reason_for_fact(
+                    "trusted_for",
+                    [remote, "skills"],
+                    "remote is trusted for skill teaching",
+                ),
+            ]);
+            self.decision(true, PolicyAction::Autocommit, reasons)
+        } else {
+            self.decision(false, PolicyAction::Autocommit, reasons)
+        }
+    }
+
     pub fn requires_activation(&self, remote: &str, item: &PolicyItem) -> PolicyDecision {
         let autocommit = self.can_autocommit(remote, item);
         if autocommit.allowed {
