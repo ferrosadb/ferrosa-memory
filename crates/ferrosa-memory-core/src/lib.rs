@@ -55,6 +55,7 @@ pub mod plan;
 pub mod promotion;
 pub mod quota;
 pub mod recursive_explore;
+pub mod remote_identity;
 pub mod router;
 pub mod scope;
 #[cfg(test)]
