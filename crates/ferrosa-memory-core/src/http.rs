@@ -456,8 +456,36 @@ where
     S: Storage + OperatorQuerySurface,
     T: AsyncReadExt + AsyncWriteExt + Unpin,
 {
+    serve_one_connection_with_session_budget(
+        stream,
+        storage,
+        metrics,
+        credential_validator,
+        readiness_checker,
+        shell_routes,
+        session,
+        REQUEST_BUDGET,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_one_connection_with_session_budget<S, T>(
+    stream: &mut T,
+    storage: &S,
+    metrics: &MemoryMetrics,
+    credential_validator: &CredentialValidator,
+    readiness_checker: &(dyn Fn() -> bool + Send + Sync),
+    shell_routes: &ShellRouteConfig,
+    session: &dispatch::SessionState,
+    request_budget: std::time::Duration,
+) -> anyhow::Result<()>
+where
+    S: Storage + OperatorQuerySurface,
+    T: AsyncReadExt + AsyncWriteExt + Unpin,
+{
     loop {
-        let handler = handle_connection_rw(
+        let keep_alive = handle_connection_rw(
             stream,
             storage,
             metrics,
@@ -465,18 +493,9 @@ where
             readiness_checker,
             shell_routes,
             session,
-        );
-        let keep_alive = match tokio::time::timeout(REQUEST_BUDGET, handler).await {
-            Ok(res) => res?,
-            Err(_) => {
-                let body = format!("request exceeded {:?}", REQUEST_BUDGET);
-                let resp = text_response("504 Gateway Timeout", &body);
-                // Best-effort notify the client; ignore write errors since
-                // the peer may already be gone.
-                let _ = stream.write_all(resp.as_bytes()).await;
-                return Err(anyhow::anyhow!("request exceeded {:?}", REQUEST_BUDGET));
-            }
-        };
+            request_budget,
+        )
+        .await?;
         if !keep_alive {
             break;
         }
@@ -492,6 +511,7 @@ where
 ///
 /// Reads the HTTP request, extracts auth, dispatches MCP, returns response.
 /// Works with both plain TCP and TLS-wrapped streams.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection_rw<
     S: Storage + OperatorQuerySurface,
     T: AsyncReadExt + AsyncWriteExt + Unpin,
@@ -503,15 +523,25 @@ async fn handle_connection_rw<
     readiness_checker: &(dyn Fn() -> bool + Send + Sync),
     shell_routes: &ShellRouteConfig,
     session: &dispatch::SessionState,
+    request_budget: std::time::Duration,
 ) -> anyhow::Result<bool> {
-    let request = match read_http_request(stream, MAX_REQUEST_BYTES).await {
-        Ok(r) => r,
-        Err(e) => {
+    let request = match tokio::time::timeout(
+        request_budget,
+        read_http_request(stream, MAX_REQUEST_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
             let msg = e.to_string();
             if msg.contains("connection closed before request headers complete") {
                 return Ok(false);
             }
             tracing::debug!(error = %e, "http: incomplete or malformed request");
+            return Ok(false);
+        }
+        Err(_) => {
+            tracing::debug!(timeout = ?request_budget, "http: idle keep-alive connection timed out");
             return Ok(false);
         }
     };
@@ -522,7 +552,7 @@ async fn handle_connection_rw<
         .iter()
         .any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("close"));
 
-    let response = handle_http_request_with_session(
+    let handler = handle_http_request_with_session(
         method,
         path,
         &headers,
@@ -533,8 +563,18 @@ async fn handle_connection_rw<
         readiness_checker,
         shell_routes,
         session,
-    )
-    .await?;
+    );
+    let response = match tokio::time::timeout(request_budget, handler).await {
+        Ok(response) => response?,
+        Err(_) => {
+            let body = format!("request exceeded {request_budget:?}");
+            let resp = text_response("504 Gateway Timeout", &body);
+            // Best-effort notify the client; ignore write errors since
+            // the peer may already be gone.
+            let _ = stream.write_all(resp.as_bytes()).await;
+            return Err(anyhow::anyhow!("request exceeded {request_budget:?}"));
+        }
+    };
     stream.write_all(response.as_bytes()).await?;
 
     Ok(!close_requested)
@@ -4728,6 +4768,52 @@ mod tests {
 
         client_task.await.unwrap();
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn keep_alive_idle_timeout_closes_without_504_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let metrics = MemoryMetrics::new().unwrap();
+        let storage = MockStorage::new();
+        let (mut client, mut server) = tokio::io::duplex(8192);
+
+        let server_task = tokio::spawn(async move {
+            serve_one_connection_with_session_budget(
+                &mut server,
+                &storage,
+                &metrics,
+                &|u, p| {
+                    if u == "user" && p == "pass" {
+                        Some(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap())
+                    } else {
+                        None
+                    }
+                },
+                &|| true,
+                &ShellRouteConfig::default(),
+                &dispatch::SessionState::default(),
+                std::time::Duration::from_millis(20),
+            )
+            .await
+        });
+
+        client
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = client.read(&mut buf).await.unwrap();
+        let first = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(first.starts_with("HTTP/1.1 200 OK"), "got: {first}");
+
+        let result = server_task.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "an idle keep-alive socket after a successful request should close cleanly, got {result:?}"
+        );
     }
 
     #[test]

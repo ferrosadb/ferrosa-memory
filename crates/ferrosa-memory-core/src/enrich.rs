@@ -637,6 +637,7 @@ pub async fn run_enrichment(
                     ollama_base_url: config.ollama_base_url.clone(),
                     model: config.embed_model.clone(),
                     dimensions: config.embed_dimensions,
+                    max_input_chars: crate::config::EmbeddingConfig::default().max_input_chars,
                     ner_model: String::new(),
                 },
             ))
