@@ -61,6 +61,9 @@ graph LR
 | [fmea.md](fmea.md) | Failure Mode and Effects Analysis with RPN scoring |
 | [lsp-code-indexing.md](lsp-code-indexing.md) | LSP-based code indexing spec for structural codebase ingestion |
 | [expert-system-knowledge-plane.md](expert-system-knowledge-plane.md) | ferrosa-memory-side expert-system architecture — rule registry, claims, approvals, aliases, derived facts, explanations |
+| [remote-memory.md](remote-memory.md) | Decision record for teacher/learner remote memory transfer, trust boundaries, signed provenance, stubs, and negative feedback |
+| [memory-remotes-teacher-learner.md](memory-remotes-teacher-learner.md) | Full blueprint for Ferrosa Memory Remotes: policy-governed knowledge teaching between fmem instances |
+| [plans/memory-remotes-project-plan.md](plans/memory-remotes-project-plan.md) | Multi-agent TDD project plan for implementing memory remotes |
 
 ## Source
 
