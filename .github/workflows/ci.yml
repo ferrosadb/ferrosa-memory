@@ -539,6 +539,53 @@ jobs:
             --keyspace agent_memory_test \
             --ddl-dir ddl
 
+          # Warm up the test cluster's graph /graph/query endpoint, both
+          # read and write. graph_live tests now target the test cluster
+          # (FERROSA_TEST_GRAPH_URL=http://127.0.0.1:17974); without an
+          # explicit write probe, public_graph_write_round_trip_for_co_occurs_edges
+          # hits the graph engine before the write path is ready and
+          # times out under the 10s reqwest limit. Same probe shape as
+          # the main-cluster warmup above.
+          echo "Waiting for test cluster /graph/query (read) on 17974..."
+          for i in $(seq 1 60); do
+            if curl -fsS -m 5 -X POST http://127.0.0.1:17974/graph/query \
+                -H "Content-Type: application/json" \
+                -d '{"query":"RETURN 1 AS x","keyspace":"agent_memory_test"}' \
+                >/dev/null 2>&1; then
+              echo "  test cluster /graph/query (read) live after ${i} attempts"
+              break
+            fi
+            if [ "$i" -eq 60 ]; then
+              echo "::error::test cluster /graph/query (read) did not respond within 120s"
+              docker compose -f docker-compose.test.yml logs 2>/dev/null | tail -100
+              exit 1
+            fi
+            sleep 2
+          done
+
+          gen_uuid() { python3 -c 'import uuid;print(uuid.uuid4())'; }
+          echo "Waiting for test cluster /graph/query MERGE+edge (write path)..."
+          for i in $(seq 1 60); do
+            T=$(gen_uuid); S=$(gen_uuid); A=$(gen_uuid); B=$(gen_uuid)
+            Q="MERGE (a:Entity {tenant_id: '${T}', session_id: '${S}', entity_id: '${A}'}) \
+               MERGE (b:Entity {tenant_id: '${T}', session_id: '${S}', entity_id: '${B}'}) \
+               MERGE (a)-[r:CO_OCCURS_WITH {tenant_id: '${T}', session_id: '${S}'}]->(b) \
+               SET r.strength = 0.5 RETURN r"
+            if curl -fsS -m 15 -X POST http://127.0.0.1:17974/graph/query \
+                -H "Content-Type: application/json" \
+                -d "{\"query\":\"${Q}\",\"keyspace\":\"agent_memory_test\"}" \
+                >/dev/null 2>&1; then
+              echo "  test cluster /graph/query (write) live after ${i} attempts"
+              break
+            fi
+            if [ "$i" -eq 60 ]; then
+              echo "::error::test cluster /graph/query (write) did not respond within 300s"
+              docker compose -f docker-compose.test.yml logs 2>/dev/null | tail -100
+              exit 1
+            fi
+            sleep 5
+          done
+
       - name: Build ferrosa-memory-mcp binary for eval tests
         # ferrosa-memory-eval's live tests spawn the MCP server via
         # McpClient::spawn(), which expects the binary at
