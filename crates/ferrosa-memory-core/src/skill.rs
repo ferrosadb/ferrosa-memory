@@ -335,18 +335,36 @@ pub async fn ingest_skill(
                  expected to materialize the tag row"
             );
         }
-        if let Err(e) = crate::graph_write::create_typed_edge(
-            storage,
-            ctx,
-            storage_session,
-            entity_id,
-            "TAGGED_AS",
-            tag_id,
-            1.0,
-            None,
-        )
-        .await
-        {
+        // Route TAGGED_AS through the graph client when one is wired
+        // (CqlStorage rejects direct typed_edge_put on graph-annotated
+        // tables). Same pattern as the REQUIRES edge below.
+        let edge_result = if let Some(graph) = graph_client {
+            graph
+                .put_typed_edge(
+                    ctx.tenant_id,
+                    storage_session,
+                    entity_id,
+                    "TAGGED_AS",
+                    tag_id,
+                    1.0,
+                    None,
+                )
+                .await
+        } else {
+            crate::graph_write::create_typed_edge(
+                storage,
+                ctx,
+                storage_session,
+                entity_id,
+                "TAGGED_AS",
+                tag_id,
+                1.0,
+                None,
+            )
+            .await
+            .map(|_| ())
+        };
+        if let Err(e) = edge_result {
             tracing::warn!(
                 skill = %params.name,
                 tag = %tag_name,
@@ -423,18 +441,41 @@ pub async fn ingest_skill(
             );
         }
 
-        if let Err(e) = crate::graph_write::create_typed_edge(
-            storage,
-            ctx,
-            storage_session,
-            entity_id,
-            "REQUIRES",
-            prereq.entity_id,
-            1.0,
-            None,
-        )
-        .await
-        {
+        // typed_edges is graph-annotated; CqlStorage rejects direct
+        // writes ("typed_edge_put must go through a GraphClient-backed
+        // storage adapter"). When a graph client is wired, route the
+        // REQUIRES edge through Cypher MERGE so it lands cluster-wide.
+        // Falling back to `create_typed_edge` here would silently
+        // produce a "missing_prerequisites" entry every time —
+        // misreporting an edge-write failure as a prereq lookup
+        // failure.
+        let edge_result = if let Some(graph) = graph_client {
+            graph
+                .put_typed_edge(
+                    ctx.tenant_id,
+                    storage_session,
+                    entity_id,
+                    "REQUIRES",
+                    prereq.entity_id,
+                    1.0,
+                    None,
+                )
+                .await
+        } else {
+            crate::graph_write::create_typed_edge(
+                storage,
+                ctx,
+                storage_session,
+                entity_id,
+                "REQUIRES",
+                prereq.entity_id,
+                1.0,
+                None,
+            )
+            .await
+            .map(|_| ())
+        };
+        if let Err(e) = edge_result {
             tracing::warn!(skill = %params.name, prereq = %prereq_name, error = %e, "REQUIRES edge write failed");
             missing_prereqs.push(prereq_name.clone());
         }
@@ -788,17 +829,34 @@ pub async fn ensure_parent_tag(
         }
     }
 
-    crate::graph_write::create_typed_edge(
-        storage,
-        ctx,
-        global_session,
-        child_id,
-        "PARENT_TAG",
-        parent_id,
-        1.0,
-        None,
-    )
-    .await?;
+    // PARENT_TAG goes through the graph client when one is wired —
+    // typed_edges is graph-annotated and CqlStorage rejects direct
+    // writes. Same pattern as REQUIRES / TAGGED_AS in `ingest_skill`.
+    if let Some(graph) = graph_client {
+        graph
+            .put_typed_edge(
+                ctx.tenant_id,
+                global_session,
+                child_id,
+                "PARENT_TAG",
+                parent_id,
+                1.0,
+                None,
+            )
+            .await?;
+    } else {
+        crate::graph_write::create_typed_edge(
+            storage,
+            ctx,
+            global_session,
+            child_id,
+            "PARENT_TAG",
+            parent_id,
+            1.0,
+            None,
+        )
+        .await?;
+    }
 
     Ok(EnsureParentTagAction::Created {
         child_id,
