@@ -211,8 +211,22 @@ pub fn plan_teaching_items(
             if hit.stale {
                 metadata["stale"] = serde_json::json!(true);
             }
+            let item_id = Uuid::new_v4();
+            let detail_expires_at = now + chrono::Duration::minutes(15);
+            let detail_token = ContentHash::sha256_bytes(
+                format!(
+                    "{}:{}:{}:{}:{}",
+                    request.remote_id,
+                    packet_id,
+                    item_id,
+                    hit.source_ref,
+                    detail_expires_at.timestamp_millis()
+                )
+                .as_bytes(),
+            )
+            .0;
             Ok(TeachingItem {
-                item_id: Uuid::new_v4(),
+                item_id,
                 packet_id,
                 kind,
                 title: hit.title,
@@ -223,9 +237,12 @@ pub fn plan_teaching_items(
                 safety,
                 detail_ref: Some(DetailRef {
                     remote_id: request.remote_id,
-                    item_id: Uuid::new_v4(),
+                    packet_id,
+                    item_id,
+                    token: detail_token,
                     detail_hash,
                     more_available: true,
+                    expires_at: detail_expires_at,
                 }),
                 metadata,
                 created_at: now,

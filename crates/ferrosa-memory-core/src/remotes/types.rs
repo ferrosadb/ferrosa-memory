@@ -187,13 +187,16 @@ pub struct SafetyClassification {
     pub requires_human: bool,
 }
 
-/// Capability reference for fetching more detail without sending raw context by default.
+/// Opaque capability reference for fetching more detail without sending raw context by default.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DetailRef {
     pub remote_id: Uuid,
+    pub packet_id: Uuid,
     pub item_id: Uuid,
+    pub token: String,
     pub detail_hash: ContentHash,
     pub more_available: bool,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Learner-side stub for a remote item whose details are deferred or gated.
@@ -308,9 +311,12 @@ mod tests {
                 },
                 detail_ref: Some(DetailRef {
                     remote_id: id(5),
+                    packet_id: id(1),
                     item_id: id(4),
+                    token: "opaque-token".into(),
                     detail_hash: ContentHash("def456".into()),
                     more_available: true,
+                    expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
                 }),
                 metadata: json!({"source": "test"}),
                 created_at: chrono::Utc::now(),
