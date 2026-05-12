@@ -376,9 +376,18 @@ impl<T: McpTransport> EvalRunner<T> {
 
     /// Take a graph snapshot via get_stats.
     async fn take_snapshot(&mut self) -> Result<GraphSnapshot, RunnerError> {
+        // Scope the snapshot to the runner's tenant so before/after counts
+        // reflect just the entities the scenario writes. Without this,
+        // get_stats either fans out across tenants (drowning the diff
+        // signal) or filters to a default tenant that doesn't match the
+        // one execute_step injects into each tool call — the after-snapshot
+        // sees 0 entities even though step 0 successfully wrote one.
         let (response, _latency) = self
             .transport
-            .call_tool("get_stats", serde_json::json!({}))
+            .call_tool(
+                "get_stats",
+                serde_json::json!({ "tenant_id": self.config.tenant_id.to_string() }),
+            )
             .await?;
         Ok(GraphSnapshot::from_stats_response(&response))
     }
