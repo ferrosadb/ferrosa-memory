@@ -519,7 +519,15 @@ jobs:
             ~/data/ferrosa-memory-test/node1 \
             ~/data/ferrosa-memory-test/node2 \
             ~/data/ferrosa-memory-test/node3
-          docker compose -f docker-compose.test.yml up -d
+          # CI brings up node1-test only (standalone). The 3-node test
+          # compose's progressive bring-up (standalone → pair → cluster)
+          # doesn't reliably reach write-quorum availability for the
+          # graph engine's adjacency keyspace within the CI window
+          # — graph writes timed out with CL=QUORUM received=0 even
+          # at RF=1. The migration-drift + graph_live + ferrosa_bugs
+          # suites only need a single-node cluster they can DROP+CREATE
+          # keyspaces on; standalone node1-test satisfies that.
+          docker compose -f docker-compose.test.yml up -d minio-test minio-test-init node1-test
           echo "Waiting for test cluster CQL on 19542..."
           for i in $(seq 1 60); do
             if bash -c "</dev/tcp/127.0.0.1/19542" 2>/dev/null; then
