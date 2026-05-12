@@ -499,9 +499,56 @@ jobs:
             fi
             sleep 5
           done
+      - name: Bring up isolated test cluster (port 19542)
+        # `crates/ferrosa-memory-core/tests/migration_drift.rs::t03_*`
+        # exercises the v30 → v31 keyspace-upgrade path and needs a
+        # cluster it can DROP+CREATE keyspaces on without colliding
+        # with the main cluster the rest of the integration tests
+        # share. `docker-compose.test.yml` is the upstream-maintained
+        # +500-port-offset compose for exactly this — bring it up
+        # alongside the main cluster.
+        run: |
+          # The compose file references `image: ferrosa-memory-node`
+          # (no build context), so build it once from the cloned
+          # ferrosa source first.
+          docker build -t ferrosa-memory-node /tmp/ferrosa-src
+          # Compose uses ~/data/ferrosa-memory-test/{minio,node1,..}
+          # — make sure the dirs exist on the runner.
+          mkdir -p \
+            ~/data/ferrosa-memory-test/minio \
+            ~/data/ferrosa-memory-test/node1 \
+            ~/data/ferrosa-memory-test/node2 \
+            ~/data/ferrosa-memory-test/node3
+          docker compose -f docker-compose.test.yml up -d
+          echo "Waiting for test cluster CQL on 19542..."
+          for i in $(seq 1 60); do
+            if bash -c "</dev/tcp/127.0.0.1/19542" 2>/dev/null; then
+              echo "  test cluster CQL ready after ${i}s"
+              break
+            fi
+            if [ "$i" -eq 60 ]; then
+              echo "::error::Test cluster did not become ready within 120s"
+              docker compose -f docker-compose.test.yml logs 2>/dev/null | tail -100
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "Applying DDL to test cluster..."
+          timeout 180s cargo run --bin migrate -- \
+            --contact-points 127.0.0.1:19542 \
+            --keyspace agent_memory_test \
+            --ddl-dir ddl
+
       - name: Run ignored (cluster-gated) Rust tests
         env:
           FERROSA_TEST_CONTAINERS: "1"
+          # Migration-drift tests run keyspace-recreate cycles against
+          # the isolated test cluster brought up above.
+          FERROSA_TEST_CQL_HOST: "127.0.0.1"
+          FERROSA_TEST_CQL_PORT: "19542"
+          FERROSA_TEST_GRAPH_URL: "http://127.0.0.1:17974"
+          FERROSA_TEST_KEYSPACE: "agent_memory_test"
+          FERROSA_TEST_S3_ENDPOINT: "http://127.0.0.1:19500"
         run: cargo test --workspace -- --ignored
       - name: Run system pytest suite against live cluster
         env:
@@ -512,10 +559,15 @@ jobs:
       - name: Collect cluster logs on failure
         if: failure()
         run: |
+          echo "=== main cluster ==="
           docker compose -f /tmp/docker-compose.memory-ci.yml logs --no-color 2>/dev/null | tail -200 || true
+          echo "=== test cluster ==="
+          docker compose -f docker-compose.test.yml logs --no-color 2>/dev/null | tail -200 || true
       - name: Tear down cluster
         if: always()
-        run: docker compose -f /tmp/docker-compose.memory-ci.yml down -v --remove-orphans 2>/dev/null || true
+        run: |
+          docker compose -f /tmp/docker-compose.memory-ci.yml down -v --remove-orphans 2>/dev/null || true
+          docker compose -f docker-compose.test.yml down -v --remove-orphans 2>/dev/null || true
 
   # Final gate: all checks must pass
   ci-pass:
