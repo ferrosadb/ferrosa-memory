@@ -2236,6 +2236,13 @@ distractor_entities = ["entity:noise"]
                     .insert("entity_name".to_string(), json!("EvalTestAlice"));
                 s.arguments
                     .insert("entity_type".to_string(), json!("person"));
+                // upsert_entity now requires context_snippet (free-form prose
+                // grounding the entity); the dispatch layer rejects calls
+                // without it (-32602).
+                s.arguments.insert(
+                    "context_snippet".to_string(),
+                    json!("Alice is a test entity used by the eval runner suite."),
+                );
                 s.arguments.insert(
                     "observations".to_string(),
                     json!(["Alice is a test entity for eval"]),
