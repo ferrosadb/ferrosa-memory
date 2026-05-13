@@ -452,22 +452,19 @@ jobs:
           # statement setup, etc.). Probe the actual query endpoint with a
           # trivial RETURN, so cluster-gated graph_live tests don't race the
           # engine's warm-up.
-          echo "Waiting for graph /graph/query to serve a trivial RETURN..."
-          for i in $(seq 1 60); do
-            if curl -fsS -m 5 -X POST http://127.0.0.1:17474/graph/query \
-                -H "Content-Type: application/json" \
-                -d '{"query":"RETURN 1 AS x","keyspace":"agent_memory"}' \
-                >/dev/null 2>&1; then
-              echo "  /graph/query (read) live after ${i} attempts"
-              break
-            fi
-            if [ "$i" -eq 60 ]; then
-              echo "::error::/graph/query (read) did not respond within 120s"
-              docker compose -f /tmp/docker-compose.memory-ci.yml logs 2>/dev/null | tail -100
-              exit 1
-            fi
-            sleep 2
-          done
+          #
+          # Each attempt prints its outcome (HTTP status or curl error) so a
+          # silent stall is impossible — if the engine is hung we see *why*
+          # in the workflow log, not a 17-minute blank screen.
+          ./.github/scripts/graph-query-probe.sh \
+            --label "main cluster /graph/query (read)" \
+            --url   http://127.0.0.1:17474/graph/query \
+            --query 'RETURN 1 AS x' \
+            --keyspace agent_memory \
+            --attempts 30 \
+            --curl-timeout 5 \
+            --sleep 2 \
+            --logs-cmd 'docker compose -f /tmp/docker-compose.memory-ci.yml logs'
 
           # Read warms up fast; write path (MERGE + edge SET) often takes
           # longer on first use — index/buffer init, write-quorum
@@ -477,28 +474,14 @@ jobs:
           # two Entity MERGEs + a CO_OCCURS_WITH edge MERGE + SET. Use
           # fresh UUIDs per attempt so each iteration actually exercises
           # the create-write path rather than a no-op match.
-          gen_uuid() { python3 -c 'import uuid;print(uuid.uuid4())'; }
-          echo "Waiting for graph /graph/query MERGE+edge (write path) to succeed..."
-          for i in $(seq 1 60); do
-            T=$(gen_uuid); S=$(gen_uuid); A=$(gen_uuid); B=$(gen_uuid)
-            Q="MERGE (a:Entity {tenant_id: '${T}', session_id: '${S}', entity_id: '${A}'}) \
-               MERGE (b:Entity {tenant_id: '${T}', session_id: '${S}', entity_id: '${B}'}) \
-               MERGE (a)-[r:CO_OCCURS_WITH {tenant_id: '${T}', session_id: '${S}'}]->(b) \
-               SET r.strength = 0.5 RETURN r"
-            if curl -fsS -m 15 -X POST http://127.0.0.1:17474/graph/query \
-                -H "Content-Type: application/json" \
-                -d "{\"query\":\"${Q}\",\"keyspace\":\"agent_memory\"}" \
-                >/dev/null 2>&1; then
-              echo "  /graph/query (write) live after ${i} attempts"
-              break
-            fi
-            if [ "$i" -eq 60 ]; then
-              echo "::error::/graph/query (write) did not respond within 300s"
-              docker compose -f /tmp/docker-compose.memory-ci.yml logs 2>/dev/null | tail -100
-              exit 1
-            fi
-            sleep 5
-          done
+          ./.github/scripts/graph-write-probe.sh \
+            --label "main cluster /graph/query (write)" \
+            --url   http://127.0.0.1:17474/graph/query \
+            --keyspace agent_memory \
+            --attempts 30 \
+            --curl-timeout 10 \
+            --sleep 3 \
+            --logs-cmd 'docker compose -f /tmp/docker-compose.memory-ci.yml logs'
       - name: Bring up isolated test cluster (port 19542)
         # `crates/ferrosa-memory-core/tests/migration_drift.rs::t03_*`
         # exercises the v30 → v31 keyspace-upgrade path and needs a
@@ -561,45 +544,24 @@ jobs:
           # hits the graph engine before the write path is ready and
           # times out under the 10s reqwest limit. Same probe shape as
           # the main-cluster warmup above.
-          echo "Waiting for test cluster /graph/query (read) on 17974..."
-          for i in $(seq 1 60); do
-            if curl -fsS -m 5 -X POST http://127.0.0.1:17974/graph/query \
-                -H "Content-Type: application/json" \
-                -d '{"query":"RETURN 1 AS x","keyspace":"agent_memory_test"}' \
-                >/dev/null 2>&1; then
-              echo "  test cluster /graph/query (read) live after ${i} attempts"
-              break
-            fi
-            if [ "$i" -eq 60 ]; then
-              echo "::error::test cluster /graph/query (read) did not respond within 120s"
-              docker compose -f docker-compose.test.yml logs 2>/dev/null | tail -100
-              exit 1
-            fi
-            sleep 2
-          done
+          ./.github/scripts/graph-query-probe.sh \
+            --label "test cluster /graph/query (read)" \
+            --url   http://127.0.0.1:17974/graph/query \
+            --query 'RETURN 1 AS x' \
+            --keyspace agent_memory_test \
+            --attempts 30 \
+            --curl-timeout 5 \
+            --sleep 2 \
+            --logs-cmd 'docker compose -f docker-compose.test.yml logs'
 
-          gen_uuid() { python3 -c 'import uuid;print(uuid.uuid4())'; }
-          echo "Waiting for test cluster /graph/query MERGE+edge (write path)..."
-          for i in $(seq 1 60); do
-            T=$(gen_uuid); S=$(gen_uuid); A=$(gen_uuid); B=$(gen_uuid)
-            Q="MERGE (a:Entity {tenant_id: '${T}', session_id: '${S}', entity_id: '${A}'}) \
-               MERGE (b:Entity {tenant_id: '${T}', session_id: '${S}', entity_id: '${B}'}) \
-               MERGE (a)-[r:CO_OCCURS_WITH {tenant_id: '${T}', session_id: '${S}'}]->(b) \
-               SET r.strength = 0.5 RETURN r"
-            if curl -fsS -m 15 -X POST http://127.0.0.1:17974/graph/query \
-                -H "Content-Type: application/json" \
-                -d "{\"query\":\"${Q}\",\"keyspace\":\"agent_memory_test\"}" \
-                >/dev/null 2>&1; then
-              echo "  test cluster /graph/query (write) live after ${i} attempts"
-              break
-            fi
-            if [ "$i" -eq 60 ]; then
-              echo "::error::test cluster /graph/query (write) did not respond within 300s"
-              docker compose -f docker-compose.test.yml logs 2>/dev/null | tail -100
-              exit 1
-            fi
-            sleep 5
-          done
+          ./.github/scripts/graph-write-probe.sh \
+            --label "test cluster /graph/query (write)" \
+            --url   http://127.0.0.1:17974/graph/query \
+            --keyspace agent_memory_test \
+            --attempts 30 \
+            --curl-timeout 10 \
+            --sleep 3 \
+            --logs-cmd 'docker compose -f docker-compose.test.yml logs'
 
       - name: Build ferrosa-memory-mcp binary for eval tests
         # ferrosa-memory-eval's live tests spawn the MCP server via
