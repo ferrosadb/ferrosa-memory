@@ -1936,7 +1936,7 @@ async fn send_viz_event(
             return false;
         }
     };
-    write.send(Message::Text(json)).await.is_ok()
+    write.send(Message::Text(json.into())).await.is_ok()
 }
 
 async fn send_streaming_viz_snapshot<S: Storage>(
@@ -3088,7 +3088,7 @@ fn compute_ws_accept(key: &str) -> String {
     hasher.update(key.as_bytes());
     hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
     let hash = hasher.finalize();
-    base64_encode(&hash)
+    base64_encode(hash.as_slice())
 }
 
 /// Minimal base64 encode (standard alphabet with padding).

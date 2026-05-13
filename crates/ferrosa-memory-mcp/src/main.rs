@@ -2231,7 +2231,7 @@ tenant_id = "00000000-0000-0000-0000-000000000123"
                     use sha2::{Digest, Sha256};
                     let mut hasher = Sha256::new();
                     hasher.update(b"s3cret");
-                    format!("{:x}", hasher.finalize())
+                    hex::encode(hasher.finalize())
                 },
                 tenant_id
             ),

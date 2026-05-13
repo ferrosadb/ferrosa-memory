@@ -35,7 +35,7 @@ pub fn content_hash(prompt: &str, context_slice: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(normalize(prompt).as_bytes());
     hasher.update(normalize(context_slice).as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Check the memo cache for a cached sub-call result.

@@ -172,7 +172,7 @@ impl ScenarioManifest {
                     .to_string();
                 entries.push(ManifestEntry {
                     file: relative,
-                    sha256: format!("{hash:x}"),
+                    sha256: hex::encode(hash),
                 });
             }
         }

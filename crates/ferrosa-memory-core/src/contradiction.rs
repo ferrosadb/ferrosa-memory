@@ -102,7 +102,7 @@ fn stem(word: &str) -> String {
 
 /// Hash a fact text for deduplication.
 pub fn hash_fact(text: &str) -> String {
-    format!("{:x}", Sha256::digest(text.as_bytes()))
+    hex::encode(Sha256::digest(text.as_bytes()))
 }
 
 #[cfg(test)]

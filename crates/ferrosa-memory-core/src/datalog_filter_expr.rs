@@ -13,23 +13,25 @@
 
 use crate::types::{ArithOp, BuiltinFilter, CmpOp, FilterExpr};
 use nom::{
-    IResult,
+    IResult, Parser,
     branch::alt,
     bytes::complete::{escaped, is_not, tag},
     character::complete::{char as ch, multispace0, one_of, satisfy},
     combinator::{all_consuming, map, recognize, value},
     multi::{fold_many0, many0_count},
     number::complete::double,
-    sequence::{delimited, pair, preceded, tuple},
+    sequence::{delimited, pair, preceded},
 };
 
-fn ws<'a, O, F>(mut inner: F) -> impl FnMut(&'a str) -> IResult<&'a str, O>
+fn ws<'a, O, P>(
+    mut inner: P,
+) -> impl Parser<&'a str, Output = O, Error = nom::error::Error<&'a str>>
 where
-    F: FnMut(&'a str) -> IResult<&'a str, O>,
+    P: Parser<&'a str, Output = O, Error = nom::error::Error<&'a str>>,
 {
     move |i: &'a str| {
         let (i, _) = multispace0(i)?;
-        let (i, out) = inner(i)?;
+        let (i, out) = inner.parse(i)?;
         let (i, _) = multispace0(i)?;
         Ok((i, out))
     }
@@ -38,12 +40,13 @@ where
 fn number(input: &str) -> IResult<&str, FilterExpr> {
     map(double, |f| {
         FilterExpr::LitNum(ordered_float::OrderedFloat(f))
-    })(input)
+    })
+    .parse(input)
 }
 
 fn string_lit(input: &str) -> IResult<&str, FilterExpr> {
     let body = escaped(is_not("\"\\"), '\\', one_of("\"\\nt"));
-    let (i, s) = delimited(ch('"'), body, ch('"'))(input)?;
+    let (i, s) = delimited(ch('"'), body, ch('"')).parse(input)?;
     Ok((i, FilterExpr::LitStr(s.to_string())))
 }
 
@@ -53,22 +56,22 @@ fn identifier(input: &str) -> IResult<&str, FilterExpr> {
     // with any ASCII letter or underscore.
     let head = satisfy(|c: char| c.is_ascii_alphabetic() || c == '_');
     let tail = many0_count(satisfy(|c: char| c.is_ascii_alphanumeric() || c == '_'));
-    let (i, name) = recognize(pair(head, tail))(input)?;
+    let (i, name) = recognize(pair(head, tail)).parse(input)?;
     Ok((i, FilterExpr::Var(name.to_string())))
 }
 
 fn parens(input: &str) -> IResult<&str, FilterExpr> {
-    delimited(ws(ch('(')), expr, ws(ch(')')))(input)
+    delimited(ws(ch('(')), expr, ws(ch(')'))).parse(input)
 }
 
 fn neg(input: &str) -> IResult<&str, FilterExpr> {
-    let (i, inner) = preceded(ws(ch('-')), factor)(input)?;
+    let (i, inner) = preceded(ws(ch('-')), factor).parse(input)?;
     Ok((i, FilterExpr::Neg(Box::new(inner))))
 }
 
 fn factor(input: &str) -> IResult<&str, FilterExpr> {
     // number is tried before neg so that `-2.5` parses as a single LitNum.
-    ws(alt((parens, number, string_lit, identifier, neg)))(input)
+    ws(alt((parens, number, string_lit, identifier, neg))).parse(input)
 }
 
 fn term(input: &str) -> IResult<&str, FilterExpr> {
@@ -85,7 +88,8 @@ fn term(input: &str) -> IResult<&str, FilterExpr> {
             lhs: Box::new(acc),
             rhs: Box::new(rhs),
         },
-    )(i)
+    )
+    .parse(i)
 }
 
 fn expr(input: &str) -> IResult<&str, FilterExpr> {
@@ -102,7 +106,8 @@ fn expr(input: &str) -> IResult<&str, FilterExpr> {
             lhs: Box::new(acc),
             rhs: Box::new(rhs),
         },
-    )(i)
+    )
+    .parse(i)
 }
 
 fn cmp_op(input: &str) -> IResult<&str, CmpOp> {
@@ -115,11 +120,12 @@ fn cmp_op(input: &str) -> IResult<&str, CmpOp> {
         value(CmpOp::Eq, tag("=")),
         value(CmpOp::Lt, tag("<")),
         value(CmpOp::Gt, tag(">")),
-    )))(input)
+    )))
+    .parse(input)
 }
 
 fn filter(input: &str) -> IResult<&str, BuiltinFilter> {
-    let (i, (lhs, op, rhs)) = tuple((expr, cmp_op, expr))(input)?;
+    let (i, (lhs, op, rhs)) = (expr, cmp_op, expr).parse(input)?;
     Ok((i, BuiltinFilter::Compare { op, lhs, rhs }))
 }
 
@@ -130,7 +136,7 @@ fn filter(input: &str) -> IResult<&str, BuiltinFilter> {
 /// `datalog.rs` pre-screen for the presence of a comparison operator
 /// before dispatching to this function.
 pub fn parse_filter(input: &str) -> anyhow::Result<BuiltinFilter> {
-    match all_consuming(filter)(input) {
+    match all_consuming(filter).parse(input) {
         Ok((_, f)) => Ok(f),
         Err(e) => anyhow::bail!("invalid filter '{}': {}", input.trim(), e),
     }

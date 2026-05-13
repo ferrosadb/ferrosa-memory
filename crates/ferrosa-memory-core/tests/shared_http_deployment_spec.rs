@@ -9,7 +9,7 @@ use uuid::Uuid;
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn shared_http_toml(server_body: &str) -> String {
