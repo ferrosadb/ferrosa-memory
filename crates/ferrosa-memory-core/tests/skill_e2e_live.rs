@@ -267,7 +267,13 @@ async fn skill_round_trip_on_live_cluster() {
     )
     .await
     .expect("tdd->testing rerun");
-    assert!(matches!(t1, EnsureParentTagAction::Created { .. }));
+    assert!(
+        matches!(
+            t1,
+            EnsureParentTagAction::Created { .. } | EnsureParentTagAction::Skipped { .. }
+        ),
+        "first ensure_parent_tag call must create or observe the existing edge on a reused live cluster, got: {t1:?}"
+    );
     assert!(matches!(t2, EnsureParentTagAction::Skipped { .. }));
     ensure_parent_tag(
         &storage,

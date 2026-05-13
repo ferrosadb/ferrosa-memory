@@ -12,6 +12,7 @@
 use ferrosa_memory_core::config::load_config;
 use ferrosa_memory_core::cql_storage::CqlStorage;
 use ferrosa_memory_core::cql_storage::{build_col_map, cql_get};
+use futures_util::StreamExt;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -52,21 +53,23 @@ async fn main() -> anyhow::Result<()> {
         let query =
             format!("SELECT {src_col}, {dst_col}, session_id, tenant_id FROM agent_memory.{table}");
         #[allow(deprecated)]
-        let _qr = session.query_unpaged(query, ()).await?;
-        let col_map = build_col_map(_qr.col_specs());
-        let rows = _qr.rows_or_empty();
+        let mut iter = session.query_iter(query, ()).await?;
+        let col_map = build_col_map(iter.get_column_specs());
 
         let mut distribution: std::collections::HashMap<(uuid::Uuid, uuid::Uuid), usize> =
             std::collections::HashMap::new();
         let mut edges_to_fix: Vec<(uuid::Uuid, uuid::Uuid)> = Vec::new();
+        let mut total_rows = 0usize;
 
-        for row in &rows {
-            let src: uuid::Uuid = cql_get(row, &col_map, src_col).unwrap_or_default();
-            let dst: uuid::Uuid = cql_get(row, &col_map, dst_col).unwrap_or_default();
+        while let Some(row_result) = iter.next().await {
+            let row = row_result?;
+            total_rows += 1;
+            let src: uuid::Uuid = cql_get(&row, &col_map, src_col).unwrap_or_default();
+            let dst: uuid::Uuid = cql_get(&row, &col_map, dst_col).unwrap_or_default();
             let tid: uuid::Uuid =
-                cql_get::<uuid::Uuid>(row, &col_map, "tenant_id").unwrap_or_default();
+                cql_get::<uuid::Uuid>(&row, &col_map, "tenant_id").unwrap_or_default();
             let sid: uuid::Uuid =
-                cql_get::<uuid::Uuid>(row, &col_map, "session_id").unwrap_or_default();
+                cql_get::<uuid::Uuid>(&row, &col_map, "session_id").unwrap_or_default();
 
             *distribution.entry((tid, sid)).or_default() += 1;
 
@@ -75,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        tracing::info!("{table}: {} total rows", rows.len());
+        tracing::info!("{table}: {total_rows} total rows");
         for ((tid, sid), count) in &distribution {
             let marker = if *tid == tenant_id && *sid == target_session {
                 " OK"
@@ -126,9 +129,8 @@ async fn main() -> anyhow::Result<()> {
     let query = "SELECT src_id, edge_type, dst_id, session_id, tenant_id, weight, metadata, created_at \
                  FROM agent_memory.typed_edges";
     #[allow(deprecated)]
-    let _qr = session.query_unpaged(query, ()).await?;
-    let col_map = build_col_map(_qr.col_specs());
-    let rows = _qr.rows_or_empty();
+    let mut iter = session.query_iter(query, ()).await?;
+    let col_map = build_col_map(iter.get_column_specs());
 
     let mut te_distribution: std::collections::HashMap<(uuid::Uuid, uuid::Uuid), usize> =
         std::collections::HashMap::new();
@@ -145,29 +147,48 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut te_rows: Vec<TypedEdgeRow> = Vec::new();
-    for row in &rows {
-        let tid: uuid::Uuid = cql_get::<uuid::Uuid>(row, &col_map, "tenant_id").unwrap_or_default();
+    let mut te_total_rows = 0usize;
+    while let Some(row_result) = iter.next().await {
+        let row = row_result?;
+        te_total_rows += 1;
+        let tid: uuid::Uuid =
+            cql_get::<uuid::Uuid>(&row, &col_map, "tenant_id").unwrap_or_default();
         let sid: uuid::Uuid =
-            cql_get::<uuid::Uuid>(row, &col_map, "session_id").unwrap_or_default();
+            cql_get::<uuid::Uuid>(&row, &col_map, "session_id").unwrap_or_default();
 
         *te_distribution.entry((tid, sid)).or_default() += 1;
 
         if tid == tenant_id && sid != target_session {
+            // Repair semantics: this binary reads existing typed_edges rows
+            // and re-INSERTs them under the corrected session_id. If the
+            // existing weight can't be decoded we MUST NOT silently
+            // fabricate one (e.g. 1.0 = max confidence), because we'd be
+            // forging data into the new row. Skip the row and surface it
+            // in the dry-run distribution count so an operator can dig in.
+            let Some(weight) = cql_get::<f64>(&row, &col_map, "weight").ok() else {
+                tracing::warn!(
+                    tenant = %tid,
+                    session = %sid,
+                    "typed_edges row has null/corrupt weight; skipping repair (would fabricate \
+                     edge confidence on re-insert)"
+                );
+                continue;
+            };
             te_rows.push(TypedEdgeRow {
-                src: cql_get::<uuid::Uuid>(row, &col_map, "src_id").unwrap_or_default(),
-                etype: cql_get::<String>(row, &col_map, "edge_type").unwrap_or_default(),
-                dst: cql_get::<uuid::Uuid>(row, &col_map, "dst_id").unwrap_or_default(),
+                src: cql_get::<uuid::Uuid>(&row, &col_map, "src_id").unwrap_or_default(),
+                etype: cql_get::<String>(&row, &col_map, "edge_type").unwrap_or_default(),
+                dst: cql_get::<uuid::Uuid>(&row, &col_map, "dst_id").unwrap_or_default(),
                 tid,
                 sid,
-                weight: cql_get::<f64>(row, &col_map, "weight").unwrap_or(1.0),
-                metadata: cql_get::<String>(row, &col_map, "metadata").unwrap_or_default(),
-                created_at: cql_get::<chrono::DateTime<chrono::Utc>>(row, &col_map, "created_at")
+                weight,
+                metadata: cql_get::<String>(&row, &col_map, "metadata").unwrap_or_default(),
+                created_at: cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
                     .unwrap_or_default(),
             });
         }
     }
 
-    tracing::info!("typed_edges: {} total rows", rows.len());
+    tracing::info!("typed_edges: {te_total_rows} total rows");
     for ((tid, sid), count) in &te_distribution {
         let marker = if *tid == tenant_id && *sid == target_session {
             " OK"

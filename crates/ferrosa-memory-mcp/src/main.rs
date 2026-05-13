@@ -22,6 +22,7 @@ use ferrosa_memory_core::http;
 use ferrosa_memory_core::storage::Storage;
 use ferrosa_memory_core::transport;
 use ferrosa_memory_core::types::*;
+use futures_util::StreamExt;
 use scylla::frame::response::result::{CqlValue, Row};
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
@@ -1333,9 +1334,9 @@ impl http::OperatorQuerySurface for ReconnectingStorage {
 
         let normalized = normalize_public_query(query)?;
         #[allow(deprecated)]
-        let result = cql.session().query_unpaged(normalized.clone(), ()).await;
-        let result = match result {
-            Ok(r) => r,
+        let iter = cql.session().query_iter(normalized.clone(), ()).await;
+        let mut iter = match iter {
+            Ok(iter) => iter,
             Err(err) => {
                 if is_connection_error(&err) {
                     drop(guard);
@@ -1345,25 +1346,28 @@ impl http::OperatorQuerySurface for ReconnectingStorage {
             }
         };
 
-        let columns: Vec<String> = result
-            .col_specs()
+        let columns: Vec<String> = iter
+            .get_column_specs()
             .iter()
             .map(|spec| spec.name().to_string())
             .collect();
-        let rows = result.rows_or_empty();
-        let total_rows = rows.len();
-        let truncated = total_rows > limit;
-        let rendered_rows: Vec<serde_json::Value> = rows
-            .iter()
-            .take(limit)
-            .map(|row| {
+        let mut rendered_rows: Vec<serde_json::Value> = Vec::with_capacity(limit.min(1024));
+        let mut total_rows = 0usize;
+        let mut truncated = false;
+        while let Some(row) = iter.next().await {
+            let row = row?;
+            total_rows += 1;
+            if rendered_rows.len() < limit {
                 let mut object = serde_json::Map::new();
                 for (index, name) in columns.iter().enumerate() {
-                    object.insert(name.clone(), cql_cell_to_json(row, index));
+                    object.insert(name.clone(), cql_cell_to_json(&row, index));
                 }
-                serde_json::Value::Object(object)
-            })
-            .collect();
+                rendered_rows.push(serde_json::Value::Object(object));
+            } else {
+                truncated = true;
+                break;
+            }
+        }
 
         Ok(serde_json::json!({
             "query": query,
@@ -2292,6 +2296,26 @@ auth_file = "{}"
         };
         let storage = ReconnectingStorage::disconnected(cfg, None, None);
         assert!(!storage.is_ready());
+    }
+
+    #[test]
+    fn reconnecting_storage_overrides_viz_stream_methods_with_cql_delegates() {
+        let source = include_str!("main.rs");
+        let impl_start = source
+            .find("impl Storage for ReconnectingStorage")
+            .expect("ReconnectingStorage must implement Storage");
+        let impl_source = &source[impl_start..];
+        for method in [
+            "entity_stream_all",
+            "edge_stream_all",
+            "typed_edge_stream_all",
+        ] {
+            let needle = format!("cql.{method}(ctx, chunk_size, tx).await");
+            assert!(
+                impl_source.contains(&needle),
+                "ReconnectingStorage must delegate {method} to CqlStorage streaming override, not fall back to Storage's materializing default"
+            );
+        }
     }
 
     // --- next_backoff tests ---
