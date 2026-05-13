@@ -237,7 +237,7 @@ async fn https_split_send_post_gets_response() {
 /// Used only by the HTTPS integration test.
 fn generate_self_signed_cert() -> (String, String) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    (cert.cert.pem(), cert.key_pair.serialize_pem())
+    (cert.cert.pem(), cert.signing_key.serialize_pem())
 }
 
 /// Regression for `bug-http-mcp-codex-initialized-notification`:

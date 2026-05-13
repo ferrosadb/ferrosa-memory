@@ -20,6 +20,7 @@ tracing = { workspace = true }
 prometheus = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
+hex = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
@@ -32,7 +33,7 @@ tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 ordered-float = { workspace = true }
 tempfile = { workspace = true }
-nom = "7"
+nom = "8"
 nom-supreme = "0.8"
 
 # Integration tests under `tests/` compile against the public crate
@@ -47,4 +48,4 @@ serial_test = "3.2"
 # bug-http-parser-rejects-split-send spec's acceptance criterion
 # is a Python http.client POST over HTTPS, so we need a throwaway
 # cert to exercise the TLS path end-to-end.
-rcgen = "0.13"
+rcgen = "0.14"

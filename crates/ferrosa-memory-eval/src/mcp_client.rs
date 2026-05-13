@@ -83,7 +83,7 @@ pub struct ServerIdentity {
 pub fn compute_binary_hash(path: &Path) -> Result<String, McpClientError> {
     let bytes = std::fs::read(path).map_err(McpClientError::Io)?;
     let hash = Sha256::digest(&bytes);
-    Ok(format!("{hash:x}"))
+    Ok(hex::encode(hash))
 }
 
 // ---------------------------------------------------------------------------

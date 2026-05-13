@@ -121,7 +121,7 @@ impl FileAuthValidator {
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {

@@ -274,7 +274,7 @@ fn content_hash(
     hasher.update(end_turn.to_be_bytes());
     hasher.update(b"\0");
     hasher.update(segment_text.as_bytes());
-    format!("sha256:{:x}", hasher.finalize())
+    format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
 pub async fn ingest_context_segments<S: Storage + ?Sized>(

@@ -33,7 +33,7 @@ pub async fn record_fact_confidence(
     source_count: usize,
     contradiction_count: usize,
 ) -> anyhow::Result<f64> {
-    let fact_hash = format!("{:x}", sha2::Sha256::digest(fact_text.as_bytes()));
+    let fact_hash = hex::encode(sha2::Sha256::digest(fact_text.as_bytes()));
     let now = chrono::Utc::now();
     let confidence = compute_confidence(source_count, now, contradiction_count);
     let score = ConfidenceScore {

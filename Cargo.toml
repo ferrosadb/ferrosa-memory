@@ -14,7 +14,7 @@ tokio = { version = "1", features = ["full"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1"
 
 # HTTP client (embedding endpoint)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -27,8 +27,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 prometheus = "0.14"
 
 # Hashing
-sha1 = "0.10"
-sha2 = "0.10"
+sha1 = "0.11"
+sha2 = "0.11"
+# digest 0.11 changed finalize() output to hybrid_array::Array, which doesn't
+# implement LowerHex — encode digests via hex::encode instead of "{:x}".
+hex = "0.4"
 
 # UUIDs
 uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
@@ -54,11 +57,11 @@ tokio-rustls = "0.26"
 rustls-pemfile = "2"
 
 # WebSocket (viz dashboard)
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.29"
 futures-util = "0.3"
 
 # Ordered floats for Eq/Hash on f64
-ordered-float = { version = "4", features = ["serde"] }
+ordered-float = { version = "5", features = ["serde"] }
 
 # Test helpers
 tempfile = "3"
