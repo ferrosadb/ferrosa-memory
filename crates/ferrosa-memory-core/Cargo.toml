@@ -47,4 +47,4 @@ serial_test = "3.2"
 # bug-http-parser-rejects-split-send spec's acceptance criterion
 # is a Python http.client POST over HTTPS, so we need a throwaway
 # cert to exercise the TLS path end-to-end.
-rcgen = "0.13"
+rcgen = "0.14"
