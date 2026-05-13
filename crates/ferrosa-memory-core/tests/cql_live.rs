@@ -12,6 +12,11 @@ use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
+const LIVE_TEST_TENANT_ID: &str = "9a5f8fbf-d842-4d30-8ea5-1aa931e618a8";
+const LIVE_TEST_SESSION_ID: &str = "11111111-2222-3333-4444-555555555555";
+const LIVE_TEST_ENTITY_A: &str = "aaaaaaaa-1111-2222-3333-444444444444";
+const LIVE_TEST_ENTITY_B: &str = "bbbbbbbb-1111-2222-3333-444444444444";
+
 fn init_test_tracing() {
     let filter = std::env::var("RUST_LOG")
         .ok()
@@ -30,6 +35,78 @@ async fn connect_plain(contact_point: &str) -> LegacySession {
         .build_legacy()
         .await
         .expect("session build failed")
+}
+
+async fn seed_live_graph_rows(session: &LegacySession) {
+    let tenant_id = Uuid::parse_str(LIVE_TEST_TENANT_ID).unwrap();
+    let session_id = Uuid::parse_str(LIVE_TEST_SESSION_ID).unwrap();
+    let entity_a = Uuid::parse_str(LIVE_TEST_ENTITY_A).unwrap();
+    let entity_b = Uuid::parse_str(LIVE_TEST_ENTITY_B).unwrap();
+    let inserted_at = chrono::Utc::now();
+
+    for (entity_id, entity_name) in [(entity_a, "ci-live-node-a"), (entity_b, "ci-live-node-b")] {
+        #[allow(deprecated)]
+        session
+            .query_unpaged(
+                "INSERT INTO agent_memory.entity_store \
+                 (tenant_id, session_id, entity_id, entity_name, entity_type, \
+                  context_snippet, confidence, created_at, state, scope, ingested_by_session) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    tenant_id,
+                    session_id,
+                    entity_id,
+                    entity_name.to_string(),
+                    "concept".to_string(),
+                    "live CI graph seed".to_string(),
+                    1.0_f32,
+                    inserted_at,
+                    "active".to_string(),
+                    "global".to_string(),
+                    session_id,
+                ),
+            )
+            .await
+            .expect("insert live test entity");
+    }
+
+    #[allow(deprecated)]
+    session
+        .query_unpaged(
+            "INSERT INTO agent_memory.typed_edges \
+             (tenant_id, session_id, src_id, edge_type, dst_id, weight, metadata, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                tenant_id,
+                session_id,
+                entity_a,
+                "related_to".to_string(),
+                entity_b,
+                1.0_f64,
+                "{}".to_string(),
+                inserted_at,
+            ),
+        )
+        .await
+        .expect("insert live test typed edge");
+
+    #[allow(deprecated)]
+    session
+        .query_unpaged(
+            "INSERT INTO agent_memory.co_occurs_with \
+             (entity_a, entity_b, session_id, tenant_id, created_at) \
+             VALUES (?, ?, ?, ?, ?)",
+            (entity_a, entity_b, session_id, tenant_id, inserted_at),
+        )
+        .await
+        .expect("insert live test co_occurs_with edge");
+}
+
+async fn seed_live_graph_rows_on_all_nodes() {
+    for contact_point in ["127.0.0.1:19042", "127.0.0.1:19043", "127.0.0.1:19044"] {
+        let session = connect_plain(contact_point).await;
+        seed_live_graph_rows(&session).await;
+    }
 }
 
 #[tokio::test]
@@ -223,6 +300,7 @@ async fn confidence_scores_prepares_on_each_live_node() {
             .build_legacy()
             .await
             .unwrap_or_else(|e| panic!("session build failed for {contact_point}: {e}"));
+        seed_live_graph_rows(&session).await;
 
         for statement in [
             "SELECT confidence, source_count, last_confirmed_at, contradiction_count \
@@ -296,8 +374,9 @@ async fn viz_streaming_queries_return_live_nodes_and_edges() {
             .await
             .expect("CqlStorage::connect should succeed on the auth-enabled local cluster"),
     );
+    seed_live_graph_rows_on_all_nodes().await;
     let ctx = TenantContext {
-        tenant_id: Uuid::parse_str("9a5f8fbf-d842-4d30-8ea5-1aa931e618a8").unwrap(),
+        tenant_id: Uuid::parse_str(LIVE_TEST_TENANT_ID).unwrap(),
         session_origin: "viz-live-test".to_string(),
     };
 

@@ -278,7 +278,7 @@ impl<T: McpTransport> EvalRunner<T> {
         self.delete_session(&session_id).await?;
 
         // T-010 / EF07: Verify clean state — CONTAMINATED if entity_count > 0
-        let pre_snapshot = self.take_snapshot().await?;
+        let pre_snapshot = self.take_snapshot(&session_id).await?;
         if pre_snapshot.entity_count != 0 {
             return Err(RunnerError::Contaminated {
                 entity_count: pre_snapshot.entity_count,
@@ -299,7 +299,7 @@ impl<T: McpTransport> EvalRunner<T> {
         }
 
         // After-snapshot
-        let graph_snapshot_after = self.take_snapshot().await?;
+        let graph_snapshot_after = self.take_snapshot(&session_id).await?;
 
         let duration = start.elapsed();
 
@@ -375,10 +375,15 @@ impl<T: McpTransport> EvalRunner<T> {
     }
 
     /// Take a graph snapshot via get_stats.
-    async fn take_snapshot(&mut self) -> Result<GraphSnapshot, RunnerError> {
+    async fn take_snapshot(&mut self, session_id: &Uuid) -> Result<GraphSnapshot, RunnerError> {
         let (response, _latency) = self
             .transport
-            .call_tool("get_stats", serde_json::json!({}))
+            .call_tool(
+                "get_stats",
+                serde_json::json!({
+                    "session_id": session_id.to_string()
+                }),
+            )
             .await?;
         Ok(GraphSnapshot::from_stats_response(&response))
     }
@@ -434,6 +439,7 @@ impl<T: McpTransport> EvalRunner<T> {
         let upsert_args = serde_json::json!({
             "entity_name": "__eval_warmup__",
             "entity_type": "eval_warmup",
+            "context_snippet": "warmup probe — safe to delete",
             "observations": ["warmup probe — safe to delete"],
             "source": "eval_warmup",
             "session_id": warmup_session.to_string(),
@@ -1240,6 +1246,18 @@ tool = "get_stats"
         assert_eq!(tool_names[3], "hybrid_search", "fourth call: second step");
         assert_eq!(tool_names[4], "get_stats", "fifth call: after-snapshot");
         assert_eq!(tool_names[5], "delete_session", "sixth call: post-cleanup");
+
+        let sid = run.session_id.to_string();
+        assert_eq!(
+            recorded[1].1["session_id"].as_str(),
+            Some(sid.as_str()),
+            "before-snapshot must read the scenario session"
+        );
+        assert_eq!(
+            recorded[4].1["session_id"].as_str(),
+            Some(sid.as_str()),
+            "after-snapshot must read the scenario session"
+        );
     }
 
     #[tokio::test]
@@ -2003,6 +2021,11 @@ distractor_entities = ["entity:noise"]
         assert_eq!(tool_names[0], "upsert_entity", "first: upsert");
         assert_eq!(tool_names[1], "hybrid_search", "second: search");
         assert_eq!(tool_names[2], "delete_session", "third: cleanup");
+        assert_eq!(
+            recorded[0].1["context_snippet"].as_str(),
+            Some("warmup probe — safe to delete"),
+            "warmup upsert must satisfy the current upsert_entity schema"
+        );
     }
 
     #[tokio::test]
@@ -2236,6 +2259,10 @@ distractor_entities = ["entity:noise"]
                     .insert("entity_name".to_string(), json!("EvalTestAlice"));
                 s.arguments
                     .insert("entity_type".to_string(), json!("person"));
+                s.arguments.insert(
+                    "context_snippet".to_string(),
+                    json!("Alice is a test entity for eval"),
+                );
                 s.arguments.insert(
                     "observations".to_string(),
                     json!(["Alice is a test entity for eval"]),

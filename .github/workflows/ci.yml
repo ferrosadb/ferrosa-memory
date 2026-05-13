@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, memory-remotes-blueprint]
 
 env:
   CARGO_TERM_COLOR: always
@@ -259,25 +259,25 @@ jobs:
           cat > /tmp/docker-compose.memory-ci.yml <<'CEOF'
           services:
             rustfs:
-              image: rustfs/rustfs:latest
+              # Keep the service name `rustfs` because Ferrosa test configs
+              # point at http://rustfs:9000. Use MinIO for the CI S3 shim:
+              # rustfs/rustfs:latest has changed startup behavior and can exit
+              # before the cluster boots.
+              image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+              command: ["server", "/data", "--address", ":9000", "--console-address", ":9001"]
               environment:
-                RUSTFS_VOLUMES: /data/rustfs0
-                RUSTFS_ADDRESS: "0.0.0.0:9000"
-                RUSTFS_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
-                RUSTFS_SECRET_KEY: rustfsadmin  # pragma: allowlist secret
-              healthcheck:
-                test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
-                interval: 5s
-                timeout: 5s
-                retries: 10
-                start_period: 10s
+                MINIO_ROOT_USER: rustfsadmin  # pragma: allowlist secret
+                MINIO_ROOT_PASSWORD: rustfsadmin  # pragma: allowlist secret
             rustfs-init:
               image: minio/mc
               depends_on:
                 rustfs:
-                  condition: service_healthy
+                  condition: service_started
               entrypoint: >
-                sh -c "mc alias set local http://rustfs:9000 rustfsadmin rustfsadmin &&
+                sh -c "until mc alias set local http://rustfs:9000 rustfsadmin rustfsadmin; do
+                         echo 'waiting for rustfs S3 shim...';
+                         sleep 2;
+                       done &&
                        mc mb local/ferrosa-test --ignore-existing &&
                        echo 'bucket ferrosa-test ready'"
               restart: "no"
@@ -290,6 +290,7 @@ jobs:
                   condition: service_completed_successfully
               ports:
                 - "19042:9042"
+                - "19542:9042"
                 - "17474:7474"
                 - "19090:9090"
               environment:
@@ -394,6 +395,19 @@ jobs:
               sleep 2
             done
           done
+          echo "Waiting for isolated test CQL alias on port 19542..."
+          for i in $(seq 1 60); do
+            if bash -c "</dev/tcp/127.0.0.1/19542" 2>/dev/null; then
+              echo "  port 19542 ready after ${i}s"
+              break
+            fi
+            if [ "$i" -eq 60 ]; then
+              echo "::error::Port 19542 did not become ready within 60s"
+              docker compose -f /tmp/docker-compose.memory-ci.yml logs 2>/dev/null | tail -100
+              exit 1
+            fi
+            sleep 2
+          done
           echo "Waiting for graph HTTP on port 17474..."
           for i in $(seq 1 60); do
             if bash -c "</dev/tcp/127.0.0.1/17474" 2>/dev/null; then
@@ -416,6 +430,11 @@ jobs:
           timeout 180s cargo run --bin migrate -- \
             --contact-points 127.0.0.1:19042 \
             --keyspace agent_memory \
+            --ddl-dir ddl
+
+          timeout 180s cargo run --bin migrate -- \
+            --contact-points 127.0.0.1:19542 \
+            --keyspace agent_memory_test \
             --ddl-dir ddl
 
           # Propagation barrier: SELECT-only probe against each peer until the
@@ -445,9 +464,17 @@ jobs:
               sleep 2
             done
           done
+      - name: Build MCP binary for eval live tests
+        run: cargo build -p ferrosa-memory-mcp
       - name: Run ignored (cluster-gated) Rust tests
         env:
           FERROSA_TEST_CONTAINERS: "1"
+          FERROSA_TEST_CQL_HOST: "127.0.0.1"
+          FERROSA_TEST_CQL_PORT: "19542"
+          FERROSA_TEST_GRAPH_URL: "http://127.0.0.1:17474"
+          FERROSA_TEST_KEYSPACE: "agent_memory_test"
+          FERROSA_TEST_USERNAME: "ferrosa_user"
+          FERROSA_TEST_PASSWORD: "ferrosa_user"
         run: cargo test --workspace -- --ignored
       - name: Run system pytest suite against live cluster
         env:

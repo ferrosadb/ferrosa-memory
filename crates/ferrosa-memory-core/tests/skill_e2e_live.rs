@@ -16,6 +16,7 @@
 use ferrosa_memory_core::config::{EmbeddingConfig, FerrosaCqlConfig};
 use ferrosa_memory_core::cql_storage::CqlStorage;
 use ferrosa_memory_core::embedding::EmbeddingClient;
+use ferrosa_memory_core::graph::{GraphClient, GraphConfig};
 use ferrosa_memory_core::migration::run_migrations;
 use ferrosa_memory_core::skill::{
     EnsureParentTagAction, IngestSkillParams, SkillIngestAction, Step, ensure_parent_tag,
@@ -36,6 +37,17 @@ fn base_cfg(test: &TestClusterConfig) -> FerrosaCqlConfig {
         admin_username: None,
         admin_password: None,
     }
+}
+
+async fn graph_client(test: &TestClusterConfig) -> GraphClient {
+    GraphClient::connect(&GraphConfig {
+        http_url: test.graph_url.clone(),
+        username: "ferrosa_user".into(),
+        password: "ferrosa_user".into(),
+        keyspace: test.keyspace.clone(),
+    })
+    .await
+    .expect("graph connect")
 }
 
 async fn tenant() -> TenantContext {
@@ -73,6 +85,7 @@ async fn skill_round_trip_on_live_cluster() {
 
     let ctx = tenant().await;
     let caller_session = Uuid::new_v4();
+    let graph = graph_client(&test_cfg).await;
 
     // Embedding client wired to the configured provider so retrieve ranks
     // on description similarity, not just name.
@@ -106,7 +119,7 @@ async fn skill_round_trip_on_live_cluster() {
     // Tolerate re-runs: Created on fresh keyspace, Skipped/Updated if a
     // previous run already seeded the same content_hash. Either way the
     // skill ends up in the graph.
-    let prereq_action = ingest_skill(&storage, &ctx, prereq, Some(&embed_client), None)
+    let prereq_action = ingest_skill(&storage, &ctx, prereq, Some(&embed_client), Some(&graph))
         .await
         .expect("ingest prereq");
     eprintln!("unit-testing ingest: {prereq_action:?}");
@@ -144,7 +157,7 @@ async fn skill_round_trip_on_live_cluster() {
         &ctx,
         tdd_params.clone(),
         Some(&embed_client),
-        None,
+        Some(&graph),
     )
     .await
     .expect("ingest tdd");
@@ -217,7 +230,7 @@ async fn skill_round_trip_on_live_cluster() {
         &ctx,
         tdd_params.clone(),
         Some(&embed_client),
-        None,
+        Some(&graph),
     )
     .await
     .expect("re-ingest");
@@ -228,17 +241,38 @@ async fn skill_round_trip_on_live_cluster() {
 
     // Step 6: ensure_parent_tag — build the taxonomy tdd→testing→quality.
     // First call creates, second is idempotent.
-    let t1 = ensure_parent_tag(&storage, &ctx, caller_session, "tdd", "testing", None)
-        .await
-        .expect("tdd->testing");
-    let t2 = ensure_parent_tag(&storage, &ctx, caller_session, "tdd", "testing", None)
-        .await
-        .expect("tdd->testing rerun");
+    let t1 = ensure_parent_tag(
+        &storage,
+        &ctx,
+        caller_session,
+        "tdd",
+        "testing",
+        Some(&graph),
+    )
+    .await
+    .expect("tdd->testing");
+    let t2 = ensure_parent_tag(
+        &storage,
+        &ctx,
+        caller_session,
+        "tdd",
+        "testing",
+        Some(&graph),
+    )
+    .await
+    .expect("tdd->testing rerun");
     assert!(matches!(t1, EnsureParentTagAction::Created { .. }));
     assert!(matches!(t2, EnsureParentTagAction::Skipped { .. }));
-    ensure_parent_tag(&storage, &ctx, caller_session, "testing", "quality", None)
-        .await
-        .expect("testing->quality");
+    ensure_parent_tag(
+        &storage,
+        &ctx,
+        caller_session,
+        "testing",
+        "quality",
+        Some(&graph),
+    )
+    .await
+    .expect("testing->quality");
 
     // Step 7: verify_skill surfaces the full neighborhood.
     let verify = verify_skill(&storage, &ctx, "tdd")

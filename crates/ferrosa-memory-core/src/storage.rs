@@ -232,6 +232,18 @@ pub trait Storage: Send + Sync {
         ctx: &TenantContext,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<EntityEntry>>> + Send;
 
+    /// List all entities for a tenant with full text/vector fields.
+    ///
+    /// This is intentionally separate from `entity_list_all()`: tenant-wide
+    /// visualization scans should stay lightweight, while maintenance jobs
+    /// such as backfill need the complete row to avoid clobbering fields.
+    fn entity_list_all_full(
+        &self,
+        ctx: &TenantContext,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<EntityEntry>>> + Send {
+        async move { self.entity_list_all(ctx).await }
+    }
+
     /// Stream all entities for a tenant in bounded chunks.
     ///
     /// The default implementation preserves compatibility for non-CQL test
@@ -1182,6 +1194,10 @@ pub mod mock {
         /// with this message. Parallel to `force_phonetic_error` so a
         /// test can target one lookup path without disabling the other.
         pub force_exact_name_error: Mutex<Option<String>>,
+        /// Test hook: return `Ok(None)` from the next N exact-name lookups
+        /// even when a matching entity exists. Mirrors read-after-write
+        /// misses from eventually propagated CQL writes.
+        pub force_exact_name_misses: AtomicUsize,
         /// Test hook: when Some((entity_type, msg)), `entity_put` returns
         /// Err(msg) for any entry whose `entity_type` matches. Lets a
         /// test simulate transient CQL write failures targeting a
@@ -1193,6 +1209,9 @@ pub mod mock {
         /// Ferrosa restart/permission-loss failure where writes appeared to
         /// succeed but were not visible to subsequent reads.
         pub force_entity_put_drop: Mutex<Option<String>>,
+        /// Test hook: when true, `typed_edge_put` never resolves. Used to
+        /// verify edge-write callers bound backend warmup stalls.
+        pub force_typed_edge_pending: std::sync::atomic::AtomicBool,
     }
 
     impl MockStorage {
@@ -1763,6 +1782,15 @@ pub mod mock {
         ) -> anyhow::Result<Option<EntityEntry>> {
             if let Some(msg) = self.force_exact_name_error.lock().await.as_ref() {
                 anyhow::bail!("{msg}");
+            }
+            if self
+                .force_exact_name_misses
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Ok(None);
             }
             let entities = self.entities.lock().await;
             Ok(entities
@@ -2722,6 +2750,12 @@ pub mod mock {
             _ctx: &TenantContext,
             edge: &TypedEdge,
         ) -> anyhow::Result<()> {
+            if self
+                .force_typed_edge_pending
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                std::future::pending::<()>().await;
+            }
             let mut edges = self.typed_edges.lock().await;
             edges.push(edge.clone());
             Ok(())

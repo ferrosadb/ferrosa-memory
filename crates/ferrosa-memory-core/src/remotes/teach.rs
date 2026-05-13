@@ -89,6 +89,12 @@ impl TeachQueryEvent {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeachStreamControl {
+    Continue,
+    Stop,
+}
+
 /// Normalized teacher retrieval hit before compaction into a wire item.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TeachingSourceHit {
@@ -258,48 +264,79 @@ pub async fn teach_query_stream<S: Storage>(
     session_id: Uuid,
     request: TeachQueryRequest,
 ) -> anyhow::Result<Vec<TeachQueryEvent>> {
+    let mut events = Vec::new();
+    teach_query_stream_with_sink(storage, ctx, session_id, request, |event| {
+        events.push(event);
+        TeachStreamControl::Continue
+    })
+    .await?;
+    Ok(events)
+}
+
+/// Execute a teacher query and emit each event as it becomes available.
+pub async fn teach_query_stream_with_sink<S, F>(
+    storage: &S,
+    ctx: &TenantContext,
+    session_id: Uuid,
+    request: TeachQueryRequest,
+    mut emit: F,
+) -> anyhow::Result<()>
+where
+    S: Storage,
+    F: FnMut(TeachQueryEvent) -> TeachStreamControl,
+{
     if request.query.trim().is_empty() {
         bail!("query is required");
     }
     let request_id = Uuid::new_v4();
     let packet_id = Uuid::new_v4();
-    let mut events = vec![TeachQueryEvent::Started {
-        request_id,
-        packet_id,
-        continuation_token: continuation(packet_id, 0),
-    }];
+    if matches!(
+        emit(TeachQueryEvent::Started {
+            request_id,
+            packet_id,
+            continuation_token: continuation(packet_id, 0),
+        }),
+        TeachStreamControl::Stop
+    ) {
+        return Ok(());
+    }
 
     if let Err(err) = enforce_policy(&request) {
-        events.push(TeachQueryEvent::Error {
+        emit(TeachQueryEvent::Error {
             packet_id,
             partial_packet_id: Some(packet_id),
             message: err.to_string(),
             signed_negative: true,
             continuation_token: Some(continuation(packet_id, 1)),
         });
-        return Ok(events);
+        return Ok(());
     }
 
     let hits = match collect_hits(storage, ctx, session_id, &request).await {
         Ok(hits) => hits,
         Err(err) => {
-            events.push(TeachQueryEvent::Error {
+            emit(TeachQueryEvent::Error {
                 packet_id,
                 partial_packet_id: Some(packet_id),
                 message: err.to_string(),
                 signed_negative: false,
                 continuation_token: Some(continuation(packet_id, 1)),
             });
-            return Ok(events);
+            return Ok(());
         }
     };
     let items = plan_teaching_items(packet_id, &request, hits)?;
     for (idx, item) in items.iter().cloned().enumerate() {
-        events.push(TeachQueryEvent::Item {
-            packet_id,
-            item: Box::new(item),
-            continuation_token: continuation(packet_id, idx + 1),
-        });
+        if matches!(
+            emit(TeachQueryEvent::Item {
+                packet_id,
+                item: Box::new(item),
+                continuation_token: continuation(packet_id, idx + 1),
+            }),
+            TeachStreamControl::Stop
+        ) {
+            return Ok(());
+        }
     }
     let packet = TeachingPacket {
         packet_id,
@@ -315,11 +352,11 @@ pub async fn teach_query_stream<S: Storage>(
         expires_at: None,
         created_at: Utc::now(),
     };
-    events.push(TeachQueryEvent::Completed {
+    emit(TeachQueryEvent::Completed {
         packet,
         continuation_token: None,
     });
-    Ok(events)
+    Ok(())
 }
 
 async fn collect_hits<S: Storage>(
@@ -693,6 +730,50 @@ mod tests {
             .expect("error event");
         assert!(error.0.is_some());
         assert!(error.1.contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn packet_l_stream_sink_can_stop_after_started_without_touching_retrieval() {
+        let store = MockStorage::new();
+        *store.force_phonetic_error.lock().await = Some("retrieval should not run".into());
+        let mut req = request();
+        req.query_embedding = None;
+        let mut events = Vec::new();
+
+        teach_query_stream_with_sink(&store, &ctx(), id(9), req, |event| {
+            events.push(event);
+            TeachStreamControl::Stop
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], TeachQueryEvent::Started { .. }));
+    }
+
+    #[tokio::test]
+    async fn packet_l_stream_sink_receives_started_before_retrieval_error() {
+        let store = MockStorage::new();
+        *store.force_phonetic_error.lock().await = Some("boom".into());
+        let mut req = request();
+        req.query_embedding = None;
+        let mut events = Vec::new();
+
+        teach_query_stream_with_sink(&store, &ctx(), id(9), req, |event| {
+            events.push(event);
+            TeachStreamControl::Continue
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            events.first(),
+            Some(TeachQueryEvent::Started { .. })
+        ));
+        assert!(matches!(
+            events.get(1),
+            Some(TeachQueryEvent::Error { message, .. }) if message.contains("boom")
+        ));
     }
 
     #[tokio::test]

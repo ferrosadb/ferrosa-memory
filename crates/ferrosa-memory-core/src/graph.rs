@@ -462,15 +462,19 @@ fn build_typed_edge_merge_query(
         None => String::new(),
     };
     format!(
-        "MERGE (a:Entity {{entity_id: {}}})\
-         MERGE (b:Entity {{entity_id: {}}})\
-         MERGE (a)-[r:TYPED_EDGE {{edge_type: {}}}]->(b) \
-         SET r.tenant_id = {}, r.session_id = {}, r.weight = {}, r.created_at = {}{} RETURN r",
-        quote_cypher(&src_id.to_string()),
-        quote_cypher(&dst_id.to_string()),
-        quote_cypher(edge_type),
+        "MERGE (a:Entity {{tenant_id: {}, session_id: {}, entity_id: {}}})\
+         MERGE (b:Entity {{tenant_id: {}, session_id: {}, entity_id: {}}})\
+         MERGE (a)-[r:TYPED_EDGE {{tenant_id: {}, session_id: {}, edge_type: {}}}]->(b) \
+         SET r.weight = {}, r.created_at = {}{} RETURN r",
         quote_cypher(&tenant_id.to_string()),
         quote_cypher(&session_id.to_string()),
+        quote_cypher(&src_id.to_string()),
+        quote_cypher(&tenant_id.to_string()),
+        quote_cypher(&session_id.to_string()),
+        quote_cypher(&dst_id.to_string()),
+        quote_cypher(&tenant_id.to_string()),
+        quote_cypher(&session_id.to_string()),
+        quote_cypher(edge_type),
         weight,
         quote_cypher(&created_at),
         metadata_clause,
@@ -776,8 +780,18 @@ mod tests {
         assert!(query.contains("edge_type: 'related'"));
         assert!(query.contains("r.weight = 0.75"));
         assert!(query.contains("r.metadata = 'probe'"));
-        assert!(query.contains("r.tenant_id = '00000000-0000-0000-0000-000000000001'"));
-        assert!(query.contains("r.session_id = '00000000-0000-0000-0000-000000000002'"));
+        assert!(
+            query.contains(
+                "MERGE (a:Entity {tenant_id: '00000000-0000-0000-0000-000000000001', session_id: '00000000-0000-0000-0000-000000000002'"
+            ),
+            "typed edge endpoint MERGE must include scoped key columns: {query}"
+        );
+        assert!(
+            query.contains(
+                "[r:TYPED_EDGE {tenant_id: '00000000-0000-0000-0000-000000000001', session_id: '00000000-0000-0000-0000-000000000002', edge_type: 'related'}]"
+            ),
+            "typed edge relationship MERGE must include scoped key columns: {query}"
+        );
         assert!(
             query.contains("r.created_at = "),
             "typed edge writes must populate created_at at the source: {query}"

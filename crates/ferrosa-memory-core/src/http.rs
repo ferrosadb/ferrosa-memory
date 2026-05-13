@@ -723,11 +723,9 @@ async fn handle_http_request_with_session<S: Storage + OperatorQuerySurface>(
                     "id": id,
                     "result": val
                 }),
-                Err((code, msg)) => serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": { "code": code, "message": msg }
-                }),
+                Err((code, msg)) => serde_json::to_value(
+                    crate::transport::JsonRpcResponse::error(id.clone(), code, msg),
+                )?,
             };
 
             let body_str = serde_json::to_string(&response_body)?;
@@ -3981,6 +3979,58 @@ mod tests {
         .unwrap();
         assert!(response.starts_with("HTTP/1.1 401 Unauthorized"));
         assert!(response.contains("WWW-Authenticate: Basic realm=\"Ferrosa Memory\""));
+    }
+
+    #[tokio::test]
+    async fn bug_m_005_mcp_create_edge_warmup_error_has_structured_retry_data() {
+        let metrics = MemoryMetrics::new().unwrap();
+        let storage = MockStorage::new();
+        storage
+            .force_typed_edge_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let headers = vec![(
+            "Authorization".to_string(),
+            "Basic dXNlcjpwYXNz".to_string(),
+        )];
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "create_edge",
+                "arguments": {
+                    "session_id": uuid::Uuid::new_v4().to_string(),
+                    "src_entity_id": uuid::Uuid::new_v4().to_string(),
+                    "dst_entity_id": uuid::Uuid::new_v4().to_string(),
+                    "edge_type": "related_to"
+                }
+            }
+        })
+        .to_string();
+        let started = std::time::Instant::now();
+
+        let response = handle_http_request(
+            "POST",
+            "/mcp",
+            &headers,
+            &body,
+            &storage,
+            &metrics,
+            &|u, p| (u == "user" && p == "pass").then_some(uuid::Uuid::from_u128(1)),
+            &|| true,
+            &ShellRouteConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "edge warmup should return before the HTTP request timeout"
+        );
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
+        assert!(response.contains(r#""error":"backend_warming""#));
+        assert!(response.contains(r#""retry_after_seconds":30"#));
+        assert!(response.contains(r#""tool":"create_edge""#));
     }
 
     #[tokio::test]

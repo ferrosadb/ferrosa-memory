@@ -77,6 +77,54 @@ where
     T::from_cql(val).map_err(|e| anyhow::anyhow!("column '{}': {}", name, e))
 }
 
+fn cql_get_vector(row: &Row, col_map: &ColMap, name: &str) -> anyhow::Result<Option<Vec<f32>>> {
+    let idx = col_map
+        .get(name)
+        .ok_or_else(|| anyhow::anyhow!("column '{}' not in result set", name))?;
+    let val = row
+        .columns
+        .get(*idx)
+        .ok_or_else(|| anyhow::anyhow!("column index {} out of range for '{}'", idx, name))?
+        .clone();
+
+    match val {
+        None | Some(CqlValue::Empty) => Ok(None),
+        Some(CqlValue::Blob(bytes)) => {
+            if bytes.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(crate::vector::decode_vector(&bytes)))
+            }
+        }
+        Some(CqlValue::List(values)) => {
+            if values.is_empty() {
+                return Ok(None);
+            }
+            let mut decoded = Vec::with_capacity(values.len());
+            for value in values {
+                let item = match value {
+                    CqlValue::Float(v) => v,
+                    CqlValue::Double(v) => v as f32,
+                    other => {
+                        anyhow::bail!(
+                            "column '{}' vector element has unsupported type {:?}",
+                            name,
+                            other
+                        );
+                    }
+                };
+                decoded.push(item);
+            }
+            Ok(Some(decoded))
+        }
+        Some(other) => anyhow::bail!(
+            "column '{}' is not a vector-compatible value: {:?}",
+            name,
+            other
+        ),
+    }
+}
+
 fn sprint1_seed_insert_statements(ks: &str) -> (String, String) {
     let entity_q = format!(
         "INSERT INTO {ks}.entity_types (type_name, description, created_at) \
@@ -98,6 +146,16 @@ fn entity_list_all_query(ks: &str) -> String {
     )
 }
 
+fn entity_list_all_full_query(ks: &str) -> String {
+    format!(
+        "SELECT entity_id, session_id, entity_name, entity_type, source_fold_id, \
+         context_snippet, entity_embedding, confidence, state, created_at, \
+         description, description_embedding, tags, properties, content_hash, \
+         updated_at, scope, ingested_by_session \
+         FROM {ks}.entity_store WHERE tenant_id = ? ALLOW FILTERING"
+    )
+}
+
 fn edge_list_all_query(ks: &str, table: &str, src_col: &str, tgt_col: &str) -> String {
     format!(
         "SELECT {src_col}, {tgt_col} FROM {ks}.{table} \
@@ -109,6 +167,21 @@ fn typed_edge_list_all_query(ks: &str) -> String {
     format!(
         "SELECT src_id, edge_type, dst_id, weight, metadata, created_at, session_id \
          FROM {ks}.typed_edges WHERE tenant_id = ? ALLOW FILTERING"
+    )
+}
+
+fn entity_find_by_exact_name_query(ks: &str) -> String {
+    format!(
+        "SELECT entity_id, entity_name, entity_type \
+         FROM {ks}.entity_store WHERE tenant_id = ? AND session_id = ?"
+    )
+}
+
+fn memo_put_query(ks: &str) -> String {
+    format!(
+        "INSERT INTO {ks}.memo_cache \
+         (content_hash, model_version, tenant_id, result, created_at, last_hit_at, hit_count, expires_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
     )
 }
 
@@ -413,10 +486,9 @@ fn context_segment_from_row(
     row: &Row,
     col_map: &ColMap,
 ) -> anyhow::Result<ContextSegment> {
-    let embedding = cql_get::<Vec<u8>>(row, col_map, "segment_embedding")
+    let embedding = cql_get_vector(row, col_map, "segment_embedding")
         .ok()
-        .filter(|v| !v.is_empty())
-        .map(|v| crate::vector::decode_vector(&v));
+        .flatten();
     Ok(ContextSegment {
         tenant_id: cql_get(row, col_map, "tenant_id").unwrap_or(ctx.tenant_id),
         session_id: cql_get(row, col_map, "session_id")?,
@@ -515,10 +587,9 @@ fn extract_rich_entity_fields(
     Option<Uuid>,
 ) {
     let description = cql_get::<String>(row, col_map, "description").ok();
-    let description_embedding = cql_get::<Vec<u8>>(row, col_map, "description_embedding")
+    let description_embedding = cql_get_vector(row, col_map, "description_embedding")
         .ok()
-        .filter(|v| !v.is_empty())
-        .map(|v| crate::vector::decode_vector(&v));
+        .flatten();
     let tags = cql_get::<String>(row, col_map, "tags")
         .ok()
         .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
@@ -582,10 +653,9 @@ fn row_to_entity_entry(
         entity_type: cql_get(row, col_map, "entity_type")?,
         source_fold_id: cql_get::<Uuid>(row, col_map, "source_fold_id").ok(),
         context_snippet: cql_get(row, col_map, "context_snippet").unwrap_or_default(),
-        entity_embedding: cql_get::<Vec<u8>>(row, col_map, "entity_embedding")
+        entity_embedding: cql_get_vector(row, col_map, "entity_embedding")
             .ok()
-            .filter(|v| !v.is_empty())
-            .map(|v| crate::vector::decode_vector(&v)),
+            .flatten(),
         confidence: cql_get::<f32>(row, col_map, "confidence")
             .map(f64::from)
             .unwrap_or(1.0),
@@ -668,6 +738,7 @@ struct PreparedStatements {
     entity_count: PreparedStatement,
     entity_list_session: PreparedStatement,
     entity_list_all: PreparedStatement,
+    entity_list_all_full: PreparedStatement,
     entity_update_state: PreparedStatement,
     // Count queries for stats
     fold_count: PreparedStatement,
@@ -760,11 +831,7 @@ impl CqlStorage {
                 ))
                 .await?,
             memo_put: session
-                .prepare(format!(
-                    "INSERT INTO {ks}.memo_cache \
-                     (content_hash, model_version, tenant_id, result, result_embedding, created_at, last_hit_at, hit_count, expires_at) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                ))
+                .prepare(memo_put_query(ks))
                 .await?,
             plan_put: session
                 .prepare(format!(
@@ -842,6 +909,7 @@ impl CqlStorage {
                 ))
                 .await?,
             entity_list_all: session.prepare(entity_list_all_query(ks)).await?,
+            entity_list_all_full: session.prepare(entity_list_all_full_query(ks)).await?,
             entity_update_state: session
                 .prepare(format!(
                     "UPDATE {ks}.entity_store SET state = ? \
@@ -1382,10 +1450,9 @@ impl CqlStorage {
                 content_hash: cql_get(&row, &col_map, "content_hash")?,
                 model_version: cql_get(&row, &col_map, "model_version")?,
                 result: cql_get(&row, &col_map, "result")?,
-                result_embedding: cql_get::<Vec<u8>>(&row, &col_map, "result_embedding")
+                result_embedding: cql_get_vector(&row, &col_map, "result_embedding")
                     .ok()
-                    .filter(|v| !v.is_empty())
-                    .map(|v| crate::vector::decode_vector(&v)),
+                    .flatten(),
                 hit_count: cql_get(&row, &col_map, "hit_count").unwrap_or(0),
                 created_at,
                 last_hit_at: cql_get::<chrono::DateTime<chrono::Utc>>(
@@ -1478,10 +1545,9 @@ impl Storage for CqlStorage {
                 content_hash: content_hash.to_string(),
                 model_version: model_version.to_string(),
                 result,
-                result_embedding: cql_get::<Vec<u8>>(&row, &col_map, "result_embedding")
+                result_embedding: cql_get_vector(&row, &col_map, "result_embedding")
                     .ok()
-                    .filter(|v| !v.is_empty())
-                    .map(|v| crate::vector::decode_vector(&v)),
+                    .flatten(),
                 hit_count,
                 created_at,
                 last_hit_at: cql_get::<chrono::DateTime<chrono::Utc>>(
@@ -1529,10 +1595,6 @@ impl Storage for CqlStorage {
                 entry.model_version.clone(),
                 ctx.tenant_id,
                 entry.result.clone(),
-                entry
-                    .result_embedding
-                    .as_ref()
-                    .map(|e| crate::vector::encode_vector(e)),
                 now,
                 now,  // last_hit_at = created_at initially
                 0i64, // hit_count
@@ -1540,6 +1602,10 @@ impl Storage for CqlStorage {
             ),
         )
         .await?;
+        if let Some(embedding) = entry.result_embedding.as_ref() {
+            self.memo_update_embedding(ctx, &entry.content_hash, &entry.model_version, embedding)
+                .await?;
+        }
         Ok(())
     }
 
@@ -1703,10 +1769,9 @@ impl Storage for CqlStorage {
                 parent_fold_id: cql_get::<Uuid>(&row, &col_map, "parent_fold_id").ok(),
                 raw_trajectory: cql_get(&row, &col_map, "raw_trajectory")?,
                 fold_summary: cql_get::<String>(&row, &col_map, "fold_summary").ok(),
-                fold_embedding: cql_get::<Vec<u8>>(&row, &col_map, "fold_embedding")
+                fold_embedding: cql_get_vector(&row, &col_map, "fold_embedding")
                     .ok()
-                    .filter(|v| !v.is_empty())
-                    .map(|v| crate::vector::decode_vector(&v)),
+                    .flatten(),
                 token_count: cql_get(&row, &col_map, "token_count")?,
                 compression_ratio: cql_get::<f64>(&row, &col_map, "compression_ratio").ok(),
                 status,
@@ -2131,35 +2196,35 @@ impl Storage for CqlStorage {
         name: &str,
         entity_type: &str,
     ) -> anyhow::Result<Option<EntityEntry>> {
-        // Exact lookup keyed on (tenant_id, session_id, entity_name,
-        // entity_type). `idx_entity_name_phonetic` (ddl/002) gives the 2i
-        // on `entity_name`; the entity_type + session + tenant predicates
-        // are added under ALLOW FILTERING so we only carry back the one
-        // row the caller cares about. This replaces the fuzzy
-        // `entity_find_phonetic` scan as the by-name idempotency key for
-        // writers like `ingest_skill`.
-        let query = format!(
-            "SELECT entity_id FROM {}.entity_store \
-             WHERE tenant_id = ? AND session_id = ? \
-               AND entity_name = ? AND entity_type = ? \
-             ALLOW FILTERING",
-            self.keyspace
-        );
+        // Scan the tenant/session partition and filter in-process. The
+        // secondary index on `entity_name` is eventually visible on live
+        // Ferrosa clusters; using it here caused immediate post-ingest
+        // prerequisite lookups to return false misses.
+        let query = entity_find_by_exact_name_query(&self.keyspace);
         #[allow(deprecated)]
         let result = self
             .session
-            .query_unpaged(query, (ctx.tenant_id, session_id, name, entity_type))
+            .query_unpaged(query, (ctx.tenant_id, session_id))
             .await?;
         let col_map = build_col_map(result.col_specs());
         let rows = result.rows_or_empty();
-        let Some(row) = rows.first() else {
-            return Ok(None);
-        };
-        let entity_id = cql_get::<Uuid>(row, &col_map, "entity_id")
-            .map_err(|e| anyhow::anyhow!("entity_find_by_exact_name row missing entity_id: {e}"))?;
-        // Delegate to the full-row read so callers see the same shape as
-        // entity_get_by_id without duplicating the column list here.
-        self.entity_get_by_id(ctx, session_id, entity_id).await
+        for row in rows {
+            let Ok(entity_name) = cql_get::<String>(&row, &col_map, "entity_name") else {
+                continue;
+            };
+            let Ok(row_type) = cql_get::<String>(&row, &col_map, "entity_type") else {
+                continue;
+            };
+            if entity_name == name && row_type == entity_type {
+                let entity_id = cql_get::<Uuid>(&row, &col_map, "entity_id").map_err(|e| {
+                    anyhow::anyhow!("entity_find_by_exact_name row missing entity_id: {e}")
+                })?;
+                // Delegate to the full-row read so callers see the same
+                // shape as entity_get_by_id without duplicating columns.
+                return self.entity_get_by_id(ctx, session_id, entity_id).await;
+            }
+        }
+        Ok(None)
     }
 
     async fn entity_get_by_id(
@@ -2411,10 +2476,9 @@ impl Storage for CqlStorage {
                 entity_type,
                 source_fold_id: cql_get::<Uuid>(&row, &col_map, "source_fold_id").ok(),
                 context_snippet,
-                entity_embedding: cql_get::<Vec<u8>>(&row, &col_map, "entity_embedding")
+                entity_embedding: cql_get_vector(&row, &col_map, "entity_embedding")
                     .ok()
-                    .filter(|v| !v.is_empty())
-                    .map(|v| crate::vector::decode_vector(&v)),
+                    .flatten(),
                 confidence: cql_get::<f32>(&row, &col_map, "confidence")
                     .map(f64::from)
                     .unwrap_or(1.0),
@@ -2465,6 +2529,18 @@ impl Storage for CqlStorage {
     async fn entity_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<EntityEntry>> {
         let (col_map, rows) = self
             .exec_prepared_rows(&self.stmts.entity_list_all, (ctx.tenant_id,))
+            .await?;
+
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            results.push(row_to_entity_entry(ctx, &row, &col_map)?);
+        }
+        Ok(results)
+    }
+
+    async fn entity_list_all_full(&self, ctx: &TenantContext) -> anyhow::Result<Vec<EntityEntry>> {
+        let (col_map, rows) = self
+            .exec_prepared_rows(&self.stmts.entity_list_all_full, (ctx.tenant_id,))
             .await?;
 
         let mut results = Vec::with_capacity(rows.len());
@@ -2542,10 +2618,9 @@ impl Storage for CqlStorage {
                 parent_fold_id: cql_get::<Uuid>(&row, &col_map, "parent_fold_id").ok(),
                 raw_trajectory: cql_get(&row, &col_map, "raw_trajectory").unwrap_or_default(),
                 fold_summary: cql_get::<String>(&row, &col_map, "fold_summary").ok(),
-                fold_embedding: cql_get::<Vec<u8>>(&row, &col_map, "fold_embedding")
+                fold_embedding: cql_get_vector(&row, &col_map, "fold_embedding")
                     .ok()
-                    .filter(|v| !v.is_empty())
-                    .map(|v| crate::vector::decode_vector(&v)),
+                    .flatten(),
                 token_count: cql_get(&row, &col_map, "token_count")?,
                 compression_ratio: cql_get::<f64>(&row, &col_map, "compression_ratio").ok(),
                 status,
@@ -5367,6 +5442,92 @@ mod cql_storage_tests {
         assert!(
             !entity_query.contains("entity_embedding"),
             "tenant-wide entity scans must not fetch vector blobs: {entity_query}"
+        );
+    }
+
+    #[test]
+    fn memo_put_query_omits_vector_column_for_literal_followup_update() {
+        let query = memo_put_query("agent_memory");
+
+        assert!(
+            !query.contains("result_embedding"),
+            "memo_put must not bind VECTOR columns through the legacy driver: {query}"
+        );
+        assert!(
+            query.contains("VALUES (?, ?, ?, ?, ?, ?, ?, ?)"),
+            "memo_put should bind only scalar memo fields before vector literal update: {query}"
+        );
+    }
+
+    #[test]
+    fn cql_get_vector_reads_ferrosa_vector_lists_and_legacy_blobs() {
+        let col_map = HashMap::from([
+            ("vector_value".to_string(), 0usize),
+            ("legacy_blob".to_string(), 1usize),
+        ]);
+        let legacy = crate::vector::encode_vector(&[0.25, -1.5, 4.0]);
+        let row = Row {
+            columns: vec![
+                Some(CqlValue::List(vec![
+                    CqlValue::Float(0.25),
+                    CqlValue::Float(-1.5),
+                    CqlValue::Float(4.0),
+                ])),
+                Some(CqlValue::Blob(legacy)),
+            ],
+        };
+
+        assert_eq!(
+            cql_get_vector(&row, &col_map, "vector_value").unwrap(),
+            Some(vec![0.25, -1.5, 4.0])
+        );
+        assert_eq!(
+            cql_get_vector(&row, &col_map, "legacy_blob").unwrap(),
+            Some(vec![0.25, -1.5, 4.0])
+        );
+    }
+
+    #[test]
+    fn exact_name_lookup_scans_session_partition_without_secondary_index() {
+        let query = entity_find_by_exact_name_query("agent_memory");
+
+        assert!(
+            query.contains(" WHERE tenant_id = ? AND session_id = ?"),
+            "exact-name lookup should read the stable session partition: {query}"
+        );
+        assert!(
+            !query.contains("entity_name = ?"),
+            "exact-name lookup must not depend on eventually-visible secondary indexes: {query}"
+        );
+        assert!(
+            !query.contains("ALLOW FILTERING"),
+            "session-partition lookup should not require filtering: {query}"
+        );
+    }
+
+    #[test]
+    fn backfill_full_entity_scan_fetches_context_and_vectors() {
+        let query = entity_list_all_full_query("agent_memory");
+
+        assert!(
+            query.contains(" WHERE tenant_id = ? ALLOW FILTERING"),
+            "backfill full scan must remain tenant-scoped: {query}"
+        );
+        assert!(
+            !query.contains(" LIMIT "),
+            "backfill full scan must not silently cap maintenance work: {query}"
+        );
+        assert!(
+            query.contains("context_snippet"),
+            "Phase 1 needs legacy enriched context text: {query}"
+        );
+        assert!(
+            query.contains("entity_embedding"),
+            "later phases must preserve existing entity embeddings during entity_put: {query}"
+        );
+        assert!(
+            query.contains("description_embedding"),
+            "Phase 2/4 need rich entity fields from the same full row: {query}"
         );
     }
 

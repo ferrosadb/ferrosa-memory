@@ -107,7 +107,10 @@ async fn g3_backfill_migrates_enriched_prefix_and_populates_description_embeddin
         );
     }
 
-    let entities = storage.entity_list_all(&ctx).await.expect("list");
+    let entities = storage
+        .entity_list_session(&ctx, session_id)
+        .await
+        .expect("list");
     let mut p1_migrated = 0;
     let mut p2_embedded = 0;
     for e in &entities {

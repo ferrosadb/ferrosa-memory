@@ -133,7 +133,8 @@ fn t04_migration_33_recreates_trajectory_folds_with_uuid_fold_ids() {
 }
 
 // ---------------------------------------------------------------------------
-// T-05: Old-schema keyspace (v30, missing first_seen) auto-upgrades to v31
+// T-05: Old-schema keyspace (v30, missing first_seen) auto-upgrades through
+// the current migration registry.
 // ---------------------------------------------------------------------------
 
 /// T-05: Simulate a keyspace at version 30 (pre-first_seen fix), run
@@ -176,23 +177,30 @@ async fn t03_old_schema_auto_upgrades_to_v31() {
         .await
         .expect("rewind schema_version to 30");
 
-    // Step 4: Delete the v31 row so the runner sees v31 as pending.
-    let delete_v31 = format!(
-        "DELETE FROM {}.schema_version WHERE version = 31",
-        cfg.keyspace
-    );
-    session
-        .query_unpaged(delete_v31, ())
-        .await
-        .expect("delete v31 record");
+    // Step 4: Delete every post-v30 row so max(schema_version) really
+    // rewinds to 30. The migration runner intentionally treats the max
+    // recorded version as current, so deleting only v31 is insufficient once
+    // later migrations exist.
+    let pending_after_rewind = MIGRATIONS.iter().filter(|m| m.version > 30).count();
+    for migration in MIGRATIONS.iter().filter(|m| m.version > 30) {
+        let delete_version = format!(
+            "DELETE FROM {}.schema_version WHERE version = {}",
+            cfg.keyspace, migration.version
+        );
+        session
+            .query_unpaged(delete_version, ())
+            .await
+            .unwrap_or_else(|_| panic!("delete v{} record", migration.version));
+    }
 
-    // Step 5: Run migrations again — should detect v31 pending and apply it.
+    // Step 5: Run migrations again — should detect v31+ pending and apply
+    // the current tail of the append-only registry.
     let applied = run_migrations(&session, &cfg.keyspace)
         .await
         .expect("migration re-run must succeed after rewind");
     assert_eq!(
-        applied, 1,
-        "exactly one migration (v31) should apply after rewind"
+        applied, pending_after_rewind,
+        "all post-v30 migrations should apply after rewind"
     );
 
     // Step 6: Verify the column now exists by describing the table.

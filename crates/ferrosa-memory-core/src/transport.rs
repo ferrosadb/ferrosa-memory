@@ -49,6 +49,7 @@ pub const INVALID_REQUEST: i32 = -32600;
 pub const METHOD_NOT_FOUND: i32 = -32601;
 pub const INVALID_PARAMS: i32 = -32602;
 pub const INTERNAL_ERROR: i32 = -32603;
+pub const BACKEND_WARMING: i32 = -32004;
 
 impl JsonRpcResponse {
     pub fn success(id: Option<Value>, result: Value) -> Self {
@@ -61,16 +62,32 @@ impl JsonRpcResponse {
     }
 
     pub fn error(id: Option<Value>, code: i32, message: impl Into<String>) -> Self {
+        let (message, data) = structured_error_message(message.into());
         Self {
             jsonrpc: "2.0".into(),
             id,
             result: None,
             error: Some(JsonRpcError {
                 code,
-                message: message.into(),
-                data: None,
+                message,
+                data,
             }),
         }
+    }
+}
+
+fn structured_error_message(message: String) -> (String, Option<Value>) {
+    match serde_json::from_str::<Value>(&message) {
+        Ok(Value::Object(map)) => {
+            let message = map
+                .get("message")
+                .or_else(|| map.get("error"))
+                .and_then(Value::as_str)
+                .unwrap_or("structured error")
+                .to_string();
+            (message, Some(Value::Object(map)))
+        }
+        _ => (message, None),
     }
 }
 
@@ -190,5 +207,27 @@ mod tests {
         assert!(s.contains("\"error\""));
         assert!(s.contains("-32601"));
         assert!(!s.contains("\"result\""));
+    }
+
+    #[test]
+    fn backend_warming_json_message_becomes_structured_error_data() {
+        let resp = JsonRpcResponse::error(
+            Some(Value::Number(7.into())),
+            BACKEND_WARMING,
+            serde_json::json!({
+                "error": "backend_warming",
+                "tool": "create_edge",
+                "retry_after_seconds": 30,
+                "message": "backend is warming"
+            })
+            .to_string(),
+        );
+
+        let value = serde_json::to_value(resp).unwrap();
+        assert_eq!(value["error"]["code"], BACKEND_WARMING);
+        assert_eq!(value["error"]["message"], "backend is warming");
+        assert_eq!(value["error"]["data"]["error"], "backend_warming");
+        assert_eq!(value["error"]["data"]["tool"], "create_edge");
+        assert_eq!(value["error"]["data"]["retry_after_seconds"], 30);
     }
 }

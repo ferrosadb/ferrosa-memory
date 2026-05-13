@@ -269,13 +269,13 @@ async fn t04_memo_get_missing_returns_none() {
 }
 
 // ---------------------------------------------------------------------------
-// T-05: memo_put with embedding round-trips the blob bytes
+// T-05: memo_put with embedding round-trips the vector value
 //
 // The embedding path is where the blob type mapping matters most.
 // cdrs-tokio used `Blob::new(bytes)` as a value; scylla accepts `Vec<u8>`.
 // ---------------------------------------------------------------------------
 
-/// T-05: memo_put with an embedding stores and retrieves the vector bytes.
+/// T-05: memo_put with an embedding stores and retrieves the VECTOR value.
 #[tokio::test]
 #[ignore = "requires live Ferrosa test cluster; run with --ignored and FERROSA_TEST_CQL_PORT"]
 async fn t05_memo_put_with_embedding_roundtrip() {
@@ -287,7 +287,7 @@ async fn t05_memo_put_with_embedding_roundtrip() {
     let ctx = tenant();
     let hash = format!("emb-hash-{}", Uuid::new_v4());
     let model = "emb-model-v1".to_string();
-    let embedding: Vec<f32> = (0..16).map(|i| i as f32 / 16.0).collect();
+    let embedding: Vec<f32> = (0..768).map(|i| i as f32 / 768.0).collect();
 
     let entry = MemoEntry {
         content_hash: hash.clone(),

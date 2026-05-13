@@ -898,8 +898,14 @@ for line in sys.stdin:
     #[tokio::test]
     #[ignore]
     async fn http_client_live_initialize_and_get_stats() {
-        // Requires a live MCP server running on HTTP
-        let mut client = HttpMcpClient::new("http://localhost:8080");
+        // Requires a live MCP HTTP server. The cluster CI job provides
+        // Ferrosa CQL/graph services, but not an authenticated MCP HTTP
+        // listener, so this test is opt-in even when `--ignored` is used.
+        let Ok(url) = std::env::var("FERROSA_EVAL_HTTP_URL") else {
+            eprintln!("FERROSA_EVAL_HTTP_URL unset; skipping live MCP HTTP client smoke");
+            return;
+        };
+        let mut client = HttpMcpClient::new(&url);
 
         let init = client.initialize().await.expect("initialize failed");
         assert!(init.response["serverInfo"]["name"].is_string());

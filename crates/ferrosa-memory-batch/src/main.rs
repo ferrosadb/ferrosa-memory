@@ -468,7 +468,12 @@ async fn backfill_rich_entities(
     );
 
     let storage = CqlStorage::connect(&batch_cql_config(config)).await?;
-    let mut entities = storage.entity_list_all(&ctx).await?;
+    let needs_full_entities = phases.contains(&1) || phases.contains(&2) || phases.contains(&4);
+    let mut entities = if needs_full_entities {
+        storage.entity_list_all_full(&ctx).await?
+    } else {
+        storage.entity_list_all(&ctx).await?
+    };
     let folds = storage.fold_list_all(&ctx).await?;
     let memos = storage.memo_list_all(&ctx).await?;
     tracing::info!(count = entities.len(), "loaded entities for backfill");
@@ -659,7 +664,7 @@ async fn backfill_rich_entities(
         // in-memory snapshot before later phases so phase 1/2/4 do not
         // overwrite newly written embeddings with stale pre-phase-0 rows.
         if !dry_run && (phases.contains(&1) || phases.contains(&2) || phases.contains(&4)) {
-            entities = storage.entity_list_all(&ctx).await?;
+            entities = storage.entity_list_all_full(&ctx).await?;
             tracing::info!(
                 count = entities.len(),
                 "reloaded entities after phase 0 to preserve freshly written embeddings"

@@ -984,6 +984,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn packet_l_pull_preview_rejects_expired_signed_teaching_packet() {
+        let storage = MockStorage::new();
+        let teacher = InstanceSigningIdentity::generate(InstanceId(id(10)));
+        let public = teacher.public_identity();
+        let mut expired = packet(vec![item(41, "gpu_builds", "Old GPU build", "obsolete")]);
+        expired.expires_at = Some(Utc::now() - Duration::seconds(1));
+        let signed = teacher.sign(expired).unwrap();
+
+        let err = pull_preview(
+            &MockRemoteClient::new(signed),
+            &storage,
+            &ctx(),
+            PullPreviewRequest::new(id(1), "gpu", "build")
+                .with_policy(policy_for("gpu"))
+                .with_public_identity(public),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("teaching packet expired"));
+    }
+
+    #[tokio::test]
+    async fn packet_l_pull_commit_rejects_expired_preview_before_mutating_storage() {
+        let storage = MockStorage::new();
+        let learner = InstanceSigningIdentity::generate(InstanceId(id(30)));
+        let teacher = InstanceSigningIdentity::generate(InstanceId(id(10)));
+        let public = teacher.public_identity();
+        let signed = teacher
+            .sign(packet(vec![item(
+                42,
+                "gpu_builds",
+                "Fresh GPU build",
+                "cache target artifacts",
+            )]))
+            .unwrap();
+        let mut preview = pull_preview(
+            &MockRemoteClient::new(signed),
+            &storage,
+            &ctx(),
+            PullPreviewRequest::new(id(1), "gpu", "build")
+                .with_policy(policy_for("gpu"))
+                .with_public_identity(public),
+        )
+        .await
+        .unwrap();
+        preview.expires_at = Utc::now() - Duration::seconds(1);
+
+        let err = pull_commit(
+            &storage,
+            &ctx(),
+            PullCommitRequest::from_preview(preview, &learner),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("preview is stale or expired; refresh pull_preview before commit")
+        );
+        assert_eq!(storage.entities.lock().await.len(), 0);
+        assert_eq!(storage.remote_stubs.lock().await.len(), 0);
+        assert_eq!(storage.import_batches.lock().await.len(), 0);
+    }
+
+    #[tokio::test]
     async fn normal_memory_pull_commit_rejects_skill_teaching_items() {
         let storage = MockStorage::new();
         let learner = InstanceSigningIdentity::generate(InstanceId(id(30)));

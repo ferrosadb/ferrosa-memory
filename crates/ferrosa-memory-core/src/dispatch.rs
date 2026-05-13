@@ -22,7 +22,7 @@ use crate::context_segment::{
     ContextMessage, ContextSegmentSearchParams, ContextWindowParams, IngestContextSegmentsParams,
     SegmentationConfig,
 };
-use crate::transport::{INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND};
+use crate::transport::{BACKEND_WARMING, INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND};
 
 /// Rotating hint counter for memory formation encouragement.
 static HINT_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -401,6 +401,15 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
         ToolDef {
             name: "remote_capabilities".into(),
             description: "Return the remote-memory MCP capabilities expected for a configured remote.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "remote_id": { "type": "string", "format": "uuid" } },
+                "required": ["remote_id"]
+            }),
+        },
+        ToolDef {
+            name: "remote_detail".into(),
+            description: "Return configured remote-memory details plus the transport/security capabilities required by remote pull smokes.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": { "remote_id": { "type": "string", "format": "uuid" } },
@@ -1649,6 +1658,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "remote_update_policy" => handle_remote_update_policy(args, storage, ctx).await,
         "remote_remove" => handle_remote_remove(args, storage, ctx).await,
         "remote_health" => handle_remote_health(args, storage, ctx).await,
+        "remote_detail" => handle_remote_capabilities(args, storage, ctx).await,
         "remote_capabilities" => handle_remote_capabilities(args, storage, ctx).await,
         "remote_explain_policy" => handle_remote_explain_policy(args, storage, ctx).await,
         "get_context_window" => handle_get_context_window(args, storage, ctx).await,
@@ -1811,6 +1821,7 @@ fn is_tier1(name: &str) -> bool {
             | "remote_update_policy"
             | "remote_remove"
             | "remote_health"
+            | "remote_detail"
             | "remote_capabilities"
             | "remote_explain_policy"
             | "search_context_segments"
@@ -2530,6 +2541,26 @@ async fn handle_pull_preview<S: crate::storage::Storage>(
     }
     if let Some(ttl) = args.get("preview_ttl_seconds").and_then(|v| v.as_i64()) {
         request.preview_ttl = chrono::Duration::seconds(ttl.clamp(1, 86400));
+    }
+    if let Some(remote) = storage
+        .remote_get(ctx, request.remote_id)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+    {
+        let policy_rows = storage
+            .remote_policy_list(ctx, request.remote_id)
+            .await
+            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+        let mut facts = vec![crate::remotes::policy::PolicyFact::remote(
+            remote.name.clone(),
+        )];
+        for row in &policy_rows {
+            if let Some(fact) = policy_fact_from_row(&remote.name, row)? {
+                facts.push(fact);
+            }
+        }
+        request.remote_name = remote.name;
+        request = request.with_policy(crate::remotes::policy::RemotePolicy::from_facts(facts));
     }
     let client = crate::remotes::pull::json_remote_client_from_args(&args)
         .map_err(|e| (INVALID_PARAMS, e.to_string()))?;
@@ -6943,11 +6974,21 @@ async fn handle_create_edge<S: crate::storage::Storage>(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    crate::graph_write::create_typed_edge(
-        storage, ctx, session_id, src_id, edge_type, dst_id, weight, metadata,
+    let edge_write = create_typed_edge_with_warmup_budget(
+        "create_edge",
+        storage,
+        ctx,
+        session_id,
+        src_id,
+        edge_type,
+        dst_id,
+        weight,
+        metadata,
     )
-    .await
-    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    .await?;
+    if let Err(err) = edge_write {
+        return Err(edge_write_error("create_edge", err));
+    }
 
     session.dirty.store(true, Ordering::Relaxed);
     session.last_activity.notify_waiters();
@@ -7018,13 +7059,27 @@ async fn handle_batch_create_edges<S: crate::storage::Storage>(
             .and_then(|v| v.as_f64())
             .unwrap_or(1.0);
 
-        match crate::graph_write::create_typed_edge(
-            storage, ctx, session_id, src_id, edge_type, dst_id, weight, None,
+        match create_typed_edge_with_warmup_budget(
+            "batch_create_edges",
+            storage,
+            ctx,
+            session_id,
+            src_id,
+            edge_type,
+            dst_id,
+            weight,
+            None,
         )
         .await
         {
-            Ok(_) => created += 1,
-            Err(_) => errors += 1,
+            Ok(Ok(_)) => created += 1,
+            Ok(Err(err)) => {
+                if looks_like_backend_warming(&err) {
+                    return Err(backend_warming_error("batch_create_edges"));
+                }
+                errors += 1;
+            }
+            Err(err) => return Err(err),
         }
     }
 
@@ -7036,6 +7091,60 @@ async fn handle_batch_create_edges<S: crate::storage::Storage>(
         "errors": errors,
         "total": edges.len(),
     }))
+}
+
+#[cfg(test)]
+const EDGE_WRITE_WARMUP_BUDGET: std::time::Duration = std::time::Duration::from_millis(20);
+#[cfg(not(test))]
+const EDGE_WRITE_WARMUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[allow(clippy::too_many_arguments)]
+async fn create_typed_edge_with_warmup_budget<S: crate::storage::Storage>(
+    tool: &str,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session_id: uuid::Uuid,
+    src_id: uuid::Uuid,
+    edge_type: &str,
+    dst_id: uuid::Uuid,
+    weight: f64,
+    metadata: Option<String>,
+) -> Result<anyhow::Result<crate::types::TypedEdge>, (i32, String)> {
+    tokio::time::timeout(
+        EDGE_WRITE_WARMUP_BUDGET,
+        crate::graph_write::create_typed_edge(
+            storage, ctx, session_id, src_id, edge_type, dst_id, weight, metadata,
+        ),
+    )
+    .await
+    .map_err(|_| backend_warming_error(tool))
+}
+
+fn edge_write_error(tool: &str, err: anyhow::Error) -> (i32, String) {
+    if looks_like_backend_warming(&err) {
+        backend_warming_error(tool)
+    } else {
+        (INTERNAL_ERROR, err.to_string())
+    }
+}
+
+fn looks_like_backend_warming(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_lowercase();
+    msg.contains("warming")
+        && (msg.contains("ann") || msg.contains("vector") || msg.contains("index"))
+}
+
+fn backend_warming_error(tool: &str) -> (i32, String) {
+    (
+        BACKEND_WARMING,
+        serde_json::json!({
+            "error": "backend_warming",
+            "tool": tool,
+            "retry_after_seconds": 30,
+            "message": "Ferrosa backend is warming ANN/vector indexes after restart; retry the edge write after the suggested backoff."
+        })
+        .to_string(),
+    )
 }
 
 async fn handle_batch_update_edges<S: crate::storage::Storage>(
@@ -8020,6 +8129,329 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn packet_l_tools_list_exposes_remote_smoke_surface_and_rejects_credentialed_endpoints() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let tools = dispatch(
+            "tools/list",
+            serde_json::json!({"include_all": true}),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let tool_names: Vec<&str> = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+
+        for name in [
+            "remote_add",
+            "remote_list",
+            "remote_detail",
+            "remote_explain_policy",
+            "teach_query_stream",
+            "pull_preview",
+            "pull_commit",
+        ] {
+            assert!(
+                tool_names.contains(&name),
+                "missing remote smoke tool: {name}"
+            );
+        }
+
+        let err = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "remote_add",
+                "arguments": {
+                    "tenant_id": ctx.tenant_id.to_string(),
+                    "remote_id": Uuid::new_v4().to_string(),
+                    "name": "credentialed",
+                    "endpoint": "https://user:pass@archive.example/mcp",
+                    "trust_class": "archive",
+                    "instance_id": Uuid::new_v4().to_string(),
+                    "public_key_fingerprint": "ed25519:archive"
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, INVALID_PARAMS);
+        assert_eq!(err.1, "remote endpoint must not contain credentials");
+    }
+
+    #[tokio::test]
+    async fn packet_l_remote_detail_and_policy_explain_smoke_cover_capabilities_and_deny_override()
+    {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let remote_id = Uuid::new_v4();
+
+        dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "remote_add",
+                "arguments": {
+                    "tenant_id": ctx.tenant_id.to_string(),
+                    "remote_id": remote_id.to_string(),
+                    "name": "gpu",
+                    "endpoint": "https://gpu.example/mcp",
+                    "trust_class": "team",
+                    "instance_id": Uuid::new_v4().to_string(),
+                    "public_key_fingerprint": "ed25519:gpu"
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+
+        let listed = dispatch(
+            "tools/call",
+            serde_json::json!({"name": "remote_list", "arguments": {"limit": 10}}),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let listed = unwrap_tool_result(listed);
+        assert_eq!(listed["count"], 1);
+        assert_eq!(listed["remotes"][0]["remote_id"], remote_id.to_string());
+
+        let detail = dispatch(
+            "tools/call",
+            serde_json::json!({"name": "remote_detail", "arguments": {"remote_id": remote_id.to_string()}}),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let detail = unwrap_tool_result(detail);
+        assert!(
+            detail["capabilities"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("pull_preview"))
+        );
+        assert_eq!(detail["details"]["supports_signed_packets"], true);
+        assert_eq!(detail["details"]["supports_policy_explain"], true);
+        assert_eq!(detail["details"]["supports_provenance"], true);
+
+        dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "remote_update_policy",
+                "arguments": {
+                    "tenant_id": ctx.tenant_id.to_string(),
+                    "remote_id": remote_id.to_string(),
+                    "facts": [
+                        {"kind": "grant", "namespace": "knowledge", "action": "autocommit"},
+                        {"kind": "grant", "namespace": "gpu_builds", "action": "trusted_for"},
+                        {"kind": "deny", "namespace": "gpu_builds", "action": "autocommit"}
+                    ]
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+
+        let explained = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "remote_explain_policy",
+                "arguments": {
+                    "remote_id": remote_id.to_string(),
+                    "action": "autocommit",
+                    "namespace": "gpu_builds"
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let explained = unwrap_tool_result(explained);
+        assert_eq!(explained["allowed"], false);
+        assert_eq!(explained["policy_fact_count"], 3);
+        assert!(
+            explained["reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| {
+                    reason["code"] == "deny"
+                        && reason["message"] == "explicit deny overrides any derived grant"
+                })
+        );
+    }
+
+    #[tokio::test]
+    async fn packet_l_dispatch_pull_preview_and_commit_write_provenance_and_stub() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let remote_id = Uuid::new_v4();
+        let teacher = crate::remote_identity::InstanceSigningIdentity::generate(
+            crate::remote_identity::InstanceId(Uuid::new_v4()),
+        );
+        let learner = crate::remote_identity::InstanceSigningIdentity::generate(
+            crate::remote_identity::InstanceId(Uuid::new_v4()),
+        );
+        let packet_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let frame = |namespace: &str| crate::remotes::types::ApplicabilityFrame {
+            namespaces: vec![namespace.into()],
+            host_os: Some("linux".into()),
+            container_runtime: Some("docker".into()),
+            hardware: vec!["gpu".into()],
+            required_tags: vec![format!("namespace:{namespace}")],
+            excluded_tags: vec![],
+            confidence: 0.91,
+        };
+        let item =
+            |title: &str, namespace: &str, summary: &str| crate::remotes::types::TeachingItem {
+                item_id: Uuid::new_v4(),
+                packet_id,
+                kind: crate::remotes::types::TeachingKind::Decision,
+                title: title.into(),
+                summary: summary.into(),
+                body: Some(summary.into()),
+                content_hash: crate::remote_identity::ContentHash::sha256_bytes(
+                    format!("{namespace}:{title}:{summary}").as_bytes(),
+                ),
+                applicability: frame(namespace),
+                safety: crate::remotes::types::SafetyClassification {
+                    risk: crate::remotes::types::SafetyRisk::Low,
+                    reasons: vec!["safe packet l smoke".into()],
+                    redacted: false,
+                    requires_human: false,
+                },
+                detail_ref: None,
+                metadata: serde_json::json!({}),
+                created_at: now,
+            };
+        let packet = crate::remotes::types::TeachingPacket {
+            packet_id,
+            teacher_instance_id: teacher.instance_id,
+            request_id: Some(Uuid::new_v4()),
+            source_namespace: "gpu_builds".into(),
+            query: "gpu build".into(),
+            items: vec![
+                item("GPU build", "gpu_builds", "Use pinned CUDA image"),
+                item("Team note", "team_notes", "Keep as remote stub"),
+            ],
+            expires_at: Some(now + chrono::Duration::hours(1)),
+            created_at: now,
+        };
+        let signed_packet = teacher.sign(packet).unwrap();
+
+        dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "remote_add",
+                "arguments": {
+                    "tenant_id": ctx.tenant_id.to_string(),
+                    "remote_id": remote_id.to_string(),
+                    "name": "gpu",
+                    "endpoint": "https://gpu.example/mcp",
+                    "trust_class": "team",
+                    "instance_id": teacher.instance_id.0.to_string(),
+                    "public_key_fingerprint": teacher.public_identity().public_key_fingerprint.0
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "remote_update_policy",
+                "arguments": {
+                    "tenant_id": ctx.tenant_id.to_string(),
+                    "remote_id": remote_id.to_string(),
+                    "facts": [
+                        {"kind": "grant", "namespace": "knowledge", "action": "autocommit"},
+                        {"kind": "grant", "namespace": "gpu_builds", "action": "trusted_for"}
+                    ]
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+
+        let preview = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "pull_preview",
+                "arguments": {
+                    "remote_id": remote_id.to_string(),
+                    "remote_name": "gpu",
+                    "query": "gpu build",
+                    "public_identity": teacher.public_identity(),
+                    "signed_packet": signed_packet
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let preview = unwrap_tool_result(preview);
+        assert_eq!(preview["items"][0]["state"], "active");
+        assert_eq!(preview["items"][1]["state"], "needs_activation");
+
+        let preview_plan: crate::remotes::pull::PullPreviewPlan =
+            serde_json::from_value(preview).unwrap();
+        let commit_request =
+            crate::remotes::pull::PullCommitRequest::from_preview(preview_plan.clone(), &learner);
+        let receipt = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "pull_commit",
+                "arguments": {
+                    "preview": preview_plan,
+                    "learner_decision": commit_request.learner_decision
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let receipt = unwrap_tool_result(receipt);
+        assert_eq!(receipt["imported_count"], 1);
+        assert_eq!(receipt["stub_count"], 1);
+        assert_eq!(store.memory_provenance.lock().await.len(), 1);
+        assert_eq!(store.remote_stubs.lock().await.len(), 1);
+        assert_eq!(store.import_batches.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
     async fn remote_feedback_record_rejects_forged_tenant() {
         let store = MockStorage::new();
         let ctx = test_ctx();
@@ -8579,6 +9011,90 @@ mod tests {
         assert_eq!(results[1]["status"], "updated");
         assert_eq!(results[2]["status"], "upserted");
         assert_eq!(results[3]["status"], "error");
+    }
+
+    #[tokio::test]
+    async fn bug_m_005_create_edge_fast_fails_with_backend_warming_when_write_stalls() {
+        let store = MockStorage::new();
+        store
+            .force_typed_edge_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+        let started = std::time::Instant::now();
+
+        let err = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "create_edge",
+                "arguments": {
+                    "session_id": sid.to_string(),
+                    "src_entity_id": Uuid::new_v4().to_string(),
+                    "dst_entity_id": Uuid::new_v4().to_string(),
+                    "edge_type": "related_to"
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, BACKEND_WARMING);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "edge warmup errors should fast-fail, not wait for the HTTP request budget"
+        );
+        let body: serde_json::Value = serde_json::from_str(&err.1).unwrap();
+        assert_eq!(body["error"], "backend_warming");
+        assert_eq!(body["tool"], "create_edge");
+        assert_eq!(body["retry_after_seconds"], 30);
+        assert_eq!(store.typed_edges.lock().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn bug_m_005_batch_create_edges_fast_fails_with_backend_warming_when_write_stalls() {
+        let store = MockStorage::new();
+        store
+            .force_typed_edge_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+        let started = std::time::Instant::now();
+
+        let err = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "batch_create_edges",
+                "arguments": {
+                    "session_id": sid.to_string(),
+                    "edges": [{
+                        "src_entity_id": Uuid::new_v4().to_string(),
+                        "dst_entity_id": Uuid::new_v4().to_string(),
+                        "edge_type": "related_to"
+                    }]
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, BACKEND_WARMING);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "batch edge warmup errors should fast-fail, not get counted as silent per-edge errors"
+        );
+        let body: serde_json::Value = serde_json::from_str(&err.1).unwrap();
+        assert_eq!(body["error"], "backend_warming");
+        assert_eq!(body["tool"], "batch_create_edges");
+        assert_eq!(body["retry_after_seconds"], 30);
+        assert_eq!(store.typed_edges.lock().await.len(), 0);
     }
 
     #[tokio::test]

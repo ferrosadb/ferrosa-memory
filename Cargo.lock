@@ -535,7 +535,7 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "ferrosa-memory-batch"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -553,7 +553,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-memory-core"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -588,7 +588,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-memory-eval"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -612,7 +612,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-memory-mcp"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-memory-sync"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "chrono",

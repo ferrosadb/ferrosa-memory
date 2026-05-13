@@ -10,7 +10,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, memory-remotes-blueprint]
 
 permissions:
   contents: read

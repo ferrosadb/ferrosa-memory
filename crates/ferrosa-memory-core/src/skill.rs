@@ -150,6 +150,68 @@ fn today_yyyymmdd() -> String {
     chrono::Utc::now().format("%Y%m%d").to_string()
 }
 
+async fn find_skill_by_exact_name_with_read_after_write_retry(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    storage_session: Uuid,
+    name: &str,
+) -> anyhow::Result<Option<EntityEntry>> {
+    const BACKOFF_MS: [u64; 4] = [25, 50, 100, 200];
+
+    for backoff_ms in BACKOFF_MS {
+        let found = storage
+            .entity_find_by_exact_name(ctx, storage_session, name, "skill")
+            .await?;
+        if found.is_some() {
+            return Ok(found);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+    }
+    storage
+        .entity_find_by_exact_name(ctx, storage_session, name, "skill")
+        .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn put_skill_typed_edge(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    session_id: Uuid,
+    src_id: Uuid,
+    edge_type: &str,
+    dst_id: Uuid,
+    weight: f64,
+    metadata: Option<&str>,
+    graph_client: Option<&crate::graph::GraphClient>,
+) -> anyhow::Result<()> {
+    if let Some(graph) = graph_client {
+        graph
+            .put_typed_edge(
+                ctx.tenant_id,
+                session_id,
+                src_id,
+                edge_type,
+                dst_id,
+                weight,
+                metadata,
+            )
+            .await
+    } else {
+        crate::graph_write::create_typed_edge(
+            storage,
+            ctx,
+            session_id,
+            src_id,
+            edge_type,
+            dst_id,
+            weight,
+            metadata.map(str::to_string),
+        )
+        .await
+        .map(|_| ())
+    }
+}
+
 /// Ingest a skill into the global-scope partition.
 ///
 /// - Resolves the storage partition via `crate::scope::resolve_storage_session`
@@ -335,7 +397,7 @@ pub async fn ingest_skill(
                  expected to materialize the tag row"
             );
         }
-        if let Err(e) = crate::graph_write::create_typed_edge(
+        if let Err(e) = put_skill_typed_edge(
             storage,
             ctx,
             storage_session,
@@ -344,6 +406,7 @@ pub async fn ingest_skill(
             tag_id,
             1.0,
             None,
+            graph_client,
         )
         .await
         {
@@ -374,10 +437,14 @@ pub async fn ingest_skill(
         // `missing_prerequisites` — the caller couldn't tell whether the
         // prereq was truly missing or the lookup just failed, and retried
         // ingests produced duplicate entities.
-        let Some(prereq) = storage
-            .entity_find_by_exact_name(ctx, storage_session, prereq_name, "skill")
-            .await
-            .map_err(|e| anyhow::anyhow!("prereq lookup failed for {prereq_name:?}: {e}"))?
+        let Some(prereq) = find_skill_by_exact_name_with_read_after_write_retry(
+            storage,
+            ctx,
+            storage_session,
+            prereq_name,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("prereq lookup failed for {prereq_name:?}: {e}"))?
         else {
             tracing::info!(
                 skill = %params.name,
@@ -423,7 +490,7 @@ pub async fn ingest_skill(
             );
         }
 
-        if let Err(e) = crate::graph_write::create_typed_edge(
+        if let Err(e) = put_skill_typed_edge(
             storage,
             ctx,
             storage_session,
@@ -432,6 +499,7 @@ pub async fn ingest_skill(
             prereq.entity_id,
             1.0,
             None,
+            graph_client,
         )
         .await
         {
@@ -788,7 +856,7 @@ pub async fn ensure_parent_tag(
         }
     }
 
-    crate::graph_write::create_typed_edge(
+    put_skill_typed_edge(
         storage,
         ctx,
         global_session,
@@ -797,6 +865,7 @@ pub async fn ensure_parent_tag(
         parent_id,
         1.0,
         None,
+        graph_client,
     )
     .await?;
 
@@ -1130,6 +1199,32 @@ mod tests {
         assert!(
             msg.contains("simulated CQL transport failure"),
             "error must name the underlying storage failure, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_skill_retries_prereq_exact_lookup_after_read_after_write_miss() {
+        // Regression for the live skill E2E flake: the prerequisite skill
+        // write can succeed, but an immediate exact-name read at consistency
+        // ONE can hit a replica that has not observed it yet. Prerequisite
+        // resolution should retry boundedly before reporting it missing.
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+
+        ingest_skill(&storage, &ctx, base_params("unit-testing"), None, None)
+            .await
+            .unwrap();
+        storage
+            .force_exact_name_misses
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+
+        let mut p = base_params("tdd");
+        p.prerequisites = vec!["unit-testing".into()];
+        let action = ingest_skill(&storage, &ctx, p, None, None).await.unwrap();
+
+        assert!(
+            action.missing_prerequisites().is_empty(),
+            "transient read-after-write misses must not surface as missing prerequisites"
         );
     }
 
