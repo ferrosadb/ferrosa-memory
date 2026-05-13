@@ -159,13 +159,28 @@ async fn main() -> anyhow::Result<()> {
         *te_distribution.entry((tid, sid)).or_default() += 1;
 
         if tid == tenant_id && sid != target_session {
+            // Repair semantics: this binary reads existing typed_edges rows
+            // and re-INSERTs them under the corrected session_id. If the
+            // existing weight can't be decoded we MUST NOT silently
+            // fabricate one (e.g. 1.0 = max confidence), because we'd be
+            // forging data into the new row. Skip the row and surface it
+            // in the dry-run distribution count so an operator can dig in.
+            let Some(weight) = cql_get::<f64>(&row, &col_map, "weight").ok() else {
+                tracing::warn!(
+                    tenant = %tid,
+                    session = %sid,
+                    "typed_edges row has null/corrupt weight; skipping repair (would fabricate \
+                     edge confidence on re-insert)"
+                );
+                continue;
+            };
             te_rows.push(TypedEdgeRow {
                 src: cql_get::<uuid::Uuid>(&row, &col_map, "src_id").unwrap_or_default(),
                 etype: cql_get::<String>(&row, &col_map, "edge_type").unwrap_or_default(),
                 dst: cql_get::<uuid::Uuid>(&row, &col_map, "dst_id").unwrap_or_default(),
                 tid,
                 sid,
-                weight: cql_get::<f64>(&row, &col_map, "weight").unwrap_or(1.0),
+                weight,
                 metadata: cql_get::<String>(&row, &col_map, "metadata").unwrap_or_default(),
                 created_at: cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
                     .unwrap_or_default(),

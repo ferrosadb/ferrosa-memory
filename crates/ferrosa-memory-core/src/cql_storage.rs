@@ -128,6 +128,34 @@ fn temporal_count_query(ks: &str) -> String {
     format!("SELECT count(*) FROM {ks}.temporal_events WHERE tenant_id = ? ALLOW FILTERING")
 }
 
+/// Decode the `weight` column from an edge row, returning `None` and emitting
+/// a tracing warning if the column is NULL or fails to deserialize.
+///
+/// **Why not default to 1.0?** `1.0` is the strongest possible edge confidence
+/// in this codebase (schema doc on `dispatch.rs` create_edge: "default 1.0",
+/// `weight.maximum=1`). Silently substituting 1.0 on read-back overstates an
+/// edge's confidence whenever the stored value was missing or corrupt —
+/// downstream ranking, traversal, and consolidation paths then trust a
+/// fabricated number. The caller skips the row instead (matching the
+/// codebase convention used for malformed `src_id`/`dst_id` rows), letting
+/// the bad data surface in the warning rather than getting laundered into
+/// the result.
+pub fn decode_edge_weight(row: &Row, col_map: &ColMap, table_label: &str) -> Option<f64> {
+    match cql_get::<f64>(row, col_map, "weight") {
+        Ok(w) => Some(w),
+        Err(e) => {
+            tracing::warn!(
+                table = table_label,
+                column = "weight",
+                err = %e,
+                "edge row has null/corrupt weight; skipping rather than fabricating a default \
+                 that would overstate edge confidence"
+            );
+            None
+        }
+    }
+}
+
 fn cql_get_i64_from_single_aggregate(
     row: &Row,
     col_map: &ColMap,
@@ -4353,13 +4381,16 @@ impl Storage for CqlStorage {
                     tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
                     Default::default()
                 });
+            let Some(weight) = decode_edge_weight(&row, &col_map, "typed_edges") else {
+                continue;
+            };
             edges.push(TypedEdge {
                 tenant_id: ctx.tenant_id,
                 session_id,
                 src_id,
                 edge_type,
                 dst_id,
-                weight: cql_get::<f64>(&row, &col_map, "weight").unwrap_or(1.0),
+                weight,
                 metadata: cql_get::<String>(&row, &col_map, "metadata")
                     .ok()
                     .filter(|s| !s.is_empty()),
@@ -4392,13 +4423,16 @@ impl Storage for CqlStorage {
                     tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
                     Default::default()
                 });
+            let Some(weight) = decode_edge_weight(&row, &col_map, "typed_edges") else {
+                continue;
+            };
             edges.push(TypedEdge {
                 tenant_id: ctx.tenant_id,
                 session_id,
                 src_id,
                 edge_type,
                 dst_id,
-                weight: cql_get::<f64>(&row, &col_map, "weight").unwrap_or(1.0),
+                weight,
                 metadata: cql_get::<String>(&row, &col_map, "metadata")
                     .ok()
                     .filter(|s| !s.is_empty()),
@@ -4438,13 +4472,24 @@ impl Storage for CqlStorage {
                 let created_at =
                     cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
                         .unwrap_or_default();
+                let weight = cql_get::<f64>(&row, &col_map, "weight").map_err(|e| {
+                    // typed_edge_stream_all's caller treats Err here as
+                    // "skip malformed row" (see the bail!-then-warn pattern
+                    // below). Be explicit about WHY we skip — silently
+                    // fabricating weight=1.0 overstates the edge's
+                    // confidence and corrupts downstream ranking.
+                    anyhow::anyhow!(
+                        "typed_edges row has null/corrupt weight ({e}); skipping rather than \
+                         fabricating a default that would overstate edge confidence"
+                    )
+                })?;
                 Ok(TypedEdge {
                     tenant_id: ctx.tenant_id,
                     session_id,
                     src_id,
                     edge_type,
                     dst_id,
-                    weight: cql_get::<f64>(&row, &col_map, "weight").unwrap_or(1.0),
+                    weight,
                     metadata: cql_get::<String>(&row, &col_map, "metadata")
                         .ok()
                         .filter(|s| !s.is_empty()),
@@ -4493,13 +4538,16 @@ impl Storage for CqlStorage {
                     tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
                     Default::default()
                 });
+            let Some(weight) = decode_edge_weight(&row, &col_map, "typed_edges") else {
+                continue;
+            };
             edges.push(TypedEdge {
                 tenant_id: ctx.tenant_id,
                 session_id,
                 src_id,
                 edge_type: cql_get::<String>(&row, &col_map, "edge_type").unwrap_or_default(),
                 dst_id: cql_get(&row, &col_map, "dst_id")?,
-                weight: cql_get::<f64>(&row, &col_map, "weight").unwrap_or(1.0),
+                weight,
                 metadata: cql_get::<String>(&row, &col_map, "metadata")
                     .ok()
                     .filter(|s| !s.is_empty()),
@@ -4852,6 +4900,53 @@ impl Storage for CqlStorage {
 #[cfg(test)]
 mod cql_storage_tests {
     use super::*;
+
+    /// Build a synthetic `Row`/`ColMap` pair for unit-testing column decoders
+    /// without spinning up a live cluster.
+    fn synthetic_row(columns: Vec<(&str, Option<CqlValue>)>) -> (Row, ColMap) {
+        let mut col_map = ColMap::new();
+        let mut cells = Vec::with_capacity(columns.len());
+        for (i, (name, value)) in columns.into_iter().enumerate() {
+            col_map.insert(name.to_string(), i);
+            cells.push(value);
+        }
+        (Row { columns: cells }, col_map)
+    }
+
+    #[test]
+    fn decode_edge_weight_returns_stored_value_when_present() {
+        let (row, col_map) = synthetic_row(vec![("weight", Some(CqlValue::Double(0.4)))]);
+        assert_eq!(decode_edge_weight(&row, &col_map, "typed_edges"), Some(0.4));
+    }
+
+    #[test]
+    fn decode_edge_weight_returns_none_on_null_so_caller_can_skip() {
+        // Regression: previously this path was
+        // `cql_get::<f64>(...).unwrap_or(1.0)` which silently coerced a null
+        // weight column to the *maximum* possible edge confidence — exactly
+        // the wrong default for a confidence field. The reviewer call-out:
+        // "doesn't that mean that the default is a high probability edge,
+        // if it's not set should it be less than 1?" Yes — and the fix is
+        // to not fabricate a default at all on read-back. Callers loop and
+        // `continue` on `None`, mirroring how malformed `src_id`/`dst_id`
+        // rows are already handled.
+        let (row, col_map) = synthetic_row(vec![("weight", None)]);
+        assert_eq!(decode_edge_weight(&row, &col_map, "typed_edges"), None);
+    }
+
+    #[test]
+    fn decode_edge_weight_returns_none_when_column_absent() {
+        let (row, col_map) = synthetic_row(vec![("not_weight", Some(CqlValue::Double(0.4)))]);
+        assert_eq!(decode_edge_weight(&row, &col_map, "typed_edges"), None);
+    }
+
+    #[test]
+    fn decode_edge_weight_returns_none_on_wrong_type() {
+        // A row that wedges a string into the weight column shouldn't
+        // poison the result with weight=1.0.
+        let (row, col_map) = synthetic_row(vec![("weight", Some(CqlValue::Text("0.4".into())))]);
+        assert_eq!(decode_edge_weight(&row, &col_map, "typed_edges"), None);
+    }
 
     #[test]
     fn sprint1_seed_insert_statements_bind_created_at_timestamp() {
