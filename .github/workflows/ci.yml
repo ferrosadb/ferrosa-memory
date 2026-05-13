@@ -217,41 +217,21 @@ jobs:
         with:
           cache-on-failure: false
       - name: Clone ferrosa for cluster image
-        # ferrosa is the source of the Ferrosa server image used by the cluster.
-        # ferrosadb/ferrosa is public — anonymous HTTPS clone works without a
-        # token. Try a branch matching this PR/branch first, then fall back
-        # to main. Cross-repo work that needs an unreleased ferrosa change
-        # can push a matching branch on ferrosadb/ferrosa and CI picks it up.
+        # ferrosa is the source of the Ferrosa server image used by the
+        # cluster. ferrosadb/ferrosa is public — anonymous HTTPS clone works
+        # without a token. clone-ferrosa-src.sh tries each candidate branch
+        # in order; a matched branch is kept only if it isn't strictly older
+        # than main (otherwise CI would build a cluster image missing every
+        # main-only fix — see run 25784440206 where a stale
+        # `chore/integrate-pr12-plus-pr10` mirror on ferrosadb/ferrosa
+        # swallowed the adjacency-write-retry fix). No match → fall back to
+        # main. Cross-repo work pushes a matching branch on ferrosadb/ferrosa.
         run: |
-          CANDIDATES=(
-            "${GITHUB_HEAD_REF:-}"
-            "${GITHUB_REF_NAME:-}"
-          )
-          CLONED=""
-          for BRANCH in "${CANDIDATES[@]}"; do
-            [ -z "${BRANCH}" ] && continue
-            echo "Trying to clone ferrosadb/ferrosa @ ${BRANCH}..."
-            if git clone --depth=1 \
-                --branch "${BRANCH}" \
-                "https://github.com/ferrosadb/ferrosa.git" \
-                /tmp/ferrosa-src 2>/dev/null; then
-              echo "Cloned ${BRANCH}."
-              CLONED="${BRANCH}"
-              break
-            fi
-          done
-          if [ -z "${CLONED}" ]; then
-            echo "No matching feature branch on ferrosadb/ferrosa; falling back to main..."
-            git clone --depth=1 \
-              "https://github.com/ferrosadb/ferrosa.git" \
-              /tmp/ferrosa-src
-          fi
-          # Sanity check: the cluster image build will COPY Cargo.lock; fail
-          # loud here if the cloned source doesn't have it.
-          if [ ! -f /tmp/ferrosa-src/Cargo.lock ]; then
-            echo "ERROR: /tmp/ferrosa-src/Cargo.lock missing — cluster image build will fail." >&2
-            exit 1
-          fi
+          ./.github/scripts/clone-ferrosa-src.sh \
+            --remote https://github.com/ferrosadb/ferrosa.git \
+            --dest   /tmp/ferrosa-src \
+            --candidate "${GITHUB_HEAD_REF:-}" \
+            --candidate "${GITHUB_REF_NAME:-}"
       - name: Bring up 3-node cluster on ports 19042-19044
         run: |
           # Write a CI compose that maps 9042→19042 etc. so tests that hardcode
