@@ -58,7 +58,7 @@ tokio-tungstenite = "0.24"
 futures-util = "0.3"
 
 # Ordered floats for Eq/Hash on f64
-ordered-float = { version = "4", features = ["serde"] }
+ordered-float = { version = "5", features = ["serde"] }
 
 # Test helpers
 tempfile = "3"
