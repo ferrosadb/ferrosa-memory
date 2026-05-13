@@ -224,6 +224,11 @@ jobs:
         # can push a matching branch on ferrosadb/ferrosa and CI picks it up.
         run: |
           CANDIDATES=(
+            # Until ferrosadb/ferrosa#34 lands, prefer the adjacency-retry
+            # branch so this cluster-int job exercises the fix for the
+            # MutationForward race seen in ferrosa-memory CI run
+            # 25778872109. Drop this line once #34 is on ferrosa main.
+            "fix/adjacency-write-retry-on-follower-apply-lag"
             "${GITHUB_HEAD_REF:-}"
             "${GITHUB_REF_NAME:-}"
           )
