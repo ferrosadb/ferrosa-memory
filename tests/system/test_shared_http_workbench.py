@@ -221,7 +221,9 @@ def test_t_s_012_viz_surface_uses_shared_nav_and_ferrosa_brand_tokens():
     assert "window.__FMEM_WORKBENCH_SCHEME__" in html
     assert "window.__FMEM_WORKBENCH_PORT__" in html
     assert "configureShellNav()" in html
-    assert "ws = new WebSocket(`${protocol}//${location.host}/viz/ws`);" in html
+    assert "const wsHost = configuredPort > 0 ? `${location.hostname}:${configuredPort}` : location.host;" in html
+    assert "const wsUrl = `${protocol}//${wsHost}/viz/ws`;" in html
+    assert "ws = new WebSocket(wsUrl);" in html
     assert "28766" not in html
     assert "28767" not in html
     assert ">Home<" in html
