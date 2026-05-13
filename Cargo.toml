@@ -3,7 +3,7 @@ members = ["crates/ferrosa-memory-core", "crates/ferrosa-memory-mcp", "crates/fe
 resolver = "2"
 
 [workspace.package]
-version = "0.8.8+8"
+version = "0.9.0"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -47,7 +47,7 @@ anyhow = "1"
 dirs = "6"
 
 # CQL driver (Ferrosa/Cassandra) — canonical ScyllaDB Rust driver (p1-22).
-# Replaces the personal cdrs-tokio fork (bkearns/cdrs-tokio, branch feature/vector-type).
+# Replaces an earlier cdrs-tokio fork on the feature/vector-type branch.
 # The fork existed only for VECTOR type support; scylla 0.15 supports bytes/blob
 # round-trips which we use for vector embedding storage (encode_vector/decode_vector).
 scylla = { version = "0.15", features = ["chrono-04"] }
