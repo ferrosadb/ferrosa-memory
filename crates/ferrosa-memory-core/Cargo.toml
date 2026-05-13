@@ -32,7 +32,7 @@ tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 ordered-float = { workspace = true }
 tempfile = { workspace = true }
-nom = "7"
+nom = "8"
 nom-supreme = "0.8"
 
 # Integration tests under `tests/` compile against the public crate
