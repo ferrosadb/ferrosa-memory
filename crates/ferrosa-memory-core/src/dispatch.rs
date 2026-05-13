@@ -325,6 +325,102 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "remote_list".into(),
+            description: "List tenant-scoped configured remote memory providers without exposing credentials.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
+                }
+            }),
+        },
+        ToolDef {
+            name: "remote_add".into(),
+            description: "Register or replace a tenant-scoped remote memory endpoint, trust class, instance id, and public-key fingerprint. Endpoints must be HTTPS/HTTP URLs; secrets are not accepted.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tenant_id": { "type": "string", "format": "uuid" },
+                    "remote_id": { "type": "string", "format": "uuid" },
+                    "instance_id": { "type": "string", "format": "uuid" },
+                    "name": { "type": "string", "minLength": 1, "maxLength": 256 },
+                    "endpoint": { "type": "string", "description": "HTTP(S) endpoint for the remote MCP server; do not include credentials." },
+                    "trust_class": { "type": "string", "enum": ["personal", "team", "partner", "public", "archive"] },
+                    "public_key_fingerprint": { "type": "string", "minLength": 1, "maxLength": 256 }
+                },
+                "required": ["tenant_id", "instance_id", "name", "endpoint", "trust_class", "public_key_fingerprint"]
+            }),
+        },
+        ToolDef {
+            name: "remote_update_policy".into(),
+            description: "Append tenant-scoped Datalog policy facts for a configured remote. Supported actions: read, detail_fetch, autocommit, requires_activation, should_consult, trusted_for, not_trusted_for, fallback_enabled.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tenant_id": { "type": "string", "format": "uuid" },
+                    "remote_id": { "type": "string", "format": "uuid" },
+                    "facts": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": { "type": "string", "enum": ["grant", "deny"] },
+                                "namespace": { "type": "string", "minLength": 1 },
+                                "action": { "type": "string", "minLength": 1 },
+                                "expires_at": { "type": "string", "format": "date-time" }
+                            },
+                            "required": ["kind", "namespace", "action"]
+                        }
+                    }
+                },
+                "required": ["tenant_id", "remote_id", "facts"]
+            }),
+        },
+        ToolDef {
+            name: "remote_remove".into(),
+            description: "Disable a configured remote while preserving import provenance and policy audit rows.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tenant_id": { "type": "string", "format": "uuid" },
+                    "remote_id": { "type": "string", "format": "uuid" }
+                },
+                "required": ["tenant_id", "remote_id"]
+            }),
+        },
+        ToolDef {
+            name: "remote_health".into(),
+            description: "Report local configuration health for one remote without dialing or leaking credentials.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "remote_id": { "type": "string", "format": "uuid" } },
+                "required": ["remote_id"]
+            }),
+        },
+        ToolDef {
+            name: "remote_capabilities".into(),
+            description: "Return the remote-memory MCP capabilities expected for a configured remote.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "remote_id": { "type": "string", "format": "uuid" } },
+                "required": ["remote_id"]
+            }),
+        },
+        ToolDef {
+            name: "remote_explain_policy".into(),
+            description: "Evaluate and explain Datalog-backed remote policy for a configured remote, action, and namespace.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "remote_id": { "type": "string", "format": "uuid" },
+                    "action": { "type": "string", "enum": ["read", "detail_fetch", "autocommit", "requires_activation", "should_consult"] },
+                    "namespace": { "type": "string", "minLength": 1 }
+                },
+                "required": ["remote_id", "action", "namespace"]
+            }),
+        },
+        ToolDef {
             name: "search_context_segments".into(),
             description: "Hybrid-search raw context segments with lexical BM25 fallback plus Nomic vector ANN, optionally returning bounded prev/next temporal expansion windows.".into(),
             input_schema: serde_json::json!({
@@ -1548,6 +1644,13 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "teach_query_stream" => handle_teach_query_stream(args, storage, ctx).await,
         "pull_preview" => handle_pull_preview(args, storage, ctx).await,
         "pull_commit" => handle_pull_commit(args, storage, ctx).await,
+        "remote_list" => handle_remote_list(args, storage, ctx).await,
+        "remote_add" => handle_remote_add(args, storage, ctx).await,
+        "remote_update_policy" => handle_remote_update_policy(args, storage, ctx).await,
+        "remote_remove" => handle_remote_remove(args, storage, ctx).await,
+        "remote_health" => handle_remote_health(args, storage, ctx).await,
+        "remote_capabilities" => handle_remote_capabilities(args, storage, ctx).await,
+        "remote_explain_policy" => handle_remote_explain_policy(args, storage, ctx).await,
         "get_context_window" => handle_get_context_window(args, storage, ctx).await,
         "upsert_entity" => handle_upsert_entity(args, storage, ctx, session).await,
         "batch_ingest" => handle_batch_ingest(args, storage, ctx, session).await,
@@ -1703,6 +1806,13 @@ fn is_tier1(name: &str) -> bool {
             | "teach_query_stream"
             | "pull_preview"
             | "pull_commit"
+            | "remote_list"
+            | "remote_add"
+            | "remote_update_policy"
+            | "remote_remove"
+            | "remote_health"
+            | "remote_capabilities"
+            | "remote_explain_policy"
             | "search_context_segments"
             | "get_context_window"
             | "hybrid_search"
@@ -1743,6 +1853,9 @@ fn is_write_tool(name: &str) -> bool {
             | "complete_fold"
             | "ingest_context_segments"
             | "pull_commit"
+            | "remote_add"
+            | "remote_update_policy"
+            | "remote_remove"
             | "upsert_entity"
             | "batch_ingest"
             | "ingest_entities"
@@ -2454,6 +2567,414 @@ async fn handle_pull_commit<S: crate::storage::Storage>(
     .await
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
     serde_json::to_value(receipt).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteListRequest {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteAddRequest {
+    tenant_id: uuid::Uuid,
+    remote_id: Option<uuid::Uuid>,
+    instance_id: uuid::Uuid,
+    name: String,
+    endpoint: String,
+    trust_class: crate::remotes::types::RemoteTrustClass,
+    public_key_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemotePolicyInputFact {
+    kind: String,
+    namespace: String,
+    action: String,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteUpdatePolicyRequest {
+    tenant_id: uuid::Uuid,
+    remote_id: uuid::Uuid,
+    facts: Vec<RemotePolicyInputFact>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteIdRequest {
+    tenant_id: Option<uuid::Uuid>,
+    remote_id: uuid::Uuid,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteExplainPolicyRequest {
+    remote_id: uuid::Uuid,
+    action: String,
+    namespace: String,
+}
+
+async fn handle_remote_list<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let request: RemoteListRequest = serde_json::from_value(args)
+        .map_err(|e| (INVALID_PARAMS, format!("invalid remote_list request: {e}")))?;
+    let limit = request.limit.unwrap_or(100).clamp(1, 100);
+    let mut remotes = storage
+        .remote_list(ctx, limit)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    remotes.sort_by(|a, b| a.name.cmp(&b.name).then(a.remote_id.cmp(&b.remote_id)));
+    remotes.truncate(limit);
+    Ok(serde_json::json!({ "remotes": remotes, "count": remotes.len() }))
+}
+
+async fn handle_remote_add<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let request: RemoteAddRequest = serde_json::from_value(args)
+        .map_err(|e| (INVALID_PARAMS, format!("invalid remote_add request: {e}")))?;
+    ensure_remote_tenant(request.tenant_id, ctx)?;
+    let name = request.name.trim();
+    let endpoint = request.endpoint.trim();
+    let fingerprint = request.public_key_fingerprint.trim();
+    if name.is_empty() || endpoint.is_empty() || fingerprint.is_empty() {
+        return Err((
+            INVALID_PARAMS,
+            "name, endpoint, and public_key_fingerprint must not be empty".into(),
+        ));
+    }
+    validate_remote_endpoint(endpoint)?;
+    let now = chrono::Utc::now();
+    let remote = crate::remotes::types::MemoryRemote {
+        remote_id: request.remote_id.unwrap_or_else(uuid::Uuid::new_v4),
+        instance_id: crate::remote_identity::InstanceId(request.instance_id),
+        name: name.to_string(),
+        endpoint: endpoint.to_string(),
+        trust_class: request.trust_class,
+        public_key_fingerprint: crate::remote_identity::PublicKeyFingerprint(
+            fingerprint.to_string(),
+        ),
+        enabled: true,
+        created_at: now,
+        updated_at: now,
+    };
+    storage
+        .remote_put(ctx, &remote)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    Ok(serde_json::json!({ "action": "upserted", "remote": remote }))
+}
+
+async fn handle_remote_update_policy<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let request: RemoteUpdatePolicyRequest = serde_json::from_value(args).map_err(|e| {
+        (
+            INVALID_PARAMS,
+            format!("invalid remote_update_policy request: {e}"),
+        )
+    })?;
+    ensure_remote_tenant(request.tenant_id, ctx)?;
+    if request.facts.is_empty() {
+        return Err((INVALID_PARAMS, "facts must not be empty".into()));
+    }
+    let now = chrono::Utc::now();
+    let mut stored = Vec::with_capacity(request.facts.len());
+    for fact in request.facts {
+        let namespace = fact.namespace.trim();
+        let action = fact.action.trim();
+        if namespace.is_empty() || action.is_empty() {
+            return Err((
+                INVALID_PARAMS,
+                "policy namespace and action must not be empty".into(),
+            ));
+        }
+        let kind = match fact.kind.as_str() {
+            "grant" => {
+                crate::remotes::types::RemotePolicyKind::Grant(crate::remotes::types::RemoteGrant {
+                    namespace: namespace.to_string(),
+                    grant: action.to_string(),
+                })
+            }
+            "deny" => {
+                crate::remotes::types::RemotePolicyKind::Deny(crate::remotes::types::RemoteDeny {
+                    namespace: namespace.to_string(),
+                    deny: action.to_string(),
+                })
+            }
+            other => {
+                return Err((
+                    INVALID_PARAMS,
+                    format!("unsupported policy fact kind: {other}"),
+                ));
+            }
+        };
+        let row = crate::remotes::types::RemotePolicyFact {
+            fact_id: uuid::Uuid::new_v4(),
+            remote_id: request.remote_id,
+            kind,
+            created_at: now,
+            expires_at: fact.expires_at,
+        };
+        storage
+            .remote_policy_put(ctx, &row)
+            .await
+            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+        stored.push(row);
+    }
+    Ok(
+        serde_json::json!({ "remote_id": request.remote_id, "facts": stored, "policy_count": stored.len() }),
+    )
+}
+
+async fn handle_remote_remove<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let request: RemoteIdRequest = serde_json::from_value(args).map_err(|e| {
+        (
+            INVALID_PARAMS,
+            format!("invalid remote_remove request: {e}"),
+        )
+    })?;
+    if let Some(tenant_id) = request.tenant_id {
+        ensure_remote_tenant(tenant_id, ctx)?;
+    }
+    let mut remote = storage
+        .remote_get(ctx, request.remote_id)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+        .ok_or_else(|| {
+            (
+                INVALID_PARAMS,
+                format!("unknown remote_id: {}", request.remote_id),
+            )
+        })?;
+    remote.enabled = false;
+    remote.updated_at = chrono::Utc::now();
+    storage
+        .remote_put(ctx, &remote)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    Ok(
+        serde_json::json!({ "remote_id": request.remote_id, "enabled": false, "disabled": true, "removed": false, "preserved_provenance": true }),
+    )
+}
+
+async fn handle_remote_health<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let request: RemoteIdRequest = serde_json::from_value(args).map_err(|e| {
+        (
+            INVALID_PARAMS,
+            format!("invalid remote_health request: {e}"),
+        )
+    })?;
+    let remote = storage
+        .remote_get(ctx, request.remote_id)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+        .ok_or_else(|| {
+            (
+                INVALID_PARAMS,
+                format!("unknown remote_id: {}", request.remote_id),
+            )
+        })?;
+    let endpoint_valid = validate_remote_endpoint(&remote.endpoint).is_ok();
+    Ok(serde_json::json!({
+        "remote_id": remote.remote_id,
+        "name": remote.name,
+        "enabled": remote.enabled,
+        "configured": true,
+        "endpoint_valid": endpoint_valid,
+        "status": if remote.enabled && endpoint_valid { "configured" } else { "disabled_or_invalid" },
+        "checked_at": chrono::Utc::now(),
+    }))
+}
+
+async fn handle_remote_capabilities<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let request: RemoteIdRequest = serde_json::from_value(args).map_err(|e| {
+        (
+            INVALID_PARAMS,
+            format!("invalid remote_capabilities request: {e}"),
+        )
+    })?;
+    let remote = storage
+        .remote_get(ctx, request.remote_id)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+        .ok_or_else(|| {
+            (
+                INVALID_PARAMS,
+                format!("unknown remote_id: {}", request.remote_id),
+            )
+        })?;
+    Ok(serde_json::json!({
+        "remote_id": remote.remote_id,
+        "instance_id": remote.instance_id,
+        "enabled": remote.enabled,
+        "capabilities": ["teach_query_stream", "pull_preview", "pull_commit", "remote_detail", "archive_detail"],
+        "details": {
+            "supports_signed_packets": true,
+            "supports_stub_activation": true,
+            "supports_policy_explain": true,
+            "supports_provenance": true
+        }
+    }))
+}
+
+async fn handle_remote_explain_policy<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let request: RemoteExplainPolicyRequest = serde_json::from_value(args).map_err(|e| {
+        (
+            INVALID_PARAMS,
+            format!("invalid remote_explain_policy request: {e}"),
+        )
+    })?;
+    let remote = storage
+        .remote_get(ctx, request.remote_id)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+        .ok_or_else(|| {
+            (
+                INVALID_PARAMS,
+                format!("unknown remote_id: {}", request.remote_id),
+            )
+        })?;
+    let policy_rows = storage
+        .remote_policy_list(ctx, request.remote_id)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    let mut facts = vec![crate::remotes::policy::PolicyFact::remote(
+        remote.name.clone(),
+    )];
+    for row in &policy_rows {
+        if let Some(fact) = policy_fact_from_row(&remote.name, row)? {
+            facts.push(fact);
+        }
+    }
+    let policy = crate::remotes::policy::RemotePolicy::from_facts(facts);
+    let decision = match request.action.as_str() {
+        "read" => policy.can_query(&remote.name, &request.namespace),
+        "detail_fetch" => policy.can_fetch_detail(&remote.name, &policy_item(&request.namespace)),
+        "autocommit" => policy.can_autocommit(&remote.name, &policy_item(&request.namespace)),
+        "requires_activation" => {
+            policy.requires_activation(&remote.name, &policy_item(&request.namespace))
+        }
+        "should_consult" => policy.should_consult(&remote.name, &request.namespace),
+        other => {
+            return Err((
+                INVALID_PARAMS,
+                format!("unsupported policy action: {other}"),
+            ));
+        }
+    };
+    let reasons: Vec<_> = decision
+        .reasons
+        .iter()
+        .map(|reason| serde_json::json!({ "code": reason.code, "fact": reason.fact, "message": reason.message }))
+        .collect();
+    Ok(serde_json::json!({
+        "remote_id": request.remote_id,
+        "remote_name": remote.name,
+        "action": request.action,
+        "namespace": request.namespace,
+        "allowed": decision.allowed,
+        "explanation": decision.explanation,
+        "reasons": reasons,
+        "policy_fact_count": policy_rows.len()
+    }))
+}
+
+fn validate_remote_endpoint(endpoint: &str) -> Result<(), (i32, String)> {
+    if endpoint.starts_with("https://") || endpoint.starts_with("http://") {
+        if endpoint.contains('@') {
+            return Err((
+                INVALID_PARAMS,
+                "remote endpoint must not contain credentials".into(),
+            ));
+        }
+        return Ok(());
+    }
+    Err((
+        INVALID_PARAMS,
+        "remote endpoint must be an http(s) URL".into(),
+    ))
+}
+
+fn policy_action(action: &str) -> Result<crate::remotes::policy::PolicyAction, (i32, String)> {
+    match action {
+        "read" => Ok(crate::remotes::policy::PolicyAction::Read),
+        "detail_fetch" => Ok(crate::remotes::policy::PolicyAction::DetailFetch),
+        "autocommit" => Ok(crate::remotes::policy::PolicyAction::Autocommit),
+        "requires_activation" => Ok(crate::remotes::policy::PolicyAction::RequiresActivation),
+        "should_consult" => Ok(crate::remotes::policy::PolicyAction::ShouldConsult),
+        other => Err((
+            INVALID_PARAMS,
+            format!("unsupported policy action: {other}"),
+        )),
+    }
+}
+
+fn policy_fact_from_row(
+    remote_name: &str,
+    row: &crate::remotes::types::RemotePolicyFact,
+) -> Result<Option<crate::remotes::policy::PolicyFact>, (i32, String)> {
+    use crate::remotes::policy::PolicyFact;
+    match &row.kind {
+        crate::remotes::types::RemotePolicyKind::Grant(grant) => match grant.grant.as_str() {
+            "trusted_for" => Ok(Some(PolicyFact::trusted_for(
+                remote_name,
+                grant.namespace.clone(),
+            ))),
+            "fallback_enabled" => Ok(Some(PolicyFact::fallback_enabled(
+                remote_name,
+                grant.namespace.clone(),
+            ))),
+            action => Ok(Some(PolicyFact::grant(
+                remote_name,
+                policy_action(action)?,
+                grant.namespace.clone(),
+            ))),
+        },
+        crate::remotes::types::RemotePolicyKind::Deny(deny) => match deny.deny.as_str() {
+            "not_trusted_for" => Ok(Some(PolicyFact::not_trusted_for(
+                remote_name,
+                deny.namespace.clone(),
+            ))),
+            action => Ok(Some(PolicyFact::deny(
+                remote_name,
+                policy_action(action)?,
+                deny.namespace.clone(),
+            ))),
+        },
+    }
+}
+
+fn policy_item(namespace: &str) -> crate::remotes::policy::PolicyItem {
+    crate::remotes::policy::PolicyItem::new("packet_k_probe", namespace)
 }
 
 async fn handle_search_context_segments<S: crate::storage::Storage>(
@@ -7202,6 +7723,20 @@ mod tests {
         assert!(names.contains(&"find_memory_chain"));
         assert!(names.contains(&"run_consolidation"));
         assert!(names.contains(&"record_outcome"));
+        for remote_tool in [
+            "remote_list",
+            "remote_add",
+            "remote_update_policy",
+            "remote_remove",
+            "remote_health",
+            "remote_capabilities",
+            "remote_explain_policy",
+        ] {
+            assert!(
+                names.contains(&remote_tool),
+                "missing {remote_tool} in tools/list"
+            );
+        }
 
         // Tier-2 tools must NOT be present
         assert!(!names.contains(&"check_memo_cache"));
@@ -7209,6 +7744,279 @@ mod tests {
         assert!(!names.contains(&"recursive_explore"));
         assert!(!names.contains(&"promote_memory"));
         assert!(!names.contains(&"list_derived_cache"));
+    }
+
+    #[tokio::test]
+    async fn remote_add_rejects_invalid_endpoint_config() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+
+        let err = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "remote_add",
+                "arguments": {
+                    "tenant_id": ctx.tenant_id.to_string(),
+                    "name": "bad",
+                    "endpoint": "localhost:18765",
+                    "trust_class": "personal",
+                    "instance_id": Uuid::new_v4().to_string(),
+                    "public_key_fingerprint": "ed25519:abc"
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, INVALID_PARAMS);
+        assert!(err.1.contains("endpoint"));
+        assert_eq!(store.remote_list(&ctx, 10).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn remote_add_list_update_policy_explain_and_remove_round_trip() {
+        use crate::remote_identity::{ContentHash, InstanceId, PublicKeyFingerprint};
+        use crate::remotes::types::{MemoryProvenance, RemotePolicyFact, RemotePolicyKind};
+
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let remote_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let local_entity_id = Uuid::new_v4();
+        let packet_id = Uuid::new_v4();
+        let item_id = Uuid::new_v4();
+
+        let add = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "remote_add",
+                "arguments": {
+                    "tenant_id": ctx.tenant_id.to_string(),
+                    "remote_id": remote_id.to_string(),
+                    "name": "team-memory",
+                    "endpoint": "https://remote.example/mcp",
+                    "trust_class": "team",
+                    "instance_id": instance_id.to_string(),
+                    "public_key_fingerprint": "ed25519:team"
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let body = unwrap_tool_result(add);
+        assert_eq!(body["remote"]["remote_id"], remote_id.to_string());
+        assert_eq!(body["remote"]["enabled"], true);
+
+        let list = dispatch(
+            "tools/call",
+            serde_json::json!({"name": "remote_list", "arguments": {"limit": 10}}),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let body = unwrap_tool_result(list);
+        assert_eq!(body["remotes"].as_array().unwrap().len(), 1);
+
+        let policy = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "remote_update_policy",
+                "arguments": {
+                    "tenant_id": ctx.tenant_id.to_string(),
+                    "remote_id": remote_id.to_string(),
+                    "facts": [
+                        {"kind": "grant", "namespace": "knowledge", "action": "read"},
+                        {"kind": "grant", "namespace": "knowledge", "action": "autocommit"},
+                        {"kind": "grant", "namespace": "gpu_builds", "action": "trusted_for"},
+                        {"kind": "grant", "namespace": "gpu_builds", "action": "fallback_enabled"},
+                        {"kind": "grant", "namespace": "gpu_builds", "action": "should_consult"}
+                    ]
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let body = unwrap_tool_result(policy);
+        assert_eq!(body["policy_count"], 5);
+
+        let explain = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "remote_explain_policy",
+                "arguments": {
+                    "remote_id": remote_id.to_string(),
+                    "action": "read",
+                    "namespace": "knowledge"
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let body = unwrap_tool_result(explain);
+        assert_eq!(body["allowed"], true);
+        assert!(body["explanation"].as_str().unwrap().contains("Allowed"));
+
+        let explain = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "remote_explain_policy",
+                "arguments": {
+                    "remote_id": remote_id.to_string(),
+                    "action": "should_consult",
+                    "namespace": "gpu_builds"
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let body = unwrap_tool_result(explain);
+        assert_eq!(body["allowed"], false);
+        assert_eq!(body["action"], "should_consult");
+
+        store
+            .memory_provenance_put(
+                &ctx,
+                &MemoryProvenance {
+                    provenance_id: Uuid::new_v4(),
+                    local_entity_id,
+                    remote_id,
+                    packet_id,
+                    item_id,
+                    content_hash: ContentHash("content".into()),
+                    signature_hash: ContentHash("sig".into()),
+                    imported_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let remove = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "remote_remove",
+                "arguments": {"tenant_id": ctx.tenant_id.to_string(), "remote_id": remote_id.to_string()}
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let body = unwrap_tool_result(remove);
+        assert_eq!(body["removed"], false);
+        assert_eq!(body["disabled"], true);
+
+        let remote = store.remote_get(&ctx, remote_id).await.unwrap().unwrap();
+        assert_eq!(remote.instance_id, InstanceId(instance_id));
+        assert_eq!(
+            remote.public_key_fingerprint,
+            PublicKeyFingerprint("ed25519:team".into())
+        );
+        assert!(!remote.enabled);
+        let provenance = store
+            .memory_provenance_list_by_entity(&ctx, local_entity_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            provenance.len(),
+            1,
+            "remote_remove must not delete import provenance"
+        );
+        let facts = store.remote_policy_list(&ctx, remote_id).await.unwrap();
+        assert!(
+            facts
+                .iter()
+                .any(|fact| matches!(fact.kind, RemotePolicyKind::Grant(_)))
+        );
+        assert!(
+            facts
+                .iter()
+                .all(|fact: &RemotePolicyFact| fact.remote_id == remote_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_capabilities_and_health_reflect_registered_remote() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let remote_id = Uuid::new_v4();
+
+        dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "remote_add",
+                "arguments": {
+                    "tenant_id": ctx.tenant_id.to_string(),
+                    "remote_id": remote_id.to_string(),
+                    "name": "archive",
+                    "endpoint": "https://archive.example/mcp",
+                    "trust_class": "archive",
+                    "instance_id": Uuid::new_v4().to_string(),
+                    "public_key_fingerprint": "ed25519:archive"
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+
+        let health = dispatch(
+            "tools/call",
+            serde_json::json!({"name": "remote_health", "arguments": {"remote_id": remote_id.to_string()}}),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let body = unwrap_tool_result(health);
+        assert_eq!(body["status"], "configured");
+        assert_eq!(body["enabled"], true);
+
+        let capabilities = dispatch(
+            "tools/call",
+            serde_json::json!({"name": "remote_capabilities", "arguments": {"remote_id": remote_id.to_string()}}),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let body = unwrap_tool_result(capabilities);
+        assert!(
+            body["capabilities"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("teach_query_stream"))
+        );
+        assert!(
+            body["capabilities"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("archive_detail"))
+        );
     }
 
     #[tokio::test]

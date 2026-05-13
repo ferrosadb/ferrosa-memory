@@ -18,6 +18,11 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use ferrosa_memory_core::cql_storage::CqlStorage;
 use ferrosa_memory_core::graph::{GraphClient, GraphConfig};
+use ferrosa_memory_core::remote_identity::{InstanceId, PublicKeyFingerprint};
+use ferrosa_memory_core::remotes::policy::{PolicyAction, PolicyFact, RemotePolicy};
+use ferrosa_memory_core::remotes::types::{
+    MemoryRemote, RemoteDeny, RemoteGrant, RemotePolicyFact, RemotePolicyKind, RemoteTrustClass,
+};
 use ferrosa_memory_core::storage::Storage;
 use ferrosa_memory_core::types::{FoldStatus, TenantContext};
 use futures_util::StreamExt;
@@ -54,6 +59,81 @@ enum Command {
         #[arg(long)]
         source: std::path::PathBuf,
     },
+    /// Manage tenant-scoped remote-memory registry and policy facts
+    Remote {
+        /// Path to local cluster config (ferrosa-memory.toml format)
+        #[arg(long)]
+        config: std::path::PathBuf,
+        /// Tenant UUID that owns the remote registry rows
+        #[arg(long)]
+        tenant_id: Uuid,
+        #[command(subcommand)]
+        action: RemoteCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum RemoteCommand {
+    /// List registered remotes for this tenant
+    List {
+        /// Maximum rows to print
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Register or update a remote endpoint
+    Add {
+        #[arg(long)]
+        remote_id: Uuid,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        endpoint: String,
+        #[arg(long)]
+        instance_id: Uuid,
+        #[arg(long)]
+        public_key_fingerprint: String,
+        #[arg(long, default_value = "external")]
+        trust_class: String,
+    },
+    /// Append/update one Datalog-backed policy fact for a remote
+    UpdatePolicy {
+        #[arg(long)]
+        remote_id: Uuid,
+        #[arg(long, default_value = "grant")]
+        kind: String,
+        #[arg(long, default_value = "read")]
+        action: String,
+        #[arg(long, default_value = "*")]
+        namespace: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long, default_value_t = 1.0)]
+        weight: f64,
+    },
+    /// Soft-disable a remote; provenance and policy rows are preserved
+    Remove {
+        #[arg(long)]
+        remote_id: Uuid,
+    },
+    /// Show local registration health for a remote
+    Health {
+        #[arg(long)]
+        remote_id: Uuid,
+    },
+    /// Show local protocol capabilities for a remote
+    Capabilities {
+        #[arg(long)]
+        remote_id: Uuid,
+    },
+    /// Explain policy decisions for a remote
+    ExplainPolicy {
+        #[arg(long)]
+        remote_id: Uuid,
+        #[arg(long, default_value = "read")]
+        action: String,
+        #[arg(long, default_value = "knowledge")]
+        namespace: String,
+    },
 }
 
 #[derive(Default)]
@@ -86,6 +166,283 @@ async fn main() -> anyhow::Result<()> {
             tenant_id,
             dry_run,
         } => cmd_sync(&source, &dest, tenant_id, dry_run).await,
+        Command::Remote {
+            config,
+            tenant_id,
+            action,
+        } => cmd_remote(&config, tenant_id, action).await,
+    }
+}
+
+async fn connect_local(config_path: &std::path::Path) -> anyhow::Result<CqlStorage> {
+    let config = ferrosa_memory_core::config::parse_config(
+        &std::fs::read_to_string(config_path)
+            .with_context(|| format!("reading {}", config_path.display()))?,
+    )?;
+    CqlStorage::connect(&config.ferrosa)
+        .await
+        .context("connecting to local cluster")
+}
+
+fn remote_policy_action(action: &str) -> anyhow::Result<PolicyAction> {
+    match action {
+        "read" => Ok(PolicyAction::Read),
+        "detail_fetch" | "fetch_detail" | "detail" => Ok(PolicyAction::DetailFetch),
+        "autocommit" | "auto_commit" => Ok(PolicyAction::Autocommit),
+        "requires_activation" => Ok(PolicyAction::RequiresActivation),
+        "should_consult" => Ok(PolicyAction::ShouldConsult),
+        other => anyhow::bail!(
+            "unknown policy action {other:?}; expected read, detail_fetch, autocommit, requires_activation, or should_consult"
+        ),
+    }
+}
+
+fn remote_policy_action_name(action: PolicyAction) -> &'static str {
+    match action {
+        PolicyAction::Read => "read",
+        PolicyAction::DetailFetch => "detail_fetch",
+        PolicyAction::Autocommit => "autocommit",
+        PolicyAction::RequiresActivation => "requires_activation",
+        PolicyAction::ShouldConsult => "should_consult",
+    }
+}
+
+fn remote_policy_kind(
+    kind: &str,
+    action: &str,
+    namespace: String,
+) -> anyhow::Result<RemotePolicyKind> {
+    match kind {
+        "grant" | "allow" => Ok(RemotePolicyKind::Grant(RemoteGrant {
+            namespace,
+            grant: action.to_string(),
+        })),
+        "deny" | "block" => Ok(RemotePolicyKind::Deny(RemoteDeny {
+            namespace,
+            deny: action.to_string(),
+        })),
+        other => anyhow::bail!("unknown policy kind {other:?}; expected grant or deny"),
+    }
+}
+
+fn remote_trust_class(value: &str) -> anyhow::Result<RemoteTrustClass> {
+    match value {
+        "personal" => Ok(RemoteTrustClass::Personal),
+        "team" => Ok(RemoteTrustClass::Team),
+        "partner" | "external" => Ok(RemoteTrustClass::Partner),
+        "public" => Ok(RemoteTrustClass::Public),
+        "archive" => Ok(RemoteTrustClass::Archive),
+        other => anyhow::bail!(
+            "unknown trust class {other:?}; expected personal, team, partner, public, external, or archive"
+        ),
+    }
+}
+
+async fn cmd_remote(
+    config_path: &std::path::Path,
+    tenant_id: Uuid,
+    action: RemoteCommand,
+) -> anyhow::Result<()> {
+    let storage = connect_local(config_path).await?;
+    let ctx = TenantContext {
+        tenant_id,
+        session_origin: "memory-sync-remote".into(),
+    };
+
+    match action {
+        RemoteCommand::List { limit } => {
+            let remotes = storage.remote_list(&ctx, limit).await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({ "remotes": remotes }))?
+            );
+        }
+        RemoteCommand::Add {
+            remote_id,
+            name,
+            endpoint,
+            instance_id,
+            public_key_fingerprint,
+            trust_class,
+        } => {
+            if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+                anyhow::bail!("remote endpoint must start with http:// or https://");
+            }
+            if endpoint.contains('@') {
+                anyhow::bail!("remote endpoint must not contain credentials");
+            }
+            let remote = MemoryRemote {
+                remote_id,
+                name,
+                endpoint,
+                instance_id: InstanceId(instance_id),
+                public_key_fingerprint: PublicKeyFingerprint(public_key_fingerprint),
+                trust_class: remote_trust_class(&trust_class)?,
+                enabled: true,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            };
+            storage.remote_put(&ctx, &remote).await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &serde_json::json!({ "remote_id": remote_id, "stored": true })
+                )?
+            );
+        }
+        RemoteCommand::UpdatePolicy {
+            remote_id,
+            kind,
+            action,
+            namespace,
+            reason: _,
+            weight: _,
+        } => {
+            let action = remote_policy_action(&action)?;
+            let kind = remote_policy_kind(&kind, remote_policy_action_name(action), namespace)?;
+            let fact = RemotePolicyFact {
+                remote_id,
+                fact_id: Uuid::new_v4(),
+                kind,
+                created_at: chrono::Utc::now(),
+                expires_at: None,
+            };
+            storage.remote_policy_put(&ctx, &fact).await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &serde_json::json!({ "remote_id": remote_id, "fact_id": fact.fact_id })
+                )?
+            );
+        }
+        RemoteCommand::Remove { remote_id } => {
+            let mut remote = storage
+                .remote_get(&ctx, remote_id)
+                .await?
+                .context("unknown remote_id")?;
+            remote.enabled = false;
+            remote.updated_at = chrono::Utc::now();
+            storage.remote_put(&ctx, &remote).await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &serde_json::json!({ "remote_id": remote_id, "disabled": true, "preserved_provenance": true })
+                )?
+            );
+        }
+        RemoteCommand::Health { remote_id } => {
+            let remote = storage
+                .remote_get(&ctx, remote_id)
+                .await?
+                .context("unknown remote_id")?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "remote_id": remote_id,
+                    "registered": true,
+                    "enabled": remote.enabled,
+                    "endpoint": remote.endpoint,
+                    "status": if remote.enabled { "configured" } else { "disabled" }
+                }))?
+            );
+        }
+        RemoteCommand::Capabilities { remote_id } => {
+            let remote = storage
+                .remote_get(&ctx, remote_id)
+                .await?
+                .context("unknown remote_id")?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "remote_id": remote_id,
+                    "enabled": remote.enabled,
+                    "capabilities": ["teach_query_stream", "pull_preview", "pull_commit", "remote_detail", "archive_detail"],
+                    "supports_policy_explain": true,
+                    "supports_provenance": true
+                }))?
+            );
+        }
+        RemoteCommand::ExplainPolicy {
+            remote_id,
+            action,
+            namespace,
+        } => {
+            let remote = storage
+                .remote_get(&ctx, remote_id)
+                .await?
+                .context("unknown remote_id")?;
+            let rows = storage.remote_policy_list(&ctx, remote_id).await?;
+            let mut facts = vec![PolicyFact::remote(remote.name.clone())];
+            for row in &rows {
+                if let Some(fact) = policy_fact_from_row(&remote.name, row)? {
+                    facts.push(fact);
+                }
+            }
+            let policy = RemotePolicy::from_facts(facts);
+            let item = ferrosa_memory_core::remotes::policy::PolicyItem::new(
+                "memory_sync_cli_probe",
+                namespace.clone(),
+            );
+            let decision = match remote_policy_action(&action)? {
+                PolicyAction::Read => policy.can_query(&remote.name, &namespace),
+                PolicyAction::DetailFetch => policy.can_fetch_detail(&remote.name, &item),
+                PolicyAction::Autocommit => policy.can_autocommit(&remote.name, &item),
+                PolicyAction::RequiresActivation => policy.requires_activation(&remote.name, &item),
+                PolicyAction::ShouldConsult => policy.should_consult(&remote.name, &namespace),
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "remote_id": remote_id,
+                    "remote_name": remote.name,
+                    "action": action,
+                    "namespace": namespace,
+                    "allowed": decision.allowed,
+                    "explanation": decision.explanation,
+                    "reasons": decision.reasons.iter().map(|reason| serde_json::json!({
+                        "code": reason.code,
+                        "fact": reason.fact,
+                        "message": reason.message,
+                    })).collect::<Vec<_>>(),
+                    "policy_fact_count": rows.len(),
+                }))?
+            );
+        }
+    }
+    Ok(())
+}
+
+fn policy_fact_from_row(
+    remote_name: &str,
+    row: &RemotePolicyFact,
+) -> anyhow::Result<Option<PolicyFact>> {
+    match &row.kind {
+        RemotePolicyKind::Grant(grant) => match grant.grant.as_str() {
+            "trusted_for" => Ok(Some(PolicyFact::trusted_for(
+                remote_name,
+                grant.namespace.clone(),
+            ))),
+            "fallback_enabled" => Ok(Some(PolicyFact::fallback_enabled(
+                remote_name,
+                grant.namespace.clone(),
+            ))),
+            action => Ok(Some(PolicyFact::grant(
+                remote_name,
+                remote_policy_action(action)?,
+                grant.namespace.clone(),
+            ))),
+        },
+        RemotePolicyKind::Deny(deny) => match deny.deny.as_str() {
+            "not_trusted_for" => Ok(Some(PolicyFact::not_trusted_for(
+                remote_name,
+                deny.namespace.clone(),
+            ))),
+            action => Ok(Some(PolicyFact::deny(
+                remote_name,
+                remote_policy_action(action)?,
+                deny.namespace.clone(),
+            ))),
+        },
     }
 }
 
@@ -486,4 +843,122 @@ async fn raw_query(
         rows.push(row.with_context(|| format!("raw query row decode failed: {query}"))?);
     }
     Ok((col_map, rows))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_cli_parses_list_and_add_commands() {
+        let tenant_id = Uuid::new_v4();
+        let remote_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+
+        let list = Args::try_parse_from([
+            "memory-sync",
+            "remote",
+            "--config",
+            "local.toml",
+            "--tenant-id",
+            &tenant_id.to_string(),
+            "list",
+            "--limit",
+            "10",
+        ])
+        .unwrap();
+        assert!(matches!(
+            list.command,
+            Command::Remote {
+                action: RemoteCommand::List { limit: 10 },
+                ..
+            }
+        ));
+
+        let add = Args::try_parse_from([
+            "memory-sync",
+            "remote",
+            "--config",
+            "local.toml",
+            "--tenant-id",
+            &tenant_id.to_string(),
+            "add",
+            "--remote-id",
+            &remote_id.to_string(),
+            "--name",
+            "gpu",
+            "--endpoint",
+            "https://gpu.example/mcp",
+            "--instance-id",
+            &instance_id.to_string(),
+            "--public-key-fingerprint",
+            "ed25519:gpu",
+            "--trust-class",
+            "personal",
+        ])
+        .unwrap();
+        assert!(matches!(
+            add.command,
+            Command::Remote {
+                action: RemoteCommand::Add { name, endpoint, .. },
+                ..
+            } if name == "gpu" && endpoint == "https://gpu.example/mcp"
+        ));
+    }
+
+    #[test]
+    fn remote_cli_parses_policy_and_explain_namespace() {
+        let tenant_id = Uuid::new_v4();
+        let remote_id = Uuid::new_v4();
+
+        let update = Args::try_parse_from([
+            "memory-sync",
+            "remote",
+            "--config",
+            "local.toml",
+            "--tenant-id",
+            &tenant_id.to_string(),
+            "update-policy",
+            "--remote-id",
+            &remote_id.to_string(),
+            "--kind",
+            "grant",
+            "--action",
+            "autocommit",
+            "--namespace",
+            "knowledge",
+        ])
+        .unwrap();
+        assert!(matches!(
+            update.command,
+            Command::Remote {
+                action: RemoteCommand::UpdatePolicy { action, namespace, .. },
+                ..
+            } if action == "autocommit" && namespace == "knowledge"
+        ));
+
+        let explain = Args::try_parse_from([
+            "memory-sync",
+            "remote",
+            "--config",
+            "local.toml",
+            "--tenant-id",
+            &tenant_id.to_string(),
+            "explain-policy",
+            "--remote-id",
+            &remote_id.to_string(),
+            "--action",
+            "should_consult",
+            "--namespace",
+            "gpu_builds",
+        ])
+        .unwrap();
+        assert!(matches!(
+            explain.command,
+            Command::Remote {
+                action: RemoteCommand::ExplainPolicy { action, namespace, .. },
+                ..
+            } if action == "should_consult" && namespace == "gpu_builds"
+        ));
+    }
 }
