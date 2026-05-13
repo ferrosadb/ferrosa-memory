@@ -278,7 +278,7 @@ impl<T: McpTransport> EvalRunner<T> {
         self.delete_session(&session_id).await?;
 
         // T-010 / EF07: Verify clean state — CONTAMINATED if entity_count > 0
-        let pre_snapshot = self.take_snapshot().await?;
+        let pre_snapshot = self.take_snapshot(Some(&session_id)).await?;
         if pre_snapshot.entity_count != 0 {
             return Err(RunnerError::Contaminated {
                 entity_count: pre_snapshot.entity_count,
@@ -298,8 +298,9 @@ impl<T: McpTransport> EvalRunner<T> {
             traces.push(trace);
         }
 
-        // After-snapshot
-        let graph_snapshot_after = self.take_snapshot().await?;
+        // After-snapshot — same (tenant_id, session_id) scope as the writes,
+        // so we actually observe the entities the steps just created.
+        let graph_snapshot_after = self.take_snapshot(Some(&session_id)).await?;
 
         let duration = start.elapsed();
 
@@ -374,12 +375,31 @@ impl<T: McpTransport> EvalRunner<T> {
         Ok(())
     }
 
-    /// Take a graph snapshot via get_stats.
-    async fn take_snapshot(&mut self) -> Result<GraphSnapshot, RunnerError> {
-        let (response, _latency) = self
-            .transport
-            .call_tool("get_stats", serde_json::json!({}))
-            .await?;
+    /// Take a graph snapshot via get_stats, scoped to the same
+    /// (tenant_id, session_id) the scenario's steps write under.
+    ///
+    /// `handle_get_stats` filters `entity_count` by `(tenant_id, session_id)`
+    /// — defaulting to `Uuid::nil()` if `session_id` is omitted. The
+    /// scenario writes entities under a fresh `Uuid::new_v4()` per run
+    /// (`run_scenario` line 274), so omitting `session_id` would query the
+    /// nil-session bucket and always return 0 even when the upsert
+    /// succeeded. Pass the scenario's session_id through so the after-snap
+    /// observes the writes it's supposed to see.
+    ///
+    /// `session_id: None` is reserved for snapshots taken outside an active
+    /// scenario (preflight / canary), where the nil-session default is
+    /// intentional.
+    async fn take_snapshot(
+        &mut self,
+        session_id: Option<&Uuid>,
+    ) -> Result<GraphSnapshot, RunnerError> {
+        let mut args = serde_json::json!({
+            "tenant_id": self.config.tenant_id.to_string(),
+        });
+        if let Some(sid) = session_id {
+            args["session_id"] = serde_json::Value::String(sid.to_string());
+        }
+        let (response, _latency) = self.transport.call_tool("get_stats", args).await?;
         Ok(GraphSnapshot::from_stats_response(&response))
     }
 
@@ -1240,6 +1260,73 @@ tool = "get_stats"
         assert_eq!(tool_names[3], "hybrid_search", "fourth call: second step");
         assert_eq!(tool_names[4], "get_stats", "fifth call: after-snapshot");
         assert_eq!(tool_names[5], "delete_session", "sixth call: post-cleanup");
+    }
+
+    #[tokio::test]
+    async fn take_snapshot_scopes_get_stats_to_scenario_session_id() {
+        // Regression: `handle_get_stats` filters `entity_count` by
+        // `(tenant_id, session_id)` and defaults missing session_id to
+        // `Uuid::nil()`. Every step in `run_scenario` writes under a
+        // fresh `Uuid::new_v4()` session, so if `take_snapshot` omits
+        // session_id the after-snapshot reads the nil-session bucket
+        // and reports 0 entities even when step 0's upsert succeeded.
+        // That is exactly the `live_run_three_step_scenario` failure
+        // (`after-snapshot should show >= 1 entity, got 0`) seen in
+        // ferrosa-memory CI runs 25767314727 and 25780775043. Pin the
+        // contract: both before- and after-snapshot calls MUST carry
+        // the scenario's session_id, and that session_id MUST match
+        // the one execute_step injects into each tool call.
+        let transport = MockTransport::new().on_tool(
+            "get_stats",
+            vec![
+                (stats_response(0, 0), Duration::from_millis(5)),
+                (stats_response(1, 0), Duration::from_millis(5)),
+            ],
+        );
+        let calls = transport.calls.clone();
+        let scenario = make_scenario("session-scope", vec![make_step("smart_ingest")]);
+        let mut runner = EvalRunner::new(transport, test_config());
+        let _run = runner.run_scenario(scenario).await.unwrap();
+
+        let recorded = calls.lock().unwrap().clone();
+        let get_stats_calls: Vec<&Value> = recorded
+            .iter()
+            .filter_map(|(name, args)| (name == "get_stats").then_some(args))
+            .collect();
+        assert_eq!(
+            get_stats_calls.len(),
+            2,
+            "expected before+after get_stats, got {} calls",
+            get_stats_calls.len()
+        );
+
+        let step_calls: Vec<&Value> = recorded
+            .iter()
+            .filter_map(|(name, args)| (name == "smart_ingest").then_some(args))
+            .collect();
+        assert_eq!(step_calls.len(), 1, "step should have been called once");
+        let step_session_id = step_calls[0]
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .expect("execute_step must inject session_id into the step args");
+
+        for (i, args) in get_stats_calls.iter().enumerate() {
+            let got = args
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "get_stats call #{i} omitted session_id (args={args}); \
+                         handle_get_stats defaults to Uuid::nil() and would miss \
+                         entities written under the scenario's session_id"
+                    )
+                });
+            assert_eq!(
+                got, step_session_id,
+                "get_stats call #{i} must use the same session_id execute_step \
+                 injected ({step_session_id}), got {got}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -217,41 +217,21 @@ jobs:
         with:
           cache-on-failure: false
       - name: Clone ferrosa for cluster image
-        # ferrosa is the source of the Ferrosa server image used by the cluster.
-        # ferrosadb/ferrosa is public — anonymous HTTPS clone works without a
-        # token. Try a branch matching this PR/branch first, then fall back
-        # to main. Cross-repo work that needs an unreleased ferrosa change
-        # can push a matching branch on ferrosadb/ferrosa and CI picks it up.
+        # ferrosa is the source of the Ferrosa server image used by the
+        # cluster. ferrosadb/ferrosa is public — anonymous HTTPS clone works
+        # without a token. clone-ferrosa-src.sh tries each candidate branch
+        # in order; a matched branch is kept only if it isn't strictly older
+        # than main (otherwise CI would build a cluster image missing every
+        # main-only fix — see run 25784440206 where a stale
+        # `chore/integrate-pr12-plus-pr10` mirror on ferrosadb/ferrosa
+        # swallowed the adjacency-write-retry fix). No match → fall back to
+        # main. Cross-repo work pushes a matching branch on ferrosadb/ferrosa.
         run: |
-          CANDIDATES=(
-            "${GITHUB_HEAD_REF:-}"
-            "${GITHUB_REF_NAME:-}"
-          )
-          CLONED=""
-          for BRANCH in "${CANDIDATES[@]}"; do
-            [ -z "${BRANCH}" ] && continue
-            echo "Trying to clone ferrosadb/ferrosa @ ${BRANCH}..."
-            if git clone --depth=1 \
-                --branch "${BRANCH}" \
-                "https://github.com/ferrosadb/ferrosa.git" \
-                /tmp/ferrosa-src 2>/dev/null; then
-              echo "Cloned ${BRANCH}."
-              CLONED="${BRANCH}"
-              break
-            fi
-          done
-          if [ -z "${CLONED}" ]; then
-            echo "No matching feature branch on ferrosadb/ferrosa; falling back to main..."
-            git clone --depth=1 \
-              "https://github.com/ferrosadb/ferrosa.git" \
-              /tmp/ferrosa-src
-          fi
-          # Sanity check: the cluster image build will COPY Cargo.lock; fail
-          # loud here if the cloned source doesn't have it.
-          if [ ! -f /tmp/ferrosa-src/Cargo.lock ]; then
-            echo "ERROR: /tmp/ferrosa-src/Cargo.lock missing — cluster image build will fail." >&2
-            exit 1
-          fi
+          ./.github/scripts/clone-ferrosa-src.sh \
+            --remote https://github.com/ferrosadb/ferrosa.git \
+            --dest   /tmp/ferrosa-src \
+            --candidate "${GITHUB_HEAD_REF:-}" \
+            --candidate "${GITHUB_REF_NAME:-}"
       - name: Bring up 3-node cluster on ports 19042-19044
         run: |
           # Write a CI compose that maps 9042→19042 etc. so tests that hardcode
@@ -452,22 +432,19 @@ jobs:
           # statement setup, etc.). Probe the actual query endpoint with a
           # trivial RETURN, so cluster-gated graph_live tests don't race the
           # engine's warm-up.
-          echo "Waiting for graph /graph/query to serve a trivial RETURN..."
-          for i in $(seq 1 60); do
-            if curl -fsS -m 5 -X POST http://127.0.0.1:17474/graph/query \
-                -H "Content-Type: application/json" \
-                -d '{"query":"RETURN 1 AS x","keyspace":"agent_memory"}' \
-                >/dev/null 2>&1; then
-              echo "  /graph/query (read) live after ${i} attempts"
-              break
-            fi
-            if [ "$i" -eq 60 ]; then
-              echo "::error::/graph/query (read) did not respond within 120s"
-              docker compose -f /tmp/docker-compose.memory-ci.yml logs 2>/dev/null | tail -100
-              exit 1
-            fi
-            sleep 2
-          done
+          #
+          # Each attempt prints its outcome (HTTP status or curl error) so a
+          # silent stall is impossible — if the engine is hung we see *why*
+          # in the workflow log, not a 17-minute blank screen.
+          ./.github/scripts/graph-query-probe.sh \
+            --label "main cluster /graph/query (read)" \
+            --url   http://127.0.0.1:17474/graph/query \
+            --query 'RETURN 1 AS x' \
+            --keyspace agent_memory \
+            --attempts 30 \
+            --curl-timeout 5 \
+            --sleep 2 \
+            --logs-cmd 'docker compose -f /tmp/docker-compose.memory-ci.yml logs'
 
           # Read warms up fast; write path (MERGE + edge SET) often takes
           # longer on first use — index/buffer init, write-quorum
@@ -477,28 +454,14 @@ jobs:
           # two Entity MERGEs + a CO_OCCURS_WITH edge MERGE + SET. Use
           # fresh UUIDs per attempt so each iteration actually exercises
           # the create-write path rather than a no-op match.
-          gen_uuid() { python3 -c 'import uuid;print(uuid.uuid4())'; }
-          echo "Waiting for graph /graph/query MERGE+edge (write path) to succeed..."
-          for i in $(seq 1 60); do
-            T=$(gen_uuid); S=$(gen_uuid); A=$(gen_uuid); B=$(gen_uuid)
-            Q="MERGE (a:Entity {tenant_id: '${T}', session_id: '${S}', entity_id: '${A}'}) \
-               MERGE (b:Entity {tenant_id: '${T}', session_id: '${S}', entity_id: '${B}'}) \
-               MERGE (a)-[r:CO_OCCURS_WITH {tenant_id: '${T}', session_id: '${S}'}]->(b) \
-               SET r.strength = 0.5 RETURN r"
-            if curl -fsS -m 15 -X POST http://127.0.0.1:17474/graph/query \
-                -H "Content-Type: application/json" \
-                -d "{\"query\":\"${Q}\",\"keyspace\":\"agent_memory\"}" \
-                >/dev/null 2>&1; then
-              echo "  /graph/query (write) live after ${i} attempts"
-              break
-            fi
-            if [ "$i" -eq 60 ]; then
-              echo "::error::/graph/query (write) did not respond within 300s"
-              docker compose -f /tmp/docker-compose.memory-ci.yml logs 2>/dev/null | tail -100
-              exit 1
-            fi
-            sleep 5
-          done
+          ./.github/scripts/graph-write-probe.sh \
+            --label "main cluster /graph/query (write)" \
+            --url   http://127.0.0.1:17474/graph/query \
+            --keyspace agent_memory \
+            --attempts 30 \
+            --curl-timeout 10 \
+            --sleep 3 \
+            --logs-cmd 'docker compose -f /tmp/docker-compose.memory-ci.yml logs'
       - name: Bring up isolated test cluster (port 19542)
         # `crates/ferrosa-memory-core/tests/migration_drift.rs::t03_*`
         # exercises the v30 → v31 keyspace-upgrade path and needs a
@@ -519,7 +482,15 @@ jobs:
             ~/data/ferrosa-memory-test/node1 \
             ~/data/ferrosa-memory-test/node2 \
             ~/data/ferrosa-memory-test/node3
-          docker compose -f docker-compose.test.yml up -d
+          # CI brings up node1-test only (standalone). The 3-node test
+          # compose's progressive bring-up (standalone → pair → cluster)
+          # doesn't reliably reach write-quorum availability for the
+          # graph engine's adjacency keyspace within the CI window
+          # — graph writes timed out with CL=QUORUM received=0 even
+          # at RF=1. The migration-drift + graph_live + ferrosa_bugs
+          # suites only need a single-node cluster they can DROP+CREATE
+          # keyspaces on; standalone node1-test satisfies that.
+          docker compose -f docker-compose.test.yml up -d minio-test minio-test-init node1-test
           echo "Waiting for test cluster CQL on 19542..."
           for i in $(seq 1 60); do
             if bash -c "</dev/tcp/127.0.0.1/19542" 2>/dev/null; then
@@ -534,9 +505,16 @@ jobs:
             sleep 2
           done
           echo "Applying DDL to test cluster..."
+          # Test cluster doesn't reliably reach full cluster-mode quorum
+          # readiness within the migrate window — writes at CL=QUORUM with
+          # the production RF=3 DDL fail with received=0/required=2 even
+          # after schema is visible. The test cluster is ephemeral, so
+          # drop to RF=1 (single replica per write) for the test keyspace.
+          # This is exactly what --replication-factor was added for.
           timeout 180s cargo run --bin migrate -- \
             --contact-points 127.0.0.1:19542 \
             --keyspace agent_memory_test \
+            --replication-factor 1 \
             --ddl-dir ddl
 
           # Warm up the test cluster's graph /graph/query endpoint, both
@@ -546,45 +524,24 @@ jobs:
           # hits the graph engine before the write path is ready and
           # times out under the 10s reqwest limit. Same probe shape as
           # the main-cluster warmup above.
-          echo "Waiting for test cluster /graph/query (read) on 17974..."
-          for i in $(seq 1 60); do
-            if curl -fsS -m 5 -X POST http://127.0.0.1:17974/graph/query \
-                -H "Content-Type: application/json" \
-                -d '{"query":"RETURN 1 AS x","keyspace":"agent_memory_test"}' \
-                >/dev/null 2>&1; then
-              echo "  test cluster /graph/query (read) live after ${i} attempts"
-              break
-            fi
-            if [ "$i" -eq 60 ]; then
-              echo "::error::test cluster /graph/query (read) did not respond within 120s"
-              docker compose -f docker-compose.test.yml logs 2>/dev/null | tail -100
-              exit 1
-            fi
-            sleep 2
-          done
+          ./.github/scripts/graph-query-probe.sh \
+            --label "test cluster /graph/query (read)" \
+            --url   http://127.0.0.1:17974/graph/query \
+            --query 'RETURN 1 AS x' \
+            --keyspace agent_memory_test \
+            --attempts 30 \
+            --curl-timeout 5 \
+            --sleep 2 \
+            --logs-cmd 'docker compose -f docker-compose.test.yml logs'
 
-          gen_uuid() { python3 -c 'import uuid;print(uuid.uuid4())'; }
-          echo "Waiting for test cluster /graph/query MERGE+edge (write path)..."
-          for i in $(seq 1 60); do
-            T=$(gen_uuid); S=$(gen_uuid); A=$(gen_uuid); B=$(gen_uuid)
-            Q="MERGE (a:Entity {tenant_id: '${T}', session_id: '${S}', entity_id: '${A}'}) \
-               MERGE (b:Entity {tenant_id: '${T}', session_id: '${S}', entity_id: '${B}'}) \
-               MERGE (a)-[r:CO_OCCURS_WITH {tenant_id: '${T}', session_id: '${S}'}]->(b) \
-               SET r.strength = 0.5 RETURN r"
-            if curl -fsS -m 15 -X POST http://127.0.0.1:17974/graph/query \
-                -H "Content-Type: application/json" \
-                -d "{\"query\":\"${Q}\",\"keyspace\":\"agent_memory_test\"}" \
-                >/dev/null 2>&1; then
-              echo "  test cluster /graph/query (write) live after ${i} attempts"
-              break
-            fi
-            if [ "$i" -eq 60 ]; then
-              echo "::error::test cluster /graph/query (write) did not respond within 300s"
-              docker compose -f docker-compose.test.yml logs 2>/dev/null | tail -100
-              exit 1
-            fi
-            sleep 5
-          done
+          ./.github/scripts/graph-write-probe.sh \
+            --label "test cluster /graph/query (write)" \
+            --url   http://127.0.0.1:17974/graph/query \
+            --keyspace agent_memory_test \
+            --attempts 30 \
+            --curl-timeout 10 \
+            --sleep 3 \
+            --logs-cmd 'docker compose -f docker-compose.test.yml logs'
 
       - name: Build ferrosa-memory-mcp binary for eval tests
         # ferrosa-memory-eval's live tests spawn the MCP server via
