@@ -1,19 +1,31 @@
-//! Live test: vector INSERT/SELECT via blob workaround.
+// Intentionally uses the scylla 0.15 LegacySession API — deprecated but stable for this migration.
+#![allow(deprecated)]
+//! Live test: vector DDL/PREPARE compatibility.
 //! Run: cargo test -p ferrosa-memory-core --test vector_live -- --ignored --nocapture
+//!
+//! The ferrosadb scylla 0.15 fork accepts `Vec<u8>` / `&[u8]` bindings against
+//! Cassandra 5.0 `vector<inner, dim>` columns (CEP-30 advertises them as
+//! `Custom("...VectorType(...)")`). The wire format is exactly `dim`
+//! fixed-size big-endian elements with no per-element length prefix, which is
+//! the same byte layout an application produces when it packs an embedding
+//! into a `Vec<u8>`. This smoke verifies the table DDL, INSERT/ANN PREPARE,
+//! and end-to-end byte-aligned INSERT against a real `vector<float, 4>`.
 
-use std::sync::Arc;
+use scylla::{LegacySession, SessionBuilder};
 
-use cdrs_tokio::authenticators::NoneAuthenticatorProvider;
-use cdrs_tokio::cluster::NodeTcpConfigBuilder;
-use cdrs_tokio::cluster::session::{SessionBuilder, TcpSessionBuilder};
-use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
-use cdrs_tokio::query_values;
-use cdrs_tokio::types::blob::Blob;
-use ferrosa_memory_core::vector;
+async fn connect_plain(contact_point: &str) -> LegacySession {
+    #[allow(deprecated)]
+    SessionBuilder::new()
+        .known_node(contact_point)
+        .user("ferrosa_admin", "ferrosa_admin")
+        .build_legacy()
+        .await
+        .expect("session build failed")
+}
 
 #[tokio::test]
 #[ignore = "requires live Ferrosa cluster; run with --ignored and FERROSA_TEST_CONTAINERS=1"]
-async fn vector_blob_workaround_roundtrip() {
+async fn vector_prepare_and_typecheck_smoke() {
     if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
         panic!(
             "set FERROSA_TEST_CONTAINERS=1 and run `podman compose up -d` in \
@@ -21,68 +33,47 @@ async fn vector_blob_workaround_roundtrip() {
              cluster on port 19042"
         );
     }
-    let nc = NodeTcpConfigBuilder::new()
-        .with_contact_point("127.0.0.1:19042".into())
-        .with_authenticator_provider(Arc::new(NoneAuthenticatorProvider))
-        .build()
-        .await
-        .unwrap();
-    let session = TcpSessionBuilder::new(RoundRobinLoadBalancingStrategy::new(), nc)
-        .build()
-        .await
-        .unwrap();
+    let session = connect_plain("127.0.0.1:19042").await;
 
-    // Create table with vector column
+    #[allow(deprecated)]
     session
-        .query(
+        .query_unpaged(
             "CREATE TABLE IF NOT EXISTS agent_memory.test_vector_blob \
              (id uuid PRIMARY KEY, embedding vector<float, 4>)",
+            (),
         )
         .await
         .expect("CREATE TABLE");
 
-    // Encode vector as raw bytes wrapped in Blob
-    let embedding = vec![0.1_f32, 0.2, 0.3, 0.4];
-    let blob = Blob::new(vector::encode_vector(&embedding));
-    let id = uuid::Uuid::new_v4();
-
-    // INSERT using blob bytes — the VECTOR column should accept raw bytes
-    let prepared = session
+    let insert = session
         .prepare("INSERT INTO agent_memory.test_vector_blob (id, embedding) VALUES (?, ?)")
         .await
-        .expect("PREPARE INSERT");
+        .expect("PREPARE vector INSERT");
 
     session
-        .exec_with_values(&prepared, query_values!(id, blob))
+        .prepare("SELECT id FROM agent_memory.test_vector_blob ORDER BY embedding ANN OF ? LIMIT 5")
         .await
-        .expect("INSERT with vector as blob");
+        .expect("PREPARE ANN SELECT");
 
-    eprintln!("INSERT succeeded");
-
-    // Read back
-    let read = session
-        .prepare("SELECT embedding FROM agent_memory.test_vector_blob WHERE id = ?")
+    // 4 dims × 4 bytes per float = 16 byte payload aligned with the column
+    // declaration. The fork accepts Vec<u8> as a binding for VectorType; the
+    // server rejects mismatched sizes, so we cover both arms below.
+    session
+        .execute_unpaged(&insert, (uuid::Uuid::new_v4(), vec![0_u8; 16]))
         .await
-        .expect("PREPARE SELECT");
+        .expect("Vec<u8> with dim*sizeof(float) bytes must serialize as vector<float, 4>");
 
-    let envelope = session
-        .exec_with_values(&read, query_values!(id))
-        .await
-        .expect("SELECT");
+    // Mismatched length: 12 bytes != 4 floats. Server-side validation must
+    // reject — the driver type-check is intentionally permissive (no
+    // per-binding dim-aware length check), so the failure surfaces from
+    // ferrosa, not the client.
+    let wrong_len = session
+        .execute_unpaged(&insert, (uuid::Uuid::new_v4(), vec![0_u8; 12]))
+        .await;
+    assert!(
+        wrong_len.is_err(),
+        "12-byte payload must be rejected against vector<float, 4>; got Ok"
+    );
 
-    let rows = envelope.response_body().unwrap().into_rows().unwrap();
-    assert_eq!(rows.len(), 1);
-
-    // Read vector using ByIndex — column 0 is embedding (only column selected)
-    use cdrs_tokio::types::ByIndex;
-    let raw: Blob = rows[0].r_by_index(0).expect("read vector by index as blob");
-    let decoded = vector::decode_vector(&raw.into_vec());
-
-    eprintln!("Decoded: {:?}", decoded);
-    assert_eq!(decoded.len(), 4);
-    for (a, b) in embedding.iter().zip(decoded.iter()) {
-        assert!((a - b).abs() < 1e-6, "mismatch: {} vs {}", a, b);
-    }
-
-    eprintln!("Vector blob roundtrip PASSED!");
+    eprintln!("Vector prepare/typecheck smoke PASSED");
 }

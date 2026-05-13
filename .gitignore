@@ -4,8 +4,6 @@
 ferrosa-memory.toml
 .fastembed_cache/
 .superpowers/
-.claude/worktrees/
-.claude/scheduled_tasks.lock
 .opencode/
 opencode.json
 .runtime/
@@ -13,3 +11,12 @@ opencode.json
 # Developer-local agent state — do not commit.
 .claude/
 .forge/
+
+# Python test/build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Coverage artifacts
+lcov.info
+coverage/

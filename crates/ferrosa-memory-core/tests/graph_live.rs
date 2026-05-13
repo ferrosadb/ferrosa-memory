@@ -3,18 +3,26 @@
 //! Graph-owned writes should go through public Cypher mutations, not direct
 //! INSERTs into graph backing tables.
 //!
-//! Requires: podman compose up -d (single node on port 19042/17474)
-//! Run with: cargo test -p ferrosa-memory-core --test graph_live -- --ignored
+//! Targets the isolated test cluster via FERROSA_TEST_GRAPH_URL /
+//! FERROSA_TEST_KEYSPACE so the suite stays portable across local dev
+//! (test cluster on 17974) and CI (same env vars exported by the
+//! cluster-int job).
+//!
+//! Run:
+//!   scripts/start-test-cluster.sh
+//!   export $(scripts/start-test-cluster.sh --env)
+//!   cargo test -p ferrosa-memory-core --test graph_live -- --ignored
 
 use ferrosa_memory_core::graph::{GraphClient, GraphConfig};
+use ferrosa_memory_core::test_cluster::TestClusterConfig;
 use uuid::Uuid;
 
-async fn connect_graph(username: &str, password: &str) -> GraphClient {
+async fn connect_graph(cfg: &TestClusterConfig, username: &str, password: &str) -> GraphClient {
     GraphClient::connect(&GraphConfig {
-        http_url: "http://localhost:17474".into(),
+        http_url: cfg.graph_url.clone(),
         username: username.into(),
         password: password.into(),
-        keyspace: "agent_memory".into(),
+        keyspace: cfg.keyspace.clone(),
     })
     .await
     .expect("graph connect failed — is the cluster running?")
@@ -24,28 +32,20 @@ async fn connect_graph(username: &str, password: &str) -> GraphClient {
 #[tokio::test]
 #[ignore = "requires live Ferrosa cluster; run with --ignored and FERROSA_TEST_CONTAINERS=1"]
 async fn graph_health_check() {
-    if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
-        panic!(
-            "set FERROSA_TEST_CONTAINERS=1 and run `podman compose up -d` in \
-             the ferrosa-memory repo root — this test needs a live Ferrosa \
-             cluster on ports 19042 (CQL) and 17474 (graph HTTP)"
-        );
-    }
-    let _client = connect_graph("ferrosa_admin", "ferrosa_admin").await;
+    let Some(cfg) = TestClusterConfig::from_env_or_skip() else {
+        return;
+    };
+    let _client = connect_graph(&cfg, "ferrosa_admin", "ferrosa_admin").await;
     // If we get here, health check passed
 }
 
 #[tokio::test]
 #[ignore = "requires live Ferrosa cluster; run with --ignored and FERROSA_TEST_CONTAINERS=1"]
 async fn match_empty_returns_no_rows() {
-    if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
-        panic!(
-            "set FERROSA_TEST_CONTAINERS=1 and run `podman compose up -d` in \
-             the ferrosa-memory repo root — this test needs a live Ferrosa \
-             cluster on ports 19042 (CQL) and 17474 (graph HTTP)"
-        );
-    }
-    let client = connect_graph("ferrosa_admin", "ferrosa_admin").await;
+    let Some(cfg) = TestClusterConfig::from_env_or_skip() else {
+        return;
+    };
+    let client = connect_graph(&cfg, "ferrosa_admin", "ferrosa_admin").await;
     let fake_id = Uuid::new_v4();
     let ancestors = client
         .get_fold_ancestors(fake_id, Uuid::new_v4(), 5)
@@ -57,14 +57,10 @@ async fn match_empty_returns_no_rows() {
 #[tokio::test]
 #[ignore = "requires live Ferrosa cluster; run with --ignored and FERROSA_TEST_CONTAINERS=1"]
 async fn public_graph_write_round_trip_for_co_occurs_edges() {
-    if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
-        panic!(
-            "set FERROSA_TEST_CONTAINERS=1 and run `podman compose up -d` in \
-             the ferrosa-memory repo root — this test needs a live Ferrosa \
-             cluster on ports 19042 (CQL) and 17474 (graph HTTP)"
-        );
-    }
-    let client = connect_graph("ferrosa_admin", "ferrosa_admin").await;
+    let Some(cfg) = TestClusterConfig::from_env_or_skip() else {
+        return;
+    };
+    let client = connect_graph(&cfg, "ferrosa_admin", "ferrosa_admin").await;
     let tenant_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
     let entity_a = Uuid::new_v4();
@@ -120,14 +116,14 @@ async fn public_graph_write_round_trip_for_co_occurs_edges() {
 #[tokio::test]
 #[ignore = "requires live Ferrosa cluster; run with --ignored and FERROSA_TEST_CONTAINERS=1"]
 async fn ferrosa_user_is_denied_direct_graph_mutations() {
-    if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
-        panic!(
-            "set FERROSA_TEST_CONTAINERS=1 and run `podman compose up -d` in \
-             the ferrosa-memory repo root — this test needs a live Ferrosa \
-             cluster on ports 19042 (CQL) and 17474 (graph HTTP)"
-        );
+    let Some(cfg) = TestClusterConfig::from_env_or_skip() else {
+        return;
+    };
+    if std::env::var("FERROSA_TEST_AUTH_ENABLED").ok().as_deref() != Some("1") {
+        eprintln!("skipping graph authz assertion because FERROSA_TEST_AUTH_ENABLED=1 is not set");
+        return;
     }
-    let client = connect_graph("ferrosa_user", "ferrosa_user").await;
+    let client = connect_graph(&cfg, "ferrosa_user", "ferrosa_user").await;
     let tenant_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
     let entity_a = Uuid::new_v4();

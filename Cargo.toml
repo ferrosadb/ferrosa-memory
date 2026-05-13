@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/ferrosa-memory-core", "crates/ferrosa-memory-mcp", "crates/ferrosa-memory-batch", "crates/ferrosa-memory-sync"]
+members = ["crates/ferrosa-memory-core", "crates/ferrosa-memory-mcp", "crates/ferrosa-memory-batch", "crates/ferrosa-memory-sync", "crates/ferrosa-memory-eval"]
 resolver = "2"
 
 [workspace.package]
@@ -43,9 +43,11 @@ anyhow = "1"
 # Config
 dirs = "6"
 
-# CQL driver (Ferrosa/Cassandra) — using fork with VECTOR type support
-# PR: https://github.com/krojew/cdrs-tokio/pull/221
-cdrs-tokio = { git = "https://github.com/bkearns/cdrs-tokio.git", branch = "feature/vector-type", features = ["derive"] }
+# CQL driver (Ferrosa/Cassandra) — canonical ScyllaDB Rust driver (p1-22).
+# Replaces the personal cdrs-tokio fork (bkearns/cdrs-tokio, branch feature/vector-type).
+# The fork existed only for VECTOR type support; scylla 0.15 supports bytes/blob
+# round-trips which we use for vector embedding storage (encode_vector/decode_vector).
+scylla = { version = "0.15", features = ["chrono-04"] }
 
 # TLS
 tokio-rustls = "0.26"
@@ -63,3 +65,13 @@ tempfile = "3"
 
 # neo4rs removed — Ferrosa's Bolt is v5, neo4rs 0.8 only supports v4
 # Graph queries go through Ferrosa's HTTP /graph/query endpoint via reqwest
+
+# Fork of scylla-rust-driver carrying the Cassandra VectorType (CEP-30)
+# custom-type deserialization fix. Upstream rejects vector-typed columns
+# from Cassandra-compatible servers (ferrosa) with
+# "Support for custom types is not yet implemented".
+# Upstream PR: https://github.com/scylladb/scylla-rust-driver/pull/1624
+[patch.crates-io]
+scylla = { git = "https://github.com/ferrosadb/scylla-rust-driver", rev = "0d9f2f87" }
+scylla-cql = { git = "https://github.com/ferrosadb/scylla-rust-driver", rev = "0d9f2f87" }
+scylla-macros = { git = "https://github.com/ferrosadb/scylla-rust-driver", rev = "0d9f2f87" }

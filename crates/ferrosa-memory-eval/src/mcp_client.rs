@@ -9,8 +9,8 @@
 //! JSON-RPC 2.0 over stdio, newline-delimited. See `ferrosa-memory-core::transport`
 //! for request/response types.
 
-use sha2::{Digest, Sha256};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -564,8 +564,7 @@ for line in sys.stdin:
         assert_eq!(content[0]["type"], "text");
 
         // Parse the nested JSON text
-        let text: Value =
-            serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
+        let text: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(text["tool"], "get_stats");
         assert_eq!(text["ok"], true);
 
@@ -810,7 +809,10 @@ for line in sys.stdin:
         std::fs::write(&file_path, b"version-2").unwrap();
         let hash2 = compute_binary_hash(&file_path).unwrap();
 
-        assert_ne!(hash1, hash2, "different content should produce different hashes");
+        assert_ne!(
+            hash1, hash2,
+            "different content should produce different hashes"
+        );
     }
 
     #[test]
@@ -889,17 +891,25 @@ for line in sys.stdin:
     #[tokio::test]
     async fn http_client_call_tool_returns_error_for_unreachable() {
         let mut client = HttpMcpClient::new("http://127.0.0.1:1");
-        let result = client
-            .call_tool("get_stats", serde_json::json!({}))
-            .await;
+        let result = client.call_tool("get_stats", serde_json::json!({})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires an HTTP-bound MCP server; set FERROSA_MCP_HTTP_URL=http://host:port to opt in"]
     async fn http_client_live_initialize_and_get_stats() {
-        // Requires a live MCP server running on HTTP
-        let mut client = HttpMcpClient::new("http://localhost:8080");
+        // Skip cleanly when the harness URL isn't set. The default workspace
+        // --ignored sweep (local + CI) doesn't spin up an HTTP-bound MCP
+        // server — only contributors testing that surface specifically do.
+        let Ok(url) = std::env::var("FERROSA_MCP_HTTP_URL") else {
+            eprintln!(
+                "skip: FERROSA_MCP_HTTP_URL unset — set to an HTTP-bound MCP \
+                 server URL (e.g. http://localhost:8080) to exercise the \
+                 HttpMcpClient initialize/get_stats round-trip"
+            );
+            return;
+        };
+        let mut client = HttpMcpClient::new(&url);
 
         let init = client.initialize().await.expect("initialize failed");
         assert!(init.response["serverInfo"]["name"].is_string());
@@ -977,10 +987,7 @@ for line in sys.stdin:
         let text = content[0]["text"].as_str().expect("text should be string");
         let stats_json: Value =
             serde_json::from_str(text).expect("stats text should be valid JSON");
-        assert!(
-            stats_json.is_object(),
-            "stats should be a JSON object"
-        );
+        assert!(stats_json.is_object(), "stats should be a JSON object");
 
         // AC4: latency is tracked
         assert!(stats.latency > Duration::ZERO, "latency should be tracked");
@@ -1008,10 +1015,7 @@ for line in sys.stdin:
             .as_array()
             .expect("expected tools array");
 
-        let names: Vec<&str> = tools
-            .iter()
-            .filter_map(|t| t["name"].as_str())
-            .collect();
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
         assert!(
             names.contains(&"get_stats"),

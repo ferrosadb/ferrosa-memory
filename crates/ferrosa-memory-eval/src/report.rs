@@ -4,6 +4,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::memory_quality::MemoryQualityScore;
+
 // ---------------------------------------------------------------------------
 // ANSI helpers
 // ---------------------------------------------------------------------------
@@ -130,6 +132,8 @@ pub struct ScenarioResult {
     pub tool_usage: ToolUsageScore,
     pub dikw: Option<DIKWScore>,
     pub semantic: Option<SemanticRepoScore>,
+    #[serde(default)]
+    pub memory_quality: Option<MemoryQualityScore>,
     pub passed: bool,
     pub duration: Duration,
 }
@@ -289,6 +293,8 @@ impl EvalReport {
         self.render_level2(&mut out);
         // Level 3
         self.render_level3(&mut out);
+        // Memory quality
+        self.render_memory_quality(&mut out);
         // Aggregate
         self.render_aggregate(&mut out);
 
@@ -352,26 +358,14 @@ impl EvalReport {
             }
         };
 
-        out.push_str(&format!(
-            "  Data->Info:       {:.2}\n",
-            avg(&d2i_scores)
-        ));
-        out.push_str(&format!(
-            "  Info->Knowledge:  {:.2}\n",
-            avg(&i2k_scores)
-        ));
-        out.push_str(&format!(
-            "  Knowledge->Wisdom: {:.2}\n",
-            avg(&k2w_scores)
-        ));
+        out.push_str(&format!("  Data->Info:       {:.2}\n", avg(&d2i_scores)));
+        out.push_str(&format!("  Info->Knowledge:  {:.2}\n", avg(&i2k_scores)));
+        out.push_str(&format!("  Knowledge->Wisdom: {:.2}\n", avg(&k2w_scores)));
         out.push_str(&format!(
             "  Emergence:        {:.2}\n",
             avg(&emergence_scores)
         ));
-        out.push_str(&format!(
-            "  DIKW Composite:   {:.2}\n",
-            avg(&composites)
-        ));
+        out.push_str(&format!("  DIKW Composite:   {:.2}\n", avg(&composites)));
     }
 
     fn render_level3(&self, out: &mut String) {
@@ -413,10 +407,35 @@ impl EvalReport {
         out.push_str(&format!("  Graph:         {:.2}\n", avg(&graph)));
         out.push_str(&format!("  Multi-hop:     {:.2}\n", avg(&multi_hop)));
         out.push_str(&format!("  Dedup:         {:.2}\n", avg(&dedup)));
-        out.push_str(&format!(
-            "  Semantic Composite: {:.2}\n",
-            avg(&composites)
-        ));
+        out.push_str(&format!("  Semantic Composite: {:.2}\n", avg(&composites)));
+    }
+
+    fn render_memory_quality(&self, out: &mut String) {
+        let results: Vec<_> = self
+            .results
+            .iter()
+            .filter_map(|r| r.memory_quality.as_ref().map(|mq| (r, mq)))
+            .collect();
+        if results.is_empty() {
+            return;
+        }
+
+        out.push_str("\n--- Memory Quality: Retrieval Evidence Metrics ---\n");
+        for (r, mq) in results {
+            out.push_str(&format!(
+                "  {} {} mode={:?} chunk={:?} recall={:.2} precision={:.2} mrr={:.2} ndcg={:.2} distractors={} failure={:?}\n",
+                r.scenario_id,
+                dots_pad(&r.scenario_id, 25),
+                mq.retrieval_mode,
+                mq.chunking_policy,
+                mq.metrics.recall_at_k,
+                mq.metrics.precision_at_k,
+                mq.metrics.mrr,
+                mq.metrics.ndcg,
+                mq.metrics.distractor_hits,
+                mq.failure_kind,
+            ));
+        }
     }
 
     fn render_aggregate(&self, out: &mut String) {
@@ -445,10 +464,7 @@ impl EvalReport {
                 .iter()
                 .filter_map(|r| r.dikw.as_ref().map(|d| d.composite))
                 .sum::<f64>()
-                / l2.iter()
-                    .filter(|r| r.dikw.is_some())
-                    .count()
-                    .max(1) as f64;
+                / l2.iter().filter(|r| r.dikw.is_some()).count().max(1) as f64;
             let l2_passed = l2.iter().all(|r| r.passed);
             out.push_str(&format!(
                 "  DIKW:            {:.2}     {}\n",
@@ -463,10 +479,7 @@ impl EvalReport {
                 .iter()
                 .filter_map(|r| r.semantic.as_ref().map(|s| s.composite))
                 .sum::<f64>()
-                / l3.iter()
-                    .filter(|r| r.semantic.is_some())
-                    .count()
-                    .max(1) as f64;
+                / l3.iter().filter(|r| r.semantic.is_some()).count().max(1) as f64;
             let l3_passed = l3.iter().all(|r| r.passed);
             out.push_str(&format!(
                 "  Semantic Repo:   {:.2}     {}\n",
@@ -477,10 +490,16 @@ impl EvalReport {
 
         // Totals across all scenarios
         let total_tokens: u64 = self.results.iter().map(|r| r.tool_usage.total_tokens).sum();
-        let total_latency: Duration =
-            self.results.iter().map(|r| r.tool_usage.total_latency).sum();
+        let total_latency: Duration = self
+            .results
+            .iter()
+            .map(|r| r.tool_usage.total_latency)
+            .sum();
 
-        out.push_str(&format!("  Total tokens:    {}\n", format_tokens(total_tokens)));
+        out.push_str(&format!(
+            "  Total tokens:    {}\n",
+            format_tokens(total_tokens)
+        ));
         out.push_str(&format!(
             "  Total latency:   {:.1}s\n",
             total_latency.as_secs_f64()
@@ -584,6 +603,7 @@ mod tests {
             },
             dikw: None,
             semantic: None,
+            memory_quality: None,
             passed: true,
             duration: Duration::from_secs(3),
         }
@@ -621,6 +641,7 @@ mod tests {
             },
             dikw: None,
             semantic: None,
+            memory_quality: None,
             passed: false,
             duration: Duration::from_secs(5),
         }
@@ -682,6 +703,7 @@ mod tests {
                 composite: 0.75,
             }),
             semantic: None,
+            memory_quality: None,
             passed: true,
             duration: Duration::from_secs(8),
         }
@@ -722,6 +744,7 @@ mod tests {
                 dedup_accuracy: 0.75,
                 composite: 0.76,
             }),
+            memory_quality: None,
             passed: true,
             duration: Duration::from_secs(10),
         }
@@ -771,7 +794,10 @@ mod tests {
         let dikw = deser.results[3].dikw.as_ref().unwrap();
         assert!((dikw.data_to_info.score - 0.85).abs() < f64::EPSILON);
         assert!((dikw.emergence.score - 0.65).abs() < f64::EPSILON);
-        assert_eq!(dikw.emergence.new_edge_types, vec!["CO_OCCURS", "SUPERSEDES"]);
+        assert_eq!(
+            dikw.emergence.new_edge_types,
+            vec!["CO_OCCURS", "SUPERSEDES"]
+        );
 
         // Check SemanticRepoScore round-trip
         let sem = deser.results[4].semantic.as_ref().unwrap();
@@ -813,7 +839,7 @@ mod tests {
         // Verify the CLI output shows 1-5 scale but composite calc uses 0-1
         let composite = report.composite_score();
         assert!(
-            composite >= 0.0 && composite <= 1.0,
+            (0.0..=1.0).contains(&composite),
             "Composite must be 0-1: got {composite}"
         );
     }
@@ -865,10 +891,7 @@ mod tests {
             output.contains("Level 1: Standard MCP Metrics"),
             "Must contain L1 header"
         );
-        assert!(
-            output.contains("memo_cache"),
-            "Must list L1 scenario"
-        );
+        assert!(output.contains("memo_cache"), "Must list L1 scenario");
         // memo_cache composite = 0.80 -> display = 4.2
         assert!(
             output.contains("4.2/5.0"),
@@ -901,10 +924,7 @@ mod tests {
             output.contains("Level 2: DIKW Knowledge Transformation"),
             "Must contain L2 header"
         );
-        assert!(
-            output.contains("Data->Info:"),
-            "Must show DIKW sub-scores"
-        );
+        assert!(output.contains("Data->Info:"), "Must show DIKW sub-scores");
         assert!(
             output.contains("DIKW Composite:"),
             "Must show DIKW composite"
@@ -943,22 +963,13 @@ mod tests {
             output.contains("MCP Quality:"),
             "Must show MCP quality aggregate"
         );
-        assert!(
-            output.contains("DIKW:"),
-            "Must show DIKW aggregate"
-        );
+        assert!(output.contains("DIKW:"), "Must show DIKW aggregate");
         assert!(
             output.contains("Semantic Repo:"),
             "Must show semantic aggregate"
         );
-        assert!(
-            output.contains("Total tokens:"),
-            "Must show total tokens"
-        );
-        assert!(
-            output.contains("Total latency:"),
-            "Must show total latency"
-        );
+        assert!(output.contains("Total tokens:"), "Must show total tokens");
+        assert!(output.contains("Total latency:"), "Must show total latency");
     }
 
     #[test]
@@ -986,11 +997,7 @@ mod tests {
 
     #[test]
     fn test_composite_score_weighted() {
-        let results = vec![
-            mock_l1_pass("a", 0.80),
-            mock_l2("b"),
-            mock_l3("c"),
-        ];
+        let results = vec![mock_l1_pass("a", 0.80), mock_l2("b"), mock_l3("c")];
         let report = EvalReport::with_weights(
             test_timestamp(),
             results,
@@ -1024,7 +1031,8 @@ mod tests {
 
         assert!(path.exists(), "JSON file should exist");
         assert!(
-            path.to_string_lossy().contains("run-2026-04-05T14-32-00Z.json"),
+            path.to_string_lossy()
+                .contains("run-2026-04-05T14-32-00Z.json"),
             "Filename must match spec format: {}",
             path.display()
         );
@@ -1069,11 +1077,36 @@ mod tests {
     }
 
     #[test]
+    fn test_render_cli_includes_memory_quality_section() {
+        let mut result = mock_l1_pass("memory_grounded", 0.90);
+        result.memory_quality = Some(crate::memory_quality::MemoryQualityScore {
+            retrieval_mode: crate::memory_quality::RetrievalMode::ActualHybrid,
+            chunking_policy: crate::memory_quality::ChunkingPolicy::EvidencePacket,
+            metrics: crate::memory_quality::MemoryEvalMetrics {
+                required_total: 2,
+                required_hits: 2,
+                recall_at_k: 1.0,
+                precision_at_k: 0.67,
+                mrr: 0.5,
+                ndcg: 0.8,
+                distractor_hits: 1,
+            },
+            failure_kind: crate::memory_quality::MemoryFailureKind::Passed,
+        });
+        let report = EvalReport::new(test_timestamp(), vec![result], Duration::from_secs(5));
+        let output = report.render_cli();
+
+        assert!(output.contains("Memory Quality: Retrieval Evidence Metrics"));
+        assert!(output.contains("mode=ActualHybrid"));
+        assert!(output.contains("chunk=EvidencePacket"));
+        assert!(output.contains("recall=1.00"));
+        assert!(output.contains("distractors=1"));
+        assert!(output.contains("failure=Passed"));
+    }
+
+    #[test]
     fn test_render_cli_with_only_l1() {
-        let results = vec![
-            mock_l1_pass("a", 0.80),
-            mock_l1_pass("b", 0.90),
-        ];
+        let results = vec![mock_l1_pass("a", 0.80), mock_l1_pass("b", 0.90)];
         let report = EvalReport::new(test_timestamp(), results, Duration::from_secs(5));
         let output = report.render_cli();
 

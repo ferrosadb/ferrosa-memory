@@ -1,26 +1,148 @@
-//! CQL storage backend using cdrs-tokio.
+//! CQL storage backend using scylla 0.15 (canonical ScyllaDB/Cassandra driver).
 //!
 //! Implements the [`Storage`] trait against a real Ferrosa/Cassandra cluster.
 //! All queries use prepared statements with parameterized bindings (STRIDE T4).
 //! Every query includes `tenant_id` from auth context (STRIDE I1).
+//!
+//! p1-22: migrated from cdrs-tokio fork → scylla 0.15. Uses LegacySession
+//! and LegacyQueryResult for minimal churn on row-reading call sites.
 
+// The entire module uses the scylla 0.15 LegacySession API intentionally.
+// The legacy API is deprecated upstream but provides stable semantics until
+// we migrate to the new generic deserialization API in a follow-up.
+#![allow(deprecated)]
+
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use cdrs_tokio::authenticators::StaticPasswordAuthenticatorProvider;
-use cdrs_tokio::cluster::session::{Session, SessionBuilder, TcpSessionBuilder};
-use cdrs_tokio::cluster::{NodeTcpConfigBuilder, TcpConnectionManager};
-use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
-use cdrs_tokio::query::*;
-use cdrs_tokio::query_values;
-use cdrs_tokio::transport::TransportTcp;
-use cdrs_tokio::types::ByName;
-use cdrs_tokio::types::rows::Row;
+use futures_util::StreamExt;
+use scylla::frame::response::cql_to_rust::FromCqlVal;
+use scylla::frame::response::result::{CqlValue, Row};
+use scylla::prepared_statement::PreparedStatement;
+use scylla::{LegacySession, SessionBuilder};
 use serde_json::json;
 use uuid::Uuid;
 
 use crate::config::FerrosaCqlConfig;
+use crate::context_segment::{ContextSegment, TemporalEdge};
 use crate::storage::Storage;
 use crate::types::*;
+
+// ---------------------------------------------------------------------------
+// Compatibility shim: by-name column access for scylla LegacyQueryResult rows
+// ---------------------------------------------------------------------------
+//
+// scylla's `Row` is positional-only (`columns: Vec<Option<CqlValue>>`).
+// The column-name → index mapping comes from `LegacyQueryResult::col_specs()`.
+// We extract the mapping once per result and pass it alongside rows via
+// `CqlResultSet`.
+
+/// Ordered column-name mapping extracted from a `LegacyQueryResult`.
+pub type ColMap = HashMap<String, usize>;
+
+/// Build a `ColMap` from a slice of `ColumnSpec`s.
+pub fn build_col_map(specs: &[scylla::frame::response::result::ColumnSpec<'_>]) -> ColMap {
+    specs
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.name().to_owned(), i))
+        .collect()
+}
+
+/// Read a typed value from a `Row` by column name.
+///
+/// Returns `Err` if the column is absent from the result metadata or if the
+/// CQL value cannot be converted to `T`. The error message includes the column
+/// name and the conversion error for easy diagnosis.
+pub fn cql_get<T>(row: &Row, col_map: &ColMap, name: &str) -> anyhow::Result<T>
+where
+    T: FromCqlVal<Option<CqlValue>>,
+{
+    let idx = col_map
+        .get(name)
+        .ok_or_else(|| anyhow::anyhow!("column '{}' not in result set", name))?;
+    let val = row
+        .columns
+        .get(*idx)
+        .ok_or_else(|| anyhow::anyhow!("column index {} out of range for '{}'", idx, name))?
+        .clone();
+    T::from_cql(val).map_err(|e| anyhow::anyhow!("column '{}': {}", name, e))
+}
+
+fn sprint1_seed_insert_statements(ks: &str) -> (String, String) {
+    let entity_q = format!(
+        "INSERT INTO {ks}.entity_types (type_name, description, created_at) \
+         VALUES (?, ?, ?)"
+    );
+    let edge_q = format!(
+        "INSERT INTO {ks}.edge_types (type_name, description, src_types, dst_types, created_at) \
+         VALUES (?, ?, ?, ?, ?)"
+    );
+    (entity_q, edge_q)
+}
+
+fn entity_list_all_query(ks: &str) -> String {
+    format!(
+        "SELECT entity_id, session_id, entity_name, entity_type, source_fold_id, \
+         confidence, state, created_at, description, tags, properties, content_hash, \
+         updated_at, scope, ingested_by_session \
+         FROM {ks}.entity_store WHERE tenant_id = ? ALLOW FILTERING"
+    )
+}
+
+fn edge_list_all_query(ks: &str, table: &str, src_col: &str, tgt_col: &str) -> String {
+    format!(
+        "SELECT {src_col}, {tgt_col} FROM {ks}.{table} \
+         WHERE tenant_id = ? ALLOW FILTERING"
+    )
+}
+
+fn typed_edge_list_all_query(ks: &str) -> String {
+    format!(
+        "SELECT src_id, edge_type, dst_id, weight, metadata, created_at, session_id \
+         FROM {ks}.typed_edges WHERE tenant_id = ? ALLOW FILTERING"
+    )
+}
+
+fn edge_count_query(ks: &str, table: &str) -> anyhow::Result<String> {
+    let count_column = match table {
+        "co_occurs_with" => "entity_a",
+        "mentioned_in" => "entity_id",
+        "folded_into" => "source_fold_id",
+        "supersedes" => "new_event_id",
+        "typed_edges" => "src_id",
+        other => anyhow::bail!("unsupported edge table for count: {other}"),
+    };
+    Ok(format!(
+        "SELECT {count_column} FROM {ks}.{table} WHERE tenant_id = ? ALLOW FILTERING"
+    ))
+}
+
+/// Execute a SELECT or DML and return `(col_map, rows)`.
+///
+/// Convenience wrapper around `execute_unpaged` + col_map extraction.
+#[allow(unused_macros)]
+macro_rules! exec_rows {
+    ($session:expr, $stmt:expr, $values:expr) => {{
+        #[allow(deprecated)]
+        let result = $session.execute_unpaged($stmt, $values).await?;
+        let col_map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
+        (col_map, rows)
+    }};
+}
+
+/// Execute a raw (non-prepared) SELECT and return `(col_map, rows)`.
+#[allow(unused_macros)]
+macro_rules! query_rows {
+    ($session:expr, $query:expr, $values:expr) => {{
+        #[allow(deprecated)]
+        let result = $session.query_unpaged($query, $values).await?;
+        let col_map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
+        (col_map, rows)
+    }};
+}
 
 fn parse_decay_zone(s: &str) -> DecayZone {
     match s {
@@ -73,33 +195,113 @@ fn render_vector_literal(values: &[f32]) -> String {
     )
 }
 
-fn rule_entry_from_row(ctx: &TenantContext, row: &Row) -> anyhow::Result<RuleEntry> {
-    let created = row
-        .r_by_name::<chrono::NaiveDateTime>("created_at")
+fn build_fold_ann_search_query(
+    keyspace: &str,
+    query_embedding: &[f32],
+    k: usize,
+) -> (String, usize) {
+    let vec_literal = render_vector_literal(query_embedding);
+    (
+        format!(
+            "SELECT fold_id, depth, fold_summary, token_count, raw_trajectory \
+             FROM {keyspace}.trajectory_folds WHERE session_id = ? AND tenant_id = ? \
+             ORDER BY fold_embedding ANN OF {vec_literal} LIMIT {k}"
+        ),
+        2,
+    )
+}
+
+fn tokenize_context_terms(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter_map(|part| {
+            let term = part.trim().to_ascii_lowercase();
+            if term.len() >= 3 { Some(term) } else { None }
+        })
+        .collect()
+}
+
+fn context_segment_from_row(
+    ctx: &TenantContext,
+    row: &Row,
+    col_map: &ColMap,
+) -> anyhow::Result<ContextSegment> {
+    let embedding = cql_get::<Vec<u8>>(row, col_map, "segment_embedding")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(|v| crate::vector::decode_vector(&v));
+    Ok(ContextSegment {
+        tenant_id: cql_get(row, col_map, "tenant_id").unwrap_or(ctx.tenant_id),
+        session_id: cql_get(row, col_map, "session_id")?,
+        segment_id: cql_get(row, col_map, "segment_id")?,
+        source_session: cql_get(row, col_map, "source_session")?,
+        source_fold_id: cql_get::<Uuid>(row, col_map, "source_fold_id").ok(),
+        conversation_id: cql_get(row, col_map, "conversation_id")?,
+        segment_index: cql_get(row, col_map, "segment_index")?,
+        start_turn: cql_get(row, col_map, "start_turn")?,
+        end_turn: cql_get(row, col_map, "end_turn")?,
+        start_time: cql_get::<chrono::DateTime<chrono::Utc>>(row, col_map, "start_time").ok(),
+        end_time: cql_get::<chrono::DateTime<chrono::Utc>>(row, col_map, "end_time").ok(),
+        segment_text: cql_get(row, col_map, "segment_text")?,
+        segment_summary: cql_get::<String>(row, col_map, "segment_summary").ok(),
+        bm25_text: cql_get(row, col_map, "bm25_text")?,
+        segment_embedding: embedding,
+        token_count: cql_get(row, col_map, "token_count")?,
+        content_hash: cql_get(row, col_map, "content_hash")?,
+        prev_segment_id: cql_get::<Uuid>(row, col_map, "prev_segment_id").ok(),
+        next_segment_id: cql_get::<Uuid>(row, col_map, "next_segment_id").ok(),
+        created_at: cql_get::<chrono::DateTime<chrono::Utc>>(row, col_map, "created_at")
+            .unwrap_or_else(|_| chrono::Utc::now()),
+    })
+}
+
+fn temporal_edge_from_row(
+    ctx: &TenantContext,
+    row: &Row,
+    col_map: &ColMap,
+) -> anyhow::Result<TemporalEdge> {
+    Ok(TemporalEdge {
+        tenant_id: cql_get(row, col_map, "tenant_id").unwrap_or(ctx.tenant_id),
+        session_id: cql_get(row, col_map, "session_id")?,
+        src_id: cql_get(row, col_map, "src_id")?,
+        edge_type: cql_get(row, col_map, "edge_type")?,
+        dst_id: cql_get(row, col_map, "dst_id")?,
+        relation_time: cql_get(row, col_map, "relation_time")?,
+        ordinal: cql_get(row, col_map, "ordinal")?,
+        metadata: cql_get(row, col_map, "metadata").unwrap_or_default(),
+        created_at: cql_get::<chrono::DateTime<chrono::Utc>>(row, col_map, "created_at")
+            .unwrap_or_else(|_| chrono::Utc::now()),
+    })
+}
+
+fn rule_entry_from_row(
+    ctx: &TenantContext,
+    row: &Row,
+    col_map: &ColMap,
+) -> anyhow::Result<RuleEntry> {
+    let created = cql_get::<chrono::DateTime<chrono::Utc>>(row, col_map, "created_at")
         .unwrap_or_else(|e| {
             tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
-            Default::default()
+            chrono::DateTime::UNIX_EPOCH
         });
-    let updated = row
-        .r_by_name::<chrono::NaiveDateTime>("updated_at")
+    let updated = cql_get::<chrono::DateTime<chrono::Utc>>(row, col_map, "updated_at")
         .unwrap_or_else(|e| {
             tracing::warn!(col = "updated_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
-            Default::default()
+            chrono::DateTime::UNIX_EPOCH
         });
-    let state_str: String = row.r_by_name("state").unwrap_or_default();
+    let state_str: String = cql_get(row, col_map, "state").unwrap_or_default();
 
     Ok(RuleEntry {
         tenant_id: ctx.tenant_id,
-        rule_id: row.r_by_name("rule_id")?,
-        version: row.r_by_name("version")?,
-        name: row.r_by_name("name")?,
-        family: row.r_by_name("family")?,
+        rule_id: cql_get(row, col_map, "rule_id")?,
+        version: cql_get(row, col_map, "version")?,
+        name: cql_get(row, col_map, "name")?,
+        family: cql_get(row, col_map, "family")?,
         state: parse_rule_state(&state_str),
-        rule_body: row.r_by_name("rule_body")?,
-        rule_weight: row.r_by_name::<f64>("rule_weight").unwrap_or(1.0),
-        incremental: row.r_by_name::<bool>("incremental").unwrap_or(false),
-        created_at: created.and_utc(),
-        updated_at: updated.and_utc(),
+        rule_body: cql_get(row, col_map, "rule_body")?,
+        rule_weight: cql_get::<f64>(row, col_map, "rule_weight").unwrap_or(1.0),
+        incremental: cql_get::<bool>(row, col_map, "incremental").unwrap_or(false),
+        created_at: created,
+        updated_at: updated,
     })
 }
 
@@ -113,6 +315,7 @@ fn rule_entry_from_row(ctx: &TenantContext, row: &Row) -> anyhow::Result<RuleEnt
 #[allow(clippy::type_complexity)]
 fn extract_rich_entity_fields(
     row: &Row,
+    col_map: &ColMap,
 ) -> (
     Option<String>,
     Option<Vec<f32>>,
@@ -123,30 +326,22 @@ fn extract_rich_entity_fields(
     EntityScope,
     Option<Uuid>,
 ) {
-    let description = row.r_by_name::<String>("description").ok();
-    let description_embedding = row
-        .r_by_name::<cdrs_tokio::types::blob::Blob>("description_embedding")
+    let description = cql_get::<String>(row, col_map, "description").ok();
+    let description_embedding = cql_get::<Vec<u8>>(row, col_map, "description_embedding")
         .ok()
-        .map(|blob| blob.into_vec())
         .filter(|v| !v.is_empty())
         .map(|v| crate::vector::decode_vector(&v));
-    let tags = row
-        .r_by_name::<String>("tags")
+    let tags = cql_get::<String>(row, col_map, "tags")
         .ok()
         .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
         .unwrap_or_default();
-    let properties = row
-        .r_by_name::<String>("properties")
+    let properties = cql_get::<String>(row, col_map, "properties")
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .unwrap_or(serde_json::Value::Null);
-    let content_hash = row.r_by_name::<String>("content_hash").ok();
-    let updated_at = row
-        .r_by_name::<chrono::NaiveDateTime>("updated_at")
-        .ok()
-        .map(|ndt| ndt.and_utc());
-    let scope = row
-        .r_by_name::<String>("scope")
+    let content_hash = cql_get::<String>(row, col_map, "content_hash").ok();
+    let updated_at = cql_get::<chrono::DateTime<chrono::Utc>>(row, col_map, "updated_at").ok();
+    let scope = cql_get::<String>(row, col_map, "scope")
         .ok()
         .and_then(|s| match s.as_str() {
             "global" => Some(EntityScope::Global),
@@ -154,7 +349,7 @@ fn extract_rich_entity_fields(
             _ => None,
         })
         .unwrap_or_default();
-    let ingested_by_session = row.r_by_name::<Uuid>("ingested_by_session").ok();
+    let ingested_by_session = cql_get::<Uuid>(row, col_map, "ingested_by_session").ok();
     (
         description,
         description_embedding,
@@ -167,12 +362,89 @@ fn extract_rich_entity_fields(
     )
 }
 
-/// Type alias for the cdrs-tokio TCP session.
-pub type CqlSession = Session<
-    TransportTcp,
-    TcpConnectionManager,
-    RoundRobinLoadBalancingStrategy<TransportTcp, TcpConnectionManager>,
->;
+/// Decode a row into an [`EntityEntry`], returning `Ok(None)` for ghost
+/// rows where a required column is NULL.
+///
+/// Ghost rows surface when bulk loaders (notably the legacy Python CQL
+/// path) insert without all NOT-NULL-ish columns set — see the test
+/// `ghost_rows_do_not_crash_queries`. Callers that iterate
+/// `entity_store` (notably `entity_list_all` and `entity_stream_all`)
+/// must skip them; otherwise a single ghost row produced by an
+/// unrelated test or pipeline poisons the entire listing with
+/// `column 'entity_name': Value is null`.
+fn row_to_entity_entry(
+    ctx: &TenantContext,
+    row: &Row,
+    col_map: &ColMap,
+) -> anyhow::Result<Option<EntityEntry>> {
+    // Required columns first — ghost rows are skipped here, matching
+    // entity_list_session's filter.
+    let Ok(entity_id) = cql_get::<Uuid>(row, col_map, "entity_id") else {
+        return Ok(None);
+    };
+    let Ok(session_id) = cql_get::<Uuid>(row, col_map, "session_id") else {
+        return Ok(None);
+    };
+    let Ok(entity_name) = cql_get::<String>(row, col_map, "entity_name") else {
+        return Ok(None);
+    };
+    let Ok(entity_type) = cql_get::<String>(row, col_map, "entity_type") else {
+        return Ok(None);
+    };
+
+    let created = cql_get::<chrono::DateTime<chrono::Utc>>(row, col_map, "created_at")
+        .unwrap_or_else(|e| {
+            tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
+            Default::default()
+        });
+    let state = cql_get::<String>(row, col_map, "state")
+        .ok()
+        .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
+        .unwrap_or_default();
+    let (
+        description,
+        description_embedding,
+        tags,
+        properties,
+        content_hash,
+        updated_at,
+        scope,
+        ingested_by_session,
+    ) = extract_rich_entity_fields(row, col_map);
+    Ok(Some(EntityEntry {
+        tenant_id: ctx.tenant_id,
+        entity_id,
+        session_id,
+        entity_name,
+        entity_type,
+        source_fold_id: cql_get::<Uuid>(row, col_map, "source_fold_id").ok(),
+        context_snippet: cql_get(row, col_map, "context_snippet").unwrap_or_default(),
+        entity_embedding: cql_get::<Vec<u8>>(row, col_map, "entity_embedding")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(|v| crate::vector::decode_vector(&v)),
+        confidence: cql_get::<f32>(row, col_map, "confidence")
+            .map(f64::from)
+            .unwrap_or(1.0),
+        state,
+        created_at: created,
+        description,
+        description_embedding,
+        tags,
+        properties,
+        content_hash,
+        updated_at,
+        scope,
+        ingested_by_session,
+    }))
+}
+
+/// Type alias for the scylla legacy session used throughout this crate.
+///
+/// `LegacySession` provides `execute_unpaged` / `query_unpaged` that return
+/// `LegacyQueryResult`, which is the lowest-churn migration path from
+/// cdrs-tokio's frame-based API.
+pub type CqlSession = LegacySession;
 
 /// Build a new CQL session with the given username/password against the
 /// contact points in `config`. Shared by `CqlStorage::connect` (runtime
@@ -185,17 +457,14 @@ pub async fn connect_session(
     if config.contact_points.is_empty() {
         anyhow::bail!("no contact points configured");
     }
-    let mut builder = NodeTcpConfigBuilder::new().with_authenticator_provider(Arc::new(
-        StaticPasswordAuthenticatorProvider::new(username, password),
-    ));
-    for cp in &config.contact_points {
-        builder = builder.with_contact_point(cp.as_str().into());
-    }
-    let node_config = builder.build().await?;
 
     let session = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        TcpSessionBuilder::new(RoundRobinLoadBalancingStrategy::new(), node_config).build(),
+        SessionBuilder::new()
+            .known_nodes(&config.contact_points)
+            .user(username, password)
+            .connection_timeout(std::time::Duration::from_secs(10))
+            .build_legacy(),
     )
     .await
     .map_err(|_| anyhow::anyhow!("CQL session build timed out (10s) — is Ferrosa running?"))??;
@@ -218,77 +487,80 @@ pub async fn connect_admin_session(config: &FerrosaCqlConfig) -> anyhow::Result<
 /// Prepared statement cache for all table operations.
 struct PreparedStatements {
     // Memo
-    memo_get: PreparedQuery,
-    memo_touch: PreparedQuery,
-    memo_put: PreparedQuery,
+    memo_get: PreparedStatement,
+    memo_touch: PreparedStatement,
+    memo_put: PreparedStatement,
     // Plan
-    plan_put: PreparedQuery,
-    plan_get: PreparedQuery,
-    plan_get_depth: PreparedQuery,
-    plan_update: PreparedQuery,
+    plan_put: PreparedStatement,
+    plan_get: PreparedStatement,
+    plan_get_depth: PreparedStatement,
+    plan_update: PreparedStatement,
     // Fold
-    fold_put: PreparedQuery,
-    fold_get: PreparedQuery,
-    fold_append: PreparedQuery,
-    fold_complete: PreparedQuery,
+    fold_put: PreparedStatement,
+    fold_get: PreparedStatement,
+    fold_append: PreparedStatement,
+    fold_complete: PreparedStatement,
     // Entity
-    entity_put: PreparedQuery,
-    entity_count: PreparedQuery,
-    entity_list_session: PreparedQuery,
-    entity_list_all: PreparedQuery,
-    entity_update_state: PreparedQuery,
+    entity_put: PreparedStatement,
+    entity_count: PreparedStatement,
+    entity_list_session: PreparedStatement,
+    entity_list_all: PreparedStatement,
+    entity_update_state: PreparedStatement,
     // Count queries for stats
-    fold_count: PreparedQuery,
-    memo_count: PreparedQuery,
+    fold_count: PreparedStatement,
+    memo_count: PreparedStatement,
     // Temporal
-    temporal_put: PreparedQuery,
-    temporal_get_current: PreparedQuery,
-    temporal_invalidate: PreparedQuery,
+    temporal_put: PreparedStatement,
+    temporal_get_current: PreparedStatement,
+    temporal_invalidate: PreparedStatement,
     // Entity neighbor queries (spreading activation)
-    edge_mentioned_in_by_entity: PreparedQuery,
-    edge_co_occurs_by_a: PreparedQuery,
-    edge_co_occurs_by_b: PreparedQuery,
-    edge_supersedes_by_new: PreparedQuery,
-    edge_supersedes_by_old: PreparedQuery,
+    edge_mentioned_in_by_entity: PreparedStatement,
+    edge_co_occurs_by_a: PreparedStatement,
+    edge_co_occurs_by_b: PreparedStatement,
+    edge_supersedes_by_new: PreparedStatement,
+    edge_supersedes_by_old: PreparedStatement,
     // Feedback
-    feedback_put: PreparedQuery,
-    feedback_list_all: PreparedQuery,
+    feedback_put: PreparedStatement,
+    feedback_list_all: PreparedStatement,
     // Intentions
-    intention_put: PreparedQuery,
-    intention_list: PreparedQuery,
-    intention_list_all: PreparedQuery,
-    intention_update_status: PreparedQuery,
+    intention_put: PreparedStatement,
+    intention_list: PreparedStatement,
+    intention_list_all: PreparedStatement,
+    intention_update_status: PreparedStatement,
     // Tool usage logging
-    tool_usage_put: PreparedQuery,
-    tool_usage_query: PreparedQuery,
+    tool_usage_put: PreparedStatement,
+    tool_usage_query: PreparedStatement,
     // Audit
-    audit_put: PreparedQuery,
+    audit_put: PreparedStatement,
     // Sync/export list queries
-    fold_list_all: PreparedQuery,
-    temporal_list_all: PreparedQuery,
+    fold_list_all: PreparedStatement,
+    temporal_list_all: PreparedStatement,
     // Warmth (Sprint 5)
-    warmth_get: PreparedQuery,
-    warmth_put: PreparedQuery,
-    warmth_list_session: PreparedQuery,
-    warmth_delete: PreparedQuery,
+    warmth_get: PreparedStatement,
+    warmth_put: PreparedStatement,
+    warmth_list_session: PreparedStatement,
+    warmth_delete: PreparedStatement,
     // Rules (Sprint 5)
-    rule_put_by_id: PreparedQuery,
-    rule_put_by_family: PreparedQuery,
-    rule_put_active_by_state: PreparedQuery,
-    rule_get: PreparedQuery,
-    rule_get_version: PreparedQuery,
-    rule_list_family: PreparedQuery,
-    rule_list_active: PreparedQuery,
+    rule_put_by_id: PreparedStatement,
+    rule_put_by_family: PreparedStatement,
+    rule_put_active_by_state: PreparedStatement,
+    rule_get: PreparedStatement,
+    rule_get_version: PreparedStatement,
+    rule_list_family: PreparedStatement,
+    rule_list_active: PreparedStatement,
     // Derived cache (Sprint 5)
-    derived_cache_get: PreparedQuery,
-    derived_cache_put: PreparedQuery,
-    derived_cache_clear: PreparedQuery,
+    derived_cache_get: PreparedStatement,
+    derived_cache_put: PreparedStatement,
+    derived_cache_clear: PreparedStatement,
     // TTL tracking (Sprint 6)
-    derived_cache_ttl_track_put: PreparedQuery,
-    derived_cache_ttl_track_get: PreparedQuery,
+    derived_cache_ttl_track_put: PreparedStatement,
+    derived_cache_ttl_track_get: PreparedStatement,
     // Provenance (Sprint 5)
-    provenance_put: PreparedQuery,
-    provenance_get: PreparedQuery,
+    provenance_put: PreparedStatement,
+    provenance_get: PreparedStatement,
+    // Confidence scores
+    confidence_put: PreparedStatement,
+    confidence_get: PreparedStatement,
 }
 
 /// CQL storage backend.
@@ -401,20 +673,12 @@ impl CqlStorage {
                 .prepare(format!(
                     "SELECT entity_id, entity_name, entity_type, source_fold_id, \
                      context_snippet, entity_embedding, confidence, state, created_at, \
-                     description, description_embedding, tags, properties, content_hash, \
+                     description, tags, properties, content_hash, \
                      updated_at, scope, ingested_by_session \
                      FROM {ks}.entity_store WHERE tenant_id = ? AND session_id = ?"
                 ))
                 .await?,
-            entity_list_all: session
-                .prepare(format!(
-                    "SELECT entity_id, session_id, entity_name, entity_type, source_fold_id, \
-                     context_snippet, entity_embedding, confidence, state, created_at, \
-                     description, description_embedding, tags, properties, content_hash, \
-                     updated_at, scope, ingested_by_session \
-                     FROM {ks}.entity_store WHERE tenant_id = ? ALLOW FILTERING"
-                ))
-                .await?,
+            entity_list_all: session.prepare(entity_list_all_query(ks)).await?,
             entity_update_state: session
                 .prepare(format!(
                     "UPDATE {ks}.entity_store SET state = ? \
@@ -689,6 +953,19 @@ impl CqlStorage {
                      FROM {ks}.derivation_provenance WHERE tenant_id = ? AND derived_edge_id = ?"
                 ))
                 .await?,
+            confidence_put: session
+                .prepare(format!(
+                    "INSERT INTO {ks}.confidence_scores \
+                     (entity_id, fact_hash, confidence, source_count, last_confirmed_at, contradiction_count) \
+                     VALUES (?, ?, ?, ?, ?, ?)"
+                ))
+                .await?,
+            confidence_get: session
+                .prepare(format!(
+                    "SELECT confidence, source_count, last_confirmed_at, contradiction_count \
+                     FROM {ks}.confidence_scores WHERE entity_id = ? AND fact_hash = ?"
+                ))
+                .await?,
         };
 
         tracing::info!(
@@ -713,16 +990,14 @@ impl CqlStorage {
     /// Returns the default set if the table doesn't exist or is empty.
     pub async fn load_entity_types(&self) -> Vec<String> {
         let query = format!("SELECT type_name FROM {}.entity_types", self.keyspace);
-        match self.session.query(query).await {
-            Ok(frame) => {
-                let rows = frame
-                    .response_body()
-                    .ok()
-                    .and_then(|b| b.into_rows())
-                    .unwrap_or_default();
+        #[allow(deprecated)]
+        match self.session.query_unpaged(query, &[] as &[&str]).await {
+            Ok(result) => {
+                let col_map = build_col_map(result.col_specs());
+                let rows = result.rows_or_empty();
                 let mut types: Vec<String> = rows
                     .iter()
-                    .filter_map(|r| r.r_by_name::<String>("type_name").ok())
+                    .filter_map(|r| cql_get::<String>(r, &col_map, "type_name").ok())
                     .collect();
                 if types.is_empty() {
                     return Self::default_entity_types();
@@ -737,16 +1012,14 @@ impl CqlStorage {
     /// Load edge types from the type registry table.
     pub async fn load_edge_types(&self) -> Vec<String> {
         let query = format!("SELECT type_name FROM {}.edge_types", self.keyspace);
-        match self.session.query(query).await {
-            Ok(frame) => {
-                let rows = frame
-                    .response_body()
-                    .ok()
-                    .and_then(|b| b.into_rows())
-                    .unwrap_or_default();
+        #[allow(deprecated)]
+        match self.session.query_unpaged(query, &[] as &[&str]).await {
+            Ok(result) => {
+                let col_map = build_col_map(result.col_specs());
+                let rows = result.rows_or_empty();
                 let mut types: Vec<String> = rows
                     .iter()
-                    .filter_map(|r| r.r_by_name::<String>("type_name").ok())
+                    .filter_map(|r| cql_get::<String>(r, &col_map, "type_name").ok())
                     .collect();
                 types.sort();
                 types
@@ -792,7 +1065,6 @@ impl CqlStorage {
     /// via that edge type.
     pub async fn seed_sprint1_types(&self) -> anyhow::Result<()> {
         let ks = &self.keyspace;
-        let now = "toTimestamp(now())";
 
         // Entity types (upsert).
         let entity_seeds: &[(&str, &str)] = &[
@@ -805,18 +1077,17 @@ impl CqlStorage {
                 "A classification label. Tags form a hierarchy via PARENT_TAG edges; entities attach via TAGGED_AS.",
             ),
         ];
-        let entity_q = format!(
-            "INSERT INTO {ks}.entity_types (type_name, description, created_at) \
-             VALUES (?, ?, {now})"
-        );
+        let (entity_q, edge_q) = sprint1_seed_insert_statements(ks);
         let entity_writes = entity_seeds.iter().map(|(name, desc)| {
             let q = entity_q.clone();
             let name = name.to_string();
             let desc = desc.to_string();
             async move {
+                let created_at = chrono::Utc::now();
+                #[allow(deprecated)]
                 let res = self
                     .session
-                    .query_with_values(q, query_values!(name.clone(), desc))
+                    .query_unpaged(q, (name.clone(), desc, created_at))
                     .await;
                 if let Err(e) = res {
                     tracing::warn!(type_name = %name, error = %e, "seed_sprint1_types: entity insert failed");
@@ -845,10 +1116,6 @@ impl CqlStorage {
                 "skill",
             ),
         ];
-        let edge_q = format!(
-            "INSERT INTO {ks}.edge_types (type_name, description, src_types, dst_types, created_at) \
-             VALUES (?, ?, ?, ?, {now})"
-        );
         let edge_writes = edge_seeds.iter().map(|(name, desc, src, dst)| {
             let q = edge_q.clone();
             let name = name.to_string();
@@ -856,9 +1123,11 @@ impl CqlStorage {
             let src = src.to_string();
             let dst = dst.to_string();
             async move {
+                let created_at = chrono::Utc::now();
+                #[allow(deprecated)]
                 let res = self
                     .session
-                    .query_with_values(q, query_values!(name.clone(), desc, src, dst))
+                    .query_unpaged(q, (name.clone(), desc, src, dst, created_at))
                     .await;
                 if let Err(e) = res {
                     tracing::warn!(edge_type = %name, error = %e, "seed_sprint1_types: edge insert failed");
@@ -878,41 +1147,17 @@ impl CqlStorage {
         Ok(())
     }
 
-    /// Helper: execute a prepared query and return rows.
-    async fn query_rows(
+    /// Helper: execute a prepared statement and return `(col_map, rows)`.
+    #[allow(deprecated)]
+    async fn exec_prepared_rows(
         &self,
-        stmt: &PreparedQuery,
-        values: QueryValues,
-    ) -> anyhow::Result<Vec<Row>> {
-        let envelope = self.session.exec_with_values(stmt, values).await?;
-        let body = envelope.response_body()?;
-        Ok(body.into_rows().unwrap_or_default())
-    }
-
-    async fn query_count_allow_filtering(
-        &self,
-        table: &str,
-        ctx: &TenantContext,
-    ) -> anyhow::Result<usize> {
-        let query = format!(
-            "SELECT COUNT(*) FROM {}.{} WHERE tenant_id = ? ALLOW FILTERING",
-            self.keyspace, table
-        );
-        let envelope = self
-            .session
-            .query_with_values(&query, query_values!(ctx.tenant_id))
-            .await?;
-        let rows = envelope.response_body()?.into_rows().unwrap_or_default();
-        let Some(row) = rows.first() else {
-            return Ok(0);
-        };
-        if let Ok(count) = row.r_by_name::<i64>("count") {
-            return Ok(count as usize);
-        }
-        if let Ok(count) = row.r_by_name::<i64>("system.count") {
-            return Ok(count as usize);
-        }
-        anyhow::bail!("COUNT(*) response for {table} did not expose a readable count column");
+        stmt: &PreparedStatement,
+        values: impl scylla::serialize::row::SerializeRow,
+    ) -> anyhow::Result<(ColMap, Vec<Row>)> {
+        let result = self.session.execute_unpaged(stmt, values).await?;
+        let col_map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
+        Ok((col_map, rows))
     }
 
     /// Update only the entity embedding + updated_at for an existing row.
@@ -941,21 +1186,20 @@ impl CqlStorage {
              WHERE tenant_id = ? AND session_id = ? AND entity_id = ?",
             ks = self.keyspace,
         );
+        #[allow(deprecated)]
         self.session
-            .query_with_values(
-                embedding_q,
-                query_values!(ctx.tenant_id, session_id, entity_id),
-            )
+            .query_unpaged(embedding_q, (ctx.tenant_id, session_id, entity_id))
             .await?;
         let updated_at_q = format!(
             "UPDATE {ks}.entity_store SET updated_at = ? \
              WHERE tenant_id = ? AND session_id = ? AND entity_id = ?",
             ks = self.keyspace,
         );
+        #[allow(deprecated)]
         self.session
-            .query_with_values(
+            .query_unpaged(
                 updated_at_q,
-                query_values!(updated_at.naive_utc(), ctx.tenant_id, session_id, entity_id),
+                (updated_at, ctx.tenant_id, session_id, entity_id),
             )
             .await?;
         Ok(())
@@ -968,40 +1212,36 @@ impl CqlStorage {
              FROM {}.memo_cache WHERE tenant_id = ? ALLOW FILTERING",
             self.keyspace
         );
-        let envelope = self
-            .session
-            .query_with_values(query, query_values!(ctx.tenant_id))
-            .await?;
-        let rows = envelope.response_body()?.into_rows().unwrap_or_default();
+        #[allow(deprecated)]
+        let result = self.session.query_unpaged(query, (ctx.tenant_id,)).await?;
+        let col_map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
 
         let mut results = Vec::with_capacity(rows.len());
         for row in rows {
-            let created_at = row
-                .r_by_name::<chrono::NaiveDateTime>("created_at")
+            let created_at = cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
                 .unwrap_or_else(|e| {
                     tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
-                    Default::default()
+                    chrono::DateTime::UNIX_EPOCH
                 });
             results.push(MemoEntry {
-                content_hash: row.r_by_name("content_hash")?,
-                model_version: row.r_by_name("model_version")?,
-                result: row.r_by_name("result")?,
-                result_embedding: row
-                    .r_by_name::<cdrs_tokio::types::blob::Blob>("result_embedding")
+                content_hash: cql_get(&row, &col_map, "content_hash")?,
+                model_version: cql_get(&row, &col_map, "model_version")?,
+                result: cql_get(&row, &col_map, "result")?,
+                result_embedding: cql_get::<Vec<u8>>(&row, &col_map, "result_embedding")
                     .ok()
-                    .map(|blob| blob.into_vec())
                     .filter(|v| !v.is_empty())
                     .map(|v| crate::vector::decode_vector(&v)),
-                hit_count: row.r_by_name("hit_count").unwrap_or(0),
-                created_at: created_at.and_utc(),
-                last_hit_at: row
-                    .r_by_name::<chrono::NaiveDateTime>("last_hit_at")
-                    .ok()
-                    .map(|t| t.and_utc()),
-                expires_at: row
-                    .r_by_name::<chrono::NaiveDateTime>("expires_at")
-                    .ok()
-                    .map(|t| t.and_utc()),
+                hit_count: cql_get(&row, &col_map, "hit_count").unwrap_or(0),
+                created_at,
+                last_hit_at: cql_get::<chrono::DateTime<chrono::Utc>>(
+                    &row,
+                    &col_map,
+                    "last_hit_at",
+                )
+                .ok(),
+                expires_at: cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "expires_at")
+                    .ok(),
             });
         }
         Ok(results)
@@ -1021,8 +1261,9 @@ impl CqlStorage {
              WHERE session_id = ? AND tenant_id = ? AND fold_id = ?",
             self.keyspace, vec_literal
         );
+        #[allow(deprecated)]
         self.session
-            .query_with_values(query, query_values!(session_id, ctx.tenant_id, fold_id))
+            .query_unpaged(query, (session_id, ctx.tenant_id, fold_id))
             .await?;
         Ok(())
     }
@@ -1041,13 +1282,14 @@ impl CqlStorage {
              WHERE content_hash = ? AND model_version = ? AND tenant_id = ?",
             self.keyspace, vec_literal
         );
+        #[allow(deprecated)]
         self.session
-            .query_with_values(
+            .query_unpaged(
                 query,
-                query_values!(
+                (
                     content_hash.to_string(),
                     model_version.to_string(),
-                    ctx.tenant_id
+                    ctx.tenant_id,
                 ),
             )
             .await?;
@@ -1062,42 +1304,40 @@ impl Storage for CqlStorage {
         content_hash: &str,
         model_version: &str,
     ) -> anyhow::Result<Option<MemoEntry>> {
-        let rows = self
-            .query_rows(
+        let (col_map, rows) = self
+            .exec_prepared_rows(
                 &self.stmts.memo_get,
-                query_values!(
+                (
                     content_hash.to_string(),
                     model_version.to_string(),
-                    ctx.tenant_id
+                    ctx.tenant_id,
                 ),
             )
             .await?;
 
         if let Some(row) = rows.into_iter().next() {
-            let result: String = row.r_by_name("result")?;
-            let hit_count: i64 = row.r_by_name("hit_count")?;
-            let created_at: chrono::NaiveDateTime = row.r_by_name("created_at")?;
+            let result: String = cql_get(&row, &col_map, "result")?;
+            let hit_count: i64 = cql_get(&row, &col_map, "hit_count")?;
+            let created_at: chrono::DateTime<chrono::Utc> = cql_get(&row, &col_map, "created_at")?;
 
             Ok(Some(MemoEntry {
                 content_hash: content_hash.to_string(),
                 model_version: model_version.to_string(),
                 result,
-                result_embedding: row
-                    .r_by_name::<cdrs_tokio::types::blob::Blob>("result_embedding")
+                result_embedding: cql_get::<Vec<u8>>(&row, &col_map, "result_embedding")
                     .ok()
-                    .map(|blob| blob.into_vec())
                     .filter(|v| !v.is_empty())
                     .map(|v| crate::vector::decode_vector(&v)),
                 hit_count,
-                created_at: created_at.and_utc(),
-                last_hit_at: row
-                    .r_by_name::<chrono::NaiveDateTime>("last_hit_at")
-                    .ok()
-                    .map(|t| t.and_utc()),
-                expires_at: row
-                    .r_by_name::<chrono::NaiveDateTime>("expires_at")
-                    .ok()
-                    .map(|t| t.and_utc()),
+                created_at,
+                last_hit_at: cql_get::<chrono::DateTime<chrono::Utc>>(
+                    &row,
+                    &col_map,
+                    "last_hit_at",
+                )
+                .ok(),
+                expires_at: cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "expires_at")
+                    .ok(),
             }))
         } else {
             Ok(None)
@@ -1110,43 +1350,42 @@ impl Storage for CqlStorage {
         content_hash: &str,
         model_version: &str,
     ) -> anyhow::Result<()> {
-        let now = chrono::Utc::now().naive_utc();
-        self.session
-            .exec_with_values(
-                &self.stmts.memo_touch,
-                query_values!(
-                    now,
-                    content_hash.to_string(),
-                    model_version.to_string(),
-                    ctx.tenant_id
-                ),
-            )
-            .await?;
+        let now = chrono::Utc::now();
+        self.exec_prepared_rows(
+            &self.stmts.memo_touch,
+            (
+                now,
+                content_hash.to_string(),
+                model_version.to_string(),
+                ctx.tenant_id,
+            ),
+        )
+        .await?;
         Ok(())
     }
 
     async fn memo_put(&self, ctx: &TenantContext, entry: &MemoEntry) -> anyhow::Result<()> {
-        let now = chrono::Utc::now().naive_utc();
-        let expires: Option<chrono::NaiveDateTime> = entry.expires_at.map(|t| t.naive_utc());
+        let now = chrono::Utc::now();
+        let expires: Option<chrono::DateTime<chrono::Utc>> = entry.expires_at;
 
-        self.session
-            .exec_with_values(
-                &self.stmts.memo_put,
-                query_values!(
-                    entry.content_hash.clone(),
-                    entry.model_version.clone(),
-                    ctx.tenant_id,
-                    entry.result.clone(),
-                    entry.result_embedding.as_ref().map(|e| {
-                        cdrs_tokio::types::blob::Blob::new(crate::vector::encode_vector(e))
-                    }),
-                    now,
-                    now,  // last_hit_at = created_at initially
-                    0i64, // hit_count
-                    expires
-                ),
-            )
-            .await?;
+        self.exec_prepared_rows(
+            &self.stmts.memo_put,
+            (
+                entry.content_hash.clone(),
+                entry.model_version.clone(),
+                ctx.tenant_id,
+                entry.result.clone(),
+                entry
+                    .result_embedding
+                    .as_ref()
+                    .map(|e| crate::vector::encode_vector(e)),
+                now,
+                now,  // last_hit_at = created_at initially
+                0i64, // hit_count
+                expires,
+            ),
+        )
+        .await?;
         Ok(())
     }
 
@@ -1155,21 +1394,20 @@ impl Storage for CqlStorage {
             .trim_matches('"')
             .to_string();
 
-        self.session
-            .exec_with_values(
-                &self.stmts.plan_put,
-                query_values!(
-                    node.session_id,
-                    ctx.tenant_id,
-                    node.depth,
-                    node.subtask_id.clone(),
-                    node.parent_subtask.clone(),
-                    node.goal_text.clone(),
-                    status,
-                    chrono::Utc::now().naive_utc()
-                ),
-            )
-            .await?;
+        self.exec_prepared_rows(
+            &self.stmts.plan_put,
+            (
+                node.session_id,
+                ctx.tenant_id,
+                node.depth,
+                node.subtask_id.clone(),
+                node.parent_subtask.clone(),
+                node.goal_text.clone(),
+                status,
+                chrono::Utc::now(),
+            ),
+        )
+        .await?;
         Ok(())
     }
 
@@ -1179,46 +1417,44 @@ impl Storage for CqlStorage {
         session_id: Uuid,
         max_depth: Option<i32>,
     ) -> anyhow::Result<Vec<PlanNode>> {
-        let rows = if let Some(depth) = max_depth {
-            self.query_rows(
+        let (col_map, rows) = if let Some(depth) = max_depth {
+            self.exec_prepared_rows(
                 &self.stmts.plan_get_depth,
-                query_values!(session_id, ctx.tenant_id, depth),
+                (session_id, ctx.tenant_id, depth),
             )
             .await?
         } else {
-            self.query_rows(
-                &self.stmts.plan_get,
-                query_values!(session_id, ctx.tenant_id),
-            )
-            .await?
+            self.exec_prepared_rows(&self.stmts.plan_get, (session_id, ctx.tenant_id))
+                .await?
         };
 
         let mut nodes = Vec::with_capacity(rows.len());
         for row in rows {
-            let status_str: String = row.r_by_name("status")?;
+            let status_str: String = cql_get(&row, &col_map, "status")?;
             let status: PlanStatus =
                 serde_json::from_str(&format!("\"{status_str}\"")).unwrap_or(PlanStatus::Pending);
 
-            let created = row
-                .r_by_name::<chrono::NaiveDateTime>("created_at")
+            let created = cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
                 .unwrap_or_else(|e| {
                     tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
-                    Default::default()
+                    chrono::DateTime::UNIX_EPOCH
                 });
 
             nodes.push(PlanNode {
                 session_id,
-                depth: row.r_by_name("depth")?,
-                subtask_id: row.r_by_name("subtask_id")?,
-                parent_subtask: row.r_by_name::<String>("parent_subtask").ok(),
-                goal_text: row.r_by_name("goal_text")?,
+                depth: cql_get(&row, &col_map, "depth")?,
+                subtask_id: cql_get(&row, &col_map, "subtask_id")?,
+                parent_subtask: cql_get::<String>(&row, &col_map, "parent_subtask").ok(),
+                goal_text: cql_get(&row, &col_map, "goal_text")?,
                 status,
-                outcome_summary: row.r_by_name::<String>("outcome_summary").ok(),
-                created_at: created.and_utc(),
-                completed_at: row
-                    .r_by_name::<chrono::NaiveDateTime>("completed_at")
-                    .ok()
-                    .map(|t| t.and_utc()),
+                outcome_summary: cql_get::<String>(&row, &col_map, "outcome_summary").ok(),
+                created_at: created,
+                completed_at: cql_get::<chrono::DateTime<chrono::Utc>>(
+                    &row,
+                    &col_map,
+                    "completed_at",
+                )
+                .ok(),
             });
         }
 
@@ -1237,26 +1473,26 @@ impl Storage for CqlStorage {
         let status_str = serde_json::to_string(&status)?
             .trim_matches('"')
             .to_string();
-        let completed = if status == PlanStatus::Complete || status == PlanStatus::Failed {
-            Some(chrono::Utc::now().naive_utc())
-        } else {
-            None
-        };
+        let completed: Option<chrono::DateTime<chrono::Utc>> =
+            if status == PlanStatus::Complete || status == PlanStatus::Failed {
+                Some(chrono::Utc::now())
+            } else {
+                None
+            };
 
-        self.session
-            .exec_with_values(
-                &self.stmts.plan_update,
-                query_values!(
-                    status_str,
-                    outcome_summary.map(String::from),
-                    completed,
-                    session_id,
-                    ctx.tenant_id,
-                    depth,
-                    subtask_id.to_string()
-                ),
-            )
-            .await?;
+        self.exec_prepared_rows(
+            &self.stmts.plan_update,
+            (
+                status_str,
+                outcome_summary.map(String::from),
+                completed,
+                session_id,
+                ctx.tenant_id,
+                depth,
+                subtask_id.to_string(),
+            ),
+        )
+        .await?;
         Ok(())
     }
 
@@ -1267,22 +1503,21 @@ impl Storage for CqlStorage {
             .trim_matches('"')
             .to_string();
 
-        self.session
-            .exec_with_values(
-                &self.stmts.fold_put,
-                query_values!(
-                    entry.session_id,
-                    entry.fold_id,
-                    ctx.tenant_id,
-                    entry.depth,
-                    entry.parent_fold_id,
-                    entry.raw_trajectory.clone(),
-                    entry.token_count,
-                    status,
-                    chrono::Utc::now().naive_utc()
-                ),
-            )
-            .await?;
+        self.exec_prepared_rows(
+            &self.stmts.fold_put,
+            (
+                entry.session_id,
+                entry.fold_id,
+                ctx.tenant_id,
+                entry.depth,
+                entry.parent_fold_id,
+                entry.raw_trajectory.clone(),
+                entry.token_count,
+                status,
+                chrono::Utc::now(),
+            ),
+        )
+        .await?;
         Ok(())
     }
 
@@ -1292,46 +1527,38 @@ impl Storage for CqlStorage {
         session_id: Uuid,
         fold_id: Uuid,
     ) -> anyhow::Result<Option<FoldEntry>> {
-        let rows = self
-            .query_rows(
-                &self.stmts.fold_get,
-                query_values!(session_id, ctx.tenant_id, fold_id),
-            )
+        let (col_map, rows) = self
+            .exec_prepared_rows(&self.stmts.fold_get, (session_id, ctx.tenant_id, fold_id))
             .await?;
 
         if let Some(row) = rows.into_iter().next() {
-            let status_str: String = row.r_by_name("status")?;
+            let status_str: String = cql_get(&row, &col_map, "status")?;
             let status: FoldStatus =
                 serde_json::from_str(&format!("\"{status_str}\"")).unwrap_or(FoldStatus::Active);
-            let created = row
-                .r_by_name::<chrono::NaiveDateTime>("created_at")
+            let created = cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
                 .unwrap_or_else(|e| {
                     tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
-                    Default::default()
+                    chrono::DateTime::UNIX_EPOCH
                 });
 
             Ok(Some(FoldEntry {
                 session_id,
                 fold_id,
                 tenant_id: ctx.tenant_id,
-                depth: row.r_by_name("depth")?,
-                parent_fold_id: row.r_by_name::<Uuid>("parent_fold_id").ok(),
-                raw_trajectory: row.r_by_name("raw_trajectory")?,
-                fold_summary: row.r_by_name::<String>("fold_summary").ok(),
-                fold_embedding: row
-                    .r_by_name::<cdrs_tokio::types::blob::Blob>("fold_embedding")
+                depth: cql_get(&row, &col_map, "depth")?,
+                parent_fold_id: cql_get::<Uuid>(&row, &col_map, "parent_fold_id").ok(),
+                raw_trajectory: cql_get(&row, &col_map, "raw_trajectory")?,
+                fold_summary: cql_get::<String>(&row, &col_map, "fold_summary").ok(),
+                fold_embedding: cql_get::<Vec<u8>>(&row, &col_map, "fold_embedding")
                     .ok()
-                    .map(|blob| blob.into_vec())
                     .filter(|v| !v.is_empty())
                     .map(|v| crate::vector::decode_vector(&v)),
-                token_count: row.r_by_name("token_count")?,
-                compression_ratio: row.r_by_name::<f64>("compression_ratio").ok(),
+                token_count: cql_get(&row, &col_map, "token_count")?,
+                compression_ratio: cql_get::<f64>(&row, &col_map, "compression_ratio").ok(),
                 status,
-                created_at: created.and_utc(),
-                folded_at: row
-                    .r_by_name::<chrono::NaiveDateTime>("folded_at")
-                    .ok()
-                    .map(|t| t.and_utc()),
+                created_at: created,
+                folded_at: cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "folded_at")
+                    .ok(),
             }))
         } else {
             Ok(None)
@@ -1351,18 +1578,17 @@ impl Storage for CqlStorage {
             let new_trajectory = format!("{}\n{}", fold.raw_trajectory, text);
             let new_count = new_trajectory.split_whitespace().count() as i32;
 
-            self.session
-                .exec_with_values(
-                    &self.stmts.fold_append,
-                    query_values!(
-                        new_trajectory,
-                        new_count,
-                        session_id,
-                        ctx.tenant_id,
-                        fold_id
-                    ),
-                )
-                .await?;
+            self.exec_prepared_rows(
+                &self.stmts.fold_append,
+                (
+                    new_trajectory,
+                    new_count,
+                    session_id,
+                    ctx.tenant_id,
+                    fold_id,
+                ),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1376,23 +1602,21 @@ impl Storage for CqlStorage {
         embedding: Vec<f32>,
         compression_ratio: f64,
     ) -> anyhow::Result<()> {
-        let embedding_blob =
-            cdrs_tokio::types::blob::Blob::new(crate::vector::encode_vector(&embedding));
-        self.session
-            .exec_with_values(
-                &self.stmts.fold_complete,
-                query_values!(
-                    "folded".to_string(),
-                    summary.to_string(),
-                    embedding_blob,
-                    compression_ratio,
-                    chrono::Utc::now().naive_utc(),
-                    session_id,
-                    ctx.tenant_id,
-                    fold_id
-                ),
-            )
-            .await?;
+        let embedding_bytes = crate::vector::encode_vector(&embedding);
+        self.exec_prepared_rows(
+            &self.stmts.fold_complete,
+            (
+                "folded".to_string(),
+                summary.to_string(),
+                embedding_bytes,
+                compression_ratio,
+                chrono::Utc::now(),
+                session_id,
+                ctx.tenant_id,
+                fold_id,
+            ),
+        )
+        .await?;
         Ok(())
     }
 
@@ -1404,23 +1628,21 @@ impl Storage for CqlStorage {
         k: usize,
         include_raw: bool,
     ) -> anyhow::Result<Vec<FoldSummary>> {
-        // ANN query using ORDER BY fold_embedding ANN OF ? LIMIT {k}
-        // CQL does not support bound parameters in LIMIT (except ANN top-k).
-        // Ferrosa does not support LIMIT ? even with ANN, so we embed k as literal.
-        let query_blob =
-            cdrs_tokio::types::blob::Blob::new(crate::vector::encode_vector(query_embedding));
-        let query = format!(
-            "SELECT fold_id, depth, fold_summary, token_count, raw_trajectory \
-             FROM {}.trajectory_folds WHERE session_id = ? AND tenant_id = ? \
-             ORDER BY fold_embedding ANN OF ? LIMIT {}",
-            self.keyspace, k
-        );
-        let envelope = match self
+        // ANN query using ORDER BY fold_embedding ANN OF [..] LIMIT {k}.
+        // Ferrosa vector ANN expects a vector literal; binding Vec<u8> serializes
+        // as Blob and produces warning-noisy fallback on live smoke tests.
+        let (query, _bind_count) = build_fold_ann_search_query(&self.keyspace, query_embedding, k);
+        #[allow(deprecated)]
+        let (col_map, rows) = match self
             .session
-            .query_with_values(query, query_values!(session_id, ctx.tenant_id, query_blob))
+            .query_unpaged(query, (session_id, ctx.tenant_id))
             .await
         {
-            Ok(e) => e,
+            Ok(result) => {
+                let col_map = build_col_map(result.col_specs());
+                let rows = result.rows_or_empty();
+                (col_map, rows)
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "ANN query failed, falling back to LIMIT");
                 let fallback = format!(
@@ -1428,24 +1650,28 @@ impl Storage for CqlStorage {
                      FROM {}.trajectory_folds WHERE session_id = ? AND tenant_id = ? LIMIT {}",
                     self.keyspace, k
                 );
-                self.session
-                    .query_with_values(fallback, query_values!(session_id, ctx.tenant_id))
-                    .await?
+                #[allow(deprecated)]
+                let result = self
+                    .session
+                    .query_unpaged(fallback, (session_id, ctx.tenant_id))
+                    .await?;
+                let col_map = build_col_map(result.col_specs());
+                let rows = result.rows_or_empty();
+                (col_map, rows)
             }
         };
 
-        let rows = envelope.response_body()?.into_rows().unwrap_or_default();
         let mut results = Vec::new();
         for row in rows {
-            if let Ok(summary) = row.r_by_name::<String>("fold_summary") {
+            if let Ok(summary) = cql_get::<String>(&row, &col_map, "fold_summary") {
                 results.push(FoldSummary {
-                    fold_id: row.r_by_name("fold_id")?,
-                    depth: row.r_by_name("depth")?,
+                    fold_id: cql_get(&row, &col_map, "fold_id")?,
+                    depth: cql_get(&row, &col_map, "depth")?,
                     fold_summary: summary,
-                    token_count: row.r_by_name("token_count")?,
+                    token_count: cql_get(&row, &col_map, "token_count")?,
                     similarity: None,
                     raw_trajectory: if include_raw {
-                        row.r_by_name::<String>("raw_trajectory").ok()
+                        cql_get::<String>(&row, &col_map, "raw_trajectory").ok()
                     } else {
                         None
                     },
@@ -1458,23 +1684,22 @@ impl Storage for CqlStorage {
     // --- Entity operations ---
 
     async fn entity_put(&self, ctx: &TenantContext, entry: &EntityEntry) -> anyhow::Result<()> {
-        // Base INSERT with required fields only — avoids cdrs-tokio Option
-        // serialization issues with Ferrosa's VECTOR columns.
-        self.session
-            .exec_with_values(
-                &self.stmts.entity_put,
-                query_values!(
-                    ctx.tenant_id,
-                    entry.entity_id,
-                    entry.session_id,
-                    entry.entity_name.clone(),
-                    entry.entity_type.clone(),
-                    entry.context_snippet.clone(),
-                    entry.confidence as f32,
-                    chrono::Utc::now().naive_utc()
-                ),
-            )
-            .await?;
+        // Base INSERT with required fields only — avoids Option serialization
+        // issues with Ferrosa's VECTOR columns.
+        self.exec_prepared_rows(
+            &self.stmts.entity_put,
+            (
+                ctx.tenant_id,
+                entry.entity_id,
+                entry.session_id,
+                entry.entity_name.clone(),
+                entry.entity_type.clone(),
+                entry.context_snippet.clone(),
+                entry.confidence as f32,
+                chrono::Utc::now(),
+            ),
+        )
+        .await?;
 
         // Set optional fields via UPDATE (CQL upsert semantics).
         if let Some(fold_id) = entry.source_fold_id {
@@ -1483,17 +1708,17 @@ impl Storage for CqlStorage {
                  WHERE tenant_id = ? AND session_id = ? AND entity_id = ?",
                 self.keyspace
             );
+            #[allow(deprecated)]
             let _ = self
                 .session
-                .query_with_values(
+                .query_unpaged(
                     q,
-                    query_values!(fold_id, ctx.tenant_id, entry.session_id, entry.entity_id),
+                    (fold_id, ctx.tenant_id, entry.session_id, entry.entity_id),
                 )
                 .await;
         }
         if let Some(ref emb) = entry.entity_embedding {
-            // cdrs-tokio doesn't support the VECTOR CQL type — Blob is rejected
-            // as type mismatch. Use a raw CQL literal [f32, f32, ...] instead.
+            // Ferrosa requires a CQL literal [f32, f32, ...] for VECTOR columns.
             let vec_literal: String = format!(
                 "[{}]",
                 emb.iter()
@@ -1506,12 +1731,10 @@ impl Storage for CqlStorage {
                  WHERE tenant_id = ? AND session_id = ? AND entity_id = ?",
                 ks = self.keyspace,
             );
+            #[allow(deprecated)]
             if let Err(e) = self
                 .session
-                .query_with_values(
-                    q,
-                    query_values!(ctx.tenant_id, entry.session_id, entry.entity_id),
-                )
+                .query_unpaged(q, (ctx.tenant_id, entry.session_id, entry.entity_id))
                 .await
             {
                 tracing::warn!(entity_id = %entry.entity_id, error = %e, "failed to store entity_embedding");
@@ -1526,22 +1749,23 @@ impl Storage for CqlStorage {
             EntityScope::Session => "session",
             EntityScope::Global => "global",
         };
-        let updated_at_ndt = entry.updated_at.unwrap_or(entry.created_at).naive_utc();
+        let updated_at = entry.updated_at.unwrap_or(entry.created_at);
         let q = format!(
             "UPDATE {ks}.entity_store SET scope = ?, updated_at = ? \
              WHERE tenant_id = ? AND session_id = ? AND entity_id = ?",
             ks = self.keyspace,
         );
+        #[allow(deprecated)]
         if let Err(e) = self
             .session
-            .query_with_values(
+            .query_unpaged(
                 q,
-                query_values!(
+                (
                     scope_str.to_string(),
-                    updated_at_ndt,
+                    updated_at,
                     ctx.tenant_id,
                     entry.session_id,
-                    entry.entity_id
+                    entry.entity_id,
                 ),
             )
             .await
@@ -1555,11 +1779,12 @@ impl Storage for CqlStorage {
                  WHERE tenant_id = ? AND session_id = ? AND entity_id = ?",
                 ks = self.keyspace,
             );
+            #[allow(deprecated)]
             if let Err(e) = self
                 .session
-                .query_with_values(
+                .query_unpaged(
                     q,
-                    query_values!(ingester, ctx.tenant_id, entry.session_id, entry.entity_id),
+                    (ingester, ctx.tenant_id, entry.session_id, entry.entity_id),
                 )
                 .await
             {
@@ -1574,15 +1799,16 @@ impl Storage for CqlStorage {
                  WHERE tenant_id = ? AND session_id = ? AND entity_id = ?",
                 ks = self.keyspace,
             );
+            #[allow(deprecated)]
             if let Err(e) = self
                 .session
-                .query_with_values(
+                .query_unpaged(
                     q,
-                    query_values!(
+                    (
                         desc.clone(),
                         ctx.tenant_id,
                         entry.session_id,
-                        entry.entity_id
+                        entry.entity_id,
                     ),
                 )
                 .await
@@ -1604,12 +1830,10 @@ impl Storage for CqlStorage {
                  WHERE tenant_id = ? AND session_id = ? AND entity_id = ?",
                 ks = self.keyspace,
             );
+            #[allow(deprecated)]
             if let Err(e) = self
                 .session
-                .query_with_values(
-                    q,
-                    query_values!(ctx.tenant_id, entry.session_id, entry.entity_id),
-                )
+                .query_unpaged(q, (ctx.tenant_id, entry.session_id, entry.entity_id))
                 .await
             {
                 tracing::warn!(entity_id = %entry.entity_id, error = %e, "failed to store description_embedding");
@@ -1623,11 +1847,12 @@ impl Storage for CqlStorage {
                  WHERE tenant_id = ? AND session_id = ? AND entity_id = ?",
                 ks = self.keyspace,
             );
+            #[allow(deprecated)]
             if let Err(e) = self
                 .session
-                .query_with_values(
+                .query_unpaged(
                     q,
-                    query_values!(tags_json, ctx.tenant_id, entry.session_id, entry.entity_id),
+                    (tags_json, ctx.tenant_id, entry.session_id, entry.entity_id),
                 )
                 .await
             {
@@ -1643,11 +1868,12 @@ impl Storage for CqlStorage {
                  WHERE tenant_id = ? AND session_id = ? AND entity_id = ?",
                 ks = self.keyspace,
             );
+            #[allow(deprecated)]
             if let Err(e) = self
                 .session
-                .query_with_values(
+                .query_unpaged(
                     q,
-                    query_values!(props_json, ctx.tenant_id, entry.session_id, entry.entity_id),
+                    (props_json, ctx.tenant_id, entry.session_id, entry.entity_id),
                 )
                 .await
             {
@@ -1661,15 +1887,16 @@ impl Storage for CqlStorage {
                  WHERE tenant_id = ? AND session_id = ? AND entity_id = ?",
                 ks = self.keyspace,
             );
+            #[allow(deprecated)]
             if let Err(e) = self
                 .session
-                .query_with_values(
+                .query_unpaged(
                     q,
-                    query_values!(
+                    (
                         hash.clone(),
                         ctx.tenant_id,
                         entry.session_id,
-                        entry.entity_id
+                        entry.entity_id,
                     ),
                 )
                 .await
@@ -1695,18 +1922,20 @@ impl Storage for CqlStorage {
              FROM {}.entity_store WHERE tenant_id = ? AND session_id = ? ALLOW FILTERING",
             self.keyspace
         );
-        let envelope = self
+        #[allow(deprecated)]
+        let result = self
             .session
-            .query_with_values(query, query_values!(ctx.tenant_id, session_id))
+            .query_unpaged(query, (ctx.tenant_id, session_id))
             .await?;
 
-        let rows = envelope.response_body()?.into_rows().unwrap_or_default();
+        let col_map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
         let lower = name.to_lowercase();
 
         // Collect matches with rank: 0=exact, 1=segment (after ::), 2=substring
         let mut scored: Vec<(u8, EntityEntry)> = Vec::new();
         for row in rows {
-            let Ok(entity_name) = row.r_by_name::<String>("entity_name") else {
+            let Ok(entity_name) = cql_get::<String>(&row, &col_map, "entity_name") else {
                 continue;
             };
             let en = entity_name.to_lowercase();
@@ -1722,20 +1951,18 @@ impl Storage for CqlStorage {
                 continue;
             };
 
-            let Ok(entity_id) = row.r_by_name::<Uuid>("entity_id") else {
+            let Ok(entity_id) = cql_get::<Uuid>(&row, &col_map, "entity_id") else {
                 continue;
             };
-            let Ok(entity_type) = row.r_by_name::<String>("entity_type") else {
+            let Ok(entity_type) = cql_get::<String>(&row, &col_map, "entity_type") else {
                 continue;
             };
-            let created = row
-                .r_by_name::<chrono::NaiveDateTime>("created_at")
+            let created = cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
                 .unwrap_or_else(|e| {
                     tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
                     Default::default()
                 });
-            let state = row
-                .r_by_name::<String>("state")
+            let state = cql_get::<String>(&row, &col_map, "state")
                 .ok()
                 .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
                 .unwrap_or_default();
@@ -1751,9 +1978,11 @@ impl Storage for CqlStorage {
                     source_fold_id: None, // not fetched in lightweight query
                     context_snippet: String::new(), // not fetched
                     entity_embedding: None, // not fetched
-                    confidence: f64::from(row.r_by_name::<f32>("confidence").unwrap_or(1.0)),
+                    confidence: f64::from(
+                        cql_get::<f32>(&row, &col_map, "confidence").unwrap_or(1.0),
+                    ),
                     state,
-                    created_at: created.and_utc(),
+                    created_at: created,
                     ..Default::default()
                 },
             ));
@@ -1784,19 +2013,17 @@ impl Storage for CqlStorage {
              ALLOW FILTERING",
             self.keyspace
         );
-        let envelope = self
+        #[allow(deprecated)]
+        let result = self
             .session
-            .query_with_values(
-                query,
-                query_values!(ctx.tenant_id, session_id, name, entity_type),
-            )
+            .query_unpaged(query, (ctx.tenant_id, session_id, name, entity_type))
             .await?;
-        let rows = envelope.response_body()?.into_rows().unwrap_or_default();
+        let col_map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
         let Some(row) = rows.first() else {
             return Ok(None);
         };
-        let entity_id = row
-            .r_by_name::<Uuid>("entity_id")
+        let entity_id = cql_get::<Uuid>(row, &col_map, "entity_id")
             .map_err(|e| anyhow::anyhow!("entity_find_by_exact_name row missing entity_id: {e}"))?;
         // Delegate to the full-row read so callers see the same shape as
         // entity_get_by_id without duplicating the column list here.
@@ -1817,29 +2044,30 @@ impl Storage for CqlStorage {
              FROM {}.entity_store WHERE tenant_id = ? AND session_id = ? AND entity_id = ?",
             self.keyspace
         );
-        let envelope = self
+        #[allow(deprecated)]
+        let result = self
             .session
-            .query_with_values(query, query_values!(ctx.tenant_id, session_id, entity_id))
+            .query_unpaged(query, (ctx.tenant_id, session_id, entity_id))
             .await?;
-        let rows = envelope.response_body()?.into_rows().unwrap_or_default();
+        let col_map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
         if let Some(row) = rows.first() {
-            let Ok(entity_name) = row.r_by_name::<String>("entity_name") else {
+            let Ok(entity_name) = cql_get::<String>(row, &col_map, "entity_name") else {
                 return Ok(None);
             };
-            let Ok(entity_type) = row.r_by_name::<String>("entity_type") else {
+            let Ok(entity_type) = cql_get::<String>(row, &col_map, "entity_type") else {
                 return Ok(None);
             };
-            let context_snippet = row.r_by_name::<String>("context_snippet").map_err(|e| {
-                anyhow::anyhow!("required column `context_snippet` read failed: {e}")
-            })?;
-            let created = row
-                .r_by_name::<chrono::NaiveDateTime>("created_at")
+            let context_snippet =
+                cql_get::<String>(row, &col_map, "context_snippet").map_err(|e| {
+                    anyhow::anyhow!("required column `context_snippet` read failed: {e}")
+                })?;
+            let created = cql_get::<chrono::DateTime<chrono::Utc>>(row, &col_map, "created_at")
                 .unwrap_or_else(|e| {
                     tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
                     Default::default()
                 });
-            let state = row
-                .r_by_name::<String>("state")
+            let state = cql_get::<String>(row, &col_map, "state")
                 .ok()
                 .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
                 .unwrap_or_default();
@@ -1852,19 +2080,19 @@ impl Storage for CqlStorage {
                 updated_at,
                 scope,
                 ingested_by_session,
-            ) = extract_rich_entity_fields(row);
+            ) = extract_rich_entity_fields(row, &col_map);
             Ok(Some(EntityEntry {
                 tenant_id: ctx.tenant_id,
                 entity_id,
                 session_id,
                 entity_name,
                 entity_type,
-                source_fold_id: row.r_by_name::<Uuid>("source_fold_id").ok(),
+                source_fold_id: cql_get::<Uuid>(row, &col_map, "source_fold_id").ok(),
                 context_snippet,
                 entity_embedding: None,
-                confidence: f64::from(row.r_by_name::<f32>("confidence").unwrap_or(1.0)),
+                confidence: f64::from(cql_get::<f32>(row, &col_map, "confidence").unwrap_or(1.0)),
                 state,
-                created_at: created.and_utc(),
+                created_at: created,
                 description,
                 description_embedding,
                 tags,
@@ -1889,90 +2117,13 @@ impl Storage for CqlStorage {
             return Ok(Vec::new());
         }
 
-        let placeholders: Vec<String> = entity_ids.iter().map(|_| "?".to_string()).collect();
-        let query = format!(
-            "SELECT entity_id, entity_name, entity_type, source_fold_id, \
-                 context_snippet, confidence, state, created_at, \
-                 description, description_embedding, tags, properties, content_hash, \
-                 updated_at, scope, ingested_by_session \
-                 FROM {}.entity_store WHERE tenant_id = ? AND session_id = ? AND entity_id IN ({})",
-            self.keyspace,
-            placeholders.join(", ")
-        );
-
-        // Prepare and bind values using SimpleValues
-        let prepared = self.session.prepare(query).await?;
-        let values: Vec<cdrs_tokio::types::value::Value> = std::iter::once(ctx.tenant_id)
-            .chain(std::iter::once(session_id))
-            .chain(entity_ids.iter().copied())
-            .map(cdrs_tokio::types::value::Value::from)
-            .collect();
-
-        let envelope = self
-            .session
-            .exec_with_values(
-                &prepared,
-                cdrs_tokio::query::QueryValues::SimpleValues(values),
-            )
-            .await?;
-        let rows = envelope.response_body()?.into_rows().unwrap_or_default();
-
+        // Scylla's SerializeRow trait doesn't support dynamic-length parameter lists.
+        // Issue individual point lookups and merge — all are primary-key reads, O(1) each.
         let mut results = Vec::new();
-        for row in rows {
-            let Ok(entity_id) = row.r_by_name::<Uuid>("entity_id") else {
-                continue;
-            };
-            let Ok(entity_name) = row.r_by_name::<String>("entity_name") else {
-                continue;
-            };
-            let Ok(entity_type) = row.r_by_name::<String>("entity_type") else {
-                continue;
-            };
-            let context_snippet = row.r_by_name::<String>("context_snippet").map_err(|e| {
-                anyhow::anyhow!("required column `context_snippet` read failed: {e}")
-            })?;
-            let created = row
-                .r_by_name::<chrono::NaiveDateTime>("created_at")
-                .unwrap_or_else(|e| {
-                    tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
-                    Default::default()
-                });
-            let state = row
-                .r_by_name::<String>("state")
-                .ok()
-                .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
-                .unwrap_or_default();
-            let (
-                description,
-                description_embedding,
-                tags,
-                properties,
-                content_hash,
-                updated_at,
-                scope,
-                ingested_by_session,
-            ) = extract_rich_entity_fields(&row);
-            results.push(EntityEntry {
-                tenant_id: ctx.tenant_id,
-                entity_id,
-                session_id,
-                entity_name,
-                entity_type,
-                source_fold_id: row.r_by_name::<Uuid>("source_fold_id").ok(),
-                context_snippet,
-                entity_embedding: None,
-                confidence: f64::from(row.r_by_name::<f32>("confidence").unwrap_or(1.0)),
-                state,
-                created_at: created.and_utc(),
-                description,
-                description_embedding,
-                tags,
-                properties,
-                content_hash,
-                updated_at,
-                scope,
-                ingested_by_session,
-            });
+        for &eid in entity_ids {
+            if let Some(entry) = self.entity_get_by_id(ctx, session_id, eid).await? {
+                results.push(entry);
+            }
         }
         Ok(results)
     }
@@ -2001,35 +2152,35 @@ impl Storage for CqlStorage {
              ORDER BY entity_embedding ANN OF {vec_literal} LIMIT {k}",
             ks = self.keyspace,
         );
-        let envelope = match self
+        #[allow(deprecated)]
+        let ann_result = match self
             .session
-            .query_with_values(query, query_values!(ctx.tenant_id, session_id))
+            .query_unpaged(query, (ctx.tenant_id, session_id))
             .await
         {
-            Ok(e) => e,
+            Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = %e, "entity ANN query failed");
                 return Ok(Vec::new());
             }
         };
-        let rows = envelope.response_body()?.into_rows().unwrap_or_default();
+        let col_map = build_col_map(ann_result.col_specs());
+        let rows = ann_result.rows_or_empty();
         let mut results = Vec::new();
         for row in rows {
             // Skip ghost rows with null required fields (P0 write-loss artifact).
-            let Ok(entity_id) = row.r_by_name::<Uuid>("entity_id") else {
+            let Ok(entity_id) = cql_get::<Uuid>(&row, &col_map, "entity_id") else {
                 continue;
             };
-            let Ok(entity_name) = row.r_by_name::<String>("entity_name") else {
+            let Ok(entity_name) = cql_get::<String>(&row, &col_map, "entity_name") else {
                 continue;
             };
-            let created = row
-                .r_by_name::<chrono::NaiveDateTime>("created_at")
+            let created = cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
                 .unwrap_or_else(|e| {
                     tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
                     Default::default()
                 });
-            let state = row
-                .r_by_name::<String>("state")
+            let state = cql_get::<String>(&row, &col_map, "state")
                 .ok()
                 .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
                 .unwrap_or_default();
@@ -2038,16 +2189,15 @@ impl Storage for CqlStorage {
                 entity_id,
                 session_id,
                 entity_name,
-                entity_type: row.r_by_name("entity_type").unwrap_or_default(),
-                source_fold_id: row.r_by_name::<Uuid>("source_fold_id").ok(),
-                context_snippet: row.r_by_name("context_snippet").unwrap_or_default(),
+                entity_type: cql_get(&row, &col_map, "entity_type").unwrap_or_default(),
+                source_fold_id: cql_get::<Uuid>(&row, &col_map, "source_fold_id").ok(),
+                context_snippet: cql_get(&row, &col_map, "context_snippet").unwrap_or_default(),
                 entity_embedding: None,
-                confidence: row
-                    .r_by_name::<f32>("confidence")
+                confidence: cql_get::<f32>(&row, &col_map, "confidence")
                     .map(f64::from)
                     .unwrap_or(0.0),
                 state,
-                created_at: created.and_utc(),
+                created_at: created,
                 ..Default::default()
             });
         }
@@ -2057,28 +2207,22 @@ impl Storage for CqlStorage {
     async fn entity_count(&self, ctx: &TenantContext, session_id: Uuid) -> anyhow::Result<usize> {
         // Client-side count: SELECT entity_id returns rows, count them.
         // Workaround for Ferrosa returning COUNT(*) column as "system.count".
-        let rows = self
-            .query_rows(
-                &self.stmts.entity_count,
-                query_values!(ctx.tenant_id, session_id),
-            )
+        let (_col_map, rows) = self
+            .exec_prepared_rows(&self.stmts.entity_count, (ctx.tenant_id, session_id))
             .await?;
         Ok(rows.len())
     }
 
     async fn fold_count(&self, ctx: &TenantContext, session_id: Uuid) -> anyhow::Result<usize> {
-        let rows = self
-            .query_rows(
-                &self.stmts.fold_count,
-                query_values!(ctx.tenant_id, session_id),
-            )
+        let (_col_map, rows) = self
+            .exec_prepared_rows(&self.stmts.fold_count, (ctx.tenant_id, session_id))
             .await?;
         Ok(rows.len())
     }
 
     async fn memo_count(&self, ctx: &TenantContext) -> anyhow::Result<usize> {
-        let rows = self
-            .query_rows(&self.stmts.memo_count, query_values!(ctx.tenant_id))
+        let (_col_map, rows) = self
+            .exec_prepared_rows(&self.stmts.memo_count, (ctx.tenant_id,))
             .await?;
         Ok(rows.len())
     }
@@ -2088,36 +2232,32 @@ impl Storage for CqlStorage {
         ctx: &TenantContext,
         session_id: Uuid,
     ) -> anyhow::Result<Vec<EntityEntry>> {
-        let rows = self
-            .query_rows(
-                &self.stmts.entity_list_session,
-                query_values!(ctx.tenant_id, session_id),
-            )
+        let (col_map, rows) = self
+            .exec_prepared_rows(&self.stmts.entity_list_session, (ctx.tenant_id, session_id))
             .await?;
 
         let mut results = Vec::with_capacity(rows.len());
         for row in rows {
             // Skip rows with NULL required fields (ghost rows from bulk loads).
-            let Ok(entity_id) = row.r_by_name::<Uuid>("entity_id") else {
+            let Ok(entity_id) = cql_get::<Uuid>(&row, &col_map, "entity_id") else {
                 continue;
             };
-            let Ok(entity_name) = row.r_by_name::<String>("entity_name") else {
+            let Ok(entity_name) = cql_get::<String>(&row, &col_map, "entity_name") else {
                 continue;
             };
-            let Ok(entity_type) = row.r_by_name::<String>("entity_type") else {
+            let Ok(entity_type) = cql_get::<String>(&row, &col_map, "entity_type") else {
                 continue;
             };
-            let context_snippet = row.r_by_name::<String>("context_snippet").map_err(|e| {
-                anyhow::anyhow!("required column `context_snippet` read failed: {e}")
-            })?;
-            let created = row
-                .r_by_name::<chrono::NaiveDateTime>("created_at")
+            let context_snippet =
+                cql_get::<String>(&row, &col_map, "context_snippet").map_err(|e| {
+                    anyhow::anyhow!("required column `context_snippet` read failed: {e}")
+                })?;
+            let created = cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
                 .unwrap_or_else(|e| {
                     tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
                     Default::default()
                 });
-            let state = row
-                .r_by_name::<String>("state")
+            let state = cql_get::<String>(&row, &col_map, "state")
                 .ok()
                 .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
                 .unwrap_or_default();
@@ -2130,27 +2270,24 @@ impl Storage for CqlStorage {
                 updated_at,
                 scope,
                 ingested_by_session,
-            ) = extract_rich_entity_fields(&row);
+            ) = extract_rich_entity_fields(&row, &col_map);
             results.push(EntityEntry {
                 tenant_id: ctx.tenant_id,
                 entity_id,
                 session_id,
                 entity_name,
                 entity_type,
-                source_fold_id: row.r_by_name::<Uuid>("source_fold_id").ok(),
+                source_fold_id: cql_get::<Uuid>(&row, &col_map, "source_fold_id").ok(),
                 context_snippet,
-                entity_embedding: row
-                    .r_by_name::<cdrs_tokio::types::blob::Blob>("entity_embedding")
+                entity_embedding: cql_get::<Vec<u8>>(&row, &col_map, "entity_embedding")
                     .ok()
-                    .map(|blob| blob.into_vec())
                     .filter(|v| !v.is_empty())
                     .map(|v| crate::vector::decode_vector(&v)),
-                confidence: row
-                    .r_by_name::<f32>("confidence")
+                confidence: cql_get::<f32>(&row, &col_map, "confidence")
                     .map(f64::from)
                     .unwrap_or(1.0),
                 state,
-                created_at: created.and_utc(),
+                created_at: created,
                 description,
                 description_embedding,
                 tags,
@@ -2173,17 +2310,18 @@ impl Storage for CqlStorage {
             "SELECT entity_type, state FROM {}.entity_store WHERE tenant_id = ? AND session_id = ?",
             self.keyspace
         );
-        let envelope = self
+        #[allow(deprecated)]
+        let result = self
             .session
-            .query_with_values(query, query_values!(ctx.tenant_id, session_id))
+            .query_unpaged(query, (ctx.tenant_id, session_id))
             .await?;
-        let rows = envelope.response_body()?.into_rows().unwrap_or_default();
+        let col_map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
         let mut counts: std::collections::BTreeMap<(String, String), usize> =
             std::collections::BTreeMap::new();
         for row in rows {
-            let entity_type = row.r_by_name::<String>("entity_type").unwrap_or_default();
-            let state = row
-                .r_by_name::<String>("state")
+            let entity_type = cql_get::<String>(&row, &col_map, "entity_type").unwrap_or_default();
+            let state = cql_get::<String>(&row, &col_map, "state")
                 .unwrap_or_else(|_| MemoryState::default().to_string());
             *counts.entry((entity_type, state)).or_insert(0) += 1;
         }
@@ -2199,130 +2337,196 @@ impl Storage for CqlStorage {
     }
 
     async fn entity_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<EntityEntry>> {
-        let rows = self
-            .query_rows(&self.stmts.entity_list_all, query_values!(ctx.tenant_id))
+        let (col_map, rows) = self
+            .exec_prepared_rows(&self.stmts.entity_list_all, (ctx.tenant_id,))
             .await?;
 
         let mut results = Vec::with_capacity(rows.len());
         for row in rows {
-            let created = row
-                .r_by_name::<chrono::NaiveDateTime>("created_at")
-                .unwrap_or_else(|e| {
-                    tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
-                    Default::default()
-                });
-            let state = row
-                .r_by_name::<String>("state")
-                .ok()
-                .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
-                .unwrap_or_default();
-            let (
-                description,
-                description_embedding,
-                tags,
-                properties,
-                content_hash,
-                updated_at,
-                scope,
-                ingested_by_session,
-            ) = extract_rich_entity_fields(&row);
-            results.push(EntityEntry {
-                tenant_id: ctx.tenant_id,
-                entity_id: row.r_by_name("entity_id")?,
-                session_id: row.r_by_name("session_id")?,
-                entity_name: row.r_by_name("entity_name")?,
-                entity_type: row.r_by_name("entity_type")?,
-                source_fold_id: row.r_by_name::<Uuid>("source_fold_id").ok(),
-                context_snippet: row.r_by_name("context_snippet")?,
-                entity_embedding: row
-                    .r_by_name::<cdrs_tokio::types::blob::Blob>("entity_embedding")
-                    .ok()
-                    .map(|blob| blob.into_vec())
-                    .filter(|v| !v.is_empty())
-                    .map(|v| crate::vector::decode_vector(&v)),
-                confidence: row
-                    .r_by_name::<f32>("confidence")
-                    .map(f64::from)
-                    .unwrap_or(1.0),
-                state,
-                created_at: created.and_utc(),
-                description,
-                description_embedding,
-                tags,
-                properties,
-                content_hash,
-                updated_at,
-                scope,
-                ingested_by_session,
-            });
+            if let Some(entry) = row_to_entity_entry(ctx, &row, &col_map)? {
+                results.push(entry);
+            }
         }
         Ok(results)
     }
 
+    async fn entity_stream_all(
+        &self,
+        ctx: TenantContext,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<EntityEntry>>>,
+    ) {
+        let chunk_size = chunk_size.max(1);
+        let mut iter = match self
+            .session
+            .execute_iter(self.stmts.entity_list_all.clone(), (ctx.tenant_id,))
+            .await
+        {
+            Ok(iter) => iter,
+            Err(e) => {
+                let _ = tx.send(Err(e.into())).await;
+                return;
+            }
+        };
+        let col_map = build_col_map(iter.get_column_specs());
+        let mut chunk = Vec::with_capacity(chunk_size);
+        while let Some(row) = iter.next().await {
+            match row
+                .map_err(anyhow::Error::from)
+                .and_then(|row| row_to_entity_entry(&ctx, &row, &col_map))
+            {
+                // Ghost rows (NULL required fields) are skipped silently —
+                // the row_to_entity_entry docstring captures the rationale.
+                Ok(None) => continue,
+                Ok(Some(entry)) => {
+                    chunk.push(entry);
+                    if chunk.len() >= chunk_size {
+                        let out = std::mem::take(&mut chunk);
+                        if tx.send(Ok(out)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            }
+        }
+        if !chunk.is_empty() {
+            let _ = tx.send(Ok(chunk)).await;
+        }
+    }
+
     async fn fold_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<FoldEntry>> {
-        let rows = self
-            .query_rows(&self.stmts.fold_list_all, query_values!(ctx.tenant_id))
+        let (col_map, rows) = self
+            .exec_prepared_rows(&self.stmts.fold_list_all, (ctx.tenant_id,))
             .await?;
 
         let mut results = Vec::with_capacity(rows.len());
         for row in rows {
-            let status_str: String = row.r_by_name("status").unwrap_or_default();
+            let status_str: String = cql_get(&row, &col_map, "status").unwrap_or_default();
             let status: FoldStatus =
                 serde_json::from_str(&format!("\"{status_str}\"")).unwrap_or(FoldStatus::Active);
-            let created = row
-                .r_by_name::<chrono::NaiveDateTime>("created_at")
+            let created = cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
                 .unwrap_or_else(|e| {
                     tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
                     Default::default()
                 });
             results.push(FoldEntry {
-                session_id: row.r_by_name("session_id")?,
-                fold_id: row.r_by_name("fold_id")?,
+                session_id: cql_get(&row, &col_map, "session_id")?,
+                fold_id: cql_get(&row, &col_map, "fold_id")?,
                 tenant_id: ctx.tenant_id,
-                depth: row.r_by_name("depth")?,
-                parent_fold_id: row.r_by_name::<Uuid>("parent_fold_id").ok(),
-                raw_trajectory: row.r_by_name("raw_trajectory").unwrap_or_default(),
-                fold_summary: row.r_by_name::<String>("fold_summary").ok(),
-                fold_embedding: row
-                    .r_by_name::<cdrs_tokio::types::blob::Blob>("fold_embedding")
+                depth: cql_get(&row, &col_map, "depth")?,
+                parent_fold_id: cql_get::<Uuid>(&row, &col_map, "parent_fold_id").ok(),
+                raw_trajectory: cql_get(&row, &col_map, "raw_trajectory").unwrap_or_default(),
+                fold_summary: cql_get::<String>(&row, &col_map, "fold_summary").ok(),
+                fold_embedding: cql_get::<Vec<u8>>(&row, &col_map, "fold_embedding")
                     .ok()
-                    .map(|blob| blob.into_vec())
                     .filter(|v| !v.is_empty())
                     .map(|v| crate::vector::decode_vector(&v)),
-                token_count: row.r_by_name("token_count")?,
-                compression_ratio: row.r_by_name::<f64>("compression_ratio").ok(),
+                token_count: cql_get(&row, &col_map, "token_count")?,
+                compression_ratio: cql_get::<f64>(&row, &col_map, "compression_ratio").ok(),
                 status,
-                created_at: created.and_utc(),
-                folded_at: row
-                    .r_by_name::<chrono::NaiveDateTime>("folded_at")
-                    .ok()
-                    .map(|t| t.and_utc()),
+                created_at: created,
+                folded_at: cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "folded_at")
+                    .ok(),
             });
         }
         Ok(results)
     }
 
+    async fn fold_stream_all(
+        &self,
+        ctx: TenantContext,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<FoldEntry>>>,
+    ) {
+        let chunk_size = chunk_size.max(1);
+        let query = format!(
+            "SELECT session_id, fold_id, depth, parent_fold_id, fold_summary, \
+             token_count, compression_ratio, status, created_at, folded_at \
+             FROM {}.trajectory_folds WHERE tenant_id = ? ALLOW FILTERING",
+            self.keyspace
+        );
+        let mut iter = match self.session.query_iter(query, (ctx.tenant_id,)).await {
+            Ok(iter) => iter,
+            Err(e) => {
+                let _ = tx.send(Err(e.into())).await;
+                return;
+            }
+        };
+        let col_map = build_col_map(iter.get_column_specs());
+        let mut chunk = Vec::with_capacity(chunk_size);
+        while let Some(row) = iter.next().await {
+            match row.map_err(anyhow::Error::from).and_then(|row| {
+                let status_str: String = cql_get(&row, &col_map, "status").unwrap_or_default();
+                let status: FoldStatus = serde_json::from_str(&format!("\"{status_str}\""))
+                    .unwrap_or(FoldStatus::Active);
+                let created_at =
+                    cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
+                        .unwrap_or_default();
+                Ok(FoldEntry {
+                    session_id: cql_get(&row, &col_map, "session_id")?,
+                    fold_id: cql_get(&row, &col_map, "fold_id")?,
+                    tenant_id: ctx.tenant_id,
+                    depth: cql_get(&row, &col_map, "depth")?,
+                    parent_fold_id: cql_get::<Uuid>(&row, &col_map, "parent_fold_id").ok(),
+                    raw_trajectory: String::new(),
+                    fold_summary: cql_get::<String>(&row, &col_map, "fold_summary").ok(),
+                    fold_embedding: None,
+                    token_count: cql_get(&row, &col_map, "token_count")?,
+                    compression_ratio: cql_get::<f64>(&row, &col_map, "compression_ratio").ok(),
+                    status,
+                    created_at,
+                    folded_at: cql_get::<chrono::DateTime<chrono::Utc>>(
+                        &row,
+                        &col_map,
+                        "folded_at",
+                    )
+                    .ok(),
+                })
+            }) {
+                Ok(fold) => {
+                    chunk.push(fold);
+                    if chunk.len() >= chunk_size {
+                        let out = std::mem::take(&mut chunk);
+                        if tx.send(Ok(out)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "fold_stream_all skipped malformed row"),
+            }
+        }
+        if !chunk.is_empty() {
+            let _ = tx.send(Ok(chunk)).await;
+        }
+    }
+
     async fn temporal_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<TemporalEvent>> {
-        let rows = self
-            .query_rows(&self.stmts.temporal_list_all, query_values!(ctx.tenant_id))
+        let (col_map, rows) = self
+            .exec_prepared_rows(&self.stmts.temporal_list_all, (ctx.tenant_id,))
             .await?;
 
         let mut results = Vec::with_capacity(rows.len());
         for row in rows {
-            let event_time: chrono::NaiveDateTime = row.r_by_name("event_time")?;
+            let event_time: chrono::DateTime<chrono::Utc> = cql_get(&row, &col_map, "event_time")?;
             results.push(TemporalEvent {
                 tenant_id: ctx.tenant_id,
-                entity_id: row.r_by_name("entity_id")?,
-                event_time: event_time.and_utc(),
-                event_id: row.r_by_name("event_id")?,
-                fact_text: row.r_by_name("fact_text")?,
-                supersedes_id: row.r_by_name::<Uuid>("supersedes_id").ok(),
-                valid_until: row
-                    .r_by_name::<chrono::NaiveDateTime>("valid_until")
-                    .ok()
-                    .map(|t| t.and_utc()),
-                source_session: row.r_by_name("source_session")?,
-                confidence: f64::from(row.r_by_name::<f32>("confidence").unwrap_or(1.0)),
+                entity_id: cql_get(&row, &col_map, "entity_id")?,
+                event_time,
+                event_id: cql_get(&row, &col_map, "event_id")?,
+                fact_text: cql_get(&row, &col_map, "fact_text")?,
+                supersedes_id: cql_get::<Uuid>(&row, &col_map, "supersedes_id").ok(),
+                valid_until: cql_get::<chrono::DateTime<chrono::Utc>>(
+                    &row,
+                    &col_map,
+                    "valid_until",
+                )
+                .ok(),
+                source_session: cql_get(&row, &col_map, "source_session")?,
+                confidence: f64::from(cql_get::<f32>(&row, &col_map, "confidence").unwrap_or(1.0)),
             });
         }
         Ok(results)
@@ -2341,21 +2545,23 @@ impl Storage for CqlStorage {
             "SELECT session_id FROM {}.entity_store WHERE tenant_id = ? AND entity_id = ? ALLOW FILTERING",
             self.keyspace
         );
-        let envelope = self
+        #[allow(deprecated)]
+        let result = self
             .session
-            .query_with_values(query, query_values!(ctx.tenant_id, entity_id))
+            .query_unpaged(query, (ctx.tenant_id, entity_id))
             .await?;
-        let rows = envelope.response_body()?.into_rows().unwrap_or_default();
+        let col_map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
         let row = rows
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("entity not found: {entity_id}"))?;
-        let session_id: Uuid = row.r_by_name("session_id")?;
+        let session_id: Uuid = cql_get(&row, &col_map, "session_id")?;
 
         self.session
-            .exec_with_values(
+            .execute_unpaged(
                 &self.stmts.entity_update_state,
-                query_values!(state_str, ctx.tenant_id, session_id, entity_id),
+                (state_str, ctx.tenant_id, session_id, entity_id),
             )
             .await?;
         Ok(())
@@ -2379,7 +2585,7 @@ impl Storage for CqlStorage {
             self.keyspace
         );
         self.session
-            .query_with_values(query, query_values!(ctx.tenant_id, session_id, entity_id))
+            .query_unpaged(query, (ctx.tenant_id, session_id, entity_id))
             .await?;
         Ok(true)
     }
@@ -2388,18 +2594,18 @@ impl Storage for CqlStorage {
 
     async fn temporal_put(&self, ctx: &TenantContext, event: &TemporalEvent) -> anyhow::Result<()> {
         self.session
-            .exec_with_values(
+            .execute_unpaged(
                 &self.stmts.temporal_put,
-                query_values!(
+                (
                     ctx.tenant_id,
                     event.entity_id,
-                    event.event_time.naive_utc(),
+                    event.event_time,
                     event.event_id,
                     event.fact_text.clone(),
                     event.supersedes_id,
-                    event.valid_until.map(|t| t.naive_utc()),
+                    event.valid_until,
                     event.source_session,
-                    event.confidence as f32
+                    event.confidence as f32,
                 ),
             )
             .await?;
@@ -2411,31 +2617,26 @@ impl Storage for CqlStorage {
         ctx: &TenantContext,
         entity_id: Uuid,
     ) -> anyhow::Result<Option<TemporalEvent>> {
-        let rows = self
-            .query_rows(
-                &self.stmts.temporal_get_current,
-                query_values!(ctx.tenant_id, entity_id),
-            )
+        let (col_map, rows) = self
+            .exec_prepared_rows(&self.stmts.temporal_get_current, (ctx.tenant_id, entity_id))
             .await?;
 
         // Filter for valid_until IS NULL (current facts) — CQL can't filter on NULL
         for row in rows {
-            if row
-                .r_by_name::<chrono::NaiveDateTime>("valid_until")
-                .is_err()
-            {
+            if cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "valid_until").is_err() {
                 // NULL means this is the current fact
-                let event_time: chrono::NaiveDateTime = row.r_by_name("event_time")?;
+                let event_time: chrono::DateTime<chrono::Utc> =
+                    cql_get(&row, &col_map, "event_time")?;
                 return Ok(Some(TemporalEvent {
                     tenant_id: ctx.tenant_id,
                     entity_id,
-                    event_time: event_time.and_utc(),
-                    event_id: row.r_by_name("event_id")?,
-                    fact_text: row.r_by_name("fact_text")?,
-                    supersedes_id: row.r_by_name::<Uuid>("supersedes_id").ok(),
+                    event_time,
+                    event_id: cql_get(&row, &col_map, "event_id")?,
+                    fact_text: cql_get(&row, &col_map, "fact_text")?,
+                    supersedes_id: cql_get::<Uuid>(&row, &col_map, "supersedes_id").ok(),
                     valid_until: None,
-                    source_session: row.r_by_name("source_session")?,
-                    confidence: f64::from(row.r_by_name::<f32>("confidence")?),
+                    source_session: cql_get(&row, &col_map, "source_session")?,
+                    confidence: f64::from(cql_get::<f32>(&row, &col_map, "confidence")?),
                 }));
             }
         }
@@ -2455,14 +2656,14 @@ impl Storage for CqlStorage {
             .filter(|e| e.event_id == event_id)
         {
             self.session
-                .exec_with_values(
+                .execute_unpaged(
                     &self.stmts.temporal_invalidate,
-                    query_values!(
-                        chrono::Utc::now().naive_utc(),
+                    (
+                        chrono::Utc::now(),
                         ctx.tenant_id,
                         entity_id,
-                        event.event_time.naive_utc(),
-                        event_id
+                        event.event_time,
+                        event_id,
                     ),
                 )
                 .await?;
@@ -2478,9 +2679,9 @@ impl Storage for CqlStorage {
         outcome: &FeedbackOutcome,
     ) -> anyhow::Result<()> {
         self.session
-            .exec_with_values(
+            .execute_unpaged(
                 &self.stmts.feedback_put,
-                query_values!(
+                (
                     ctx.tenant_id,
                     outcome.session_id,
                     outcome.query_id,
@@ -2489,7 +2690,7 @@ impl Storage for CqlStorage {
                     outcome.succeeded,
                     outcome.latency_ms,
                     outcome.token_cost,
-                    chrono::Utc::now().naive_utc()
+                    chrono::Utc::now(),
                 ),
             )
             .await?;
@@ -2497,39 +2698,21 @@ impl Storage for CqlStorage {
     }
 
     async fn feedback_list_all(&self) -> anyhow::Result<Vec<FeedbackOutcome>> {
-        let envelope = self.session.exec(&self.stmts.feedback_list_all).await?;
-        let body = envelope.response_body()?;
-        let rows = body.into_rows().unwrap_or_default();
+        let (col_map, rows) = self
+            .exec_prepared_rows(&self.stmts.feedback_list_all, ())
+            .await?;
 
         let mut outcomes = Vec::with_capacity(rows.len());
         for row in &rows {
-            let tenant_id: Uuid = row
-                .by_name("tenant_id")?
-                .ok_or_else(|| anyhow::anyhow!("missing tenant_id"))?;
-            let session_id: Uuid = row
-                .by_name("session_id")?
-                .ok_or_else(|| anyhow::anyhow!("missing session_id"))?;
-            let query_id: Uuid = row
-                .by_name("query_id")?
-                .ok_or_else(|| anyhow::anyhow!("missing query_id"))?;
-            let program_type: String = row
-                .by_name("program_type")?
-                .ok_or_else(|| anyhow::anyhow!("missing program_type"))?;
-            let task_complexity: String = row
-                .by_name("task_complexity")?
-                .ok_or_else(|| anyhow::anyhow!("missing task_complexity"))?;
-            let succeeded: bool = row
-                .by_name("succeeded")?
-                .ok_or_else(|| anyhow::anyhow!("missing succeeded"))?;
-            let latency_ms: i32 = row
-                .by_name("latency_ms")?
-                .ok_or_else(|| anyhow::anyhow!("missing latency_ms"))?;
-            let token_cost: i32 = row
-                .by_name("token_cost")?
-                .ok_or_else(|| anyhow::anyhow!("missing token_cost"))?;
-            let created_at: chrono::NaiveDateTime = row
-                .by_name("created_at")?
-                .ok_or_else(|| anyhow::anyhow!("missing created_at"))?;
+            let tenant_id: Uuid = cql_get(row, &col_map, "tenant_id")?;
+            let session_id: Uuid = cql_get(row, &col_map, "session_id")?;
+            let query_id: Uuid = cql_get(row, &col_map, "query_id")?;
+            let program_type: String = cql_get(row, &col_map, "program_type")?;
+            let task_complexity: String = cql_get(row, &col_map, "task_complexity")?;
+            let succeeded: bool = cql_get(row, &col_map, "succeeded")?;
+            let latency_ms: i32 = cql_get(row, &col_map, "latency_ms")?;
+            let token_cost: i32 = cql_get(row, &col_map, "token_cost")?;
+            let created_at: chrono::DateTime<chrono::Utc> = cql_get(row, &col_map, "created_at")?;
 
             outcomes.push(FeedbackOutcome {
                 tenant_id,
@@ -2540,7 +2723,7 @@ impl Storage for CqlStorage {
                 succeeded,
                 latency_ms,
                 token_cost,
-                created_at: chrono::DateTime::from_naive_utc_and_offset(created_at, chrono::Utc),
+                created_at,
             });
         }
 
@@ -2556,14 +2739,13 @@ impl Storage for CqlStorage {
             "SELECT hit_count FROM {}.memo_cache WHERE tenant_id = ? ALLOW FILTERING",
             self.keyspace
         );
-        let envelope = self
-            .session
-            .query_with_values(query, query_values!(ctx.tenant_id))
-            .await?;
-        let rows = envelope.response_body()?.into_rows().unwrap_or_default();
+        #[allow(deprecated)]
+        let result = self.session.query_unpaged(query, (ctx.tenant_id,)).await?;
+        let col_map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
         let mut total: i64 = 0;
         for row in &rows {
-            let hits: i64 = row.r_by_name("hit_count").unwrap_or(0);
+            let hits: i64 = cql_get(row, &col_map, "hit_count").unwrap_or(0);
             total += hits;
         }
         Ok(total)
@@ -2584,15 +2766,14 @@ impl Storage for CqlStorage {
             "SELECT status FROM {}.trajectory_folds WHERE tenant_id = ? ALLOW FILTERING",
             self.keyspace
         );
-        let envelope = self
-            .session
-            .query_with_values(query, query_values!(ctx.tenant_id))
-            .await?;
-        let rows = envelope.response_body()?.into_rows().unwrap_or_default();
+        #[allow(deprecated)]
+        let result = self.session.query_unpaged(query, (ctx.tenant_id,)).await?;
+        let col_map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
         let count = rows
             .iter()
             .filter(|r| {
-                r.r_by_name::<String>("status")
+                cql_get::<String>(r, &col_map, "status")
                     .map(|s| s == status_str)
                     .unwrap_or(false)
             })
@@ -2605,11 +2786,10 @@ impl Storage for CqlStorage {
             "SELECT event_id FROM {}.temporal_events WHERE tenant_id = ? ALLOW FILTERING",
             self.keyspace
         );
-        let envelope = self
-            .session
-            .query_with_values(query, query_values!(ctx.tenant_id))
-            .await?;
-        let rows = envelope.response_body()?.into_rows().unwrap_or_default();
+        #[allow(deprecated)]
+        let result = self.session.query_unpaged(query, (ctx.tenant_id,)).await?;
+        let _col_map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
         Ok(rows.len())
     }
 
@@ -2622,7 +2802,10 @@ impl Storage for CqlStorage {
             "supersedes",
             "typed_edges",
         ] {
-            total += self.query_count_allow_filtering(table, ctx).await?;
+            let query = edge_count_query(&self.keyspace, table)?;
+            #[allow(deprecated)]
+            let result = self.session.query_unpaged(query, (ctx.tenant_id,)).await?;
+            total += result.rows_or_empty().len();
         }
         Ok(total)
     }
@@ -2652,7 +2835,7 @@ impl Storage for CqlStorage {
         for (name, query) in &tables {
             match self
                 .session
-                .query_with_values(query.as_str(), query_values!(session_id, ctx.tenant_id))
+                .query_unpaged(query.as_str(), (session_id, ctx.tenant_id))
                 .await
             {
                 Ok(_) => count += 1,
@@ -2748,31 +2931,30 @@ impl Storage for CqlStorage {
 
         for (table, src_col, tgt_col, label) in edge_queries {
             let query = format!(
-                "SELECT {src_col}, {tgt_col} FROM {}.{table} \
-                 WHERE session_id = ? AND tenant_id = ? ALLOW FILTERING",
+                "SELECT {src_col}, {tgt_col}, tenant_id, session_id FROM {}.{table}",
                 self.keyspace
             );
             match self.session.prepare(query).await {
-                Ok(prepared) => {
-                    match self
-                        .session
-                        .exec_with_values(&prepared, query_values!(session_id, ctx.tenant_id))
-                        .await
-                    {
-                        Ok(envelope) => {
-                            let rows = envelope.response_body()?.into_rows().unwrap_or_default();
-                            for row in rows {
-                                if let (Ok(src), Ok(tgt)) = (
-                                    row.r_by_name::<Uuid>(src_col),
-                                    row.r_by_name::<Uuid>(tgt_col),
-                                ) {
-                                    edges.push((src, tgt, label.to_string()));
-                                }
+                Ok(prepared) => match self.exec_prepared_rows(&prepared, ()).await {
+                    Ok((col_map, rows)) => {
+                        for row in rows {
+                            let row_tenant = cql_get::<Uuid>(&row, &col_map, "tenant_id");
+                            let row_session = cql_get::<Uuid>(&row, &col_map, "session_id");
+                            if row_tenant.as_ref().ok() != Some(&ctx.tenant_id)
+                                || row_session.as_ref().ok() != Some(&session_id)
+                            {
+                                continue;
+                            }
+                            if let (Ok(src), Ok(tgt)) = (
+                                cql_get::<Uuid>(&row, &col_map, src_col),
+                                cql_get::<Uuid>(&row, &col_map, tgt_col),
+                            ) {
+                                edges.push((src, tgt, label.to_string()));
                             }
                         }
-                        Err(e) => tracing::warn!(table, error = %e, "edge query failed"),
                     }
-                }
+                    Err(e) => tracing::warn!(table, error = %e, "edge query failed"),
+                },
                 Err(e) => tracing::warn!(table, error = %e, "edge query prepare failed"),
             }
         }
@@ -2783,19 +2965,23 @@ impl Storage for CqlStorage {
              WHERE tenant_id = ? ALLOW FILTERING",
             self.keyspace
         );
-        if let Ok(prepared) = self.session.prepare(query).await
-            && let Ok(envelope) = self
+        #[allow(deprecated)]
+        if let Ok(prepared) = self.session.prepare(query).await {
+            #[allow(deprecated)]
+            if let Ok(result) = self
                 .session
-                .exec_with_values(&prepared, query_values!(ctx.tenant_id))
+                .execute_unpaged(&prepared, (ctx.tenant_id,))
                 .await
-        {
-            let rows = envelope.response_body()?.into_rows().unwrap_or_default();
-            for row in rows {
-                if let (Ok(src), Ok(tgt)) = (
-                    row.r_by_name::<Uuid>("new_event_id"),
-                    row.r_by_name::<Uuid>("old_event_id"),
-                ) {
-                    edges.push((src, tgt, "SUPERSEDES".into()));
+            {
+                let sup_col_map = build_col_map(result.col_specs());
+                let rows = result.rows_or_empty();
+                for row in rows {
+                    if let (Ok(src), Ok(tgt)) = (
+                        cql_get::<Uuid>(&row, &sup_col_map, "new_event_id"),
+                        cql_get::<Uuid>(&row, &sup_col_map, "old_event_id"),
+                    ) {
+                        edges.push((src, tgt, "SUPERSEDES".into()));
+                    }
                 }
             }
         }
@@ -2823,30 +3009,90 @@ impl Storage for CqlStorage {
         ];
 
         for &(table, src_col, tgt_col, edge_type) in queries {
-            let query = format!(
-                "SELECT {src_col}, {tgt_col} FROM {}.{table} WHERE tenant_id = ? ALLOW FILTERING",
-                self.keyspace
-            );
-            if let Ok(prepared) = self.session().prepare(query).await
-                && let Ok(frame) = self
-                    .session()
-                    .exec_with_values(&prepared, query_values!(ctx.tenant_id))
+            let query = edge_list_all_query(&self.keyspace, table, src_col, tgt_col);
+            #[allow(deprecated)]
+            if let Ok(prepared) = self.session.prepare(query).await {
+                #[allow(deprecated)]
+                if let Ok(result) = self
+                    .session
+                    .execute_unpaged(&prepared, (ctx.tenant_id,))
                     .await
-                && let Ok(body) = frame.response_body()
-                && let Some(rows) = body.into_rows()
-            {
-                for row in rows {
-                    if let (Ok(a), Ok(b)) = (
-                        row.r_by_name::<Uuid>(src_col),
-                        row.r_by_name::<Uuid>(tgt_col),
-                    ) {
-                        edges.push((a, b, edge_type.into()));
+                {
+                    let ea_col_map = build_col_map(result.col_specs());
+                    let rows = result.rows_or_empty();
+                    for row in rows {
+                        if let (Ok(a), Ok(b)) = (
+                            cql_get::<Uuid>(&row, &ea_col_map, src_col),
+                            cql_get::<Uuid>(&row, &ea_col_map, tgt_col),
+                        ) {
+                            edges.push((a, b, edge_type.into()));
+                        }
+                    }
+                } // end if execute_unpaged
+            } // end if prepare
+        } // end for
+
+        Ok(edges)
+    }
+
+    async fn edge_stream_all(
+        &self,
+        ctx: TenantContext,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<(Uuid, Uuid, String)>>>,
+    ) {
+        let chunk_size = chunk_size.max(1);
+        let queries: &[(&str, &str, &str, &str)] = &[
+            ("co_occurs_with", "entity_a", "entity_b", "CO_OCCURS"),
+            ("mentioned_in", "entity_id", "fold_id", "MENTIONED_IN"),
+            (
+                "folded_into",
+                "source_fold_id",
+                "target_fold_id",
+                "FOLDED_INTO",
+            ),
+            ("supersedes", "new_event_id", "old_event_id", "SUPERSEDES"),
+        ];
+
+        for &(table, src_col, tgt_col, edge_type) in queries {
+            let query = edge_list_all_query(&self.keyspace, table, src_col, tgt_col);
+            let mut iter = match self.session.query_iter(query, (ctx.tenant_id,)).await {
+                Ok(iter) => iter,
+                Err(e) => {
+                    let _ = tx.send(Err(e.into())).await;
+                    return;
+                }
+            };
+            let col_map = build_col_map(iter.get_column_specs());
+            let mut chunk = Vec::with_capacity(chunk_size);
+            while let Some(row) = iter.next().await {
+                match row.map_err(anyhow::Error::from).and_then(|row| {
+                    let src = cql_get::<Uuid>(&row, &col_map, src_col)?;
+                    let tgt = cql_get::<Uuid>(&row, &col_map, tgt_col)?;
+                    Ok((src, tgt, edge_type.to_string()))
+                }) {
+                    Ok(edge) => {
+                        chunk.push(edge);
+                        if chunk.len() >= chunk_size {
+                            let out = std::mem::take(&mut chunk);
+                            if tx.send(Ok(out)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
                     }
                 }
             }
+            if !chunk.is_empty() {
+                let out = std::mem::take(&mut chunk);
+                if tx.send(Ok(out)).await.is_err() {
+                    return;
+                }
+            }
         }
-
-        Ok(edges)
     }
 
     async fn edge_list_for_entity(
@@ -2857,62 +3103,56 @@ impl Storage for CqlStorage {
         let mut neighbors = Vec::new();
 
         // MENTIONED_IN edges (entity -> fold)
-        let rows = self
-            .query_rows(
+        let (col_map, rows) = self
+            .exec_prepared_rows(
                 &self.stmts.edge_mentioned_in_by_entity,
-                query_values!(entity_id, ctx.tenant_id),
+                (entity_id, ctx.tenant_id),
             )
             .await?;
         for row in rows {
-            let fold_id: Uuid = row.r_by_name("fold_id")?;
+            let fold_id: Uuid = cql_get(&row, &col_map, "fold_id")?;
             neighbors.push((fold_id, "MENTIONED_IN".into()));
         }
 
         // CO_OCCURS_WITH edges (entity as entity_a)
-        let rows = self
-            .query_rows(
-                &self.stmts.edge_co_occurs_by_a,
-                query_values!(entity_id, ctx.tenant_id),
-            )
+        let (col_map, rows) = self
+            .exec_prepared_rows(&self.stmts.edge_co_occurs_by_a, (entity_id, ctx.tenant_id))
             .await?;
         for row in rows {
-            let other: Uuid = row.r_by_name("entity_b")?;
+            let other: Uuid = cql_get(&row, &col_map, "entity_b")?;
             neighbors.push((other, "CO_OCCURS".into()));
         }
 
         // CO_OCCURS_WITH edges (entity as entity_b)
-        let rows = self
-            .query_rows(
-                &self.stmts.edge_co_occurs_by_b,
-                query_values!(entity_id, ctx.tenant_id),
-            )
+        let (col_map, rows) = self
+            .exec_prepared_rows(&self.stmts.edge_co_occurs_by_b, (entity_id, ctx.tenant_id))
             .await?;
         for row in rows {
-            let other: Uuid = row.r_by_name("entity_a")?;
+            let other: Uuid = cql_get(&row, &col_map, "entity_a")?;
             neighbors.push((other, "CO_OCCURS".into()));
         }
 
         // SUPERSEDES edges (entity as new_event_id)
-        let rows = self
-            .query_rows(
+        let (col_map, rows) = self
+            .exec_prepared_rows(
                 &self.stmts.edge_supersedes_by_new,
-                query_values!(entity_id, ctx.tenant_id),
+                (entity_id, ctx.tenant_id),
             )
             .await?;
         for row in rows {
-            let old: Uuid = row.r_by_name("old_event_id")?;
+            let old: Uuid = cql_get(&row, &col_map, "old_event_id")?;
             neighbors.push((old, "SUPERSEDES".into()));
         }
 
         // SUPERSEDES edges (entity as old_event_id)
-        let rows = self
-            .query_rows(
+        let (col_map, rows) = self
+            .exec_prepared_rows(
                 &self.stmts.edge_supersedes_by_old,
-                query_values!(entity_id, ctx.tenant_id),
+                (entity_id, ctx.tenant_id),
             )
             .await?;
         for row in rows {
-            let new_id: Uuid = row.r_by_name("new_event_id")?;
+            let new_id: Uuid = cql_get(&row, &col_map, "new_event_id")?;
             neighbors.push((new_id, "SUPERSEDES".into()));
         }
 
@@ -2925,20 +3165,20 @@ impl Storage for CqlStorage {
             self.keyspace
         );
         let prepared = self.session.prepare(query).await?;
-        let rows = self
-            .query_rows(&prepared, query_values!(ctx.tenant_id, nil_session))
+        let (col_map, rows) = self
+            .exec_prepared_rows(&prepared, (ctx.tenant_id, nil_session))
             .await
             .unwrap_or_default();
         for row in rows {
-            let src: Uuid = match row.r_by_name("src_id") {
+            let src: Uuid = match cql_get(&row, &col_map, "src_id") {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let dst: Uuid = match row.r_by_name("dst_id") {
+            let dst: Uuid = match cql_get(&row, &col_map, "dst_id") {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let edge_type: String = row.r_by_name("edge_type").unwrap_or_default();
+            let edge_type: String = cql_get(&row, &col_map, "edge_type").unwrap_or_default();
             if src == entity_id {
                 neighbors.push((dst, edge_type));
             } else if dst == entity_id {
@@ -2965,9 +3205,9 @@ impl Storage for CqlStorage {
             .to_string();
 
         self.session
-            .exec_with_values(
+            .execute_unpaged(
                 &self.stmts.intention_put,
-                query_values!(
+                (
                     ctx.tenant_id,
                     intention.repo.clone(),
                     intention.id,
@@ -2975,9 +3215,9 @@ impl Storage for CqlStorage {
                     trigger_json,
                     priority_str,
                     status_str,
-                    intention.created_at.naive_utc(),
-                    intention.triggered_at.map(|t| t.naive_utc()),
-                    intention.completed_at.map(|t| t.naive_utc())
+                    intention.created_at,
+                    intention.triggered_at,
+                    intention.completed_at,
                 ),
             )
             .await?;
@@ -2989,53 +3229,57 @@ impl Storage for CqlStorage {
         ctx: &TenantContext,
         repo: &str,
     ) -> anyhow::Result<Vec<crate::intention::Intention>> {
-        let rows = self
-            .query_rows(
+        let (col_map, rows) = self
+            .exec_prepared_rows(
                 &self.stmts.intention_list,
-                query_values!(ctx.tenant_id, repo.to_string()),
+                (ctx.tenant_id, repo.to_string()),
             )
             .await?;
 
         let mut results = Vec::with_capacity(rows.len());
         for row in rows {
-            let trigger_json: String = row.r_by_name("trigger_json")?;
+            let trigger_json: String = cql_get(&row, &col_map, "trigger_json")?;
             let trigger: crate::intention::IntentionTrigger = serde_json::from_str(&trigger_json)?;
 
-            let priority_str: String = row.r_by_name("priority")?;
+            let priority_str: String = cql_get(&row, &col_map, "priority")?;
             let priority: crate::intention::Priority =
                 serde_json::from_str(&format!("\"{priority_str}\""))
                     .unwrap_or(crate::intention::Priority::Normal);
 
-            let status_str: String = row.r_by_name("status")?;
+            let status_str: String = cql_get(&row, &col_map, "status")?;
             let status: crate::intention::IntentionStatus =
                 serde_json::from_str(&format!("\"{status_str}\""))
                     .unwrap_or(crate::intention::IntentionStatus::Pending);
 
-            let created = row
-                .r_by_name::<chrono::NaiveDateTime>("created_at")
+            let created = cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
                 .unwrap_or_else(|e| {
                     tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
                     Default::default()
                 });
 
-            let repo_val: String = row.r_by_name("repo").unwrap_or_else(|_| repo.to_string());
+            let repo_val: String =
+                cql_get(&row, &col_map, "repo").unwrap_or_else(|_| repo.to_string());
 
             results.push(crate::intention::Intention {
-                id: row.r_by_name("intention_id")?,
+                id: cql_get(&row, &col_map, "intention_id")?,
                 repo: repo_val,
-                description: row.r_by_name("description")?,
+                description: cql_get(&row, &col_map, "description")?,
                 trigger,
                 priority,
                 status,
-                created_at: created.and_utc(),
-                triggered_at: row
-                    .r_by_name::<chrono::NaiveDateTime>("triggered_at")
-                    .ok()
-                    .map(|t| t.and_utc()),
-                completed_at: row
-                    .r_by_name::<chrono::NaiveDateTime>("completed_at")
-                    .ok()
-                    .map(|t| t.and_utc()),
+                created_at: created,
+                triggered_at: cql_get::<chrono::DateTime<chrono::Utc>>(
+                    &row,
+                    &col_map,
+                    "triggered_at",
+                )
+                .ok(),
+                completed_at: cql_get::<chrono::DateTime<chrono::Utc>>(
+                    &row,
+                    &col_map,
+                    "completed_at",
+                )
+                .ok(),
             });
         }
         Ok(results)
@@ -3045,50 +3289,53 @@ impl Storage for CqlStorage {
         &self,
         ctx: &TenantContext,
     ) -> anyhow::Result<Vec<crate::intention::Intention>> {
-        let rows = self
-            .query_rows(&self.stmts.intention_list_all, query_values!(ctx.tenant_id))
+        let (col_map, rows) = self
+            .exec_prepared_rows(&self.stmts.intention_list_all, (ctx.tenant_id,))
             .await?;
 
         let mut results = Vec::with_capacity(rows.len());
         for row in rows {
-            let trigger_json: String = row.r_by_name("trigger_json")?;
+            let trigger_json: String = cql_get(&row, &col_map, "trigger_json")?;
             let trigger: crate::intention::IntentionTrigger = serde_json::from_str(&trigger_json)?;
 
-            let priority_str: String = row.r_by_name("priority")?;
+            let priority_str: String = cql_get(&row, &col_map, "priority")?;
             let priority: crate::intention::Priority =
                 serde_json::from_str(&format!("\"{priority_str}\""))
                     .unwrap_or(crate::intention::Priority::Normal);
 
-            let status_str: String = row.r_by_name("status")?;
+            let status_str: String = cql_get(&row, &col_map, "status")?;
             let status: crate::intention::IntentionStatus =
                 serde_json::from_str(&format!("\"{status_str}\""))
                     .unwrap_or(crate::intention::IntentionStatus::Pending);
 
-            let created = row
-                .r_by_name::<chrono::NaiveDateTime>("created_at")
+            let created = cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
                 .unwrap_or_else(|e| {
                     tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
                     Default::default()
                 });
 
-            let repo_val: String = row.r_by_name("repo").unwrap_or_default();
+            let repo_val: String = cql_get(&row, &col_map, "repo").unwrap_or_default();
 
             results.push(crate::intention::Intention {
-                id: row.r_by_name("intention_id")?,
+                id: cql_get(&row, &col_map, "intention_id")?,
                 repo: repo_val,
-                description: row.r_by_name("description")?,
+                description: cql_get(&row, &col_map, "description")?,
                 trigger,
                 priority,
                 status,
-                created_at: created.and_utc(),
-                triggered_at: row
-                    .r_by_name::<chrono::NaiveDateTime>("triggered_at")
-                    .ok()
-                    .map(|t| t.and_utc()),
-                completed_at: row
-                    .r_by_name::<chrono::NaiveDateTime>("completed_at")
-                    .ok()
-                    .map(|t| t.and_utc()),
+                created_at: created,
+                triggered_at: cql_get::<chrono::DateTime<chrono::Utc>>(
+                    &row,
+                    &col_map,
+                    "triggered_at",
+                )
+                .ok(),
+                completed_at: cql_get::<chrono::DateTime<chrono::Utc>>(
+                    &row,
+                    &col_map,
+                    "completed_at",
+                )
+                .ok(),
             });
         }
         Ok(results)
@@ -3104,15 +3351,15 @@ impl Storage for CqlStorage {
         completed_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> anyhow::Result<()> {
         self.session
-            .exec_with_values(
+            .execute_unpaged(
                 &self.stmts.intention_update_status,
-                query_values!(
+                (
                     status.to_string(),
-                    triggered_at.map(|t| t.naive_utc()),
-                    completed_at.map(|t| t.naive_utc()),
+                    triggered_at,
+                    completed_at,
                     ctx.tenant_id,
                     repo.to_string(),
-                    id
+                    id,
                 ),
             )
             .await?;
@@ -3134,9 +3381,9 @@ impl Storage for CqlStorage {
     ) -> anyhow::Result<()> {
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         self.session
-            .exec_with_values(
+            .execute_unpaged(
                 &self.stmts.tool_usage_put,
-                query_values!(
+                (
                     ctx.tenant_id,
                     today,
                     tool_name.to_string(),
@@ -3145,7 +3392,7 @@ impl Storage for CqlStorage {
                     output_bytes,
                     estimated_tokens,
                     latency_ms,
-                    error
+                    error,
                 ),
             )
             .await?;
@@ -3157,26 +3404,24 @@ impl Storage for CqlStorage {
         ctx: &TenantContext,
         day: &str,
     ) -> anyhow::Result<Vec<crate::types::ToolUsageRow>> {
-        let rows = self
-            .query_rows(
+        let (col_map, rows) = self
+            .exec_prepared_rows(
                 &self.stmts.tool_usage_query,
-                query_values!(ctx.tenant_id, day.to_string()),
+                (ctx.tenant_id, day.to_string()),
             )
             .await?;
 
         let mut results = Vec::with_capacity(rows.len());
         for row in rows {
             results.push(crate::types::ToolUsageRow {
-                tool_name: row.r_by_name("tool_name")?,
-                repo: row.r_by_name::<String>("repo").unwrap_or_default(),
-                input_bytes: row.r_by_name("input_bytes")?,
-                output_bytes: row.r_by_name("output_bytes")?,
-                estimated_tokens: row.r_by_name("estimated_tokens")?,
-                latency_ms: row.r_by_name("latency_ms")?,
-                error: row.r_by_name("error")?,
-                created_at: row
-                    .r_by_name::<chrono::NaiveDateTime>("created_at")
-                    .map(|t| t.and_utc())
+                tool_name: cql_get(&row, &col_map, "tool_name")?,
+                repo: cql_get::<String>(&row, &col_map, "repo").unwrap_or_default(),
+                input_bytes: cql_get(&row, &col_map, "input_bytes")?,
+                output_bytes: cql_get(&row, &col_map, "output_bytes")?,
+                estimated_tokens: cql_get(&row, &col_map, "estimated_tokens")?,
+                latency_ms: cql_get(&row, &col_map, "latency_ms")?,
+                error: cql_get(&row, &col_map, "error")?,
+                created_at: cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
                     .unwrap_or_else(|_| chrono::Utc::now()),
             });
         }
@@ -3187,16 +3432,16 @@ impl Storage for CqlStorage {
 
     async fn audit_put(&self, ctx: &TenantContext, entry: &AuditEntry) -> anyhow::Result<()> {
         self.session
-            .exec_with_values(
+            .execute_unpaged(
                 &self.stmts.audit_put,
-                query_values!(
+                (
                     ctx.tenant_id,
                     entry.audit_id,
                     entry.operation.clone(),
                     entry.target_table.clone(),
                     entry.target_id.clone(),
                     entry.session_id,
-                    entry.created_at.naive_utc()
+                    entry.created_at,
                 ),
             )
             .await?;
@@ -3210,39 +3455,36 @@ impl Storage for CqlStorage {
         ctx: &TenantContext,
         entity_id: Uuid,
     ) -> anyhow::Result<Option<WarmthEntry>> {
-        let rows = self
-            .query_rows(
-                &self.stmts.warmth_get,
-                query_values!(ctx.tenant_id, entity_id),
-            )
+        let (col_map, rows) = self
+            .exec_prepared_rows(&self.stmts.warmth_get, (ctx.tenant_id, entity_id))
             .await?;
 
         if let Some(row) = rows.into_iter().next() {
-            let last_accessed = row
-                .r_by_name::<chrono::NaiveDateTime>("last_accessed_at")
+            let last_accessed = cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "last_accessed_at")
                 .unwrap_or_else(|e| {
                     tracing::warn!(col = "last_accessed_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
                     Default::default()
                 });
-            let updated = row
-                .r_by_name::<chrono::NaiveDateTime>("updated_at")
+            let updated = cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "updated_at")
                 .unwrap_or_else(|e| {
                     tracing::warn!(col = "updated_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
                     Default::default()
                 });
-            let zone_str: String = row.r_by_name("decay_zone").unwrap_or_default();
+            let zone_str: String = cql_get(&row, &col_map, "decay_zone").unwrap_or_default();
 
             Ok(Some(WarmthEntry {
                 tenant_id: ctx.tenant_id,
                 entity_id,
-                session_id: row.r_by_name("session_id")?,
-                warmth: row.r_by_name("warmth")?,
-                pagerank: row.r_by_name::<f64>("pagerank").unwrap_or(0.0),
-                reputation: row.r_by_name::<f64>("reputation").unwrap_or(0.0),
-                last_accessed_at: last_accessed.and_utc(),
-                access_count: i64::from(row.r_by_name::<i32>("access_count").unwrap_or(0)),
+                session_id: cql_get(&row, &col_map, "session_id")?,
+                warmth: cql_get(&row, &col_map, "warmth")?,
+                pagerank: cql_get::<f64>(&row, &col_map, "pagerank").unwrap_or(0.0),
+                reputation: cql_get::<f64>(&row, &col_map, "reputation").unwrap_or(0.0),
+                last_accessed_at: last_accessed,
+                access_count: i64::from(
+                    cql_get::<i32>(&row, &col_map, "access_count").unwrap_or(0),
+                ),
                 decay_zone: parse_decay_zone(&zone_str),
-                updated_at: updated.and_utc(),
+                updated_at: updated,
             }))
         } else {
             Ok(None)
@@ -3251,19 +3493,19 @@ impl Storage for CqlStorage {
 
     async fn warmth_put(&self, ctx: &TenantContext, entry: &WarmthEntry) -> anyhow::Result<()> {
         self.session
-            .exec_with_values(
+            .execute_unpaged(
                 &self.stmts.warmth_put,
-                query_values!(
+                (
                     ctx.tenant_id,
                     entry.entity_id,
                     entry.session_id,
                     entry.warmth,
                     entry.pagerank,
                     entry.reputation,
-                    entry.last_accessed_at.naive_utc(),
+                    entry.last_accessed_at,
                     entry.access_count as i32,
                     entry.decay_zone.to_string(),
-                    entry.updated_at.naive_utc()
+                    entry.updated_at,
                 ),
             )
             .await?;
@@ -3308,40 +3550,47 @@ impl Storage for CqlStorage {
         ctx: &TenantContext,
         session_id: Uuid,
     ) -> anyhow::Result<Vec<WarmthEntry>> {
-        let rows = self
-            .query_rows(&self.stmts.warmth_list_session, query_values!(session_id))
+        let (col_map, rows) = self
+            .exec_prepared_rows(&self.stmts.warmth_list_session, (session_id,))
             .await?;
 
         let mut results = Vec::with_capacity(rows.len());
         for row in rows {
-            let last_accessed = row
-                .r_by_name::<chrono::NaiveDateTime>("last_accessed_at")
+            let last_accessed = cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "last_accessed_at")
                 .unwrap_or_else(|e| {
                     tracing::warn!(col = "last_accessed_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
                     Default::default()
                 });
-            let updated = row
-                .r_by_name::<chrono::NaiveDateTime>("updated_at")
+            let updated = cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "updated_at")
                 .unwrap_or_else(|e| {
                     tracing::warn!(col = "updated_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
                     Default::default()
                 });
-            let zone_str: String = row.r_by_name("decay_zone").unwrap_or_default();
+            let zone_str: String = cql_get(&row, &col_map, "decay_zone").unwrap_or_default();
 
             results.push(WarmthEntry {
                 tenant_id: ctx.tenant_id,
-                entity_id: row.r_by_name("entity_id")?,
+                entity_id: cql_get(&row, &col_map, "entity_id")?,
                 session_id,
-                warmth: row.r_by_name("warmth")?,
-                pagerank: row.r_by_name::<f64>("pagerank").unwrap_or(0.0),
-                reputation: row.r_by_name::<f64>("reputation").unwrap_or(0.0),
-                last_accessed_at: last_accessed.and_utc(),
-                access_count: i64::from(row.r_by_name::<i32>("access_count").unwrap_or(0)),
+                warmth: cql_get(&row, &col_map, "warmth")?,
+                pagerank: cql_get::<f64>(&row, &col_map, "pagerank").unwrap_or(0.0),
+                reputation: cql_get::<f64>(&row, &col_map, "reputation").unwrap_or(0.0),
+                last_accessed_at: last_accessed,
+                access_count: i64::from(
+                    cql_get::<i32>(&row, &col_map, "access_count").unwrap_or(0),
+                ),
                 decay_zone: parse_decay_zone(&zone_str),
-                updated_at: updated.and_utc(),
+                updated_at: updated,
             });
         }
         Ok(results)
+    }
+
+    async fn warmth_delete(&self, ctx: &TenantContext, entity_id: Uuid) -> anyhow::Result<()> {
+        self.session
+            .execute_unpaged(&self.stmts.warmth_delete, (ctx.tenant_id, entity_id))
+            .await?;
+        Ok(())
     }
 
     async fn warmth_decay_all(
@@ -3361,10 +3610,7 @@ impl Storage for CqlStorage {
             if new_warmth < 0.01 {
                 // Below threshold: delete the row
                 self.session
-                    .exec_with_values(
-                        &self.stmts.warmth_delete,
-                        query_values!(ctx.tenant_id, entry.entity_id),
-                    )
+                    .execute_unpaged(&self.stmts.warmth_delete, (ctx.tenant_id, entry.entity_id))
                     .await?;
                 pruned += 1;
             } else {
@@ -3385,13 +3631,13 @@ impl Storage for CqlStorage {
 
     async fn rule_put(&self, ctx: &TenantContext, entry: &RuleEntry) -> anyhow::Result<()> {
         let state_str = entry.state.to_string();
-        let now = chrono::Utc::now().naive_utc();
+        let now = chrono::Utc::now();
 
         // Denormalized write: rules_by_id
         self.session
-            .exec_with_values(
+            .execute_unpaged(
                 &self.stmts.rule_put_by_id,
-                query_values!(
+                (
                     ctx.tenant_id,
                     entry.rule_id.clone(),
                     entry.version,
@@ -3401,36 +3647,36 @@ impl Storage for CqlStorage {
                     entry.rule_body.clone(),
                     entry.rule_weight,
                     entry.incremental,
-                    entry.created_at.naive_utc(),
-                    now
+                    entry.created_at,
+                    now,
                 ),
             )
             .await?;
 
         // Denormalized write: rules_by_family
         self.session
-            .exec_with_values(
+            .execute_unpaged(
                 &self.stmts.rule_put_by_family,
-                query_values!(
+                (
                     ctx.tenant_id,
                     entry.family.clone(),
                     state_str.clone(),
                     entry.rule_id.clone(),
                     entry.version,
-                    now
+                    now,
                 ),
             )
             .await?;
         self.session
-            .exec_with_values(
+            .execute_unpaged(
                 &self.stmts.rule_put_active_by_state,
-                query_values!(
+                (
                     ctx.tenant_id,
                     state_str,
                     entry.family.clone(),
                     entry.rule_id.clone(),
                     entry.version,
-                    now
+                    now,
                 ),
             )
             .await?;
@@ -3445,25 +3691,25 @@ impl Storage for CqlStorage {
         state: RuleState,
     ) -> anyhow::Result<Vec<RuleEntry>> {
         let state_str = state.to_string();
-        let rows = self
-            .query_rows(
+        let (col_map, rows) = self
+            .exec_prepared_rows(
                 &self.stmts.rule_list_family,
-                query_values!(ctx.tenant_id, family.to_string(), state_str.clone()),
+                (ctx.tenant_id, family.to_string(), state_str.clone()),
             )
             .await?;
 
         let mut results = Vec::new();
         for row in rows {
-            let rule_id: String = row.r_by_name("rule_id")?;
-            let version: i32 = row.r_by_name("version")?;
-            let full_rows = self
-                .query_rows(
+            let rule_id: String = cql_get(&row, &col_map, "rule_id")?;
+            let version: i32 = cql_get(&row, &col_map, "version")?;
+            let (full_col_map, full_rows) = self
+                .exec_prepared_rows(
                     &self.stmts.rule_get_version,
-                    query_values!(ctx.tenant_id, rule_id, version),
+                    (ctx.tenant_id, rule_id, version),
                 )
                 .await?;
             if let Some(full_row) = full_rows.into_iter().next() {
-                results.push(rule_entry_from_row(ctx, &full_row)?);
+                results.push(rule_entry_from_row(ctx, &full_row, &full_col_map)?);
             }
         }
 
@@ -3477,25 +3723,22 @@ impl Storage for CqlStorage {
         state: RuleState,
     ) -> anyhow::Result<Vec<RuleEntry>> {
         let state_str = state.to_string();
-        let rows = self
-            .query_rows(
-                &self.stmts.rule_list_active,
-                query_values!(ctx.tenant_id, state_str),
-            )
+        let (col_map, rows) = self
+            .exec_prepared_rows(&self.stmts.rule_list_active, (ctx.tenant_id, state_str))
             .await?;
 
         let mut results = Vec::new();
         for row in rows {
-            let rule_id: String = row.r_by_name("rule_id")?;
-            let version: i32 = row.r_by_name("version")?;
-            let full_rows = self
-                .query_rows(
+            let rule_id: String = cql_get(&row, &col_map, "rule_id")?;
+            let version: i32 = cql_get(&row, &col_map, "version")?;
+            let (full_col_map, full_rows) = self
+                .exec_prepared_rows(
                     &self.stmts.rule_get_version,
-                    query_values!(ctx.tenant_id, rule_id, version),
+                    (ctx.tenant_id, rule_id, version),
                 )
                 .await?;
             if let Some(full_row) = full_rows.into_iter().next() {
-                results.push(rule_entry_from_row(ctx, &full_row)?);
+                results.push(rule_entry_from_row(ctx, &full_row, &full_col_map)?);
             }
         }
 
@@ -3513,15 +3756,12 @@ impl Storage for CqlStorage {
         ctx: &TenantContext,
         rule_id: &str,
     ) -> anyhow::Result<Option<RuleEntry>> {
-        let rows = self
-            .query_rows(
-                &self.stmts.rule_get,
-                query_values!(ctx.tenant_id, rule_id.to_string()),
-            )
+        let (col_map, rows) = self
+            .exec_prepared_rows(&self.stmts.rule_get, (ctx.tenant_id, rule_id.to_string()))
             .await?;
 
         if let Some(row) = rows.into_iter().next() {
-            Ok(Some(rule_entry_from_row(ctx, &row)?))
+            Ok(Some(rule_entry_from_row(ctx, &row, &col_map)?))
         } else {
             Ok(None)
         }
@@ -3539,13 +3779,13 @@ impl Storage for CqlStorage {
             self.keyspace
         );
         self.session
-            .query_with_values(
+            .query_unpaged(
                 query,
-                query_values!(
+                (
                     ctx.tenant_id,
                     entry.artifact_kind.to_string(),
                     entry.artifact_ref.clone(),
-                    entry.created_at.naive_utc(),
+                    entry.created_at,
                     entry.approval_id,
                     entry.decision.to_string(),
                     entry.review_note.clone().unwrap_or_default(),
@@ -3553,7 +3793,7 @@ impl Storage for CqlStorage {
                     entry.scope.clone(),
                     entry.workspace_scope.clone().unwrap_or_default(),
                     entry.session_scope,
-                    entry.mirror_entity_id
+                    entry.mirror_entity_id,
                 ),
             )
             .await?;
@@ -3571,49 +3811,46 @@ impl Storage for CqlStorage {
              FROM {}.approvals_by_target WHERE tenant_id = ? AND artifact_kind = ? AND artifact_ref = ?",
             self.keyspace
         );
-        let rows = self
+        #[allow(deprecated)]
+        let _qr = self
             .session
-            .query_with_values(
+            .query_unpaged(
                 query,
-                query_values!(
+                (
                     ctx.tenant_id,
                     artifact_kind.to_string(),
-                    artifact_ref.to_string()
+                    artifact_ref.to_string(),
                 ),
             )
-            .await?
-            .response_body()?
-            .into_rows()
-            .unwrap_or_default();
+            .await?;
+        let col_map = build_col_map(_qr.col_specs());
+        let rows = _qr.rows_or_empty();
 
         let mut results = Vec::new();
         for row in rows {
-            let created = row
-                .r_by_name::<chrono::NaiveDateTime>("created_at")
+            let created = cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
                 .unwrap_or_default();
             results.push(ApprovalEntry {
                 tenant_id: ctx.tenant_id,
-                approval_id: row.r_by_name("approval_id")?,
+                approval_id: cql_get(&row, &col_map, "approval_id")?,
                 artifact_kind: crate::expert_system::parse_artifact_kind(
-                    &row.r_by_name::<String>("artifact_kind").unwrap_or_default(),
+                    &cql_get::<String>(&row, &col_map, "artifact_kind").unwrap_or_default(),
                 )?,
-                artifact_ref: row.r_by_name("artifact_ref")?,
+                artifact_ref: cql_get(&row, &col_map, "artifact_ref")?,
                 decision: parse_approval_decision(
-                    &row.r_by_name::<String>("decision").unwrap_or_default(),
+                    &cql_get::<String>(&row, &col_map, "decision").unwrap_or_default(),
                 ),
-                review_note: row
-                    .r_by_name::<String>("review_note")
+                review_note: cql_get::<String>(&row, &col_map, "review_note")
                     .ok()
                     .filter(|value| !value.is_empty()),
-                reviewer: row.r_by_name("reviewer")?,
-                scope: row.r_by_name("scope")?,
-                workspace_scope: row
-                    .r_by_name::<String>("workspace_scope")
+                reviewer: cql_get(&row, &col_map, "reviewer")?,
+                scope: cql_get(&row, &col_map, "scope")?,
+                workspace_scope: cql_get::<String>(&row, &col_map, "workspace_scope")
                     .ok()
                     .filter(|value| !value.is_empty()),
-                session_scope: row.r_by_name::<Uuid>("session_scope").ok(),
-                mirror_entity_id: row.r_by_name("mirror_entity_id")?,
-                created_at: created.and_utc(),
+                session_scope: cql_get::<Uuid>(&row, &col_map, "session_scope").ok(),
+                mirror_entity_id: cql_get(&row, &col_map, "mirror_entity_id")?,
+                created_at: created,
             });
         }
         results.sort_by(|left, right| {
@@ -3646,9 +3883,9 @@ impl Storage for CqlStorage {
             self.keyspace
         );
         self.session
-            .query_with_values(
+            .query_unpaged(
                 query,
-                query_values!(
+                (
                     ctx.tenant_id,
                     entry.alias_name.clone(),
                     entry.scope_kind.to_string(),
@@ -3659,8 +3896,8 @@ impl Storage for CqlStorage {
                     entry.fixed_arguments.to_string(),
                     entry.args_templates.to_string(),
                     entry.status.to_string(),
-                    entry.created_at.naive_utc(),
-                    entry.updated_at.naive_utc()
+                    entry.created_at,
+                    entry.updated_at,
                 ),
             )
             .await?;
@@ -3677,49 +3914,44 @@ impl Storage for CqlStorage {
              FROM {}.aliases_by_name WHERE tenant_id = ? AND alias_name = ?",
             self.keyspace
         );
-        let rows = self
+        #[allow(deprecated)]
+        let _qr = self
             .session
-            .query_with_values(query, query_values!(ctx.tenant_id, alias_name.to_string()))
-            .await?
-            .response_body()?
-            .into_rows()
-            .unwrap_or_default();
+            .query_unpaged(query, (ctx.tenant_id, alias_name.to_string()))
+            .await?;
+        let col_map = build_col_map(_qr.col_specs());
+        let rows = _qr.rows_or_empty();
 
         let mut results = Vec::new();
         for row in rows {
             results.push(AliasEntry {
                 tenant_id: ctx.tenant_id,
-                alias_id: row.r_by_name("alias_id")?,
-                alias_name: row.r_by_name("alias_name")?,
+                alias_id: cql_get(&row, &col_map, "alias_id")?,
+                alias_name: cql_get(&row, &col_map, "alias_name")?,
                 scope_kind: parse_alias_scope_kind(
-                    &row.r_by_name::<String>("scope_kind").unwrap_or_default(),
+                    &cql_get::<String>(&row, &col_map, "scope_kind").unwrap_or_default(),
                 ),
-                scope_ref: row.r_by_name("scope_ref")?,
-                canonical_tool: row.r_by_name("canonical_tool")?,
-                parameter_map: row
-                    .r_by_name::<String>("parameter_map")
+                scope_ref: cql_get(&row, &col_map, "scope_ref")?,
+                canonical_tool: cql_get(&row, &col_map, "canonical_tool")?,
+                parameter_map: cql_get::<String>(&row, &col_map, "parameter_map")
                     .ok()
                     .and_then(|value| serde_json::from_str(&value).ok())
                     .unwrap_or_else(|| json!({})),
-                fixed_arguments: row
-                    .r_by_name::<String>("fixed_arguments")
+                fixed_arguments: cql_get::<String>(&row, &col_map, "fixed_arguments")
                     .ok()
                     .and_then(|value| serde_json::from_str(&value).ok())
                     .unwrap_or_else(|| json!({})),
-                args_templates: row
-                    .r_by_name::<String>("args_templates")
+                args_templates: cql_get::<String>(&row, &col_map, "args_templates")
                     .ok()
                     .and_then(|value| serde_json::from_str(&value).ok())
                     .unwrap_or_else(|| json!({})),
-                status: parse_claim_status(&row.r_by_name::<String>("status").unwrap_or_default()),
-                created_at: row
-                    .r_by_name::<chrono::NaiveDateTime>("created_at")
-                    .unwrap_or_default()
-                    .and_utc(),
-                updated_at: row
-                    .r_by_name::<chrono::NaiveDateTime>("updated_at")
-                    .unwrap_or_default()
-                    .and_utc(),
+                status: parse_claim_status(
+                    &cql_get::<String>(&row, &col_map, "status").unwrap_or_default(),
+                ),
+                created_at: cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
+                    .unwrap_or_default(),
+                updated_at: cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "updated_at")
+                    .unwrap_or_default(),
             });
         }
         results.sort_by_key(|row| std::cmp::Reverse(row.updated_at));
@@ -3733,24 +3965,24 @@ impl Storage for CqlStorage {
         ctx: &TenantContext,
         cache_key: &str,
     ) -> anyhow::Result<Vec<DerivedFact>> {
-        let rows = self
-            .query_rows(
+        let (col_map, rows) = self
+            .exec_prepared_rows(
                 &self.stmts.derived_cache_get,
-                query_values!(ctx.tenant_id, cache_key.to_string()),
+                (ctx.tenant_id, cache_key.to_string()),
             )
             .await?;
 
         let mut facts = Vec::with_capacity(rows.len());
         for row in rows {
-            let src_id: Uuid = row.r_by_name("src_id")?;
-            let dst_id: Uuid = row.r_by_name("dst_id")?;
+            let src_id: Uuid = cql_get(&row, &col_map, "src_id")?;
+            let dst_id: Uuid = cql_get(&row, &col_map, "dst_id")?;
 
             facts.push(DerivedFact {
                 src_id: src_id.to_string(),
-                pred: row.r_by_name("pred")?,
+                pred: cql_get(&row, &col_map, "pred")?,
                 dst_id: dst_id.to_string(),
-                confidence: row.r_by_name::<f64>("confidence").unwrap_or(1.0),
-                rule_id: row.r_by_name("rule_id").unwrap_or_default(),
+                confidence: cql_get::<f64>(&row, &col_map, "confidence").unwrap_or(1.0),
+                rule_id: cql_get(&row, &col_map, "rule_id").unwrap_or_default(),
                 support_count: 1,
                 provenance: vec![],
             });
@@ -3764,7 +3996,7 @@ impl Storage for CqlStorage {
         cache_key: &str,
         facts: &[DerivedFact],
     ) -> anyhow::Result<()> {
-        let now = chrono::Utc::now().naive_utc();
+        let now = chrono::Utc::now();
 
         for (idx, fact) in facts.iter().enumerate() {
             let src_uuid: Uuid = fact.src_id.parse().map_err(|e| {
@@ -3783,9 +4015,9 @@ impl Storage for CqlStorage {
             })?;
 
             self.session
-                .exec_with_values(
+                .execute_unpaged(
                     &self.stmts.derived_cache_put,
-                    query_values!(
+                    (
                         ctx.tenant_id,
                         cache_key.to_string(),
                         idx as i32,
@@ -3794,7 +4026,7 @@ impl Storage for CqlStorage {
                         dst_uuid,
                         fact.confidence,
                         fact.rule_id.clone(),
-                        now
+                        now,
                     ),
                 )
                 .await?;
@@ -3806,9 +4038,9 @@ impl Storage for CqlStorage {
         // Delete the partition for this exact cache_key.
         // The `pred` parameter is used as cache_key in the derived_cache table.
         self.session
-            .exec_with_values(
+            .execute_unpaged(
                 &self.stmts.derived_cache_clear,
-                query_values!(ctx.tenant_id, pred.to_string()),
+                (ctx.tenant_id, pred.to_string()),
             )
             .await?;
         tracing::debug!(pred, "derived cache cleared for key");
@@ -3826,23 +4058,25 @@ impl Storage for CqlStorage {
              WHERE tenant_id = ? LIMIT {} ALLOW FILTERING",
             self.keyspace, limit
         );
-        let envelope = self
+        #[allow(deprecated)]
+        let result = self
             .session
-            .query_with_values(&query, query_values!(ctx.tenant_id))
+            .query_unpaged(query.clone(), (ctx.tenant_id,))
             .await?;
-        let rows = envelope.response_body()?.into_rows().unwrap_or_default();
+        let col_map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
 
         let mut results: Vec<crate::types::DerivedFactRow> = Vec::new();
         for row in rows {
-            let cache_key: Option<String> = row.r_by_name::<String>("cache_key").ok();
-            let _seq: i32 = row.r_by_name("seq").unwrap_or_default();
-            let src_id: Uuid = row.r_by_name("src_id").unwrap_or_default();
-            let pred: String = row.r_by_name("pred").unwrap_or_default();
-            let dst_id: Uuid = row.r_by_name("dst_id").unwrap_or_default();
-            let confidence: f64 = row.r_by_name("confidence").unwrap_or_default();
-            let rule_id: String = row.r_by_name("rule_id").unwrap_or_default();
-            let computed_at: Option<chrono::NaiveDateTime> =
-                row.r_by_name::<chrono::NaiveDateTime>("computed_at").ok();
+            let cache_key: Option<String> = cql_get::<String>(&row, &col_map, "cache_key").ok();
+            let _seq: i32 = cql_get(&row, &col_map, "seq").unwrap_or_default();
+            let src_id: Uuid = cql_get(&row, &col_map, "src_id").unwrap_or_default();
+            let pred: String = cql_get(&row, &col_map, "pred").unwrap_or_default();
+            let dst_id: Uuid = cql_get(&row, &col_map, "dst_id").unwrap_or_default();
+            let confidence: f64 = cql_get(&row, &col_map, "confidence").unwrap_or_default();
+            let rule_id: String = cql_get(&row, &col_map, "rule_id").unwrap_or_default();
+            let computed_at: Option<chrono::DateTime<chrono::Utc>> =
+                cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "computed_at").ok();
 
             results.push(crate::types::DerivedFactRow {
                 source_id: src_id.to_string(),
@@ -3865,7 +4099,7 @@ impl Storage for CqlStorage {
         cache_key: &str,
         facts: &[crate::types::TtlTrackEntry],
     ) -> anyhow::Result<()> {
-        let now = chrono::Utc::now().naive_utc();
+        let now = chrono::Utc::now();
 
         for fact in facts {
             let src_uuid: Uuid = fact.src_id.parse().map_err(|e| {
@@ -3884,9 +4118,9 @@ impl Storage for CqlStorage {
             })?;
 
             self.session
-                .exec_with_values(
+                .execute_unpaged(
                     &self.stmts.derived_cache_ttl_track_put,
-                    query_values!(
+                    (
                         ctx.tenant_id,
                         cache_key.to_string(),
                         fact.seq,
@@ -3896,7 +4130,7 @@ impl Storage for CqlStorage {
                         fact.ttl_seconds,
                         fact.rule_id.clone(),
                         now,
-                        fact.next_maintenance.clone()
+                        fact.next_maintenance.clone(),
                     ),
                 )
                 .await?;
@@ -3909,17 +4143,17 @@ impl Storage for CqlStorage {
         ctx: &TenantContext,
         cache_key: &str,
     ) -> anyhow::Result<Vec<(i32, i32)>> {
-        let rows = self
-            .query_rows(
+        let (col_map, rows) = self
+            .exec_prepared_rows(
                 &self.stmts.derived_cache_ttl_track_get,
-                query_values!(ctx.tenant_id, cache_key.to_string()),
+                (ctx.tenant_id, cache_key.to_string()),
             )
             .await?;
 
         let mut entries: Vec<(i32, i32)> = Vec::new();
         for row in rows {
-            let seq: i32 = row.r_by_name("seq").unwrap_or_default();
-            let ttl_seconds: i32 = row.r_by_name("ttl_seconds").unwrap_or_default();
+            let seq: i32 = cql_get(&row, &col_map, "seq").unwrap_or_default();
+            let ttl_seconds: i32 = cql_get(&row, &col_map, "ttl_seconds").unwrap_or_default();
             entries.push((seq, ttl_seconds));
         }
         Ok(entries)
@@ -3935,16 +4169,16 @@ impl Storage for CqlStorage {
     ) -> anyhow::Result<()> {
         for (idx, step) in steps.iter().enumerate() {
             self.session
-                .exec_with_values(
+                .execute_unpaged(
                     &self.stmts.provenance_put,
-                    query_values!(
+                    (
                         ctx.tenant_id,
                         derived_edge_id.to_string(),
                         idx as i32,
                         step.parent_src.clone(),
                         step.parent_pred.clone(),
                         step.parent_dst.clone(),
-                        step.parent_kind.clone()
+                        step.parent_kind.clone(),
                     ),
                 )
                 .await?;
@@ -3957,20 +4191,20 @@ impl Storage for CqlStorage {
         ctx: &TenantContext,
         derived_edge_id: &str,
     ) -> anyhow::Result<Vec<ProvenanceStep>> {
-        let rows = self
-            .query_rows(
+        let (col_map, rows) = self
+            .exec_prepared_rows(
                 &self.stmts.provenance_get,
-                query_values!(ctx.tenant_id, derived_edge_id.to_string()),
+                (ctx.tenant_id, derived_edge_id.to_string()),
             )
             .await?;
 
         let mut steps = Vec::with_capacity(rows.len());
         for row in rows {
             steps.push(ProvenanceStep {
-                parent_src: row.r_by_name("parent_src")?,
-                parent_pred: row.r_by_name("parent_pred")?,
-                parent_dst: row.r_by_name("parent_dst")?,
-                parent_kind: row.r_by_name("parent_kind")?,
+                parent_src: cql_get(&row, &col_map, "parent_src")?,
+                parent_pred: cql_get(&row, &col_map, "parent_pred")?,
+                parent_dst: cql_get(&row, &col_map, "parent_dst")?,
+                parent_kind: cql_get(&row, &col_map, "parent_kind")?,
             });
         }
         Ok(steps)
@@ -4069,29 +4303,28 @@ impl Storage for CqlStorage {
             self.keyspace
         );
         let prepared = self.session.prepare(query).await?;
-        let rows = self
+        #[allow(deprecated)]
+        let _qr = self
             .session
-            .exec_with_values(&prepared, query_values!(ctx.tenant_id, session_id))
-            .await?
-            .response_body()?
-            .into_rows()
-            .unwrap_or_default();
+            .execute_unpaged(&prepared, (ctx.tenant_id, session_id))
+            .await?;
+        let col_map = build_col_map(_qr.col_specs());
+        let rows = _qr.rows_or_empty();
 
         let mut edges = Vec::new();
         for row in rows {
             // Skip ghost rows with NULL required fields.
-            let Ok(src_id) = row.r_by_name::<Uuid>("src_id") else {
+            let Ok(src_id) = cql_get::<Uuid>(&row, &col_map, "src_id") else {
                 continue;
             };
-            let Ok(dst_id) = row.r_by_name::<Uuid>("dst_id") else {
+            let Ok(dst_id) = cql_get::<Uuid>(&row, &col_map, "dst_id") else {
                 continue;
             };
-            let edge_type = row.r_by_name::<String>("edge_type").unwrap_or_default();
+            let edge_type = cql_get::<String>(&row, &col_map, "edge_type").unwrap_or_default();
             if edge_type.is_empty() {
                 continue;
             };
-            let created = row
-                .r_by_name::<chrono::NaiveDateTime>("created_at")
+            let created = cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
                 .unwrap_or_else(|e| {
                     tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
                     Default::default()
@@ -4102,47 +4335,41 @@ impl Storage for CqlStorage {
                 src_id,
                 edge_type,
                 dst_id,
-                weight: row.r_by_name::<f64>("weight").unwrap_or(1.0),
-                metadata: row
-                    .r_by_name::<String>("metadata")
+                weight: cql_get::<f64>(&row, &col_map, "weight").unwrap_or(1.0),
+                metadata: cql_get::<String>(&row, &col_map, "metadata")
                     .ok()
                     .filter(|s| !s.is_empty()),
-                created_at: created.and_utc(),
+                created_at: created,
             });
         }
         Ok(edges)
     }
 
     async fn typed_edge_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<TypedEdge>> {
-        let query = format!(
-            "SELECT src_id, edge_type, dst_id, weight, metadata, created_at, session_id \
-             FROM {}.typed_edges WHERE tenant_id = ? ALLOW FILTERING",
-            self.keyspace
-        );
+        let query = typed_edge_list_all_query(&self.keyspace);
         let prepared = self.session.prepare(query).await?;
-        let rows = self
+        #[allow(deprecated)]
+        let _qr = self
             .session
-            .exec_with_values(&prepared, query_values!(ctx.tenant_id))
-            .await?
-            .response_body()?
-            .into_rows()
-            .unwrap_or_default();
+            .execute_unpaged(&prepared, (ctx.tenant_id,))
+            .await?;
+        let col_map = build_col_map(_qr.col_specs());
+        let rows = _qr.rows_or_empty();
 
         let mut edges = Vec::new();
         for row in rows {
-            let Ok(src_id) = row.r_by_name::<Uuid>("src_id") else {
+            let Ok(src_id) = cql_get::<Uuid>(&row, &col_map, "src_id") else {
                 continue;
             };
-            let Ok(dst_id) = row.r_by_name::<Uuid>("dst_id") else {
+            let Ok(dst_id) = cql_get::<Uuid>(&row, &col_map, "dst_id") else {
                 continue;
             };
-            let edge_type = row.r_by_name::<String>("edge_type").unwrap_or_default();
+            let edge_type = cql_get::<String>(&row, &col_map, "edge_type").unwrap_or_default();
             if edge_type.is_empty() {
                 continue;
             }
-            let session_id = row.r_by_name::<Uuid>("session_id").unwrap_or(Uuid::nil());
-            let created = row
-                .r_by_name::<chrono::NaiveDateTime>("created_at")
+            let session_id = cql_get::<Uuid>(&row, &col_map, "session_id").unwrap_or(Uuid::nil());
+            let created = cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
                 .unwrap_or_else(|e| {
                     tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
                     Default::default()
@@ -4153,15 +4380,76 @@ impl Storage for CqlStorage {
                 src_id,
                 edge_type,
                 dst_id,
-                weight: row.r_by_name::<f64>("weight").unwrap_or(1.0),
-                metadata: row
-                    .r_by_name::<String>("metadata")
+                weight: cql_get::<f64>(&row, &col_map, "weight").unwrap_or(1.0),
+                metadata: cql_get::<String>(&row, &col_map, "metadata")
                     .ok()
                     .filter(|s| !s.is_empty()),
-                created_at: created.and_utc(),
+                created_at: created,
             });
         }
         Ok(edges)
+    }
+
+    async fn typed_edge_stream_all(
+        &self,
+        ctx: TenantContext,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<TypedEdge>>>,
+    ) {
+        let chunk_size = chunk_size.max(1);
+        let query = typed_edge_list_all_query(&self.keyspace);
+        let mut iter = match self.session.query_iter(query, (ctx.tenant_id,)).await {
+            Ok(iter) => iter,
+            Err(e) => {
+                let _ = tx.send(Err(e.into())).await;
+                return;
+            }
+        };
+        let col_map = build_col_map(iter.get_column_specs());
+        let mut chunk = Vec::with_capacity(chunk_size);
+        while let Some(row) = iter.next().await {
+            match row.map_err(anyhow::Error::from).and_then(|row| {
+                let src_id = cql_get::<Uuid>(&row, &col_map, "src_id")?;
+                let dst_id = cql_get::<Uuid>(&row, &col_map, "dst_id")?;
+                let edge_type = cql_get::<String>(&row, &col_map, "edge_type").unwrap_or_default();
+                if edge_type.is_empty() {
+                    anyhow::bail!("typed edge row has empty edge_type");
+                }
+                let session_id =
+                    cql_get::<Uuid>(&row, &col_map, "session_id").unwrap_or(Uuid::nil());
+                let created_at =
+                    cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
+                        .unwrap_or_default();
+                Ok(TypedEdge {
+                    tenant_id: ctx.tenant_id,
+                    session_id,
+                    src_id,
+                    edge_type,
+                    dst_id,
+                    weight: cql_get::<f64>(&row, &col_map, "weight").unwrap_or(1.0),
+                    metadata: cql_get::<String>(&row, &col_map, "metadata")
+                        .ok()
+                        .filter(|s| !s.is_empty()),
+                    created_at,
+                })
+            }) {
+                Ok(edge) => {
+                    chunk.push(edge);
+                    if chunk.len() >= chunk_size {
+                        let out = std::mem::take(&mut chunk);
+                        if tx.send(Ok(out)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "typed_edge_stream_all skipped malformed row");
+                }
+            }
+        }
+        if !chunk.is_empty() {
+            let _ = tx.send(Ok(chunk)).await;
+        }
     }
 
     async fn typed_edge_list_from(
@@ -4177,18 +4465,17 @@ impl Storage for CqlStorage {
             self.keyspace
         );
         let prepared = self.session.prepare(query).await?;
-        let rows = self
+        #[allow(deprecated)]
+        let _qr = self
             .session
-            .exec_with_values(&prepared, query_values!(ctx.tenant_id, session_id, src_id))
-            .await?
-            .response_body()?
-            .into_rows()
-            .unwrap_or_default();
+            .execute_unpaged(&prepared, (ctx.tenant_id, session_id, src_id))
+            .await?;
+        let col_map = build_col_map(_qr.col_specs());
+        let rows = _qr.rows_or_empty();
 
         let mut edges = Vec::new();
         for row in rows {
-            let created = row
-                .r_by_name::<chrono::NaiveDateTime>("created_at")
+            let created = cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
                 .unwrap_or_else(|e| {
                     tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
                     Default::default()
@@ -4197,14 +4484,13 @@ impl Storage for CqlStorage {
                 tenant_id: ctx.tenant_id,
                 session_id,
                 src_id,
-                edge_type: row.r_by_name::<String>("edge_type").unwrap_or_default(),
-                dst_id: row.r_by_name("dst_id")?,
-                weight: row.r_by_name::<f64>("weight").unwrap_or(1.0),
-                metadata: row
-                    .r_by_name::<String>("metadata")
+                edge_type: cql_get::<String>(&row, &col_map, "edge_type").unwrap_or_default(),
+                dst_id: cql_get(&row, &col_map, "dst_id")?,
+                weight: cql_get::<f64>(&row, &col_map, "weight").unwrap_or(1.0),
+                metadata: cql_get::<String>(&row, &col_map, "metadata")
                     .ok()
                     .filter(|s| !s.is_empty()),
-                created_at: created.and_utc(),
+                created_at: created,
             });
         }
         Ok(edges)
@@ -4219,5 +4505,418 @@ impl Storage for CqlStorage {
         _dst_id: Uuid,
     ) -> anyhow::Result<bool> {
         Err(Self::graph_write_error("typed_edge_delete"))
+    }
+
+    async fn context_segment_put(
+        &self,
+        ctx: &TenantContext,
+        segment: &ContextSegment,
+    ) -> anyhow::Result<()> {
+        let q = format!(
+            "INSERT INTO {ks}.context_segments (tenant_id, session_id, segment_id, \
+             source_session, source_fold_id, conversation_id, segment_index, start_turn, \
+             end_turn, start_time, end_time, segment_text, bm25_text, token_count, \
+             content_hash, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ks = self.keyspace
+        );
+        self.session
+            .query_unpaged(
+                q,
+                (
+                    ctx.tenant_id,
+                    segment.session_id,
+                    segment.segment_id,
+                    segment.source_session,
+                    segment.source_fold_id,
+                    segment.conversation_id.clone(),
+                    segment.segment_index,
+                    segment.start_turn,
+                    segment.end_turn,
+                    segment.start_time,
+                    segment.end_time,
+                    segment.segment_text.clone(),
+                    segment.bm25_text.clone(),
+                    segment.token_count,
+                    segment.content_hash.clone(),
+                    segment.created_at,
+                ),
+            )
+            .await?;
+
+        if segment.segment_summary.is_some()
+            || segment.prev_segment_id.is_some()
+            || segment.next_segment_id.is_some()
+        {
+            let q = format!(
+                "UPDATE {ks}.context_segments SET segment_summary = ?, \
+                 prev_segment_id = ?, next_segment_id = ? \
+                 WHERE tenant_id = ? AND session_id = ? AND segment_id = ?",
+                ks = self.keyspace
+            );
+            self.session
+                .query_unpaged(
+                    q,
+                    (
+                        segment.segment_summary.clone(),
+                        segment.prev_segment_id,
+                        segment.next_segment_id,
+                        ctx.tenant_id,
+                        segment.session_id,
+                        segment.segment_id,
+                    ),
+                )
+                .await?;
+        }
+
+        if let Some(embedding) = &segment.segment_embedding {
+            let vec_literal = render_vector_literal(embedding);
+            let q = format!(
+                "UPDATE {ks}.context_segments SET segment_embedding = {vec_literal} \
+                 WHERE tenant_id = ? AND session_id = ? AND segment_id = ?",
+                ks = self.keyspace
+            );
+            self.session
+                .query_unpaged(q, (ctx.tenant_id, segment.session_id, segment.segment_id))
+                .await?;
+        }
+
+        let terms = tokenize_context_terms(&segment.bm25_text);
+        let doc_len = terms.len() as i32;
+        let mut counts: HashMap<String, i32> = HashMap::new();
+        for term in terms {
+            *counts.entry(term).or_insert(0) += 1;
+        }
+        let q = format!(
+            "INSERT INTO {ks}.context_segment_terms \
+             (tenant_id, session_id, term, segment_id, tf, doc_len) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+            ks = self.keyspace
+        );
+        for (term, tf) in counts {
+            self.session
+                .query_unpaged(
+                    q.clone(),
+                    (
+                        ctx.tenant_id,
+                        segment.session_id,
+                        term,
+                        segment.segment_id,
+                        tf,
+                        doc_len,
+                    ),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn context_segment_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        segment_id: Uuid,
+    ) -> anyhow::Result<Option<ContextSegment>> {
+        let q = format!(
+            "SELECT * FROM {ks}.context_segments \
+             WHERE tenant_id = ? AND session_id = ? AND segment_id = ?",
+            ks = self.keyspace
+        );
+        let result = self
+            .session
+            .query_unpaged(q, (ctx.tenant_id, session_id, segment_id))
+            .await?;
+        let col_map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
+        rows.first()
+            .map(|row| context_segment_from_row(ctx, row, &col_map))
+            .transpose()
+    }
+
+    async fn context_segment_get_by_hash(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        content_hash: &str,
+    ) -> anyhow::Result<Option<ContextSegment>> {
+        let q = format!(
+            "SELECT * FROM {ks}.context_segments \
+             WHERE tenant_id = ? AND session_id = ? AND content_hash = ? \
+             LIMIT 1 ALLOW FILTERING",
+            ks = self.keyspace
+        );
+        let result = self
+            .session
+            .query_unpaged(q, (ctx.tenant_id, session_id, content_hash.to_string()))
+            .await?;
+        let col_map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
+        rows.first()
+            .map(|row| context_segment_from_row(ctx, row, &col_map))
+            .transpose()
+    }
+
+    async fn context_segment_search_bm25(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        query: &str,
+        k: usize,
+    ) -> anyhow::Result<Vec<ContextSegment>> {
+        let mut scores: HashMap<Uuid, i32> = HashMap::new();
+        let term_q = format!(
+            "SELECT segment_id, tf FROM {ks}.context_segment_terms \
+             WHERE tenant_id = ? AND session_id = ? AND term = ?",
+            ks = self.keyspace
+        );
+        for term in tokenize_context_terms(query) {
+            let result = self
+                .session
+                .query_unpaged(term_q.clone(), (ctx.tenant_id, session_id, term))
+                .await?;
+            let col_map = build_col_map(result.col_specs());
+            for row in result.rows_or_empty() {
+                let id: Uuid = cql_get(&row, &col_map, "segment_id")?;
+                let tf: i32 = cql_get(&row, &col_map, "tf").unwrap_or(1);
+                *scores.entry(id).or_insert(0) += tf;
+            }
+        }
+        let mut ranked: Vec<(Uuid, i32)> = scores.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let mut segments = Vec::new();
+        for (segment_id, _) in ranked.into_iter().take(k) {
+            if let Some(segment) = self
+                .context_segment_get(ctx, session_id, segment_id)
+                .await?
+            {
+                segments.push(segment);
+            }
+        }
+        Ok(segments)
+    }
+
+    async fn context_segment_search_ann(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        query_embedding: &[f32],
+        k: usize,
+    ) -> anyhow::Result<Vec<ContextSegment>> {
+        let vec_literal = render_vector_literal(query_embedding);
+        let q = format!(
+            "SELECT * FROM {ks}.context_segments \
+             WHERE tenant_id = ? AND session_id = ? \
+             ORDER BY segment_embedding ANN OF {vec_literal} LIMIT {k}",
+            ks = self.keyspace,
+            k = k
+        );
+        let result = match self
+            .session
+            .query_unpaged(q, (ctx.tenant_id, session_id))
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::warn!(error = %e, "context segment ANN query failed, falling back to session scan");
+                let fallback = format!(
+                    "SELECT * FROM {ks}.context_segments \
+                     WHERE tenant_id = ? AND session_id = ? LIMIT {k}",
+                    ks = self.keyspace,
+                    k = k
+                );
+                self.session
+                    .query_unpaged(fallback, (ctx.tenant_id, session_id))
+                    .await?
+            }
+        };
+        let col_map = build_col_map(result.col_specs());
+        result
+            .rows_or_empty()
+            .into_iter()
+            .map(|row| context_segment_from_row(ctx, &row, &col_map))
+            .collect()
+    }
+
+    async fn temporal_edge_put(
+        &self,
+        ctx: &TenantContext,
+        edge: &TemporalEdge,
+    ) -> anyhow::Result<()> {
+        let q = format!(
+            "INSERT INTO {ks}.temporal_edges \
+             (tenant_id, session_id, src_id, edge_type, dst_id, relation_time, ordinal, metadata, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ks = self.keyspace
+        );
+        self.session
+            .query_unpaged(
+                q,
+                (
+                    ctx.tenant_id,
+                    edge.session_id,
+                    edge.src_id,
+                    edge.edge_type.clone(),
+                    edge.dst_id,
+                    edge.relation_time,
+                    edge.ordinal,
+                    edge.metadata.clone(),
+                    edge.created_at,
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn temporal_edge_list_from(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        src_id: Uuid,
+        edge_type: &str,
+    ) -> anyhow::Result<Vec<TemporalEdge>> {
+        let q = format!(
+            "SELECT * FROM {ks}.temporal_edges \
+             WHERE tenant_id = ? AND session_id = ? AND src_id = ? AND edge_type = ?",
+            ks = self.keyspace
+        );
+        let result = self
+            .session
+            .query_unpaged(
+                q,
+                (ctx.tenant_id, session_id, src_id, edge_type.to_string()),
+            )
+            .await?;
+        let col_map = build_col_map(result.col_specs());
+        let mut edges: Vec<TemporalEdge> = result
+            .rows_or_empty()
+            .into_iter()
+            .map(|row| temporal_edge_from_row(ctx, &row, &col_map))
+            .collect::<anyhow::Result<_>>()?;
+        edges.sort_by_key(|edge| edge.ordinal);
+        Ok(edges)
+    }
+
+    async fn confidence_put(
+        &self,
+        _ctx: &TenantContext,
+        score: &crate::types::ConfidenceScore,
+    ) -> anyhow::Result<()> {
+        self.exec_prepared_rows(
+            &self.stmts.confidence_put,
+            (
+                score.entity_id,
+                score.fact_hash.clone(),
+                score.confidence,
+                score.source_count,
+                score.last_confirmed_at,
+                score.contradiction_count,
+            ),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn confidence_get(
+        &self,
+        _ctx: &TenantContext,
+        entity_id: Uuid,
+        fact_hash: &str,
+    ) -> anyhow::Result<Option<crate::types::ConfidenceScore>> {
+        let (col_map, rows) = self
+            .exec_prepared_rows(
+                &self.stmts.confidence_get,
+                (entity_id, fact_hash.to_string()),
+            )
+            .await?;
+        if let Some(row) = rows.into_iter().next() {
+            let confidence: f64 = cql_get(&row, &col_map, "confidence")?;
+            let source_count: i32 = cql_get(&row, &col_map, "source_count")?;
+            let last_confirmed_at: chrono::DateTime<chrono::Utc> =
+                cql_get(&row, &col_map, "last_confirmed_at")?;
+            let contradiction_count: i32 = cql_get(&row, &col_map, "contradiction_count")?;
+            Ok(Some(crate::types::ConfidenceScore {
+                entity_id,
+                fact_hash: fact_hash.to_string(),
+                confidence,
+                source_count,
+                last_confirmed_at,
+                contradiction_count,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod cql_storage_tests {
+    use super::*;
+
+    #[test]
+    fn sprint1_seed_insert_statements_bind_created_at_timestamp() {
+        let (entity_q, edge_q) = sprint1_seed_insert_statements("agent_memory");
+
+        assert!(
+            entity_q.contains("created_at)"),
+            "entity seed query should write created_at: {entity_q}"
+        );
+        assert!(
+            entity_q.contains("VALUES (?, ?, ?)"),
+            "entity seed query should bind created_at as a timestamp parameter: {entity_q}"
+        );
+        assert!(
+            edge_q.contains("VALUES (?, ?, ?, ?, ?)"),
+            "edge seed query should bind created_at as a timestamp parameter: {edge_q}"
+        );
+        assert!(
+            !entity_q.contains("now()") && !edge_q.contains("now()"),
+            "seed queries must not rely on Ferrosa CQL now() coercion"
+        );
+    }
+
+    #[test]
+    fn tenant_wide_viz_snapshot_queries_are_uncapped_and_exclude_heavy_blobs() {
+        let entity_query = entity_list_all_query("agent_memory");
+        let edge_query =
+            edge_list_all_query("agent_memory", "co_occurs_with", "entity_a", "entity_b");
+        let typed_edge_query = typed_edge_list_all_query("agent_memory");
+
+        for query in [&entity_query, &edge_query, &typed_edge_query] {
+            assert!(
+                query.contains(" WHERE tenant_id = ? ALLOW FILTERING"),
+                "tenant-wide viz scans must be tenant-scoped and uncapped so /viz/ws can stream the full browser stress-test dataset: {query}"
+            );
+            assert!(
+                !query.contains(" LIMIT "),
+                "tenant-wide viz scans must not silently cap the all-node browser stream: {query}"
+            );
+        }
+
+        assert!(
+            !entity_query.contains("context_snippet"),
+            "tenant-wide entity scans must not fetch multi-KB context snippets: {entity_query}"
+        );
+        assert!(
+            !entity_query.contains("entity_embedding"),
+            "tenant-wide entity scans must not fetch vector blobs: {entity_query}"
+        );
+    }
+
+    #[test]
+    fn fold_ann_search_query_uses_vector_literal_not_blob_parameter() {
+        let (query, bind_count) = build_fold_ann_search_query("agent_memory", &[0.25, -1.5], 7);
+
+        assert!(
+            query.contains("ORDER BY fold_embedding ANN OF [0.25000000,-1.50000000] LIMIT 7"),
+            "fold ANN query should render a vector literal: {query}"
+        );
+        assert!(
+            !query.contains("ANN OF ?"),
+            "fold ANN query must not bind the vector as a blob: {query}"
+        );
+        assert_eq!(
+            bind_count, 2,
+            "only session_id and tenant_id should be bound after rendering the vector literal"
+        );
     }
 }

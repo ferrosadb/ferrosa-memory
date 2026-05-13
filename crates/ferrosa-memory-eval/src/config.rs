@@ -467,10 +467,7 @@ cql_seeds = "10.0.0.1:9042,10.0.0.2:9042"
         assert!(cfg.parallel);
         assert!(cfg.stability_canary);
         assert!(!cfg.warmup);
-        assert_eq!(
-            cfg.mcp_binary,
-            PathBuf::from("/usr/local/bin/ferrosa-mcp")
-        );
+        assert_eq!(cfg.mcp_binary, PathBuf::from("/usr/local/bin/ferrosa-mcp"));
         assert_eq!(cfg.cql_seeds, "10.0.0.1:9042,10.0.0.2:9042");
     }
 

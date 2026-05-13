@@ -6,10 +6,10 @@ USE agent_memory;
 -- 4.3 Trajectory Folds
 CREATE TABLE IF NOT EXISTS trajectory_folds (
     session_id       uuid,
-    fold_id          timeuuid,
+    fold_id          uuid,
     tenant_id        uuid,
     depth            int,
-    parent_fold_id   timeuuid,
+    parent_fold_id   uuid,
     raw_trajectory   text,
     fold_summary     text,
     fold_embedding   vector<float, 768>,
@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS temporal_events (
 CREATE TABLE IF NOT EXISTS feedback_outcomes (
     tenant_id        uuid,
     session_id       uuid,
-    query_id         timeuuid,
+    query_id         uuid,
     program_type     text,
     query_embedding  vector<float, 768>,
     task_complexity  text,

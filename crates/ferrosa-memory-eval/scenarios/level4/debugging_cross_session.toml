@@ -1,0 +1,52 @@
+# Level 4 Task: Multi-session bug investigation
+#
+# Validates that the system maintains and leverages episodic context across
+# multiple dependent sessions to resolve a root cause.
+
+[scenario]
+id = "l4-debug-cross-session"
+name = "Multi-session bug investigation"
+description = """
+A user reports login failures across three sessions. In each session, the agent
+must retrieve prior findings, add new observations, and eventually correlate
+the issue with a deploy timeline. Tests episodic memory and cross-session
+context transfer."""
+level = 4
+tags = ["task-level", "episodic", "cross-session"]
+timeout_ms = 60000
+
+# Session 1: Initial investigation
+[[sessions]]
+name = "s1"
+prompt = "User reports login failures. Investigate and store findings."
+expected_findings = ["OAuth token expiry", "redis pool exhaustion"]
+tools_allowed = ["smart_ingest", "hybrid_search", "write_temporal_fact", "create_edge"]
+max_steps = 5
+
+# Session 2: Continuation with memory
+[[sessions]]
+name = "s2"
+depends_on = ["s1"]
+prompt = "Login still failing. Check memory for prior findings and continue."
+expected_findings = ["OAuth token expiry", "redis pool exhaustion", "session store timeout"]
+tools_allowed = ["smart_ingest", "hybrid_search", "write_temporal_fact", "create_edge", "get_temporal_chain"]
+max_steps = 5
+
+# Session 3: Timeline correlation
+[[sessions]]
+name = "s3"
+depends_on = ["s1", "s2"]
+prompt = "User says 'this started after the deploy on Tuesday.' Cross-reference with your timeline."
+expected_findings = ["OAuth token expiry", "redis pool exhaustion", "session store timeout", "deploy correlation"]
+tools_allowed = ["smart_ingest", "hybrid_search", "write_temporal_fact", "create_edge", "get_temporal_chain", "explore_connections"]
+max_steps = 5
+
+[grading]
+type = "task_success"
+subtasks = [
+    "Identify OAuth token expiry",
+    "Identify redis pool exhaustion",
+    "Identify session store timeout",
+    "Correlate with deploy timeline",
+]
+passing_threshold = 0.75

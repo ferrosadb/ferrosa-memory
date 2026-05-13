@@ -16,15 +16,34 @@ jobs:
     name: Format & Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
       - name: Check formatting
         run: cargo fmt --check
       - name: Clippy (warnings as errors)
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # P0-11/W-01: no hardcoded loopback CQL addresses in non-test source.
+      # Uses an awk-based scanner that strips #[cfg(test)] modules so the
+      # tests that VERIFY the W-01 validator (which must literally use
+      # "localhost:19042" as a fixture) don't trip the rule.
+      - name: No loopback CQL addresses in production source (p0-11)
+        run: ./.github/scripts/check-no-prod-loopback.sh
+
+  # Stage 1b: Dependency advisories
+  advisories:
+    name: Dependency Advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny
+      - name: Check advisories + licenses + bans + sources
+        run: cargo deny check
 
   # Stage 2: Build + Typecheck
   build:
@@ -32,9 +51,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: fmt-lint
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
       - name: Build workspace
         run: cargo build --workspace --all-targets
 
@@ -43,20 +62,31 @@ jobs:
     name: Tests & Coverage
     runs-on: ubuntu-latest
     needs: build
+    defaults:
+      run:
+        shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
         with:
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@f355b1dcaf1a1c56ccead97cc540a259faf4bd5a # v2.62.20
+        with:
+          tool: cargo-llvm-cov
       - name: Run tests with coverage
         run: |
           # Exclude: test files, mock storage, infrastructure needing live services
           # (CQL storage, MCP/batch binaries, HTTP server, graph/embedding clients)
           EXCL='(tests/|test_|_test\.rs|mock|cql_storage\.rs|main\.rs|http\.rs|graph\.rs|embedding\.rs)'
-          cargo llvm-cov --workspace \
+          # Skip integration tests entirely from the coverage pass — they
+          # panic-loud on missing FERROSA_TEST_CQL_PORT (per fmem CLAUDE.md
+          # policy: tests requiring a cluster must `panic!` rather than
+          # `#[ignore]`). The integration job below exercises them with a
+          # real cluster. `--lib --bins` covers all unit-test code without
+          # touching `tests/*.rs`.
+          cargo llvm-cov --workspace --lib --bins \
             --lcov --output-path lcov.info \
             --ignore-filename-regex "$EXCL"
       - name: Coverage summary
@@ -66,7 +96,7 @@ jobs:
             --ignore-filename-regex "$EXCL" \
             --no-run 2>/dev/null || true
       - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coverage-report
           path: lcov.info
@@ -90,7 +120,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install rust-code-analysis
         run: |
           cargo install rust-code-analysis-cli 2>/dev/null || \
@@ -123,7 +153,7 @@ jobs:
           fi
           cat complexity-report.md
       - name: Upload complexity report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: complexity-report
           path: complexity-report.md
@@ -134,15 +164,15 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
       - name: Build documentation
         run: cargo doc --workspace --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: "-D warnings"
       - name: Upload docs artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rustdoc
           path: target/doc
@@ -153,8 +183,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
       - name: Install harness dependencies
@@ -168,21 +198,405 @@ jobs:
           pytest tests/property -v
           pytest tests/duration/test_duration_specs.py -v
 
+  # Stage 7: Cluster-backed integration tests (--ignored, Docker)
+  # Cross-repo dependency: clones ferrosa to build the cluster image.
+  # Tests hardcode ports 19042-19044; CI runners are isolated so this is safe.
+  integration:
+    name: Cluster integration tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    needs: build
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          cache-on-failure: false
+      - name: Clone ferrosa for cluster image
+        # ferrosa is the source of the Ferrosa server image used by the
+        # cluster. ferrosadb/ferrosa is public — anonymous HTTPS clone works
+        # without a token. clone-ferrosa-src.sh tries each candidate branch
+        # in order; a matched branch is kept only if it isn't strictly older
+        # than main (otherwise CI would build a cluster image missing every
+        # main-only fix — see run 25784440206 where a stale
+        # `chore/integrate-pr12-plus-pr10` mirror on ferrosadb/ferrosa
+        # swallowed the adjacency-write-retry fix). No match → fall back to
+        # main. Cross-repo work pushes a matching branch on ferrosadb/ferrosa.
+        run: |
+          ./.github/scripts/clone-ferrosa-src.sh \
+            --remote https://github.com/ferrosadb/ferrosa.git \
+            --dest   /tmp/ferrosa-src \
+            --candidate "${GITHUB_HEAD_REF:-}" \
+            --candidate "${GITHUB_REF_NAME:-}"
+      - name: Bring up 3-node cluster on ports 19042-19044
+        run: |
+          # Write a CI compose that maps 9042→19042 etc. so tests that hardcode
+          # 127.0.0.1:19042-19044 connect correctly.
+          cat > /tmp/docker-compose.memory-ci.yml <<'CEOF'
+          services:
+            rustfs:
+              image: rustfs/rustfs:latest
+              environment:
+                RUSTFS_VOLUMES: /data/rustfs0
+                RUSTFS_ADDRESS: "0.0.0.0:9000"
+                RUSTFS_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
+                RUSTFS_SECRET_KEY: rustfsadmin  # pragma: allowlist secret
+              healthcheck:
+                test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
+                interval: 5s
+                timeout: 5s
+                retries: 10
+                start_period: 10s
+            rustfs-init:
+              image: minio/mc
+              depends_on:
+                rustfs:
+                  condition: service_healthy
+              entrypoint: >
+                sh -c "mc alias set local http://rustfs:9000 rustfsadmin rustfsadmin &&
+                       mc mb local/ferrosa-test --ignore-existing &&
+                       echo 'bucket ferrosa-test ready'"
+              restart: "no"
+            node1:
+              build:
+                context: /tmp/ferrosa-src
+                dockerfile: Dockerfile
+              depends_on:
+                rustfs-init:
+                  condition: service_completed_successfully
+              ports:
+                - "19042:9042"
+                - "17474:7474"
+                - "19090:9090"
+              environment:
+                FERROSA_HOST_ID: "11111111-1111-1111-1111-111111111111"
+                FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+                FERROSA_INTERNODE_BROADCAST: "node1:7000"
+                FERROSA_CQL_BIND: "0.0.0.0:9042"
+                FERROSA_WEB_BIND: "0.0.0.0:9090"
+                FERROSA_GRAPH_ENABLED: "true"
+                FERROSA_CLUSTER_NAME: "ferrosa-memory-ci"
+                FERROSA_DATA_DIR: "/var/lib/ferrosa"
+                FERROSA_AUTH_DISABLED: "true"
+                FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+                FERROSA_S3_BUCKET: "ferrosa-test"
+                FERROSA_S3_ALLOW_HTTP: "true"
+                FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
+                FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+              healthcheck:
+                test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9042' || exit 1"]
+                interval: 5s
+                timeout: 5s
+                retries: 30
+                start_period: 20s
+            node2:
+              build:
+                context: /tmp/ferrosa-src
+                dockerfile: Dockerfile
+              depends_on:
+                node1:
+                  condition: service_healthy
+              ports:
+                - "19043:9042"
+              environment:
+                FERROSA_HOST_ID: "22222222-2222-2222-2222-222222222222"
+                FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+                FERROSA_INTERNODE_BROADCAST: "node2:7000"
+                FERROSA_SEED: "node1:7000"
+                FERROSA_CQL_BIND: "0.0.0.0:9042"
+                FERROSA_WEB_BIND: "0.0.0.0:9090"
+                FERROSA_CLUSTER_NAME: "ferrosa-memory-ci"
+                FERROSA_DATA_DIR: "/var/lib/ferrosa"
+                FERROSA_AUTH_DISABLED: "true"
+                FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+                FERROSA_S3_BUCKET: "ferrosa-test"
+                FERROSA_S3_ALLOW_HTTP: "true"
+                FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
+                FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+              healthcheck:
+                test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9042' || exit 1"]
+                interval: 5s
+                timeout: 5s
+                retries: 30
+                start_period: 20s
+            node3:
+              build:
+                context: /tmp/ferrosa-src
+                dockerfile: Dockerfile
+              depends_on:
+                node1:
+                  condition: service_healthy
+                node2:
+                  condition: service_healthy
+              ports:
+                - "19044:9042"
+              environment:
+                FERROSA_HOST_ID: "33333333-3333-3333-3333-333333333333"
+                FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+                FERROSA_INTERNODE_BROADCAST: "node3:7000"
+                FERROSA_SEED: "node1:7000"
+                FERROSA_CQL_BIND: "0.0.0.0:9042"
+                FERROSA_WEB_BIND: "0.0.0.0:9090"
+                FERROSA_CLUSTER_NAME: "ferrosa-memory-ci"
+                FERROSA_DATA_DIR: "/var/lib/ferrosa"
+                FERROSA_AUTH_DISABLED: "true"
+                FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+                FERROSA_S3_BUCKET: "ferrosa-test"
+                FERROSA_S3_ALLOW_HTTP: "true"
+                FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
+                FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+              healthcheck:
+                test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9042' || exit 1"]
+                interval: 5s
+                timeout: 5s
+                retries: 30
+                start_period: 20s
+          CEOF
+          docker compose -f /tmp/docker-compose.memory-ci.yml up -d --build
+      - name: Wait for all 3 nodes on 19042-19044
+        run: |
+          for port in 19042 19043 19044; do
+            echo "Waiting for CQL on port ${port}..."
+            for i in $(seq 1 60); do
+              if bash -c "</dev/tcp/127.0.0.1/${port}" 2>/dev/null; then
+                echo "  port ${port} ready after ${i}s"
+                break
+              fi
+              if [ "$i" -eq 60 ]; then
+                echo "::error::Port ${port} did not become ready within 60s"
+                docker compose -f /tmp/docker-compose.memory-ci.yml logs 2>/dev/null | tail -100
+                exit 1
+              fi
+              sleep 2
+            done
+          done
+          echo "Waiting for graph HTTP on port 17474..."
+          for i in $(seq 1 60); do
+            if bash -c "</dev/tcp/127.0.0.1/17474" 2>/dev/null; then
+              echo "  graph HTTP TCP listener up after ${i}s"
+              break
+            fi
+            if [ "$i" -eq 60 ]; then
+              echo "::error::Graph HTTP did not become ready within 60s"
+              docker compose -f /tmp/docker-compose.memory-ci.yml logs 2>/dev/null | tail -100
+              exit 1
+            fi
+            sleep 2
+          done
+      - name: Apply DDL + wait for schema propagation across all 3 nodes
+        # p1-37 (ferrosa) lifted the scylla 0.15 driver-compat block, so
+        # the migrate binary can now apply DDL against ferrosa via raw
+        # `session.query_unpaged`. Verified locally: all 28 fmem DDL
+        # files apply end-to-end ("migrations completed").
+        run: |
+          timeout 180s cargo run --bin migrate -- \
+            --contact-points 127.0.0.1:19042 \
+            --keyspace agent_memory \
+            --ddl-dir ddl
+
+          # Propagation barrier: SELECT-only probe against each peer until the
+          # agent_memory keyspace is visible in system_schema.keyspaces. We
+          # cannot re-run the migrate DDL here — the scylla driver's auto
+          # schema-agreement metadata fetch (triggered by any DDL once schema
+          # exists) currently fails against ferrosa's system_schema.views
+          # column shape. The --probe-only path issues a single SELECT only,
+          # which sidesteps that path.
+          for port in 19043 19044; do
+            echo "Waiting for keyspace propagation on port ${port}..."
+            for i in $(seq 1 30); do
+              # Keep each probe bounded. A wedged peer must fail this attempt
+              # and surface diagnostics instead of hanging the cluster job.
+              if timeout 20s cargo run --quiet --bin migrate -- \
+                  --contact-points 127.0.0.1:${port} \
+                  --keyspace agent_memory \
+                  --probe-only >/dev/null 2>&1; then
+                echo "  port ${port} sees agent_memory after ${i} attempts"
+                break
+              fi
+              if [ "$i" -eq 30 ]; then
+                echo "::error::Schema not visible on port ${port} within bounded retries"
+                docker compose -f /tmp/docker-compose.memory-ci.yml logs 2>/dev/null | tail -100
+                exit 1
+              fi
+              sleep 2
+            done
+          done
+
+          # The graph engine's TCP listener comes up well before the engine
+          # can answer queries — /graph/health passes ~1s in, but /graph/query
+          # for a real keyspace takes longer (schema discovery, prepared-
+          # statement setup, etc.). Probe the actual query endpoint with a
+          # trivial RETURN, so cluster-gated graph_live tests don't race the
+          # engine's warm-up.
+          #
+          # Each attempt prints its outcome (HTTP status or curl error) so a
+          # silent stall is impossible — if the engine is hung we see *why*
+          # in the workflow log, not a 17-minute blank screen.
+          ./.github/scripts/graph-query-probe.sh \
+            --label "main cluster /graph/query (read)" \
+            --url   http://127.0.0.1:17474/graph/query \
+            --query 'RETURN 1 AS x' \
+            --keyspace agent_memory \
+            --attempts 30 \
+            --curl-timeout 5 \
+            --sleep 2 \
+            --logs-cmd 'docker compose -f /tmp/docker-compose.memory-ci.yml logs'
+
+          # Read warms up fast; write path (MERGE + edge SET) often takes
+          # longer on first use — index/buffer init, write-quorum
+          # negotiation, S3 first-write, etc. The 10s reqwest timeout in
+          # GraphClient bites here. Mirror the exact shape the failing
+          # test uses (public_graph_write_round_trip_for_co_occurs_edges):
+          # two Entity MERGEs + a CO_OCCURS_WITH edge MERGE + SET. Use
+          # fresh UUIDs per attempt so each iteration actually exercises
+          # the create-write path rather than a no-op match.
+          ./.github/scripts/graph-write-probe.sh \
+            --label "main cluster /graph/query (write)" \
+            --url   http://127.0.0.1:17474/graph/query \
+            --keyspace agent_memory \
+            --attempts 30 \
+            --curl-timeout 10 \
+            --sleep 3 \
+            --logs-cmd 'docker compose -f /tmp/docker-compose.memory-ci.yml logs'
+      - name: Bring up isolated test cluster (port 19542)
+        # `crates/ferrosa-memory-core/tests/migration_drift.rs::t03_*`
+        # exercises the v30 → v31 keyspace-upgrade path and needs a
+        # cluster it can DROP+CREATE keyspaces on without colliding
+        # with the main cluster the rest of the integration tests
+        # share. `docker-compose.test.yml` is the upstream-maintained
+        # +500-port-offset compose for exactly this — bring it up
+        # alongside the main cluster.
+        run: |
+          # The compose file references `image: ferrosa-memory-node`
+          # (no build context), so build it once from the cloned
+          # ferrosa source first.
+          docker build -t ferrosa-memory-node /tmp/ferrosa-src
+          # Compose uses ~/data/ferrosa-memory-test/{minio,node1,..}
+          # — make sure the dirs exist on the runner.
+          mkdir -p \
+            ~/data/ferrosa-memory-test/minio \
+            ~/data/ferrosa-memory-test/node1 \
+            ~/data/ferrosa-memory-test/node2 \
+            ~/data/ferrosa-memory-test/node3
+          # CI brings up node1-test only (standalone). The 3-node test
+          # compose's progressive bring-up (standalone → pair → cluster)
+          # doesn't reliably reach write-quorum availability for the
+          # graph engine's adjacency keyspace within the CI window
+          # — graph writes timed out with CL=QUORUM received=0 even
+          # at RF=1. The migration-drift + graph_live + ferrosa_bugs
+          # suites only need a single-node cluster they can DROP+CREATE
+          # keyspaces on; standalone node1-test satisfies that.
+          docker compose -f docker-compose.test.yml up -d minio-test minio-test-init node1-test
+          echo "Waiting for test cluster CQL on 19542..."
+          for i in $(seq 1 60); do
+            if bash -c "</dev/tcp/127.0.0.1/19542" 2>/dev/null; then
+              echo "  test cluster CQL ready after ${i}s"
+              break
+            fi
+            if [ "$i" -eq 60 ]; then
+              echo "::error::Test cluster did not become ready within 120s"
+              docker compose -f docker-compose.test.yml logs 2>/dev/null | tail -100
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "Applying DDL to test cluster..."
+          # Test cluster doesn't reliably reach full cluster-mode quorum
+          # readiness within the migrate window — writes at CL=QUORUM with
+          # the production RF=3 DDL fail with received=0/required=2 even
+          # after schema is visible. The test cluster is ephemeral, so
+          # drop to RF=1 (single replica per write) for the test keyspace.
+          # This is exactly what --replication-factor was added for.
+          timeout 180s cargo run --bin migrate -- \
+            --contact-points 127.0.0.1:19542 \
+            --keyspace agent_memory_test \
+            --replication-factor 1 \
+            --ddl-dir ddl
+
+          # Warm up the test cluster's graph /graph/query endpoint, both
+          # read and write. graph_live tests now target the test cluster
+          # (FERROSA_TEST_GRAPH_URL=http://127.0.0.1:17974); without an
+          # explicit write probe, public_graph_write_round_trip_for_co_occurs_edges
+          # hits the graph engine before the write path is ready and
+          # times out under the 10s reqwest limit. Same probe shape as
+          # the main-cluster warmup above.
+          ./.github/scripts/graph-query-probe.sh \
+            --label "test cluster /graph/query (read)" \
+            --url   http://127.0.0.1:17974/graph/query \
+            --query 'RETURN 1 AS x' \
+            --keyspace agent_memory_test \
+            --attempts 30 \
+            --curl-timeout 5 \
+            --sleep 2 \
+            --logs-cmd 'docker compose -f docker-compose.test.yml logs'
+
+          ./.github/scripts/graph-write-probe.sh \
+            --label "test cluster /graph/query (write)" \
+            --url   http://127.0.0.1:17974/graph/query \
+            --keyspace agent_memory_test \
+            --attempts 30 \
+            --curl-timeout 10 \
+            --sleep 3 \
+            --logs-cmd 'docker compose -f docker-compose.test.yml logs'
+
+      - name: Build ferrosa-memory-mcp binary for eval tests
+        # ferrosa-memory-eval's live tests spawn the MCP server via
+        # McpClient::spawn(), which expects the binary at
+        # target/{debug,release}/ferrosa-memory-mcp. The default
+        # `cargo test --workspace -- --ignored` doesn't build binaries
+        # for non-test targets, so we pre-build here.
+        run: cargo build -p ferrosa-memory-mcp
+      - name: Run ignored (cluster-gated) Rust tests
+        env:
+          FERROSA_TEST_CONTAINERS: "1"
+          # Migration-drift tests run keyspace-recreate cycles against
+          # the isolated test cluster brought up above.
+          FERROSA_TEST_CQL_HOST: "127.0.0.1"
+          FERROSA_TEST_CQL_PORT: "19542"
+          FERROSA_TEST_GRAPH_URL: "http://127.0.0.1:17974"
+          FERROSA_TEST_KEYSPACE: "agent_memory_test"
+          FERROSA_TEST_S3_ENDPOINT: "http://127.0.0.1:19500"
+        run: cargo test --workspace -- --ignored
+      - name: Run system pytest suite against live cluster
+        env:
+          FERROSA_BASE_URL: "http://127.0.0.1:19090"
+        run: |
+          python -m pip install -r tests/requirements.txt
+          pytest tests/system -v
+      - name: Collect cluster logs on failure
+        if: failure()
+        run: |
+          echo "=== main cluster ==="
+          docker compose -f /tmp/docker-compose.memory-ci.yml logs --no-color 2>/dev/null | tail -200 || true
+          echo "=== test cluster ==="
+          docker compose -f docker-compose.test.yml logs --no-color 2>/dev/null | tail -200 || true
+      - name: Tear down cluster
+        if: always()
+        run: |
+          docker compose -f /tmp/docker-compose.memory-ci.yml down -v --remove-orphans 2>/dev/null || true
+          docker compose -f docker-compose.test.yml down -v --remove-orphans 2>/dev/null || true
+
   # Final gate: all checks must pass
   ci-pass:
     name: CI Pass
     runs-on: ubuntu-latest
-    needs: [fmt-lint, build, test-coverage, complexity, docs, python-harness]
+    needs: [fmt-lint, advisories, build, test-coverage, complexity, docs, python-harness, integration]
     if: always()
     steps:
       - name: Check all jobs passed
         run: |
           if [ "${{ needs.fmt-lint.result }}" != "success" ] || \
+             [ "${{ needs.advisories.result }}" != "success" ] || \
              [ "${{ needs.build.result }}" != "success" ] || \
              [ "${{ needs.test-coverage.result }}" != "success" ] || \
              [ "${{ needs.complexity.result }}" != "success" ] || \
              [ "${{ needs.docs.result }}" != "success" ] || \
-             [ "${{ needs.python-harness.result }}" != "success" ]; then
+             [ "${{ needs.python-harness.result }}" != "success" ] || \
+             [ "${{ needs.integration.result }}" != "success" ]; then
             echo "::error::One or more CI stages failed"
             exit 1
           fi

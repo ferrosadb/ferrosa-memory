@@ -32,6 +32,21 @@
 
 ## Current Focus
 
+### Post-Sprint 10 Backlog (filed 2026-05-04)
+
+Operational gaps discovered during live debugging sessions:
+
+| Item | Type | Priority | File |
+|------|------|----------|------|
+| Auto-session entity extraction | Feature | P2 | `todo/feat-auto-session-entity-extraction.md` |
+| Consolidation timeout resilience | Bug | P1 | `todo/bug-run-consolidation-timeout-under-prepare-failures.md` |
+| `memory` tool silent rejection | Bug | P1 | `todo/bug-memory-tool-silent-rejection.md` |
+| Duplicate entities across sessions | Bug | P2 | `todo/bug-duplicate-entities-across-sessions.md` |
+| Consolidation cron job | Feature | P2 | `todo/feat-consolidation-cron-job.md` |
+| Migration status endpoint | Feature | P1 | `todo/feat-migration-status-endpoint.md` |
+
+These were discovered while diagnosing: (1) arXiv cron silence (`search_arxiv.py` double-encoding), (2) `trajectory_folds` ANN PREPARE failure (FRSA-BUG-025), (3) migration 31 application status unknown, (4) `memory` tool at 93% blocking operational notes.
+
 ### Sprint 7 — Complete
 
 Shared HTTP is now treated as a real authenticated service boundary:

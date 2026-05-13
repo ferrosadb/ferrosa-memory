@@ -42,10 +42,10 @@ fn extract_entity_ids(value: &Value) -> HashSet<String> {
 fn collect_entity_ids(value: &Value, ids: &mut HashSet<String>) {
     match value {
         Value::Object(map) => {
-            if let Some(id_val) = map.get("entity_id") {
-                if let Some(s) = id_val.as_str() {
-                    ids.insert(s.to_string());
-                }
+            if let Some(id_val) = map.get("entity_id")
+                && let Some(s) = id_val.as_str()
+            {
+                ids.insert(s.to_string());
             }
             // Also collect from entity_ids arrays
             if let Some(Value::Array(arr)) = map.get("entity_ids") {
@@ -166,7 +166,7 @@ pub fn grade(traces: &[ToolCallTrace]) -> ToolUsageScore {
     let total_latency_ms: u64 = traces.iter().map(|t| t.latency_ms).sum();
 
     // Token estimation
-    let total_tokens: u64 = traces.iter().map(|t| estimate_tokens(t)).sum();
+    let total_tokens: u64 = traces.iter().map(estimate_tokens).sum();
 
     // Unnecessary call detection
     let unnecessary_flags = detect_unnecessary(traces);
@@ -213,10 +213,7 @@ mod tests {
 
     fn make_trace(tool: &str, args: Value, response: Value, latency_ms: u64) -> ToolCallTrace {
         let arguments = match args {
-            Value::Object(map) => map
-                .into_iter()
-                .map(|(k, v)| (k, v))
-                .collect::<HashMap<String, Value>>(),
+            Value::Object(map) => map.into_iter().collect::<HashMap<String, Value>>(),
             _ => HashMap::new(),
         };
         ToolCallTrace {
@@ -331,7 +328,10 @@ mod tests {
         ];
 
         let flags = detect_unnecessary(&traces);
-        assert!(flags[0], "Call 0 should be unnecessary (ent-001 never referenced later)");
+        assert!(
+            flags[0],
+            "Call 0 should be unnecessary (ent-001 never referenced later)"
+        );
         // Call 1 is the last call -- its output can't be referenced by anything
         // so it has entity_ids but no subsequent calls. Still flagged.
     }
@@ -357,7 +357,10 @@ mod tests {
         ];
 
         let flags = detect_unnecessary(&traces);
-        assert!(!flags[0], "Call 0 should be necessary (ent-001 is referenced in call 1)");
+        assert!(
+            !flags[0],
+            "Call 0 should be necessary (ent-001 is referenced in call 1)"
+        );
     }
 
     // ── Token estimation ─────────────────────────────────────────
@@ -538,18 +541,8 @@ mod tests {
     fn tool_usage_calls_without_entity_ids_not_flagged() {
         // Both calls return no entity_ids -- neither can be flagged
         let traces = vec![
-            make_trace(
-                "get_stats",
-                json!({}),
-                json!({"entity_count": 10}),
-                20,
-            ),
-            make_trace(
-                "get_stats",
-                json!({}),
-                json!({"entity_count": 10}),
-                20,
-            ),
+            make_trace("get_stats", json!({}), json!({"entity_count": 10}), 20),
+            make_trace("get_stats", json!({}), json!({"entity_count": 10}), 20),
         ];
 
         let score = grade(&traces);

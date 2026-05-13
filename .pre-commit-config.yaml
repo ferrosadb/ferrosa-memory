@@ -14,7 +14,7 @@ repos:
     rev: v2.4.1
     hooks:
       - id: codespell
-        args: ['--skip=Cargo.lock,target', '--ignore-words-list=wit,allEdges']
+        args: ['--skip=Cargo.lock,target', '--ignore-words-list=wit,allEdges,crate']
 
   - repo: https://github.com/compilerla/conventional-pre-commit
     rev: v4.0.0
@@ -38,10 +38,30 @@ repos:
         types: [rust]
         pass_filenames: false
 
+
+      - id: cargo-clippy-prepush
+        name: cargo clippy (pre-push, all-targets)
+        entry: cargo clippy --workspace --all-targets -- -D warnings
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: cargo-fmt-prepush
+        name: cargo fmt --check (pre-push)
+        entry: cargo fmt --check
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: no-prod-loopback-prepush
+        name: no hardcoded loopback CQL in prod source (p0-11 W-01)
+        entry: ./.github/scripts/check-no-prod-loopback.sh
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
       - id: cargo-test
         name: cargo test
-        entry: cargo test --workspace
+        entry: cargo test --workspace --lib --bins
         language: system
-        types: [rust]
         pass_filenames: false
         stages: [pre-push]

@@ -124,6 +124,22 @@ pub enum VizEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         total_edges: Option<usize>,
     },
+    /// Begin an incremental snapshot stream. The browser should clear local
+    /// graph state and append following chunks until `SnapshotStreamEnd`.
+    SnapshotStreamStart {
+        level: Option<String>,
+        parent: Option<String>,
+    },
+    /// Chunk of an initial snapshot streamed from paged storage reads.
+    SnapshotStreamChunk {
+        nodes: Vec<VizNode>,
+        edges: Vec<VizEdge>,
+    },
+    /// End of an incremental snapshot stream.
+    SnapshotStreamEnd {
+        total_nodes: usize,
+        total_edges: usize,
+    },
     /// Entity created or updated.
     EntityChanged { node: VizNode, action: String },
     /// New edge created.

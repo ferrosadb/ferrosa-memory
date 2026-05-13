@@ -13,11 +13,12 @@
 
 use uuid::Uuid;
 
+use crate::context_segment::{ContextSegment, TemporalEdge};
 use crate::types::{
-    AliasEntry, ApprovalEntry, AuditEntry, DerivedFact, EntityEntry, EntityTypeStateCount,
-    FeedbackOutcome, FoldEntry, FoldSummary, MaterializedEdge, MemoEntry, MemoryState, PlanNode,
-    PlanStatus, PromotedPredicate, ProvenanceStep, RuleEntry, RuleState, TemporalEvent,
-    TenantContext, ToolUsageRow, TypedEdge, WarmthEntry,
+    AliasEntry, ApprovalEntry, AuditEntry, ConfidenceScore, DerivedFact, EntityEntry,
+    EntityTypeStateCount, FeedbackOutcome, FoldEntry, FoldSummary, MaterializedEdge, MemoEntry,
+    MemoryState, PlanNode, PlanStatus, PromotedPredicate, ProvenanceStep, RuleEntry, RuleState,
+    TemporalEvent, TenantContext, ToolUsageRow, TypedEdge, WarmthEntry,
 };
 
 /// Core storage operations for the memory system.
@@ -227,11 +228,68 @@ pub trait Storage: Send + Sync {
         ctx: &TenantContext,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<EntityEntry>>> + Send;
 
+    /// Stream all entities for a tenant in bounded chunks.
+    ///
+    /// The default implementation preserves compatibility for non-CQL test
+    /// backends by chunking `entity_list_all()`. CQL storage overrides this
+    /// with a paged driver iterator so tenant-wide viz SELECT rows can flow to
+    /// the websocket without waiting for a full in-memory result set first.
+    fn entity_stream_all(
+        &self,
+        ctx: TenantContext,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<EntityEntry>>>,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        async move {
+            let chunk_size = chunk_size.max(1);
+            match self.entity_list_all(&ctx).await {
+                Ok(entities) => {
+                    for chunk in entities.chunks(chunk_size) {
+                        if tx.send(Ok(chunk.to_vec())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                }
+            }
+        }
+    }
+
     /// List all folds for a tenant (sync/export use only — uses ALLOW FILTERING).
     fn fold_list_all(
         &self,
         ctx: &TenantContext,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<FoldEntry>>> + Send;
+
+    /// Stream all folds for a tenant in bounded chunks.
+    ///
+    /// The default implementation chunks `fold_list_all()` for in-memory test
+    /// backends. CQL storage overrides this with paged driver iteration and a
+    /// viz-safe projection that omits heavy raw trajectory/embedding columns.
+    fn fold_stream_all(
+        &self,
+        ctx: TenantContext,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<FoldEntry>>>,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        async move {
+            let chunk_size = chunk_size.max(1);
+            match self.fold_list_all(&ctx).await {
+                Ok(folds) => {
+                    for chunk in folds.chunks(chunk_size) {
+                        if tx.send(Ok(chunk.to_vec())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                }
+            }
+        }
+    }
 
     /// List all temporal events for a tenant (sync/export use only — uses ALLOW FILTERING).
     fn temporal_list_all(
@@ -377,6 +435,33 @@ pub trait Storage: Send + Sync {
         ctx: &TenantContext,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<(Uuid, Uuid, String)>>> + Send;
 
+    /// Stream all graph edges for a tenant in bounded chunks.
+    ///
+    /// The default implementation chunks `edge_list_all()` for in-memory test
+    /// backends. CQL storage overrides this with paged driver iteration.
+    fn edge_stream_all(
+        &self,
+        ctx: TenantContext,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<(Uuid, Uuid, String)>>>,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        async move {
+            let chunk_size = chunk_size.max(1);
+            match self.edge_list_all(&ctx).await {
+                Ok(edges) => {
+                    for chunk in edges.chunks(chunk_size) {
+                        if tx.send(Ok(chunk.to_vec())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                }
+            }
+        }
+    }
+
     /// List all neighbors of an entity as (neighbor_id, edge_type) pairs.
     ///
     /// Searches mentioned_in, co_occurs_with, and supersedes edges where the
@@ -519,6 +604,13 @@ pub trait Storage: Send + Sync {
         session_id: Uuid,
         elapsed_hours: f64,
     ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send;
+
+    /// Delete a warmth entry by entity_id.
+    fn warmth_delete(
+        &self,
+        ctx: &TenantContext,
+        entity_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     // --- Rule registry operations (Sprint 5) ---
 
@@ -703,6 +795,33 @@ pub trait Storage: Send + Sync {
         ctx: &TenantContext,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<TypedEdge>>> + Send;
 
+    /// Stream all typed edges for a tenant in bounded chunks.
+    ///
+    /// The default implementation chunks `typed_edge_list_all()` for in-memory
+    /// test backends. CQL storage overrides this with paged driver iteration.
+    fn typed_edge_stream_all(
+        &self,
+        ctx: TenantContext,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<TypedEdge>>>,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        async move {
+            let chunk_size = chunk_size.max(1);
+            match self.typed_edge_list_all(&ctx).await {
+                Ok(edges) => {
+                    for chunk in edges.chunks(chunk_size) {
+                        if tx.send(Ok(chunk.to_vec())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                }
+            }
+        }
+    }
+
     /// List typed edges from a specific source entity.
     fn typed_edge_list_from(
         &self,
@@ -773,6 +892,82 @@ pub trait Storage: Send + Sync {
         &self,
         ctx: &TenantContext,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<PromotedPredicate>>> + Send;
+
+    // --- Context segment operations ---
+
+    /// Store a raw, ordered context segment.
+    fn context_segment_put(
+        &self,
+        ctx: &TenantContext,
+        segment: &ContextSegment,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// Get a context segment by ID.
+    fn context_segment_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        segment_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<ContextSegment>>> + Send;
+
+    /// Get a context segment by stable content hash.
+    fn context_segment_get_by_hash(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        content_hash: &str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<ContextSegment>>> + Send;
+
+    /// Lexical/BM25-style context segment search.
+    fn context_segment_search_bm25(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        query: &str,
+        k: usize,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<ContextSegment>>> + Send;
+
+    /// ANN context segment search.
+    fn context_segment_search_ann(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        query_embedding: &[f32],
+        k: usize,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<ContextSegment>>> + Send;
+
+    /// Store a temporal edge between two context artifacts.
+    fn temporal_edge_put(
+        &self,
+        ctx: &TenantContext,
+        edge: &TemporalEdge,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// List temporal edges of a type from a source ID.
+    fn temporal_edge_list_from(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        src_id: Uuid,
+        edge_type: &str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<TemporalEdge>>> + Send;
+
+    // --- Confidence operations ---
+
+    /// Store or update a confidence score for a fact.
+    fn confidence_put(
+        &self,
+        ctx: &TenantContext,
+        score: &ConfidenceScore,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// Retrieve a confidence score by entity and fact hash.
+    fn confidence_get(
+        &self,
+        ctx: &TenantContext,
+        entity_id: Uuid,
+        fact_hash: &str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<ConfidenceScore>>> + Send;
 }
 
 /// In-memory mock storage for unit tests.
@@ -784,6 +979,7 @@ pub mod mock {
     use crate::http::OperatorQuerySurface;
     use crate::types::{DecayZone, FoldStatus};
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex;
 
     /// An edge stored in mock storage: (source, target, edge_type, session_id).
@@ -817,6 +1013,12 @@ pub mod mock {
         pub materialized_edges: Mutex<Vec<MaterializedEdge>>,
         pub promoted_predicates: Mutex<Vec<PromotedPredicate>>,
         pub typed_edges: Mutex<Vec<TypedEdge>>,
+        pub confidence_scores: Mutex<Vec<ConfidenceScore>>,
+        pub context_segments: Mutex<Vec<ContextSegment>>,
+        pub temporal_edges: Mutex<Vec<TemporalEdge>>,
+        pub edge_list_all_calls: AtomicUsize,
+        pub edge_list_session_calls: AtomicUsize,
+        pub edge_list_for_entity_calls: AtomicUsize,
         /// Test hook: when Some, `entity_find_phonetic` returns Err with
         /// this message. Used to verify callers propagate phonetic-scan
         /// errors instead of fail-quieting them into empty results, and
@@ -1477,6 +1679,7 @@ pub mod mock {
             _ctx: &TenantContext,
             session_id: Uuid,
         ) -> anyhow::Result<Vec<(Uuid, Uuid, String)>> {
+            self.edge_list_session_calls.fetch_add(1, Ordering::Relaxed);
             let edges = self.edges.lock().await;
             Ok(edges
                 .iter()
@@ -1489,6 +1692,7 @@ pub mod mock {
             &self,
             _ctx: &TenantContext,
         ) -> anyhow::Result<Vec<(Uuid, Uuid, String)>> {
+            self.edge_list_all_calls.fetch_add(1, Ordering::Relaxed);
             let edges = self.edges.lock().await;
             Ok(edges
                 .iter()
@@ -1501,6 +1705,8 @@ pub mod mock {
             _ctx: &TenantContext,
             entity_id: Uuid,
         ) -> anyhow::Result<Vec<(Uuid, String)>> {
+            self.edge_list_for_entity_calls
+                .fetch_add(1, Ordering::Relaxed);
             let edges = self.edges.lock().await;
             let mut neighbors = Vec::new();
             for e in edges.iter() {
@@ -1693,6 +1899,12 @@ pub mod mock {
                 .filter(|e| e.tenant_id == ctx.tenant_id && e.session_id == session_id)
                 .cloned()
                 .collect())
+        }
+
+        async fn warmth_delete(&self, ctx: &TenantContext, entity_id: Uuid) -> anyhow::Result<()> {
+            let mut entries = self.warmth_entries.lock().await;
+            entries.retain(|e| !(e.tenant_id == ctx.tenant_id && e.entity_id == entity_id));
+            Ok(())
         }
 
         async fn warmth_decay_all(
@@ -2134,6 +2346,187 @@ pub mod mock {
                     && edge.dst_id == dst_id)
             });
             Ok(edges.len() != before)
+        }
+
+        async fn context_segment_put(
+            &self,
+            ctx: &TenantContext,
+            segment: &ContextSegment,
+        ) -> anyhow::Result<()> {
+            let mut segments = self.context_segments.lock().await;
+            if let Some(existing) = segments.iter_mut().find(|s| {
+                s.tenant_id == ctx.tenant_id
+                    && s.session_id == segment.session_id
+                    && s.segment_id == segment.segment_id
+            }) {
+                *existing = segment.clone();
+            } else {
+                segments.push(segment.clone());
+            }
+            Ok(())
+        }
+
+        async fn context_segment_get(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+            segment_id: Uuid,
+        ) -> anyhow::Result<Option<ContextSegment>> {
+            let segments = self.context_segments.lock().await;
+            Ok(segments
+                .iter()
+                .find(|s| {
+                    s.tenant_id == ctx.tenant_id
+                        && s.session_id == session_id
+                        && s.segment_id == segment_id
+                })
+                .cloned())
+        }
+
+        async fn context_segment_get_by_hash(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+            content_hash: &str,
+        ) -> anyhow::Result<Option<ContextSegment>> {
+            let segments = self.context_segments.lock().await;
+            Ok(segments
+                .iter()
+                .find(|s| {
+                    s.tenant_id == ctx.tenant_id
+                        && s.session_id == session_id
+                        && s.content_hash == content_hash
+                })
+                .cloned())
+        }
+
+        async fn context_segment_search_bm25(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+            query: &str,
+            k: usize,
+        ) -> anyhow::Result<Vec<ContextSegment>> {
+            let q_terms: Vec<String> = query
+                .split_whitespace()
+                .map(|s| s.to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let segments = self.context_segments.lock().await;
+            let mut scored: Vec<(usize, ContextSegment)> = segments
+                .iter()
+                .filter(|s| s.tenant_id == ctx.tenant_id && s.session_id == session_id)
+                .filter_map(|s| {
+                    let text = s.bm25_text.to_lowercase();
+                    let score = q_terms
+                        .iter()
+                        .filter(|term| text.contains(term.as_str()))
+                        .count();
+                    (score > 0).then(|| (score, s.clone()))
+                })
+                .collect();
+            scored.sort_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| a.1.segment_index.cmp(&b.1.segment_index))
+            });
+            Ok(scored.into_iter().take(k).map(|(_, s)| s).collect())
+        }
+
+        async fn context_segment_search_ann(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+            query_embedding: &[f32],
+            k: usize,
+        ) -> anyhow::Result<Vec<ContextSegment>> {
+            let segments = self.context_segments.lock().await;
+            let mut scored: Vec<(ordered_float::OrderedFloat<f64>, ContextSegment)> = segments
+                .iter()
+                .filter(|s| s.tenant_id == ctx.tenant_id && s.session_id == session_id)
+                .filter_map(|s| {
+                    s.segment_embedding.as_ref().map(|embedding| {
+                        (
+                            ordered_float::OrderedFloat(crate::context_segment::cosine(
+                                query_embedding,
+                                embedding,
+                            )),
+                            s.clone(),
+                        )
+                    })
+                })
+                .collect();
+            scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+            Ok(scored.into_iter().take(k).map(|(_, s)| s).collect())
+        }
+
+        async fn temporal_edge_put(
+            &self,
+            ctx: &TenantContext,
+            edge: &TemporalEdge,
+        ) -> anyhow::Result<()> {
+            let mut edges = self.temporal_edges.lock().await;
+            if !edges.iter().any(|e| {
+                e.tenant_id == ctx.tenant_id
+                    && e.session_id == edge.session_id
+                    && e.src_id == edge.src_id
+                    && e.edge_type == edge.edge_type
+                    && e.dst_id == edge.dst_id
+            }) {
+                edges.push(edge.clone());
+            }
+            Ok(())
+        }
+
+        async fn temporal_edge_list_from(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+            src_id: Uuid,
+            edge_type: &str,
+        ) -> anyhow::Result<Vec<TemporalEdge>> {
+            let edges = self.temporal_edges.lock().await;
+            let mut found: Vec<_> = edges
+                .iter()
+                .filter(|e| {
+                    e.tenant_id == ctx.tenant_id
+                        && e.session_id == session_id
+                        && e.src_id == src_id
+                        && e.edge_type == edge_type
+                })
+                .cloned()
+                .collect();
+            found.sort_by_key(|e| e.ordinal);
+            Ok(found)
+        }
+
+        async fn confidence_put(
+            &self,
+            _ctx: &TenantContext,
+            score: &ConfidenceScore,
+        ) -> anyhow::Result<()> {
+            let mut scores = self.confidence_scores.lock().await;
+            if let Some(existing) = scores
+                .iter_mut()
+                .find(|s| s.entity_id == score.entity_id && s.fact_hash == score.fact_hash)
+            {
+                *existing = score.clone();
+            } else {
+                scores.push(score.clone());
+            }
+            Ok(())
+        }
+
+        async fn confidence_get(
+            &self,
+            _ctx: &TenantContext,
+            entity_id: Uuid,
+            fact_hash: &str,
+        ) -> anyhow::Result<Option<ConfidenceScore>> {
+            let scores = self.confidence_scores.lock().await;
+            Ok(scores
+                .iter()
+                .find(|s| s.entity_id == entity_id && s.fact_hash == fact_hash)
+                .cloned())
         }
     }
 

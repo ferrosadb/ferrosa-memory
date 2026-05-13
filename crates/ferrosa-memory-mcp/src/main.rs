@@ -11,13 +11,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use cdrs_tokio::frame::message_result::{ColType, RowsMetadata};
-use cdrs_tokio::types::ByIndex;
-use cdrs_tokio::types::blob::Blob;
-use cdrs_tokio::types::prelude::Row;
 use ferrosa_memory_core::auth;
 use ferrosa_memory_core::config::FerrosaCqlConfig;
 use ferrosa_memory_core::config::{Config, validate_shared_http_config};
+use ferrosa_memory_core::context_segment::{ContextSegment, TemporalEdge};
 use ferrosa_memory_core::cql_storage::CqlStorage;
 use ferrosa_memory_core::dispatch;
 use ferrosa_memory_core::graph::GraphClient;
@@ -25,6 +22,7 @@ use ferrosa_memory_core::http;
 use ferrosa_memory_core::storage::Storage;
 use ferrosa_memory_core::transport;
 use ferrosa_memory_core::types::*;
+use scylla::frame::response::result::{CqlValue, Row};
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 
@@ -182,6 +180,7 @@ fn is_connection_error(err: impl std::fmt::Display) -> bool {
         || msg.contains("channel closed")
         || msg.contains("io error")
         || msg.contains("timed out")
+        || msg.contains("read timeout")
         || msg.contains("not connected")
         || msg.contains("eof")
         // Stale prepared statements after node restart — need full reconnect
@@ -189,61 +188,73 @@ fn is_connection_error(err: impl std::fmt::Display) -> bool {
         || msg.contains("column or udt property")
 }
 
-fn cql_cell_to_json(row: &Row, metadata: &RowsMetadata, index: usize) -> serde_json::Value {
-    let col_type = metadata
-        .col_specs
-        .get(index)
-        .map(|spec| spec.col_type.id)
-        .unwrap_or(ColType::Varchar);
+fn cql_cell_to_json(row: &Row, index: usize) -> serde_json::Value {
+    let cell = match row.columns.get(index) {
+        Some(c) => c,
+        None => return serde_json::Value::Null,
+    };
+    match cell {
+        None => serde_json::Value::Null,
+        Some(CqlValue::Text(s)) | Some(CqlValue::Ascii(s)) => serde_json::Value::String(s.clone()),
+        Some(CqlValue::BigInt(n)) => serde_json::Value::from(*n),
+        Some(CqlValue::Counter(c)) => serde_json::Value::from(c.0),
+        Some(CqlValue::Int(n)) => serde_json::Value::from(*n),
+        Some(CqlValue::SmallInt(n)) => serde_json::Value::from(*n),
+        Some(CqlValue::TinyInt(n)) => serde_json::Value::from(*n),
+        Some(CqlValue::Boolean(b)) => serde_json::Value::Bool(*b),
+        Some(CqlValue::Double(f)) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Some(CqlValue::Float(f)) => serde_json::Number::from_f64(f64::from(*f))
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Some(CqlValue::Uuid(u)) => serde_json::Value::String(u.to_string()),
+        Some(CqlValue::Timeuuid(u)) => serde_json::Value::String(u.to_string()),
+        Some(CqlValue::Timestamp(ts)) => {
+            // ts.0 is milliseconds since epoch (CqlTimestamp wraps i64)
+            let millis = ts.0;
+            serde_json::Value::String(
+                chrono::DateTime::from_timestamp_millis(millis)
+                    .map(|dt| dt.to_rfc3339())
+                    .unwrap_or_else(|| format!("<ts:{millis}>")),
+            )
+        }
+        Some(CqlValue::Blob(bytes)) => {
+            serde_json::Value::String(format!("<blob:{} bytes>", bytes.len()))
+        }
+        other => serde_json::Value::String(format!("<{}>", cql_value_type_name(other))),
+    }
+}
 
-    match col_type {
-        ColType::Ascii | ColType::Varchar | ColType::Custom => row
-            .r_by_index::<String>(index)
-            .map(serde_json::Value::String)
-            .unwrap_or(serde_json::Value::Null),
-        ColType::Bigint | ColType::Counter | ColType::Time => row
-            .r_by_index::<i64>(index)
-            .map(serde_json::Value::from)
-            .unwrap_or(serde_json::Value::Null),
-        ColType::Int | ColType::Date => row
-            .r_by_index::<i32>(index)
-            .map(serde_json::Value::from)
-            .unwrap_or(serde_json::Value::Null),
-        ColType::Smallint => row
-            .r_by_index::<i16>(index)
-            .map(serde_json::Value::from)
-            .unwrap_or(serde_json::Value::Null),
-        ColType::Tinyint => row
-            .r_by_index::<i8>(index)
-            .map(serde_json::Value::from)
-            .unwrap_or(serde_json::Value::Null),
-        ColType::Boolean => row
-            .r_by_index::<bool>(index)
-            .map(serde_json::Value::from)
-            .unwrap_or(serde_json::Value::Null),
-        ColType::Double => row
-            .r_by_index::<f64>(index)
-            .map(serde_json::Value::from)
-            .unwrap_or(serde_json::Value::Null),
-        ColType::Float => row
-            .r_by_index::<f32>(index)
-            .map(serde_json::Value::from)
-            .unwrap_or(serde_json::Value::Null),
-        ColType::Uuid | ColType::Timeuuid => row
-            .r_by_index::<uuid::Uuid>(index)
-            .map(|value| serde_json::Value::String(value.to_string()))
-            .unwrap_or(serde_json::Value::Null),
-        ColType::Timestamp => row
-            .r_by_index::<chrono::NaiveDateTime>(index)
-            .map(|value| serde_json::Value::String(value.and_utc().to_rfc3339()))
-            .unwrap_or(serde_json::Value::Null),
-        ColType::Blob => row
-            .r_by_index::<Blob>(index)
-            .map(|value| {
-                serde_json::Value::String(format!("<blob:{} bytes>", value.into_vec().len()))
-            })
-            .unwrap_or(serde_json::Value::Null),
-        other => serde_json::Value::String(format!("<unsupported:{other:?}>")),
+fn cql_value_type_name(v: &Option<CqlValue>) -> &'static str {
+    match v {
+        None => "null",
+        Some(CqlValue::Ascii(_)) => "ascii",
+        Some(CqlValue::Boolean(_)) => "boolean",
+        Some(CqlValue::Blob(_)) => "blob",
+        Some(CqlValue::Counter(_)) => "counter",
+        Some(CqlValue::Decimal(_)) => "decimal",
+        Some(CqlValue::Double(_)) => "double",
+        Some(CqlValue::Float(_)) => "float",
+        Some(CqlValue::Int(_)) => "int",
+        Some(CqlValue::BigInt(_)) => "bigint",
+        Some(CqlValue::Text(_)) => "text",
+        Some(CqlValue::Timestamp(_)) => "timestamp",
+        Some(CqlValue::Uuid(_)) => "uuid",
+        Some(CqlValue::Varint(_)) => "varint",
+        Some(CqlValue::Timeuuid(_)) => "timeuuid",
+        Some(CqlValue::Inet(_)) => "inet",
+        Some(CqlValue::Date(_)) => "date",
+        Some(CqlValue::Time(_)) => "time",
+        Some(CqlValue::SmallInt(_)) => "smallint",
+        Some(CqlValue::TinyInt(_)) => "tinyint",
+        Some(CqlValue::Duration(_)) => "duration",
+        Some(CqlValue::List(_)) => "list",
+        Some(CqlValue::Map(_)) => "map",
+        Some(CqlValue::Set(_)) => "set",
+        Some(CqlValue::UserDefinedType { .. }) => "udt",
+        Some(CqlValue::Tuple(_)) => "tuple",
+        Some(CqlValue::Empty) => "empty",
     }
 }
 
@@ -558,6 +569,21 @@ impl Storage for ReconnectingStorage {
         delegate!(self, entity_list_all, ctx)
     }
 
+    async fn entity_stream_all(
+        &self,
+        ctx: TenantContext,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<EntityEntry>>>,
+    ) {
+        let guard = self.inner.read().await;
+        match guard.as_ref() {
+            Some(cql) => cql.entity_stream_all(ctx, chunk_size, tx).await,
+            None => {
+                let _ = tx.send(Err(anyhow::anyhow!(NOT_CONNECTED_MSG))).await;
+            }
+        }
+    }
+
     async fn fold_list_all(
         &self,
         ctx: &TenantContext,
@@ -720,6 +746,21 @@ impl Storage for ReconnectingStorage {
         delegate!(self, edge_list_all, ctx)
     }
 
+    async fn edge_stream_all(
+        &self,
+        ctx: TenantContext,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<(uuid::Uuid, uuid::Uuid, String)>>>,
+    ) {
+        let guard = self.inner.read().await;
+        match guard.as_ref() {
+            Some(cql) => cql.edge_stream_all(ctx, chunk_size, tx).await,
+            None => {
+                let _ = tx.send(Err(anyhow::anyhow!(NOT_CONNECTED_MSG))).await;
+            }
+        }
+    }
+
     async fn edge_list_for_entity(
         &self,
         ctx: &TenantContext,
@@ -876,6 +917,115 @@ impl Storage for ReconnectingStorage {
         elapsed_hours: f64,
     ) -> anyhow::Result<usize> {
         delegate!(self, warmth_decay_all, ctx, session_id, elapsed_hours)
+    }
+
+    async fn warmth_delete(
+        &self,
+        ctx: &TenantContext,
+        entity_id: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        delegate!(self, warmth_delete, ctx, entity_id)
+    }
+
+    async fn context_segment_put(
+        &self,
+        ctx: &TenantContext,
+        segment: &ContextSegment,
+    ) -> anyhow::Result<()> {
+        delegate!(self, context_segment_put, ctx, segment)
+    }
+
+    async fn context_segment_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        segment_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<ContextSegment>> {
+        delegate!(self, context_segment_get, ctx, session_id, segment_id)
+    }
+
+    async fn context_segment_get_by_hash(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        content_hash: &str,
+    ) -> anyhow::Result<Option<ContextSegment>> {
+        delegate!(
+            self,
+            context_segment_get_by_hash,
+            ctx,
+            session_id,
+            content_hash
+        )
+    }
+
+    async fn context_segment_search_bm25(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        query: &str,
+        k: usize,
+    ) -> anyhow::Result<Vec<ContextSegment>> {
+        delegate!(self, context_segment_search_bm25, ctx, session_id, query, k)
+    }
+
+    async fn context_segment_search_ann(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        query_embedding: &[f32],
+        k: usize,
+    ) -> anyhow::Result<Vec<ContextSegment>> {
+        delegate!(
+            self,
+            context_segment_search_ann,
+            ctx,
+            session_id,
+            query_embedding,
+            k
+        )
+    }
+
+    async fn temporal_edge_put(
+        &self,
+        ctx: &TenantContext,
+        edge: &TemporalEdge,
+    ) -> anyhow::Result<()> {
+        delegate!(self, temporal_edge_put, ctx, edge)
+    }
+
+    async fn temporal_edge_list_from(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        src_id: uuid::Uuid,
+        edge_type: &str,
+    ) -> anyhow::Result<Vec<TemporalEdge>> {
+        delegate!(
+            self,
+            temporal_edge_list_from,
+            ctx,
+            session_id,
+            src_id,
+            edge_type
+        )
+    }
+
+    async fn confidence_put(
+        &self,
+        ctx: &TenantContext,
+        score: &ferrosa_memory_core::types::ConfidenceScore,
+    ) -> anyhow::Result<()> {
+        delegate!(self, confidence_put, ctx, score)
+    }
+
+    async fn confidence_get(
+        &self,
+        ctx: &TenantContext,
+        entity_id: uuid::Uuid,
+        fact_hash: &str,
+    ) -> anyhow::Result<Option<ferrosa_memory_core::types::ConfidenceScore>> {
+        delegate!(self, confidence_get, ctx, entity_id, fact_hash)
     }
 
     // --- Rule registry operations (Sprint 5) ---
@@ -1121,6 +1271,21 @@ impl Storage for ReconnectingStorage {
         delegate!(self, typed_edge_list_all, ctx)
     }
 
+    async fn typed_edge_stream_all(
+        &self,
+        ctx: TenantContext,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<TypedEdge>>>,
+    ) {
+        let guard = self.inner.read().await;
+        match guard.as_ref() {
+            Some(cql) => cql.typed_edge_stream_all(ctx, chunk_size, tx).await,
+            None => {
+                let _ = tx.send(Err(anyhow::anyhow!(NOT_CONNECTED_MSG))).await;
+            }
+        }
+    }
+
     async fn typed_edge_list_from(
         &self,
         ctx: &TenantContext,
@@ -1167,9 +1332,10 @@ impl http::OperatorQuerySurface for ReconnectingStorage {
             .ok_or_else(|| anyhow::anyhow!(NOT_CONNECTED_MSG))?;
 
         let normalized = normalize_public_query(query)?;
-        let envelope = cql.session().query(normalized.clone()).await;
-        let envelope = match envelope {
-            Ok(envelope) => envelope,
+        #[allow(deprecated)]
+        let result = cql.session().query_unpaged(normalized.clone(), ()).await;
+        let result = match result {
+            Ok(r) => r,
             Err(err) => {
                 if is_connection_error(&err) {
                     drop(guard);
@@ -1179,17 +1345,12 @@ impl http::OperatorQuerySurface for ReconnectingStorage {
             }
         };
 
-        let body = envelope.response_body()?;
-        let metadata = body
-            .as_rows_metadata()
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("CQL query did not return rows"))?;
-        let columns: Vec<String> = metadata
-            .col_specs
+        let columns: Vec<String> = result
+            .col_specs()
             .iter()
-            .map(|spec| spec.name.clone())
+            .map(|spec| spec.name().to_string())
             .collect();
-        let rows = body.into_rows().unwrap_or_default();
+        let rows = result.rows_or_empty();
         let total_rows = rows.len();
         let truncated = total_rows > limit;
         let rendered_rows: Vec<serde_json::Value> = rows
@@ -1198,7 +1359,7 @@ impl http::OperatorQuerySurface for ReconnectingStorage {
             .map(|row| {
                 let mut object = serde_json::Map::new();
                 for (index, name) in columns.iter().enumerate() {
-                    object.insert(name.clone(), cql_cell_to_json(row, &metadata, index));
+                    object.insert(name.clone(), cql_cell_to_json(row, index));
                 }
                 serde_json::Value::Object(object)
             })
@@ -1377,13 +1538,25 @@ async fn idle_consolidation_loop<S: Storage + Send + Sync + 'static>(
             continue;
         }
 
-        let sid = match session.default_session_id {
-            Some(id) => id,
-            None => continue,
+        let session_ids = drain_consolidation_queue(&session).await;
+        let session_ids = if session_ids.is_empty() {
+            match session.default_session_id {
+                Some(id) => vec![id],
+                None => continue,
+            }
+        } else {
+            session_ids
         };
 
-        run_idle_consolidation(storage.as_ref(), &ctx, sid, &cfg).await;
+        for sid in session_ids {
+            run_idle_consolidation(storage.as_ref(), &ctx, sid, &cfg).await;
+        }
     }
+}
+
+async fn drain_consolidation_queue(session: &dispatch::SessionState) -> Vec<uuid::Uuid> {
+    let mut queue = session.consolidation_queue.lock().await;
+    queue.drain(..).collect()
 }
 
 /// Executes consolidation, edge weight decay, and optional stale-edge pruning.
@@ -1434,7 +1607,7 @@ async fn main() -> anyhow::Result<()> {
     let debug = std::env::args().any(|a| a == "--debug");
 
     let default_filter = if debug {
-        "debug,cdrs_tokio=debug,hyper=info,reqwest=info"
+        "debug,scylla=warn,hyper=info,reqwest=info"
     } else {
         "ferrosa_memory_core=warn,ferrosa_memory_mcp=warn"
     };
@@ -1509,6 +1682,53 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Run schema migrations BEFORE opening the runtime CqlStorage session.
+    // CqlStorage::connect eagerly prepares every application statement
+    // on startup; if the tables those statements target don't exist yet
+    // (greenfield install or a new migration), the session fails to
+    // build and the MCP enters a reconnect loop.  By running migrations
+    // on a bare Scylla admin session (no prepared-statement bloat) first,
+    // we guarantee the DDL is in place before CqlStorage tries to use it.
+    let keyspace = config.ferrosa.keyspace.clone();
+    let migrations_enabled = matches!(
+        std::env::var("FERROSA_MIGRATIONS_ENABLED").ok().as_deref(),
+        None | Some("true" | "1" | "on" | "yes")
+    );
+    if migrations_enabled {
+        match ferrosa_memory_core::cql_storage::connect_admin_session(&config.ferrosa).await {
+            Ok(admin_session) => {
+                match ferrosa_memory_core::migration::run_migrations(&admin_session, &keyspace)
+                    .await
+                {
+                    Ok(0) => tracing::debug!("schema up to date"),
+                    Ok(n) => tracing::info!(applied = n, "schema migrations applied"),
+                    Err(e) => {
+                        // Migration failures are not recoverable by retry. The
+                        // schema is in an unknown state. Log at ERROR so
+                        // operators see it immediately, and do not mask the
+                        // failure as a warning.
+                        tracing::error!(
+                            "schema migration failed: {e}. The keyspace may be out of sync with this binary. \
+                             Investigate the failing DDL and restart. CqlStorage will attempt to connect, \
+                             but runtime queries may fail if the schema is incomplete."
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "admin CQL session unavailable ({e}), skipping migrations. \
+                     Migrations will retry on the next reconnect cycle."
+                );
+            }
+        }
+    } else {
+        tracing::info!(
+            "FERROSA_MIGRATIONS_ENABLED is disabled; skipping schema migrations. \
+             Ensure the keyspace schema is managed externally (DBaaS mode) or manually applied."
+        );
+    }
+
     // Connect to real Ferrosa — retry in background if initial connect fails.
     // Never fall back to mock storage (mock silently loses data).
     let storage: Arc<ReconnectingStorage> = match CqlStorage::connect(&config.ferrosa).await {
@@ -1540,33 +1760,6 @@ async fn main() -> anyhow::Result<()> {
     // Always spawn the reconnect watcher — it handles both initial failure
     // and mid-operation connection loss (rolling restarts, network blips).
     tokio::spawn(cql_reconnect_watcher(Arc::clone(&storage)));
-
-    // Run schema migrations before loading the type registry — migration
-    // 020 adds columns that later queries assume. Failure is fatal: partial
-    // migrations leave the keyspace in a half-upgraded state and the
-    // operator's recovery path is a backup restore.
-    //
-    // Migrations open a *separate* session using `admin_username` /
-    // `admin_password` when configured, so CREATE KEYSPACE/TABLE can run
-    // as ferrosa_admin while the runtime session stays scoped to
-    // ferrosa_user. When admin creds aren't set the helper falls back to
-    // the runtime creds (auth-disabled dev clusters).
-    if storage.inner.read().await.is_some() {
-        let keyspace = config.ferrosa.keyspace.clone();
-        let admin_session =
-            ferrosa_memory_core::cql_storage::connect_admin_session(&config.ferrosa)
-                .await
-                .map_err(|e| anyhow::anyhow!("admin CQL session for migrations failed: {e}"))?;
-        match ferrosa_memory_core::migration::run_migrations(&admin_session, &keyspace).await {
-            Ok(0) => tracing::debug!("schema up to date"),
-            Ok(n) => tracing::info!(applied = n, "schema migrations applied"),
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "schema migration failed, aborting startup: {e}"
-                ));
-            }
-        }
-    }
 
     // Load dynamic type registry from the database (falls back to defaults).
     //
@@ -1867,9 +2060,12 @@ async fn main() -> anyhow::Result<()> {
                         } else {
                             "http".into()
                         },
-                        workbench_port: config.server.http_port,
+                        workbench_port: config
+                            .server
+                            .public_port
+                            .unwrap_or(config.server.http_port),
                         viz_scheme: "http".into(),
-                        viz_port: config.viz.port,
+                        viz_port: config.viz.public_port.unwrap_or(config.viz.port),
                     },
                     session,
                 },
@@ -1951,6 +2147,14 @@ mod tests {
     #[test]
     fn is_connection_error_timed_out() {
         let err = anyhow::anyhow!("Request timed out");
+        assert!(is_connection_error(&err));
+    }
+
+    #[test]
+    fn is_connection_error_read_timeout() {
+        let err = anyhow::anyhow!(
+            "server error: storage error: invalid data: cluster: read timeout: CL=LOCAL_QUORUM, received=1, required=2, data_present=true"
+        );
         assert!(is_connection_error(&err));
     }
 
@@ -2054,6 +2258,24 @@ auth_file = "{}"
         assert_eq!(validator("alice", "wrong"), None);
 
         let _ = fs::remove_file(auth_path);
+    }
+
+    #[tokio::test]
+    async fn idle_queue_drain_returns_explicit_sessions_and_clears_queue() {
+        let session = dispatch::SessionState::default();
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        {
+            let mut queue = session.consolidation_queue.lock().await;
+            queue.push_back(first);
+            queue.push_back(second);
+        }
+
+        assert_eq!(
+            drain_consolidation_queue(&session).await,
+            vec![first, second]
+        );
+        assert!(drain_consolidation_queue(&session).await.is_empty());
     }
 
     #[tokio::test]

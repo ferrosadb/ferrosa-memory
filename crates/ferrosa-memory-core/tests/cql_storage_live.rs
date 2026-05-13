@@ -1,11 +1,19 @@
+// Intentionally uses the scylla 0.15 LegacySession API — deprecated but stable for this migration.
+#![allow(deprecated)]
 //! Live test — prepare each statement individually to find which fails.
 //! Run with: cargo test -p ferrosa-memory-core --test cql_storage_live -- --ignored --nocapture
 
-use cdrs_tokio::authenticators::NoneAuthenticatorProvider;
-use cdrs_tokio::cluster::NodeTcpConfigBuilder;
-use cdrs_tokio::cluster::session::{SessionBuilder, TcpSessionBuilder};
-use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
-use std::sync::Arc;
+use scylla::{LegacySession, SessionBuilder};
+
+async fn connect_plain(contact_point: &str) -> LegacySession {
+    #[allow(deprecated)]
+    SessionBuilder::new()
+        .known_node(contact_point)
+        .user("ferrosa_admin", "ferrosa_admin")
+        .build_legacy()
+        .await
+        .expect("session build failed")
+}
 
 #[tokio::test]
 #[ignore = "requires live Ferrosa cluster; run with --ignored and FERROSA_TEST_CONTAINERS=1"]
@@ -17,16 +25,7 @@ async fn prepare_each_statement() {
              cluster on port 19042"
         );
     }
-    let node_config = NodeTcpConfigBuilder::new()
-        .with_contact_point("127.0.0.1:19042".into())
-        .with_authenticator_provider(Arc::new(NoneAuthenticatorProvider))
-        .build()
-        .await
-        .unwrap();
-    let session = TcpSessionBuilder::new(RoundRobinLoadBalancingStrategy::new(), node_config)
-        .build()
-        .await
-        .unwrap();
+    let session = connect_plain("127.0.0.1:19042").await;
 
     let ks = "agent_memory";
     let stmts: Vec<(&str, String)> = vec![
@@ -136,7 +135,7 @@ async fn prepare_each_statement() {
 
     let mut failed = Vec::new();
     for (name, stmt) in &stmts {
-        match session.prepare(stmt).await {
+        match session.prepare(stmt.as_str()).await {
             Ok(_) => eprintln!("  ok: {name}"),
             Err(e) => {
                 eprintln!("FAIL: {name} — {e}");

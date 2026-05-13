@@ -602,7 +602,8 @@ mod tests {
         }
 
         assert_eq!(
-            false_positives, 0,
+            false_positives,
+            0,
             "0% false positive rate required. Failures:\n{}",
             failures.join("\n")
         );
@@ -656,10 +657,7 @@ mod tests {
     fn test_negation_case_insensitive() {
         let claim = Claim::parse("entity created").unwrap();
         let result = claim.evaluate("No entity created at all.");
-        assert!(
-            !result.met,
-            "Negation detection should be case-insensitive"
-        );
+        assert!(!result.met, "Negation detection should be case-insensitive");
     }
 
     #[test]

@@ -135,6 +135,29 @@ pub async fn run_decay_pass(
     Ok(pruned)
 }
 
+/// Remove warmth entries below threshold (soft-delete).
+pub async fn prune_forgotten(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    session_id: Uuid,
+    threshold: f64,
+    config: &RmhConfig,
+) -> anyhow::Result<usize> {
+    let entries = storage.warmth_list_session(ctx, session_id).await?;
+    let mut pruned = 0;
+    for entry in entries {
+        let score = compute_warmth_score(storage, ctx, entry.entity_id, config).await?;
+        if score < threshold {
+            if let Err(e) = storage.warmth_delete(ctx, entry.entity_id).await {
+                tracing::warn!(entity_id=%entry.entity_id, error=%e, "failed to prune forgotten entity");
+            } else {
+                pruned += 1;
+            }
+        }
+    }
+    Ok(pruned)
+}
+
 /// Retrieve live warmth scores for all entities in a session.
 ///
 /// Lists warmth entries from storage and applies Ebbinghaus decay to each,
@@ -165,6 +188,74 @@ pub async fn get_warmth_scores(
         .collect();
 
     Ok(scores)
+}
+
+/// Apply an outcome-based warmth boost or penalty to an entity.
+///
+/// When an entity is retrieved and the user reports success, boost its warmth
+/// so the system prioritizes it in future retrieval.  On failure, penalize it
+/// so the system deprioritizes the memory.
+///
+/// This closes the episodic feedback loop: `record_outcome` → `apply_outcome_boost`
+/// → future `hybrid_search` ranking.
+pub async fn apply_outcome_boost(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    entity_id: Uuid,
+    succeeded: bool,
+    latency_ms: i32,
+) -> anyhow::Result<()> {
+    let now = chrono::Utc::now();
+    let entry = match storage.warmth_get(ctx, entity_id).await? {
+        Some(mut existing) => {
+            let delta = if succeeded {
+                // Success + fast = larger boost
+                if latency_ms < 50 { 0.30 } else { 0.15 }
+            } else {
+                // Failure = penalty (clamped to keep warmth positive in intent)
+                -0.20
+            };
+            existing.warmth = (existing.warmth + delta).max(0.0);
+            existing.last_accessed_at = now;
+            existing.updated_at = now;
+            existing
+        }
+        None => WarmthEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id,
+            session_id: Uuid::nil(),
+            warmth: if succeeded { 0.15 } else { 0.0 },
+            pagerank: 0.0,
+            reputation: 0.0,
+            last_accessed_at: now,
+            access_count: 0,
+            decay_zone: DecayZone::Knowledge,
+            updated_at: now,
+        },
+    };
+    storage.warmth_put(ctx, &entry).await
+}
+
+/// Convenience wrapper: penalize warmth for failed retrieval.
+/// Useful when a user explicitly flags an entity as incorrect / unhelpful.
+pub async fn warmth_penalty(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    entity_id: Uuid,
+    amount: f64,
+) -> anyhow::Result<()> {
+    apply_outcome_boost(storage, ctx, entity_id, false, 999)
+        .await
+        .ok();
+    // If entity exists, subtract additional `amount` from warmth
+    if let Some(mut existing) = storage.warmth_get(ctx, entity_id).await? {
+        let now = chrono::Utc::now();
+        existing.warmth = (existing.warmth - amount).max(0.0);
+        existing.last_accessed_at = now;
+        existing.updated_at = now;
+        storage.warmth_put(ctx, &existing).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -387,18 +478,112 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_zone_decay_rates() {
-        // Identity decays 10x slower than Knowledge
-        let id_decay = (-0.1 * 0.1 * 10.0_f64).exp(); // ~0.99
-        let kn_decay = (-0.1 * 1.0 * 10.0_f64).exp(); // ~0.37
-        let op_decay = (-0.1 * 3.0 * 10.0_f64).exp(); // ~0.05
+    async fn test_outcome_boost_increases_warmth() {
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+        let eid = Uuid::new_v4();
+        let sid = Uuid::new_v4();
+        let config = default_config();
+
+        // Prime with base warmth
+        boost_on_access(&storage, &ctx, eid, sid, &DecayZone::Knowledge, &config)
+            .await
+            .unwrap();
+        let before = storage.warmth_get(&ctx, eid).await.unwrap().unwrap().warmth;
+
+        // Success outcome should add +0.15
+        apply_outcome_boost(&storage, &ctx, eid, true, 100)
+            .await
+            .unwrap();
+        let after = storage.warmth_get(&ctx, eid).await.unwrap().unwrap().warmth;
         assert!(
-            id_decay > kn_decay,
-            "identity should decay slower than knowledge"
+            (after - before - 0.15).abs() < 0.01,
+            "expected +0.15 boost, before={before}, after={after}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_fast_success_bigger_boost() {
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+        let eid = Uuid::new_v4();
+        let sid = Uuid::new_v4();
+        let config = default_config();
+
+        boost_on_access(&storage, &ctx, eid, sid, &DecayZone::Knowledge, &config)
+            .await
+            .unwrap();
+        let baseline = storage.warmth_get(&ctx, eid).await.unwrap().unwrap().warmth;
+
+        apply_outcome_boost(&storage, &ctx, eid, true, 30)
+            .await
+            .unwrap();
+        let fast = storage.warmth_get(&ctx, eid).await.unwrap().unwrap().warmth;
+
         assert!(
-            kn_decay > op_decay,
-            "knowledge should decay slower than operational"
+            fast - baseline >= 0.29,
+            "fast success should get ~0.30 boost: baseline={baseline}, fast={fast}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_outcome_penalty_decreases_warmth() {
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+        let eid = Uuid::new_v4();
+        let sid = Uuid::new_v4();
+        let config = default_config();
+
+        boost_on_access(&storage, &ctx, eid, sid, &DecayZone::Knowledge, &config)
+            .await
+            .unwrap();
+        let before = storage.warmth_get(&ctx, eid).await.unwrap().unwrap().warmth;
+
+        // Failure should subtract 0.20
+        apply_outcome_boost(&storage, &ctx, eid, false, 100)
+            .await
+            .unwrap();
+        let after = storage.warmth_get(&ctx, eid).await.unwrap().unwrap().warmth;
+        assert!(
+            (before - after - 0.20).abs() < 0.01,
+            "expected -0.20 penalty, before={before}, after={after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_outcome_boost_for_absent() {
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+        let eid = Uuid::new_v4();
+
+        // Entity has no prior warmth entry
+        assert!(storage.warmth_get(&ctx, eid).await.unwrap().is_none());
+
+        apply_outcome_boost(&storage, &ctx, eid, true, 100)
+            .await
+            .unwrap();
+        let entry = storage.warmth_get(&ctx, eid).await.unwrap().unwrap();
+        assert!(
+            (entry.warmth - 0.15).abs() < 0.01,
+            "expected initial warmth 0.15 for success, got {}",
+            entry.warmth
+        );
+    }
+
+    #[tokio::test]
+    async fn test_warmth_penalty_clamped() {
+        let storage = MockStorage::new();
+        let ctx = test_ctx();
+        let eid = Uuid::new_v4();
+
+        // Low initial warmth
+        apply_outcome_boost(&storage, &ctx, eid, true, 100)
+            .await
+            .unwrap();
+
+        // Large penalty should clamp at 0
+        warmth_penalty(&storage, &ctx, eid, 10.0).await.unwrap();
+        let after = storage.warmth_get(&ctx, eid).await.unwrap().unwrap().warmth;
+        assert_eq!(after, 0.0, "warmth must never go negative");
     }
 }

@@ -11,6 +11,7 @@
 
 use uuid::Uuid;
 
+use crate::confidence;
 use crate::storage::Storage;
 use crate::types::{TemporalEvent, TenantContext};
 
@@ -54,6 +55,9 @@ pub async fn write_temporal_fact(
     };
 
     storage.temporal_put(ctx, &event).await?;
+
+    // Record confidence score for the new fact (non-fatal)
+    let _ = confidence::record_fact_confidence(storage, ctx, entity_id, fact_text, 1, 0).await;
 
     // Create SUPERSEDES edge if this fact replaces an older one
     if let Some(old_id) = supersedes_id

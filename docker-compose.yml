@@ -57,6 +57,7 @@ services:
 
   node1:
     image: ferrosa-memory-node
+    user: "1000:1000"
     # 2G cap per Ferrosa node. Historical steady-state is ~1-2GB under
     # dev load (13.9k entities, 68k edges). The 2G ceiling covers
     # compaction + SSTable cache headroom and lets 3 nodes + MinIO fit
@@ -124,6 +125,7 @@ services:
 
   node2:
     image: ferrosa-memory-node
+    user: "1000:1000"
     # 2G cap per Ferrosa node. Historical steady-state is ~1-2GB under
     # dev load (13.9k entities, 68k edges). The 2G ceiling covers
     # compaction + SSTable cache headroom and lets 3 nodes + MinIO fit
@@ -143,7 +145,7 @@ services:
     restart: on-failure:5
     stop_grace_period: 35s
     logging:
-      driver: json-file
+      driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
@@ -191,6 +193,7 @@ services:
 
   node3:
     image: ferrosa-memory-node
+    user: "1000:1000"
     # 2G cap per Ferrosa node. Historical steady-state is ~1-2GB under
     # dev load (13.9k entities, 68k edges). The 2G ceiling covers
     # compaction + SSTable cache headroom and lets 3 nodes + MinIO fit
@@ -210,7 +213,7 @@ services:
     restart: on-failure:5
     stop_grace_period: 35s
     logging:
-      driver: json-file
+      driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
@@ -270,15 +273,18 @@ services:
         condition: service_healthy
       node3:
         condition: service_healthy
+    # Runtime config intentionally uses localhost contact points for CQL,
+    # Graph, SPARQL, Ollama, and loopback-only operator HTTP/Viz binds.
+    # Keep this service on the host network so the mounted config means the
+    # same thing inside the container as it does for the historical standalone
+    # `docker run --network host` launch.
+    network_mode: host
     environment:
       FERROSA_MEMORY_CONFIG: /run/secrets/ferrosa-memory/ferrosa-memory-http-podman.toml
-    ports:
-      - "18765:8765"
-      - "127.0.0.1:18766:8766"
     volumes:
       - ./.runtime:/run/secrets/ferrosa-memory:ro
     healthcheck:
-      test: ["CMD", "curl", "-skf", "https://127.0.0.1:8765/healthz/live"]
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:18765/healthz/live"]
       interval: 5s
       timeout: 5s
       retries: 20

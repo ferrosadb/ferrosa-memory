@@ -1,0 +1,51 @@
+# Level 4 Task: Contradiction resolution across sessions
+#
+# Tests that the system detects and resolves contradictory facts stored in
+# different sessions, keeping the most recent or most confident version.
+
+[scenario]
+id = "l4-contradiction"
+name = "Contradiction resolution"
+description = """
+Three sessions store facts about the same entity that initially contradict,
+then are resolved. Tests temporal fact supersession and contradiction
+detection."""
+level = 4
+tags = ["task-level", "contradiction", "temporal"]
+timeout_ms = 60000
+
+# Session 1: Initial fact
+[[sessions]]
+name = "s1"
+prompt = "Store: The deploy pipeline uses GitHub Actions."
+expected_findings = ["deploy pipeline: GitHub Actions"]
+tools_allowed = ["smart_ingest", "write_temporal_fact"]
+max_steps = 3
+
+# Session 2: Contradictory fact
+[[sessions]]
+name = "s2"
+depends_on = ["s1"]
+prompt = "Update: The deploy pipeline now uses GitLab CI. This supersedes the prior fact."
+expected_findings = ["deploy pipeline: GitLab CI"]
+tools_allowed = ["smart_ingest", "write_temporal_fact", "get_temporal_chain"]
+max_steps = 3
+
+# Session 3: Resolution verification
+[[sessions]]
+name = "s3"
+depends_on = ["s1", "s2"]
+prompt = "Query the current deploy pipeline tool. Should return GitLab CI, not GitHub Actions."
+expected_findings = ["deploy pipeline: GitLab CI", "GitHub Actions superseded"]
+tools_allowed = ["get_temporal_chain", "hybrid_search"]
+max_steps = 3
+
+[grading]
+type = "task_success"
+subtasks = [
+    "Initial fact stored",
+    "Contradictory fact supersedes old",
+    "Temporal chain shows both facts",
+    "Current fact returns latest version",
+]
+passing_threshold = 0.75

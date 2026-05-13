@@ -1,0 +1,51 @@
+# Level 4 Task: Requirements evolution across sessions
+#
+# Tests that the system tracks changing requirements and resolves contradictions
+# when new requirements override old ones.
+
+[scenario]
+id = "l4-req-evolution"
+name = "Requirements evolution"
+description = """
+A product requirement changes across three sessions: initial spec, revised
+constraints, and final override. The agent must track the temporal chain of
+requirements and answer based on the current (latest) version."""
+level = 4
+tags = ["task-level", "temporal", "contradiction"]
+timeout_ms = 60000
+
+# Session 1: Initial requirement
+[[sessions]]
+name = "s1"
+prompt = "Store the requirement: API rate limit is 100 requests per minute."
+expected_findings = ["rate limit: 100 req/min"]
+tools_allowed = ["smart_ingest", "write_temporal_fact"]
+max_steps = 3
+
+# Session 2: Revised constraint
+[[sessions]]
+name = "s2"
+depends_on = ["s1"]
+prompt = "Update requirement: API rate limit is now 500 requests per minute due to enterprise tier."
+expected_findings = ["rate limit: 500 req/min"]
+tools_allowed = ["smart_ingest", "write_temporal_fact", "get_temporal_chain"]
+max_steps = 3
+
+# Session 3: Final override with burst allowance
+[[sessions]]
+name = "s3"
+depends_on = ["s1", "s2"]
+prompt = "New requirement: Burst limit of 1000 requests with sustained at 500/min. Store and resolve with prior versions."
+expected_findings = ["burst limit: 1000", "sustained: 500 req/min"]
+tools_allowed = ["smart_ingest", "write_temporal_fact", "get_temporal_chain", "create_edge"]
+max_steps = 5
+
+[grading]
+type = "task_success"
+subtasks = [
+    "Initial rate limit recorded",
+    "Revised rate limit supersedes old",
+    "Burst limit added with sustained",
+    "Temporal chain shows evolution",
+]
+passing_threshold = 0.75
