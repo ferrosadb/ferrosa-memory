@@ -1968,6 +1968,7 @@ async fn handle_ingest_context_segments<S: crate::storage::Storage>(
             ollama_base_url: session.ollama_base_url.clone(),
             model: session.embed_model.clone(),
             dimensions: session.embed_dimensions,
+            max_input_chars: crate::config::EmbeddingConfig::default().max_input_chars,
             ner_model: String::new(),
         });
         let mut vectors = Vec::with_capacity(preview.len());
@@ -2016,6 +2017,7 @@ async fn handle_search_context_segments<S: crate::storage::Storage>(
             ollama_base_url: session.ollama_base_url.clone(),
             model: session.embed_model.clone(),
             dimensions: session.embed_dimensions,
+            max_input_chars: crate::config::EmbeddingConfig::default().max_input_chars,
             ner_model: String::new(),
         });
         match client.embed(&query).await {
@@ -2101,6 +2103,7 @@ async fn handle_upsert_entity<S: crate::storage::Storage>(
             ollama_base_url: session.ollama_base_url.clone(),
             model: session.embed_model.clone(),
             dimensions: session.embed_dimensions,
+            max_input_chars: crate::config::EmbeddingConfig::default().max_input_chars,
             ner_model: String::new(),
         });
         match client.embed(context_snippet).await {
@@ -2415,6 +2418,7 @@ fn build_ingest_embedding_client(
             ollama_base_url: session.ollama_base_url.clone(),
             model,
             dimensions: session.embed_dimensions,
+            max_input_chars: crate::config::EmbeddingConfig::default().max_input_chars,
             ner_model: String::new(),
         },
     ))
@@ -3325,6 +3329,7 @@ async fn handle_retrieve_entities<S: crate::storage::Storage>(
             ollama_base_url: session.ollama_base_url.clone(),
             model: session.embed_model.clone(),
             dimensions: session.embed_dimensions,
+            max_input_chars: crate::config::EmbeddingConfig::default().max_input_chars,
             ner_model: String::new(),
         });
         match client.embed(query).await {
@@ -3657,6 +3662,7 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
             ollama_base_url: session.ollama_base_url.clone(),
             model: session.embed_model.clone(),
             dimensions: session.embed_dimensions,
+            max_input_chars: crate::config::EmbeddingConfig::default().max_input_chars,
             ner_model: String::new(),
         });
         match client.embed(content).await {
@@ -3904,6 +3910,7 @@ async fn handle_ingest_skill<S: crate::storage::Storage>(
                 ollama_base_url: session.ollama_base_url.clone(),
                 model: session.embed_model.clone(),
                 dimensions: session.embed_dimensions,
+                max_input_chars: crate::config::EmbeddingConfig::default().max_input_chars,
                 ner_model: String::new(),
             },
         ))
@@ -3967,6 +3974,7 @@ async fn handle_retrieve_skills_for_context<S: crate::storage::Storage>(
             ollama_base_url: session.ollama_base_url.clone(),
             model: session.embed_model.clone(),
             dimensions: session.embed_dimensions,
+            max_input_chars: crate::config::EmbeddingConfig::default().max_input_chars,
             ner_model: String::new(),
         });
         if let Ok(emb) = client.embed(&context).await {
@@ -4459,6 +4467,7 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
             ollama_base_url: session.ollama_base_url.clone(),
             model: session.embed_model.clone(),
             dimensions: session.embed_dimensions,
+            max_input_chars: crate::config::EmbeddingConfig::default().max_input_chars,
             ner_model: String::new(),
         });
         match client.embed(query).await {

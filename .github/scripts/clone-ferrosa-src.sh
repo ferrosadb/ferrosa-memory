@@ -2,15 +2,22 @@
 # clone-ferrosa-src.sh — clone ferrosa source for the cluster image build,
 # with a stale-branch guard.
 #
-# Tries each --candidate branch in order. If a matched branch clones, it is
-# kept ONLY if it isn't strictly older than main: a branch whose HEAD is an
-# ancestor of main contains no fixes main doesn't already have, and using it
-# means the image build silently misses recent main fixes (see ferrosa-memory
-# CI run 25784440206 — a stale `chore/integrate-pr12-plus-pr10` mirror on
-# ferrosadb/ferrosa swallowed the adjacency-write-retry fix that PR#34 had
-# already landed on main).
+# Tries each --candidate branch in order. A matched branch is kept ONLY if
+# `origin/main` is reachable from its HEAD (i.e. matched branch contains
+# every commit main has, possibly plus its own). Three cases this rejects:
 #
-# Falls back to main if no matched branch exists or if every match is stale.
+#   * Strictly-behind branches (stale mirror left over from earlier work) —
+#     missing main's recent fixes. Seen in CI run 25784440206 with a stale
+#     `chore/integrate-pr12-plus-pr10` mirror.
+#   * Divergent branches that have their own commits but never picked up
+#     main's fixes — seen in CI run 25806209774 with
+#     `ferrosadb/ferrosa@local/pr4` which forked May 11 (perf work) and
+#     missed PR#34 (adjacency-write retry) that landed May 13.
+#   * Anything else where the matched branch is not a clean superset of main.
+#
+# Falls back to main if no candidate branch is a main-descendant. Cross-repo
+# coordination still works — push the matching branch on ferrosadb/ferrosa
+# AFTER rebasing onto main, and this guard accepts it.
 #
 # Usage:
 #   clone-ferrosa-src.sh \
@@ -62,15 +69,23 @@ for BRANCH in "${CANDIDATES[@]+"${CANDIDATES[@]}"}"; do
     )
     MATCHED_HEAD=$(cd "${DEST}" && git rev-parse HEAD)
     MAIN_HEAD=$(cd "${DEST}" && git rev-parse "refs/remotes/origin/${MAIN_BRANCH}" 2>/dev/null || echo "")
-    if [ -n "${MAIN_HEAD}" ] && [ "${MATCHED_HEAD}" != "${MAIN_HEAD}" ] \
-       && (cd "${DEST}" && git merge-base --is-ancestor "${MATCHED_HEAD}" "refs/remotes/origin/${MAIN_BRANCH}" 2>/dev/null); then
-      echo "Branch ${BRANCH} is an ancestor of ${MAIN_BRANCH} (stale) — discarding and trying next candidate."
-      rm -rf "${DEST}"
-      continue
+    if [ -z "${MAIN_HEAD}" ]; then
+      # No view of main — can't safely compare. Fail open: keep this match.
+      echo "Cloned ${BRANCH} (HEAD=${MATCHED_HEAD}) — main HEAD unavailable, skipping guard."
+      CLONED="${BRANCH}"
+      break
     fi
-    echo "Cloned ${BRANCH} (HEAD=${MATCHED_HEAD})."
-    CLONED="${BRANCH}"
-    break
+    if [ "${MATCHED_HEAD}" = "${MAIN_HEAD}" ] \
+       || (cd "${DEST}" && git merge-base --is-ancestor "${MAIN_HEAD}" "${MATCHED_HEAD}" 2>/dev/null); then
+      # Matched branch is a main-descendant: contains every commit main has,
+      # possibly plus its own. Safe to use.
+      echo "Cloned ${BRANCH} (HEAD=${MATCHED_HEAD}) — main is an ancestor, keeping."
+      CLONED="${BRANCH}"
+      break
+    fi
+    echo "Branch ${BRANCH} (HEAD=${MATCHED_HEAD}) is not a descendant of ${MAIN_BRANCH} (HEAD=${MAIN_HEAD}) — discarding and trying next candidate."
+    rm -rf "${DEST}"
+    continue
   fi
 done
 

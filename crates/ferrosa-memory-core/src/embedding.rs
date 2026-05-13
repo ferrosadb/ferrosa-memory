@@ -46,6 +46,7 @@ pub struct EmbeddingClient {
     base_url: String,
     model: String,
     dimensions: u32,
+    max_input_chars: usize,
 }
 
 impl EmbeddingClient {
@@ -64,6 +65,7 @@ impl EmbeddingClient {
             base_url: config.ollama_base_url.clone(),
             model: config.model.clone(),
             dimensions: config.dimensions,
+            max_input_chars: config.max_input_chars,
         }
     }
 
@@ -74,6 +76,34 @@ impl EmbeddingClient {
     /// - [`EmbeddingError::Unavailable`] if the endpoint can't be reached
     /// - [`EmbeddingError::DimensionMismatch`] if the response has wrong dimensions
     pub async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        let chunks = chunk_text_for_embedding(text, self.max_input_chars);
+        let mut accum: Option<Vec<f64>> = None;
+        let mut count = 0usize;
+
+        for chunk in chunks {
+            let embedding = self.embed_one(&chunk).await?;
+            if let Some(ref mut sum) = accum {
+                for (slot, value) in sum.iter_mut().zip(embedding) {
+                    *slot += value;
+                }
+            } else {
+                accum = Some(embedding);
+            }
+            count += 1;
+        }
+
+        let Some(mut averaged) = accum else {
+            return Err(EmbeddingError::BadResponse(
+                "no embedding chunks produced".into(),
+            ));
+        };
+        for value in &mut averaged {
+            *value /= count as f64;
+        }
+        Ok(averaged.into_iter().map(|v| v as f32).collect())
+    }
+
+    async fn embed_one(&self, text: &str) -> Result<Vec<f64>, EmbeddingError> {
         let url = format!("{}/api/embed", self.base_url);
         let body = OllamaEmbedRequest {
             model: &self.model,
@@ -113,8 +143,7 @@ impl EmbeddingClient {
             });
         }
 
-        // Convert f64 -> f32 for storage (CQL vectors are float32)
-        Ok(embedding.into_iter().map(|v| v as f32).collect())
+        Ok(embedding)
     }
 
     /// Health check: verify the embedding endpoint is reachable AND the
@@ -160,6 +189,31 @@ impl EmbeddingClient {
     }
 }
 
+fn chunk_text_for_embedding(text: &str, max_chars: usize) -> Vec<String> {
+    let max_chars = max_chars.max(1);
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_chars = 0usize;
+
+    for ch in text.chars() {
+        if current_chars == max_chars {
+            chunks.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+        current.push(ch);
+        current_chars += 1;
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
 /// Shape of Ollama's `/api/tags` response (subset we care about).
 #[derive(Deserialize)]
 struct OllamaTagsResponse {
@@ -187,6 +241,10 @@ fn is_model_loaded(loaded: &[OllamaLoadedModel], target: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
 
     #[test]
     fn client_creation_with_defaults() {
@@ -194,6 +252,92 @@ mod tests {
         let client = EmbeddingClient::new(&config);
         assert_eq!(client.dimensions, 768);
         assert_eq!(client.model, "nomic-embed-text-v2-moe");
+        assert_eq!(client.max_input_chars, 6_000);
+    }
+
+    #[test]
+    fn embedding_chunks_keep_oversized_input_below_configured_limit() {
+        let chunks = chunk_text_for_embedding("abcdefghijklmnop", 5);
+        assert_eq!(chunks, vec!["abcde", "fghij", "klmno", "p"]);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= 5));
+    }
+
+    #[tokio::test]
+    async fn embed_sends_long_inputs_as_bounded_chunks_and_averages_vectors() {
+        let (base_url, requests, handle) = spawn_embedding_server(vec![
+            "{\"embeddings\":[[1.0,3.0]]}",
+            "{\"embeddings\":[[3.0,5.0]]}",
+            "{\"embeddings\":[[5.0,7.0]]}",
+        ]);
+        let config = EmbeddingConfig {
+            ollama_base_url: base_url,
+            dimensions: 2,
+            max_input_chars: 4,
+            ..EmbeddingConfig::default()
+        };
+
+        let embedding = EmbeddingClient::new(&config)
+            .embed("aaaabbbbcccc")
+            .await
+            .unwrap();
+
+        assert_eq!(embedding, vec![3.0, 5.0]);
+        let bodies = requests.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 3);
+        assert!(bodies.iter().all(|body| body.contains("\"input\":")));
+        assert!(bodies.iter().any(|body| body.contains("aaaa")));
+        assert!(bodies.iter().any(|body| body.contains("bbbb")));
+        assert!(bodies.iter().any(|body| body.contains("cccc")));
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn embed_rejects_ollama_error_payload_even_when_http_status_is_success() {
+        let (base_url, _requests, handle) =
+            spawn_embedding_server(vec!["{\"error\":\"input exceeds context length\"}"]);
+        let config = EmbeddingConfig {
+            ollama_base_url: base_url,
+            dimensions: 2,
+            max_input_chars: 100,
+            ..EmbeddingConfig::default()
+        };
+
+        let err = EmbeddingClient::new(&config)
+            .embed("too long")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, EmbeddingError::BadResponse(_)),
+            "HTTP 200 with an Ollama error payload must fail hard, got {err:?}"
+        );
+        handle.join().unwrap();
+    }
+
+    fn spawn_embedding_server(
+        responses: Vec<&'static str>,
+    ) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        let handle = thread::spawn(move || {
+            for response_body in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap();
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (format!("http://{addr}"), requests, handle)
     }
 
     fn model(name: &str) -> OllamaLoadedModel {

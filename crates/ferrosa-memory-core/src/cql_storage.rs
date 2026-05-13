@@ -105,17 +105,78 @@ fn typed_edge_list_all_query(ks: &str) -> String {
 }
 
 fn edge_count_query(ks: &str, table: &str) -> anyhow::Result<String> {
-    let count_column = match table {
-        "co_occurs_with" => "entity_a",
-        "mentioned_in" => "entity_id",
-        "folded_into" => "source_fold_id",
-        "supersedes" => "new_event_id",
-        "typed_edges" => "src_id",
+    match table {
+        "co_occurs_with" | "mentioned_in" | "folded_into" | "supersedes" | "typed_edges" => {}
         other => anyhow::bail!("unsupported edge table for count: {other}"),
-    };
+    }
     Ok(format!(
-        "SELECT {count_column} FROM {ks}.{table} WHERE tenant_id = ? ALLOW FILTERING"
+        "SELECT count(*) FROM {ks}.{table} WHERE tenant_id = ? ALLOW FILTERING"
     ))
+}
+
+fn memo_total_hits_query(ks: &str) -> String {
+    format!("SELECT sum(hit_count) FROM {ks}.memo_cache WHERE tenant_id = ? ALLOW FILTERING")
+}
+
+fn fold_count_by_status_query(ks: &str) -> String {
+    format!(
+        "SELECT count(*) FROM {ks}.trajectory_folds WHERE tenant_id = ? AND status = ? ALLOW FILTERING"
+    )
+}
+
+fn temporal_count_query(ks: &str) -> String {
+    format!("SELECT count(*) FROM {ks}.temporal_events WHERE tenant_id = ? ALLOW FILTERING")
+}
+
+/// Decode the `weight` column from an edge row, returning `None` and emitting
+/// a tracing warning if the column is NULL or fails to deserialize.
+///
+/// **Why not default to 1.0?** `1.0` is the strongest possible edge confidence
+/// in this codebase (schema doc on `dispatch.rs` create_edge: "default 1.0",
+/// `weight.maximum=1`). Silently substituting 1.0 on read-back overstates an
+/// edge's confidence whenever the stored value was missing or corrupt —
+/// downstream ranking, traversal, and consolidation paths then trust a
+/// fabricated number. The caller skips the row instead (matching the
+/// codebase convention used for malformed `src_id`/`dst_id` rows), letting
+/// the bad data surface in the warning rather than getting laundered into
+/// the result.
+pub fn decode_edge_weight(row: &Row, col_map: &ColMap, table_label: &str) -> Option<f64> {
+    match cql_get::<f64>(row, col_map, "weight") {
+        Ok(w) => Some(w),
+        Err(e) => {
+            tracing::warn!(
+                table = table_label,
+                column = "weight",
+                err = %e,
+                "edge row has null/corrupt weight; skipping rather than fabricating a default \
+                 that would overstate edge confidence"
+            );
+            None
+        }
+    }
+}
+
+fn cql_get_i64_from_single_aggregate(
+    row: &Row,
+    col_map: &ColMap,
+    candidate_names: &[&str],
+) -> anyhow::Result<i64> {
+    for name in candidate_names {
+        if col_map.contains_key(*name) {
+            return cql_get(row, col_map, name);
+        }
+    }
+    if col_map.len() == 1 {
+        let name = col_map
+            .keys()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("aggregate result had no columns"))?;
+        return cql_get(row, col_map, name);
+    }
+    anyhow::bail!(
+        "aggregate result did not include any expected column ({})",
+        candidate_names.join(", ")
+    )
 }
 
 /// Execute a SELECT or DML and return `(col_map, rows)`.
@@ -141,6 +202,43 @@ macro_rules! query_rows {
         let col_map = build_col_map(result.col_specs());
         let rows = result.rows_or_empty();
         (col_map, rows)
+    }};
+}
+
+/// Execute a raw SELECT through the driver's paged iterator.
+///
+/// Use this for read paths that must return a `Vec` to the existing trait API:
+/// the final response is still collected for the caller, but each CQL page is
+/// decoded and dropped incrementally instead of asking the server/driver for one
+/// unbounded response via `query_unpaged`.
+macro_rules! query_paged_rows {
+    ($session:expr, $query:expr, $values:expr) => {{
+        async {
+            let mut iter = $session.query_iter($query, $values).await?;
+            let col_map = build_col_map(iter.get_column_specs());
+            let mut rows = Vec::new();
+            while let Some(row) = iter.next().await {
+                rows.push(row?);
+            }
+            Ok::<_, anyhow::Error>((col_map, rows))
+        }
+        .await
+    }};
+}
+
+/// Execute a prepared SELECT through the driver's paged iterator.
+macro_rules! exec_paged_rows {
+    ($session:expr, $stmt:expr, $values:expr) => {{
+        async {
+            let mut iter = $session.execute_iter($stmt.clone(), $values).await?;
+            let col_map = build_col_map(iter.get_column_specs());
+            let mut rows = Vec::new();
+            while let Some(row) = iter.next().await {
+                rows.push(row?);
+            }
+            Ok::<_, anyhow::Error>((col_map, rows))
+        }
+        .await
     }};
 }
 
@@ -990,11 +1088,8 @@ impl CqlStorage {
     /// Returns the default set if the table doesn't exist or is empty.
     pub async fn load_entity_types(&self) -> Vec<String> {
         let query = format!("SELECT type_name FROM {}.entity_types", self.keyspace);
-        #[allow(deprecated)]
-        match self.session.query_unpaged(query, &[] as &[&str]).await {
-            Ok(result) => {
-                let col_map = build_col_map(result.col_specs());
-                let rows = result.rows_or_empty();
+        match query_paged_rows!(self.session, query, &[] as &[&str]) {
+            Ok((col_map, rows)) => {
                 let mut types: Vec<String> = rows
                     .iter()
                     .filter_map(|r| cql_get::<String>(r, &col_map, "type_name").ok())
@@ -1012,11 +1107,8 @@ impl CqlStorage {
     /// Load edge types from the type registry table.
     pub async fn load_edge_types(&self) -> Vec<String> {
         let query = format!("SELECT type_name FROM {}.edge_types", self.keyspace);
-        #[allow(deprecated)]
-        match self.session.query_unpaged(query, &[] as &[&str]).await {
-            Ok(result) => {
-                let col_map = build_col_map(result.col_specs());
-                let rows = result.rows_or_empty();
+        match query_paged_rows!(self.session, query, &[] as &[&str]) {
+            Ok((col_map, rows)) => {
                 let mut types: Vec<String> = rows
                     .iter()
                     .filter_map(|r| cql_get::<String>(r, &col_map, "type_name").ok())
@@ -1212,12 +1304,9 @@ impl CqlStorage {
              FROM {}.memo_cache WHERE tenant_id = ? ALLOW FILTERING",
             self.keyspace
         );
-        #[allow(deprecated)]
-        let result = self.session.query_unpaged(query, (ctx.tenant_id,)).await?;
-        let col_map = build_col_map(result.col_specs());
-        let rows = result.rows_or_empty();
+        let (col_map, rows) = query_paged_rows!(self.session, query, (ctx.tenant_id,))?;
 
-        let mut results = Vec::with_capacity(rows.len());
+        let mut results = Vec::new();
         for row in rows {
             let created_at = cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
                 .unwrap_or_else(|e| {
@@ -1632,34 +1721,19 @@ impl Storage for CqlStorage {
         // Ferrosa vector ANN expects a vector literal; binding Vec<u8> serializes
         // as Blob and produces warning-noisy fallback on live smoke tests.
         let (query, _bind_count) = build_fold_ann_search_query(&self.keyspace, query_embedding, k);
-        #[allow(deprecated)]
-        let (col_map, rows) = match self
-            .session
-            .query_unpaged(query, (session_id, ctx.tenant_id))
-            .await
-        {
-            Ok(result) => {
-                let col_map = build_col_map(result.col_specs());
-                let rows = result.rows_or_empty();
-                (col_map, rows)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "ANN query failed, falling back to LIMIT");
-                let fallback = format!(
-                    "SELECT fold_id, depth, fold_summary, token_count, raw_trajectory \
+        let (col_map, rows) =
+            match query_paged_rows!(self.session, query, (session_id, ctx.tenant_id)) {
+                Ok((col_map, rows)) => (col_map, rows),
+                Err(e) => {
+                    tracing::warn!(error = %e, "ANN query failed, falling back to LIMIT");
+                    let fallback = format!(
+                        "SELECT fold_id, depth, fold_summary, token_count, raw_trajectory \
                      FROM {}.trajectory_folds WHERE session_id = ? AND tenant_id = ? LIMIT {}",
-                    self.keyspace, k
-                );
-                #[allow(deprecated)]
-                let result = self
-                    .session
-                    .query_unpaged(fallback, (session_id, ctx.tenant_id))
-                    .await?;
-                let col_map = build_col_map(result.col_specs());
-                let rows = result.rows_or_empty();
-                (col_map, rows)
-            }
-        };
+                        self.keyspace, k
+                    );
+                    query_paged_rows!(self.session, fallback, (session_id, ctx.tenant_id))?
+                }
+            };
 
         let mut results = Vec::new();
         for row in rows {
@@ -1922,14 +1996,7 @@ impl Storage for CqlStorage {
              FROM {}.entity_store WHERE tenant_id = ? AND session_id = ? ALLOW FILTERING",
             self.keyspace
         );
-        #[allow(deprecated)]
-        let result = self
-            .session
-            .query_unpaged(query, (ctx.tenant_id, session_id))
-            .await?;
-
-        let col_map = build_col_map(result.col_specs());
-        let rows = result.rows_or_empty();
+        let (col_map, rows) = query_paged_rows!(self.session, query, (ctx.tenant_id, session_id))?;
         let lower = name.to_lowercase();
 
         // Collect matches with rank: 0=exact, 1=segment (after ::), 2=substring
@@ -2310,13 +2377,7 @@ impl Storage for CqlStorage {
             "SELECT entity_type, state FROM {}.entity_store WHERE tenant_id = ? AND session_id = ?",
             self.keyspace
         );
-        #[allow(deprecated)]
-        let result = self
-            .session
-            .query_unpaged(query, (ctx.tenant_id, session_id))
-            .await?;
-        let col_map = build_col_map(result.col_specs());
-        let rows = result.rows_or_empty();
+        let (col_map, rows) = query_paged_rows!(self.session, query, (ctx.tenant_id, session_id))?;
         let mut counts: std::collections::BTreeMap<(String, String), usize> =
             std::collections::BTreeMap::new();
         for row in rows {
@@ -2733,22 +2794,15 @@ impl Storage for CqlStorage {
     // --- Observability operations ---
 
     async fn memo_total_hits(&self, ctx: &TenantContext) -> anyhow::Result<i64> {
-        // Client-side sum: fetch all hit_count values and sum.
-        // Workaround for Ferrosa returning aggregate columns as "system.sum".
-        let query = format!(
-            "SELECT hit_count FROM {}.memo_cache WHERE tenant_id = ? ALLOW FILTERING",
-            self.keyspace
-        );
+        let query = memo_total_hits_query(&self.keyspace);
         #[allow(deprecated)]
         let result = self.session.query_unpaged(query, (ctx.tenant_id,)).await?;
         let col_map = build_col_map(result.col_specs());
         let rows = result.rows_or_empty();
-        let mut total: i64 = 0;
-        for row in &rows {
-            let hits: i64 = cql_get(row, &col_map, "hit_count").unwrap_or(0);
-            total += hits;
-        }
-        Ok(total)
+        let Some(row) = rows.first() else {
+            return Ok(0);
+        };
+        cql_get_i64_from_single_aggregate(row, &col_map, &["system.sum", "sum", "sum(hit_count)"])
     }
 
     async fn fold_count_by_status(
@@ -2761,36 +2815,40 @@ impl Storage for CqlStorage {
             crate::types::FoldStatus::Folded => "folded",
             crate::types::FoldStatus::Archived => "archived",
         };
-        // Client-side count filtered by status.
-        let query = format!(
-            "SELECT status FROM {}.trajectory_folds WHERE tenant_id = ? ALLOW FILTERING",
-            self.keyspace
-        );
+        let query = fold_count_by_status_query(&self.keyspace);
+        #[allow(deprecated)]
+        let result = self
+            .session
+            .query_unpaged(query, (ctx.tenant_id, status_str))
+            .await?;
+        let col_map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
+        let Some(row) = rows.first() else {
+            return Ok(0);
+        };
+        let count = cql_get_i64_from_single_aggregate(
+            row,
+            &col_map,
+            &["system.count", "count", "count(*)"],
+        )?;
+        Ok(count.max(0) as usize)
+    }
+
+    async fn temporal_count(&self, ctx: &TenantContext) -> anyhow::Result<usize> {
+        let query = temporal_count_query(&self.keyspace);
         #[allow(deprecated)]
         let result = self.session.query_unpaged(query, (ctx.tenant_id,)).await?;
         let col_map = build_col_map(result.col_specs());
         let rows = result.rows_or_empty();
-        let count = rows
-            .iter()
-            .filter(|r| {
-                cql_get::<String>(r, &col_map, "status")
-                    .map(|s| s == status_str)
-                    .unwrap_or(false)
-            })
-            .count();
-        Ok(count)
-    }
-
-    async fn temporal_count(&self, ctx: &TenantContext) -> anyhow::Result<usize> {
-        let query = format!(
-            "SELECT event_id FROM {}.temporal_events WHERE tenant_id = ? ALLOW FILTERING",
-            self.keyspace
-        );
-        #[allow(deprecated)]
-        let result = self.session.query_unpaged(query, (ctx.tenant_id,)).await?;
-        let _col_map = build_col_map(result.col_specs());
-        let rows = result.rows_or_empty();
-        Ok(rows.len())
+        let Some(row) = rows.first() else {
+            return Ok(0);
+        };
+        let count = cql_get_i64_from_single_aggregate(
+            row,
+            &col_map,
+            &["system.count", "count", "count(*)"],
+        )?;
+        Ok(count.max(0) as usize)
     }
 
     async fn edge_count(&self, ctx: &TenantContext) -> anyhow::Result<usize> {
@@ -2805,7 +2863,16 @@ impl Storage for CqlStorage {
             let query = edge_count_query(&self.keyspace, table)?;
             #[allow(deprecated)]
             let result = self.session.query_unpaged(query, (ctx.tenant_id,)).await?;
-            total += result.rows_or_empty().len();
+            let col_map = build_col_map(result.col_specs());
+            let rows = result.rows_or_empty();
+            if let Some(row) = rows.first() {
+                let count = cql_get_i64_from_single_aggregate(
+                    row,
+                    &col_map,
+                    &["system.count", "count", "count(*)"],
+                )?;
+                total += count.max(0) as usize;
+            }
         }
         Ok(total)
     }
@@ -3010,26 +3077,22 @@ impl Storage for CqlStorage {
 
         for &(table, src_col, tgt_col, edge_type) in queries {
             let query = edge_list_all_query(&self.keyspace, table, src_col, tgt_col);
-            #[allow(deprecated)]
-            if let Ok(prepared) = self.session.prepare(query).await {
-                #[allow(deprecated)]
-                if let Ok(result) = self
-                    .session
-                    .execute_unpaged(&prepared, (ctx.tenant_id,))
-                    .await
-                {
-                    let ea_col_map = build_col_map(result.col_specs());
-                    let rows = result.rows_or_empty();
-                    for row in rows {
-                        if let (Ok(a), Ok(b)) = (
-                            cql_get::<Uuid>(&row, &ea_col_map, src_col),
-                            cql_get::<Uuid>(&row, &ea_col_map, tgt_col),
-                        ) {
-                            edges.push((a, b, edge_type.into()));
-                        }
+            let prepared = match self.session.prepare(query).await {
+                Ok(prepared) => prepared,
+                Err(_) => continue,
+            };
+            if let Ok((ea_col_map, rows)) =
+                exec_paged_rows!(self.session, prepared, (ctx.tenant_id,))
+            {
+                for row in rows {
+                    if let (Ok(a), Ok(b)) = (
+                        cql_get::<Uuid>(&row, &ea_col_map, src_col),
+                        cql_get::<Uuid>(&row, &ea_col_map, tgt_col),
+                    ) {
+                        edges.push((a, b, edge_type.into()));
                     }
-                } // end if execute_unpaged
-            } // end if prepare
+                }
+            }
         } // end for
 
         Ok(edges)
@@ -4058,13 +4121,7 @@ impl Storage for CqlStorage {
              WHERE tenant_id = ? LIMIT {} ALLOW FILTERING",
             self.keyspace, limit
         );
-        #[allow(deprecated)]
-        let result = self
-            .session
-            .query_unpaged(query.clone(), (ctx.tenant_id,))
-            .await?;
-        let col_map = build_col_map(result.col_specs());
-        let rows = result.rows_or_empty();
+        let (col_map, rows) = query_paged_rows!(self.session, query, (ctx.tenant_id,))?;
 
         let mut results: Vec<crate::types::DerivedFactRow> = Vec::new();
         for row in rows {
@@ -4303,13 +4360,8 @@ impl Storage for CqlStorage {
             self.keyspace
         );
         let prepared = self.session.prepare(query).await?;
-        #[allow(deprecated)]
-        let _qr = self
-            .session
-            .execute_unpaged(&prepared, (ctx.tenant_id, session_id))
-            .await?;
-        let col_map = build_col_map(_qr.col_specs());
-        let rows = _qr.rows_or_empty();
+        let (col_map, rows) =
+            exec_paged_rows!(self.session, prepared, (ctx.tenant_id, session_id))?;
 
         let mut edges = Vec::new();
         for row in rows {
@@ -4329,13 +4381,16 @@ impl Storage for CqlStorage {
                     tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
                     Default::default()
                 });
+            let Some(weight) = decode_edge_weight(&row, &col_map, "typed_edges") else {
+                continue;
+            };
             edges.push(TypedEdge {
                 tenant_id: ctx.tenant_id,
                 session_id,
                 src_id,
                 edge_type,
                 dst_id,
-                weight: cql_get::<f64>(&row, &col_map, "weight").unwrap_or(1.0),
+                weight,
                 metadata: cql_get::<String>(&row, &col_map, "metadata")
                     .ok()
                     .filter(|s| !s.is_empty()),
@@ -4348,13 +4403,7 @@ impl Storage for CqlStorage {
     async fn typed_edge_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<TypedEdge>> {
         let query = typed_edge_list_all_query(&self.keyspace);
         let prepared = self.session.prepare(query).await?;
-        #[allow(deprecated)]
-        let _qr = self
-            .session
-            .execute_unpaged(&prepared, (ctx.tenant_id,))
-            .await?;
-        let col_map = build_col_map(_qr.col_specs());
-        let rows = _qr.rows_or_empty();
+        let (col_map, rows) = exec_paged_rows!(self.session, prepared, (ctx.tenant_id,))?;
 
         let mut edges = Vec::new();
         for row in rows {
@@ -4374,13 +4423,16 @@ impl Storage for CqlStorage {
                     tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
                     Default::default()
                 });
+            let Some(weight) = decode_edge_weight(&row, &col_map, "typed_edges") else {
+                continue;
+            };
             edges.push(TypedEdge {
                 tenant_id: ctx.tenant_id,
                 session_id,
                 src_id,
                 edge_type,
                 dst_id,
-                weight: cql_get::<f64>(&row, &col_map, "weight").unwrap_or(1.0),
+                weight,
                 metadata: cql_get::<String>(&row, &col_map, "metadata")
                     .ok()
                     .filter(|s| !s.is_empty()),
@@ -4420,13 +4472,24 @@ impl Storage for CqlStorage {
                 let created_at =
                     cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
                         .unwrap_or_default();
+                let weight = cql_get::<f64>(&row, &col_map, "weight").map_err(|e| {
+                    // typed_edge_stream_all's caller treats Err here as
+                    // "skip malformed row" (see the bail!-then-warn pattern
+                    // below). Be explicit about WHY we skip — silently
+                    // fabricating weight=1.0 overstates the edge's
+                    // confidence and corrupts downstream ranking.
+                    anyhow::anyhow!(
+                        "typed_edges row has null/corrupt weight ({e}); skipping rather than \
+                         fabricating a default that would overstate edge confidence"
+                    )
+                })?;
                 Ok(TypedEdge {
                     tenant_id: ctx.tenant_id,
                     session_id,
                     src_id,
                     edge_type,
                     dst_id,
-                    weight: cql_get::<f64>(&row, &col_map, "weight").unwrap_or(1.0),
+                    weight,
                     metadata: cql_get::<String>(&row, &col_map, "metadata")
                         .ok()
                         .filter(|s| !s.is_empty()),
@@ -4465,13 +4528,8 @@ impl Storage for CqlStorage {
             self.keyspace
         );
         let prepared = self.session.prepare(query).await?;
-        #[allow(deprecated)]
-        let _qr = self
-            .session
-            .execute_unpaged(&prepared, (ctx.tenant_id, session_id, src_id))
-            .await?;
-        let col_map = build_col_map(_qr.col_specs());
-        let rows = _qr.rows_or_empty();
+        let (col_map, rows) =
+            exec_paged_rows!(self.session, prepared, (ctx.tenant_id, session_id, src_id))?;
 
         let mut edges = Vec::new();
         for row in rows {
@@ -4480,13 +4538,16 @@ impl Storage for CqlStorage {
                     tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
                     Default::default()
                 });
+            let Some(weight) = decode_edge_weight(&row, &col_map, "typed_edges") else {
+                continue;
+            };
             edges.push(TypedEdge {
                 tenant_id: ctx.tenant_id,
                 session_id,
                 src_id,
                 edge_type: cql_get::<String>(&row, &col_map, "edge_type").unwrap_or_default(),
                 dst_id: cql_get(&row, &col_map, "dst_id")?,
-                weight: cql_get::<f64>(&row, &col_map, "weight").unwrap_or(1.0),
+                weight,
                 metadata: cql_get::<String>(&row, &col_map, "metadata")
                     .ok()
                     .filter(|s| !s.is_empty()),
@@ -4670,12 +4731,12 @@ impl Storage for CqlStorage {
             ks = self.keyspace
         );
         for term in tokenize_context_terms(query) {
-            let result = self
-                .session
-                .query_unpaged(term_q.clone(), (ctx.tenant_id, session_id, term))
-                .await?;
-            let col_map = build_col_map(result.col_specs());
-            for row in result.rows_or_empty() {
+            let (col_map, rows) = query_paged_rows!(
+                self.session,
+                term_q.clone(),
+                (ctx.tenant_id, session_id, term)
+            )?;
+            for row in rows {
                 let id: Uuid = cql_get(&row, &col_map, "segment_id")?;
                 let tf: i32 = cql_get(&row, &col_map, "tf").unwrap_or(1);
                 *scores.entry(id).or_insert(0) += tf;
@@ -4710,12 +4771,9 @@ impl Storage for CqlStorage {
             ks = self.keyspace,
             k = k
         );
-        let result = match self
-            .session
-            .query_unpaged(q, (ctx.tenant_id, session_id))
-            .await
+        let (col_map, rows) = match query_paged_rows!(self.session, q, (ctx.tenant_id, session_id))
         {
-            Ok(result) => result,
+            Ok((col_map, rows)) => (col_map, rows),
             Err(e) => {
                 tracing::warn!(error = %e, "context segment ANN query failed, falling back to session scan");
                 let fallback = format!(
@@ -4724,15 +4782,10 @@ impl Storage for CqlStorage {
                     ks = self.keyspace,
                     k = k
                 );
-                self.session
-                    .query_unpaged(fallback, (ctx.tenant_id, session_id))
-                    .await?
+                query_paged_rows!(self.session, fallback, (ctx.tenant_id, session_id))?
             }
         };
-        let col_map = build_col_map(result.col_specs());
-        result
-            .rows_or_empty()
-            .into_iter()
+        rows.into_iter()
             .map(|row| context_segment_from_row(ctx, &row, &col_map))
             .collect()
     }
@@ -4779,16 +4832,12 @@ impl Storage for CqlStorage {
              WHERE tenant_id = ? AND session_id = ? AND src_id = ? AND edge_type = ?",
             ks = self.keyspace
         );
-        let result = self
-            .session
-            .query_unpaged(
-                q,
-                (ctx.tenant_id, session_id, src_id, edge_type.to_string()),
-            )
-            .await?;
-        let col_map = build_col_map(result.col_specs());
-        let mut edges: Vec<TemporalEdge> = result
-            .rows_or_empty()
+        let (col_map, rows) = query_paged_rows!(
+            self.session,
+            q,
+            (ctx.tenant_id, session_id, src_id, edge_type.to_string())
+        )?;
+        let mut edges: Vec<TemporalEdge> = rows
             .into_iter()
             .map(|row| temporal_edge_from_row(ctx, &row, &col_map))
             .collect::<anyhow::Result<_>>()?;
@@ -4852,6 +4901,53 @@ impl Storage for CqlStorage {
 mod cql_storage_tests {
     use super::*;
 
+    /// Build a synthetic `Row`/`ColMap` pair for unit-testing column decoders
+    /// without spinning up a live cluster.
+    fn synthetic_row(columns: Vec<(&str, Option<CqlValue>)>) -> (Row, ColMap) {
+        let mut col_map = ColMap::new();
+        let mut cells = Vec::with_capacity(columns.len());
+        for (i, (name, value)) in columns.into_iter().enumerate() {
+            col_map.insert(name.to_string(), i);
+            cells.push(value);
+        }
+        (Row { columns: cells }, col_map)
+    }
+
+    #[test]
+    fn decode_edge_weight_returns_stored_value_when_present() {
+        let (row, col_map) = synthetic_row(vec![("weight", Some(CqlValue::Double(0.4)))]);
+        assert_eq!(decode_edge_weight(&row, &col_map, "typed_edges"), Some(0.4));
+    }
+
+    #[test]
+    fn decode_edge_weight_returns_none_on_null_so_caller_can_skip() {
+        // Regression: previously this path was
+        // `cql_get::<f64>(...).unwrap_or(1.0)` which silently coerced a null
+        // weight column to the *maximum* possible edge confidence — exactly
+        // the wrong default for a confidence field. The reviewer call-out:
+        // "doesn't that mean that the default is a high probability edge,
+        // if it's not set should it be less than 1?" Yes — and the fix is
+        // to not fabricate a default at all on read-back. Callers loop and
+        // `continue` on `None`, mirroring how malformed `src_id`/`dst_id`
+        // rows are already handled.
+        let (row, col_map) = synthetic_row(vec![("weight", None)]);
+        assert_eq!(decode_edge_weight(&row, &col_map, "typed_edges"), None);
+    }
+
+    #[test]
+    fn decode_edge_weight_returns_none_when_column_absent() {
+        let (row, col_map) = synthetic_row(vec![("not_weight", Some(CqlValue::Double(0.4)))]);
+        assert_eq!(decode_edge_weight(&row, &col_map, "typed_edges"), None);
+    }
+
+    #[test]
+    fn decode_edge_weight_returns_none_on_wrong_type() {
+        // A row that wedges a string into the weight column shouldn't
+        // poison the result with weight=1.0.
+        let (row, col_map) = synthetic_row(vec![("weight", Some(CqlValue::Text("0.4".into())))]);
+        assert_eq!(decode_edge_weight(&row, &col_map, "typed_edges"), None);
+    }
+
     #[test]
     fn sprint1_seed_insert_statements_bind_created_at_timestamp() {
         let (entity_q, edge_q) = sprint1_seed_insert_statements("agent_memory");
@@ -4900,6 +4996,29 @@ mod cql_storage_tests {
             !entity_query.contains("entity_embedding"),
             "tenant-wide entity scans must not fetch vector blobs: {entity_query}"
         );
+    }
+
+    #[test]
+    fn observability_count_queries_use_server_side_aggregates() {
+        let memo_hits = memo_total_hits_query("agent_memory");
+        let fold_count = fold_count_by_status_query("agent_memory");
+        let temporal_count = temporal_count_query("agent_memory");
+        let edge_count = edge_count_query("agent_memory", "mentioned_in").unwrap();
+
+        for query in [&memo_hits, &fold_count, &temporal_count, &edge_count] {
+            assert!(
+                query.to_ascii_lowercase().contains("count(")
+                    || query.to_ascii_lowercase().contains("sum("),
+                "observability queries must return one aggregate row instead of materializing raw rows: {query}"
+            );
+            assert!(
+                !query.contains("SELECT hit_count")
+                    && !query.contains("SELECT status")
+                    && !query.contains("SELECT event_id")
+                    && !query.contains("SELECT entity_id"),
+                "observability queries must not fetch raw columns for client-side count/sum: {query}"
+            );
+        }
     }
 
     #[test]

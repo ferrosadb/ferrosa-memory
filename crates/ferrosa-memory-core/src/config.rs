@@ -408,6 +408,12 @@ pub struct EmbeddingConfig {
     pub model: String,
     #[serde(default = "default_dimensions")]
     pub dimensions: u32,
+    /// Maximum characters sent to a single embedding request.
+    ///
+    /// Ollama tokenizes before rejecting over-context inputs, so client-side
+    /// chunking prevents retry loops from turning a too-large text into CPU burn.
+    #[serde(default = "default_embedding_max_input_chars")]
+    pub max_input_chars: usize,
     #[serde(default = "default_ner_model")]
     pub ner_model: String,
 }
@@ -419,6 +425,7 @@ impl Default for EmbeddingConfig {
             ollama_base_url: default_ollama_url(),
             model: default_embed_model(),
             dimensions: default_dimensions(),
+            max_input_chars: default_embedding_max_input_chars(),
             ner_model: default_ner_model(),
         }
     }
@@ -519,6 +526,9 @@ fn default_embed_model() -> String {
 }
 fn default_dimensions() -> u32 {
     768
+}
+fn default_embedding_max_input_chars() -> usize {
+    6_000
 }
 fn default_ner_model() -> String {
     "qwen3.5:27b".into()

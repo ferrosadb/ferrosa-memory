@@ -20,6 +20,7 @@ use ferrosa_memory_core::cql_storage::CqlStorage;
 use ferrosa_memory_core::graph::{GraphClient, GraphConfig};
 use ferrosa_memory_core::storage::Storage;
 use ferrosa_memory_core::types::{FoldStatus, TenantContext};
+use futures_util::StreamExt;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -156,6 +157,7 @@ async fn cmd_sync(
 /// Discover tenant IDs present on a cluster.
 async fn cmd_discover(config_path: &std::path::Path) -> anyhow::Result<()> {
     use ferrosa_memory_core::cql_storage::{build_col_map, cql_get};
+    use futures_util::StreamExt;
     use std::collections::BTreeSet;
 
     let config = ferrosa_memory_core::config::parse_config(
@@ -181,12 +183,17 @@ async fn cmd_discover(config_path: &std::path::Path) -> anyhow::Result<()> {
 
     for query in &queries {
         #[allow(deprecated)]
-        match storage.session().query_unpaged(query.to_owned(), ()).await {
-            Ok(result) => {
-                let col_map = build_col_map(result.col_specs());
-                for row in result.rows_or_empty() {
-                    if let Ok(tid) = cql_get::<Uuid>(&row, &col_map, "tenant_id") {
-                        tenants.insert(tid);
+        match storage.session().query_iter(query.to_owned(), ()).await {
+            Ok(mut iter) => {
+                let col_map = build_col_map(iter.get_column_specs());
+                while let Some(row) = iter.next().await {
+                    match row {
+                        Ok(row) => {
+                            if let Ok(tid) = cql_get::<Uuid>(&row, &col_map, "tenant_id") {
+                                tenants.insert(tid);
+                            }
+                        }
+                        Err(e) => tracing::warn!(query, %e, "row decode failed"),
                     }
                 }
             }
@@ -468,11 +475,15 @@ async fn raw_query(
     Vec<scylla::frame::response::result::Row>,
 )> {
     #[allow(deprecated)]
-    let result = storage
+    let mut iter = storage
         .session()
-        .query_unpaged(query.to_string(), (tenant_id,))
+        .query_iter(query.to_string(), (tenant_id,))
         .await
         .with_context(|| format!("raw query failed: {query}"))?;
-    let col_map = ferrosa_memory_core::cql_storage::build_col_map(result.col_specs());
-    Ok((col_map, result.rows_or_empty()))
+    let col_map = ferrosa_memory_core::cql_storage::build_col_map(iter.get_column_specs());
+    let mut rows = Vec::new();
+    while let Some(row) = iter.next().await {
+        rows.push(row.with_context(|| format!("raw query row decode failed: {query}"))?);
+    }
+    Ok((col_map, rows))
 }
