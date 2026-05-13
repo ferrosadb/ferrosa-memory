@@ -1,6 +1,6 @@
 # P0 Bug: Acknowledged CQL Writes Silently Lost
 
-**Filed:** 2026-04-01 | **GitHub:** bkearns/ferrosa#92 | **fmem entity:** 046819a9-15f0-48f7-83fa-85c1c2d3b13a
+**Filed:** 2026-04-01 | **GitHub:** ferrosadb/ferrosa#92 | **fmem entity:** 046819a9-15f0-48f7-83fa-85c1c2d3b13a
 
 ## What happened
 
