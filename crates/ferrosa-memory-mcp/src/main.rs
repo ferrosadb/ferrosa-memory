@@ -174,6 +174,15 @@ const NOT_CONNECTED_MSG: &str = "CQL connection not yet established, retrying in
 /// (as opposed to a query-level error like "table not found").
 fn is_connection_error(err: impl std::fmt::Display) -> bool {
     let msg = err.to_string().to_lowercase();
+
+    // Ferrosa/Cassandra query-level consistency failures are storage results,
+    // not transport failures. Treating them as connection loss poisons the
+    // shared MCP storage handle and can turn a best-effort read timeout into a
+    // write-path outage for the rest of the tool call.
+    if msg.contains("read timeout: cl=") || msg.contains("write timeout: cl=") {
+        return false;
+    }
+
     msg.contains("broken pipe")
         || msg.contains("connection reset")
         || msg.contains("connection refused")
@@ -181,7 +190,6 @@ fn is_connection_error(err: impl std::fmt::Display) -> bool {
         || msg.contains("channel closed")
         || msg.contains("io error")
         || msg.contains("timed out")
-        || msg.contains("read timeout")
         || msg.contains("not connected")
         || msg.contains("eof")
         // Stale prepared statements after node restart — need full reconnect
@@ -2155,11 +2163,14 @@ mod tests {
     }
 
     #[test]
-    fn is_connection_error_read_timeout() {
+    fn is_connection_error_false_for_cluster_read_timeout() {
         let err = anyhow::anyhow!(
             "server error: storage error: invalid data: cluster: read timeout: CL=LOCAL_QUORUM, received=1, required=2, data_present=true"
         );
-        assert!(is_connection_error(&err));
+        assert!(
+            !is_connection_error(&err),
+            "query-level quorum read timeouts must not poison the shared CQL session"
+        );
     }
 
     #[test]
