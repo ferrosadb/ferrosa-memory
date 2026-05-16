@@ -115,25 +115,45 @@ pub async fn smart_ingest(
     let (resolved_name, resolved_type) =
         resolve_entity_name(entity_name, content, entity_type, ner_config).await;
 
-    // Always check for exact name match first (cheap phonetic scan).
-    // This prevents duplicates when the same entity is updated with new content,
-    // regardless of whether ANN or phonetic search is the primary strategy.
+    // Always check for an exact-name match first. This path preserves updates for
+    // repeated entity names, but it is still a dedup optimization: a read-side
+    // timeout here must not prevent the write path from creating a new memory.
     let mut existing = if !resolved_name.is_empty() {
-        let mut matches = storage
-            .entity_find_phonetic(ctx, session_id, &resolved_name)
-            .await?;
-        // Keep only exact name matches for dedup
-        matches.retain(|e| e.entity_name == resolved_name);
-        matches.truncate(1);
-        matches
+        match storage
+            .entity_find_by_exact_name(ctx, session_id, &resolved_name, &resolved_type)
+            .await
+        {
+            Ok(Some(entry)) => vec![entry],
+            Ok(None) => Vec::new(),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    entity_name = %resolved_name,
+                    entity_type = %resolved_type,
+                    "smart_ingest: exact dedup lookup failed; continuing with create path"
+                );
+                Vec::new()
+            }
+        }
     } else {
         Vec::new()
     };
 
-    // If no exact name match, fall back to semantic/phonetic search
+    // If no exact name match, fall back to semantic/phonetic search. These reads
+    // are best-effort duplicate suppression only; availability of memory writes
+    // is more important than fuzzy dedup when a quorum read times out.
     if existing.is_empty() {
         existing = if let Some(emb) = embedding {
-            storage.entity_search_ann(ctx, session_id, emb, 3).await?
+            match storage.entity_search_ann(ctx, session_id, emb, 3).await {
+                Ok(matches) => matches,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "smart_ingest: ANN dedup lookup failed; continuing with create path"
+                    );
+                    Vec::new()
+                }
+            }
         } else {
             let name_hint = if !resolved_name.is_empty() {
                 resolved_name.clone()
@@ -144,11 +164,23 @@ pub async fn smart_ingest(
                     .collect::<Vec<_>>()
                     .join(" ")
             };
-            let mut matches = storage
+            match storage
                 .entity_find_phonetic(ctx, session_id, &name_hint)
-                .await?;
-            matches.truncate(3);
-            matches
+                .await
+            {
+                Ok(mut matches) => {
+                    matches.truncate(3);
+                    matches
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        name_hint = %name_hint,
+                        "smart_ingest: fuzzy dedup lookup failed; continuing with create path"
+                    );
+                    Vec::new()
+                }
+            }
         };
     }
 
@@ -724,6 +756,36 @@ mod tests {
         )
         .await
         .unwrap();
+
+        assert!(matches!(result, IngestDecision::Created { .. }));
+    }
+
+    #[tokio::test]
+    async fn smart_ingest_new_memory_is_not_blocked_by_fuzzy_lookup_failure() {
+        use crate::storage::mock::MockStorage;
+
+        let store = MockStorage::new();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "test".into(),
+        };
+        *store.force_phonetic_error.lock().await =
+            Some("simulated LOCAL_QUORUM fuzzy lookup timeout".into());
+
+        let result = smart_ingest(
+            &store,
+            &ctx,
+            Uuid::new_v4(),
+            "Memory writes must remain available when best-effort dedup lookup times out",
+            "pattern",
+            None,
+            None,
+            &IngestConfig::default(),
+            Some("fmem save availability"),
+            None,
+        )
+        .await
+        .expect("a fuzzy dedup read timeout must not block creating a new memory");
 
         assert!(matches!(result, IngestDecision::Created { .. }));
     }
