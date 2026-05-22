@@ -21,10 +21,10 @@ contact_points = ["ferrosa-node1:9042", "ferrosa-node2:9042", "ferrosa-node3:904
 keyspace = "agent_memory"
 replication_factor = 3
 consistency = "LOCAL_QUORUM"
-username = "ferrosa_user"
-password = "ferrosa_user"
-# Admin credentials used only for schema migrations (DDL). Runtime
-# queries still run as ferrosa_user.
+username = "ferrosa_admin"
+password = "ferrosa_admin"
+# Admin credentials used for schema migrations (DDL). Runtime defaults to
+# ferrosa_admin too so first-use writes keep working across ferrosa restarts.
 admin_username = "ferrosa_admin"
 admin_password = "ferrosa_admin"
 
