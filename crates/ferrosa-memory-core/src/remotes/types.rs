@@ -135,7 +135,7 @@ pub struct TeachingRequest {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// Signed envelope payload returned by a teacher.
+/// Signed envelope payload returned by a teacher for normal memory transfer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TeachingPacket {
     pub packet_id: Uuid,
@@ -146,6 +146,48 @@ pub struct TeachingPacket {
     pub items: Vec<TeachingItem>,
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Signed envelope payload returned by a teacher for skill transfer.
+///
+/// Skills are deliberately separate from [`TeachingPacket`] so procedural content cannot be
+/// committed through the normal memory import path.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkillTeachingPacket {
+    pub packet_id: Uuid,
+    pub teacher_instance_id: InstanceId,
+    pub request_id: Option<Uuid>,
+    pub source_namespace: String,
+    pub query: String,
+    pub skills: Vec<SkillTeachingItem>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One procedural skill proposed by a remote teacher.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkillTeachingItem {
+    pub skill_name: String,
+    pub category: String,
+    pub description: String,
+    pub steps: Vec<SkillTeachingStep>,
+    pub prerequisites: Vec<String>,
+    pub triggers: Vec<String>,
+    pub verification: Vec<String>,
+    pub pitfalls: Vec<String>,
+    pub content_hash: ContentHash,
+    pub applicability: ApplicabilityFrame,
+    pub safety: SafetyClassification,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One ordered procedural step in a remote skill proposal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillTeachingStep {
+    pub phase: Option<String>,
+    pub instruction: String,
 }
 
 /// One transferrable memory item inside a packet.
@@ -361,5 +403,64 @@ mod tests {
         let value = serde_json::to_value(&grant).unwrap();
         assert_eq!(value["kind"]["grant"]["namespace"], "gpu_builds");
         assert_eq!(value["kind"]["grant"]["grant"], "autocommit");
+    }
+
+    #[test]
+    fn skill_teaching_packet_includes_full_skill_shape() {
+        let packet = SkillTeachingPacket {
+            packet_id: id(20),
+            teacher_instance_id: InstanceId(id(21)),
+            request_id: Some(id(22)),
+            query: "teach me tdd".into(),
+            source_namespace: "skills".into(),
+            skills: vec![SkillTeachingItem {
+                skill_name: "test-driven-development".into(),
+                category: "software-development".into(),
+                description: "Red-green-refactor development workflow.".into(),
+                steps: vec![SkillTeachingStep {
+                    phase: Some("red".into()),
+                    instruction: "Write a failing behavior test first.".into(),
+                }],
+                prerequisites: vec!["rust".into()],
+                triggers: vec!["bug fix".into(), "behavior change".into()],
+                verification: vec!["focused RED and GREEN tests observed".into()],
+                pitfalls: vec!["Do not write production code before RED.".into()],
+                content_hash: ContentHash("skill-hash".into()),
+                applicability: ApplicabilityFrame {
+                    namespaces: vec!["skills".into()],
+                    host_os: None,
+                    container_runtime: None,
+                    hardware: vec![],
+                    required_tags: vec!["tdd".into()],
+                    excluded_tags: vec![],
+                    confidence: 0.95,
+                },
+                safety: SafetyClassification {
+                    risk: SafetyRisk::Low,
+                    reasons: vec!["methodology".into()],
+                    redacted: false,
+                    requires_human: false,
+                },
+                metadata: json!({"format": "SKILL.md"}),
+                created_at: chrono::Utc::now(),
+            }],
+            expires_at: None,
+            created_at: chrono::Utc::now(),
+        };
+
+        let encoded = serde_json::to_string(&packet).unwrap();
+        let decoded: SkillTeachingPacket = serde_json::from_str(&encoded).unwrap();
+        let skill = &decoded.skills[0];
+        assert_eq!(
+            skill.steps[0].instruction,
+            "Write a failing behavior test first."
+        );
+        assert_eq!(skill.prerequisites, vec!["rust"]);
+        assert!(skill.triggers.contains(&"bug fix".to_string()));
+        assert_eq!(skill.verification.len(), 1);
+        assert_eq!(
+            skill.pitfalls[0],
+            "Do not write production code before RED."
+        );
     }
 }

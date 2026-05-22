@@ -581,13 +581,17 @@ Proposed tool groups:
 
 ### Remote management
 
-- `remote_list`
-- `remote_add`
-- `remote_update_policy`
-- `remote_remove`
-- `remote_health`
-- `remote_capabilities`
-- `remote_explain_policy`
+Packet K exposes the same tenant-scoped remote-management surface through MCP tools and the `memory-sync remote ...` CLI. Registry commands must never accept or print credentials; endpoint values are validated before storage and must be HTTP(S) URLs without embedded userinfo.
+
+- `remote_list` / `memory-sync remote --config <ferrosa-memory.toml> --tenant-id <uuid> list [--limit N]`
+- `remote_add` / `memory-sync remote --config <ferrosa-memory.toml> --tenant-id <uuid> add --remote-id <uuid> --name <name> --endpoint https://remote.example/mcp --instance-id <uuid> --public-key-fingerprint <fingerprint> --trust-class personal|team|partner|external|public|archive`
+- `remote_update_policy` / `memory-sync remote ... update-policy --remote-id <uuid> --kind grant|deny --action read|detail_fetch|autocommit|requires_activation|should_consult --namespace <namespace>`
+- `remote_remove` / `memory-sync remote ... remove --remote-id <uuid>`; soft-disables the remote and preserves provenance/policy audit rows.
+- `remote_health` / `memory-sync remote ... health --remote-id <uuid>`; reports local registration health without dialing the remote.
+- `remote_capabilities` / `memory-sync remote ... capabilities --remote-id <uuid>`; reports expected remote-memory capabilities.
+- `remote_explain_policy` / `memory-sync remote ... explain-policy --remote-id <uuid> --action read|detail_fetch|autocommit|requires_activation|should_consult --namespace <namespace>`; returns `allowed`, `explanation`, `reasons`, and `policy_fact_count`.
+
+Canonical policy action names match core `PolicyAction` variants serialized as snake_case: `read`, `detail_fetch`, `autocommit`, `requires_activation`, and `should_consult`. The CLI accepts `fetch_detail` and `detail` as aliases for `detail_fetch`, and accepts `external` as a compatibility alias for the `partner` trust class.
 
 ### Teaching / pull
 

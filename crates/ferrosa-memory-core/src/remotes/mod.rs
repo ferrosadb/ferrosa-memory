@@ -10,5 +10,6 @@ pub mod feedback;
 pub mod policy;
 pub mod pull;
 pub mod safety;
+pub mod skills;
 pub mod teach;
 pub mod types;
