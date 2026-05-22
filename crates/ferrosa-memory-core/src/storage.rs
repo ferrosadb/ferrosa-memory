@@ -16,10 +16,107 @@ use uuid::Uuid;
 use crate::context_segment::{ContextSegment, TemporalEdge};
 use crate::types::{
     AliasEntry, ApprovalEntry, AuditEntry, ConfidenceScore, DerivedFact, EntityEntry,
-    EntityTypeStateCount, FeedbackOutcome, FoldEntry, FoldSummary, MaterializedEdge, MemoEntry,
-    MemoryState, PlanNode, PlanStatus, PromotedPredicate, ProvenanceStep, RuleEntry, RuleState,
-    TemporalEvent, TenantContext, ToolUsageRow, TypedEdge, WarmthEntry,
+    EntityListQuery, EntityListScope, EntityTypeStateCount, FeedbackOutcome, FoldEntry,
+    FoldSummary, MaterializedEdge, MemoEntry, MemoryState, PlanNode, PlanStatus, PromotedPredicate,
+    ProvenanceStep, RuleEntry, RuleState, TemporalEvent, TenantContext, ToolUsageRow, TypedEdge,
+    WarmthEntry,
 };
+
+fn entity_list_sessions(
+    tenant_id: Uuid,
+    caller_session: Uuid,
+    scope: EntityListScope,
+) -> Option<Vec<Uuid>> {
+    let global = crate::scope::tenant_global_session_uuid(tenant_id);
+    let nil = Uuid::nil();
+    let mut sessions = match scope {
+        EntityListScope::Session => vec![caller_session],
+        EntityListScope::Global => vec![global, nil],
+        EntityListScope::Both => vec![caller_session, global, nil],
+        EntityListScope::All => return None,
+    };
+    sessions.sort_unstable();
+    sessions.dedup();
+    Some(sessions)
+}
+
+fn json_scalar_matches(actual: &serde_json::Value, expected: &serde_json::Value) -> bool {
+    match (actual, expected) {
+        (serde_json::Value::Array(values), _) => values.iter().any(|value| value == expected),
+        (serde_json::Value::String(actual), serde_json::Value::String(expected)) => {
+            actual == expected
+        }
+        (serde_json::Value::Number(actual), serde_json::Value::Number(expected)) => {
+            actual == expected
+        }
+        (serde_json::Value::Bool(actual), serde_json::Value::Bool(expected)) => actual == expected,
+        _ => actual == expected,
+    }
+}
+
+fn property_path_value<'a>(
+    properties: &'a serde_json::Value,
+    path: &str,
+) -> Option<&'a serde_json::Value> {
+    let mut current = properties;
+    for part in path.split('.') {
+        current = current.get(part)?;
+    }
+    Some(current)
+}
+
+fn entity_matches_list_query(
+    entry: &EntityEntry,
+    ctx: &TenantContext,
+    query: &EntityListQuery,
+) -> bool {
+    if entry.tenant_id != ctx.tenant_id {
+        return false;
+    }
+    if let Some(entity_type) = query.entity_type.as_deref()
+        && entry.entity_type != entity_type
+    {
+        return false;
+    }
+
+    query
+        .filters
+        .iter()
+        .all(|(key, expected)| match key.as_str() {
+            "entity_id" | "id" => expected == &serde_json::json!(entry.entity_id.to_string()),
+            "session_id" => expected == &serde_json::json!(entry.session_id.to_string()),
+            "entity_name" | "name" => expected == &serde_json::json!(entry.entity_name),
+            "entity_type" => expected == &serde_json::json!(entry.entity_type),
+            "state" => expected == &serde_json::json!(entry.state.to_string()),
+            "scope" => {
+                let scope = match entry.scope {
+                    crate::types::EntityScope::Session => "session",
+                    crate::types::EntityScope::Global => "global",
+                };
+                expected == &serde_json::json!(scope)
+            }
+            "content_hash" => entry
+                .content_hash
+                .as_ref()
+                .is_some_and(|hash| expected == &serde_json::json!(hash)),
+            "tags" => match expected {
+                serde_json::Value::Array(required) => required.iter().all(|tag| {
+                    tag.as_str()
+                        .is_some_and(|tag| entry.tags.iter().any(|actual| actual == tag))
+                }),
+                serde_json::Value::String(tag) => entry.tags.iter().any(|actual| actual == tag),
+                _ => false,
+            },
+            "confidence" => expected
+                .as_f64()
+                .is_some_and(|expected| (entry.confidence - expected).abs() < f64::EPSILON),
+            key => {
+                let property_key = key.strip_prefix("properties.").unwrap_or(key);
+                property_path_value(&entry.properties, property_key)
+                    .is_some_and(|actual| json_scalar_matches(actual, expected))
+            }
+        })
+}
 
 /// Core storage operations for the memory system.
 ///
@@ -214,6 +311,42 @@ pub trait Storage: Send + Sync {
         ctx: &TenantContext,
         session_id: Uuid,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<EntityEntry>>> + Send;
+
+    /// List entities with structured equality predicates over entity columns
+    /// and JSON `properties`.
+    fn entity_list_matching(
+        &self,
+        ctx: &TenantContext,
+        query: EntityListQuery,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<EntityEntry>>> + Send {
+        async move {
+            let mut candidates = Vec::new();
+            if let Some(sessions) =
+                entity_list_sessions(ctx.tenant_id, query.session_id, query.scope)
+            {
+                for session_id in sessions {
+                    candidates.extend(self.entity_list_session(ctx, session_id).await?);
+                }
+            } else {
+                candidates = self.entity_list_all(ctx).await?;
+            }
+
+            let limit = query.limit.max(1);
+            candidates.sort_by(|a, b| {
+                let a_time = a.updated_at.unwrap_or(a.created_at);
+                let b_time = b.updated_at.unwrap_or(b.created_at);
+                b_time
+                    .cmp(&a_time)
+                    .then_with(|| a.entity_name.cmp(&b.entity_name))
+                    .then_with(|| a.entity_id.cmp(&b.entity_id))
+            });
+            Ok(candidates
+                .into_iter()
+                .filter(|entry| entity_matches_list_query(entry, ctx, &query))
+                .take(limit)
+                .collect())
+        }
+    }
 
     /// Return a flat histogram over entity_type and state for one session.
     fn entity_counts_by_type_and_state(

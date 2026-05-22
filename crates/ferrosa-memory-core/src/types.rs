@@ -214,6 +214,32 @@ pub struct EntityTypeStateCount {
     pub count: usize,
 }
 
+/// Session partition scope for structured entity listings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EntityListScope {
+    /// Only the caller's session partition.
+    Session,
+    /// Tenant global partitions: the deterministic global sentinel plus the
+    /// legacy nil-session partition used by older bulk scripts.
+    Global,
+    /// Caller session plus tenant global partitions.
+    Both,
+    /// Every session partition for this tenant. Uses a tenant-wide scan.
+    #[default]
+    All,
+}
+
+/// Structured entity list request used by storage backends.
+#[derive(Debug, Clone, Default)]
+pub struct EntityListQuery {
+    pub session_id: Uuid,
+    pub entity_type: Option<String>,
+    pub filters: serde_json::Map<String, serde_json::Value>,
+    pub scope: EntityListScope,
+    pub limit: usize,
+}
+
 impl Default for EntityEntry {
     fn default() -> Self {
         Self {
