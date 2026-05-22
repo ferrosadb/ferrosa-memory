@@ -38,37 +38,40 @@ first batch of any ingest script is silently dropped.
 
 ---
 
-### BUG-M-002 · P2 · `ferrosa_user` permission loss not detected — writes fail silently
+### BUG-M-005 · P2 · `create_edge` / `batch_create_edges` hang silently for 30s during ANN warmup
 
-**Component:** ferrosa-memory-mcp  
+**Component:** ferrosa-memory-mcp (root cause: ferrosa — see BUG-F-001)  
 **Version:** ≤ 0.9.0
 
-**Description:** After a ferrosa restart (which clears all GRANTs — see
-BUG-F-002), `smart_ingest` and `ingest_entities` return success responses
-(`inserted: 1, skipped: 0`) but insert nothing. No error is surfaced in the MCP
-response or tool output.
+**Description:** During the ANN index cold-load window (~300s after restart),
+`create_edge` and `batch_create_edges` do not return a fast 504 like other MCP
+tools. Instead they silently block for the full 30-second MCP request timeout
+before returning a non-actionable error: `Streamable HTTP error: Error POSTing
+to endpoint: request exceeded 30s`. No indication is given that the operation
+did not complete.
 
 **Reproduce:**
-1. Restart ferrosa without re-granting permissions.
-2. Call `smart_ingest` with a new entity.
-3. Observe: tool returns `{"inserted": 1}`.
-4. Call `retrieve_entities` with the same entity ID.
-5. Observe: entity not found.
+1. Restart ferrosa with 3,600+ entities in the store.
+2. Immediately call `batch_create_edges` with one or more edges.
+3. Observe: tool hangs for 30 seconds, then returns `request exceeded 30s`.
+4. Edges are not inserted.
 
-**Impact:** Ingest appears to succeed. Data is silently dropped. The only signal
-is a later retrieval miss.
+**Impact:** Graph edge operations silently fail during the warmup window with no
+actionable error. The hang duration (30s per call) means a batch-edge ingest
+script can burn through the entire warmup window one timeout at a time before
+discovering no edges landed.
 
-**Workaround:** Always re-grant permissions after a ferrosa restart before
-starting ferrosa-memory-mcp:
+**Workaround:**
+- Wait for the ANN warmup window to pass (confirmed via a successful
+  `get_stats` or `retrieve_entities` call) before calling graph edge tools.
+- If edges must be written during warmup, insert directly into the CQL table:
+  ```cql
+  INSERT INTO agent_memory.typed_edges
+    (tenant_id, session_id, src_id, edge_type, dst_id, weight, created_at)
+  VALUES (<tenant_uuid>, <session_uuid>, <src_uuid>, 'related_to', <dst_uuid>, 1.0, <ts_ms>)
+  ```
 
-```python
-from cassandra.cluster import Cluster
-from cassandra.auth import PlainTextAuthProvider
-s = Cluster(['127.0.0.1'], port=9042,
-            auth_provider=PlainTextAuthProvider('ferrosa_admin', 'ferrosa_admin'),
-            protocol_version=4).connect('agent_memory')
-s.execute("GRANT ALL PERMISSIONS ON KEYSPACE agent_memory TO ferrosa_user")
-```
+**Related:** BUG-M-001 (all tools 504 during warmup), BUG-F-001 (root cause).
 
 ---
 
@@ -135,24 +138,6 @@ health probe) before starting dependent services.
 
 ---
 
-### BUG-F-002 · P0 · Role permissions not persisted across restarts
-
-**Component:** ferrosa  
-**Version:** ≤ 0.11.0
-
-**Description:** `GRANT ALL PERMISSIONS ON KEYSPACE agent_memory TO ferrosa_user`
-is not persisted. Every ferrosa process restart drops all grants. Writes from
-sessions authenticated as `ferrosa_user` silently succeed with no rows inserted.
-
-**Impact:** Silent data loss after any restart. The symptom is
-indistinguishable from a successful write until a later retrieval miss reveals
-the missing rows.
-
-**Workaround:** Re-run the GRANT statement after every restart, before starting
-ferrosa-memory-mcp.
-
----
-
 ### BUG-F-003 · P2 · PREPARE returns malformed metadata — breaks cassandra-driver
 
 **Component:** ferrosa  
@@ -198,38 +183,22 @@ compaction and limiting storage management.
 
 ---
 
-### BUG-F-006 · P3 · Bolt graph vertex label DDL syntax undocumented and non-functional
-
-**Component:** ferrosa  
-**Version:** ≤ 0.11.0
-
-**Description:** `create_edge` and `explore_connections` require ferrosa's
-embedded Bolt server to have vertex label tables registered via Cypher DDL.
-None of the standard DDL forms work: `CREATE (n:Entity)`, `MERGE (n:Entity
-{id:$id})`, `CALL schema.createVertexLabel('Entity')` all return errors. No
-working DDL syntax is documented.
-
-**Impact:** The graph layer (`create_edge`, `explore_connections`) is
-non-functional for new installs. Edge inserts must bypass the MCP tool and write
-directly to the `typed_edges` CQL table.
-
-**Workaround:**
-```cql
-INSERT INTO agent_memory.typed_edges
-  (tenant_id, session_id, src_id, edge_type, dst_id, weight, created_at)
-VALUES (<tenant_uuid>, <session_uuid>, <src_uuid>, 'contains', <dst_uuid>, 1.0, <ts_ms>)
-```
-
 ---
 
 ## Fixed in 0.9.0 (ferrosa-memory-mcp)
 
 | # | Issue | PR |
 |---|-------|----|
-| `create_edge` MERGE omitted `tenant_id`/`session_id` from relationship key — edges silently dropped or unretriavable | [#27](https://github.com/ferrosadb/ferrosa-memory/pull/27) |
+| `create_edge` MERGE omitted `tenant_id`/`session_id` from relationship key — edges silently dropped or unretrievable | [#27](https://github.com/ferrosadb/ferrosa-memory/pull/27) |
 | `hybrid_search` did not cross session boundary — entities stored under nil-session UUID were invisible to live sessions | [#27](https://github.com/ferrosadb/ferrosa-memory/pull/27) |
 | No `list_entities` tool for structured equality filtering (status, entity_type, assignee, properties) | [#27](https://github.com/ferrosadb/ferrosa-memory/pull/27) |
 | First-use setup: circular bootstrap — MCP PREPARE statements issued before keyspace migrations run, causing infinite reconnect loop | [#28](https://github.com/ferrosadb/ferrosa-memory/pull/28) |
+
+## Fixed in 0.11.0 (ferrosa-memory-mcp)
+
+| # | Issue | Fix |
+|---|-------|-----|
+| **BUG-M-002** · `ferrosa_user` permission loss not detected — `smart_ingest`/`ingest_entities` returned success but silently dropped all writes after a ferrosa restart cleared grants. Root cause eliminated by BUG-F-002 fix: ferrosa 0.11.0 now persists grants across restarts, so `ferrosa_user` always has permissions after the initial `GRANT`. Re-grant once after upgrading to 0.11.0 to write the first persisted row. | ferrosa [#56](https://github.com/ferrosadb/ferrosa/pull/56) |
 
 ## Fixed in 0.11.0 (ferrosa)
 
@@ -238,6 +207,13 @@ VALUES (<tenant_uuid>, <session_uuid>, <src_uuid>, 'contains', <dst_uuid>, 1.0, 
 | Default internode port 7000 collides with macOS ControlCenter | [#55](https://github.com/ferrosadb/ferrosa/pull/55) |
 | `ferrosa.toml` config ignored when env vars absent | [#55](https://github.com/ferrosadb/ferrosa/pull/55) |
 | Corrupt/empty `host_id` crashes startup or causes silent split-brain | [#55](https://github.com/ferrosadb/ferrosa/pull/55) |
+| **BUG-F-002** · `GRANT`/`REVOKE` now written to `system_auth.role_permissions` via `SystemTableWriter`; `SystemTableLoader` replays grants on startup. Grants issued before this fix were never persisted — re-grant once after upgrading. | [#56](https://github.com/ferrosadb/ferrosa/pull/56) |
+
+## Retracted
+
+| # | Original report | Retraction |
+|---|-----------------|------------|
+| **BUG-F-006** · Bolt graph vertex label DDL undocumented and non-functional | The 30-second timeout that triggered the original diagnosis was caused by BUG-F-001 (ANN cold-load blocking all CQL). The underlying Cypher `MERGE` materialization bug (where `execute_merge` skipped the create arm when `skip_partition_read = true`) was fixed in ferrosa commit `b25f659` (2026-05-17). Graph edge operations via `create_edge` and `explore_connections` function correctly once the ANN warmup window has passed. |
 
 ## Historical (fixed prior to 0.9.0)
 
