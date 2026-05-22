@@ -67,6 +67,12 @@ struct PrincipalRecord {
 impl FileAuthValidator {
     pub fn from_path(path: &str) -> Result<Self, AuthError> {
         let principals = Self::load_principals(path)?;
+        if principals.is_empty() {
+            tracing::warn!(
+                path,
+                "auth file loaded but contains no principals — all requests will be rejected with 401"
+            );
+        }
         Ok(Self {
             principals: RwLock::new(principals),
             path: path.to_string(),
@@ -76,6 +82,12 @@ impl FileAuthValidator {
     pub fn reload(&self) -> Result<usize, AuthError> {
         let new_principals = Self::load_principals(&self.path)?;
         let count = new_principals.len();
+        if count == 0 {
+            tracing::warn!(
+                path = %self.path,
+                "auth file loaded but contains no principals — all requests will be rejected with 401"
+            );
+        }
         let mut guard = self.principals.write().unwrap();
         guard.clear();
         guard.extend(new_principals);

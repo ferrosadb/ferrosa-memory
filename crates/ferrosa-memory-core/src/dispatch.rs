@@ -14,6 +14,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use futures_util::future::join_all;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -6112,6 +6113,7 @@ async fn handle_batch_create_edges<S: crate::storage::Storage>(
 
     let mut created: usize = 0;
     let mut errors: usize = 0;
+    let mut parsed_edges = Vec::with_capacity(edges.len());
 
     for edge_json in edges {
         let src_id = match edge_json
@@ -6148,11 +6150,20 @@ async fn handle_batch_create_edges<S: crate::storage::Storage>(
             .and_then(|v| v.as_f64())
             .unwrap_or(1.0);
 
-        match crate::graph_write::create_typed_edge(
-            storage, ctx, session_id, src_id, edge_type, dst_id, weight, None,
-        )
-        .await
-        {
+        parsed_edges.push((src_id, edge_type.to_string(), dst_id, weight));
+    }
+
+    let writes = parsed_edges
+        .into_iter()
+        .map(|(src_id, edge_type, dst_id, weight)| async move {
+            crate::graph_write::create_typed_edge(
+                storage, ctx, session_id, src_id, edge_type, dst_id, weight, None,
+            )
+            .await
+        });
+
+    for result in join_all(writes).await {
+        match result {
             Ok(_) => created += 1,
             Err(_) => errors += 1,
         }

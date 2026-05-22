@@ -116,6 +116,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "fix trajectory_folds timeuuid → uuid fold identifiers",
         ddl: include_str!("../../../ddl/033_trajectory_folds_uuid_columns.cql"),
     },
+    Migration {
+        version: 34,
+        description: "secondary indexes for Datalog filters",
+        ddl: include_str!("../../../ddl/034_datalog_filter_indexes.cql"),
+    },
 ];
 
 /// Pre-versioning DDLs. Applied in order when `run_migrations` detects a
