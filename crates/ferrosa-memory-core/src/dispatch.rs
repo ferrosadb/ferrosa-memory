@@ -196,6 +196,57 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
     let entity_type_enum: Value = serde_json::json!(entity_types);
     vec![
         ToolDef {
+            name: "feedback_record".into(),
+            description: "Record terse feedback about a remote-memory candidate, classify it into a structured Packet H signal, and persist a queryable feedback explanation under the authenticated tenant.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tenant_id": { "type": "string", "description": "Must match the authenticated tenant context." },
+                    "remote_id": { "type": "string" },
+                    "target_id": { "type": "string", "description": "Remote item/entity/candidate UUID receiving feedback." },
+                    "source_namespace": { "type": "string", "minLength": 1 },
+                    "scope": { "type": "string", "minLength": 1 },
+                    "feedback": { "type": "string", "minLength": 1, "maxLength": 4096 }
+                },
+                "required": ["tenant_id", "remote_id", "target_id", "source_namespace", "scope", "feedback"]
+            }),
+        },
+        ToolDef {
+            name: "usage_mark".into(),
+            description: "Mark a remote-memory item as selected, confirmed, or successful and return a scoped trust reinforcement preview. Tenant id must match authenticated context.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tenant_id": { "type": "string" },
+                    "remote_id": { "type": "string" },
+                    "target_id": { "type": "string" },
+                    "source_namespace": { "type": "string", "minLength": 1 },
+                    "scope": { "type": "string", "minLength": 1 },
+                    "usage": { "type": "string", "enum": ["chosen", "confirmed", "success"] }
+                },
+                "required": ["tenant_id", "remote_id", "target_id", "source_namespace", "scope", "usage"]
+            }),
+        },
+        ToolDef {
+            name: "trust_update".into(),
+            description: "Apply scoped Packet H trust reinforcements for one remote namespace/scope and persist a not_trusted_for policy fact when repeated strong negatives cross threshold.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tenant_id": { "type": "string" },
+                    "remote_id": { "type": "string" },
+                    "source_namespace": { "type": "string", "minLength": 1 },
+                    "scope": { "type": "string", "minLength": 1 },
+                    "reinforcements": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": { "type": "string", "enum": ["chosen", "policy_chosen", "confirmed", "user_confirmed", "success", "wrong_scope", "strong_negative"] }
+                    }
+                },
+                "required": ["tenant_id", "remote_id", "source_namespace", "scope", "reinforcements"]
+            }),
+        },
+        ToolDef {
             name: "ingest_context_segments".into(),
             description: "Persist raw pre-compaction conversation context as deterministic semantic segments, with Nomic embeddings when configured and temporal prev/next links for later expansion.".into(),
             input_schema: serde_json::json!({
@@ -1451,6 +1502,9 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "ingest_entities" => handle_ingest_entities(args, storage, ctx, session).await,
         "retrieve_entities" => handle_retrieve_entities(args, storage, ctx, session).await,
         "record_outcome" => handle_record_outcome(args, storage, ctx).await,
+        "feedback_record" => handle_feedback_record(args, storage, ctx).await,
+        "usage_mark" => handle_usage_mark(args, ctx).await,
+        "trust_update" => handle_trust_update(args, storage, ctx).await,
         "delete_session" => handle_delete_session(args, storage, ctx).await,
         "smart_ingest" => handle_smart_ingest(args, storage, ctx, session).await,
         "ingest_skill" => handle_ingest_skill(args, storage, ctx, session).await,
@@ -1615,6 +1669,9 @@ fn is_tier1(name: &str) -> bool {
             | "find_memory_chain"
             | "run_consolidation"
             | "record_outcome"
+            | "feedback_record"
+            | "usage_mark"
+            | "trust_update"
     )
 }
 
@@ -1634,6 +1691,9 @@ fn is_write_tool(name: &str) -> bool {
             | "batch_ingest"
             | "ingest_entities"
             | "record_outcome"
+            | "feedback_record"
+            | "usage_mark"
+            | "trust_update"
             | "delete_session"
             | "smart_ingest"
             | "set_intention"
@@ -1655,6 +1715,240 @@ fn is_write_tool(name: &str) -> bool {
 }
 
 // --- Tool handlers ---
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FeedbackRecordRequest {
+    tenant_id: uuid::Uuid,
+    remote_id: uuid::Uuid,
+    target_id: uuid::Uuid,
+    source_namespace: String,
+    scope: String,
+    feedback: String,
+}
+
+async fn handle_feedback_record<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let request: FeedbackRecordRequest = serde_json::from_value(args).map_err(|e| {
+        (
+            INVALID_PARAMS,
+            format!("invalid feedback_record request: {e}"),
+        )
+    })?;
+    if request.tenant_id != ctx.tenant_id {
+        return Err((
+            INVALID_PARAMS,
+            format!(
+                "tenant_id {} does not match authenticated tenant {}",
+                request.tenant_id, ctx.tenant_id
+            ),
+        ));
+    }
+    if request.feedback.trim().is_empty() {
+        return Err((INVALID_PARAMS, "feedback must not be empty".into()));
+    }
+    if request.source_namespace.trim().is_empty() || request.scope.trim().is_empty() {
+        return Err((
+            INVALID_PARAMS,
+            "source_namespace and scope must not be empty".into(),
+        ));
+    }
+
+    let signal = crate::remotes::feedback::FeedbackSignal::classify(&request.feedback);
+    let note = format!(
+        "Packet H feedback for namespace={} scope={}: {}; raw={}",
+        request.source_namespace,
+        request.scope,
+        signal.explanation,
+        request.feedback.trim()
+    );
+    let feedback = crate::remotes::types::MemoryFeedback {
+        feedback_id: uuid::Uuid::new_v4(),
+        remote_id: request.remote_id,
+        target_id: request.target_id,
+        feedback_type: signal.feedback_type,
+        note: Some(note.clone()),
+        created_at: chrono::Utc::now(),
+    };
+    storage
+        .memory_feedback_put(ctx, &feedback)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    Ok(serde_json::json!({
+        "feedback_id": feedback.feedback_id,
+        "remote_id": request.remote_id,
+        "target_id": request.target_id,
+        "source_namespace": request.source_namespace,
+        "scope": request.scope,
+        "feedback_type": signal.feedback_type,
+        "weight": signal.weight,
+        "requires_review": signal.requires_review,
+        "applicability_correction": signal.applicability_correction,
+        "explanation": signal.explanation,
+        "halt_current_chain": signal.halt_current_chain,
+        "guidance": if signal.halt_current_chain {
+            "halt the current remote-memory chain and require an explicit next retrieval"
+        } else {
+            "persist feedback and apply only scoped trust updates"
+        },
+        "stored_note": note,
+    }))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UsageMarkRequest {
+    tenant_id: uuid::Uuid,
+    remote_id: uuid::Uuid,
+    target_id: uuid::Uuid,
+    source_namespace: String,
+    scope: String,
+    usage: String,
+}
+
+async fn handle_usage_mark(
+    args: Value,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let request: UsageMarkRequest = serde_json::from_value(args)
+        .map_err(|e| (INVALID_PARAMS, format!("invalid usage_mark request: {e}")))?;
+    ensure_remote_tenant(request.tenant_id, ctx)?;
+    if request.source_namespace.trim().is_empty() || request.scope.trim().is_empty() {
+        return Err((
+            INVALID_PARAMS,
+            "source_namespace and scope must not be empty".into(),
+        ));
+    }
+    let reinforcement = usage_reinforcement(&request.usage)?;
+    let key = crate::remotes::feedback::TrustKey::new(
+        request.remote_id,
+        request.source_namespace.clone(),
+        request.scope.clone(),
+    );
+    let mut ledger = crate::remotes::feedback::TrustLedger::default();
+    let update = ledger.apply(&key, reinforcement);
+    Ok(serde_json::json!({
+        "remote_id": request.remote_id,
+        "target_id": request.target_id,
+        "source_namespace": request.source_namespace,
+        "scope": request.scope,
+        "usage": request.usage,
+        "reinforcement": reinforcement,
+        "delta": update.delta,
+        "score": update.score,
+        "policy_persisted": false,
+        "guidance": "apply this reinforcement only to the returned remote_id/source_namespace/scope key",
+    }))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrustUpdateRequest {
+    tenant_id: uuid::Uuid,
+    remote_id: uuid::Uuid,
+    source_namespace: String,
+    scope: String,
+    reinforcements: Vec<String>,
+}
+
+async fn handle_trust_update<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let request: TrustUpdateRequest = serde_json::from_value(args)
+        .map_err(|e| (INVALID_PARAMS, format!("invalid trust_update request: {e}")))?;
+    ensure_remote_tenant(request.tenant_id, ctx)?;
+    if request.source_namespace.trim().is_empty() || request.scope.trim().is_empty() {
+        return Err((
+            INVALID_PARAMS,
+            "source_namespace and scope must not be empty".into(),
+        ));
+    }
+    if request.reinforcements.is_empty() {
+        return Err((
+            INVALID_PARAMS,
+            "reinforcements must contain at least one entry".into(),
+        ));
+    }
+    let key = crate::remotes::feedback::TrustKey::new(
+        request.remote_id,
+        request.source_namespace.clone(),
+        request.scope.clone(),
+    );
+    let mut ledger = crate::remotes::feedback::TrustLedger::default();
+    let mut updates = Vec::with_capacity(request.reinforcements.len());
+    for raw in &request.reinforcements {
+        let reinforcement = trust_reinforcement(raw)?;
+        updates.push(ledger.apply(&key, reinforcement));
+    }
+    let policy = ledger.not_trusted_for_fact(&key);
+    let policy_persisted = policy.is_some();
+    if let Some(fact) = &policy {
+        storage
+            .remote_policy_put(ctx, fact)
+            .await
+            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    }
+    let final_score = ledger.score(&key);
+    Ok(serde_json::json!({
+        "remote_id": request.remote_id,
+        "source_namespace": request.source_namespace,
+        "scope": request.scope,
+        "score": final_score,
+        "updates": updates,
+        "policy_persisted": policy_persisted,
+        "policy_fact": policy,
+        "guidance": "trust updates are scoped by remote_id, source_namespace, and scope; do not apply globally",
+    }))
+}
+
+fn ensure_remote_tenant(
+    tenant_id: uuid::Uuid,
+    ctx: &crate::types::TenantContext,
+) -> Result<(), (i32, String)> {
+    if tenant_id == ctx.tenant_id {
+        return Ok(());
+    }
+    Err((
+        INVALID_PARAMS,
+        format!(
+            "tenant_id {} does not match authenticated tenant {}",
+            tenant_id, ctx.tenant_id
+        ),
+    ))
+}
+
+fn usage_reinforcement(
+    usage: &str,
+) -> Result<crate::remotes::feedback::Reinforcement, (i32, String)> {
+    match usage.trim().to_ascii_lowercase().as_str() {
+        "chosen" => Ok(crate::remotes::feedback::Reinforcement::PolicyChosen),
+        "confirmed" | "success" => Ok(crate::remotes::feedback::Reinforcement::UserConfirmed),
+        other => Err((INVALID_PARAMS, format!("unknown usage mark: {other}"))),
+    }
+}
+
+fn trust_reinforcement(
+    raw: &str,
+) -> Result<crate::remotes::feedback::Reinforcement, (i32, String)> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "chosen" | "policy_chosen" => Ok(crate::remotes::feedback::Reinforcement::PolicyChosen),
+        "confirmed" | "user_confirmed" | "success" => {
+            Ok(crate::remotes::feedback::Reinforcement::UserConfirmed)
+        }
+        "wrong_scope" => Ok(crate::remotes::feedback::Reinforcement::WrongScope),
+        "strong_negative" => Ok(crate::remotes::feedback::Reinforcement::StrongNegative),
+        other => Err((
+            INVALID_PARAMS,
+            format!("unknown trust reinforcement: {other}"),
+        )),
+    }
+}
 
 async fn handle_check_memo<S: crate::storage::Storage>(
     args: Value,
@@ -6691,6 +6985,191 @@ mod tests {
         assert!(!names.contains(&"recursive_explore"));
         assert!(!names.contains(&"promote_memory"));
         assert!(!names.contains(&"list_derived_cache"));
+    }
+
+    #[tokio::test]
+    async fn remote_feedback_record_rejects_forged_tenant() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let remote_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+        let forged = Uuid::new_v4();
+
+        let err = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "feedback_record",
+                "arguments": {
+                    "tenant_id": forged.to_string(),
+                    "remote_id": remote_id.to_string(),
+                    "target_id": target_id.to_string(),
+                    "source_namespace": "gpu_builds",
+                    "scope": "linux",
+                    "feedback": "no"
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, INVALID_PARAMS);
+        assert!(err.1.contains("authenticated tenant"));
+    }
+
+    #[tokio::test]
+    async fn remote_feedback_negative_creates_queryable_explanation() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let remote_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+
+        let result = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "feedback_record",
+                "arguments": {
+                    "tenant_id": ctx.tenant_id.to_string(),
+                    "remote_id": remote_id.to_string(),
+                    "target_id": target_id.to_string(),
+                    "source_namespace": "gpu_builds",
+                    "scope": "linux",
+                    "feedback": "WTF"
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let body = unwrap_tool_result(result);
+
+        assert_eq!(body["feedback_type"], "wrong_fact");
+        assert_eq!(body["requires_review"], true);
+        assert!(
+            body["explanation"]
+                .as_str()
+                .unwrap()
+                .contains("strong negative")
+        );
+
+        let rows = store
+            .memory_feedback_list_by_target(&ctx, remote_id, target_id)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].note.as_ref().unwrap().contains("strong negative"));
+    }
+
+    #[tokio::test]
+    async fn remote_feedback_stop_signal_surfaces_halt_guidance() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let remote_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+
+        let result = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "feedback_record",
+                "arguments": {
+                    "tenant_id": ctx.tenant_id.to_string(),
+                    "remote_id": remote_id.to_string(),
+                    "target_id": target_id.to_string(),
+                    "source_namespace": "gpu_builds",
+                    "scope": "linux",
+                    "feedback": "stop"
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let body = unwrap_tool_result(result);
+
+        assert_eq!(body["feedback_type"], "stop_signal");
+        assert_eq!(body["halt_current_chain"], true);
+        assert!(body["guidance"].as_str().unwrap().contains("halt"));
+    }
+
+    #[tokio::test]
+    async fn remote_usage_mark_rejects_forged_tenant() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+
+        let err = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "usage_mark",
+                "arguments": {
+                    "tenant_id": Uuid::new_v4().to_string(),
+                    "remote_id": Uuid::new_v4().to_string(),
+                    "target_id": Uuid::new_v4().to_string(),
+                    "source_namespace": "gpu_builds",
+                    "scope": "linux",
+                    "usage": "confirmed"
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, INVALID_PARAMS);
+        assert!(err.1.contains("authenticated tenant"));
+    }
+
+    #[tokio::test]
+    async fn remote_trust_update_repeated_strong_negative_persists_scoped_policy() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let remote_id = Uuid::new_v4();
+
+        let result = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "trust_update",
+                "arguments": {
+                    "tenant_id": ctx.tenant_id.to_string(),
+                    "remote_id": remote_id.to_string(),
+                    "source_namespace": "deployment_info",
+                    "scope": "linux",
+                    "reinforcements": ["strong_negative", "strong_negative"]
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let body = unwrap_tool_result(result);
+
+        assert_eq!(body["source_namespace"], "deployment_info");
+        assert_eq!(body["scope"], "linux");
+        assert_eq!(body["policy_persisted"], true);
+
+        let facts = store.remote_policy_list(&ctx, remote_id).await.unwrap();
+        assert_eq!(facts.len(), 1);
+        match &facts[0].kind {
+            crate::remotes::types::RemotePolicyKind::Deny(deny) => {
+                assert_eq!(deny.namespace, "deployment_info");
+                assert_eq!(deny.deny, "not_trusted_for:linux");
+            }
+            other => panic!("expected deny policy, got {other:?}"),
+        }
     }
 
     #[tokio::test]

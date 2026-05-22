@@ -1,0 +1,10 @@
+//! Module: Remote teacher/learner transfer domain surface.
+//! Correctness: Correct when packet types round-trip, remote storage remains tenant-scoped, and policy/import rows are represented without lossy JSON call sites.
+//! Last revised: 2026-05-12
+//! Last changed: Added Packet C policy and Packet D applicability/safety modules.
+
+pub mod applicability;
+pub mod feedback;
+pub mod policy;
+pub mod safety;
+pub mod types;
