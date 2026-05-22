@@ -243,8 +243,8 @@ jobs:
               environment:
                 RUSTFS_VOLUMES: /data/rustfs0
                 RUSTFS_ADDRESS: "0.0.0.0:9000"
-                RUSTFS_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
-                RUSTFS_SECRET_KEY: rustfsadmin  # pragma: allowlist secret
+                RUSTFS_ACCESS_KEY: ferrosa-ci-access  # pragma: allowlist secret
+                RUSTFS_SECRET_KEY: ferrosa-ci-secret-key  # pragma: allowlist secret
               healthcheck:
                 test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
                 interval: 5s
@@ -257,7 +257,7 @@ jobs:
                 rustfs:
                   condition: service_healthy
               entrypoint: >
-                sh -c "mc alias set local http://rustfs:9000 rustfsadmin rustfsadmin &&
+                sh -c "mc alias set local http://rustfs:9000 ferrosa-ci-access ferrosa-ci-secret-key &&
                        mc mb local/ferrosa-test --ignore-existing &&
                        echo 'bucket ferrosa-test ready'"
               restart: "no"
@@ -285,8 +285,8 @@ jobs:
                 FERROSA_S3_ENDPOINT: "http://rustfs:9000"
                 FERROSA_S3_BUCKET: "ferrosa-test"
                 FERROSA_S3_ALLOW_HTTP: "true"
-                FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
-                FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+                FERROSA_S3_ACCESS_KEY_ID: "ferrosa-ci-access"
+                FERROSA_S3_SECRET_ACCESS_KEY: "ferrosa-ci-secret-key"  # pragma: allowlist secret
               healthcheck:
                 test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9042' || exit 1"]
                 interval: 5s
@@ -315,8 +315,8 @@ jobs:
                 FERROSA_S3_ENDPOINT: "http://rustfs:9000"
                 FERROSA_S3_BUCKET: "ferrosa-test"
                 FERROSA_S3_ALLOW_HTTP: "true"
-                FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
-                FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+                FERROSA_S3_ACCESS_KEY_ID: "ferrosa-ci-access"
+                FERROSA_S3_SECRET_ACCESS_KEY: "ferrosa-ci-secret-key"  # pragma: allowlist secret
               healthcheck:
                 test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9042' || exit 1"]
                 interval: 5s
@@ -347,8 +347,8 @@ jobs:
                 FERROSA_S3_ENDPOINT: "http://rustfs:9000"
                 FERROSA_S3_BUCKET: "ferrosa-test"
                 FERROSA_S3_ALLOW_HTTP: "true"
-                FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
-                FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+                FERROSA_S3_ACCESS_KEY_ID: "ferrosa-ci-access"
+                FERROSA_S3_SECRET_ACCESS_KEY: "ferrosa-ci-secret-key"  # pragma: allowlist secret
               healthcheck:
                 test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9042' || exit 1"]
                 interval: 5s

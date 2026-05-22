@@ -110,18 +110,16 @@ pub struct SearchFilter {
 /// Resolve the list of session partitions to query given the caller's session
 /// and the filter scope.
 fn sessions_to_query(caller_session: Uuid, tenant_id: Uuid, scope: SearchScope) -> Vec<Uuid> {
-    match scope {
+    let global = crate::scope::tenant_global_session_uuid(tenant_id);
+    let nil = Uuid::nil();
+    let mut sessions = match scope {
         SearchScope::SessionOnly => vec![caller_session],
-        SearchScope::GlobalOnly => vec![crate::scope::tenant_global_session_uuid(tenant_id)],
-        SearchScope::Both => {
-            let global = crate::scope::tenant_global_session_uuid(tenant_id);
-            if caller_session == global {
-                vec![global]
-            } else {
-                vec![caller_session, global]
-            }
-        }
-    }
+        SearchScope::GlobalOnly => vec![global, nil],
+        SearchScope::Both => vec![caller_session, global, nil],
+    };
+    sessions.sort_unstable();
+    sessions.dedup();
+    sessions
 }
 
 /// Run a hybrid search combining up to 6 signals: phonetic entity lookup,
@@ -325,30 +323,30 @@ mod tests {
         let caller = Uuid::new_v4();
         let tenant = Uuid::new_v4();
         let sessions = sessions_to_query(caller, tenant, SearchScope::GlobalOnly);
-        assert_eq!(
-            sessions,
-            vec![crate::scope::tenant_global_session_uuid(tenant)]
-        );
+        assert!(sessions.contains(&crate::scope::tenant_global_session_uuid(tenant)));
+        assert!(sessions.contains(&Uuid::nil()));
+        assert_eq!(sessions.len(), 2);
     }
 
     #[test]
-    fn sessions_to_query_both_returns_caller_and_sentinel() {
+    fn sessions_to_query_both_returns_caller_sentinel_and_legacy_nil() {
         let caller = Uuid::new_v4();
         let tenant = Uuid::new_v4();
         let sessions = sessions_to_query(caller, tenant, SearchScope::Both);
-        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions.len(), 3);
         assert!(sessions.contains(&caller));
         assert!(sessions.contains(&crate::scope::tenant_global_session_uuid(tenant)));
+        assert!(sessions.contains(&Uuid::nil()));
     }
 
     #[test]
     fn sessions_to_query_both_dedups_when_caller_is_sentinel() {
-        // If a caller happens to pass the global sentinel as their session,
-        // don't query the same partition twice.
         let tenant = Uuid::new_v4();
         let sentinel = crate::scope::tenant_global_session_uuid(tenant);
         let sessions = sessions_to_query(sentinel, tenant, SearchScope::Both);
-        assert_eq!(sessions, vec![sentinel]);
+        assert!(sessions.contains(&sentinel));
+        assert!(sessions.contains(&Uuid::nil()));
+        assert_eq!(sessions.len(), 2);
     }
 
     #[test]

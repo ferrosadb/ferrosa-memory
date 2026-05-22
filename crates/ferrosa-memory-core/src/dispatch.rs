@@ -572,6 +572,32 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                 "required": ["query"]
             }),
         },
+        ToolDef {
+            name: "list_entities".into(),
+            description: "List entities with structured equality predicates over entity fields and properties. Use this for kanban/task-style queries such as all task entities with status=ready and assignee=claude; use hybrid_search for semantic recall.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "entity_type": { "type": "string", "description": "Optional entity_type filter, e.g. task" },
+                    "filters": {
+                        "type": "object",
+                        "description": "Equality predicates. Known entity fields include entity_id/id, session_id, entity_name/name, entity_type, state, scope, tags, content_hash, confidence. Other keys match properties.<key>."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["session", "global", "both", "all"],
+                        "description": "session=current session; global=tenant global plus legacy nil session; both=session+global; all=tenant-wide scan. Default all."
+                    },
+                    "include_cross_session": {
+                        "type": "boolean",
+                        "description": "Compatibility flag. true is equivalent to scope=all; false is equivalent to scope=session when scope is omitted."
+                    },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Max results to return (default 50)" }
+                },
+                "required": []
+            }),
+        },
         // --- Feedback tool (Sprint 3) ---
         ToolDef {
             name: "record_outcome".into(),
@@ -838,7 +864,16 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                         "items": { "type": "number" },
                         "description": "Optional embedding vector for ANN search strategies"
                     },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Max results to return (default: 10)" }
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Max results to return (default: 10)" },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["session", "global", "both"],
+                        "description": "session=current session only; global=tenant global plus legacy nil session; both=session+global. Default session."
+                    },
+                    "include_cross_session": {
+                        "type": "boolean",
+                        "description": "Compatibility flag. true is equivalent to scope=both when scope is omitted."
+                    }
                 },
                 "required": ["query"]
             }),
@@ -1450,6 +1485,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "batch_ingest" => handle_batch_ingest(args, storage, ctx, session).await,
         "ingest_entities" => handle_ingest_entities(args, storage, ctx, session).await,
         "retrieve_entities" => handle_retrieve_entities(args, storage, ctx, session).await,
+        "list_entities" => handle_list_entities(args, storage, ctx).await,
         "record_outcome" => handle_record_outcome(args, storage, ctx).await,
         "delete_session" => handle_delete_session(args, storage, ctx).await,
         "smart_ingest" => handle_smart_ingest(args, storage, ctx, session).await,
@@ -1612,6 +1648,7 @@ fn is_tier1(name: &str) -> bool {
             | "write_temporal_fact"
             | "get_temporal_chain"
             | "retrieve_entities"
+            | "list_entities"
             | "find_memory_chain"
             | "run_consolidation"
             | "record_outcome"
@@ -3462,6 +3499,90 @@ async fn handle_retrieve_entities<S: crate::storage::Storage>(
     serde_json::to_value(&slim).map_err(|e| (INTERNAL_ERROR, e.to_string()))
 }
 
+fn parse_entity_list_scope(args: &Value) -> Result<crate::types::EntityListScope, (i32, String)> {
+    if let Some(scope) = args.get("scope").and_then(|v| v.as_str()) {
+        return match scope {
+            "session" | "session_only" => Ok(crate::types::EntityListScope::Session),
+            "global" | "global_only" => Ok(crate::types::EntityListScope::Global),
+            "both" => Ok(crate::types::EntityListScope::Both),
+            "all" => Ok(crate::types::EntityListScope::All),
+            other => Err((
+                INVALID_PARAMS,
+                format!("invalid scope: expected session|global|both|all, got {other}"),
+            )),
+        };
+    }
+
+    match args.get("include_cross_session").and_then(|v| v.as_bool()) {
+        Some(true) | None => Ok(crate::types::EntityListScope::All),
+        Some(false) => Ok(crate::types::EntityListScope::Session),
+    }
+}
+
+fn entity_list_response_entry(entity: &crate::types::EntityEntry) -> Value {
+    serde_json::json!({
+        "entity_id": entity.entity_id,
+        "session_id": entity.session_id,
+        "entity_name": entity.entity_name,
+        "entity_type": entity.entity_type,
+        "context_snippet": entity.context_snippet,
+        "confidence": entity.confidence,
+        "state": entity.state,
+        "created_at": entity.created_at,
+        "updated_at": entity.updated_at,
+        "scope": entity.scope,
+        "ingested_by_session": entity.ingested_by_session,
+        "tags": entity.tags,
+        "properties": entity.properties,
+        "content_hash": entity.content_hash,
+    })
+}
+
+async fn handle_list_entities<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(50)
+        .clamp(1, 500) as usize;
+    let filters = match args.get("filters") {
+        Some(Value::Object(map)) => map.clone(),
+        Some(Value::Null) | None => serde_json::Map::new(),
+        Some(_) => {
+            return Err((
+                INVALID_PARAMS,
+                "filters must be an object of equality predicates".into(),
+            ));
+        }
+    };
+    let query = crate::types::EntityListQuery {
+        session_id,
+        entity_type: args
+            .get("entity_type")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        filters,
+        scope: parse_entity_list_scope(&args)?,
+        limit,
+    };
+
+    let scope = query.scope;
+    let entities = storage
+        .entity_list_matching(ctx, query)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    let response_entities: Vec<Value> = entities.iter().map(entity_list_response_entry).collect();
+    Ok(serde_json::json!({
+        "entities": response_entities,
+        "count": response_entities.len(),
+        "scope": scope,
+    }))
+}
+
 // --- Memory state handlers ---
 
 async fn handle_promote_memory<S: crate::storage::Storage>(
@@ -4449,6 +4570,31 @@ async fn handle_explore_connections<S: crate::storage::Storage>(
 
 // --- Hybrid search handler ---
 
+fn parse_hybrid_search_scope(
+    args: &Value,
+) -> Result<crate::hybrid_search::SearchScope, (i32, String)> {
+    if let Some(scope) = args.get("scope").and_then(|v| v.as_str()) {
+        return match scope {
+            "session" | "session_only" => Ok(crate::hybrid_search::SearchScope::SessionOnly),
+            "global" | "global_only" => Ok(crate::hybrid_search::SearchScope::GlobalOnly),
+            "both" => Ok(crate::hybrid_search::SearchScope::Both),
+            other => Err((
+                INVALID_PARAMS,
+                format!("invalid scope: expected session|global|both, got {other}"),
+            )),
+        };
+    }
+    if args
+        .get("include_cross_session")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        Ok(crate::hybrid_search::SearchScope::Both)
+    } else {
+        Ok(crate::hybrid_search::SearchScope::SessionOnly)
+    }
+}
+
 async fn handle_hybrid_search<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
@@ -4459,6 +4605,11 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
     let query = require_str(&args, "query")?;
     let mut embedding = optional_f32_array(&args, "embedding")?;
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    let filter = crate::hybrid_search::SearchFilter {
+        scope: parse_hybrid_search_scope(&args)?,
+        entity_types: None,
+        tags: None,
+    };
 
     // Auto-generate query embedding for ANN search if Ollama is configured.
     if embedding.is_none() && !session.ollama_base_url.is_empty() {
@@ -4487,7 +4638,7 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         None,
         None,
         &crate::hybrid_search::FusionConfig::default(),
-        None,
+        Some(&filter),
     )
     .await
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
@@ -6594,6 +6745,183 @@ mod tests {
             tenant_id: Uuid::new_v4(),
             session_origin: "test".into(),
         }
+    }
+
+    fn test_entity(
+        ctx: &TenantContext,
+        session_id: Uuid,
+        name: &str,
+        entity_type: &str,
+        properties: Value,
+    ) -> crate::types::EntityEntry {
+        crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id,
+            entity_name: name.into(),
+            entity_type: entity_type.into(),
+            context_snippet: format!("{name} context"),
+            confidence: 1.0,
+            created_at: chrono::Utc::now(),
+            properties,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn list_entities_filters_properties_across_sessions_by_default() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let live_session = Uuid::new_v4();
+        let session = SessionState::default();
+
+        let nil_task = test_entity(
+            &ctx,
+            Uuid::nil(),
+            "nil ready task",
+            "task",
+            serde_json::json!({"status": "ready", "assignee": "claude"}),
+        );
+        let live_task = test_entity(
+            &ctx,
+            live_session,
+            "live ready task",
+            "task",
+            serde_json::json!({"status": "ready", "assignee": "claude"}),
+        );
+        let blocked_task = test_entity(
+            &ctx,
+            Uuid::nil(),
+            "blocked task",
+            "task",
+            serde_json::json!({"status": "blocked", "assignee": "claude"}),
+        );
+        store.entity_put(&ctx, &nil_task).await.unwrap();
+        store.entity_put(&ctx, &live_task).await.unwrap();
+        store.entity_put(&ctx, &blocked_task).await.unwrap();
+
+        let params = serde_json::json!({
+            "name": "list_entities",
+            "arguments": {
+                "session_id": live_session.to_string(),
+                "entity_type": "task",
+                "filters": { "status": "ready", "assignee": "claude" },
+                "limit": 50
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        let names: std::collections::HashSet<_> = result["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entity| entity["entity_name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(result["count"], 2);
+        assert!(names.contains("nil ready task"));
+        assert!(names.contains("live ready task"));
+        assert!(!names.contains("blocked task"));
+    }
+
+    #[tokio::test]
+    async fn list_entities_can_stay_session_scoped() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let live_session = Uuid::new_v4();
+        let session = SessionState::default();
+
+        store
+            .entity_put(
+                &ctx,
+                &test_entity(
+                    &ctx,
+                    Uuid::nil(),
+                    "nil ready task",
+                    "task",
+                    serde_json::json!({"status": "ready"}),
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .entity_put(
+                &ctx,
+                &test_entity(
+                    &ctx,
+                    live_session,
+                    "live ready task",
+                    "task",
+                    serde_json::json!({"status": "ready"}),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let params = serde_json::json!({
+            "name": "list_entities",
+            "arguments": {
+                "session_id": live_session.to_string(),
+                "entity_type": "task",
+                "filters": { "status": "ready" },
+                "include_cross_session": false
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["count"], 1);
+        assert_eq!(result["entities"][0]["entity_name"], "live ready task");
+        assert_eq!(result["scope"], "session");
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_cross_session_includes_legacy_nil_session() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let live_session = Uuid::new_v4();
+        let session = SessionState::default();
+
+        store
+            .entity_put(
+                &ctx,
+                &test_entity(
+                    &ctx,
+                    Uuid::nil(),
+                    "beam actor model task",
+                    "task",
+                    serde_json::json!({"status": "ready"}),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let scoped_params = serde_json::json!({
+            "name": "hybrid_search",
+            "arguments": {
+                "session_id": live_session.to_string(),
+                "query": "beam actor model task"
+            }
+        });
+        let scoped = dispatch("tools/call", scoped_params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        assert_eq!(unwrap_tool_result(scoped)["count"], 0);
+
+        let cross_session_params = serde_json::json!({
+            "name": "hybrid_search",
+            "arguments": {
+                "session_id": live_session.to_string(),
+                "query": "beam actor model task",
+                "include_cross_session": true
+            }
+        });
+        let cross_session = dispatch("tools/call", cross_session_params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        assert_eq!(unwrap_tool_result(cross_session)["count"], 1);
     }
 
     #[tokio::test]
