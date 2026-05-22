@@ -2878,6 +2878,28 @@ fn build_ingest_embedding_client(
     ))
 }
 
+fn write_not_visible_message(tool: &str, entity_id: uuid::Uuid) -> String {
+    format!(
+        "write_not_visible: {tool} reported entity {entity_id} written but it could not be read back. Ferrosa permissions may have been lost after restart; re-run GRANTs for ferrosa_user before retrying."
+    )
+}
+
+async fn verify_entity_write_visible<S: crate::storage::Storage>(
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session_id: uuid::Uuid,
+    entity_id: uuid::Uuid,
+    tool: &str,
+) -> Result<(), String> {
+    match storage.entity_get_by_id(ctx, session_id, entity_id).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(write_not_visible_message(tool, entity_id)),
+        Err(err) => Err(format!(
+            "write_visibility_check_failed: {err}. Ferrosa permissions may have been lost after restart; re-run GRANTs for ferrosa_user before retrying."
+        )),
+    }
+}
+
 async fn handle_ingest_entities<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
@@ -3084,6 +3106,22 @@ async fn handle_ingest_entities<S: crate::storage::Storage>(
             entity_failed.push(serde_json::json!({
                 "id": entity.id.to_string(),
                 "reason": err.to_string()
+            }));
+            continue;
+        }
+        if !request.options.dry_run
+            && let Err(reason) = verify_entity_write_visible(
+                storage,
+                ctx,
+                request.session_id,
+                entity.id,
+                "ingest_entities",
+            )
+            .await
+        {
+            entity_failed.push(serde_json::json!({
+                "id": entity.id.to_string(),
+                "reason": reason
             }));
             continue;
         }
@@ -4169,6 +4207,14 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+
+    if matches!(action.as_str(), "Created" | "Updated" | "Superseded")
+        && let Ok(written_entity_id) = entity_id.parse::<uuid::Uuid>()
+    {
+        verify_entity_write_visible(storage, ctx, session_id, written_entity_id, "smart_ingest")
+            .await
+            .map_err(|msg| (INTERNAL_ERROR, msg))?;
+    }
 
     if !entity_id.is_empty() {
         session.event_bus.emit(crate::viz::VizEvent::EntityChanged {
@@ -8025,6 +8071,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ingest_entities_reports_write_not_visible_after_silent_permission_loss() {
+        let store = MockStorage::new();
+        *store.force_entity_put_drop.lock().await = Some("bug".into());
+        let ctx = test_ctx();
+        let session = SessionState {
+            ollama_base_url: String::new(),
+            entity_types: vec!["bug".into()],
+            ..SessionState::default()
+        };
+        let sid = Uuid::new_v4();
+        let entity_id = Uuid::new_v4();
+
+        let result = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "ingest_entities",
+                "arguments": {
+                    "tenant_id": ctx.tenant_id.to_string(),
+                    "session_id": sid.to_string(),
+                    "entities": [
+                        {
+                            "id": entity_id.to_string(),
+                            "name": "Bug M002",
+                            "entity_type": "bug",
+                            "context": "permission loss should not be silent"
+                        }
+                    ],
+                    "options": {
+                        "embed_missing": false
+                    }
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["entities"]["inserted"], 0);
+        let failed = result["entities"]["failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 1);
+        let reason = failed[0]["reason"].as_str().unwrap();
+        assert!(reason.contains("write_not_visible"), "got: {reason}");
+        assert!(reason.contains("ferrosa_user"), "got: {reason}");
+        assert!(reason.contains("GRANT"), "got: {reason}");
+    }
+
+    #[tokio::test]
     async fn ingest_entities_rejects_tenant_mismatch() {
         let store = MockStorage::new();
         let ctx = test_ctx();
@@ -8184,6 +8279,38 @@ mod tests {
         let result = unwrap_tool_result(result);
         assert_eq!(result["action"], "Created");
         assert!(result["entity_id"].is_string());
+    }
+
+    #[tokio::test]
+    async fn smart_ingest_errors_when_created_entity_is_not_visible_after_write() {
+        let store = MockStorage::new();
+        *store.force_entity_put_drop.lock().await = Some("concept".into());
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+
+        let err = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "smart_ingest",
+                "arguments": {
+                    "session_id": sid.to_string(),
+                    "content": "BUG-M-002 should surface invisible writes",
+                    "entity_type": "concept",
+                    "entity_name": "BUG-M-002 regression"
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, INTERNAL_ERROR);
+        assert!(err.1.contains("write_not_visible"), "got: {}", err.1);
+        assert!(err.1.contains("ferrosa_user"), "got: {}", err.1);
+        assert!(err.1.contains("GRANT"), "got: {}", err.1);
     }
 
     #[tokio::test]

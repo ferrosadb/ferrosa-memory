@@ -682,6 +682,16 @@ pub fn validate_shared_http_config(config: &Config) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if config
+        .server
+        .bind_addr
+        .trim()
+        .eq_ignore_ascii_case("localhost")
+    {
+        anyhow::bail!(
+            "HTTP transport server.bind_addr must be an explicit address, not localhost; use 127.0.0.1 for IPv4 loopback or ::1 for IPv6 loopback"
+        );
+    }
     if !config.server.require_tls && !is_loopback_bind_addr(&config.server.bind_addr) {
         anyhow::bail!("HTTP transport requires TLS unless server.bind_addr is loopback-only");
     }
@@ -1278,6 +1288,25 @@ auth_file = "/etc/ferrosa/auth.toml"
 "#;
         let config = parse_config(toml).unwrap();
         validate_shared_http_config(&config).expect("loopback-only http config should validate");
+    }
+
+    #[test]
+    fn validate_shared_http_rejects_localhost_bind_addr() {
+        let toml = r#"
+[ferrosa]
+contact_points = ["localhost:19042"]
+[server]
+transport = "http"
+bind_addr = "localhost"
+require_tls = false
+auth_file = "/etc/ferrosa/auth.toml"
+"#;
+        let config = parse_config(toml).unwrap();
+        let err = validate_shared_http_config(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("localhost"), "got: {msg}");
+        assert!(msg.contains("127.0.0.1"), "got: {msg}");
+        assert!(msg.contains("::1"), "got: {msg}");
     }
 
     #[test]

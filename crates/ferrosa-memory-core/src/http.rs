@@ -413,10 +413,10 @@ async fn write_rate_limit_response(stream: &mut tokio::net::TcpStream) {
     .await;
 }
 
-/// Run one request under `REQUEST_BUDGET`. On timeout, emit HTTP 504
-/// so the client can distinguish "server took too long" from TLS or
-/// transport-level failures. Any error reading/writing the stream is
-/// propagated to the caller for logging.
+/// Run one request under `REQUEST_BUDGET`. On timeout, MCP requests remain
+/// JSON-RPC responses so clients get actionable retry guidance instead of an
+/// opaque gateway timeout. Any error reading/writing the stream is propagated
+/// to the caller for logging.
 #[cfg(test)]
 async fn serve_one_connection<S, T>(
     stream: &mut T,
@@ -567,8 +567,7 @@ async fn handle_connection_rw<
     let response = match tokio::time::timeout(request_budget, handler).await {
         Ok(response) => response?,
         Err(_) => {
-            let body = format!("request exceeded {request_budget:?}");
-            let resp = text_response("504 Gateway Timeout", &body);
+            let resp = timeout_response_for_request(method, path, body, request_budget);
             // Best-effort notify the client; ignore write errors since
             // the peer may already be gone.
             let _ = stream.write_all(resp.as_bytes()).await;
@@ -752,6 +751,34 @@ fn json_response(status: &str, body: &str) -> String {
         body.len(),
         body
     )
+}
+
+fn timeout_response_for_request(
+    method: &str,
+    path: &str,
+    body: &str,
+    request_budget: std::time::Duration,
+) -> String {
+    if method == "POST" && path == "/mcp" {
+        let id = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|request| request.get("id").cloned())
+            .unwrap_or(serde_json::Value::Null);
+        let response_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32004,
+                "message": format!(
+                    "Ferrosa backend did not respond within {request_budget:?}; it may be warming ANN/vector indexes after restart. retry with exponential backoff such as 30s then 60s before treating the tool call as failed."
+                )
+            }
+        });
+        return json_response("200 OK", &response_body.to_string());
+    }
+
+    let body = format!("request exceeded {request_budget:?}");
+    text_response("504 Gateway Timeout", &body)
 }
 
 fn snapshot_stream_required_response() -> String {
@@ -4814,6 +4841,28 @@ mod tests {
             result.is_ok(),
             "an idle keep-alive socket after a successful request should close cleanly, got {result:?}"
         );
+    }
+
+    #[test]
+    fn mcp_request_timeout_returns_json_rpc_warming_error_not_504() {
+        let body = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"retrieve_entities","arguments":{"entity_ids":["00000000-0000-0000-0000-000000000001"]}}}"#;
+
+        let response =
+            timeout_response_for_request("POST", "/mcp", body, std::time::Duration::from_secs(30));
+
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "MCP timeout must stay in JSON-RPC response space, got: {response}"
+        );
+        assert!(
+            !response.starts_with("HTTP/1.1 504 Gateway Timeout"),
+            "MCP clients should not see bare gateway timeouts: {response}"
+        );
+        assert!(response.contains(r#""id":7"#), "got: {response}");
+        assert!(response.contains(r#""error""#), "got: {response}");
+        assert!(response.contains("warming"), "got: {response}");
+        assert!(response.contains("retry"), "got: {response}");
+        assert!(response.contains("backoff"), "got: {response}");
     }
 
     #[test]
