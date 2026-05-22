@@ -1188,6 +1188,11 @@ pub mod mock {
         /// specific kind of entity (e.g., tag upserts failing under
         /// concurrent contention) without breaking unrelated writes.
         pub force_entity_put_error: Mutex<Option<(String, String)>>,
+        /// Test hook: when Some(entity_type), `entity_put` reports success
+        /// for matching entries but does not store them. This mirrors the
+        /// Ferrosa restart/permission-loss failure where writes appeared to
+        /// succeed but were not visible to subsequent reads.
+        pub force_entity_put_drop: Mutex<Option<String>>,
     }
 
     impl MockStorage {
@@ -1695,6 +1700,11 @@ pub mod mock {
                 && entry.entity_type == *target_type
             {
                 anyhow::bail!("{msg}");
+            }
+            if let Some(target_type) = self.force_entity_put_drop.lock().await.as_ref()
+                && entry.entity_type == *target_type
+            {
+                return Ok(());
             }
             let mut entities = self.entities.lock().await;
             // Upsert by (session_id, entity_id) — CQL INSERT on the same

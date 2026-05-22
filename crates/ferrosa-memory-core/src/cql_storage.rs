@@ -71,6 +71,9 @@ where
         .get(*idx)
         .ok_or_else(|| anyhow::anyhow!("column index {} out of range for '{}'", idx, name))?
         .clone();
+    if val.is_none() {
+        anyhow::bail!("column '{}' is NULL", name);
+    }
     T::from_cql(val).map_err(|e| anyhow::anyhow!("column '{}': {}", name, e))
 }
 
@@ -5300,6 +5303,22 @@ mod remotes_cql_tests {
 #[cfg(test)]
 mod cql_storage_tests {
     use super::*;
+
+    #[test]
+    fn cql_get_string_treats_null_text_as_absent_not_empty_string() {
+        let mut col_map = ColMap::new();
+        col_map.insert("optional_text".to_string(), 0);
+        let row = Row {
+            columns: vec![None],
+        };
+
+        let err = cql_get::<String>(&row, &col_map, "optional_text").unwrap_err();
+
+        assert!(
+            err.to_string().contains("NULL"),
+            "optional text readers rely on null returning Err, got: {err}"
+        );
+    }
 
     #[test]
     fn sprint1_seed_insert_statements_bind_created_at_timestamp() {

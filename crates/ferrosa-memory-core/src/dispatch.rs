@@ -276,6 +276,55 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "teach_query_stream".into(),
+            description: "Teacher-side remote memory query stream. Returns a transport-neutral JSON event array beginning with a start event before retrieval completion; raw context/detail/skill output requires explicit grants.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "remote_id": { "type": "string", "format": "uuid" },
+                    "learner_instance_id": { "type": "string", "format": "uuid" },
+                    "query": { "type": "string", "maxLength": 4096 },
+                    "namespaces": { "type": "array", "items": { "type": "string" } },
+                    "max_items": { "type": "integer", "minimum": 1, "maximum": 50 },
+                    "query_embedding": { "type": "array", "items": { "type": "number" } },
+                    "grants": { "type": "array", "items": { "type": "string", "enum": ["raw_context", "detail", "skill"] } },
+                    "include_raw_context": { "type": "boolean" },
+                    "include_detail": { "type": "boolean" },
+                    "include_skill": { "type": "boolean" }
+                },
+                "required": ["remote_id", "query"]
+            }),
+        },
+        ToolDef {
+            name: "pull_preview".into(),
+            description: "Learner-side remote memory pull preview. Verifies a signed teaching packet, evaluates dry-run import policy, and reports duplicate/conflict candidates without mutating local storage.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "remote_id": { "type": "string", "format": "uuid" },
+                    "remote_name": { "type": "string", "maxLength": 256 },
+                    "query": { "type": "string", "maxLength": 4096 },
+                    "public_identity": { "type": "object", "description": "Teacher InstancePublicIdentity used to verify signed_packet" },
+                    "signed_packet": { "type": "object", "description": "SignedEnvelope<TeachingPacket> from teach_query_stream or remote transport" },
+                    "local_applicability": { "type": "object" },
+                    "preview_ttl_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 }
+                },
+                "required": ["remote_id", "remote_name", "query", "public_identity", "signed_packet"]
+            }),
+        },
+        ToolDef {
+            name: "pull_commit".into(),
+            description: "Commit an accepted learner-side remote memory pull preview. Writes active imports with provenance, persists stubs/quarantine decisions, and records an import batch.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "preview": { "type": "object", "description": "PullPreviewPlan returned by pull_preview" },
+                    "learner_decision": { "type": "object", "description": "SignedEnvelope<ImportDecisionPayload> authorizing this commit" }
+                },
+                "required": ["preview", "learner_decision"]
+            }),
+        },
+        ToolDef {
             name: "search_context_segments".into(),
             description: "Hybrid-search raw context segments with lexical BM25 fallback plus Nomic vector ANN, optionally returning bounded prev/next temporal expansion windows.".into(),
             input_schema: serde_json::json!({
@@ -1496,6 +1545,9 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "search_context_segments" => {
             handle_search_context_segments(args, storage, ctx, session).await
         }
+        "teach_query_stream" => handle_teach_query_stream(args, storage, ctx).await,
+        "pull_preview" => handle_pull_preview(args, storage, ctx).await,
+        "pull_commit" => handle_pull_commit(args, storage, ctx).await,
         "get_context_window" => handle_get_context_window(args, storage, ctx).await,
         "upsert_entity" => handle_upsert_entity(args, storage, ctx, session).await,
         "batch_ingest" => handle_batch_ingest(args, storage, ctx, session).await,
@@ -1648,6 +1700,9 @@ fn is_tier1(name: &str) -> bool {
             | "ensure_parent_tag"
             | "verify_skill"
             | "ingest_context_segments"
+            | "teach_query_stream"
+            | "pull_preview"
+            | "pull_commit"
             | "search_context_segments"
             | "get_context_window"
             | "hybrid_search"
@@ -1687,6 +1742,7 @@ fn is_write_tool(name: &str) -> bool {
             | "append_to_fold"
             | "complete_fold"
             | "ingest_context_segments"
+            | "pull_commit"
             | "upsert_entity"
             | "batch_ingest"
             | "ingest_entities"
@@ -2296,6 +2352,110 @@ async fn handle_ingest_context_segments<S: crate::storage::Storage>(
     serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
 }
 
+async fn handle_teach_query_stream<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+    let request = crate::remotes::teach::TeachQueryRequest {
+        remote_id: require_uuid(&args, "remote_id")?,
+        learner_instance_id: crate::remote_identity::InstanceId(
+            optional_uuid(&args, "learner_instance_id")?.unwrap_or(uuid::Uuid::nil()),
+        ),
+        query: require_str(&args, "query")?.to_string(),
+        namespaces: optional_string_array(&args, "namespaces")?,
+        max_items: args
+            .get("max_items")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(8)
+            .clamp(1, 50) as i32,
+        query_embedding: optional_f32_array(&args, "query_embedding")?,
+        grants: optional_string_array(&args, "grants")?,
+        include_raw_context: args
+            .get("include_raw_context")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        include_detail: args
+            .get("include_detail")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        include_skill: args
+            .get("include_skill")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    };
+    let events = crate::remotes::teach::teach_query_stream(storage, ctx, session_id, request)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    serde_json::to_value(events).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
+async fn handle_pull_preview<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let mut request = crate::remotes::pull::PullPreviewRequest::new(
+        require_uuid(&args, "remote_id")?,
+        require_str(&args, "remote_name")?.to_string(),
+        require_str(&args, "query")?.to_string(),
+    )
+    .with_public_identity(
+        serde_json::from_value(
+            args.get("public_identity")
+                .cloned()
+                .ok_or((INVALID_PARAMS, "missing public_identity".into()))?,
+        )
+        .map_err(|e| (INVALID_PARAMS, format!("invalid public_identity: {e}")))?,
+    );
+    if let Some(value) = args.get("local_applicability") {
+        request = request.with_local_applicability(
+            serde_json::from_value(value.clone())
+                .map_err(|e| (INVALID_PARAMS, format!("invalid local_applicability: {e}")))?,
+        );
+    }
+    if let Some(ttl) = args.get("preview_ttl_seconds").and_then(|v| v.as_i64()) {
+        request.preview_ttl = chrono::Duration::seconds(ttl.clamp(1, 86400));
+    }
+    let client = crate::remotes::pull::json_remote_client_from_args(&args)
+        .map_err(|e| (INVALID_PARAMS, e.to_string()))?;
+    let preview = crate::remotes::pull::pull_preview(&client, storage, ctx, request)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    serde_json::to_value(preview).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
+async fn handle_pull_commit<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let preview: crate::remotes::pull::PullPreviewPlan = serde_json::from_value(
+        args.get("preview")
+            .cloned()
+            .ok_or((INVALID_PARAMS, "missing preview".into()))?,
+    )
+    .map_err(|e| (INVALID_PARAMS, format!("invalid preview: {e}")))?;
+    let learner_decision = serde_json::from_value(
+        args.get("learner_decision")
+            .cloned()
+            .ok_or((INVALID_PARAMS, "missing learner_decision".into()))?,
+    )
+    .map_err(|e| (INVALID_PARAMS, format!("invalid learner_decision: {e}")))?;
+    let receipt = crate::remotes::pull::pull_commit(
+        storage,
+        ctx,
+        crate::remotes::pull::PullCommitRequest {
+            preview,
+            learner_decision,
+        },
+    )
+    .await
+    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    serde_json::to_value(receipt).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
 async fn handle_search_context_segments<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
@@ -2718,6 +2878,28 @@ fn build_ingest_embedding_client(
     ))
 }
 
+fn write_not_visible_message(tool: &str, entity_id: uuid::Uuid) -> String {
+    format!(
+        "write_not_visible: {tool} reported entity {entity_id} written but it could not be read back. Ferrosa permissions may have been lost after restart; re-run GRANTs for ferrosa_user before retrying."
+    )
+}
+
+async fn verify_entity_write_visible<S: crate::storage::Storage>(
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session_id: uuid::Uuid,
+    entity_id: uuid::Uuid,
+    tool: &str,
+) -> Result<(), String> {
+    match storage.entity_get_by_id(ctx, session_id, entity_id).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(write_not_visible_message(tool, entity_id)),
+        Err(err) => Err(format!(
+            "write_visibility_check_failed: {err}. Ferrosa permissions may have been lost after restart; re-run GRANTs for ferrosa_user before retrying."
+        )),
+    }
+}
+
 async fn handle_ingest_entities<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
@@ -2924,6 +3106,22 @@ async fn handle_ingest_entities<S: crate::storage::Storage>(
             entity_failed.push(serde_json::json!({
                 "id": entity.id.to_string(),
                 "reason": err.to_string()
+            }));
+            continue;
+        }
+        if !request.options.dry_run
+            && let Err(reason) = verify_entity_write_visible(
+                storage,
+                ctx,
+                request.session_id,
+                entity.id,
+                "ingest_entities",
+            )
+            .await
+        {
+            entity_failed.push(serde_json::json!({
+                "id": entity.id.to_string(),
+                "reason": reason
             }));
             continue;
         }
@@ -4009,6 +4207,14 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+
+    if matches!(action.as_str(), "Created" | "Updated" | "Superseded")
+        && let Ok(written_entity_id) = entity_id.parse::<uuid::Uuid>()
+    {
+        verify_entity_write_visible(storage, ctx, session_id, written_entity_id, "smart_ingest")
+            .await
+            .map_err(|msg| (INTERNAL_ERROR, msg))?;
+    }
 
     if !entity_id.is_empty() {
         session.event_bus.emit(crate::viz::VizEvent::EntityChanged {
@@ -6848,6 +7054,24 @@ fn optional_f32_array(args: &Value, field: &str) -> Result<Option<Vec<f32>>, (i3
     }
 }
 
+fn optional_string_array(args: &Value, field: &str) -> Result<Vec<String>, (i32, String)> {
+    let Some(value) = args.get(field) else {
+        return Ok(Vec::new());
+    };
+    let array = value
+        .as_array()
+        .ok_or((INVALID_PARAMS, format!("{field} must be array")))?;
+    array
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or((INVALID_PARAMS, format!("{field} must contain strings")))
+        })
+        .collect()
+}
+
 fn require_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, (i32, String)> {
     args.get(field)
         .and_then(|v| v.as_str())
@@ -7847,6 +8071,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ingest_entities_reports_write_not_visible_after_silent_permission_loss() {
+        let store = MockStorage::new();
+        *store.force_entity_put_drop.lock().await = Some("bug".into());
+        let ctx = test_ctx();
+        let session = SessionState {
+            ollama_base_url: String::new(),
+            entity_types: vec!["bug".into()],
+            ..SessionState::default()
+        };
+        let sid = Uuid::new_v4();
+        let entity_id = Uuid::new_v4();
+
+        let result = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "ingest_entities",
+                "arguments": {
+                    "tenant_id": ctx.tenant_id.to_string(),
+                    "session_id": sid.to_string(),
+                    "entities": [
+                        {
+                            "id": entity_id.to_string(),
+                            "name": "Bug M002",
+                            "entity_type": "bug",
+                            "context": "permission loss should not be silent"
+                        }
+                    ],
+                    "options": {
+                        "embed_missing": false
+                    }
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["entities"]["inserted"], 0);
+        let failed = result["entities"]["failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 1);
+        let reason = failed[0]["reason"].as_str().unwrap();
+        assert!(reason.contains("write_not_visible"), "got: {reason}");
+        assert!(reason.contains("ferrosa_user"), "got: {reason}");
+        assert!(reason.contains("GRANT"), "got: {reason}");
+    }
+
+    #[tokio::test]
     async fn ingest_entities_rejects_tenant_mismatch() {
         let store = MockStorage::new();
         let ctx = test_ctx();
@@ -8006,6 +8279,38 @@ mod tests {
         let result = unwrap_tool_result(result);
         assert_eq!(result["action"], "Created");
         assert!(result["entity_id"].is_string());
+    }
+
+    #[tokio::test]
+    async fn smart_ingest_errors_when_created_entity_is_not_visible_after_write() {
+        let store = MockStorage::new();
+        *store.force_entity_put_drop.lock().await = Some("concept".into());
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+
+        let err = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "smart_ingest",
+                "arguments": {
+                    "session_id": sid.to_string(),
+                    "content": "BUG-M-002 should surface invisible writes",
+                    "entity_type": "concept",
+                    "entity_name": "BUG-M-002 regression"
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, INTERNAL_ERROR);
+        assert!(err.1.contains("write_not_visible"), "got: {}", err.1);
+        assert!(err.1.contains("ferrosa_user"), "got: {}", err.1);
+        assert!(err.1.contains("GRANT"), "got: {}", err.1);
     }
 
     #[tokio::test]
