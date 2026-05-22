@@ -562,7 +562,7 @@ fn build_co_occurs_merge_query(
     format!(
         "MERGE (a:Entity {{tenant_id: {}, session_id: {}, entity_id: {}}})\
          MERGE (b:Entity {{tenant_id: {}, session_id: {}, entity_id: {}}})\
-         MERGE (a)-[r:CO_OCCURS_WITH {{tenant_id: {}, session_id: {}}}]->(b) \
+         MERGE (a)-[r:CO_OCCURS_WITH {{tenant_id: {}, session_id: {}, entity_a: {}, entity_b: {}}}]->(b) \
          SET r.strength = {}, r.created_at = {}, r.first_seen = {}, r.last_reinforced = {} RETURN r",
         quote_cypher(&tenant_id.to_string()),
         quote_cypher(&session_id.to_string()),
@@ -572,6 +572,8 @@ fn build_co_occurs_merge_query(
         quote_cypher(&entity_b.to_string()),
         quote_cypher(&tenant_id.to_string()),
         quote_cypher(&session_id.to_string()),
+        quote_cypher(&entity_a.to_string()),
+        quote_cypher(&entity_b.to_string()),
         strength,
         quote_cypher(&now),
         quote_cypher(&now),
@@ -833,6 +835,14 @@ mod tests {
         assert!(
             co_occurs.contains("-[r:CO_OCCURS_WITH {tenant_id: "),
             "Relationship MERGE must include scoped key columns: {co_occurs}"
+        );
+        assert!(
+            co_occurs.contains("entity_a: '00000000-0000-0000-0000-000000000003'"),
+            "Relationship MERGE must include graph source identity: {co_occurs}"
+        );
+        assert!(
+            co_occurs.contains("entity_b: '00000000-0000-0000-0000-000000000004'"),
+            "Relationship MERGE must include graph target identity: {co_occurs}"
         );
         assert!(co_occurs.contains("r.strength = 0.5"));
         assert!(
