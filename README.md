@@ -73,15 +73,17 @@ Analogy: talking to PostgreSQL over its wire protocol is fine; writing directly 
 
 ## Tools
 
-12 MCP tools across 5 functional groups:
+27 MCP tools across 7 functional groups:
 
 | Group | Tools | Purpose |
 |-------|-------|---------|
-| Memo | `check_memo_cache`, `store_memo_result` | Sub-call memoization |
-| Plan | `write_plan_node`, `get_plan_context`, `update_plan_node` | Hierarchical plan state |
-| Fold | `start_fold`, `append_to_fold`, `complete_fold`, `retrieve_fold_context` | Trajectory fold/summarize |
-| Entity | `upsert_entity`, `retrieve_entities` | Named entity graph |
-| Feedback | `record_outcome` | Strategy outcome recording |
+| Core memory | `smart_ingest`, `ingest_entities`, `retrieve_entities`, `hybrid_search`, `list_entities`, `count_entities_by_type` | Ingest, retrieve, and structured-filter entities; semantic + lexical + phonetic + graph search |
+| Graph / edges | `create_edge`, `batch_create_edges`, `batch_update_edges`, `batch_delete_edges`, `explore_connections`, `find_memory_chain` | Build and traverse the knowledge graph |
+| Temporal | `write_temporal_fact`, `get_temporal_chain` | Timestamped facts with supersession tracking |
+| Skills | `ingest_skill`, `invoke_skill`, `verify_skill`, `retrieve_skills_for_context` | Skill lifecycle: ingest, invoke, verify, retrieve |
+| Intentions | `set_intention`, `check_intentions`, `complete_intention` | Prospective memory — deferred actions triggered by topic, file pattern, duration, or context |
+| Batch ops | `batch_update_entities`, `batch_delete_entities` | Bulk entity updates and deletions |
+| Maintenance | `run_consolidation`, `get_stats`, `record_outcome`, `ensure_parent_tag` | Discover CO_OCCURS patterns, health stats, strategy feedback, tag hierarchy |
 
 ## Quick Start
 

@@ -504,6 +504,9 @@ Once the stack and MCP client work, run these examples.
 | `curl :18765` fails | Is the MCP container running? Is it host-networked or port-mapped? Is the config HTTP or HTTPS? |
 | `ready` fails but `live` works | Check CQL contact points, auth, and node health. |
 | `get_stats` times out | Check all three Ferrosa nodes, recent replay/OOM logs, and CQL read timeouts. |
+| All tools return 504 immediately after restart | ANN index cold-load: Ferrosa rebuilds its vector index in memory before serving queries. With a large entity store this takes several minutes. Wait and retry. |
+| `smart_ingest` reports success but entities are missing on retrieval | Ferrosa drops role GRANTs on restart. Re-run `GRANT ALL PERMISSIONS ON KEYSPACE agent_memory TO ferrosa_user` before starting ferrosa-memory-mcp. |
+| `curl http://localhost:18765/health` fails but `curl http://127.0.0.1:18765/health` works | macOS resolves `localhost` to IPv6 (`::1`) first; ferrosa-memory-mcp binds IPv4 only. Always use `127.0.0.1` explicitly, not `localhost`. |
 | Claude/Codex cannot see tools | Verify the harness MCP config path and restart the harness. |
 | Hermes tools list is stale | Run `/reload-mcp` in a new session after fmem health is green. |
 | Bridge container cannot reach `localhost:19042` | Use host networking for MCP or change CQL contact points to container-routable names. |
