@@ -70,7 +70,9 @@ Goal: fix the concrete rust-streaming audit findings with tests first, run local
 - [x] SPARQL passthrough is byte-capped, but still parses all bindings within the cap before applying `limit`.
   - Fix: the SPARQL JSON parser now uses `DeserializeSeed` to retain only `limit` bindings while counting skipped rows with `IgnoredAny`; the response byte cap still applies.
   - Verify: `cargo test -p ferrosa-memory-mcp sparql_result_parser_keeps_only_limit_bindings`.
-- [ ] Batch update/delete paths are bounded but still serial; evaluate concurrency/backpressure for large operator batches.
+- [x] Batch update/delete paths are bounded but still serial; evaluate concurrency/backpressure for large operator batches.
+  - Fix: `batch_update_entities`, `batch_delete_entities`, `batch_update_edges`, and `batch_delete_edges` now execute storage mutations through `buffer_unordered(BATCH_MUTATION_CONCURRENCY)` and sort per-item results by original input index before returning.
+  - Verify: `cargo test -p ferrosa-memory-core batch_mutation_handlers_use_bounded_concurrency` and `cargo test -p ferrosa-memory-core batch_`.
 
 ## CI Gate
 
@@ -79,6 +81,7 @@ Goal: fix the concrete rust-streaming audit findings with tests first, run local
 - [x] `make test-all`
   - Rust/unit/contract phases passed through `make test-all`.
   - Python phases were run with `uv run --with-requirements tests/requirements.txt ...` because system `python3` lacks `pytest`.
+  - Latest run repeated the same gate shape: Rust `test-unit` and `test-contracts` passed through `make test-all`; Python `test-integration`, `test-system`, `test-property`, and `test-security` passed through `uv run --with-requirements tests/requirements.txt pytest ...`.
 - [x] PR opened and GitHub CI monitored until green.
   - PR: https://github.com/ferrosadb/ferrosa-memory/pull/33
   - Final GitHub result: Format & Lint, Build, Tests & Coverage, Cluster integration tests, Dependency Advisories, Complexity Analysis, Generate Docs, Blueprint Harness Smoke, Verify SHA pins, and CI Pass all succeeded for commit `5db7840`.

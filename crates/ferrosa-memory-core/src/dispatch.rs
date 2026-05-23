@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use futures_util::future::join_all;
+use futures_util::{StreamExt, future::join_all, stream};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -26,6 +26,30 @@ use crate::context_segment::{
 use crate::transport::{INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND};
 
 const CONSOLIDATION_QUEUE_CAPACITY: usize = 1024;
+const BATCH_MUTATION_CONCURRENCY: usize = 16;
+
+#[derive(Clone, Copy)]
+enum BatchMutationKind {
+    Updated,
+    Unchanged,
+    NotFound,
+    Error,
+    Deleted,
+    Missing,
+    Invalid,
+    Upserted,
+}
+
+struct BatchMutationOutcome {
+    index: usize,
+    kind: BatchMutationKind,
+    result: Value,
+}
+
+fn ordered_batch_results(mut outcomes: Vec<BatchMutationOutcome>) -> Vec<Value> {
+    outcomes.sort_by_key(|outcome| outcome.index);
+    outcomes.into_iter().map(|outcome| outcome.result).collect()
+}
 
 /// Rotating hint counter for memory formation encouragement.
 static HINT_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -2897,378 +2921,443 @@ async fn handle_batch_update_entities<S: crate::storage::Storage>(
         ));
     }
 
-    let mut updated: usize = 0;
-    let mut unchanged: usize = 0;
-    let mut not_found: usize = 0;
-    let mut errors: usize = 0;
-    let mut results = Vec::with_capacity(entities.len());
-
-    for entity_json in entities {
-        let idx = results.len();
-        let Some(row) = entity_json.as_object() else {
-            errors += 1;
-            results.push(serde_json::json!({
-                "index": idx,
-                "status": "error",
-                "reason": format!("batch_update_entities[{idx}] must be an object")
-            }));
-            continue;
-        };
-
-        let entity_id = match row
-            .get("entity_id")
-            .and_then(|v| v.as_str())
-            .and_then(|v| uuid::Uuid::parse_str(v).ok())
-        {
-            Some(id) => id,
-            None => {
-                errors += 1;
-                results.push(serde_json::json!({
+    let jobs = entities
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(idx, entity_json)| async move {
+            let Some(row) = entity_json.as_object() else {
+                return BatchMutationOutcome {
+                    index: idx,
+                    kind: BatchMutationKind::Error,
+                    result: serde_json::json!({
                     "index": idx,
                     "status": "error",
-                    "reason": format!("batch_update_entities[{idx}] missing/invalid entity_id")
-                }));
-                continue;
-            }
-        };
+                    "reason": format!("batch_update_entities[{idx}] must be an object")
+                    }),
+                };
+            };
 
-        let mut entity = match storage
-            .entity_get_by_id(ctx, session_id, entity_id)
-            .await
-            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
-        {
-            Some(entity) => entity,
-            None => {
-                not_found += 1;
-                results.push(serde_json::json!({
-                    "index": idx,
-                    "entity_id": entity_id.to_string(),
-                    "status": "not_found"
-                }));
-                continue;
-            }
-        };
-
-        let mut mutated = false;
-        if let Some(v) = row.get("entity_name") {
-            match v.as_str() {
-                Some(v) => {
-                    entity.entity_name = v.to_string();
-                    mutated = true;
-                }
+            let entity_id = match row
+                .get("entity_id")
+                .and_then(|v| v.as_str())
+                .and_then(|v| uuid::Uuid::parse_str(v).ok())
+            {
+                Some(id) => id,
                 None => {
-                    errors += 1;
-                    results.push(serde_json::json!({
+                    return BatchMutationOutcome {
+                        index: idx,
+                        kind: BatchMutationKind::Error,
+                        result: serde_json::json!({
+                        "index": idx,
+                        "status": "error",
+                        "reason": format!("batch_update_entities[{idx}] missing/invalid entity_id")
+                        }),
+                    };
+                }
+            };
+
+            let mut entity = match storage.entity_get_by_id(ctx, session_id, entity_id).await {
+                Ok(Some(entity)) => entity,
+                Ok(None) => {
+                    return BatchMutationOutcome {
+                        index: idx,
+                        kind: BatchMutationKind::NotFound,
+                        result: serde_json::json!({
                         "index": idx,
                         "entity_id": entity_id.to_string(),
-                        "status": "error",
-                        "reason": "entity_name must be a string"
-                    }));
-                    continue;
+                        "status": "not_found"
+                        }),
+                    };
                 }
-            }
-        }
-        if let Some(v) = row.get("entity_type") {
-            match v.as_str() {
-                Some(v) => {
-                    entity.entity_type = v.to_string();
-                    mutated = true;
-                }
-                None => {
-                    errors += 1;
-                    results.push(serde_json::json!({
-                        "index": idx,
-                        "entity_id": entity_id.to_string(),
-                        "status": "error",
-                        "reason": "entity_type must be a string"
-                    }));
-                    continue;
-                }
-            }
-        }
-        if let Some(v) = row.get("context_snippet") {
-            match v.as_str() {
-                Some(v) => {
-                    entity.context_snippet = v.to_string();
-                    mutated = true;
-                }
-                None => {
-                    errors += 1;
-                    results.push(serde_json::json!({
-                        "index": idx,
-                        "entity_id": entity_id.to_string(),
-                        "status": "error",
-                        "reason": "context_snippet must be a string"
-                    }));
-                    continue;
-                }
-            }
-        }
-
-        if let Some(v) = row.get("source_fold_id") {
-            if v.is_null() {
-                entity.source_fold_id = None;
-                mutated = true;
-            } else if let Some(raw) = v.as_str() {
-                entity.source_fold_id = match uuid::Uuid::parse_str(raw) {
-                    Ok(id) => {
-                        mutated = true;
-                        Some(id)
-                    }
-                    Err(err) => {
-                        errors += 1;
-                        results.push(serde_json::json!({
+                Err(err) => {
+                    return BatchMutationOutcome {
+                        index: idx,
+                        kind: BatchMutationKind::Error,
+                        result: serde_json::json!({
                             "index": idx,
                             "entity_id": entity_id.to_string(),
                             "status": "error",
-                            "reason": format!("source_fold_id invalid uuid: {err}")
-                        }));
-                        continue;
-                    }
-                };
-            } else {
-                errors += 1;
-                results.push(serde_json::json!({
-                    "index": idx,
-                    "entity_id": entity_id.to_string(),
-                    "status": "error",
-                    "reason": "source_fold_id must be string UUID or null"
-                }));
-                continue;
-            }
-        }
-
-        if let Some(v) = row.get("confidence") {
-            let confidence = match v.as_f64() {
-                Some(value) => value,
-                None => {
-                    errors += 1;
-                    results.push(serde_json::json!({
-                        "index": idx,
-                        "entity_id": entity_id.to_string(),
-                        "status": "error",
-                        "reason": "confidence must be a number"
-                    }));
-                    continue;
+                            "reason": err.to_string()
+                        }),
+                    };
                 }
             };
-            if !(0.0..=1.0).contains(&confidence) {
-                errors += 1;
-                results.push(serde_json::json!({
-                    "index": idx,
-                    "entity_id": entity_id.to_string(),
-                    "status": "error",
-                    "reason": "confidence must be between 0 and 1"
-                }));
-                continue;
-            }
-            entity.confidence = confidence;
-            mutated = true;
-        }
 
-        if let Some(v) = row.get("state") {
-            let state = match v.as_str() {
-                Some(state) => state,
-                None => {
-                    errors += 1;
-                    results.push(serde_json::json!({
-                        "index": idx,
-                        "entity_id": entity_id.to_string(),
-                        "status": "error",
-                        "reason": format!("batch_update_entities[{idx}] state must be a string")
-                    }));
-                    continue;
-                }
-            };
-            let state = match parse_ingest_state(Some(state)) {
-                Ok(state) => state,
-                Err(reason) => {
-                    errors += 1;
-                    results.push(serde_json::json!({
-                        "index": idx,
-                        "entity_id": entity_id.to_string(),
-                        "status": "error",
-                        "reason": reason
-                    }));
-                    continue;
-                }
-            };
-            if entity.state != state {
-                entity.state = state;
-                mutated = true;
-            }
-        }
-
-        if row.contains_key("description") {
-            match row.get("description") {
-                Some(value) if value.is_null() => {
-                    entity.description = None;
-                    mutated = true;
-                }
-                Some(value) => match value.as_str() {
-                    Some(value) => {
-                        entity.description = Some(value.to_string());
+            let mut mutated = false;
+            if let Some(v) = row.get("entity_name") {
+                match v.as_str() {
+                    Some(v) => {
+                        entity.entity_name = v.to_string();
                         mutated = true;
                     }
                     None => {
-                        errors += 1;
-                        results.push(serde_json::json!({
+                        return BatchMutationOutcome {
+                            index: idx,
+                            kind: BatchMutationKind::Error,
+                            result: serde_json::json!({
                             "index": idx,
                             "entity_id": entity_id.to_string(),
                             "status": "error",
-                            "reason": "description must be a string or null"
-                        }));
-                        continue;
+                            "reason": "entity_name must be a string"
+                            }),
+                        };
                     }
-                },
-                None => {}
+                }
             }
-        }
+            if let Some(v) = row.get("entity_type") {
+                match v.as_str() {
+                    Some(v) => {
+                        entity.entity_type = v.to_string();
+                        mutated = true;
+                    }
+                    None => {
+                        return BatchMutationOutcome {
+                            index: idx,
+                            kind: BatchMutationKind::Error,
+                            result: serde_json::json!({
+                            "index": idx,
+                            "entity_id": entity_id.to_string(),
+                            "status": "error",
+                            "reason": "entity_type must be a string"
+                            }),
+                        };
+                    }
+                }
+            }
+            if let Some(v) = row.get("context_snippet") {
+                match v.as_str() {
+                    Some(v) => {
+                        entity.context_snippet = v.to_string();
+                        mutated = true;
+                    }
+                    None => {
+                        return BatchMutationOutcome {
+                            index: idx,
+                            kind: BatchMutationKind::Error,
+                            result: serde_json::json!({
+                            "index": idx,
+                            "entity_id": entity_id.to_string(),
+                            "status": "error",
+                            "reason": "context_snippet must be a string"
+                            }),
+                        };
+                    }
+                }
+            }
 
-        if row.contains_key("tags") {
-            let tags = row.get("tags").unwrap();
-            match tags {
-                Value::Array(values) => {
-                    let mut parsed_tags = Vec::with_capacity(values.len());
-                    let mut invalid = false;
-                    for v in values {
-                        match v.as_str() {
-                            Some(tag) => parsed_tags.push(tag.to_string()),
-                            None => {
-                                errors += 1;
-                                results.push(serde_json::json!({
-                                    "index": idx,
-                                    "entity_id": entity_id.to_string(),
-                                    "status": "error",
-                                    "reason": "tags must be an array of strings"
-                                }));
-                                invalid = true;
-                                break;
-                            }
+            if let Some(v) = row.get("source_fold_id") {
+                if v.is_null() {
+                    entity.source_fold_id = None;
+                    mutated = true;
+                } else if let Some(raw) = v.as_str() {
+                    entity.source_fold_id = match uuid::Uuid::parse_str(raw) {
+                        Ok(id) => {
+                            mutated = true;
+                            Some(id)
                         }
-                    }
-                    if invalid {
-                        continue;
-                    }
-                    entity.tags = parsed_tags;
-                    mutated = true;
-                }
-                Value::Null => {
-                    entity.tags = Vec::new();
-                    mutated = true;
-                }
-                _ => {
-                    errors += 1;
-                    results.push(serde_json::json!({
-                        "index": idx,
-                        "entity_id": entity_id.to_string(),
-                        "status": "error",
-                        "reason": "tags must be an array of strings"
-                    }));
-                    continue;
-                }
-            }
-        }
-
-        if row.contains_key("properties") {
-            match row.get("properties") {
-                Some(value) if value.is_object() || value.is_null() => {
-                    entity.properties = value.clone();
-                    mutated = true;
-                }
-                _ => {
-                    errors += 1;
-                    results.push(serde_json::json!({
-                        "index": idx,
-                        "entity_id": entity_id.to_string(),
-                        "status": "error",
-                        "reason": "properties must be an object"
-                    }));
-                    continue;
-                }
-            }
-        }
-
-        if row.contains_key("embedding") {
-            match row.get("embedding") {
-                Some(value) if value.is_null() => {
-                    entity.entity_embedding = None;
-                    mutated = true;
-                }
-                Some(value) => match value.as_array() {
-                    Some(values) => {
-                        let mut embedding = Vec::with_capacity(values.len());
-                        let mut invalid = false;
-                        for value in values {
-                            match value.as_f64() {
-                                Some(v) => embedding.push(v as f32),
-                                None => {
-                                    invalid = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if invalid {
-                            errors += 1;
-                            results.push(serde_json::json!({
+                        Err(err) => {
+                            return BatchMutationOutcome {
+                                index: idx,
+                                kind: BatchMutationKind::Error,
+                                result: serde_json::json!({
                                 "index": idx,
                                 "entity_id": entity_id.to_string(),
                                 "status": "error",
-                                "reason": "embedding must be a number array"
-                            }));
-                            continue;
+                                "reason": format!("source_fold_id invalid uuid: {err}")
+                                }),
+                            };
                         }
-                        entity.entity_embedding = Some(embedding);
-                        mutated = true;
-                    }
+                    };
+                } else {
+                    return BatchMutationOutcome {
+                        index: idx,
+                        kind: BatchMutationKind::Error,
+                        result: serde_json::json!({
+                        "index": idx,
+                        "entity_id": entity_id.to_string(),
+                        "status": "error",
+                        "reason": "source_fold_id must be string UUID or null"
+                        }),
+                    };
+                }
+            }
+
+            if let Some(v) = row.get("confidence") {
+                let confidence = match v.as_f64() {
+                    Some(value) => value,
                     None => {
-                        errors += 1;
-                        results.push(serde_json::json!({
+                        return BatchMutationOutcome {
+                            index: idx,
+                            kind: BatchMutationKind::Error,
+                            result: serde_json::json!({
                             "index": idx,
                             "entity_id": entity_id.to_string(),
                             "status": "error",
-                            "reason": "embedding must be an array"
-                        }));
-                        continue;
+                            "reason": "confidence must be a number"
+                            }),
+                        };
                     }
-                },
-                None => {}
+                };
+                if !(0.0..=1.0).contains(&confidence) {
+                    return BatchMutationOutcome {
+                        index: idx,
+                        kind: BatchMutationKind::Error,
+                        result: serde_json::json!({
+                        "index": idx,
+                        "entity_id": entity_id.to_string(),
+                        "status": "error",
+                        "reason": "confidence must be between 0 and 1"
+                        }),
+                    };
+                }
+                entity.confidence = confidence;
+                mutated = true;
             }
-        }
 
-        if !mutated {
-            unchanged += 1;
-            results.push(serde_json::json!({
-                "index": idx,
-                "entity_id": entity_id.to_string(),
-                "status": "unchanged"
-            }));
-            continue;
-        }
+            if let Some(v) = row.get("state") {
+                let state = match v.as_str() {
+                    Some(state) => state,
+                    None => {
+                        return BatchMutationOutcome {
+                            index: idx,
+                            kind: BatchMutationKind::Error,
+                            result: serde_json::json!({
+                            "index": idx,
+                            "entity_id": entity_id.to_string(),
+                            "status": "error",
+                            "reason": format!("batch_update_entities[{idx}] state must be a string")
+                            }),
+                        };
+                    }
+                };
+                let state = match parse_ingest_state(Some(state)) {
+                    Ok(state) => state,
+                    Err(reason) => {
+                        return BatchMutationOutcome {
+                            index: idx,
+                            kind: BatchMutationKind::Error,
+                            result: serde_json::json!({
+                            "index": idx,
+                            "entity_id": entity_id.to_string(),
+                            "status": "error",
+                            "reason": reason
+                            }),
+                        };
+                    }
+                };
+                if entity.state != state {
+                    entity.state = state;
+                    mutated = true;
+                }
+            }
 
-        entity.updated_at = Some(chrono::Utc::now());
-        match storage.entity_put(ctx, &entity).await {
-            Ok(_) => {
-                updated += 1;
-                session.dirty.store(true, Ordering::Relaxed);
-                session.last_activity.notify_waiters();
-                results.push(serde_json::json!({
+            if row.contains_key("description") {
+                match row.get("description") {
+                    Some(value) if value.is_null() => {
+                        entity.description = None;
+                        mutated = true;
+                    }
+                    Some(value) => match value.as_str() {
+                        Some(value) => {
+                            entity.description = Some(value.to_string());
+                            mutated = true;
+                        }
+                        None => {
+                            return BatchMutationOutcome {
+                                index: idx,
+                                kind: BatchMutationKind::Error,
+                                result: serde_json::json!({
+                                "index": idx,
+                                "entity_id": entity_id.to_string(),
+                                "status": "error",
+                                "reason": "description must be a string or null"
+                                }),
+                            };
+                        }
+                    },
+                    None => {}
+                }
+            }
+
+            if row.contains_key("tags") {
+                let tags = row.get("tags").unwrap();
+                match tags {
+                    Value::Array(values) => {
+                        let mut parsed_tags = Vec::with_capacity(values.len());
+                        for v in values {
+                            match v.as_str() {
+                                Some(tag) => parsed_tags.push(tag.to_string()),
+                                None => {
+                                    return BatchMutationOutcome {
+                                        index: idx,
+                                        kind: BatchMutationKind::Error,
+                                        result: serde_json::json!({
+                                        "index": idx,
+                                        "entity_id": entity_id.to_string(),
+                                        "status": "error",
+                                        "reason": "tags must be an array of strings"
+                                        }),
+                                    };
+                                }
+                            }
+                        }
+                        entity.tags = parsed_tags;
+                        mutated = true;
+                    }
+                    Value::Null => {
+                        entity.tags = Vec::new();
+                        mutated = true;
+                    }
+                    _ => {
+                        return BatchMutationOutcome {
+                            index: idx,
+                            kind: BatchMutationKind::Error,
+                            result: serde_json::json!({
+                            "index": idx,
+                            "entity_id": entity_id.to_string(),
+                            "status": "error",
+                            "reason": "tags must be an array of strings"
+                            }),
+                        };
+                    }
+                }
+            }
+
+            if row.contains_key("properties") {
+                match row.get("properties") {
+                    Some(value) if value.is_object() || value.is_null() => {
+                        entity.properties = value.clone();
+                        mutated = true;
+                    }
+                    _ => {
+                        return BatchMutationOutcome {
+                            index: idx,
+                            kind: BatchMutationKind::Error,
+                            result: serde_json::json!({
+                            "index": idx,
+                            "entity_id": entity_id.to_string(),
+                            "status": "error",
+                            "reason": "properties must be an object"
+                            }),
+                        };
+                    }
+                }
+            }
+
+            if row.contains_key("embedding") {
+                match row.get("embedding") {
+                    Some(value) if value.is_null() => {
+                        entity.entity_embedding = None;
+                        mutated = true;
+                    }
+                    Some(value) => match value.as_array() {
+                        Some(values) => {
+                            let mut embedding = Vec::with_capacity(values.len());
+                            let mut invalid = false;
+                            for value in values {
+                                match value.as_f64() {
+                                    Some(v) => embedding.push(v as f32),
+                                    None => {
+                                        invalid = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if invalid {
+                                return BatchMutationOutcome {
+                                    index: idx,
+                                    kind: BatchMutationKind::Error,
+                                    result: serde_json::json!({
+                                    "index": idx,
+                                    "entity_id": entity_id.to_string(),
+                                    "status": "error",
+                                    "reason": "embedding must be a number array"
+                                    }),
+                                };
+                            }
+                            entity.entity_embedding = Some(embedding);
+                            mutated = true;
+                        }
+                        None => {
+                            return BatchMutationOutcome {
+                                index: idx,
+                                kind: BatchMutationKind::Error,
+                                result: serde_json::json!({
+                                "index": idx,
+                                "entity_id": entity_id.to_string(),
+                                "status": "error",
+                                "reason": "embedding must be an array"
+                                }),
+                            };
+                        }
+                    },
+                    None => {}
+                }
+            }
+
+            if !mutated {
+                return BatchMutationOutcome {
+                    index: idx,
+                    kind: BatchMutationKind::Unchanged,
+                    result: serde_json::json!({
                     "index": idx,
                     "entity_id": entity_id.to_string(),
-                    "status": "updated"
-                }));
+                    "status": "unchanged"
+                    }),
+                };
             }
-            Err(err) => {
-                errors += 1;
-                results.push(serde_json::json!({
+
+            entity.updated_at = Some(chrono::Utc::now());
+            match storage.entity_put(ctx, &entity).await {
+                Ok(_) => {
+                    session.dirty.store(true, Ordering::Relaxed);
+                    session.last_activity.notify_waiters();
+                    BatchMutationOutcome {
+                        index: idx,
+                        kind: BatchMutationKind::Updated,
+                        result: serde_json::json!({
+                        "index": idx,
+                        "entity_id": entity_id.to_string(),
+                        "status": "updated"
+                        }),
+                    }
+                }
+                Err(err) => BatchMutationOutcome {
+                    index: idx,
+                    kind: BatchMutationKind::Error,
+                    result: serde_json::json!({
                     "index": idx,
                     "entity_id": entity_id.to_string(),
                     "status": "error",
                     "reason": err.to_string()
-                }));
+                    }),
+                },
             }
+        });
+
+    let outcomes: Vec<BatchMutationOutcome> = stream::iter(jobs)
+        .buffer_unordered(BATCH_MUTATION_CONCURRENCY)
+        .collect()
+        .await;
+
+    let mut updated: usize = 0;
+    let mut unchanged: usize = 0;
+    let mut not_found: usize = 0;
+    let mut errors: usize = 0;
+    for outcome in &outcomes {
+        match outcome.kind {
+            BatchMutationKind::Updated => updated += 1,
+            BatchMutationKind::Unchanged => unchanged += 1,
+            BatchMutationKind::NotFound => not_found += 1,
+            BatchMutationKind::Error => errors += 1,
+            BatchMutationKind::Deleted
+            | BatchMutationKind::Missing
+            | BatchMutationKind::Invalid
+            | BatchMutationKind::Upserted => {}
         }
     }
+    let results = ordered_batch_results(outcomes);
 
     Ok(serde_json::json!({
         "updated": updated,
@@ -3302,72 +3391,101 @@ async fn handle_batch_delete_entities<S: crate::storage::Storage>(
         ));
     }
 
-    let mut deleted: usize = 0;
-    let mut not_found: usize = 0;
-    let mut errors: usize = 0;
-    let mut results = Vec::with_capacity(entities.len());
-
-    for entity_json in entities {
-        let idx = results.len();
-        let Some(row) = entity_json.as_object() else {
-            errors += 1;
-            results.push(serde_json::json!({
-                "index": idx,
-                "status": "error",
-                "reason": format!("batch_delete_entities[{idx}] must be an object")
-            }));
-            continue;
-        };
-
-        let entity_id = match row
-            .get("entity_id")
-            .and_then(|v| v.as_str())
-            .and_then(|v| uuid::Uuid::parse_str(v).ok())
-        {
-            Some(id) => id,
-            None => {
-                errors += 1;
-                results.push(serde_json::json!({
+    let jobs = entities
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(idx, entity_json)| async move {
+            let Some(row) = entity_json.as_object() else {
+                return BatchMutationOutcome {
+                    index: idx,
+                    kind: BatchMutationKind::Error,
+                    result: serde_json::json!({
                     "index": idx,
                     "status": "error",
-                    "reason": format!(
-                        "batch_delete_entities[{idx}] missing/invalid entity_id"
-                    )
-                }));
-                continue;
-            }
-        };
+                    "reason": format!("batch_delete_entities[{idx}] must be an object")
+                    }),
+                };
+            };
 
-        match storage.entity_delete(ctx, session_id, entity_id).await {
-            Ok(true) => {
-                deleted += 1;
-                session.dirty.store(true, Ordering::Relaxed);
-                session.last_activity.notify_waiters();
-                results.push(serde_json::json!({
-                    "index": idx,
-                    "entity_id": entity_id.to_string(),
-                    "status": "deleted"
-                }));
-            }
-            Ok(false) => {
-                not_found += 1;
-                results.push(serde_json::json!({
+            let entity_id = match row
+                .get("entity_id")
+                .and_then(|v| v.as_str())
+                .and_then(|v| uuid::Uuid::parse_str(v).ok())
+            {
+                Some(id) => id,
+                None => {
+                    return BatchMutationOutcome {
+                        index: idx,
+                        kind: BatchMutationKind::Error,
+                        result: serde_json::json!({
+                        "index": idx,
+                        "status": "error",
+                        "reason": format!(
+                            "batch_delete_entities[{idx}] missing/invalid entity_id"
+                        )
+                        }),
+                    };
+                }
+            };
+
+            match storage.entity_delete(ctx, session_id, entity_id).await {
+                Ok(true) => {
+                    session.dirty.store(true, Ordering::Relaxed);
+                    session.last_activity.notify_waiters();
+                    BatchMutationOutcome {
+                        index: idx,
+                        kind: BatchMutationKind::Deleted,
+                        result: serde_json::json!({
+                        "index": idx,
+                        "entity_id": entity_id.to_string(),
+                        "status": "deleted"
+                        }),
+                    }
+                }
+                Ok(false) => BatchMutationOutcome {
+                    index: idx,
+                    kind: BatchMutationKind::NotFound,
+                    result: serde_json::json!({
                     "index": idx,
                     "entity_id": entity_id.to_string(),
                     "status": "not_found"
-                }));
-            }
-            Err(err) => {
-                errors += 1;
-                results.push(serde_json::json!({
+                    }),
+                },
+                Err(err) => BatchMutationOutcome {
+                    index: idx,
+                    kind: BatchMutationKind::Error,
+                    result: serde_json::json!({
                     "index": idx,
                     "entity_id": entity_id.to_string(),
                     "status": "error",
                     "reason": err.to_string()
-                }));
+                    }),
+                },
             }
+        });
+
+    let outcomes: Vec<BatchMutationOutcome> = stream::iter(jobs)
+        .buffer_unordered(BATCH_MUTATION_CONCURRENCY)
+        .collect()
+        .await;
+
+    let mut deleted: usize = 0;
+    let mut not_found: usize = 0;
+    let mut errors: usize = 0;
+    for outcome in &outcomes {
+        match outcome.kind {
+            BatchMutationKind::Deleted => deleted += 1,
+            BatchMutationKind::NotFound => not_found += 1,
+            BatchMutationKind::Error => errors += 1,
+            BatchMutationKind::Updated
+            | BatchMutationKind::Unchanged
+            | BatchMutationKind::Missing
+            | BatchMutationKind::Invalid
+            | BatchMutationKind::Upserted => {}
         }
     }
+    let results = ordered_batch_results(outcomes);
 
     Ok(serde_json::json!({
         "deleted": deleted,
@@ -6235,216 +6353,275 @@ async fn handle_batch_update_edges<S: crate::storage::Storage>(
         ));
     }
 
+    let jobs = edges
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(idx, edge_json)| async move {
+            let Some(edge_row) = edge_json.as_object() else {
+                return BatchMutationOutcome {
+                    index: idx,
+                    kind: BatchMutationKind::Error,
+                    result: serde_json::json!({
+                    "index": idx,
+                    "status": "error",
+                    "reason": format!("batch_update_edges[{idx}] must be an object")
+                    }),
+                };
+            };
+
+            let src_id = match edge_row
+                .get("src_entity_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            {
+                Some(id) => id,
+                None => {
+                    return BatchMutationOutcome {
+                        index: idx,
+                        kind: BatchMutationKind::Error,
+                        result: serde_json::json!({
+                        "index": idx,
+                        "status": "error",
+                        "reason": "invalid or missing src_entity_id"
+                        }),
+                    };
+                }
+            };
+            let dst_id = match edge_json
+                .get("dst_entity_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            {
+                Some(id) => id,
+                None => {
+                    return BatchMutationOutcome {
+                        index: idx,
+                        kind: BatchMutationKind::Error,
+                        result: serde_json::json!({
+                        "index": idx,
+                        "status": "error",
+                        "reason": "invalid or missing dst_entity_id"
+                        }),
+                    };
+                }
+            };
+            let edge_type = match edge_row.get("edge_type").and_then(|v| v.as_str()) {
+                Some(t) => t.to_string(),
+                None => {
+                    return BatchMutationOutcome {
+                        index: idx,
+                        kind: BatchMutationKind::Error,
+                        result: serde_json::json!({
+                        "index": idx,
+                        "status": "error",
+                        "reason": "missing edge_type"
+                        }),
+                    };
+                }
+            };
+
+            let metadata_override_set = edge_row.contains_key("metadata");
+            let weight_override_set = edge_row.contains_key("weight");
+
+            let weight_override = if weight_override_set {
+                match edge_row.get("weight").and_then(|v| v.as_f64()) {
+                    Some(weight) => Some(weight),
+                    None => {
+                        return BatchMutationOutcome {
+                            index: idx,
+                            kind: BatchMutationKind::Error,
+                            result: serde_json::json!({
+                            "index": idx,
+                            "status": "error",
+                            "reason": "weight must be a number"
+                            }),
+                        };
+                    }
+                }
+            } else {
+                None
+            };
+
+            let metadata_override = if metadata_override_set {
+                match edge_row.get("metadata").unwrap() {
+                    Value::String(value) => Some(value.to_string()),
+                    Value::Null => None,
+                    _ => {
+                        return BatchMutationOutcome {
+                            index: idx,
+                            kind: BatchMutationKind::Error,
+                            result: serde_json::json!({
+                            "index": idx,
+                            "status": "error",
+                            "reason": "metadata must be a string"
+                            }),
+                        };
+                    }
+                }
+            } else {
+                None
+            };
+
+            if weight_override_set && !weight_override.unwrap().is_finite() {
+                return BatchMutationOutcome {
+                    index: idx,
+                    kind: BatchMutationKind::Error,
+                    result: serde_json::json!({
+                    "index": idx,
+                    "status": "error",
+                    "reason": "weight must be finite"
+                    }),
+                };
+            }
+
+            let existing_edges = match storage.typed_edge_list_from(ctx, session_id, src_id).await {
+                Ok(edges) => edges,
+                Err(err) => {
+                    return BatchMutationOutcome {
+                        index: idx,
+                        kind: BatchMutationKind::Error,
+                        result: serde_json::json!({
+                            "index": idx,
+                            "status": "error",
+                            "reason": err.to_string()
+                        }),
+                    };
+                }
+            };
+            let existing = existing_edges
+                .into_iter()
+                .find(|edge| edge.dst_id == dst_id && edge.edge_type == edge_type);
+
+            match existing {
+                None => {
+                    let final_weight = weight_override.unwrap_or(1.0);
+                    if !weight_override_set && !metadata_override_set {
+                        // No existing edge and no replacement data => we can only upsert defaults.
+                        // Preserve current semantics and allow this path to act as a create.
+                    }
+                    let final_metadata = metadata_override;
+
+                    match crate::graph_write::create_typed_edge(
+                        storage,
+                        ctx,
+                        session_id,
+                        src_id,
+                        edge_type,
+                        dst_id,
+                        final_weight,
+                        final_metadata,
+                    )
+                    .await
+                    {
+                        Ok(created) => {
+                            session.dirty.store(true, Ordering::Relaxed);
+                            session.last_activity.notify_waiters();
+                            BatchMutationOutcome {
+                                index: idx,
+                                kind: BatchMutationKind::Upserted,
+                                result: serde_json::json!({
+                                    "index": idx,
+                                    "status": "upserted",
+                                    "created_at": created.created_at.to_rfc3339(),
+                                    "weight": created.weight,
+                                }),
+                            }
+                        }
+                        Err(err) => BatchMutationOutcome {
+                            index: idx,
+                            kind: BatchMutationKind::Error,
+                            result: serde_json::json!({
+                                "index": idx,
+                                "status": "error",
+                                "reason": err.to_string()
+                            }),
+                        },
+                    }
+                }
+                Some(existing_edge) => {
+                    let final_weight = weight_override.unwrap_or(existing_edge.weight);
+                    let final_metadata = if metadata_override_set {
+                        metadata_override
+                    } else {
+                        existing_edge.metadata.clone()
+                    };
+
+                    let unchanged_weight =
+                        !weight_override_set || final_weight == existing_edge.weight;
+                    let unchanged_metadata =
+                        !metadata_override_set || final_metadata == existing_edge.metadata;
+                    if unchanged_weight && unchanged_metadata {
+                        return BatchMutationOutcome {
+                            index: idx,
+                            kind: BatchMutationKind::Unchanged,
+                            result: serde_json::json!({
+                                "index": idx,
+                                "status": "unchanged"
+                            }),
+                        };
+                    }
+
+                    match crate::graph_write::create_typed_edge(
+                        storage,
+                        ctx,
+                        session_id,
+                        src_id,
+                        edge_type,
+                        dst_id,
+                        final_weight,
+                        final_metadata,
+                    )
+                    .await
+                    {
+                        Ok(updated) => {
+                            session.dirty.store(true, Ordering::Relaxed);
+                            session.last_activity.notify_waiters();
+                            BatchMutationOutcome {
+                                index: idx,
+                                kind: BatchMutationKind::Upserted,
+                                result: serde_json::json!({
+                                    "index": idx,
+                                    "status": "updated",
+                                    "weight": updated.weight
+                                }),
+                            }
+                        }
+                        Err(err) => BatchMutationOutcome {
+                            index: idx,
+                            kind: BatchMutationKind::Error,
+                            result: serde_json::json!({
+                                "index": idx,
+                                "status": "error",
+                                "reason": err.to_string()
+                            }),
+                        },
+                    }
+                }
+            }
+        });
+
+    let outcomes: Vec<BatchMutationOutcome> = stream::iter(jobs)
+        .buffer_unordered(BATCH_MUTATION_CONCURRENCY)
+        .collect()
+        .await;
+
     let mut upserted: usize = 0;
     let mut unchanged: usize = 0;
     let mut errors: usize = 0;
-    let mut results = Vec::with_capacity(edges.len());
-
-    for edge_json in edges {
-        let idx = results.len();
-        let Some(edge_row) = edge_json.as_object() else {
-            errors += 1;
-            results.push(serde_json::json!({
-                "index": idx,
-                "status": "error",
-                "reason": format!("batch_update_edges[{idx}] must be an object")
-            }));
-            continue;
-        };
-
-        let src_id = match edge_row
-            .get("src_entity_id")
-            .and_then(|v| v.as_str())
-            .and_then(|s| uuid::Uuid::parse_str(s).ok())
-        {
-            Some(id) => id,
-            None => {
-                errors += 1;
-                results.push(serde_json::json!({
-                    "index": idx,
-                    "status": "error",
-                    "reason": "invalid or missing src_entity_id"
-                }));
-                continue;
-            }
-        };
-        let dst_id = match edge_json
-            .get("dst_entity_id")
-            .and_then(|v| v.as_str())
-            .and_then(|s| uuid::Uuid::parse_str(s).ok())
-        {
-            Some(id) => id,
-            None => {
-                errors += 1;
-                results.push(serde_json::json!({
-                    "index": idx,
-                    "status": "error",
-                    "reason": "invalid or missing dst_entity_id"
-                }));
-                continue;
-            }
-        };
-        let edge_type = match edge_row.get("edge_type").and_then(|v| v.as_str()) {
-            Some(t) => t,
-            None => {
-                errors += 1;
-                results.push(serde_json::json!({
-                    "index": idx,
-                    "status": "error",
-                    "reason": "missing edge_type"
-                }));
-                continue;
-            }
-        };
-
-        let metadata_override_set = edge_row.contains_key("metadata");
-        let weight_override_set = edge_row.contains_key("weight");
-
-        let weight_override = if weight_override_set {
-            match edge_row.get("weight").and_then(|v| v.as_f64()) {
-                Some(weight) => Some(weight),
-                None => {
-                    errors += 1;
-                    results.push(serde_json::json!({
-                        "index": idx,
-                        "status": "error",
-                        "reason": "weight must be a number"
-                    }));
-                    continue;
-                }
-            }
-        } else {
-            None
-        };
-
-        let metadata_override = if metadata_override_set {
-            match edge_row.get("metadata").unwrap() {
-                Value::String(value) => Some(value.to_string()),
-                Value::Null => None,
-                _ => {
-                    errors += 1;
-                    results.push(serde_json::json!({
-                        "index": idx,
-                        "status": "error",
-                        "reason": "metadata must be a string"
-                    }));
-                    continue;
-                }
-            }
-        } else {
-            None
-        };
-
-        if weight_override_set && !weight_override.unwrap().is_finite() {
-            errors += 1;
-            results.push(serde_json::json!({
-                "index": idx,
-                "status": "error",
-                "reason": "weight must be finite"
-            }));
-            continue;
-        }
-
-        let existing = storage
-            .typed_edge_list_from(ctx, session_id, src_id)
-            .await
-            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
-            .into_iter()
-            .find(|edge| edge.dst_id == dst_id && edge.edge_type == edge_type);
-
-        let Some(existing_edge) = existing else {
-            let final_weight = weight_override.unwrap_or(1.0);
-            if !weight_override_set && !metadata_override_set {
-                // No existing edge and no replacement data => we can only upsert defaults.
-                // Preserve current semantics and allow this path to act as a create.
-            }
-            let final_metadata = metadata_override;
-
-            match crate::graph_write::create_typed_edge(
-                storage,
-                ctx,
-                session_id,
-                src_id,
-                edge_type,
-                dst_id,
-                final_weight,
-                final_metadata,
-            )
-            .await
-            {
-                Ok(created) => {
-                    upserted += 1;
-                    session.dirty.store(true, Ordering::Relaxed);
-                    session.last_activity.notify_waiters();
-                    results.push(serde_json::json!({
-                        "index": idx,
-                        "status": "upserted",
-                        "created_at": created.created_at.to_rfc3339(),
-                        "weight": created.weight,
-                    }));
-                }
-                Err(err) => {
-                    errors += 1;
-                    results.push(serde_json::json!({
-                        "index": idx,
-                        "status": "error",
-                        "reason": err.to_string()
-                    }));
-                }
-            }
-            continue;
-        };
-
-        let final_weight = weight_override.unwrap_or(existing_edge.weight);
-        let final_metadata = if metadata_override_set {
-            metadata_override
-        } else {
-            existing_edge.metadata.clone()
-        };
-
-        let unchanged_weight = !weight_override_set || final_weight == existing_edge.weight;
-        let unchanged_metadata = !metadata_override_set || final_metadata == existing_edge.metadata;
-        if unchanged_weight && unchanged_metadata {
-            unchanged += 1;
-            results.push(serde_json::json!({
-                "index": idx,
-                "status": "unchanged"
-            }));
-            continue;
-        }
-
-        match crate::graph_write::create_typed_edge(
-            storage,
-            ctx,
-            session_id,
-            src_id,
-            edge_type,
-            dst_id,
-            final_weight,
-            final_metadata,
-        )
-        .await
-        {
-            Ok(updated) => {
-                upserted += 1;
-                session.dirty.store(true, Ordering::Relaxed);
-                session.last_activity.notify_waiters();
-                results.push(serde_json::json!({
-                    "index": idx,
-                    "status": "updated",
-                    "weight": updated.weight
-                }));
-            }
-            Err(err) => {
-                errors += 1;
-                results.push(serde_json::json!({
-                    "index": idx,
-                    "status": "error",
-                    "reason": err.to_string()
-                }));
-            }
+    for outcome in &outcomes {
+        match outcome.kind {
+            BatchMutationKind::Upserted => upserted += 1,
+            BatchMutationKind::Unchanged => unchanged += 1,
+            BatchMutationKind::Error => errors += 1,
+            BatchMutationKind::Updated
+            | BatchMutationKind::NotFound
+            | BatchMutationKind::Deleted
+            | BatchMutationKind::Missing
+            | BatchMutationKind::Invalid => {}
         }
     }
+    let results = ordered_batch_results(outcomes);
 
     Ok(serde_json::json!({
         "upserted": upserted,
@@ -6474,108 +6651,141 @@ async fn handle_batch_delete_edges<S: crate::storage::Storage>(
         ));
     }
 
-    let mut deleted = 0usize;
-    let mut missing = 0usize;
-    let mut invalid = 0usize;
-    let mut errors = 0usize;
-    let mut results = Vec::with_capacity(edges.len());
-
-    for edge_json in edges {
-        let idx = results.len();
-        let Some(edge_row) = edge_json.as_object() else {
-            invalid += 1;
-            results.push(serde_json::json!({
-                "index": idx,
-                "status": "error",
-                "reason": format!("batch_delete_edges[{idx}] must be an object")
-            }));
-            continue;
-        };
-
-        let src_id = match edge_row
-            .get("src_entity_id")
-            .and_then(|v| v.as_str())
-            .and_then(|s| uuid::Uuid::parse_str(s).ok())
-        {
-            Some(id) => id,
-            None => {
-                invalid += 1;
-                results.push(serde_json::json!({
+    let jobs = edges
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(idx, edge_json)| async move {
+            let Some(edge_row) = edge_json.as_object() else {
+                return BatchMutationOutcome {
+                    index: idx,
+                    kind: BatchMutationKind::Invalid,
+                    result: serde_json::json!({
                     "index": idx,
                     "status": "error",
-                    "reason": "invalid or missing src_entity_id"
-                }));
-                continue;
-            }
-        };
-        let dst_id = match edge_row
-            .get("dst_entity_id")
-            .and_then(|v| v.as_str())
-            .and_then(|s| uuid::Uuid::parse_str(s).ok())
-        {
-            Some(id) => id,
-            None => {
-                invalid += 1;
-                results.push(serde_json::json!({
-                    "index": idx,
-                    "status": "error",
-                    "reason": "invalid or missing dst_entity_id"
-                }));
-                continue;
-            }
-        };
-        let edge_type = match edge_row.get("edge_type").and_then(|v| v.as_str()) {
-            Some(t) => t,
-            None => {
-                invalid += 1;
-                results.push(serde_json::json!({
-                    "index": idx,
-                    "status": "error",
-                    "reason": "missing edge_type"
-                }));
-                continue;
-            }
-        };
+                    "reason": format!("batch_delete_edges[{idx}] must be an object")
+                    }),
+                };
+            };
 
-        match storage
-            .typed_edge_delete(ctx, session_id, src_id, edge_type, dst_id)
-            .await
-        {
-            Ok(true) => {
-                deleted += 1;
-                session.dirty.store(true, Ordering::Relaxed);
-                session.last_activity.notify_waiters();
-                results.push(serde_json::json!({
-                    "index": idx,
-                    "src_id": src_id.to_string(),
-                    "dst_id": dst_id.to_string(),
-                    "edge_type": edge_type,
-                    "status": "deleted"
-                }));
-            }
-            Ok(false) => {
-                missing += 1;
-                results.push(serde_json::json!({
+            let src_id = match edge_row
+                .get("src_entity_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            {
+                Some(id) => id,
+                None => {
+                    return BatchMutationOutcome {
+                        index: idx,
+                        kind: BatchMutationKind::Invalid,
+                        result: serde_json::json!({
+                        "index": idx,
+                        "status": "error",
+                        "reason": "invalid or missing src_entity_id"
+                        }),
+                    };
+                }
+            };
+            let dst_id = match edge_row
+                .get("dst_entity_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            {
+                Some(id) => id,
+                None => {
+                    return BatchMutationOutcome {
+                        index: idx,
+                        kind: BatchMutationKind::Invalid,
+                        result: serde_json::json!({
+                        "index": idx,
+                        "status": "error",
+                        "reason": "invalid or missing dst_entity_id"
+                        }),
+                    };
+                }
+            };
+            let edge_type = match edge_row.get("edge_type").and_then(|v| v.as_str()) {
+                Some(t) => t.to_string(),
+                None => {
+                    return BatchMutationOutcome {
+                        index: idx,
+                        kind: BatchMutationKind::Invalid,
+                        result: serde_json::json!({
+                        "index": idx,
+                        "status": "error",
+                        "reason": "missing edge_type"
+                        }),
+                    };
+                }
+            };
+
+            match storage
+                .typed_edge_delete(ctx, session_id, src_id, &edge_type, dst_id)
+                .await
+            {
+                Ok(true) => {
+                    session.dirty.store(true, Ordering::Relaxed);
+                    session.last_activity.notify_waiters();
+                    BatchMutationOutcome {
+                        index: idx,
+                        kind: BatchMutationKind::Deleted,
+                        result: serde_json::json!({
+                        "index": idx,
+                        "src_id": src_id.to_string(),
+                        "dst_id": dst_id.to_string(),
+                        "edge_type": edge_type,
+                        "status": "deleted"
+                        }),
+                    }
+                }
+                Ok(false) => BatchMutationOutcome {
+                    index: idx,
+                    kind: BatchMutationKind::Missing,
+                    result: serde_json::json!({
                     "index": idx,
                     "src_id": src_id.to_string(),
                     "dst_id": dst_id.to_string(),
                     "edge_type": edge_type,
                     "status": "not_found"
-                }));
-            }
-            Err(err) => {
-                errors += 1;
-                results.push(serde_json::json!({
+                    }),
+                },
+                Err(err) => BatchMutationOutcome {
+                    index: idx,
+                    kind: BatchMutationKind::Error,
+                    result: serde_json::json!({
                     "index": idx,
                     "src_id": src_id.to_string(),
                     "dst_id": dst_id.to_string(),
                     "edge_type": edge_type,
                     "status": "error",
                     "reason": err.to_string()
-                }));
+                    }),
+                },
             }
+        });
+
+    let outcomes: Vec<BatchMutationOutcome> = stream::iter(jobs)
+        .buffer_unordered(BATCH_MUTATION_CONCURRENCY)
+        .collect()
+        .await;
+
+    let mut deleted = 0usize;
+    let mut missing = 0usize;
+    let mut invalid = 0usize;
+    let mut errors = 0usize;
+    for outcome in &outcomes {
+        match outcome.kind {
+            BatchMutationKind::Deleted => deleted += 1,
+            BatchMutationKind::Missing => missing += 1,
+            BatchMutationKind::Invalid => invalid += 1,
+            BatchMutationKind::Error => errors += 1,
+            BatchMutationKind::Updated
+            | BatchMutationKind::Unchanged
+            | BatchMutationKind::NotFound
+            | BatchMutationKind::Upserted => {}
         }
     }
+    let results = ordered_batch_results(outcomes);
 
     Ok(serde_json::json!({
         "deleted": deleted,
@@ -6792,6 +7002,33 @@ mod tests {
         TenantContext {
             tenant_id: Uuid::new_v4(),
             session_origin: "test".into(),
+        }
+    }
+
+    #[test]
+    fn batch_mutation_handlers_use_bounded_concurrency() {
+        let source = include_str!("dispatch.rs");
+        assert!(
+            source.contains("const BATCH_MUTATION_CONCURRENCY: usize"),
+            "batch mutation handlers need one named concurrency budget"
+        );
+
+        for handler in [
+            "handle_batch_update_entities",
+            "handle_batch_delete_entities",
+            "handle_batch_update_edges",
+            "handle_batch_delete_edges",
+        ] {
+            let start = source
+                .find(&format!("async fn {handler}"))
+                .unwrap_or_else(|| panic!("{handler} should exist"));
+            let tail = &source[start..];
+            let end = tail.find("\nasync fn ").unwrap_or(tail.len());
+            let body = &tail[..end];
+            assert!(
+                body.contains(".buffer_unordered(BATCH_MUTATION_CONCURRENCY)"),
+                "{handler} should run storage mutations with bounded concurrency"
+            );
         }
     }
 
