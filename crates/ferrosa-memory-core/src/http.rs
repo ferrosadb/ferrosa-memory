@@ -147,6 +147,8 @@ const TLS_ACCEPT_BUDGET: std::time::Duration = std::time::Duration::from_secs(10
 /// above any real MCP payload and well below anything that would
 /// pressure RAM on a per-connection basis under spawned tasks.
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+const VIZ_DERIVED_FACTS_DEFAULT_LIMIT: usize = 100;
+const VIZ_DERIVED_FACTS_MAX_LIMIT: usize = 1_000;
 
 /// Upper bound on how long a single request is allowed to occupy a
 /// spawned connection task. Covers read, dispatch, and write. Tuned
@@ -1758,7 +1760,8 @@ async fn handle_viz_connection<S: crate::storage::Storage + 'static>(
 
             let limit: usize = query_param(path, "limit")
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(100);
+                .unwrap_or(VIZ_DERIVED_FACTS_DEFAULT_LIMIT)
+                .clamp(1, VIZ_DERIVED_FACTS_MAX_LIMIT);
 
             let session_uuid = uuid::Uuid::parse_str(&session_id).unwrap_or(uuid::Uuid::nil());
             let cache_key = format!("consolidation:{}", session_uuid);
@@ -3716,6 +3719,53 @@ mod tests {
             2
         );
         assert_eq!(storage.derived_cache_get_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn viz_derived_facts_clamps_large_limit_before_storage_call() {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let storage = Arc::new(MockStorage::new());
+        let ctx = Arc::new(test_tenant());
+        let session_id = Uuid::nil();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_storage = Arc::clone(&storage);
+        let server_ctx = Arc::clone(&ctx);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_viz_connection(
+                stream,
+                Arc::new(EventBus::new()),
+                server_storage,
+                server_ctx,
+                session_id,
+                &ShellRouteConfig::default(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "GET /viz/api/derived_facts?session_id={session_id}&limit=999999999 HTTP/1.1\r\n\
+             Host: 127.0.0.1\r\n\
+             Connection: close\r\n\r\n"
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        server.await.unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert_eq!(
+            storage
+                .derived_cache_get_limited_last_limit
+                .load(Ordering::Relaxed),
+            VIZ_DERIVED_FACTS_MAX_LIMIT
+        );
     }
 
     #[test]

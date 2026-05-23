@@ -26,9 +26,27 @@ Goal: fix the remaining concrete rust-streaming audit findings in ferrosa-memory
   - Fix: `temporal_list_all`, `feedback_list_all`, and `intention_list_all` now use driver paged iteration with explicit row caps and actionable errors.
   - Verify: `cargo test -p ferrosa-memory-core cql_secondary_list_all_apis_use_paged_iterators_with_explicit_caps`.
 
+- [x] `list_entities` must apply caller `limit` during CQL paging, not after materializing a tenant-wide candidate set.
+  - Evidence: default `entity_list_matching` called `entity_list_all()` for `scope=all`, then sorted/filtered/took the limit in memory.
+  - Fix: CQL storage overrides `entity_list_matching`, pages through scoped rows, keeps only a bounded top result set, and fails closed after the named broad-scan cap.
+  - Verify: `cargo test -p ferrosa-memory-core cql_entity_list_matching_streams_and_applies_limit_during_scan`.
+
+- [x] Viz derived facts limit must be bounded before reaching storage.
+  - Evidence: `/viz/api/derived_facts?limit=999999999` passed the raw caller limit into `derived_cache_get_limited`.
+  - Fix: clamp to `VIZ_DERIVED_FACTS_MAX_LIMIT`.
+  - Verify: `cargo test -p ferrosa-memory-core viz_derived_facts_clamps_large_limit_before_storage_call`.
+
 - [ ] Workbench summary should avoid broad expensive scans for counts and should surface degraded count paths clearly.
   - Evidence: live `/workbench/api/summary` returned `status:"not_ready"` with Ferrosa `Bulk lane send timeout` while MCP health was ready.
   - TDD: summary count path should use bounded/aggregate queries and distinguish partial/degraded counters from total endpoint failure.
+
+- [ ] Top-level HTTP request timeout must not cancel composite read/dispatch/write futures mid-operation.
+  - Evidence: `serve_one_connection_with_session` wraps `handle_connection_rw` in `tokio::time::timeout`; timeout can drop a partially read request, mutating handler, or response write.
+  - TDD: slow body/write test proves timeout happens at safe checkpoints or returns before dispatching mutating work.
+
+- [ ] Batch/sync jobs must not materialize full tenant datasets without caps or streaming.
+  - Evidence: `ferrosa-memory-batch` and `ferrosa-memory-sync` call broad list APIs; `memo_list_all()` and `typed_edge_list_all()` still collect all paged rows without named caps.
+  - TDD: source/unit tests requiring explicit caps or streaming replacements for memo and typed-edge list-all paths.
 
 ## Ferrosa Core Streaming Findings
 
@@ -40,6 +58,14 @@ Goal: fix the remaining concrete rust-streaming audit findings in ferrosa-memory
   - Evidence: stream chunks are written directly under live `sstables/.../{sstable_id}/{component}` before checksum validation.
   - TDD: bad checksum leaves no live SSTable files visible and cleans staged files.
 
+- [ ] Object-store restore must stream object bodies to staging instead of materializing them and writing live paths directly.
+  - Evidence: `ferrosa-storage/src/engine.rs` and `ferrosa-storage/src/restore/manager.rs` use `.bytes().await` and direct final-path writes for SSTable/commit-log restore.
+  - TDD: fake large object plus failing writer leaves no live partial component and memory stays bounded.
+
+- [ ] Compaction promotion must be generation-atomic, not component-by-component live renames.
+  - Evidence: `ferrosa-storage/src/engine.rs` renames component files one at a time; a crash after one rename can expose a partial SSTable generation.
+  - TDD: inject failure after first component rename; restart must not discover the partial target generation.
+
 - [ ] Forming-mode DDL queue must be bounded.
   - Evidence: `tokio::sync::mpsc::unbounded_channel` accepts unbounded DDL operations while forming.
   - TDD: queue-full behavior returns an explicit retryable error after the configured capacity.
@@ -47,6 +73,14 @@ Goal: fix the remaining concrete rust-streaming audit findings in ferrosa-memory
 - [ ] Streaming session maps must cap or expire abandoned sessions.
   - Evidence: `DashMap` session state grows on starts and is only removed on end/error.
   - TDD: many starts without matching end cannot grow session state past the configured cap or timeout.
+
+- [ ] Restore/index/compaction schedulers must use bounded queues or explicit backpressure.
+  - Evidence: compaction executor, index scheduler, and index builder use unbounded channels or full-object materialization before checking budgets.
+  - TDD: blocked workers reject or backpressure submissions beyond configured capacity.
+
+- [ ] RPC lane timeouts must not cancel non-cancel-safe sends with leaked pending stream IDs.
+  - Evidence: `RpcClient::send` documents non-cancel-safety while lane actor wraps it in `tokio::time::timeout`.
+  - TDD: force timeout while frame send is blocked; pending response slots are removed and stream IDs do not leak.
 
 ## MCP Runtime Diagnosis
 

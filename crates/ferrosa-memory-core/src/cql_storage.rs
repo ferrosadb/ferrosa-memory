@@ -594,6 +594,20 @@ fn row_to_entity_entry(
     }))
 }
 
+fn entity_list_result_order(a: &EntityEntry, b: &EntityEntry) -> std::cmp::Ordering {
+    let a_time = a.updated_at.unwrap_or(a.created_at);
+    let b_time = b.updated_at.unwrap_or(b.created_at);
+    b_time
+        .cmp(&a_time)
+        .then_with(|| a.entity_name.cmp(&b.entity_name))
+        .then_with(|| a.entity_id.cmp(&b.entity_id))
+}
+
+fn trim_entity_list_matches(matches: &mut Vec<EntityEntry>, limit: usize) {
+    matches.sort_by(entity_list_result_order);
+    matches.truncate(limit);
+}
+
 /// Type alias for the scylla legacy session used throughout this crate.
 ///
 /// `LegacySession` provides `execute_unpaged` / `query_unpaged` that return
@@ -1328,6 +1342,40 @@ impl CqlStorage {
             results.push(entry);
         }
         Ok(results)
+    }
+
+    async fn collect_entity_matches_from_paged_iter(
+        &self,
+        ctx: &TenantContext,
+        stmt: PreparedStatement,
+        values: impl scylla::serialize::row::SerializeRow,
+        query: &EntityListQuery,
+        matches: &mut Vec<EntityEntry>,
+        scanned_rows: &mut usize,
+    ) -> anyhow::Result<()> {
+        let limit = query.limit.max(1);
+        let mut iter = self.session.execute_iter(stmt, values).await?;
+        let col_map = build_col_map(iter.get_column_specs());
+        while let Some(row) = iter.next().await {
+            let row = row?;
+            if *scanned_rows >= CQL_ENTITY_LIST_MAX_ROWS {
+                anyhow::bail!(
+                    "entity_list_matching exceeded {CQL_ENTITY_LIST_MAX_ROWS} scanned rows; narrow the scope or filters for broad scans"
+                );
+            }
+            *scanned_rows += 1;
+            let Some(entry) = row_to_entity_entry(ctx, &row, &col_map)? else {
+                continue;
+            };
+            if crate::storage::entity_matches_list_query(&entry, ctx, query) {
+                matches.push(entry);
+                if matches.len() > limit {
+                    trim_entity_list_matches(matches, limit);
+                }
+            }
+        }
+        trim_entity_list_matches(matches, limit);
+        Ok(())
     }
 
     async fn collect_legacy_edges_from_paged_iter(
@@ -2417,6 +2465,42 @@ impl Storage for CqlStorage {
             "entity_list_session",
         )
         .await
+    }
+
+    async fn entity_list_matching(
+        &self,
+        ctx: &TenantContext,
+        query: EntityListQuery,
+    ) -> anyhow::Result<Vec<EntityEntry>> {
+        let mut matches = Vec::new();
+        let mut scanned_rows = 0usize;
+        if let Some(sessions) =
+            crate::storage::entity_list_sessions(ctx.tenant_id, query.session_id, query.scope)
+        {
+            for session_id in sessions {
+                self.collect_entity_matches_from_paged_iter(
+                    ctx,
+                    self.stmts.entity_list_session.clone(),
+                    (ctx.tenant_id, session_id),
+                    &query,
+                    &mut matches,
+                    &mut scanned_rows,
+                )
+                .await?;
+            }
+        } else {
+            self.collect_entity_matches_from_paged_iter(
+                ctx,
+                self.stmts.entity_list_all.clone(),
+                (ctx.tenant_id,),
+                &query,
+                &mut matches,
+                &mut scanned_rows,
+            )
+            .await?;
+        }
+        trim_entity_list_matches(&mut matches, query.limit.max(1));
+        Ok(matches)
     }
 
     async fn entity_counts_by_type_and_state(
@@ -5332,6 +5416,51 @@ mod cql_storage_tests {
         assert!(
             source.contains("CQL_ENTITY_LIST_MAX_ROWS"),
             "entity list APIs must have a named maximum and clear failure mode"
+        );
+    }
+
+    #[test]
+    fn cql_entity_list_matching_streams_and_applies_limit_during_scan() {
+        let source = include_str!("cql_storage.rs");
+        let method_start = source
+            .find("async fn entity_list_matching")
+            .expect("CQL storage must override entity_list_matching");
+        let tail = &source[method_start..];
+        let method_end = tail
+            .find("async fn entity_counts_by_type_and_state")
+            .unwrap_or(tail.len());
+        let method_source = &tail[..method_end];
+
+        assert!(
+            method_source.contains("trim_entity_list_matches"),
+            "CQL entity_list_matching must keep only the bounded top result set during scans"
+        );
+        assert!(
+            method_source.contains("collect_entity_matches_from_paged_iter"),
+            "CQL entity_list_matching must use the paged matching helper"
+        );
+        assert!(
+            !method_source.contains("entity_list_all(ctx)")
+                && !method_source.contains("entity_list_session(ctx"),
+            "CQL entity_list_matching must not materialize broad list APIs before applying limit"
+        );
+
+        let helper_start = source
+            .find("async fn collect_entity_matches_from_paged_iter")
+            .expect("paged matching helper must exist");
+        let helper_tail = &source[helper_start..];
+        let helper_end = helper_tail
+            .find("async fn collect_legacy_edges_from_paged_iter")
+            .unwrap_or(helper_tail.len());
+        let helper_source = &helper_tail[..helper_end];
+
+        assert!(
+            helper_source.contains("execute_iter"),
+            "entity matching helper must page through CQL rows"
+        );
+        assert!(
+            helper_source.contains("CQL_ENTITY_LIST_MAX_ROWS"),
+            "entity matching helper must fail closed on excessive broad scans"
         );
     }
 

@@ -22,7 +22,7 @@ use crate::types::{
     WarmthEntry,
 };
 
-fn entity_list_sessions(
+pub(crate) fn entity_list_sessions(
     tenant_id: Uuid,
     caller_session: Uuid,
     scope: EntityListScope,
@@ -65,7 +65,7 @@ fn property_path_value<'a>(
     Some(current)
 }
 
-fn entity_matches_list_query(
+pub(crate) fn entity_matches_list_query(
     entry: &EntityEntry,
     ctx: &TenantContext,
     query: &EntityListQuery,
