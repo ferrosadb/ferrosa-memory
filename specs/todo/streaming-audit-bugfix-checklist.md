@@ -79,4 +79,6 @@ Goal: fix the concrete rust-streaming audit findings with tests first, run local
 - [x] `make test-all`
   - Rust/unit/contract phases passed through `make test-all`.
   - Python phases were run with `uv run --with-requirements tests/requirements.txt ...` because system `python3` lacks `pytest`.
-- [ ] PR opened and GitHub CI monitored every 15 minutes until green.
+- [x] PR opened and GitHub CI monitored until green.
+  - PR: https://github.com/ferrosadb/ferrosa-memory/pull/33
+  - Final GitHub result: Format & Lint, Build, Tests & Coverage, Cluster integration tests, Dependency Advisories, Complexity Analysis, Generate Docs, Blueprint Harness Smoke, Verify SHA pins, and CI Pass all succeeded for commit `5db7840`.
