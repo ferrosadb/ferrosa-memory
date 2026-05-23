@@ -48,7 +48,7 @@ const SPARQL_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// the failed query. `notify_one` is called while the write lock is still
 /// held so the signal cannot be lost to cancellation.
 struct ReconnectingStorage {
-    inner: RwLock<Option<CqlStorage>>,
+    inner: RwLock<Option<Arc<CqlStorage>>>,
     /// Monotonically increasing generation — bumped on every `set_connected`.
     /// Prevents stale errors from disconnecting a fresh session.
     generation: AtomicU64,
@@ -318,7 +318,7 @@ impl ReconnectingStorage {
     /// Swap in a newly connected CQL backend and bump the generation.
     async fn set_connected(&self, cql: CqlStorage) {
         let mut guard = self.inner.write().await;
-        *guard = Some(cql);
+        *guard = Some(Arc::new(cql));
         self.generation.fetch_add(1, Ordering::Release);
     }
 
@@ -340,7 +340,7 @@ impl ReconnectingStorage {
             .unwrap_or(false)
     }
 
-    async fn current_cql(&self) -> Option<CqlStorage> {
+    async fn current_cql(&self) -> Option<Arc<CqlStorage>> {
         self.inner.read().await.as_ref().cloned()
     }
 
@@ -1041,18 +1041,28 @@ impl Storage for ReconnectingStorage {
         latency_ms: i32,
         error: bool,
     ) -> anyhow::Result<()> {
-        delegate!(
-            self,
-            tool_usage_put,
-            ctx,
-            tool_name,
-            repo,
-            input_bytes,
-            output_bytes,
-            estimated_tokens,
-            latency_ms,
-            error
-        )
+        let cql = self.current_cql().await;
+        match cql {
+            Some(cql) => {
+                let result = cql
+                    .tool_usage_put(
+                        ctx,
+                        tool_name,
+                        repo,
+                        input_bytes,
+                        output_bytes,
+                        estimated_tokens,
+                        latency_ms,
+                        error,
+                    )
+                    .await;
+                if result.is_err() {
+                    return Err(anyhow::anyhow!("tool usage logging failed"));
+                }
+                Ok(())
+            }
+            None => Err(anyhow::anyhow!(NOT_CONNECTED_MSG)),
+        }
     }
 
     async fn tool_usage_query(
@@ -2622,6 +2632,65 @@ auth_file = "{}"
         assert!(
             !macro_source.contains("let guard = $self.inner.read().await;"),
             "delegate macro must not hold the reconnect RwLock read guard across awaited storage calls"
+        );
+    }
+
+    #[test]
+    fn reconnecting_storage_clones_arc_not_cql_backend() {
+        let source = include_str!("main.rs");
+        let impl_start = source
+            .find("impl ReconnectingStorage")
+            .expect("ReconnectingStorage impl must exist");
+        let impl_tail = &source[impl_start..];
+        let impl_end = impl_tail
+            .find("/// Error returned when CQL is not yet connected.")
+            .expect("ReconnectingStorage impl section must end before error constants");
+        let impl_source = &impl_tail[..impl_end];
+        assert!(
+            source.contains("inner: RwLock<Option<Arc<CqlStorage>>>"),
+            "ReconnectingStorage must store Arc<CqlStorage> so each request clones only a pointer"
+        );
+        assert!(
+            impl_source.contains("async fn current_cql(&self) -> Option<Arc<CqlStorage>>"),
+            "current_cql must return Arc<CqlStorage>, not clone the prepared-statement cache"
+        );
+        assert!(
+            impl_source.contains("*guard = Some(Arc::new(cql));"),
+            "set_connected must wrap the backend in Arc before publishing it"
+        );
+        assert!(
+            !impl_source.contains("async fn current_cql(&self) -> Option<CqlStorage>"),
+            "current_cql must not clone CqlStorage directly"
+        );
+    }
+
+    #[test]
+    fn tool_usage_logging_does_not_use_connection_error_delegate() {
+        let source = include_str!("main.rs");
+        let impl_start = source
+            .find("impl Storage for ReconnectingStorage")
+            .expect("ReconnectingStorage must implement Storage");
+        let impl_source = &source[impl_start..];
+        let method_start = impl_source
+            .find("async fn tool_usage_put")
+            .expect("tool_usage_put override must exist");
+        let tail = &impl_source[method_start..];
+        let method_end = tail
+            .find("async fn tool_usage_query")
+            .expect("tool_usage_put section must end before tool_usage_query");
+        let method_source = &tail[..method_end];
+
+        assert!(
+            !method_source.contains("delegate!("),
+            "best-effort telemetry must not use the generic delegate path"
+        );
+        assert!(
+            !method_source.contains("is_connection_error"),
+            "best-effort telemetry must not format/inspect driver errors"
+        );
+        assert!(
+            method_source.contains("tool usage logging failed"),
+            "telemetry failures should collapse to a bounded local error"
         );
     }
 

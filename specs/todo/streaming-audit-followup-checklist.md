@@ -48,7 +48,7 @@ Goal: fix the remaining concrete rust-streaming audit findings in ferrosa-memory
 
 ## MCP Runtime Diagnosis
 
-- [ ] Confirm the client-side MCP config uses credentials matching `.runtime/http-auth.toml`.
+- [x] Confirm the client-side MCP config uses credentials matching `.runtime/http-auth.toml`.
   - Evidence: direct HTTP JSON-RPC succeeds with the `codex` header from `~/.codex/config.toml`; a wrong `codex:codex` header returns `unauthorized`.
   - Verify: authenticated `check_intentions` against `http://127.0.0.1:18765/mcp`.
 
@@ -56,6 +56,11 @@ Goal: fix the remaining concrete rust-streaming audit findings in ferrosa-memory
   - Evidence: startup previously awaited graph health, admin migration CQL, runtime CQL, and embedding health before serving transports.
   - Fix: startup now creates reconnecting storage immediately; the reconnect worker runs migrations before runtime CQL connect, graph client construction avoids a startup health probe, and embedding health runs in a background task.
   - Verify: `cargo test -p ferrosa-memory-mcp startup_main_does_not_await_backend_connects_before_serving` and `cargo test -p ferrosa-memory-mcp reconnect_watcher_runs_migrations_before_runtime_cql_connect`; manual offline stdio initialize returns immediately when stderr is drained.
+
+- [x] MCP `tools/call` must not overflow tokio worker stacks on the first request.
+  - Evidence: launchd restarted `ferrosa-memory-mcp` with `thread 'tokio-rt-worker' has overflowed its stack` before any tool handler log; foreground debug reproduced this with `check_intentions`.
+  - Fix: `dispatch_tool` now boxes the selected handler future instead of embedding every handler future in one large match; reconnecting storage keeps `Arc<CqlStorage>` handles; best-effort telemetry avoids the generic connection-error formatting path.
+  - Verify: `cargo test -p ferrosa-memory-core tool_dispatch_boxes_selected_handler_future`; launchd `check_intentions` returns HTTP 200 in about 10ms after restart.
 
 - [ ] Investigate the repeated 30s request timeouts in `/tmp/ferrosa-memory-mcp.log`.
   - Evidence: server has been listening and health-ready, but logs repeated `request exceeded 30s`.

@@ -11,6 +11,8 @@
 //! - `notifications/initialized` — client acknowledgment (no-op)
 
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -27,6 +29,9 @@ use crate::transport::{INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND};
 
 const CONSOLIDATION_QUEUE_CAPACITY: usize = 1024;
 const BATCH_MUTATION_CONCURRENCY: usize = 16;
+
+type ToolDispatchFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Value, (i32, String)>> + Send + 'a>>;
 
 #[derive(Clone, Copy)]
 enum BatchMutationKind {
@@ -1491,76 +1496,81 @@ async fn dispatch_tool<S: crate::storage::Storage>(
     let input_bytes = serde_json::to_string(&args).map(|s| s.len()).unwrap_or(0) as i32;
     let start = std::time::Instant::now();
     tracing::info!(tool = name, input_bytes, "tool call started");
-    let result = match name {
-        "check_memo_cache" => handle_check_memo(args, storage, ctx).await,
-        "store_memo_result" => handle_store_memo(args, storage, ctx).await,
-        "write_plan_node" => handle_write_plan(args, storage, ctx).await,
-        "get_plan_context" => handle_get_plan(args, storage, ctx).await,
-        "update_plan_node" => handle_update_plan(args, storage, ctx).await,
-        "start_fold" => handle_start_fold(args, storage, ctx).await,
-        "append_to_fold" => handle_append_fold(args, storage, ctx).await,
-        "complete_fold" => handle_complete_fold(args, storage, ctx, session).await,
-        "retrieve_fold_context" => handle_retrieve_fold(args, storage, ctx).await,
+    let handler: ToolDispatchFuture<'_> = match name {
+        "check_memo_cache" => Box::pin(handle_check_memo(args, storage, ctx)),
+        "store_memo_result" => Box::pin(handle_store_memo(args, storage, ctx)),
+        "write_plan_node" => Box::pin(handle_write_plan(args, storage, ctx)),
+        "get_plan_context" => Box::pin(handle_get_plan(args, storage, ctx)),
+        "update_plan_node" => Box::pin(handle_update_plan(args, storage, ctx)),
+        "start_fold" => Box::pin(handle_start_fold(args, storage, ctx)),
+        "append_to_fold" => Box::pin(handle_append_fold(args, storage, ctx)),
+        "complete_fold" => Box::pin(handle_complete_fold(args, storage, ctx, session)),
+        "retrieve_fold_context" => Box::pin(handle_retrieve_fold(args, storage, ctx)),
         "ingest_context_segments" => {
-            handle_ingest_context_segments(args, storage, ctx, session).await
+            Box::pin(handle_ingest_context_segments(args, storage, ctx, session))
         }
         "search_context_segments" => {
-            handle_search_context_segments(args, storage, ctx, session).await
+            Box::pin(handle_search_context_segments(args, storage, ctx, session))
         }
-        "get_context_window" => handle_get_context_window(args, storage, ctx).await,
-        "upsert_entity" => handle_upsert_entity(args, storage, ctx, session).await,
-        "batch_ingest" => handle_batch_ingest(args, storage, ctx, session).await,
-        "ingest_entities" => handle_ingest_entities(args, storage, ctx, session).await,
-        "retrieve_entities" => handle_retrieve_entities(args, storage, ctx, session).await,
-        "list_entities" => handle_list_entities(args, storage, ctx).await,
-        "record_outcome" => handle_record_outcome(args, storage, ctx).await,
-        "delete_session" => handle_delete_session(args, storage, ctx).await,
-        "smart_ingest" => handle_smart_ingest(args, storage, ctx, session).await,
-        "ingest_skill" => handle_ingest_skill(args, storage, ctx, session).await,
-        "retrieve_skills_for_context" => {
-            handle_retrieve_skills_for_context(args, storage, ctx, session).await
+        "get_context_window" => Box::pin(handle_get_context_window(args, storage, ctx)),
+        "upsert_entity" => Box::pin(handle_upsert_entity(args, storage, ctx, session)),
+        "batch_ingest" => Box::pin(handle_batch_ingest(args, storage, ctx, session)),
+        "ingest_entities" => Box::pin(handle_ingest_entities(args, storage, ctx, session)),
+        "retrieve_entities" => Box::pin(handle_retrieve_entities(args, storage, ctx, session)),
+        "list_entities" => Box::pin(handle_list_entities(args, storage, ctx)),
+        "record_outcome" => Box::pin(handle_record_outcome(args, storage, ctx)),
+        "delete_session" => Box::pin(handle_delete_session(args, storage, ctx)),
+        "smart_ingest" => Box::pin(handle_smart_ingest(args, storage, ctx, session)),
+        "ingest_skill" => Box::pin(handle_ingest_skill(args, storage, ctx, session)),
+        "retrieve_skills_for_context" => Box::pin(handle_retrieve_skills_for_context(
+            args, storage, ctx, session,
+        )),
+        "invoke_skill" => Box::pin(handle_invoke_skill(args, storage, ctx, session)),
+        "ensure_parent_tag" => Box::pin(handle_ensure_parent_tag(args, storage, ctx, session)),
+        "verify_skill" => Box::pin(handle_verify_skill(args, storage, ctx, session)),
+        "set_intention" => Box::pin(handle_set_intention(args, storage, ctx, session)),
+        "check_intentions" => Box::pin(handle_check_intentions(args, storage, ctx, session)),
+        "complete_intention" => Box::pin(handle_complete_intention(args, storage, ctx, session)),
+        "list_intentions" => Box::pin(handle_list_intentions(args, storage, ctx, session)),
+        "snooze_intention" => Box::pin(handle_snooze_intention(args, storage, ctx, session)),
+        "write_temporal_fact" => Box::pin(handle_write_temporal_fact(args, storage, ctx, session)),
+        "get_temporal_chain" => Box::pin(handle_get_temporal_chain(args, storage, ctx)),
+        "explore_connections" => Box::pin(handle_explore_connections(args, storage, ctx, session)),
+        "hybrid_search" => Box::pin(handle_hybrid_search(args, storage, ctx, session)),
+        "run_consolidation" => Box::pin(handle_run_consolidation(args, storage, ctx, session)),
+        "enrich_entities" => Box::pin(handle_enrich_entities(args, storage, ctx, session)),
+        "get_stats" => Box::pin(handle_get_stats(args, storage, ctx, session)),
+        "count_entities_by_type" => Box::pin(handle_count_entities_by_type(args, storage, ctx)),
+        "promote_memory" => Box::pin(handle_promote_memory(args, storage, ctx, session)),
+        "demote_memory" => Box::pin(handle_demote_memory(args, storage, ctx, session)),
+        "importance_score" => Box::pin(handle_importance_score(args, storage, ctx, session)),
+        "find_memory_chain" => Box::pin(handle_find_memory_chain(args, storage, ctx)),
+        "predict_needed" => Box::pin(handle_predict_needed(args, session)),
+        "spread_activation" => Box::pin(handle_spread_activation(args, storage, ctx)),
+        "find_duplicates" => Box::pin(handle_find_duplicates(args, storage, ctx)),
+        "recursive_explore" => Box::pin(handle_recursive_explore(args, storage, ctx, session)),
+        "query_derived" => Box::pin(handle_query_derived(args, storage, ctx)),
+        "manage_rules" => Box::pin(handle_manage_rules(args, storage, ctx)),
+        "manage_claims" => Box::pin(handle_manage_claims(args, storage, ctx)),
+        "manage_approvals" => Box::pin(handle_manage_approvals(args, storage, ctx)),
+        "manage_aliases" => Box::pin(handle_manage_aliases(args, storage, ctx)),
+        "explain_derived" => Box::pin(handle_explain_derived(args, storage, ctx)),
+        "get_effective_rule_set" => Box::pin(handle_get_effective_rule_set(args, storage, ctx)),
+        "promote_predicate" => Box::pin(handle_promote_predicate(args, storage, ctx)),
+        "batch_update_entities" => {
+            Box::pin(handle_batch_update_entities(args, storage, ctx, session))
         }
-        "invoke_skill" => handle_invoke_skill(args, storage, ctx, session).await,
-        "ensure_parent_tag" => handle_ensure_parent_tag(args, storage, ctx, session).await,
-        "verify_skill" => handle_verify_skill(args, storage, ctx, session).await,
-        "set_intention" => handle_set_intention(args, storage, ctx, session).await,
-        "check_intentions" => handle_check_intentions(args, storage, ctx, session).await,
-        "complete_intention" => handle_complete_intention(args, storage, ctx, session).await,
-        "list_intentions" => handle_list_intentions(args, storage, ctx, session).await,
-        "snooze_intention" => handle_snooze_intention(args, storage, ctx, session).await,
-        "write_temporal_fact" => handle_write_temporal_fact(args, storage, ctx, session).await,
-        "get_temporal_chain" => handle_get_temporal_chain(args, storage, ctx).await,
-        "explore_connections" => handle_explore_connections(args, storage, ctx, session).await,
-        "hybrid_search" => handle_hybrid_search(args, storage, ctx, session).await,
-        "run_consolidation" => handle_run_consolidation(args, storage, ctx, session).await,
-        "enrich_entities" => handle_enrich_entities(args, storage, ctx, session).await,
-        "get_stats" => handle_get_stats(args, storage, ctx, session).await,
-        "count_entities_by_type" => handle_count_entities_by_type(args, storage, ctx).await,
-        "promote_memory" => handle_promote_memory(args, storage, ctx, session).await,
-        "demote_memory" => handle_demote_memory(args, storage, ctx, session).await,
-        "importance_score" => handle_importance_score(args, storage, ctx, session).await,
-        "find_memory_chain" => handle_find_memory_chain(args, storage, ctx).await,
-        "predict_needed" => handle_predict_needed(args, session).await,
-        "spread_activation" => handle_spread_activation(args, storage, ctx).await,
-        "find_duplicates" => handle_find_duplicates(args, storage, ctx).await,
-        "recursive_explore" => handle_recursive_explore(args, storage, ctx, session).await,
-        "query_derived" => handle_query_derived(args, storage, ctx).await,
-        "manage_rules" => handle_manage_rules(args, storage, ctx).await,
-        "manage_claims" => handle_manage_claims(args, storage, ctx).await,
-        "manage_approvals" => handle_manage_approvals(args, storage, ctx).await,
-        "manage_aliases" => handle_manage_aliases(args, storage, ctx).await,
-        "explain_derived" => handle_explain_derived(args, storage, ctx).await,
-        "get_effective_rule_set" => handle_get_effective_rule_set(args, storage, ctx).await,
-        "promote_predicate" => handle_promote_predicate(args, storage, ctx).await,
-        "batch_update_entities" => handle_batch_update_entities(args, storage, ctx, session).await,
-        "batch_delete_entities" => handle_batch_delete_entities(args, storage, ctx, session).await,
-        "create_edge" => handle_create_edge(args, storage, ctx, session).await,
-        "batch_create_edges" => handle_batch_create_edges(args, storage, ctx, session).await,
-        "batch_update_edges" => handle_batch_update_edges(args, storage, ctx, session).await,
-        "batch_delete_edges" => handle_batch_delete_edges(args, storage, ctx, session).await,
-        "list_derived_cache" => handle_list_derived_cache(args, storage, ctx).await,
-        _ => Err((METHOD_NOT_FOUND, format!("unknown tool: {name}"))),
+        "batch_delete_entities" => {
+            Box::pin(handle_batch_delete_entities(args, storage, ctx, session))
+        }
+        "create_edge" => Box::pin(handle_create_edge(args, storage, ctx, session)),
+        "batch_create_edges" => Box::pin(handle_batch_create_edges(args, storage, ctx, session)),
+        "batch_update_edges" => Box::pin(handle_batch_update_edges(args, storage, ctx, session)),
+        "batch_delete_edges" => Box::pin(handle_batch_delete_edges(args, storage, ctx, session)),
+        "list_derived_cache" => Box::pin(handle_list_derived_cache(args, storage, ctx)),
+        _ => Box::pin(async move { Err((METHOD_NOT_FOUND, format!("unknown tool: {name}"))) }),
     };
+    let result = handler.await;
     let elapsed = start.elapsed();
     match &result {
         Ok(v) => {
@@ -7350,6 +7360,36 @@ mod tests {
         assert!(!names.contains(&"recursive_explore"));
         assert!(!names.contains(&"promote_memory"));
         assert!(!names.contains(&"list_derived_cache"));
+    }
+
+    #[test]
+    fn tool_dispatch_boxes_selected_handler_future() {
+        let source = include_str!("dispatch.rs");
+        let start = source
+            .find("async fn dispatch_tool")
+            .expect("dispatch_tool must exist");
+        let tail = &source[start..];
+        let end = tail
+            .find("/// Returns true for tier-1 tools")
+            .expect("dispatch_tool section must end before tier-1 helper");
+        let dispatch_tool = &tail[..end];
+
+        assert!(
+            source.contains("type ToolDispatchFuture"),
+            "dispatcher should have an explicit boxed future type alias"
+        );
+        assert!(
+            dispatch_tool.contains("let handler: ToolDispatchFuture<'_> = match name"),
+            "dispatch_tool must box exactly the selected handler future"
+        );
+        assert!(
+            dispatch_tool.contains("Box::pin(handle_check_intentions"),
+            "check_intentions must go through the boxed handler path"
+        );
+        assert!(
+            dispatch_tool.contains("let result = handler.await;"),
+            "dispatch_tool should await only the boxed selected handler"
+        );
     }
 
     #[tokio::test]

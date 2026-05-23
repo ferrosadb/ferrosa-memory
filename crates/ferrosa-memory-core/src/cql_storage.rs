@@ -18,6 +18,7 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use scylla::frame::response::cql_to_rust::FromCqlVal;
 use scylla::frame::response::result::{CqlValue, Row};
+use scylla::frame::value::CqlTimeuuid;
 use scylla::prepared_statement::PreparedStatement;
 use scylla::{LegacySession, SessionBuilder};
 use serde_json::json;
@@ -79,6 +80,15 @@ fn sprint1_seed_insert_statements(ks: &str) -> (String, String) {
          VALUES (?, ?, ?, ?, ?)"
     );
     (entity_q, edge_q)
+}
+
+fn tool_usage_put_query(ks: &str) -> String {
+    format!(
+        "INSERT INTO {ks}.tool_usage_log \
+         (tenant_id, day, call_id, tool_name, repo, input_bytes, output_bytes, \
+          estimated_tokens, latency_ms, error) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
 }
 
 fn entity_list_all_query(ks: &str) -> String {
@@ -926,12 +936,7 @@ impl CqlStorage {
                 ))
                 .await?,
             tool_usage_put: session
-                .prepare(format!(
-                    "INSERT INTO {ks}.tool_usage_log \
-                     (tenant_id, day, call_id, tool_name, repo, input_bytes, output_bytes, \
-                      estimated_tokens, latency_ms, error) \
-                     VALUES (?, ?, now(), ?, ?, ?, ?, ?, ?, ?)"
-                ))
+                .prepare(tool_usage_put_query(ks))
                 .await?,
             tool_usage_query: session
                 .prepare(format!(
@@ -3522,6 +3527,7 @@ impl Storage for CqlStorage {
                 (
                     ctx.tenant_id,
                     today,
+                    CqlTimeuuid::from(Uuid::now_v7()),
                     tool_name.to_string(),
                     repo.to_string(),
                     input_bytes,
@@ -5130,6 +5136,24 @@ mod cql_storage_tests {
         assert!(
             !entity_q.contains("now()") && !edge_q.contains("now()"),
             "seed queries must not rely on Ferrosa CQL now() coercion"
+        );
+    }
+
+    #[test]
+    fn tool_usage_insert_binds_call_id_instead_of_server_side_now() {
+        let query = tool_usage_put_query("agent_memory");
+
+        assert!(
+            query.contains("call_id"),
+            "tool usage insert must write the call_id clustering column: {query}"
+        );
+        assert!(
+            query.contains("VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"),
+            "tool usage insert must bind all values, including call_id: {query}"
+        );
+        assert!(
+            !query.contains("now()") && !query.contains("toTimestamp"),
+            "tool usage logging must not send Ferrosa a server-side time expression: {query}"
         );
     }
 
