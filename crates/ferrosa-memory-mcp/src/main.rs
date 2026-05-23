@@ -24,6 +24,7 @@ use ferrosa_memory_core::transport;
 use ferrosa_memory_core::types::*;
 use futures_util::StreamExt;
 use scylla::frame::response::result::{CqlValue, Row};
+use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 
@@ -100,6 +101,201 @@ async fn read_sparql_response_body_bounded(
     }
 
     String::from_utf8(body).map_err(|e| anyhow::anyhow!("SPARQL response is not UTF-8: {e}"))
+}
+
+struct LimitedSparqlResult {
+    columns: serde_json::Value,
+    rows: Vec<serde_json::Value>,
+    total_rows: usize,
+    truncated: bool,
+}
+
+fn parse_sparql_response_limited(body: &str, limit: usize) -> anyhow::Result<LimitedSparqlResult> {
+    let mut deserializer = serde_json::Deserializer::from_str(body);
+    SparqlResponseSeed { limit }
+        .deserialize(&mut deserializer)
+        .map_err(anyhow::Error::from)
+}
+
+struct SparqlResponseSeed {
+    limit: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for SparqlResponseSeed {
+    type Value = LimitedSparqlResult;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(SparqlResponseVisitor { limit: self.limit })
+    }
+}
+
+struct SparqlResponseVisitor {
+    limit: usize,
+}
+
+impl<'de> Visitor<'de> for SparqlResponseVisitor {
+    type Value = LimitedSparqlResult;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a SPARQL JSON results object")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut columns = serde_json::Value::Array(Vec::new());
+        let mut rows = Vec::with_capacity(self.limit.min(1024));
+        let mut total_rows = 0usize;
+        let mut truncated = false;
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "head" => {
+                    let head = map.next_value::<serde_json::Value>()?;
+                    columns = head
+                        .get("vars")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+                }
+                "results" => {
+                    let parsed = map.next_value_seed(SparqlResultsSeed { limit: self.limit })?;
+                    rows = parsed.rows;
+                    total_rows = parsed.total_rows;
+                    truncated = parsed.truncated;
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+
+        Ok(LimitedSparqlResult {
+            columns,
+            rows,
+            total_rows,
+            truncated,
+        })
+    }
+}
+
+struct ParsedBindings {
+    rows: Vec<serde_json::Value>,
+    total_rows: usize,
+    truncated: bool,
+}
+
+struct SparqlResultsSeed {
+    limit: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for SparqlResultsSeed {
+    type Value = ParsedBindings;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(SparqlResultsVisitor { limit: self.limit })
+    }
+}
+
+struct SparqlResultsVisitor {
+    limit: usize,
+}
+
+impl<'de> Visitor<'de> for SparqlResultsVisitor {
+    type Value = ParsedBindings;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a SPARQL results object")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut parsed = ParsedBindings {
+            rows: Vec::with_capacity(self.limit.min(1024)),
+            total_rows: 0,
+            truncated: false,
+        };
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "bindings" => {
+                    parsed = map.next_value_seed(SparqlBindingsSeed { limit: self.limit })?;
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+
+        Ok(parsed)
+    }
+}
+
+struct SparqlBindingsSeed {
+    limit: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for SparqlBindingsSeed {
+    type Value = ParsedBindings;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(SparqlBindingsVisitor { limit: self.limit })
+    }
+}
+
+struct SparqlBindingsVisitor {
+    limit: usize,
+}
+
+impl<'de> Visitor<'de> for SparqlBindingsVisitor {
+    type Value = ParsedBindings;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a SPARQL bindings array")
+    }
+
+    fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+    where
+        S: SeqAccess<'de>,
+    {
+        let mut rows = Vec::with_capacity(self.limit.min(1024));
+        let mut total_rows = 0usize;
+
+        while rows.len() < self.limit {
+            let Some(row) = seq.next_element::<serde_json::Value>()? else {
+                return Ok(ParsedBindings {
+                    rows,
+                    total_rows,
+                    truncated: false,
+                });
+            };
+            rows.push(row);
+            total_rows += 1;
+        }
+
+        let mut truncated = false;
+        while seq.next_element::<IgnoredAny>()?.is_some() {
+            total_rows += 1;
+            truncated = true;
+        }
+
+        Ok(ParsedBindings {
+            rows,
+            total_rows,
+            truncated,
+        })
+    }
 }
 
 impl ReconnectingStorage {
@@ -1459,29 +1655,15 @@ impl http::OperatorQuerySurface for ReconnectingStorage {
             );
         }
 
-        let parsed: serde_json::Value = serde_json::from_str(&body)?;
-        let bindings = parsed
-            .get("results")
-            .and_then(|value| value.get("bindings"))
-            .and_then(|value| value.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let total_rows = bindings.len();
-        let truncated = total_rows > limit;
-        let rows = bindings.into_iter().take(limit).collect::<Vec<_>>();
-        let columns = parsed
-            .get("head")
-            .and_then(|value| value.get("vars"))
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!([]));
+        let parsed = parse_sparql_response_limited(&body, limit)?;
 
         Ok(serde_json::json!({
             "query": query,
-            "columns": columns,
-            "rows": rows,
-            "count": total_rows.min(limit),
-            "total_rows": total_rows,
-            "truncated": truncated,
+            "columns": parsed.columns,
+            "rows": parsed.rows,
+            "count": parsed.total_rows.min(limit),
+            "total_rows": parsed.total_rows,
+            "truncated": parsed.truncated,
             "content_type": content_type,
             "source": "ferrosa-sparql",
         }))
@@ -2386,6 +2568,29 @@ auth_file = "{}"
             "error must name the response cap: {err}"
         );
         server.await.unwrap();
+    }
+
+    #[test]
+    fn sparql_result_parser_keeps_only_limit_bindings() {
+        let body = r#"{
+            "head": {"vars": ["s"]},
+            "results": {"bindings": [
+                {"s": {"type": "literal", "value": "row-1"}},
+                {"s": {"type": "literal", "value": "row-2"}},
+                {"s": {"type": "literal", "value": "row-3"}}
+            ]}
+        }"#;
+
+        let parsed = parse_sparql_response_limited(body, 1).unwrap();
+
+        assert_eq!(parsed.columns, serde_json::json!(["s"]));
+        assert_eq!(parsed.rows.len(), 1);
+        assert_eq!(parsed.total_rows, 3);
+        assert!(parsed.truncated);
+        assert_eq!(
+            parsed.rows[0]["s"]["value"],
+            serde_json::Value::String("row-1".into())
+        );
     }
 
     #[test]

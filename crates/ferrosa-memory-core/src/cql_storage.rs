@@ -107,6 +107,16 @@ fn typed_edge_list_all_query(ks: &str) -> String {
 const CONTEXT_SEGMENT_BM25_MIN_CANDIDATES: usize = 256;
 const CONTEXT_SEGMENT_BM25_CANDIDATES_PER_RESULT: usize = 128;
 const CONTEXT_SEGMENT_BM25_MAX_CANDIDATES: usize = 4096;
+const CQL_ENTITY_LIST_MAX_ROWS: usize = 100_000;
+const CQL_FOLD_LIST_MAX_ROWS: usize = 100_000;
+const CQL_LEGACY_EDGE_LIST_MAX_ROWS: usize = 200_000;
+
+struct LegacyEdgeProjection<'a> {
+    src_col: &'a str,
+    tgt_col: &'a str,
+    edge_type: &'a str,
+    operation: &'static str,
+}
 
 fn context_segment_bm25_candidate_limit(k: usize) -> usize {
     if k == 0 {
@@ -1279,6 +1289,64 @@ impl CqlStorage {
         Ok((col_map, rows))
     }
 
+    async fn collect_entity_entries_from_paged_iter(
+        &self,
+        ctx: &TenantContext,
+        stmt: PreparedStatement,
+        values: impl scylla::serialize::row::SerializeRow,
+        operation: &'static str,
+    ) -> anyhow::Result<Vec<EntityEntry>> {
+        let mut iter = self.session.execute_iter(stmt, values).await?;
+        let col_map = build_col_map(iter.get_column_specs());
+        let mut results = Vec::new();
+        while let Some(row) = iter.next().await {
+            let row = row?;
+            let Some(entry) = row_to_entity_entry(ctx, &row, &col_map)? else {
+                continue;
+            };
+            if results.len() >= CQL_ENTITY_LIST_MAX_ROWS {
+                anyhow::bail!(
+                    "{operation} exceeded {CQL_ENTITY_LIST_MAX_ROWS} rows; use entity_stream_all/entity_stream_session for unbounded scans"
+                );
+            }
+            results.push(entry);
+        }
+        Ok(results)
+    }
+
+    async fn collect_legacy_edges_from_paged_iter(
+        &self,
+        query: String,
+        values: impl scylla::serialize::row::SerializeRow,
+        projection: LegacyEdgeProjection<'_>,
+        edges: &mut Vec<(Uuid, Uuid, String)>,
+    ) -> anyhow::Result<()> {
+        let mut iter = self.session.query_iter(query, values).await?;
+        let col_map = build_col_map(iter.get_column_specs());
+        while let Some(row) = iter.next().await {
+            let row = row?;
+            if edges.len() >= CQL_LEGACY_EDGE_LIST_MAX_ROWS {
+                anyhow::bail!(
+                    "{} exceeded {CQL_LEGACY_EDGE_LIST_MAX_ROWS} rows; use edge_stream_all for unbounded scans",
+                    projection.operation
+                );
+            }
+            match (
+                cql_get::<Uuid>(&row, &col_map, projection.src_col),
+                cql_get::<Uuid>(&row, &col_map, projection.tgt_col),
+            ) {
+                (Ok(src), Ok(tgt)) => edges.push((src, tgt, projection.edge_type.to_string())),
+                _ => tracing::warn!(
+                    src_col = projection.src_col,
+                    tgt_col = projection.tgt_col,
+                    edge_type = projection.edge_type,
+                    "legacy edge list skipped malformed row"
+                ),
+            }
+        }
+        Ok(())
+    }
+
     /// Update only the entity embedding + updated_at for an existing row.
     ///
     /// This avoids the broader entity_put upsert path when running embedding
@@ -2326,73 +2394,13 @@ impl Storage for CqlStorage {
         ctx: &TenantContext,
         session_id: Uuid,
     ) -> anyhow::Result<Vec<EntityEntry>> {
-        let (col_map, rows) = self
-            .exec_prepared_rows(&self.stmts.entity_list_session, (ctx.tenant_id, session_id))
-            .await?;
-
-        let mut results = Vec::with_capacity(rows.len());
-        for row in rows {
-            // Skip rows with NULL required fields (ghost rows from bulk loads).
-            let Ok(entity_id) = cql_get::<Uuid>(&row, &col_map, "entity_id") else {
-                continue;
-            };
-            let Ok(entity_name) = cql_get::<String>(&row, &col_map, "entity_name") else {
-                continue;
-            };
-            let Ok(entity_type) = cql_get::<String>(&row, &col_map, "entity_type") else {
-                continue;
-            };
-            let context_snippet =
-                cql_get::<String>(&row, &col_map, "context_snippet").map_err(|e| {
-                    anyhow::anyhow!("required column `context_snippet` read failed: {e}")
-                })?;
-            let created = cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
-                .unwrap_or_else(|e| {
-                    tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
-                    Default::default()
-                });
-            let state = cql_get::<String>(&row, &col_map, "state")
-                .ok()
-                .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
-                .unwrap_or_default();
-            let (
-                description,
-                description_embedding,
-                tags,
-                properties,
-                content_hash,
-                updated_at,
-                scope,
-                ingested_by_session,
-            ) = extract_rich_entity_fields(&row, &col_map);
-            results.push(EntityEntry {
-                tenant_id: ctx.tenant_id,
-                entity_id,
-                session_id,
-                entity_name,
-                entity_type,
-                source_fold_id: cql_get::<Uuid>(&row, &col_map, "source_fold_id").ok(),
-                context_snippet,
-                entity_embedding: cql_get::<Vec<u8>>(&row, &col_map, "entity_embedding")
-                    .ok()
-                    .filter(|v| !v.is_empty())
-                    .map(|v| crate::vector::decode_vector(&v)),
-                confidence: cql_get::<f32>(&row, &col_map, "confidence")
-                    .map(f64::from)
-                    .unwrap_or(1.0),
-                state,
-                created_at: created,
-                description,
-                description_embedding,
-                tags,
-                properties,
-                content_hash,
-                updated_at,
-                scope,
-                ingested_by_session,
-            });
-        }
-        Ok(results)
+        self.collect_entity_entries_from_paged_iter(
+            ctx,
+            self.stmts.entity_list_session.clone(),
+            (ctx.tenant_id, session_id),
+            "entity_list_session",
+        )
+        .await
     }
 
     async fn entity_counts_by_type_and_state(
@@ -2425,17 +2433,13 @@ impl Storage for CqlStorage {
     }
 
     async fn entity_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<EntityEntry>> {
-        let (col_map, rows) = self
-            .exec_prepared_rows(&self.stmts.entity_list_all, (ctx.tenant_id,))
-            .await?;
-
-        let mut results = Vec::with_capacity(rows.len());
-        for row in rows {
-            if let Some(entry) = row_to_entity_entry(ctx, &row, &col_map)? {
-                results.push(entry);
-            }
-        }
-        Ok(results)
+        self.collect_entity_entries_from_paged_iter(
+            ctx,
+            self.stmts.entity_list_all.clone(),
+            (ctx.tenant_id,),
+            "entity_list_all",
+        )
+        .await
     }
 
     async fn entity_stream_all(
@@ -2537,12 +2541,14 @@ impl Storage for CqlStorage {
     }
 
     async fn fold_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<FoldEntry>> {
-        let (col_map, rows) = self
-            .exec_prepared_rows(&self.stmts.fold_list_all, (ctx.tenant_id,))
+        let mut iter = self
+            .session
+            .execute_iter(self.stmts.fold_list_all.clone(), (ctx.tenant_id,))
             .await?;
-
-        let mut results = Vec::with_capacity(rows.len());
-        for row in rows {
+        let col_map = build_col_map(iter.get_column_specs());
+        let mut results = Vec::new();
+        while let Some(row) = iter.next().await {
+            let row = row?;
             let status_str: String = cql_get(&row, &col_map, "status").unwrap_or_default();
             let status: FoldStatus =
                 serde_json::from_str(&format!("\"{status_str}\"")).unwrap_or(FoldStatus::Active);
@@ -2551,6 +2557,11 @@ impl Storage for CqlStorage {
                     tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
                     Default::default()
                 });
+            if results.len() >= CQL_FOLD_LIST_MAX_ROWS {
+                anyhow::bail!(
+                    "fold_list_all exceeded {CQL_FOLD_LIST_MAX_ROWS} rows; use fold_stream_all for unbounded scans"
+                );
+            }
             results.push(FoldEntry {
                 session_id: cql_get(&row, &col_map, "session_id")?,
                 fold_id: cql_get(&row, &col_map, "fold_id")?,
@@ -2634,7 +2645,16 @@ impl Storage for CqlStorage {
                         }
                     }
                 }
-                Err(e) => tracing::warn!(error = %e, "fold_stream_all skipped malformed row"),
+                Err(e) => {
+                    if !chunk.is_empty() {
+                        let out = std::mem::take(&mut chunk);
+                        if tx.send(Ok(out)).await.is_err() {
+                            return;
+                        }
+                    }
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
             }
         }
         if !chunk.is_empty() {
@@ -3060,8 +3080,6 @@ impl Storage for CqlStorage {
     ) -> anyhow::Result<Vec<(Uuid, Uuid, String)>> {
         let mut edges = Vec::new();
 
-        // Use prepare+execute to avoid paging bug where dynamic QUERY
-        // returns only the first result page. Each table is best-effort.
         let edge_queries: &[(&str, &str, &str, &str)] = &[
             (
                 "folded_into",
@@ -3075,32 +3093,22 @@ impl Storage for CqlStorage {
 
         for (table, src_col, tgt_col, label) in edge_queries {
             let query = format!(
-                "SELECT {src_col}, {tgt_col}, tenant_id, session_id FROM {}.{table}",
+                "SELECT {src_col}, {tgt_col} FROM {}.{table} \
+                 WHERE tenant_id = ? AND session_id = ? ALLOW FILTERING",
                 self.keyspace
             );
-            match self.session.prepare(query).await {
-                Ok(prepared) => match self.exec_prepared_rows(&prepared, ()).await {
-                    Ok((col_map, rows)) => {
-                        for row in rows {
-                            let row_tenant = cql_get::<Uuid>(&row, &col_map, "tenant_id");
-                            let row_session = cql_get::<Uuid>(&row, &col_map, "session_id");
-                            if row_tenant.as_ref().ok() != Some(&ctx.tenant_id)
-                                || row_session.as_ref().ok() != Some(&session_id)
-                            {
-                                continue;
-                            }
-                            if let (Ok(src), Ok(tgt)) = (
-                                cql_get::<Uuid>(&row, &col_map, src_col),
-                                cql_get::<Uuid>(&row, &col_map, tgt_col),
-                            ) {
-                                edges.push((src, tgt, label.to_string()));
-                            }
-                        }
-                    }
-                    Err(e) => tracing::warn!(table, error = %e, "edge query failed"),
+            self.collect_legacy_edges_from_paged_iter(
+                query,
+                (ctx.tenant_id, session_id),
+                LegacyEdgeProjection {
+                    src_col,
+                    tgt_col,
+                    edge_type: label,
+                    operation: "edge_list_session",
                 },
-                Err(e) => tracing::warn!(table, error = %e, "edge query prepare failed"),
-            }
+                &mut edges,
+            )
+            .await?;
         }
 
         // SUPERSEDES edges (not session-scoped, return all for tenant)
@@ -3109,26 +3117,18 @@ impl Storage for CqlStorage {
              WHERE tenant_id = ? ALLOW FILTERING",
             self.keyspace
         );
-        #[allow(deprecated)]
-        if let Ok(prepared) = self.session.prepare(query).await {
-            #[allow(deprecated)]
-            if let Ok(result) = self
-                .session
-                .execute_unpaged(&prepared, (ctx.tenant_id,))
-                .await
-            {
-                let sup_col_map = build_col_map(result.col_specs());
-                let rows = result.rows_or_empty();
-                for row in rows {
-                    if let (Ok(src), Ok(tgt)) = (
-                        cql_get::<Uuid>(&row, &sup_col_map, "new_event_id"),
-                        cql_get::<Uuid>(&row, &sup_col_map, "old_event_id"),
-                    ) {
-                        edges.push((src, tgt, "SUPERSEDES".into()));
-                    }
-                }
-            }
-        }
+        self.collect_legacy_edges_from_paged_iter(
+            query,
+            (ctx.tenant_id,),
+            LegacyEdgeProjection {
+                src_col: "new_event_id",
+                tgt_col: "old_event_id",
+                edge_type: "SUPERSEDES",
+                operation: "edge_list_session",
+            },
+            &mut edges,
+        )
+        .await?;
 
         Ok(edges)
     }
@@ -3154,22 +3154,18 @@ impl Storage for CqlStorage {
 
         for &(table, src_col, tgt_col, edge_type) in queries {
             let query = edge_list_all_query(&self.keyspace, table, src_col, tgt_col);
-            let prepared = match self.session.prepare(query).await {
-                Ok(prepared) => prepared,
-                Err(_) => continue,
-            };
-            if let Ok((ea_col_map, rows)) =
-                exec_paged_rows!(self.session, prepared, (ctx.tenant_id,))
-            {
-                for row in rows {
-                    if let (Ok(a), Ok(b)) = (
-                        cql_get::<Uuid>(&row, &ea_col_map, src_col),
-                        cql_get::<Uuid>(&row, &ea_col_map, tgt_col),
-                    ) {
-                        edges.push((a, b, edge_type.into()));
-                    }
-                }
-            }
+            self.collect_legacy_edges_from_paged_iter(
+                query,
+                (ctx.tenant_id,),
+                LegacyEdgeProjection {
+                    src_col,
+                    tgt_col,
+                    edge_type,
+                    operation: "edge_list_all",
+                },
+                &mut edges,
+            )
+            .await?;
         } // end for
 
         Ok(edges)
@@ -4583,7 +4579,14 @@ impl Storage for CqlStorage {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "typed_edge_stream_all skipped malformed row");
+                    if !chunk.is_empty() {
+                        let out = std::mem::take(&mut chunk);
+                        if tx.send(Ok(out)).await.is_err() {
+                            return;
+                        }
+                    }
+                    let _ = tx.send(Err(e)).await;
+                    return;
                 }
             }
         }
@@ -4659,7 +4662,14 @@ impl Storage for CqlStorage {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "typed_edge_stream_session skipped malformed row");
+                    if !chunk.is_empty() {
+                        let out = std::mem::take(&mut chunk);
+                        if tx.send(Ok(out)).await.is_err() {
+                            return;
+                        }
+                    }
+                    let _ = tx.send(Err(e)).await;
+                    return;
                 }
             }
         }
@@ -5186,6 +5196,130 @@ mod cql_storage_tests {
             context_segment_bm25_candidate_limit(10) <= CONTEXT_SEGMENT_BM25_MAX_CANDIDATES,
             "BM25 candidate cap must remain bounded even for large top-k requests"
         );
+    }
+
+    #[test]
+    fn cql_entity_list_apis_use_paged_iterators_with_explicit_cap() {
+        let source = include_str!("cql_storage.rs");
+        for (method, next_method) in [
+            ("entity_list_session", "entity_counts_by_type_and_state"),
+            ("entity_list_all", "entity_stream_all"),
+        ] {
+            let method_start = source
+                .find(&format!("async fn {method}"))
+                .unwrap_or_else(|| panic!("{method} must exist"));
+            let tail = &source[method_start..];
+            let method_end = tail
+                .find(&format!("async fn {next_method}"))
+                .unwrap_or(tail.len());
+            let method_source = &tail[..method_end];
+
+            assert!(
+                method_source.contains("collect_entity_entries_from_paged_iter"),
+                "{method} must collect from a paged iterator with an explicit row cap"
+            );
+            assert!(
+                !method_source.contains("exec_prepared_rows"),
+                "{method} must not execute an unpaged query before decoding rows"
+            );
+        }
+        assert!(
+            source.contains("CQL_ENTITY_LIST_MAX_ROWS"),
+            "entity list APIs must have a named maximum and clear failure mode"
+        );
+    }
+
+    #[test]
+    fn cql_fold_list_all_uses_paged_iterator_with_explicit_cap() {
+        let source = include_str!("cql_storage.rs");
+        let method_start = source
+            .find("async fn fold_list_all")
+            .expect("fold_list_all must exist");
+        let tail = &source[method_start..];
+        let method_end = tail.find("async fn fold_stream_all").unwrap_or(tail.len());
+        let method_source = &tail[..method_end];
+
+        assert!(
+            method_source.contains("execute_iter"),
+            "fold_list_all must page through CQL rows instead of materializing an unpaged result"
+        );
+        assert!(
+            method_source.contains("CQL_FOLD_LIST_MAX_ROWS"),
+            "fold_list_all must have a named maximum and clear failure mode"
+        );
+        assert!(
+            !method_source.contains("exec_prepared_rows"),
+            "fold_list_all must not execute an unpaged query before decoding rows"
+        );
+    }
+
+    #[test]
+    fn cql_legacy_edge_list_apis_are_scoped_paged_and_fail_closed() {
+        let source = include_str!("cql_storage.rs");
+        for (method, next_method) in [
+            ("edge_list_session", "#[allow(clippy::result_large_err)]"),
+            ("edge_list_all", "async fn edge_stream_all"),
+        ] {
+            let method_start = source
+                .find(&format!("async fn {method}"))
+                .unwrap_or_else(|| panic!("{method} must exist"));
+            let tail = &source[method_start..];
+            let method_end = tail.find(next_method).unwrap_or(tail.len());
+            let method_source = &tail[..method_end];
+
+            assert!(
+                method_source.contains("collect_legacy_edges_from_paged_iter"),
+                "{method} must collect edges from paged CQL iteration with a shared cap/error path"
+            );
+            assert!(
+                !method_source.contains("exec_prepared_rows")
+                    && !method_source.contains("exec_paged_rows!")
+                    && !method_source.contains("execute_unpaged"),
+                "{method} must not materialize unbounded edge result sets"
+            );
+            assert!(
+                !method_source.contains("=> continue"),
+                "{method} must fail closed on table-level query errors instead of silently dropping an edge table"
+            );
+        }
+
+        assert!(
+            source.contains("WHERE tenant_id = ? AND session_id = ? ALLOW FILTERING"),
+            "session edge scans must be scoped in CQL before rows reach the client"
+        );
+        assert!(
+            source.contains("CQL_LEGACY_EDGE_LIST_MAX_ROWS"),
+            "legacy edge list APIs must have a named maximum and clear failure mode"
+        );
+    }
+
+    #[test]
+    fn cql_stream_decode_errors_are_sent_to_consumers() {
+        let source = include_str!("cql_storage.rs");
+        for (method, next_method) in [
+            ("fold_stream_all", "async fn temporal_list_all"),
+            (
+                "typed_edge_stream_all",
+                "async fn typed_edge_stream_session",
+            ),
+            ("typed_edge_stream_session", "async fn typed_edge_list_from"),
+        ] {
+            let method_start = source
+                .find(&format!("async fn {method}"))
+                .unwrap_or_else(|| panic!("{method} must exist"));
+            let tail = &source[method_start..];
+            let method_end = tail.find(next_method).unwrap_or(tail.len());
+            let method_source = &tail[..method_end];
+
+            assert!(
+                !method_source.contains("skipped malformed row"),
+                "{method} must not hide malformed row errors behind warn-and-continue"
+            );
+            assert!(
+                method_source.contains("tx.send(Err(e)).await"),
+                "{method} must send row decode errors to stream consumers"
+            );
+        }
     }
 
     #[test]

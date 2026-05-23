@@ -55,11 +55,21 @@ Goal: fix the concrete rust-streaming audit findings with tests first, run local
 
 ## Remaining Follow-Up
 
-- [ ] CQL tenant/session entity listing still has unbounded list APIs for non-viz call sites: `entity_list_all` and `entity_list_session`.
-- [ ] `fold_list_all` still materializes full fold payloads, including large trajectory/embedding columns, for non-viz callers.
-- [ ] Legacy `edge_list_session` and `edge_list_all` still materialize/filter broad reads and can hide per-table failures.
-- [ ] Streaming row decode errors should be surfaced to stream consumers instead of only logged for `fold_stream_all`, `typed_edge_stream_all`, and `typed_edge_stream_session`.
-- [ ] SPARQL passthrough is byte-capped, but still parses all bindings within the cap before applying `limit`.
+- [x] CQL tenant/session entity listing still has unbounded list APIs for non-viz call sites: `entity_list_all` and `entity_list_session`.
+  - Fix: both methods now collect from `execute_iter` paging and fail clearly after `CQL_ENTITY_LIST_MAX_ROWS` instead of issuing one unpaged result materialization.
+  - Verify: `cargo test -p ferrosa-memory-core cql_entity_list_apis_use_paged_iterators_with_explicit_cap`.
+- [x] `fold_list_all` still materializes full fold payloads, including large trajectory/embedding columns, for non-viz callers.
+  - Fix: `fold_list_all` now pages through CQL rows and fails clearly after `CQL_FOLD_LIST_MAX_ROWS`; full-fidelity payload columns are preserved for callers that need backup/sync semantics.
+  - Verify: `cargo test -p ferrosa-memory-core cql_fold_list_all_uses_paged_iterator_with_explicit_cap`.
+- [x] Legacy `edge_list_session` and `edge_list_all` still materialize/filter broad reads and can hide per-table failures.
+  - Fix: legacy edge list APIs now use scoped paged iteration, fail closed on table-level query errors, and stop with a clear error after `CQL_LEGACY_EDGE_LIST_MAX_ROWS`.
+  - Verify: `cargo test -p ferrosa-memory-core cql_legacy_edge_list_apis_are_scoped_paged_and_fail_closed`.
+- [x] Streaming row decode errors should be surfaced to stream consumers instead of only logged for `fold_stream_all`, `typed_edge_stream_all`, and `typed_edge_stream_session`.
+  - Fix: stream producers now flush any partial chunk, send `Err(e)` to the receiver, and stop on malformed rows.
+  - Verify: `cargo test -p ferrosa-memory-core cql_stream_decode_errors_are_sent_to_consumers`.
+- [x] SPARQL passthrough is byte-capped, but still parses all bindings within the cap before applying `limit`.
+  - Fix: the SPARQL JSON parser now uses `DeserializeSeed` to retain only `limit` bindings while counting skipped rows with `IgnoredAny`; the response byte cap still applies.
+  - Verify: `cargo test -p ferrosa-memory-mcp sparql_result_parser_keeps_only_limit_bindings`.
 - [ ] Batch update/delete paths are bounded but still serial; evaluate concurrency/backpressure for large operator batches.
 
 ## CI Gate
