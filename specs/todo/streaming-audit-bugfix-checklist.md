@@ -14,7 +14,7 @@ Goal: fix the concrete rust-streaming audit findings with tests first, run local
 - [x] Local MCP protocol configuration must match the running server.
   - Evidence today: launchd server listens on plain HTTP `127.0.0.1:18765`, but client config used HTTPS.
   - Verify: `curl http://127.0.0.1:18765/healthz/ready` and authenticated `POST /mcp` both succeed.
-  - Local fix: `~/.codex/config.toml` and `~/.mcp.json` both use `http://localhost:18765/mcp`, matching `.runtime/ferrosa-memory-http-18765.toml` where `require_tls = false`.
+  - Local fix: `~/.codex/config.toml` uses `http://127.0.0.1:18765/mcp` with explicit `Authorization` header because this Codex build reports URL-embedded Basic credentials as `Unsupported`; `~/.mcp.json` and Claude both connect over HTTP. This matches `.runtime/ferrosa-memory-http-18765.toml` where `require_tls = false`.
 
 - [x] Podman MCP healthcheck must probe the actual in-container endpoint.
   - Evidence today: compose probes `http://127.0.0.1:18765/healthz/live`, while the container serves HTTPS on `8765`.
@@ -44,9 +44,23 @@ Goal: fix the concrete rust-streaming audit findings with tests first, run local
   - Test: stalled stream plus `mark_disconnected` updates state within a short timeout.
   - Verify: `cargo test -p ferrosa-memory-mcp reconnecting_storage_stream_methods_drop_read_lock_before_awaiting_sends`.
 
+- [x] `ReconnectingStorage` generic delegates and operator CQL passthrough must not hold the reconnect read lock across awaited CQL calls.
+  - Evidence: the first streaming fix covered viz chunk sends, but the delegate macro, `feedback_list_all`, and operator CQL passthrough still used `inner.read().await` around awaited backend work.
+  - Tests: static regression tests assert the delegate macro and operator passthrough clone `current_cql()` before awaited backend calls.
+  - Verify: `cargo test -p ferrosa-memory-mcp reconnecting_storage` and `cargo test -p ferrosa-memory-mcp operator_cql_passthrough_does_not_hold_read_lock_while_streaming_rows`.
+
 - [x] Consolidation queue must be bounded or coalesce deterministically.
   - Test: more unique sessions than queue budget cannot grow memory without bound.
   - Verify: `cargo test -p ferrosa-memory-core consolidation_queue_is_bounded`.
+
+## Remaining Follow-Up
+
+- [ ] CQL tenant/session entity listing still has unbounded list APIs for non-viz call sites: `entity_list_all` and `entity_list_session`.
+- [ ] `fold_list_all` still materializes full fold payloads, including large trajectory/embedding columns, for non-viz callers.
+- [ ] Legacy `edge_list_session` and `edge_list_all` still materialize/filter broad reads and can hide per-table failures.
+- [ ] Streaming row decode errors should be surfaced to stream consumers instead of only logged for `fold_stream_all`, `typed_edge_stream_all`, and `typed_edge_stream_session`.
+- [ ] SPARQL passthrough is byte-capped, but still parses all bindings within the cap before applying `limit`.
+- [ ] Batch update/delete paths are bounded but still serial; evaluate concurrency/backpressure for large operator batches.
 
 ## CI Gate
 

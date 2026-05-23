@@ -332,13 +332,12 @@ fn build_http_validator(config: &Config) -> anyhow::Result<Arc<http::CredentialV
 macro_rules! delegate {
     ($self:ident, $method:ident $(, $arg:expr)*) => {{
         let conn_gen = $self.current_generation();
-        let guard = $self.inner.read().await;
-        match guard.as_ref() {
+        let cql = $self.current_cql().await;
+        match cql {
             Some(cql) => {
                 let result = cql.$method($($arg),*).await;
                 if let Err(ref e) = result {
                     if is_connection_error(e) {
-                        drop(guard); // release read lock before taking write lock
                         $self.mark_disconnected(conn_gen).await;
                     }
                 }
@@ -516,14 +515,13 @@ impl Storage for ReconnectingStorage {
         entity_ids: &[uuid::Uuid],
     ) -> anyhow::Result<Vec<EntityEntry>> {
         let conn_gen = self.current_generation();
-        let guard = self.inner.read().await;
-        match guard.as_ref() {
+        let cql = self.current_cql().await;
+        match cql {
             Some(cql) => {
                 let result = cql.entity_get_batch(ctx, session_id, entity_ids).await;
                 if let Err(ref e) = result
                     && is_connection_error(e)
                 {
-                    drop(guard);
                     self.mark_disconnected(conn_gen).await;
                 }
                 result
@@ -659,9 +657,18 @@ impl Storage for ReconnectingStorage {
     }
 
     async fn feedback_list_all(&self) -> anyhow::Result<Vec<FeedbackOutcome>> {
-        let guard = self.inner.read().await;
-        match guard.as_ref() {
-            Some(cql) => cql.feedback_list_all().await,
+        let conn_gen = self.current_generation();
+        let cql = self.current_cql().await;
+        match cql {
+            Some(cql) => {
+                let result = cql.feedback_list_all().await;
+                if let Err(ref e) = result
+                    && is_connection_error(e)
+                {
+                    self.mark_disconnected(conn_gen).await;
+                }
+                result
+            }
             None => Err(anyhow::anyhow!(NOT_CONNECTED_MSG)),
         }
     }
@@ -1357,9 +1364,9 @@ impl http::OperatorQuerySurface for ReconnectingStorage {
         limit: usize,
     ) -> anyhow::Result<serde_json::Value> {
         let conn_gen = self.current_generation();
-        let guard = self.inner.read().await;
-        let cql = guard
-            .as_ref()
+        let cql = self
+            .current_cql()
+            .await
             .ok_or_else(|| anyhow::anyhow!(NOT_CONNECTED_MSG))?;
 
         let normalized = normalize_public_query(query)?;
@@ -1369,7 +1376,6 @@ impl http::OperatorQuerySurface for ReconnectingStorage {
             Ok(iter) => iter,
             Err(err) => {
                 if is_connection_error(&err) {
-                    drop(guard);
                     self.mark_disconnected(conn_gen).await;
                 }
                 return Err(err.into());
@@ -1385,7 +1391,15 @@ impl http::OperatorQuerySurface for ReconnectingStorage {
         let mut total_rows = 0usize;
         let mut truncated = false;
         while let Some(row) = iter.next().await {
-            let row = row?;
+            let row = match row {
+                Ok(row) => row,
+                Err(err) => {
+                    if is_connection_error(&err) {
+                        self.mark_disconnected(conn_gen).await;
+                    }
+                    return Err(err.into());
+                }
+            };
             total_rows += 1;
             if rendered_rows.len() < limit {
                 let mut object = serde_json::Map::new();
@@ -2423,6 +2437,54 @@ auth_file = "{}"
                 "{method} must not hold the reconnect RwLock read guard while awaiting stream sends"
             );
         }
+    }
+
+    #[test]
+    fn reconnecting_storage_delegate_macro_does_not_hold_read_lock_across_await() {
+        let source = include_str!("main.rs");
+        let macro_start = source
+            .find("macro_rules! delegate")
+            .expect("delegate macro must exist");
+        let macro_tail = &source[macro_start..];
+        let macro_end = macro_tail
+            .find("/// Delegate all Storage methods through")
+            .expect("delegate macro section must end before Storage impl");
+        let macro_source = &macro_tail[..macro_end];
+
+        assert!(
+            macro_source.contains("let cql = $self.current_cql().await;"),
+            "delegate macro must clone the current CQL backend before awaiting storage calls"
+        );
+        assert!(
+            !macro_source.contains("let guard = $self.inner.read().await;"),
+            "delegate macro must not hold the reconnect RwLock read guard across awaited storage calls"
+        );
+    }
+
+    #[test]
+    fn operator_cql_passthrough_does_not_hold_read_lock_while_streaming_rows() {
+        let source = include_str!("main.rs");
+        let impl_start = source
+            .find("impl http::OperatorQuerySurface for ReconnectingStorage")
+            .expect("operator query impl must exist");
+        let impl_source = &source[impl_start..];
+        let method_start = impl_source
+            .find("async fn cql_query_passthrough")
+            .expect("cql_query_passthrough must exist");
+        let tail = &impl_source[method_start..];
+        let method_end = tail
+            .find("async fn sparql_query_passthrough")
+            .unwrap_or(tail.len());
+        let method_source = &tail[..method_end];
+
+        assert!(
+            method_source.contains(".current_cql()"),
+            "operator passthrough must clone the CQL backend before query/row awaits"
+        );
+        assert!(
+            !method_source.contains("self.inner.read().await"),
+            "operator passthrough must not hold the reconnect RwLock read guard while streaming rows"
+        );
     }
 
     // --- next_backoff tests ---
