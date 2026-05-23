@@ -1127,6 +1127,8 @@ impl CqlStorage {
             "event",
             "concept",
             "org",
+            "document",
+            "section",
             "bug",
             "decision",
             "pattern",
@@ -5036,6 +5038,24 @@ mod cql_storage_tests {
         assert_eq!(
             bind_count, 2,
             "only session_id and tenant_id should be bound after rendering the vector literal"
+        );
+    }
+
+    #[test]
+    fn default_entity_types_include_install_schema_types() {
+        let entity_types = CqlStorage::default_entity_types();
+
+        assert!(
+            entity_types
+                .iter()
+                .any(|entity_type| entity_type == "document"),
+            "fallback entity type registry must include document"
+        );
+        assert!(
+            entity_types
+                .iter()
+                .any(|entity_type| entity_type == "section"),
+            "fallback entity type registry must include section"
         );
     }
 }
