@@ -21,9 +21,10 @@ Goal: fix the remaining concrete rust-streaming audit findings in ferrosa-memory
   - Fix: `/viz/api/derived_facts` now calls `derived_cache_get_limited`; CQL pushes `LIMIT` into the derived-cache query and the viz route preserves query params after route matching.
   - Verify: `cargo test -p ferrosa-memory-core viz_derived_facts_applies_limit_at_storage_boundary` and `cargo test -p ferrosa-memory-core derived_cache_limited_query_pushes_limit_to_cql`.
 
-- [ ] List-all storage helpers must avoid unpaged full-result materialization or enforce explicit caps.
+- [x] List-all storage helpers must avoid unpaged full-result materialization or enforce explicit caps.
   - Evidence: `exec_prepared_rows` backs several `*_list_all` paths with `execute_unpaged`.
-  - TDD: focused tests for temporal, feedback, and intention list-all cap/stream behavior.
+  - Fix: `temporal_list_all`, `feedback_list_all`, and `intention_list_all` now use driver paged iteration with explicit row caps and actionable errors.
+  - Verify: `cargo test -p ferrosa-memory-core cql_secondary_list_all_apis_use_paged_iterators_with_explicit_caps`.
 
 - [ ] Workbench summary should avoid broad expensive scans for counts and should surface degraded count paths clearly.
   - Evidence: live `/workbench/api/summary` returned `status:"not_ready"` with Ferrosa `Bulk lane send timeout` while MCP health was ready.

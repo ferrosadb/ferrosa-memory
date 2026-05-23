@@ -131,6 +131,9 @@ const CONTEXT_SEGMENT_BM25_MAX_CANDIDATES: usize = 4096;
 const CQL_ENTITY_LIST_MAX_ROWS: usize = 100_000;
 const CQL_FOLD_LIST_MAX_ROWS: usize = 100_000;
 const CQL_LEGACY_EDGE_LIST_MAX_ROWS: usize = 200_000;
+const CQL_TEMPORAL_LIST_MAX_ROWS: usize = 100_000;
+const CQL_FEEDBACK_LIST_MAX_ROWS: usize = 100_000;
+const CQL_INTENTION_LIST_MAX_ROWS: usize = 100_000;
 
 struct LegacyEdgeProjection<'a> {
     src_col: &'a str,
@@ -2676,12 +2679,20 @@ impl Storage for CqlStorage {
     }
 
     async fn temporal_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<TemporalEvent>> {
-        let (col_map, rows) = self
-            .exec_prepared_rows(&self.stmts.temporal_list_all, (ctx.tenant_id,))
+        let mut iter = self
+            .session
+            .execute_iter(self.stmts.temporal_list_all.clone(), (ctx.tenant_id,))
             .await?;
+        let col_map = build_col_map(iter.get_column_specs());
 
-        let mut results = Vec::with_capacity(rows.len());
-        for row in rows {
+        let mut results = Vec::new();
+        while let Some(row) = iter.next().await {
+            let row = row?;
+            if results.len() >= CQL_TEMPORAL_LIST_MAX_ROWS {
+                anyhow::bail!(
+                    "temporal_list_all exceeded {CQL_TEMPORAL_LIST_MAX_ROWS} rows; add a scoped temporal query for unbounded scans"
+                );
+            }
             let event_time: chrono::DateTime<chrono::Utc> = cql_get(&row, &col_map, "event_time")?;
             results.push(TemporalEvent {
                 tenant_id: ctx.tenant_id,
@@ -2869,21 +2880,29 @@ impl Storage for CqlStorage {
     }
 
     async fn feedback_list_all(&self) -> anyhow::Result<Vec<FeedbackOutcome>> {
-        let (col_map, rows) = self
-            .exec_prepared_rows(&self.stmts.feedback_list_all, ())
+        let mut iter = self
+            .session
+            .execute_iter(self.stmts.feedback_list_all.clone(), ())
             .await?;
+        let col_map = build_col_map(iter.get_column_specs());
 
-        let mut outcomes = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let tenant_id: Uuid = cql_get(row, &col_map, "tenant_id")?;
-            let session_id: Uuid = cql_get(row, &col_map, "session_id")?;
-            let query_id: Uuid = cql_get(row, &col_map, "query_id")?;
-            let program_type: String = cql_get(row, &col_map, "program_type")?;
-            let task_complexity: String = cql_get(row, &col_map, "task_complexity")?;
-            let succeeded: bool = cql_get(row, &col_map, "succeeded")?;
-            let latency_ms: i32 = cql_get(row, &col_map, "latency_ms")?;
-            let token_cost: i32 = cql_get(row, &col_map, "token_cost")?;
-            let created_at: chrono::DateTime<chrono::Utc> = cql_get(row, &col_map, "created_at")?;
+        let mut outcomes = Vec::new();
+        while let Some(row) = iter.next().await {
+            let row = row?;
+            if outcomes.len() >= CQL_FEEDBACK_LIST_MAX_ROWS {
+                anyhow::bail!(
+                    "feedback_list_all exceeded {CQL_FEEDBACK_LIST_MAX_ROWS} rows; add a scoped feedback query for unbounded scans"
+                );
+            }
+            let tenant_id: Uuid = cql_get(&row, &col_map, "tenant_id")?;
+            let session_id: Uuid = cql_get(&row, &col_map, "session_id")?;
+            let query_id: Uuid = cql_get(&row, &col_map, "query_id")?;
+            let program_type: String = cql_get(&row, &col_map, "program_type")?;
+            let task_complexity: String = cql_get(&row, &col_map, "task_complexity")?;
+            let succeeded: bool = cql_get(&row, &col_map, "succeeded")?;
+            let latency_ms: i32 = cql_get(&row, &col_map, "latency_ms")?;
+            let token_cost: i32 = cql_get(&row, &col_map, "token_cost")?;
+            let created_at: chrono::DateTime<chrono::Utc> = cql_get(&row, &col_map, "created_at")?;
 
             outcomes.push(FeedbackOutcome {
                 tenant_id,
@@ -3438,12 +3457,20 @@ impl Storage for CqlStorage {
         &self,
         ctx: &TenantContext,
     ) -> anyhow::Result<Vec<crate::intention::Intention>> {
-        let (col_map, rows) = self
-            .exec_prepared_rows(&self.stmts.intention_list_all, (ctx.tenant_id,))
+        let mut iter = self
+            .session
+            .execute_iter(self.stmts.intention_list_all.clone(), (ctx.tenant_id,))
             .await?;
+        let col_map = build_col_map(iter.get_column_specs());
 
-        let mut results = Vec::with_capacity(rows.len());
-        for row in rows {
+        let mut results = Vec::new();
+        while let Some(row) = iter.next().await {
+            let row = row?;
+            if results.len() >= CQL_INTENTION_LIST_MAX_ROWS {
+                anyhow::bail!(
+                    "intention_list_all exceeded {CQL_INTENTION_LIST_MAX_ROWS} rows; use a repo-scoped intention query for unbounded scans"
+                );
+            }
             let trigger_json: String = cql_get(&row, &col_map, "trigger_json")?;
             let trigger: crate::intention::IntentionTrigger = serde_json::from_str(&trigger_json)?;
 
@@ -5330,6 +5357,48 @@ mod cql_storage_tests {
             !method_source.contains("exec_prepared_rows"),
             "fold_list_all must not execute an unpaged query before decoding rows"
         );
+    }
+
+    #[test]
+    fn cql_secondary_list_all_apis_use_paged_iterators_with_explicit_caps() {
+        let source = include_str!("cql_storage.rs");
+        for (method, next_method, cap_name) in [
+            (
+                "temporal_list_all",
+                "async fn entity_update_state",
+                "CQL_TEMPORAL_LIST_MAX_ROWS",
+            ),
+            (
+                "feedback_list_all",
+                "// --- Observability operations ---",
+                "CQL_FEEDBACK_LIST_MAX_ROWS",
+            ),
+            (
+                "intention_list_all",
+                "async fn intention_update_status",
+                "CQL_INTENTION_LIST_MAX_ROWS",
+            ),
+        ] {
+            let method_start = source
+                .find(&format!("async fn {method}"))
+                .unwrap_or_else(|| panic!("{method} must exist"));
+            let tail = &source[method_start..];
+            let method_end = tail.find(next_method).unwrap_or(tail.len());
+            let method_source = &tail[..method_end];
+
+            assert!(
+                method_source.contains("execute_iter"),
+                "{method} must page through CQL rows instead of materializing an unpaged result"
+            );
+            assert!(
+                method_source.contains(cap_name),
+                "{method} must have a named maximum and clear failure mode"
+            );
+            assert!(
+                !method_source.contains("exec_prepared_rows"),
+                "{method} must not execute an unpaged query before decoding rows"
+            );
+        }
     }
 
     #[test]
