@@ -292,6 +292,15 @@ pub trait Storage: Send + Sync {
         session_id: Uuid,
     ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send;
 
+    /// Count entities matching structured predicates without materializing
+    /// matching rows. CQL storage streams rows from the driver and increments
+    /// a counter as each row passes the predicate.
+    fn entity_count_matching(
+        &self,
+        ctx: &TenantContext,
+        query: EntityListQuery,
+    ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send;
+
     /// Count folds in a session.
     fn fold_count(
         &self,
@@ -886,6 +895,12 @@ pub trait Storage: Send + Sync {
         ctx: &TenantContext,
         limit: usize,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<crate::types::DerivedFactRow>>> + Send;
+
+    /// Count all derived-cache rows for a tenant without materializing them.
+    fn derived_cache_count(
+        &self,
+        ctx: &TenantContext,
+    ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send;
 
     /// Store TTL tracking entries for derived facts.
     /// Called when facts are written to record their TTL rule and next maintenance window.
@@ -1611,6 +1626,27 @@ pub mod mock {
             Ok(entities
                 .iter()
                 .filter(|e| e.session_id == session_id)
+                .count())
+        }
+
+        async fn entity_count_matching(
+            &self,
+            ctx: &TenantContext,
+            query: EntityListQuery,
+        ) -> anyhow::Result<usize> {
+            let entities = self.entities.lock().await;
+            Ok(entities
+                .iter()
+                .filter(|entry| {
+                    let in_scope = if let Some(sessions) =
+                        entity_list_sessions(ctx.tenant_id, query.session_id, query.scope)
+                    {
+                        sessions.contains(&entry.session_id)
+                    } else {
+                        true
+                    };
+                    in_scope && entity_matches_list_query(entry, ctx, &query)
+                })
                 .count())
         }
 
@@ -2349,6 +2385,11 @@ pub mod mock {
             }
             all_rows.truncate(limit);
             Ok(all_rows)
+        }
+
+        async fn derived_cache_count(&self, _ctx: &TenantContext) -> anyhow::Result<usize> {
+            let cache = self.derived_cache.lock().await;
+            Ok(cache.values().map(Vec::len).sum())
         }
 
         async fn derived_cache_ttl_track_put(

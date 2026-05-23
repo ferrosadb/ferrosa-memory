@@ -1378,6 +1378,28 @@ impl CqlStorage {
         Ok(())
     }
 
+    async fn count_entity_matches_from_paged_iter(
+        &self,
+        ctx: &TenantContext,
+        stmt: PreparedStatement,
+        values: impl scylla::serialize::row::SerializeRow,
+        query: &EntityListQuery,
+    ) -> anyhow::Result<usize> {
+        let mut iter = self.session.execute_iter(stmt, values).await?;
+        let col_map = build_col_map(iter.get_column_specs());
+        let mut count = 0usize;
+        while let Some(row) = iter.next().await {
+            let row = row?;
+            let Some(entry) = row_to_entity_entry(ctx, &row, &col_map)? else {
+                continue;
+            };
+            if crate::storage::entity_matches_list_query(&entry, ctx, query) {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     async fn collect_legacy_edges_from_paged_iter(
         &self,
         query: String,
@@ -2431,12 +2453,51 @@ impl Storage for CqlStorage {
     }
 
     async fn entity_count(&self, ctx: &TenantContext, session_id: Uuid) -> anyhow::Result<usize> {
-        // Client-side count: SELECT entity_id returns rows, count them.
-        // Workaround for Ferrosa returning COUNT(*) column as "system.count".
-        let (_col_map, rows) = self
-            .exec_prepared_rows(&self.stmts.entity_count, (ctx.tenant_id, session_id))
+        // Client-side count: SELECT entity_id returns rows, count them as the
+        // driver yields pages. Ferrosa's COUNT(*) column naming has varied, so
+        // this keeps exact counts without materializing the result set.
+        let mut iter = self
+            .session
+            .execute_iter(self.stmts.entity_count.clone(), (ctx.tenant_id, session_id))
             .await?;
-        Ok(rows.len())
+        let mut count = 0usize;
+        while let Some(row) = iter.next().await {
+            row?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    async fn entity_count_matching(
+        &self,
+        ctx: &TenantContext,
+        query: EntityListQuery,
+    ) -> anyhow::Result<usize> {
+        let mut count = 0usize;
+        if let Some(sessions) =
+            crate::storage::entity_list_sessions(ctx.tenant_id, query.session_id, query.scope)
+        {
+            for session_id in sessions {
+                count += self
+                    .count_entity_matches_from_paged_iter(
+                        ctx,
+                        self.stmts.entity_list_session.clone(),
+                        (ctx.tenant_id, session_id),
+                        &query,
+                    )
+                    .await?;
+            }
+        } else {
+            count += self
+                .count_entity_matches_from_paged_iter(
+                    ctx,
+                    self.stmts.entity_list_all.clone(),
+                    (ctx.tenant_id,),
+                    &query,
+                )
+                .await?;
+        }
+        Ok(count)
     }
 
     async fn fold_count(&self, ctx: &TenantContext, session_id: Uuid) -> anyhow::Result<usize> {
@@ -4379,6 +4440,21 @@ impl Storage for CqlStorage {
         Ok(results)
     }
 
+    async fn derived_cache_count(&self, ctx: &TenantContext) -> anyhow::Result<usize> {
+        let query = format!(
+            "SELECT cache_key, seq FROM {}.derived_cache_by_query \
+             WHERE tenant_id = ? ALLOW FILTERING",
+            self.keyspace
+        );
+        let mut iter = self.session.query_iter(query, (ctx.tenant_id,)).await?;
+        let mut count = 0usize;
+        while let Some(row) = iter.next().await {
+            row?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     // --- TTL tracking (Sprint 6) ---
 
     async fn derived_cache_ttl_track_put(
@@ -5461,6 +5537,78 @@ mod cql_storage_tests {
         assert!(
             helper_source.contains("CQL_ENTITY_LIST_MAX_ROWS"),
             "entity matching helper must fail closed on excessive broad scans"
+        );
+    }
+
+    #[test]
+    fn cql_count_apis_stream_without_materializing_rows() {
+        let source = include_str!("cql_storage.rs");
+        let method = "entity_count";
+        let method_start = source
+            .find(&format!("async fn {method}"))
+            .expect("entity_count must exist");
+        let tail = &source[method_start..];
+        let method_end = tail.find("async fn entity_count_matching").unwrap();
+        let method_source = &tail[..method_end];
+
+        assert!(
+            method_source.contains("execute_iter"),
+            "{method} must consume driver pages instead of unpaged rows"
+        );
+        assert!(
+            !method_source.contains("exec_prepared_rows"),
+            "{method} must not materialize all count rows before counting"
+        );
+        assert!(
+            !method_source.contains("Vec<"),
+            "{method} must not allocate a result Vec for count-only work"
+        );
+
+        let matching_start = source
+            .find("async fn entity_count_matching")
+            .expect("entity_count_matching must exist");
+        let matching_tail = &source[matching_start..];
+        let matching_end = matching_tail.find("async fn fold_count").unwrap();
+        let matching_source = &matching_tail[..matching_end];
+        assert!(
+            matching_source.contains("count_entity_matches_from_paged_iter"),
+            "entity_count_matching must delegate to the streaming count helper"
+        );
+        assert!(
+            !matching_source.contains("exec_prepared_rows"),
+            "entity_count_matching must not materialize all count rows before counting"
+        );
+
+        let helper_start = source
+            .find("async fn count_entity_matches_from_paged_iter")
+            .expect("count_entity_matches_from_paged_iter must exist");
+        let helper_tail = &source[helper_start..];
+        let helper_end = helper_tail
+            .find("async fn collect_legacy_edges_from_paged_iter")
+            .unwrap();
+        let helper_source = &helper_tail[..helper_end];
+        assert!(
+            helper_source.contains("execute_iter"),
+            "count_entity_matches_from_paged_iter must consume driver pages"
+        );
+        assert!(
+            !helper_source.contains("Vec<"),
+            "count_entity_matches_from_paged_iter must not allocate a result Vec"
+        );
+
+        let derived_start = source
+            .find("async fn derived_cache_count")
+            .expect("derived_cache_count must exist");
+        let derived_tail = &source[derived_start..];
+        let derived_end = derived_tail.find("// --- TTL tracking").unwrap();
+        let derived_source = &derived_tail[..derived_end];
+        assert!(
+            derived_source.contains("query_iter"),
+            "derived_cache_count must consume driver pages"
+        );
+        assert!(
+            !derived_source.contains("exec_prepared_rows") && !derived_source.contains("Vec<"),
+            "derived_cache_count must not materialize rows for count-only work"
         );
     }
 

@@ -932,53 +932,80 @@ async fn handle_operator_request<S: Storage + OperatorQuerySurface>(
                 .to_string(),
             ))
         }
-        ("GET", "/workbench/api/summary") => {
+        ("GET", summary_path)
+            if summary_path == "/workbench/api/summary"
+                || summary_path.starts_with("/workbench/api/summary?") =>
+        {
             let effective_rules =
                 crate::datalog::load_effective_rule_entries(storage, ctx, None).await;
-            let entities = storage.entity_list_all(ctx).await;
+            let explicit_session_id = query_param(summary_path, "session_id")
+                .and_then(|value| Uuid::parse_str(&value).ok());
+            let session_id = explicit_session_id.unwrap_or_else(Uuid::nil);
+            let entity_count = if explicit_session_id.is_some() {
+                storage.entity_count(ctx, session_id).await
+            } else {
+                storage
+                    .entity_count_matching(
+                        ctx,
+                        crate::types::EntityListQuery {
+                            session_id,
+                            entity_type: None,
+                            filters: serde_json::Map::new(),
+                            scope: crate::types::EntityListScope::All,
+                            limit: 0,
+                        },
+                    )
+                    .await
+            };
             let edge_count = storage.edge_count(ctx).await;
-            let derived_fact_count = storage.derived_cache_list_all(ctx, 100_000).await;
-            let summary_error = entities
+            let derived_fact_count = storage.derived_cache_count(ctx).await;
+            let mut approval_filters = serde_json::Map::new();
+            approval_filters.insert(
+                "decision".into(),
+                Value::String(crate::types::ApprovalDecision::Proposed.to_string()),
+            );
+            let pending_approvals = storage
+                .entity_count_matching(
+                    ctx,
+                    crate::types::EntityListQuery {
+                        session_id,
+                        entity_type: Some(
+                            crate::expert_system::APPROVAL_MIRROR_ENTITY_TYPE.to_string(),
+                        ),
+                        filters: approval_filters,
+                        scope: if explicit_session_id.is_some() {
+                            crate::types::EntityListScope::Session
+                        } else {
+                            crate::types::EntityListScope::All
+                        },
+                        limit: 0,
+                    },
+                )
+                .await;
+            let summary_error = entity_count
                 .as_ref()
                 .err()
                 .or_else(|| edge_count.as_ref().err())
                 .or_else(|| derived_fact_count.as_ref().err())
+                .or_else(|| pending_approvals.as_ref().err())
                 .or_else(|| effective_rules.as_ref().err())
                 .map(|e| e.to_string());
-            let entity_rows = entities.unwrap_or_default();
-            let node_count = entity_rows.len();
+            let node_count = entity_count.unwrap_or(0);
             let edge_count = edge_count.unwrap_or(0);
-            let derived_fact_count = derived_fact_count.map(|rows| rows.len()).unwrap_or(0);
-            let approvals: Vec<_> = entity_rows
-                .iter()
-                .filter(|entry| {
-                    entry.entity_type == crate::expert_system::APPROVAL_MIRROR_ENTITY_TYPE
-                })
-                .cloned()
-                .collect();
-            let pending = approvals
-                .iter()
-                .filter(|entry| {
-                    entry.properties.get("decision").and_then(|v| v.as_str()) == Some("proposed")
-                })
-                .count();
-            let session_id = query_param(path, "session_id")
-                .or_else(|| {
-                    approvals.first().and_then(|entry| {
-                        entry
-                            .properties
-                            .get("session_scope")
-                            .and_then(|value| value.as_str())
-                            .map(str::to_string)
-                    })
-                })
-                .unwrap_or_default();
+            let derived_fact_count = derived_fact_count.unwrap_or(0);
+            let pending = pending_approvals.unwrap_or(0);
+            let session_id_text = if explicit_session_id.is_some() {
+                session_id.to_string()
+            } else {
+                "all".to_string()
+            };
             Ok(json_response(
                 "200 OK",
                 &serde_json::json!({
                     "status": if summary_error.is_some() { "not_ready" } else { "ready" },
-                    "session_id": session_id,
+                    "session_id": session_id_text,
                     "node_count": node_count,
+                    "node_count_scope": if explicit_session_id.is_some() { "session" } else { "all" },
                     "edge_count": edge_count,
                     "derived_fact_count": derived_fact_count,
                     "rule_count": effective_rules.unwrap_or_default().len(),
@@ -4716,13 +4743,14 @@ mod tests {
             tenant_id,
             session_origin: "http:alice".into(),
         };
+        let summary_session_id = Uuid::new_v4();
         storage
             .entity_put(
                 &ctx,
                 &crate::types::EntityEntry {
                     tenant_id,
                     entity_id: Uuid::new_v4(),
-                    session_id: Uuid::new_v4(),
+                    session_id: summary_session_id,
                     entity_name: "summary-test".into(),
                     entity_type: "concept".into(),
                     source_fold_id: None,
@@ -4762,10 +4790,54 @@ mod tests {
             )
             .await
             .unwrap();
+        let derived_facts: Vec<crate::types::DerivedFact> = (0..1_005)
+            .map(|_| crate::types::DerivedFact {
+                src_id: Uuid::new_v4().to_string(),
+                pred: "related".into(),
+                dst_id: Uuid::new_v4().to_string(),
+                confidence: 1.0,
+                rule_id: "summary-rule".into(),
+                support_count: 1,
+                provenance: Vec::new(),
+            })
+            .collect();
+        storage
+            .derived_cache_put(&ctx, "summary-derived", &derived_facts)
+            .await
+            .unwrap();
+        storage
+            .entity_put(
+                &ctx,
+                &crate::types::EntityEntry {
+                    tenant_id,
+                    entity_id: Uuid::new_v4(),
+                    session_id: summary_session_id,
+                    entity_name: "pending-approval".into(),
+                    entity_type: crate::expert_system::APPROVAL_MIRROR_ENTITY_TYPE.into(),
+                    source_fold_id: None,
+                    context_snippet: "approval".into(),
+                    entity_embedding: None,
+                    confidence: 1.0,
+                    created_at: chrono::Utc::now(),
+                    state: crate::types::MemoryState::Active,
+                    description: None,
+                    description_embedding: None,
+                    tags: Vec::new(),
+                    properties: serde_json::json!({
+                        "decision": crate::types::ApprovalDecision::Proposed.to_string()
+                    }),
+                    content_hash: None,
+                    updated_at: None,
+                    scope: crate::types::EntityScope::Session,
+                    ingested_by_session: None,
+                },
+            )
+            .await
+            .unwrap();
 
         let response = handle_http_request(
             "GET",
-            "/workbench/api/summary",
+            &format!("/workbench/api/summary?session_id={summary_session_id}"),
             &headers,
             "",
             &storage,
@@ -4784,7 +4856,75 @@ mod tests {
         .unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("\"status\":\"ready\""));
+        assert!(response.contains("\"node_count\":2"));
+        assert!(response.contains("\"node_count_scope\":\"session\""));
+        assert!(response.contains("\"derived_fact_count\":1005"));
+        assert!(response.contains("\"pending_approvals\":1"));
         assert!(response.contains("\"rule_count\":10"));
+
+        let degraded_response = handle_http_request(
+            "GET",
+            "/workbench/api/summary",
+            &headers,
+            "",
+            &storage,
+            &metrics,
+            &move |u, p| {
+                if u == "user" && p == "pass" {
+                    Some(tenant_id)
+                } else {
+                    None
+                }
+            },
+            &|| true,
+            &ShellRouteConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert!(degraded_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(degraded_response.contains("\"status\":\"ready\""));
+        assert!(degraded_response.contains("\"node_count\":2"));
+        assert!(degraded_response.contains("\"node_count_scope\":\"all\""));
+        assert!(degraded_response.contains("\"derived_fact_count\":1005"));
+        assert!(degraded_response.contains("\"pending_approvals\":1"));
+    }
+
+    #[test]
+    fn workbench_summary_avoids_broad_entity_and_derived_cache_scans() {
+        let source = include_str!("http.rs");
+        let route_start = source
+            .find("/workbench/api/summary")
+            .expect("workbench summary route must exist");
+        let route_tail = &source[route_start..];
+        let route_end = route_tail
+            .find("(\"POST\", \"/workbench/api/cql/query\")")
+            .unwrap_or(route_tail.len());
+        let route_source = &route_tail[..route_end];
+
+        assert!(
+            !route_source.contains("entity_list_all(ctx)"),
+            "workbench summary must not materialize all entities for counts or approval mirrors"
+        );
+        assert!(
+            !route_source.contains("derived_cache_list_all(ctx, 100_000)"),
+            "workbench summary must not materialize a huge derived-cache sample for a count"
+        );
+        assert!(
+            !route_source.contains("WORKBENCH_SUMMARY_"),
+            "workbench summary must not use capped samples for counts"
+        );
+        assert!(
+            route_source.contains("entity_count("),
+            "workbench summary should use an aggregate entity count path"
+        );
+        assert!(
+            route_source.contains("entity_count_matching("),
+            "workbench summary should count matching approval mirrors without materializing them"
+        );
+        assert!(
+            route_source.contains("derived_cache_count("),
+            "workbench summary should stream-count derived-cache rows"
+        );
     }
 
     #[tokio::test]

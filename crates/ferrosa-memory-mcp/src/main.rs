@@ -727,6 +727,14 @@ impl Storage for ReconnectingStorage {
         delegate!(self, entity_count, ctx, session_id)
     }
 
+    async fn entity_count_matching(
+        &self,
+        ctx: &TenantContext,
+        query: EntityListQuery,
+    ) -> anyhow::Result<usize> {
+        delegate!(self, entity_count_matching, ctx, query)
+    }
+
     async fn fold_count(
         &self,
         ctx: &TenantContext,
@@ -1370,6 +1378,10 @@ impl Storage for ReconnectingStorage {
         limit: usize,
     ) -> anyhow::Result<Vec<ferrosa_memory_core::types::DerivedFactRow>> {
         delegate!(self, derived_cache_list_all, ctx, limit)
+    }
+
+    async fn derived_cache_count(&self, ctx: &TenantContext) -> anyhow::Result<usize> {
+        delegate!(self, derived_cache_count, ctx)
     }
 
     async fn derived_cache_ttl_track_put(
