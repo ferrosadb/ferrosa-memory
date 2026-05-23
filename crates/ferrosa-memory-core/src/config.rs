@@ -398,7 +398,7 @@ impl Default for MemoryConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct EmbeddingConfig {
     #[serde(default = "default_provider")]
     pub provider: String,

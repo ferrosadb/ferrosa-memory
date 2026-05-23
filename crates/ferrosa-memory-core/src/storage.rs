@@ -1221,6 +1221,10 @@ pub mod mock {
         /// with this message. Parallel to `force_phonetic_error` so a
         /// test can target one lookup path without disabling the other.
         pub force_exact_name_error: Mutex<Option<String>>,
+        /// Test hook: when Some, `entity_list_all` returns Err with this
+        /// message. Used to verify operator endpoints surface list-scan
+        /// backpressure instead of converting it into empty successful state.
+        pub force_entity_list_all_error: Mutex<Option<String>>,
         /// Test hook: when Some((entity_type, msg)), `entity_put` returns
         /// Err(msg) for any entry whose `entity_type` matches. Lets a
         /// test simulate transient CQL write failures targeting a
@@ -1654,6 +1658,9 @@ pub mod mock {
         }
 
         async fn entity_list_all(&self, _ctx: &TenantContext) -> anyhow::Result<Vec<EntityEntry>> {
+            if let Some(message) = self.force_entity_list_all_error.lock().await.clone() {
+                anyhow::bail!(message);
+            }
             let entities = self.entities.lock().await;
             Ok(entities.clone())
         }

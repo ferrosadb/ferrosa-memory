@@ -299,23 +299,6 @@ impl<'de> Visitor<'de> for SparqlBindingsVisitor {
 }
 
 impl ReconnectingStorage {
-    /// Create with an already-connected CQL backend.
-    fn connected(
-        cql: CqlStorage,
-        config: FerrosaCqlConfig,
-        graph: Option<Arc<GraphClient>>,
-        sparql: Option<SparqlPassthrough>,
-    ) -> Self {
-        Self {
-            inner: RwLock::new(Some(cql)),
-            generation: AtomicU64::new(1),
-            reconnect_signal: tokio::sync::Notify::new(),
-            cql_config: config,
-            graph,
-            sparql,
-        }
-    }
-
     /// Create in "reconnecting" state — no backend available yet.
     fn disconnected(
         config: FerrosaCqlConfig,
@@ -1679,6 +1662,46 @@ fn next_backoff(attempt: u32) -> Duration {
     }
 }
 
+fn migrations_enabled() -> bool {
+    matches!(
+        std::env::var("FERROSA_MIGRATIONS_ENABLED").ok().as_deref(),
+        None | Some("true" | "1" | "on" | "yes")
+    )
+}
+
+async fn run_schema_migrations_if_enabled(config: &FerrosaCqlConfig) {
+    if !migrations_enabled() {
+        tracing::info!(
+            "FERROSA_MIGRATIONS_ENABLED is disabled; skipping schema migrations. \
+             Ensure the keyspace schema is managed externally (DBaaS mode) or manually applied."
+        );
+        return;
+    }
+
+    match ferrosa_memory_core::cql_storage::connect_admin_session(config).await {
+        Ok(admin_session) => {
+            match ferrosa_memory_core::migration::run_migrations(&admin_session, &config.keyspace)
+                .await
+            {
+                Ok(0) => tracing::debug!("schema up to date"),
+                Ok(n) => tracing::info!(applied = n, "schema migrations applied"),
+                Err(e) => {
+                    tracing::error!(
+                        "schema migration failed: {e}. The keyspace may be out of sync with this binary. \
+                         Investigate the failing DDL and restart. CqlStorage will attempt to connect, \
+                         but runtime queries may fail if the schema is incomplete."
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "admin CQL session unavailable ({e}), skipping migrations for this reconnect attempt"
+            );
+        }
+    }
+}
+
 /// Persistent reconnection watcher.
 ///
 /// Waits for `reconnect_signal` (fired on initial failure or mid-operation
@@ -1720,6 +1743,8 @@ async fn cql_reconnect_watcher(storage: Arc<ReconnectingStorage>) {
                 "CQL reconnection attempt scheduled"
             );
             tokio::time::sleep(delay).await;
+
+            run_schema_migrations_if_enabled(&storage.cql_config).await;
 
             match CqlStorage::connect(&storage.cql_config).await {
                 Ok(cql) => {
@@ -1891,105 +1916,37 @@ async fn main() -> anyhow::Result<()> {
         )
     });
 
-    // Connect graph client via HTTP (non-fatal if it fails).
-    let graph_client = match ferrosa_memory_core::graph::GraphClient::connect(
+    // Build the graph client without a startup health check. Graph operations
+    // still fail loudly per request if Ferrosa's graph endpoint is unavailable,
+    // but MCP initialize must not wait on backend probes.
+    let graph_client = match ferrosa_memory_core::graph::GraphClient::from_config(
         &ferrosa_memory_core::graph::GraphConfig {
             http_url: config.graph.http_url.clone(),
             username: config.graph.username.clone(),
             password: config.graph.password.clone(),
             keyspace: config.ferrosa.keyspace.clone(),
         },
-    )
-    .await
-    {
-        Ok(graph) => {
-            tracing::info!("connected to Ferrosa graph (HTTP)");
-            Some(Arc::new(graph))
-        }
+    ) {
+        Ok(graph) => Some(Arc::new(graph)),
         Err(e) => {
-            tracing::warn!("graph connection failed ({e}), graph traversals disabled");
+            tracing::warn!("graph client configuration failed ({e}), graph traversals disabled");
             None
         }
     };
 
-    // Run schema migrations BEFORE opening the runtime CqlStorage session.
-    // CqlStorage::connect eagerly prepares every application statement
-    // on startup; if the tables those statements target don't exist yet
-    // (greenfield install or a new migration), the session fails to
-    // build and the MCP enters a reconnect loop.  By running migrations
-    // on a bare Scylla admin session (no prepared-statement bloat) first,
-    // we guarantee the DDL is in place before CqlStorage tries to use it.
-    let keyspace = config.ferrosa.keyspace.clone();
-    let migrations_enabled = matches!(
-        std::env::var("FERROSA_MIGRATIONS_ENABLED").ok().as_deref(),
-        None | Some("true" | "1" | "on" | "yes")
-    );
-    if migrations_enabled {
-        match ferrosa_memory_core::cql_storage::connect_admin_session(&config.ferrosa).await {
-            Ok(admin_session) => {
-                match ferrosa_memory_core::migration::run_migrations(&admin_session, &keyspace)
-                    .await
-                {
-                    Ok(0) => tracing::debug!("schema up to date"),
-                    Ok(n) => tracing::info!(applied = n, "schema migrations applied"),
-                    Err(e) => {
-                        // Migration failures are not recoverable by retry. The
-                        // schema is in an unknown state. Log at ERROR so
-                        // operators see it immediately, and do not mask the
-                        // failure as a warning.
-                        tracing::error!(
-                            "schema migration failed: {e}. The keyspace may be out of sync with this binary. \
-                             Investigate the failing DDL and restart. CqlStorage will attempt to connect, \
-                             but runtime queries may fail if the schema is incomplete."
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "admin CQL session unavailable ({e}), skipping migrations. \
-                     Migrations will retry on the next reconnect cycle."
-                );
-            }
-        }
-    } else {
-        tracing::info!(
-            "FERROSA_MIGRATIONS_ENABLED is disabled; skipping schema migrations. \
-             Ensure the keyspace schema is managed externally (DBaaS mode) or manually applied."
-        );
-    }
-
-    // Connect to real Ferrosa — retry in background if initial connect fails.
-    // Never fall back to mock storage (mock silently loses data).
-    let storage: Arc<ReconnectingStorage> = match CqlStorage::connect(&config.ferrosa).await {
-        Ok(cql) => {
-            tracing::info!("connected to Ferrosa CQL cluster");
-            Arc::new(ReconnectingStorage::connected(
-                cql,
-                config.ferrosa.clone(),
-                graph_client.clone(),
-                sparql.clone(),
-            ))
-        }
-        Err(e) => {
-            tracing::warn!(
-                "CQL connection failed ({e}), starting in reconnecting mode — \
-                 tools will return errors until connection is established"
-            );
-            let storage = Arc::new(ReconnectingStorage::disconnected(
-                config.ferrosa.clone(),
-                graph_client.clone(),
-                sparql.clone(),
-            ));
-            // Signal immediately so the watcher starts its first attempt.
-            storage.reconnect_signal.notify_one();
-            storage
-        }
-    };
+    // Start disconnected and let the watcher perform migrations plus runtime
+    // CQL connect in the background. This keeps MCP initialize independent of
+    // CQL availability while preserving the migration-before-prepare invariant.
+    let storage = Arc::new(ReconnectingStorage::disconnected(
+        config.ferrosa.clone(),
+        graph_client.clone(),
+        sparql.clone(),
+    ));
 
     // Always spawn the reconnect watcher — it handles both initial failure
     // and mid-operation connection loss (rolling restarts, network blips).
     tokio::spawn(cql_reconnect_watcher(Arc::clone(&storage)));
+    storage.reconnect_signal.notify_one();
 
     // Load dynamic type registry from the database (falls back to defaults).
     //
@@ -2041,30 +1998,32 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Embedding provider health check (non-fatal). Many tools require
-    // embeddings; failing here warns loudly at startup rather than surfacing
-    // later as per-request failures.
-    let embed_health = ferrosa_memory_core::embedding::EmbeddingClient::new(&config.embeddings);
-    match embed_health.health_check().await {
-        Ok(()) => tracing::info!(
-            provider = %config.embeddings.provider,
-            url = %config.embeddings.ollama_base_url,
-            model = %config.embeddings.model,
-            "embedding provider reachable and model loaded"
-        ),
-        Err(e) => tracing::warn!(
-            provider = %config.embeddings.provider,
-            url = %config.embeddings.ollama_base_url,
-            model = %config.embeddings.model,
-            error = %e,
-            "embedding provider check failed — tools that require embeddings \
-             (smart_ingest, hybrid_search, retrieve_fold_context, retrieve_entities) \
-             will fail at call time. Start Ollama and ensure '{}' is pulled: \
-             `ollama pull {}`",
-            config.embeddings.model,
-            config.embeddings.model
-        ),
-    }
+    // Embedding provider health check is non-fatal and must not block MCP
+    // initialize. Tool calls still fail clearly if embeddings are unavailable.
+    let embeddings_config = config.embeddings.clone();
+    tokio::spawn(async move {
+        let embed_health = ferrosa_memory_core::embedding::EmbeddingClient::new(&embeddings_config);
+        match embed_health.health_check().await {
+            Ok(()) => tracing::info!(
+                provider = %embeddings_config.provider,
+                url = %embeddings_config.ollama_base_url,
+                model = %embeddings_config.model,
+                "embedding provider reachable and model loaded"
+            ),
+            Err(e) => tracing::warn!(
+                provider = %embeddings_config.provider,
+                url = %embeddings_config.ollama_base_url,
+                model = %embeddings_config.model,
+                error = %e,
+                "embedding provider check failed — tools that require embeddings \
+                 (smart_ingest, hybrid_search, retrieve_fold_context, retrieve_entities) \
+                 will fail at call time. Start Ollama and ensure '{}' is pulled: \
+                 `ollama pull {}`",
+                embeddings_config.model,
+                embeddings_config.model
+            ),
+        }
+    });
 
     // Start visualization server if enabled.
     //
@@ -2689,6 +2648,59 @@ auth_file = "{}"
         assert!(
             !method_source.contains("self.inner.read().await"),
             "operator passthrough must not hold the reconnect RwLock read guard while streaming rows"
+        );
+    }
+
+    #[test]
+    fn startup_main_does_not_await_backend_connects_before_serving() {
+        let source = include_str!("main.rs");
+        let main_start = source.find("async fn main()").expect("main must exist");
+        let main_tail = &source[main_start..];
+        let test_start = main_tail.find("#[cfg(test)]").unwrap_or(main_tail.len());
+        let main_source = &main_tail[..test_start];
+
+        for forbidden in [
+            "GraphClient::connect(",
+            "connect_admin_session(&config.ferrosa).await",
+            "CqlStorage::connect(&config.ferrosa).await",
+        ] {
+            assert!(
+                !main_source.contains(forbidden),
+                "main must not block MCP startup on backend probe `{forbidden}`"
+            );
+        }
+
+        assert!(
+            main_source.contains("ReconnectingStorage::disconnected("),
+            "main should start with reconnecting storage and let the watcher connect in the background"
+        );
+        assert!(
+            main_source.contains("tokio::spawn(cql_reconnect_watcher"),
+            "main should spawn the background CQL reconnect watcher before serving transports"
+        );
+        assert!(
+            main_source.contains("tokio::spawn(async move {\n        let embed_health"),
+            "embedding provider health checks should run in a background task"
+        );
+    }
+
+    #[test]
+    fn reconnect_watcher_runs_migrations_before_runtime_cql_connect() {
+        let source = include_str!("main.rs");
+        let watcher_start = source
+            .find("async fn cql_reconnect_watcher")
+            .expect("reconnect watcher must exist");
+        let watcher_source = &source[watcher_start..];
+        let migration_pos = watcher_source
+            .find("run_schema_migrations_if_enabled(&storage.cql_config).await")
+            .expect("watcher must run migrations");
+        let connect_pos = watcher_source
+            .find("CqlStorage::connect(&storage.cql_config).await")
+            .expect("watcher must connect runtime CQL");
+
+        assert!(
+            migration_pos < connect_pos,
+            "migrations must run before runtime CQL prepare/connect attempts"
         );
     }
 

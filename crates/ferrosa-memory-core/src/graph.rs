@@ -71,8 +71,12 @@ pub struct CoOccursEdgeRow {
 }
 
 impl GraphClient {
-    /// Connect to Ferrosa's graph HTTP endpoint.
-    pub async fn connect(config: &GraphConfig) -> anyhow::Result<Self> {
+    /// Build a graph client without a startup health check.
+    ///
+    /// Use this on process startup paths where MCP handshake latency must not
+    /// depend on graph endpoint availability. Individual graph operations still
+    /// fail loudly through their normal request paths if the endpoint is down.
+    pub fn from_config(config: &GraphConfig) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()?;
@@ -80,9 +84,22 @@ impl GraphClient {
         let auth = base64_encode(&format!("{}:{}", config.username, config.password));
         let auth_header = format!("Basic {auth}");
 
+        Ok(Self {
+            client,
+            base_url: config.http_url.clone(),
+            auth_header,
+            keyspace: config.keyspace.clone(),
+        })
+    }
+
+    /// Connect to Ferrosa's graph HTTP endpoint.
+    pub async fn connect(config: &GraphConfig) -> anyhow::Result<Self> {
+        let graph = Self::from_config(config)?;
+
         // Health check
-        let resp = client
-            .get(format!("{}/graph/health", config.http_url))
+        let resp = graph
+            .client
+            .get(format!("{}/graph/health", graph.base_url))
             .send()
             .await?;
 
@@ -92,12 +109,7 @@ impl GraphClient {
 
         tracing::info!(url = %config.http_url, "graph client connected via HTTP");
 
-        Ok(Self {
-            client,
-            base_url: config.http_url.clone(),
-            auth_header,
-            keyspace: config.keyspace.clone(),
-        })
+        Ok(graph)
     }
 
     /// Execute a Cypher MATCH query against the graph endpoint.

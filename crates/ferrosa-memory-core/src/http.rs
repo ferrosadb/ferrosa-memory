@@ -1245,7 +1245,7 @@ async fn handle_operator_request<S: Storage + OperatorQuerySurface>(
             let approvals: Vec<Value> = storage
                 .entity_list_all(ctx)
                 .await
-                .unwrap_or_default()
+                .map_err(|e| anyhow::anyhow!("failed to list approval mirror entities: {e}"))?
                 .into_iter()
                 .filter(|entry| {
                     entry.entity_type == crate::expert_system::APPROVAL_MIRROR_ENTITY_TYPE
@@ -1302,7 +1302,7 @@ async fn handle_operator_request<S: Storage + OperatorQuerySurface>(
                 storage
                     .entity_list_all(ctx)
                     .await
-                    .unwrap_or_default()
+                    .map_err(|e| anyhow::anyhow!("failed to list alias mirror entities: {e}"))?
                     .into_iter()
                     .filter(|entry| entry.entity_type == crate::expert_system::ALIAS_MIRROR_ENTITY_TYPE)
                     .map(|entry| {
@@ -1344,7 +1344,7 @@ async fn handle_operator_request<S: Storage + OperatorQuerySurface>(
                 storage
                     .entity_list_all(ctx)
                     .await
-                    .unwrap_or_default()
+                    .map_err(|e| anyhow::anyhow!("failed to list alias mirror entities: {e}"))?
                     .into_iter()
                     .filter(|entry| entry.entity_type == crate::expert_system::ALIAS_MIRROR_ENTITY_TYPE)
                     .map(|entry| {
@@ -4643,6 +4643,50 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("\"status\":\"ready\""));
         assert!(response.contains("\"rule_count\":10"));
+    }
+
+    #[tokio::test]
+    async fn workbench_list_endpoints_propagate_entity_scan_errors() {
+        let metrics = MemoryMetrics::new().unwrap();
+        let storage = MockStorage::new();
+        *storage.force_entity_list_all_error.lock().await =
+            Some("entity list backpressure: row cap exceeded".to_string());
+        let headers = vec![(
+            "Authorization".to_string(),
+            "Basic dXNlcjpwYXNz".to_string(),
+        )];
+        let tenant_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+
+        for path in ["/workbench/api/approvals", "/workbench/api/aliases"] {
+            let response = handle_http_request(
+                "GET",
+                path,
+                &headers,
+                "",
+                &storage,
+                &metrics,
+                &move |u, p| {
+                    if u == "user" && p == "pass" {
+                        Some(tenant_id)
+                    } else {
+                        None
+                    }
+                },
+                &|| true,
+                &ShellRouteConfig::default(),
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                response.starts_with("HTTP/1.1 502 Bad Gateway"),
+                "{path} must fail loudly on storage scan errors, got: {response}"
+            );
+            assert!(
+                response.contains("entity list backpressure"),
+                "{path} response must preserve the storage error, got: {response}"
+            );
+        }
     }
 
     #[tokio::test]
