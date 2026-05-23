@@ -1740,11 +1740,11 @@ async fn handle_viz_connection<S: crate::storage::Storage + 'static>(
             );
             stream.write_all(response.as_bytes()).await?;
         }
-        (method, path) if method == "GET" && path.starts_with("/viz/snapshot") => {
+        (method, route) if method == "GET" && route.starts_with("/viz/snapshot") => {
             let response = snapshot_stream_required_response();
             stream.write_all(response.as_bytes()).await?;
         }
-        (method, path) if method == "GET" && path.starts_with("/viz/api/derived_facts") => {
+        (method, route) if method == "GET" && route.starts_with("/viz/api/derived_facts") => {
             // Fetch derived facts from cache for the viz tab
             // Parse query string from path (e.g., /viz/api/derived_facts?session_id=xxx&limit=100)
             let query_string = path.split('?').nth(1).unwrap_or("");
@@ -1756,20 +1756,20 @@ async fn handle_viz_connection<S: crate::storage::Storage + 'static>(
                 .unwrap_or("00000000-0000-0000-0000-000000000000")
                 .to_string();
 
-            let limit: usize = query_string
-                .split('&')
-                .find(|p| p.starts_with("limit="))
-                .and_then(|p| p.split('=').nth(1))
+            let limit: usize = query_param(path, "limit")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(100);
 
             let session_uuid = uuid::Uuid::parse_str(&session_id).unwrap_or(uuid::Uuid::nil());
             let cache_key = format!("consolidation:{}", session_uuid);
 
-            let derived_facts = match storage.derived_cache_get(&ctx, &cache_key).await {
+            let derived_facts = match storage
+                .derived_cache_get_limited(&ctx, &cache_key, limit)
+                .await
+            {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!(error = %e, cache_key, "viz: derived_cache_get failed; serving empty");
+                    tracing::warn!(error = %e, cache_key, limit, "viz: derived_cache_get_limited failed; serving empty");
                     Vec::new()
                 }
             };
@@ -1812,7 +1812,6 @@ async fn handle_viz_connection<S: crate::storage::Storage + 'static>(
 
             let facts: Vec<_> = derived_facts
                 .into_iter()
-                .take(limit)
                 .map(|f| {
                     let src_name = entity_names
                         .get(&f.src_id)
@@ -3624,6 +3623,99 @@ mod tests {
             !viz_snapshot_route.contains("serde_json::to_string(&snapshot"),
             "viz /viz/snapshot must not serialize a giant snapshot body: {viz_snapshot_route}"
         );
+    }
+
+    #[tokio::test]
+    async fn viz_derived_facts_applies_limit_at_storage_boundary() {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let storage = Arc::new(MockStorage::new());
+        let ctx = Arc::new(test_tenant());
+        let session_id = Uuid::nil();
+        let cache_key = format!("consolidation:{session_id}");
+        storage
+            .derived_cache_put(
+                &ctx,
+                &cache_key,
+                &[
+                    crate::types::DerivedFact {
+                        src_id: Uuid::new_v4().to_string(),
+                        pred: "related".into(),
+                        dst_id: Uuid::new_v4().to_string(),
+                        confidence: 0.9,
+                        rule_id: "r1".into(),
+                        support_count: 1,
+                        provenance: vec![],
+                    },
+                    crate::types::DerivedFact {
+                        src_id: Uuid::new_v4().to_string(),
+                        pred: "related".into(),
+                        dst_id: Uuid::new_v4().to_string(),
+                        confidence: 0.8,
+                        rule_id: "r2".into(),
+                        support_count: 1,
+                        provenance: vec![],
+                    },
+                    crate::types::DerivedFact {
+                        src_id: Uuid::new_v4().to_string(),
+                        pred: "related".into(),
+                        dst_id: Uuid::new_v4().to_string(),
+                        confidence: 0.7,
+                        rule_id: "r3".into(),
+                        support_count: 1,
+                        provenance: vec![],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_storage = Arc::clone(&storage);
+        let server_ctx = Arc::clone(&ctx);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_viz_connection(
+                stream,
+                Arc::new(EventBus::new()),
+                server_storage,
+                server_ctx,
+                session_id,
+                &ShellRouteConfig::default(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "GET /viz/api/derived_facts?session_id={session_id}&limit=2 HTTP/1.1\r\n\
+             Host: 127.0.0.1\r\n\
+             Connection: close\r\n\r\n"
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        server.await.unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("\"count\":2"), "{response}");
+        assert!(!response.contains("\"rule_id\":\"r3\""), "{response}");
+        assert_eq!(
+            storage
+                .derived_cache_get_limited_calls
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            storage
+                .derived_cache_get_limited_last_limit
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(storage.derived_cache_get_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]

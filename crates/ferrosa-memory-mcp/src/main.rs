@@ -1342,6 +1342,15 @@ impl Storage for ReconnectingStorage {
         delegate!(self, derived_cache_get, ctx, cache_key)
     }
 
+    async fn derived_cache_get_limited(
+        &self,
+        ctx: &TenantContext,
+        cache_key: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ferrosa_memory_core::types::DerivedFact>> {
+        delegate!(self, derived_cache_get_limited, ctx, cache_key, limit)
+    }
+
     async fn derived_cache_put(
         &self,
         ctx: &TenantContext,

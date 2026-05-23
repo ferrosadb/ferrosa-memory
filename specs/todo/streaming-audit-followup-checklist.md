@@ -16,9 +16,10 @@ Goal: fix the remaining concrete rust-streaming audit findings in ferrosa-memory
   - Fix: propagate list-scan failures as explicit operator errors.
   - Verify: `cargo test -p ferrosa-memory-core workbench_list_endpoints_propagate_entity_scan_errors`.
 
-- [ ] Viz facts endpoint must apply `limit` at the storage boundary instead of loading a full derived-cache partition.
+- [x] Viz facts endpoint must apply `limit` at the storage boundary instead of loading a full derived-cache partition.
   - Evidence: `/viz/facts` calls `derived_cache_get` and truncates only after materialization.
-  - TDD: `viz_facts_applies_limit_at_storage_boundary`.
+  - Fix: `/viz/api/derived_facts` now calls `derived_cache_get_limited`; CQL pushes `LIMIT` into the derived-cache query and the viz route preserves query params after route matching.
+  - Verify: `cargo test -p ferrosa-memory-core viz_derived_facts_applies_limit_at_storage_boundary` and `cargo test -p ferrosa-memory-core derived_cache_limited_query_pushes_limit_to_cql`.
 
 - [ ] List-all storage helpers must avoid unpaged full-result materialization or enforce explicit caps.
   - Evidence: `exec_prepared_rows` backs several `*_list_all` paths with `execute_unpaged`.

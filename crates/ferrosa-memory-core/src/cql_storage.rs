@@ -91,6 +91,17 @@ fn tool_usage_put_query(ks: &str) -> String {
     )
 }
 
+fn derived_cache_get_query(ks: &str, limit: Option<usize>) -> String {
+    let mut query = format!(
+        "SELECT seq, src_id, pred, dst_id, confidence, rule_id, computed_at \
+         FROM {ks}.derived_cache_by_query WHERE tenant_id = ? AND cache_key = ?"
+    );
+    if let Some(limit) = limit {
+        query.push_str(&format!(" LIMIT {limit}"));
+    }
+    query
+}
+
 fn entity_list_all_query(ks: &str) -> String {
     format!(
         "SELECT entity_id, session_id, entity_name, entity_type, source_fold_id, \
@@ -1046,10 +1057,7 @@ impl CqlStorage {
                 .await?,
             // Derived cache (Sprint 5)
             derived_cache_get: session
-                .prepare(format!(
-                    "SELECT seq, src_id, pred, dst_id, confidence, rule_id, computed_at \
-                     FROM {ks}.derived_cache_by_query WHERE tenant_id = ? AND cache_key = ?"
-                ))
+                .prepare(derived_cache_get_query(ks, None))
                 .await?,
             derived_cache_put: session
                 .prepare(format!(
@@ -4132,6 +4140,39 @@ impl Storage for CqlStorage {
         Ok(facts)
     }
 
+    async fn derived_cache_get_limited(
+        &self,
+        ctx: &TenantContext,
+        cache_key: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<DerivedFact>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let query = derived_cache_get_query(&self.keyspace, Some(limit));
+        let prepared = self.session.prepare(query).await?;
+        let (col_map, rows) = self
+            .exec_prepared_rows(&prepared, (ctx.tenant_id, cache_key.to_string()))
+            .await?;
+
+        let mut facts = Vec::with_capacity(rows.len());
+        for row in rows {
+            let src_id: Uuid = cql_get(&row, &col_map, "src_id")?;
+            let dst_id: Uuid = cql_get(&row, &col_map, "dst_id")?;
+
+            facts.push(DerivedFact {
+                src_id: src_id.to_string(),
+                pred: cql_get(&row, &col_map, "pred")?,
+                dst_id: dst_id.to_string(),
+                confidence: cql_get::<f64>(&row, &col_map, "confidence").unwrap_or(1.0),
+                rule_id: cql_get(&row, &col_map, "rule_id").unwrap_or_default(),
+                support_count: 1,
+                provenance: vec![],
+            });
+        }
+        Ok(facts)
+    }
+
     async fn derived_cache_put(
         &self,
         ctx: &TenantContext,
@@ -5154,6 +5195,20 @@ mod cql_storage_tests {
         assert!(
             !query.contains("now()") && !query.contains("toTimestamp"),
             "tool usage logging must not send Ferrosa a server-side time expression: {query}"
+        );
+    }
+
+    #[test]
+    fn derived_cache_limited_query_pushes_limit_to_cql() {
+        let query = derived_cache_get_query("agent_memory", Some(25));
+
+        assert!(
+            query.contains("WHERE tenant_id = ? AND cache_key = ?"),
+            "derived cache query must stay tenant/cache scoped: {query}"
+        );
+        assert!(
+            query.ends_with(" LIMIT 25"),
+            "derived cache limited query must push the caller limit into CQL: {query}"
         );
     }
 

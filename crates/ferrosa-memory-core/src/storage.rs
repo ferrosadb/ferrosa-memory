@@ -856,6 +856,14 @@ pub trait Storage: Send + Sync {
         cache_key: &str,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<DerivedFact>>> + Send;
 
+    /// Get at most `limit` cached derived facts by cache key.
+    fn derived_cache_get_limited(
+        &self,
+        ctx: &TenantContext,
+        cache_key: &str,
+        limit: usize,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<DerivedFact>>> + Send;
+
     /// Store derived facts under a cache key.
     fn derived_cache_put(
         &self,
@@ -1211,6 +1219,9 @@ pub mod mock {
         pub edge_list_all_calls: AtomicUsize,
         pub edge_list_session_calls: AtomicUsize,
         pub edge_list_for_entity_calls: AtomicUsize,
+        pub derived_cache_get_calls: AtomicUsize,
+        pub derived_cache_get_limited_calls: AtomicUsize,
+        pub derived_cache_get_limited_last_limit: AtomicUsize,
         /// Test hook: when Some, `entity_find_phonetic` returns Err with
         /// this message. Used to verify callers propagate phonetic-scan
         /// errors instead of fail-quieting them into empty results, and
@@ -2270,8 +2281,29 @@ pub mod mock {
             _ctx: &TenantContext,
             cache_key: &str,
         ) -> anyhow::Result<Vec<DerivedFact>> {
+            self.derived_cache_get_calls.fetch_add(1, Ordering::Relaxed);
             let cache = self.derived_cache.lock().await;
             Ok(cache.get(cache_key).cloned().unwrap_or_default())
+        }
+
+        async fn derived_cache_get_limited(
+            &self,
+            _ctx: &TenantContext,
+            cache_key: &str,
+            limit: usize,
+        ) -> anyhow::Result<Vec<DerivedFact>> {
+            self.derived_cache_get_limited_calls
+                .fetch_add(1, Ordering::Relaxed);
+            self.derived_cache_get_limited_last_limit
+                .store(limit, Ordering::Relaxed);
+            let cache = self.derived_cache.lock().await;
+            Ok(cache
+                .get(cache_key)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .take(limit)
+                .collect())
         }
 
         async fn derived_cache_put(
