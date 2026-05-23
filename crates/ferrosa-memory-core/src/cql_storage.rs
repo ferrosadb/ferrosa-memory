@@ -104,6 +104,29 @@ fn typed_edge_list_all_query(ks: &str) -> String {
     )
 }
 
+const CONTEXT_SEGMENT_BM25_MIN_CANDIDATES: usize = 256;
+const CONTEXT_SEGMENT_BM25_CANDIDATES_PER_RESULT: usize = 128;
+const CONTEXT_SEGMENT_BM25_MAX_CANDIDATES: usize = 4096;
+
+fn context_segment_bm25_candidate_limit(k: usize) -> usize {
+    if k == 0 {
+        return 0;
+    }
+    k.saturating_mul(CONTEXT_SEGMENT_BM25_CANDIDATES_PER_RESULT)
+        .clamp(
+            CONTEXT_SEGMENT_BM25_MIN_CANDIDATES,
+            CONTEXT_SEGMENT_BM25_MAX_CANDIDATES,
+        )
+}
+
+fn context_segment_terms_query(ks: &str, candidate_limit: usize) -> String {
+    format!(
+        "SELECT segment_id, tf FROM {ks}.context_segment_terms \
+         WHERE tenant_id = ? AND session_id = ? AND term = ? \
+         LIMIT {candidate_limit}"
+    )
+}
+
 fn edge_count_query(ks: &str, table: &str) -> anyhow::Result<String> {
     match table {
         "co_occurs_with" | "mentioned_in" | "folded_into" | "supersedes" | "typed_edges" => {}
@@ -583,6 +606,7 @@ pub async fn connect_admin_session(config: &FerrosaCqlConfig) -> anyhow::Result<
 }
 
 /// Prepared statement cache for all table operations.
+#[derive(Clone)]
 struct PreparedStatements {
     // Memo
     memo_get: PreparedStatement,
@@ -662,6 +686,7 @@ struct PreparedStatements {
 }
 
 /// CQL storage backend.
+#[derive(Clone)]
 pub struct CqlStorage {
     session: Arc<CqlSession>,
     stmts: PreparedStatements,
@@ -769,7 +794,7 @@ impl CqlStorage {
                 .await?,
             entity_list_session: session
                 .prepare(format!(
-                    "SELECT entity_id, entity_name, entity_type, source_fold_id, \
+                    "SELECT entity_id, session_id, entity_name, entity_type, source_fold_id, \
                      context_snippet, entity_embedding, confidence, state, created_at, \
                      description, tags, properties, content_hash, \
                      updated_at, scope, ingested_by_session \
@@ -2440,6 +2465,56 @@ impl Storage for CqlStorage {
             {
                 // Ghost rows (NULL required fields) are skipped silently —
                 // the row_to_entity_entry docstring captures the rationale.
+                Ok(None) => continue,
+                Ok(Some(entry)) => {
+                    chunk.push(entry);
+                    if chunk.len() >= chunk_size {
+                        let out = std::mem::take(&mut chunk);
+                        if tx.send(Ok(out)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            }
+        }
+        if !chunk.is_empty() {
+            let _ = tx.send(Ok(chunk)).await;
+        }
+    }
+
+    async fn entity_stream_session(
+        &self,
+        ctx: TenantContext,
+        session_id: Uuid,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<EntityEntry>>>,
+    ) {
+        let chunk_size = chunk_size.max(1);
+        let mut iter = match self
+            .session
+            .execute_iter(
+                self.stmts.entity_list_session.clone(),
+                (ctx.tenant_id, session_id),
+            )
+            .await
+        {
+            Ok(iter) => iter,
+            Err(e) => {
+                let _ = tx.send(Err(e.into())).await;
+                return;
+            }
+        };
+        let col_map = build_col_map(iter.get_column_specs());
+        let mut chunk = Vec::with_capacity(chunk_size);
+        while let Some(row) = iter.next().await {
+            match row
+                .map_err(anyhow::Error::from)
+                .and_then(|row| row_to_entity_entry(&ctx, &row, &col_map))
+            {
                 Ok(None) => continue,
                 Ok(Some(entry)) => {
                     chunk.push(entry);
@@ -4517,6 +4592,82 @@ impl Storage for CqlStorage {
         }
     }
 
+    async fn typed_edge_stream_session(
+        &self,
+        ctx: TenantContext,
+        session_id: Uuid,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<TypedEdge>>>,
+    ) {
+        let chunk_size = chunk_size.max(1);
+        let query = format!(
+            "SELECT src_id, edge_type, dst_id, weight, metadata, created_at \
+             FROM {}.typed_edges \
+             WHERE tenant_id = ? AND session_id = ?",
+            self.keyspace
+        );
+        let mut iter = match self
+            .session
+            .query_iter(query, (ctx.tenant_id, session_id))
+            .await
+        {
+            Ok(iter) => iter,
+            Err(e) => {
+                let _ = tx.send(Err(e.into())).await;
+                return;
+            }
+        };
+        let col_map = build_col_map(iter.get_column_specs());
+        let mut chunk = Vec::with_capacity(chunk_size);
+        while let Some(row) = iter.next().await {
+            match row.map_err(anyhow::Error::from).and_then(|row| {
+                let src_id = cql_get::<Uuid>(&row, &col_map, "src_id")?;
+                let dst_id = cql_get::<Uuid>(&row, &col_map, "dst_id")?;
+                let edge_type = cql_get::<String>(&row, &col_map, "edge_type").unwrap_or_default();
+                if edge_type.is_empty() {
+                    anyhow::bail!("typed edge row has empty edge_type");
+                }
+                let created_at =
+                    cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
+                        .unwrap_or_default();
+                let weight = cql_get::<f64>(&row, &col_map, "weight").map_err(|e| {
+                    anyhow::anyhow!(
+                        "typed_edges row has null/corrupt weight ({e}); skipping rather than \
+                         fabricating a default that would overstate edge confidence"
+                    )
+                })?;
+                Ok(TypedEdge {
+                    tenant_id: ctx.tenant_id,
+                    session_id,
+                    src_id,
+                    edge_type,
+                    dst_id,
+                    weight,
+                    metadata: cql_get::<String>(&row, &col_map, "metadata")
+                        .ok()
+                        .filter(|s| !s.is_empty()),
+                    created_at,
+                })
+            }) {
+                Ok(edge) => {
+                    chunk.push(edge);
+                    if chunk.len() >= chunk_size {
+                        let out = std::mem::take(&mut chunk);
+                        if tx.send(Ok(out)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "typed_edge_stream_session skipped malformed row");
+                }
+            }
+        }
+        if !chunk.is_empty() {
+            let _ = tx.send(Ok(chunk)).await;
+        }
+    }
+
     async fn typed_edge_list_from(
         &self,
         ctx: &TenantContext,
@@ -4726,12 +4877,12 @@ impl Storage for CqlStorage {
         query: &str,
         k: usize,
     ) -> anyhow::Result<Vec<ContextSegment>> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
         let mut scores: HashMap<Uuid, i32> = HashMap::new();
-        let term_q = format!(
-            "SELECT segment_id, tf FROM {ks}.context_segment_terms \
-             WHERE tenant_id = ? AND session_id = ? AND term = ?",
-            ks = self.keyspace
-        );
+        let term_q =
+            context_segment_terms_query(&self.keyspace, context_segment_bm25_candidate_limit(k));
         for term in tokenize_context_terms(query) {
             let (col_map, rows) = query_paged_rows!(
                 self.session,
@@ -5021,6 +5172,20 @@ mod cql_storage_tests {
                 "observability queries must not fetch raw columns for client-side count/sum: {query}"
             );
         }
+    }
+
+    #[test]
+    fn cql_paged_helpers_enforce_candidate_cap() {
+        let query = context_segment_terms_query("agent_memory", 512);
+
+        assert!(
+            query.contains("LIMIT 512"),
+            "BM25 term scans must cap each paged candidate stream before client-side scoring: {query}"
+        );
+        assert!(
+            context_segment_bm25_candidate_limit(10) <= CONTEXT_SEGMENT_BM25_MAX_CANDIDATES,
+            "BM25 candidate cap must remain bounded even for large top-k requests"
+        );
     }
 
     #[test]

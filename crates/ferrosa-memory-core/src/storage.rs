@@ -390,6 +390,36 @@ pub trait Storage: Send + Sync {
         }
     }
 
+    /// Stream entities for one session in bounded chunks.
+    ///
+    /// The default implementation chunks `entity_list_session()` for in-memory
+    /// test backends. CQL storage overrides this with a paged driver iterator
+    /// so scoped viz snapshots do not materialize an entire session before the
+    /// first WebSocket chunk is sent.
+    fn entity_stream_session(
+        &self,
+        ctx: TenantContext,
+        session_id: Uuid,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<EntityEntry>>>,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        async move {
+            let chunk_size = chunk_size.max(1);
+            match self.entity_list_session(&ctx, session_id).await {
+                Ok(entities) => {
+                    for chunk in entities.chunks(chunk_size) {
+                        if tx.send(Ok(chunk.to_vec())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                }
+            }
+        }
+    }
+
     /// List all folds for a tenant (sync/export use only — uses ALLOW FILTERING).
     fn fold_list_all(
         &self,
@@ -941,6 +971,35 @@ pub trait Storage: Send + Sync {
         async move {
             let chunk_size = chunk_size.max(1);
             match self.typed_edge_list_all(&ctx).await {
+                Ok(edges) => {
+                    for chunk in edges.chunks(chunk_size) {
+                        if tx.send(Ok(chunk.to_vec())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                }
+            }
+        }
+    }
+
+    /// Stream typed edges for one session in bounded chunks.
+    ///
+    /// The default implementation chunks `typed_edge_list_session()` for
+    /// in-memory test backends. CQL storage overrides this with a paged driver
+    /// iterator for scoped viz snapshots.
+    fn typed_edge_stream_session(
+        &self,
+        ctx: TenantContext,
+        session_id: Uuid,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<TypedEdge>>>,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        async move {
+            let chunk_size = chunk_size.max(1);
+            match self.typed_edge_list_session(&ctx, session_id).await {
                 Ok(edges) => {
                     for chunk in edges.chunks(chunk_size) {
                         if tx.send(Ok(chunk.to_vec())).await.is_err() {

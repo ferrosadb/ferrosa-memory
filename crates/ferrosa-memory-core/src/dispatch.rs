@@ -25,6 +25,8 @@ use crate::context_segment::{
 };
 use crate::transport::{INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND};
 
+const CONSOLIDATION_QUEUE_CAPACITY: usize = 1024;
+
 /// Rotating hint counter for memory formation encouragement.
 static HINT_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -4754,7 +4756,16 @@ async fn handle_run_consolidation<S: crate::storage::Storage>(
 
     {
         let mut queue = session.consolidation_queue.lock().await;
-        if !queue.contains(&session_id) {
+        if queue.contains(&session_id) {
+            // Already queued; deterministic coalescing keeps the queue bounded.
+        } else if queue.len() >= CONSOLIDATION_QUEUE_CAPACITY {
+            return Err((
+                INTERNAL_ERROR,
+                format!(
+                    "consolidation queue full (capacity {CONSOLIDATION_QUEUE_CAPACITY}); retry after the idle worker drains pending sessions"
+                ),
+            ));
+        } else {
             queue.push_back(session_id);
         }
     }
@@ -7002,6 +7013,52 @@ mod tests {
                 .copied()
                 .collect::<Vec<_>>(),
             vec![session_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn consolidation_queue_is_bounded() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+
+        for _ in 0..CONSOLIDATION_QUEUE_CAPACITY {
+            let session_id = Uuid::new_v4();
+            let params = serde_json::json!({
+                "name": "run_consolidation",
+                "arguments": {"session_id": session_id.to_string()}
+            });
+            dispatch("tools/call", params, &store, &ctx, &session)
+                .await
+                .unwrap();
+        }
+
+        let duplicate = session.consolidation_queue.lock().await[0];
+        let duplicate_params = serde_json::json!({
+            "name": "run_consolidation",
+            "arguments": {"session_id": duplicate.to_string()}
+        });
+        dispatch("tools/call", duplicate_params, &store, &ctx, &session)
+            .await
+            .unwrap();
+
+        let overflow = Uuid::new_v4();
+        let overflow_params = serde_json::json!({
+            "name": "run_consolidation",
+            "arguments": {"session_id": overflow.to_string()}
+        });
+        let err = dispatch("tools/call", overflow_params, &store, &ctx, &session)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.0, INTERNAL_ERROR);
+        assert!(
+            err.1.contains("consolidation queue full"),
+            "error must name bounded queue backpressure: {err:?}"
+        );
+        assert_eq!(
+            session.consolidation_queue.lock().await.len(),
+            CONSOLIDATION_QUEUE_CAPACITY
         );
     }
 

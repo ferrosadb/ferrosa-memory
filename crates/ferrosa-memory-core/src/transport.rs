@@ -10,7 +10,10 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+/// Maximum newline-delimited JSON-RPC frame accepted on stdio.
+const STDIO_MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 
 /// A JSON-RPC 2.0 request.
 #[derive(Debug, Deserialize)]
@@ -85,6 +88,106 @@ pub type Handler = Box<
         + Sync,
 >;
 
+#[derive(Debug)]
+enum StdioReadError {
+    Io(std::io::Error),
+    LineTooLong { max_bytes: usize },
+    InvalidUtf8(std::string::FromUtf8Error),
+}
+
+impl std::fmt::Display for StdioReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "{e}"),
+            Self::LineTooLong { max_bytes } => {
+                write!(f, "stdio JSON-RPC line exceeded {max_bytes} bytes")
+            }
+            Self::InvalidUtf8(e) => write!(f, "stdio JSON-RPC line is not UTF-8: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for StdioReadError {}
+
+impl From<std::io::Error> for StdioReadError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<std::string::FromUtf8Error> for StdioReadError {
+    fn from(value: std::string::FromUtf8Error) -> Self {
+        Self::InvalidUtf8(value)
+    }
+}
+
+async fn discard_until_newline<R>(reader: &mut R) -> std::io::Result<()>
+where
+    R: AsyncBufRead + Unpin,
+{
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(());
+        }
+        let take = available
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|pos| pos + 1)
+            .unwrap_or(available.len());
+        let has_newline = available.get(take.saturating_sub(1)) == Some(&b'\n');
+        reader.consume(take);
+        if has_newline {
+            return Ok(());
+        }
+    }
+}
+
+async fn read_bounded_json_line<R>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<Option<String>, StdioReadError>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut out = Vec::with_capacity(max_bytes.min(4096));
+
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if out.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+
+        let take = available
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|pos| pos + 1)
+            .unwrap_or(available.len());
+        let has_newline = available.get(take.saturating_sub(1)) == Some(&b'\n');
+        if out.len().saturating_add(take) > max_bytes {
+            reader.consume(take);
+            if !has_newline {
+                discard_until_newline(reader).await?;
+            }
+            return Err(StdioReadError::LineTooLong { max_bytes });
+        }
+
+        out.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if has_newline {
+            break;
+        }
+    }
+
+    while matches!(out.last(), Some(b'\n' | b'\r')) {
+        out.pop();
+    }
+    Ok(Some(String::from_utf8(out)?))
+}
+
 /// Run the stdio transport loop.
 ///
 /// Reads JSON-RPC requests from stdin, dispatches to the handler,
@@ -92,10 +195,26 @@ pub type Handler = Box<
 pub async fn serve_stdio(handler: Handler) -> anyhow::Result<()> {
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
-    let reader = BufReader::new(stdin);
-    let mut lines = reader.lines();
+    let mut reader = BufReader::new(stdin);
 
-    while let Some(line) = lines.next_line().await? {
+    loop {
+        let line = match read_bounded_json_line(&mut reader, STDIO_MAX_LINE_BYTES).await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(StdioReadError::LineTooLong { max_bytes }) => {
+                let response = JsonRpcResponse::error(
+                    None,
+                    INVALID_REQUEST,
+                    format!("request too large: stdio JSON-RPC line exceeded {max_bytes} bytes"),
+                );
+                let mut out = serde_json::to_vec(&response)?;
+                out.push(b'\n');
+                stdout.write_all(&out).await?;
+                stdout.flush().await?;
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
         let line = line.trim().to_string();
         if line.is_empty() {
             continue;
@@ -169,6 +288,19 @@ mod tests {
         let json = r#"{"not valid json"#;
         let result = serde_json::from_str::<JsonRpcRequest>(json);
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn stdio_rejects_overlarge_line() {
+        let input = format!("{}\n", "x".repeat(17));
+        let mut reader = BufReader::new(input.as_bytes());
+
+        let err = read_bounded_json_line(&mut reader, 16).await.unwrap_err();
+
+        assert!(
+            err.to_string().contains("exceeded 16 bytes"),
+            "error must name the configured line cap: {err}"
+        );
     }
 
     #[test]

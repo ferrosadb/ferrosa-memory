@@ -2015,10 +2015,17 @@ async fn send_streaming_viz_snapshot<S: Storage>(
                 VizSnapshotScope::All => unreachable!(),
             };
             for sid in sessions {
-                match storage.entity_list_session(ctx, sid).await {
-                    Ok(entities) => {
-                        for chunk in entities.chunks(VIZ_CHUNK_SIZE) {
-                            let nodes: Vec<_> = chunk.iter().map(viz::entity_to_viz_node).collect();
+                let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+                let producer = storage.entity_stream_session(ctx.clone(), sid, VIZ_CHUNK_SIZE, tx);
+                tokio::pin!(producer);
+                let mut producer_done = false;
+                loop {
+                    tokio::select! {
+                        _ = &mut producer, if !producer_done => producer_done = true,
+                        chunk = rx.recv() => {
+                            match chunk {
+                                Some(Ok(entities)) => {
+                                    let nodes: Vec<_> = entities.iter().map(viz::entity_to_viz_node).collect();
                             total_nodes += nodes.len();
                             if !nodes.is_empty()
                                 && !send_viz_event(
@@ -2032,10 +2039,18 @@ async fn send_streaming_viz_snapshot<S: Storage>(
                             {
                                 return false;
                             }
+                                }
+                                Some(Err(e)) => {
+                                    tracing::warn!(session_id = %sid, "viz: failed to stream scoped entities for snapshot: {e}");
+                                    break;
+                                }
+                                None if producer_done => break,
+                                None => {}
+                            }
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(session_id = %sid, "viz: failed to load scoped entities for snapshot stream: {e}")
+                    if producer_done && rx.is_empty() {
+                        break;
                     }
                 }
             }
@@ -2158,34 +2173,56 @@ async fn send_streaming_viz_snapshot<S: Storage>(
             };
             for probe_ctx in [ctx, &swapped_ctx] {
                 for sid in &probe {
-                    match storage.typed_edge_list_session(probe_ctx, *sid).await {
-                        Ok(typed_edges) => {
-                            for te in typed_edges {
-                                edge_chunk.push(VizEdge {
-                                    source: te.src_id.to_string(),
-                                    target: te.dst_id.to_string(),
-                                    edge_type: te.edge_type,
-                                    strength: Some(te.weight as f32),
-                                });
-                                total_edges += 1;
-                                if edge_chunk.len() >= VIZ_CHUNK_SIZE {
-                                    let edges = std::mem::take(&mut edge_chunk);
-                                    if !send_viz_event(
-                                        write,
-                                        &VizEvent::SnapshotStreamChunk {
-                                            nodes: Vec::new(),
-                                            edges,
-                                        },
-                                    )
-                                    .await
-                                    {
-                                        return false;
+                    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+                    let producer = storage.typed_edge_stream_session(
+                        (*probe_ctx).clone(),
+                        *sid,
+                        VIZ_CHUNK_SIZE,
+                        tx,
+                    );
+                    tokio::pin!(producer);
+                    let mut producer_done = false;
+                    loop {
+                        tokio::select! {
+                            _ = &mut producer, if !producer_done => producer_done = true,
+                            chunk = rx.recv() => {
+                                match chunk {
+                                    Some(Ok(typed_edges)) => {
+                                        for te in typed_edges {
+                                            edge_chunk.push(VizEdge {
+                                                source: te.src_id.to_string(),
+                                                target: te.dst_id.to_string(),
+                                                edge_type: te.edge_type,
+                                                strength: Some(te.weight as f32),
+                                            });
+                                            total_edges += 1;
+                                            if edge_chunk.len() >= VIZ_CHUNK_SIZE {
+                                                let edges = std::mem::take(&mut edge_chunk);
+                                                if !send_viz_event(
+                                                    write,
+                                                    &VizEvent::SnapshotStreamChunk {
+                                                        nodes: Vec::new(),
+                                                        edges,
+                                                    },
+                                                )
+                                                .await
+                                                {
+                                                    return false;
+                                                }
+                                            }
+                                        }
                                     }
+                                    Some(Err(e)) => {
+                                        tracing::warn!(error = %e, session_id = %sid, "viz: typed_edge_stream_session failed");
+                                        break;
+                                    }
+                                    None if producer_done => break,
+                                    None => {}
                                 }
                             }
                         }
-                        Err(e) => {
-                            tracing::warn!(error = %e, session_id = %sid, "viz: typed_edge_list_session failed")
+                        if producer_done && rx.is_empty() {
+                            break;
                         }
                     }
                 }
@@ -3625,6 +3662,30 @@ mod tests {
         assert!(
             streaming_snapshot.contains("typed_edge_stream_all"),
             "viz websocket connect must stream all-scope typed_edges so the all-node graph has edges without falling back to session scope: {streaming_snapshot}"
+        );
+    }
+
+    #[test]
+    fn scoped_viz_snapshot_streams_incrementally() {
+        let source = include_str!("http.rs");
+        let streaming_snapshot = source
+            .split("async fn send_streaming_viz_snapshot")
+            .nth(1)
+            .and_then(|rest| rest.split("/// Handle a WebSocket connection").next())
+            .expect("send_streaming_viz_snapshot body must be present");
+
+        assert!(
+            !streaming_snapshot.contains("entity_list_session"),
+            "scoped viz snapshot must stream entity chunks instead of materializing session entities: {streaming_snapshot}"
+        );
+        assert!(
+            !streaming_snapshot.contains("typed_edge_list_session"),
+            "scoped viz snapshot must stream typed-edge chunks instead of materializing session edges: {streaming_snapshot}"
+        );
+        assert!(
+            streaming_snapshot.contains("entity_stream_session")
+                && streaming_snapshot.contains("typed_edge_stream_session"),
+            "scoped viz snapshot must use the bounded session streaming APIs: {streaming_snapshot}"
         );
     }
 

@@ -27,6 +27,8 @@ use scylla::frame::response::result::{CqlValue, Row};
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 
+const SPARQL_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
 /// Storage wrapper that holds an `Option<CqlStorage>` behind a `RwLock`.
 ///
 /// When `inner` is `None`, the server is still reconnecting — all Storage
@@ -82,6 +84,22 @@ impl SparqlPassthrough {
             format!("{}/sparql", self.http_url.trim_end_matches('/'))
         }
     }
+}
+
+async fn read_sparql_response_body_bounded(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> anyhow::Result<String> {
+    let mut body = Vec::with_capacity(max_bytes.min(64 * 1024));
+
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > max_bytes {
+            anyhow::bail!("SPARQL response exceeded {max_bytes} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    String::from_utf8(body).map_err(|e| anyhow::anyhow!("SPARQL response is not UTF-8: {e}"))
 }
 
 impl ReconnectingStorage {
@@ -141,6 +159,10 @@ impl ReconnectingStorage {
             .try_read()
             .map(|guard| guard.is_some())
             .unwrap_or(false)
+    }
+
+    async fn current_cql(&self) -> Option<CqlStorage> {
+        self.inner.read().await.as_ref().cloned()
     }
 
     /// Mark as disconnected and signal the reconnect watcher, but only if the
@@ -584,8 +606,8 @@ impl Storage for ReconnectingStorage {
         chunk_size: usize,
         tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<EntityEntry>>>,
     ) {
-        let guard = self.inner.read().await;
-        match guard.as_ref() {
+        let cql = self.current_cql().await;
+        match cql {
             Some(cql) => cql.entity_stream_all(ctx, chunk_size, tx).await,
             None => {
                 let _ = tx.send(Err(anyhow::anyhow!(NOT_CONNECTED_MSG))).await;
@@ -761,8 +783,8 @@ impl Storage for ReconnectingStorage {
         chunk_size: usize,
         tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<(uuid::Uuid, uuid::Uuid, String)>>>,
     ) {
-        let guard = self.inner.read().await;
-        match guard.as_ref() {
+        let cql = self.current_cql().await;
+        match cql {
             Some(cql) => cql.edge_stream_all(ctx, chunk_size, tx).await,
             None => {
                 let _ = tx.send(Err(anyhow::anyhow!(NOT_CONNECTED_MSG))).await;
@@ -1286,8 +1308,8 @@ impl Storage for ReconnectingStorage {
         chunk_size: usize,
         tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<TypedEdge>>>,
     ) {
-        let guard = self.inner.read().await;
-        match guard.as_ref() {
+        let cql = self.current_cql().await;
+        match cql {
             Some(cql) => cql.typed_edge_stream_all(ctx, chunk_size, tx).await,
             None => {
                 let _ = tx.send(Err(anyhow::anyhow!(NOT_CONNECTED_MSG))).await;
@@ -1414,7 +1436,7 @@ impl http::OperatorQuerySurface for ReconnectingStorage {
             .and_then(|value| value.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let body = response.text().await?;
+        let body = read_sparql_response_body_bounded(response, SPARQL_MAX_RESPONSE_BYTES).await?;
         if !status.is_success() {
             anyhow::bail!(
                 "SPARQL passthrough failed: {} {}",
@@ -2309,6 +2331,49 @@ auth_file = "{}"
         assert!(!storage.is_ready());
     }
 
+    #[tokio::test]
+    async fn sparql_passthrough_bounds_large_result() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
+            let body = format!(
+                r#"{{"head":{{"vars":["s"]}},"results":{{"bindings":[{}]}}}}"#,
+                (0..128)
+                    .map(|i| format!(r#"{{"s":{{"type":"literal","value":"row-{i}"}}}}"#))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/sparql-results+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes())
+                .await
+                .unwrap();
+        });
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/sparql"))
+            .body("SELECT ?s WHERE { ?s ?p ?o }")
+            .send()
+            .await
+            .unwrap();
+
+        let err = read_sparql_response_body_bounded(response, 128)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("SPARQL response exceeded 128 bytes"),
+            "error must name the response cap: {err}"
+        );
+        server.await.unwrap();
+    }
+
     #[test]
     fn reconnecting_storage_overrides_viz_stream_methods_with_cql_delegates() {
         let source = include_str!("main.rs");
@@ -2325,6 +2390,37 @@ auth_file = "{}"
             assert!(
                 impl_source.contains(&needle),
                 "ReconnectingStorage must delegate {method} to CqlStorage streaming override, not fall back to Storage's materializing default"
+            );
+        }
+    }
+
+    #[test]
+    fn reconnecting_storage_stream_methods_drop_read_lock_before_awaiting_sends() {
+        let source = include_str!("main.rs");
+        let impl_start = source
+            .find("impl Storage for ReconnectingStorage")
+            .expect("ReconnectingStorage must implement Storage");
+        let impl_source = &source[impl_start..];
+        for (method, next_method) in [
+            ("entity_stream_all", "fold_list_all"),
+            ("edge_stream_all", "edge_list_for_entity"),
+            ("typed_edge_stream_all", "typed_edge_list_from"),
+        ] {
+            let method_start = impl_source
+                .find(&format!("async fn {method}"))
+                .unwrap_or_else(|| panic!("{method} must exist"));
+            let tail = &impl_source[method_start..];
+            let method_end = tail
+                .find(&format!("async fn {next_method}"))
+                .unwrap_or(tail.len());
+            let method_source = &tail[..method_end];
+            assert!(
+                method_source.contains("let cql = self.current_cql().await;"),
+                "{method} must clone the current CQL backend before awaiting stream sends"
+            );
+            assert!(
+                !method_source.contains("let guard = self.inner.read().await;"),
+                "{method} must not hold the reconnect RwLock read guard while awaiting stream sends"
             );
         }
     }
