@@ -288,6 +288,9 @@ pub async fn smart_ingest(
             ..Default::default()
         };
         storage.entity_put(ctx, &entry).await?;
+        let removed_edges =
+            delete_typed_edges_referencing_entity(storage, ctx, session_id, best_match.entity_id)
+                .await?;
         // Create supersession edge
         let _ = crate::graph_write::create_supersedes_edge(
             storage,
@@ -301,6 +304,7 @@ pub async fn smart_ingest(
             new_id = %new_id,
             old_id = %best_match.entity_id,
             similarity,
+            removed_edges,
             "smart_ingest: SUPERSEDED"
         );
         return Ok(IngestDecision::Superseded {
@@ -333,6 +337,28 @@ pub async fn smart_ingest(
         "smart_ingest: CREATED (novel content)"
     );
     Ok(IngestDecision::Created { entity_id })
+}
+
+async fn delete_typed_edges_referencing_entity<S: Storage + ?Sized>(
+    storage: &S,
+    ctx: &TenantContext,
+    session_id: Uuid,
+    entity_id: Uuid,
+) -> anyhow::Result<usize> {
+    let edges = storage.typed_edge_list_session(ctx, session_id).await?;
+    let mut deleted = 0;
+    for edge in edges
+        .into_iter()
+        .filter(|edge| edge.src_id == entity_id || edge.dst_id == entity_id)
+    {
+        if storage
+            .typed_edge_delete(ctx, session_id, edge.src_id, &edge.edge_type, edge.dst_id)
+            .await?
+        {
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
 }
 
 /// Extract candidate entities from text using simple heuristics.
@@ -788,6 +814,97 @@ mod tests {
         .expect("a fuzzy dedup read timeout must not block creating a new memory");
 
         assert!(matches!(result, IngestDecision::Created { .. }));
+    }
+
+    #[tokio::test]
+    async fn smart_ingest_supersede_removes_typed_edges_referencing_old_entity() {
+        use crate::storage::Storage;
+        use crate::storage::mock::MockStorage;
+        use crate::types::{EntityEntry, TypedEdge};
+
+        let store = MockStorage::new();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "test".into(),
+        };
+        let session_id = Uuid::new_v4();
+        let old_entity_id = Uuid::new_v4();
+        let other_entity_id = Uuid::new_v4();
+        let unrelated_src_id = Uuid::new_v4();
+        let unrelated_dst_id = Uuid::new_v4();
+
+        store
+            .entity_put(
+                &ctx,
+                &EntityEntry {
+                    tenant_id: ctx.tenant_id,
+                    entity_id: old_entity_id,
+                    session_id,
+                    entity_name: "Old Topic".into(),
+                    entity_type: "concept".into(),
+                    context_snippet: "alpha beta gamma".into(),
+                    created_at: chrono::Utc::now(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        for (src_id, edge_type, dst_id) in [
+            (old_entity_id, "related_to", other_entity_id),
+            (other_entity_id, "references", old_entity_id),
+            (unrelated_src_id, "keeps", unrelated_dst_id),
+        ] {
+            store
+                .typed_edge_put(
+                    &ctx,
+                    &TypedEdge {
+                        tenant_id: ctx.tenant_id,
+                        session_id,
+                        src_id,
+                        edge_type: edge_type.into(),
+                        dst_id,
+                        weight: 1.0,
+                        metadata: None,
+                        created_at: chrono::Utc::now(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let result = smart_ingest(
+            &store,
+            &ctx,
+            session_id,
+            "alpha beta delta",
+            "concept",
+            Some(&[0.1, 0.2]),
+            None,
+            &IngestConfig::default(),
+            Some("New Topic"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result, IngestDecision::Superseded { .. }));
+        let typed_edges = store
+            .typed_edge_list_session(&ctx, session_id)
+            .await
+            .unwrap();
+        assert!(
+            typed_edges
+                .iter()
+                .all(|edge| edge.src_id != old_entity_id && edge.dst_id != old_entity_id),
+            "supersede must not leave typed_edges pointing at the old entity: {typed_edges:?}"
+        );
+        assert!(
+            typed_edges
+                .iter()
+                .any(|edge| edge.src_id == unrelated_src_id && edge.dst_id == unrelated_dst_id),
+            "supersede cleanup should preserve unrelated typed_edges"
+        );
     }
 
     #[test]

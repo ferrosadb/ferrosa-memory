@@ -1168,6 +1168,11 @@ pub mod mock {
         /// specific kind of entity (e.g., tag upserts failing under
         /// concurrent contention) without breaking unrelated writes.
         pub force_entity_put_error: Mutex<Option<(String, String)>>,
+        /// Test hook: entity types whose `entity_put` call returns Ok but
+        /// intentionally leaves storage unchanged. This models storage-layer
+        /// false positives where a client reports success even though the row
+        /// is not visible after the write.
+        pub silently_drop_entity_put_types: Mutex<Vec<String>>,
     }
 
     impl MockStorage {
@@ -1401,6 +1406,15 @@ pub mod mock {
                 && entry.entity_type == *target_type
             {
                 anyhow::bail!("{msg}");
+            }
+            if self
+                .silently_drop_entity_put_types
+                .lock()
+                .await
+                .iter()
+                .any(|target_type| target_type == &entry.entity_type)
+            {
+                return Ok(());
             }
             let mut entities = self.entities.lock().await;
             // Upsert by (session_id, entity_id) — CQL INSERT on the same

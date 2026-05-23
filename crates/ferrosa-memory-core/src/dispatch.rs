@@ -2671,6 +2671,32 @@ async fn handle_ingest_entities<S: crate::storage::Storage>(
             }));
             continue;
         }
+        if !request.options.dry_run {
+            let visible = storage
+                .entity_get_by_id(ctx, request.session_id, entity.id)
+                .await
+                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+            match visible {
+                Some(stored)
+                    if stored.entity_type == entity.entity_type
+                        && stored.entity_name == entity.name
+                        && stored.context_snippet == entity.context => {}
+                Some(_) => {
+                    entity_failed.push(serde_json::json!({
+                        "id": entity.id.to_string(),
+                        "reason": "entity row visible after write but stored values did not match request"
+                    }));
+                    continue;
+                }
+                None => {
+                    entity_failed.push(serde_json::json!({
+                        "id": entity.id.to_string(),
+                        "reason": "entity row not visible after write"
+                    }));
+                    continue;
+                }
+            }
+        }
 
         if existing.is_some() {
             entity_updated += 1;
@@ -7592,6 +7618,119 @@ mod tests {
         assert_eq!(stored.context_snippet, "updated bug context");
         assert_eq!(stored.properties["severity"], "critical");
         assert_eq!(store.typed_edges.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ingest_entities_fails_loudly_when_section_write_is_not_visible() {
+        let store = MockStorage::new();
+        store
+            .silently_drop_entity_put_types
+            .lock()
+            .await
+            .push("section".into());
+        let ctx = test_ctx();
+        let session = SessionState {
+            ollama_base_url: String::new(),
+            entity_types: vec!["section".into()],
+            ..SessionState::default()
+        };
+        let sid = Uuid::nil();
+        let section_id = Uuid::parse_str("aaaaaaaa-0000-0000-0000-000000000001").unwrap();
+
+        let result = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "ingest_entities",
+                "arguments": {
+                    "tenant_id": ctx.tenant_id.to_string(),
+                    "session_id": sid.to_string(),
+                    "entities": [
+                        {
+                            "id": section_id.to_string(),
+                            "name": "Test Section",
+                            "entity_type": "section",
+                            "context": "This is a test section entity."
+                        }
+                    ],
+                    "options": {
+                        "embed_missing": false,
+                        "on_conflict": "update"
+                    }
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let result = unwrap_tool_result(result);
+
+        assert_eq!(result["entities"]["inserted"], 0);
+        assert_eq!(result["entities"]["updated"], 0);
+        let failed = result["entities"]["failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0]["id"], section_id.to_string());
+        assert!(
+            failed[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("not visible after write"),
+            "unexpected failure reason: {}",
+            failed[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_entities_persists_section_entities() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            ollama_base_url: String::new(),
+            entity_types: vec!["section".into()],
+            ..SessionState::default()
+        };
+        let sid = Uuid::nil();
+        let section_id = Uuid::parse_str("aaaaaaaa-0000-0000-0000-000000000001").unwrap();
+
+        let result = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "ingest_entities",
+                "arguments": {
+                    "tenant_id": ctx.tenant_id.to_string(),
+                    "session_id": sid.to_string(),
+                    "entities": [
+                        {
+                            "id": section_id.to_string(),
+                            "name": "Test Section",
+                            "entity_type": "section",
+                            "context": "This is a test section entity."
+                        }
+                    ],
+                    "options": {
+                        "embed_missing": false,
+                        "on_conflict": "update"
+                    }
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let result = unwrap_tool_result(result);
+
+        assert_eq!(result["entities"]["inserted"], 1);
+        assert_eq!(result["entities"]["failed"], serde_json::json!([]));
+        let stored = store
+            .entity_get_by_id(&ctx, sid, section_id)
+            .await
+            .unwrap()
+            .expect("section row should be visible after ingest_entities success");
+        assert_eq!(stored.entity_type, "section");
+        assert_eq!(stored.entity_name, "Test Section");
     }
 
     #[tokio::test]
