@@ -178,6 +178,10 @@ fn edge_count_query(ks: &str, table: &str) -> anyhow::Result<String> {
     ))
 }
 
+fn derived_cache_count_query(ks: &str) -> String {
+    format!("SELECT count(*) FROM {ks}.derived_cache_by_query WHERE tenant_id = ? ALLOW FILTERING")
+}
+
 fn memo_total_hits_query(ks: &str) -> String {
     format!("SELECT sum(hit_count) FROM {ks}.memo_cache WHERE tenant_id = ? ALLOW FILTERING")
 }
@@ -4393,6 +4397,68 @@ impl Storage for CqlStorage {
         Ok(facts)
     }
 
+    async fn derived_cache_stream(
+        &self,
+        ctx: TenantContext,
+        cache_key: String,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<DerivedFact>>>,
+    ) {
+        let chunk_size = chunk_size.max(1);
+        let query = derived_cache_get_query(&self.keyspace, None);
+        let mut iter = match self
+            .session
+            .query_iter(query, (ctx.tenant_id, cache_key))
+            .await
+        {
+            Ok(iter) => iter,
+            Err(e) => {
+                let _ = tx.send(Err(e.into())).await;
+                return;
+            }
+        };
+        let col_map = build_col_map(iter.get_column_specs());
+        let mut chunk = Vec::with_capacity(chunk_size);
+        while let Some(row) = iter.next().await {
+            match row.map_err(anyhow::Error::from).and_then(|row| {
+                let src_id: Uuid = cql_get(&row, &col_map, "src_id")?;
+                let dst_id: Uuid = cql_get(&row, &col_map, "dst_id")?;
+                Ok(DerivedFact {
+                    src_id: src_id.to_string(),
+                    pred: cql_get(&row, &col_map, "pred")?,
+                    dst_id: dst_id.to_string(),
+                    confidence: cql_get::<f64>(&row, &col_map, "confidence").unwrap_or(1.0),
+                    rule_id: cql_get(&row, &col_map, "rule_id").unwrap_or_default(),
+                    support_count: 1,
+                    provenance: vec![],
+                })
+            }) {
+                Ok(fact) => {
+                    chunk.push(fact);
+                    if chunk.len() >= chunk_size {
+                        let out = std::mem::take(&mut chunk);
+                        if tx.send(Ok(out)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    if !chunk.is_empty() {
+                        let out = std::mem::take(&mut chunk);
+                        if tx.send(Ok(out)).await.is_err() {
+                            return;
+                        }
+                    }
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            }
+        }
+        if !chunk.is_empty() {
+            let _ = tx.send(Ok(chunk)).await;
+        }
+    }
+
     async fn derived_cache_put(
         &self,
         ctx: &TenantContext,
@@ -4489,18 +4555,20 @@ impl Storage for CqlStorage {
     }
 
     async fn derived_cache_count(&self, ctx: &TenantContext) -> anyhow::Result<usize> {
-        let query = format!(
-            "SELECT cache_key, seq FROM {}.derived_cache_by_query \
-             WHERE tenant_id = ? ALLOW FILTERING",
-            self.keyspace
-        );
-        let mut iter = self.session.query_iter(query, (ctx.tenant_id,)).await?;
-        let mut count = 0usize;
-        while let Some(row) = iter.next().await {
-            row?;
-            count += 1;
-        }
-        Ok(count)
+        let query = derived_cache_count_query(&self.keyspace);
+        #[allow(deprecated)]
+        let result = self.session.query_unpaged(query, (ctx.tenant_id,)).await?;
+        let col_map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
+        let Some(row) = rows.first() else {
+            return Ok(0);
+        };
+        let count = cql_get_i64_from_single_aggregate(
+            row,
+            &col_map,
+            &["system.count", "count", "count(*)"],
+        )?;
+        Ok(count.max(0) as usize)
     }
 
     // --- TTL tracking (Sprint 6) ---
@@ -5656,12 +5724,38 @@ mod cql_storage_tests {
         let derived_end = derived_tail.find("// --- TTL tracking").unwrap();
         let derived_source = &derived_tail[..derived_end];
         assert!(
-            derived_source.contains("query_iter"),
-            "derived_cache_count must consume driver pages"
+            derived_source.contains("derived_cache_count_query"),
+            "derived_cache_count must use the exact aggregate count path"
         );
         assert!(
-            !derived_source.contains("exec_prepared_rows") && !derived_source.contains("Vec<"),
-            "derived_cache_count must not materialize rows for count-only work"
+            derived_source.contains("cql_get_i64_from_single_aggregate"),
+            "derived_cache_count must parse Ferrosa/Cassandra aggregate count metadata"
+        );
+        assert!(
+            !derived_source.contains("query_iter")
+                && !derived_source.contains("exec_prepared_rows")
+                && !derived_source.contains("Vec<"),
+            "derived_cache_count must not stream or materialize every derived-cache row for count-only work"
+        );
+
+        let stream_start = source
+            .find("async fn derived_cache_stream")
+            .expect("derived_cache_stream must exist");
+        let stream_tail = &source[stream_start..];
+        let stream_end = stream_tail.find("async fn derived_cache_put").unwrap();
+        let stream_source = &stream_tail[..stream_end];
+        assert!(
+            stream_source.contains("query_iter"),
+            "derived_cache_stream must consume CQL pages incrementally"
+        );
+        assert!(
+            !stream_source.contains("derived_cache_get_limited")
+                && !stream_source.contains("exec_prepared_rows"),
+            "derived_cache_stream must not delegate to capped or materializing APIs"
+        );
+        assert!(
+            stream_source.contains("tx.send(Ok(out))"),
+            "derived_cache_stream must emit bounded chunks through the channel"
         );
     }
 

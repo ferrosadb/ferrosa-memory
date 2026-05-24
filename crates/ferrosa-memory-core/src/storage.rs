@@ -873,6 +873,36 @@ pub trait Storage: Send + Sync {
         limit: usize,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<DerivedFact>>> + Send;
 
+    /// Stream cached derived facts by cache key in bounded chunks.
+    ///
+    /// The default implementation chunks `derived_cache_get()` for in-memory
+    /// test backends. CQL storage overrides this with paged driver iteration so
+    /// viz routes can write a response as rows arrive instead of enforcing a
+    /// hidden row cap.
+    fn derived_cache_stream(
+        &self,
+        ctx: TenantContext,
+        cache_key: String,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<DerivedFact>>>,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        async move {
+            let chunk_size = chunk_size.max(1);
+            match self.derived_cache_get(&ctx, &cache_key).await {
+                Ok(facts) => {
+                    for chunk in facts.chunks(chunk_size) {
+                        if tx.send(Ok(chunk.to_vec())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                }
+            }
+        }
+    }
+
     /// Store derived facts under a cache key.
     fn derived_cache_put(
         &self,

@@ -147,8 +147,7 @@ const TLS_ACCEPT_BUDGET: std::time::Duration = std::time::Duration::from_secs(10
 /// above any real MCP payload and well below anything that would
 /// pressure RAM on a per-connection basis under spawned tasks.
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
-const VIZ_DERIVED_FACTS_DEFAULT_LIMIT: usize = 100;
-const VIZ_DERIVED_FACTS_MAX_LIMIT: usize = 1_000;
+const VIZ_DERIVED_FACT_CHUNK_SIZE: usize = 128;
 
 /// Upper bound on how long a single request is allowed to occupy a
 /// spawned connection task. Covers read, dispatch, and write. Tuned
@@ -716,6 +715,199 @@ fn json_response(status: &str, body: &str) -> String {
     )
 }
 
+fn parse_optional_positive_limit(path: &str) -> anyhow::Result<Option<usize>> {
+    let Some(raw) = query_param(path, "limit") else {
+        return Ok(None);
+    };
+    let limit = raw
+        .parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("limit must be a positive integer"))?;
+    anyhow::ensure!(limit > 0, "limit must be greater than zero");
+    Ok(Some(limit))
+}
+
+fn short_id_label(id: &str) -> String {
+    let prefix: String = id.chars().take(8).collect();
+    format!("{prefix}...")
+}
+
+async fn write_viz_derived_fact_batch<S: Storage>(
+    stream: &mut tokio::net::TcpStream,
+    storage: &S,
+    ctx: &TenantContext,
+    session_uuid: Uuid,
+    facts: Vec<crate::types::DerivedFact>,
+    first: &mut bool,
+    emitted: &mut usize,
+) -> anyhow::Result<()> {
+    let mut entity_ids: Vec<Uuid> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for fact in &facts {
+        if let Ok(id) = Uuid::parse_str(&fact.src_id)
+            && seen.insert(id)
+        {
+            entity_ids.push(id);
+        }
+        if let Ok(id) = Uuid::parse_str(&fact.dst_id)
+            && seen.insert(id)
+        {
+            entity_ids.push(id);
+        }
+    }
+
+    let mut entity_names: HashMap<String, String> = HashMap::new();
+    if !entity_ids.is_empty() {
+        match storage
+            .entity_get_batch(ctx, session_uuid, &entity_ids)
+            .await
+        {
+            Ok(entities) => {
+                for entity in entities {
+                    entity_names.insert(entity.entity_id.to_string(), entity.entity_name);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, count = entity_ids.len(), "viz: entity_get_batch failed; entity names will be missing");
+            }
+        }
+    }
+
+    for fact in facts {
+        if !*first {
+            stream.write_all(b",").await?;
+        }
+        *first = false;
+        let src_name = entity_names
+            .get(&fact.src_id)
+            .cloned()
+            .unwrap_or_else(|| short_id_label(&fact.src_id));
+        let dst_name = entity_names
+            .get(&fact.dst_id)
+            .cloned()
+            .unwrap_or_else(|| short_id_label(&fact.dst_id));
+        let item = serde_json::json!({
+            "src_id": fact.src_id,
+            "src_name": src_name,
+            "pred": fact.pred,
+            "dst_id": fact.dst_id,
+            "dst_name": dst_name,
+            "confidence": fact.confidence,
+            "rule_id": fact.rule_id,
+            "support_count": fact.support_count,
+        })
+        .to_string();
+        stream.write_all(item.as_bytes()).await?;
+        *emitted += 1;
+    }
+    Ok(())
+}
+
+async fn handle_viz_derived_facts_request<S: Storage + 'static>(
+    stream: &mut tokio::net::TcpStream,
+    storage: Arc<S>,
+    ctx: Arc<TenantContext>,
+    path: &str,
+) -> anyhow::Result<()> {
+    let limit = match parse_optional_positive_limit(path) {
+        Ok(limit) => limit,
+        Err(e) => {
+            let response = json_response(
+                "400 Bad Request",
+                &serde_json::json!({ "error": e.to_string() }).to_string(),
+            );
+            stream.write_all(response.as_bytes()).await?;
+            return Ok(());
+        }
+    };
+    let session_id = query_param(path, "session_id")
+        .unwrap_or_else(|| "00000000-0000-0000-0000-000000000000".to_string());
+    let session_uuid = Uuid::parse_str(&session_id).unwrap_or(Uuid::nil());
+    let cache_key = format!("consolidation:{session_uuid}");
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let producer_storage = Arc::clone(&storage);
+    let producer_ctx = (*ctx).clone();
+    let producer_cache_key = cache_key.clone();
+    tokio::spawn(async move {
+        producer_storage
+            .derived_cache_stream(
+                producer_ctx,
+                producer_cache_key,
+                VIZ_DERIVED_FACT_CHUNK_SIZE,
+                tx,
+            )
+            .await;
+    });
+
+    let Some(first_batch) = rx.recv().await else {
+        let response = json_response(
+            "200 OK",
+            &serde_json::json!({ "derived_facts": [], "count": 0, "total": 0 }).to_string(),
+        );
+        stream.write_all(response.as_bytes()).await?;
+        return Ok(());
+    };
+
+    let mut first_batch = match first_batch {
+        Ok(batch) => batch,
+        Err(e) => {
+            let response = json_response(
+                "502 Bad Gateway",
+                &serde_json::json!({ "error": e.to_string() }).to_string(),
+            );
+            stream.write_all(response.as_bytes()).await?;
+            return Ok(());
+        }
+    };
+
+    let headers = "HTTP/1.1 200 OK\r\n\
+                   Content-Type: application/json\r\n\
+                   Cache-Control: no-cache\r\n\
+                   Access-Control-Allow-Origin: *\r\n\
+                   Connection: close\r\n\r\n";
+    stream.write_all(headers.as_bytes()).await?;
+    stream.write_all(b"{\"derived_facts\":[").await?;
+
+    let mut emitted = 0usize;
+    let mut first = true;
+    loop {
+        if let Some(limit) = limit {
+            if emitted >= limit {
+                break;
+            }
+            first_batch.truncate(limit - emitted);
+        }
+        write_viz_derived_fact_batch(
+            stream,
+            storage.as_ref(),
+            &ctx,
+            session_uuid,
+            first_batch,
+            &mut first,
+            &mut emitted,
+        )
+        .await?;
+
+        if limit.is_some_and(|limit| emitted >= limit) {
+            break;
+        }
+        first_batch = match rx.recv().await {
+            Some(Ok(batch)) => batch,
+            Some(Err(e)) => {
+                let err = serde_json::to_string(&e.to_string())?;
+                let suffix = format!("],\"count\":{emitted},\"total\":{emitted},\"error\":{err}}}");
+                stream.write_all(suffix.as_bytes()).await?;
+                return Ok(());
+            }
+            None => break,
+        };
+    }
+
+    let suffix = format!("],\"count\":{emitted},\"total\":{emitted}}}");
+    stream.write_all(suffix.as_bytes()).await?;
+    Ok(())
+}
+
 fn snapshot_stream_required_response() -> String {
     let body = serde_json::json!({
         "error": "/viz/snapshot no longer returns a materialized full graph; connect to /viz/ws and consume SnapshotStreamStart/SnapshotStreamChunk/SnapshotStreamEnd events",
@@ -911,49 +1103,56 @@ async fn handle_workbench_summary_request<S: Storage + OperatorQuerySurface>(
     ctx: &TenantContext,
     summary_path: &str,
 ) -> anyhow::Result<String> {
-    let effective_rules = crate::datalog::load_effective_rule_entries(storage, ctx, None).await;
     let explicit_session_id =
         query_param(summary_path, "session_id").and_then(|value| Uuid::parse_str(&value).ok());
     let session_id = explicit_session_id.unwrap_or_else(Uuid::nil);
-    let entity_count = if explicit_session_id.is_some() {
-        storage.entity_count(ctx, session_id).await
+
+    let entity_query = if explicit_session_id.is_some() {
+        None
     } else {
-        storage
-            .entity_count_matching(
-                ctx,
-                crate::types::EntityListQuery {
-                    session_id,
-                    entity_type: None,
-                    filters: serde_json::Map::new(),
-                    scope: crate::types::EntityListScope::All,
-                    limit: 0,
-                },
-            )
-            .await
+        Some(crate::types::EntityListQuery {
+            session_id,
+            entity_type: None,
+            filters: serde_json::Map::new(),
+            scope: crate::types::EntityListScope::All,
+            limit: 0,
+        })
     };
-    let edge_count = storage.edge_count(ctx).await;
-    let derived_fact_count = storage.derived_cache_count(ctx).await;
     let mut approval_filters = serde_json::Map::new();
     approval_filters.insert(
         "decision".into(),
         Value::String(crate::types::ApprovalDecision::Proposed.to_string()),
     );
-    let pending_approvals = storage
-        .entity_count_matching(
-            ctx,
-            crate::types::EntityListQuery {
-                session_id,
-                entity_type: Some(crate::expert_system::APPROVAL_MIRROR_ENTITY_TYPE.to_string()),
-                filters: approval_filters,
-                scope: if explicit_session_id.is_some() {
-                    crate::types::EntityListScope::Session
-                } else {
-                    crate::types::EntityListScope::All
-                },
-                limit: 0,
-            },
-        )
-        .await;
+    let approval_query = crate::types::EntityListQuery {
+        session_id,
+        entity_type: Some(crate::expert_system::APPROVAL_MIRROR_ENTITY_TYPE.to_string()),
+        filters: approval_filters,
+        scope: if explicit_session_id.is_some() {
+            crate::types::EntityListScope::Session
+        } else {
+            crate::types::EntityListScope::All
+        },
+        limit: 0,
+    };
+
+    let effective_rules_fut = crate::datalog::load_effective_rule_entries(storage, ctx, None);
+    let entity_count_fut = async {
+        match entity_query {
+            Some(query) => storage.entity_count_matching(ctx, query).await,
+            None => storage.entity_count(ctx, session_id).await,
+        }
+    };
+    let edge_count_fut = storage.edge_count(ctx);
+    let derived_fact_count_fut = storage.derived_cache_count(ctx);
+    let pending_approvals_fut = storage.entity_count_matching(ctx, approval_query);
+    let (effective_rules, entity_count, edge_count, derived_fact_count, pending_approvals) = tokio::join!(
+        effective_rules_fut,
+        entity_count_fut,
+        edge_count_fut,
+        derived_fact_count_fut,
+        pending_approvals_fut
+    );
+
     let summary_error = entity_count
         .as_ref()
         .err()
@@ -1779,113 +1978,13 @@ async fn handle_viz_connection<S: crate::storage::Storage + 'static>(
             stream.write_all(response.as_bytes()).await?;
         }
         (method, route) if method == "GET" && route.starts_with("/viz/api/derived_facts") => {
-            // Fetch derived facts from cache for the viz tab
-            // Parse query string from path (e.g., /viz/api/derived_facts?session_id=xxx&limit=100)
-            let query_string = path.split('?').nth(1).unwrap_or("");
-
-            let session_id = query_string
-                .split('&')
-                .find(|p| p.starts_with("session_id="))
-                .and_then(|p| p.split('=').nth(1))
-                .unwrap_or("00000000-0000-0000-0000-000000000000")
-                .to_string();
-
-            let limit: usize = query_param(path, "limit")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(VIZ_DERIVED_FACTS_DEFAULT_LIMIT)
-                .clamp(1, VIZ_DERIVED_FACTS_MAX_LIMIT);
-
-            let session_uuid = uuid::Uuid::parse_str(&session_id).unwrap_or(uuid::Uuid::nil());
-            let cache_key = format!("consolidation:{}", session_uuid);
-
-            let derived_facts = match storage
-                .derived_cache_get_limited(&ctx, &cache_key, limit)
-                .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(error = %e, cache_key, limit, "viz: derived_cache_get_limited failed; serving empty");
-                    Vec::new()
-                }
-            };
-            let total = derived_facts.len();
-
-            // Collect unique entity IDs for batch lookup
-            let mut entity_ids: Vec<uuid::Uuid> = Vec::new();
-            let mut seen: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
-            for fact in &derived_facts {
-                if let Ok(id) = uuid::Uuid::parse_str(&fact.src_id)
-                    && seen.insert(id)
-                {
-                    entity_ids.push(id);
-                }
-                if let Ok(id) = uuid::Uuid::parse_str(&fact.dst_id)
-                    && seen.insert(id)
-                {
-                    entity_ids.push(id);
-                }
-            }
-
-            // Batch fetch entity names using single query
-            let mut entity_names: std::collections::HashMap<String, String> =
-                std::collections::HashMap::new();
-            if !entity_ids.is_empty() {
-                let entities = match storage
-                    .entity_get_batch(&ctx, session_uuid, &entity_ids)
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(error = %e, count = entity_ids.len(), "viz: entity_get_batch failed; entity names will be missing");
-                        Vec::new()
-                    }
-                };
-                for entity in entities {
-                    entity_names.insert(entity.entity_id.to_string(), entity.entity_name);
-                }
-            }
-
-            let facts: Vec<_> = derived_facts
-                .into_iter()
-                .map(|f| {
-                    let src_name = entity_names
-                        .get(&f.src_id)
-                        .cloned()
-                        .unwrap_or_else(|| f.src_id[..8].to_string() + "...");
-                    let dst_name = entity_names
-                        .get(&f.dst_id)
-                        .cloned()
-                        .unwrap_or_else(|| f.dst_id[..8].to_string() + "...");
-                    serde_json::json!({
-                        "src_id": f.src_id,
-                        "src_name": src_name,
-                        "pred": f.pred,
-                        "dst_id": f.dst_id,
-                        "dst_name": dst_name,
-                        "confidence": f.confidence,
-                        "rule_id": f.rule_id,
-                        "support_count": f.support_count,
-                    })
-                })
-                .collect();
-
-            let body = serde_json::json!({
-                "derived_facts": facts,
-                "count": facts.len(),
-                "total": total,
-            })
-            .to_string();
-
-            let response = format!(
-                "HTTP/1.1 200 OK\r\n\
-                 Content-Type: application/json\r\n\
-                 Cache-Control: no-cache\r\n\
-                 Access-Control-Allow-Origin: *\r\n\
-                 Content-Length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(response.as_bytes()).await?;
+            handle_viz_derived_facts_request(
+                &mut stream,
+                Arc::clone(&storage),
+                Arc::clone(&ctx),
+                path,
+            )
+            .await?;
         }
         ("GET", "/subscribe/anomalies") => {
             handle_anomaly_sse(stream, event_bus).await?;
@@ -3669,7 +3768,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn viz_derived_facts_applies_limit_at_storage_boundary() {
+    async fn viz_derived_facts_streams_and_honors_explicit_client_limit() {
         use std::sync::atomic::Ordering;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -3750,61 +3849,43 @@ mod tests {
             storage
                 .derived_cache_get_limited_calls
                 .load(Ordering::Relaxed),
-            1
+            0
         );
-        assert_eq!(
-            storage
-                .derived_cache_get_limited_last_limit
-                .load(Ordering::Relaxed),
-            2
-        );
-        assert_eq!(storage.derived_cache_get_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(storage.derived_cache_get_calls.load(Ordering::Relaxed), 1);
     }
 
-    #[tokio::test]
-    async fn viz_derived_facts_clamps_large_limit_before_storage_call() {
-        use std::sync::atomic::Ordering;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let storage = Arc::new(MockStorage::new());
-        let ctx = Arc::new(test_tenant());
-        let session_id = Uuid::nil();
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server_storage = Arc::clone(&storage);
-        let server_ctx = Arc::clone(&ctx);
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            handle_viz_connection(
-                stream,
-                Arc::new(EventBus::new()),
-                server_storage,
-                server_ctx,
-                session_id,
-                &ShellRouteConfig::default(),
-            )
-            .await
-            .unwrap();
-        });
-
-        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let request = format!(
-            "GET /viz/api/derived_facts?session_id={session_id}&limit=999999999 HTTP/1.1\r\n\
-             Host: 127.0.0.1\r\n\
-             Connection: close\r\n\r\n"
+    #[test]
+    fn viz_derived_facts_route_uses_streaming_storage_without_hidden_caps() {
+        let source = include_str!("http.rs");
+        let route = source
+            .split("async fn handle_viz_derived_facts_request")
+            .nth(1)
+            .and_then(|rest| rest.split("fn snapshot_stream_required_response").next())
+            .expect("derived facts streaming handler must exist");
+        assert!(
+            route.contains("derived_cache_stream("),
+            "viz derived facts must stream from storage instead of using a capped Vec API: {route}"
         );
-        client.write_all(request.as_bytes()).await.unwrap();
-        let mut response = String::new();
-        client.read_to_string(&mut response).await.unwrap();
-        server.await.unwrap();
-
-        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert_eq!(
-            storage
-                .derived_cache_get_limited_last_limit
-                .load(Ordering::Relaxed),
-            VIZ_DERIVED_FACTS_MAX_LIMIT
+        assert!(
+            !source
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap_or(source)
+                .contains("VIZ_DERIVED_FACTS_DEFAULT_LIMIT")
+                && !source
+                    .split("#[cfg(test)]")
+                    .next()
+                    .unwrap_or(source)
+                    .contains("VIZ_DERIVED_FACTS_MAX_LIMIT"),
+            "viz derived facts must not use hidden default/max row caps"
+        );
+        assert!(
+            !route.contains("derived_cache_get_limited"),
+            "viz derived facts must not push a hidden limit into storage"
+        );
+        assert!(
+            !route.contains("Content-Length"),
+            "streaming derived facts response must not precompute the whole JSON body"
         );
     }
 
@@ -4941,7 +5022,11 @@ mod tests {
         );
         assert!(
             route_source.contains("derived_cache_count("),
-            "workbench summary should stream-count derived-cache rows"
+            "workbench summary should use the storage count path for derived-cache rows"
+        );
+        assert!(
+            route_source.contains("tokio::join!"),
+            "workbench summary should run independent exact counts concurrently"
         );
     }
 
