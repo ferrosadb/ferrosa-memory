@@ -111,6 +111,13 @@ fn entity_list_all_query(ks: &str) -> String {
     )
 }
 
+fn entity_count_all_query(ks: &str) -> String {
+    format!(
+        "SELECT entity_id, session_id, entity_name, entity_type \
+         FROM {ks}.entity_store WHERE tenant_id = ? ALLOW FILTERING"
+    )
+}
+
 fn edge_list_all_query(ks: &str, table: &str, src_col: &str, tgt_col: &str) -> String {
     format!(
         "SELECT {src_col}, {tgt_col} FROM {ks}.{table} \
@@ -673,6 +680,7 @@ struct PreparedStatements {
     // Entity
     entity_put: PreparedStatement,
     entity_count: PreparedStatement,
+    entity_count_all: PreparedStatement,
     entity_list_session: PreparedStatement,
     entity_list_all: PreparedStatement,
     entity_update_state: PreparedStatement,
@@ -840,6 +848,7 @@ impl CqlStorage {
                     "SELECT entity_id FROM {ks}.entity_store WHERE tenant_id = ? AND session_id = ?"
                 ))
                 .await?,
+            entity_count_all: session.prepare(entity_count_all_query(ks)).await?,
             entity_list_session: session
                 .prepare(format!(
                     "SELECT entity_id, session_id, entity_name, entity_type, source_fold_id, \
@@ -1394,6 +1403,27 @@ impl CqlStorage {
                 continue;
             };
             if crate::storage::entity_matches_list_query(&entry, ctx, query) {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn count_entities_from_minimal_paged_iter(
+        &self,
+        stmt: PreparedStatement,
+        values: impl scylla::serialize::row::SerializeRow,
+    ) -> anyhow::Result<usize> {
+        let mut iter = self.session.execute_iter(stmt, values).await?;
+        let col_map = build_col_map(iter.get_column_specs());
+        let mut count = 0usize;
+        while let Some(row) = iter.next().await {
+            let row = row?;
+            if cql_get::<Uuid>(&row, &col_map, "entity_id").is_ok()
+                && cql_get::<Uuid>(&row, &col_map, "session_id").is_ok()
+                && cql_get::<String>(&row, &col_map, "entity_name").is_ok()
+                && cql_get::<String>(&row, &col_map, "entity_type").is_ok()
+            {
                 count += 1;
             }
         }
@@ -2473,6 +2503,24 @@ impl Storage for CqlStorage {
         ctx: &TenantContext,
         query: EntityListQuery,
     ) -> anyhow::Result<usize> {
+        if query.entity_type.is_none() && query.filters.is_empty() && query.limit == 0 {
+            if let Some(sessions) =
+                crate::storage::entity_list_sessions(ctx.tenant_id, query.session_id, query.scope)
+            {
+                let mut count = 0usize;
+                for session_id in sessions {
+                    count += self.entity_count(ctx, session_id).await?;
+                }
+                return Ok(count);
+            }
+            return self
+                .count_entities_from_minimal_paged_iter(
+                    self.stmts.entity_count_all.clone(),
+                    (ctx.tenant_id,),
+                )
+                .await;
+        }
+
         let mut count = 0usize;
         if let Some(sessions) =
             crate::storage::entity_list_sessions(ctx.tenant_id, query.session_id, query.scope)
@@ -5573,6 +5621,11 @@ mod cql_storage_tests {
         assert!(
             matching_source.contains("count_entity_matches_from_paged_iter"),
             "entity_count_matching must delegate to the streaming count helper"
+        );
+        assert!(
+            matching_source.contains("count_entities_from_minimal_paged_iter")
+                && matching_source.contains("entity_count_all"),
+            "unfiltered entity_count_matching must use a minimal projection instead of full entity rows"
         );
         assert!(
             !matching_source.contains("exec_prepared_rows"),
