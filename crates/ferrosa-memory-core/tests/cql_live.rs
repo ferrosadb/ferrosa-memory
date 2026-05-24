@@ -7,6 +7,7 @@ use ferrosa_memory_core::config::FerrosaCqlConfig;
 use ferrosa_memory_core::cql_storage::{CqlStorage, build_col_map, cql_get};
 use ferrosa_memory_core::storage::Storage;
 use ferrosa_memory_core::types::{EntityEntry, TenantContext, TypedEdge};
+use futures_util::StreamExt;
 use scylla::{LegacySession, SessionBuilder};
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
@@ -32,6 +33,23 @@ async fn connect_plain(contact_point: &str) -> LegacySession {
         .expect("session build failed")
 }
 
+fn local_cluster_config() -> FerrosaCqlConfig {
+    FerrosaCqlConfig {
+        contact_points: vec![
+            "127.0.0.1:19042".into(),
+            "127.0.0.1:19043".into(),
+            "127.0.0.1:19044".into(),
+        ],
+        keyspace: "agent_memory".into(),
+        replication_factor: 3,
+        consistency: "LOCAL_QUORUM".into(),
+        username: "ferrosa_admin".into(),
+        password: "ferrosa_admin".into(),
+        admin_username: None,
+        admin_password: None,
+    }
+}
+
 /// Insert one entity, one typed_edge, and one co-occurrence edge so
 /// downstream count/stream assertions have rows to find. RF=3 +
 /// LOCAL_QUORUM means every coordinator will see the rows.
@@ -48,20 +66,7 @@ async fn connect_plain(contact_point: &str) -> LegacySession {
 /// raw CQL INSERTs on an admin session for those two, matching the row
 /// shape the graph engine would persist.
 async fn seed_minimal_fixture(tenant_id: Uuid, session_origin: &str) -> (Uuid, Uuid, Uuid, Uuid) {
-    let cfg = FerrosaCqlConfig {
-        contact_points: vec![
-            "127.0.0.1:19042".into(),
-            "127.0.0.1:19043".into(),
-            "127.0.0.1:19044".into(),
-        ],
-        keyspace: "agent_memory".into(),
-        replication_factor: 3,
-        consistency: "LOCAL_QUORUM".into(),
-        username: "ferrosa_admin".into(),
-        password: "ferrosa_admin".into(),
-        admin_username: None,
-        admin_password: None,
-    };
+    let cfg = local_cluster_config();
     let storage = CqlStorage::connect(&cfg)
         .await
         .expect("seed_minimal_fixture: CqlStorage::connect");
@@ -129,6 +134,55 @@ async fn seed_minimal_fixture(tenant_id: Uuid, session_origin: &str) -> (Uuid, U
         .expect("seed_minimal_fixture: co_occurs_with raw insert");
 
     (ctx.tenant_id, session_id, a, b)
+}
+
+#[tokio::test]
+#[ignore = "requires live Ferrosa cluster; run with --ignored and FERROSA_TEST_CONTAINERS=1"]
+async fn derived_cache_count_streams_past_one_hundred_thousand_live_rows() {
+    if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
+        eprintln!(
+            "set FERROSA_TEST_CONTAINERS=1 and run `podman compose up -d` in \
+             /Users/bkearns/src/ferrosa-suite/ferrosa-memory before this live test"
+        );
+        return;
+    }
+
+    init_test_tracing();
+    let cfg = local_cluster_config();
+    let storage = CqlStorage::connect(&cfg)
+        .await
+        .expect("CqlStorage::connect");
+    let ctx = TenantContext {
+        tenant_id: Uuid::parse_str("9a5f8fbf-d842-4d30-8ea5-1aa931e618a8").unwrap(),
+        session_origin: "live-count-regression".into(),
+    };
+
+    let storage_count = storage
+        .derived_cache_count(&ctx)
+        .await
+        .expect("derived_cache_count should stream all live pages");
+
+    let raw = connect_plain("127.0.0.1:19042").await;
+    let query = "SELECT cache_key, seq FROM agent_memory.derived_cache_by_query \
+                 WHERE tenant_id = ? ALLOW FILTERING";
+    let mut iter = raw
+        .query_iter(query, (ctx.tenant_id,))
+        .await
+        .expect("raw derived_cache query_iter");
+    let mut raw_count = 0usize;
+    while let Some(row) = iter.next().await {
+        row.expect("raw derived_cache row");
+        raw_count += 1;
+    }
+
+    assert!(
+        raw_count > 100_000,
+        "live fixture must exercise the historical 100k page/cap boundary; raw_count={raw_count}"
+    );
+    assert_eq!(
+        storage_count, raw_count,
+        "derived_cache_count must stream every CQL page, not report a rounded cap"
+    );
 }
 
 #[tokio::test]

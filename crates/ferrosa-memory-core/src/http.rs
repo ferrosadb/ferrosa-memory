@@ -906,6 +906,89 @@ async fn call_tool_http<S: Storage>(
     serde_json::from_str(text).map_err(|e| anyhow::anyhow!("invalid tool response JSON: {e}"))
 }
 
+async fn handle_workbench_summary_request<S: Storage + OperatorQuerySurface>(
+    storage: &S,
+    ctx: &TenantContext,
+    summary_path: &str,
+) -> anyhow::Result<String> {
+    let effective_rules = crate::datalog::load_effective_rule_entries(storage, ctx, None).await;
+    let explicit_session_id =
+        query_param(summary_path, "session_id").and_then(|value| Uuid::parse_str(&value).ok());
+    let session_id = explicit_session_id.unwrap_or_else(Uuid::nil);
+    let entity_count = if explicit_session_id.is_some() {
+        storage.entity_count(ctx, session_id).await
+    } else {
+        storage
+            .entity_count_matching(
+                ctx,
+                crate::types::EntityListQuery {
+                    session_id,
+                    entity_type: None,
+                    filters: serde_json::Map::new(),
+                    scope: crate::types::EntityListScope::All,
+                    limit: 0,
+                },
+            )
+            .await
+    };
+    let edge_count = storage.edge_count(ctx).await;
+    let derived_fact_count = storage.derived_cache_count(ctx).await;
+    let mut approval_filters = serde_json::Map::new();
+    approval_filters.insert(
+        "decision".into(),
+        Value::String(crate::types::ApprovalDecision::Proposed.to_string()),
+    );
+    let pending_approvals = storage
+        .entity_count_matching(
+            ctx,
+            crate::types::EntityListQuery {
+                session_id,
+                entity_type: Some(crate::expert_system::APPROVAL_MIRROR_ENTITY_TYPE.to_string()),
+                filters: approval_filters,
+                scope: if explicit_session_id.is_some() {
+                    crate::types::EntityListScope::Session
+                } else {
+                    crate::types::EntityListScope::All
+                },
+                limit: 0,
+            },
+        )
+        .await;
+    let summary_error = entity_count
+        .as_ref()
+        .err()
+        .or_else(|| edge_count.as_ref().err())
+        .or_else(|| derived_fact_count.as_ref().err())
+        .or_else(|| pending_approvals.as_ref().err())
+        .or_else(|| effective_rules.as_ref().err())
+        .map(|e| e.to_string());
+    let node_count = entity_count.unwrap_or(0);
+    let edge_count = edge_count.unwrap_or(0);
+    let derived_fact_count = derived_fact_count.unwrap_or(0);
+    let pending = pending_approvals.unwrap_or(0);
+    let session_id_text = if explicit_session_id.is_some() {
+        session_id.to_string()
+    } else {
+        "all".to_string()
+    };
+    Ok(json_response(
+        "200 OK",
+        &serde_json::json!({
+            "status": if summary_error.is_some() { "not_ready" } else { "ready" },
+            "session_id": session_id_text,
+            "node_count": node_count,
+            "node_count_scope": if explicit_session_id.is_some() { "session" } else { "all" },
+            "edge_count": edge_count,
+            "derived_fact_count": derived_fact_count,
+            "rule_count": effective_rules.unwrap_or_default().len(),
+            "pending_approvals": pending,
+            "query_rate_1m": 0,
+            "error": summary_error,
+        })
+        .to_string(),
+    ))
+}
+
 async fn handle_operator_request<S: Storage + OperatorQuerySurface>(
     method: &str,
     path: &str,
@@ -932,89 +1015,11 @@ async fn handle_operator_request<S: Storage + OperatorQuerySurface>(
                 .to_string(),
             ))
         }
-        ("GET", summary_path)
-            if summary_path == "/workbench/api/summary"
-                || summary_path.starts_with("/workbench/api/summary?") =>
-        {
-            let effective_rules =
-                crate::datalog::load_effective_rule_entries(storage, ctx, None).await;
-            let explicit_session_id = query_param(summary_path, "session_id")
-                .and_then(|value| Uuid::parse_str(&value).ok());
-            let session_id = explicit_session_id.unwrap_or_else(Uuid::nil);
-            let entity_count = if explicit_session_id.is_some() {
-                storage.entity_count(ctx, session_id).await
-            } else {
-                storage
-                    .entity_count_matching(
-                        ctx,
-                        crate::types::EntityListQuery {
-                            session_id,
-                            entity_type: None,
-                            filters: serde_json::Map::new(),
-                            scope: crate::types::EntityListScope::All,
-                            limit: 0,
-                        },
-                    )
-                    .await
-            };
-            let edge_count = storage.edge_count(ctx).await;
-            let derived_fact_count = storage.derived_cache_count(ctx).await;
-            let mut approval_filters = serde_json::Map::new();
-            approval_filters.insert(
-                "decision".into(),
-                Value::String(crate::types::ApprovalDecision::Proposed.to_string()),
-            );
-            let pending_approvals = storage
-                .entity_count_matching(
-                    ctx,
-                    crate::types::EntityListQuery {
-                        session_id,
-                        entity_type: Some(
-                            crate::expert_system::APPROVAL_MIRROR_ENTITY_TYPE.to_string(),
-                        ),
-                        filters: approval_filters,
-                        scope: if explicit_session_id.is_some() {
-                            crate::types::EntityListScope::Session
-                        } else {
-                            crate::types::EntityListScope::All
-                        },
-                        limit: 0,
-                    },
-                )
-                .await;
-            let summary_error = entity_count
-                .as_ref()
-                .err()
-                .or_else(|| edge_count.as_ref().err())
-                .or_else(|| derived_fact_count.as_ref().err())
-                .or_else(|| pending_approvals.as_ref().err())
-                .or_else(|| effective_rules.as_ref().err())
-                .map(|e| e.to_string());
-            let node_count = entity_count.unwrap_or(0);
-            let edge_count = edge_count.unwrap_or(0);
-            let derived_fact_count = derived_fact_count.unwrap_or(0);
-            let pending = pending_approvals.unwrap_or(0);
-            let session_id_text = if explicit_session_id.is_some() {
-                session_id.to_string()
-            } else {
-                "all".to_string()
-            };
-            Ok(json_response(
-                "200 OK",
-                &serde_json::json!({
-                    "status": if summary_error.is_some() { "not_ready" } else { "ready" },
-                    "session_id": session_id_text,
-                    "node_count": node_count,
-                    "node_count_scope": if explicit_session_id.is_some() { "session" } else { "all" },
-                    "edge_count": edge_count,
-                    "derived_fact_count": derived_fact_count,
-                    "rule_count": effective_rules.unwrap_or_default().len(),
-                    "pending_approvals": pending,
-                    "query_rate_1m": 0,
-                    "error": summary_error,
-                })
-                .to_string(),
-            ))
+        ("GET", "/workbench/api/summary") => {
+            handle_workbench_summary_request(storage, ctx, "/workbench/api/summary").await
+        }
+        ("GET", summary_path) if summary_path.starts_with("/workbench/api/summary?") => {
+            handle_workbench_summary_request(storage, ctx, summary_path).await
         }
         ("POST", "/workbench/api/cql/query") => {
             let payload = parse_json_body(body)?;
@@ -2138,51 +2143,59 @@ async fn send_streaming_viz_snapshot<S: Storage>(
     // edge store and has a paged streaming storage path.
     match scope {
         VizSnapshotScope::All => {
-            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-            let producer = storage.typed_edge_stream_all(ctx.clone(), VIZ_CHUNK_SIZE, tx);
-            tokio::pin!(producer);
-            let mut producer_done = false;
-            loop {
-                tokio::select! {
-                    _ = &mut producer, if !producer_done => producer_done = true,
-                    chunk = rx.recv() => {
-                        match chunk {
-                            Some(Ok(typed_edges)) => {
-                                for te in typed_edges {
-                                    edge_chunk.push(VizEdge {
-                                        source: te.src_id.to_string(),
-                                        target: te.dst_id.to_string(),
-                                        edge_type: te.edge_type,
-                                        strength: Some(te.weight as f32),
-                                    });
-                                    total_edges += 1;
-                                    if edge_chunk.len() >= VIZ_CHUNK_SIZE {
-                                        let edges = std::mem::take(&mut edge_chunk);
-                                        if !send_viz_event(
-                                            write,
-                                            &VizEvent::SnapshotStreamChunk {
-                                                nodes: Vec::new(),
-                                                edges,
-                                            },
-                                        )
-                                        .await
-                                        {
-                                            return false;
+            for (edge_ctx, label) in [
+                (ctx.clone(), "current"),
+                (swapped_ctx.clone(), "legacy-swapped"),
+            ] {
+                if label == "legacy-swapped" && edge_ctx.tenant_id == ctx.tenant_id {
+                    continue;
+                }
+                let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+                let producer = storage.typed_edge_stream_all(edge_ctx, VIZ_CHUNK_SIZE, tx);
+                tokio::pin!(producer);
+                let mut producer_done = false;
+                loop {
+                    tokio::select! {
+                        _ = &mut producer, if !producer_done => producer_done = true,
+                        chunk = rx.recv() => {
+                            match chunk {
+                                Some(Ok(typed_edges)) => {
+                                    for te in typed_edges {
+                                        edge_chunk.push(VizEdge {
+                                            source: te.src_id.to_string(),
+                                            target: te.dst_id.to_string(),
+                                            edge_type: te.edge_type,
+                                            strength: Some(te.weight as f32),
+                                        });
+                                        total_edges += 1;
+                                        if edge_chunk.len() >= VIZ_CHUNK_SIZE {
+                                            let edges = std::mem::take(&mut edge_chunk);
+                                            if !send_viz_event(
+                                                write,
+                                                &VizEvent::SnapshotStreamChunk {
+                                                    nodes: Vec::new(),
+                                                    edges,
+                                                },
+                                            )
+                                            .await
+                                            {
+                                                return false;
+                                            }
                                         }
                                     }
                                 }
+                                Some(Err(e)) => {
+                                    tracing::warn!(error = %e, edge_context = label, "viz: failed to stream all-scope typed edges");
+                                    break;
+                                }
+                                None if producer_done => break,
+                                None => {}
                             }
-                            Some(Err(e)) => {
-                                tracing::warn!(error = %e, "viz: failed to stream all-scope typed edges");
-                                break;
-                            }
-                            None if producer_done => break,
-                            None => {}
                         }
                     }
-                }
-                if producer_done && rx.is_empty() {
-                    break;
+                    if producer_done && rx.is_empty() {
+                        break;
+                    }
                 }
             }
         }
@@ -3832,6 +3845,11 @@ mod tests {
             streaming_snapshot.contains("typed_edge_stream_all"),
             "viz websocket connect must stream all-scope typed_edges so the all-node graph has edges without falling back to session scope: {streaming_snapshot}"
         );
+        assert!(
+            streaming_snapshot.contains("(swapped_ctx.clone(), \"legacy-swapped\")")
+                && streaming_snapshot.contains("typed_edge_stream_all(edge_ctx"),
+            "all-scope streaming must preserve the old snapshot's legacy swapped-tenant typed edge fallback: {streaming_snapshot}"
+        );
     }
 
     #[test]
@@ -4892,14 +4910,14 @@ mod tests {
     #[test]
     fn workbench_summary_avoids_broad_entity_and_derived_cache_scans() {
         let source = include_str!("http.rs");
-        let route_start = source
-            .find("/workbench/api/summary")
-            .expect("workbench summary route must exist");
-        let route_tail = &source[route_start..];
-        let route_end = route_tail
-            .find("(\"POST\", \"/workbench/api/cql/query\")")
-            .unwrap_or(route_tail.len());
-        let route_source = &route_tail[..route_end];
+        let helper_start = source
+            .find("async fn handle_workbench_summary_request")
+            .expect("workbench summary helper must exist");
+        let helper_tail = &source[helper_start..];
+        let helper_end = helper_tail
+            .find("async fn handle_operator_request")
+            .unwrap_or(helper_tail.len());
+        let route_source = &helper_tail[..helper_end];
 
         assert!(
             !route_source.contains("entity_list_all(ctx)"),
