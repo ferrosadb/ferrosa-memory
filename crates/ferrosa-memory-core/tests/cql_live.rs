@@ -7,7 +7,7 @@ use ferrosa_memory_core::config::FerrosaCqlConfig;
 use ferrosa_memory_core::cql_storage::{CqlStorage, build_col_map, cql_get};
 use ferrosa_memory_core::storage::Storage;
 use ferrosa_memory_core::types::{EntityEntry, TenantContext, TypedEdge};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream};
 use scylla::{LegacySession, SessionBuilder};
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
@@ -148,21 +148,57 @@ async fn derived_cache_count_streams_past_one_hundred_thousand_live_rows() {
     }
 
     init_test_tracing();
+    const BOUNDARY_ROWS: usize = 100_001;
+
     let cfg = local_cluster_config();
     let storage = CqlStorage::connect(&cfg)
         .await
         .expect("CqlStorage::connect");
     let ctx = TenantContext {
-        tenant_id: Uuid::parse_str("9a5f8fbf-d842-4d30-8ea5-1aa931e618a8").unwrap(),
+        tenant_id: Uuid::new_v4(),
         session_origin: "live-count-regression".into(),
     };
+    let raw = Arc::new(connect_plain("127.0.0.1:19042").await);
+    let cache_key = format!("count-boundary:{}", ctx.tenant_id);
+    let tenant_id = ctx.tenant_id;
+    let src_id = Uuid::new_v4();
+    let dst_id = Uuid::new_v4();
+    let computed_at = chrono::Utc::now();
+    let insert = "INSERT INTO agent_memory.derived_cache_by_query \
+                  (tenant_id, cache_key, seq, src_id, pred, dst_id, confidence, rule_id, computed_at) \
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+    stream::iter(0..BOUNDARY_ROWS)
+        .for_each_concurrent(128, |seq| {
+            let raw = Arc::clone(&raw);
+            let cache_key = cache_key.clone();
+            let computed_at = computed_at;
+            async move {
+                raw.query_unpaged(
+                    insert,
+                    (
+                        tenant_id,
+                        cache_key,
+                        seq as i32,
+                        src_id,
+                        "boundary",
+                        dst_id,
+                        0.99_f64,
+                        "test:count-boundary",
+                        computed_at,
+                    ),
+                )
+                .await
+                .expect("seed derived_cache boundary row");
+            }
+        })
+        .await;
 
     let storage_count = storage
         .derived_cache_count(&ctx)
         .await
         .expect("derived_cache_count should stream all live pages");
 
-    let raw = connect_plain("127.0.0.1:19042").await;
     let query = "SELECT cache_key, seq FROM agent_memory.derived_cache_by_query \
                  WHERE tenant_id = ? ALLOW FILTERING";
     let mut iter = raw
@@ -176,7 +212,7 @@ async fn derived_cache_count_streams_past_one_hundred_thousand_live_rows() {
     }
 
     assert!(
-        raw_count > 100_000,
+        raw_count >= BOUNDARY_ROWS,
         "live fixture must exercise the historical 100k page/cap boundary; raw_count={raw_count}"
     );
     assert_eq!(
