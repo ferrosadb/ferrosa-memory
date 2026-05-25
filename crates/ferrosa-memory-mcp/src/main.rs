@@ -1359,6 +1359,26 @@ impl Storage for ReconnectingStorage {
         delegate!(self, derived_cache_get_limited, ctx, cache_key, limit)
     }
 
+    async fn derived_cache_stream(
+        &self,
+        ctx: TenantContext,
+        cache_key: String,
+        chunk_size: usize,
+        limit: Option<usize>,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<ferrosa_memory_core::types::DerivedFact>>>,
+    ) {
+        let cql = self.current_cql().await;
+        match cql {
+            Some(cql) => {
+                cql.derived_cache_stream(ctx, cache_key, chunk_size, limit, tx)
+                    .await
+            }
+            None => {
+                let _ = tx.send(Err(anyhow::anyhow!(NOT_CONNECTED_MSG))).await;
+            }
+        }
+    }
+
     async fn derived_cache_put(
         &self,
         ctx: &TenantContext,
@@ -2601,6 +2621,10 @@ auth_file = "{}"
                 "ReconnectingStorage must delegate {method} to CqlStorage streaming override, not fall back to Storage's materializing default"
             );
         }
+        assert!(
+            impl_source.contains("cql.derived_cache_stream(ctx, cache_key, chunk_size, limit, tx)"),
+            "ReconnectingStorage must delegate derived_cache_stream to CqlStorage streaming override, not fall back to Storage's materializing default"
+        );
     }
 
     #[test]
@@ -2614,6 +2638,7 @@ auth_file = "{}"
             ("entity_stream_all", "fold_list_all"),
             ("edge_stream_all", "edge_list_for_entity"),
             ("typed_edge_stream_all", "typed_edge_list_from"),
+            ("derived_cache_stream", "derived_cache_put"),
         ] {
             let method_start = impl_source
                 .find(&format!("async fn {method}"))

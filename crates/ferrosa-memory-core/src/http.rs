@@ -834,6 +834,7 @@ async fn handle_viz_derived_facts_request<S: Storage + 'static>(
                 producer_ctx,
                 producer_cache_key,
                 VIZ_DERIVED_FACT_CHUNK_SIZE,
+                limit,
                 tx,
             )
             .await;
@@ -3849,9 +3850,9 @@ mod tests {
             storage
                 .derived_cache_get_limited_calls
                 .load(Ordering::Relaxed),
-            0
+            1
         );
-        assert_eq!(storage.derived_cache_get_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(storage.derived_cache_get_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -3865,6 +3866,10 @@ mod tests {
         assert!(
             route.contains("derived_cache_stream("),
             "viz derived facts must stream from storage instead of using a capped Vec API: {route}"
+        );
+        assert!(
+            route.contains("VIZ_DERIVED_FACT_CHUNK_SIZE,\n                limit,"),
+            "viz derived facts must push an explicit client limit into the streaming storage query without introducing a hidden cap: {route}"
         );
         assert!(
             !source
@@ -3881,7 +3886,7 @@ mod tests {
         );
         assert!(
             !route.contains("derived_cache_get_limited"),
-            "viz derived facts must not push a hidden limit into storage"
+            "viz derived facts handler must stay on the streaming API; explicit limits belong in derived_cache_stream"
         );
         assert!(
             !route.contains("Content-Length"),

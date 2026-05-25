@@ -884,11 +884,19 @@ pub trait Storage: Send + Sync {
         ctx: TenantContext,
         cache_key: String,
         chunk_size: usize,
+        limit: Option<usize>,
         tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<DerivedFact>>>,
     ) -> impl std::future::Future<Output = ()> + Send {
         async move {
             let chunk_size = chunk_size.max(1);
-            match self.derived_cache_get(&ctx, &cache_key).await {
+            let facts = match limit {
+                Some(limit) => {
+                    self.derived_cache_get_limited(&ctx, &cache_key, limit)
+                        .await
+                }
+                None => self.derived_cache_get(&ctx, &cache_key).await,
+            };
+            match facts {
                 Ok(facts) => {
                     for chunk in facts.chunks(chunk_size) {
                         if tx.send(Ok(chunk.to_vec())).await.is_err() {

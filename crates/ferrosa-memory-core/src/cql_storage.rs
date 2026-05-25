@@ -4402,10 +4402,11 @@ impl Storage for CqlStorage {
         ctx: TenantContext,
         cache_key: String,
         chunk_size: usize,
+        limit: Option<usize>,
         tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<DerivedFact>>>,
     ) {
         let chunk_size = chunk_size.max(1);
-        let query = derived_cache_get_query(&self.keyspace, None);
+        let query = derived_cache_get_query(&self.keyspace, limit);
         let mut iter = match self
             .session
             .query_iter(query, (ctx.tenant_id, cache_key))
