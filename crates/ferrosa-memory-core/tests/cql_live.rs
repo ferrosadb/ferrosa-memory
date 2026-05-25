@@ -172,7 +172,6 @@ async fn derived_cache_count_streams_past_one_hundred_thousand_live_rows() {
         .for_each_concurrent(128, |seq| {
             let raw = Arc::clone(&raw);
             let cache_key = cache_key.clone();
-            let computed_at = computed_at;
             async move {
                 raw.query_unpaged(
                     insert,
