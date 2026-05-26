@@ -18,6 +18,7 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use scylla::frame::response::cql_to_rust::FromCqlVal;
 use scylla::frame::response::result::{CqlValue, Row};
+use scylla::frame::value::CqlTimeuuid;
 use scylla::prepared_statement::PreparedStatement;
 use scylla::{LegacySession, SessionBuilder};
 use serde_json::json;
@@ -81,11 +82,38 @@ fn sprint1_seed_insert_statements(ks: &str) -> (String, String) {
     (entity_q, edge_q)
 }
 
+fn tool_usage_put_query(ks: &str) -> String {
+    format!(
+        "INSERT INTO {ks}.tool_usage_log \
+         (tenant_id, day, call_id, tool_name, repo, input_bytes, output_bytes, \
+          estimated_tokens, latency_ms, error) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+}
+
+fn derived_cache_get_query(ks: &str, limit: Option<usize>) -> String {
+    let mut query = format!(
+        "SELECT seq, src_id, pred, dst_id, confidence, rule_id, computed_at \
+         FROM {ks}.derived_cache_by_query WHERE tenant_id = ? AND cache_key = ?"
+    );
+    if let Some(limit) = limit {
+        query.push_str(&format!(" LIMIT {limit}"));
+    }
+    query
+}
+
 fn entity_list_all_query(ks: &str) -> String {
     format!(
         "SELECT entity_id, session_id, entity_name, entity_type, source_fold_id, \
          confidence, state, created_at, description, tags, properties, content_hash, \
          updated_at, scope, ingested_by_session \
+         FROM {ks}.entity_store WHERE tenant_id = ? ALLOW FILTERING"
+    )
+}
+
+fn entity_count_all_query(ks: &str) -> String {
+    format!(
+        "SELECT entity_id, session_id, entity_name, entity_type \
          FROM {ks}.entity_store WHERE tenant_id = ? ALLOW FILTERING"
     )
 }
@@ -104,6 +132,42 @@ fn typed_edge_list_all_query(ks: &str) -> String {
     )
 }
 
+const CONTEXT_SEGMENT_BM25_MIN_CANDIDATES: usize = 256;
+const CONTEXT_SEGMENT_BM25_CANDIDATES_PER_RESULT: usize = 128;
+const CONTEXT_SEGMENT_BM25_MAX_CANDIDATES: usize = 4096;
+const CQL_ENTITY_LIST_MAX_ROWS: usize = 100_000;
+const CQL_FOLD_LIST_MAX_ROWS: usize = 100_000;
+const CQL_LEGACY_EDGE_LIST_MAX_ROWS: usize = 200_000;
+const CQL_TEMPORAL_LIST_MAX_ROWS: usize = 100_000;
+const CQL_FEEDBACK_LIST_MAX_ROWS: usize = 100_000;
+const CQL_INTENTION_LIST_MAX_ROWS: usize = 100_000;
+
+struct LegacyEdgeProjection<'a> {
+    src_col: &'a str,
+    tgt_col: &'a str,
+    edge_type: &'a str,
+    operation: &'static str,
+}
+
+fn context_segment_bm25_candidate_limit(k: usize) -> usize {
+    if k == 0 {
+        return 0;
+    }
+    k.saturating_mul(CONTEXT_SEGMENT_BM25_CANDIDATES_PER_RESULT)
+        .clamp(
+            CONTEXT_SEGMENT_BM25_MIN_CANDIDATES,
+            CONTEXT_SEGMENT_BM25_MAX_CANDIDATES,
+        )
+}
+
+fn context_segment_terms_query(ks: &str, candidate_limit: usize) -> String {
+    format!(
+        "SELECT segment_id, tf FROM {ks}.context_segment_terms \
+         WHERE tenant_id = ? AND session_id = ? AND term = ? \
+         LIMIT {candidate_limit}"
+    )
+}
+
 fn edge_count_query(ks: &str, table: &str) -> anyhow::Result<String> {
     match table {
         "co_occurs_with" | "mentioned_in" | "folded_into" | "supersedes" | "typed_edges" => {}
@@ -112,6 +176,10 @@ fn edge_count_query(ks: &str, table: &str) -> anyhow::Result<String> {
     Ok(format!(
         "SELECT count(*) FROM {ks}.{table} WHERE tenant_id = ? ALLOW FILTERING"
     ))
+}
+
+fn derived_cache_count_query(ks: &str) -> String {
+    format!("SELECT count(*) FROM {ks}.derived_cache_by_query WHERE tenant_id = ? ALLOW FILTERING")
 }
 
 fn memo_total_hits_query(ks: &str) -> String {
@@ -537,6 +605,20 @@ fn row_to_entity_entry(
     }))
 }
 
+fn entity_list_result_order(a: &EntityEntry, b: &EntityEntry) -> std::cmp::Ordering {
+    let a_time = a.updated_at.unwrap_or(a.created_at);
+    let b_time = b.updated_at.unwrap_or(b.created_at);
+    b_time
+        .cmp(&a_time)
+        .then_with(|| a.entity_name.cmp(&b.entity_name))
+        .then_with(|| a.entity_id.cmp(&b.entity_id))
+}
+
+fn trim_entity_list_matches(matches: &mut Vec<EntityEntry>, limit: usize) {
+    matches.sort_by(entity_list_result_order);
+    matches.truncate(limit);
+}
+
 /// Type alias for the scylla legacy session used throughout this crate.
 ///
 /// `LegacySession` provides `execute_unpaged` / `query_unpaged` that return
@@ -583,6 +665,7 @@ pub async fn connect_admin_session(config: &FerrosaCqlConfig) -> anyhow::Result<
 }
 
 /// Prepared statement cache for all table operations.
+#[derive(Clone)]
 struct PreparedStatements {
     // Memo
     memo_get: PreparedStatement,
@@ -601,6 +684,7 @@ struct PreparedStatements {
     // Entity
     entity_put: PreparedStatement,
     entity_count: PreparedStatement,
+    entity_count_all: PreparedStatement,
     entity_list_session: PreparedStatement,
     entity_list_all: PreparedStatement,
     entity_update_state: PreparedStatement,
@@ -662,6 +746,7 @@ struct PreparedStatements {
 }
 
 /// CQL storage backend.
+#[derive(Clone)]
 pub struct CqlStorage {
     session: Arc<CqlSession>,
     stmts: PreparedStatements,
@@ -767,9 +852,10 @@ impl CqlStorage {
                     "SELECT entity_id FROM {ks}.entity_store WHERE tenant_id = ? AND session_id = ?"
                 ))
                 .await?,
+            entity_count_all: session.prepare(entity_count_all_query(ks)).await?,
             entity_list_session: session
                 .prepare(format!(
-                    "SELECT entity_id, entity_name, entity_type, source_fold_id, \
+                    "SELECT entity_id, session_id, entity_name, entity_type, source_fold_id, \
                      context_snippet, entity_embedding, confidence, state, created_at, \
                      description, tags, properties, content_hash, \
                      updated_at, scope, ingested_by_session \
@@ -891,12 +977,7 @@ impl CqlStorage {
                 ))
                 .await?,
             tool_usage_put: session
-                .prepare(format!(
-                    "INSERT INTO {ks}.tool_usage_log \
-                     (tenant_id, day, call_id, tool_name, repo, input_bytes, output_bytes, \
-                      estimated_tokens, latency_ms, error) \
-                     VALUES (?, ?, now(), ?, ?, ?, ?, ?, ?, ?)"
-                ))
+                .prepare(tool_usage_put_query(ks))
                 .await?,
             tool_usage_query: session
                 .prepare(format!(
@@ -1006,10 +1087,7 @@ impl CqlStorage {
                 .await?,
             // Derived cache (Sprint 5)
             derived_cache_get: session
-                .prepare(format!(
-                    "SELECT seq, src_id, pred, dst_id, confidence, rule_id, computed_at \
-                     FROM {ks}.derived_cache_by_query WHERE tenant_id = ? AND cache_key = ?"
-                ))
+                .prepare(derived_cache_get_query(ks, None))
                 .await?,
             derived_cache_put: session
                 .prepare(format!(
@@ -1252,6 +1330,141 @@ impl CqlStorage {
         let col_map = build_col_map(result.col_specs());
         let rows = result.rows_or_empty();
         Ok((col_map, rows))
+    }
+
+    async fn collect_entity_entries_from_paged_iter(
+        &self,
+        ctx: &TenantContext,
+        stmt: PreparedStatement,
+        values: impl scylla::serialize::row::SerializeRow,
+        operation: &'static str,
+    ) -> anyhow::Result<Vec<EntityEntry>> {
+        let mut iter = self.session.execute_iter(stmt, values).await?;
+        let col_map = build_col_map(iter.get_column_specs());
+        let mut results = Vec::new();
+        while let Some(row) = iter.next().await {
+            let row = row?;
+            let Some(entry) = row_to_entity_entry(ctx, &row, &col_map)? else {
+                continue;
+            };
+            if results.len() >= CQL_ENTITY_LIST_MAX_ROWS {
+                anyhow::bail!(
+                    "{operation} exceeded {CQL_ENTITY_LIST_MAX_ROWS} rows; use entity_stream_all/entity_stream_session for unbounded scans"
+                );
+            }
+            results.push(entry);
+        }
+        Ok(results)
+    }
+
+    async fn collect_entity_matches_from_paged_iter(
+        &self,
+        ctx: &TenantContext,
+        stmt: PreparedStatement,
+        values: impl scylla::serialize::row::SerializeRow,
+        query: &EntityListQuery,
+        matches: &mut Vec<EntityEntry>,
+        scanned_rows: &mut usize,
+    ) -> anyhow::Result<()> {
+        let limit = query.limit.max(1);
+        let mut iter = self.session.execute_iter(stmt, values).await?;
+        let col_map = build_col_map(iter.get_column_specs());
+        while let Some(row) = iter.next().await {
+            let row = row?;
+            if *scanned_rows >= CQL_ENTITY_LIST_MAX_ROWS {
+                anyhow::bail!(
+                    "entity_list_matching exceeded {CQL_ENTITY_LIST_MAX_ROWS} scanned rows; narrow the scope or filters for broad scans"
+                );
+            }
+            *scanned_rows += 1;
+            let Some(entry) = row_to_entity_entry(ctx, &row, &col_map)? else {
+                continue;
+            };
+            if crate::storage::entity_matches_list_query(&entry, ctx, query) {
+                matches.push(entry);
+                if matches.len() > limit {
+                    trim_entity_list_matches(matches, limit);
+                }
+            }
+        }
+        trim_entity_list_matches(matches, limit);
+        Ok(())
+    }
+
+    async fn count_entity_matches_from_paged_iter(
+        &self,
+        ctx: &TenantContext,
+        stmt: PreparedStatement,
+        values: impl scylla::serialize::row::SerializeRow,
+        query: &EntityListQuery,
+    ) -> anyhow::Result<usize> {
+        let mut iter = self.session.execute_iter(stmt, values).await?;
+        let col_map = build_col_map(iter.get_column_specs());
+        let mut count = 0usize;
+        while let Some(row) = iter.next().await {
+            let row = row?;
+            let Some(entry) = row_to_entity_entry(ctx, &row, &col_map)? else {
+                continue;
+            };
+            if crate::storage::entity_matches_list_query(&entry, ctx, query) {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn count_entities_from_minimal_paged_iter(
+        &self,
+        stmt: PreparedStatement,
+        values: impl scylla::serialize::row::SerializeRow,
+    ) -> anyhow::Result<usize> {
+        let mut iter = self.session.execute_iter(stmt, values).await?;
+        let col_map = build_col_map(iter.get_column_specs());
+        let mut count = 0usize;
+        while let Some(row) = iter.next().await {
+            let row = row?;
+            if cql_get::<Uuid>(&row, &col_map, "entity_id").is_ok()
+                && cql_get::<Uuid>(&row, &col_map, "session_id").is_ok()
+                && cql_get::<String>(&row, &col_map, "entity_name").is_ok()
+                && cql_get::<String>(&row, &col_map, "entity_type").is_ok()
+            {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn collect_legacy_edges_from_paged_iter(
+        &self,
+        query: String,
+        values: impl scylla::serialize::row::SerializeRow,
+        projection: LegacyEdgeProjection<'_>,
+        edges: &mut Vec<(Uuid, Uuid, String)>,
+    ) -> anyhow::Result<()> {
+        let mut iter = self.session.query_iter(query, values).await?;
+        let col_map = build_col_map(iter.get_column_specs());
+        while let Some(row) = iter.next().await {
+            let row = row?;
+            if edges.len() >= CQL_LEGACY_EDGE_LIST_MAX_ROWS {
+                anyhow::bail!(
+                    "{} exceeded {CQL_LEGACY_EDGE_LIST_MAX_ROWS} rows; use edge_stream_all for unbounded scans",
+                    projection.operation
+                );
+            }
+            match (
+                cql_get::<Uuid>(&row, &col_map, projection.src_col),
+                cql_get::<Uuid>(&row, &col_map, projection.tgt_col),
+            ) {
+                (Ok(src), Ok(tgt)) => edges.push((src, tgt, projection.edge_type.to_string())),
+                _ => tracing::warn!(
+                    src_col = projection.src_col,
+                    tgt_col = projection.tgt_col,
+                    edge_type = projection.edge_type,
+                    "legacy edge list skipped malformed row"
+                ),
+            }
+        }
+        Ok(())
     }
 
     /// Update only the entity embedding + updated_at for an existing row.
@@ -2274,12 +2487,69 @@ impl Storage for CqlStorage {
     }
 
     async fn entity_count(&self, ctx: &TenantContext, session_id: Uuid) -> anyhow::Result<usize> {
-        // Client-side count: SELECT entity_id returns rows, count them.
-        // Workaround for Ferrosa returning COUNT(*) column as "system.count".
-        let (_col_map, rows) = self
-            .exec_prepared_rows(&self.stmts.entity_count, (ctx.tenant_id, session_id))
+        // Client-side count: SELECT entity_id returns rows, count them as the
+        // driver yields pages. Ferrosa's COUNT(*) column naming has varied, so
+        // this keeps exact counts without materializing the result set.
+        let mut iter = self
+            .session
+            .execute_iter(self.stmts.entity_count.clone(), (ctx.tenant_id, session_id))
             .await?;
-        Ok(rows.len())
+        let mut count = 0usize;
+        while let Some(row) = iter.next().await {
+            row?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    async fn entity_count_matching(
+        &self,
+        ctx: &TenantContext,
+        query: EntityListQuery,
+    ) -> anyhow::Result<usize> {
+        if query.entity_type.is_none() && query.filters.is_empty() && query.limit == 0 {
+            if let Some(sessions) =
+                crate::storage::entity_list_sessions(ctx.tenant_id, query.session_id, query.scope)
+            {
+                let mut count = 0usize;
+                for session_id in sessions {
+                    count += self.entity_count(ctx, session_id).await?;
+                }
+                return Ok(count);
+            }
+            return self
+                .count_entities_from_minimal_paged_iter(
+                    self.stmts.entity_count_all.clone(),
+                    (ctx.tenant_id,),
+                )
+                .await;
+        }
+
+        let mut count = 0usize;
+        if let Some(sessions) =
+            crate::storage::entity_list_sessions(ctx.tenant_id, query.session_id, query.scope)
+        {
+            for session_id in sessions {
+                count += self
+                    .count_entity_matches_from_paged_iter(
+                        ctx,
+                        self.stmts.entity_list_session.clone(),
+                        (ctx.tenant_id, session_id),
+                        &query,
+                    )
+                    .await?;
+            }
+        } else {
+            count += self
+                .count_entity_matches_from_paged_iter(
+                    ctx,
+                    self.stmts.entity_list_all.clone(),
+                    (ctx.tenant_id,),
+                    &query,
+                )
+                .await?;
+        }
+        Ok(count)
     }
 
     async fn fold_count(&self, ctx: &TenantContext, session_id: Uuid) -> anyhow::Result<usize> {
@@ -2301,73 +2571,49 @@ impl Storage for CqlStorage {
         ctx: &TenantContext,
         session_id: Uuid,
     ) -> anyhow::Result<Vec<EntityEntry>> {
-        let (col_map, rows) = self
-            .exec_prepared_rows(&self.stmts.entity_list_session, (ctx.tenant_id, session_id))
-            .await?;
+        self.collect_entity_entries_from_paged_iter(
+            ctx,
+            self.stmts.entity_list_session.clone(),
+            (ctx.tenant_id, session_id),
+            "entity_list_session",
+        )
+        .await
+    }
 
-        let mut results = Vec::with_capacity(rows.len());
-        for row in rows {
-            // Skip rows with NULL required fields (ghost rows from bulk loads).
-            let Ok(entity_id) = cql_get::<Uuid>(&row, &col_map, "entity_id") else {
-                continue;
-            };
-            let Ok(entity_name) = cql_get::<String>(&row, &col_map, "entity_name") else {
-                continue;
-            };
-            let Ok(entity_type) = cql_get::<String>(&row, &col_map, "entity_type") else {
-                continue;
-            };
-            let context_snippet =
-                cql_get::<String>(&row, &col_map, "context_snippet").map_err(|e| {
-                    anyhow::anyhow!("required column `context_snippet` read failed: {e}")
-                })?;
-            let created = cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
-                .unwrap_or_else(|e| {
-                    tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
-                    Default::default()
-                });
-            let state = cql_get::<String>(&row, &col_map, "state")
-                .ok()
-                .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
-                .unwrap_or_default();
-            let (
-                description,
-                description_embedding,
-                tags,
-                properties,
-                content_hash,
-                updated_at,
-                scope,
-                ingested_by_session,
-            ) = extract_rich_entity_fields(&row, &col_map);
-            results.push(EntityEntry {
-                tenant_id: ctx.tenant_id,
-                entity_id,
-                session_id,
-                entity_name,
-                entity_type,
-                source_fold_id: cql_get::<Uuid>(&row, &col_map, "source_fold_id").ok(),
-                context_snippet,
-                entity_embedding: cql_get::<Vec<u8>>(&row, &col_map, "entity_embedding")
-                    .ok()
-                    .filter(|v| !v.is_empty())
-                    .map(|v| crate::vector::decode_vector(&v)),
-                confidence: cql_get::<f32>(&row, &col_map, "confidence")
-                    .map(f64::from)
-                    .unwrap_or(1.0),
-                state,
-                created_at: created,
-                description,
-                description_embedding,
-                tags,
-                properties,
-                content_hash,
-                updated_at,
-                scope,
-                ingested_by_session,
-            });
+    async fn entity_list_matching(
+        &self,
+        ctx: &TenantContext,
+        query: EntityListQuery,
+    ) -> anyhow::Result<Vec<EntityEntry>> {
+        let mut matches = Vec::new();
+        let mut scanned_rows = 0usize;
+        if let Some(sessions) =
+            crate::storage::entity_list_sessions(ctx.tenant_id, query.session_id, query.scope)
+        {
+            for session_id in sessions {
+                self.collect_entity_matches_from_paged_iter(
+                    ctx,
+                    self.stmts.entity_list_session.clone(),
+                    (ctx.tenant_id, session_id),
+                    &query,
+                    &mut matches,
+                    &mut scanned_rows,
+                )
+                .await?;
+            }
+        } else {
+            self.collect_entity_matches_from_paged_iter(
+                ctx,
+                self.stmts.entity_list_all.clone(),
+                (ctx.tenant_id,),
+                &query,
+                &mut matches,
+                &mut scanned_rows,
+            )
+            .await?;
         }
-        Ok(results)
+        trim_entity_list_matches(&mut matches, query.limit.max(1));
+        Ok(matches)
     }
 
     async fn entity_counts_by_type_and_state(
@@ -2400,17 +2646,13 @@ impl Storage for CqlStorage {
     }
 
     async fn entity_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<EntityEntry>> {
-        let (col_map, rows) = self
-            .exec_prepared_rows(&self.stmts.entity_list_all, (ctx.tenant_id,))
-            .await?;
-
-        let mut results = Vec::with_capacity(rows.len());
-        for row in rows {
-            if let Some(entry) = row_to_entity_entry(ctx, &row, &col_map)? {
-                results.push(entry);
-            }
-        }
-        Ok(results)
+        self.collect_entity_entries_from_paged_iter(
+            ctx,
+            self.stmts.entity_list_all.clone(),
+            (ctx.tenant_id,),
+            "entity_list_all",
+        )
+        .await
     }
 
     async fn entity_stream_all(
@@ -2461,13 +2703,65 @@ impl Storage for CqlStorage {
         }
     }
 
-    async fn fold_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<FoldEntry>> {
-        let (col_map, rows) = self
-            .exec_prepared_rows(&self.stmts.fold_list_all, (ctx.tenant_id,))
-            .await?;
+    async fn entity_stream_session(
+        &self,
+        ctx: TenantContext,
+        session_id: Uuid,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<EntityEntry>>>,
+    ) {
+        let chunk_size = chunk_size.max(1);
+        let mut iter = match self
+            .session
+            .execute_iter(
+                self.stmts.entity_list_session.clone(),
+                (ctx.tenant_id, session_id),
+            )
+            .await
+        {
+            Ok(iter) => iter,
+            Err(e) => {
+                let _ = tx.send(Err(e.into())).await;
+                return;
+            }
+        };
+        let col_map = build_col_map(iter.get_column_specs());
+        let mut chunk = Vec::with_capacity(chunk_size);
+        while let Some(row) = iter.next().await {
+            match row
+                .map_err(anyhow::Error::from)
+                .and_then(|row| row_to_entity_entry(&ctx, &row, &col_map))
+            {
+                Ok(None) => continue,
+                Ok(Some(entry)) => {
+                    chunk.push(entry);
+                    if chunk.len() >= chunk_size {
+                        let out = std::mem::take(&mut chunk);
+                        if tx.send(Ok(out)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            }
+        }
+        if !chunk.is_empty() {
+            let _ = tx.send(Ok(chunk)).await;
+        }
+    }
 
-        let mut results = Vec::with_capacity(rows.len());
-        for row in rows {
+    async fn fold_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<FoldEntry>> {
+        let mut iter = self
+            .session
+            .execute_iter(self.stmts.fold_list_all.clone(), (ctx.tenant_id,))
+            .await?;
+        let col_map = build_col_map(iter.get_column_specs());
+        let mut results = Vec::new();
+        while let Some(row) = iter.next().await {
+            let row = row?;
             let status_str: String = cql_get(&row, &col_map, "status").unwrap_or_default();
             let status: FoldStatus =
                 serde_json::from_str(&format!("\"{status_str}\"")).unwrap_or(FoldStatus::Active);
@@ -2476,6 +2770,11 @@ impl Storage for CqlStorage {
                     tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
                     Default::default()
                 });
+            if results.len() >= CQL_FOLD_LIST_MAX_ROWS {
+                anyhow::bail!(
+                    "fold_list_all exceeded {CQL_FOLD_LIST_MAX_ROWS} rows; use fold_stream_all for unbounded scans"
+                );
+            }
             results.push(FoldEntry {
                 session_id: cql_get(&row, &col_map, "session_id")?,
                 fold_id: cql_get(&row, &col_map, "fold_id")?,
@@ -2559,7 +2858,16 @@ impl Storage for CqlStorage {
                         }
                     }
                 }
-                Err(e) => tracing::warn!(error = %e, "fold_stream_all skipped malformed row"),
+                Err(e) => {
+                    if !chunk.is_empty() {
+                        let out = std::mem::take(&mut chunk);
+                        if tx.send(Ok(out)).await.is_err() {
+                            return;
+                        }
+                    }
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
             }
         }
         if !chunk.is_empty() {
@@ -2568,12 +2876,20 @@ impl Storage for CqlStorage {
     }
 
     async fn temporal_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<TemporalEvent>> {
-        let (col_map, rows) = self
-            .exec_prepared_rows(&self.stmts.temporal_list_all, (ctx.tenant_id,))
+        let mut iter = self
+            .session
+            .execute_iter(self.stmts.temporal_list_all.clone(), (ctx.tenant_id,))
             .await?;
+        let col_map = build_col_map(iter.get_column_specs());
 
-        let mut results = Vec::with_capacity(rows.len());
-        for row in rows {
+        let mut results = Vec::new();
+        while let Some(row) = iter.next().await {
+            let row = row?;
+            if results.len() >= CQL_TEMPORAL_LIST_MAX_ROWS {
+                anyhow::bail!(
+                    "temporal_list_all exceeded {CQL_TEMPORAL_LIST_MAX_ROWS} rows; add a scoped temporal query for unbounded scans"
+                );
+            }
             let event_time: chrono::DateTime<chrono::Utc> = cql_get(&row, &col_map, "event_time")?;
             results.push(TemporalEvent {
                 tenant_id: ctx.tenant_id,
@@ -2761,21 +3077,29 @@ impl Storage for CqlStorage {
     }
 
     async fn feedback_list_all(&self) -> anyhow::Result<Vec<FeedbackOutcome>> {
-        let (col_map, rows) = self
-            .exec_prepared_rows(&self.stmts.feedback_list_all, ())
+        let mut iter = self
+            .session
+            .execute_iter(self.stmts.feedback_list_all.clone(), ())
             .await?;
+        let col_map = build_col_map(iter.get_column_specs());
 
-        let mut outcomes = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let tenant_id: Uuid = cql_get(row, &col_map, "tenant_id")?;
-            let session_id: Uuid = cql_get(row, &col_map, "session_id")?;
-            let query_id: Uuid = cql_get(row, &col_map, "query_id")?;
-            let program_type: String = cql_get(row, &col_map, "program_type")?;
-            let task_complexity: String = cql_get(row, &col_map, "task_complexity")?;
-            let succeeded: bool = cql_get(row, &col_map, "succeeded")?;
-            let latency_ms: i32 = cql_get(row, &col_map, "latency_ms")?;
-            let token_cost: i32 = cql_get(row, &col_map, "token_cost")?;
-            let created_at: chrono::DateTime<chrono::Utc> = cql_get(row, &col_map, "created_at")?;
+        let mut outcomes = Vec::new();
+        while let Some(row) = iter.next().await {
+            let row = row?;
+            if outcomes.len() >= CQL_FEEDBACK_LIST_MAX_ROWS {
+                anyhow::bail!(
+                    "feedback_list_all exceeded {CQL_FEEDBACK_LIST_MAX_ROWS} rows; add a scoped feedback query for unbounded scans"
+                );
+            }
+            let tenant_id: Uuid = cql_get(&row, &col_map, "tenant_id")?;
+            let session_id: Uuid = cql_get(&row, &col_map, "session_id")?;
+            let query_id: Uuid = cql_get(&row, &col_map, "query_id")?;
+            let program_type: String = cql_get(&row, &col_map, "program_type")?;
+            let task_complexity: String = cql_get(&row, &col_map, "task_complexity")?;
+            let succeeded: bool = cql_get(&row, &col_map, "succeeded")?;
+            let latency_ms: i32 = cql_get(&row, &col_map, "latency_ms")?;
+            let token_cost: i32 = cql_get(&row, &col_map, "token_cost")?;
+            let created_at: chrono::DateTime<chrono::Utc> = cql_get(&row, &col_map, "created_at")?;
 
             outcomes.push(FeedbackOutcome {
                 tenant_id,
@@ -2985,8 +3309,6 @@ impl Storage for CqlStorage {
     ) -> anyhow::Result<Vec<(Uuid, Uuid, String)>> {
         let mut edges = Vec::new();
 
-        // Use prepare+execute to avoid paging bug where dynamic QUERY
-        // returns only the first result page. Each table is best-effort.
         let edge_queries: &[(&str, &str, &str, &str)] = &[
             (
                 "folded_into",
@@ -3000,32 +3322,22 @@ impl Storage for CqlStorage {
 
         for (table, src_col, tgt_col, label) in edge_queries {
             let query = format!(
-                "SELECT {src_col}, {tgt_col}, tenant_id, session_id FROM {}.{table}",
+                "SELECT {src_col}, {tgt_col} FROM {}.{table} \
+                 WHERE tenant_id = ? AND session_id = ? ALLOW FILTERING",
                 self.keyspace
             );
-            match self.session.prepare(query).await {
-                Ok(prepared) => match self.exec_prepared_rows(&prepared, ()).await {
-                    Ok((col_map, rows)) => {
-                        for row in rows {
-                            let row_tenant = cql_get::<Uuid>(&row, &col_map, "tenant_id");
-                            let row_session = cql_get::<Uuid>(&row, &col_map, "session_id");
-                            if row_tenant.as_ref().ok() != Some(&ctx.tenant_id)
-                                || row_session.as_ref().ok() != Some(&session_id)
-                            {
-                                continue;
-                            }
-                            if let (Ok(src), Ok(tgt)) = (
-                                cql_get::<Uuid>(&row, &col_map, src_col),
-                                cql_get::<Uuid>(&row, &col_map, tgt_col),
-                            ) {
-                                edges.push((src, tgt, label.to_string()));
-                            }
-                        }
-                    }
-                    Err(e) => tracing::warn!(table, error = %e, "edge query failed"),
+            self.collect_legacy_edges_from_paged_iter(
+                query,
+                (ctx.tenant_id, session_id),
+                LegacyEdgeProjection {
+                    src_col,
+                    tgt_col,
+                    edge_type: label,
+                    operation: "edge_list_session",
                 },
-                Err(e) => tracing::warn!(table, error = %e, "edge query prepare failed"),
-            }
+                &mut edges,
+            )
+            .await?;
         }
 
         // SUPERSEDES edges (not session-scoped, return all for tenant)
@@ -3034,26 +3346,18 @@ impl Storage for CqlStorage {
              WHERE tenant_id = ? ALLOW FILTERING",
             self.keyspace
         );
-        #[allow(deprecated)]
-        if let Ok(prepared) = self.session.prepare(query).await {
-            #[allow(deprecated)]
-            if let Ok(result) = self
-                .session
-                .execute_unpaged(&prepared, (ctx.tenant_id,))
-                .await
-            {
-                let sup_col_map = build_col_map(result.col_specs());
-                let rows = result.rows_or_empty();
-                for row in rows {
-                    if let (Ok(src), Ok(tgt)) = (
-                        cql_get::<Uuid>(&row, &sup_col_map, "new_event_id"),
-                        cql_get::<Uuid>(&row, &sup_col_map, "old_event_id"),
-                    ) {
-                        edges.push((src, tgt, "SUPERSEDES".into()));
-                    }
-                }
-            }
-        }
+        self.collect_legacy_edges_from_paged_iter(
+            query,
+            (ctx.tenant_id,),
+            LegacyEdgeProjection {
+                src_col: "new_event_id",
+                tgt_col: "old_event_id",
+                edge_type: "SUPERSEDES",
+                operation: "edge_list_session",
+            },
+            &mut edges,
+        )
+        .await?;
 
         Ok(edges)
     }
@@ -3079,22 +3383,18 @@ impl Storage for CqlStorage {
 
         for &(table, src_col, tgt_col, edge_type) in queries {
             let query = edge_list_all_query(&self.keyspace, table, src_col, tgt_col);
-            let prepared = match self.session.prepare(query).await {
-                Ok(prepared) => prepared,
-                Err(_) => continue,
-            };
-            if let Ok((ea_col_map, rows)) =
-                exec_paged_rows!(self.session, prepared, (ctx.tenant_id,))
-            {
-                for row in rows {
-                    if let (Ok(a), Ok(b)) = (
-                        cql_get::<Uuid>(&row, &ea_col_map, src_col),
-                        cql_get::<Uuid>(&row, &ea_col_map, tgt_col),
-                    ) {
-                        edges.push((a, b, edge_type.into()));
-                    }
-                }
-            }
+            self.collect_legacy_edges_from_paged_iter(
+                query,
+                (ctx.tenant_id,),
+                LegacyEdgeProjection {
+                    src_col,
+                    tgt_col,
+                    edge_type,
+                    operation: "edge_list_all",
+                },
+                &mut edges,
+            )
+            .await?;
         } // end for
 
         Ok(edges)
@@ -3354,12 +3654,20 @@ impl Storage for CqlStorage {
         &self,
         ctx: &TenantContext,
     ) -> anyhow::Result<Vec<crate::intention::Intention>> {
-        let (col_map, rows) = self
-            .exec_prepared_rows(&self.stmts.intention_list_all, (ctx.tenant_id,))
+        let mut iter = self
+            .session
+            .execute_iter(self.stmts.intention_list_all.clone(), (ctx.tenant_id,))
             .await?;
+        let col_map = build_col_map(iter.get_column_specs());
 
-        let mut results = Vec::with_capacity(rows.len());
-        for row in rows {
+        let mut results = Vec::new();
+        while let Some(row) = iter.next().await {
+            let row = row?;
+            if results.len() >= CQL_INTENTION_LIST_MAX_ROWS {
+                anyhow::bail!(
+                    "intention_list_all exceeded {CQL_INTENTION_LIST_MAX_ROWS} rows; use a repo-scoped intention query for unbounded scans"
+                );
+            }
             let trigger_json: String = cql_get(&row, &col_map, "trigger_json")?;
             let trigger: crate::intention::IntentionTrigger = serde_json::from_str(&trigger_json)?;
 
@@ -3451,6 +3759,7 @@ impl Storage for CqlStorage {
                 (
                     ctx.tenant_id,
                     today,
+                    CqlTimeuuid::from(Uuid::now_v7()),
                     tool_name.to_string(),
                     repo.to_string(),
                     input_bytes,
@@ -4055,6 +4364,102 @@ impl Storage for CqlStorage {
         Ok(facts)
     }
 
+    async fn derived_cache_get_limited(
+        &self,
+        ctx: &TenantContext,
+        cache_key: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<DerivedFact>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let query = derived_cache_get_query(&self.keyspace, Some(limit));
+        let prepared = self.session.prepare(query).await?;
+        let (col_map, rows) = self
+            .exec_prepared_rows(&prepared, (ctx.tenant_id, cache_key.to_string()))
+            .await?;
+
+        let mut facts = Vec::with_capacity(rows.len());
+        for row in rows {
+            let src_id: Uuid = cql_get(&row, &col_map, "src_id")?;
+            let dst_id: Uuid = cql_get(&row, &col_map, "dst_id")?;
+
+            facts.push(DerivedFact {
+                src_id: src_id.to_string(),
+                pred: cql_get(&row, &col_map, "pred")?,
+                dst_id: dst_id.to_string(),
+                confidence: cql_get::<f64>(&row, &col_map, "confidence").unwrap_or(1.0),
+                rule_id: cql_get(&row, &col_map, "rule_id").unwrap_or_default(),
+                support_count: 1,
+                provenance: vec![],
+            });
+        }
+        Ok(facts)
+    }
+
+    async fn derived_cache_stream(
+        &self,
+        ctx: TenantContext,
+        cache_key: String,
+        chunk_size: usize,
+        limit: Option<usize>,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<DerivedFact>>>,
+    ) {
+        let chunk_size = chunk_size.max(1);
+        let query = derived_cache_get_query(&self.keyspace, limit);
+        let mut iter = match self
+            .session
+            .query_iter(query, (ctx.tenant_id, cache_key))
+            .await
+        {
+            Ok(iter) => iter,
+            Err(e) => {
+                let _ = tx.send(Err(e.into())).await;
+                return;
+            }
+        };
+        let col_map = build_col_map(iter.get_column_specs());
+        let mut chunk = Vec::with_capacity(chunk_size);
+        while let Some(row) = iter.next().await {
+            match row.map_err(anyhow::Error::from).and_then(|row| {
+                let src_id: Uuid = cql_get(&row, &col_map, "src_id")?;
+                let dst_id: Uuid = cql_get(&row, &col_map, "dst_id")?;
+                Ok(DerivedFact {
+                    src_id: src_id.to_string(),
+                    pred: cql_get(&row, &col_map, "pred")?,
+                    dst_id: dst_id.to_string(),
+                    confidence: cql_get::<f64>(&row, &col_map, "confidence").unwrap_or(1.0),
+                    rule_id: cql_get(&row, &col_map, "rule_id").unwrap_or_default(),
+                    support_count: 1,
+                    provenance: vec![],
+                })
+            }) {
+                Ok(fact) => {
+                    chunk.push(fact);
+                    if chunk.len() >= chunk_size {
+                        let out = std::mem::take(&mut chunk);
+                        if tx.send(Ok(out)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    if !chunk.is_empty() {
+                        let out = std::mem::take(&mut chunk);
+                        if tx.send(Ok(out)).await.is_err() {
+                            return;
+                        }
+                    }
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            }
+        }
+        if !chunk.is_empty() {
+            let _ = tx.send(Ok(chunk)).await;
+        }
+    }
+
     async fn derived_cache_put(
         &self,
         ctx: &TenantContext,
@@ -4148,6 +4553,23 @@ impl Storage for CqlStorage {
             });
         }
         Ok(results)
+    }
+
+    async fn derived_cache_count(&self, ctx: &TenantContext) -> anyhow::Result<usize> {
+        let query = derived_cache_count_query(&self.keyspace);
+        #[allow(deprecated)]
+        let result = self.session.query_unpaged(query, (ctx.tenant_id,)).await?;
+        let col_map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
+        let Some(row) = rows.first() else {
+            return Ok(0);
+        };
+        let count = cql_get_i64_from_single_aggregate(
+            row,
+            &col_map,
+            &["system.count", "count", "count(*)"],
+        )?;
+        Ok(count.max(0) as usize)
     }
 
     // --- TTL tracking (Sprint 6) ---
@@ -4508,7 +4930,97 @@ impl Storage for CqlStorage {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "typed_edge_stream_all skipped malformed row");
+                    if !chunk.is_empty() {
+                        let out = std::mem::take(&mut chunk);
+                        if tx.send(Ok(out)).await.is_err() {
+                            return;
+                        }
+                    }
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            }
+        }
+        if !chunk.is_empty() {
+            let _ = tx.send(Ok(chunk)).await;
+        }
+    }
+
+    async fn typed_edge_stream_session(
+        &self,
+        ctx: TenantContext,
+        session_id: Uuid,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<TypedEdge>>>,
+    ) {
+        let chunk_size = chunk_size.max(1);
+        let query = format!(
+            "SELECT src_id, edge_type, dst_id, weight, metadata, created_at \
+             FROM {}.typed_edges \
+             WHERE tenant_id = ? AND session_id = ?",
+            self.keyspace
+        );
+        let mut iter = match self
+            .session
+            .query_iter(query, (ctx.tenant_id, session_id))
+            .await
+        {
+            Ok(iter) => iter,
+            Err(e) => {
+                let _ = tx.send(Err(e.into())).await;
+                return;
+            }
+        };
+        let col_map = build_col_map(iter.get_column_specs());
+        let mut chunk = Vec::with_capacity(chunk_size);
+        while let Some(row) = iter.next().await {
+            match row.map_err(anyhow::Error::from).and_then(|row| {
+                let src_id = cql_get::<Uuid>(&row, &col_map, "src_id")?;
+                let dst_id = cql_get::<Uuid>(&row, &col_map, "dst_id")?;
+                let edge_type = cql_get::<String>(&row, &col_map, "edge_type").unwrap_or_default();
+                if edge_type.is_empty() {
+                    anyhow::bail!("typed edge row has empty edge_type");
+                }
+                let created_at =
+                    cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
+                        .unwrap_or_default();
+                let weight = cql_get::<f64>(&row, &col_map, "weight").map_err(|e| {
+                    anyhow::anyhow!(
+                        "typed_edges row has null/corrupt weight ({e}); skipping rather than \
+                         fabricating a default that would overstate edge confidence"
+                    )
+                })?;
+                Ok(TypedEdge {
+                    tenant_id: ctx.tenant_id,
+                    session_id,
+                    src_id,
+                    edge_type,
+                    dst_id,
+                    weight,
+                    metadata: cql_get::<String>(&row, &col_map, "metadata")
+                        .ok()
+                        .filter(|s| !s.is_empty()),
+                    created_at,
+                })
+            }) {
+                Ok(edge) => {
+                    chunk.push(edge);
+                    if chunk.len() >= chunk_size {
+                        let out = std::mem::take(&mut chunk);
+                        if tx.send(Ok(out)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    if !chunk.is_empty() {
+                        let out = std::mem::take(&mut chunk);
+                        if tx.send(Ok(out)).await.is_err() {
+                            return;
+                        }
+                    }
+                    let _ = tx.send(Err(e)).await;
+                    return;
                 }
             }
         }
@@ -4726,12 +5238,12 @@ impl Storage for CqlStorage {
         query: &str,
         k: usize,
     ) -> anyhow::Result<Vec<ContextSegment>> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
         let mut scores: HashMap<Uuid, i32> = HashMap::new();
-        let term_q = format!(
-            "SELECT segment_id, tf FROM {ks}.context_segment_terms \
-             WHERE tenant_id = ? AND session_id = ? AND term = ?",
-            ks = self.keyspace
-        );
+        let term_q =
+            context_segment_terms_query(&self.keyspace, context_segment_bm25_candidate_limit(k));
         for term in tokenize_context_terms(query) {
             let (col_map, rows) = query_paged_rows!(
                 self.session,
@@ -4973,6 +5485,38 @@ mod cql_storage_tests {
     }
 
     #[test]
+    fn tool_usage_insert_binds_call_id_instead_of_server_side_now() {
+        let query = tool_usage_put_query("agent_memory");
+
+        assert!(
+            query.contains("call_id"),
+            "tool usage insert must write the call_id clustering column: {query}"
+        );
+        assert!(
+            query.contains("VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"),
+            "tool usage insert must bind all values, including call_id: {query}"
+        );
+        assert!(
+            !query.contains("now()") && !query.contains("toTimestamp"),
+            "tool usage logging must not send Ferrosa a server-side time expression: {query}"
+        );
+    }
+
+    #[test]
+    fn derived_cache_limited_query_pushes_limit_to_cql() {
+        let query = derived_cache_get_query("agent_memory", Some(25));
+
+        assert!(
+            query.contains("WHERE tenant_id = ? AND cache_key = ?"),
+            "derived cache query must stay tenant/cache scoped: {query}"
+        );
+        assert!(
+            query.ends_with(" LIMIT 25"),
+            "derived cache limited query must push the caller limit into CQL: {query}"
+        );
+    }
+
+    #[test]
     fn tenant_wide_viz_snapshot_queries_are_uncapped_and_exclude_heavy_blobs() {
         let entity_query = entity_list_all_query("agent_memory");
         let edge_query =
@@ -5019,6 +5563,334 @@ mod cql_storage_tests {
                     && !query.contains("SELECT event_id")
                     && !query.contains("SELECT entity_id"),
                 "observability queries must not fetch raw columns for client-side count/sum: {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn cql_paged_helpers_enforce_candidate_cap() {
+        let query = context_segment_terms_query("agent_memory", 512);
+
+        assert!(
+            query.contains("LIMIT 512"),
+            "BM25 term scans must cap each paged candidate stream before client-side scoring: {query}"
+        );
+        assert!(
+            context_segment_bm25_candidate_limit(10) <= CONTEXT_SEGMENT_BM25_MAX_CANDIDATES,
+            "BM25 candidate cap must remain bounded even for large top-k requests"
+        );
+    }
+
+    #[test]
+    fn cql_entity_list_apis_use_paged_iterators_with_explicit_cap() {
+        let source = include_str!("cql_storage.rs");
+        for (method, next_method) in [
+            ("entity_list_session", "entity_counts_by_type_and_state"),
+            ("entity_list_all", "entity_stream_all"),
+        ] {
+            let method_start = source
+                .find(&format!("async fn {method}"))
+                .unwrap_or_else(|| panic!("{method} must exist"));
+            let tail = &source[method_start..];
+            let method_end = tail
+                .find(&format!("async fn {next_method}"))
+                .unwrap_or(tail.len());
+            let method_source = &tail[..method_end];
+
+            assert!(
+                method_source.contains("collect_entity_entries_from_paged_iter"),
+                "{method} must collect from a paged iterator with an explicit row cap"
+            );
+            assert!(
+                !method_source.contains("exec_prepared_rows"),
+                "{method} must not execute an unpaged query before decoding rows"
+            );
+        }
+        assert!(
+            source.contains("CQL_ENTITY_LIST_MAX_ROWS"),
+            "entity list APIs must have a named maximum and clear failure mode"
+        );
+    }
+
+    #[test]
+    fn cql_entity_list_matching_streams_and_applies_limit_during_scan() {
+        let source = include_str!("cql_storage.rs");
+        let method_start = source
+            .find("async fn entity_list_matching")
+            .expect("CQL storage must override entity_list_matching");
+        let tail = &source[method_start..];
+        let method_end = tail
+            .find("async fn entity_counts_by_type_and_state")
+            .unwrap_or(tail.len());
+        let method_source = &tail[..method_end];
+
+        assert!(
+            method_source.contains("trim_entity_list_matches"),
+            "CQL entity_list_matching must keep only the bounded top result set during scans"
+        );
+        assert!(
+            method_source.contains("collect_entity_matches_from_paged_iter"),
+            "CQL entity_list_matching must use the paged matching helper"
+        );
+        assert!(
+            !method_source.contains("entity_list_all(ctx)")
+                && !method_source.contains("entity_list_session(ctx"),
+            "CQL entity_list_matching must not materialize broad list APIs before applying limit"
+        );
+
+        let helper_start = source
+            .find("async fn collect_entity_matches_from_paged_iter")
+            .expect("paged matching helper must exist");
+        let helper_tail = &source[helper_start..];
+        let helper_end = helper_tail
+            .find("async fn collect_legacy_edges_from_paged_iter")
+            .unwrap_or(helper_tail.len());
+        let helper_source = &helper_tail[..helper_end];
+
+        assert!(
+            helper_source.contains("execute_iter"),
+            "entity matching helper must page through CQL rows"
+        );
+        assert!(
+            helper_source.contains("CQL_ENTITY_LIST_MAX_ROWS"),
+            "entity matching helper must fail closed on excessive broad scans"
+        );
+    }
+
+    #[test]
+    fn cql_count_apis_stream_without_materializing_rows() {
+        let source = include_str!("cql_storage.rs");
+        let method = "entity_count";
+        let method_start = source
+            .find(&format!("async fn {method}"))
+            .expect("entity_count must exist");
+        let tail = &source[method_start..];
+        let method_end = tail.find("async fn entity_count_matching").unwrap();
+        let method_source = &tail[..method_end];
+
+        assert!(
+            method_source.contains("execute_iter"),
+            "{method} must consume driver pages instead of unpaged rows"
+        );
+        assert!(
+            !method_source.contains("exec_prepared_rows"),
+            "{method} must not materialize all count rows before counting"
+        );
+        assert!(
+            !method_source.contains("Vec<"),
+            "{method} must not allocate a result Vec for count-only work"
+        );
+
+        let matching_start = source
+            .find("async fn entity_count_matching")
+            .expect("entity_count_matching must exist");
+        let matching_tail = &source[matching_start..];
+        let matching_end = matching_tail.find("async fn fold_count").unwrap();
+        let matching_source = &matching_tail[..matching_end];
+        assert!(
+            matching_source.contains("count_entity_matches_from_paged_iter"),
+            "entity_count_matching must delegate to the streaming count helper"
+        );
+        assert!(
+            matching_source.contains("count_entities_from_minimal_paged_iter")
+                && matching_source.contains("entity_count_all"),
+            "unfiltered entity_count_matching must use a minimal projection instead of full entity rows"
+        );
+        assert!(
+            !matching_source.contains("exec_prepared_rows"),
+            "entity_count_matching must not materialize all count rows before counting"
+        );
+
+        let helper_start = source
+            .find("async fn count_entity_matches_from_paged_iter")
+            .expect("count_entity_matches_from_paged_iter must exist");
+        let helper_tail = &source[helper_start..];
+        let helper_end = helper_tail
+            .find("async fn collect_legacy_edges_from_paged_iter")
+            .unwrap();
+        let helper_source = &helper_tail[..helper_end];
+        assert!(
+            helper_source.contains("execute_iter"),
+            "count_entity_matches_from_paged_iter must consume driver pages"
+        );
+        assert!(
+            !helper_source.contains("Vec<"),
+            "count_entity_matches_from_paged_iter must not allocate a result Vec"
+        );
+
+        let derived_start = source
+            .find("async fn derived_cache_count")
+            .expect("derived_cache_count must exist");
+        let derived_tail = &source[derived_start..];
+        let derived_end = derived_tail.find("// --- TTL tracking").unwrap();
+        let derived_source = &derived_tail[..derived_end];
+        assert!(
+            derived_source.contains("derived_cache_count_query"),
+            "derived_cache_count must use the exact aggregate count path"
+        );
+        assert!(
+            derived_source.contains("cql_get_i64_from_single_aggregate"),
+            "derived_cache_count must parse Ferrosa/Cassandra aggregate count metadata"
+        );
+        assert!(
+            !derived_source.contains("query_iter")
+                && !derived_source.contains("exec_prepared_rows")
+                && !derived_source.contains("Vec<"),
+            "derived_cache_count must not stream or materialize every derived-cache row for count-only work"
+        );
+
+        let stream_start = source
+            .find("async fn derived_cache_stream")
+            .expect("derived_cache_stream must exist");
+        let stream_tail = &source[stream_start..];
+        let stream_end = stream_tail.find("async fn derived_cache_put").unwrap();
+        let stream_source = &stream_tail[..stream_end];
+        assert!(
+            stream_source.contains("query_iter"),
+            "derived_cache_stream must consume CQL pages incrementally"
+        );
+        assert!(
+            !stream_source.contains("derived_cache_get_limited")
+                && !stream_source.contains("exec_prepared_rows"),
+            "derived_cache_stream must not delegate to capped or materializing APIs"
+        );
+        assert!(
+            stream_source.contains("tx.send(Ok(out))"),
+            "derived_cache_stream must emit bounded chunks through the channel"
+        );
+    }
+
+    #[test]
+    fn cql_fold_list_all_uses_paged_iterator_with_explicit_cap() {
+        let source = include_str!("cql_storage.rs");
+        let method_start = source
+            .find("async fn fold_list_all")
+            .expect("fold_list_all must exist");
+        let tail = &source[method_start..];
+        let method_end = tail.find("async fn fold_stream_all").unwrap_or(tail.len());
+        let method_source = &tail[..method_end];
+
+        assert!(
+            method_source.contains("execute_iter"),
+            "fold_list_all must page through CQL rows instead of materializing an unpaged result"
+        );
+        assert!(
+            method_source.contains("CQL_FOLD_LIST_MAX_ROWS"),
+            "fold_list_all must have a named maximum and clear failure mode"
+        );
+        assert!(
+            !method_source.contains("exec_prepared_rows"),
+            "fold_list_all must not execute an unpaged query before decoding rows"
+        );
+    }
+
+    #[test]
+    fn cql_secondary_list_all_apis_use_paged_iterators_with_explicit_caps() {
+        let source = include_str!("cql_storage.rs");
+        for (method, next_method, cap_name) in [
+            (
+                "temporal_list_all",
+                "async fn entity_update_state",
+                "CQL_TEMPORAL_LIST_MAX_ROWS",
+            ),
+            (
+                "feedback_list_all",
+                "// --- Observability operations ---",
+                "CQL_FEEDBACK_LIST_MAX_ROWS",
+            ),
+            (
+                "intention_list_all",
+                "async fn intention_update_status",
+                "CQL_INTENTION_LIST_MAX_ROWS",
+            ),
+        ] {
+            let method_start = source
+                .find(&format!("async fn {method}"))
+                .unwrap_or_else(|| panic!("{method} must exist"));
+            let tail = &source[method_start..];
+            let method_end = tail.find(next_method).unwrap_or(tail.len());
+            let method_source = &tail[..method_end];
+
+            assert!(
+                method_source.contains("execute_iter"),
+                "{method} must page through CQL rows instead of materializing an unpaged result"
+            );
+            assert!(
+                method_source.contains(cap_name),
+                "{method} must have a named maximum and clear failure mode"
+            );
+            assert!(
+                !method_source.contains("exec_prepared_rows"),
+                "{method} must not execute an unpaged query before decoding rows"
+            );
+        }
+    }
+
+    #[test]
+    fn cql_legacy_edge_list_apis_are_scoped_paged_and_fail_closed() {
+        let source = include_str!("cql_storage.rs");
+        for (method, next_method) in [
+            ("edge_list_session", "#[allow(clippy::result_large_err)]"),
+            ("edge_list_all", "async fn edge_stream_all"),
+        ] {
+            let method_start = source
+                .find(&format!("async fn {method}"))
+                .unwrap_or_else(|| panic!("{method} must exist"));
+            let tail = &source[method_start..];
+            let method_end = tail.find(next_method).unwrap_or(tail.len());
+            let method_source = &tail[..method_end];
+
+            assert!(
+                method_source.contains("collect_legacy_edges_from_paged_iter"),
+                "{method} must collect edges from paged CQL iteration with a shared cap/error path"
+            );
+            assert!(
+                !method_source.contains("exec_prepared_rows")
+                    && !method_source.contains("exec_paged_rows!")
+                    && !method_source.contains("execute_unpaged"),
+                "{method} must not materialize unbounded edge result sets"
+            );
+            assert!(
+                !method_source.contains("=> continue"),
+                "{method} must fail closed on table-level query errors instead of silently dropping an edge table"
+            );
+        }
+
+        assert!(
+            source.contains("WHERE tenant_id = ? AND session_id = ? ALLOW FILTERING"),
+            "session edge scans must be scoped in CQL before rows reach the client"
+        );
+        assert!(
+            source.contains("CQL_LEGACY_EDGE_LIST_MAX_ROWS"),
+            "legacy edge list APIs must have a named maximum and clear failure mode"
+        );
+    }
+
+    #[test]
+    fn cql_stream_decode_errors_are_sent_to_consumers() {
+        let source = include_str!("cql_storage.rs");
+        for (method, next_method) in [
+            ("fold_stream_all", "async fn temporal_list_all"),
+            (
+                "typed_edge_stream_all",
+                "async fn typed_edge_stream_session",
+            ),
+            ("typed_edge_stream_session", "async fn typed_edge_list_from"),
+        ] {
+            let method_start = source
+                .find(&format!("async fn {method}"))
+                .unwrap_or_else(|| panic!("{method} must exist"));
+            let tail = &source[method_start..];
+            let method_end = tail.find(next_method).unwrap_or(tail.len());
+            let method_source = &tail[..method_end];
+
+            assert!(
+                !method_source.contains("skipped malformed row"),
+                "{method} must not hide malformed row errors behind warn-and-continue"
+            );
+            assert!(
+                method_source.contains("tx.send(Err(e)).await"),
+                "{method} must send row decode errors to stream consumers"
             );
         }
     }

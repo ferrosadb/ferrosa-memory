@@ -147,6 +147,7 @@ const TLS_ACCEPT_BUDGET: std::time::Duration = std::time::Duration::from_secs(10
 /// above any real MCP payload and well below anything that would
 /// pressure RAM on a per-connection basis under spawned tasks.
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+const VIZ_DERIVED_FACT_CHUNK_SIZE: usize = 128;
 
 /// Upper bound on how long a single request is allowed to occupy a
 /// spawned connection task. Covers read, dispatch, and write. Tuned
@@ -714,6 +715,200 @@ fn json_response(status: &str, body: &str) -> String {
     )
 }
 
+fn parse_optional_positive_limit(path: &str) -> anyhow::Result<Option<usize>> {
+    let Some(raw) = query_param(path, "limit") else {
+        return Ok(None);
+    };
+    let limit = raw
+        .parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("limit must be a positive integer"))?;
+    anyhow::ensure!(limit > 0, "limit must be greater than zero");
+    Ok(Some(limit))
+}
+
+fn short_id_label(id: &str) -> String {
+    let prefix: String = id.chars().take(8).collect();
+    format!("{prefix}...")
+}
+
+async fn write_viz_derived_fact_batch<S: Storage>(
+    stream: &mut tokio::net::TcpStream,
+    storage: &S,
+    ctx: &TenantContext,
+    session_uuid: Uuid,
+    facts: Vec<crate::types::DerivedFact>,
+    first: &mut bool,
+    emitted: &mut usize,
+) -> anyhow::Result<()> {
+    let mut entity_ids: Vec<Uuid> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for fact in &facts {
+        if let Ok(id) = Uuid::parse_str(&fact.src_id)
+            && seen.insert(id)
+        {
+            entity_ids.push(id);
+        }
+        if let Ok(id) = Uuid::parse_str(&fact.dst_id)
+            && seen.insert(id)
+        {
+            entity_ids.push(id);
+        }
+    }
+
+    let mut entity_names: HashMap<String, String> = HashMap::new();
+    if !entity_ids.is_empty() {
+        match storage
+            .entity_get_batch(ctx, session_uuid, &entity_ids)
+            .await
+        {
+            Ok(entities) => {
+                for entity in entities {
+                    entity_names.insert(entity.entity_id.to_string(), entity.entity_name);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, count = entity_ids.len(), "viz: entity_get_batch failed; entity names will be missing");
+            }
+        }
+    }
+
+    for fact in facts {
+        if !*first {
+            stream.write_all(b",").await?;
+        }
+        *first = false;
+        let src_name = entity_names
+            .get(&fact.src_id)
+            .cloned()
+            .unwrap_or_else(|| short_id_label(&fact.src_id));
+        let dst_name = entity_names
+            .get(&fact.dst_id)
+            .cloned()
+            .unwrap_or_else(|| short_id_label(&fact.dst_id));
+        let item = serde_json::json!({
+            "src_id": fact.src_id,
+            "src_name": src_name,
+            "pred": fact.pred,
+            "dst_id": fact.dst_id,
+            "dst_name": dst_name,
+            "confidence": fact.confidence,
+            "rule_id": fact.rule_id,
+            "support_count": fact.support_count,
+        })
+        .to_string();
+        stream.write_all(item.as_bytes()).await?;
+        *emitted += 1;
+    }
+    Ok(())
+}
+
+async fn handle_viz_derived_facts_request<S: Storage + 'static>(
+    stream: &mut tokio::net::TcpStream,
+    storage: Arc<S>,
+    ctx: Arc<TenantContext>,
+    path: &str,
+) -> anyhow::Result<()> {
+    let limit = match parse_optional_positive_limit(path) {
+        Ok(limit) => limit,
+        Err(e) => {
+            let response = json_response(
+                "400 Bad Request",
+                &serde_json::json!({ "error": e.to_string() }).to_string(),
+            );
+            stream.write_all(response.as_bytes()).await?;
+            return Ok(());
+        }
+    };
+    let session_id = query_param(path, "session_id")
+        .unwrap_or_else(|| "00000000-0000-0000-0000-000000000000".to_string());
+    let session_uuid = Uuid::parse_str(&session_id).unwrap_or(Uuid::nil());
+    let cache_key = format!("consolidation:{session_uuid}");
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let producer_storage = Arc::clone(&storage);
+    let producer_ctx = (*ctx).clone();
+    let producer_cache_key = cache_key.clone();
+    tokio::spawn(async move {
+        producer_storage
+            .derived_cache_stream(
+                producer_ctx,
+                producer_cache_key,
+                VIZ_DERIVED_FACT_CHUNK_SIZE,
+                limit,
+                tx,
+            )
+            .await;
+    });
+
+    let Some(first_batch) = rx.recv().await else {
+        let response = json_response(
+            "200 OK",
+            &serde_json::json!({ "derived_facts": [], "count": 0, "total": 0 }).to_string(),
+        );
+        stream.write_all(response.as_bytes()).await?;
+        return Ok(());
+    };
+
+    let mut first_batch = match first_batch {
+        Ok(batch) => batch,
+        Err(e) => {
+            let response = json_response(
+                "502 Bad Gateway",
+                &serde_json::json!({ "error": e.to_string() }).to_string(),
+            );
+            stream.write_all(response.as_bytes()).await?;
+            return Ok(());
+        }
+    };
+
+    let headers = "HTTP/1.1 200 OK\r\n\
+                   Content-Type: application/json\r\n\
+                   Cache-Control: no-cache\r\n\
+                   Access-Control-Allow-Origin: *\r\n\
+                   Connection: close\r\n\r\n";
+    stream.write_all(headers.as_bytes()).await?;
+    stream.write_all(b"{\"derived_facts\":[").await?;
+
+    let mut emitted = 0usize;
+    let mut first = true;
+    loop {
+        if let Some(limit) = limit {
+            if emitted >= limit {
+                break;
+            }
+            first_batch.truncate(limit - emitted);
+        }
+        write_viz_derived_fact_batch(
+            stream,
+            storage.as_ref(),
+            &ctx,
+            session_uuid,
+            first_batch,
+            &mut first,
+            &mut emitted,
+        )
+        .await?;
+
+        if limit.is_some_and(|limit| emitted >= limit) {
+            break;
+        }
+        first_batch = match rx.recv().await {
+            Some(Ok(batch)) => batch,
+            Some(Err(e)) => {
+                let err = serde_json::to_string(&e.to_string())?;
+                let suffix = format!("],\"count\":{emitted},\"total\":{emitted},\"error\":{err}}}");
+                stream.write_all(suffix.as_bytes()).await?;
+                return Ok(());
+            }
+            None => break,
+        };
+    }
+
+    let suffix = format!("],\"count\":{emitted},\"total\":{emitted}}}");
+    stream.write_all(suffix.as_bytes()).await?;
+    Ok(())
+}
+
 fn snapshot_stream_required_response() -> String {
     let body = serde_json::json!({
         "error": "/viz/snapshot no longer returns a materialized full graph; connect to /viz/ws and consume SnapshotStreamStart/SnapshotStreamChunk/SnapshotStreamEnd events",
@@ -904,6 +1099,96 @@ async fn call_tool_http<S: Storage>(
     serde_json::from_str(text).map_err(|e| anyhow::anyhow!("invalid tool response JSON: {e}"))
 }
 
+async fn handle_workbench_summary_request<S: Storage + OperatorQuerySurface>(
+    storage: &S,
+    ctx: &TenantContext,
+    summary_path: &str,
+) -> anyhow::Result<String> {
+    let explicit_session_id =
+        query_param(summary_path, "session_id").and_then(|value| Uuid::parse_str(&value).ok());
+    let session_id = explicit_session_id.unwrap_or_else(Uuid::nil);
+
+    let entity_query = if explicit_session_id.is_some() {
+        None
+    } else {
+        Some(crate::types::EntityListQuery {
+            session_id,
+            entity_type: None,
+            filters: serde_json::Map::new(),
+            scope: crate::types::EntityListScope::All,
+            limit: 0,
+        })
+    };
+    let mut approval_filters = serde_json::Map::new();
+    approval_filters.insert(
+        "decision".into(),
+        Value::String(crate::types::ApprovalDecision::Proposed.to_string()),
+    );
+    let approval_query = crate::types::EntityListQuery {
+        session_id,
+        entity_type: Some(crate::expert_system::APPROVAL_MIRROR_ENTITY_TYPE.to_string()),
+        filters: approval_filters,
+        scope: if explicit_session_id.is_some() {
+            crate::types::EntityListScope::Session
+        } else {
+            crate::types::EntityListScope::All
+        },
+        limit: 0,
+    };
+
+    let effective_rules_fut = crate::datalog::load_effective_rule_entries(storage, ctx, None);
+    let entity_count_fut = async {
+        match entity_query {
+            Some(query) => storage.entity_count_matching(ctx, query).await,
+            None => storage.entity_count(ctx, session_id).await,
+        }
+    };
+    let edge_count_fut = storage.edge_count(ctx);
+    let derived_fact_count_fut = storage.derived_cache_count(ctx);
+    let pending_approvals_fut = storage.entity_count_matching(ctx, approval_query);
+    let (effective_rules, entity_count, edge_count, derived_fact_count, pending_approvals) = tokio::join!(
+        effective_rules_fut,
+        entity_count_fut,
+        edge_count_fut,
+        derived_fact_count_fut,
+        pending_approvals_fut
+    );
+
+    let summary_error = entity_count
+        .as_ref()
+        .err()
+        .or_else(|| edge_count.as_ref().err())
+        .or_else(|| derived_fact_count.as_ref().err())
+        .or_else(|| pending_approvals.as_ref().err())
+        .or_else(|| effective_rules.as_ref().err())
+        .map(|e| e.to_string());
+    let node_count = entity_count.unwrap_or(0);
+    let edge_count = edge_count.unwrap_or(0);
+    let derived_fact_count = derived_fact_count.unwrap_or(0);
+    let pending = pending_approvals.unwrap_or(0);
+    let session_id_text = if explicit_session_id.is_some() {
+        session_id.to_string()
+    } else {
+        "all".to_string()
+    };
+    Ok(json_response(
+        "200 OK",
+        &serde_json::json!({
+            "status": if summary_error.is_some() { "not_ready" } else { "ready" },
+            "session_id": session_id_text,
+            "node_count": node_count,
+            "node_count_scope": if explicit_session_id.is_some() { "session" } else { "all" },
+            "edge_count": edge_count,
+            "derived_fact_count": derived_fact_count,
+            "rule_count": effective_rules.unwrap_or_default().len(),
+            "pending_approvals": pending,
+            "query_rate_1m": 0,
+            "error": summary_error,
+        })
+        .to_string(),
+    ))
+}
+
 async fn handle_operator_request<S: Storage + OperatorQuerySurface>(
     method: &str,
     path: &str,
@@ -931,61 +1216,10 @@ async fn handle_operator_request<S: Storage + OperatorQuerySurface>(
             ))
         }
         ("GET", "/workbench/api/summary") => {
-            let effective_rules =
-                crate::datalog::load_effective_rule_entries(storage, ctx, None).await;
-            let entities = storage.entity_list_all(ctx).await;
-            let edge_count = storage.edge_count(ctx).await;
-            let derived_fact_count = storage.derived_cache_list_all(ctx, 100_000).await;
-            let summary_error = entities
-                .as_ref()
-                .err()
-                .or_else(|| edge_count.as_ref().err())
-                .or_else(|| derived_fact_count.as_ref().err())
-                .or_else(|| effective_rules.as_ref().err())
-                .map(|e| e.to_string());
-            let entity_rows = entities.unwrap_or_default();
-            let node_count = entity_rows.len();
-            let edge_count = edge_count.unwrap_or(0);
-            let derived_fact_count = derived_fact_count.map(|rows| rows.len()).unwrap_or(0);
-            let approvals: Vec<_> = entity_rows
-                .iter()
-                .filter(|entry| {
-                    entry.entity_type == crate::expert_system::APPROVAL_MIRROR_ENTITY_TYPE
-                })
-                .cloned()
-                .collect();
-            let pending = approvals
-                .iter()
-                .filter(|entry| {
-                    entry.properties.get("decision").and_then(|v| v.as_str()) == Some("proposed")
-                })
-                .count();
-            let session_id = query_param(path, "session_id")
-                .or_else(|| {
-                    approvals.first().and_then(|entry| {
-                        entry
-                            .properties
-                            .get("session_scope")
-                            .and_then(|value| value.as_str())
-                            .map(str::to_string)
-                    })
-                })
-                .unwrap_or_default();
-            Ok(json_response(
-                "200 OK",
-                &serde_json::json!({
-                    "status": if summary_error.is_some() { "not_ready" } else { "ready" },
-                    "session_id": session_id,
-                    "node_count": node_count,
-                    "edge_count": edge_count,
-                    "derived_fact_count": derived_fact_count,
-                    "rule_count": effective_rules.unwrap_or_default().len(),
-                    "pending_approvals": pending,
-                    "query_rate_1m": 0,
-                    "error": summary_error,
-                })
-                .to_string(),
-            ))
+            handle_workbench_summary_request(storage, ctx, "/workbench/api/summary").await
+        }
+        ("GET", summary_path) if summary_path.starts_with("/workbench/api/summary?") => {
+            handle_workbench_summary_request(storage, ctx, summary_path).await
         }
         ("POST", "/workbench/api/cql/query") => {
             let payload = parse_json_body(body)?;
@@ -1245,7 +1479,7 @@ async fn handle_operator_request<S: Storage + OperatorQuerySurface>(
             let approvals: Vec<Value> = storage
                 .entity_list_all(ctx)
                 .await
-                .unwrap_or_default()
+                .map_err(|e| anyhow::anyhow!("failed to list approval mirror entities: {e}"))?
                 .into_iter()
                 .filter(|entry| {
                     entry.entity_type == crate::expert_system::APPROVAL_MIRROR_ENTITY_TYPE
@@ -1302,7 +1536,7 @@ async fn handle_operator_request<S: Storage + OperatorQuerySurface>(
                 storage
                     .entity_list_all(ctx)
                     .await
-                    .unwrap_or_default()
+                    .map_err(|e| anyhow::anyhow!("failed to list alias mirror entities: {e}"))?
                     .into_iter()
                     .filter(|entry| entry.entity_type == crate::expert_system::ALIAS_MIRROR_ENTITY_TYPE)
                     .map(|entry| {
@@ -1344,7 +1578,7 @@ async fn handle_operator_request<S: Storage + OperatorQuerySurface>(
                 storage
                     .entity_list_all(ctx)
                     .await
-                    .unwrap_or_default()
+                    .map_err(|e| anyhow::anyhow!("failed to list alias mirror entities: {e}"))?
                     .into_iter()
                     .filter(|entry| entry.entity_type == crate::expert_system::ALIAS_MIRROR_ENTITY_TYPE)
                     .map(|entry| {
@@ -1740,118 +1974,18 @@ async fn handle_viz_connection<S: crate::storage::Storage + 'static>(
             );
             stream.write_all(response.as_bytes()).await?;
         }
-        (method, path) if method == "GET" && path.starts_with("/viz/snapshot") => {
+        (method, route) if method == "GET" && route.starts_with("/viz/snapshot") => {
             let response = snapshot_stream_required_response();
             stream.write_all(response.as_bytes()).await?;
         }
-        (method, path) if method == "GET" && path.starts_with("/viz/api/derived_facts") => {
-            // Fetch derived facts from cache for the viz tab
-            // Parse query string from path (e.g., /viz/api/derived_facts?session_id=xxx&limit=100)
-            let query_string = path.split('?').nth(1).unwrap_or("");
-
-            let session_id = query_string
-                .split('&')
-                .find(|p| p.starts_with("session_id="))
-                .and_then(|p| p.split('=').nth(1))
-                .unwrap_or("00000000-0000-0000-0000-000000000000")
-                .to_string();
-
-            let limit: usize = query_string
-                .split('&')
-                .find(|p| p.starts_with("limit="))
-                .and_then(|p| p.split('=').nth(1))
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(100);
-
-            let session_uuid = uuid::Uuid::parse_str(&session_id).unwrap_or(uuid::Uuid::nil());
-            let cache_key = format!("consolidation:{}", session_uuid);
-
-            let derived_facts = match storage.derived_cache_get(&ctx, &cache_key).await {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(error = %e, cache_key, "viz: derived_cache_get failed; serving empty");
-                    Vec::new()
-                }
-            };
-            let total = derived_facts.len();
-
-            // Collect unique entity IDs for batch lookup
-            let mut entity_ids: Vec<uuid::Uuid> = Vec::new();
-            let mut seen: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
-            for fact in &derived_facts {
-                if let Ok(id) = uuid::Uuid::parse_str(&fact.src_id)
-                    && seen.insert(id)
-                {
-                    entity_ids.push(id);
-                }
-                if let Ok(id) = uuid::Uuid::parse_str(&fact.dst_id)
-                    && seen.insert(id)
-                {
-                    entity_ids.push(id);
-                }
-            }
-
-            // Batch fetch entity names using single query
-            let mut entity_names: std::collections::HashMap<String, String> =
-                std::collections::HashMap::new();
-            if !entity_ids.is_empty() {
-                let entities = match storage
-                    .entity_get_batch(&ctx, session_uuid, &entity_ids)
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(error = %e, count = entity_ids.len(), "viz: entity_get_batch failed; entity names will be missing");
-                        Vec::new()
-                    }
-                };
-                for entity in entities {
-                    entity_names.insert(entity.entity_id.to_string(), entity.entity_name);
-                }
-            }
-
-            let facts: Vec<_> = derived_facts
-                .into_iter()
-                .take(limit)
-                .map(|f| {
-                    let src_name = entity_names
-                        .get(&f.src_id)
-                        .cloned()
-                        .unwrap_or_else(|| f.src_id[..8].to_string() + "...");
-                    let dst_name = entity_names
-                        .get(&f.dst_id)
-                        .cloned()
-                        .unwrap_or_else(|| f.dst_id[..8].to_string() + "...");
-                    serde_json::json!({
-                        "src_id": f.src_id,
-                        "src_name": src_name,
-                        "pred": f.pred,
-                        "dst_id": f.dst_id,
-                        "dst_name": dst_name,
-                        "confidence": f.confidence,
-                        "rule_id": f.rule_id,
-                        "support_count": f.support_count,
-                    })
-                })
-                .collect();
-
-            let body = serde_json::json!({
-                "derived_facts": facts,
-                "count": facts.len(),
-                "total": total,
-            })
-            .to_string();
-
-            let response = format!(
-                "HTTP/1.1 200 OK\r\n\
-                 Content-Type: application/json\r\n\
-                 Cache-Control: no-cache\r\n\
-                 Access-Control-Allow-Origin: *\r\n\
-                 Content-Length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(response.as_bytes()).await?;
+        (method, route) if method == "GET" && route.starts_with("/viz/api/derived_facts") => {
+            handle_viz_derived_facts_request(
+                &mut stream,
+                Arc::clone(&storage),
+                Arc::clone(&ctx),
+                path,
+            )
+            .await?;
         }
         ("GET", "/subscribe/anomalies") => {
             handle_anomaly_sse(stream, event_bus).await?;
@@ -2015,10 +2149,17 @@ async fn send_streaming_viz_snapshot<S: Storage>(
                 VizSnapshotScope::All => unreachable!(),
             };
             for sid in sessions {
-                match storage.entity_list_session(ctx, sid).await {
-                    Ok(entities) => {
-                        for chunk in entities.chunks(VIZ_CHUNK_SIZE) {
-                            let nodes: Vec<_> = chunk.iter().map(viz::entity_to_viz_node).collect();
+                let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+                let producer = storage.entity_stream_session(ctx.clone(), sid, VIZ_CHUNK_SIZE, tx);
+                tokio::pin!(producer);
+                let mut producer_done = false;
+                loop {
+                    tokio::select! {
+                        _ = &mut producer, if !producer_done => producer_done = true,
+                        chunk = rx.recv() => {
+                            match chunk {
+                                Some(Ok(entities)) => {
+                                    let nodes: Vec<_> = entities.iter().map(viz::entity_to_viz_node).collect();
                             total_nodes += nodes.len();
                             if !nodes.is_empty()
                                 && !send_viz_event(
@@ -2032,10 +2173,18 @@ async fn send_streaming_viz_snapshot<S: Storage>(
                             {
                                 return false;
                             }
+                                }
+                                Some(Err(e)) => {
+                                    tracing::warn!(session_id = %sid, "viz: failed to stream scoped entities for snapshot: {e}");
+                                    break;
+                                }
+                                None if producer_done => break,
+                                None => {}
+                            }
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(session_id = %sid, "viz: failed to load scoped entities for snapshot stream: {e}")
+                    if producer_done && rx.is_empty() {
+                        break;
                     }
                 }
             }
@@ -2094,51 +2243,59 @@ async fn send_streaming_viz_snapshot<S: Storage>(
     // edge store and has a paged streaming storage path.
     match scope {
         VizSnapshotScope::All => {
-            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-            let producer = storage.typed_edge_stream_all(ctx.clone(), VIZ_CHUNK_SIZE, tx);
-            tokio::pin!(producer);
-            let mut producer_done = false;
-            loop {
-                tokio::select! {
-                    _ = &mut producer, if !producer_done => producer_done = true,
-                    chunk = rx.recv() => {
-                        match chunk {
-                            Some(Ok(typed_edges)) => {
-                                for te in typed_edges {
-                                    edge_chunk.push(VizEdge {
-                                        source: te.src_id.to_string(),
-                                        target: te.dst_id.to_string(),
-                                        edge_type: te.edge_type,
-                                        strength: Some(te.weight as f32),
-                                    });
-                                    total_edges += 1;
-                                    if edge_chunk.len() >= VIZ_CHUNK_SIZE {
-                                        let edges = std::mem::take(&mut edge_chunk);
-                                        if !send_viz_event(
-                                            write,
-                                            &VizEvent::SnapshotStreamChunk {
-                                                nodes: Vec::new(),
-                                                edges,
-                                            },
-                                        )
-                                        .await
-                                        {
-                                            return false;
+            for (edge_ctx, label) in [
+                (ctx.clone(), "current"),
+                (swapped_ctx.clone(), "legacy-swapped"),
+            ] {
+                if label == "legacy-swapped" && edge_ctx.tenant_id == ctx.tenant_id {
+                    continue;
+                }
+                let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+                let producer = storage.typed_edge_stream_all(edge_ctx, VIZ_CHUNK_SIZE, tx);
+                tokio::pin!(producer);
+                let mut producer_done = false;
+                loop {
+                    tokio::select! {
+                        _ = &mut producer, if !producer_done => producer_done = true,
+                        chunk = rx.recv() => {
+                            match chunk {
+                                Some(Ok(typed_edges)) => {
+                                    for te in typed_edges {
+                                        edge_chunk.push(VizEdge {
+                                            source: te.src_id.to_string(),
+                                            target: te.dst_id.to_string(),
+                                            edge_type: te.edge_type,
+                                            strength: Some(te.weight as f32),
+                                        });
+                                        total_edges += 1;
+                                        if edge_chunk.len() >= VIZ_CHUNK_SIZE {
+                                            let edges = std::mem::take(&mut edge_chunk);
+                                            if !send_viz_event(
+                                                write,
+                                                &VizEvent::SnapshotStreamChunk {
+                                                    nodes: Vec::new(),
+                                                    edges,
+                                                },
+                                            )
+                                            .await
+                                            {
+                                                return false;
+                                            }
                                         }
                                     }
                                 }
+                                Some(Err(e)) => {
+                                    tracing::warn!(error = %e, edge_context = label, "viz: failed to stream all-scope typed edges");
+                                    break;
+                                }
+                                None if producer_done => break,
+                                None => {}
                             }
-                            Some(Err(e)) => {
-                                tracing::warn!(error = %e, "viz: failed to stream all-scope typed edges");
-                                break;
-                            }
-                            None if producer_done => break,
-                            None => {}
                         }
                     }
-                }
-                if producer_done && rx.is_empty() {
-                    break;
+                    if producer_done && rx.is_empty() {
+                        break;
+                    }
                 }
             }
         }
@@ -2158,34 +2315,56 @@ async fn send_streaming_viz_snapshot<S: Storage>(
             };
             for probe_ctx in [ctx, &swapped_ctx] {
                 for sid in &probe {
-                    match storage.typed_edge_list_session(probe_ctx, *sid).await {
-                        Ok(typed_edges) => {
-                            for te in typed_edges {
-                                edge_chunk.push(VizEdge {
-                                    source: te.src_id.to_string(),
-                                    target: te.dst_id.to_string(),
-                                    edge_type: te.edge_type,
-                                    strength: Some(te.weight as f32),
-                                });
-                                total_edges += 1;
-                                if edge_chunk.len() >= VIZ_CHUNK_SIZE {
-                                    let edges = std::mem::take(&mut edge_chunk);
-                                    if !send_viz_event(
-                                        write,
-                                        &VizEvent::SnapshotStreamChunk {
-                                            nodes: Vec::new(),
-                                            edges,
-                                        },
-                                    )
-                                    .await
-                                    {
-                                        return false;
+                    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+                    let producer = storage.typed_edge_stream_session(
+                        (*probe_ctx).clone(),
+                        *sid,
+                        VIZ_CHUNK_SIZE,
+                        tx,
+                    );
+                    tokio::pin!(producer);
+                    let mut producer_done = false;
+                    loop {
+                        tokio::select! {
+                            _ = &mut producer, if !producer_done => producer_done = true,
+                            chunk = rx.recv() => {
+                                match chunk {
+                                    Some(Ok(typed_edges)) => {
+                                        for te in typed_edges {
+                                            edge_chunk.push(VizEdge {
+                                                source: te.src_id.to_string(),
+                                                target: te.dst_id.to_string(),
+                                                edge_type: te.edge_type,
+                                                strength: Some(te.weight as f32),
+                                            });
+                                            total_edges += 1;
+                                            if edge_chunk.len() >= VIZ_CHUNK_SIZE {
+                                                let edges = std::mem::take(&mut edge_chunk);
+                                                if !send_viz_event(
+                                                    write,
+                                                    &VizEvent::SnapshotStreamChunk {
+                                                        nodes: Vec::new(),
+                                                        edges,
+                                                    },
+                                                )
+                                                .await
+                                                {
+                                                    return false;
+                                                }
+                                            }
+                                        }
                                     }
+                                    Some(Err(e)) => {
+                                        tracing::warn!(error = %e, session_id = %sid, "viz: typed_edge_stream_session failed");
+                                        break;
+                                    }
+                                    None if producer_done => break,
+                                    None => {}
                                 }
                             }
                         }
-                        Err(e) => {
-                            tracing::warn!(error = %e, session_id = %sid, "viz: typed_edge_list_session failed")
+                        if producer_done && rx.is_empty() {
+                            break;
                         }
                     }
                 }
@@ -3589,6 +3768,132 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn viz_derived_facts_streams_and_honors_explicit_client_limit() {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let storage = Arc::new(MockStorage::new());
+        let ctx = Arc::new(test_tenant());
+        let session_id = Uuid::nil();
+        let cache_key = format!("consolidation:{session_id}");
+        storage
+            .derived_cache_put(
+                &ctx,
+                &cache_key,
+                &[
+                    crate::types::DerivedFact {
+                        src_id: Uuid::new_v4().to_string(),
+                        pred: "related".into(),
+                        dst_id: Uuid::new_v4().to_string(),
+                        confidence: 0.9,
+                        rule_id: "r1".into(),
+                        support_count: 1,
+                        provenance: vec![],
+                    },
+                    crate::types::DerivedFact {
+                        src_id: Uuid::new_v4().to_string(),
+                        pred: "related".into(),
+                        dst_id: Uuid::new_v4().to_string(),
+                        confidence: 0.8,
+                        rule_id: "r2".into(),
+                        support_count: 1,
+                        provenance: vec![],
+                    },
+                    crate::types::DerivedFact {
+                        src_id: Uuid::new_v4().to_string(),
+                        pred: "related".into(),
+                        dst_id: Uuid::new_v4().to_string(),
+                        confidence: 0.7,
+                        rule_id: "r3".into(),
+                        support_count: 1,
+                        provenance: vec![],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_storage = Arc::clone(&storage);
+        let server_ctx = Arc::clone(&ctx);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_viz_connection(
+                stream,
+                Arc::new(EventBus::new()),
+                server_storage,
+                server_ctx,
+                session_id,
+                &ShellRouteConfig::default(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "GET /viz/api/derived_facts?session_id={session_id}&limit=2 HTTP/1.1\r\n\
+             Host: 127.0.0.1\r\n\
+             Connection: close\r\n\r\n"
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        server.await.unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("\"count\":2"), "{response}");
+        assert!(!response.contains("\"rule_id\":\"r3\""), "{response}");
+        assert_eq!(
+            storage
+                .derived_cache_get_limited_calls
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(storage.derived_cache_get_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn viz_derived_facts_route_uses_streaming_storage_without_hidden_caps() {
+        let source = include_str!("http.rs");
+        let route = source
+            .split("async fn handle_viz_derived_facts_request")
+            .nth(1)
+            .and_then(|rest| rest.split("fn snapshot_stream_required_response").next())
+            .expect("derived facts streaming handler must exist");
+        assert!(
+            route.contains("derived_cache_stream("),
+            "viz derived facts must stream from storage instead of using a capped Vec API: {route}"
+        );
+        assert!(
+            route.contains("VIZ_DERIVED_FACT_CHUNK_SIZE,\n                limit,"),
+            "viz derived facts must push an explicit client limit into the streaming storage query without introducing a hidden cap: {route}"
+        );
+        assert!(
+            !source
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap_or(source)
+                .contains("VIZ_DERIVED_FACTS_DEFAULT_LIMIT")
+                && !source
+                    .split("#[cfg(test)]")
+                    .next()
+                    .unwrap_or(source)
+                    .contains("VIZ_DERIVED_FACTS_MAX_LIMIT"),
+            "viz derived facts must not use hidden default/max row caps"
+        );
+        assert!(
+            !route.contains("derived_cache_get_limited"),
+            "viz derived facts handler must stay on the streaming API; explicit limits belong in derived_cache_stream"
+        );
+        assert!(
+            !route.contains("Content-Length"),
+            "streaming derived facts response must not precompute the whole JSON body"
+        );
+    }
+
     #[test]
     fn viz_websocket_does_not_retain_full_graph_for_navigation() {
         let source = include_str!("http.rs");
@@ -3625,6 +3930,35 @@ mod tests {
         assert!(
             streaming_snapshot.contains("typed_edge_stream_all"),
             "viz websocket connect must stream all-scope typed_edges so the all-node graph has edges without falling back to session scope: {streaming_snapshot}"
+        );
+        assert!(
+            streaming_snapshot.contains("(swapped_ctx.clone(), \"legacy-swapped\")")
+                && streaming_snapshot.contains("typed_edge_stream_all(edge_ctx"),
+            "all-scope streaming must preserve the old snapshot's legacy swapped-tenant typed edge fallback: {streaming_snapshot}"
+        );
+    }
+
+    #[test]
+    fn scoped_viz_snapshot_streams_incrementally() {
+        let source = include_str!("http.rs");
+        let streaming_snapshot = source
+            .split("async fn send_streaming_viz_snapshot")
+            .nth(1)
+            .and_then(|rest| rest.split("/// Handle a WebSocket connection").next())
+            .expect("send_streaming_viz_snapshot body must be present");
+
+        assert!(
+            !streaming_snapshot.contains("entity_list_session"),
+            "scoped viz snapshot must stream entity chunks instead of materializing session entities: {streaming_snapshot}"
+        );
+        assert!(
+            !streaming_snapshot.contains("typed_edge_list_session"),
+            "scoped viz snapshot must stream typed-edge chunks instead of materializing session edges: {streaming_snapshot}"
+        );
+        assert!(
+            streaming_snapshot.contains("entity_stream_session")
+                && streaming_snapshot.contains("typed_edge_stream_session"),
+            "scoped viz snapshot must use the bounded session streaming APIs: {streaming_snapshot}"
         );
     }
 
@@ -4513,13 +4847,14 @@ mod tests {
             tenant_id,
             session_origin: "http:alice".into(),
         };
+        let summary_session_id = Uuid::new_v4();
         storage
             .entity_put(
                 &ctx,
                 &crate::types::EntityEntry {
                     tenant_id,
                     entity_id: Uuid::new_v4(),
-                    session_id: Uuid::new_v4(),
+                    session_id: summary_session_id,
                     entity_name: "summary-test".into(),
                     entity_type: "concept".into(),
                     source_fold_id: None,
@@ -4559,10 +4894,54 @@ mod tests {
             )
             .await
             .unwrap();
+        let derived_facts: Vec<crate::types::DerivedFact> = (0..1_005)
+            .map(|_| crate::types::DerivedFact {
+                src_id: Uuid::new_v4().to_string(),
+                pred: "related".into(),
+                dst_id: Uuid::new_v4().to_string(),
+                confidence: 1.0,
+                rule_id: "summary-rule".into(),
+                support_count: 1,
+                provenance: Vec::new(),
+            })
+            .collect();
+        storage
+            .derived_cache_put(&ctx, "summary-derived", &derived_facts)
+            .await
+            .unwrap();
+        storage
+            .entity_put(
+                &ctx,
+                &crate::types::EntityEntry {
+                    tenant_id,
+                    entity_id: Uuid::new_v4(),
+                    session_id: summary_session_id,
+                    entity_name: "pending-approval".into(),
+                    entity_type: crate::expert_system::APPROVAL_MIRROR_ENTITY_TYPE.into(),
+                    source_fold_id: None,
+                    context_snippet: "approval".into(),
+                    entity_embedding: None,
+                    confidence: 1.0,
+                    created_at: chrono::Utc::now(),
+                    state: crate::types::MemoryState::Active,
+                    description: None,
+                    description_embedding: None,
+                    tags: Vec::new(),
+                    properties: serde_json::json!({
+                        "decision": crate::types::ApprovalDecision::Proposed.to_string()
+                    }),
+                    content_hash: None,
+                    updated_at: None,
+                    scope: crate::types::EntityScope::Session,
+                    ingested_by_session: None,
+                },
+            )
+            .await
+            .unwrap();
 
         let response = handle_http_request(
             "GET",
-            "/workbench/api/summary",
+            &format!("/workbench/api/summary?session_id={summary_session_id}"),
             &headers,
             "",
             &storage,
@@ -4581,7 +4960,123 @@ mod tests {
         .unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("\"status\":\"ready\""));
+        assert!(response.contains("\"node_count\":2"));
+        assert!(response.contains("\"node_count_scope\":\"session\""));
+        assert!(response.contains("\"derived_fact_count\":1005"));
+        assert!(response.contains("\"pending_approvals\":1"));
         assert!(response.contains("\"rule_count\":10"));
+
+        let degraded_response = handle_http_request(
+            "GET",
+            "/workbench/api/summary",
+            &headers,
+            "",
+            &storage,
+            &metrics,
+            &move |u, p| {
+                if u == "user" && p == "pass" {
+                    Some(tenant_id)
+                } else {
+                    None
+                }
+            },
+            &|| true,
+            &ShellRouteConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert!(degraded_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(degraded_response.contains("\"status\":\"ready\""));
+        assert!(degraded_response.contains("\"node_count\":2"));
+        assert!(degraded_response.contains("\"node_count_scope\":\"all\""));
+        assert!(degraded_response.contains("\"derived_fact_count\":1005"));
+        assert!(degraded_response.contains("\"pending_approvals\":1"));
+    }
+
+    #[test]
+    fn workbench_summary_avoids_broad_entity_and_derived_cache_scans() {
+        let source = include_str!("http.rs");
+        let helper_start = source
+            .find("async fn handle_workbench_summary_request")
+            .expect("workbench summary helper must exist");
+        let helper_tail = &source[helper_start..];
+        let helper_end = helper_tail
+            .find("async fn handle_operator_request")
+            .unwrap_or(helper_tail.len());
+        let route_source = &helper_tail[..helper_end];
+
+        assert!(
+            !route_source.contains("entity_list_all(ctx)"),
+            "workbench summary must not materialize all entities for counts or approval mirrors"
+        );
+        assert!(
+            !route_source.contains("derived_cache_list_all(ctx, 100_000)"),
+            "workbench summary must not materialize a huge derived-cache sample for a count"
+        );
+        assert!(
+            !route_source.contains("WORKBENCH_SUMMARY_"),
+            "workbench summary must not use capped samples for counts"
+        );
+        assert!(
+            route_source.contains("entity_count("),
+            "workbench summary should use an aggregate entity count path"
+        );
+        assert!(
+            route_source.contains("entity_count_matching("),
+            "workbench summary should count matching approval mirrors without materializing them"
+        );
+        assert!(
+            route_source.contains("derived_cache_count("),
+            "workbench summary should use the storage count path for derived-cache rows"
+        );
+        assert!(
+            route_source.contains("tokio::join!"),
+            "workbench summary should run independent exact counts concurrently"
+        );
+    }
+
+    #[tokio::test]
+    async fn workbench_list_endpoints_propagate_entity_scan_errors() {
+        let metrics = MemoryMetrics::new().unwrap();
+        let storage = MockStorage::new();
+        *storage.force_entity_list_all_error.lock().await =
+            Some("entity list backpressure: row cap exceeded".to_string());
+        let headers = vec![(
+            "Authorization".to_string(),
+            "Basic dXNlcjpwYXNz".to_string(),
+        )];
+        let tenant_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+
+        for path in ["/workbench/api/approvals", "/workbench/api/aliases"] {
+            let response = handle_http_request(
+                "GET",
+                path,
+                &headers,
+                "",
+                &storage,
+                &metrics,
+                &move |u, p| {
+                    if u == "user" && p == "pass" {
+                        Some(tenant_id)
+                    } else {
+                        None
+                    }
+                },
+                &|| true,
+                &ShellRouteConfig::default(),
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                response.starts_with("HTTP/1.1 502 Bad Gateway"),
+                "{path} must fail loudly on storage scan errors, got: {response}"
+            );
+            assert!(
+                response.contains("entity list backpressure"),
+                "{path} response must preserve the storage error, got: {response}"
+            );
+        }
     }
 
     #[tokio::test]

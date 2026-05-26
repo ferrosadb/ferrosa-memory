@@ -347,7 +347,10 @@ impl<T: McpTransport> EvalRunner<T> {
         let args_value =
             serde_json::to_value(&arguments).unwrap_or(Value::Object(serde_json::Map::new()));
 
-        match self.transport.call_tool(&step.tool, args_value).await {
+        match self
+            .call_tool_after_storage_ready(&step.tool, args_value)
+            .await
+        {
             Ok((response, latency)) => ToolCallTrace {
                 tool: step.tool.clone(),
                 arguments,
@@ -399,8 +402,38 @@ impl<T: McpTransport> EvalRunner<T> {
         if let Some(sid) = session_id {
             args["session_id"] = serde_json::Value::String(sid.to_string());
         }
-        let (response, _latency) = self.transport.call_tool("get_stats", args).await?;
+        let (response, _latency) = self
+            .call_tool_after_storage_ready("get_stats", args)
+            .await?;
         Ok(GraphSnapshot::from_stats_response(&response))
+    }
+
+    async fn call_tool_after_storage_ready(
+        &mut self,
+        tool_name: &str,
+        arguments: Value,
+    ) -> Result<(Value, Duration), RunnerError> {
+        let deadline = Instant::now()
+            + Duration::from_millis(self.config.timeout_ms.max(self.config.preflight_timeout_ms));
+        let mut delay = Duration::from_millis(25);
+        let mut attempts = 0usize;
+
+        loop {
+            attempts += 1;
+            match self.transport.call_tool(tool_name, arguments.clone()).await {
+                Ok(result) => return Ok(result),
+                Err(err) if is_storage_starting_error(&err) && Instant::now() < deadline => {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_millis(500));
+                }
+                Err(err) if is_storage_starting_error(&err) => {
+                    return Err(RunnerError::McpClient(format!(
+                        "storage did not become ready for {tool_name} after {attempts} attempts: {err}"
+                    )));
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -597,6 +630,13 @@ impl<T: McpTransport> EvalRunner<T> {
         };
         Ok([g0, g1, g2])
     }
+}
+
+fn is_storage_starting_error(err: &RunnerError) -> bool {
+    let msg = err.to_string();
+    msg.contains("CQL connection not yet established")
+        || msg.contains("storage not ready")
+        || msg.contains("storage is not ready")
 }
 
 // ---------------------------------------------------------------------------
@@ -894,8 +934,12 @@ mod tests {
     struct MockTransport {
         /// Pre-configured responses keyed by tool name.
         responses: HashMap<String, Vec<(Value, Duration)>>,
+        /// Pre-configured transient errors keyed by tool name.
+        errors: HashMap<String, Vec<String>>,
         /// Index into the response vec for each tool.
         call_index: HashMap<String, usize>,
+        /// Index into the error vec for each tool.
+        error_index: HashMap<String, usize>,
         /// Recorded calls for assertion.
         calls: Arc<Mutex<Vec<(String, Value)>>>,
         /// Default response for tools not explicitly configured.
@@ -906,7 +950,9 @@ mod tests {
         fn new() -> Self {
             Self {
                 responses: HashMap::new(),
+                errors: HashMap::new(),
                 call_index: HashMap::new(),
+                error_index: HashMap::new(),
                 calls: Arc::new(Mutex::new(Vec::new())),
                 default_response: (json!({"ok": true}), Duration::from_millis(10)),
             }
@@ -915,6 +961,15 @@ mod tests {
         /// Register a sequence of responses for a tool.
         fn on_tool(mut self, tool: &str, responses: Vec<(Value, Duration)>) -> Self {
             self.responses.insert(tool.to_string(), responses);
+            self
+        }
+
+        /// Register a sequence of MCP client errors for a tool.
+        fn on_tool_errors(mut self, tool: &str, errors: Vec<&str>) -> Self {
+            self.errors.insert(
+                tool.to_string(),
+                errors.into_iter().map(ToString::to_string).collect(),
+            );
             self
         }
 
@@ -936,6 +991,15 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((tool_name.to_string(), arguments.clone()));
+
+            if let Some(errors) = self.errors.get(tool_name) {
+                let idx = self.error_index.entry(tool_name.to_string()).or_insert(0);
+                if *idx < errors.len() {
+                    let err = errors[*idx].clone();
+                    *idx += 1;
+                    return Err(RunnerError::McpClient(err));
+                }
+            }
 
             // Return the next configured response, or the default
             if let Some(resps) = self.responses.get(tool_name) {
@@ -1441,6 +1505,44 @@ tool = "get_stats"
                 .contains("connection refused"),
             "error should be captured in trace response"
         );
+    }
+
+    #[tokio::test]
+    async fn run_scenario_retries_explicit_storage_startup_errors_before_recording_step_failure() {
+        let transport = MockTransport::new()
+            .on_tool(
+                "get_stats",
+                vec![
+                    (stats_response(0, 0), Duration::from_millis(1)),
+                    (stats_response(1, 0), Duration::from_millis(1)),
+                ],
+            )
+            .on_tool_errors(
+                "upsert_entity",
+                vec!["CQL connection not yet established, retrying in background..."],
+            )
+            .on_tool(
+                "upsert_entity",
+                vec![(json!({"entity_id": "retry-ok"}), Duration::from_millis(2))],
+            );
+        let calls = transport.calls.clone();
+        let scenario = make_scenario("storage-warmup", vec![make_step("upsert_entity")]);
+        let mut runner = EvalRunner::new(transport, test_config());
+
+        let run = runner.run_scenario(scenario).await.unwrap();
+
+        assert_eq!(run.traces.len(), 1);
+        assert!(
+            run.traces[0].success,
+            "explicit MCP storage warmup errors should be retried before recording a failed step"
+        );
+        let upsert_calls = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(tool, _)| tool == "upsert_entity")
+            .count();
+        assert_eq!(upsert_calls, 2, "first write should be retried once");
     }
 
     #[tokio::test]

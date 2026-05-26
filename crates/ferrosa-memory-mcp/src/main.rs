@@ -24,8 +24,11 @@ use ferrosa_memory_core::transport;
 use ferrosa_memory_core::types::*;
 use futures_util::StreamExt;
 use scylla::frame::response::result::{CqlValue, Row};
+use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
+
+const SPARQL_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Storage wrapper that holds an `Option<CqlStorage>` behind a `RwLock`.
 ///
@@ -45,7 +48,7 @@ use tracing_subscriber::EnvFilter;
 /// the failed query. `notify_one` is called while the write lock is still
 /// held so the signal cannot be lost to cancellation.
 struct ReconnectingStorage {
-    inner: RwLock<Option<CqlStorage>>,
+    inner: RwLock<Option<Arc<CqlStorage>>>,
     /// Monotonically increasing generation — bumped on every `set_connected`.
     /// Prevents stale errors from disconnecting a fresh session.
     generation: AtomicU64,
@@ -84,24 +87,218 @@ impl SparqlPassthrough {
     }
 }
 
-impl ReconnectingStorage {
-    /// Create with an already-connected CQL backend.
-    fn connected(
-        cql: CqlStorage,
-        config: FerrosaCqlConfig,
-        graph: Option<Arc<GraphClient>>,
-        sparql: Option<SparqlPassthrough>,
-    ) -> Self {
-        Self {
-            inner: RwLock::new(Some(cql)),
-            generation: AtomicU64::new(1),
-            reconnect_signal: tokio::sync::Notify::new(),
-            cql_config: config,
-            graph,
-            sparql,
+async fn read_sparql_response_body_bounded(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> anyhow::Result<String> {
+    let mut body = Vec::with_capacity(max_bytes.min(64 * 1024));
+
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > max_bytes {
+            anyhow::bail!("SPARQL response exceeded {max_bytes} bytes");
         }
+        body.extend_from_slice(&chunk);
     }
 
+    String::from_utf8(body).map_err(|e| anyhow::anyhow!("SPARQL response is not UTF-8: {e}"))
+}
+
+struct LimitedSparqlResult {
+    columns: serde_json::Value,
+    rows: Vec<serde_json::Value>,
+    total_rows: usize,
+    truncated: bool,
+}
+
+fn parse_sparql_response_limited(body: &str, limit: usize) -> anyhow::Result<LimitedSparqlResult> {
+    let mut deserializer = serde_json::Deserializer::from_str(body);
+    SparqlResponseSeed { limit }
+        .deserialize(&mut deserializer)
+        .map_err(anyhow::Error::from)
+}
+
+struct SparqlResponseSeed {
+    limit: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for SparqlResponseSeed {
+    type Value = LimitedSparqlResult;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(SparqlResponseVisitor { limit: self.limit })
+    }
+}
+
+struct SparqlResponseVisitor {
+    limit: usize,
+}
+
+impl<'de> Visitor<'de> for SparqlResponseVisitor {
+    type Value = LimitedSparqlResult;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a SPARQL JSON results object")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut columns = serde_json::Value::Array(Vec::new());
+        let mut rows = Vec::with_capacity(self.limit.min(1024));
+        let mut total_rows = 0usize;
+        let mut truncated = false;
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "head" => {
+                    let head = map.next_value::<serde_json::Value>()?;
+                    columns = head
+                        .get("vars")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+                }
+                "results" => {
+                    let parsed = map.next_value_seed(SparqlResultsSeed { limit: self.limit })?;
+                    rows = parsed.rows;
+                    total_rows = parsed.total_rows;
+                    truncated = parsed.truncated;
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+
+        Ok(LimitedSparqlResult {
+            columns,
+            rows,
+            total_rows,
+            truncated,
+        })
+    }
+}
+
+struct ParsedBindings {
+    rows: Vec<serde_json::Value>,
+    total_rows: usize,
+    truncated: bool,
+}
+
+struct SparqlResultsSeed {
+    limit: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for SparqlResultsSeed {
+    type Value = ParsedBindings;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(SparqlResultsVisitor { limit: self.limit })
+    }
+}
+
+struct SparqlResultsVisitor {
+    limit: usize,
+}
+
+impl<'de> Visitor<'de> for SparqlResultsVisitor {
+    type Value = ParsedBindings;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a SPARQL results object")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut parsed = ParsedBindings {
+            rows: Vec::with_capacity(self.limit.min(1024)),
+            total_rows: 0,
+            truncated: false,
+        };
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "bindings" => {
+                    parsed = map.next_value_seed(SparqlBindingsSeed { limit: self.limit })?;
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+
+        Ok(parsed)
+    }
+}
+
+struct SparqlBindingsSeed {
+    limit: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for SparqlBindingsSeed {
+    type Value = ParsedBindings;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(SparqlBindingsVisitor { limit: self.limit })
+    }
+}
+
+struct SparqlBindingsVisitor {
+    limit: usize,
+}
+
+impl<'de> Visitor<'de> for SparqlBindingsVisitor {
+    type Value = ParsedBindings;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a SPARQL bindings array")
+    }
+
+    fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+    where
+        S: SeqAccess<'de>,
+    {
+        let mut rows = Vec::with_capacity(self.limit.min(1024));
+        let mut total_rows = 0usize;
+
+        while rows.len() < self.limit {
+            let Some(row) = seq.next_element::<serde_json::Value>()? else {
+                return Ok(ParsedBindings {
+                    rows,
+                    total_rows,
+                    truncated: false,
+                });
+            };
+            rows.push(row);
+            total_rows += 1;
+        }
+
+        let mut truncated = false;
+        while seq.next_element::<IgnoredAny>()?.is_some() {
+            total_rows += 1;
+            truncated = true;
+        }
+
+        Ok(ParsedBindings {
+            rows,
+            total_rows,
+            truncated,
+        })
+    }
+}
+
+impl ReconnectingStorage {
     /// Create in "reconnecting" state — no backend available yet.
     fn disconnected(
         config: FerrosaCqlConfig,
@@ -121,7 +318,7 @@ impl ReconnectingStorage {
     /// Swap in a newly connected CQL backend and bump the generation.
     async fn set_connected(&self, cql: CqlStorage) {
         let mut guard = self.inner.write().await;
-        *guard = Some(cql);
+        *guard = Some(Arc::new(cql));
         self.generation.fetch_add(1, Ordering::Release);
     }
 
@@ -141,6 +338,10 @@ impl ReconnectingStorage {
             .try_read()
             .map(|guard| guard.is_some())
             .unwrap_or(false)
+    }
+
+    async fn current_cql(&self) -> Option<Arc<CqlStorage>> {
+        self.inner.read().await.as_ref().cloned()
     }
 
     /// Mark as disconnected and signal the reconnect watcher, but only if the
@@ -310,13 +511,12 @@ fn build_http_validator(config: &Config) -> anyhow::Result<Arc<http::CredentialV
 macro_rules! delegate {
     ($self:ident, $method:ident $(, $arg:expr)*) => {{
         let conn_gen = $self.current_generation();
-        let guard = $self.inner.read().await;
-        match guard.as_ref() {
+        let cql = $self.current_cql().await;
+        match cql {
             Some(cql) => {
                 let result = cql.$method($($arg),*).await;
                 if let Err(ref e) = result {
                     if is_connection_error(e) {
-                        drop(guard); // release read lock before taking write lock
                         $self.mark_disconnected(conn_gen).await;
                     }
                 }
@@ -494,14 +694,13 @@ impl Storage for ReconnectingStorage {
         entity_ids: &[uuid::Uuid],
     ) -> anyhow::Result<Vec<EntityEntry>> {
         let conn_gen = self.current_generation();
-        let guard = self.inner.read().await;
-        match guard.as_ref() {
+        let cql = self.current_cql().await;
+        match cql {
             Some(cql) => {
                 let result = cql.entity_get_batch(ctx, session_id, entity_ids).await;
                 if let Err(ref e) = result
                     && is_connection_error(e)
                 {
-                    drop(guard);
                     self.mark_disconnected(conn_gen).await;
                 }
                 result
@@ -526,6 +725,14 @@ impl Storage for ReconnectingStorage {
         session_id: uuid::Uuid,
     ) -> anyhow::Result<usize> {
         delegate!(self, entity_count, ctx, session_id)
+    }
+
+    async fn entity_count_matching(
+        &self,
+        ctx: &TenantContext,
+        query: EntityListQuery,
+    ) -> anyhow::Result<usize> {
+        delegate!(self, entity_count_matching, ctx, query)
     }
 
     async fn fold_count(
@@ -584,8 +791,8 @@ impl Storage for ReconnectingStorage {
         chunk_size: usize,
         tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<EntityEntry>>>,
     ) {
-        let guard = self.inner.read().await;
-        match guard.as_ref() {
+        let cql = self.current_cql().await;
+        match cql {
             Some(cql) => cql.entity_stream_all(ctx, chunk_size, tx).await,
             None => {
                 let _ = tx.send(Err(anyhow::anyhow!(NOT_CONNECTED_MSG))).await;
@@ -637,9 +844,18 @@ impl Storage for ReconnectingStorage {
     }
 
     async fn feedback_list_all(&self) -> anyhow::Result<Vec<FeedbackOutcome>> {
-        let guard = self.inner.read().await;
-        match guard.as_ref() {
-            Some(cql) => cql.feedback_list_all().await,
+        let conn_gen = self.current_generation();
+        let cql = self.current_cql().await;
+        match cql {
+            Some(cql) => {
+                let result = cql.feedback_list_all().await;
+                if let Err(ref e) = result
+                    && is_connection_error(e)
+                {
+                    self.mark_disconnected(conn_gen).await;
+                }
+                result
+            }
             None => Err(anyhow::anyhow!(NOT_CONNECTED_MSG)),
         }
     }
@@ -761,8 +977,8 @@ impl Storage for ReconnectingStorage {
         chunk_size: usize,
         tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<(uuid::Uuid, uuid::Uuid, String)>>>,
     ) {
-        let guard = self.inner.read().await;
-        match guard.as_ref() {
+        let cql = self.current_cql().await;
+        match cql {
             Some(cql) => cql.edge_stream_all(ctx, chunk_size, tx).await,
             None => {
                 let _ = tx.send(Err(anyhow::anyhow!(NOT_CONNECTED_MSG))).await;
@@ -833,18 +1049,28 @@ impl Storage for ReconnectingStorage {
         latency_ms: i32,
         error: bool,
     ) -> anyhow::Result<()> {
-        delegate!(
-            self,
-            tool_usage_put,
-            ctx,
-            tool_name,
-            repo,
-            input_bytes,
-            output_bytes,
-            estimated_tokens,
-            latency_ms,
-            error
-        )
+        let cql = self.current_cql().await;
+        match cql {
+            Some(cql) => {
+                let result = cql
+                    .tool_usage_put(
+                        ctx,
+                        tool_name,
+                        repo,
+                        input_bytes,
+                        output_bytes,
+                        estimated_tokens,
+                        latency_ms,
+                        error,
+                    )
+                    .await;
+                if result.is_err() {
+                    return Err(anyhow::anyhow!("tool usage logging failed"));
+                }
+                Ok(())
+            }
+            None => Err(anyhow::anyhow!(NOT_CONNECTED_MSG)),
+        }
     }
 
     async fn tool_usage_query(
@@ -1124,6 +1350,35 @@ impl Storage for ReconnectingStorage {
         delegate!(self, derived_cache_get, ctx, cache_key)
     }
 
+    async fn derived_cache_get_limited(
+        &self,
+        ctx: &TenantContext,
+        cache_key: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ferrosa_memory_core::types::DerivedFact>> {
+        delegate!(self, derived_cache_get_limited, ctx, cache_key, limit)
+    }
+
+    async fn derived_cache_stream(
+        &self,
+        ctx: TenantContext,
+        cache_key: String,
+        chunk_size: usize,
+        limit: Option<usize>,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<ferrosa_memory_core::types::DerivedFact>>>,
+    ) {
+        let cql = self.current_cql().await;
+        match cql {
+            Some(cql) => {
+                cql.derived_cache_stream(ctx, cache_key, chunk_size, limit, tx)
+                    .await
+            }
+            None => {
+                let _ = tx.send(Err(anyhow::anyhow!(NOT_CONNECTED_MSG))).await;
+            }
+        }
+    }
+
     async fn derived_cache_put(
         &self,
         ctx: &TenantContext,
@@ -1143,6 +1398,10 @@ impl Storage for ReconnectingStorage {
         limit: usize,
     ) -> anyhow::Result<Vec<ferrosa_memory_core::types::DerivedFactRow>> {
         delegate!(self, derived_cache_list_all, ctx, limit)
+    }
+
+    async fn derived_cache_count(&self, ctx: &TenantContext) -> anyhow::Result<usize> {
+        delegate!(self, derived_cache_count, ctx)
     }
 
     async fn derived_cache_ttl_track_put(
@@ -1286,8 +1545,8 @@ impl Storage for ReconnectingStorage {
         chunk_size: usize,
         tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<TypedEdge>>>,
     ) {
-        let guard = self.inner.read().await;
-        match guard.as_ref() {
+        let cql = self.current_cql().await;
+        match cql {
             Some(cql) => cql.typed_edge_stream_all(ctx, chunk_size, tx).await,
             None => {
                 let _ = tx.send(Err(anyhow::anyhow!(NOT_CONNECTED_MSG))).await;
@@ -1335,9 +1594,9 @@ impl http::OperatorQuerySurface for ReconnectingStorage {
         limit: usize,
     ) -> anyhow::Result<serde_json::Value> {
         let conn_gen = self.current_generation();
-        let guard = self.inner.read().await;
-        let cql = guard
-            .as_ref()
+        let cql = self
+            .current_cql()
+            .await
             .ok_or_else(|| anyhow::anyhow!(NOT_CONNECTED_MSG))?;
 
         let normalized = normalize_public_query(query)?;
@@ -1347,7 +1606,6 @@ impl http::OperatorQuerySurface for ReconnectingStorage {
             Ok(iter) => iter,
             Err(err) => {
                 if is_connection_error(&err) {
-                    drop(guard);
                     self.mark_disconnected(conn_gen).await;
                 }
                 return Err(err.into());
@@ -1363,7 +1621,15 @@ impl http::OperatorQuerySurface for ReconnectingStorage {
         let mut total_rows = 0usize;
         let mut truncated = false;
         while let Some(row) = iter.next().await {
-            let row = row?;
+            let row = match row {
+                Ok(row) => row,
+                Err(err) => {
+                    if is_connection_error(&err) {
+                        self.mark_disconnected(conn_gen).await;
+                    }
+                    return Err(err.into());
+                }
+            };
             total_rows += 1;
             if rendered_rows.len() < limit {
                 let mut object = serde_json::Map::new();
@@ -1414,7 +1680,7 @@ impl http::OperatorQuerySurface for ReconnectingStorage {
             .and_then(|value| value.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let body = response.text().await?;
+        let body = read_sparql_response_body_bounded(response, SPARQL_MAX_RESPONSE_BYTES).await?;
         if !status.is_success() {
             anyhow::bail!(
                 "SPARQL passthrough failed: {} {}",
@@ -1423,29 +1689,15 @@ impl http::OperatorQuerySurface for ReconnectingStorage {
             );
         }
 
-        let parsed: serde_json::Value = serde_json::from_str(&body)?;
-        let bindings = parsed
-            .get("results")
-            .and_then(|value| value.get("bindings"))
-            .and_then(|value| value.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let total_rows = bindings.len();
-        let truncated = total_rows > limit;
-        let rows = bindings.into_iter().take(limit).collect::<Vec<_>>();
-        let columns = parsed
-            .get("head")
-            .and_then(|value| value.get("vars"))
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!([]));
+        let parsed = parse_sparql_response_limited(&body, limit)?;
 
         Ok(serde_json::json!({
             "query": query,
-            "columns": columns,
-            "rows": rows,
-            "count": total_rows.min(limit),
-            "total_rows": total_rows,
-            "truncated": truncated,
+            "columns": parsed.columns,
+            "rows": parsed.rows,
+            "count": parsed.total_rows.min(limit),
+            "total_rows": parsed.total_rows,
+            "truncated": parsed.truncated,
             "content_type": content_type,
             "source": "ferrosa-sparql",
         }))
@@ -1458,6 +1710,46 @@ fn next_backoff(attempt: u32) -> Duration {
         Duration::from_secs(1 << attempt)
     } else {
         Duration::from_secs(30)
+    }
+}
+
+fn migrations_enabled() -> bool {
+    matches!(
+        std::env::var("FERROSA_MIGRATIONS_ENABLED").ok().as_deref(),
+        None | Some("true" | "1" | "on" | "yes")
+    )
+}
+
+async fn run_schema_migrations_if_enabled(config: &FerrosaCqlConfig) {
+    if !migrations_enabled() {
+        tracing::info!(
+            "FERROSA_MIGRATIONS_ENABLED is disabled; skipping schema migrations. \
+             Ensure the keyspace schema is managed externally (DBaaS mode) or manually applied."
+        );
+        return;
+    }
+
+    match ferrosa_memory_core::cql_storage::connect_admin_session(config).await {
+        Ok(admin_session) => {
+            match ferrosa_memory_core::migration::run_migrations(&admin_session, &config.keyspace)
+                .await
+            {
+                Ok(0) => tracing::debug!("schema up to date"),
+                Ok(n) => tracing::info!(applied = n, "schema migrations applied"),
+                Err(e) => {
+                    tracing::error!(
+                        "schema migration failed: {e}. The keyspace may be out of sync with this binary. \
+                         Investigate the failing DDL and restart. CqlStorage will attempt to connect, \
+                         but runtime queries may fail if the schema is incomplete."
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "admin CQL session unavailable ({e}), skipping migrations for this reconnect attempt"
+            );
+        }
     }
 }
 
@@ -1502,6 +1794,8 @@ async fn cql_reconnect_watcher(storage: Arc<ReconnectingStorage>) {
                 "CQL reconnection attempt scheduled"
             );
             tokio::time::sleep(delay).await;
+
+            run_schema_migrations_if_enabled(&storage.cql_config).await;
 
             match CqlStorage::connect(&storage.cql_config).await {
                 Ok(cql) => {
@@ -1673,105 +1967,37 @@ async fn main() -> anyhow::Result<()> {
         )
     });
 
-    // Connect graph client via HTTP (non-fatal if it fails).
-    let graph_client = match ferrosa_memory_core::graph::GraphClient::connect(
+    // Build the graph client without a startup health check. Graph operations
+    // still fail loudly per request if Ferrosa's graph endpoint is unavailable,
+    // but MCP initialize must not wait on backend probes.
+    let graph_client = match ferrosa_memory_core::graph::GraphClient::from_config(
         &ferrosa_memory_core::graph::GraphConfig {
             http_url: config.graph.http_url.clone(),
             username: config.graph.username.clone(),
             password: config.graph.password.clone(),
             keyspace: config.ferrosa.keyspace.clone(),
         },
-    )
-    .await
-    {
-        Ok(graph) => {
-            tracing::info!("connected to Ferrosa graph (HTTP)");
-            Some(Arc::new(graph))
-        }
+    ) {
+        Ok(graph) => Some(Arc::new(graph)),
         Err(e) => {
-            tracing::warn!("graph connection failed ({e}), graph traversals disabled");
+            tracing::warn!("graph client configuration failed ({e}), graph traversals disabled");
             None
         }
     };
 
-    // Run schema migrations BEFORE opening the runtime CqlStorage session.
-    // CqlStorage::connect eagerly prepares every application statement
-    // on startup; if the tables those statements target don't exist yet
-    // (greenfield install or a new migration), the session fails to
-    // build and the MCP enters a reconnect loop.  By running migrations
-    // on a bare Scylla admin session (no prepared-statement bloat) first,
-    // we guarantee the DDL is in place before CqlStorage tries to use it.
-    let keyspace = config.ferrosa.keyspace.clone();
-    let migrations_enabled = matches!(
-        std::env::var("FERROSA_MIGRATIONS_ENABLED").ok().as_deref(),
-        None | Some("true" | "1" | "on" | "yes")
-    );
-    if migrations_enabled {
-        match ferrosa_memory_core::cql_storage::connect_admin_session(&config.ferrosa).await {
-            Ok(admin_session) => {
-                match ferrosa_memory_core::migration::run_migrations(&admin_session, &keyspace)
-                    .await
-                {
-                    Ok(0) => tracing::debug!("schema up to date"),
-                    Ok(n) => tracing::info!(applied = n, "schema migrations applied"),
-                    Err(e) => {
-                        // Migration failures are not recoverable by retry. The
-                        // schema is in an unknown state. Log at ERROR so
-                        // operators see it immediately, and do not mask the
-                        // failure as a warning.
-                        tracing::error!(
-                            "schema migration failed: {e}. The keyspace may be out of sync with this binary. \
-                             Investigate the failing DDL and restart. CqlStorage will attempt to connect, \
-                             but runtime queries may fail if the schema is incomplete."
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "admin CQL session unavailable ({e}), skipping migrations. \
-                     Migrations will retry on the next reconnect cycle."
-                );
-            }
-        }
-    } else {
-        tracing::info!(
-            "FERROSA_MIGRATIONS_ENABLED is disabled; skipping schema migrations. \
-             Ensure the keyspace schema is managed externally (DBaaS mode) or manually applied."
-        );
-    }
-
-    // Connect to real Ferrosa — retry in background if initial connect fails.
-    // Never fall back to mock storage (mock silently loses data).
-    let storage: Arc<ReconnectingStorage> = match CqlStorage::connect(&config.ferrosa).await {
-        Ok(cql) => {
-            tracing::info!("connected to Ferrosa CQL cluster");
-            Arc::new(ReconnectingStorage::connected(
-                cql,
-                config.ferrosa.clone(),
-                graph_client.clone(),
-                sparql.clone(),
-            ))
-        }
-        Err(e) => {
-            tracing::warn!(
-                "CQL connection failed ({e}), starting in reconnecting mode — \
-                 tools will return errors until connection is established"
-            );
-            let storage = Arc::new(ReconnectingStorage::disconnected(
-                config.ferrosa.clone(),
-                graph_client.clone(),
-                sparql.clone(),
-            ));
-            // Signal immediately so the watcher starts its first attempt.
-            storage.reconnect_signal.notify_one();
-            storage
-        }
-    };
+    // Start disconnected and let the watcher perform migrations plus runtime
+    // CQL connect in the background. This keeps MCP initialize independent of
+    // CQL availability while preserving the migration-before-prepare invariant.
+    let storage = Arc::new(ReconnectingStorage::disconnected(
+        config.ferrosa.clone(),
+        graph_client.clone(),
+        sparql.clone(),
+    ));
 
     // Always spawn the reconnect watcher — it handles both initial failure
     // and mid-operation connection loss (rolling restarts, network blips).
     tokio::spawn(cql_reconnect_watcher(Arc::clone(&storage)));
+    storage.reconnect_signal.notify_one();
 
     // Load dynamic type registry from the database (falls back to defaults).
     //
@@ -1823,30 +2049,32 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Embedding provider health check (non-fatal). Many tools require
-    // embeddings; failing here warns loudly at startup rather than surfacing
-    // later as per-request failures.
-    let embed_health = ferrosa_memory_core::embedding::EmbeddingClient::new(&config.embeddings);
-    match embed_health.health_check().await {
-        Ok(()) => tracing::info!(
-            provider = %config.embeddings.provider,
-            url = %config.embeddings.ollama_base_url,
-            model = %config.embeddings.model,
-            "embedding provider reachable and model loaded"
-        ),
-        Err(e) => tracing::warn!(
-            provider = %config.embeddings.provider,
-            url = %config.embeddings.ollama_base_url,
-            model = %config.embeddings.model,
-            error = %e,
-            "embedding provider check failed — tools that require embeddings \
-             (smart_ingest, hybrid_search, retrieve_fold_context, retrieve_entities) \
-             will fail at call time. Start Ollama and ensure '{}' is pulled: \
-             `ollama pull {}`",
-            config.embeddings.model,
-            config.embeddings.model
-        ),
-    }
+    // Embedding provider health check is non-fatal and must not block MCP
+    // initialize. Tool calls still fail clearly if embeddings are unavailable.
+    let embeddings_config = config.embeddings.clone();
+    tokio::spawn(async move {
+        let embed_health = ferrosa_memory_core::embedding::EmbeddingClient::new(&embeddings_config);
+        match embed_health.health_check().await {
+            Ok(()) => tracing::info!(
+                provider = %embeddings_config.provider,
+                url = %embeddings_config.ollama_base_url,
+                model = %embeddings_config.model,
+                "embedding provider reachable and model loaded"
+            ),
+            Err(e) => tracing::warn!(
+                provider = %embeddings_config.provider,
+                url = %embeddings_config.ollama_base_url,
+                model = %embeddings_config.model,
+                error = %e,
+                "embedding provider check failed — tools that require embeddings \
+                 (smart_ingest, hybrid_search, retrieve_fold_context, retrieve_entities) \
+                 will fail at call time. Start Ollama and ensure '{}' is pulled: \
+                 `ollama pull {}`",
+                embeddings_config.model,
+                embeddings_config.model
+            ),
+        }
+    });
 
     // Start visualization server if enabled.
     //
@@ -2309,6 +2537,72 @@ auth_file = "{}"
         assert!(!storage.is_ready());
     }
 
+    #[tokio::test]
+    async fn sparql_passthrough_bounds_large_result() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
+            let body = format!(
+                r#"{{"head":{{"vars":["s"]}},"results":{{"bindings":[{}]}}}}"#,
+                (0..128)
+                    .map(|i| format!(r#"{{"s":{{"type":"literal","value":"row-{i}"}}}}"#))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/sparql-results+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes())
+                .await
+                .unwrap();
+        });
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/sparql"))
+            .body("SELECT ?s WHERE { ?s ?p ?o }")
+            .send()
+            .await
+            .unwrap();
+
+        let err = read_sparql_response_body_bounded(response, 128)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("SPARQL response exceeded 128 bytes"),
+            "error must name the response cap: {err}"
+        );
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn sparql_result_parser_keeps_only_limit_bindings() {
+        let body = r#"{
+            "head": {"vars": ["s"]},
+            "results": {"bindings": [
+                {"s": {"type": "literal", "value": "row-1"}},
+                {"s": {"type": "literal", "value": "row-2"}},
+                {"s": {"type": "literal", "value": "row-3"}}
+            ]}
+        }"#;
+
+        let parsed = parse_sparql_response_limited(body, 1).unwrap();
+
+        assert_eq!(parsed.columns, serde_json::json!(["s"]));
+        assert_eq!(parsed.rows.len(), 1);
+        assert_eq!(parsed.total_rows, 3);
+        assert!(parsed.truncated);
+        assert_eq!(
+            parsed.rows[0]["s"]["value"],
+            serde_json::Value::String("row-1".into())
+        );
+    }
+
     #[test]
     fn reconnecting_storage_overrides_viz_stream_methods_with_cql_delegates() {
         let source = include_str!("main.rs");
@@ -2327,6 +2621,202 @@ auth_file = "{}"
                 "ReconnectingStorage must delegate {method} to CqlStorage streaming override, not fall back to Storage's materializing default"
             );
         }
+        assert!(
+            impl_source.contains("cql.derived_cache_stream(ctx, cache_key, chunk_size, limit, tx)"),
+            "ReconnectingStorage must delegate derived_cache_stream to CqlStorage streaming override, not fall back to Storage's materializing default"
+        );
+    }
+
+    #[test]
+    fn reconnecting_storage_stream_methods_drop_read_lock_before_awaiting_sends() {
+        let source = include_str!("main.rs");
+        let impl_start = source
+            .find("impl Storage for ReconnectingStorage")
+            .expect("ReconnectingStorage must implement Storage");
+        let impl_source = &source[impl_start..];
+        for (method, next_method) in [
+            ("entity_stream_all", "fold_list_all"),
+            ("edge_stream_all", "edge_list_for_entity"),
+            ("typed_edge_stream_all", "typed_edge_list_from"),
+            ("derived_cache_stream", "derived_cache_put"),
+        ] {
+            let method_start = impl_source
+                .find(&format!("async fn {method}"))
+                .unwrap_or_else(|| panic!("{method} must exist"));
+            let tail = &impl_source[method_start..];
+            let method_end = tail
+                .find(&format!("async fn {next_method}"))
+                .unwrap_or(tail.len());
+            let method_source = &tail[..method_end];
+            assert!(
+                method_source.contains("let cql = self.current_cql().await;"),
+                "{method} must clone the current CQL backend before awaiting stream sends"
+            );
+            assert!(
+                !method_source.contains("let guard = self.inner.read().await;"),
+                "{method} must not hold the reconnect RwLock read guard while awaiting stream sends"
+            );
+        }
+    }
+
+    #[test]
+    fn reconnecting_storage_delegate_macro_does_not_hold_read_lock_across_await() {
+        let source = include_str!("main.rs");
+        let macro_start = source
+            .find("macro_rules! delegate")
+            .expect("delegate macro must exist");
+        let macro_tail = &source[macro_start..];
+        let macro_end = macro_tail
+            .find("/// Delegate all Storage methods through")
+            .expect("delegate macro section must end before Storage impl");
+        let macro_source = &macro_tail[..macro_end];
+
+        assert!(
+            macro_source.contains("let cql = $self.current_cql().await;"),
+            "delegate macro must clone the current CQL backend before awaiting storage calls"
+        );
+        assert!(
+            !macro_source.contains("let guard = $self.inner.read().await;"),
+            "delegate macro must not hold the reconnect RwLock read guard across awaited storage calls"
+        );
+    }
+
+    #[test]
+    fn reconnecting_storage_clones_arc_not_cql_backend() {
+        let source = include_str!("main.rs");
+        let impl_start = source
+            .find("impl ReconnectingStorage")
+            .expect("ReconnectingStorage impl must exist");
+        let impl_tail = &source[impl_start..];
+        let impl_end = impl_tail
+            .find("/// Error returned when CQL is not yet connected.")
+            .expect("ReconnectingStorage impl section must end before error constants");
+        let impl_source = &impl_tail[..impl_end];
+        assert!(
+            source.contains("inner: RwLock<Option<Arc<CqlStorage>>>"),
+            "ReconnectingStorage must store Arc<CqlStorage> so each request clones only a pointer"
+        );
+        assert!(
+            impl_source.contains("async fn current_cql(&self) -> Option<Arc<CqlStorage>>"),
+            "current_cql must return Arc<CqlStorage>, not clone the prepared-statement cache"
+        );
+        assert!(
+            impl_source.contains("*guard = Some(Arc::new(cql));"),
+            "set_connected must wrap the backend in Arc before publishing it"
+        );
+        assert!(
+            !impl_source.contains("async fn current_cql(&self) -> Option<CqlStorage>"),
+            "current_cql must not clone CqlStorage directly"
+        );
+    }
+
+    #[test]
+    fn tool_usage_logging_does_not_use_connection_error_delegate() {
+        let source = include_str!("main.rs");
+        let impl_start = source
+            .find("impl Storage for ReconnectingStorage")
+            .expect("ReconnectingStorage must implement Storage");
+        let impl_source = &source[impl_start..];
+        let method_start = impl_source
+            .find("async fn tool_usage_put")
+            .expect("tool_usage_put override must exist");
+        let tail = &impl_source[method_start..];
+        let method_end = tail
+            .find("async fn tool_usage_query")
+            .expect("tool_usage_put section must end before tool_usage_query");
+        let method_source = &tail[..method_end];
+
+        assert!(
+            !method_source.contains("delegate!("),
+            "best-effort telemetry must not use the generic delegate path"
+        );
+        assert!(
+            !method_source.contains("is_connection_error"),
+            "best-effort telemetry must not format/inspect driver errors"
+        );
+        assert!(
+            method_source.contains("tool usage logging failed"),
+            "telemetry failures should collapse to a bounded local error"
+        );
+    }
+
+    #[test]
+    fn operator_cql_passthrough_does_not_hold_read_lock_while_streaming_rows() {
+        let source = include_str!("main.rs");
+        let impl_start = source
+            .find("impl http::OperatorQuerySurface for ReconnectingStorage")
+            .expect("operator query impl must exist");
+        let impl_source = &source[impl_start..];
+        let method_start = impl_source
+            .find("async fn cql_query_passthrough")
+            .expect("cql_query_passthrough must exist");
+        let tail = &impl_source[method_start..];
+        let method_end = tail
+            .find("async fn sparql_query_passthrough")
+            .unwrap_or(tail.len());
+        let method_source = &tail[..method_end];
+
+        assert!(
+            method_source.contains(".current_cql()"),
+            "operator passthrough must clone the CQL backend before query/row awaits"
+        );
+        assert!(
+            !method_source.contains("self.inner.read().await"),
+            "operator passthrough must not hold the reconnect RwLock read guard while streaming rows"
+        );
+    }
+
+    #[test]
+    fn startup_main_does_not_await_backend_connects_before_serving() {
+        let source = include_str!("main.rs");
+        let main_start = source.find("async fn main()").expect("main must exist");
+        let main_tail = &source[main_start..];
+        let test_start = main_tail.find("#[cfg(test)]").unwrap_or(main_tail.len());
+        let main_source = &main_tail[..test_start];
+
+        for forbidden in [
+            "GraphClient::connect(",
+            "connect_admin_session(&config.ferrosa).await",
+            "CqlStorage::connect(&config.ferrosa).await",
+        ] {
+            assert!(
+                !main_source.contains(forbidden),
+                "main must not block MCP startup on backend probe `{forbidden}`"
+            );
+        }
+
+        assert!(
+            main_source.contains("ReconnectingStorage::disconnected("),
+            "main should start with reconnecting storage and let the watcher connect in the background"
+        );
+        assert!(
+            main_source.contains("tokio::spawn(cql_reconnect_watcher"),
+            "main should spawn the background CQL reconnect watcher before serving transports"
+        );
+        assert!(
+            main_source.contains("tokio::spawn(async move {\n        let embed_health"),
+            "embedding provider health checks should run in a background task"
+        );
+    }
+
+    #[test]
+    fn reconnect_watcher_runs_migrations_before_runtime_cql_connect() {
+        let source = include_str!("main.rs");
+        let watcher_start = source
+            .find("async fn cql_reconnect_watcher")
+            .expect("reconnect watcher must exist");
+        let watcher_source = &source[watcher_start..];
+        let migration_pos = watcher_source
+            .find("run_schema_migrations_if_enabled(&storage.cql_config).await")
+            .expect("watcher must run migrations");
+        let connect_pos = watcher_source
+            .find("CqlStorage::connect(&storage.cql_config).await")
+            .expect("watcher must connect runtime CQL");
+
+        assert!(
+            migration_pos < connect_pos,
+            "migrations must run before runtime CQL prepare/connect attempts"
+        );
     }
 
     // --- next_backoff tests ---

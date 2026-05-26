@@ -22,7 +22,7 @@ use crate::types::{
     WarmthEntry,
 };
 
-fn entity_list_sessions(
+pub(crate) fn entity_list_sessions(
     tenant_id: Uuid,
     caller_session: Uuid,
     scope: EntityListScope,
@@ -65,7 +65,7 @@ fn property_path_value<'a>(
     Some(current)
 }
 
-fn entity_matches_list_query(
+pub(crate) fn entity_matches_list_query(
     entry: &EntityEntry,
     ctx: &TenantContext,
     query: &EntityListQuery,
@@ -292,6 +292,15 @@ pub trait Storage: Send + Sync {
         session_id: Uuid,
     ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send;
 
+    /// Count entities matching structured predicates without materializing
+    /// matching rows. CQL storage streams rows from the driver and increments
+    /// a counter as each row passes the predicate.
+    fn entity_count_matching(
+        &self,
+        ctx: &TenantContext,
+        query: EntityListQuery,
+    ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send;
+
     /// Count folds in a session.
     fn fold_count(
         &self,
@@ -376,6 +385,36 @@ pub trait Storage: Send + Sync {
         async move {
             let chunk_size = chunk_size.max(1);
             match self.entity_list_all(&ctx).await {
+                Ok(entities) => {
+                    for chunk in entities.chunks(chunk_size) {
+                        if tx.send(Ok(chunk.to_vec())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                }
+            }
+        }
+    }
+
+    /// Stream entities for one session in bounded chunks.
+    ///
+    /// The default implementation chunks `entity_list_session()` for in-memory
+    /// test backends. CQL storage overrides this with a paged driver iterator
+    /// so scoped viz snapshots do not materialize an entire session before the
+    /// first WebSocket chunk is sent.
+    fn entity_stream_session(
+        &self,
+        ctx: TenantContext,
+        session_id: Uuid,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<EntityEntry>>>,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        async move {
+            let chunk_size = chunk_size.max(1);
+            match self.entity_list_session(&ctx, session_id).await {
                 Ok(entities) => {
                     for chunk in entities.chunks(chunk_size) {
                         if tx.send(Ok(chunk.to_vec())).await.is_err() {
@@ -826,6 +865,52 @@ pub trait Storage: Send + Sync {
         cache_key: &str,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<DerivedFact>>> + Send;
 
+    /// Get at most `limit` cached derived facts by cache key.
+    fn derived_cache_get_limited(
+        &self,
+        ctx: &TenantContext,
+        cache_key: &str,
+        limit: usize,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<DerivedFact>>> + Send;
+
+    /// Stream cached derived facts by cache key in bounded chunks.
+    ///
+    /// The default implementation chunks `derived_cache_get()` for in-memory
+    /// test backends. CQL storage overrides this with paged driver iteration so
+    /// viz routes can write a response as rows arrive instead of enforcing a
+    /// hidden row cap.
+    fn derived_cache_stream(
+        &self,
+        ctx: TenantContext,
+        cache_key: String,
+        chunk_size: usize,
+        limit: Option<usize>,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<DerivedFact>>>,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        async move {
+            let chunk_size = chunk_size.max(1);
+            let facts = match limit {
+                Some(limit) => {
+                    self.derived_cache_get_limited(&ctx, &cache_key, limit)
+                        .await
+                }
+                None => self.derived_cache_get(&ctx, &cache_key).await,
+            };
+            match facts {
+                Ok(facts) => {
+                    for chunk in facts.chunks(chunk_size) {
+                        if tx.send(Ok(chunk.to_vec())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                }
+            }
+        }
+    }
+
     /// Store derived facts under a cache key.
     fn derived_cache_put(
         &self,
@@ -848,6 +933,12 @@ pub trait Storage: Send + Sync {
         ctx: &TenantContext,
         limit: usize,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<crate::types::DerivedFactRow>>> + Send;
+
+    /// Count all derived-cache rows for a tenant without materializing them.
+    fn derived_cache_count(
+        &self,
+        ctx: &TenantContext,
+    ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send;
 
     /// Store TTL tracking entries for derived facts.
     /// Called when facts are written to record their TTL rule and next maintenance window.
@@ -941,6 +1032,35 @@ pub trait Storage: Send + Sync {
         async move {
             let chunk_size = chunk_size.max(1);
             match self.typed_edge_list_all(&ctx).await {
+                Ok(edges) => {
+                    for chunk in edges.chunks(chunk_size) {
+                        if tx.send(Ok(chunk.to_vec())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                }
+            }
+        }
+    }
+
+    /// Stream typed edges for one session in bounded chunks.
+    ///
+    /// The default implementation chunks `typed_edge_list_session()` for
+    /// in-memory test backends. CQL storage overrides this with a paged driver
+    /// iterator for scoped viz snapshots.
+    fn typed_edge_stream_session(
+        &self,
+        ctx: TenantContext,
+        session_id: Uuid,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<TypedEdge>>>,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        async move {
+            let chunk_size = chunk_size.max(1);
+            match self.typed_edge_list_session(&ctx, session_id).await {
                 Ok(edges) => {
                     for chunk in edges.chunks(chunk_size) {
                         if tx.send(Ok(chunk.to_vec())).await.is_err() {
@@ -1152,6 +1272,9 @@ pub mod mock {
         pub edge_list_all_calls: AtomicUsize,
         pub edge_list_session_calls: AtomicUsize,
         pub edge_list_for_entity_calls: AtomicUsize,
+        pub derived_cache_get_calls: AtomicUsize,
+        pub derived_cache_get_limited_calls: AtomicUsize,
+        pub derived_cache_get_limited_last_limit: AtomicUsize,
         /// Test hook: when Some, `entity_find_phonetic` returns Err with
         /// this message. Used to verify callers propagate phonetic-scan
         /// errors instead of fail-quieting them into empty results, and
@@ -1162,6 +1285,10 @@ pub mod mock {
         /// with this message. Parallel to `force_phonetic_error` so a
         /// test can target one lookup path without disabling the other.
         pub force_exact_name_error: Mutex<Option<String>>,
+        /// Test hook: when Some, `entity_list_all` returns Err with this
+        /// message. Used to verify operator endpoints surface list-scan
+        /// backpressure instead of converting it into empty successful state.
+        pub force_entity_list_all_error: Mutex<Option<String>>,
         /// Test hook: when Some((entity_type, msg)), `entity_put` returns
         /// Err(msg) for any entry whose `entity_type` matches. Lets a
         /// test simulate transient CQL write failures targeting a
@@ -1540,6 +1667,27 @@ pub mod mock {
                 .count())
         }
 
+        async fn entity_count_matching(
+            &self,
+            ctx: &TenantContext,
+            query: EntityListQuery,
+        ) -> anyhow::Result<usize> {
+            let entities = self.entities.lock().await;
+            Ok(entities
+                .iter()
+                .filter(|entry| {
+                    let in_scope = if let Some(sessions) =
+                        entity_list_sessions(ctx.tenant_id, query.session_id, query.scope)
+                    {
+                        sessions.contains(&entry.session_id)
+                    } else {
+                        true
+                    };
+                    in_scope && entity_matches_list_query(entry, ctx, &query)
+                })
+                .count())
+        }
+
         async fn fold_count(
             &self,
             _ctx: &TenantContext,
@@ -1595,6 +1743,9 @@ pub mod mock {
         }
 
         async fn entity_list_all(&self, _ctx: &TenantContext) -> anyhow::Result<Vec<EntityEntry>> {
+            if let Some(message) = self.force_entity_list_all_error.lock().await.clone() {
+                anyhow::bail!(message);
+            }
             let entities = self.entities.lock().await;
             Ok(entities.clone())
         }
@@ -2204,8 +2355,29 @@ pub mod mock {
             _ctx: &TenantContext,
             cache_key: &str,
         ) -> anyhow::Result<Vec<DerivedFact>> {
+            self.derived_cache_get_calls.fetch_add(1, Ordering::Relaxed);
             let cache = self.derived_cache.lock().await;
             Ok(cache.get(cache_key).cloned().unwrap_or_default())
+        }
+
+        async fn derived_cache_get_limited(
+            &self,
+            _ctx: &TenantContext,
+            cache_key: &str,
+            limit: usize,
+        ) -> anyhow::Result<Vec<DerivedFact>> {
+            self.derived_cache_get_limited_calls
+                .fetch_add(1, Ordering::Relaxed);
+            self.derived_cache_get_limited_last_limit
+                .store(limit, Ordering::Relaxed);
+            let cache = self.derived_cache.lock().await;
+            Ok(cache
+                .get(cache_key)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .take(limit)
+                .collect())
         }
 
         async fn derived_cache_put(
@@ -2251,6 +2423,11 @@ pub mod mock {
             }
             all_rows.truncate(limit);
             Ok(all_rows)
+        }
+
+        async fn derived_cache_count(&self, _ctx: &TenantContext) -> anyhow::Result<usize> {
+            let cache = self.derived_cache.lock().await;
+            Ok(cache.values().map(Vec::len).sum())
         }
 
         async fn derived_cache_ttl_track_put(
