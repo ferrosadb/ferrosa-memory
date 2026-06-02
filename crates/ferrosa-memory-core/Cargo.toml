@@ -43,7 +43,7 @@ nom-supreme = "0.8"
 [dev-dependencies]
 ferrosa-memory-core = { path = ".", features = ["mock-storage", "scylla-driver"] }
 tracing-subscriber = { workspace = true }
-serial_test = "3.2"
+serial_test = "3.5"
 # Self-signed cert generation for HTTPS integration tests — the
 # bug-http-parser-rejects-split-send spec's acceptance criterion
 # is a Python http.client POST over HTTPS, so we need a throwaway
