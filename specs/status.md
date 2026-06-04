@@ -1,6 +1,6 @@
 # ferrosa-memory Development Status
 
-> Last updated: 2026-04-23
+> Last updated: 2026-06-04
 > Status: Living document
 
 ## Overview
@@ -10,8 +10,10 @@
 - shared HTTP auth/startup guardrails
 - converged expert-system governance backends
 - an operator workbench rooted at `/`
-- explicit Sprint 9 work to finish the role-scoped boundary:
-  app-table CQL stays allowed, graph-table writes do not
+- role-scoped serving boundary: app-table CQL stays allowed, graph writes use
+  the public graph seam, and Datalog remains local
+- bounded streaming surfaces for MCP/HTTP, CQL scans, SPARQL passthrough, viz,
+  batch mutations, and consolidation queues
 
 ## Sprint Status
 
@@ -27,8 +29,8 @@
 | Sprint 6 | Complete | Production hardening and type registry |
 | Sprint 7 | Complete | Shared HTTP deployment hardening |
 | Sprint 8 | Complete | Operator workbench, CQL/SPARQL passthrough, local Datalog ownership, rules/approvals/aliases, and live summary fixes are landed. |
-| Sprint 9 | In Progress | Code-side graph-write cutover is landed, but final completion is blocked by a Ferrosa bug: public `TYPED_EDGE` MERGE succeeds without materializing a row. |
-| Sprint 10 | In Progress | `ingest_entities` is landed on the MCP surface, batch entity/edge CRUD tools now use the real storage/graph delete paths, and live embedding generation works on `18765`; remaining work is progress notifications plus closing a Ferrosa-side existing-row backfill visibility / ANN issue. |
+| Sprint 9 | In Progress | Code-side graph-write cutover is landed; final completion is blocked by the Ferrosa public `TYPED_EDGE` MERGE materialization bug. |
+| Sprint 10 | In Progress | `ingest_entities` is the canonical MCP bulk-ingest surface, batch entity/edge CRUD uses real storage/graph backends, and live embedding generation works on `18765`; remaining work is progress notifications plus the Ferrosa-side existing-row backfill visibility / ANN issue. |
 
 ## Current Focus
 
@@ -85,6 +87,7 @@ The remaining architectural correction is narrowed to one external blocker:
 - dead local workbench CQL emulation is removed
 - startup/readiness now succeed on the rebuilt local stack
 - final completion is blocked by Ferrosa not materializing canonical public `TYPED_EDGE` MERGE writes
+- ferrosa-memory does not treat graph-owned backing-table mutation as an acceptable workaround
 
 ### Sprint 10 — In Progress
 
@@ -100,6 +103,19 @@ The server-owned bulk ingest workstream is underway:
 - live `ingest_entities` + `retrieve_entities` verification is green for fresh v2-embedded rows on `http://127.0.0.1:18765/mcp`
 - tenant-wide v2 backfill verification is green: phase 0 reran cleanly for `7555` rows with zero failures, representative old rows now read back with fresh `updated_at` values, and managed-server `hybrid_search` returns `entity_ann` hits from the old partition
 
+### Streaming hardening — Complete for 0.13
+
+- MCP stdio rejects oversized JSON-RPC lines instead of buffering without bound.
+- HTTP request bodies, TLS accept, per-connection request time, and per-IP rate
+  are bounded.
+- CQL list helpers page with explicit caps and surface row-decode errors to
+  stream consumers.
+- SPARQL passthrough is byte-capped and retains only the requested result limit.
+- Viz snapshots, derived-fact routes, workbench summaries, and batch mutation
+  handlers apply limits at the storage boundary.
+- `dispatch_tool` boxes selected handler futures, avoiding large enum futures
+  that previously overflowed tokio worker stacks.
+
 ## Open Workstreams
 
 1. Close the Ferrosa bug where canonical public `TYPED_EDGE` MERGE does not materialize a row.
@@ -110,7 +126,10 @@ The server-owned bulk ingest workstream is underway:
 
 ## Verification Notes
 
-Current local verification on the rebuilt `28765/28766` stack:
+Current local verification has been run in two shapes:
+
+- Standard compose/onboarding ports: `18765` for MCP and `18766` for viz/workbench.
+- Rebuilt isolated stack ports: `28765` for MCP and `28766` for viz/workbench.
 
 - `https://127.0.0.1:28765/healthz/ready` -> `ready`
 - `http://127.0.0.1:28766/workbench/api/summary` -> `ready`

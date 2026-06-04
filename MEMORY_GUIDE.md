@@ -17,7 +17,8 @@ You have a semantic memory system. Use it BEFORE grep, find, or reading files. I
 
 ## Storing Knowledge
 
-- **`smart_ingest`** — ALWAYS use this to store new information. It automatically decides CREATE/UPDATE/SUPERSEDE/SKIP. Do NOT use `upsert_entity` directly.
+- **`smart_ingest`** — Prefer this for durable knowledge. It automatically decides CREATE/UPDATE/SUPERSEDE/SKIP.
+- **`upsert_entity`** — Valid low-level write path when you already know the exact entity shape and do not want smart conflict handling.
 - Store insights, decisions, relationships, and facts — not raw file contents
 - The system learns what's worth keeping
 
@@ -41,10 +42,16 @@ The core tools above cover 90% of cases. When you hit limits, responses suggest 
 
 | Situation | Tool suggested |
 |-----------|---------------|
+| Need nearby raw context | `search_context_segments`, then `get_context_window` |
+| Reusing sub-call output | `check_memo_cache`, then `store_memo_result` after a miss |
 | `hybrid_search` returns few results | `recursive_explore` (multi-pass decomposed search) |
 | `explore_connections` finds few edges | `spread_activation` (broader associative recall) |
 | "How does X relate to Y?" | `find_memory_chain` (shortest path) |
 | Need transitive/inferred relationships | `query_derived` (Datalog inference) |
+| Need scoring or next-context prediction | `importance_score`, `predict_needed` |
+| Need cleanup or quality checks | `find_duplicates`, `run_consolidation` |
+| Need governance / operator state | `manage_rules`, `manage_claims`, `manage_approvals`, `manage_aliases`, `explain_derived`, `get_effective_rule_set` |
+| Need derived facts promoted or listed | `promote_predicate`, `list_derived_cache` |
 | 10+ new entities, no edges discovered | `run_consolidation` (discover CO_OCCURS patterns) |
 
 ## Feedback: When Memory Falls Short
@@ -65,7 +72,7 @@ Every retrieval miss trains the system to store that kind of information in the 
 ## What NOT to Do
 
 - Don't grep/find/read files before checking memory
-- Don't use `upsert_entity` — use `smart_ingest`
+- Don't default to `upsert_entity` when `smart_ingest` can handle conflict semantics for you
 - Don't store every sentence — store the insight worth remembering
 - Don't skip edge creation — unconnected entities are wasted knowledge
 - Don't ignore `check_intentions` — that's where your future self left you notes

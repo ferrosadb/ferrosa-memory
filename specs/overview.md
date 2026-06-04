@@ -45,18 +45,25 @@ graph LR
 
 ## Boundary Correction
 
-Current code reality and target architecture are not the same.
+The role-scoped boundary is now implemented in the main serving path.
 
-- **Current reality:** the runtime still embeds direct CQL storage through `cdrs-tokio` and `CqlStorage`; graph traversals already use the public HTTP Cypher endpoint, but graph writes still bypass that interface and target graph-owned backing tables directly.
-- **Required target:** direct CQL driver usage remains acceptable for app-owned tables and compatible with the `app_reader` rollout, but graph writes must go through Ferrosa's graph interfaces. `ferrosa-memory` should fail loudly when public query interfaces do not behave as advertised, rather than emulating missing semantics locally.
+- **Current reality:** the runtime uses the Scylla Rust driver through
+  `CqlStorage` for app-owned tables; graph traversals and graph writes route
+  through the public graph client seam. Workbench CQL and SPARQL routes are
+  authenticated passthrough surfaces, while Datalog remains a local
+  ferrosa-memory inference engine over Ferrosa-backed data.
+- **Remaining blocker:** Ferrosa's public `TYPED_EDGE` MERGE path can return
+  success without materializing the expected typed-edge row. `ferrosa-memory`
+  treats that as a Ferrosa public-interface bug rather than writing graph-owned
+  backing tables directly.
 
 This correction is tracked in [ADR-005](./decisions/adr-005-endpoint-only-ferrosa-client.md).
 
 ## Bulk Ingest Boundary
 
-`ferrosa-memory` also needs a server-owned bulk ingest surface for application data. The current tool mix (`batch_ingest`, `smart_ingest`, skill-specific ingest flows, and external loaders) is not yet the clean contract future ingestors need.
-
-Required direction:
+`ferrosa-memory` now exposes a server-owned bulk ingest surface for application
+data. `ingest_entities` is the canonical contract for semantic entity plus
+typed-edge ingest.
 
 - clients send semantic entities and typed edges in one `ingest_entities` MCP call
 - `ferrosa-memory` owns schema mapping, idempotency, dry-run behavior, and structured per-row failures
@@ -89,9 +96,9 @@ The rule-loader convergence and governance backend surfaces are now implemented 
 
 - **Language:** Rust (Tokio async runtime)
 - **MCP protocol:** JSON-RPC over stdio or HTTP+SSE
-- **Current storage implementation:** direct CQL driver via `cdrs-tokio` v9 in the runtime path
-- **Current graph client:** HTTP POST to Ferrosa's public Cypher endpoint via `reqwest` for reads; write routing still needs to move behind the same public graph interface
-- **Target Ferrosa integration:** direct CQL for app tables, graph writes through Cypher/graph interfaces, public CQL/SPARQL passthrough for operator inspection, repo-owned Datalog evaluation in `ferrosa-memory`, and a server-owned `ingest_entities` bulk ingest contract for app data
+- **Current storage implementation:** direct CQL driver via the Scylla Rust driver in the runtime path
+- **Current graph client:** HTTP POST to Ferrosa's public Cypher endpoint via `reqwest` for reads and graph-write seam calls
+- **Target Ferrosa integration:** direct CQL for app tables, graph writes through Cypher/graph interfaces, public CQL/SPARQL passthrough for operator inspection, repo-owned Datalog evaluation in `ferrosa-memory`, and the server-owned `ingest_entities` bulk ingest contract for app data
 - **Compression:** Rust-native implementation (no Python — LLMLingua algorithm ported to Rust)
 - **Embedding:** HTTP call to Ollama endpoint (nomic-embed-text, 768 dimensions)
 - **Serialization:** `serde` + `serde_json`

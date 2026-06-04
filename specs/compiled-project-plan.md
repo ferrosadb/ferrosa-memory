@@ -3,7 +3,11 @@
 **Generated:** 2026-04-22T00:00:00Z
 **Planning basis:** `ferrosa-memory` needs a single semantic ingest seam for forge and future ingestors. Clients should stop owning CQL schema details, loader subprocesses, embedding plumbing, and silent partial-failure handling. The server should absorb schema drift, conflict semantics, dry-run planning, and progress reporting.
 
-**Current state (2026-04-22):** adjacent ingest surfaces (`batch_ingest`, `smart_ingest`, `ingest_skill`, `create_edge`) exist, but there is no single `ingest_entities` contract that covers semantic bulk entities + typed edges with row-level failure reporting, server-owned schema mapping, and dry-run support.
+**Historical state (2026-04-22):** adjacent ingest surfaces (`batch_ingest`, `smart_ingest`, `ingest_skill`, `create_edge`) existed, but there was no single `ingest_entities` contract that covered semantic bulk entities + typed edges with row-level failure reporting, server-owned schema mapping, and dry-run support.
+
+**Current note (2026-06-04):** `ingest_entities` is now implemented and
+discoverable via `tools/list`. This compiled plan is retained as historical
+traceability for the work packets rather than the current roadmap.
 
 **Total tasks:** 8
 **Estimated parallel batches:** 4

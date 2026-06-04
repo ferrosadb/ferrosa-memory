@@ -39,9 +39,17 @@ graph LR
 
 **Boundary rule:** `ferrosa-memory` may use Ferrosa's public wire protocols, including direct CQL via the Rust driver, but it must not treat graph-owned backing tables as a public API. Workbench query surfaces should be passthrough clients, and bugs in those public interfaces should be fixed in Ferrosa rather than papered over locally.
 
-**Current implementation note:** the runtime still contains direct `CqlStorage` coupling in places. See [overview.md](overview.md) and [dsm-analysis.md](dsm-analysis.md) for the current-vs-target gap and refactor direction.
+**Current implementation note:** direct `CqlStorage` remains the app-table client
+for server-owned memory tables. Graph reads/writes go through the graph client
+seam; the remaining blocker is Ferrosa public `TYPED_EDGE` MERGE materialization.
+See [overview.md](overview.md) and [dsm-analysis.md](dsm-analysis.md).
 
-**32+ MCP tools** across 8 functional groups: memoization, plan state, trajectory folds, entity graph, temporal chains, feedback/routing, cognitive memory (spreading activation, dream consolidation, importance scoring, intention tracking), and hybrid search. Entity type schemas are dynamic — loaded from the `entity_types` registry table at startup.
+**61 MCP tools** are defined in `crates/ferrosa-memory-core/src/dispatch.rs`.
+The registry covers context segments, memoization, plan state, trajectory folds,
+entity graph, bulk ingest, temporal chains, feedback/routing, skills,
+intentions, cognitive memory, governance, derived facts, and hybrid search.
+Entity type schemas are dynamic — loaded from the `entity_types` registry table
+at startup.
 
 ## Index
 

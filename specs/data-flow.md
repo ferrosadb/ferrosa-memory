@@ -78,7 +78,10 @@ sequenceDiagram
     D-->>C: MCP result + progress notifications
 ```
 
-Current implementation note: this is target-state architecture. The current codebase has adjacent ingest tools, but not yet a single server-owned `ingest_entities` contract with structured batch failure semantics.
+Current implementation note: `ingest_entities` is implemented as the
+server-owned contract for semantic entities plus typed edges, with schema
+mapping, dry-run behavior, strict edge validation, and structured row-level
+failures owned by `ferrosa-memory`.
 
 ## 2. Memoization Write Path
 
