@@ -17,7 +17,7 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Top-level configuration.
 #[derive(Debug, Deserialize)]
@@ -47,6 +47,8 @@ pub struct Config {
     pub promotion: PromotionConfig,
     #[serde(default)]
     pub enrich: EnrichConfig,
+    #[serde(default)]
+    pub judge: JudgeConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -268,6 +270,51 @@ fn default_enrich_batch() -> usize {
 }
 fn default_enrich_max_tokens() -> u32 {
     2048
+}
+
+/// Judge model configuration for evaluation and reranker-feedback workflows.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct JudgeConfig {
+    /// Provider family. Supported UI probes include `ollama`, `lmstudio`, and `openai_compatible`.
+    #[serde(default = "default_judge_provider")]
+    pub provider: String,
+    /// Base URL for the model provider.
+    #[serde(default = "default_judge_base_url")]
+    pub base_url: String,
+    /// Model name used for judge calls.
+    #[serde(default = "default_judge_model")]
+    pub model: String,
+    /// Optional bearer/API token. Runtime GET endpoints redact this value.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Request timeout for judge/model discovery calls.
+    #[serde(default = "default_judge_timeout_seconds")]
+    pub timeout_seconds: u64,
+}
+
+impl Default for JudgeConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_judge_provider(),
+            base_url: default_judge_base_url(),
+            model: default_judge_model(),
+            token: None,
+            timeout_seconds: default_judge_timeout_seconds(),
+        }
+    }
+}
+
+fn default_judge_provider() -> String {
+    "ollama".into()
+}
+fn default_judge_base_url() -> String {
+    "http://127.0.0.1:11434".into()
+}
+fn default_judge_model() -> String {
+    "qwen3.5:27b".into()
+}
+fn default_judge_timeout_seconds() -> u64 {
+    30
 }
 
 #[derive(Debug, Deserialize)]
@@ -1395,6 +1442,37 @@ port = 9999
         assert_eq!(cfg.ollama_base_url, "http://127.0.0.1:11434");
         assert_eq!(cfg.model, "nomic-embed-text-v2-moe");
         assert_eq!(cfg.dimensions, 768);
+    }
+
+    #[test]
+    fn judge_config_defaults_to_local_ollama_without_token() {
+        let cfg = JudgeConfig::default();
+        assert_eq!(cfg.provider, "ollama");
+        assert_eq!(cfg.base_url, "http://127.0.0.1:11434");
+        assert_eq!(cfg.model, "qwen3.5:27b");
+        assert_eq!(cfg.token, None);
+        assert_eq!(cfg.timeout_seconds, 30);
+    }
+
+    #[test]
+    fn parse_judge_config_fields() {
+        let toml = r#"
+[ferrosa]
+contact_points = ["localhost:9042"]
+
+[judge]
+provider = "lmstudio"
+base_url = "http://127.0.0.1:1234"
+model = "qwen3"
+token = "secret"
+timeout_seconds = 12
+"#;
+        let config = parse_config(toml).expect("should parse judge config");
+        assert_eq!(config.judge.provider, "lmstudio");
+        assert_eq!(config.judge.base_url, "http://127.0.0.1:1234");
+        assert_eq!(config.judge.model, "qwen3");
+        assert_eq!(config.judge.token.as_deref(), Some("secret"));
+        assert_eq!(config.judge.timeout_seconds, 12);
     }
 
     #[test]

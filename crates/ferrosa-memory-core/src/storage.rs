@@ -14,12 +14,13 @@
 use uuid::Uuid;
 
 use crate::context_segment::{ContextSegment, TemporalEdge};
+use crate::migration::{MIGRATIONS, MigrationStatus, PRE_VERSIONING_BASELINE};
 use crate::types::{
-    AliasEntry, ApprovalEntry, AuditEntry, ConfidenceScore, DerivedFact, EntityEntry,
-    EntityListQuery, EntityListScope, EntityTypeStateCount, FeedbackOutcome, FoldEntry,
-    FoldSummary, MaterializedEdge, MemoEntry, MemoryState, PlanNode, PlanStatus, PromotedPredicate,
-    ProvenanceStep, RuleEntry, RuleState, TemporalEvent, TenantContext, ToolUsageRow, TypedEdge,
-    WarmthEntry,
+    AliasEntry, ApprovalEntry, AuditEntry, ConfidenceScore, DerivedFact, DocumentChunk,
+    EntityEntry, EntityListQuery, EntityListScope, EntityTypeStateCount, FeedbackOutcome,
+    FoldEntry, FoldSummary, MaterializedEdge, MemoEntry, MemoryState, PlanNode, PlanStatus,
+    PromotedPredicate, ProvenanceStep, RuleEntry, RuleState, TemporalEvent, TenantContext,
+    ToolUsageRow, TypedEdge, WarmthEntry,
 };
 
 pub(crate) fn entity_list_sessions(
@@ -260,6 +261,23 @@ pub trait Storage: Send + Sync {
         entity_type: &str,
     ) -> impl std::future::Future<Output = anyhow::Result<Option<EntityEntry>>> + Send;
 
+    /// Exact `(entity_name, entity_type)` lookup across every session in the
+    /// tenant. Used for conservative cross-session duplicate suppression.
+    fn entity_find_by_exact_name_any_session(
+        &self,
+        ctx: &TenantContext,
+        name: &str,
+        entity_type: &str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<EntityEntry>>> + Send {
+        async move {
+            Ok(self.entity_list_all(ctx).await?.into_iter().find(|entry| {
+                entry.tenant_id == ctx.tenant_id
+                    && entry.entity_name == name
+                    && entry.entity_type == entity_type
+            }))
+        }
+    }
+
     /// Get a single entity by primary key (targeted lookup, no scan).
     fn entity_get_by_id(
         &self,
@@ -363,6 +381,50 @@ pub trait Storage: Send + Sync {
         ctx: &TenantContext,
         session_id: Uuid,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<EntityTypeStateCount>>> + Send;
+
+    // --- Document chunk retrieval plane ---
+
+    /// Store one semantic document chunk plus its retrieval indexes.
+    fn document_chunk_put(
+        &self,
+        ctx: &TenantContext,
+        chunk: &DocumentChunk,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// Get a document chunk by ID.
+    fn document_chunk_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        chunk_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<DocumentChunk>>> + Send;
+
+    /// Search document chunks by lexical/BM25-style term index.
+    fn document_chunk_search_bm25(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        query: &str,
+        k: usize,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<DocumentChunk>>> + Send;
+
+    /// Search document chunks by phonetic term index.
+    fn document_chunk_search_phonetic(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        query: &str,
+        k: usize,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<DocumentChunk>>> + Send;
+
+    /// Search document chunks by ANN over chunk embeddings.
+    fn document_chunk_search_ann(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        query_embedding: &[f32],
+        k: usize,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<DocumentChunk>>> + Send;
 
     /// List all entities for a tenant (for viz snapshot).
     fn entity_list_all(
@@ -1221,6 +1283,25 @@ pub trait Storage: Send + Sync {
         entity_id: Uuid,
         fact_hash: &str,
     ) -> impl std::future::Future<Output = anyhow::Result<Option<ConfidenceScore>>> + Send;
+
+    /// Read-only migration status for operator diagnostics.
+    fn migration_status(
+        &self,
+    ) -> impl std::future::Future<Output = anyhow::Result<MigrationStatus>> + Send {
+        async move {
+            let binary_version = MIGRATIONS
+                .iter()
+                .map(|m| m.version)
+                .max()
+                .unwrap_or(PRE_VERSIONING_BASELINE);
+            Ok(MigrationStatus {
+                db_version: binary_version,
+                binary_version,
+                pending: Vec::new(),
+                last_applied: None,
+            })
+        }
+    }
 }
 
 /// In-memory mock storage for unit tests.
@@ -1268,6 +1349,7 @@ pub mod mock {
         pub typed_edges: Mutex<Vec<TypedEdge>>,
         pub confidence_scores: Mutex<Vec<ConfidenceScore>>,
         pub context_segments: Mutex<Vec<ContextSegment>>,
+        pub document_chunks: Mutex<Vec<DocumentChunk>>,
         pub temporal_edges: Mutex<Vec<TemporalEdge>>,
         pub edge_list_all_calls: AtomicUsize,
         pub edge_list_session_calls: AtomicUsize,
@@ -1739,6 +1821,109 @@ pub mod mock {
                         .expect("known MemoryState string"),
                     count,
                 })
+                .collect())
+        }
+
+        async fn document_chunk_put(
+            &self,
+            ctx: &TenantContext,
+            chunk: &DocumentChunk,
+        ) -> anyhow::Result<()> {
+            let mut chunks = self.document_chunks.lock().await;
+            let mut chunk = chunk.clone();
+            chunk.tenant_id = ctx.tenant_id;
+            if let Some(pos) = chunks
+                .iter()
+                .position(|existing| existing.chunk_id == chunk.chunk_id)
+            {
+                chunks[pos] = chunk;
+            } else {
+                chunks.push(chunk);
+            }
+            Ok(())
+        }
+
+        async fn document_chunk_get(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+            chunk_id: Uuid,
+        ) -> anyhow::Result<Option<DocumentChunk>> {
+            let chunks = self.document_chunks.lock().await;
+            Ok(chunks
+                .iter()
+                .find(|chunk| {
+                    chunk.tenant_id == ctx.tenant_id
+                        && chunk.session_id == session_id
+                        && chunk.chunk_id == chunk_id
+                })
+                .cloned())
+        }
+
+        async fn document_chunk_search_bm25(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+            query: &str,
+            k: usize,
+        ) -> anyhow::Result<Vec<DocumentChunk>> {
+            let terms: Vec<String> = query
+                .split(|c: char| !c.is_alphanumeric())
+                .filter_map(|part| {
+                    let term = part.trim().to_ascii_lowercase();
+                    (term.len() >= 3).then_some(term)
+                })
+                .collect();
+            let chunks = self.document_chunks.lock().await;
+            let mut scored: Vec<(usize, DocumentChunk)> = chunks
+                .iter()
+                .filter(|chunk| chunk.tenant_id == ctx.tenant_id && chunk.session_id == session_id)
+                .filter_map(|chunk| {
+                    let text = chunk.bm25_text.to_ascii_lowercase();
+                    let score = terms
+                        .iter()
+                        .filter(|term| text.contains(term.as_str()))
+                        .count();
+                    (score > 0).then(|| (score, chunk.clone()))
+                })
+                .collect();
+            scored.sort_by(|left, right| {
+                right
+                    .0
+                    .cmp(&left.0)
+                    .then_with(|| left.1.ordinal.cmp(&right.1.ordinal))
+            });
+            Ok(scored.into_iter().take(k).map(|(_, chunk)| chunk).collect())
+        }
+
+        async fn document_chunk_search_phonetic(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+            query: &str,
+            k: usize,
+        ) -> anyhow::Result<Vec<DocumentChunk>> {
+            self.document_chunk_search_bm25(ctx, session_id, query, k)
+                .await
+        }
+
+        async fn document_chunk_search_ann(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+            _query_embedding: &[f32],
+            k: usize,
+        ) -> anyhow::Result<Vec<DocumentChunk>> {
+            let chunks = self.document_chunks.lock().await;
+            Ok(chunks
+                .iter()
+                .filter(|chunk| {
+                    chunk.tenant_id == ctx.tenant_id
+                        && chunk.session_id == session_id
+                        && chunk.chunk_embedding.is_some()
+                })
+                .take(k)
+                .cloned()
                 .collect())
         }
 

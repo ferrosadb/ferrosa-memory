@@ -33,6 +33,7 @@ pub mod datalog;
 pub mod datalog_filter_expr;
 pub mod dedup;
 pub mod dispatch;
+pub mod document_chunking;
 pub mod dream;
 pub mod embedding;
 pub mod enrich;

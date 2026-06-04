@@ -15,6 +15,14 @@ pub struct SearchResult {
     pub content: String,
     pub score: f64,
     pub result_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prev_chunk_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_chunk_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 /// Configuration for 6-signal RRF fusion weights.
@@ -24,11 +32,19 @@ pub struct FusionConfig {
     pub phonetic_weight: f64,
     pub ann_weight: f64,
     pub fold_weight: f64,
+    pub context_bm25_weight: f64,
+    pub context_ann_weight: f64,
+    pub document_bm25_weight: f64,
+    pub document_ann_weight: f64,
+    pub document_phonetic_weight: f64,
     pub warmth_weight: f64,
     pub pagerank_weight: f64,
     /// Reputation signal weight. Moderate (0.5) to demote bad entities
     /// without a single negative event burying good information.
     pub reputation_weight: f64,
+    /// Workspace affinity signal weight. Boosts entities learned in or near
+    /// the caller's working directory without filtering out global knowledge.
+    pub workspace_weight: f64,
 }
 
 impl Default for FusionConfig {
@@ -37,9 +53,15 @@ impl Default for FusionConfig {
             phonetic_weight: 1.0,
             ann_weight: 1.0,
             fold_weight: 1.0,
+            context_bm25_weight: 1.5,
+            context_ann_weight: 1.0,
+            document_bm25_weight: 2.5,
+            document_ann_weight: 1.5,
+            document_phonetic_weight: 1.0,
             warmth_weight: 1.0,
             pagerank_weight: 1.0,
             reputation_weight: 0.5,
+            workspace_weight: 2.0,
         }
     }
 }
@@ -105,6 +127,84 @@ pub struct SearchFilter {
     pub entity_types: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_cwd: Option<String>,
+}
+
+fn normalize_workspace_path(path: &str) -> String {
+    let mut normalized = path.trim().trim_end_matches('/').to_string();
+    if normalized.is_empty() {
+        return String::new();
+    }
+    while normalized.contains("//") {
+        normalized = normalized.replace("//", "/");
+    }
+    normalized
+}
+
+fn workspace_affinity_score(query_cwd: &str, candidate_cwd: &str) -> Option<f64> {
+    let query = normalize_workspace_path(query_cwd);
+    let candidate = normalize_workspace_path(candidate_cwd);
+    if query.is_empty() || candidate.is_empty() {
+        return None;
+    }
+    if query == candidate {
+        return Some(3.0);
+    }
+    let query_child = query
+        .strip_prefix(&candidate)
+        .is_some_and(|rest| rest.starts_with('/'));
+    let candidate_child = candidate
+        .strip_prefix(&query)
+        .is_some_and(|rest| rest.starts_with('/'));
+    if query_child || candidate_child {
+        Some(2.0)
+    } else {
+        None
+    }
+}
+
+fn workspace_candidate_paths(properties: &serde_json::Value) -> Vec<&str> {
+    [
+        "cwd",
+        "workspace",
+        "working_directory",
+        "repo",
+        "repository",
+    ]
+    .iter()
+    .filter_map(|key| properties.get(*key).and_then(|v| v.as_str()))
+    .collect()
+}
+
+fn workspace_feedback_adjustment(query_cwd: &str, properties: &serde_json::Value) -> f64 {
+    let Some(feedback) = properties
+        .get("workspace_feedback")
+        .and_then(|value| value.as_object())
+    else {
+        return 0.0;
+    };
+    let mut total = 0.0;
+    for entry in feedback.values() {
+        let Some(cwd) = entry.get("cwd").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let Some(affinity) = workspace_affinity_score(query_cwd, cwd) else {
+            continue;
+        };
+        let factor = if affinity >= 3.0 { 1.0 } else { 0.67 };
+        if let Some(score) = entry.get("score").and_then(|value| value.as_f64()) {
+            total += score * factor;
+        }
+        if let Some(mechanisms) = entry.get("mechanisms").and_then(|value| value.as_object()) {
+            for mechanism in mechanisms.values() {
+                if let Some(score) = mechanism.get("score").and_then(|value| value.as_f64()) {
+                    total += score * factor;
+                }
+            }
+        }
+    }
+    total.clamp(-1.0, 1.0)
 }
 
 /// Resolve the list of session partitions to query given the caller's session
@@ -170,6 +270,10 @@ pub async fn hybrid_search(
                         content: e.context_snippet.clone(),
                         score: 1.0 - (i as f64 * 0.1), // rank decay
                         result_type: "entity".into(),
+                        document_id: None,
+                        prev_chunk_id: None,
+                        next_chunk_id: None,
+                        hint: None,
                     })
                     .collect(),
             );
@@ -189,6 +293,10 @@ pub async fn hybrid_search(
                         content: e.context_snippet,
                         score: 1.0,
                         result_type: "entity".into(),
+                        document_id: None,
+                        prev_chunk_id: None,
+                        next_chunk_id: None,
+                        hint: None,
                     })
                     .collect(),
             );
@@ -208,10 +316,145 @@ pub async fn hybrid_search(
                         content: f.fold_summary,
                         score: f.similarity.unwrap_or(0.0),
                         result_type: "fold".into(),
+                        document_id: None,
+                        prev_chunk_id: None,
+                        next_chunk_id: None,
+                        hint: None,
                     })
                     .collect(),
             );
             weights.push(config.fold_weight);
+        }
+
+        // Strategy 4: raw context lexical/BM25 search over semantic segments.
+        if let Ok(segments) = storage
+            .context_segment_search_bm25(ctx, sid, query, limit)
+            .await
+            && !segments.is_empty()
+        {
+            lists.push(
+                segments
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, segment)| SearchResult {
+                        id: segment.segment_id,
+                        source: "context_bm25".into(),
+                        content: segment.segment_text,
+                        score: 1.0 - (i as f64 * 0.1),
+                        result_type: "context_segment".into(),
+                        document_id: None,
+                        prev_chunk_id: None,
+                        next_chunk_id: None,
+                        hint: Some("This is a raw context segment. Use ctx_window with this segment_id when adjacent turns may contain the rest of the answer.".into()),
+                    })
+                    .collect(),
+            );
+            weights.push(config.context_bm25_weight);
+        }
+
+        // Strategy 5: raw context ANN search over semantic segment embeddings.
+        if let Some(emb) = embedding
+            && let Ok(segments) = storage
+                .context_segment_search_ann(ctx, sid, emb, limit)
+                .await
+            && !segments.is_empty()
+        {
+            lists.push(
+                segments
+                    .into_iter()
+                    .map(|segment| SearchResult {
+                        id: segment.segment_id,
+                        source: "context_ann".into(),
+                        content: segment.segment_text,
+                        score: 1.0,
+                        result_type: "context_segment".into(),
+                        document_id: None,
+                        prev_chunk_id: None,
+                        next_chunk_id: None,
+                        hint: Some("This vector-matched context segment has temporal neighbors. Use ctx_window for bounded prev/next expansion.".into()),
+                    })
+                    .collect(),
+            );
+            weights.push(config.context_ann_weight);
+        }
+
+        // Strategy 6: document lexical/BM25 search over semantic chunks.
+        if let Ok(chunks) = storage
+            .document_chunk_search_bm25(ctx, sid, query, limit)
+            .await
+            && !chunks.is_empty()
+        {
+            lists.push(
+                chunks
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, chunk)| SearchResult {
+                        id: chunk.chunk_id,
+                        source: "document_bm25".into(),
+                        content: chunk.content,
+                        score: 1.0 - (i as f64 * 0.1),
+                        result_type: "document_chunk".into(),
+                        document_id: Some(chunk.document_id),
+                        prev_chunk_id: chunk.prev_chunk_id,
+                        next_chunk_id: chunk.next_chunk_id,
+                        hint: Some("This is a semantic document chunk. If surrounding list items or adjacent context may matter, call chunk_ctx with prev/next expansion.".into()),
+                    })
+                    .collect(),
+            );
+            weights.push(config.document_bm25_weight);
+        }
+
+        // Strategy 7: document phonetic term search. This helps doc IDs,
+        // titles, and spelling variants contribute candidates before RRF.
+        if let Ok(chunks) = storage
+            .document_chunk_search_phonetic(ctx, sid, query, limit)
+            .await
+            && !chunks.is_empty()
+        {
+            lists.push(
+                chunks
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, chunk)| SearchResult {
+                        id: chunk.chunk_id,
+                        source: "document_phonetic".into(),
+                        content: chunk.content,
+                        score: 1.0 - (i as f64 * 0.1),
+                        result_type: "document_chunk".into(),
+                        document_id: Some(chunk.document_id),
+                        prev_chunk_id: chunk.prev_chunk_id,
+                        next_chunk_id: chunk.next_chunk_id,
+                        hint: Some("This document chunk has linked neighbors. Use chunk_ctx when the answer depends on adjacent context.".into()),
+                    })
+                    .collect(),
+            );
+            weights.push(config.document_phonetic_weight);
+        }
+
+        // Strategy 8: document ANN search over chunk embeddings.
+        if let Some(emb) = embedding
+            && let Ok(chunks) = storage
+                .document_chunk_search_ann(ctx, sid, emb, limit)
+                .await
+            && !chunks.is_empty()
+        {
+            lists.push(
+                chunks
+                    .into_iter()
+                    .map(|chunk| SearchResult {
+                        id: chunk.chunk_id,
+                        source: "document_ann".into(),
+                        content: chunk.content,
+                        score: 1.0,
+                        result_type: "document_chunk".into(),
+                        document_id: Some(chunk.document_id),
+                        prev_chunk_id: chunk.prev_chunk_id,
+                        next_chunk_id: chunk.next_chunk_id,
+                        hint: Some("This is a vector-matched semantic document chunk. Use chunk_ctx for neighboring context.".into()),
+                    })
+                    .collect(),
+            );
+            weights.push(config.document_ann_weight);
         }
     }
 
@@ -227,6 +470,10 @@ pub async fn hybrid_search(
                     content: r.content.clone(),
                     score: *score,
                     result_type: r.result_type.clone(),
+                    document_id: r.document_id,
+                    prev_chunk_id: r.prev_chunk_id,
+                    next_chunk_id: r.next_chunk_id,
+                    hint: r.hint.clone(),
                 })
             })
             .collect();
@@ -252,6 +499,10 @@ pub async fn hybrid_search(
                     content: r.content.clone(),
                     score: *score,
                     result_type: r.result_type.clone(),
+                    document_id: r.document_id,
+                    prev_chunk_id: r.prev_chunk_id,
+                    next_chunk_id: r.next_chunk_id,
+                    hint: r.hint.clone(),
                 })
             })
             .collect();
@@ -279,6 +530,10 @@ pub async fn hybrid_search(
                     content: r.content.clone(),
                     score: score + 1.0, // shift [-1,1] to [0,2] for ranking
                     result_type: r.result_type.clone(),
+                    document_id: r.document_id,
+                    prev_chunk_id: r.prev_chunk_id,
+                    next_chunk_id: r.next_chunk_id,
+                    hint: r.hint.clone(),
                 })
             })
             .collect();
@@ -292,7 +547,76 @@ pub async fn hybrid_search(
         weights.push(config.reputation_weight);
     }
 
-    let merged = rrf_merge(lists, 60.0, &weights);
+    // Strategy 7: Workspace affinity — if the caller supplies cwd/repo context,
+    // rank candidates learned in that same tree higher. This is intentionally
+    // a boost rather than a filter because cross-repo facts can still be useful.
+    if let Some(workspace_cwd) = filter.and_then(|f| f.workspace_cwd.as_deref())
+        && !workspace_cwd.trim().is_empty()
+    {
+        let mut workspace_ranked = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for candidate in lists.iter().flatten().filter(|r| r.result_type == "entity") {
+            if !seen.insert(candidate.id) {
+                continue;
+            }
+            for sid in &sessions {
+                if let Ok(Some(entity)) = storage.entity_get_by_id(ctx, *sid, candidate.id).await {
+                    let score = workspace_candidate_paths(&entity.properties)
+                        .into_iter()
+                        .filter_map(|path| workspace_affinity_score(workspace_cwd, path))
+                        .fold(None, |best: Option<f64>, score| {
+                            Some(best.map_or(score, |b| b.max(score)))
+                        });
+                    if let Some(score) = score {
+                        workspace_ranked.push(SearchResult {
+                            id: candidate.id,
+                            source: "workspace".to_string(),
+                            content: candidate.content.clone(),
+                            score,
+                            result_type: candidate.result_type.clone(),
+                            document_id: candidate.document_id,
+                            prev_chunk_id: candidate.prev_chunk_id,
+                            next_chunk_id: candidate.next_chunk_id,
+                            hint: candidate.hint.clone(),
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+        workspace_ranked.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if !workspace_ranked.is_empty() {
+            lists.push(workspace_ranked);
+            weights.push(config.workspace_weight);
+        }
+    }
+
+    let mut merged = rrf_merge(lists, 60.0, &weights);
+    if let Some(workspace_cwd) = filter.and_then(|f| f.workspace_cwd.as_deref())
+        && !workspace_cwd.trim().is_empty()
+    {
+        for result in &mut merged {
+            if result.result_type != "entity" {
+                continue;
+            }
+            for sid in &sessions {
+                if let Ok(Some(entity)) = storage.entity_get_by_id(ctx, *sid, result.id).await {
+                    result.score +=
+                        workspace_feedback_adjustment(workspace_cwd, &entity.properties) * 0.02;
+                    break;
+                }
+            }
+        }
+        merged.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
     Ok(merged.into_iter().take(limit).collect())
 }
 
@@ -307,7 +631,70 @@ mod tests {
             content: format!("content-{source}"),
             score,
             result_type: "entity".into(),
+            document_id: None,
+            prev_chunk_id: None,
+            next_chunk_id: None,
+            hint: None,
         }
+    }
+
+    #[test]
+    fn workspace_affinity_scores_exact_and_tree_matches() {
+        assert_eq!(
+            workspace_affinity_score("/repo/project", "/repo/project"),
+            Some(3.0)
+        );
+        assert_eq!(
+            workspace_affinity_score("/repo/project/crate", "/repo/project"),
+            Some(2.0)
+        );
+        assert_eq!(
+            workspace_affinity_score("/repo/project", "/repo/project/crate"),
+            Some(2.0)
+        );
+        assert_eq!(workspace_affinity_score("/repo/a", "/repo/b"), None);
+    }
+
+    #[test]
+    fn workspace_candidate_paths_reads_supported_property_names() {
+        let properties = serde_json::json!({
+            "cwd": "/repo/current",
+            "workspace": "/repo/workspace",
+            "working_directory": "/repo/wd",
+            "repo": "/repo/root",
+            "repository": "/repo/name",
+            "other": "/ignored"
+        });
+        let paths = workspace_candidate_paths(&properties);
+        assert_eq!(paths.len(), 5);
+        assert!(paths.contains(&"/repo/current"));
+        assert!(paths.contains(&"/repo/root"));
+    }
+
+    #[test]
+    fn workspace_feedback_adjustment_demotes_current_workspace_only() {
+        let properties = serde_json::json!({
+            "workspace_feedback": {
+                "local": {
+                    "cwd": "/repo/project",
+                    "score": -0.2,
+                    "mechanisms": {
+                        "hybrid_search": {"score": -0.4},
+                        "phonetic": {"score": 0.1}
+                    }
+                },
+                "other": {
+                    "cwd": "/repo/other",
+                    "score": -1.0
+                }
+            }
+        });
+        let local = workspace_feedback_adjustment("/repo/project", &properties);
+        let child = workspace_feedback_adjustment("/repo/project/crate", &properties);
+        let other = workspace_feedback_adjustment("/repo/unrelated", &properties);
+        assert!(local < -0.49 && local > -0.51);
+        assert!(child < -0.32 && child > -0.35);
+        assert_eq!(other, 0.0);
     }
 
     #[test]
@@ -360,10 +747,12 @@ mod tests {
             scope: SearchScope::Both,
             entity_types: Some(vec!["skill".into()]),
             tags: Some(vec!["testing".into(), "quality".into()]),
+            workspace_cwd: Some("/repo/project".into()),
         };
         let json = serde_json::to_string(&filter).unwrap();
         let back: SearchFilter = serde_json::from_str(&json).unwrap();
         assert_eq!(back.scope, SearchScope::Both);
+        assert_eq!(back.workspace_cwd.as_deref(), Some("/repo/project"));
         assert_eq!(back.entity_types, Some(vec!["skill".into()]));
         assert_eq!(back.tags, Some(vec!["testing".into(), "quality".into()]));
     }
@@ -378,22 +767,11 @@ mod tests {
     fn rrf_merge_single_list() {
         let id1 = Uuid::new_v4();
         let id2 = Uuid::new_v4();
-        let list = vec![
-            SearchResult {
-                id: id1,
-                source: "a".into(),
-                content: "first".into(),
-                score: 1.0,
-                result_type: "entity".into(),
-            },
-            SearchResult {
-                id: id2,
-                source: "a".into(),
-                content: "second".into(),
-                score: 1.0,
-                result_type: "entity".into(),
-            },
-        ];
+        let mut first = make_result(id1, "a", 1.0);
+        first.content = "first".into();
+        let mut second = make_result(id2, "a", 1.0);
+        second.content = "second".into();
+        let list = vec![first, second];
         let merged = rrf_merge(vec![list], 60.0, &[1.0]);
         assert_eq!(merged.len(), 2);
         // Rank 0 score: 1/(60+0+1) = 1/61
@@ -409,29 +787,15 @@ mod tests {
         let shared_id = Uuid::new_v4();
         let unique_id = Uuid::new_v4();
 
-        let list_a = vec![SearchResult {
-            id: shared_id,
-            source: "a".into(),
-            content: "shared".into(),
-            score: 1.0,
-            result_type: "entity".into(),
-        }];
-        let list_b = vec![
-            SearchResult {
-                id: unique_id,
-                source: "b".into(),
-                content: "unique".into(),
-                score: 1.0,
-                result_type: "fold".into(),
-            },
-            SearchResult {
-                id: shared_id,
-                source: "b".into(),
-                content: "shared".into(),
-                score: 1.0,
-                result_type: "entity".into(),
-            },
-        ];
+        let mut shared_a = make_result(shared_id, "a", 1.0);
+        shared_a.content = "shared".into();
+        let list_a = vec![shared_a];
+        let mut unique_b = make_result(unique_id, "b", 1.0);
+        unique_b.content = "unique".into();
+        unique_b.result_type = "fold".into();
+        let mut shared_b = make_result(shared_id, "b", 1.0);
+        shared_b.content = "shared".into();
+        let list_b = vec![unique_b, shared_b];
 
         let merged = rrf_merge(vec![list_a, list_b], 60.0, &[1.0, 1.0]);
         assert_eq!(merged.len(), 2);
@@ -455,12 +819,10 @@ mod tests {
         let list: Vec<SearchResult> = ids
             .iter()
             .enumerate()
-            .map(|(i, &id)| SearchResult {
-                id,
-                source: "test".into(),
-                content: format!("item {i}"),
-                score: 1.0,
-                result_type: "entity".into(),
+            .map(|(i, &id)| {
+                let mut result = make_result(id, "test", 1.0);
+                result.content = format!("item {i}");
+                result
             })
             .collect();
 

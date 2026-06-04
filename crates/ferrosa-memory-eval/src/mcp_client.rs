@@ -95,6 +95,7 @@ pub struct HttpMcpClient {
     client: reqwest::Client,
     url: String,
     next_id: u64,
+    basic_auth: Option<(String, String)>,
 }
 
 impl std::fmt::Debug for HttpMcpClient {
@@ -102,6 +103,10 @@ impl std::fmt::Debug for HttpMcpClient {
         f.debug_struct("HttpMcpClient")
             .field("url", &self.url)
             .field("next_id", &self.next_id)
+            .field(
+                "basic_auth",
+                &self.basic_auth.as_ref().map(|(user, _)| user),
+            )
             .finish()
     }
 }
@@ -113,7 +118,18 @@ impl HttpMcpClient {
             client: reqwest::Client::new(),
             url: url.to_string(),
             next_id: 1,
+            basic_auth: None,
         }
+    }
+
+    /// Configure HTTP Basic auth credentials for protected MCP endpoints.
+    pub fn with_basic_auth(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.basic_auth = Some((username.into(), password.into()));
+        self
     }
 
     /// Returns the configured URL.
@@ -176,10 +192,12 @@ impl HttpMcpClient {
 
         let start = Instant::now();
 
-        let resp = self
-            .client
-            .post(&self.url)
-            .json(&request)
+        let mut http_request = self.client.post(&self.url).json(&request);
+        if let Some((username, password)) = &self.basic_auth {
+            http_request = http_request.basic_auth(username, Some(password));
+        }
+
+        let resp = http_request
             .send()
             .await
             .map_err(|e| McpClientError::Http(e.to_string()))?;

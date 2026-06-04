@@ -139,6 +139,27 @@ pub async fn smart_ingest(
         Vec::new()
     };
 
+    // Suppress obvious cross-session duplicates. Keep this deliberately exact
+    // for now: cross-session fuzzy/ANN matches can create surprising updates
+    // when two sessions discuss similarly named but unrelated things.
+    if existing.is_empty() && !resolved_name.is_empty() {
+        match storage
+            .entity_find_by_exact_name_any_session(ctx, &resolved_name, &resolved_type)
+            .await
+        {
+            Ok(Some(entry)) => existing.push(entry),
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    entity_name = %resolved_name,
+                    entity_type = %resolved_type,
+                    "smart_ingest: cross-session exact dedup lookup failed; continuing with create path"
+                );
+            }
+        }
+    }
+
     // If no exact name match, fall back to semantic/phonetic search. These reads
     // are best-effort duplicate suppression only; availability of memory writes
     // is more important than fuzzy dedup when a quorum read times out.
@@ -214,7 +235,7 @@ pub async fn smart_ingest(
     let best_match = if existing[0].context_snippet.is_empty() {
         // Lightweight match — fetch full entity for similarity comparison
         storage
-            .entity_get_by_id(ctx, session_id, existing[0].entity_id)
+            .entity_get_by_id(ctx, existing[0].session_id, existing[0].entity_id)
             .await?
             .unwrap_or_else(|| existing[0].clone())
     } else {
@@ -814,6 +835,74 @@ mod tests {
         .expect("a fuzzy dedup read timeout must not block creating a new memory");
 
         assert!(matches!(result, IngestDecision::Created { .. }));
+    }
+
+    #[tokio::test]
+    async fn smart_ingest_updates_exact_name_match_from_another_session() {
+        use crate::storage::Storage;
+        use crate::storage::mock::MockStorage;
+        use crate::types::EntityEntry;
+
+        let store = MockStorage::new();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "test".into(),
+        };
+        let original_session_id = Uuid::new_v4();
+        let ingest_session_id = Uuid::new_v4();
+        let entity_id = Uuid::new_v4();
+
+        store
+            .entity_put(
+                &ctx,
+                &EntityEntry {
+                    tenant_id: ctx.tenant_id,
+                    entity_id,
+                    session_id: original_session_id,
+                    entity_name: "BRIGHT-Pro".into(),
+                    entity_type: "concept".into(),
+                    context_snippet: "BRIGHT-Pro evaluates reasoning-intensive retrieval".into(),
+                    created_at: chrono::Utc::now(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let result = smart_ingest(
+            &store,
+            &ctx,
+            ingest_session_id,
+            "BRIGHT-Pro adds aspect-aware retrieval metrics for agentic search",
+            "concept",
+            None,
+            None,
+            &IngestConfig::default(),
+            Some("BRIGHT-Pro"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        match result {
+            IngestDecision::Updated {
+                entity_id: updated_id,
+                similarity,
+            } => {
+                assert_eq!(updated_id, entity_id);
+                assert_eq!(similarity, 1.0);
+            }
+            other => panic!("expected cross-session exact duplicate to update, got {other:?}"),
+        }
+
+        let entities = store.entities.lock().await;
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].entity_id, entity_id);
+        assert_eq!(entities[0].session_id, original_session_id);
+        assert_eq!(
+            entities[0].context_snippet,
+            "BRIGHT-Pro adds aspect-aware retrieval metrics for agentic search"
+        );
     }
 
     #[tokio::test]

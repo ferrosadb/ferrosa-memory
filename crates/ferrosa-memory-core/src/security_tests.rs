@@ -414,7 +414,7 @@ mod tests {
                     || name_lower.contains("get_feedback")
                     || name_lower.contains("query_feedback")
                     || name_lower.contains("list_feedback"))
-                    && !name_lower.contains("record")
+                    && !matches!(name_lower.as_str(), "record_feedback" | "feedback")
             })
             .collect();
 

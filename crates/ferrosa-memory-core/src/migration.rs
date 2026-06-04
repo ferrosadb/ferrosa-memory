@@ -24,6 +24,15 @@
 
 use crate::cql_storage::{CqlSession, build_col_map, cql_get};
 
+/// Operator-facing schema status for the running binary and target keyspace.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct MigrationStatus {
+    pub db_version: u32,
+    pub binary_version: u32,
+    pub pending: Vec<u32>,
+    pub last_applied: Option<String>,
+}
+
 /// A single schema change wired into the server binary.
 #[derive(Debug)]
 pub struct Migration {
@@ -120,6 +129,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 34,
         description: "secondary indexes for Datalog filters",
         ddl: include_str!("../../../ddl/034_datalog_filter_indexes.cql"),
+    },
+    Migration {
+        version: 35,
+        description: "semantic document chunks and retrieval indexes",
+        ddl: include_str!("../../../ddl/035_document_chunks.cql"),
     },
 ];
 
@@ -341,9 +355,29 @@ pub async fn run_migrations(session: &CqlSession, keyspace: &str) -> Result<usiz
     // even if `current` (MAX) sits above it. Closes the window where a
     // single bookkeeping row goes missing (manual rollback, partial
     // restore) and the runner silently never re-applies it.
-    let applied = applied_versions(session, keyspace)
+    let mut applied = applied_versions(session, keyspace)
         .await
         .map_err(|e| MigrationError::Setup { source: e })?;
+    let applied_migrations: Vec<&Migration> = MIGRATIONS
+        .iter()
+        .filter(|m| applied.contains(&m.version))
+        .collect();
+    for m in applied_migrations {
+        let satisfied = migration_postcondition_satisfied(session, keyspace, m.version)
+            .await
+            .map_err(|e| MigrationError::Setup { source: e })?;
+        if !satisfied {
+            tracing::warn!(
+                version = m.version,
+                description = m.description,
+                "schema_version row exists but migration postcondition is missing; deleting ledger row for repair"
+            );
+            delete_version(session, keyspace, m.version)
+                .await
+                .map_err(|e| MigrationError::Setup { source: e })?;
+            applied.remove(&m.version);
+        }
+    }
     let pending: Vec<&Migration> = MIGRATIONS
         .iter()
         .filter(|m| !applied.contains(&m.version))
@@ -406,6 +440,25 @@ pub async fn run_migrations(session: &CqlSession, keyspace: &str) -> Result<usiz
                 source: e.into(),
             });
         }
+        let satisfied = migration_postcondition_satisfied(session, keyspace, m.version)
+            .await
+            .map_err(|source| MigrationError::Statement {
+                version: m.version,
+                stmt_index: split_cql(m.ddl).len(),
+                last_good,
+                source,
+            })?;
+        if !satisfied {
+            return Err(MigrationError::Statement {
+                version: m.version,
+                stmt_index: split_cql(m.ddl).len(),
+                last_good,
+                source: anyhow::anyhow!(
+                    "migration {} postcondition failed; required schema objects are missing",
+                    m.version
+                ),
+            });
+        }
         record_version(session, keyspace, m.version, m.description)
             .await
             .map_err(|source| MigrationError::BookkeepingWrite {
@@ -422,6 +475,37 @@ pub async fn run_migrations(session: &CqlSession, keyspace: &str) -> Result<usiz
         "schema migrations complete"
     );
     Ok(applied)
+}
+
+/// Return the current migration status without applying migrations.
+///
+/// This is intentionally read-only so operators and MCP clients can ask
+/// whether the database schema is current without causing DDL side effects.
+pub async fn migration_status(
+    session: &CqlSession,
+    keyspace: &str,
+) -> anyhow::Result<MigrationStatus> {
+    ensure_schema_version_table(session, keyspace).await?;
+    let applied = applied_versions(session, keyspace).await?;
+    let db_version = current_version(session, keyspace).await?.unwrap_or(0);
+    let binary_version = MIGRATIONS
+        .iter()
+        .map(|m| m.version)
+        .max()
+        .unwrap_or(PRE_VERSIONING_BASELINE);
+    let pending = MIGRATIONS
+        .iter()
+        .filter(|m| !applied.contains(&m.version))
+        .map(|m| m.version)
+        .collect();
+    let last_applied = last_applied_at(session, keyspace).await?;
+
+    Ok(MigrationStatus {
+        db_version,
+        binary_version,
+        pending,
+        last_applied,
+    })
 }
 
 /// Apply the historic bootstrap DDLs against a greenfield keyspace.
@@ -696,6 +780,52 @@ async fn keyspace_exists(session: &CqlSession, keyspace: &str) -> anyhow::Result
     Ok(false)
 }
 
+async fn table_exists(session: &CqlSession, keyspace: &str, table: &str) -> anyhow::Result<bool> {
+    #[allow(deprecated)]
+    let result = session
+        .query_unpaged(
+            "SELECT keyspace_name, table_name FROM system_schema.tables",
+            (),
+        )
+        .await?;
+    let col_map = build_col_map(result.col_specs());
+    let rows = result.rows_or_empty();
+    for row in rows {
+        let Ok(ks) = cql_get::<String>(&row, &col_map, "keyspace_name") else {
+            continue;
+        };
+        let Ok(name) = cql_get::<String>(&row, &col_map, "table_name") else {
+            continue;
+        };
+        if ks == keyspace && name == table {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn migration_postcondition_satisfied(
+    session: &CqlSession,
+    keyspace: &str,
+    version: u32,
+) -> anyhow::Result<bool> {
+    match version {
+        35 => {
+            for table in [
+                "document_chunks",
+                "document_terms",
+                "document_phonetic_terms",
+            ] {
+                if !table_exists(session, keyspace, table).await? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        _ => Ok(true),
+    }
+}
+
 pub async fn ensure_schema_version_table(
     session: &CqlSession,
     keyspace: &str,
@@ -753,6 +883,23 @@ async fn current_version(session: &CqlSession, keyspace: &str) -> anyhow::Result
     Ok(max)
 }
 
+async fn last_applied_at(session: &CqlSession, keyspace: &str) -> anyhow::Result<Option<String>> {
+    let q = format!("SELECT applied_at FROM {keyspace}.schema_version");
+    #[allow(deprecated)]
+    let result = session.query_unpaged(q, ()).await?;
+    let col_map = build_col_map(result.col_specs());
+    let rows = result.rows_or_empty();
+    let mut last: Option<chrono::DateTime<chrono::Utc>> = None;
+    for row in rows {
+        if let Ok(applied_at) =
+            cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "applied_at")
+        {
+            last = Some(last.map_or(applied_at, |current| current.max(applied_at)));
+        }
+    }
+    Ok(last.map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)))
+}
+
 fn schema_version_insert_query(keyspace: &str) -> String {
     format!(
         "INSERT INTO {keyspace}.schema_version \
@@ -777,6 +924,13 @@ pub async fn record_version(
             (version as i32, applied_at, description.to_string(), host),
         )
         .await?;
+    Ok(())
+}
+
+async fn delete_version(session: &CqlSession, keyspace: &str, version: u32) -> anyhow::Result<()> {
+    let q = format!("DELETE FROM {keyspace}.schema_version WHERE version = ?");
+    #[allow(deprecated)]
+    session.query_unpaged(q, (version as i32,)).await?;
     Ok(())
 }
 

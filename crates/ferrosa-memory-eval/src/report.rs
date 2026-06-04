@@ -4,6 +4,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::bright_pro::BrightProScore;
 use crate::memory_quality::MemoryQualityScore;
 
 // ---------------------------------------------------------------------------
@@ -134,6 +135,8 @@ pub struct ScenarioResult {
     pub semantic: Option<SemanticRepoScore>,
     #[serde(default)]
     pub memory_quality: Option<MemoryQualityScore>,
+    #[serde(default)]
+    pub bright_pro: Option<BrightProScore>,
     pub passed: bool,
     pub duration: Duration,
 }
@@ -295,6 +298,8 @@ impl EvalReport {
         self.render_level3(&mut out);
         // Memory quality
         self.render_memory_quality(&mut out);
+        // BRIGHT-Pro
+        self.render_bright_pro(&mut out);
         // Aggregate
         self.render_aggregate(&mut out);
 
@@ -434,6 +439,37 @@ impl EvalReport {
                 mq.metrics.ndcg,
                 mq.metrics.distractor_hits,
                 mq.failure_kind,
+            ));
+        }
+    }
+
+    fn render_bright_pro(&self, out: &mut String) {
+        let results: Vec<_> = self
+            .results
+            .iter()
+            .filter_map(|r| r.bright_pro.as_ref().map(|bp| (r, bp)))
+            .collect();
+        if results.is_empty() {
+            return;
+        }
+
+        out.push_str("\n--- BRIGHT-Pro: Aspect-Aware Retrieval Metrics ---\n");
+        for (r, bp) in results {
+            let aer = bp
+                .aer
+                .map(|score| format!(" aer={score:.2}"))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "  {} {} protocol={:?} alpha_ndcg={:.2} aspect_recall={:.2} rounds={} unique_docs={:.2} failure={:?}{}\n",
+                r.scenario_id,
+                dots_pad(&r.scenario_id, 25),
+                bp.protocol,
+                bp.alpha_ndcg,
+                bp.aspect_recall,
+                bp.rounds,
+                bp.unique_doc_ratio,
+                bp.failure_mode,
+                aer,
             ));
         }
     }
@@ -604,6 +640,7 @@ mod tests {
             dikw: None,
             semantic: None,
             memory_quality: None,
+            bright_pro: None,
             passed: true,
             duration: Duration::from_secs(3),
         }
@@ -642,6 +679,7 @@ mod tests {
             dikw: None,
             semantic: None,
             memory_quality: None,
+            bright_pro: None,
             passed: false,
             duration: Duration::from_secs(5),
         }
@@ -704,6 +742,7 @@ mod tests {
             }),
             semantic: None,
             memory_quality: None,
+            bright_pro: None,
             passed: true,
             duration: Duration::from_secs(8),
         }
@@ -745,6 +784,7 @@ mod tests {
                 composite: 0.76,
             }),
             memory_quality: None,
+            bright_pro: None,
             passed: true,
             duration: Duration::from_secs(10),
         }
@@ -1102,6 +1142,29 @@ mod tests {
         assert!(output.contains("recall=1.00"));
         assert!(output.contains("distractors=1"));
         assert!(output.contains("failure=Passed"));
+    }
+
+    #[test]
+    fn test_render_cli_includes_bright_pro_section() {
+        let mut result = mock_l1_pass("bright_grounded", 0.90);
+        result.bright_pro = Some(crate::bright_pro::BrightProScore {
+            protocol: crate::bright_pro::BrightProProtocol::FixedThree,
+            alpha_ndcg: 0.82,
+            aspect_recall: 0.75,
+            rounds: 3,
+            unique_doc_ratio: 0.67,
+            aer: Some(0.68),
+            failure_mode: crate::bright_pro::AgenticFailureMode::AspectTunnelVision,
+        });
+        let report = EvalReport::new(test_timestamp(), vec![result], Duration::from_secs(5));
+        let output = report.render_cli();
+
+        assert!(output.contains("BRIGHT-Pro: Aspect-Aware Retrieval Metrics"));
+        assert!(output.contains("protocol=FixedThree"));
+        assert!(output.contains("alpha_ndcg=0.82"));
+        assert!(output.contains("aspect_recall=0.75"));
+        assert!(output.contains("failure=AspectTunnelVision"));
+        assert!(output.contains("aer=0.68"));
     }
 
     #[test]
