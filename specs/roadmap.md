@@ -13,7 +13,8 @@ These came up while wiring official BRIGHT-Pro / MemoryBench eval corpora. They 
 - [ ] **Eval corpus isolation and baselines need hardening.**
   - Observed: capped BRIGHT-Pro MCP runs can score 0.0 when relevant support docs are outside the capped ingest window.
   - Impact: small live slices validate wiring but cannot be compared to paper systems unless the official support corpus is fully ingested or the harness ingests support-closed subsets.
-  - Next: add support-doc closed sampling, persisted corpus sessions, and CI baseline comparison before treating BRIGHT-Pro scores as a regression gate.
+  - Implemented: `scripts/run-official-evals.py bright-pro --backend mcp-http --mcp-max-docs N` now samples only examples whose support docs are fully inside the capped ingest window.
+  - Next: add persisted corpus sessions and CI baseline comparison before treating BRIGHT-Pro scores as a regression gate.
 
 - [ ] **Benchmark/corpus passage isolation is incomplete.**
   - Implemented: `benchmark_document` is available as a default type and is indexed through the document chunk plane.

@@ -574,6 +574,59 @@ def bright_pro_splits(corpus_dir: Path, requested: list[str] | None) -> list[str
     return [split for split in splits if not requested or split in requested]
 
 
+def support_docs_for_example(
+    example_id: int, aspects_by_example: dict[int, list[Aspect]]
+) -> set[str]:
+    return {
+        doc_id
+        for aspect in aspects_by_example.get(example_id, [])
+        for doc_id in aspect.supporting_docs
+    }
+
+
+def select_support_closed_examples(
+    examples: list[dict[str, Any]],
+    aspects_by_example: dict[int, list[Aspect]],
+    available_doc_ids: set[str],
+    limit: int | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Select examples whose gold support docs are fully inside a capped corpus."""
+    if limit is not None and limit <= 0:
+        return [], {
+            "candidate_examples": len(examples),
+            "selected_examples": 0,
+            "excluded_no_aspects": 0,
+            "excluded_open_support": 0,
+            "available_documents": len(available_doc_ids),
+        }
+
+    selected = []
+    excluded_no_aspects = 0
+    excluded_open_support = 0
+
+    for row in examples:
+        example_id = int(row["id"])
+        aspects = aspects_by_example.get(example_id, [])
+        support_docs = support_docs_for_example(example_id, aspects_by_example)
+        if not aspects or not support_docs:
+            excluded_no_aspects += 1
+            continue
+        if not support_docs.issubset(available_doc_ids):
+            excluded_open_support += 1
+            continue
+        selected.append(row)
+        if limit is not None and len(selected) >= limit:
+            break
+
+    return selected, {
+        "candidate_examples": len(examples),
+        "selected_examples": len(selected),
+        "excluded_no_aspects": excluded_no_aspects,
+        "excluded_open_support": excluded_open_support,
+        "available_documents": len(available_doc_ids),
+    }
+
+
 def load_bright_aspects(corpus_dir: Path, split: str) -> dict[int, list[Aspect]]:
     rows = read_parquet_rows(corpus_dir / "aspects" / f"{split}.parquet")
     grouped: dict[int, list[Aspect]] = collections.defaultdict(list)
@@ -627,18 +680,38 @@ def run_bright_pro(args: argparse.Namespace) -> int:
     failures = []
     split_summaries = {}
     ingest_summaries = {}
+    sampling_summaries = {}
     remaining = args.limit_examples
     mcp_retriever = McpBrightRetriever(args) if args.backend == "mcp-http" else None
 
     for split in splits:
         examples = read_parquet_rows(corpus_dir / "examples" / f"{split}.parquet")
+        aspects_by_example = load_bright_aspects(corpus_dir, split)
+        document_rows = read_parquet_rows(corpus_dir / "documents" / f"{split}.parquet")
+        if mcp_retriever and args.mcp_max_docs is not None:
+            document_rows = document_rows[: args.mcp_max_docs]
+            available_doc_ids = {str(row["id"]) for row in document_rows}
+            examples, sampling_summary = select_support_closed_examples(
+                examples, aspects_by_example, available_doc_ids, remaining
+            )
+            sampling_summary["support_doc_closed"] = True
+            sampling_summaries[split] = sampling_summary
+        else:
+            candidate_count = len(examples)
+            if remaining is not None:
+                examples = examples[:remaining]
+            sampling_summaries[split] = {
+                "candidate_examples": candidate_count,
+                "selected_examples": len(examples),
+                "excluded_no_aspects": 0,
+                "excluded_open_support": 0,
+                "available_documents": len(document_rows),
+                "support_doc_closed": False,
+            }
         if remaining is not None:
-            examples = examples[:remaining]
             remaining -= len(examples)
             if remaining <= 0:
                 remaining = 0
-        aspects_by_example = load_bright_aspects(corpus_dir, split)
-        document_rows = read_parquet_rows(corpus_dir / "documents" / f"{split}.parquet")
         if mcp_retriever:
             print(f"BRIGHT-Pro {split}: ingesting documents through MCP {args.mcp_url}")
             ingest_summaries[split] = mcp_retriever.ingest_documents(document_rows, split)
@@ -726,6 +799,7 @@ def run_bright_pro(args: argparse.Namespace) -> int:
         "failure_count": len(failures),
         "summary": summarize_cases(all_cases),
         "splits": split_summaries,
+        "sampling": sampling_summaries,
         "ingest_summary": ingest_summary,
         "ingest": ingest_summaries,
         "failure_report": str(output_dir / "bright-pro-failures.jsonl"),
@@ -941,6 +1015,20 @@ def run_self_test() -> int:
         ]
     )
     assert index.search("retrieval evidence", 1)[0].id == "d1"
+
+    selected, sampling = select_support_closed_examples(
+        [{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}],
+        {
+            1: [Aspect("a1", "closed", 1.0, ("d1",))],
+            2: [Aspect("a2", "outside", 1.0, ("d3",))],
+            3: [Aspect("a3", "closed multi", 1.0, ("d1", "d2"))],
+        },
+        {"d1", "d2"},
+        limit=None,
+    )
+    assert [row["id"] for row in selected] == [1, 3]
+    assert sampling["excluded_open_support"] == 1
+    assert sampling["excluded_no_aspects"] == 1
 
     parsed = parse_ingest_response(
         {
