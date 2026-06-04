@@ -990,17 +990,14 @@ async fn feedback_outcomes_uuid_write_probe(
     let session_id = Uuid::from_u128(0xfeed_bacc_0000_4000_8000_000000000037);
     let query_id = Uuid::from_u128(0xfeed_bacc_0000_4000_8000_000000000038);
     let created_at = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
-    let insert = session
-        .prepare(format!(
-            "INSERT INTO {keyspace}.{table} \
+    let insert_result = session
+        .query_unpaged(
+            format!(
+                "INSERT INTO {keyspace}.{table} \
              (tenant_id, session_id, query_id, program_type, task_complexity, \
               succeeded, latency_ms, token_cost, created_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-        ))
-        .await?;
-    let insert_result = session
-        .execute_unpaged(
-            &insert,
+            ),
             (
                 tenant_id,
                 session_id,
@@ -1014,18 +1011,24 @@ async fn feedback_outcomes_uuid_write_probe(
             ),
         )
         .await;
-    if insert_result.is_err() {
+    if let Err(error) = insert_result {
+        tracing::warn!(
+            keyspace,
+            table,
+            error = %error,
+            "feedback_outcomes uuid write probe insert failed"
+        );
         return Ok(false);
     }
 
-    let delete = session
-        .prepare(format!(
-            "DELETE FROM {keyspace}.{table} \
-             WHERE tenant_id = ? AND created_at = ? AND query_id = ?"
-        ))
-        .await?;
     session
-        .execute_unpaged(&delete, (tenant_id, created_at, query_id))
+        .query_unpaged(
+            format!(
+                "DELETE FROM {keyspace}.{table} \
+             WHERE tenant_id = ? AND created_at = ? AND query_id = ?"
+            ),
+            (tenant_id, created_at, query_id),
+        )
         .await?;
     Ok(true)
 }
@@ -1129,9 +1132,18 @@ async fn apply_feedback_outcomes_query_id_uuid_migration(
         FeedbackQueryIdEncoding::Timeuuid,
     )
     .await?;
-    if i64::try_from(staged)? != legacy_count {
+    let staged_count = count_table(session, keyspace, staging).await?;
+    if i64::try_from(staged)? != staged_count {
         anyhow::bail!(
-            "feedback_outcomes v36 staged {staged} legacy rows, expected {legacy_count}; leaving legacy table intact"
+            "feedback_outcomes v36 staged {staged} legacy rows, but staging table contains {staged_count}; leaving legacy table intact"
+        );
+    }
+    if staged_count != legacy_count {
+        tracing::warn!(
+            keyspace,
+            legacy_count,
+            staged_count,
+            "feedback_outcomes v36 COUNT(*) disagrees with enumerable legacy rows; proceeding with staged enumerable rows"
         );
     }
 
@@ -1152,9 +1164,9 @@ async fn apply_feedback_outcomes_query_id_uuid_migration(
         FeedbackQueryIdEncoding::Uuid,
     )
     .await?;
-    if i64::try_from(restored)? != legacy_count {
+    if i64::try_from(restored)? != staged_count {
         anyhow::bail!(
-            "feedback_outcomes v36 restored {restored} rows, expected {legacy_count}; preserved rows remain in {keyspace}.{staging}"
+            "feedback_outcomes v36 restored {restored} rows, expected {staged_count}; preserved rows remain in {keyspace}.{staging}"
         );
     }
 

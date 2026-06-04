@@ -2384,6 +2384,9 @@ async fn main() -> anyhow::Result<()> {
                 http::HttpConfig {
                     bind_addr: config.server.bind_addr.clone(),
                     port: config.server.http_port,
+                    request_budget: std::time::Duration::from_secs(
+                        config.server.request_timeout_seconds.clamp(1, 300),
+                    ),
                     require_tls: config.server.require_tls,
                     cert_path: config.server.cert_path.clone(),
                     key_path: config.server.key_path.clone(),

@@ -8,6 +8,20 @@
   - Verification after correction: raw CQL showed `entity_store=25481`, `typed_edges=42801`, `document_chunks=1041`, `document_terms=133680`, `document_phonetic_terms=115360`; workbench summary showed `node_count=12469`.
   - Guardrail: before trusting eval/UI counts, inspect live container mounts with `podman inspect ferrosa-memory_node1_1 ferrosa-memory_node2_1 ferrosa-memory_node3_1 --format '{{json .Mounts}}'`. Do not hunt for data until the mounted source is confirmed.
 
+## Active Retrieval Gaps
+
+- [ ] **Hybrid search needs an async judge-rerank mode with streamed status.**
+  - Current: live LLM reranking can be enabled and works against local Ollama (`qwen2.5-coder:7b` hot path is ~2-3s for 8 candidates), but it is still in-band with the MCP request.
+  - Implemented: judge-model reranking asks for per-candidate relevance scores and records `"-"` abstentions separately from valid `-1/0/1` judgments. `record_feedback` also accepts `"-"` and tracks per-judge sums so caller LLM, human, and judge-model feedback can accumulate without losing abstention/error evidence.
+  - Desired: return normal hybrid results immediately with `reranker.status = "queued" | "warming" | "running" | "complete" | "failed"`, stream progress over the existing event/workbench channel, and expose a stable rerank result lookup by `rerank_job_id`.
+  - Rationale: cold local model loads and remote judges should not block first-token retrieval. The LLM/user can start with baseline candidates, then adopt the reranked list when the judge completes.
+  - Acceptance: `hybrid_search(..., rerank_mode="async")` returns baseline results plus a job id; the job emits bounded progress; callers can fetch the reranked result set; failures leave baseline results valid and include the judge error.
+
+- [ ] **Entity lexical/snippet retrieval is too brittle.**
+  - Observed: `list` finds rich entities for normal phrases, while `hybrid_search` can miss unless phonetic matching hits. ANN errors are logged when legacy `entity_embedding` cells are not vector values, and phonetic hits may lack context snippets.
+  - Implemented in this pass: phonetic entity candidates now fall back to `entity_name` when `context_snippet` is empty so judge reranking has meaningful text.
+  - Next: add or wire an entity-name/context BM25 or exact-token candidate source so natural queries like "onboarding hooks Codex Claude Hermes" retrieve the known onboarding memory without relying on phonetic match quality.
+
 ## Knowledge Type Gaps
 
 These came up while wiring official BRIGHT-Pro / MemoryBench eval corpora. They should stay near the top because missing or weak types force agents and eval harnesses to collapse rich artifacts into generic `concept` nodes, which degrades retrieval, UI filtering, and graph semantics.

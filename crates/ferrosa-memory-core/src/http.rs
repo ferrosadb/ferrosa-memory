@@ -149,11 +149,9 @@ const TLS_ACCEPT_BUDGET: std::time::Duration = std::time::Duration::from_secs(10
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const VIZ_DERIVED_FACT_CHUNK_SIZE: usize = 128;
 
-/// Upper bound on how long a single request is allowed to occupy a
-/// spawned connection task. Covers read, dispatch, and write. Tuned
-/// to the longest reasonable MCP call (consolidation / recursive
-/// explore on a warm cluster); slower work should be moved off-path.
-const REQUEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+/// Default test request budget matching the production config default.
+#[cfg(test)]
+const DEFAULT_REQUEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Run a future that yields `std::io::Result<T>` under a timeout budget.
 /// Factored out so the timeout contract can be unit-tested without
@@ -228,6 +226,7 @@ fn load_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<tokio_ru
 pub struct HttpConfig {
     pub bind_addr: String,
     pub port: u16,
+    pub request_budget: std::time::Duration,
     pub require_tls: bool,
     pub cert_path: Option<String>,
     pub key_path: Option<String>,
@@ -261,7 +260,7 @@ pub trait OperatorQuerySurface: Send + Sync {
 ///
 /// Each accepted TCP connection is handed to a `tokio::spawn`ed task
 /// that performs the TLS handshake (if configured) and runs the
-/// request under `REQUEST_BUDGET`. The accept loop itself does no
+/// request under the configured request budget. The accept loop itself does no
 /// per-request work — it only rate-limits and hands off — so a
 /// stalled handshake, slow storage call, or multi-packet client never
 /// blocks other clients.
@@ -292,6 +291,7 @@ pub async fn serve_http<S: Storage + OperatorQuerySurface + 'static>(
     let readiness = config.readiness_checker.clone();
     let shell_routes = config.shell_routes.clone();
     let session = Arc::clone(&config.session);
+    let request_budget = config.request_budget;
     let addr = format!("{}:{}", config.bind_addr, config.port);
     let listener = TcpListener::bind(&addr).await?;
     let protocol = if tls_acceptor.is_some() {
@@ -328,6 +328,10 @@ pub async fn serve_http<S: Storage + OperatorQuerySurface + 'static>(
         let acceptor = tls_acceptor.clone();
         let shell_routes = shell_routes.clone();
         let session = Arc::clone(&session);
+        let request_budget = request_budget.clamp(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(300),
+        );
 
         tokio::spawn(async move {
             let outcome = match acceptor {
@@ -341,6 +345,7 @@ pub async fn serve_http<S: Storage + OperatorQuerySurface + 'static>(
                             readiness.as_ref(),
                             &shell_routes,
                             session.as_ref(),
+                            request_budget,
                         )
                         .await
                     }
@@ -359,6 +364,7 @@ pub async fn serve_http<S: Storage + OperatorQuerySurface + 'static>(
                         readiness.as_ref(),
                         &shell_routes,
                         session.as_ref(),
+                        request_budget,
                     )
                     .await
                 }
@@ -414,7 +420,7 @@ async fn write_rate_limit_response(stream: &mut tokio::net::TcpStream) {
     .await;
 }
 
-/// Run one request under `REQUEST_BUDGET`. On timeout, emit HTTP 504
+/// Run one request under `request_budget`. On timeout, emit HTTP 504
 /// so the client can distinguish "server took too long" from TLS or
 /// transport-level failures. Any error reading/writing the stream is
 /// propagated to the caller for logging.
@@ -440,6 +446,7 @@ where
         readiness_checker,
         shell_routes,
         &session,
+        DEFAULT_REQUEST_BUDGET,
     )
     .await
 }
@@ -452,6 +459,7 @@ async fn serve_one_connection_with_session<S, T>(
     readiness_checker: &(dyn Fn() -> bool + Send + Sync),
     shell_routes: &ShellRouteConfig,
     session: &dispatch::SessionState,
+    request_budget: std::time::Duration,
 ) -> anyhow::Result<()>
 where
     S: Storage + OperatorQuerySurface,
@@ -467,15 +475,15 @@ where
             shell_routes,
             session,
         );
-        let keep_alive = match tokio::time::timeout(REQUEST_BUDGET, handler).await {
+        let keep_alive = match tokio::time::timeout(request_budget, handler).await {
             Ok(res) => res?,
             Err(_) => {
-                let body = format!("request exceeded {:?}", REQUEST_BUDGET);
+                let body = format!("request exceeded {:?}", request_budget);
                 let resp = text_response("504 Gateway Timeout", &body);
                 // Best-effort notify the client; ignore write errors since
                 // the peer may already be gone.
                 let _ = stream.write_all(resp.as_bytes()).await;
-                return Err(anyhow::anyhow!("request exceeded {:?}", REQUEST_BUDGET));
+                return Err(anyhow::anyhow!("request exceeded {:?}", request_budget));
             }
         };
         if !keep_alive {
@@ -1101,6 +1109,7 @@ async fn call_tool_http<S: Storage>(
 
 fn redacted_judge_config(config: &crate::config::JudgeConfig) -> Value {
     serde_json::json!({
+        "enabled": config.enabled,
         "provider": &config.provider,
         "base_url": &config.base_url,
         "model": &config.model,
@@ -1157,6 +1166,10 @@ async fn handle_judge_config_put(
     let provider = sanitized_config_string(&payload, "provider", &config.provider, 64)?;
     let base_url = sanitized_config_string(&payload, "base_url", &config.base_url, 2048)?;
     let model = sanitized_config_string(&payload, "model", &config.model, 512)?;
+    let enabled = payload
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(config.enabled);
     let token = match payload.get("token") {
         None => config.token.clone(),
         Some(Value::Null) => None,
@@ -1169,6 +1182,7 @@ async fn handle_judge_config_put(
     };
 
     *config = crate::config::JudgeConfig {
+        enabled,
         provider,
         base_url,
         model,
@@ -4347,6 +4361,7 @@ mod tests {
         let config = HttpConfig {
             bind_addr: "127.0.0.1".into(),
             port: 8765,
+            request_budget: DEFAULT_REQUEST_BUDGET,
             require_tls: false,
             cert_path: None,
             key_path: None,
@@ -4361,6 +4376,7 @@ mod tests {
         let config_tls = HttpConfig {
             bind_addr: "127.0.0.1".into(),
             port: 443,
+            request_budget: DEFAULT_REQUEST_BUDGET,
             require_tls: true,
             cert_path: Some("/etc/ssl/cert.pem".into()),
             key_path: Some("/etc/ssl/key.pem".into()),
@@ -4712,7 +4728,7 @@ mod tests {
             "POST",
             "/workbench/api/judge/config",
             &headers,
-            r#"{"provider":"lmstudio","base_url":"http://127.0.0.1:1234","model":"local-judge","token":"super-secret","timeout_seconds":7}"#,
+            r#"{"enabled":true,"provider":"lmstudio","base_url":"http://127.0.0.1:1234","model":"local-judge","token":"super-secret","timeout_seconds":7}"#,
             &storage,
             &metrics,
             &validator,
@@ -4723,6 +4739,7 @@ mod tests {
         .await
         .unwrap();
         assert!(put_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(put_response.contains("\"enabled\":true"));
         assert!(put_response.contains("\"token_configured\":true"));
         assert!(!put_response.contains("super-secret"));
 
@@ -4741,6 +4758,7 @@ mod tests {
         .await
         .unwrap();
         assert!(get_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(get_response.contains("\"enabled\":true"));
         assert!(get_response.contains("\"provider\":\"lmstudio\""));
         assert!(get_response.contains("\"base_url\":\"http://127.0.0.1:1234\""));
         assert!(get_response.contains("\"model\":\"local-judge\""));

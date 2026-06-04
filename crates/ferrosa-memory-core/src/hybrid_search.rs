@@ -267,7 +267,11 @@ pub async fn hybrid_search(
                     .map(|(i, e)| SearchResult {
                         id: e.entity_id,
                         source: "entity_phonetic".into(),
-                        content: e.context_snippet.clone(),
+                        content: if e.context_snippet.trim().is_empty() {
+                            e.entity_name.clone()
+                        } else {
+                            e.context_snippet.clone()
+                        },
                         score: 1.0 - (i as f64 * 0.1), // rank decay
                         result_type: "entity".into(),
                         document_id: None,

@@ -34,6 +34,7 @@ const BATCH_MUTATION_CONCURRENCY: usize = 16;
 const MIN_RETRIEVAL_LIMIT: usize = 1;
 const MAX_RETRIEVAL_LIMIT: usize = 50;
 const DEFAULT_RETRIEVAL_LIMIT: usize = 10;
+const LLM_RERANK_MAX_CANDIDATES: usize = 8;
 
 type ToolDispatchFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Value, (i32, String)>> + Send + 'a>>;
@@ -888,7 +889,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "record_feedback".into(),
-            description: "Records feedback on the most recent hybrid_search result set for this session.\n\nCALL WHEN: Retrieved memories were clearly helpful, irrelevant, or wrong for the current working directory. Cheapest form: pass scores in last-result order, where 1=helpful, -1=irrelevant/wrong, 0=neutral/skip. Include cwd so future searches in the same directory are reranked dynamically.\nCost: ~5ms + small entity property updates.".into(),
+            description: "Records feedback on the most recent hybrid_search result set for this session.\n\nCALL WHEN: Retrieved memories were clearly helpful, irrelevant, wrong, or impossible to judge for the current working directory. Cheapest form: pass scores in last-result order, where 1=helpful, -1=irrelevant/wrong, 0=neutral, and \"-\"=judge abstained/failed. Include cwd so future searches in the same directory are reranked dynamically.\nCost: ~5ms + small entity property updates.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -896,9 +897,10 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                     "relevant": { "type": "boolean", "description": "Fallback when scores is omitted: apply one relevance label to all last results." },
                     "scores": {
                         "type": "array",
-                        "items": { "type": "integer", "minimum": -1, "maximum": 1 },
-                        "description": "Per-result feedback in last retrieval order. 1=helpful, -1=irrelevant/wrong, 0=neutral/skip."
+                        "items": {},
+                        "description": "Per-result feedback in last retrieval order. 1=helpful, -1=irrelevant/wrong, 0=neutral, \"-\" or null=judge abstained/failed."
                     },
+                    "judge": { "type": "string", "maxLength": 64, "description": "Who made this judgment, e.g. caller_llm, human, judge_model. Scores from multiple judges are summed; abstentions are tracked separately." },
                     "cwd": { "type": "string", "maxLength": 1024 },
                     "reason": { "type": "string", "maxLength": 1024 },
                     "entity_ids": {
@@ -1199,6 +1201,10 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                         "type": "string",
                         "maxLength": 1024,
                         "description": "Alias for cwd; explicit workspace path used for reranking affinity."
+                    },
+                    "rerank": {
+                        "type": "boolean",
+                        "description": "Override live LLM reranking for this call. Defaults to [judge].enabled."
                     }
                 },
                 "required": ["query"]
@@ -4576,7 +4582,9 @@ async fn update_workspace_feedback<S: crate::storage::Storage>(
     entity_id: uuid::Uuid,
     cwd: &str,
     source: &str,
-    score_delta: f64,
+    judge_source: &str,
+    score_delta: Option<f64>,
+    judgment: Option<i64>,
 ) -> anyhow::Result<bool> {
     if cwd.trim().is_empty() {
         return Ok(false);
@@ -4603,6 +4611,8 @@ async fn update_workspace_feedback<S: crate::storage::Storage>(
             "score": 0.0,
             "positives": 0,
             "negatives": 0,
+            "neutrals": 0,
+            "abstentions": 0,
             "mechanisms": {}
         })
     });
@@ -4612,23 +4622,28 @@ async fn update_workspace_feedback<S: crate::storage::Storage>(
             "score": 0.0,
             "positives": 0,
             "negatives": 0,
+            "neutrals": 0,
+            "abstentions": 0,
             "mechanisms": {}
         });
     }
     let entry_obj = entry.as_object_mut().expect("object set above");
     entry_obj.insert("cwd".into(), Value::String(cwd.to_string()));
-    let current_score = entry_obj
-        .get("score")
-        .and_then(|value| value.as_f64())
-        .unwrap_or(0.0);
-    entry_obj.insert(
-        "score".into(),
-        serde_json::json!((current_score + score_delta).clamp(-1.0, 1.0)),
-    );
-    let count_key = if score_delta >= 0.0 {
-        "positives"
-    } else {
-        "negatives"
+    if let Some(score_delta) = score_delta {
+        let current_score = entry_obj
+            .get("score")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0);
+        entry_obj.insert(
+            "score".into(),
+            serde_json::json!(current_score + score_delta),
+        );
+    }
+    let count_key = match judgment {
+        Some(score) if score > 0 => "positives",
+        Some(score) if score < 0 => "negatives",
+        Some(_) => "neutrals",
+        None => "abstentions",
     };
     let count = entry_obj
         .get(count_key)
@@ -4646,30 +4661,79 @@ async fn update_workspace_feedback<S: crate::storage::Storage>(
         serde_json::json!({
             "score": 0.0,
             "positives": 0,
-            "negatives": 0
+            "negatives": 0,
+            "neutrals": 0,
+            "abstentions": 0,
+            "judges": {}
         })
     });
     if !mechanism.is_object() {
         *mechanism = serde_json::json!({
             "score": 0.0,
             "positives": 0,
-            "negatives": 0
+            "negatives": 0,
+            "neutrals": 0,
+            "abstentions": 0,
+            "judges": {}
         });
     }
     let mechanism_obj = mechanism.as_object_mut().expect("object set above");
-    let mechanism_score = mechanism_obj
-        .get("score")
-        .and_then(|value| value.as_f64())
-        .unwrap_or(0.0);
-    mechanism_obj.insert(
-        "score".into(),
-        serde_json::json!((mechanism_score + score_delta).clamp(-1.0, 1.0)),
-    );
+    if let Some(score_delta) = score_delta {
+        let mechanism_score = mechanism_obj
+            .get("score")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0);
+        mechanism_obj.insert(
+            "score".into(),
+            serde_json::json!(mechanism_score + score_delta),
+        );
+    }
     let count = mechanism_obj
         .get(count_key)
         .and_then(|value| value.as_i64())
         .unwrap_or(0);
     mechanism_obj.insert(count_key.into(), serde_json::json!(count + 1));
+
+    let judges = mechanism_obj
+        .entry("judges")
+        .or_insert_with(|| serde_json::json!({}));
+    if !judges.is_object() {
+        *judges = serde_json::json!({});
+    }
+    let judges_obj = judges.as_object_mut().expect("object set above");
+    let judge = judges_obj
+        .entry(judge_source.to_string())
+        .or_insert_with(|| {
+            serde_json::json!({
+                "score": 0.0,
+                "positives": 0,
+                "negatives": 0,
+                "neutrals": 0,
+                "abstentions": 0
+            })
+        });
+    if !judge.is_object() {
+        *judge = serde_json::json!({
+            "score": 0.0,
+            "positives": 0,
+            "negatives": 0,
+            "neutrals": 0,
+            "abstentions": 0
+        });
+    }
+    let judge_obj = judge.as_object_mut().expect("object set above");
+    if let Some(score_delta) = score_delta {
+        let judge_score = judge_obj
+            .get("score")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0);
+        judge_obj.insert("score".into(), serde_json::json!(judge_score + score_delta));
+    }
+    let count = judge_obj
+        .get(count_key)
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0);
+    judge_obj.insert(count_key.into(), serde_json::json!(count + 1));
 
     entity.properties = properties;
     entity.updated_at = Some(chrono::Utc::now());
@@ -4745,7 +4809,9 @@ async fn handle_record_outcome<S: crate::storage::Storage>(
                                 eid,
                                 cwd,
                                 source,
-                                if succeeded { 0.10 } else { -0.20 },
+                                "outcome",
+                                Some(if succeeded { 0.10 } else { -0.20 }),
+                                Some(if succeeded { 1 } else { -1 }),
                             )
                             .await
                             {
@@ -4820,14 +4886,10 @@ async fn handle_record_feedback<S: crate::storage::Storage>(
                 .filter_map(|value| value.as_str()?.parse::<uuid::Uuid>().ok())
                 .collect()
         });
-    let scores: Vec<i64> = args
+    let scores: Vec<Option<i64>> = args
         .get("scores")
         .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .map(|value| value.as_i64().unwrap_or(0).clamp(-1, 1))
-                .collect()
-        })
+        .map(|arr| arr.iter().map(parse_judge_score_value).collect())
         .unwrap_or_default();
     let fallback_score = args
         .get("relevant")
@@ -4845,9 +4907,16 @@ async fn handle_record_feedback<S: crate::storage::Storage>(
         .or(last.cwd.as_deref())
         .unwrap_or("");
     let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+    let judge_source = args
+        .get("judge")
+        .or_else(|| args.get("feedback_source"))
+        .or_else(|| args.get("source"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("caller_llm");
 
     let mut updated = Vec::new();
     let mut skipped = 0usize;
+    let mut abstained = 0usize;
     for (idx, result) in last.results.iter().enumerate() {
         if requested_subset
             .as_ref()
@@ -4856,14 +4925,55 @@ async fn handle_record_feedback<S: crate::storage::Storage>(
             skipped += 1;
             continue;
         }
-        let score = scores
-            .get(idx)
-            .copied()
-            .or(fallback_score)
-            .unwrap_or(0)
-            .clamp(-1, 1);
+        let score = scores.get(idx).copied().flatten().or(fallback_score);
+        let Some(score) = score else {
+            abstained += 1;
+            if !cwd.is_empty()
+                && let Err(e) = update_workspace_feedback(
+                    storage,
+                    ctx,
+                    session_id,
+                    result.entity_id,
+                    cwd,
+                    &result.source,
+                    judge_source,
+                    None,
+                    None,
+                )
+                .await
+            {
+                tracing::warn!(entity_id = %result.entity_id, error = %e, "workspace feedback abstention update failed");
+            }
+            updated.push(serde_json::json!({
+                "entity_id": result.entity_id,
+                "source": result.source,
+                "score": "-"
+            }));
+            continue;
+        };
+        let score = score.clamp(-1, 1);
         if score == 0 {
-            skipped += 1;
+            if !cwd.is_empty()
+                && let Err(e) = update_workspace_feedback(
+                    storage,
+                    ctx,
+                    session_id,
+                    result.entity_id,
+                    cwd,
+                    &result.source,
+                    judge_source,
+                    Some(0.0),
+                    Some(0),
+                )
+                .await
+            {
+                tracing::warn!(entity_id = %result.entity_id, error = %e, "workspace neutral feedback update failed");
+            }
+            updated.push(serde_json::json!({
+                "entity_id": result.entity_id,
+                "source": result.source,
+                "score": 0
+            }));
             continue;
         }
         let succeeded = score > 0;
@@ -4887,7 +4997,9 @@ async fn handle_record_feedback<S: crate::storage::Storage>(
                 result.entity_id,
                 cwd,
                 &result.source,
-                if succeeded { 0.10 } else { -0.20 },
+                judge_source,
+                Some(if succeeded { 0.10 } else { -0.20 }),
+                Some(score),
             )
             .await
         {
@@ -4924,9 +5036,11 @@ async fn handle_record_feedback<S: crate::storage::Storage>(
         "query_id": last.query_id,
         "query": last.query,
         "cwd": cwd,
+        "judge": judge_source,
         "updated": updated,
         "skipped": skipped,
-        "hint": "Feedback recorded. Future hybrid_search calls with the same cwd will boost +1 items and demote -1 items."
+        "abstained": abstained,
+        "hint": "Feedback recorded. Future hybrid_search calls with the same cwd will sum valid judge scores and track '-' abstentions separately."
     }))
 }
 
@@ -5776,6 +5890,397 @@ async fn handle_explore_connections<S: crate::storage::Storage>(
 
 // --- Hybrid search handler ---
 
+#[derive(Debug, Clone)]
+struct LlmRerankReport {
+    enabled: bool,
+    applied: bool,
+    provider: String,
+    model: String,
+    candidate_count: usize,
+    returned_ids: Vec<uuid::Uuid>,
+    judged_ids: Vec<uuid::Uuid>,
+    judge_scores: Vec<Option<i64>>,
+    score_sum: i64,
+    abstentions: usize,
+    error: Option<String>,
+}
+
+impl LlmRerankReport {
+    fn disabled(config: &crate::config::JudgeConfig) -> Self {
+        Self {
+            enabled: false,
+            applied: false,
+            provider: config.provider.clone(),
+            model: config.model.clone(),
+            candidate_count: 0,
+            returned_ids: Vec::new(),
+            judged_ids: Vec::new(),
+            judge_scores: Vec::new(),
+            score_sum: 0,
+            abstentions: 0,
+            error: None,
+        }
+    }
+
+    fn skipped(config: &crate::config::JudgeConfig, reason: impl Into<String>) -> Self {
+        Self {
+            enabled: config.enabled,
+            applied: false,
+            provider: config.provider.clone(),
+            model: config.model.clone(),
+            candidate_count: 0,
+            returned_ids: Vec::new(),
+            judged_ids: Vec::new(),
+            judge_scores: Vec::new(),
+            score_sum: 0,
+            abstentions: 0,
+            error: Some(reason.into()),
+        }
+    }
+
+    fn skipped_with_count(
+        config: &crate::config::JudgeConfig,
+        candidate_count: usize,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            enabled: config.enabled,
+            applied: false,
+            provider: config.provider.clone(),
+            model: config.model.clone(),
+            candidate_count,
+            returned_ids: Vec::new(),
+            judged_ids: Vec::new(),
+            judge_scores: vec![None; candidate_count],
+            score_sum: 0,
+            abstentions: candidate_count,
+            error: Some(reason.into()),
+        }
+    }
+}
+
+fn truncate_for_llm(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    text.chars().take(max_chars).collect::<String>()
+}
+
+fn parse_llm_rerank_json(raw: &str) -> Option<Value> {
+    let trimmed = raw.trim();
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        return Some(value);
+    }
+    let object = trimmed
+        .find('{')
+        .zip(trimmed.rfind('}'))
+        .and_then(|(start, end)| trimmed.get(start..=end))
+        .and_then(|slice| serde_json::from_str::<Value>(slice).ok());
+    if object.is_some() {
+        return object;
+    }
+    trimmed
+        .find('[')
+        .zip(trimmed.rfind(']'))
+        .and_then(|(start, end)| trimmed.get(start..=end))
+        .and_then(|slice| serde_json::from_str::<Value>(slice).ok())
+}
+
+fn parse_llm_rerank_order(raw: &str, candidate_ids: &[uuid::Uuid]) -> Vec<uuid::Uuid> {
+    let Some(value) = parse_llm_rerank_json(raw) else {
+        return Vec::new();
+    };
+    let candidate_set: std::collections::HashSet<uuid::Uuid> =
+        candidate_ids.iter().copied().collect();
+    let mut ordered = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    collect_rerank_ids(
+        &value,
+        candidate_ids,
+        &candidate_set,
+        &mut seen,
+        &mut ordered,
+    );
+    ordered
+}
+
+fn parse_llm_judge_scores(raw: &str, candidate_count: usize) -> Vec<Option<i64>> {
+    let Some(value) = parse_llm_rerank_json(raw) else {
+        return vec![None; candidate_count];
+    };
+    let scores_value = value.get("scores").or_else(|| value.get("judgments"));
+    let Some(values) = scores_value.and_then(Value::as_array) else {
+        return vec![None; candidate_count];
+    };
+    let mut scores = values
+        .iter()
+        .take(candidate_count)
+        .map(parse_judge_score_value)
+        .collect::<Vec<_>>();
+    scores.resize(candidate_count, None);
+    scores
+}
+
+fn parse_judge_score_value(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) => number.as_i64().map(|score| score.clamp(-1, 1)),
+        Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed == "-" || trimmed.eq_ignore_ascii_case("abstain") {
+                None
+            } else {
+                trimmed.parse::<i64>().ok().map(|score| score.clamp(-1, 1))
+            }
+        }
+        Value::Bool(relevant) => Some(if *relevant { 1 } else { -1 }),
+        Value::Null => None,
+        _ => None,
+    }
+}
+
+fn collect_rerank_ids(
+    value: &Value,
+    candidate_ids: &[uuid::Uuid],
+    candidate_set: &std::collections::HashSet<uuid::Uuid>,
+    seen: &mut std::collections::HashSet<uuid::Uuid>,
+    ordered: &mut Vec<uuid::Uuid>,
+) {
+    match value {
+        Value::String(raw) => {
+            let trimmed = raw.trim().trim_matches('"');
+            if let Ok(id) = trimmed.parse::<uuid::Uuid>()
+                && candidate_set.contains(&id)
+                && seen.insert(id)
+            {
+                ordered.push(id);
+            }
+        }
+        Value::Number(number) => {
+            if let Some(raw) = number.as_u64()
+                && raw > 0
+                && let Some(id) = candidate_ids.get(raw as usize - 1).copied()
+                && seen.insert(id)
+            {
+                ordered.push(id);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_rerank_ids(value, candidate_ids, candidate_set, seen, ordered);
+            }
+        }
+        Value::Object(map) => {
+            for key in ["order", "ranking", "ids", "results", "ranked_ids"] {
+                if let Some(value) = map.get(key) {
+                    collect_rerank_ids(value, candidate_ids, candidate_set, seen, ordered);
+                    return;
+                }
+            }
+            if let Some(value) = map.get("id").or_else(|| map.get("entity_id")) {
+                collect_rerank_ids(value, candidate_ids, candidate_set, seen, ordered);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn apply_llm_rerank_order(
+    results: Vec<crate::hybrid_search::SearchResult>,
+    order: &[uuid::Uuid],
+    candidate_count: usize,
+) -> Vec<crate::hybrid_search::SearchResult> {
+    if order.is_empty() || candidate_count == 0 {
+        return results;
+    }
+    let split_at = results.len().min(candidate_count);
+    let mut top = results[..split_at].to_vec();
+    let tail = results[split_at..].to_vec();
+    let mut reranked = Vec::with_capacity(results.len());
+    for id in order {
+        if let Some(pos) = top.iter().position(|result| &result.id == id) {
+            reranked.push(top.remove(pos));
+        }
+    }
+    reranked.extend(top);
+    reranked.extend(tail);
+    reranked
+}
+
+fn judge_scores_for_response(scores: &[Option<i64>]) -> Vec<Value> {
+    scores
+        .iter()
+        .map(|score| match score {
+            Some(score) => serde_json::json!(score),
+            None => serde_json::json!("-"),
+        })
+        .collect()
+}
+
+async fn generate_judge_text(
+    config: &crate::config::JudgeConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> anyhow::Result<String> {
+    let provider = config.provider.trim().to_ascii_lowercase();
+    if provider == "mock" {
+        return Ok(r#"{"order":[2,1],"scores":[1,1]}"#.to_string());
+    }
+    let timeout = std::time::Duration::from_secs(config.timeout_seconds.clamp(1, 300));
+    let client = reqwest::Client::builder().timeout(timeout).build()?;
+    let base_url = config.base_url.trim_end_matches('/');
+    anyhow::ensure!(!base_url.is_empty(), "judge base_url is empty");
+    let mut request = match provider.as_str() {
+        "ollama" | "ollama.com" => {
+            client
+                .post(format!("{base_url}/api/generate"))
+                .json(&serde_json::json!({
+                    "model": config.model,
+                    "prompt": format!("{system_prompt}\n\n{user_prompt}"),
+                    "stream": false,
+                    "format": "json",
+                    "options": {
+                        "temperature": 0.0,
+                        "num_predict": 128
+                    }
+                }))
+        }
+        "lmstudio" | "openai_compatible" | "openai-compatible" | "openai" => client
+            .post(format!("{base_url}/v1/chat/completions"))
+            .json(&serde_json::json!({
+                "model": config.model,
+                "temperature": 0.0,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ]
+            })),
+        "disabled" => anyhow::bail!("judge provider is disabled"),
+        other => anyhow::bail!("unsupported judge provider: {other}"),
+    };
+    if let Some(token) = config.token.as_deref()
+        && !token.is_empty()
+    {
+        request = request.bearer_auth(token);
+    }
+    let value: Value = request.send().await?.error_for_status()?.json().await?;
+    let text = value
+        .get("response")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .get("choices")
+                .and_then(Value::as_array)
+                .and_then(|choices| choices.first())
+                .and_then(|choice| {
+                    choice
+                        .get("message")
+                        .and_then(|message| message.get("content"))
+                        .and_then(Value::as_str)
+                        .or_else(|| choice.get("text").and_then(Value::as_str))
+                })
+        })
+        .ok_or_else(|| anyhow::anyhow!("judge provider returned no text"))?;
+    Ok(text.to_string())
+}
+
+async fn maybe_llm_rerank_results(
+    query: &str,
+    results: Vec<crate::hybrid_search::SearchResult>,
+    session: &SessionState,
+    rerank_override: Option<bool>,
+) -> (Vec<crate::hybrid_search::SearchResult>, LlmRerankReport) {
+    let config = session.judge_config.lock().await.clone();
+    let enabled = rerank_override.unwrap_or(config.enabled);
+    if !enabled {
+        return (results, LlmRerankReport::disabled(&config));
+    }
+    if results.len() < 2 {
+        return (
+            results,
+            LlmRerankReport::skipped(&config, "fewer than two candidates"),
+        );
+    }
+    let candidate_count = results.len().min(LLM_RERANK_MAX_CANDIDATES);
+    let candidate_ids = results
+        .iter()
+        .take(candidate_count)
+        .map(|result| result.id)
+        .collect::<Vec<_>>();
+    let candidates = results
+        .iter()
+        .take(candidate_count)
+        .enumerate()
+        .map(|(idx, result)| {
+            serde_json::json!({
+                "rank": idx + 1,
+                "id": result.id,
+                "type": result.result_type,
+                "source": result.source,
+                "content": truncate_for_llm(&result.content, 500),
+            })
+        })
+        .collect::<Vec<_>>();
+    let prompt = format!(
+        "Query:\n{query}\n\nCandidates JSON:\n{}\n\n\
+         Rank the candidates by usefulness for answering the query. \
+         Also judge each candidate's relevance as 1 helpful, 0 neutral/unclear, -1 irrelevant/wrong, or \"-\" if you cannot judge. \
+         Return JSON only in this shape: {{\"order\":[rank_number,...],\"scores\":[1|0|-1|\"-\",...]}}. \
+         Use the 1-based rank numbers from the input, not UUIDs. \
+         The scores array must be in the original candidate order.",
+        serde_json::to_string(&candidates).unwrap_or_else(|_| "[]".to_string())
+    );
+    let raw = match generate_judge_text(
+        &config,
+        "You are a retrieval reranker. Return compact JSON only.",
+        &prompt,
+    )
+    .await
+    {
+        Ok(raw) => raw,
+        Err(error) => {
+            let message = error.to_string();
+            tracing::warn!(
+                provider = %config.provider,
+                model = %config.model,
+                error = %message,
+                "LLM reranking skipped"
+            );
+            return (results, LlmRerankReport::skipped(&config, message));
+        }
+    };
+    let order = parse_llm_rerank_order(&raw, &candidate_ids);
+    let judge_scores = parse_llm_judge_scores(&raw, candidate_count);
+    let score_sum = judge_scores.iter().flatten().sum::<i64>();
+    let abstentions = judge_scores.iter().filter(|score| score.is_none()).count();
+    if order.len() < 2 {
+        return (
+            results,
+            LlmRerankReport::skipped_with_count(
+                &config,
+                candidate_count,
+                "judge returned fewer than two recognized IDs",
+            ),
+        );
+    }
+    let reranked = apply_llm_rerank_order(results, &order, candidate_count);
+    (
+        reranked,
+        LlmRerankReport {
+            enabled: true,
+            applied: true,
+            provider: config.provider,
+            model: config.model,
+            candidate_count,
+            returned_ids: order,
+            judged_ids: candidate_ids,
+            judge_scores,
+            score_sum,
+            abstentions,
+            error: None,
+        },
+    )
+}
+
 fn parse_hybrid_search_scope(
     args: &Value,
 ) -> Result<crate::hybrid_search::SearchScope, (i32, String)> {
@@ -5854,6 +6359,44 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
     .await
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
+    let rerank_override = args.get("rerank").and_then(Value::as_bool);
+    let (all_results, reranker_report) =
+        maybe_llm_rerank_results(query, all_results, session, rerank_override).await;
+    if let Some(cwd) = filter.workspace_cwd.as_deref() {
+        for (idx, entity_id) in reranker_report.judged_ids.iter().enumerate() {
+            let Some(result) = all_results.iter().find(|result| result.id == *entity_id) else {
+                continue;
+            };
+            if result.result_type != "entity" {
+                continue;
+            }
+            let judgment = reranker_report.judge_scores.get(idx).copied().flatten();
+            let score_delta = judgment.map(|score| {
+                if score > 0 {
+                    0.05
+                } else if score < 0 {
+                    -0.10
+                } else {
+                    0.0
+                }
+            });
+            if let Err(e) = update_workspace_feedback(
+                storage,
+                ctx,
+                session_id,
+                *entity_id,
+                cwd,
+                &result.source,
+                "judge_model",
+                score_delta,
+                judgment,
+            )
+            .await
+            {
+                tracing::warn!(entity_id = %entity_id, error = %e, "judge-model workspace feedback update failed");
+            }
+        }
+    }
     let results: Vec<_> = all_results.into_iter().skip(offset).take(limit).collect();
     let result_count = results.len();
 
@@ -5924,9 +6467,9 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         ])
     } else {
         pick_hint(&[
-            "Found prior context. After judging it, call record_feedback with scores like [1,-1,0] so cwd-specific reranking improves.",
-            "Prior context found. Use record_feedback: 1=helpful, -1=irrelevant/wrong, 0=neutral.",
-            "Check if these memories were useful here; send compact feedback with record_feedback scores in result order.",
+            "Found prior context. After judging it, call record_feedback with scores like [1,\"-\",-1,0] so cwd-specific reranking improves.",
+            "Prior context found. Use record_feedback: 1=helpful, -1=irrelevant/wrong, 0=neutral, \"-\"=cannot judge.",
+            "Check if these memories were useful here; send compact feedback with record_feedback scores in result order, using \"-\" for abstain.",
         ])
     };
 
@@ -5935,7 +6478,20 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         "count": result_count,
         "offset": offset,
         "next_offset": if result_count == limit && offset + limit < 50 { Some(offset + limit) } else { None },
-        "hint": hint
+        "hint": hint,
+        "reranker": {
+            "enabled": reranker_report.enabled,
+            "applied": reranker_report.applied,
+            "provider": reranker_report.provider,
+            "model": reranker_report.model,
+            "candidate_count": reranker_report.candidate_count,
+            "returned_ids": reranker_report.returned_ids,
+            "judged_ids": reranker_report.judged_ids,
+            "judge_scores": judge_scores_for_response(&reranker_report.judge_scores),
+            "score_sum": reranker_report.score_sum,
+            "abstentions": reranker_report.abstentions,
+            "error": reranker_report.error,
+        }
     });
     if result_count == 0 {
         response["_hint"] = serde_json::json!(
@@ -5947,7 +6503,7 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         );
     } else if result_count == limit && offset + limit < 50 {
         response["_hint"] = serde_json::json!(
-            "After judging this page, call record_feedback with scores like [1,-1,0]. If all useful-looking items are -1 or 0, call hybrid_search again with next_offset."
+            "After judging this page, call record_feedback with scores like [1,\"-\",-1,0]. If all useful-looking items are -1, 0, or \"-\", call hybrid_search again with next_offset."
         );
     }
     Ok(response)
@@ -11040,6 +11596,168 @@ mod tests {
             promoted_id.to_string(),
             "positive feedback should lift this entity for the same cwd"
         );
+    }
+
+    #[tokio::test]
+    async fn record_feedback_records_abstentions_separately_from_neutral_scores() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            ollama_base_url: String::new(),
+            ..SessionState::default()
+        };
+        let sid = Uuid::new_v4();
+        let cwd = "/repo/ferrosa-memory";
+        let first = crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "Judge Abstention".into(),
+            entity_type: "concept".into(),
+            context_snippet: "Judge abstention should be tracked separately".into(),
+            entity_embedding: None,
+            confidence: 0.9,
+            state: Default::default(),
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        };
+        let second = crate::types::EntityEntry {
+            entity_id: Uuid::new_v4(),
+            entity_name: "Judge Neutral".into(),
+            context_snippet: "Judge neutral should not be treated as abstention".into(),
+            ..first.clone()
+        };
+        store.entities.lock().await.push(first.clone());
+        store.entities.lock().await.push(second.clone());
+
+        let search = serde_json::json!({
+            "name": "hybrid_search",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "query": "Judge",
+                "cwd": cwd,
+                "limit": 2
+            }
+        });
+        let result = dispatch("tools/call", search, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        let results = result["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        let abstained_id = Uuid::parse_str(results[0]["id"].as_str().unwrap()).unwrap();
+        let neutral_id = Uuid::parse_str(results[1]["id"].as_str().unwrap()).unwrap();
+
+        let feedback = serde_json::json!({
+            "name": "record_feedback",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "scores": ["-", 0],
+                "judge": "test_judge",
+                "cwd": cwd
+            }
+        });
+        let feedback = dispatch("tools/call", feedback, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let feedback = unwrap_tool_result(feedback);
+        assert_eq!(feedback["abstained"], 1);
+        assert_eq!(feedback["updated"].as_array().unwrap()[0]["score"], "-");
+        assert_eq!(feedback["updated"].as_array().unwrap()[1]["score"], 0);
+
+        let abstained = store
+            .entity_get_by_id(&ctx, sid, abstained_id)
+            .await
+            .unwrap()
+            .expect("entity should exist");
+        let feedback = abstained
+            .properties
+            .pointer("/workspace_feedback")
+            .and_then(Value::as_object)
+            .expect("workspace feedback should exist");
+        let entry = feedback.values().next().unwrap();
+        assert_eq!(entry["abstentions"], 1);
+        assert_eq!(entry["neutrals"].as_i64().unwrap_or(0), 0);
+        assert_eq!(
+            entry["mechanisms"]["entity_phonetic"]["judges"]["test_judge"]["abstentions"],
+            1
+        );
+
+        let neutral = store
+            .entity_get_by_id(&ctx, sid, neutral_id)
+            .await
+            .unwrap()
+            .expect("entity should exist");
+        let feedback = neutral
+            .properties
+            .pointer("/workspace_feedback")
+            .and_then(Value::as_object)
+            .expect("workspace feedback should exist");
+        let entry = feedback.values().next().unwrap();
+        assert_eq!(entry["neutrals"], 1);
+        assert_eq!(entry["abstentions"].as_i64().unwrap_or(0), 0);
+        assert_eq!(
+            entry["mechanisms"]["entity_phonetic"]["judges"]["test_judge"]["neutrals"],
+            1
+        );
+    }
+
+    #[test]
+    fn parse_llm_rerank_order_accepts_object_array_and_indices() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let third = Uuid::new_v4();
+        let ids = vec![first, second, third];
+
+        let raw = format!(
+            r#"Here is the JSON: {{"order":[{{"id":"{second}"}}, "not-a-candidate", 1, "{third}"]}}"#
+        );
+        let parsed = parse_llm_rerank_order(&raw, &ids);
+
+        assert_eq!(parsed, vec![second, first, third]);
+    }
+
+    #[test]
+    fn parse_llm_judge_scores_preserves_abstentions() {
+        let raw = r#"{"order":[1,2,3,4],"scores":[1,"-",0,-1]}"#;
+        let parsed = parse_llm_judge_scores(raw, 5);
+        assert_eq!(parsed, vec![Some(1), None, Some(0), Some(-1), None]);
+        assert_eq!(
+            Value::Array(judge_scores_for_response(&parsed)),
+            serde_json::json!([1, "-", 0, -1, "-"])
+        );
+    }
+
+    #[test]
+    fn apply_llm_rerank_order_preserves_omitted_candidates_and_tail() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let third = Uuid::new_v4();
+        let fourth = Uuid::new_v4();
+        let result = |id, content: &str| crate::hybrid_search::SearchResult {
+            id,
+            source: "entity_ann".into(),
+            content: content.into(),
+            score: 1.0,
+            result_type: "entity".into(),
+            document_id: None,
+            prev_chunk_id: None,
+            next_chunk_id: None,
+            hint: None,
+        };
+        let reranked = apply_llm_rerank_order(
+            vec![
+                result(first, "first"),
+                result(second, "second"),
+                result(third, "third"),
+                result(fourth, "fourth"),
+            ],
+            &[third, first],
+            3,
+        );
+        let ids = reranked.into_iter().map(|r| r.id).collect::<Vec<_>>();
+
+        assert_eq!(ids, vec![third, first, second, fourth]);
     }
 
     #[tokio::test]

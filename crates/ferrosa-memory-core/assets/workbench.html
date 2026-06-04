@@ -1056,7 +1056,11 @@
             <label for="judgeBaseUrl">Provider URL</label>
             <input id="judgeBaseUrl" class="input mono" type="url" placeholder="http://127.0.0.1:11434" required>
             <label for="judgeModel">Model</label>
-            <input id="judgeModel" class="input mono" type="text" placeholder="qwen3.5:27b" required>
+            <input id="judgeModel" class="input mono" type="text" placeholder="qwen2.5-coder:7b" required>
+            <label class="checkbox-row" for="judgeEnabled">
+              <input id="judgeEnabled" type="checkbox">
+              <span>Use judge for live retrieval reranking</span>
+            </label>
             <label for="judgeToken">Token</label>
             <input id="judgeToken" class="input mono" type="password" autocomplete="off" placeholder="optional; leave blank to keep or clear via checkbox">
             <label class="checkbox-row" for="judgeClearToken">
@@ -1405,6 +1409,7 @@
       judgeProvider: document.getElementById('judgeProvider'),
       judgeBaseUrl: document.getElementById('judgeBaseUrl'),
       judgeModel: document.getElementById('judgeModel'),
+      judgeEnabled: document.getElementById('judgeEnabled'),
       judgeToken: document.getElementById('judgeToken'),
       judgeClearToken: document.getElementById('judgeClearToken'),
       judgeTimeout: document.getElementById('judgeTimeout'),
@@ -1980,7 +1985,8 @@
     const populateJudgeForm = (payload) => {
       selectors.judgeProvider.value = payload.provider || 'ollama';
       selectors.judgeBaseUrl.value = payload.base_url || 'http://127.0.0.1:11434';
-      selectors.judgeModel.value = payload.model || 'qwen3.5:27b';
+      selectors.judgeModel.value = payload.model || 'qwen2.5-coder:7b';
+      selectors.judgeEnabled.checked = Boolean(payload.enabled);
       selectors.judgeTimeout.value = String(payload.timeout_seconds || 30);
       selectors.judgeToken.value = '';
       selectors.judgeToken.placeholder = payload.token_configured
@@ -2009,6 +2015,7 @@
       event.preventDefault();
       const token = selectors.judgeToken.value;
       const payload = {
+        enabled: selectors.judgeEnabled.checked,
         provider: selectors.judgeProvider.value,
         base_url: selectors.judgeBaseUrl.value.trim(),
         model: selectors.judgeModel.value.trim(),
