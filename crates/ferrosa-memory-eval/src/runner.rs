@@ -14,6 +14,11 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::bright_pro::{
+    AspectTrace, BrightProGroundTruth, BrightProHit, BrightProProtocol, BrightProRound,
+    BrightProScore, adaptive_efficiency_reward, aspect_recall_at_k, classify_agentic_trace,
+    fixed_round_budget, novelty_alpha_ndcg_at_k,
+};
 use crate::config::EvalConfig;
 use crate::grading::claim_rubric;
 use crate::grading::programmatic::{self, NoOpResolver};
@@ -548,6 +553,7 @@ impl<T: McpTransport> EvalRunner<T> {
             programmatic: programmatic_score,
             claims: claim_score,
             memory_quality: None,
+            bright_pro: None,
         };
 
         if let Some(ref truth) = run.scenario.retrieval_ground_truth {
@@ -567,6 +573,31 @@ impl<T: McpTransport> EvalRunner<T> {
                 chunking_policy: ChunkingPolicy::EvidencePacket,
                 metrics,
                 failure_kind,
+            });
+        }
+
+        if let Some(ref config) = run.scenario.bright_pro {
+            let truth = BrightProGroundTruth::from(config);
+            let hits = extract_bright_pro_hits(&run.traces);
+            let rounds = extract_bright_pro_rounds(&run.traces);
+            let cutoff = bright_pro_cutoff(config.protocol, hits.len());
+            let alpha_ndcg = novelty_alpha_ndcg_at_k(&truth, &hits, cutoff, config.alpha);
+            let aspect_recall = aspect_recall_at_k(&truth, &hits, cutoff);
+            let unique_doc_ratio = unique_doc_ratio(&hits);
+            let trace = AspectTrace::new(rounds, aspect_recall, true);
+            let failure_mode = classify_agentic_trace(&truth, &trace);
+            let observed_rounds = trace.rounds.len().max(1);
+            let aer = (config.protocol == BrightProProtocol::Adaptive)
+                .then(|| adaptive_efficiency_reward(aspect_recall, observed_rounds, config.gamma));
+
+            result.bright_pro = Some(BrightProScore {
+                protocol: config.protocol,
+                alpha_ndcg,
+                aspect_recall,
+                rounds: observed_rounds,
+                unique_doc_ratio,
+                aer,
+                failure_mode,
             });
         }
 
@@ -803,6 +834,7 @@ pub struct GradeResult {
     pub programmatic: Option<programmatic::ProgrammaticScore>,
     pub claims: Option<claim_rubric::ClaimScore>,
     pub memory_quality: Option<MemoryQualityScore>,
+    pub bright_pro: Option<BrightProScore>,
 }
 
 impl GradeResult {
@@ -893,6 +925,83 @@ fn collect_evidence_ids(value: &Value, hits: &mut Vec<EvidenceHit>) {
     }
 }
 
+fn extract_bright_pro_hits(traces: &[ToolCallTrace]) -> Vec<BrightProHit> {
+    traces
+        .iter()
+        .filter(|trace| trace.tool == "hybrid_search")
+        .flat_map(|trace| {
+            let mut ids = Vec::new();
+            collect_bright_pro_ids(&trace.response, &mut ids);
+            ids
+        })
+        .map(BrightProHit::new)
+        .collect()
+}
+
+fn extract_bright_pro_rounds(traces: &[ToolCallTrace]) -> Vec<BrightProRound> {
+    traces
+        .iter()
+        .filter(|trace| trace.tool == "hybrid_search")
+        .map(|trace| {
+            let mut ids = Vec::new();
+            collect_bright_pro_ids(&trace.response, &mut ids);
+            BrightProRound::new(ids.into_iter().map(BrightProHit::new).collect())
+        })
+        .collect()
+}
+
+fn collect_bright_pro_ids(value: &Value, ids: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for key in [
+                "id",
+                "entity_id",
+                "fold_id",
+                "fact_id",
+                "event_id",
+                "edge_id",
+                "source_fold_id",
+            ] {
+                if let Some(id) = map.get(key).and_then(|v| v.as_str()) {
+                    ids.push(id.to_string());
+                }
+            }
+            for nested in map.values() {
+                collect_bright_pro_ids(nested, ids);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_bright_pro_ids(item, ids);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn bright_pro_cutoff(protocol: BrightProProtocol, observed_hits: usize) -> usize {
+    match protocol {
+        BrightProProtocol::FixedOne => {
+            fixed_round_budget(crate::bright_pro::FixedRoundProtocol::One)
+        }
+        BrightProProtocol::FixedTwo => {
+            fixed_round_budget(crate::bright_pro::FixedRoundProtocol::Two)
+        }
+        BrightProProtocol::FixedThree => {
+            fixed_round_budget(crate::bright_pro::FixedRoundProtocol::Three)
+        }
+        BrightProProtocol::Static | BrightProProtocol::Adaptive => observed_hits,
+    }
+}
+
+fn unique_doc_ratio(hits: &[BrightProHit]) -> f64 {
+    if hits.is_empty() {
+        return 0.0;
+    }
+    let unique: std::collections::HashSet<&str> = hits.iter().map(|hit| hit.id.as_str()).collect();
+    unique.len() as f64 / hits.len() as f64
+}
+
 fn classify_observed_failure(
     retrieval: &MemoryEvalMetrics,
     actual_score: f64,
@@ -922,6 +1031,7 @@ fn classify_observed_failure(
 mod tests {
     use super::*;
     use serde_json::json;
+    use serial_test::serial;
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -1053,6 +1163,7 @@ mod tests {
             steps,
             grading: GradingConfig::default(),
             retrieval_ground_truth: None,
+            bright_pro: None,
             dikw: None,
             semantic: None,
         }
@@ -1783,6 +1894,58 @@ tool = "get_stats"
         );
     }
 
+    #[tokio::test]
+    async fn grade_run_populates_bright_pro_when_aspect_ground_truth_is_present() {
+        let transport = MockTransport::new().on_tool(
+            "hybrid_search",
+            vec![(
+                json!({
+                    "results": [
+                        {"id": "doc:cause"},
+                        {"id": "doc:mitigation"}
+                    ]
+                }),
+                Duration::from_millis(20),
+            )],
+        );
+        let mut runner = EvalRunner::new(transport, test_config());
+        let mut scenario = make_scenario("bright-pro-test", vec![make_step("hybrid_search")]);
+        scenario.bright_pro = Some(crate::bright_pro::BrightProConfig {
+            protocol: crate::bright_pro::BrightProProtocol::FixedTwo,
+            alpha: 0.5,
+            gamma: 0.05,
+            aspects: vec![
+                crate::bright_pro::ReasoningAspect {
+                    id: "cause".to_string(),
+                    weight: 1.0,
+                    evidence_ids: vec!["doc:cause".to_string()],
+                },
+                crate::bright_pro::ReasoningAspect {
+                    id: "mitigation".to_string(),
+                    weight: 1.0,
+                    evidence_ids: vec!["doc:mitigation".to_string()],
+                },
+            ],
+        });
+
+        let run = runner.run_scenario(scenario).await.unwrap();
+        let grade = runner.grade_run(&run);
+        let bright = grade.bright_pro.expect("bright-pro score");
+
+        assert_eq!(
+            bright.protocol,
+            crate::bright_pro::BrightProProtocol::FixedTwo
+        );
+        assert_eq!(bright.aspect_recall, 1.0);
+        assert!(bright.alpha_ndcg > 0.95);
+        assert_eq!(bright.rounds, 1);
+        assert_eq!(bright.unique_doc_ratio, 1.0);
+        assert_eq!(
+            bright.failure_mode,
+            crate::bright_pro::AgenticFailureMode::EarlyRoundEfficiency
+        );
+    }
+
     #[test]
     fn scenario_toml_parses_retrieval_ground_truth_ids() {
         let toml = r#"
@@ -1809,6 +1972,47 @@ distractor_entities = ["entity:noise"]
         assert_eq!(truth.distractor_entities, vec!["entity:noise"]);
     }
 
+    #[test]
+    fn scenario_toml_parses_bright_pro_aspect_ground_truth() {
+        let toml = r#"
+[scenario]
+id = "bright_pro_case"
+name = "BRIGHT-Pro case"
+
+[[steps]]
+tool = "hybrid_search"
+
+[bright_pro]
+protocol = "fixed_three"
+alpha = 0.4
+gamma = 0.07
+
+[[bright_pro.aspects]]
+id = "root_cause"
+weight = 2.0
+evidence_ids = ["doc:root", "doc:trace"]
+
+[[bright_pro.aspects]]
+id = "mitigation"
+weight = 1.0
+evidence_ids = ["doc:fix"]
+"#;
+
+        let scenario: EvalScenario = toml::from_str(toml).expect("parse scenario");
+        let truth = scenario.bright_pro.expect("bright-pro config");
+
+        assert_eq!(
+            truth.protocol,
+            crate::bright_pro::BrightProProtocol::FixedThree
+        );
+        assert_eq!(truth.alpha, 0.4);
+        assert_eq!(truth.gamma, 0.07);
+        assert_eq!(truth.aspects.len(), 2);
+        assert_eq!(truth.aspects[0].id, "root_cause");
+        assert_eq!(truth.aspects[0].weight, 2.0);
+        assert_eq!(truth.aspects[0].evidence_ids, vec!["doc:root", "doc:trace"]);
+    }
+
     #[tokio::test]
     async fn grade_result_composite_averages_methods() {
         let grade = GradeResult {
@@ -1822,6 +2026,7 @@ distractor_entities = ["entity:noise"]
             }),
             claims: None,
             memory_quality: None,
+            bright_pro: None,
         };
 
         assert!(
@@ -1850,6 +2055,7 @@ distractor_entities = ["entity:noise"]
                 threshold: 0.75,
             }),
             memory_quality: None,
+            bright_pro: None,
         };
 
         let composite = grade.composite_score();
@@ -2368,6 +2574,7 @@ distractor_entities = ["entity:noise"]
 
     #[tokio::test]
     #[ignore]
+    #[serial(mcp_live)]
     async fn live_run_three_step_scenario() {
         use crate::mcp_client::McpClient;
 

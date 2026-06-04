@@ -781,6 +781,67 @@ impl Storage for ReconnectingStorage {
         delegate!(self, entity_counts_by_type_and_state, ctx, session_id)
     }
 
+    async fn document_chunk_put(
+        &self,
+        ctx: &TenantContext,
+        chunk: &DocumentChunk,
+    ) -> anyhow::Result<()> {
+        delegate!(self, document_chunk_put, ctx, chunk)
+    }
+
+    async fn document_chunk_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        chunk_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<DocumentChunk>> {
+        delegate!(self, document_chunk_get, ctx, session_id, chunk_id)
+    }
+
+    async fn document_chunk_search_bm25(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        query: &str,
+        k: usize,
+    ) -> anyhow::Result<Vec<DocumentChunk>> {
+        delegate!(self, document_chunk_search_bm25, ctx, session_id, query, k)
+    }
+
+    async fn document_chunk_search_phonetic(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        query: &str,
+        k: usize,
+    ) -> anyhow::Result<Vec<DocumentChunk>> {
+        delegate!(
+            self,
+            document_chunk_search_phonetic,
+            ctx,
+            session_id,
+            query,
+            k
+        )
+    }
+
+    async fn document_chunk_search_ann(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        query_embedding: &[f32],
+        k: usize,
+    ) -> anyhow::Result<Vec<DocumentChunk>> {
+        delegate!(
+            self,
+            document_chunk_search_ann,
+            ctx,
+            session_id,
+            query_embedding,
+            k
+        )
+    }
+
     async fn entity_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<EntityEntry>> {
         delegate!(self, entity_list_all, ctx)
     }
@@ -1744,6 +1805,17 @@ async fn run_schema_migrations_if_enabled(config: &FerrosaCqlConfig) {
                     );
                 }
             }
+            match ferrosa_memory_core::migration::migration_status(&admin_session, &config.keyspace)
+                .await
+            {
+                Ok(status) => tracing::info!(
+                    db_version = status.db_version,
+                    binary_version = status.binary_version,
+                    pending = ?status.pending,
+                    "schema migration status"
+                ),
+                Err(e) => tracing::warn!("schema migration status unavailable: {e}"),
+            }
         }
         Err(e) => {
             tracing::warn!(
@@ -1855,7 +1927,7 @@ async fn idle_consolidation_loop<S: Storage + Send + Sync + 'static>(
         };
 
         for sid in session_ids {
-            run_idle_consolidation(storage.as_ref(), &ctx, sid, &cfg).await;
+            run_idle_consolidation(&session, storage.as_ref(), &ctx, sid, &cfg).await;
         }
     }
 }
@@ -1867,11 +1939,14 @@ async fn drain_consolidation_queue(session: &dispatch::SessionState) -> Vec<uuid
 
 /// Executes consolidation, edge weight decay, and optional stale-edge pruning.
 async fn run_idle_consolidation<S: Storage>(
+    session: &dispatch::SessionState,
     storage: &S,
     ctx: &TenantContext,
     session_id: uuid::Uuid,
     cfg: &IdleConsolidationConfig,
 ) {
+    dispatch::record_consolidation_running(session, session_id).await;
+
     // 1. Decay existing edge weights so unreinforced edges lose strength.
     if cfg.edge_decay_factor < 1.0 {
         match storage.edge_decay_weights(ctx, cfg.edge_decay_factor).await {
@@ -1887,12 +1962,19 @@ async fn run_idle_consolidation<S: Storage>(
 
     // 2. Run consolidation — rediscovered edges get fresh weights.
     match ferrosa_memory_core::dream::run_consolidation(storage, ctx, session_id).await {
-        Ok(r) => tracing::info!(
-            entities = r.entities_processed,
-            connections = r.connections_created,
-            "idle consolidation complete"
-        ),
-        Err(e) => tracing::warn!("idle consolidation failed: {e}"),
+        Ok(r) => {
+            dispatch::record_consolidation_finished(session, session_id, Ok(&r)).await;
+            tracing::info!(
+                entities = r.entities_processed,
+                connections = r.connections_created,
+                "idle consolidation complete"
+            );
+        }
+        Err(e) => {
+            let error = e.to_string();
+            dispatch::record_consolidation_finished(session, session_id, Err(error.as_str())).await;
+            tracing::warn!("idle consolidation failed: {e}");
+        }
     }
 
     // 3. Optionally prune stale edges (0 = disabled).
@@ -2169,6 +2251,10 @@ async fn main() -> anyhow::Result<()> {
                 graph: graph_client.clone(),
                 enrich_llm_url: config.enrich.llm_base_url.clone(),
                 enrich_llm_model: config.enrich.llm_model.clone(),
+                judge_config: Arc::new(tokio::sync::Mutex::new(config.judge.clone())),
+                retrieval_default_limit: Arc::new(std::sync::atomic::AtomicUsize::new(
+                    config.retrieval.default_limit.clamp(1, 50),
+                )),
                 ..dispatch::SessionState::default()
             });
             if let Some(sid) = default_session_id {
@@ -2283,6 +2369,10 @@ async fn main() -> anyhow::Result<()> {
                 graph: graph_client.clone(),
                 enrich_llm_url: config.enrich.llm_base_url.clone(),
                 enrich_llm_model: config.enrich.llm_model.clone(),
+                judge_config: Arc::new(tokio::sync::Mutex::new(config.judge.clone())),
+                retrieval_default_limit: Arc::new(std::sync::atomic::AtomicUsize::new(
+                    config.retrieval.default_limit.clamp(1, 50),
+                )),
                 ..dispatch::SessionState::default()
             });
 

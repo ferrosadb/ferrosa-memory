@@ -8,6 +8,12 @@ ferrosa-memory.toml
 opencode.json
 .runtime/
 
+# Large local evaluation corpora downloaded from Hugging Face.
+# Use scripts/download-eval-corpora.sh to populate these locally.
+.eval-corpus/
+eval-corpus/
+diagnostics/
+
 # Developer-local agent state — do not commit.
 .claude/
 .forge/

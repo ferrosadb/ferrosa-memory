@@ -1099,6 +1099,174 @@ async fn call_tool_http<S: Storage>(
     serde_json::from_str(text).map_err(|e| anyhow::anyhow!("invalid tool response JSON: {e}"))
 }
 
+fn redacted_judge_config(config: &crate::config::JudgeConfig) -> Value {
+    serde_json::json!({
+        "provider": &config.provider,
+        "base_url": &config.base_url,
+        "model": &config.model,
+        "timeout_seconds": config.timeout_seconds,
+        "token_configured": config.token.as_deref().is_some_and(|token| !token.is_empty()),
+    })
+}
+
+fn sanitized_config_string(
+    payload: &Value,
+    key: &str,
+    current: &str,
+    max_len: usize,
+) -> anyhow::Result<String> {
+    match payload.get(key) {
+        None | Some(Value::Null) => Ok(current.to_string()),
+        Some(Value::String(value)) => {
+            let value = value.trim();
+            anyhow::ensure!(!value.is_empty(), "{key} must not be empty");
+            anyhow::ensure!(value.len() <= max_len, "{key} is too long");
+            Ok(value.to_string())
+        }
+        Some(_) => anyhow::bail!("{key} must be a string"),
+    }
+}
+
+async fn handle_judge_config_get(session: &dispatch::SessionState) -> anyhow::Result<String> {
+    let config = session.judge_config.lock().await.clone();
+    Ok(json_response(
+        "200 OK",
+        &redacted_judge_config(&config).to_string(),
+    ))
+}
+
+async fn handle_judge_config_put(
+    session: &dispatch::SessionState,
+    body: &str,
+) -> anyhow::Result<String> {
+    let payload = parse_json_body(body)?;
+    let mut config = session.judge_config.lock().await;
+    let timeout_seconds = match payload.get("timeout_seconds") {
+        None | Some(Value::Null) => config.timeout_seconds,
+        Some(Value::Number(number)) => {
+            let raw = number
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("timeout_seconds must be a positive integer"))?;
+            anyhow::ensure!(raw > 0, "timeout_seconds must be greater than zero");
+            anyhow::ensure!(raw <= 300, "timeout_seconds must be <= 300");
+            raw
+        }
+        Some(_) => anyhow::bail!("timeout_seconds must be a positive integer"),
+    };
+
+    let provider = sanitized_config_string(&payload, "provider", &config.provider, 64)?;
+    let base_url = sanitized_config_string(&payload, "base_url", &config.base_url, 2048)?;
+    let model = sanitized_config_string(&payload, "model", &config.model, 512)?;
+    let token = match payload.get("token") {
+        None => config.token.clone(),
+        Some(Value::Null) => None,
+        Some(Value::String(value)) if value.trim().is_empty() => None,
+        Some(Value::String(value)) => {
+            anyhow::ensure!(value.len() <= 8192, "token is too long");
+            Some(value.to_string())
+        }
+        Some(_) => anyhow::bail!("token must be a string or null"),
+    };
+
+    *config = crate::config::JudgeConfig {
+        provider,
+        base_url,
+        model,
+        token,
+        timeout_seconds,
+    };
+    Ok(json_response(
+        "200 OK",
+        &serde_json::json!({
+            "saved": true,
+            "config": redacted_judge_config(&config),
+        })
+        .to_string(),
+    ))
+}
+
+async fn handle_judge_models_get(
+    session: &dispatch::SessionState,
+    path: &str,
+) -> anyhow::Result<String> {
+    let mut config = session.judge_config.lock().await.clone();
+    if let Some(provider) = query_param(path, "provider") {
+        config.provider = provider;
+    }
+    if let Some(base_url) = query_param(path, "base_url") {
+        config.base_url = base_url;
+    }
+
+    let base_url = config.base_url.trim_end_matches('/');
+    anyhow::ensure!(!base_url.is_empty(), "base_url must not be empty");
+    let provider = config.provider.to_ascii_lowercase();
+    let ollama_like = provider == "ollama" || provider == "ollama.com";
+    let url = if ollama_like {
+        format!("{base_url}/api/tags")
+    } else {
+        format!("{base_url}/v1/models")
+    };
+
+    let timeout = std::time::Duration::from_secs(config.timeout_seconds.clamp(1, 300));
+    let client = reqwest::Client::builder().timeout(timeout).build()?;
+    let mut request = client.get(&url);
+    if let Some(token) = config.token.as_deref()
+        && !token.is_empty()
+    {
+        request = request.bearer_auth(token);
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("model provider request failed: {e}"))?;
+    let status = response.status();
+    let value: Value = response
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("model provider returned non-JSON response: {e}"))?;
+    if !status.is_success() {
+        anyhow::bail!("model provider returned HTTP {status}");
+    }
+
+    let models = if ollama_like {
+        value
+            .get("models")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|model| {
+                model
+                    .get("name")
+                    .or_else(|| model.get("model"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        value
+            .get("data")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|model| model.get("id").and_then(Value::as_str).map(str::to_string))
+            .collect::<Vec<_>>()
+    };
+
+    let count = models.len();
+    Ok(json_response(
+        "200 OK",
+        &serde_json::json!({
+            "provider": &config.provider,
+            "base_url": &config.base_url,
+            "endpoint": url,
+            "models": models,
+            "count": count,
+        })
+        .to_string(),
+    ))
+}
+
 async fn handle_workbench_summary_request<S: Storage + OperatorQuerySurface>(
     storage: &S,
     ctx: &TenantContext,
@@ -1220,6 +1388,14 @@ async fn handle_operator_request<S: Storage + OperatorQuerySurface>(
         }
         ("GET", summary_path) if summary_path.starts_with("/workbench/api/summary?") => {
             handle_workbench_summary_request(storage, ctx, summary_path).await
+        }
+        ("GET", "/workbench/api/judge/config") => handle_judge_config_get(session).await,
+        ("POST", "/workbench/api/judge/config") | ("PUT", "/workbench/api/judge/config") => {
+            handle_judge_config_put(session, body).await
+        }
+        ("GET", "/workbench/api/judge/models") => handle_judge_models_get(session, path).await,
+        ("GET", models_path) if models_path.starts_with("/workbench/api/judge/models?") => {
+            handle_judge_models_get(session, models_path).await
         }
         ("POST", "/workbench/api/cql/query") => {
             let payload = parse_json_body(body)?;
@@ -4092,6 +4268,20 @@ mod tests {
     }
 
     #[test]
+    fn workbench_query_limit_inputs_match_api_cap() {
+        assert!(WORKBENCH_HTML.contains(r#"id="cqlLimit" type="number" min="1" max="1000""#));
+        assert!(WORKBENCH_HTML.contains(r#"id="sparqlLimit" type="number" min="1" max="1000""#));
+    }
+
+    #[test]
+    fn workbench_html_includes_judge_config_tab() {
+        assert!(WORKBENCH_HTML.contains(r#"data-section="judge""#));
+        assert!(WORKBENCH_HTML.contains(r#"id="judgeForm""#));
+        assert!(WORKBENCH_HTML.contains("/workbench/api/judge/config"));
+        assert!(WORKBENCH_HTML.contains("/workbench/api/judge/models"));
+    }
+
+    #[test]
     fn parse_viz_get_request() {
         let raw = "GET /viz HTTP/1.1\r\nHost: localhost:8766\r\n\r\n";
         let (method, path, _headers, _body) = parse_http_request(raw).unwrap();
@@ -4499,6 +4689,64 @@ mod tests {
         .unwrap();
         assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
         assert!(response.contains("\"error\":\"limit must be <= 1000\""));
+    }
+
+    #[tokio::test]
+    async fn workbench_judge_config_updates_runtime_state_and_redacts_token() {
+        let metrics = MemoryMetrics::new().unwrap();
+        let storage = MockStorage::new();
+        let session = dispatch::SessionState::default();
+        let headers = vec![(
+            "Authorization".to_string(),
+            "Basic dXNlcjpwYXNz".to_string(),
+        )];
+        let validator = |u: &str, p: &str| {
+            if u == "user" && p == "pass" {
+                Some(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap())
+            } else {
+                None
+            }
+        };
+
+        let put_response = handle_http_request_with_session(
+            "POST",
+            "/workbench/api/judge/config",
+            &headers,
+            r#"{"provider":"lmstudio","base_url":"http://127.0.0.1:1234","model":"local-judge","token":"super-secret","timeout_seconds":7}"#,
+            &storage,
+            &metrics,
+            &validator,
+            &|| true,
+            &ShellRouteConfig::default(),
+            &session,
+        )
+        .await
+        .unwrap();
+        assert!(put_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(put_response.contains("\"token_configured\":true"));
+        assert!(!put_response.contains("super-secret"));
+
+        let get_response = handle_http_request_with_session(
+            "GET",
+            "/workbench/api/judge/config",
+            &headers,
+            "",
+            &storage,
+            &metrics,
+            &validator,
+            &|| true,
+            &ShellRouteConfig::default(),
+            &session,
+        )
+        .await
+        .unwrap();
+        assert!(get_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(get_response.contains("\"provider\":\"lmstudio\""));
+        assert!(get_response.contains("\"base_url\":\"http://127.0.0.1:1234\""));
+        assert!(get_response.contains("\"model\":\"local-judge\""));
+        assert!(get_response.contains("\"timeout_seconds\":7"));
+        assert!(get_response.contains("\"token_configured\":true"));
+        assert!(!get_response.contains("super-secret"));
     }
 
     #[tokio::test]

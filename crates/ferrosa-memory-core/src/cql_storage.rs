@@ -82,6 +82,76 @@ fn sprint1_seed_insert_statements(ks: &str) -> (String, String) {
     (entity_q, edge_q)
 }
 
+const DEFAULT_ENTITY_TYPE_SEEDS: &[(&str, &str)] = &[
+    ("person", "A person or user identity."),
+    ("place", "A physical or logical location."),
+    ("event", "A dated or meaningful occurrence."),
+    ("concept", "A general concept when no richer type applies."),
+    ("org", "An organization, team, company, or institution."),
+    (
+        "document",
+        "A source document such as a paper, web page, note, or benchmark document.",
+    ),
+    (
+        "section",
+        "A section, passage, chunk, or excerpt from a larger document.",
+    ),
+    (
+        "benchmark_document",
+        "A benchmark corpus passage or document scoped to an evaluation run.",
+    ),
+    (
+        "feedback",
+        "User or system feedback that should influence future behavior.",
+    ),
+    (
+        "procedure",
+        "Reusable procedural knowledge or workflow guidance.",
+    ),
+    (
+        "policy_preference",
+        "A stable preference, policy, or correction learned from feedback.",
+    ),
+    (
+        "eval_run",
+        "An evaluation run, benchmark execution, or regression gate artifact.",
+    ),
+    (
+        "eval_failure",
+        "A failed or low-scoring evaluation case requiring diagnosis.",
+    ),
+    (
+        "corpus_manifest",
+        "A manifest describing an external or downloaded evaluation corpus.",
+    ),
+    (
+        "conversation",
+        "A conversation session or transcript container.",
+    ),
+    ("message", "A message inside a conversation."),
+    ("turn", "A single interaction turn inside a conversation."),
+    (
+        "workspace",
+        "A repository, working directory, or agent execution root.",
+    ),
+    (
+        "knowledge_artifact",
+        "A file, paper, summary, repo reference, or remote artifact pointer.",
+    ),
+    ("bug", "A software defect or correctness gap."),
+    ("decision", "A design, product, or operational decision."),
+    ("pattern", "A reusable implementation or reasoning pattern."),
+    ("preference", "A durable user or project preference."),
+    (
+        "skill",
+        "A methodology or procedure with structured steps (e.g. TDD, STRIDE threat modeling). Retrieved for context-aware suggestions.",
+    ),
+    (
+        "tag",
+        "A classification label. Tags form a hierarchy via PARENT_TAG edges; entities attach via TAGGED_AS.",
+    ),
+];
+
 fn tool_usage_put_query(ks: &str) -> String {
     format!(
         "INSERT INTO {ks}.tool_usage_log \
@@ -384,6 +454,62 @@ fn tokenize_context_terms(text: &str) -> Vec<String> {
             if term.len() >= 3 { Some(term) } else { None }
         })
         .collect()
+}
+
+fn phonetic_index_code(term: &str) -> Option<String> {
+    let mut chars = term
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .map(|c| c.to_ascii_lowercase());
+    let first = chars.next()?;
+    let mut code = String::new();
+    code.push(first);
+    for ch in chars {
+        if !"aeiou".contains(ch) {
+            code.push(ch);
+        }
+    }
+    (code.len() >= 3).then_some(code)
+}
+
+fn document_chunk_from_row(
+    ctx: &TenantContext,
+    row: &Row,
+    col_map: &ColMap,
+) -> anyhow::Result<DocumentChunk> {
+    let embedding = cql_get::<Vec<u8>>(row, col_map, "chunk_embedding")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(|v| crate::vector::decode_vector(&v));
+    let metadata_text: String = cql_get(row, col_map, "metadata").unwrap_or_default();
+    let metadata = if metadata_text.trim().is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str(&metadata_text).unwrap_or(serde_json::Value::Null)
+    };
+    Ok(DocumentChunk {
+        tenant_id: cql_get(row, col_map, "tenant_id").unwrap_or(ctx.tenant_id),
+        session_id: cql_get(row, col_map, "session_id")?,
+        document_id: cql_get(row, col_map, "document_id")?,
+        chunk_id: cql_get(row, col_map, "chunk_id")?,
+        ordinal: cql_get::<i32>(row, col_map, "ordinal").unwrap_or_default(),
+        source_doc_id: cql_get(row, col_map, "source_doc_id").unwrap_or_default(),
+        title: cql_get(row, col_map, "title").unwrap_or_default(),
+        section_path: cql_get(row, col_map, "section_path").unwrap_or_default(),
+        semantic_kind: cql_get(row, col_map, "semantic_kind").unwrap_or_default(),
+        content: cql_get(row, col_map, "content").unwrap_or_default(),
+        bm25_text: cql_get(row, col_map, "bm25_text").unwrap_or_default(),
+        chunk_embedding: embedding,
+        token_count: cql_get::<i32>(row, col_map, "token_count").unwrap_or_default(),
+        content_hash: cql_get(row, col_map, "content_hash").unwrap_or_default(),
+        prev_chunk_id: cql_get(row, col_map, "prev_chunk_id").ok(),
+        next_chunk_id: cql_get(row, col_map, "next_chunk_id").ok(),
+        overlap_from_prev: cql_get::<bool>(row, col_map, "overlap_from_prev").unwrap_or(false),
+        overlap_to_next: cql_get::<bool>(row, col_map, "overlap_to_next").unwrap_or(false),
+        metadata,
+        created_at: cql_get(row, col_map, "created_at").unwrap_or_default(),
+        updated_at: cql_get(row, col_map, "updated_at").unwrap_or_default(),
+    })
 }
 
 fn context_segment_from_row(
@@ -1199,24 +1325,10 @@ impl CqlStorage {
     }
 
     pub fn default_entity_types() -> Vec<String> {
-        [
-            "person",
-            "place",
-            "event",
-            "concept",
-            "org",
-            "document",
-            "section",
-            "bug",
-            "decision",
-            "pattern",
-            "preference",
-            "skill",
-            "tag",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+        DEFAULT_ENTITY_TYPE_SEEDS
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect()
     }
 
     /// Get the keyspace name this storage is connected to.
@@ -1224,33 +1336,14 @@ impl CqlStorage {
         &self.keyspace
     }
 
-    /// Idempotently register the Sprint 1 entity and edge types in the type
+    /// Idempotently register built-in entity and edge types in the type
     /// registry. Safe to run on every startup — CQL INSERT on the primary
     /// key is upsert, so re-running is a no-op for existing entries.
-    ///
-    /// Adds:
-    /// - entity_types: `skill`, `tag`
-    /// - edge_types: `TAGGED_AS` (entity → tag), `PARENT_TAG` (tag → tag
-    ///   hierarchy), `REQUIRES` (skill prerequisite)
-    ///
-    /// `SUPERSEDES` was already seeded in DDL 019; versions of skills link
-    /// via that edge type.
     pub async fn seed_sprint1_types(&self) -> anyhow::Result<()> {
         let ks = &self.keyspace;
 
-        // Entity types (upsert).
-        let entity_seeds: &[(&str, &str)] = &[
-            (
-                "skill",
-                "A methodology or procedure with structured steps (e.g. TDD, STRIDE threat modeling). Retrieved for context-aware suggestions.",
-            ),
-            (
-                "tag",
-                "A classification label. Tags form a hierarchy via PARENT_TAG edges; entities attach via TAGGED_AS.",
-            ),
-        ];
         let (entity_q, edge_q) = sprint1_seed_insert_statements(ks);
-        let entity_writes = entity_seeds.iter().map(|(name, desc)| {
+        let entity_writes = DEFAULT_ENTITY_TYPE_SEEDS.iter().map(|(name, desc)| {
             let q = entity_q.clone();
             let name = name.to_string();
             let desc = desc.to_string();
@@ -1602,6 +1695,10 @@ impl CqlStorage {
 }
 
 impl Storage for CqlStorage {
+    async fn migration_status(&self) -> anyhow::Result<crate::migration::MigrationStatus> {
+        crate::migration::migration_status(&self.session, &self.keyspace).await
+    }
+
     async fn memo_get(
         &self,
         ctx: &TenantContext,
@@ -2310,6 +2407,42 @@ impl Storage for CqlStorage {
         // Delegate to the full-row read so callers see the same shape as
         // entity_get_by_id without duplicating the column list here.
         self.entity_get_by_id(ctx, session_id, entity_id).await
+    }
+
+    async fn entity_find_by_exact_name_any_session(
+        &self,
+        ctx: &TenantContext,
+        name: &str,
+        entity_type: &str,
+    ) -> anyhow::Result<Option<EntityEntry>> {
+        // Same exact-name idempotency key as entity_find_by_exact_name, but
+        // intentionally omits session_id so smart_ingest can suppress obvious
+        // cross-session duplicates without broadening fuzzy/ANN matching.
+        let query = format!(
+            "SELECT entity_id, session_id FROM {}.entity_store \
+             WHERE tenant_id = ? AND entity_name = ? AND entity_type = ? \
+             ALLOW FILTERING",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        let result = self
+            .session
+            .query_unpaged(query, (ctx.tenant_id, name, entity_type))
+            .await?;
+        let col_map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let entity_id = cql_get::<Uuid>(row, &col_map, "entity_id").map_err(|e| {
+            anyhow::anyhow!("entity_find_by_exact_name_any_session row missing entity_id: {e}")
+        })?;
+        let matched_session_id = cql_get::<Uuid>(row, &col_map, "session_id").map_err(|e| {
+            anyhow::anyhow!("entity_find_by_exact_name_any_session row missing session_id: {e}")
+        })?;
+
+        self.entity_get_by_id(ctx, matched_session_id, entity_id)
+            .await
     }
 
     async fn entity_get_by_id(
@@ -5186,6 +5319,252 @@ impl Storage for CqlStorage {
         Ok(())
     }
 
+    async fn document_chunk_put(
+        &self,
+        ctx: &TenantContext,
+        chunk: &DocumentChunk,
+    ) -> anyhow::Result<()> {
+        let q = format!(
+            "INSERT INTO {ks}.document_chunks (tenant_id, session_id, document_id, chunk_id, \
+             ordinal, source_doc_id, title, section_path, semantic_kind, content, bm25_text, \
+             token_count, content_hash, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ks = self.keyspace
+        );
+        self.session
+            .query_unpaged(
+                q,
+                (
+                    ctx.tenant_id,
+                    chunk.session_id,
+                    chunk.document_id,
+                    chunk.chunk_id,
+                    chunk.ordinal,
+                    chunk.source_doc_id.clone(),
+                    chunk.title.clone(),
+                    chunk.section_path.clone(),
+                    chunk.semantic_kind.clone(),
+                    chunk.content.clone(),
+                    chunk.bm25_text.clone(),
+                    chunk.token_count,
+                    chunk.content_hash.clone(),
+                    chunk.created_at,
+                    chunk.updated_at,
+                ),
+            )
+            .await?;
+
+        let q = format!(
+            "UPDATE {ks}.document_chunks SET prev_chunk_id = ?, next_chunk_id = ?, \
+             overlap_from_prev = ?, overlap_to_next = ?, metadata = ? \
+             WHERE tenant_id = ? AND session_id = ? AND chunk_id = ?",
+            ks = self.keyspace
+        );
+        self.session
+            .query_unpaged(
+                q,
+                (
+                    chunk.prev_chunk_id,
+                    chunk.next_chunk_id,
+                    chunk.overlap_from_prev,
+                    chunk.overlap_to_next,
+                    chunk.metadata.to_string(),
+                    ctx.tenant_id,
+                    chunk.session_id,
+                    chunk.chunk_id,
+                ),
+            )
+            .await?;
+
+        if let Some(embedding) = &chunk.chunk_embedding {
+            let vec_literal = render_vector_literal(embedding);
+            let q = format!(
+                "UPDATE {ks}.document_chunks SET chunk_embedding = {vec_literal} \
+                 WHERE tenant_id = ? AND session_id = ? AND chunk_id = ?",
+                ks = self.keyspace
+            );
+            self.session
+                .query_unpaged(q, (ctx.tenant_id, chunk.session_id, chunk.chunk_id))
+                .await?;
+        }
+
+        let terms = tokenize_context_terms(&chunk.bm25_text);
+        let doc_len = terms.len() as i32;
+        let mut counts: HashMap<String, i32> = HashMap::new();
+        for term in terms {
+            *counts.entry(term).or_insert(0) += 1;
+        }
+
+        let term_q = format!(
+            "INSERT INTO {ks}.document_terms \
+             (tenant_id, session_id, term, chunk_id, document_id, tf, doc_len) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ks = self.keyspace
+        );
+        let phonetic_q = format!(
+            "INSERT INTO {ks}.document_phonetic_terms \
+             (tenant_id, session_id, phonetic_code, chunk_id, document_id, term) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+            ks = self.keyspace
+        );
+        for (term, tf) in counts {
+            self.session
+                .query_unpaged(
+                    term_q.clone(),
+                    (
+                        ctx.tenant_id,
+                        chunk.session_id,
+                        term.clone(),
+                        chunk.chunk_id,
+                        chunk.document_id,
+                        tf,
+                        doc_len,
+                    ),
+                )
+                .await?;
+            if let Some(code) = phonetic_index_code(&term) {
+                self.session
+                    .query_unpaged(
+                        phonetic_q.clone(),
+                        (
+                            ctx.tenant_id,
+                            chunk.session_id,
+                            code,
+                            chunk.chunk_id,
+                            chunk.document_id,
+                            term,
+                        ),
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn document_chunk_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        chunk_id: Uuid,
+    ) -> anyhow::Result<Option<DocumentChunk>> {
+        let q = format!(
+            "SELECT * FROM {ks}.document_chunks \
+             WHERE tenant_id = ? AND session_id = ? AND chunk_id = ?",
+            ks = self.keyspace
+        );
+        let result = self
+            .session
+            .query_unpaged(q, (ctx.tenant_id, session_id, chunk_id))
+            .await?;
+        let col_map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
+        rows.first()
+            .map(|row| document_chunk_from_row(ctx, row, &col_map))
+            .transpose()
+    }
+
+    async fn document_chunk_search_bm25(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        query: &str,
+        k: usize,
+    ) -> anyhow::Result<Vec<DocumentChunk>> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let mut scores: HashMap<Uuid, i32> = HashMap::new();
+        let candidate_limit = context_segment_bm25_candidate_limit(k);
+        let term_q = format!(
+            "SELECT chunk_id, tf FROM {ks}.document_terms \
+             WHERE tenant_id = ? AND session_id = ? AND term = ? \
+             LIMIT {candidate_limit}",
+            ks = self.keyspace
+        );
+        for term in tokenize_context_terms(query) {
+            let (col_map, rows) = query_paged_rows!(
+                self.session,
+                term_q.clone(),
+                (ctx.tenant_id, session_id, term)
+            )?;
+            for row in rows {
+                let id: Uuid = cql_get(&row, &col_map, "chunk_id")?;
+                let tf: i32 = cql_get(&row, &col_map, "tf").unwrap_or(1);
+                *scores.entry(id).or_insert(0) += tf;
+            }
+        }
+        let mut ranked: Vec<(Uuid, i32)> = scores.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let mut chunks = Vec::new();
+        for (chunk_id, _) in ranked.into_iter().take(k) {
+            if let Some(chunk) = self.document_chunk_get(ctx, session_id, chunk_id).await? {
+                chunks.push(chunk);
+            }
+        }
+        Ok(chunks)
+    }
+
+    async fn document_chunk_search_phonetic(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        query: &str,
+        k: usize,
+    ) -> anyhow::Result<Vec<DocumentChunk>> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let mut scores: HashMap<Uuid, i32> = HashMap::new();
+        let candidate_limit = context_segment_bm25_candidate_limit(k);
+        let q = format!(
+            "SELECT chunk_id FROM {ks}.document_phonetic_terms \
+             WHERE tenant_id = ? AND session_id = ? AND phonetic_code = ? \
+             LIMIT {candidate_limit}",
+            ks = self.keyspace
+        );
+        for term in tokenize_context_terms(query) {
+            let Some(code) = phonetic_index_code(&term) else {
+                continue;
+            };
+            let (col_map, rows) =
+                query_paged_rows!(self.session, q.clone(), (ctx.tenant_id, session_id, code))?;
+            for row in rows {
+                let id: Uuid = cql_get(&row, &col_map, "chunk_id")?;
+                *scores.entry(id).or_insert(0) += 1;
+            }
+        }
+        let mut ranked: Vec<(Uuid, i32)> = scores.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let mut chunks = Vec::new();
+        for (chunk_id, _) in ranked.into_iter().take(k) {
+            if let Some(chunk) = self.document_chunk_get(ctx, session_id, chunk_id).await? {
+                chunks.push(chunk);
+            }
+        }
+        Ok(chunks)
+    }
+
+    async fn document_chunk_search_ann(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        query_embedding: &[f32],
+        k: usize,
+    ) -> anyhow::Result<Vec<DocumentChunk>> {
+        let vec_literal = render_vector_literal(query_embedding);
+        let q = format!(
+            "SELECT * FROM {ks}.document_chunks \
+             WHERE tenant_id = ? AND session_id = ? \
+             ORDER BY chunk_embedding ANN OF {vec_literal} LIMIT {k}",
+            ks = self.keyspace,
+            k = k
+        );
+        let (col_map, rows) = query_paged_rows!(self.session, q, (ctx.tenant_id, session_id))?;
+        rows.into_iter()
+            .map(|row| document_chunk_from_row(ctx, &row, &col_map))
+            .collect()
+    }
+
     async fn context_segment_get(
         &self,
         ctx: &TenantContext,
@@ -5917,17 +6296,28 @@ mod cql_storage_tests {
     fn default_entity_types_include_install_schema_types() {
         let entity_types = CqlStorage::default_entity_types();
 
-        assert!(
-            entity_types
-                .iter()
-                .any(|entity_type| entity_type == "document"),
-            "fallback entity type registry must include document"
-        );
-        assert!(
-            entity_types
-                .iter()
-                .any(|entity_type| entity_type == "section"),
-            "fallback entity type registry must include section"
-        );
+        for expected in [
+            "document",
+            "section",
+            "benchmark_document",
+            "feedback",
+            "procedure",
+            "policy_preference",
+            "eval_run",
+            "eval_failure",
+            "corpus_manifest",
+            "conversation",
+            "message",
+            "turn",
+            "workspace",
+            "knowledge_artifact",
+        ] {
+            assert!(
+                entity_types
+                    .iter()
+                    .any(|entity_type| entity_type == expected),
+                "fallback entity type registry must include {expected}"
+            );
+        }
     }
 }

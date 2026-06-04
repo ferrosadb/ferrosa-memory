@@ -73,17 +73,23 @@ Analogy: talking to PostgreSQL over its wire protocol is fine; writing directly 
 
 ## Tools
 
-27 MCP tools across 7 functional groups:
+61 MCP tools are defined in `crates/ferrosa-memory-core/src/dispatch.rs` and
+returned by `tools/list`. Keep this section aligned with the dispatch registry
+when adding or removing tools.
 
 | Group | Tools | Purpose |
 |-------|-------|---------|
-| Core memory | `smart_ingest`, `ingest_entities`, `retrieve_entities`, `hybrid_search`, `list_entities`, `count_entities_by_type` | Ingest, retrieve, and structured-filter entities; semantic + lexical + phonetic + graph search |
+| Context and folds | `ingest_context_segments`, `search_context_segments`, `get_context_window`, `start_fold`, `append_to_fold`, `complete_fold`, `retrieve_fold_context` | Store raw context windows and fold long trajectories into retrievable summaries |
+| Memo and plans | `check_memo_cache`, `store_memo_result`, `write_plan_node`, `get_plan_context`, `update_plan_node` | Cache sub-call results and maintain hierarchical plan state |
+| Core memory | `smart_ingest`, `upsert_entity`, `batch_ingest`, `ingest_entities`, `retrieve_entities`, `list_entities`, `hybrid_search`, `count_entities_by_type` | Ingest, retrieve, and structured-filter entities; semantic + lexical + phonetic + graph search |
 | Graph / edges | `create_edge`, `batch_create_edges`, `batch_update_edges`, `batch_delete_edges`, `explore_connections`, `find_memory_chain` | Build and traverse the knowledge graph |
 | Temporal | `write_temporal_fact`, `get_temporal_chain` | Timestamped facts with supersession tracking |
 | Skills | `ingest_skill`, `invoke_skill`, `verify_skill`, `retrieve_skills_for_context` | Skill lifecycle: ingest, invoke, verify, retrieve |
-| Intentions | `set_intention`, `check_intentions`, `complete_intention` | Prospective memory — deferred actions triggered by topic, file pattern, duration, or context |
-| Batch ops | `batch_update_entities`, `batch_delete_entities` | Bulk entity updates and deletions |
-| Maintenance | `run_consolidation`, `get_stats`, `record_outcome`, `ensure_parent_tag` | Discover CO_OCCURS patterns, health stats, strategy feedback, tag hierarchy |
+| Intentions | `set_intention`, `check_intentions`, `complete_intention`, `list_intentions`, `snooze_intention` | Prospective memory — deferred actions triggered by topic, file pattern, duration, or context |
+| Batch ops | `batch_update_entities`, `batch_delete_entities`, `delete_session` | Bulk entity updates, deletions, and scoped cleanup |
+| Knowledge plane | `run_consolidation`, `enrich_entities`, `importance_score`, `predict_needed`, `spread_activation`, `find_duplicates`, `recursive_explore`, `query_derived`, `list_derived_cache` | Consolidation, scoring, associative recall, recursive search, and derived-fact access |
+| Governance | `manage_rules`, `manage_claims`, `manage_approvals`, `manage_aliases`, `explain_derived`, `get_effective_rule_set`, `promote_predicate`, `promote_memory`, `demote_memory` | Rule governance, claims, approvals, explanations, and memory promotion |
+| Maintenance | `get_stats`, `record_outcome`, `ensure_parent_tag` | Health stats, strategy feedback, and tag hierarchy |
 
 ## Quick Start
 
@@ -113,6 +119,7 @@ cp examples/http-auth.toml ./http-auth.toml
 
 FERROSA_MEMORY_CONFIG=./ferrosa-memory-http.toml cargo run --bin ferrosa-memory-mcp
 # Listens on port 8765 by default and exposes:
+#   GET /health
 #   GET /healthz/live
 #   GET /healthz/ready
 #   POST /mcp
@@ -128,12 +135,24 @@ Shared HTTP startup is fail-closed. The binary refuses to bind the listener unle
 Probe semantics differ on purpose:
 
 - `GET /healthz/live` reports process liveness only
+- `GET /health` is an alias of `/healthz/live`
 - `GET /healthz/ready` reports whether the Ferrosa-facing data-plane clients are currently ready for MCP traffic. Under the role-aware boundary, that means auth + app-table CQL + enabled public query endpoints are healthy. It must not require graph-table `MODIFY` to report ready.
 
 ```sh
+curl -sk https://127.0.0.1:8765/health
 curl -sk https://127.0.0.1:8765/healthz/live
 curl -sk https://127.0.0.1:8765/healthz/ready
 ```
+
+Streaming and request safety defaults:
+
+| Limit | Default |
+|-------|---------|
+| Request body cap | 8 MiB |
+| Per-connection request budget | 30 seconds |
+| TLS accept budget | 10 seconds |
+| Per-IP rate limit | 50 requests/minute |
+| SPARQL passthrough response cap | 4 MiB |
 
 The shared HTTP template keeps `viz` disabled. If you enable it under HTTP mode, the viz listener stays loopback-only and requires an explicit `[viz].tenant_id`.
 
@@ -212,6 +231,8 @@ See [`examples/ferrosa-memory.toml`](examples/ferrosa-memory.toml) for all optio
 | `[sparql]` | Public SPARQL endpoint enablement and URL |
 | `[datalog]` | Local ferrosa-memory Datalog engine limits and cache behavior |
 | `[memory]` | TTL, compression threshold, confidence gate, memo limits |
+| `[retrieval]` | Default result count for retrieval tools when `k`/`limit` is omitted |
+| `[eval]` | Eval harness settings such as BRIGHT-Pro/MemoryBench `retrieval_k` |
 | `[embeddings]` | Provider (Ollama/OpenAI), model, dimensions |
 | `[security]` | Audit log, anomaly detection, sigma threshold |
 | `[routing]` | Guideline version, feedback export schedule |
@@ -234,9 +255,11 @@ Shared HTTP mode requires:
 
 ```
 crates/
-  ferrosa-memory-core/          Shared library (17 modules)
+  ferrosa-memory-core/   Shared library, storage abstractions, tool handlers, HTTP/workbench
   ferrosa-memory-mcp/    MCP server binary
   ferrosa-memory-batch/  Nightly routing guideline job
+  ferrosa-memory-sync/   Cross-device sync binary
+  ferrosa-memory-eval/   Evaluation runner and scenarios
 ddl/                     CQL schema definitions
 specs/                   Architecture, DSM, threat model, FMEA, project plan
 product/                 Product specification

@@ -198,6 +198,10 @@ pub async fn explore(
                         content: String::new(), // Will be enriched by caller
                         score: 0.5 * (1.0 / (1.0 + pass_idx as f64)), // Decay score by pass
                         result_type: "entity".to_string(),
+                        document_id: None,
+                        prev_chunk_id: None,
+                        next_chunk_id: None,
+                        hint: None,
                     },
                 );
             }

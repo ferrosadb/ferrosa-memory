@@ -425,20 +425,76 @@ If the harness cannot attach MCP servers, keep the HTTP JSON-RPC smoke commands 
 
 ---
 
-## Phase 12 — Optional hooks
+## Phase 12 — Install agent hooks
 
-Only install hooks the user explicitly wants.
+Run the hook installer after MCP health checks pass. A Claude or Hermes agent can run this step directly from the repository checkout:
 
-Recommended hook categories:
+```bash
+python3 scripts/install-agent-hooks.py --harness auto --verify
+```
 
-1. **Session-end memory hook:** summarize stable decisions and call Ferrosa Memory ingest tools.
-2. **Pre-compaction context hook:** send raw soon-to-be-compressed context to context-segment ingestion.
-3. **Repo-task hook:** when working inside the Ferrosa repos, load `repo-workflow`, `test-driven-development`, and `ferrosa-memory-ops` guidance.
-4. **Health hook:** before memory-heavy tasks, check MCP readiness and fail clearly if fmem is down.
+The installer detects local Codex, Claude, and Hermes harnesses. It writes wrapper scripts and a manifest under:
+
+```text
+~/.config/ferrosa-memory/hooks/
+```
+
+Generated wrappers:
+
+```text
+<harness>-recall.sh
+<harness>-ingest-turn.sh
+```
+
+The recall wrapper calls `check_intentions` and `hybrid_search` with the current working directory. The ingest wrapper stores a best-effort `turn` entity with `cwd`, `workspace`, and `working_directory` attributes so later retrieval and reranking can prefer knowledge learned in the same repo.
+
+Default endpoint:
+
+```text
+http://127.0.0.1:18765/mcp
+```
+
+Override it when needed:
+
+```bash
+python3 scripts/install-agent-hooks.py \
+  --harness auto \
+  --mcp-url http://127.0.0.1:18765/mcp \
+  --verify
+```
+
+If the MCP endpoint requires auth, edit `~/.config/ferrosa-memory/hooks/env` or export one of these before the harness starts:
+
+```bash
+export FERROSA_MEMORY_MCP_USER='ferrosa_user'
+export FERROSA_MEMORY_MCP_PASSWORD='ferrosa_user'
+# or:
+export FERROSA_MEMORY_AUTH_HEADER='Basic <base64 user:password>'
+```
+
+Harness config behavior:
+
+- Claude Code: patches `~/.claude/settings.json` with `UserPromptSubmit`, `Stop`, `SubagentStop`, and `PreCompact` hooks, with a timestamped backup.
+- Hermes: patches `~/.hermes/config.yaml` only when the existing `hooks` block is empty, with a timestamped backup.
+- Codex: installs wrapper commands and writes `codex-hooks-note.md`; use the existing MCP config path unless the local Codex build exposes lifecycle hook config.
+
+For a config-only dry run that still refreshes wrapper scripts but does not patch harness config files:
+
+```bash
+python3 scripts/install-agent-hooks.py --harness auto --dry-run --no-apply-config --verify
+```
+
+Manual merge snippets are always written:
+
+```text
+~/.config/ferrosa-memory/hooks/claude-settings-snippet.json
+~/.config/ferrosa-memory/hooks/hermes-hooks-snippet.yaml
+~/.config/ferrosa-memory/hooks/codex-hooks-note.md
+```
 
 Hook safety rules:
 
-- Hooks must log to stderr if they also output JSON to a harness.
+- Hooks are best-effort and exit zero after logging failures to stderr.
 - Hooks must not block session shutdown on long consolidation jobs.
 - Hooks must not ingest secrets or full environment dumps.
 - Hooks must be idempotent and safe to retry.
@@ -468,8 +524,19 @@ Once the stack and MCP client work, run these examples.
 {
   "tool": "hybrid_search",
   "arguments": {
-    "query": "Ferrosa Memory onboarding",
-    "limit": 5
+    "query": "Ferrosa Memory onboarding"
+  }
+}
+```
+
+Retrieval tools use `[retrieval] default_limit` when `limit`/`k` is omitted.
+To reduce token usage at runtime, call:
+
+```json
+{
+  "tool": "config",
+  "arguments": {
+    "retrieval_limit": 5
   }
 }
 ```
@@ -506,7 +573,7 @@ Once the stack and MCP client work, run these examples.
 | `get_stats` times out | Check all three Ferrosa nodes, recent replay/OOM logs, and CQL read timeouts. |
 | All tools return 504 immediately after restart | ANN index cold-load: Ferrosa rebuilds its vector index in memory before serving queries. With a large entity store this takes several minutes. Wait and retry. |
 | `smart_ingest` reports success but entities are missing on retrieval | Ferrosa drops role GRANTs on restart. Re-run `GRANT ALL PERMISSIONS ON KEYSPACE agent_memory TO ferrosa_user` before starting ferrosa-memory-mcp. |
-| `curl http://localhost:18765/health` fails but `curl http://127.0.0.1:18765/health` works | macOS resolves `localhost` to IPv6 (`::1`) first; ferrosa-memory-mcp binds IPv4 only. Always use `127.0.0.1` explicitly, not `localhost`. |
+| `/health` fails | `/health` is an alias of `/healthz/live`; check whether the listener is HTTP or HTTPS, host-networked or port-mapped, and whether a proxy/tunnel is intercepting the host/port. Prefer `127.0.0.1` for bind-specific local stacks. |
 | Claude/Codex cannot see tools | Verify the harness MCP config path and restart the harness. |
 | Hermes tools list is stale | Run `/reload-mcp` in a new session after fmem health is green. |
 | Bridge container cannot reach `localhost:19042` | Use host networking for MCP or change CQL contact points to container-routable names. |

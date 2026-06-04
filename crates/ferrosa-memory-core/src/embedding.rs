@@ -11,6 +11,7 @@
 //! Tools that don't need embeddings (plan_tools, feedback_tools) are unaffected.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::config::EmbeddingConfig;
 
@@ -43,6 +44,7 @@ struct OllamaEmbedResponse {
 /// HTTP client for generating text embeddings.
 pub struct EmbeddingClient {
     http: reqwest::Client,
+    provider: String,
     base_url: String,
     model: String,
     dimensions: u32,
@@ -62,6 +64,7 @@ impl EmbeddingClient {
 
         Self {
             http,
+            provider: config.provider.clone(),
             base_url: config.ollama_base_url.clone(),
             model: config.model.clone(),
             dimensions: config.dimensions,
@@ -76,6 +79,10 @@ impl EmbeddingClient {
     /// - [`EmbeddingError::Unavailable`] if the endpoint can't be reached
     /// - [`EmbeddingError::DimensionMismatch`] if the response has wrong dimensions
     pub async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        if self.provider.eq_ignore_ascii_case("synthetic") {
+            return Ok(synthetic_embedding(text, self.dimensions));
+        }
+
         let chunks = chunk_text_for_embedding(text, self.max_input_chars);
         let mut accum: Option<Vec<f64>> = None;
         let mut count = 0usize;
@@ -153,6 +160,10 @@ impl EmbeddingClient {
     /// `Err(RequestFailed)` with a clear message if the configured model is
     /// not in the loaded model list.
     pub async fn health_check(&self) -> Result<(), EmbeddingError> {
+        if self.provider.eq_ignore_ascii_case("synthetic") {
+            return Ok(());
+        }
+
         let url = format!("{}/api/tags", self.base_url);
         let resp = self
             .http
@@ -187,6 +198,27 @@ impl EmbeddingClient {
 
         Ok(())
     }
+}
+
+fn synthetic_embedding(text: &str, dimensions: u32) -> Vec<f32> {
+    let dimensions = dimensions.max(1) as usize;
+    let mut out = Vec::with_capacity(dimensions);
+    let mut counter = 0u64;
+
+    while out.len() < dimensions {
+        let mut hasher = Sha256::new();
+        hasher.update(counter.to_le_bytes());
+        hasher.update(text.as_bytes());
+        for byte in hasher.finalize() {
+            if out.len() == dimensions {
+                break;
+            }
+            out.push((byte as f32 / 127.5) - 1.0);
+        }
+        counter += 1;
+    }
+
+    out
 }
 
 fn chunk_text_for_embedding(text: &str, max_chars: usize) -> Vec<String> {
@@ -260,6 +292,27 @@ mod tests {
         let chunks = chunk_text_for_embedding("abcdefghijklmnop", 5);
         assert_eq!(chunks, vec!["abcde", "fghij", "klmno", "p"]);
         assert!(chunks.iter().all(|chunk| chunk.len() <= 5));
+    }
+
+    #[tokio::test]
+    async fn synthetic_provider_returns_deterministic_local_vectors() {
+        let config = EmbeddingConfig {
+            provider: "synthetic".into(),
+            ollama_base_url: String::new(),
+            model: "synthetic-ci".into(),
+            dimensions: 8,
+            ..EmbeddingConfig::default()
+        };
+        let client = EmbeddingClient::new(&config);
+
+        client.health_check().await.unwrap();
+        let first = client.embed("same input").await.unwrap();
+        let second = client.embed("same input").await.unwrap();
+        let different = client.embed("different input").await.unwrap();
+
+        assert_eq!(first.len(), 8);
+        assert_eq!(first, second);
+        assert_ne!(first, different);
     }
 
     #[tokio::test]

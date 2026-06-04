@@ -240,6 +240,37 @@ pub struct EntityListQuery {
     pub limit: usize,
 }
 
+/// Retrieval-optimized semantic chunk from a source document.
+///
+/// `entity_store` keeps the durable document identity; document chunks keep the
+/// ordered, searchable content plane. Neighbor IDs let callers expand around a
+/// hit when the answer depends on surrounding list items or adjacent sections.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentChunk {
+    pub tenant_id: Uuid,
+    pub session_id: Uuid,
+    pub document_id: Uuid,
+    pub chunk_id: Uuid,
+    pub ordinal: i32,
+    pub source_doc_id: String,
+    pub title: String,
+    pub section_path: String,
+    pub semantic_kind: String,
+    pub content: String,
+    pub bm25_text: String,
+    pub chunk_embedding: Option<Vec<f32>>,
+    pub token_count: i32,
+    pub content_hash: String,
+    pub prev_chunk_id: Option<Uuid>,
+    pub next_chunk_id: Option<Uuid>,
+    pub overlap_from_prev: bool,
+    pub overlap_to_next: bool,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
 impl Default for EntityEntry {
     fn default() -> Self {
         Self {

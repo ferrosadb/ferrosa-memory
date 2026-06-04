@@ -370,6 +370,21 @@
       flex-wrap: wrap;
     }
 
+    .checkbox-row {
+      display: flex !important;
+      align-items: center;
+      gap: 8px;
+      margin: 8px 0 10px;
+      text-transform: none !important;
+      letter-spacing: 0 !important;
+    }
+
+    .checkbox-row input {
+      width: 16px;
+      height: 16px;
+      accent-color: var(--accent);
+    }
+
     .field input[type="number"] {
       width: 96px;
       border-radius: 8px;
@@ -727,6 +742,7 @@
         <a href="/#cql" data-section="cql">CQL Explorer</a>
         <a href="/#sparql" data-section="sparql">SPARQL Explorer</a>
         <a href="/#datalog" data-section="datalog">Datalog Explorer</a>
+        <a href="/#judge" data-section="judge">Judge Config</a>
         <a href="/#aliases" data-section="aliases">Aliases</a>
         <a href="/#rules" data-section="rules">Rules</a>
         <a href="/#approvals" data-section="approvals">Approvals / Explanations</a>
@@ -778,6 +794,7 @@
               <button class="btn" data-open="cql" type="button">Open CQL</button>
               <button class="btn" data-open="sparql" type="button">Open SPARQL</button>
               <button class="btn" data-open="datalog" type="button">Open Datalog</button>
+              <button class="btn secondary" data-open="judge" type="button">Judge Config</button>
               <button class="btn secondary" data-open="aliases" type="button">Open Aliases</button>
               <button class="btn secondary" data-open="rules" type="button">Review Rules</button>
             </div>
@@ -790,6 +807,7 @@
               <li>CQL passthrough endpoint: <code>/workbench/api/cql/query</code> (read-only)</li>
               <li>SPARQL passthrough endpoint: <code>/workbench/api/sparql/query</code> (wire contract forwarded)</li>
               <li>Local Datalog inference endpoint: <code>/workbench/api/datalog/query</code> (ferrosa-memory engine)</li>
+              <li>Judge config endpoint: <code>/workbench/api/judge/config</code></li>
               <li>Aliases endpoint: <code>/workbench/api/aliases</code></li>
               <li>Explanation drilldown: <code>/workbench/api/explanations/query</code></li>
               <li>Rules endpoint: <code>/workbench/api/rules</code></li>
@@ -824,7 +842,7 @@
             <div class="inline">
               <div class="field">
                 <label for="cqlLimit">Row Cap</label>
-                <input class="input" id="cqlLimit" type="number" min="1" max="5000" value="200">
+                <input class="input" id="cqlLimit" type="number" min="1" max="1000" value="200">
               </div>
               <span class="pill">Read-only passthrough</span>
               <span class="pill">Common app tables: agent_memory.entity_store, agent_memory.rules_by_id, agent_memory.rules_by_family, agent_memory.aliases_by_name, agent_memory.approvals_by_target, agent_memory.derived_cache_by_pred</span>
@@ -871,7 +889,7 @@
             <div class="inline">
               <div class="field">
                 <label for="sparqlLimit">Row Cap</label>
-                <input class="input" id="sparqlLimit" type="number" min="1" max="5000" value="200">
+                <input class="input" id="sparqlLimit" type="number" min="1" max="1000" value="200">
               </div>
               <span class="pill">Public passthrough</span>
               <span class="pill">SPARQL-only surface</span>
@@ -1001,6 +1019,64 @@
               <p class="muted" id="explanationMeta">No explanation requested yet.</p>
               <div id="explanationOutput" class="output-box">No explanation yet.</div>
             </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="judge" class="panel" data-panel="judge">
+      <div class="panel-head">
+        <div>
+          <h2>Judge Config</h2>
+          <p>Configure the model endpoint used by MemoryBench, BRIGHT-Pro, reranker audits, and operator-side judging workflows.</p>
+        </div>
+        <a class="chip" href="/viz">Open Viz →</a>
+      </div>
+      <div class="panel-body">
+        <div class="grid split">
+          <form id="judgeForm" class="card query-form">
+            <h3>Runtime Judge</h3>
+            <p class="muted">Settings are stored in the running MCP server session. Token values are accepted on save and redacted on readback.</p>
+            <div class="inline">
+              <div class="field" style="flex:1;min-width:180px;">
+                <label for="judgeProvider">Provider</label>
+                <select id="judgeProvider">
+                  <option value="ollama">Ollama local</option>
+                  <option value="ollama.com">Ollama.com</option>
+                  <option value="lmstudio">LM Studio</option>
+                  <option value="openai_compatible">OpenAI-compatible</option>
+                  <option value="custom">Custom</option>
+                </select>
+              </div>
+              <div class="field" style="flex:1;min-width:180px;">
+                <label for="judgeTimeout">Timeout Seconds</label>
+                <input class="input" id="judgeTimeout" type="number" min="1" max="300" step="1" value="30">
+              </div>
+            </div>
+            <label for="judgeBaseUrl">Provider URL</label>
+            <input id="judgeBaseUrl" class="input mono" type="url" placeholder="http://127.0.0.1:11434" required>
+            <label for="judgeModel">Model</label>
+            <input id="judgeModel" class="input mono" type="text" placeholder="qwen3.5:27b" required>
+            <label for="judgeToken">Token</label>
+            <input id="judgeToken" class="input mono" type="password" autocomplete="off" placeholder="optional; leave blank to keep or clear via checkbox">
+            <label class="checkbox-row" for="judgeClearToken">
+              <input id="judgeClearToken" type="checkbox">
+              <span>Clear stored token on save</span>
+            </label>
+            <div class="toolbar-row">
+              <button class="btn" type="submit">Save Config</button>
+              <button class="btn secondary" id="judgeProbeModels" type="button">Probe Models</button>
+              <button class="btn secondary" id="judgeReload" type="button">Reload</button>
+            </div>
+            <div class="status" id="judgeStatus">Ready.</div>
+          </form>
+          <div class="card">
+            <h3>Config Response</h3>
+            <div class="console-strip">
+              <p class="muted" style="margin:0;">Raw JSON from <code>/workbench/api/judge/config</code> and <code>/workbench/api/judge/models</code>.</p>
+              <span id="judgeResultMeta" class="badge">idle</span>
+            </div>
+            <div id="judgeOutput" class="output-box">No judge config loaded yet.</div>
           </div>
         </div>
       </div>
@@ -1267,6 +1343,7 @@
       lastDatalogQuery: '',
       selectedDatalogResult: null,
       selectedDatalogIndex: null,
+      lastJudgePayload: null,
       ruleFilters: {
         requestedSource: 'effective',
         endpointSource: 'effective',
@@ -1275,7 +1352,7 @@
     };
 
     const API_BASE = '/workbench/api';
-    const sections = ['home', 'cql', 'sparql', 'datalog', 'aliases', 'rules', 'approvals'];
+    const sections = ['home', 'cql', 'sparql', 'datalog', 'judge', 'aliases', 'rules', 'approvals'];
 
     const selectors = {
       navLinks: [...document.querySelectorAll('.nav a[data-section]')],
@@ -1324,6 +1401,18 @@
       explanationOutput: document.getElementById('explanationOutput'),
       explanationUseCurrent: document.getElementById('explanationUseCurrent'),
       explanationClear: document.getElementById('explanationClear'),
+      judgeForm: document.getElementById('judgeForm'),
+      judgeProvider: document.getElementById('judgeProvider'),
+      judgeBaseUrl: document.getElementById('judgeBaseUrl'),
+      judgeModel: document.getElementById('judgeModel'),
+      judgeToken: document.getElementById('judgeToken'),
+      judgeClearToken: document.getElementById('judgeClearToken'),
+      judgeTimeout: document.getElementById('judgeTimeout'),
+      judgeProbeModels: document.getElementById('judgeProbeModels'),
+      judgeReload: document.getElementById('judgeReload'),
+      judgeStatus: document.getElementById('judgeStatus'),
+      judgeOutput: document.getElementById('judgeOutput'),
+      judgeResultMeta: document.getElementById('judgeResultMeta'),
       aliasSearchForm: document.getElementById('aliasSearchForm'),
       aliasSearchName: document.getElementById('aliasSearchName'),
       aliasSearchStatus: document.getElementById('aliasSearchStatus'),
@@ -1501,6 +1590,8 @@
         loadAliases();
       } else if (section === 'approvals') {
         loadApprovals();
+      } else if (section === 'judge') {
+        loadJudgeConfig();
       }
     };
 
@@ -1886,6 +1977,94 @@
       }
     };
 
+    const populateJudgeForm = (payload) => {
+      selectors.judgeProvider.value = payload.provider || 'ollama';
+      selectors.judgeBaseUrl.value = payload.base_url || 'http://127.0.0.1:11434';
+      selectors.judgeModel.value = payload.model || 'qwen3.5:27b';
+      selectors.judgeTimeout.value = String(payload.timeout_seconds || 30);
+      selectors.judgeToken.value = '';
+      selectors.judgeToken.placeholder = payload.token_configured
+        ? 'token configured; leave blank to keep'
+        : 'optional';
+      selectors.judgeClearToken.checked = false;
+    };
+
+    const loadJudgeConfig = async () => {
+      try {
+        renderStatus(selectors.judgeStatus, 'Loading judge config…', 'warn');
+        const payload = await request('/judge/config', { method: 'GET' });
+        state.lastJudgePayload = payload;
+        populateJudgeForm(payload);
+        selectors.judgeOutput.textContent = safeJson(payload);
+        selectors.judgeResultMeta.textContent = payload.token_configured ? 'token configured' : 'no token';
+        renderStatus(selectors.judgeStatus, 'Judge config loaded.', 'ok');
+      } catch (error) {
+        selectors.judgeOutput.textContent = safeJson({ error: error.message });
+        selectors.judgeResultMeta.textContent = 'error';
+        renderStatus(selectors.judgeStatus, error.message || 'Failed to load judge config.', 'err');
+      }
+    };
+
+    const saveJudgeConfig = async (event) => {
+      event.preventDefault();
+      const token = selectors.judgeToken.value;
+      const payload = {
+        provider: selectors.judgeProvider.value,
+        base_url: selectors.judgeBaseUrl.value.trim(),
+        model: selectors.judgeModel.value.trim(),
+        timeout_seconds: Number(selectors.judgeTimeout.value || 30),
+      };
+      if (selectors.judgeClearToken.checked) {
+        payload.token = null;
+      } else if (token) {
+        payload.token = token;
+      }
+
+      try {
+        renderStatus(selectors.judgeStatus, 'Saving judge config…', 'warn');
+        const response = await request('/judge/config', {
+          method: 'POST',
+          body: JSON.stringify(payload),
+        });
+        state.lastJudgePayload = response;
+        const config = response.config || response;
+        populateJudgeForm(config);
+        selectors.judgeOutput.textContent = safeJson(response);
+        selectors.judgeResultMeta.textContent = config.token_configured ? 'token configured' : 'no token';
+        renderStatus(selectors.judgeStatus, 'Judge config saved.', 'ok');
+      } catch (error) {
+        selectors.judgeOutput.textContent = safeJson({ error: error.message });
+        selectors.judgeResultMeta.textContent = 'error';
+        renderStatus(selectors.judgeStatus, error.message || 'Failed to save judge config.', 'err');
+      }
+    };
+
+    const probeJudgeModels = async () => {
+      try {
+        renderStatus(selectors.judgeStatus, 'Probing judge provider models…', 'warn');
+        const params = new URLSearchParams({
+          provider: selectors.judgeProvider.value,
+          base_url: selectors.judgeBaseUrl.value.trim(),
+        });
+        const payload = await request(`/judge/models?${params.toString()}`, { method: 'GET' });
+        state.lastJudgePayload = payload;
+        selectors.judgeOutput.textContent = safeJson(payload);
+        selectors.judgeResultMeta.textContent = `${payload.count || 0} model${payload.count === 1 ? '' : 's'}`;
+        renderStatus(
+          selectors.judgeStatus,
+          payload.count ? `Loaded ${payload.count} model${payload.count === 1 ? '' : 's'}.` : 'Provider responded with no models.',
+          payload.count ? 'ok' : 'warn'
+        );
+        if (!selectors.judgeModel.value && Array.isArray(payload.models) && payload.models.length) {
+          selectors.judgeModel.value = payload.models[0];
+        }
+      } catch (error) {
+        selectors.judgeOutput.textContent = safeJson({ error: error.message });
+        selectors.judgeResultMeta.textContent = 'error';
+        renderStatus(selectors.judgeStatus, error.message || 'Failed to probe judge models.', 'err');
+      }
+    };
+
     const loadHomeSummary = async () => {
       try {
         const summary = await request('/summary', { method: 'GET' });
@@ -2218,6 +2397,9 @@
     selectors.sparqlForm.addEventListener('submit', runSparql);
     selectors.datalogForm.addEventListener('submit', runDatalog);
     selectors.explanationForm.addEventListener('submit', queryExplanation);
+    selectors.judgeForm.addEventListener('submit', saveJudgeConfig);
+    selectors.judgeProbeModels.addEventListener('click', probeJudgeModels);
+    selectors.judgeReload.addEventListener('click', loadJudgeConfig);
     selectors.aliasSearchForm.addEventListener('submit', async (event) => {
       event.preventDefault();
       await loadAliases(selectors.aliasSearchName.value.trim());
@@ -2313,6 +2495,8 @@
         await loadRules();
       } else if (state.currentSection === 'approvals') {
         await loadApprovals();
+      } else if (state.currentSection === 'judge') {
+        await loadJudgeConfig();
       }
     };
 
@@ -2323,6 +2507,7 @@
       selectors.datalogSessionId.value = state.sessionId;
       await ensureAuthToken();
       await loadHomeSummary();
+      await loadJudgeConfig();
       await loadAliases();
       await loadRules();
       await loadApprovals();

@@ -32,6 +32,11 @@ admin_password = "ferrosa_admin"
 # confidence_gate = 0.7
 # max_memo_results = 50
 
+[retrieval]
+# Default ranked results returned by retrieval tools when k/limit is omitted.
+# Lower this if agent contexts become token-heavy; eval configs can use a higher k.
+# default_limit = 10
+
 [embeddings]
 provider = "ollama"
 ollama_base_url = "http://127.0.0.1:11434"
@@ -57,6 +62,11 @@ http_url = "http://localhost:18080"
 [routing]
 # guideline_version = "v1"
 # feedback_export_cron = "0 2 * * *"
+
+[eval]
+# BRIGHT-Pro/MemoryBench fixture retrieval depth. Keep this higher than the
+# normal MCP default so benchmark recall is measured before context packing.
+# retrieval_k = 25
 
 [datalog]
 # ferrosa-memory owns Datalog evaluation locally; this section controls local inference limits.

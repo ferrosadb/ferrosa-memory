@@ -190,11 +190,11 @@ same honesty:
    30 days). ferrosa-memory itself does not talk to S3 directly; it relies on
    the cluster's storage tiering.
 
-There is **no SPARQL integration today** despite the overview diagram
-suggesting one. SPARQL is aspirational; no code path uses it. Datalog is
-evaluated locally in
-[`datalog`](../crates/ferrosa-memory-core/src/datalog.rs) over facts
-materialized from CQL reads — another point listed for correction in ADR-005.
+SPARQL is exposed only as an authenticated public passthrough surface for
+operator inspection. `ferrosa-memory` does not implement SPARQL semantics
+locally. Datalog is evaluated locally in
+[`datalog`](../crates/ferrosa-memory-core/src/datalog.rs) over Ferrosa-backed
+facts and is intentionally repo-owned.
 
 ## The embedding pipeline
 
