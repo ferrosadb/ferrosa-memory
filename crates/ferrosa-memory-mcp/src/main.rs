@@ -2150,7 +2150,9 @@ async fn main() -> anyhow::Result<()> {
                 error = %e,
                 "embedding provider check failed — tools that require embeddings \
                  (smart_ingest, hybrid_search, retrieve_fold_context, retrieve_entities) \
-                 will fail at call time. Start Ollama and ensure '{}' is pulled: \
+                 will continue with lexical/phonetic/graph fallback where possible; \
+                 semantic ANN quality will be degraded and advertised eval results may \
+                 not be reproducible. Start Ollama and ensure '{}' is pulled: \
                  `ollama pull {}`",
                 embeddings_config.model,
                 embeddings_config.model
@@ -2242,6 +2244,7 @@ async fn main() -> anyhow::Result<()> {
                 event_bus: Arc::clone(&shared_event_bus),
                 default_session_id,
                 repo: repo_lock,
+                embed_provider: config.embeddings.provider.clone(),
                 ollama_base_url: config.embeddings.ollama_base_url.clone(),
                 ner_model: config.embeddings.ner_model.clone(),
                 embed_model: config.embeddings.model.clone(),
@@ -2360,6 +2363,7 @@ async fn main() -> anyhow::Result<()> {
                 event_bus: Arc::clone(&shared_event_bus),
                 default_session_id,
                 repo: repo_lock,
+                embed_provider: config.embeddings.provider.clone(),
                 ollama_base_url: config.embeddings.ollama_base_url.clone(),
                 ner_model: config.embeddings.ner_model.clone(),
                 embed_model: config.embeddings.model.clone(),

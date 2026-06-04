@@ -22,7 +22,12 @@
 //! aborts with a clear "downgrade detected" error. Restore from backup to
 //! recover.
 
-use crate::cql_storage::{CqlSession, build_col_map, cql_get};
+use futures_util::StreamExt;
+use scylla::frame::response::result::{CqlValue, Row};
+use scylla::frame::value::CqlTimeuuid;
+use uuid::Uuid;
+
+use crate::cql_storage::{ColMap, CqlSession, build_col_map, cql_get};
 
 /// Operator-facing schema status for the running binary and target keyspace.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -134,6 +139,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 35,
         description: "semantic document chunks and retrieval indexes",
         ddl: include_str!("../../../ddl/035_document_chunks.cql"),
+    },
+    Migration {
+        version: 36,
+        description: "fix feedback_outcomes query_id timeuuid → uuid",
+        ddl: include_str!("../../../ddl/036_feedback_outcomes_query_uuid.cql"),
     },
 ];
 
@@ -414,21 +424,32 @@ pub async fn run_migrations(session: &CqlSession, keyspace: &str) -> Result<usiz
             description = m.description,
             "applying migration"
         );
-        // Some DDL files in MIGRATIONS hardcode `agent_memory.<table>`
-        // qualified references — `USE keyspace` only helps unqualified
-        // names. Run the same qualify_ddl rewrite the bootstrap path
-        // uses so the modern migrations are deployable into any
-        // configured keyspace (agent_memory_test, per-tenant ks, etc.).
-        let qualified = qualify_ddl(m.ddl, keyspace);
-        for (i, stmt) in split_cql(&qualified).iter().enumerate() {
-            #[allow(deprecated)]
-            if let Err(source) = session.query_unpaged(stmt.as_str(), ()).await {
-                return Err(MigrationError::Statement {
+        if m.version == 36 {
+            apply_feedback_outcomes_query_id_uuid_migration(session, keyspace)
+                .await
+                .map_err(|source| MigrationError::Statement {
                     version: m.version,
-                    stmt_index: i,
+                    stmt_index: 0,
                     last_good,
-                    source: source.into(),
-                });
+                    source,
+                })?;
+        } else {
+            // Some DDL files in MIGRATIONS hardcode `agent_memory.<table>`
+            // qualified references — `USE keyspace` only helps unqualified
+            // names. Run the same qualify_ddl rewrite the bootstrap path
+            // uses so the modern migrations are deployable into any
+            // configured keyspace (agent_memory_test, per-tenant ks, etc.).
+            let qualified = qualify_ddl(m.ddl, keyspace);
+            for (i, stmt) in split_cql(&qualified).iter().enumerate() {
+                #[allow(deprecated)]
+                if let Err(source) = session.query_unpaged(stmt.as_str(), ()).await {
+                    return Err(MigrationError::Statement {
+                        version: m.version,
+                        stmt_index: i,
+                        last_good,
+                        source: source.into(),
+                    });
+                }
             }
         }
         // Allow schema to settle across nodes before recording version.
@@ -804,12 +825,353 @@ async fn table_exists(session: &CqlSession, keyspace: &str, table: &str) -> anyh
     Ok(false)
 }
 
+async fn column_type(
+    session: &CqlSession,
+    keyspace: &str,
+    table: &str,
+    column: &str,
+) -> anyhow::Result<Option<String>> {
+    #[allow(deprecated)]
+    let result = session
+        .query_unpaged(
+            format!(
+                "SELECT type FROM system_schema.columns \
+                 WHERE keyspace_name = '{keyspace}' \
+                 AND table_name = '{table}' \
+                 AND column_name = '{column}'"
+            ),
+            (),
+        )
+        .await?;
+    let col_map = build_col_map(result.col_specs());
+    let rows = result.rows_or_empty();
+    let mut found: Option<String> = None;
+    for row in rows {
+        let actual = cql_get::<String>(&row, &col_map, "type")?;
+        if let Some(prior) = &found {
+            if !prior.eq_ignore_ascii_case(&actual) {
+                anyhow::bail!(
+                    "conflicting system_schema.columns rows for {keyspace}.{table}.{column}: {prior} and {actual}"
+                );
+            }
+        } else {
+            found = Some(actual);
+        }
+    }
+    Ok(found)
+}
+
+fn cql_get_raw(row: &Row, col_map: &ColMap, name: &str) -> Option<CqlValue> {
+    let idx = col_map.get(name)?;
+    row.columns.get(*idx).cloned().flatten()
+}
+
+fn feedback_outcomes_create_table_ddl(keyspace: &str, table: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {keyspace}.{table} (\
+            tenant_id uuid,\
+            session_id uuid,\
+            query_id uuid,\
+            program_type text,\
+            query_embedding vector<float, 768>,\
+            task_complexity text,\
+            succeeded boolean,\
+            latency_ms int,\
+            token_cost int,\
+            guideline_version text,\
+            created_at timestamp,\
+            PRIMARY KEY ((tenant_id), created_at, query_id)\
+        ) WITH CLUSTERING ORDER BY (created_at DESC, query_id DESC)"
+    )
+}
+
+async fn count_table(session: &CqlSession, keyspace: &str, table: &str) -> anyhow::Result<i64> {
+    #[allow(deprecated)]
+    let result = session
+        .query_unpaged(format!("SELECT COUNT(*) FROM {keyspace}.{table}"), ())
+        .await?;
+    let rows = result.rows_or_empty();
+    let row = rows
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("COUNT(*) returned no rows for {keyspace}.{table}"))?;
+    match row.columns.first().cloned().flatten() {
+        Some(CqlValue::BigInt(count)) => Ok(count),
+        Some(CqlValue::Int(count)) => Ok(i64::from(count)),
+        other => {
+            anyhow::bail!("COUNT(*) for {keyspace}.{table} returned unexpected value {other:?}")
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FeedbackQueryIdEncoding {
+    Uuid,
+    Timeuuid,
+}
+
+#[allow(deprecated)]
+async fn copy_feedback_outcomes_rows(
+    session: &CqlSession,
+    keyspace: &str,
+    src_table: &str,
+    dst_table: &str,
+    query_id_encoding: FeedbackQueryIdEncoding,
+) -> anyhow::Result<usize> {
+    let select = format!(
+        "SELECT tenant_id, session_id, query_id, program_type, query_embedding, \
+         task_complexity, succeeded, latency_ms, token_cost, guideline_version, created_at \
+         FROM {keyspace}.{src_table}"
+    );
+    let insert = session
+        .prepare(format!(
+            "INSERT INTO {keyspace}.{dst_table} \
+             (tenant_id, session_id, query_id, program_type, query_embedding, task_complexity, \
+              succeeded, latency_ms, token_cost, guideline_version, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ))
+        .await?;
+    let select = session.prepare(select).await?;
+    let mut iter = session.execute_iter(select, ()).await?;
+    let col_map = build_col_map(iter.get_column_specs());
+    let mut copied = 0usize;
+    while let Some(row) = iter.next().await {
+        let row = row?;
+        let tenant_id: Uuid = cql_get(&row, &col_map, "tenant_id")?;
+        let session_id: Uuid = cql_get(&row, &col_map, "session_id")?;
+        let query_id = match query_id_encoding {
+            FeedbackQueryIdEncoding::Uuid => cql_get::<Uuid>(&row, &col_map, "query_id")?,
+            FeedbackQueryIdEncoding::Timeuuid => {
+                let legacy = cql_get::<CqlTimeuuid>(&row, &col_map, "query_id")?;
+                Uuid::from(legacy)
+            }
+        };
+        let program_type: String = cql_get(&row, &col_map, "program_type")?;
+        let query_embedding = cql_get_raw(&row, &col_map, "query_embedding");
+        let task_complexity: String = cql_get(&row, &col_map, "task_complexity")?;
+        let succeeded: bool = cql_get(&row, &col_map, "succeeded")?;
+        let latency_ms: i32 = cql_get(&row, &col_map, "latency_ms")?;
+        let token_cost: i32 = cql_get(&row, &col_map, "token_cost")?;
+        let guideline_version = cql_get_raw(&row, &col_map, "guideline_version");
+        let created_at: chrono::DateTime<chrono::Utc> = cql_get(&row, &col_map, "created_at")?;
+
+        session
+            .execute_unpaged(
+                &insert,
+                (
+                    tenant_id,
+                    session_id,
+                    query_id,
+                    program_type,
+                    query_embedding,
+                    task_complexity,
+                    succeeded,
+                    latency_ms,
+                    token_cost,
+                    guideline_version,
+                    created_at,
+                ),
+            )
+            .await?;
+        copied += 1;
+    }
+    Ok(copied)
+}
+
+#[allow(deprecated)]
+async fn feedback_outcomes_uuid_write_probe(
+    session: &CqlSession,
+    keyspace: &str,
+    table: &str,
+) -> anyhow::Result<bool> {
+    if !table_exists(session, keyspace, table).await? {
+        return Ok(false);
+    }
+    let tenant_id = Uuid::from_u128(0xfeed_bacc_0000_4000_8000_000000000036);
+    let session_id = Uuid::from_u128(0xfeed_bacc_0000_4000_8000_000000000037);
+    let query_id = Uuid::from_u128(0xfeed_bacc_0000_4000_8000_000000000038);
+    let created_at = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
+    let insert = session
+        .prepare(format!(
+            "INSERT INTO {keyspace}.{table} \
+             (tenant_id, session_id, query_id, program_type, task_complexity, \
+              succeeded, latency_ms, token_cost, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ))
+        .await?;
+    let insert_result = session
+        .execute_unpaged(
+            &insert,
+            (
+                tenant_id,
+                session_id,
+                query_id,
+                "__migration_v36_uuid_probe__",
+                "simple",
+                true,
+                0i32,
+                0i32,
+                created_at,
+            ),
+        )
+        .await;
+    if insert_result.is_err() {
+        return Ok(false);
+    }
+
+    let delete = session
+        .prepare(format!(
+            "DELETE FROM {keyspace}.{table} \
+             WHERE tenant_id = ? AND created_at = ? AND query_id = ?"
+        ))
+        .await?;
+    session
+        .execute_unpaged(&delete, (tenant_id, created_at, query_id))
+        .await?;
+    Ok(true)
+}
+
+async fn apply_feedback_outcomes_query_id_uuid_migration(
+    session: &CqlSession,
+    keyspace: &str,
+) -> anyhow::Result<()> {
+    let table = "feedback_outcomes";
+    let staging = "feedback_outcomes_v36";
+
+    if feedback_outcomes_uuid_write_probe(session, keyspace, table).await? {
+        if table_exists(session, keyspace, staging).await? {
+            let staging_count = count_table(session, keyspace, staging).await?;
+            if staging_count > 0 {
+                let copied = copy_feedback_outcomes_rows(
+                    session,
+                    keyspace,
+                    staging,
+                    table,
+                    FeedbackQueryIdEncoding::Uuid,
+                )
+                .await?;
+                if i64::try_from(copied)? != staging_count {
+                    anyhow::bail!(
+                        "feedback_outcomes v36 recovery copied {copied} rows from staging, expected {staging_count}"
+                    );
+                }
+            }
+            #[allow(deprecated)]
+            session
+                .query_unpaged(format!("DROP TABLE IF EXISTS {keyspace}.{staging}"), ())
+                .await?;
+        }
+        return Ok(());
+    }
+
+    let final_type = column_type(session, keyspace, table, "query_id").await?;
+    if final_type
+        .as_deref()
+        .is_some_and(|actual| actual.eq_ignore_ascii_case("uuid"))
+    {
+        anyhow::bail!(
+            "feedback_outcomes.query_id metadata reports uuid, but UUID write probe failed"
+        );
+    }
+
+    if final_type
+        .as_deref()
+        .is_some_and(|actual| !actual.eq_ignore_ascii_case("timeuuid"))
+    {
+        anyhow::bail!(
+            "feedback_outcomes.query_id has unexpected type {:?}; expected uuid or legacy timeuuid",
+            final_type
+        );
+    }
+
+    if final_type.is_none() {
+        #[allow(deprecated)]
+        session
+            .query_unpaged(feedback_outcomes_create_table_ddl(keyspace, table), ())
+            .await?;
+        if table_exists(session, keyspace, staging).await? {
+            let staging_count = count_table(session, keyspace, staging).await?;
+            let copied = copy_feedback_outcomes_rows(
+                session,
+                keyspace,
+                staging,
+                table,
+                FeedbackQueryIdEncoding::Uuid,
+            )
+            .await?;
+            if i64::try_from(copied)? != staging_count {
+                anyhow::bail!(
+                    "feedback_outcomes v36 recovery copied {copied} rows from staging, expected {staging_count}"
+                );
+            }
+            #[allow(deprecated)]
+            session
+                .query_unpaged(format!("DROP TABLE IF EXISTS {keyspace}.{staging}"), ())
+                .await?;
+        }
+        return Ok(());
+    }
+
+    #[allow(deprecated)]
+    session
+        .query_unpaged(format!("DROP TABLE IF EXISTS {keyspace}.{staging}"), ())
+        .await?;
+    #[allow(deprecated)]
+    session
+        .query_unpaged(feedback_outcomes_create_table_ddl(keyspace, staging), ())
+        .await?;
+
+    let legacy_count = count_table(session, keyspace, table).await?;
+    let staged = copy_feedback_outcomes_rows(
+        session,
+        keyspace,
+        table,
+        staging,
+        FeedbackQueryIdEncoding::Timeuuid,
+    )
+    .await?;
+    if i64::try_from(staged)? != legacy_count {
+        anyhow::bail!(
+            "feedback_outcomes v36 staged {staged} legacy rows, expected {legacy_count}; leaving legacy table intact"
+        );
+    }
+
+    #[allow(deprecated)]
+    session
+        .query_unpaged(format!("DROP TABLE {keyspace}.{table}"), ())
+        .await?;
+    #[allow(deprecated)]
+    session
+        .query_unpaged(feedback_outcomes_create_table_ddl(keyspace, table), ())
+        .await?;
+
+    let restored = copy_feedback_outcomes_rows(
+        session,
+        keyspace,
+        staging,
+        table,
+        FeedbackQueryIdEncoding::Uuid,
+    )
+    .await?;
+    if i64::try_from(restored)? != legacy_count {
+        anyhow::bail!(
+            "feedback_outcomes v36 restored {restored} rows, expected {legacy_count}; preserved rows remain in {keyspace}.{staging}"
+        );
+    }
+
+    #[allow(deprecated)]
+    session
+        .query_unpaged(format!("DROP TABLE IF EXISTS {keyspace}.{staging}"), ())
+        .await?;
+    Ok(())
+}
+
 async fn migration_postcondition_satisfied(
     session: &CqlSession,
     keyspace: &str,
     version: u32,
 ) -> anyhow::Result<bool> {
     match version {
+        36 => feedback_outcomes_uuid_write_probe(session, keyspace, "feedback_outcomes").await,
         35 => {
             for table in [
                 "document_chunks",

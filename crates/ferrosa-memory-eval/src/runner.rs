@@ -22,6 +22,7 @@ use crate::bright_pro::{
 use crate::config::EvalConfig;
 use crate::grading::claim_rubric;
 use crate::grading::programmatic::{self, NoOpResolver};
+use crate::llm::{JudgeDecision, LlmClient};
 use crate::memory_quality::{
     ChunkingPolicy, EvidenceHit, MemoryEvalMetrics, MemoryFailureKind, MemoryQualityScore,
     RetrievalMode, evaluate_retrieval,
@@ -552,6 +553,8 @@ impl<T: McpTransport> EvalRunner<T> {
         let mut result = GradeResult {
             programmatic: programmatic_score,
             claims: claim_score,
+            judge: None,
+            judge_error: None,
             memory_quality: None,
             bright_pro: None,
         };
@@ -601,6 +604,68 @@ impl<T: McpTransport> EvalRunner<T> {
             });
         }
 
+        result
+    }
+
+    /// Grade a run and optionally apply the configured LLM judge.
+    ///
+    /// This keeps the existing synchronous `grade_run` deterministic for CI
+    /// while letting local eval profiles opt into model-backed task-native
+    /// judging.
+    pub async fn grade_run_with_judge(&self, run: &ScenarioRun) -> GradeResult {
+        let mut result = self.grade_run(run);
+        if !self.config.judge_enabled {
+            return result;
+        }
+        let Some(ref judge_cfg) = run.scenario.grading.llm_judge else {
+            return result;
+        };
+        if !run.scenario.grading.methods.is_empty()
+            && !run
+                .scenario
+                .grading
+                .methods
+                .iter()
+                .any(|method| method == "llm_judge")
+        {
+            return result;
+        }
+
+        let response_text = run
+            .traces
+            .iter()
+            .map(|trace| response_to_text(&trace.response))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let evidence_text = run
+            .traces
+            .iter()
+            .map(|trace| serde_json::to_string(&trace.response).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        match LlmClient::new(self.config.llm_config()) {
+            Ok(client) => match client
+                .judge(&judge_cfg.rubric, &response_text, &evidence_text)
+                .await
+            {
+                Ok(decision) => result.judge = Some(decision),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "LLM judge unavailable; falling back to non-judge grading"
+                    );
+                    result.judge_error = Some(err.to_string());
+                }
+            },
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "LLM judge client could not be created; falling back to non-judge grading"
+                );
+                result.judge_error = Some(err.to_string());
+            }
+        }
         result
     }
 
@@ -833,6 +898,8 @@ pub async fn sweep_stale_ledger<T: McpTransport>(
 pub struct GradeResult {
     pub programmatic: Option<programmatic::ProgrammaticScore>,
     pub claims: Option<claim_rubric::ClaimScore>,
+    pub judge: Option<JudgeDecision>,
+    pub judge_error: Option<String>,
     pub memory_quality: Option<MemoryQualityScore>,
     pub bright_pro: Option<BrightProScore>,
 }
@@ -849,6 +916,10 @@ impl GradeResult {
         }
         if let Some(ref c) = self.claims {
             total += c.score;
+            count += 1;
+        }
+        if let Some(ref j) = self.judge {
+            total += j.score;
             count += 1;
         }
 
@@ -1849,6 +1920,53 @@ tool = "get_stats"
     }
 
     #[tokio::test]
+    async fn grade_run_with_judge_uses_mock_llm_when_enabled() {
+        use crate::scenario::{GradingConfig, LlmJudgeConfig};
+
+        let transport = MockTransport::new()
+            .on_tool(
+                "get_stats",
+                vec![
+                    (stats_response(0, 0), Duration::from_millis(5)),
+                    (stats_response(1, 0), Duration::from_millis(5)),
+                ],
+            )
+            .on_tool(
+                "smart_ingest",
+                vec![(
+                    json!({"action": "Created", "entity_id": "e1", "content": "exact evidence"}),
+                    Duration::from_millis(20),
+                )],
+            );
+
+        let mut scenario = make_scenario("judge-test", vec![make_step("smart_ingest")]);
+        scenario.grading = GradingConfig {
+            methods: vec!["programmatic".to_string(), "llm_judge".to_string()],
+            claim_rubric: None,
+            llm_judge: Some(LlmJudgeConfig {
+                rubric: "Score whether the response used exact evidence.".to_string(),
+            }),
+        };
+
+        let config = EvalConfig {
+            judge_enabled: true,
+            judge_provider: "mock".to_string(),
+            ..test_config()
+        };
+        let mut runner = EvalRunner::new(transport, config);
+        let run = runner.run_scenario(scenario).await.unwrap();
+        let grade = runner.grade_run_with_judge(&run).await;
+
+        let judge = grade.judge.as_ref().expect("mock judge should run");
+        assert_eq!(judge.score, 0.75);
+        assert!(grade.judge_error.is_none());
+        assert!(
+            grade.composite_score() > 0.0,
+            "judge score should contribute to composite"
+        );
+    }
+
+    #[tokio::test]
     async fn grade_run_populates_memory_quality_when_ground_truth_is_present() {
         let transport = MockTransport::new().on_tool(
             "hybrid_search",
@@ -2025,6 +2143,8 @@ evidence_ids = ["doc:fix"]
                 score: 0.8,
             }),
             claims: None,
+            judge: None,
+            judge_error: None,
             memory_quality: None,
             bright_pro: None,
         };
@@ -2054,6 +2174,8 @@ evidence_ids = ["doc:fix"]
                 passed: false,
                 threshold: 0.75,
             }),
+            judge: None,
+            judge_error: None,
             memory_quality: None,
             bright_pro: None,
         };

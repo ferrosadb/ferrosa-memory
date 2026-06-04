@@ -195,11 +195,13 @@ pub struct SessionState {
     pub last_consolidation_status: Arc<Mutex<HashMap<uuid::Uuid, ConsolidationRunStatus>>>,
     /// Last retrieval result ids/sources by session, used by feedback-on-last-call.
     pub last_retrieval: Arc<Mutex<HashMap<uuid::Uuid, LastRetrievalCall>>>,
-    /// Base URL for the Ollama API (used for embeddings and NER extraction).
+    /// Embedding provider used for semantic vectors (`ollama`, `synthetic`, or disabled).
+    pub embed_provider: String,
+    /// Base URL for the Ollama API (used for Ollama embeddings and NER extraction).
     pub ollama_base_url: String,
     /// Model name for NER entity extraction via Ollama.
     pub ner_model: String,
-    /// Model name for text embedding via Ollama (default nomic-embed-text-v2-moe).
+    /// Model name for text embedding (default nomic-embed-text-v2-moe).
     pub embed_model: String,
     /// Expected embedding dimensions (default 768).
     pub embed_dimensions: u32,
@@ -233,6 +235,7 @@ impl Default for SessionState {
             smart_ingest_created_since_consolidation: Arc::new(Mutex::new(HashMap::new())),
             last_consolidation_status: Arc::new(Mutex::new(HashMap::new())),
             last_retrieval: Arc::new(Mutex::new(HashMap::new())),
+            embed_provider: "ollama".to_string(),
             ollama_base_url: "http://127.0.0.1:11434".to_string(),
             ner_model: "qwen3.5:27b".to_string(),
             embed_model: "nomic-embed-text-v2-moe".to_string(),
@@ -2468,7 +2471,7 @@ async fn handle_ingest_context_segments<S: crate::storage::Storage>(
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
-    let embeddings = if embed_missing && !session.ollama_base_url.is_empty() {
+    let embeddings = if embed_missing {
         let preview = crate::context_segment::segment_messages(
             session_id,
             &conversation_id,
@@ -2476,24 +2479,41 @@ async fn handle_ingest_context_segments<S: crate::storage::Storage>(
             &segmentation,
         )
         .map_err(|e| (INVALID_PARAMS, e.to_string()))?;
-        let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
-            provider: "ollama".into(),
-            ollama_base_url: session.ollama_base_url.clone(),
-            model: session.embed_model.clone(),
-            dimensions: session.embed_dimensions,
-            max_input_chars: crate::config::EmbeddingConfig::default().max_input_chars,
-            ner_model: String::new(),
-        });
+        let Some(client) = session_embedding_client(session) else {
+            return serde_json::to_value(
+                crate::context_segment::ingest_context_segments(
+                    storage,
+                    ctx,
+                    IngestContextSegmentsParams {
+                        session_id,
+                        conversation_id,
+                        messages,
+                        segmentation,
+                        embed_missing,
+                    },
+                    None,
+                )
+                .await
+                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?,
+            )
+            .map_err(|e| (INTERNAL_ERROR, e.to_string()));
+        };
         let mut vectors = Vec::with_capacity(preview.len());
+        let mut failed = false;
         for segment in preview {
-            vectors.push(
-                client
-                    .embed(&segment.segment_text)
-                    .await
-                    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?,
-            );
+            match client.embed(&segment.segment_text).await {
+                Ok(vector) => vectors.push(vector),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "context segment embedding generation failed; storing segments without vectors"
+                    );
+                    failed = true;
+                    break;
+                }
+            }
         }
-        Some(vectors)
+        if failed { None } else { Some(vectors) }
     } else {
         None
     };
@@ -2524,15 +2544,9 @@ async fn handle_search_context_segments<S: crate::storage::Storage>(
     let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
     let query = require_str(&args, "query")?.to_string();
     let mut query_embedding = optional_f32_array(&args, "query_embedding")?;
-    if query_embedding.is_none() && !session.ollama_base_url.is_empty() {
-        let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
-            provider: "ollama".into(),
-            ollama_base_url: session.ollama_base_url.clone(),
-            model: session.embed_model.clone(),
-            dimensions: session.embed_dimensions,
-            max_input_chars: crate::config::EmbeddingConfig::default().max_input_chars,
-            ner_model: String::new(),
-        });
+    if query_embedding.is_none()
+        && let Some(client) = session_embedding_client(session)
+    {
         match client.embed(&query).await {
             Ok(embedding) => query_embedding = Some(embedding),
             Err(e) => tracing::debug!("context segment query embedding skipped: {e}"),
@@ -2719,15 +2733,9 @@ async fn handle_upsert_entity<S: crate::storage::Storage>(
     let confidence = args.get("confidence").and_then(|v| v.as_f64());
 
     // Auto-generate embedding if not provided and Ollama is configured.
-    if embedding.is_none() && !session.ollama_base_url.is_empty() {
-        let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
-            provider: "ollama".into(),
-            ollama_base_url: session.ollama_base_url.clone(),
-            model: session.embed_model.clone(),
-            dimensions: session.embed_dimensions,
-            max_input_chars: crate::config::EmbeddingConfig::default().max_input_chars,
-            ner_model: String::new(),
-        });
+    if embedding.is_none()
+        && let Some(client) = session_embedding_client(session)
+    {
         match client.embed(context_snippet).await {
             Ok(emb) => embedding = Some(emb),
             Err(e) => tracing::debug!("embedding generation skipped: {e}"),
@@ -3020,23 +3028,39 @@ fn validate_json_object(value: Option<&Value>, field: &str) -> Result<(), String
     }
 }
 
+fn embedding_provider_is_disabled(provider: &str) -> bool {
+    let provider = provider.trim();
+    provider.is_empty()
+        || provider.eq_ignore_ascii_case("disabled")
+        || provider.eq_ignore_ascii_case("none")
+}
+
+fn embedding_provider_requires_url(provider: &str) -> bool {
+    !provider.eq_ignore_ascii_case("synthetic")
+}
+
 fn build_ingest_embedding_client(
     session: &SessionState,
     override_model: Option<&str>,
 ) -> Option<crate::embedding::EmbeddingClient> {
-    if session.ollama_base_url.is_empty() {
+    if embedding_provider_is_disabled(&session.embed_provider) {
+        return None;
+    }
+    if embedding_provider_requires_url(&session.embed_provider)
+        && session.ollama_base_url.is_empty()
+    {
         return None;
     }
     let model = override_model
         .filter(|m| !m.is_empty())
         .unwrap_or(&session.embed_model)
         .to_string();
-    if model.is_empty() {
+    if model.is_empty() && !session.embed_provider.eq_ignore_ascii_case("synthetic") {
         return None;
     }
     Some(crate::embedding::EmbeddingClient::new(
         &crate::config::EmbeddingConfig {
-            provider: "ollama".into(),
+            provider: session.embed_provider.clone(),
             ollama_base_url: session.ollama_base_url.clone(),
             model,
             dimensions: session.embed_dimensions,
@@ -3044,6 +3068,10 @@ fn build_ingest_embedding_client(
             ner_model: String::new(),
         },
     ))
+}
+
+fn session_embedding_client(session: &SessionState) -> Option<crate::embedding::EmbeddingClient> {
+    build_ingest_embedding_client(session, None)
 }
 
 #[derive(Default)]
@@ -4230,15 +4258,9 @@ async fn handle_retrieve_entities<S: crate::storage::Storage>(
     let mut embedding = optional_f32_array(&args, "embedding")?;
 
     // Auto-generate query embedding for ANN search if Ollama is configured.
-    if embedding.is_none() && !session.ollama_base_url.is_empty() {
-        let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
-            provider: "ollama".into(),
-            ollama_base_url: session.ollama_base_url.clone(),
-            model: session.embed_model.clone(),
-            dimensions: session.embed_dimensions,
-            max_input_chars: crate::config::EmbeddingConfig::default().max_input_chars,
-            ner_model: String::new(),
-        });
+    if embedding.is_none()
+        && let Some(client) = session_embedding_client(session)
+    {
         match client.embed(query).await {
             Ok(emb) => embedding = Some(emb),
             Err(e) => tracing::debug!("query embedding generation skipped: {e}"),
@@ -4971,15 +4993,9 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
     let source_fold_id = optional_uuid(&args, "source_fold_id")?;
 
     // Auto-generate embedding if not provided and Ollama is configured.
-    if embedding.is_none() && !session.ollama_base_url.is_empty() {
-        let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
-            provider: "ollama".into(),
-            ollama_base_url: session.ollama_base_url.clone(),
-            model: session.embed_model.clone(),
-            dimensions: session.embed_dimensions,
-            max_input_chars: crate::config::EmbeddingConfig::default().max_input_chars,
-            ner_model: String::new(),
-        });
+    if embedding.is_none()
+        && let Some(client) = session_embedding_client(session)
+    {
         match client.embed(content).await {
             Ok(emb) => embedding = Some(emb),
             Err(e) => tracing::debug!("embedding generation skipped: {e}"),
@@ -5234,20 +5250,7 @@ async fn handle_ingest_skill<S: crate::storage::Storage>(
 
     // Build an embedding client from session config so description_embedding
     // is populated alongside the skill entity.
-    let embed_client = if !session.ollama_base_url.is_empty() {
-        Some(crate::embedding::EmbeddingClient::new(
-            &crate::config::EmbeddingConfig {
-                provider: "ollama".into(),
-                ollama_base_url: session.ollama_base_url.clone(),
-                model: session.embed_model.clone(),
-                dimensions: session.embed_dimensions,
-                max_input_chars: crate::config::EmbeddingConfig::default().max_input_chars,
-                ner_model: String::new(),
-            },
-        ))
-    } else {
-        None
-    };
+    let embed_client = session_embedding_client(session);
 
     let action = crate::skill::ingest_skill(
         storage,
@@ -5299,18 +5302,11 @@ async fn handle_retrieve_skills_for_context<S: crate::storage::Storage>(
             .filter_map(|n| n.as_f64().map(|f| f as f32))
             .collect::<Vec<f32>>()
     });
-    if query_embedding.is_none() && !session.ollama_base_url.is_empty() {
-        let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
-            provider: "ollama".into(),
-            ollama_base_url: session.ollama_base_url.clone(),
-            model: session.embed_model.clone(),
-            dimensions: session.embed_dimensions,
-            max_input_chars: crate::config::EmbeddingConfig::default().max_input_chars,
-            ner_model: String::new(),
-        });
-        if let Ok(emb) = client.embed(&context).await {
-            query_embedding = Some(emb);
-        }
+    if query_embedding.is_none()
+        && let Some(client) = session_embedding_client(session)
+        && let Ok(emb) = client.embed(&context).await
+    {
+        query_embedding = Some(emb);
     }
 
     // Used-in-session signal — retrieval_tracker records which entity_ids
@@ -5833,15 +5829,9 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
     };
 
     // Auto-generate query embedding for ANN search if Ollama is configured.
-    if embedding.is_none() && !session.ollama_base_url.is_empty() {
-        let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
-            provider: "ollama".into(),
-            ollama_base_url: session.ollama_base_url.clone(),
-            model: session.embed_model.clone(),
-            dimensions: session.embed_dimensions,
-            max_input_chars: crate::config::EmbeddingConfig::default().max_input_chars,
-            ner_model: String::new(),
-        });
+    if embedding.is_none()
+        && let Some(client) = session_embedding_client(session)
+    {
         match client.embed(query).await {
             Ok(emb) => embedding = Some(emb),
             Err(e) => tracing::debug!("query embedding generation skipped: {e}"),
@@ -6028,6 +6018,7 @@ async fn handle_enrich_entities<S: crate::storage::Storage>(
         force,
         dry_run,
         batch_size: 10,
+        embed_provider: session.embed_provider.clone(),
         ollama_base_url: session.ollama_base_url.clone(),
         embed_model: session.embed_model.clone(),
         embed_dimensions: session.embed_dimensions,
@@ -10883,6 +10874,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn smart_ingest_uses_synthetic_embeddings_without_provider_url() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            embed_provider: "synthetic".to_string(),
+            ollama_base_url: String::new(),
+            embed_dimensions: 8,
+            ..SessionState::default()
+        };
+        let sid = Uuid::new_v4();
+
+        let params = serde_json::json!({
+            "name": "smart_ingest",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "content": "Synthetic embeddings keep CI semantic paths covered",
+                "entity_type": "concept",
+                "entity_name": "Synthetic Embeddings"
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["action"], "Created");
+
+        let entity_id = Uuid::parse_str(result["entity_id"].as_str().unwrap()).unwrap();
+        let entity = store
+            .entity_get_by_id(&ctx, sid, entity_id)
+            .await
+            .unwrap()
+            .expect("entity should be persisted");
+        assert_eq!(entity.entity_embedding.as_ref().unwrap().len(), 8);
+    }
+
+    #[tokio::test]
     async fn hybrid_search_embedding_fallback_when_ollama_unavailable() {
         // When ollama_base_url is set but unreachable, hybrid_search falls back
         // to phonetic-only search.
@@ -10923,6 +10950,95 @@ mod tests {
         assert!(
             result["count"].as_u64().unwrap() > 0,
             "should find via phonetic fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_feedback_reranks_future_searches_for_same_workspace() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            ollama_base_url: String::new(),
+            ..SessionState::default()
+        };
+        let sid = Uuid::new_v4();
+        let cwd = "/repo/ferrosa-memory";
+        let first = crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "Atlas Cache".into(),
+            entity_type: "concept".into(),
+            context_snippet: "Atlas cache stores reusable retrieval hints".into(),
+            entity_embedding: None,
+            confidence: 0.9,
+            state: Default::default(),
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        };
+        let second = crate::types::EntityEntry {
+            entity_id: Uuid::new_v4(),
+            context_snippet: "Atlas cache stores reusable retrieval hints".into(),
+            ..first.clone()
+        };
+        store.entities.lock().await.push(first);
+        store.entities.lock().await.push(second);
+
+        let search = serde_json::json!({
+            "name": "hybrid_search",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "query": "Atlas Cache",
+                "cwd": cwd,
+                "limit": 2
+            }
+        });
+        let result = dispatch("tools/call", search.clone(), &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        let results = result["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        let demoted_id = Uuid::parse_str(results[0]["id"].as_str().unwrap()).unwrap();
+        let promoted_id = Uuid::parse_str(results[1]["id"].as_str().unwrap()).unwrap();
+
+        let feedback = serde_json::json!({
+            "name": "record_feedback",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "scores": [-1, 1],
+                "cwd": cwd
+            }
+        });
+        let feedback = dispatch("tools/call", feedback, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let feedback = unwrap_tool_result(feedback);
+        assert_eq!(feedback["updated"].as_array().unwrap().len(), 2);
+
+        let demoted = store
+            .entity_get_by_id(&ctx, sid, demoted_id)
+            .await
+            .unwrap()
+            .expect("demoted entity should exist");
+        assert!(
+            demoted
+                .properties
+                .get("workspace_feedback")
+                .and_then(|value| value.as_object())
+                .is_some(),
+            "feedback should be persisted on the entity"
+        );
+
+        let reranked = dispatch("tools/call", search, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let reranked = unwrap_tool_result(reranked);
+        let reranked_results = reranked["results"].as_array().unwrap();
+        assert_eq!(
+            reranked_results[0]["id"].as_str().unwrap(),
+            promoted_id.to_string(),
+            "positive feedback should lift this entity for the same cwd"
         );
     }
 

@@ -1,11 +1,13 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use ferrosa_memory_eval::bright_pro::{BrightProConfig, BrightProProtocol, ReasoningAspect};
+use ferrosa_memory_eval::config::{EvalConfig, load_eval_config};
 use ferrosa_memory_eval::fixture::{
     BrightProFixture, CorpusDocument, LexicalFixtureRetriever, run_bright_pro_fixture,
 };
 use ferrosa_memory_eval::live_fixture::{
     LiveMcpFixtureRunner, run_bright_pro_fixture_live, run_memorybench_fixture_live,
 };
+use ferrosa_memory_eval::llm::{LlmClient, LlmHealth};
 use ferrosa_memory_eval::mcp_client::HttpMcpClient;
 use ferrosa_memory_eval::memory_quality::EvidenceGroundTruth;
 use ferrosa_memory_eval::memorybench::{
@@ -33,6 +35,9 @@ enum Command {
         backend: FixtureBackend,
         #[arg(long)]
         json: bool,
+        /// Path to ferrosa-memory.toml. Reads [eval] judge settings when present.
+        #[arg(long, short)]
+        config: Option<PathBuf>,
         #[arg(long, default_value = "BRIGHT-Pro")]
         synthetic_topic: String,
         #[arg(long, default_value_t = 3)]
@@ -50,8 +55,23 @@ enum Command {
         ollama_url: String,
         #[arg(long, default_value = "qwen3.5:27b")]
         ollama_model: String,
-        #[arg(long, default_value_t = 0.9)]
-        temperature: f64,
+        /// Provider for fixture generation/judging: mock, ollama, lmstudio, openai_compatible.
+        #[arg(long)]
+        judge_provider: Option<String>,
+        /// Base URL for fixture generation/judging provider.
+        #[arg(long)]
+        judge_url: Option<String>,
+        /// Model for fixture generation/judging provider.
+        #[arg(long)]
+        judge_model: Option<String>,
+        /// Environment variable containing the optional judge/provider token.
+        #[arg(long)]
+        judge_token_env: Option<String>,
+        /// Timeout for judge/provider calls.
+        #[arg(long)]
+        judge_timeout_seconds: Option<u64>,
+        #[arg(long)]
+        temperature: Option<f64>,
         /// MCP JSON-RPC HTTP endpoint used by --backend mcp-http.
         #[arg(long, default_value = "http://127.0.0.1:18775/mcp")]
         mcp_url: String,
@@ -87,6 +107,7 @@ struct FixtureSmokeReport {
     memorybench: Option<ferrosa_memory_eval::memorybench::MemoryBenchResult>,
     backend: String,
     retrieval_k: usize,
+    llm_health: Option<LlmHealth>,
     live_session_ids: Vec<Uuid>,
 }
 
@@ -113,6 +134,7 @@ async fn main() -> anyhow::Result<()> {
             suite,
             backend,
             json,
+            config,
             synthetic_topic,
             synthetic_conversations,
             bright_pro_fixture,
@@ -120,6 +142,11 @@ async fn main() -> anyhow::Result<()> {
             use_local_llm,
             ollama_url,
             ollama_model,
+            judge_provider,
+            judge_url,
+            judge_model,
+            judge_token_env,
+            judge_timeout_seconds,
             temperature,
             mcp_url,
             mcp_user,
@@ -127,11 +154,19 @@ async fn main() -> anyhow::Result<()> {
             mcp_session_id,
             retrieval_k,
         }) => {
-            let llm = use_local_llm.then_some(LocalLlmConfig {
-                base_url: ollama_url,
-                model: ollama_model,
+            let eval_config = load_eval_config(config.as_ref())?;
+            let llm = build_llm_config(
+                &eval_config,
+                use_local_llm,
+                &ollama_url,
+                &ollama_model,
+                judge_provider,
+                judge_url,
+                judge_model,
+                judge_token_env,
+                judge_timeout_seconds,
                 temperature,
-            });
+            );
             let report = run_fixture_smoke(FixtureSmokeConfig {
                 suite,
                 synthetic_topic: &synthetic_topic,
@@ -231,6 +266,71 @@ async fn run_fixture_smoke(config: FixtureSmokeConfig<'_>) -> anyhow::Result<Fix
         },
         retrieval_k,
         live_session_ids,
+        llm_health: match llm {
+            Some(config) => Some(LlmClient::new(config.clone())?.health().await),
+            None => None,
+        },
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_llm_config(
+    eval_config: &EvalConfig,
+    use_local_llm: bool,
+    ollama_url: &str,
+    ollama_model: &str,
+    judge_provider: Option<String>,
+    judge_url: Option<String>,
+    judge_model: Option<String>,
+    judge_token_env: Option<String>,
+    judge_timeout_seconds: Option<u64>,
+    temperature: Option<f64>,
+) -> Option<LocalLlmConfig> {
+    if !use_local_llm
+        && judge_provider.is_none()
+        && judge_url.is_none()
+        && judge_model.is_none()
+        && !eval_config.judge_enabled
+    {
+        return None;
+    }
+    let provider = judge_provider.unwrap_or_else(|| {
+        if use_local_llm {
+            "ollama".to_string()
+        } else {
+            eval_config.judge_provider.clone()
+        }
+    });
+    let base_url = judge_url.unwrap_or_else(|| {
+        if use_local_llm {
+            ollama_url.to_string()
+        } else {
+            eval_config.judge_url.clone()
+        }
+    });
+    let model = judge_model.unwrap_or_else(|| {
+        if use_local_llm {
+            ollama_model.to_string()
+        } else {
+            eval_config.judge_model.clone()
+        }
+    });
+    let token_env = judge_token_env.or_else(|| eval_config.judge_token_env.clone());
+    let token = token_env
+        .as_deref()
+        .and_then(|name| std::env::var(name).ok())
+        .filter(|value| !value.trim().is_empty());
+    Some(LocalLlmConfig {
+        provider,
+        base_url,
+        model,
+        token,
+        timeout_seconds: judge_timeout_seconds.unwrap_or(eval_config.judge_timeout_seconds),
+        temperature: temperature.unwrap_or(if use_local_llm {
+            0.9
+        } else {
+            eval_config.judge_temperature
+        }),
     })
 }
 
@@ -327,6 +427,12 @@ fn bright_pro_smoke_fixture() -> BrightProFixture {
 fn render_fixture_smoke_text(report: &FixtureSmokeReport) {
     println!("backend={}", report.backend);
     println!("retrieval_k={}", report.retrieval_k);
+    if let Some(health) = &report.llm_health {
+        println!(
+            "llm provider={} model={} available={} detail={}",
+            health.provider, health.model, health.available, health.detail
+        );
+    }
     for session_id in &report.live_session_ids {
         println!("live_session_id={session_id}");
     }
@@ -348,5 +454,67 @@ fn render_fixture_smoke_text(report: &FixtureSmokeReport) {
             memory.mean_feedback_gain,
             memory.cases.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_llm_config_uses_eval_config_when_judge_enabled() {
+        let eval = EvalConfig {
+            judge_enabled: true,
+            judge_provider: "mock".into(),
+            judge_url: "http://judge.local".into(),
+            judge_model: "judge-model".into(),
+            judge_timeout_seconds: 12,
+            judge_temperature: 0.4,
+            ..EvalConfig::default()
+        };
+
+        let llm = build_llm_config(
+            &eval,
+            false,
+            "http://127.0.0.1:11434",
+            "ollama-default",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("judge_enabled should activate LLM config");
+
+        assert_eq!(llm.provider, "mock");
+        assert_eq!(llm.base_url, "http://judge.local");
+        assert_eq!(llm.model, "judge-model");
+        assert_eq!(llm.timeout_seconds, 12);
+        assert!((llm.temperature - 0.4).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn build_llm_config_keeps_ollama_alias_for_use_local_llm() {
+        let eval = EvalConfig::default();
+
+        let llm = build_llm_config(
+            &eval,
+            true,
+            "http://127.0.0.1:11434",
+            "qwen-local",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("use_local_llm should activate LLM config");
+
+        assert_eq!(llm.provider, "ollama");
+        assert_eq!(llm.base_url, "http://127.0.0.1:11434");
+        assert_eq!(llm.model, "qwen-local");
+        assert!((llm.temperature - 0.9).abs() < f64::EPSILON);
     }
 }

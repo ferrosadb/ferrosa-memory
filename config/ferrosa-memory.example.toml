@@ -69,6 +69,21 @@ http_url = "http://localhost:9090"
 # guideline_version = "v1"
 # feedback_export_cron = "0 2 * * *"
 
+[eval]
+# Ranked retrieval depth used by BRIGHT-Pro/MemoryBench fixture scoring.
+retrieval_k = 25
+# Optional LLM-as-judge / synthetic-conversation provider. The eval harness
+# supports "mock" for CI, "ollama", "ollama.com", "lmstudio", and
+# "openai_compatible". Tokens are read from the named environment variable
+# instead of being stored in this file.
+judge_enabled = false
+judge_provider = "ollama"
+judge_url = "http://127.0.0.1:11434"
+judge_model = "qwen3.5:27b"
+# judge_token_env = "FMEM_JUDGE_TOKEN"
+judge_timeout_seconds = 30
+judge_temperature = 0.0
+
 [datalog]
 # ferrosa-memory owns Datalog evaluation locally; this section controls local inference limits.
 # max_iterations = 8

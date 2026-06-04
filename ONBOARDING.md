@@ -22,6 +22,8 @@ The agent must read this file, ask the questions in Phase 0, then execute only t
 4. **Keep secrets out of chat.** Ask users to set API keys and passwords in environment/config files; do not ask them to paste secrets into the conversation.
 5. **Verify each layer.** Source checkout, build, containers, HTTP health, MCP tools, and agent harness integration each need separate verification.
 6. **Record decisions.** If the harness supports memory/notes, save only stable decisions: install directory, container runtime, exposed ports, and selected agent integrations.
+7. **Verify persistent mounts before diagnosing missing data.** For the full local compose stack, node data must be mounted from `~/data/ferrosa-memory/node1`, `~/data/ferrosa-memory/node2`, and `~/data/ferrosa-memory/node3`. If `19042-19044` are served by CI/test containers or `.runtime/` data directories, stop and fix the runtime wiring before searching for or restoring data.
+8. **Preserve schema migration order and data.** Follow `AGENTS.md`: every schema change needs an ordered version bump and an automatic migration. A database at version `N` must upgrade to version `M` by applying every migration in sequence, and migrations must preserve or transform old rows rather than dropping, damaging, or orphaning them.
 
 ---
 

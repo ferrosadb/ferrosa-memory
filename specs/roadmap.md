@@ -1,5 +1,13 @@
 # Ferrosa Memory Roadmap
 
+## Local Runtime Target
+
+- [x] **Dev MCP/viz must point at the persistent compose data tree.**
+  - Correct dev target: CQL `127.0.0.1:19042`, `19043`, `19044` backed by bind mounts `/Users/bkearns/data/ferrosa-memory/node1`, `/node2`, `/node3`, with MinIO at `/Users/bkearns/data/ferrosa-memory/minio`.
+  - Incorrect sparse target observed on 2026-06-04: `ferrosa-memory-ci-node1..3` mounted `.runtime/ferrosa-memory-ci/node1..3` on the same `19042-19044` ports.
+  - Verification after correction: raw CQL showed `entity_store=25481`, `typed_edges=42801`, `document_chunks=1041`, `document_terms=133680`, `document_phonetic_terms=115360`; workbench summary showed `node_count=12469`.
+  - Guardrail: before trusting eval/UI counts, inspect live container mounts with `podman inspect ferrosa-memory_node1_1 ferrosa-memory_node2_1 ferrosa-memory_node3_1 --format '{{json .Mounts}}'`. Do not hunt for data until the mounted source is confirmed.
+
 ## Knowledge Type Gaps
 
 These came up while wiring official BRIGHT-Pro / MemoryBench eval corpora. They should stay near the top because missing or weak types force agents and eval harnesses to collapse rich artifacts into generic `concept` nodes, which degrades retrieval, UI filtering, and graph semantics.

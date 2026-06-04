@@ -10,6 +10,8 @@ use clap::Parser;
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::llm::LlmConfig;
+
 // ── Default value functions (serde) ─────────────────────────────────────────
 
 fn default_scenario_dir() -> PathBuf {
@@ -58,6 +60,26 @@ fn default_max_parallel() -> usize {
 
 fn default_retrieval_k() -> usize {
     25
+}
+
+fn default_judge_provider() -> String {
+    ferrosa_memory_core::config::JudgeConfig::default().provider
+}
+
+fn default_judge_url() -> String {
+    ferrosa_memory_core::config::JudgeConfig::default().base_url
+}
+
+fn default_judge_model() -> String {
+    ferrosa_memory_core::config::JudgeConfig::default().model
+}
+
+fn default_judge_timeout_seconds() -> u64 {
+    ferrosa_memory_core::config::JudgeConfig::default().timeout_seconds
+}
+
+fn default_judge_temperature() -> f64 {
+    0.0
 }
 
 // ── TOML-deserializable config ──────────────────────────────────────────────
@@ -117,6 +139,30 @@ pub struct EvalToml {
     #[serde(default = "default_retrieval_k")]
     pub retrieval_k: usize,
 
+    /// Provider for optional LLM generation and judge calls.
+    #[serde(default = "default_judge_provider")]
+    pub judge_provider: String,
+
+    /// Base URL for optional LLM generation and judge calls.
+    #[serde(default = "default_judge_url")]
+    pub judge_url: String,
+
+    /// Model name for optional LLM generation and judge calls.
+    #[serde(default = "default_judge_model")]
+    pub judge_model: String,
+
+    /// Environment variable containing the optional provider token.
+    #[serde(default)]
+    pub judge_token_env: Option<String>,
+
+    /// Request timeout for optional LLM generation and judge calls.
+    #[serde(default = "default_judge_timeout_seconds")]
+    pub judge_timeout_seconds: u64,
+
+    /// Sampling temperature for synthetic fixture generation.
+    #[serde(default = "default_judge_temperature")]
+    pub judge_temperature: f64,
+
     /// Expected server binary SHA-256 hash (optional verification)
     #[serde(default)]
     pub expect_server_hash: Option<String>,
@@ -145,6 +191,12 @@ impl Default for EvalToml {
             mcp_url: None,
             max_parallel: default_max_parallel(),
             retrieval_k: default_retrieval_k(),
+            judge_provider: default_judge_provider(),
+            judge_url: default_judge_url(),
+            judge_model: default_judge_model(),
+            judge_token_env: None,
+            judge_timeout_seconds: default_judge_timeout_seconds(),
+            judge_temperature: default_judge_temperature(),
             expect_server_hash: None,
             verify_manifest: None,
         }
@@ -229,6 +281,30 @@ pub struct EvalCliOverrides {
     #[arg(long)]
     pub retrieval_k: Option<usize>,
 
+    /// Provider for optional LLM generation/judging: mock, ollama, lmstudio, openai_compatible
+    #[arg(long)]
+    pub judge_provider: Option<String>,
+
+    /// Base URL for optional LLM generation/judging
+    #[arg(long)]
+    pub judge_url: Option<String>,
+
+    /// Model for optional LLM generation/judging
+    #[arg(long)]
+    pub judge_model: Option<String>,
+
+    /// Environment variable containing the optional provider token
+    #[arg(long)]
+    pub judge_token_env: Option<String>,
+
+    /// Request timeout for optional LLM generation/judging
+    #[arg(long)]
+    pub judge_timeout_seconds: Option<u64>,
+
+    /// Sampling temperature for synthetic fixture generation
+    #[arg(long)]
+    pub judge_temperature: Option<f64>,
+
     /// Expected server binary SHA-256 hash
     #[arg(long)]
     pub expect_server_hash: Option<String>,
@@ -269,6 +345,18 @@ pub struct EvalConfig {
     pub max_parallel: usize,
     /// Ranked retrieval depth for fixture/evidence evals.
     pub retrieval_k: usize,
+    /// Provider for optional LLM generation and judge calls.
+    pub judge_provider: String,
+    /// Base URL for optional LLM generation and judge calls.
+    pub judge_url: String,
+    /// Model name for optional LLM generation and judge calls.
+    pub judge_model: String,
+    /// Environment variable containing the optional provider token.
+    pub judge_token_env: Option<String>,
+    /// Request timeout for optional LLM generation and judge calls.
+    pub judge_timeout_seconds: u64,
+    /// Sampling temperature for synthetic fixture generation.
+    pub judge_temperature: f64,
     /// Expected server binary SHA-256 hash (optional verification).
     pub expect_server_hash: Option<String>,
     /// Path to manifest JSON for verification.
@@ -303,6 +391,12 @@ impl From<EvalToml> for EvalConfig {
             mcp_url: t.mcp_url,
             max_parallel: t.max_parallel,
             retrieval_k: t.retrieval_k,
+            judge_provider: t.judge_provider,
+            judge_url: t.judge_url,
+            judge_model: t.judge_model,
+            judge_token_env: t.judge_token_env,
+            judge_timeout_seconds: t.judge_timeout_seconds,
+            judge_temperature: t.judge_temperature,
             expect_server_hash: t.expect_server_hash,
             verify_manifest: t.verify_manifest,
         }
@@ -310,6 +404,22 @@ impl From<EvalToml> for EvalConfig {
 }
 
 impl EvalConfig {
+    pub fn llm_config(&self) -> LlmConfig {
+        let token = self
+            .judge_token_env
+            .as_deref()
+            .and_then(|name| std::env::var(name).ok())
+            .filter(|value| !value.trim().is_empty());
+        LlmConfig {
+            provider: self.judge_provider.clone(),
+            base_url: self.judge_url.clone(),
+            model: self.judge_model.clone(),
+            token,
+            timeout_seconds: self.judge_timeout_seconds,
+            temperature: self.judge_temperature,
+        }
+    }
+
     /// Merge CLI overrides on top of TOML-loaded config. CLI wins when present.
     pub fn with_overrides(mut self, cli: &EvalCliOverrides) -> Self {
         if let Some(ref v) = cli.scenario_dir {
@@ -361,6 +471,24 @@ impl EvalConfig {
         }
         if let Some(v) = cli.retrieval_k {
             self.retrieval_k = v.clamp(1, 50);
+        }
+        if let Some(ref v) = cli.judge_provider {
+            self.judge_provider = v.clone();
+        }
+        if let Some(ref v) = cli.judge_url {
+            self.judge_url = v.clone();
+        }
+        if let Some(ref v) = cli.judge_model {
+            self.judge_model = v.clone();
+        }
+        if let Some(ref v) = cli.judge_token_env {
+            self.judge_token_env = Some(v.clone());
+        }
+        if let Some(v) = cli.judge_timeout_seconds {
+            self.judge_timeout_seconds = v.clamp(1, 300);
+        }
+        if let Some(v) = cli.judge_temperature {
+            self.judge_temperature = v.clamp(0.0, 2.0);
         }
         if let Some(ref v) = cli.expect_server_hash {
             self.expect_server_hash = Some(v.clone());
@@ -442,6 +570,11 @@ contact_points = ["localhost:9042"]
         assert_eq!(cfg.mcp_binary, PathBuf::from("ferrosa-memory-mcp"));
         assert_eq!(cfg.cql_seeds, "127.0.0.1:9042");
         assert_eq!(cfg.retrieval_k, 25);
+        assert_eq!(cfg.judge_provider, "ollama");
+        assert_eq!(cfg.judge_url, "http://127.0.0.1:11434");
+        assert_eq!(cfg.judge_model, "qwen3.5:27b");
+        assert_eq!(cfg.judge_timeout_seconds, 30);
+        assert!((cfg.judge_temperature - 0.0).abs() < f64::EPSILON);
         assert_eq!(
             cfg.tenant_id,
             Uuid::parse_str("00000000-0000-0000-0000-e0a100000000").unwrap()
@@ -477,6 +610,12 @@ warmup = false
 mcp_binary = "/usr/local/bin/ferrosa-mcp"
 cql_seeds = "10.0.0.1:9042,10.0.0.2:9042"
 retrieval_k = 25
+judge_provider = "lmstudio"
+judge_url = "http://127.0.0.1:1234"
+judge_model = "local-judge"
+judge_token_env = "FMEM_JUDGE_TOKEN"
+judge_timeout_seconds = 12
+judge_temperature = 0.7
 "#;
         let cfg: EvalConfig = parse_eval_toml(toml_str).unwrap().into();
 
@@ -491,6 +630,12 @@ retrieval_k = 25
         assert_eq!(cfg.mcp_binary, PathBuf::from("/usr/local/bin/ferrosa-mcp"));
         assert_eq!(cfg.cql_seeds, "10.0.0.1:9042,10.0.0.2:9042");
         assert_eq!(cfg.retrieval_k, 25);
+        assert_eq!(cfg.judge_provider, "lmstudio");
+        assert_eq!(cfg.judge_url, "http://127.0.0.1:1234");
+        assert_eq!(cfg.judge_model, "local-judge");
+        assert_eq!(cfg.judge_token_env.as_deref(), Some("FMEM_JUDGE_TOKEN"));
+        assert_eq!(cfg.judge_timeout_seconds, 12);
+        assert!((cfg.judge_temperature - 0.7).abs() < f64::EPSILON);
     }
 
     // ── T4: Partial config fills missing fields with defaults ───────────
@@ -550,6 +695,12 @@ cql_seeds = "10.0.0.1:9042"
             mcp_url: None,
             max_parallel: None,
             retrieval_k: Some(12),
+            judge_provider: Some("mock".to_string()),
+            judge_url: Some("http://mock.local".to_string()),
+            judge_model: Some("mock-judge".to_string()),
+            judge_token_env: Some("TOKEN_ENV".to_string()),
+            judge_timeout_seconds: Some(600),
+            judge_temperature: Some(3.0),
             expect_server_hash: None,
             verify_manifest: None,
             config: None,
@@ -565,6 +716,12 @@ cql_seeds = "10.0.0.1:9042"
         assert!(!merged.warmup);
         assert_eq!(merged.cql_seeds, "cli-host:9042");
         assert_eq!(merged.retrieval_k, 12);
+        assert_eq!(merged.judge_provider, "mock");
+        assert_eq!(merged.judge_url, "http://mock.local");
+        assert_eq!(merged.judge_model, "mock-judge");
+        assert_eq!(merged.judge_token_env.as_deref(), Some("TOKEN_ENV"));
+        assert_eq!(merged.judge_timeout_seconds, 300);
+        assert_eq!(merged.judge_temperature, 2.0);
         assert_eq!(
             merged.tenant_id,
             Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap()
@@ -600,6 +757,12 @@ cql_seeds = "10.0.0.1:9042"
             mcp_url: None,
             max_parallel: None,
             retrieval_k: None,
+            judge_provider: None,
+            judge_url: None,
+            judge_model: None,
+            judge_token_env: None,
+            judge_timeout_seconds: None,
+            judge_temperature: None,
             expect_server_hash: None,
             verify_manifest: None,
             config: None,

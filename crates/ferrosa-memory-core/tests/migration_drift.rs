@@ -27,6 +27,14 @@ fn trajectory_folds_ddl_columns_are_uuid_compatible(ddl: &str) -> bool {
         && !ddl_lower.contains("parent_fold_id   timeuuid")
 }
 
+fn feedback_outcomes_ddl_query_id_is_uuid(ddl: &str) -> bool {
+    let ddl_lower = ddl.to_lowercase();
+    ddl_lower.contains("feedback_outcomes")
+        && ddl_lower.contains("query_id")
+        && ddl_lower.contains("query_id         uuid")
+        && !ddl_lower.contains("query_id         timeuuid")
+}
+
 fn test_cfg(test: &TestClusterConfig) -> FerrosaCqlConfig {
     FerrosaCqlConfig {
         contact_points: vec![test.contact_point()],
@@ -133,10 +141,52 @@ fn t04_migration_33_recreates_trajectory_folds_with_uuid_fold_ids() {
 }
 
 // ---------------------------------------------------------------------------
-// T-05: Old-schema keyspace (v30, missing first_seen) auto-upgrades to v31
+// T-05: feedback_outcomes UUID compatibility for record_outcome query IDs
 // ---------------------------------------------------------------------------
 
-/// T-05: Simulate a keyspace at version 30 (pre-first_seen fix), run
+/// T-05: Greenfield bootstrap DDL must create feedback_outcomes.query_id as
+/// UUID because record_outcome accepts arbitrary UUID query identifiers, not
+/// CQL timeuuid values.
+#[test]
+fn t05_bootstrap_feedback_outcomes_query_id_uses_uuid() {
+    let bootstrap_ddl = include_str!("../../../ddl/002_folds_entities.cql");
+    assert!(
+        feedback_outcomes_ddl_query_id_is_uuid(bootstrap_ddl),
+        "feedback_outcomes bootstrap DDL must use uuid for query_id, not timeuuid. Got:\n{}",
+        bootstrap_ddl
+    );
+}
+
+/// T-06: Existing keyspaces need an explicit data-preserving migration that
+/// converts legacy timeuuid query identifiers into UUID-compatible rows.
+#[test]
+fn t06_migration_36_is_data_preserving_feedback_outcomes_query_id_repair() {
+    let m36: &Migration = MIGRATIONS
+        .iter()
+        .find(|m| m.version == 36)
+        .expect("migration 36 must exist for feedback_outcomes uuid query_id");
+
+    let ddl_lower = m36.ddl.to_lowercase();
+    assert!(
+        ddl_lower.contains("custom rust migration")
+            && ddl_lower.contains("staging table")
+            && ddl_lower.contains("copies legacy rows")
+            && ddl_lower.contains("verifies counts"),
+        "migration 36 must document the custom staging/copy/swap data-preserving path. Got:\n{}",
+        m36.ddl
+    );
+    assert!(
+        !ddl_lower.contains("drop table if exists feedback_outcomes;"),
+        "migration 36 must not be a destructive DROP-only DDL; legacy telemetry must be copied. Got:\n{}",
+        m36.ddl
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T-07: Old-schema keyspace (v30, missing first_seen) auto-upgrades to v31
+// ---------------------------------------------------------------------------
+
+/// T-07: Simulate a keyspace at version 30 (pre-first_seen fix), run
 /// migrations, and assert the column exists and the graph MERGE path
 /// no longer errors on "unknown property 'first_seen'".
 #[tokio::test]

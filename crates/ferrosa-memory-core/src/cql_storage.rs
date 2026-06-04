@@ -828,7 +828,6 @@ struct PreparedStatements {
     edge_supersedes_by_new: PreparedStatement,
     edge_supersedes_by_old: PreparedStatement,
     // Feedback
-    feedback_put: PreparedStatement,
     feedback_list_all: PreparedStatement,
     // Intentions
     intention_put: PreparedStatement,
@@ -1023,14 +1022,6 @@ impl CqlStorage {
                 .prepare(format!(
                     "UPDATE {ks}.temporal_events SET valid_until = ? \
                      WHERE tenant_id = ? AND entity_id = ? AND event_time = ? AND event_id = ?"
-                ))
-                .await?,
-            feedback_put: session
-                .prepare(format!(
-                    "INSERT INTO {ks}.feedback_outcomes \
-                     (tenant_id, session_id, query_id, program_type, task_complexity, \
-                      succeeded, latency_ms, token_cost, created_at) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 ))
                 .await?,
             feedback_list_all: session
@@ -3191,8 +3182,14 @@ impl Storage for CqlStorage {
         outcome: &FeedbackOutcome,
     ) -> anyhow::Result<()> {
         self.session
-            .execute_unpaged(
-                &self.stmts.feedback_put,
+            .query_unpaged(
+                format!(
+                    "INSERT INTO {}.feedback_outcomes \
+                     (tenant_id, session_id, query_id, program_type, task_complexity, \
+                      succeeded, latency_ms, token_cost, created_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    self.keyspace
+                ),
                 (
                     ctx.tenant_id,
                     outcome.session_id,
