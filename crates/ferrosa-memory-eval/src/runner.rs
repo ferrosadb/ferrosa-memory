@@ -1031,6 +1031,7 @@ fn classify_observed_failure(
 mod tests {
     use super::*;
     use serde_json::json;
+    use serial_test::serial;
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -2573,6 +2574,7 @@ evidence_ids = ["doc:fix"]
 
     #[tokio::test]
     #[ignore]
+    #[serial(mcp_live)]
     async fn live_run_three_step_scenario() {
         use crate::mcp_client::McpClient;
 

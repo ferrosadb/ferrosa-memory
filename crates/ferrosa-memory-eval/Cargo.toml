@@ -31,3 +31,4 @@ async-trait = "0.1"
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+serial_test = "3.5"

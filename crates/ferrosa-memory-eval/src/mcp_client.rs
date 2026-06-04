@@ -443,6 +443,7 @@ impl McpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     // -------------------------------------------------------------------
     // Unit tests (no live server required)
@@ -958,6 +959,7 @@ for line in sys.stdin:
 
     #[tokio::test]
     #[ignore]
+    #[serial(mcp_live)]
     async fn live_initialize_and_get_stats() {
         // Build path: target/debug/ferrosa-memory-mcp
         let binary = find_mcp_binary();
@@ -1018,6 +1020,7 @@ for line in sys.stdin:
 
     #[tokio::test]
     #[ignore]
+    #[serial(mcp_live)]
     async fn live_tools_list_contains_expected_tools() {
         let binary = find_mcp_binary();
 
@@ -1037,15 +1040,15 @@ for line in sys.stdin:
 
         assert!(
             names.contains(&"get_stats"),
-            "tools should include get_stats"
+            "tools should include get_stats; advertised tools: {names:?}"
         );
         assert!(
             names.contains(&"hybrid_search"),
-            "tools should include hybrid_search"
+            "tools should include hybrid_search; advertised tools: {names:?}"
         );
         assert!(
             names.contains(&"smart_ingest"),
-            "tools should include smart_ingest"
+            "tools should include smart_ingest; advertised tools: {names:?}"
         );
 
         client.shutdown().await.expect("shutdown failed");
@@ -1053,6 +1056,7 @@ for line in sys.stdin:
 
     #[tokio::test]
     #[ignore]
+    #[serial(mcp_live)]
     async fn live_server_crash_detection() {
         let binary = find_mcp_binary();
 
