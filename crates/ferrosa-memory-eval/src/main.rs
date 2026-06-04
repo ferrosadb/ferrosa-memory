@@ -86,6 +86,20 @@ struct FixtureSmokeReport {
     live_session_ids: Vec<Uuid>,
 }
 
+struct FixtureSmokeConfig<'a> {
+    suite: FixtureSuite,
+    synthetic_topic: &'a str,
+    synthetic_conversations: usize,
+    bright_pro_fixture_path: Option<PathBuf>,
+    memorybench_fixture_path: Option<PathBuf>,
+    llm: Option<&'a LocalLlmConfig>,
+    backend: FixtureBackend,
+    mcp_url: &'a str,
+    mcp_user: &'a str,
+    mcp_password: &'a str,
+    mcp_session_id: Option<Uuid>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -112,19 +126,19 @@ async fn main() -> anyhow::Result<()> {
                 model: ollama_model,
                 temperature,
             });
-            let report = run_fixture_smoke(
+            let report = run_fixture_smoke(FixtureSmokeConfig {
                 suite,
-                &synthetic_topic,
+                synthetic_topic: &synthetic_topic,
                 synthetic_conversations,
-                bright_pro_fixture,
-                memorybench_fixture,
-                llm.as_ref(),
+                bright_pro_fixture_path: bright_pro_fixture,
+                memorybench_fixture_path: memorybench_fixture,
+                llm: llm.as_ref(),
                 backend,
-                &mcp_url,
-                &mcp_user,
-                &mcp_password,
+                mcp_url: &mcp_url,
+                mcp_user: &mcp_user,
+                mcp_password: &mcp_password,
                 mcp_session_id,
-            )
+            })
             .await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -140,19 +154,21 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_fixture_smoke(
-    suite: FixtureSuite,
-    synthetic_topic: &str,
-    synthetic_conversations: usize,
-    bright_pro_fixture_path: Option<PathBuf>,
-    memorybench_fixture_path: Option<PathBuf>,
-    llm: Option<&LocalLlmConfig>,
-    backend: FixtureBackend,
-    mcp_url: &str,
-    mcp_user: &str,
-    mcp_password: &str,
-    mcp_session_id: Option<Uuid>,
-) -> anyhow::Result<FixtureSmokeReport> {
+async fn run_fixture_smoke(config: FixtureSmokeConfig<'_>) -> anyhow::Result<FixtureSmokeReport> {
+    let FixtureSmokeConfig {
+        suite,
+        synthetic_topic,
+        synthetic_conversations,
+        bright_pro_fixture_path,
+        memorybench_fixture_path,
+        llm,
+        backend,
+        mcp_url,
+        mcp_user,
+        mcp_password,
+        mcp_session_id,
+    } = config;
+
     let mut live_session_ids = Vec::new();
     let bright_pro = if matches!(suite, FixtureSuite::All | FixtureSuite::BrightPro) {
         let fixture = match bright_pro_fixture_path {
