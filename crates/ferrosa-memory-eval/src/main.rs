@@ -62,6 +62,9 @@ enum Command {
         /// Optional session id for live MCP fixture data. Defaults to a fresh UUID per suite.
         #[arg(long)]
         mcp_session_id: Option<Uuid>,
+        /// Ranked retrieval depth for fixture scoring.
+        #[arg(long, default_value_t = 25)]
+        retrieval_k: usize,
     },
 }
 
@@ -83,6 +86,7 @@ struct FixtureSmokeReport {
     bright_pro: Option<ferrosa_memory_eval::fixture::BrightProFixtureResult>,
     memorybench: Option<ferrosa_memory_eval::memorybench::MemoryBenchResult>,
     backend: String,
+    retrieval_k: usize,
     live_session_ids: Vec<Uuid>,
 }
 
@@ -98,6 +102,7 @@ struct FixtureSmokeConfig<'a> {
     mcp_user: &'a str,
     mcp_password: &'a str,
     mcp_session_id: Option<Uuid>,
+    retrieval_k: usize,
 }
 
 #[tokio::main]
@@ -120,6 +125,7 @@ async fn main() -> anyhow::Result<()> {
             mcp_user,
             mcp_password,
             mcp_session_id,
+            retrieval_k,
         }) => {
             let llm = use_local_llm.then_some(LocalLlmConfig {
                 base_url: ollama_url,
@@ -138,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
                 mcp_user: &mcp_user,
                 mcp_password: &mcp_password,
                 mcp_session_id,
+                retrieval_k: retrieval_k.clamp(1, 50),
             })
             .await?;
             if json {
@@ -167,6 +174,7 @@ async fn run_fixture_smoke(config: FixtureSmokeConfig<'_>) -> anyhow::Result<Fix
         mcp_user,
         mcp_password,
         mcp_session_id,
+        retrieval_k,
     } = config;
 
     let mut live_session_ids = Vec::new();
@@ -178,13 +186,13 @@ async fn run_fixture_smoke(config: FixtureSmokeConfig<'_>) -> anyhow::Result<Fix
         Some(match backend {
             FixtureBackend::Lexical => {
                 let retriever = LexicalFixtureRetriever::new(fixture.corpus.clone());
-                run_bright_pro_fixture(&fixture, &retriever, 5)
+                run_bright_pro_fixture(&fixture, &retriever, retrieval_k)
             }
             FixtureBackend::McpHttp => {
                 let mut runner =
                     live_runner(mcp_url, mcp_user, mcp_password, mcp_session_id).await?;
                 live_session_ids.push(runner.session_id());
-                run_bright_pro_fixture_live(&fixture, &mut runner, 5).await?
+                run_bright_pro_fixture_live(&fixture, &mut runner, retrieval_k).await?
             }
         })
     } else {
@@ -201,13 +209,13 @@ async fn run_fixture_smoke(config: FixtureSmokeConfig<'_>) -> anyhow::Result<Fix
         Some(match backend {
             FixtureBackend::Lexical => {
                 let retriever = LexicalFixtureRetriever::new(fixture.corpus_documents());
-                run_memorybench_fixture(&fixture, &retriever, 5)
+                run_memorybench_fixture(&fixture, &retriever, retrieval_k)
             }
             FixtureBackend::McpHttp => {
                 let mut runner =
                     live_runner(mcp_url, mcp_user, mcp_password, mcp_session_id).await?;
                 live_session_ids.push(runner.session_id());
-                run_memorybench_fixture_live(&fixture, &mut runner, 5).await?
+                run_memorybench_fixture_live(&fixture, &mut runner, retrieval_k).await?
             }
         })
     } else {
@@ -221,6 +229,7 @@ async fn run_fixture_smoke(config: FixtureSmokeConfig<'_>) -> anyhow::Result<Fix
             FixtureBackend::Lexical => "lexical".to_string(),
             FixtureBackend::McpHttp => "mcp-http".to_string(),
         },
+        retrieval_k,
         live_session_ids,
     })
 }
@@ -317,6 +326,7 @@ fn bright_pro_smoke_fixture() -> BrightProFixture {
 
 fn render_fixture_smoke_text(report: &FixtureSmokeReport) {
     println!("backend={}", report.backend);
+    println!("retrieval_k={}", report.retrieval_k);
     for session_id in &report.live_session_ids {
         println!("live_session_id={session_id}");
     }

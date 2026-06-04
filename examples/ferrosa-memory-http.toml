@@ -34,6 +34,10 @@ ollama_base_url = "http://ollama:11434"
 model = "nomic-embed-text"
 dimensions = 768
 
+[retrieval]
+# Default ranked results returned by retrieval tools when k/limit is omitted.
+default_limit = 10
+
 [graph]
 http_url = "http://ferrosa-node1:7474"
 username = "ferrosa_admin"

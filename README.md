@@ -231,6 +231,8 @@ See [`examples/ferrosa-memory.toml`](examples/ferrosa-memory.toml) for all optio
 | `[sparql]` | Public SPARQL endpoint enablement and URL |
 | `[datalog]` | Local ferrosa-memory Datalog engine limits and cache behavior |
 | `[memory]` | TTL, compression threshold, confidence gate, memo limits |
+| `[retrieval]` | Default result count for retrieval tools when `k`/`limit` is omitted |
+| `[eval]` | Eval harness settings such as BRIGHT-Pro/MemoryBench `retrieval_k` |
 | `[embeddings]` | Provider (Ollama/OpenAI), model, dimensions |
 | `[security]` | Audit log, anomaly detection, sigma threshold |
 | `[routing]` | Guideline version, feedback export schedule |

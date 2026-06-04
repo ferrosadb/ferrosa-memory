@@ -2252,6 +2252,9 @@ async fn main() -> anyhow::Result<()> {
                 enrich_llm_url: config.enrich.llm_base_url.clone(),
                 enrich_llm_model: config.enrich.llm_model.clone(),
                 judge_config: Arc::new(tokio::sync::Mutex::new(config.judge.clone())),
+                retrieval_default_limit: Arc::new(std::sync::atomic::AtomicUsize::new(
+                    config.retrieval.default_limit.clamp(1, 50),
+                )),
                 ..dispatch::SessionState::default()
             });
             if let Some(sid) = default_session_id {
@@ -2367,6 +2370,9 @@ async fn main() -> anyhow::Result<()> {
                 enrich_llm_url: config.enrich.llm_base_url.clone(),
                 enrich_llm_model: config.enrich.llm_model.clone(),
                 judge_config: Arc::new(tokio::sync::Mutex::new(config.judge.clone())),
+                retrieval_default_limit: Arc::new(std::sync::atomic::AtomicUsize::new(
+                    config.retrieval.default_limit.clamp(1, 50),
+                )),
                 ..dispatch::SessionState::default()
             });
 

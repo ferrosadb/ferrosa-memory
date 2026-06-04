@@ -49,6 +49,8 @@ pub struct Config {
     pub enrich: EnrichConfig,
     #[serde(default)]
     pub judge: JudgeConfig,
+    #[serde(default)]
+    pub retrieval: RetrievalConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -302,6 +304,26 @@ impl Default for JudgeConfig {
             timeout_seconds: default_judge_timeout_seconds(),
         }
     }
+}
+
+/// Runtime retrieval defaults shared by MCP tools that return ranked context.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct RetrievalConfig {
+    /// Default number of ranked results when a retrieval call omits k/limit.
+    #[serde(default = "default_retrieval_limit")]
+    pub default_limit: usize,
+}
+
+impl Default for RetrievalConfig {
+    fn default() -> Self {
+        Self {
+            default_limit: default_retrieval_limit(),
+        }
+    }
+}
+
+fn default_retrieval_limit() -> usize {
+    10
 }
 
 fn default_judge_provider() -> String {
@@ -1070,6 +1092,7 @@ contact_points = ["localhost:9042"]
         assert_eq!(config.server.transport, "stdio");
         assert_eq!(config.memory.default_ttl_days, 7);
         assert_eq!(config.embeddings.dimensions, 768);
+        assert_eq!(config.retrieval.default_limit, 10);
     }
 
     #[test]
@@ -1109,6 +1132,9 @@ anomaly_alerts_enabled = false
 [routing]
 guideline_version = "v2"
 feedback_export_cron = "0 3 * * *"
+
+[retrieval]
+default_limit = 25
 "#;
         let config = parse_config(toml).expect("should parse full config");
         assert_eq!(config.server.transport, "http");
@@ -1118,6 +1144,7 @@ feedback_export_cron = "0 3 * * *"
         assert_eq!(config.ferrosa.keyspace, "test_memory");
         assert_eq!(config.memory.default_ttl_days, 14);
         assert_eq!(config.memory.confidence_gate, 0.8);
+        assert_eq!(config.retrieval.default_limit, 25);
         assert_eq!(config.embeddings.provider, "openai");
         assert_eq!(config.embeddings.dimensions, 1536);
         assert!(!config.security.audit_log_enabled);

@@ -524,8 +524,19 @@ Once the stack and MCP client work, run these examples.
 {
   "tool": "hybrid_search",
   "arguments": {
-    "query": "Ferrosa Memory onboarding",
-    "limit": 5
+    "query": "Ferrosa Memory onboarding"
+  }
+}
+```
+
+Retrieval tools use `[retrieval] default_limit` when `limit`/`k` is omitted.
+To reduce token usage at runtime, call:
+
+```json
+{
+  "tool": "config",
+  "arguments": {
+    "retrieval_limit": 5
   }
 }
 ```

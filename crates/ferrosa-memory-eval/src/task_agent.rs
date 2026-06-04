@@ -130,6 +130,7 @@ pub struct SessionConfig {
     pub tools_allowed: Vec<String>,
     pub max_steps: usize,
     pub expected_findings: Vec<String>,
+    pub retrieval_k: usize,
 }
 
 /// TaskAgent simulates an LLM agent using fmem via MCP stdio.
@@ -179,14 +180,14 @@ impl TaskAgent {
                 serde_json::json!({
                     "query": config.prompt,
                     "session_id": self.session_id.to_string(),
-                    "limit": 5
+                    "limit": config.retrieval_k.clamp(1, 50)
                 }),
             )
             .await?;
 
         tool_calls.push(ToolCallTrace {
             tool_name: "hybrid_search".to_string(),
-            arguments: serde_json::json!({"query": config.prompt, "limit": 5}),
+            arguments: serde_json::json!({"query": config.prompt, "limit": config.retrieval_k.clamp(1, 50)}),
             response: preloaded.response.clone(),
             latency_ms: preloaded.latency.as_millis() as u64,
             success: true,
@@ -445,6 +446,7 @@ mod tests {
             tools_allowed: vec!["smart_ingest".to_string()],
             max_steps: 3,
             expected_findings: vec!["Created: TestEntity".to_string()],
+            retrieval_k: 25,
         };
 
         // Simulate the pre-load + tool execution

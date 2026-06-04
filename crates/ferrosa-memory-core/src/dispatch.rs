@@ -31,6 +31,9 @@ use crate::transport::{INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND};
 const CONSOLIDATION_QUEUE_CAPACITY: usize = 1024;
 const SMART_INGEST_AUTO_CONSOLIDATE_THRESHOLD: usize = 10;
 const BATCH_MUTATION_CONCURRENCY: usize = 16;
+const MIN_RETRIEVAL_LIMIT: usize = 1;
+const MAX_RETRIEVAL_LIMIT: usize = 50;
+const DEFAULT_RETRIEVAL_LIMIT: usize = 10;
 
 type ToolDispatchFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Value, (i32, String)>> + Send + 'a>>;
@@ -210,6 +213,8 @@ pub struct SessionState {
     pub enrich_llm_model: String,
     /// Runtime judge model configuration used by eval and operator workflows.
     pub judge_config: Arc<Mutex<crate::config::JudgeConfig>>,
+    /// Runtime default ranked-result count for retrieval tools when omitted by the caller.
+    pub retrieval_default_limit: Arc<AtomicUsize>,
 }
 
 impl Default for SessionState {
@@ -237,8 +242,38 @@ impl Default for SessionState {
             enrich_llm_url: "http://localhost:1234".to_string(),
             enrich_llm_model: "google/gemma-4-31b".to_string(),
             judge_config: Arc::new(Mutex::new(crate::config::JudgeConfig::default())),
+            retrieval_default_limit: Arc::new(AtomicUsize::new(DEFAULT_RETRIEVAL_LIMIT)),
         }
     }
+}
+
+fn retrieval_default_limit(session: &SessionState) -> usize {
+    session
+        .retrieval_default_limit
+        .load(Ordering::Relaxed)
+        .clamp(MIN_RETRIEVAL_LIMIT, MAX_RETRIEVAL_LIMIT)
+}
+
+fn optional_retrieval_limit(
+    args: &Value,
+    keys: &[&str],
+    session: &SessionState,
+) -> Result<usize, (i32, String)> {
+    for key in keys {
+        if let Some(raw) = args.get(*key).and_then(|v| v.as_u64()) {
+            let value = raw as usize;
+            if !(MIN_RETRIEVAL_LIMIT..=MAX_RETRIEVAL_LIMIT).contains(&value) {
+                return Err((
+                    INVALID_PARAMS,
+                    format!(
+                        "{key} must be between {MIN_RETRIEVAL_LIMIT} and {MAX_RETRIEVAL_LIMIT}"
+                    ),
+                ));
+            }
+            return Ok(value);
+        }
+    }
+    Ok(retrieval_default_limit(session))
 }
 
 /// MCP tool definition for `tools/list`.
@@ -278,6 +313,7 @@ fn short_tool_name(canonical: &str) -> Option<&'static str> {
         "list_entities" => Some("list"),
         "record_outcome" => Some("outcome"),
         "record_feedback" => Some("feedback"),
+        "configure" => Some("config"),
         "delete_session" => Some("delete_session"),
         "smart_ingest" => Some("ingest"),
         "ingest_skill" => Some("skill_ingest"),
@@ -348,6 +384,7 @@ fn canonical_tool_name(name: &str) -> &str {
         "list" => "list_entities",
         "outcome" => "record_outcome",
         "feedback" => "record_feedback",
+        "config" => "configure",
         "ingest" => "smart_ingest",
         "skill_ingest" => "ingest_skill",
         "skills" => "retrieve_skills_for_context",
@@ -609,7 +646,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                     "session_id": { "type": "string" },
                     "query_embedding": { "type": "array", "items": { "type": "number" } },
                     "query": { "type": "string", "maxLength": 4096, "description": "Optional text query for routing optimization. If provided, the router selects optimal k and include_raw." },
-                    "k": { "type": "integer", "minimum": 1, "maximum": 100 },
+                    "k": { "type": "integer", "minimum": 1, "maximum": 50 },
                     "include_raw": { "type": "boolean" }
                 },
                 "required": ["query_embedding"]
@@ -790,7 +827,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                     "query": { "type": "string", "maxLength": 4096 },
                     "embedding": { "type": "array", "items": { "type": "number" } },
                     "strategy": { "type": "string", "enum": ["ann", "phonetic", "both"] },
-                    "k": { "type": "integer", "minimum": 1, "maximum": 100 }
+                    "k": { "type": "integer", "minimum": 1, "maximum": 50 }
                 },
                 "required": ["query"]
             }),
@@ -865,6 +902,28 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                         "type": "array",
                         "items": { "type": "string", "format": "uuid" },
                         "description": "Optional subset of last results to score. Omit to score all entity results from the last retrieval."
+                    }
+                },
+                "required": []
+            }),
+        },
+        ToolDef {
+            name: "configure".into(),
+            description: "Read or update compact runtime defaults. Use retrieval_limit to reduce or expand default search results when omitted by retrieval calls.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "retrieval_limit": {
+                        "type": "integer",
+                        "minimum": MIN_RETRIEVAL_LIMIT,
+                        "maximum": MAX_RETRIEVAL_LIMIT,
+                        "description": "Default ranked results returned by retrieval tools when k/limit is omitted."
+                    },
+                    "default_limit": {
+                        "type": "integer",
+                        "minimum": MIN_RETRIEVAL_LIMIT,
+                        "maximum": MAX_RETRIEVAL_LIMIT,
+                        "description": "Alias for retrieval_limit."
                     }
                 },
                 "required": []
@@ -1768,7 +1827,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "start_fold" => Box::pin(handle_start_fold(args, storage, ctx)),
         "append_to_fold" => Box::pin(handle_append_fold(args, storage, ctx)),
         "complete_fold" => Box::pin(handle_complete_fold(args, storage, ctx, session)),
-        "retrieve_fold_context" => Box::pin(handle_retrieve_fold(args, storage, ctx)),
+        "retrieve_fold_context" => Box::pin(handle_retrieve_fold(args, storage, ctx, session)),
         "ingest_context_segments" => {
             Box::pin(handle_ingest_context_segments(args, storage, ctx, session))
         }
@@ -1786,6 +1845,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "record_feedback" | "record_last_retrieval_feedback" => {
             Box::pin(handle_record_feedback(args, storage, ctx, session))
         }
+        "configure" => Box::pin(handle_configure(args, session)),
         "delete_session" => Box::pin(handle_delete_session(args, storage, ctx)),
         "smart_ingest" => Box::pin(handle_smart_ingest(args, storage, ctx, session)),
         "ingest_skill" => Box::pin(handle_ingest_skill(args, storage, ctx, session)),
@@ -1932,6 +1992,7 @@ fn is_tier1(name: &str) -> bool {
         "smart_ingest"
             | "all_tools"
             | "hybrid_search"
+            | "configure"
             | "get_chunk_context"
             | "record_feedback"
             | "create_edge"
@@ -2341,6 +2402,7 @@ async fn handle_retrieve_fold<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
     ctx: &crate::types::TenantContext,
+    session: &SessionState,
 ) -> Result<Value, (i32, String)> {
     let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
     let query_embedding = require_f32_array(&args, "query_embedding")?;
@@ -2355,11 +2417,11 @@ async fn handle_retrieve_fold<S: crate::storage::Storage>(
     });
 
     // User-provided k and include_raw override the router's suggestion
-    let k = args
-        .get("k")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize)
-        .or(Some(decision.k));
+    let k = if args.get("k").is_some() {
+        Some(optional_retrieval_limit(&args, &["k"], session)?)
+    } else {
+        Some(retrieval_default_limit(session))
+    };
     let include_raw = args
         .get("include_raw")
         .and_then(|v| v.as_bool())
@@ -2477,7 +2539,7 @@ async fn handle_search_context_segments<S: crate::storage::Storage>(
         };
     }
     let expand = args.get("expand").cloned().unwrap_or(Value::Null);
-    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    let limit = optional_retrieval_limit(&args, &["limit"], session)?;
     let expand_prev = expand.get("prev").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let expand_next = expand.get("next").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let max_expanded_tokens = expand
@@ -4197,11 +4259,11 @@ async fn handle_retrieve_entities<S: crate::storage::Storage>(
         _ => "both",
     };
     let strategy = user_strategy.unwrap_or(router_strategy);
-    let k = args
-        .get("k")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize)
-        .or(Some(decision.k));
+    let k = if args.get("k").is_some() {
+        Some(optional_retrieval_limit(&args, &["k"], session)?)
+    } else {
+        Some(retrieval_default_limit(session))
+    };
 
     let entities = crate::entity::retrieve_entities(
         storage,
@@ -4843,6 +4905,38 @@ async fn handle_record_feedback<S: crate::storage::Storage>(
         "updated": updated,
         "skipped": skipped,
         "hint": "Feedback recorded. Future hybrid_search calls with the same cwd will boost +1 items and demote -1 items."
+    }))
+}
+
+async fn handle_configure(args: Value, session: &SessionState) -> Result<Value, (i32, String)> {
+    let requested = args
+        .get("retrieval_limit")
+        .or_else(|| args.get("default_limit"))
+        .and_then(|v| v.as_u64());
+    let updated = if let Some(raw) = requested {
+        let value = raw as usize;
+        if !(MIN_RETRIEVAL_LIMIT..=MAX_RETRIEVAL_LIMIT).contains(&value) {
+            return Err((
+                INVALID_PARAMS,
+                format!(
+                    "retrieval_limit must be between {MIN_RETRIEVAL_LIMIT} and {MAX_RETRIEVAL_LIMIT}"
+                ),
+            ));
+        }
+        session
+            .retrieval_default_limit
+            .store(value, Ordering::Relaxed);
+        true
+    } else {
+        false
+    };
+
+    Ok(serde_json::json!({
+        "updated": updated,
+        "retrieval_limit": retrieval_default_limit(session),
+        "min_retrieval_limit": MIN_RETRIEVAL_LIMIT,
+        "max_retrieval_limit": MAX_RETRIEVAL_LIMIT,
+        "hint": "Pass retrieval_limit when searches are too sparse or too token-heavy. Individual calls can still override with limit/k."
     }))
 }
 
@@ -5563,7 +5657,7 @@ async fn handle_explore_connections<S: crate::storage::Storage>(
 ) -> Result<Value, (i32, String)> {
     let traversal = require_str(&args, "traversal")?;
     let max_depth = args.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(2) as usize;
-    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    let limit = optional_retrieval_limit(&args, &["limit"], session)?;
 
     let results = match traversal {
         "fold_ancestors" => {
@@ -5720,7 +5814,7 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
     let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
     let query = require_str(&args, "query")?;
     let mut embedding = optional_f32_array(&args, "embedding")?;
-    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    let limit = optional_retrieval_limit(&args, &["limit"], session)?;
     let offset = args
         .get("offset")
         .and_then(|v| v.as_u64())
@@ -6020,6 +6114,7 @@ async fn handle_get_stats<S: crate::storage::Storage>(
         "temporal_fact_count": temporal_fact_count,
         "edge_count": edge_count,
         "intention_count": intention_count,
+        "retrieval_default_limit": retrieval_default_limit(session),
         "last_consolidation_status": last_consolidation_status,
         "hint": hint
     });
@@ -8337,7 +8432,7 @@ mod tests {
             expected_tier1,
             "default tools/list should return all tier-1 tools"
         );
-        assert_eq!(tools.len(), 10, "tier-1 tool surface should stay compact");
+        assert_eq!(tools.len(), 11, "tier-1 tool surface should stay compact");
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         // All default tools must be compact public names.
@@ -8346,6 +8441,7 @@ mod tests {
         assert!(names.contains(&"search"));
         assert!(names.contains(&"chunk_ctx"));
         assert!(names.contains(&"feedback"));
+        assert!(names.contains(&"config"));
         assert!(names.contains(&"edge"));
         assert!(names.contains(&"check"));
         assert!(names.contains(&"stats"));
@@ -10394,6 +10490,85 @@ mod tests {
                 .contains("retrieve_entities"),
             "expected _hint suggesting retrieve_entities for zero results"
         );
+    }
+
+    #[tokio::test]
+    async fn configure_updates_default_retrieval_limit_for_omitted_search_limit() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            ollama_base_url: String::new(),
+            retrieval_default_limit: Arc::new(AtomicUsize::new(3)),
+            ..SessionState::default()
+        };
+        let sid = Uuid::new_v4();
+
+        for idx in 0..3 {
+            store.entities.lock().await.push(crate::types::EntityEntry {
+                tenant_id: ctx.tenant_id,
+                entity_id: Uuid::new_v4(),
+                session_id: sid,
+                entity_name: format!("LimitTest::{idx}"),
+                entity_type: "concept".into(),
+                context_snippet: format!("limit test context {idx}"),
+                confidence: 0.9,
+                created_at: chrono::Utc::now(),
+                ..Default::default()
+            });
+        }
+
+        let initial = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "hybrid_search",
+                "arguments": {
+                    "session_id": sid.to_string(),
+                    "query": "LimitTest"
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let initial = unwrap_tool_result(initial);
+        assert_eq!(initial["count"], 3);
+
+        let updated = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "config",
+                "arguments": {
+                    "retrieval_limit": 1
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let updated = unwrap_tool_result(updated);
+        assert_eq!(updated["retrieval_limit"], 1);
+
+        let narrowed = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "hybrid_search",
+                "arguments": {
+                    "session_id": sid.to_string(),
+                    "query": "LimitTest"
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let narrowed = unwrap_tool_result(narrowed);
+        assert_eq!(narrowed["count"], 1);
     }
 
     #[tokio::test]

@@ -56,6 +56,10 @@ fn default_max_parallel() -> usize {
     4
 }
 
+fn default_retrieval_k() -> usize {
+    25
+}
+
 // ── TOML-deserializable config ──────────────────────────────────────────────
 
 /// The `[eval]` section of `ferrosa-memory.toml`.
@@ -109,6 +113,10 @@ pub struct EvalToml {
     #[serde(default = "default_max_parallel")]
     pub max_parallel: usize,
 
+    /// Ranked retrieval depth for fixture/evidence evals.
+    #[serde(default = "default_retrieval_k")]
+    pub retrieval_k: usize,
+
     /// Expected server binary SHA-256 hash (optional verification)
     #[serde(default)]
     pub expect_server_hash: Option<String>,
@@ -136,6 +144,7 @@ impl Default for EvalToml {
             transport: default_transport(),
             mcp_url: None,
             max_parallel: default_max_parallel(),
+            retrieval_k: default_retrieval_k(),
             expect_server_hash: None,
             verify_manifest: None,
         }
@@ -216,6 +225,10 @@ pub struct EvalCliOverrides {
     #[arg(long)]
     pub max_parallel: Option<usize>,
 
+    /// Ranked retrieval depth for fixture/evidence evals
+    #[arg(long)]
+    pub retrieval_k: Option<usize>,
+
     /// Expected server binary SHA-256 hash
     #[arg(long)]
     pub expect_server_hash: Option<String>,
@@ -254,6 +267,8 @@ pub struct EvalConfig {
     pub mcp_url: Option<String>,
     /// Maximum parallel scenario executions.
     pub max_parallel: usize,
+    /// Ranked retrieval depth for fixture/evidence evals.
+    pub retrieval_k: usize,
     /// Expected server binary SHA-256 hash (optional verification).
     pub expect_server_hash: Option<String>,
     /// Path to manifest JSON for verification.
@@ -287,6 +302,7 @@ impl From<EvalToml> for EvalConfig {
             transport: t.transport,
             mcp_url: t.mcp_url,
             max_parallel: t.max_parallel,
+            retrieval_k: t.retrieval_k,
             expect_server_hash: t.expect_server_hash,
             verify_manifest: t.verify_manifest,
         }
@@ -342,6 +358,9 @@ impl EvalConfig {
         }
         if let Some(v) = cli.max_parallel {
             self.max_parallel = v;
+        }
+        if let Some(v) = cli.retrieval_k {
+            self.retrieval_k = v.clamp(1, 50);
         }
         if let Some(ref v) = cli.expect_server_hash {
             self.expect_server_hash = Some(v.clone());
@@ -422,6 +441,7 @@ contact_points = ["localhost:9042"]
         assert!(cfg.warmup);
         assert_eq!(cfg.mcp_binary, PathBuf::from("ferrosa-memory-mcp"));
         assert_eq!(cfg.cql_seeds, "127.0.0.1:9042");
+        assert_eq!(cfg.retrieval_k, 25);
         assert_eq!(
             cfg.tenant_id,
             Uuid::parse_str("00000000-0000-0000-0000-e0a100000000").unwrap()
@@ -456,6 +476,7 @@ stability_canary = true
 warmup = false
 mcp_binary = "/usr/local/bin/ferrosa-mcp"
 cql_seeds = "10.0.0.1:9042,10.0.0.2:9042"
+retrieval_k = 25
 "#;
         let cfg: EvalConfig = parse_eval_toml(toml_str).unwrap().into();
 
@@ -469,6 +490,7 @@ cql_seeds = "10.0.0.1:9042,10.0.0.2:9042"
         assert!(!cfg.warmup);
         assert_eq!(cfg.mcp_binary, PathBuf::from("/usr/local/bin/ferrosa-mcp"));
         assert_eq!(cfg.cql_seeds, "10.0.0.1:9042,10.0.0.2:9042");
+        assert_eq!(cfg.retrieval_k, 25);
     }
 
     // ── T4: Partial config fills missing fields with defaults ───────────
@@ -495,6 +517,7 @@ judge_enabled = true
         assert!(cfg.warmup);
         assert_eq!(cfg.mcp_binary, PathBuf::from("ferrosa-memory-mcp"));
         assert_eq!(cfg.cql_seeds, "127.0.0.1:9042");
+        assert_eq!(cfg.retrieval_k, 25);
     }
 
     // ── T5: CLI overrides beat TOML values ──────────────────────────────
@@ -526,6 +549,7 @@ cql_seeds = "10.0.0.1:9042"
             transport: None,
             mcp_url: None,
             max_parallel: None,
+            retrieval_k: Some(12),
             expect_server_hash: None,
             verify_manifest: None,
             config: None,
@@ -540,6 +564,7 @@ cql_seeds = "10.0.0.1:9042"
         assert!(merged.parallel);
         assert!(!merged.warmup);
         assert_eq!(merged.cql_seeds, "cli-host:9042");
+        assert_eq!(merged.retrieval_k, 12);
         assert_eq!(
             merged.tenant_id,
             Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap()
@@ -574,6 +599,7 @@ cql_seeds = "10.0.0.1:9042"
             transport: None,
             mcp_url: None,
             max_parallel: None,
+            retrieval_k: None,
             expect_server_hash: None,
             verify_manifest: None,
             config: None,
