@@ -409,6 +409,14 @@ def deterministic_entity_id(session_id: str, doc_id: str) -> str:
     return str(uuid.uuid5(namespace, doc_id))
 
 
+def result_entity_id_for_mapping(result: dict[str, Any]) -> str:
+    """Return the stable corpus entity id for direct entity and chunk search hits."""
+    document_id = result.get("document_id")
+    if document_id:
+        return str(document_id)
+    return str(result.get("id", ""))
+
+
 class McpBrightRetriever:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -537,7 +545,7 @@ class McpBrightRetriever:
         )
         hits = []
         for result in response.get("results", []):
-            entity_id = str(result.get("id", ""))
+            entity_id = result_entity_id_for_mapping(result)
             doc_id = self.entity_to_doc.get(entity_id, entity_id)
             hits.append(
                 Hit(
@@ -1029,6 +1037,8 @@ def run_self_test() -> int:
     assert [row["id"] for row in selected] == [1, 3]
     assert sampling["excluded_open_support"] == 1
     assert sampling["excluded_no_aspects"] == 1
+    assert result_entity_id_for_mapping({"id": "chunk", "document_id": "doc"}) == "doc"
+    assert result_entity_id_for_mapping({"id": "entity"}) == "entity"
 
     parsed = parse_ingest_response(
         {
