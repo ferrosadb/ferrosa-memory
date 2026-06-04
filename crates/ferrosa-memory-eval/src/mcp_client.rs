@@ -269,11 +269,28 @@ impl McpClient {
     /// The server inherits the current process environment (including
     /// `FERROSA_CQL_SEEDS`).
     pub async fn spawn(binary_path: &str) -> Result<Self, McpClientError> {
-        let mut child = Command::new(binary_path)
+        Self::spawn_with_env(binary_path, std::iter::empty::<(&str, &str)>()).await
+    }
+
+    /// Spawn the MCP server binary with additional environment variables.
+    ///
+    /// This is primarily used by live tests to supply an explicit test config
+    /// instead of inheriting developer-machine defaults.
+    pub async fn spawn_with_env<I, K, V>(binary_path: &str, envs: I) -> Result<Self, McpClientError>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<std::ffi::OsStr>,
+        V: AsRef<std::ffi::OsStr>,
+    {
+        let mut command = Command::new(binary_path);
+        command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()?;
+            .stderr(std::process::Stdio::inherit());
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        let mut child = command.spawn()?;
 
         let child_stdin = child.stdin.take().ok_or(McpClientError::PipeClosed)?;
         let child_stdout = child.stdout.take().ok_or(McpClientError::PipeClosed)?;
@@ -963,8 +980,9 @@ for line in sys.stdin:
     async fn live_initialize_and_get_stats() {
         // Build path: target/debug/ferrosa-memory-mcp
         let binary = find_mcp_binary();
+        let config = live_mcp_test_config();
 
-        let mut client = McpClient::spawn(&binary)
+        let mut client = spawn_live_mcp(&binary, &config)
             .await
             .expect("failed to spawn MCP server");
 
@@ -1023,8 +1041,9 @@ for line in sys.stdin:
     #[serial(mcp_live)]
     async fn live_tools_list_contains_expected_tools() {
         let binary = find_mcp_binary();
+        let config = live_mcp_test_config();
 
-        let mut client = McpClient::spawn(&binary)
+        let mut client = spawn_live_mcp(&binary, &config)
             .await
             .expect("failed to spawn MCP server");
 
@@ -1038,18 +1057,20 @@ for line in sys.stdin:
 
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
-        assert!(
-            names.contains(&"get_stats"),
-            "tools should include get_stats; advertised tools: {names:?}"
-        );
-        assert!(
-            names.contains(&"hybrid_search"),
-            "tools should include hybrid_search; advertised tools: {names:?}"
-        );
-        assert!(
-            names.contains(&"smart_ingest"),
-            "tools should include smart_ingest; advertised tools: {names:?}"
-        );
+        for expected in ["all_tools", "stats", "search", "ingest", "feedback"] {
+            assert!(
+                names.contains(&expected),
+                "tools should include {expected}; advertised tools: {names:?}"
+            );
+        }
+
+        for hidden_by_default in ["get_stats", "hybrid_search", "smart_ingest"] {
+            assert!(
+                !names.contains(&hidden_by_default),
+                "verbose tier-2 tool {hidden_by_default} should not be advertised by default; \
+                 advertised tools: {names:?}"
+            );
+        }
 
         client.shutdown().await.expect("shutdown failed");
     }
@@ -1059,8 +1080,9 @@ for line in sys.stdin:
     #[serial(mcp_live)]
     async fn live_server_crash_detection() {
         let binary = find_mcp_binary();
+        let config = live_mcp_test_config();
 
-        let mut client = McpClient::spawn(&binary)
+        let mut client = spawn_live_mcp(&binary, &config)
             .await
             .expect("failed to spawn MCP server");
 
@@ -1087,6 +1109,46 @@ for line in sys.stdin:
         }
     }
 
+    async fn spawn_live_mcp(
+        binary: &str,
+        config: &tempfile::NamedTempFile,
+    ) -> Result<McpClient, McpClientError> {
+        let config_path = config.path().to_string_lossy().to_string();
+        McpClient::spawn_with_env(binary, [("FERROSA_MEMORY_CONFIG", config_path.as_str())]).await
+    }
+
+    fn live_mcp_test_config() -> tempfile::NamedTempFile {
+        use std::io::Write as _;
+
+        let mut file = tempfile::NamedTempFile::new().expect("create live MCP test config");
+        write!(
+            file,
+            r#"
+[server]
+transport = "stdio"
+tenant_id = "00000000-0000-0000-0000-000000000001"
+
+[ferrosa]
+contact_points = ["127.0.0.1:19542"]
+keyspace = "agent_memory_test"
+username = "cassandra"
+password = "cassandra"
+
+[viz]
+enabled = false
+
+[embeddings]
+provider = "synthetic"
+ollama_base_url = ""
+model = "synthetic-ci"
+dimensions = 768
+"#
+        )
+        .expect("write live MCP test config");
+        file.flush().expect("flush live MCP test config");
+        file
+    }
+
     /// Find the MCP server binary, building it if necessary.
     fn find_mcp_binary() -> String {
         // Check common locations
@@ -1097,10 +1159,10 @@ for line in sys.stdin:
         let debug_path = format!("{workspace_root}/target/debug/ferrosa-memory-mcp");
         let release_path = format!("{workspace_root}/target/release/ferrosa-memory-mcp");
 
-        if std::path::Path::new(&release_path).exists() {
-            release_path
-        } else if std::path::Path::new(&debug_path).exists() {
+        if std::path::Path::new(&debug_path).exists() {
             debug_path
+        } else if std::path::Path::new(&release_path).exists() {
+            release_path
         } else {
             panic!(
                 "ferrosa-memory-mcp binary not found. Build it first with: \

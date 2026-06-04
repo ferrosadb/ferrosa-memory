@@ -35,15 +35,17 @@ async fn connect_test_cluster(cfg: &TestClusterConfig) -> LegacySession {
 
 // ---- FIXED: Vector PREPARE + ANN ----
 
-/// Creates `<ks>.test_vector_blob` if it does not exist. The table is
-/// test-only (not in production DDL), so each test that depends on it must
-/// bootstrap it. Using `IF NOT EXISTS` keeps this idempotent across the
-/// vector_live and ferrosa_bugs suites that share the table.
-async fn ensure_test_vector_blob(s: &LegacySession, ks: &str) {
+/// Creates a test-only vector table. Each test gets a distinct table so
+/// parallel ignored tests cannot drop each other's fixture.
+async fn recreate_test_vector_blob(s: &LegacySession, ks: &str, table: &str) {
+    #[allow(deprecated)]
+    s.query_unpaged(format!("DROP TABLE IF EXISTS {ks}.{table}"), ())
+        .await
+        .expect("DROP TABLE test vector fixture");
     #[allow(deprecated)]
     s.query_unpaged(
         format!(
-            "CREATE TABLE IF NOT EXISTS {ks}.test_vector_blob \
+            "CREATE TABLE {ks}.{table} \
              (id uuid PRIMARY KEY, embedding vector<float, 4>)"
         ),
         (),
@@ -58,9 +60,10 @@ async fn fixed_vector_prepare() {
     let Some(cfg) = test_cluster() else { return };
     let s = connect_test_cluster(&cfg).await;
     let ks = &cfg.keyspace;
-    ensure_test_vector_blob(&s, ks).await;
+    let table = "test_vector_blob_prepare";
+    recreate_test_vector_blob(&s, ks, table).await;
     s.prepare(format!(
-        "INSERT INTO {ks}.test_vector_blob (id, embedding) VALUES (?, ?)"
+        "INSERT INTO {ks}.{table} (id, embedding) VALUES (?, ?)"
     ))
     .await
     .expect("PREPARE on vector column");
@@ -72,9 +75,10 @@ async fn fixed_vector_ann_query() {
     let Some(cfg) = test_cluster() else { return };
     let s = connect_test_cluster(&cfg).await;
     let ks = &cfg.keyspace;
-    ensure_test_vector_blob(&s, ks).await;
+    let table = "test_vector_blob_ann";
+    recreate_test_vector_blob(&s, ks, table).await;
     s.prepare(format!(
-        "SELECT id FROM {ks}.test_vector_blob ORDER BY embedding ANN OF ? LIMIT 5"
+        "SELECT id FROM {ks}.{table} ORDER BY embedding ANN OF ? LIMIT 5"
     ))
     .await
     .expect("ANN query PREPARE");
