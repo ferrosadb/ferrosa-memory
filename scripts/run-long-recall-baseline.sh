@@ -25,6 +25,10 @@ k="${FMEM_EVAL_K:-25}"
 rerank_candidates="${FMEM_EVAL_RERANK_CANDIDATES:-25}"
 candidate_limit="${FMEM_EVAL_CANDIDATE_LIMIT:-50}"
 fusion_profile="${FMEM_EVAL_FUSION_PROFILE:-all}"
+chunk_expansion="${FMEM_EVAL_CHUNK_EXPANSION:-none}"
+chunk_prev="${FMEM_EVAL_CHUNK_PREV:-1}"
+chunk_next="${FMEM_EVAL_CHUNK_NEXT:-1}"
+chunk_max_tokens="${FMEM_EVAL_CHUNK_MAX_TOKENS:-1600}"
 
 common_mcp_args=(
   --mcp-url "${mcp_url}"
@@ -35,6 +39,10 @@ common_mcp_args=(
   --mcp-rerank-candidates "${rerank_candidates}"
   --mcp-candidate-limit "${candidate_limit}"
   --mcp-fusion-profile "${fusion_profile}"
+  --mcp-chunk-expansion "${chunk_expansion}"
+  --mcp-chunk-prev "${chunk_prev}"
+  --mcp-chunk-next "${chunk_next}"
+  --mcp-chunk-max-tokens "${chunk_max_tokens}"
   --mcp-embed-missing
   --progress
 )

@@ -1201,6 +1201,29 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                         "type": "object",
                         "description": "Optional numeric source weight overrides, e.g. {\"document_bm25\":2.5,\"document_ann\":1.5,\"document_phonetic\":0}."
                     },
+                    "chunk_expansion": {
+                        "type": "string",
+                        "enum": ["none", "neighbors"],
+                        "description": "Expand document_chunk hits before reranking/returning. neighbors adds bounded prev/next chunks."
+                    },
+                    "chunk_prev": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 5,
+                        "description": "Previous document chunks to include when chunk_expansion=neighbors."
+                    },
+                    "chunk_next": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 5,
+                        "description": "Next document chunks to include when chunk_expansion=neighbors."
+                    },
+                    "chunk_max_tokens": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 8000,
+                        "description": "Approximate added-token budget per result for chunk expansion."
+                    },
                     "scope": {
                         "type": "string",
                         "enum": ["session", "global", "both"],
@@ -6026,6 +6049,24 @@ fn truncate_for_llm(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect::<String>()
 }
 
+fn rerank_candidate_content(result: &crate::hybrid_search::SearchResult) -> String {
+    if result.expanded_context.is_empty() {
+        return truncate_for_llm(&result.content, 500);
+    }
+    let mut text = format!("Hit chunk:\n{}", truncate_for_llm(&result.content, 360));
+    text.push_str("\n\nExpanded neighboring chunks:");
+    for chunk in &result.expanded_context {
+        text.push_str(&format!(
+            "\n[{}:{} tokens={}]\n{}",
+            chunk.position,
+            chunk.distance,
+            chunk.token_count,
+            truncate_for_llm(&chunk.content, 260)
+        ));
+    }
+    truncate_for_llm(&text, 1200)
+}
+
 fn parse_llm_rerank_json(raw: &str) -> Option<Value> {
     let trimmed = raw.trim();
     if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
@@ -6353,7 +6394,7 @@ async fn judge_rerank_candidates(
                 "id": result.id,
                 "type": result.result_type,
                 "source": result.source,
-                "content": truncate_for_llm(&result.content, 500),
+                "content": rerank_candidate_content(result),
             })
         })
         .collect::<Vec<_>>();
@@ -6720,6 +6761,161 @@ fn parse_hybrid_search_scope(
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct ChunkExpansionReport {
+    mode: String,
+    prev: usize,
+    next: usize,
+    max_tokens: i32,
+    expanded_results: usize,
+    added_chunks: usize,
+    added_tokens: i32,
+}
+
+fn parse_chunk_expansion(args: &Value) -> Result<(&str, usize, usize, i32), (i32, String)> {
+    let mode = args
+        .get("chunk_expansion")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    match mode {
+        "none" | "neighbors" => {}
+        _ => {
+            return Err((INVALID_PARAMS, format!("unknown chunk_expansion: {mode}")));
+        }
+    }
+    let prev = args
+        .get("chunk_prev")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .min(5) as usize;
+    let next = args
+        .get("chunk_next")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .min(5) as usize;
+    let max_tokens = args
+        .get("chunk_max_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(1600)
+        .clamp(1, 8000) as i32;
+    Ok((mode, prev, next, max_tokens))
+}
+
+fn expanded_chunk_context(
+    chunk: &crate::types::DocumentChunk,
+    position: &str,
+    distance: usize,
+) -> crate::hybrid_search::ExpandedChunkContext {
+    crate::hybrid_search::ExpandedChunkContext {
+        chunk_id: chunk.chunk_id,
+        document_id: chunk.document_id,
+        ordinal: chunk.ordinal,
+        position: position.to_string(),
+        distance,
+        token_count: chunk.token_count,
+        section_path: chunk.section_path.clone(),
+        content: chunk.content.clone(),
+    }
+}
+
+async fn apply_chunk_expansion<S: crate::storage::Storage>(
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session_id: uuid::Uuid,
+    results: &mut [crate::hybrid_search::SearchResult],
+    mode: &str,
+    prev: usize,
+    next: usize,
+    max_tokens: i32,
+) -> Result<ChunkExpansionReport, (i32, String)> {
+    let mut report = ChunkExpansionReport {
+        mode: mode.to_string(),
+        prev,
+        next,
+        max_tokens,
+        expanded_results: 0,
+        added_chunks: 0,
+        added_tokens: 0,
+    };
+    if mode == "none" || (prev == 0 && next == 0) {
+        return Ok(report);
+    }
+
+    for result in results.iter_mut() {
+        if result.result_type != "document_chunk" {
+            continue;
+        }
+        let mut added = Vec::new();
+        let mut added_tokens = 0i32;
+
+        let mut before = Vec::new();
+        let mut cursor = result.prev_chunk_id;
+        while before.len() < prev {
+            let Some(chunk_id) = cursor else { break };
+            let Some(chunk) = storage
+                .document_chunk_get(ctx, session_id, chunk_id)
+                .await
+                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+            else {
+                break;
+            };
+            cursor = chunk.prev_chunk_id;
+            before.push(chunk);
+        }
+        before.reverse();
+        for (idx, chunk) in before.iter().enumerate() {
+            let distance = before.len().saturating_sub(idx);
+            if added_tokens + chunk.token_count.max(0) > max_tokens {
+                continue;
+            }
+            added_tokens += chunk.token_count.max(0);
+            added.push(expanded_chunk_context(chunk, "prev", distance));
+        }
+
+        cursor = result.next_chunk_id;
+        let mut distance = 1usize;
+        while distance <= next {
+            let Some(chunk_id) = cursor else { break };
+            let Some(chunk) = storage
+                .document_chunk_get(ctx, session_id, chunk_id)
+                .await
+                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+            else {
+                break;
+            };
+            cursor = chunk.next_chunk_id;
+            if added_tokens + chunk.token_count.max(0) <= max_tokens {
+                added_tokens += chunk.token_count.max(0);
+                added.push(expanded_chunk_context(&chunk, "next", distance));
+            }
+            distance += 1;
+        }
+
+        if added.is_empty() {
+            continue;
+        }
+
+        let mut expanded_text = String::new();
+        for chunk in &added {
+            expanded_text.push_str(&format!(
+                "\n\n[expanded {} chunk distance={} ordinal={}]\n{}",
+                chunk.position, chunk.distance, chunk.ordinal, chunk.content
+            ));
+        }
+        result.content.push_str(&expanded_text);
+        result.expanded_context = added;
+        result.hint = Some(
+            "This result includes bounded prev/next chunk expansion. Use chunk_ctx if more neighboring context is needed."
+                .into(),
+        );
+        report.expanded_results += 1;
+        report.added_chunks += result.expanded_context.len();
+        report.added_tokens += added_tokens;
+    }
+
+    Ok(report)
+}
+
 async fn handle_hybrid_search<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
@@ -6814,7 +7010,20 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
     .await
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
     let candidate_fanout = search_output.diagnostics;
-    let all_results = search_output.results;
+    let mut all_results = search_output.results;
+    let (chunk_expansion_mode, chunk_prev, chunk_next, chunk_max_tokens) =
+        parse_chunk_expansion(&args)?;
+    let chunk_expansion_report = apply_chunk_expansion(
+        storage,
+        ctx,
+        session_id,
+        &mut all_results,
+        chunk_expansion_mode,
+        chunk_prev,
+        chunk_next,
+        chunk_max_tokens,
+    )
+    .await?;
 
     let rerank_override = args.get("rerank").and_then(Value::as_bool);
     let rerank_candidate_override = args
@@ -6972,6 +7181,7 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
             "error": reranker_report.error,
         },
         "candidate_fanout": candidate_fanout,
+        "chunk_expansion": chunk_expansion_report,
         "fusion": {
             "profile": fusion_profile,
             "weights": fusion_config,
@@ -12227,6 +12437,38 @@ mod tests {
     }
 
     #[test]
+    fn rerank_candidate_content_includes_expanded_chunks() {
+        let id = Uuid::new_v4();
+        let result = crate::hybrid_search::SearchResult {
+            id,
+            source: "document_bm25".into(),
+            content: "hit chunk".into(),
+            score: 1.0,
+            result_type: "document_chunk".into(),
+            document_id: Some(id),
+            prev_chunk_id: None,
+            next_chunk_id: None,
+            hint: None,
+            expanded_context: vec![crate::hybrid_search::ExpandedChunkContext {
+                chunk_id: Uuid::new_v4(),
+                document_id: id,
+                ordinal: 2,
+                position: "next".into(),
+                distance: 1,
+                token_count: 5,
+                section_path: "section".into(),
+                content: "neighbor answer text".into(),
+            }],
+        };
+
+        let content = rerank_candidate_content(&result);
+
+        assert!(content.contains("hit chunk"));
+        assert!(content.contains("Expanded neighboring chunks"));
+        assert!(content.contains("neighbor answer text"));
+    }
+
+    #[test]
     fn apply_llm_rerank_order_preserves_omitted_candidates_and_tail() {
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
@@ -12242,6 +12484,7 @@ mod tests {
             prev_chunk_id: None,
             next_chunk_id: None,
             hint: None,
+            expanded_context: Vec::new(),
         };
         let reranked = apply_llm_rerank_order(
             vec![
@@ -12274,6 +12517,7 @@ mod tests {
             prev_chunk_id: None,
             next_chunk_id: None,
             hint: None,
+            expanded_context: Vec::new(),
         };
 
         let reranked = apply_llm_rerank_decision(
@@ -12307,6 +12551,7 @@ mod tests {
             prev_chunk_id: None,
             next_chunk_id: None,
             hint: None,
+            expanded_context: Vec::new(),
         };
 
         let reranked = apply_llm_rerank_decision(
@@ -12339,6 +12584,7 @@ mod tests {
             prev_chunk_id: None,
             next_chunk_id: None,
             hint: None,
+            expanded_context: Vec::new(),
         };
 
         let reranked = apply_llm_rerank_decision(

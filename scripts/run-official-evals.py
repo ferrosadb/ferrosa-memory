@@ -533,6 +533,7 @@ class McpBrightRetriever:
         self.last_reranker: dict[str, Any] | None = None
         self.last_candidate_fanout: dict[str, Any] | None = None
         self.last_fusion: dict[str, Any] | None = None
+        self.last_chunk_expansion: dict[str, Any] | None = None
         self.client.initialize()
 
     def ingest_documents(self, rows: list[dict[str, Any]], split: str) -> dict[str, Any]:
@@ -665,12 +666,18 @@ class McpBrightRetriever:
             arguments["candidate_limit"] = self.args.mcp_candidate_limit
         if self.args.mcp_fusion_profile is not None:
             arguments["fusion_profile"] = self.args.mcp_fusion_profile
+        if self.args.mcp_chunk_expansion is not None:
+            arguments["chunk_expansion"] = self.args.mcp_chunk_expansion
+            arguments["chunk_prev"] = self.args.mcp_chunk_prev
+            arguments["chunk_next"] = self.args.mcp_chunk_next
+            arguments["chunk_max_tokens"] = self.args.mcp_chunk_max_tokens
         if self.args.mcp_rerank is not None:
             arguments["rerank"] = self.args.mcp_rerank
         response = self.client.call_tool("hybrid_search", arguments)
         self.last_reranker = response.get("reranker")
         self.last_candidate_fanout = response.get("candidate_fanout")
         self.last_fusion = response.get("fusion")
+        self.last_chunk_expansion = response.get("chunk_expansion")
         hits = []
         for result in response.get("results", []):
             entity_id = result_entity_id_for_mapping(result)
@@ -913,6 +920,7 @@ def run_bright_pro(args: argparse.Namespace) -> int:
                 case["reranker"] = mcp_retriever.last_reranker
                 case["candidate_fanout"] = mcp_retriever.last_candidate_fanout
                 case["fusion"] = mcp_retriever.last_fusion
+                case["chunk_expansion"] = mcp_retriever.last_chunk_expansion
             split_cases.append(case)
             all_cases.append(case)
 
@@ -972,6 +980,14 @@ def run_bright_pro(args: argparse.Namespace) -> int:
         ),
         "mcp_fusion_profile": (
             args.mcp_fusion_profile if args.backend == "mcp-http" else None
+        ),
+        "mcp_chunk_expansion": (
+            args.mcp_chunk_expansion if args.backend == "mcp-http" else None
+        ),
+        "mcp_chunk_prev": args.mcp_chunk_prev if args.backend == "mcp-http" else None,
+        "mcp_chunk_next": args.mcp_chunk_next if args.backend == "mcp-http" else None,
+        "mcp_chunk_max_tokens": (
+            args.mcp_chunk_max_tokens if args.backend == "mcp-http" else None
         ),
         "document_indexing_mode": ingest_summary["document_indexing_mode"],
         "k": args.k,
@@ -1218,6 +1234,7 @@ class McpMemoryBenchRetriever:
         self.last_reranker: dict[str, Any] | None = None
         self.last_candidate_fanout: dict[str, Any] | None = None
         self.last_fusion: dict[str, Any] | None = None
+        self.last_chunk_expansion: dict[str, Any] | None = None
         self.client.initialize()
 
     def ingest_documents(self, documents: list[MemoryBenchDocument]) -> dict[str, Any]:
@@ -1346,12 +1363,18 @@ class McpMemoryBenchRetriever:
             arguments["candidate_limit"] = self.args.mcp_candidate_limit
         if self.args.mcp_fusion_profile is not None:
             arguments["fusion_profile"] = self.args.mcp_fusion_profile
+        if self.args.mcp_chunk_expansion is not None:
+            arguments["chunk_expansion"] = self.args.mcp_chunk_expansion
+            arguments["chunk_prev"] = self.args.mcp_chunk_prev
+            arguments["chunk_next"] = self.args.mcp_chunk_next
+            arguments["chunk_max_tokens"] = self.args.mcp_chunk_max_tokens
         if self.args.mcp_rerank is not None:
             arguments["rerank"] = self.args.mcp_rerank
         response = self.client.call_tool("hybrid_search", arguments)
         self.last_reranker = response.get("reranker")
         self.last_candidate_fanout = response.get("candidate_fanout")
         self.last_fusion = response.get("fusion")
+        self.last_chunk_expansion = response.get("chunk_expansion")
         hits = []
         for result in response.get("results", []):
             entity_id = result_entity_id_for_mapping(result)
@@ -1524,6 +1547,7 @@ def run_memorybench(args: argparse.Namespace) -> int:
                 "reranker": mcp_retriever.last_reranker,
                 "candidate_fanout": mcp_retriever.last_candidate_fanout,
                 "fusion": mcp_retriever.last_fusion,
+                "chunk_expansion": mcp_retriever.last_chunk_expansion,
                 "hits": [
                     {
                         "id": hit.id,
@@ -1585,6 +1609,14 @@ def run_memorybench(args: argparse.Namespace) -> int:
         ),
         "mcp_fusion_profile": (
             args.mcp_fusion_profile if args.backend == "mcp-http" else None
+        ),
+        "mcp_chunk_expansion": (
+            args.mcp_chunk_expansion if args.backend == "mcp-http" else None
+        ),
+        "mcp_chunk_prev": args.mcp_chunk_prev if args.backend == "mcp-http" else None,
+        "mcp_chunk_next": args.mcp_chunk_next if args.backend == "mcp-http" else None,
+        "mcp_chunk_max_tokens": (
+            args.mcp_chunk_max_tokens if args.backend == "mcp-http" else None
         ),
         "k": args.k if args.backend == "mcp-http" else None,
         "dataset_count": len(summaries),
@@ -1798,6 +1830,14 @@ def parse_args() -> argparse.Namespace:
         ],
         help="Named hybrid_search source-weight profile for ablations.",
     )
+    bright.add_argument(
+        "--mcp-chunk-expansion",
+        choices=["none", "neighbors"],
+        help="Expand document chunk hits before reranking/returning.",
+    )
+    bright.add_argument("--mcp-chunk-prev", type=int, default=1)
+    bright.add_argument("--mcp-chunk-next", type=int, default=1)
+    bright.add_argument("--mcp-chunk-max-tokens", type=int, default=1600)
     rerank_group = bright.add_mutually_exclusive_group()
     rerank_group.add_argument(
         "--mcp-rerank",
@@ -1893,6 +1933,14 @@ def parse_args() -> argparse.Namespace:
         ],
         help="Named hybrid_search source-weight profile for ablations.",
     )
+    memory.add_argument(
+        "--mcp-chunk-expansion",
+        choices=["none", "neighbors"],
+        help="Expand document chunk hits before reranking/returning.",
+    )
+    memory.add_argument("--mcp-chunk-prev", type=int, default=1)
+    memory.add_argument("--mcp-chunk-next", type=int, default=1)
+    memory.add_argument("--mcp-chunk-max-tokens", type=int, default=1600)
     memory_rerank_group = memory.add_mutually_exclusive_group()
     memory_rerank_group.add_argument(
         "--mcp-rerank",

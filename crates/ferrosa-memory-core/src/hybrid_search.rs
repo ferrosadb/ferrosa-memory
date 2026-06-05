@@ -9,6 +9,18 @@ use crate::storage::Storage;
 use crate::types::TenantContext;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpandedChunkContext {
+    pub chunk_id: Uuid,
+    pub document_id: Uuid,
+    pub ordinal: i32,
+    pub position: String,
+    pub distance: usize,
+    pub token_count: i32,
+    pub section_path: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub id: Uuid,
     pub source: String,
@@ -23,6 +35,8 @@ pub struct SearchResult {
     pub next_chunk_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expanded_context: Vec<ExpandedChunkContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -522,6 +536,7 @@ pub async fn hybrid_search_with_diagnostics(
                         prev_chunk_id: None,
                         next_chunk_id: None,
                         hint: None,
+                        expanded_context: Vec::new(),
                     })
                     .collect(),
             );
@@ -546,6 +561,7 @@ pub async fn hybrid_search_with_diagnostics(
                         prev_chunk_id: None,
                         next_chunk_id: None,
                         hint: None,
+                        expanded_context: Vec::new(),
                     })
                     .collect(),
             );
@@ -572,6 +588,7 @@ pub async fn hybrid_search_with_diagnostics(
                         prev_chunk_id: None,
                         next_chunk_id: None,
                         hint: None,
+                        expanded_context: Vec::new(),
                     })
                     .collect(),
             );
@@ -598,6 +615,7 @@ pub async fn hybrid_search_with_diagnostics(
                         prev_chunk_id: None,
                         next_chunk_id: None,
                         hint: Some("This is a raw context segment. Use ctx_window with this segment_id when adjacent turns may contain the rest of the answer.".into()),
+                        expanded_context: Vec::new(),
                     })
                     .collect(),
             );
@@ -624,6 +642,7 @@ pub async fn hybrid_search_with_diagnostics(
                         prev_chunk_id: None,
                         next_chunk_id: None,
                         hint: Some("This vector-matched context segment has temporal neighbors. Use ctx_window for bounded prev/next expansion.".into()),
+                        expanded_context: Vec::new(),
                     })
                     .collect(),
             );
@@ -650,6 +669,7 @@ pub async fn hybrid_search_with_diagnostics(
                         prev_chunk_id: chunk.prev_chunk_id,
                         next_chunk_id: chunk.next_chunk_id,
                         hint: Some("This is a semantic document chunk. If surrounding list items or adjacent context may matter, call chunk_ctx with prev/next expansion.".into()),
+                        expanded_context: Vec::new(),
                     })
                     .collect(),
             );
@@ -677,6 +697,7 @@ pub async fn hybrid_search_with_diagnostics(
                         prev_chunk_id: chunk.prev_chunk_id,
                         next_chunk_id: chunk.next_chunk_id,
                         hint: Some("This document chunk has linked neighbors. Use chunk_ctx when the answer depends on adjacent context.".into()),
+                        expanded_context: Vec::new(),
                     })
                     .collect(),
             );
@@ -703,6 +724,7 @@ pub async fn hybrid_search_with_diagnostics(
                         prev_chunk_id: chunk.prev_chunk_id,
                         next_chunk_id: chunk.next_chunk_id,
                         hint: Some("This is a vector-matched semantic document chunk. Use chunk_ctx for neighboring context.".into()),
+                        expanded_context: Vec::new(),
                     })
                     .collect(),
             );
@@ -726,6 +748,7 @@ pub async fn hybrid_search_with_diagnostics(
                     prev_chunk_id: r.prev_chunk_id,
                     next_chunk_id: r.next_chunk_id,
                     hint: r.hint.clone(),
+                    expanded_context: r.expanded_context.clone(),
                 })
             })
             .collect();
@@ -755,6 +778,7 @@ pub async fn hybrid_search_with_diagnostics(
                     prev_chunk_id: r.prev_chunk_id,
                     next_chunk_id: r.next_chunk_id,
                     hint: r.hint.clone(),
+                    expanded_context: r.expanded_context.clone(),
                 })
             })
             .collect();
@@ -786,6 +810,7 @@ pub async fn hybrid_search_with_diagnostics(
                     prev_chunk_id: r.prev_chunk_id,
                     next_chunk_id: r.next_chunk_id,
                     hint: r.hint.clone(),
+                    expanded_context: r.expanded_context.clone(),
                 })
             })
             .collect();
@@ -830,6 +855,7 @@ pub async fn hybrid_search_with_diagnostics(
                             prev_chunk_id: candidate.prev_chunk_id,
                             next_chunk_id: candidate.next_chunk_id,
                             hint: candidate.hint.clone(),
+                            expanded_context: candidate.expanded_context.clone(),
                         });
                     }
                     break;
@@ -895,6 +921,7 @@ mod tests {
             prev_chunk_id: None,
             next_chunk_id: None,
             hint: None,
+            expanded_context: Vec::new(),
         }
     }
 

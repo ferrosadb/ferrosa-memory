@@ -115,6 +115,18 @@ scripts/run-fusion-ablations.sh
 
 Use `FMEM_EVAL_INCLUDE_LLM_RERANK=true` to add the slower `all-llm-rerank` profile.
 
+Chunk expansion can be exercised without changing the harness:
+
+```bash
+FMEM_EVAL_CHUNK_EXPANSION=neighbors \
+FMEM_EVAL_CHUNK_PREV=1 \
+FMEM_EVAL_CHUNK_NEXT=1 \
+FMEM_EVAL_CHUNK_MAX_TOKENS=1600 \
+scripts/run-long-recall-baseline.sh bright-pro
+```
+
+Current measurement: unconditional `neighbors` expansion is not a default. On the BRIGHT-Pro 200-doc support-closed slice it preserved recall but reduced LLM-reranked alpha-nDCG (`0.796 -> 0.744`), so follow-up tuning should use conditional/list-aware expansion or structured neighbor summaries.
+
 ## CI Shape
 
 ### Required PR Gate

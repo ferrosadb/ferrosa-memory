@@ -21,6 +21,14 @@
   - Measurement on BRIGHT-Pro biology 200-doc support-closed 5-case slice, candidate_limit=50, reused corpus session: `all+LLM` led alpha-nDCG (`0.796`) while preserving aspect recall (`0.94`) and recall (`0.796`); `bm25-only` led plain NDCG (`0.797`) but lower aspect recall (`0.88`); `semantic-only` was weak (`alpha=0.418`, `recall=0.209`).
   - Interpretation: BM25 is still the strongest ranker on this slice, phonetic/fanout improves support coverage, and LLM rerank recovers rank quality from the broader candidate pool. Workspace and graph effects were not exercised in this benchmark slice because no cwd/graph candidate signals were present.
 
+- [x] **Chunk expansion policy needs first-class retrieval controls.**
+  - Implemented: `hybrid_search` accepts `chunk_expansion=none|neighbors`, `chunk_prev`, `chunk_next`, and `chunk_max_tokens`; document chunk hits can include bounded prev/next context and return `chunk_expansion` diagnostics.
+  - Implemented: eval scripts accept matching MCP flags and environment controls, so BRIGHT-Pro and MemoryBench runs can compare expansion policies without code changes.
+  - Measurement on BRIGHT-Pro biology 200-doc support-closed 5-case slice, candidate_limit=50, `fusion_profile=all`, no LLM rerank: `neighbors(prev=1,next=1,max_tokens=1600)` expanded 5/5 cases and added 158 chunks, but metrics were unchanged because support-doc scoring depends on ranking/doc ids, not returned neighboring text.
+  - Measurement with LLM rerank on the same slice: `none` beat `neighbors` on alpha-nDCG (`0.796 -> 0.744`) and NDCG (`0.775 -> 0.756`), while aspect recall (`0.94`) and recall (`0.796`) were unchanged.
+  - MemoryBench retrieval-proxy smoke on 2 `DialSim-bigbang` rows was unchanged by neighbor expansion: answer-term recall `0.75`, exact-answer hit rate `0.50`.
+  - Interpretation: unconditional neighbor text is currently neutral without rerank and noisy for judge rerank. Keep the default `none`; next improvement should make expansion conditional/list-aware or pass structured neighbor summaries to the judge instead of raw appended text.
+
 - [ ] **Hybrid search needs an async judge-rerank mode with streamed status.**
   - Current: live LLM reranking can be enabled and works against local Ollama (`qwen2.5-coder:7b` hot path is ~2-3s for 8 candidates), but it is still in-band with the MCP request.
   - Implemented: judge-model reranking asks for per-candidate relevance scores and records `"-"` abstentions separately from valid `-1/0/1` judgments. `record_feedback` also accepts `"-"` and tracks per-judge sums so caller LLM, human, and judge-model feedback can accumulate without losing abstention/error evidence.

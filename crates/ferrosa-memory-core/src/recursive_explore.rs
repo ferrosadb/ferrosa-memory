@@ -202,6 +202,7 @@ pub async fn explore(
                         prev_chunk_id: None,
                         next_chunk_id: None,
                         hint: None,
+                        expanded_context: Vec::new(),
                     },
                 );
             }

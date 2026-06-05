@@ -11,6 +11,10 @@ limit_examples="${FMEM_EVAL_LIMIT_EXAMPLES:-5}"
 max_docs="${FMEM_EVAL_MCP_MAX_DOCS:-200}"
 candidate_limit="${FMEM_EVAL_CANDIDATE_LIMIT:-50}"
 rerank_candidates="${FMEM_EVAL_RERANK_CANDIDATES:-25}"
+chunk_expansion="${FMEM_EVAL_CHUNK_EXPANSION:-none}"
+chunk_prev="${FMEM_EVAL_CHUNK_PREV:-1}"
+chunk_next="${FMEM_EVAL_CHUNK_NEXT:-1}"
+chunk_max_tokens="${FMEM_EVAL_CHUNK_MAX_TOKENS:-1600}"
 
 mkdir -p "${output_root}"
 
@@ -24,6 +28,10 @@ for profile in ${profiles}; do
     --mcp-skip-ingest \
     --mcp-candidate-limit "${candidate_limit}" \
     --mcp-fusion-profile "${profile}" \
+    --mcp-chunk-expansion "${chunk_expansion}" \
+    --mcp-chunk-prev "${chunk_prev}" \
+    --mcp-chunk-next "${chunk_next}" \
+    --mcp-chunk-max-tokens "${chunk_max_tokens}" \
     --mcp-no-rerank \
     --mcp-rerank-candidates "${rerank_candidates}" \
     --output-dir "${output_root}/${profile}" \
@@ -40,6 +48,10 @@ if [[ "${FMEM_EVAL_INCLUDE_LLM_RERANK:-false}" == "true" ]]; then
     --mcp-skip-ingest \
     --mcp-candidate-limit "${candidate_limit}" \
     --mcp-fusion-profile all \
+    --mcp-chunk-expansion "${chunk_expansion}" \
+    --mcp-chunk-prev "${chunk_prev}" \
+    --mcp-chunk-next "${chunk_next}" \
+    --mcp-chunk-max-tokens "${chunk_max_tokens}" \
     --mcp-rerank \
     --mcp-rerank-candidates "${rerank_candidates}" \
     --output-dir "${output_root}/all-llm-rerank" \
