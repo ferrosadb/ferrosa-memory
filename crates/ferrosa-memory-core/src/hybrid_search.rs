@@ -25,6 +25,29 @@ pub struct SearchResult {
     pub hint: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandidateSourceStats {
+    pub source: String,
+    pub candidates: usize,
+    pub unique_candidates: usize,
+    pub weight: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchDiagnostics {
+    pub requested_limit: usize,
+    pub source_limit: usize,
+    pub total_candidates: usize,
+    pub unique_candidates: usize,
+    pub sources: Vec<CandidateSourceStats>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchOutput {
+    pub results: Vec<SearchResult>,
+    pub diagnostics: SearchDiagnostics,
+}
+
 /// Configuration for 6-signal RRF fusion weights.
 /// Default weight 1.0 for all signals. Set to 0.0 to disable a signal.
 #[derive(Debug, Clone)]
@@ -144,6 +167,52 @@ pub struct SearchFilter {
     pub tags: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_limit: Option<usize>,
+}
+
+fn source_limit(limit: usize, filter: Option<&SearchFilter>) -> usize {
+    filter
+        .and_then(|f| f.candidate_limit)
+        .unwrap_or_else(|| limit.saturating_mul(2))
+        .clamp(limit, 50)
+}
+
+fn candidate_source_stats(
+    lists: &[Vec<SearchResult>],
+    weights: &[f64],
+    requested_limit: usize,
+    source_limit: usize,
+) -> SearchDiagnostics {
+    let mut sources = Vec::new();
+    let mut all_unique = HashSet::new();
+    let mut total_candidates = 0usize;
+    for (idx, list) in lists.iter().enumerate() {
+        let source = list
+            .first()
+            .map(|result| result.source.clone())
+            .unwrap_or_else(|| format!("source_{idx}"));
+        let unique_candidates = list
+            .iter()
+            .map(|result| result.id)
+            .collect::<HashSet<_>>()
+            .len();
+        total_candidates += list.len();
+        all_unique.extend(list.iter().map(|result| result.id));
+        sources.push(CandidateSourceStats {
+            source,
+            candidates: list.len(),
+            unique_candidates,
+            weight: weights.get(idx).copied().unwrap_or(1.0),
+        });
+    }
+    SearchDiagnostics {
+        requested_limit,
+        source_limit,
+        total_candidates,
+        unique_candidates: all_unique.len(),
+        sources,
+    }
 }
 
 fn normalize_workspace_path(path: &str) -> String {
@@ -260,11 +329,43 @@ pub async fn hybrid_search(
     config: &FusionConfig,
     filter: Option<&SearchFilter>,
 ) -> anyhow::Result<Vec<SearchResult>> {
+    hybrid_search_with_diagnostics(
+        storage,
+        ctx,
+        session_id,
+        query,
+        embedding,
+        limit,
+        warmth_scores,
+        pagerank_scores,
+        reputation_scores,
+        config,
+        filter,
+    )
+    .await
+    .map(|output| output.results)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn hybrid_search_with_diagnostics(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    session_id: Uuid,
+    query: &str,
+    embedding: Option<&[f32]>,
+    limit: usize,
+    warmth_scores: Option<&HashMap<Uuid, f64>>,
+    pagerank_scores: Option<&HashMap<Uuid, f64>>,
+    reputation_scores: Option<&HashMap<Uuid, f64>>,
+    config: &FusionConfig,
+    filter: Option<&SearchFilter>,
+) -> anyhow::Result<SearchOutput> {
     anyhow::ensure!(!query.is_empty(), "query must not be empty");
     anyhow::ensure!(limit > 0 && limit <= 50, "limit must be between 1 and 50");
 
     let scope = filter.map(|f| f.scope).unwrap_or_default();
     let sessions = sessions_to_query(session_id, ctx.tenant_id, scope);
+    let source_limit = source_limit(limit, filter);
 
     let mut lists: Vec<Vec<SearchResult>> = Vec::new();
     let mut weights: Vec<f64> = Vec::new();
@@ -277,7 +378,7 @@ pub async fn hybrid_search(
             lists.push(
                 entities
                     .into_iter()
-                    .take(limit)
+                    .take(source_limit)
                     .enumerate()
                     .map(|(i, e)| SearchResult {
                         id: e.entity_id,
@@ -301,7 +402,8 @@ pub async fn hybrid_search(
 
         // Strategy 2: ANN entity search
         if let Some(emb) = embedding
-            && let Ok(entities) = storage.entity_search_ann(ctx, sid, emb, limit).await
+            && let Ok(entities) = storage.entity_search_ann(ctx, sid, emb, source_limit).await
+            && !entities.is_empty()
         {
             lists.push(
                 entities
@@ -324,7 +426,10 @@ pub async fn hybrid_search(
 
         // Strategy 3: ANN fold search
         if let Some(emb) = embedding
-            && let Ok(folds) = storage.fold_search(ctx, sid, emb, limit, false).await
+            && let Ok(folds) = storage
+                .fold_search(ctx, sid, emb, source_limit, false)
+                .await
+            && !folds.is_empty()
         {
             lists.push(
                 folds
@@ -347,7 +452,7 @@ pub async fn hybrid_search(
 
         // Strategy 4: raw context lexical/BM25 search over semantic segments.
         if let Ok(segments) = storage
-            .context_segment_search_bm25(ctx, sid, query, limit)
+            .context_segment_search_bm25(ctx, sid, query, source_limit)
             .await
             && !segments.is_empty()
         {
@@ -374,7 +479,7 @@ pub async fn hybrid_search(
         // Strategy 5: raw context ANN search over semantic segment embeddings.
         if let Some(emb) = embedding
             && let Ok(segments) = storage
-                .context_segment_search_ann(ctx, sid, emb, limit)
+                .context_segment_search_ann(ctx, sid, emb, source_limit)
                 .await
             && !segments.is_empty()
         {
@@ -399,7 +504,7 @@ pub async fn hybrid_search(
 
         // Strategy 6: document lexical/BM25 search over semantic chunks.
         if let Ok(chunks) = storage
-            .document_chunk_search_bm25(ctx, sid, query, limit)
+            .document_chunk_search_bm25(ctx, sid, query, source_limit)
             .await
             && !chunks.is_empty()
         {
@@ -426,7 +531,7 @@ pub async fn hybrid_search(
         // Strategy 7: document phonetic term search. This helps doc IDs,
         // titles, and spelling variants contribute candidates before RRF.
         if let Ok(chunks) = storage
-            .document_chunk_search_phonetic(ctx, sid, query, limit)
+            .document_chunk_search_phonetic(ctx, sid, query, source_limit)
             .await
             && !chunks.is_empty()
         {
@@ -453,7 +558,7 @@ pub async fn hybrid_search(
         // Strategy 8: document ANN search over chunk embeddings.
         if let Some(emb) = embedding
             && let Ok(chunks) = storage
-                .document_chunk_search_ann(ctx, sid, emb, limit)
+                .document_chunk_search_ann(ctx, sid, emb, source_limit)
                 .await
             && !chunks.is_empty()
         {
@@ -614,6 +719,7 @@ pub async fn hybrid_search(
         }
     }
 
+    let diagnostics = candidate_source_stats(&lists, &weights, limit, source_limit);
     let mut merged = rrf_merge(lists, 60.0, &weights);
     if let Some(workspace_cwd) = filter.and_then(|f| f.workspace_cwd.as_deref())
         && !workspace_cwd.trim().is_empty()
@@ -636,10 +742,14 @@ pub async fn hybrid_search(
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
     }
-    Ok(collapse_duplicate_document_chunks(merged)
+    let results = collapse_duplicate_document_chunks(merged)
         .into_iter()
         .take(limit)
-        .collect())
+        .collect();
+    Ok(SearchOutput {
+        results,
+        diagnostics,
+    })
 }
 
 #[cfg(test)]
@@ -770,13 +880,65 @@ mod tests {
             entity_types: Some(vec!["skill".into()]),
             tags: Some(vec!["testing".into(), "quality".into()]),
             workspace_cwd: Some("/repo/project".into()),
+            candidate_limit: Some(25),
         };
         let json = serde_json::to_string(&filter).unwrap();
         let back: SearchFilter = serde_json::from_str(&json).unwrap();
         assert_eq!(back.scope, SearchScope::Both);
         assert_eq!(back.workspace_cwd.as_deref(), Some("/repo/project"));
+        assert_eq!(back.candidate_limit, Some(25));
         assert_eq!(back.entity_types, Some(vec!["skill".into()]));
         assert_eq!(back.tags, Some(vec!["testing".into(), "quality".into()]));
+    }
+
+    #[test]
+    fn source_limit_defaults_to_bounded_double_limit() {
+        assert_eq!(source_limit(10, None), 20);
+        assert_eq!(source_limit(25, None), 50);
+        assert_eq!(source_limit(50, None), 50);
+    }
+
+    #[test]
+    fn source_limit_respects_explicit_candidate_limit_floor_and_ceiling() {
+        let low = SearchFilter {
+            candidate_limit: Some(5),
+            ..Default::default()
+        };
+        let high = SearchFilter {
+            candidate_limit: Some(100),
+            ..Default::default()
+        };
+        assert_eq!(source_limit(10, Some(&low)), 10);
+        assert_eq!(source_limit(10, Some(&high)), 50);
+    }
+
+    #[test]
+    fn candidate_source_stats_reports_source_counts_and_uniques() {
+        let shared = Uuid::new_v4();
+        let unique = Uuid::new_v4();
+        let lists = vec![
+            vec![
+                make_result(shared, "document_bm25", 1.0),
+                make_result(unique, "document_bm25", 0.9),
+            ],
+            vec![make_result(shared, "document_ann", 1.0)],
+        ];
+
+        let stats = candidate_source_stats(&lists, &[2.5, 1.5], 10, 20);
+
+        assert_eq!(stats.requested_limit, 10);
+        assert_eq!(stats.source_limit, 20);
+        assert_eq!(stats.total_candidates, 3);
+        assert_eq!(stats.unique_candidates, 2);
+        assert_eq!(stats.sources.len(), 2);
+        assert_eq!(stats.sources[0].source, "document_bm25");
+        assert_eq!(stats.sources[0].candidates, 2);
+        assert_eq!(stats.sources[0].unique_candidates, 2);
+        assert_eq!(stats.sources[0].weight, 2.5);
+        assert_eq!(stats.sources[1].source, "document_ann");
+        assert_eq!(stats.sources[1].candidates, 1);
+        assert_eq!(stats.sources[1].unique_candidates, 1);
+        assert_eq!(stats.sources[1].weight, 1.5);
     }
 
     #[test]

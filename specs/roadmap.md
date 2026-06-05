@@ -10,6 +10,11 @@
 
 ## Active Retrieval Gaps
 
+- [x] **Candidate generation fanout needs measurable source accounting.**
+  - Implemented: `hybrid_search` now has a per-source `candidate_limit` before fusion and returns `candidate_fanout` diagnostics with source counts, weights, total candidates, and unique candidates.
+  - Implemented: eval scripts accept `--mcp-candidate-limit`; `scripts/run-long-recall-baseline.sh` defaults `FMEM_EVAL_CANDIDATE_LIMIT=50` for long-recall runs.
+  - Measurement on BRIGHT-Pro biology 200-doc support-closed 5-case slice, no LLM rerank, reused corpus session: candidate limit 25 -> 50 improved alpha-nDCG `0.703 -> 0.720`, aspect recall `0.84 -> 0.94`, recall `0.736 -> 0.796`; one single case regressed in rank quality, so fusion ablations remain necessary.
+
 - [ ] **Hybrid search needs an async judge-rerank mode with streamed status.**
   - Current: live LLM reranking can be enabled and works against local Ollama (`qwen2.5-coder:7b` hot path is ~2-3s for 8 candidates), but it is still in-band with the MCP request.
   - Implemented: judge-model reranking asks for per-candidate relevance scores and records `"-"` abstentions separately from valid `-1/0/1` judgments. `record_feedback` also accepts `"-"` and tracks per-judge sums so caller LLM, human, and judge-model feedback can accumulate without losing abstention/error evidence.

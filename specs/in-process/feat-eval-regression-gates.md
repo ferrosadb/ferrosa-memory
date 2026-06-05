@@ -99,6 +99,7 @@ FMEM_EVAL_MCP_USER=ferrosa_user \
 FMEM_EVAL_MCP_PASSWORD=ferrosa_user \
 FMEM_EVAL_MCP_BATCH_SIZE=25 \
 FMEM_EVAL_RERANK_CANDIDATES=25 \
+FMEM_EVAL_CANDIDATE_LIMIT=50 \
 scripts/run-long-recall-baseline.sh bright-pro
 ```
 

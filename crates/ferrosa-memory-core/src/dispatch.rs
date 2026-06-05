@@ -1186,6 +1186,12 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                     },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Max results to return (default: 10)" },
                     "offset": { "type": "integer", "minimum": 0, "maximum": 49, "description": "Skip this many fused results for pagination. Use offset=5 after scoring the first 5 as irrelevant." },
+                    "candidate_limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "description": "Per-source candidate fanout before fusion. Defaults to min(limit*2, 50); lower it to reduce retrieval work."
+                    },
                     "scope": {
                         "type": "string",
                         "enum": ["session", "global", "both"],
@@ -6721,6 +6727,12 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         .unwrap_or(0)
         .min(49) as usize;
     let search_limit = (limit + offset).min(50);
+    let candidate_limit = args
+        .get("candidate_limit")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .filter(|value| *value > 0)
+        .map(|value| value.min(50));
     let filter = crate::hybrid_search::SearchFilter {
         scope: parse_hybrid_search_scope(&args)?,
         entity_types: None,
@@ -6730,6 +6742,7 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
             .or_else(|| args.get("cwd"))
             .and_then(|v| v.as_str())
             .map(str::to_string),
+        candidate_limit,
     };
 
     // Auto-generate query embedding for ANN search if Ollama is configured.
@@ -6742,7 +6755,7 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         }
     }
 
-    let all_results = crate::hybrid_search::hybrid_search(
+    let search_output = crate::hybrid_search::hybrid_search_with_diagnostics(
         storage,
         ctx,
         session_id,
@@ -6757,6 +6770,8 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
     )
     .await
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    let candidate_fanout = search_output.diagnostics;
+    let all_results = search_output.results;
 
     let rerank_override = args.get("rerank").and_then(Value::as_bool);
     let rerank_candidate_override = args
@@ -6912,7 +6927,8 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
                 "error": batch.error,
             })).collect::<Vec<_>>(),
             "error": reranker_report.error,
-        }
+        },
+        "candidate_fanout": candidate_fanout,
     });
     if result_count == 0 {
         response["_hint"] = serde_json::json!(
