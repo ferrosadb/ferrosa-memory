@@ -14,6 +14,7 @@ import collections
 import heapq
 import json
 import math
+import os
 import re
 import statistics
 import sys
@@ -65,6 +66,62 @@ STOPWORDS = {
 TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 
 
+def load_user_memory_config() -> dict[str, Any]:
+    config_path = Path(
+        os.environ.get(
+            "FERROSA_MEMORY_CONFIG_FILE", str(Path.home() / ".config/ferrosa-memory.toml")
+        )
+    )
+    if not config_path.exists():
+        return {}
+    try:
+        import tomllib
+
+        return tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+USER_MEMORY_CONFIG = load_user_memory_config()
+
+
+def default_mcp_url() -> str:
+    explicit = os.environ.get("FMEM_EVAL_MCP_URL") or os.environ.get(
+        "FERROSA_MEMORY_MCP_URL"
+    )
+    if explicit:
+        return explicit
+    port = USER_MEMORY_CONFIG.get("server", {}).get("http_port", 18765)
+    return f"http://127.0.0.1:{port}/mcp"
+
+
+def default_mcp_user() -> str:
+    return (
+        os.environ.get("FMEM_EVAL_MCP_USER")
+        or os.environ.get("FERROSA_MEMORY_MCP_USER")
+        or USER_MEMORY_CONFIG.get("client", {}).get("http_username")
+        or "ferrosa_user"
+    )
+
+
+def default_mcp_password() -> str:
+    return (
+        os.environ.get("FMEM_EVAL_MCP_PASSWORD")
+        or os.environ.get("FERROSA_MEMORY_MCP_PASSWORD")
+        or USER_MEMORY_CONFIG.get("client", {}).get("http_password")
+        or "ferrosa_user"
+    )
+
+
+def default_mcp_tenant_id() -> str:
+    return (
+        os.environ.get("FMEM_EVAL_MCP_TENANT_ID")
+        or os.environ.get("FERROSA_MEMORY_TENANT_ID")
+        or USER_MEMORY_CONFIG.get("server", {}).get("tenant_id")
+        or "00000000-0000-0000-0000-000000000000"
+    )
+
+
 @dataclass(frozen=True)
 class Aspect:
     id: str
@@ -92,6 +149,10 @@ class MemoryBenchPrediction:
     answer: str
     retrieved: list[Hit]
     generator: str
+
+
+BRIGHT_PRO_FULL_MCP_SESSION_ID = "00000000-0000-0000-0000-00000000b7f1"
+MEMORYBENCH_FULL_MCP_SESSION_ID = "00000000-0000-0000-0000-00000000b7f2"
 
 
 def tokenize(text: str) -> list[str]:
@@ -439,6 +500,19 @@ def deterministic_entity_id(session_id: str, doc_id: str) -> str:
     return str(uuid.uuid5(namespace, doc_id))
 
 
+def deterministic_benchmark_entity_id(session_id: str, benchmark: str, doc_id: str) -> str:
+    namespace = uuid.uuid5(uuid.NAMESPACE_URL, f"ferrosa-{benchmark}:{session_id}")
+    return str(uuid.uuid5(namespace, doc_id))
+
+
+def require_uuid(value: str, label: str) -> str:
+    try:
+        uuid.UUID(value)
+    except ValueError as exc:
+        raise ValueError(f"{label} must be a UUID: {value}") from exc
+    return value
+
+
 def result_entity_id_for_mapping(result: dict[str, Any]) -> str:
     """Return the stable corpus entity id for direct entity and chunk search hits."""
     document_id = result.get("document_id")
@@ -718,6 +792,28 @@ def summarize(values: list[float]) -> dict[str, float]:
 
 
 def run_bright_pro(args: argparse.Namespace) -> int:
+    if args.full_corpus:
+        if args.backend != "mcp-http":
+            print("--full-corpus requires --backend mcp-http", file=sys.stderr)
+            return 2
+        if args.split:
+            print("--full-corpus cannot be combined with --split", file=sys.stderr)
+            return 2
+        if args.limit_examples is not None:
+            print("--full-corpus cannot be combined with --limit-examples", file=sys.stderr)
+            return 2
+        if args.mcp_max_docs is not None:
+            print("--full-corpus cannot be combined with --mcp-max-docs", file=sys.stderr)
+            return 2
+        if args.mcp_session_id is None:
+            args.mcp_session_id = BRIGHT_PRO_FULL_MCP_SESSION_ID
+    if args.mcp_session_id is not None:
+        try:
+            args.mcp_session_id = require_uuid(args.mcp_session_id, "--mcp-session-id")
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+
     corpus_dir = Path(args.corpus_dir).expanduser().resolve() / "bright-pro"
     if not corpus_dir.exists():
         print(f"missing BRIGHT-Pro corpus: {corpus_dir}", file=sys.stderr)
@@ -735,6 +831,7 @@ def run_bright_pro(args: argparse.Namespace) -> int:
     split_summaries = {}
     ingest_summaries = {}
     sampling_summaries = {}
+    corpus_summaries = {}
     remaining = args.limit_examples
     mcp_retriever = McpBrightRetriever(args) if args.backend == "mcp-http" else None
 
@@ -742,6 +839,11 @@ def run_bright_pro(args: argparse.Namespace) -> int:
         examples = read_parquet_rows(corpus_dir / "examples" / f"{split}.parquet")
         aspects_by_example = load_bright_aspects(corpus_dir, split)
         document_rows = read_parquet_rows(corpus_dir / "documents" / f"{split}.parquet")
+        corpus_summaries[split] = {
+            "documents": len(document_rows),
+            "examples": len(examples),
+            "aspects": sum(len(aspects) for aspects in aspects_by_example.values()),
+        }
         if mcp_retriever and args.mcp_max_docs is not None:
             document_rows = document_rows[: args.mcp_max_docs]
             available_doc_ids = {str(row["id"]) for row in document_rows}
@@ -844,6 +946,8 @@ def run_bright_pro(args: argparse.Namespace) -> int:
     report = {
         "suite": "bright-pro",
         "backend": args.backend,
+        "profile": "full-corpus-mcp" if args.full_corpus else "custom",
+        "full_corpus": args.full_corpus,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "corpus_dir": str(corpus_dir),
         "mcp_url": args.mcp_url if args.backend == "mcp-http" else None,
@@ -858,6 +962,14 @@ def run_bright_pro(args: argparse.Namespace) -> int:
         "alpha": args.alpha,
         "case_count": len(all_cases),
         "failure_count": len(failures),
+        "corpus": {
+            "splits": corpus_summaries,
+            "totals": {
+                "documents": sum(item["documents"] for item in corpus_summaries.values()),
+                "examples": sum(item["examples"] for item in corpus_summaries.values()),
+                "aspects": sum(item["aspects"] for item in corpus_summaries.values()),
+            },
+        },
         "summary": summarize_cases(all_cases),
         "splits": split_summaries,
         "sampling": sampling_summaries,
@@ -956,7 +1068,312 @@ def parse_json_field(value: Any) -> tuple[Any | None, str | None]:
         return None, str(exc)
 
 
+def parse_jsonish(value: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return value
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return ""
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    try:
+        return ast.literal_eval(text)
+    except Exception:
+        return value
+
+
+def memorybench_dialog_text(value: Any) -> str:
+    parsed = parse_jsonish(value)
+    if parsed is None:
+        return ""
+    if isinstance(parsed, str):
+        return parsed.strip()
+    if isinstance(parsed, list):
+        parts = []
+        for item in parsed:
+            text = memorybench_dialog_text(item)
+            if text:
+                parts.append(text)
+        return "\n".join(parts)
+    if isinstance(parsed, dict):
+        role = parsed.get("role") or parsed.get("speaker") or parsed.get("from")
+        content = (
+            parsed.get("content")
+            or parsed.get("text")
+            or parsed.get("message")
+            or parsed.get("value")
+            or parsed.get("utterance")
+        )
+        if content is not None:
+            content_text = memorybench_dialog_text(content)
+            return f"{role}: {content_text}" if role and content_text else content_text
+        parts = []
+        for key in sorted(parsed):
+            text = memorybench_dialog_text(parsed[key])
+            if text:
+                parts.append(f"{key}: {text}")
+        return "\n".join(parts)
+    return str(parsed).strip()
+
+
+def memorybench_source_fields(row: dict[str, Any]) -> list[str]:
+    fields = []
+    for key, value in row.items():
+        if not (key.startswith("dialog") or key.startswith("implicit_feedback")):
+            continue
+        text = memorybench_dialog_text(value)
+        if text:
+            fields.append(key)
+    return sorted(fields)
+
+
+def memorybench_doc_id(
+    dataset_name: str, split: str, row_index: int, row: dict[str, Any], source_field: str
+) -> str:
+    test_idx = row.get("test_idx")
+    stable_idx = row_index if test_idx in (None, "") else test_idx
+    return f"{dataset_name}/{split}/{stable_idx}/{source_field}"
+
+
+def normalize_answer(value: Any) -> str:
+    parsed = parse_jsonish(value)
+    if parsed is None:
+        return ""
+    if isinstance(parsed, str):
+        return parsed.strip()
+    if isinstance(parsed, list):
+        return " ".join(part for part in (normalize_answer(item) for item in parsed) if part)
+    if isinstance(parsed, dict):
+        for key in ("answer", "golden_answer", "value", "text", "content"):
+            if key in parsed:
+                return normalize_answer(parsed[key])
+        return json.dumps(parsed, sort_keys=True)
+    return str(parsed).strip()
+
+
+def memorybench_golden_answer(info: Any) -> str:
+    parsed = parse_jsonish(info)
+    if not isinstance(parsed, dict):
+        return ""
+    for key in (
+        "golden_answer",
+        "answer",
+        "reference_answer",
+        "target",
+        "expected_answer",
+    ):
+        if key in parsed:
+            answer = normalize_answer(parsed[key])
+            if answer:
+                return answer
+    return ""
+
+
+def memorybench_answer_metrics(answer: str, hits: list[Hit]) -> dict[str, float]:
+    answer_text = answer.strip()
+    if not answer_text:
+        return {"exact_answer_hit": 0.0, "answer_term_recall": 0.0}
+    retrieved_text = "\n".join(hit.text for hit in hits).lower()
+    exact = 1.0 if answer_text.lower() in retrieved_text else 0.0
+    answer_terms = sorted(set(tokenize(answer_text)))
+    if not answer_terms:
+        return {"exact_answer_hit": exact, "answer_term_recall": exact}
+    retrieved_terms = set(tokenize(retrieved_text))
+    recall = len(set(answer_terms).intersection(retrieved_terms)) / len(answer_terms)
+    return {"exact_answer_hit": exact, "answer_term_recall": recall}
+
+
+class McpMemoryBenchRetriever:
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.client = McpHttpClient(
+            args.mcp_url, args.mcp_user, args.mcp_password, args.mcp_timeout_seconds
+        )
+        self.session_id = args.mcp_session_id or str(uuid.uuid4())
+        self.tenant_id = args.mcp_tenant_id
+        self.entity_to_doc: dict[str, str] = {}
+        self.entity_to_text: dict[str, str] = {}
+        self.last_reranker: dict[str, Any] | None = None
+        self.client.initialize()
+
+    def ingest_documents(self, documents: list[MemoryBenchDocument]) -> dict[str, Any]:
+        started = time.time()
+        total = len(documents)
+        for document in documents:
+            entity_id = deterministic_benchmark_entity_id(
+                self.session_id, "memorybench", document.id
+            )
+            self.entity_to_doc[entity_id] = document.id
+            self.entity_to_text[entity_id] = document.content
+        if self.args.mcp_skip_ingest:
+            return {
+                "skipped_ingest": True,
+                "documents": total,
+                "mcp_embed_missing": self.args.mcp_embed_missing,
+                "document_indexing_mode": "reused-existing-session",
+            }
+
+        entity_failed = []
+        embedding_failed = []
+        inserted = 0
+        updated = 0
+        skipped = 0
+        embeddings_computed = 0
+        embeddings_received = 0
+        document_chunks_indexed = 0
+        document_chunk_embeddings_computed = 0
+        document_chunk_embeddings_failed = 0
+        document_indexing_modes: set[str] = set()
+
+        for offset in range(0, total, self.args.mcp_batch_size):
+            batch = documents[offset : offset + self.args.mcp_batch_size]
+            entities = []
+            for document in batch:
+                entity_id = deterministic_benchmark_entity_id(
+                    self.session_id, "memorybench", document.id
+                )
+                entities.append(
+                    {
+                        "id": entity_id,
+                        "name": f"{self.session_id}::{document.id}",
+                        "entity_type": self.args.mcp_entity_type,
+                        "context": document.content[: self.args.mcp_context_chars],
+                        "confidence": 1.0,
+                        "attrs": document.attrs,
+                    }
+                )
+            response = self.client.call_tool(
+                "ingest_entities",
+                {
+                    "tenant_id": self.tenant_id,
+                    "session_id": self.session_id,
+                    "entities": entities,
+                    "edges": [],
+                    "options": {
+                        "embed_missing": self.args.mcp_embed_missing,
+                        "on_conflict": "skip",
+                        "strict_edges": True,
+                    },
+                },
+            )
+            parsed = parse_ingest_response(response)
+            inserted += parsed["entity_inserted"]
+            updated += parsed["entity_updated"]
+            skipped += parsed["entity_skipped"]
+            embeddings_computed += parsed["embeddings_computed"]
+            embeddings_received += parsed["embeddings_received"]
+            document_chunks_indexed += parsed["document_chunks_indexed"]
+            document_chunk_embeddings_computed += parsed[
+                "document_chunk_embeddings_computed"
+            ]
+            document_chunk_embeddings_failed += parsed["document_chunk_embeddings_failed"]
+            entity_failed.extend(parsed["entity_failed"])
+            embedding_failed.extend(parsed["embeddings_failed"])
+            if parsed["document_indexing_mode"]:
+                document_indexing_modes.add(parsed["document_indexing_mode"])
+            if self.args.progress:
+                print(
+                    "MCP ingest memorybench: "
+                    f"{min(offset + len(batch), total)}/{total} "
+                    f"entities inserted={inserted} updated={updated} skipped={skipped} "
+                    f"entity_failed={len(entity_failed)} "
+                    f"embeddings computed={embeddings_computed} "
+                    f"received={embeddings_received} failed={len(embedding_failed)}",
+                    f"chunks={document_chunks_indexed}",
+                    flush=True,
+                )
+
+        if len(document_indexing_modes) == 1:
+            document_indexing_mode = next(iter(document_indexing_modes))
+        elif len(document_indexing_modes) > 1:
+            document_indexing_mode = "mixed:" + ",".join(sorted(document_indexing_modes))
+        else:
+            document_indexing_mode = None
+        return {
+            "skipped_ingest": False,
+            "documents": total,
+            "mcp_embed_missing": self.args.mcp_embed_missing,
+            "entity_inserted": inserted,
+            "entity_updated": updated,
+            "entity_skipped": skipped,
+            "entity_failed": len(entity_failed),
+            "entity_failed_samples": entity_failed[:20],
+            "embeddings_computed": embeddings_computed,
+            "embeddings_received": embeddings_received,
+            "embeddings_failed": len(embedding_failed),
+            "embeddings_failed_samples": embedding_failed[:20],
+            "document_chunks_indexed": document_chunks_indexed,
+            "document_chunk_embeddings_computed": document_chunk_embeddings_computed,
+            "document_chunk_embeddings_failed": document_chunk_embeddings_failed,
+            "document_indexing_mode": document_indexing_mode,
+            "elapsed_seconds": time.time() - started,
+        }
+
+    def search(self, query: str, k: int) -> list[Hit]:
+        arguments = {
+            "session_id": self.session_id,
+            "query": query,
+            "limit": k,
+            "scope": "session",
+        }
+        if self.args.mcp_rerank_candidates is not None:
+            arguments["rerank_candidates"] = self.args.mcp_rerank_candidates
+        if self.args.mcp_rerank is not None:
+            arguments["rerank"] = self.args.mcp_rerank
+        response = self.client.call_tool("hybrid_search", arguments)
+        self.last_reranker = response.get("reranker")
+        hits = []
+        for result in response.get("results", []):
+            entity_id = result_entity_id_for_mapping(result)
+            doc_id = self.entity_to_doc.get(entity_id, entity_id)
+            text = str(result.get("content", "")) or self.entity_to_text.get(entity_id, "")
+            hits.append(Hit(id=doc_id, score=float(result.get("score", 0.0)), text=text))
+        return hits
+
+
+def summarize_memorybench_cases(cases: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "exact_answer_hit_rate": summarize(
+            [case["exact_answer_hit"] for case in cases if case.get("scored")]
+        ),
+        "answer_term_recall": summarize(
+            [case["answer_term_recall"] for case in cases if case.get("scored")]
+        ),
+        "retrieved_count": summarize([case["retrieved_count"] for case in cases]),
+        "scored_cases": sum(1 for case in cases if case.get("scored")),
+        "unscored_cases": sum(1 for case in cases if not case.get("scored")),
+    }
+
+
 def run_memorybench(args: argparse.Namespace) -> int:
+    if args.full_corpus:
+        if args.backend != "mcp-http":
+            print("--full-corpus requires --backend mcp-http", file=sys.stderr)
+            return 2
+        if args.dataset:
+            print("--full-corpus cannot be combined with --dataset", file=sys.stderr)
+            return 2
+        if args.limit_rows is not None:
+            print("--full-corpus cannot be combined with --limit-rows", file=sys.stderr)
+            return 2
+        if args.limit_cases is not None:
+            print("--full-corpus cannot be combined with --limit-cases", file=sys.stderr)
+            return 2
+        if args.mcp_session_id is None:
+            args.mcp_session_id = MEMORYBENCH_FULL_MCP_SESSION_ID
+    if args.mcp_session_id is not None:
+        try:
+            args.mcp_session_id = require_uuid(args.mcp_session_id, "--mcp-session-id")
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+
     variant = args.memorybench_variant
     corpus_dir = Path(args.corpus_dir).expanduser().resolve() / f"memorybench-{variant}"
     dataset_dir = corpus_dir / "dataset"
@@ -976,6 +1393,8 @@ def run_memorybench(args: argparse.Namespace) -> int:
 
     summaries = []
     failures = []
+    documents = []
+    retrieval_cases = []
     for dataset_path in dataset_paths:
         dataset_name = dataset_path.name
         split_counts = {}
@@ -993,7 +1412,7 @@ def run_memorybench(args: argparse.Namespace) -> int:
             if args.limit_rows is not None:
                 rows = rows[: args.limit_rows]
             split_counts[split] = len(rows)
-            for row in rows:
+            for row_index, row in enumerate(rows):
                 field_counts.update(row.keys())
                 parsed_info, info_error = parse_json_field(row.get("info"))
                 if info_error and row.get("info") not in (None, ""):
@@ -1012,8 +1431,41 @@ def run_memorybench(args: argparse.Namespace) -> int:
                     evidence_rows += 1
                 if any(key.startswith("implicit_feedback") for key in row):
                     feedback_rows += 1
-                if any(key.startswith("dialog") for key in row):
+                source_fields = memorybench_source_fields(row)
+                if any(key.startswith("dialog") for key in source_fields):
                     dialog_rows += 1
+                for source_field in source_fields:
+                    doc_id = memorybench_doc_id(
+                        dataset_name, split, row_index, row, source_field
+                    )
+                    source_text = memorybench_dialog_text(row.get(source_field))
+                    documents.append(
+                        MemoryBenchDocument(
+                            id=doc_id,
+                            content=source_text,
+                            attrs={
+                                "benchmark": "memorybench",
+                                "dataset": dataset_name,
+                                "split": split,
+                                "test_idx": row.get("test_idx"),
+                                "source_field": source_field,
+                                "lang": row.get("lang"),
+                            },
+                        )
+                    )
+                if split == "test":
+                    answer = memorybench_golden_answer(parsed_info)
+                    query = str(row.get("input_prompt") or "").strip()
+                    if query:
+                        retrieval_cases.append(
+                            {
+                                "dataset": dataset_name,
+                                "split": split,
+                                "test_idx": row.get("test_idx"),
+                                "query": query,
+                                "golden_answer": answer,
+                            }
+                        )
         summary = {
             "dataset": dataset_name,
             "splits": split_counts,
@@ -1026,28 +1478,106 @@ def run_memorybench(args: argparse.Namespace) -> int:
         summaries.append(summary)
         failures.extend(sampled_failures)
 
+    mcp_retriever = None
+    ingest_summary = None
+    retrieval_results = []
+    if args.backend == "mcp-http":
+        mcp_retriever = McpMemoryBenchRetriever(args)
+        print(f"MemoryBench: ingesting {len(documents)} documents through MCP {args.mcp_url}")
+        ingest_summary = mcp_retriever.ingest_documents(documents)
+        cases_to_run = retrieval_cases
+        if args.limit_cases is not None:
+            cases_to_run = cases_to_run[: args.limit_cases]
+        for index, case in enumerate(cases_to_run, start=1):
+            hits = mcp_retriever.search(case["query"], args.k)
+            metrics = memorybench_answer_metrics(case["golden_answer"], hits)
+            result = {
+                **case,
+                "scored": bool(case["golden_answer"]),
+                "exact_answer_hit": metrics["exact_answer_hit"],
+                "answer_term_recall": metrics["answer_term_recall"],
+                "retrieved_count": len(hits),
+                "reranker": mcp_retriever.last_reranker,
+                "hits": [
+                    {
+                        "id": hit.id,
+                        "score": hit.score,
+                        "text_preview": hit.text[:160],
+                    }
+                    for hit in hits[: args.failure_hits]
+                ],
+            }
+            retrieval_results.append(result)
+            if result["scored"] and result["answer_term_recall"] < args.failure_answer_recall:
+                failures.append(
+                    {
+                        "dataset": case["dataset"],
+                        "split": case["split"],
+                        "test_idx": case["test_idx"],
+                        "reason": "low_answer_term_recall",
+                        "answer_term_recall": result["answer_term_recall"],
+                        "golden_answer": case["golden_answer"],
+                        "query": case["query"],
+                        "top_hits": result["hits"],
+                    }
+                )
+            if args.progress:
+                print(
+                    f"MemoryBench search: {index}/{len(cases_to_run)} "
+                    f"answer_recall={result['answer_term_recall']:.3f}",
+                    flush=True,
+                )
+
     report = {
         "suite": "memorybench",
-        "mode": "official_corpus_audit",
+        "mode": (
+            "official_corpus_mcp_retrieval_proxy"
+            if args.backend == "mcp-http"
+            else "official_corpus_audit"
+        ),
+        "backend": args.backend,
+        "profile": "full-corpus-mcp" if args.full_corpus else "custom",
+        "full_corpus": args.full_corpus,
         "paper_score_runnable": False,
+        "mcp_retrieval_proxy_runnable": args.backend == "mcp-http",
         "paper_score_blockers": [
             "Ferrosa prediction generation adapter for MemoryBench tasks is not implemented.",
             "Task-native judges/metrics from the MemoryBench repo require additional model/API configuration.",
-            "This audit validates local corpus shape and identifies data issues, but does not reproduce Table 10/12 scores.",
+            "The MCP retrieval-proxy mode measures answer-containing evidence retrieval, but does not reproduce Table 10/12 scores.",
         ],
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "corpus_dir": str(corpus_dir),
+        "mcp_url": args.mcp_url if args.backend == "mcp-http" else None,
+        "mcp_session_id": mcp_retriever.session_id if mcp_retriever else None,
+        "mcp_embed_missing": args.mcp_embed_missing if args.backend == "mcp-http" else None,
+        "mcp_rerank": args.mcp_rerank if args.backend == "mcp-http" else None,
+        "mcp_rerank_candidates": (
+            args.mcp_rerank_candidates if args.backend == "mcp-http" else None
+        ),
+        "k": args.k if args.backend == "mcp-http" else None,
         "dataset_count": len(summaries),
         "datasets": summaries,
+        "document_count": len(documents),
+        "retrieval_case_count": len(retrieval_results),
+        "retrieval_summary": (
+            summarize_memorybench_cases(retrieval_results)
+            if args.backend == "mcp-http"
+            else None
+        ),
+        "ingest_summary": ingest_summary,
         "failure_report": str(output_dir / "memorybench-failures.jsonl"),
     }
     write_json(output_dir / "memorybench-report.json", report)
     write_jsonl(output_dir / "memorybench-failures.jsonl", failures)
+    if args.include_cases and args.backend == "mcp-http":
+        write_jsonl(output_dir / "memorybench-cases.jsonl", retrieval_results)
     print(
         json.dumps(
             {
                 "dataset_count": report["dataset_count"],
                 "paper_score_runnable": report["paper_score_runnable"],
+                "mcp_retrieval_proxy_runnable": report["mcp_retrieval_proxy_runnable"],
+                "retrieval_summary": report["retrieval_summary"],
                 "failure_count": len(failures),
             },
             indent=2,
@@ -1122,6 +1652,27 @@ def run_self_test() -> int:
     assert parsed["document_chunks_indexed"] == 6
     assert parsed["document_chunk_embeddings_computed"] == 7
     assert parsed["document_chunk_embeddings_failed"] == 1
+
+    dialog = json.dumps(
+        [
+            {"role": "user", "content": "Alice prefers jasmine tea."},
+            {"role": "assistant", "content": "Preference recorded."},
+        ]
+    )
+    assert "Alice prefers jasmine tea" in memorybench_dialog_text(dialog)
+    assert memorybench_source_fields({"dialog_0": dialog, "empty": ""}) == ["dialog_0"]
+    assert (
+        memorybench_golden_answer(json.dumps({"golden_answer": "jasmine tea"}))
+        == "jasmine tea"
+    )
+    metrics = memorybench_answer_metrics(
+        "jasmine tea", [Hit("doc", 1.0, "Alice prefers jasmine tea.")]
+    )
+    assert metrics["exact_answer_hit"] == 1.0
+    assert metrics["answer_term_recall"] == 1.0
+    assert require_uuid(BRIGHT_PRO_FULL_MCP_SESSION_ID, "session") == (
+        BRIGHT_PRO_FULL_MCP_SESSION_ID
+    )
     print("self-test passed")
     return 0
 
@@ -1147,18 +1698,26 @@ def parse_args() -> argparse.Namespace:
     )
     bright.add_argument("--split", action="append")
     bright.add_argument("--limit-examples", type=int)
+    bright.add_argument(
+        "--full-corpus",
+        action="store_true",
+        help=(
+            "Run the complete BRIGHT-Pro MCP corpus. Disallows split/example/doc caps "
+            "and defaults to a deterministic reusable MCP session."
+        ),
+    )
     bright.add_argument("--k", type=int, default=25)
     bright.add_argument("--alpha", type=float, default=0.5)
     bright.add_argument("--failure-alpha-ndcg", type=float, default=0.5)
     bright.add_argument("--failure-aspect-recall", type=float, default=1.0)
     bright.add_argument("--failure-hits", type=int, default=10)
     bright.add_argument("--include-cases", action="store_true")
-    bright.add_argument("--mcp-url", default="http://127.0.0.1:18775/mcp")
-    bright.add_argument("--mcp-user", default="user")
-    bright.add_argument("--mcp-password", default="pass")
+    bright.add_argument("--mcp-url", default=default_mcp_url())
+    bright.add_argument("--mcp-user", default=default_mcp_user())
+    bright.add_argument("--mcp-password", default=default_mcp_password())
     bright.add_argument(
         "--mcp-tenant-id",
-        default="00000000-0000-0000-0000-00000000e075",
+        default=default_mcp_tenant_id(),
         help="Tenant UUID from the HTTP auth principal.",
     )
     bright.add_argument("--mcp-session-id")
@@ -1205,13 +1764,82 @@ def parse_args() -> argparse.Namespace:
     )
     bright.add_argument("--progress", action="store_true")
 
-    memory = subparsers.add_parser("memorybench", help="Audit official MemoryBench corpus.")
+    memory = subparsers.add_parser("memorybench", help="Run official MemoryBench diagnostics.")
     memory.add_argument("--corpus-dir", default=".eval-corpus")
     memory.add_argument("--output-dir", default=default_output_dir())
+    memory.add_argument(
+        "--backend",
+        choices=["audit-only", "mcp-http"],
+        default="audit-only",
+        help="Use audit-only for corpus shape checks or mcp-http for retrieval-proxy baselines.",
+    )
     memory.add_argument("--memorybench-variant", choices=["balanced", "full"], default="full")
     memory.add_argument("--dataset", action="append")
     memory.add_argument("--limit-rows", type=int)
+    memory.add_argument("--limit-cases", type=int)
+    memory.add_argument(
+        "--full-corpus",
+        action="store_true",
+        help=(
+            "Run the complete MemoryBench MCP corpus. Disallows dataset/row/case caps "
+            "and defaults to a deterministic reusable MCP session."
+        ),
+    )
+    memory.add_argument("--k", type=int, default=25)
+    memory.add_argument("--include-cases", action="store_true")
     memory.add_argument("--failure-limit", type=int, default=20)
+    memory.add_argument("--failure-hits", type=int, default=10)
+    memory.add_argument("--failure-answer-recall", type=float, default=1.0)
+    memory.add_argument("--mcp-url", default=default_mcp_url())
+    memory.add_argument("--mcp-user", default=default_mcp_user())
+    memory.add_argument("--mcp-password", default=default_mcp_password())
+    memory.add_argument(
+        "--mcp-tenant-id",
+        default=default_mcp_tenant_id(),
+        help="Tenant UUID from the HTTP auth principal.",
+    )
+    memory.add_argument("--mcp-session-id")
+    memory.add_argument("--mcp-timeout-seconds", type=float, default=60.0)
+    memory.add_argument("--mcp-batch-size", type=int, default=100)
+    memory.add_argument(
+        "--mcp-entity-type",
+        default="benchmark_document",
+        help="Entity type used for MemoryBench documents when ingesting through MCP.",
+    )
+    memory.add_argument("--mcp-context-chars", type=int, default=16000)
+    memory.add_argument(
+        "--mcp-embed-missing",
+        action="store_true",
+        help=(
+            "Pass embed_missing=true to ingest_entities so the MCP server computes "
+            "missing corpus document embeddings before retrieval."
+        ),
+    )
+    memory.add_argument(
+        "--mcp-skip-ingest",
+        action="store_true",
+        help="Reuse an existing deterministic session corpus; only rebuild ID mapping locally.",
+    )
+    memory.add_argument(
+        "--mcp-rerank-candidates",
+        type=int,
+        help="Override hybrid_search rerank_candidates for MCP runs, e.g. 25 for MemoryBench.",
+    )
+    memory_rerank_group = memory.add_mutually_exclusive_group()
+    memory_rerank_group.add_argument(
+        "--mcp-rerank",
+        dest="mcp_rerank",
+        action="store_true",
+        default=None,
+        help="Force MCP hybrid_search rerank=true.",
+    )
+    memory_rerank_group.add_argument(
+        "--mcp-no-rerank",
+        dest="mcp_rerank",
+        action="store_false",
+        help="Force MCP hybrid_search rerank=false.",
+    )
+    memory.add_argument("--progress", action="store_true")
     return parser.parse_args()
 
 

@@ -83,6 +83,29 @@ scripts/download-eval-corpora.sh --output-dir /data/ferrosa-eval-corpus --clean
 
 Each downloaded dataset directory gets a `manifest.json` with repo id, requested revision, resolved SHA, file count, and byte totals.
 
+## Full-Corpus MCP Baseline
+
+Run the long-recall baseline through the live MCP server with deterministic corpus sessions:
+
+```bash
+scripts/run-long-recall-baseline.sh all
+```
+
+Useful overrides:
+
+```bash
+FMEM_EVAL_MCP_URL=http://127.0.0.1:18765/mcp \
+FMEM_EVAL_MCP_USER=ferrosa_user \
+FMEM_EVAL_MCP_PASSWORD=ferrosa_user \
+FMEM_EVAL_MCP_BATCH_SIZE=25 \
+FMEM_EVAL_RERANK_CANDIDATES=25 \
+scripts/run-long-recall-baseline.sh bright-pro
+```
+
+The BRIGHT-Pro full-corpus profile runs against the complete official support corpus and uses a stable default session id so later runs can set `FMEM_EVAL_SKIP_INGEST=true`.
+
+The MemoryBench profile is currently an MCP retrieval-proxy baseline: it ingests official dialog and feedback rows, then measures whether retrieved evidence contains each row's `golden_answer` when one is present. It does not reproduce the paper's task-native generation/judge metrics yet.
+
 ## CI Shape
 
 ### Required PR Gate
