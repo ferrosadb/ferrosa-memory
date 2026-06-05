@@ -579,10 +579,35 @@ class McpBrightRetriever:
         if self.args.mcp_max_docs is not None:
             rows_to_ingest = rows_to_ingest[: self.args.mcp_max_docs]
         total = len(rows_to_ingest)
+        write_progress(
+            self.args.mcp_progress_file,
+            {
+                "status": "running",
+                "phase": "ingest",
+                "split": split,
+                "completed_documents": 0,
+                "total_documents": total,
+                "session_id": self.session_id,
+                "embed_missing": self.args.mcp_embed_missing,
+            },
+        )
         if self.args.mcp_skip_ingest:
             for row in rows_to_ingest:
                 entity_id = deterministic_entity_id(self.session_id, str(row["id"]))
                 self.entity_to_doc[entity_id] = str(row["id"])
+            write_progress(
+                self.args.mcp_progress_file,
+                {
+                    "status": "complete",
+                    "phase": "ingest",
+                    "split": split,
+                    "completed_documents": total,
+                    "total_documents": total,
+                    "session_id": self.session_id,
+                    "embed_missing": self.args.mcp_embed_missing,
+                    "document_indexing_mode": "reused-existing-session",
+                },
+            )
             return {
                 "skipped_ingest": True,
                 "documents": total,
@@ -654,11 +679,54 @@ class McpBrightRetriever:
                     f"chunks={document_chunks_indexed}",
                     flush=True,
                 )
+            write_progress(
+                self.args.mcp_progress_file,
+                {
+                    "status": "running",
+                    "phase": "ingest",
+                    "split": split,
+                    "completed_documents": min(offset + len(batch), total),
+                    "total_documents": total,
+                    "session_id": self.session_id,
+                    "embed_missing": self.args.mcp_embed_missing,
+                    "entity_inserted": inserted,
+                    "entity_updated": updated,
+                    "entity_skipped": skipped,
+                    "entity_failed": len(entity_failed),
+                    "embeddings_computed": embeddings_computed,
+                    "embeddings_received": embeddings_received,
+                    "embeddings_failed": len(embedding_failed),
+                    "document_chunks_indexed": document_chunks_indexed,
+                    "elapsed_seconds": time.time() - started,
+                },
+            )
         document_indexing_mode = None
         if len(document_indexing_modes) == 1:
             document_indexing_mode = next(iter(document_indexing_modes))
         elif len(document_indexing_modes) > 1:
             document_indexing_mode = "mixed:" + ",".join(sorted(document_indexing_modes))
+        write_progress(
+            self.args.mcp_progress_file,
+            {
+                "status": "complete",
+                "phase": "ingest",
+                "split": split,
+                "completed_documents": total,
+                "total_documents": total,
+                "session_id": self.session_id,
+                "embed_missing": self.args.mcp_embed_missing,
+                "entity_inserted": inserted,
+                "entity_updated": updated,
+                "entity_skipped": skipped,
+                "entity_failed": len(entity_failed),
+                "embeddings_computed": embeddings_computed,
+                "embeddings_received": embeddings_received,
+                "embeddings_failed": len(embedding_failed),
+                "document_chunks_indexed": document_chunks_indexed,
+                "document_indexing_mode": document_indexing_mode,
+                "elapsed_seconds": time.time() - started,
+            },
+        )
         return {
             "skipped_ingest": False,
             "documents": total,
@@ -741,6 +809,14 @@ def read_parquet_rows(path: Path) -> list[dict[str, Any]]:
 def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def write_progress(path: str | None, data: dict[str, Any]) -> None:
+    if not path:
+        return
+    payload = dict(data)
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+    write_json(Path(path).expanduser(), payload)
 
 
 def write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
@@ -861,6 +937,9 @@ def run_bright_pro(args: argparse.Namespace) -> int:
             return 2
         if args.mcp_session_id is None:
             args.mcp_session_id = BRIGHT_PRO_FULL_MCP_SESSION_ID
+    if args.mcp_ingest_only and args.backend != "mcp-http":
+        print("--mcp-ingest-only requires --backend mcp-http", file=sys.stderr)
+        return 2
     if args.mcp_session_id is not None:
         try:
             args.mcp_session_id = require_uuid(args.mcp_session_id, "--mcp-session-id")
@@ -925,6 +1004,9 @@ def run_bright_pro(args: argparse.Namespace) -> int:
         if mcp_retriever:
             print(f"BRIGHT-Pro {split}: ingesting documents through MCP {args.mcp_url}")
             ingest_summaries[split] = mcp_retriever.ingest_documents(document_rows, split)
+            if args.mcp_ingest_only:
+                split_summaries[split] = summarize_cases([])
+                continue
             index = None
         else:
             print("BRIGHT-Pro local BM25: parser/scoring diagnostic, not Ferrosa retrieval")
@@ -1010,6 +1092,7 @@ def run_bright_pro(args: argparse.Namespace) -> int:
         "corpus_dir": str(corpus_dir),
         "mcp_url": args.mcp_url if args.backend == "mcp-http" else None,
         "mcp_session_id": mcp_retriever.session_id if mcp_retriever else None,
+        "mcp_ingest_only": args.mcp_ingest_only if args.backend == "mcp-http" else None,
         "mcp_embed_missing": args.mcp_embed_missing if args.backend == "mcp-http" else None,
         "mcp_rerank": args.mcp_rerank if args.backend == "mcp-http" else None,
         "mcp_rerank_candidates": (
@@ -1891,6 +1974,15 @@ def parse_args() -> argparse.Namespace:
     )
     bright.add_argument("--mcp-context-chars", type=int, default=16000)
     bright.add_argument("--mcp-max-docs", type=int)
+    bright.add_argument(
+        "--mcp-ingest-only",
+        action="store_true",
+        help="Populate the MCP corpus session and write an ingest report without running retrieval.",
+    )
+    bright.add_argument(
+        "--mcp-progress-file",
+        help="Write machine-readable MCP ingest/search progress to this JSON file.",
+    )
     bright.add_argument(
         "--mcp-embed-missing",
         action="store_true",

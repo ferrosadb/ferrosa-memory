@@ -72,6 +72,7 @@ These came up while wiring official BRIGHT-Pro / MemoryBench eval corpora. They 
   - Impact: small live slices validate wiring but cannot be compared to paper systems unless the official support corpus is fully ingested or the harness ingests support-closed subsets.
   - Implemented: `scripts/run-official-evals.py bright-pro --backend mcp-http --mcp-max-docs N` now samples only examples whose support docs are fully inside the capped ingest window.
   - Implemented: eval MCP HTTP client now honors `Retry-After` on 429 responses and supports `--mcp-search-delay-seconds`; long-recall profiles can set `FMEM_EVAL_EMBED_MISSING=false` to avoid accidental full-corpus Ollama embedding backfill.
+  - Implemented: `scripts/start-bright-pro-full-load.sh` starts a resumable ingest-only full-corpus MCP load with `heartbeat.json`, `progress.json`, PID files, and `load.log`; `run-official-evals.py bright-pro` supports `--mcp-ingest-only` and `--mcp-progress-file`.
   - Implemented: full-corpus MCP profiles use deterministic persisted corpus sessions for BRIGHT-Pro and MemoryBench via `scripts/run-long-recall-baseline.sh`.
   - Measurement: full all-split local BM25 diagnostic over 739 BRIGHT-Pro examples scored alpha-nDCG `0.310`, aspect recall `0.459`, NDCG `0.292`, recall `0.352`. This is a scorer/parser reference, not an MCP result.
   - Implemented: MemoryBench now has an MCP retrieval-proxy baseline that ingests official dialog/feedback rows and reports answer-containing evidence retrieval. This is intentionally separate from the paper's task-native judge score.
