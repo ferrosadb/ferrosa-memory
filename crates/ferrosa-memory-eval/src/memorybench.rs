@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 use crate::fixture::{CorpusDocument, FixtureHit, FixtureRetriever, tokenize};
+use crate::llm::{LlmClient, LlmConfig};
 use crate::memory_quality::{
     EvidenceGroundTruth, EvidenceHit, MemoryEvalMetrics, evaluate_retrieval,
 };
@@ -249,23 +250,9 @@ impl SyntheticConversationSpec {
     }
 }
 
-/// Local LLM config for generating more varied conversations.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct LocalLlmConfig {
-    pub base_url: String,
-    pub model: String,
-    pub temperature: f64,
-}
-
-impl Default for LocalLlmConfig {
-    fn default() -> Self {
-        Self {
-            base_url: "http://127.0.0.1:11434".to_string(),
-            model: "qwen3.5:27b".to_string(),
-            temperature: 0.9,
-        }
-    }
-}
+/// Backward-compatible local LLM config for callers that still use the
+/// original Ollama-specific fixture API.
+pub type LocalLlmConfig = LlmConfig;
 
 /// Generate a two-agent conversation. Uses a local Ollama-compatible model
 /// when available, otherwise falls back to deterministic synthetic turns.
@@ -274,7 +261,7 @@ pub async fn generate_two_agent_conversation(
     llm: Option<&LocalLlmConfig>,
 ) -> MemoryConversation {
     if let Some(llm) = llm
-        && let Ok(generated) = try_generate_with_ollama(spec, llm).await
+        && let Ok(generated) = try_generate_with_llm(spec, llm).await
     {
         return generated;
     }
@@ -308,11 +295,11 @@ fn deterministic_two_agent_conversation(spec: &SyntheticConversationSpec) -> Mem
     }
 }
 
-async fn try_generate_with_ollama(
+async fn try_generate_with_llm(
     spec: &SyntheticConversationSpec,
     llm: &LocalLlmConfig,
 ) -> anyhow::Result<MemoryConversation> {
-    let client = reqwest::Client::new();
+    let client = LlmClient::new(llm.clone())?;
     let prompt = format!(
         "Create a concise two-agent conversation about {topic}. Agent A gives an initial answer, \
          Agent B provides user feedback, Agent A corrects course. Include this durable preference \
@@ -321,28 +308,12 @@ async fn try_generate_with_ollama(
         preference = spec.preference,
         correction = spec.correction,
     );
-    let response: serde_json::Value = client
-        .post(format!(
-            "{}/api/generate",
-            llm.base_url.trim_end_matches('/')
-        ))
-        .json(&serde_json::json!({
-            "model": llm.model,
-            "prompt": prompt,
-            "stream": false,
-            "options": {
-                "temperature": llm.temperature
-            }
-        }))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
+    let text = client
+        .generate(
+            "You create realistic two-agent benchmark conversations.",
+            &prompt,
+        )
         .await?;
-    let text = response
-        .get("response")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
     if text.trim().is_empty() {
         anyhow::bail!("local LLM returned empty synthetic conversation");
     }

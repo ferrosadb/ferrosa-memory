@@ -90,6 +90,15 @@ fn origin_for_host(scheme: &str, host: &str, port: u16) -> String {
 /// Credential validator: takes (username, password), returns tenant_id if valid.
 pub type CredentialValidator = dyn Fn(&str, &str) -> Option<uuid::Uuid> + Send + Sync;
 
+struct ConnectionContext<'a> {
+    metrics: &'a MemoryMetrics,
+    credential_validator: &'a CredentialValidator,
+    readiness_checker: &'a (dyn Fn() -> bool + Send + Sync),
+    shell_routes: &'a ShellRouteConfig,
+    session: &'a dispatch::SessionState,
+    request_budget: std::time::Duration,
+}
+
 /// Per-IP connection rate limiter.
 ///
 /// Tracks connection counts per source IP within a rolling one-minute window.
@@ -148,12 +157,11 @@ const TLS_ACCEPT_BUDGET: std::time::Duration = std::time::Duration::from_secs(10
 /// pressure RAM on a per-connection basis under spawned tasks.
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const VIZ_DERIVED_FACT_CHUNK_SIZE: usize = 128;
+const VIZ_STREAM_IDLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Upper bound on how long a single request is allowed to occupy a
-/// spawned connection task. Covers read, dispatch, and write. Tuned
-/// to the longest reasonable MCP call (consolidation / recursive
-/// explore on a warm cluster); slower work should be moved off-path.
-const REQUEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+/// Default test request budget matching the production config default.
+#[cfg(test)]
+const DEFAULT_REQUEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Run a future that yields `std::io::Result<T>` under a timeout budget.
 /// Factored out so the timeout contract can be unit-tested without
@@ -228,6 +236,7 @@ fn load_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<tokio_ru
 pub struct HttpConfig {
     pub bind_addr: String,
     pub port: u16,
+    pub request_budget: std::time::Duration,
     pub require_tls: bool,
     pub cert_path: Option<String>,
     pub key_path: Option<String>,
@@ -261,7 +270,7 @@ pub trait OperatorQuerySurface: Send + Sync {
 ///
 /// Each accepted TCP connection is handed to a `tokio::spawn`ed task
 /// that performs the TLS handshake (if configured) and runs the
-/// request under `REQUEST_BUDGET`. The accept loop itself does no
+/// request under the configured request budget. The accept loop itself does no
 /// per-request work — it only rate-limits and hands off — so a
 /// stalled handshake, slow storage call, or multi-packet client never
 /// blocks other clients.
@@ -292,6 +301,7 @@ pub async fn serve_http<S: Storage + OperatorQuerySurface + 'static>(
     let readiness = config.readiness_checker.clone();
     let shell_routes = config.shell_routes.clone();
     let session = Arc::clone(&config.session);
+    let request_budget = config.request_budget;
     let addr = format!("{}:{}", config.bind_addr, config.port);
     let listener = TcpListener::bind(&addr).await?;
     let protocol = if tls_acceptor.is_some() {
@@ -328,6 +338,10 @@ pub async fn serve_http<S: Storage + OperatorQuerySurface + 'static>(
         let acceptor = tls_acceptor.clone();
         let shell_routes = shell_routes.clone();
         let session = Arc::clone(&session);
+        let request_budget = request_budget.clamp(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(300),
+        );
 
         tokio::spawn(async move {
             let outcome = match acceptor {
@@ -336,11 +350,14 @@ pub async fn serve_http<S: Storage + OperatorQuerySurface + 'static>(
                         serve_one_connection_with_session(
                             &mut tls,
                             storage.as_ref(),
-                            &metrics,
-                            validator.as_ref(),
-                            readiness.as_ref(),
-                            &shell_routes,
-                            session.as_ref(),
+                            ConnectionContext {
+                                metrics: &metrics,
+                                credential_validator: validator.as_ref(),
+                                readiness_checker: readiness.as_ref(),
+                                shell_routes: &shell_routes,
+                                session: session.as_ref(),
+                                request_budget,
+                            },
                         )
                         .await
                     }
@@ -354,11 +371,14 @@ pub async fn serve_http<S: Storage + OperatorQuerySurface + 'static>(
                     serve_one_connection_with_session(
                         &mut stream,
                         storage.as_ref(),
-                        &metrics,
-                        validator.as_ref(),
-                        readiness.as_ref(),
-                        &shell_routes,
-                        session.as_ref(),
+                        ConnectionContext {
+                            metrics: &metrics,
+                            credential_validator: validator.as_ref(),
+                            readiness_checker: readiness.as_ref(),
+                            shell_routes: &shell_routes,
+                            session: session.as_ref(),
+                            request_budget,
+                        },
                     )
                     .await
                 }
@@ -414,7 +434,7 @@ async fn write_rate_limit_response(stream: &mut tokio::net::TcpStream) {
     .await;
 }
 
-/// Run one request under `REQUEST_BUDGET`. On timeout, emit HTTP 504
+/// Run one request under `request_budget`. On timeout, emit HTTP 504
 /// so the client can distinguish "server took too long" from TLS or
 /// transport-level failures. Any error reading/writing the stream is
 /// propagated to the caller for logging.
@@ -435,11 +455,14 @@ where
     serve_one_connection_with_session(
         stream,
         storage,
-        metrics,
-        credential_validator,
-        readiness_checker,
-        shell_routes,
-        &session,
+        ConnectionContext {
+            metrics,
+            credential_validator,
+            readiness_checker,
+            shell_routes,
+            session: &session,
+            request_budget: DEFAULT_REQUEST_BUDGET,
+        },
     )
     .await
 }
@@ -447,11 +470,7 @@ where
 async fn serve_one_connection_with_session<S, T>(
     stream: &mut T,
     storage: &S,
-    metrics: &MemoryMetrics,
-    credential_validator: &CredentialValidator,
-    readiness_checker: &(dyn Fn() -> bool + Send + Sync),
-    shell_routes: &ShellRouteConfig,
-    session: &dispatch::SessionState,
+    connection: ConnectionContext<'_>,
 ) -> anyhow::Result<()>
 where
     S: Storage + OperatorQuerySurface,
@@ -461,21 +480,24 @@ where
         let handler = handle_connection_rw(
             stream,
             storage,
-            metrics,
-            credential_validator,
-            readiness_checker,
-            shell_routes,
-            session,
+            connection.metrics,
+            connection.credential_validator,
+            connection.readiness_checker,
+            connection.shell_routes,
+            connection.session,
         );
-        let keep_alive = match tokio::time::timeout(REQUEST_BUDGET, handler).await {
+        let keep_alive = match tokio::time::timeout(connection.request_budget, handler).await {
             Ok(res) => res?,
             Err(_) => {
-                let body = format!("request exceeded {:?}", REQUEST_BUDGET);
+                let body = format!("request exceeded {:?}", connection.request_budget);
                 let resp = text_response("504 Gateway Timeout", &body);
                 // Best-effort notify the client; ignore write errors since
                 // the peer may already be gone.
                 let _ = stream.write_all(resp.as_bytes()).await;
-                return Err(anyhow::anyhow!("request exceeded {:?}", REQUEST_BUDGET));
+                return Err(anyhow::anyhow!(
+                    "request exceeded {:?}",
+                    connection.request_budget
+                ));
             }
         };
         if !keep_alive {
@@ -1101,10 +1123,12 @@ async fn call_tool_http<S: Storage>(
 
 fn redacted_judge_config(config: &crate::config::JudgeConfig) -> Value {
     serde_json::json!({
+        "enabled": config.enabled,
         "provider": &config.provider,
         "base_url": &config.base_url,
         "model": &config.model,
         "timeout_seconds": config.timeout_seconds,
+        "max_rerank_candidates": config.max_rerank_candidates,
         "token_configured": config.token.as_deref().is_some_and(|token| !token.is_empty()),
     })
 }
@@ -1157,6 +1181,22 @@ async fn handle_judge_config_put(
     let provider = sanitized_config_string(&payload, "provider", &config.provider, 64)?;
     let base_url = sanitized_config_string(&payload, "base_url", &config.base_url, 2048)?;
     let model = sanitized_config_string(&payload, "model", &config.model, 512)?;
+    let max_rerank_candidates = match payload.get("max_rerank_candidates") {
+        None | Some(Value::Null) => config.max_rerank_candidates,
+        Some(Value::Number(number)) => {
+            let raw = number.as_u64().ok_or_else(|| {
+                anyhow::anyhow!("max_rerank_candidates must be a positive integer")
+            })? as usize;
+            anyhow::ensure!(raw >= 2, "max_rerank_candidates must be >= 2");
+            anyhow::ensure!(raw <= 50, "max_rerank_candidates must be <= 50");
+            raw
+        }
+        Some(_) => anyhow::bail!("max_rerank_candidates must be a positive integer"),
+    };
+    let enabled = payload
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(config.enabled);
     let token = match payload.get("token") {
         None => config.token.clone(),
         Some(Value::Null) => None,
@@ -1169,11 +1209,13 @@ async fn handle_judge_config_put(
     };
 
     *config = crate::config::JudgeConfig {
+        enabled,
         provider,
         base_url,
         model,
         token,
         timeout_seconds,
+        max_rerank_candidates,
     };
     Ok(json_response(
         "200 OK",
@@ -2281,13 +2323,23 @@ async fn send_streaming_viz_snapshot<S: Storage>(
             let (tx, mut rx) = tokio::sync::mpsc::channel(4);
             let producer = storage.entity_stream_all(ctx.clone(), VIZ_CHUNK_SIZE, tx);
             tokio::pin!(producer);
+            let idle_deadline = tokio::time::sleep(VIZ_STREAM_IDLE_BUDGET);
+            tokio::pin!(idle_deadline);
             let mut producer_done = false;
             loop {
                 tokio::select! {
                     _ = &mut producer, if !producer_done => producer_done = true,
+                    _ = &mut idle_deadline, if !producer_done => {
+                        tracing::warn!(
+                            timeout_ms = VIZ_STREAM_IDLE_BUDGET.as_millis() as u64,
+                            "viz: entity stream idle timeout; serving partial snapshot"
+                        );
+                        break;
+                    }
                     chunk = rx.recv() => {
                         match chunk {
                             Some(Ok(entities)) => {
+                                idle_deadline.as_mut().reset(tokio::time::Instant::now() + VIZ_STREAM_IDLE_BUDGET);
                                 let nodes: Vec<_> = entities.iter().map(viz::entity_to_viz_node).collect();
                                 total_nodes += nodes.len();
                                 if !nodes.is_empty()
@@ -2328,13 +2380,24 @@ async fn send_streaming_viz_snapshot<S: Storage>(
                 let (tx, mut rx) = tokio::sync::mpsc::channel(4);
                 let producer = storage.entity_stream_session(ctx.clone(), sid, VIZ_CHUNK_SIZE, tx);
                 tokio::pin!(producer);
+                let idle_deadline = tokio::time::sleep(VIZ_STREAM_IDLE_BUDGET);
+                tokio::pin!(idle_deadline);
                 let mut producer_done = false;
                 loop {
                     tokio::select! {
                         _ = &mut producer, if !producer_done => producer_done = true,
+                        _ = &mut idle_deadline, if !producer_done => {
+                            tracing::warn!(
+                                session_id = %sid,
+                                timeout_ms = VIZ_STREAM_IDLE_BUDGET.as_millis() as u64,
+                                "viz: scoped entity stream idle timeout; serving partial snapshot"
+                            );
+                            break;
+                        }
                         chunk = rx.recv() => {
                             match chunk {
                                 Some(Ok(entities)) => {
+                                    idle_deadline.as_mut().reset(tokio::time::Instant::now() + VIZ_STREAM_IDLE_BUDGET);
                                     let nodes: Vec<_> = entities.iter().map(viz::entity_to_viz_node).collect();
                             total_nodes += nodes.len();
                             if !nodes.is_empty()
@@ -2370,13 +2433,23 @@ async fn send_streaming_viz_snapshot<S: Storage>(
     let (tx, mut rx) = tokio::sync::mpsc::channel(4);
     let producer = storage.fold_stream_all(ctx.clone(), VIZ_CHUNK_SIZE, tx);
     tokio::pin!(producer);
+    let idle_deadline = tokio::time::sleep(VIZ_STREAM_IDLE_BUDGET);
+    tokio::pin!(idle_deadline);
     let mut producer_done = false;
     loop {
         tokio::select! {
             _ = &mut producer, if !producer_done => producer_done = true,
+            _ = &mut idle_deadline, if !producer_done => {
+                tracing::warn!(
+                    timeout_ms = VIZ_STREAM_IDLE_BUDGET.as_millis() as u64,
+                    "viz: fold stream idle timeout; serving partial snapshot"
+                );
+                break;
+            }
             chunk = rx.recv() => {
                 match chunk {
                     Some(Ok(folds)) => {
+                        idle_deadline.as_mut().reset(tokio::time::Instant::now() + VIZ_STREAM_IDLE_BUDGET);
                         let nodes: Vec<_> = folds.iter().map(viz::fold_to_viz_node).collect();
                         total_nodes += nodes.len();
                         if !nodes.is_empty()
@@ -2429,13 +2502,24 @@ async fn send_streaming_viz_snapshot<S: Storage>(
                 let (tx, mut rx) = tokio::sync::mpsc::channel(4);
                 let producer = storage.typed_edge_stream_all(edge_ctx, VIZ_CHUNK_SIZE, tx);
                 tokio::pin!(producer);
+                let idle_deadline = tokio::time::sleep(VIZ_STREAM_IDLE_BUDGET);
+                tokio::pin!(idle_deadline);
                 let mut producer_done = false;
                 loop {
                     tokio::select! {
                         _ = &mut producer, if !producer_done => producer_done = true,
+                        _ = &mut idle_deadline, if !producer_done => {
+                            tracing::warn!(
+                                edge_context = label,
+                                timeout_ms = VIZ_STREAM_IDLE_BUDGET.as_millis() as u64,
+                                "viz: all-scope typed edge stream idle timeout; serving partial snapshot"
+                            );
+                            break;
+                        }
                         chunk = rx.recv() => {
                             match chunk {
                                 Some(Ok(typed_edges)) => {
+                                    idle_deadline.as_mut().reset(tokio::time::Instant::now() + VIZ_STREAM_IDLE_BUDGET);
                                     for te in typed_edges {
                                         edge_chunk.push(VizEdge {
                                             source: te.src_id.to_string(),
@@ -2499,13 +2583,24 @@ async fn send_streaming_viz_snapshot<S: Storage>(
                         tx,
                     );
                     tokio::pin!(producer);
+                    let idle_deadline = tokio::time::sleep(VIZ_STREAM_IDLE_BUDGET);
+                    tokio::pin!(idle_deadline);
                     let mut producer_done = false;
                     loop {
                         tokio::select! {
                             _ = &mut producer, if !producer_done => producer_done = true,
+                            _ = &mut idle_deadline, if !producer_done => {
+                                tracing::warn!(
+                                    session_id = %sid,
+                                    timeout_ms = VIZ_STREAM_IDLE_BUDGET.as_millis() as u64,
+                                    "viz: session typed edge stream idle timeout; serving partial snapshot"
+                                );
+                                break;
+                            }
                             chunk = rx.recv() => {
                                 match chunk {
                                     Some(Ok(typed_edges)) => {
+                                        idle_deadline.as_mut().reset(tokio::time::Instant::now() + VIZ_STREAM_IDLE_BUDGET);
                                         for te in typed_edges {
                                             edge_chunk.push(VizEdge {
                                                 source: te.src_id.to_string(),
@@ -4112,6 +4207,11 @@ mod tests {
                 && streaming_snapshot.contains("typed_edge_stream_all(edge_ctx"),
             "all-scope streaming must preserve the old snapshot's legacy swapped-tenant typed edge fallback: {streaming_snapshot}"
         );
+        assert!(
+            streaming_snapshot.contains("VIZ_STREAM_IDLE_BUDGET")
+                && streaming_snapshot.contains("serving partial snapshot"),
+            "viz snapshot streams must fail soft under backend lane contention instead of hanging the browser: {streaming_snapshot}"
+        );
     }
 
     #[test]
@@ -4277,6 +4377,7 @@ mod tests {
     fn workbench_html_includes_judge_config_tab() {
         assert!(WORKBENCH_HTML.contains(r#"data-section="judge""#));
         assert!(WORKBENCH_HTML.contains(r#"id="judgeForm""#));
+        assert!(WORKBENCH_HTML.contains(r#"id="judgeRerankCandidates""#));
         assert!(WORKBENCH_HTML.contains("/workbench/api/judge/config"));
         assert!(WORKBENCH_HTML.contains("/workbench/api/judge/models"));
     }
@@ -4347,6 +4448,7 @@ mod tests {
         let config = HttpConfig {
             bind_addr: "127.0.0.1".into(),
             port: 8765,
+            request_budget: DEFAULT_REQUEST_BUDGET,
             require_tls: false,
             cert_path: None,
             key_path: None,
@@ -4361,6 +4463,7 @@ mod tests {
         let config_tls = HttpConfig {
             bind_addr: "127.0.0.1".into(),
             port: 443,
+            request_budget: DEFAULT_REQUEST_BUDGET,
             require_tls: true,
             cert_path: Some("/etc/ssl/cert.pem".into()),
             key_path: Some("/etc/ssl/key.pem".into()),
@@ -4712,7 +4815,7 @@ mod tests {
             "POST",
             "/workbench/api/judge/config",
             &headers,
-            r#"{"provider":"lmstudio","base_url":"http://127.0.0.1:1234","model":"local-judge","token":"super-secret","timeout_seconds":7}"#,
+            r#"{"enabled":true,"provider":"lmstudio","base_url":"http://127.0.0.1:1234","model":"local-judge","token":"super-secret","timeout_seconds":7,"max_rerank_candidates":25}"#,
             &storage,
             &metrics,
             &validator,
@@ -4723,6 +4826,7 @@ mod tests {
         .await
         .unwrap();
         assert!(put_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(put_response.contains("\"enabled\":true"));
         assert!(put_response.contains("\"token_configured\":true"));
         assert!(!put_response.contains("super-secret"));
 
@@ -4741,10 +4845,12 @@ mod tests {
         .await
         .unwrap();
         assert!(get_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(get_response.contains("\"enabled\":true"));
         assert!(get_response.contains("\"provider\":\"lmstudio\""));
         assert!(get_response.contains("\"base_url\":\"http://127.0.0.1:1234\""));
         assert!(get_response.contains("\"model\":\"local-judge\""));
         assert!(get_response.contains("\"timeout_seconds\":7"));
+        assert!(get_response.contains("\"max_rerank_candidates\":25"));
         assert!(get_response.contains("\"token_configured\":true"));
         assert!(!get_response.contains("super-secret"));
     }

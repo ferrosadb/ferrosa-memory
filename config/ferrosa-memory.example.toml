@@ -19,6 +19,7 @@
 [server]
 transport = "stdio"          # "stdio" for Claude Code/Desktop, "http" for remote
 # http_port = 8765           # only used in http mode
+# request_timeout_seconds = 30 # increase for cold local judge/embedding model loads
 # log_level = "info"
 tenant_id = "00000000-0000-0000-0000-000000000001"
 
@@ -43,10 +44,16 @@ admin_password = "ferrosa_admin"
 # confidence_gate = 0.7
 # max_memo_results = 50
 
+[retrieval]
+# Default ranked results returned by retrieval tools when k/limit is omitted.
+# Keep live agent defaults compact to control context size. Use the eval profile
+# below when measuring BRIGHT-Pro/MemoryBench recall before context packing.
+default_limit = 10
+
 [embeddings]
 provider = "ollama"
 ollama_base_url = "http://127.0.0.1:11434"
-model = "nomic-embed-text"
+model = "nomic-embed-text-v2-moe"
 dimensions = 768
 
 [graph]
@@ -68,6 +75,43 @@ http_url = "http://localhost:9090"
 [routing]
 # guideline_version = "v1"
 # feedback_export_cron = "0 2 * * *"
+
+[eval]
+# Ranked retrieval depth used by BRIGHT-Pro/MemoryBench fixture scoring.
+retrieval_k = 25
+# Current best-known BRIGHT-Pro support-doc-closed MCP slice profile:
+#   candidate_limit=50
+#   fusion_profile="all"
+#   query_decomposition="llm"
+#   query_task="bright_pro"
+#   query_variant_limit=5
+#   query_embed_variants=true
+#   chunk_expansion="none"
+#   rerank=false
+# This measured alpha_nDCG=0.816, NDCG=0.799, aspect_recall=0.940,
+# and recall=0.796 on the 200-doc biology support-closed slice.
+# Optional LLM-as-judge / synthetic-conversation provider. The eval harness
+# supports "mock" for CI, "ollama", "ollama.com", "lmstudio", and
+# "openai_compatible". Tokens are read from the named environment variable
+# instead of being stored in this file.
+judge_enabled = false
+judge_provider = "ollama"
+judge_url = "http://127.0.0.1:11434"
+judge_model = "qwen2.5-coder:7b"
+# judge_token_env = "FMEM_JUDGE_TOKEN"
+judge_timeout_seconds = 60
+judge_temperature = 0.0
+
+[judge]
+# Optional live LLM reranker used by hybrid_search. Keep disabled for CI/offline
+# installs. When enabled, LLM failures are logged and hybrid_search falls back
+# to normal hybrid fusion order.
+enabled = false
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+model = "qwen2.5-coder:7b"
+# token = ""
+timeout_seconds = 60
 
 [datalog]
 # ferrosa-memory owns Datalog evaluation locally; this section controls local inference limits.

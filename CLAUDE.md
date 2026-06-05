@@ -11,6 +11,10 @@ Ferrosa Memory MCP Server — a Rust MCP server exposing Ferrosa DB as typed mem
 
 See [specs/project-plan.md](specs/project-plan.md) for the current project plan with sprint breakdown, risk register, and task details.
 
+## Agent Rules
+
+Follow [AGENTS.md](AGENTS.md). In particular, every schema change must include an ordered, versioned, automatic, data-preserving migration. Migrations must support upgrading from version `N` to `M` by applying `N+1`, `N+2`, ... `M` in sequence, and must never silently drop, damage, or orphan legacy data.
+
 ## Architecture
 
 See [specs/](specs/) for full architecture specs, DSM analysis, threat model, and FMEA.

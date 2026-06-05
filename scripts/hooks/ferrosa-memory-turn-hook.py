@@ -58,6 +58,13 @@ def env_auth_header() -> str | None:
     return None
 
 
+def env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 class McpClient:
     def __init__(self, url: str, timeout: float) -> None:
         self.url = url
@@ -130,15 +137,89 @@ def extract_response(payload: dict[str, Any]) -> str:
     return ""
 
 
-def transcript_tail(payload: dict[str, Any]) -> tuple[str, str]:
+def compact_text(value: Any, limit: int = 4000) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()[:limit]
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)[:limit]
+    except Exception:
+        return str(value)[:limit]
+
+
+def object_content(obj: dict[str, Any]) -> str:
+    for key in ("content", "text", "output", "result", "message", "args", "arguments"):
+        value = obj.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, (dict, list)):
+            return compact_text(value)
+    return compact_text(obj)
+
+
+def artifact_from_object(obj: Any, source: str) -> dict[str, str] | None:
+    if not isinstance(obj, dict):
+        text = compact_text(obj)
+        return {"source": source, "name": source, "content": text} if text else None
+    role = obj.get("role") or obj.get("type") or obj.get("kind") or obj.get("event")
+    name = obj.get("name") or obj.get("tool_name") or obj.get("function") or role or source
+    content = object_content(obj)
+    if not content:
+        return None
+    return {
+        "source": source,
+        "name": str(name)[:128],
+        "role": str(role or "tool")[:64],
+        "content": content[:4000],
+    }
+
+
+def append_artifacts(value: Any, source: str, out: list[dict[str, str]], limit: int = 20) -> None:
+    if len(out) >= limit:
+        return
+    if isinstance(value, list):
+        for item in value:
+            append_artifacts(item, source, out, limit)
+            if len(out) >= limit:
+                return
+    else:
+        artifact = artifact_from_object(value, source)
+        if artifact:
+            out.append(artifact)
+
+
+def extract_tool_artifacts(payload: dict[str, Any]) -> list[dict[str, str]]:
+    artifacts: list[dict[str, str]] = []
+    for key in (
+        "tool_calls",
+        "tool_results",
+        "tool_outputs",
+        "tool_uses",
+        "function_calls",
+        "function_results",
+        "events",
+    ):
+        if key in payload:
+            append_artifacts(payload[key], key, artifacts)
+    extra = payload.get("extra")
+    if isinstance(extra, dict):
+        for key in ("tool_calls", "tool_results", "tool_outputs", "events"):
+            if key in extra:
+                append_artifacts(extra[key], f"extra.{key}", artifacts)
+    return artifacts[:20]
+
+
+def transcript_tail(payload: dict[str, Any]) -> tuple[str, str, list[dict[str, str]]]:
     path = payload.get("transcript_path")
     if not isinstance(path, str) or not path:
-        return "", ""
+        return "", "", []
     transcript = Path(path).expanduser()
     if not transcript.exists() or transcript.stat().st_size > 20_000_000:
-        return "", ""
+        return "", "", []
     user = ""
     assistant = ""
+    artifacts: list[dict[str, str]] = []
     try:
         lines = transcript.read_text(errors="ignore").splitlines()[-200:]
         for line in lines:
@@ -152,10 +233,18 @@ def transcript_tail(payload: dict[str, Any]) -> tuple[str, str]:
                 user = text[:4000]
             elif role == "assistant":
                 assistant = text[:4000]
-        return user, assistant
+            role_text = str(role or "").lower()
+            if (
+                "tool" in role_text
+                or "function" in role_text
+                or obj.get("tool_call_id")
+                or obj.get("tool_name")
+            ):
+                append_artifacts(obj, "transcript", artifacts)
+        return user, assistant, artifacts[:20]
     except Exception as exc:
         eprint(f"transcript read failed: {exc}")
-        return "", ""
+        return "", "", []
 
 
 def cwd_from_payload(payload: dict[str, Any]) -> str:
@@ -229,8 +318,10 @@ def recall_context(client: McpClient, payload: dict[str, Any], args: argparse.Na
 def ingest_turn(client: McpClient, payload: dict[str, Any], args: argparse.Namespace) -> None:
     prompt = extract_prompt(payload)
     response = extract_response(payload)
+    artifacts = extract_tool_artifacts(payload)
     if not prompt and not response:
-        prompt, response = transcript_tail(payload)
+        prompt, response, transcript_artifacts = transcript_tail(payload)
+        artifacts.extend(transcript_artifacts)
     if not prompt and not response:
         return
     cwd = cwd_from_payload(payload)
@@ -242,40 +333,110 @@ def ingest_turn(client: McpClient, payload: dict[str, Any], args: argparse.Names
         for part in [
             f"User: {prompt}" if prompt else "",
             f"Assistant: {response}" if response else "",
+            (
+                "Tool artifacts:\n"
+                + "\n".join(
+                    f"- {artifact.get('name', 'tool')}: {artifact.get('content', '')[:1000]}"
+                    for artifact in artifacts[:10]
+                )
+                if artifacts
+                else ""
+            ),
         ]
         if part
     )
-    client.call_tool(
-        "ingest_entities",
-        {
-            "tenant_id": os.environ.get("FERROSA_MEMORY_TENANT_ID", DEFAULT_TENANT_ID),
-            "session_id": session_id,
-            "entities": [
-                {
-                    "id": entity_id,
-                    "name": f"{args.harness} turn {turn_id}",
-                    "entity_type": "turn",
-                    "context": text[:16000],
-                    "confidence": 0.7,
-                    "attrs": {
-                        "harness": args.harness,
-                        "hook_event_name": payload.get("hook_event_name") or args.event,
-                        "session_id": session_id,
-                        "turn_id": turn_id,
-                        "cwd": cwd,
-                        "workspace": cwd,
-                        "working_directory": cwd,
-                        "captured_at_ms": int(time.time() * 1000),
-                    },
-                }
-            ],
-            "options": {
-                "embed_missing": False,
-                "on_conflict": "skip",
-                "strict_edges": True,
+    common_attrs = {
+        "harness": args.harness,
+        "hook_event_name": payload.get("hook_event_name") or args.event,
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "cwd": cwd,
+        "workspace": cwd,
+        "working_directory": cwd,
+        "captured_at_ms": int(time.time() * 1000),
+    }
+    try:
+        client.call_tool(
+            "ingest",
+            {
+                "tenant_id": os.environ.get("FERROSA_MEMORY_TENANT_ID", DEFAULT_TENANT_ID),
+                "session_id": session_id,
+                "entities": [
+                    {
+                        "id": entity_id,
+                        "name": f"{args.harness} turn {turn_id}",
+                        "entity_type": "turn",
+                        "context": text[:16000],
+                        "confidence": 0.7,
+                        "attrs": common_attrs,
+                    }
+                ],
+                "options": {
+                    "embed_missing": False,
+                    "on_conflict": "skip",
+                    "strict_edges": True,
+                },
             },
-        },
-    )
+        )
+    except Exception as exc:
+        eprint(f"turn entity ingest failed: {exc}")
+
+    if not env_bool("FERROSA_MEMORY_HOOK_CAPTURE_SEGMENTS", True):
+        return
+    messages: list[dict[str, Any]] = []
+    turn_index = 0
+    if prompt:
+        messages.append(
+            {
+                "role": "user",
+                "content": prompt[:131072],
+                "turn_index": turn_index,
+                "metadata": common_attrs,
+            }
+        )
+        turn_index += 1
+    if response:
+        messages.append(
+            {
+                "role": "assistant",
+                "content": response[:131072],
+                "turn_index": turn_index,
+                "metadata": common_attrs,
+            }
+        )
+        turn_index += 1
+    for artifact in artifacts[:10]:
+        metadata = dict(common_attrs)
+        metadata.update(
+            {
+                "tool_source": artifact.get("source", ""),
+                "tool_name": artifact.get("name", ""),
+                "tool_role": artifact.get("role", ""),
+            }
+        )
+        messages.append(
+            {
+                "role": "tool",
+                "content": artifact.get("content", "")[:131072],
+                "turn_index": turn_index,
+                "metadata": metadata,
+            }
+        )
+        turn_index += 1
+    if not messages:
+        return
+    try:
+        client.call_tool(
+            "ctx_ingest",
+            {
+                "session_id": session_id,
+                "conversation_id": f"{args.harness}:{session_id}:{cwd}",
+                "messages": messages,
+                "embed_missing": env_bool("FERROSA_MEMORY_HOOK_EMBED_MISSING", False),
+            },
+        )
+    except Exception as exc:
+        eprint(f"context segment ingest failed: {exc}")
 
 
 def emit_context(context: str, output_format: str, event: str) -> None:
@@ -305,8 +466,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--event", default="")
     parser.add_argument("--format", choices=["plain", "codex-json", "hermes-json"], default="plain")
     parser.add_argument("--mcp-url", default=os.environ.get("FERROSA_MEMORY_MCP_URL", DEFAULT_URL))
-    parser.add_argument("--timeout", type=float, default=float(os.environ.get("FERROSA_MEMORY_HOOK_TIMEOUT", "2.5")))
-    parser.add_argument("--limit", type=int, default=5)
+    parser.add_argument("--timeout", type=float, default=float(os.environ.get("FERROSA_MEMORY_HOOK_TIMEOUT", "8")))
+    parser.add_argument("--limit", type=int, default=int(os.environ.get("FERROSA_MEMORY_HOOK_SEARCH_LIMIT", "5")))
     parser.add_argument("--max-context-chars", type=int, default=4000)
     return parser.parse_args()
 

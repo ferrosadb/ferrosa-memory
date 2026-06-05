@@ -11,7 +11,8 @@ ferrosa-memory-mcp fixes this by providing durable, typed memory tools over Ferr
 - **Trajectory folds** — branch-and-collapse pattern with semantic retrieval over fold summaries
 - **Entity graph** — named entity tracking with phonetic deduplication and multi-hop Cypher queries
 - **Temporal chains** — timestamped facts with supersession tracking (most-recent-valid retrieval)
-- **Feedback loop** — record retrieval strategy outcomes for offline guideline refinement
+- **Document recall** — document/section/chunk entities, chunk adjacency, BM25 + vector + phonetic candidate generation, and task-aware query decomposition
+- **Feedback loop** — retrieval feedback, judge abstentions, cwd/workspace-aware reranking, and offline guideline refinement
 
 ## Architecture
 
@@ -236,6 +237,54 @@ See [`examples/ferrosa-memory.toml`](examples/ferrosa-memory.toml) for all optio
 | `[embeddings]` | Provider (Ollama/OpenAI), model, dimensions |
 | `[security]` | Audit log, anomaly detection, sigma threshold |
 | `[routing]` | Guideline version, feedback export schedule |
+
+Current local defaults:
+
+- Live retrieval keeps `[retrieval].default_limit = 10` so ordinary agent turns do not overfill context. Agents or users can lower it at runtime with the `config` MCP tool when token use is too high.
+- Semantic retrieval uses Ollama `nomic-embed-text-v2-moe` with 768-dimensional embeddings when Ollama is available. If the embedding provider is absent, the server logs a warning and continues with lexical, phonetic, graph, and exact lookup behavior.
+- The optional live LLM judge/reranker is disabled by default. Enable `[judge]` only when a local or OpenAI-compatible model endpoint is available; failed or abstained judgments are recorded as abstentions, not false positives or negatives.
+
+## 0.13 Long-Recall Evaluation Profile
+
+The best-known BRIGHT-Pro support-doc-closed MCP slice profile as of the 0.13 preview is:
+
+```text
+retrieval_k=25
+candidate_limit=50
+fusion_profile=all
+query_decomposition=llm
+query_task=bright_pro
+query_variant_limit=5
+query_embed_variants=true
+chunk_expansion=none
+rerank=false
+```
+
+On the 200-document biology support-closed slice, that measured:
+
+| Metric | Score |
+|--------|-------|
+| alpha_nDCG | 0.816 |
+| NDCG | 0.799 |
+| aspect_recall | 0.940 |
+| recall | 0.796 |
+
+Use the helper scripts to reproduce and extend the runs:
+
+```sh
+# Deterministic harness self-test
+scripts/run-official-evals.sh --self-test
+
+# Fusion/decomposition ablations against an already-ingested MCP slice
+FMEM_EVAL_QUERY_DECOMPOSITION=llm \
+FMEM_EVAL_QUERY_EMBED_VARIANTS=true \
+scripts/run-fusion-ablations.sh
+
+# Start a resumable full-corpus BRIGHT-Pro MCP ingest with heartbeat files
+scripts/start-bright-pro-full-load.sh
+```
+
+Full-corpus BRIGHT-Pro currently contains hundreds of thousands of support documents. The loader writes `heartbeat.json`, `progress.json`, and `load.log` under `diagnostics/eval-runs/...` so overnight runs can be checked without attaching to the process.
 
 For shared deployments, use:
 

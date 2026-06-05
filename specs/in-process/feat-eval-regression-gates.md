@@ -83,6 +83,90 @@ scripts/download-eval-corpora.sh --output-dir /data/ferrosa-eval-corpus --clean
 
 Each downloaded dataset directory gets a `manifest.json` with repo id, requested revision, resolved SHA, file count, and byte totals.
 
+## Full-Corpus MCP Baseline
+
+Run the long-recall baseline through the live MCP server with deterministic corpus sessions:
+
+```bash
+scripts/run-long-recall-baseline.sh all
+```
+
+Useful overrides:
+
+```bash
+FMEM_EVAL_MCP_URL=http://127.0.0.1:18765/mcp \
+FMEM_EVAL_MCP_USER=ferrosa_user \
+FMEM_EVAL_MCP_PASSWORD=ferrosa_user \
+FMEM_EVAL_MCP_BATCH_SIZE=25 \
+FMEM_EVAL_RERANK_CANDIDATES=25 \
+FMEM_EVAL_CANDIDATE_LIMIT=50 \
+scripts/run-long-recall-baseline.sh bright-pro
+```
+
+The BRIGHT-Pro full-corpus profile runs against the complete official support corpus and uses a stable default session id so later runs can set `FMEM_EVAL_SKIP_INGEST=true`.
+
+The MemoryBench profile is currently an MCP retrieval-proxy baseline: it ingests official dialog and feedback rows, then measures whether retrieved evidence contains each row's `golden_answer` when one is present. It does not reproduce the paper's task-native generation/judge metrics yet.
+
+Run fusion ablations over a fixed support-closed BRIGHT-Pro slice with:
+
+```bash
+scripts/run-fusion-ablations.sh
+```
+
+Use `FMEM_EVAL_INCLUDE_LLM_RERANK=true` to add the slower `all-llm-rerank` profile.
+
+Chunk expansion can be exercised without changing the harness:
+
+```bash
+FMEM_EVAL_CHUNK_EXPANSION=neighbors \
+FMEM_EVAL_CHUNK_PREV=1 \
+FMEM_EVAL_CHUNK_NEXT=1 \
+FMEM_EVAL_CHUNK_MAX_TOKENS=1600 \
+scripts/run-long-recall-baseline.sh bright-pro
+```
+
+Current measurement: unconditional `neighbors` expansion is not a default. On the BRIGHT-Pro 200-doc support-closed slice it preserved recall but reduced LLM-reranked alpha-nDCG (`0.796 -> 0.744`), so follow-up tuning should use conditional/list-aware expansion or structured neighbor summaries.
+
+Query decomposition can be exercised with:
+
+```bash
+FMEM_EVAL_QUERY_DECOMPOSITION=heuristic \
+FMEM_EVAL_QUERY_VARIANT_LIMIT=5 \
+scripts/run-long-recall-baseline.sh bright-pro
+```
+
+Current measurement: deterministic heuristic decomposition is not a default. On the BRIGHT-Pro 200-doc support-closed slice it broadened the candidate pool but reduced alpha-nDCG (`0.720 -> 0.669` no rerank, `0.796 -> 0.697` with LLM rerank). MemoryBench's two-row retrieval proxy also regressed answer-term recall (`0.75 -> 0.50`). Treat this as ablation infrastructure only.
+
+Task-aware LLM subqueries can be exercised with:
+
+```bash
+FMEM_EVAL_QUERY_DECOMPOSITION=llm \
+FMEM_EVAL_QUERY_TASK=bright_pro \
+FMEM_EVAL_QUERY_VARIANT_LIMIT=5 \
+FMEM_EVAL_INCLUDE_LLM_RERANK=false \
+scripts/run-long-recall-baseline.sh bright-pro
+```
+
+Current measurement: task-aware LLM decomposition is the first positive query-decomposition profile on the BRIGHT-Pro 200-doc support-closed slice. With `candidate_limit=50`, `fusion_profile=all`, `query_task=bright_pro`, and no in-band LLM rerank, alpha-nDCG improved `0.720 -> 0.811` and NDCG improved `0.725 -> 0.792`; aspect recall (`0.94`) and recall (`0.796`) were unchanged. Combining the same generated variants with the current in-band LLM reranker regressed alpha-nDCG (`0.796 -> 0.714`), so use the no-rerank profile until reranker ablations separate original-query rank, variant rank, and judge score. On the two-row MemoryBench retrieval proxy, `query_task=memorybench` was neutral after prompt hardening: answer-term recall `0.75`, exact-answer hit rate `0.50`.
+
+Tuning update: the best balanced BRIGHT-Pro support-closed slice profile found on 2026-06-05 was:
+
+```bash
+FMEM_EVAL_CANDIDATE_LIMIT=50 \
+FMEM_EVAL_FUSION_PROFILE=all \
+FMEM_EVAL_QUERY_DECOMPOSITION=llm \
+FMEM_EVAL_QUERY_TASK=bright_pro \
+FMEM_EVAL_QUERY_VARIANT_LIMIT=5 \
+FMEM_EVAL_QUERY_EMBED_VARIANTS=true \
+FMEM_EVAL_CHUNK_EXPANSION=none \
+FMEM_EVAL_INCLUDE_LLM_RERANK=false \
+scripts/run-long-recall-baseline.sh bright-pro
+```
+
+On the same 5-case/200-doc slice this reached alpha-nDCG `0.816`, NDCG `0.799`, aspect recall `0.94`, and recall `0.796`. `bm25-only` had similar alpha-nDCG (`0.812`) and higher plain NDCG (`0.801`) but lower aspect recall (`0.88`) and recall (`0.776`). Variant limits `6` and `7` increased recall but reduced alpha-nDCG. Candidate limits `75` and `100` did not move results beyond `50`.
+
+Full all-split MCP comparison is currently blocked by ingestion throughput, not metrics. The official BRIGHT-Pro corpus has `526,319` support documents and the deterministic full-corpus MCP session was not populated; a skip-ingest probe returned zero hits. A fresh no-embedding MCP ingest reached only `200/59,513` biology documents after several minutes. Full all-split local BM25 diagnostic over 739 examples scored alpha-nDCG `0.310`, aspect recall `0.459`, NDCG `0.292`, recall `0.352`; this is a parser/scorer reference, not an MCP result.
+
 ## CI Shape
 
 ### Required PR Gate

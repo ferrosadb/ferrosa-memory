@@ -451,9 +451,91 @@ fn tokenize_context_terms(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter_map(|part| {
             let term = part.trim().to_ascii_lowercase();
-            if term.len() >= 3 { Some(term) } else { None }
+            if term.len() >= 3 && !is_context_stopword(&term) {
+                Some(term)
+            } else {
+                None
+            }
         })
         .collect()
+}
+
+fn is_context_stopword(term: &str) -> bool {
+    matches!(
+        term,
+        "about"
+            | "after"
+            | "again"
+            | "also"
+            | "and"
+            | "any"
+            | "are"
+            | "because"
+            | "been"
+            | "but"
+            | "can"
+            | "could"
+            | "does"
+            | "for"
+            | "from"
+            | "had"
+            | "has"
+            | "have"
+            | "how"
+            | "into"
+            | "isn"
+            | "its"
+            | "not"
+            | "off"
+            | "one"
+            | "only"
+            | "out"
+            | "over"
+            | "same"
+            | "that"
+            | "the"
+            | "their"
+            | "then"
+            | "there"
+            | "these"
+            | "they"
+            | "this"
+            | "through"
+            | "was"
+            | "what"
+            | "when"
+            | "where"
+            | "which"
+            | "while"
+            | "who"
+            | "why"
+            | "will"
+            | "with"
+            | "would"
+            | "you"
+            | "your"
+    )
+}
+
+fn bm25_posting_score(
+    tf: i32,
+    doc_len: i32,
+    avg_doc_len: f64,
+    doc_freq: usize,
+    corpus_size: usize,
+) -> f64 {
+    if tf <= 0 || doc_len <= 0 || avg_doc_len <= 0.0 || doc_freq == 0 || corpus_size == 0 {
+        return 0.0;
+    }
+    const K1: f64 = 1.2;
+    const B: f64 = 0.75;
+    let tf = tf as f64;
+    let doc_len = doc_len as f64;
+    let doc_freq = doc_freq as f64;
+    let corpus_size = corpus_size as f64;
+    let idf = (((corpus_size - doc_freq + 0.5) / (doc_freq + 0.5)) + 1.0).ln();
+    let denominator = tf + K1 * (1.0 - B + B * (doc_len / avg_doc_len));
+    idf * ((tf * (K1 + 1.0)) / denominator)
 }
 
 fn phonetic_index_code(term: &str) -> Option<String> {
@@ -828,7 +910,6 @@ struct PreparedStatements {
     edge_supersedes_by_new: PreparedStatement,
     edge_supersedes_by_old: PreparedStatement,
     // Feedback
-    feedback_put: PreparedStatement,
     feedback_list_all: PreparedStatement,
     // Intentions
     intention_put: PreparedStatement,
@@ -1023,14 +1104,6 @@ impl CqlStorage {
                 .prepare(format!(
                     "UPDATE {ks}.temporal_events SET valid_until = ? \
                      WHERE tenant_id = ? AND entity_id = ? AND event_time = ? AND event_id = ?"
-                ))
-                .await?,
-            feedback_put: session
-                .prepare(format!(
-                    "INSERT INTO {ks}.feedback_outcomes \
-                     (tenant_id, session_id, query_id, program_type, task_complexity, \
-                      succeeded, latency_ms, token_cost, created_at) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 ))
                 .await?,
             feedback_list_all: session
@@ -3191,8 +3264,14 @@ impl Storage for CqlStorage {
         outcome: &FeedbackOutcome,
     ) -> anyhow::Result<()> {
         self.session
-            .execute_unpaged(
-                &self.stmts.feedback_put,
+            .query_unpaged(
+                format!(
+                    "INSERT INTO {}.feedback_outcomes \
+                     (tenant_id, session_id, query_id, program_type, task_complexity, \
+                      succeeded, latency_ms, token_cost, created_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    self.keyspace
+                ),
                 (
                     ctx.tenant_id,
                     outcome.session_id,
@@ -5473,28 +5552,71 @@ impl Storage for CqlStorage {
         if k == 0 {
             return Ok(Vec::new());
         }
-        let mut scores: HashMap<Uuid, i32> = HashMap::new();
+        let query_terms = tokenize_context_terms(query)
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        if query_terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut postings: HashMap<Uuid, (i32, HashMap<String, i32>)> = HashMap::new();
+        let mut doc_freqs: HashMap<String, usize> = HashMap::new();
         let candidate_limit = context_segment_bm25_candidate_limit(k);
         let term_q = format!(
-            "SELECT chunk_id, tf FROM {ks}.document_terms \
+            "SELECT chunk_id, tf, doc_len FROM {ks}.document_terms \
              WHERE tenant_id = ? AND session_id = ? AND term = ? \
              LIMIT {candidate_limit}",
             ks = self.keyspace
         );
-        for term in tokenize_context_terms(query) {
+        for term in query_terms {
             let (col_map, rows) = query_paged_rows!(
                 self.session,
                 term_q.clone(),
-                (ctx.tenant_id, session_id, term)
+                (ctx.tenant_id, session_id, term.clone())
             )?;
+            doc_freqs.insert(term.clone(), rows.len());
             for row in rows {
                 let id: Uuid = cql_get(&row, &col_map, "chunk_id")?;
                 let tf: i32 = cql_get(&row, &col_map, "tf").unwrap_or(1);
-                *scores.entry(id).or_insert(0) += tf;
+                let doc_len: i32 = cql_get(&row, &col_map, "doc_len").unwrap_or(1).max(1);
+                let entry = postings
+                    .entry(id)
+                    .or_insert_with(|| (doc_len, HashMap::new()));
+                entry.0 = entry.0.max(doc_len);
+                entry.1.insert(term.clone(), tf);
             }
         }
-        let mut ranked: Vec<(Uuid, i32)> = scores.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let corpus_size = postings.len();
+        if corpus_size == 0 {
+            return Ok(Vec::new());
+        }
+        let avg_doc_len = postings
+            .values()
+            .map(|(doc_len, _)| *doc_len as f64)
+            .sum::<f64>()
+            / corpus_size as f64;
+        let mut ranked: Vec<(Uuid, f64)> = postings
+            .into_iter()
+            .map(|(chunk_id, (doc_len, terms))| {
+                let score = terms
+                    .into_iter()
+                    .map(|(term, tf)| {
+                        bm25_posting_score(
+                            tf,
+                            doc_len,
+                            avg_doc_len,
+                            doc_freqs.get(&term).copied().unwrap_or(1),
+                            corpus_size,
+                        )
+                    })
+                    .sum();
+                (chunk_id, score)
+            })
+            .collect();
+        ranked.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         let mut chunks = Vec::new();
         for (chunk_id, _) in ranked.into_iter().take(k) {
             if let Some(chunk) = self.document_chunk_get(ctx, session_id, chunk_id).await? {
@@ -5957,6 +6079,38 @@ mod cql_storage_tests {
         assert!(
             context_segment_bm25_candidate_limit(10) <= CONTEXT_SEGMENT_BM25_MAX_CANDIDATES,
             "BM25 candidate cap must remain bounded even for large top-k requests"
+        );
+    }
+
+    #[test]
+    fn tokenized_context_terms_drop_common_stopwords() {
+        let terms = tokenize_context_terms(
+            "Why do I only breathe out of one nostril, and what is the nasal cycle?",
+        );
+
+        assert!(terms.contains(&"breathe".to_string()));
+        assert!(terms.contains(&"nostril".to_string()));
+        assert!(terms.contains(&"nasal".to_string()));
+        assert!(terms.contains(&"cycle".to_string()));
+        assert!(!terms.contains(&"why".to_string()));
+        assert!(!terms.contains(&"only".to_string()));
+        assert!(!terms.contains(&"one".to_string()));
+        assert!(!terms.contains(&"the".to_string()));
+    }
+
+    #[test]
+    fn bm25_posting_score_prefers_specific_shorter_documents() {
+        let short_specific = bm25_posting_score(2, 80, 500.0, 2, 100);
+        let long_repetitive = bm25_posting_score(4, 2_000, 500.0, 2, 100);
+        let common_term = bm25_posting_score(2, 80, 500.0, 80, 100);
+
+        assert!(
+            short_specific > long_repetitive,
+            "BM25 length normalization should beat raw term-frequency spam"
+        );
+        assert!(
+            short_specific > common_term,
+            "BM25 IDF should reward rarer query terms over common terms"
         );
     }
 

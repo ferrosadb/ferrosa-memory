@@ -30,6 +30,7 @@ async fn start_server() -> u16 {
     let config = HttpConfig {
         bind_addr: "127.0.0.1".into(),
         port,
+        request_budget: std::time::Duration::from_secs(30),
         require_tls: false,
         cert_path: None,
         key_path: None,
@@ -158,6 +159,7 @@ async fn https_split_send_post_gets_response() {
     let config = HttpConfig {
         bind_addr: "127.0.0.1".into(),
         port,
+        request_budget: std::time::Duration::from_secs(30),
         require_tls: true,
         cert_path: Some(cert_file.path().to_string_lossy().into_owned()),
         key_path: Some(key_file.path().to_string_lossy().into_owned()),
@@ -320,6 +322,7 @@ async fn https_initialize_then_initialized_notification_same_connection() {
     let config = HttpConfig {
         bind_addr: "127.0.0.1".into(),
         port,
+        request_budget: std::time::Duration::from_secs(30),
         require_tls: true,
         cert_path: Some(cert_file.path().to_string_lossy().into_owned()),
         key_path: Some(key_file.path().to_string_lossy().into_owned()),

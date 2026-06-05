@@ -30,10 +30,11 @@ pub struct EnrichRunConfig {
     pub force: bool,
     pub dry_run: bool,
     pub batch_size: usize,
-    /// Embedding provider URL + model, used to generate `description_embedding`
-    /// alongside each LLM-generated description. When unset (empty url),
-    /// description is written without an embedding.
+    /// Embedding provider + model, used to generate `description_embedding`
+    /// alongside each LLM-generated description. Disabled providers write the
+    /// description without an embedding.
     #[doc(hidden)]
+    pub embed_provider: String,
     pub ollama_base_url: String,
     pub embed_model: String,
     pub embed_dimensions: u32,
@@ -630,10 +631,18 @@ pub async fn run_enrichment(
 
         // Optional embedding client for populating description_embedding
         // alongside each LLM-generated description.
-        let embed_client = if !config.ollama_base_url.is_empty() && !config.embed_model.is_empty() {
+        let provider = config.embed_provider.trim();
+        let provider_disabled = provider.is_empty()
+            || provider.eq_ignore_ascii_case("disabled")
+            || provider.eq_ignore_ascii_case("none");
+        let provider_requires_url = !provider.eq_ignore_ascii_case("synthetic");
+        let embed_client = if !provider_disabled
+            && !config.embed_model.is_empty()
+            && (!provider_requires_url || !config.ollama_base_url.is_empty())
+        {
             Some(crate::embedding::EmbeddingClient::new(
                 &crate::config::EmbeddingConfig {
-                    provider: "ollama".into(),
+                    provider: config.embed_provider.clone(),
                     ollama_base_url: config.ollama_base_url.clone(),
                     model: config.embed_model.clone(),
                     dimensions: config.embed_dimensions,

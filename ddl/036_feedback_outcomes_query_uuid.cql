@@ -1,0 +1,10 @@
+-- 036: Fix feedback_outcomes.query_id column type (timeuuid -> uuid)
+--
+-- This migration is implemented as a custom Rust migration in
+-- migration.rs because CQL cannot alter primary-key column types in place.
+-- The runner creates a staging table, copies legacy rows while converting
+-- timeuuid query_id values to uuid, recreates feedback_outcomes with the
+-- corrected schema, copies rows back, verifies counts, and drops staging.
+--
+-- Keep this file as the registry artifact for version 36. Do not add a
+-- destructive DROP-only DDL here; legacy telemetry must be preserved.

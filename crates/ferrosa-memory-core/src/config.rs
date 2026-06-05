@@ -277,6 +277,9 @@ fn default_enrich_max_tokens() -> u32 {
 /// Judge model configuration for evaluation and reranker-feedback workflows.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct JudgeConfig {
+    /// Enable judge-model reranking in live retrieval paths.
+    #[serde(default)]
+    pub enabled: bool,
     /// Provider family. Supported UI probes include `ollama`, `lmstudio`, and `openai_compatible`.
     #[serde(default = "default_judge_provider")]
     pub provider: String,
@@ -292,18 +295,27 @@ pub struct JudgeConfig {
     /// Request timeout for judge/model discovery calls.
     #[serde(default = "default_judge_timeout_seconds")]
     pub timeout_seconds: u64,
+    /// Maximum candidates sent to the judge reranker per retrieval call.
+    #[serde(default = "default_judge_max_rerank_candidates")]
+    pub max_rerank_candidates: usize,
 }
 
 impl Default for JudgeConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             provider: default_judge_provider(),
             base_url: default_judge_base_url(),
             model: default_judge_model(),
             token: None,
             timeout_seconds: default_judge_timeout_seconds(),
+            max_rerank_candidates: default_judge_max_rerank_candidates(),
         }
     }
+}
+
+fn default_judge_max_rerank_candidates() -> usize {
+    8
 }
 
 /// Runtime retrieval defaults shared by MCP tools that return ranked context.
@@ -333,7 +345,7 @@ fn default_judge_base_url() -> String {
     "http://127.0.0.1:11434".into()
 }
 fn default_judge_model() -> String {
-    "qwen3.5:27b".into()
+    "qwen2.5-coder:7b".into()
 }
 fn default_judge_timeout_seconds() -> u64 {
     30
@@ -363,6 +375,9 @@ pub struct ServerConfig {
     pub key_path: Option<String>,
     /// Path to the file-backed HTTP auth principal database.
     pub auth_file: Option<String>,
+    /// Per-request HTTP timeout. Long enough to allow first-call local model loads.
+    #[serde(default = "default_request_timeout_seconds")]
+    pub request_timeout_seconds: u64,
     /// Fixed tenant UUID for sharing data across sessions.
     /// If not set, a random UUID is generated per session.
     pub tenant_id: Option<String>,
@@ -396,6 +411,7 @@ impl Default for ServerConfig {
             cert_path: None,
             key_path: None,
             auth_file: None,
+            request_timeout_seconds: default_request_timeout_seconds(),
             tenant_id: None,
             session_id: None,
             idle_consolidation_enabled: true,
@@ -550,6 +566,9 @@ fn default_bind_addr() -> String {
 }
 fn default_http_port() -> u16 {
     8765
+}
+fn default_request_timeout_seconds() -> u64 {
+    30
 }
 fn default_log_level() -> String {
     "info".into()
@@ -1262,6 +1281,12 @@ contact_points = "not_an_array"
     }
 
     #[test]
+    fn server_config_default_request_timeout_seconds() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.request_timeout_seconds, 30);
+    }
+
+    #[test]
     fn server_config_default_bind_addr() {
         let cfg = ServerConfig::default();
         assert_eq!(cfg.bind_addr, "0.0.0.0");
@@ -1474,11 +1499,13 @@ port = 9999
     #[test]
     fn judge_config_defaults_to_local_ollama_without_token() {
         let cfg = JudgeConfig::default();
+        assert!(!cfg.enabled);
         assert_eq!(cfg.provider, "ollama");
         assert_eq!(cfg.base_url, "http://127.0.0.1:11434");
-        assert_eq!(cfg.model, "qwen3.5:27b");
+        assert_eq!(cfg.model, "qwen2.5-coder:7b");
         assert_eq!(cfg.token, None);
         assert_eq!(cfg.timeout_seconds, 30);
+        assert_eq!(cfg.max_rerank_candidates, 8);
     }
 
     #[test]
@@ -1488,16 +1515,20 @@ port = 9999
 contact_points = ["localhost:9042"]
 
 [judge]
+enabled = true
 provider = "lmstudio"
 base_url = "http://127.0.0.1:1234"
 model = "qwen3"
 token = "secret"
 timeout_seconds = 12
+max_rerank_candidates = 25
 "#;
         let config = parse_config(toml).expect("should parse judge config");
+        assert!(config.judge.enabled);
         assert_eq!(config.judge.provider, "lmstudio");
         assert_eq!(config.judge.base_url, "http://127.0.0.1:1234");
         assert_eq!(config.judge.model, "qwen3");
+        assert_eq!(config.judge.max_rerank_candidates, 25);
         assert_eq!(config.judge.token.as_deref(), Some("secret"));
         assert_eq!(config.judge.timeout_seconds, 12);
     }

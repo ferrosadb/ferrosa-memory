@@ -35,12 +35,12 @@ admin_password = "ferrosa_admin"
 [retrieval]
 # Default ranked results returned by retrieval tools when k/limit is omitted.
 # Lower this if agent contexts become token-heavy; eval configs can use a higher k.
-# default_limit = 10
+default_limit = 10
 
 [embeddings]
 provider = "ollama"
 ollama_base_url = "http://127.0.0.1:11434"
-model = "nomic-embed-text"
+model = "nomic-embed-text-v2-moe"
 dimensions = 768
 
 [graph]
@@ -66,7 +66,11 @@ http_url = "http://localhost:18080"
 [eval]
 # BRIGHT-Pro/MemoryBench fixture retrieval depth. Keep this higher than the
 # normal MCP default so benchmark recall is measured before context packing.
-# retrieval_k = 25
+retrieval_k = 25
+# Best-known BRIGHT-Pro support-doc-closed MCP slice profile:
+# candidate_limit=50, fusion_profile="all", query_decomposition="llm",
+# query_task="bright_pro", query_variant_limit=5, query_embed_variants=true,
+# chunk_expansion="none", rerank=false.
 
 [datalog]
 # ferrosa-memory owns Datalog evaluation locally; this section controls local inference limits.

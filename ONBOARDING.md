@@ -22,6 +22,8 @@ The agent must read this file, ask the questions in Phase 0, then execute only t
 4. **Keep secrets out of chat.** Ask users to set API keys and passwords in environment/config files; do not ask them to paste secrets into the conversation.
 5. **Verify each layer.** Source checkout, build, containers, HTTP health, MCP tools, and agent harness integration each need separate verification.
 6. **Record decisions.** If the harness supports memory/notes, save only stable decisions: install directory, container runtime, exposed ports, and selected agent integrations.
+7. **Verify persistent mounts before diagnosing missing data.** For the full local compose stack, node data must be mounted from `~/data/ferrosa-memory/node1`, `~/data/ferrosa-memory/node2`, and `~/data/ferrosa-memory/node3`. If `19042-19044` are served by CI/test containers or `.runtime/` data directories, stop and fix the runtime wiring before searching for or restoring data.
+8. **Preserve schema migration order and data.** Follow `AGENTS.md`: every schema change needs an ordered version bump and an automatic migration. A database at version `N` must upgrade to version `M` by applying every migration in sequence, and migrations must preserve or transform old rows rather than dropping, damaging, or orphaning them.
 
 ---
 
@@ -63,6 +65,21 @@ curl -fsSL https://ferrosadb.com/setup-memory.sh | bash
 ```
 
 `setup-memory.sh` should use this `ONBOARDING.md` as its source of truth for skills, hints, hooks, prompts, runtime choices, credentials, and ports. It should not require users to clone either repo manually unless they choose a source build or local development workflow.
+
+If the user already has a repository checkout, use the repo-local setup script. It builds the MCP binary by default, installs/restarts the macOS LaunchAgent when available, writes Codex/Claude/Hermes hook wrappers, patches supported harness config files, and verifies the default MCP tool list includes `ingest`:
+
+```bash
+cd ~/src/ferrosa-suite/ferrosa-memory
+./setup.sh --harness auto
+```
+
+Common variants:
+
+```bash
+./setup.sh --harness all --skip-service
+./setup.sh --harness codex --skip-build --skip-service
+./setup.sh --harness auto --no-apply-config
+```
 
 Manual clone/update remains available for contributors:
 
@@ -433,6 +450,12 @@ Run the hook installer after MCP health checks pass. A Claude or Hermes agent ca
 python3 scripts/install-agent-hooks.py --harness auto --verify
 ```
 
+For a full source-checkout setup, prefer the top-level wrapper:
+
+```bash
+./setup.sh --harness auto
+```
+
 The installer detects local Codex, Claude, and Hermes harnesses. It writes wrapper scripts and a manifest under:
 
 ```text
@@ -446,7 +469,18 @@ Generated wrappers:
 <harness>-ingest-turn.sh
 ```
 
-The recall wrapper calls `check_intentions` and `hybrid_search` with the current working directory. The ingest wrapper stores a best-effort `turn` entity with `cwd`, `workspace`, and `working_directory` attributes so later retrieval and reranking can prefer knowledge learned in the same repo.
+The recall wrapper calls `check_intentions` and `hybrid_search` with the current working directory. The ingest wrapper stores:
+
+- a durable `turn` entity with `cwd`, `workspace`, and `working_directory` attributes;
+- deterministic context segments through `ctx_ingest`, including user, assistant, and tool artifacts when the harness payload exposes them;
+- session, turn, harness, and cwd metadata so later retrieval and reranking can prefer knowledge learned in the same repo.
+
+This is the intended session-memory loop:
+
+1. Pre-turn recall injects relevant memories for the active working directory.
+2. Turn-end capture stores the trajectory and surrounding context.
+3. Search/rerank uses cwd/workspace metadata and later `feedback`/`outcome` signals to adjust future rankings.
+4. The agent should call `feedback` with `+1`/`-1` item feedback after retrieval, and call `outcome` for broader task success/failure when it can identify the relevant entity IDs.
 
 Default endpoint:
 
@@ -476,7 +510,7 @@ Harness config behavior:
 
 - Claude Code: patches `~/.claude/settings.json` with `UserPromptSubmit`, `Stop`, `SubagentStop`, and `PreCompact` hooks, with a timestamped backup.
 - Hermes: patches `~/.hermes/config.yaml` only when the existing `hooks` block is empty, with a timestamped backup.
-- Codex: installs wrapper commands and writes `codex-hooks-note.md`; use the existing MCP config path unless the local Codex build exposes lifecycle hook config.
+- Codex: patches `~/.codex/hooks.json` with `UserPromptSubmit`, `Stop`, `SubagentStop`, and `PreCompact` hooks when that file is available or can be created, with a timestamped backup when modifying an existing file.
 
 For a config-only dry run that still refreshes wrapper scripts but does not patch harness config files:
 
@@ -489,7 +523,22 @@ Manual merge snippets are always written:
 ```text
 ~/.config/ferrosa-memory/hooks/claude-settings-snippet.json
 ~/.config/ferrosa-memory/hooks/hermes-hooks-snippet.yaml
-~/.config/ferrosa-memory/hooks/codex-hooks-note.md
+~/.config/ferrosa-memory/hooks/codex-hooks-snippet.json
+```
+
+Hook environment knobs live in:
+
+```text
+~/.config/ferrosa-memory/hooks/env
+```
+
+Important defaults:
+
+```bash
+export FERROSA_MEMORY_HOOK_TIMEOUT=${FERROSA_MEMORY_HOOK_TIMEOUT:-8}
+export FERROSA_MEMORY_HOOK_SEARCH_LIMIT=${FERROSA_MEMORY_HOOK_SEARCH_LIMIT:-5}
+export FERROSA_MEMORY_HOOK_CAPTURE_SEGMENTS=${FERROSA_MEMORY_HOOK_CAPTURE_SEGMENTS:-true}
+export FERROSA_MEMORY_HOOK_EMBED_MISSING=${FERROSA_MEMORY_HOOK_EMBED_MISSING:-false}
 ```
 
 Hook safety rules:
@@ -498,6 +547,7 @@ Hook safety rules:
 - Hooks must not block session shutdown on long consolidation jobs.
 - Hooks must not ingest secrets or full environment dumps.
 - Hooks must be idempotent and safe to retry.
+- Keep `FERROSA_MEMORY_HOOK_EMBED_MISSING=false` until an embedding provider is configured. Set it to `true` for higher semantic recall once Nomic/Ollama or another provider is healthy.
 
 ---
 
@@ -509,7 +559,7 @@ Once the stack and MCP client work, run these examples.
 
 ```json
 {
-  "tool": "smart_ingest",
+  "tool": "ingest",
   "arguments": {
     "entity_name": "Ferrosa Memory onboarding",
     "entity_type": "concept",
@@ -547,7 +597,7 @@ To reduce token usage at runtime, call:
 {
   "tool": "write_temporal_fact",
   "arguments": {
-    "entity_id": "<entity UUID from smart_ingest>",
+    "entity_id": "<entity UUID from ingest>",
     "fact_text": "Initial local onboarding completed successfully."
   }
 }
@@ -564,7 +614,70 @@ To reduce token usage at runtime, call:
 
 ---
 
-## Phase 14 — Troubleshooting checklist
+## Phase 14 — Long-recall defaults and eval profile
+
+For local 0.13 preview installs, verify the runtime config uses:
+
+```toml
+[retrieval]
+default_limit = 10
+
+[embeddings]
+provider = "ollama"
+model = "nomic-embed-text-v2-moe"
+dimensions = 768
+
+[eval]
+retrieval_k = 25
+```
+
+`default_limit = 10` is the live agent default. It keeps normal memory turns compact. If a user reports token churn, lower it with the `config` MCP tool; if a benchmark needs wider recall, set the eval runner's candidate parameters instead of raising the live default.
+
+The current best-known BRIGHT-Pro support-doc-closed MCP slice settings are:
+
+```text
+candidate_limit=50
+fusion_profile=all
+query_decomposition=llm
+query_task=bright_pro
+query_variant_limit=5
+query_embed_variants=true
+chunk_expansion=none
+rerank=false
+```
+
+That profile measured alpha_nDCG `0.816`, NDCG `0.799`, aspect_recall `0.940`, and recall `0.796` on the 200-document biology support-closed slice. Treat these as preview slice numbers, not a full-corpus paper comparison.
+
+Optional local judge/reranker settings:
+
+```toml
+[judge]
+enabled = false
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+model = "qwen2.5-coder:7b"
+timeout_seconds = 60
+```
+
+Keep live judge disabled unless the machine has a warm local or remote model endpoint. Judge failures or no-decisions should be recorded as abstentions (`"-"`), while agent/user feedback should use `+1` and `-1` scores so the reranker can learn by workspace and retrieval channel.
+
+Useful eval commands:
+
+```bash
+scripts/run-official-evals.sh --self-test
+
+FMEM_EVAL_QUERY_DECOMPOSITION=llm \
+FMEM_EVAL_QUERY_EMBED_VARIANTS=true \
+scripts/run-fusion-ablations.sh
+
+scripts/start-bright-pro-full-load.sh
+```
+
+The full-corpus loader writes `heartbeat.json`, `progress.json`, and `load.log` under `diagnostics/eval-runs/...`. It is intentionally resumable and observable because full BRIGHT-Pro ingestion is large.
+
+---
+
+## Phase 15 — Troubleshooting checklist
 
 | Symptom | First checks |
 |---|---|
@@ -572,7 +685,7 @@ To reduce token usage at runtime, call:
 | `ready` fails but `live` works | Check CQL contact points, auth, and node health. |
 | `get_stats` times out | Check all three Ferrosa nodes, recent replay/OOM logs, and CQL read timeouts. |
 | All tools return 504 immediately after restart | ANN index cold-load: Ferrosa rebuilds its vector index in memory before serving queries. With a large entity store this takes several minutes. Wait and retry. |
-| `smart_ingest` reports success but entities are missing on retrieval | Ferrosa drops role GRANTs on restart. Re-run `GRANT ALL PERMISSIONS ON KEYSPACE agent_memory TO ferrosa_user` before starting ferrosa-memory-mcp. |
+| `ingest` reports success but entities are missing on retrieval | Ferrosa drops role GRANTs on restart. Re-run `GRANT ALL PERMISSIONS ON KEYSPACE agent_memory TO ferrosa_user` before starting ferrosa-memory-mcp. |
 | `/health` fails | `/health` is an alias of `/healthz/live`; check whether the listener is HTTP or HTTPS, host-networked or port-mapped, and whether a proxy/tunnel is intercepting the host/port. Prefer `127.0.0.1` for bind-specific local stacks. |
 | Claude/Codex cannot see tools | Verify the harness MCP config path and restart the harness. |
 | Hermes tools list is stale | Run `/reload-mcp` in a new session after fmem health is green. |

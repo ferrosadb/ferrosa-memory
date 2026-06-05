@@ -10,7 +10,7 @@
 //! - `tools/call` — dispatches to the named tool handler
 //! - `notifications/initialized` — client acknowledgment (no-op)
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -34,6 +34,10 @@ const BATCH_MUTATION_CONCURRENCY: usize = 16;
 const MIN_RETRIEVAL_LIMIT: usize = 1;
 const MAX_RETRIEVAL_LIMIT: usize = 50;
 const DEFAULT_RETRIEVAL_LIMIT: usize = 10;
+const LLM_RERANK_MIN_CANDIDATES: usize = 2;
+const LLM_RERANK_HARD_MAX_CANDIDATES: usize = 50;
+const LLM_RERANK_MIN_SCORE_COVERAGE: usize = 5;
+const LLM_RERANK_BATCH_SIZE: usize = 5;
 
 type ToolDispatchFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Value, (i32, String)>> + Send + 'a>>;
@@ -80,7 +84,7 @@ const INGEST_HINTS: &[&str] = &[
     "People, roles, and relationships mentioned? Those build context over time.",
     "Debugging insights — what caused a bug, what fixed it — save future you the trouble.",
     "Configuration gotchas and environment details are easy to forget. Ingest them.",
-    "What did you learn about how this codebase works? That's worth a smart_ingest.",
+    "What did you learn about how this codebase works? That's worth an ingest.",
     "Any surprising behavior or non-obvious design choices? Those are prime memory candidates.",
 ];
 
@@ -195,11 +199,13 @@ pub struct SessionState {
     pub last_consolidation_status: Arc<Mutex<HashMap<uuid::Uuid, ConsolidationRunStatus>>>,
     /// Last retrieval result ids/sources by session, used by feedback-on-last-call.
     pub last_retrieval: Arc<Mutex<HashMap<uuid::Uuid, LastRetrievalCall>>>,
-    /// Base URL for the Ollama API (used for embeddings and NER extraction).
+    /// Embedding provider used for semantic vectors (`ollama`, `synthetic`, or disabled).
+    pub embed_provider: String,
+    /// Base URL for the Ollama API (used for Ollama embeddings and NER extraction).
     pub ollama_base_url: String,
     /// Model name for NER entity extraction via Ollama.
     pub ner_model: String,
-    /// Model name for text embedding via Ollama (default nomic-embed-text-v2-moe).
+    /// Model name for text embedding (default nomic-embed-text-v2-moe).
     pub embed_model: String,
     /// Expected embedding dimensions (default 768).
     pub embed_dimensions: u32,
@@ -233,6 +239,7 @@ impl Default for SessionState {
             smart_ingest_created_since_consolidation: Arc::new(Mutex::new(HashMap::new())),
             last_consolidation_status: Arc::new(Mutex::new(HashMap::new())),
             last_retrieval: Arc::new(Mutex::new(HashMap::new())),
+            embed_provider: "ollama".to_string(),
             ollama_base_url: "http://127.0.0.1:11434".to_string(),
             ner_model: "qwen3.5:27b".to_string(),
             embed_model: "nomic-embed-text-v2-moe".to_string(),
@@ -885,7 +892,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "record_feedback".into(),
-            description: "Records feedback on the most recent hybrid_search result set for this session.\n\nCALL WHEN: Retrieved memories were clearly helpful, irrelevant, or wrong for the current working directory. Cheapest form: pass scores in last-result order, where 1=helpful, -1=irrelevant/wrong, 0=neutral/skip. Include cwd so future searches in the same directory are reranked dynamically.\nCost: ~5ms + small entity property updates.".into(),
+            description: "Records feedback on the most recent hybrid_search result set for this session.\n\nCALL WHEN: Retrieved memories were clearly helpful, irrelevant, wrong, or impossible to judge for the current working directory. Cheapest form: pass scores in last-result order, where 1=helpful, -1=irrelevant/wrong, 0=neutral, and \"-\"=judge abstained/failed. Include cwd so future searches in the same directory are reranked dynamically.\nCost: ~5ms + small entity property updates.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -893,9 +900,10 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                     "relevant": { "type": "boolean", "description": "Fallback when scores is omitted: apply one relevance label to all last results." },
                     "scores": {
                         "type": "array",
-                        "items": { "type": "integer", "minimum": -1, "maximum": 1 },
-                        "description": "Per-result feedback in last retrieval order. 1=helpful, -1=irrelevant/wrong, 0=neutral/skip."
+                        "items": {},
+                        "description": "Per-result feedback in last retrieval order. 1=helpful, -1=irrelevant/wrong, 0=neutral, \"-\" or null=judge abstained/failed."
                     },
+                    "judge": { "type": "string", "maxLength": 64, "description": "Who made this judgment, e.g. caller_llm, human, judge_model. Scores from multiple judges are summed; abstentions are tracked separately." },
                     "cwd": { "type": "string", "maxLength": 1024 },
                     "reason": { "type": "string", "maxLength": 1024 },
                     "entity_ids": {
@@ -1117,7 +1125,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
         // --- Temporal fact tools ---
         ToolDef {
             name: "write_temporal_fact".into(),
-            description: "Records a timestamped fact about an entity. Auto-supersedes the previous fact, preserving history.\n\nCALL WHEN facts change over time — this is how you track evolution:\n- Role changes: 'Alice is now VP' supersedes 'Alice is Director'\n- Status updates: 'deploy succeeded' supersedes 'deploy in progress'\n- Project state: 'using Rust 1.82' supersedes 'using Rust 1.78'\n- Preference changes: 'user prefers dark mode' supersedes 'user likes light mode'\n- Bug status: 'fixed in commit abc' supersedes 'investigating OOM'\n\nFirst call smart_ingest to create the entity, then write_temporal_fact for facts that evolve. The supersession chain is queryable — you can answer 'what was X before?'\n\nReturns: event_id of the new fact.\nCost: ~5ms.".into(),
+            description: "Records a timestamped fact about an entity. Auto-supersedes the previous fact, preserving history.\n\nCALL WHEN facts change over time — this is how you track evolution:\n- Role changes: 'Alice is now VP' supersedes 'Alice is Director'\n- Status updates: 'deploy succeeded' supersedes 'deploy in progress'\n- Project state: 'using Rust 1.82' supersedes 'using Rust 1.78'\n- Preference changes: 'user prefers dark mode' supersedes 'user likes light mode'\n- Bug status: 'fixed in commit abc' supersedes 'investigating OOM'\n\nFirst call ingest to create the entity, then write_temporal_fact for facts that evolve. The supersession chain is queryable — you can answer 'what was X before?'\n\nReturns: event_id of the new fact.\nCost: ~5ms.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1178,6 +1186,70 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                     },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Max results to return (default: 10)" },
                     "offset": { "type": "integer", "minimum": 0, "maximum": 49, "description": "Skip this many fused results for pagination. Use offset=5 after scoring the first 5 as irrelevant." },
+                    "candidate_limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "description": "Per-source candidate fanout before fusion. Defaults to min(limit*2, 50); lower it to reduce retrieval work."
+                    },
+                    "fusion_profile": {
+                        "type": "string",
+                        "enum": ["default", "all", "bm25-only", "semantic-only", "bm25-semantic", "bm25-semantic-phonetic", "bm25-semantic-phonetic-workspace"],
+                        "description": "Named source-weight profile for ablations. Defaults to all."
+                    },
+                    "fusion_weights": {
+                        "type": "object",
+                        "description": "Optional numeric source weight overrides, e.g. {\"document_bm25\":2.5,\"document_ann\":1.5,\"document_phonetic\":0}."
+                    },
+                    "query_decomposition": {
+                        "type": "string",
+                        "enum": ["none", "heuristic", "llm"],
+                        "description": "Generate bounded query variants and RRF-union their candidate sets before reranking. llm uses the configured judge model. Default none."
+                    },
+                    "query_task": {
+                        "type": "string",
+                        "enum": ["general", "bright_pro", "memorybench"],
+                        "description": "Task hint for query decomposition prompt shaping. Default general."
+                    },
+                    "query_variants": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": {"type": "string", "maxLength": 2048},
+                        "description": "Caller-provided extra query variants to union with the primary query."
+                    },
+                    "query_variant_limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 8,
+                        "description": "Maximum total query variants, including the original query. Default 5."
+                    },
+                    "query_embed_variants": {
+                        "type": "boolean",
+                        "description": "When true and an embedding provider is configured, embed each query variant separately. Default false."
+                    },
+                    "chunk_expansion": {
+                        "type": "string",
+                        "enum": ["none", "neighbors"],
+                        "description": "Expand document_chunk hits before reranking/returning. neighbors adds bounded prev/next chunks."
+                    },
+                    "chunk_prev": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 5,
+                        "description": "Previous document chunks to include when chunk_expansion=neighbors."
+                    },
+                    "chunk_next": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 5,
+                        "description": "Next document chunks to include when chunk_expansion=neighbors."
+                    },
+                    "chunk_max_tokens": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 8000,
+                        "description": "Approximate added-token budget per result for chunk expansion."
+                    },
                     "scope": {
                         "type": "string",
                         "enum": ["session", "global", "both"],
@@ -1196,6 +1268,16 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                         "type": "string",
                         "maxLength": 1024,
                         "description": "Alias for cwd; explicit workspace path used for reranking affinity."
+                    },
+                    "rerank": {
+                        "type": "boolean",
+                        "description": "Override live LLM reranking for this call. Defaults to [judge].enabled."
+                    },
+                    "rerank_candidates": {
+                        "type": "integer",
+                        "minimum": 2,
+                        "maximum": 50,
+                        "description": "Override how many top candidates the judge reranker sees. Keep small for token economy; evals may use 25."
                     }
                 },
                 "required": ["query"]
@@ -1704,13 +1786,13 @@ SESSION START: (1) check_intentions with current context, (2) hybrid_search for 
 
 SEARCHING: hybrid_search first. If it returns what you need, you're done — no need to grep or read files. For document_chunk hits, call chunk_ctx when adjacent chunks or split list items could contain the rest of the answer. If the first page is irrelevant, send compact +1/-1 item feedback with feedback, then request the next page before falling back to grep/find/read.
 
-STORING: Use smart_ingest for new knowledge. It decides CREATE/UPDATE/SUPERSEDE/SKIP. Store insights, decisions, relationships, and facts — not raw file contents.
+STORING: Use ingest for new knowledge. It decides CREATE/UPDATE/SUPERSEDE/SKIP. Store insights, decisions, relationships, and facts — not raw file contents.
 
 CONNECTING: After learning 2+ related facts, use create_edge to link them. Types: depends_on, contains, part_of, related_to, calls, implements, uses, references. Connected facts are knowledge; isolated facts are just data.
 
 INTENTIONS: set_intention for deferred actions. check_intentions at session start. Triggers: Topic, FilePattern, Duration, Context.
 
-CONSOLIDATION: The server automatically queues consolidation after enough new smart_ingest entities. Use run_consolidation only to force a background consolidation request, such as at wrap-up.
+CONSOLIDATION: The server automatically queues consolidation after enough new ingest-created entities. Use run_consolidation only to force a background consolidation request, such as at wrap-up.
 
 FEEDBACK: If you had to use grep, find, or read files to get context that SHOULD have been in memory, call record_outcome with program_type="retrieval_miss" and include what you were looking for. This trains the system to store that kind of information in the future. Every retrieval miss is a signal to improve."#;
 
@@ -2468,7 +2550,7 @@ async fn handle_ingest_context_segments<S: crate::storage::Storage>(
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
-    let embeddings = if embed_missing && !session.ollama_base_url.is_empty() {
+    let embeddings = if embed_missing {
         let preview = crate::context_segment::segment_messages(
             session_id,
             &conversation_id,
@@ -2476,24 +2558,41 @@ async fn handle_ingest_context_segments<S: crate::storage::Storage>(
             &segmentation,
         )
         .map_err(|e| (INVALID_PARAMS, e.to_string()))?;
-        let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
-            provider: "ollama".into(),
-            ollama_base_url: session.ollama_base_url.clone(),
-            model: session.embed_model.clone(),
-            dimensions: session.embed_dimensions,
-            max_input_chars: crate::config::EmbeddingConfig::default().max_input_chars,
-            ner_model: String::new(),
-        });
+        let Some(client) = session_embedding_client(session) else {
+            return serde_json::to_value(
+                crate::context_segment::ingest_context_segments(
+                    storage,
+                    ctx,
+                    IngestContextSegmentsParams {
+                        session_id,
+                        conversation_id,
+                        messages,
+                        segmentation,
+                        embed_missing,
+                    },
+                    None,
+                )
+                .await
+                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?,
+            )
+            .map_err(|e| (INTERNAL_ERROR, e.to_string()));
+        };
         let mut vectors = Vec::with_capacity(preview.len());
+        let mut failed = false;
         for segment in preview {
-            vectors.push(
-                client
-                    .embed(&segment.segment_text)
-                    .await
-                    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?,
-            );
+            match client.embed(&segment.segment_text).await {
+                Ok(vector) => vectors.push(vector),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "context segment embedding generation failed; storing segments without vectors"
+                    );
+                    failed = true;
+                    break;
+                }
+            }
         }
-        Some(vectors)
+        if failed { None } else { Some(vectors) }
     } else {
         None
     };
@@ -2524,15 +2623,9 @@ async fn handle_search_context_segments<S: crate::storage::Storage>(
     let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
     let query = require_str(&args, "query")?.to_string();
     let mut query_embedding = optional_f32_array(&args, "query_embedding")?;
-    if query_embedding.is_none() && !session.ollama_base_url.is_empty() {
-        let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
-            provider: "ollama".into(),
-            ollama_base_url: session.ollama_base_url.clone(),
-            model: session.embed_model.clone(),
-            dimensions: session.embed_dimensions,
-            max_input_chars: crate::config::EmbeddingConfig::default().max_input_chars,
-            ner_model: String::new(),
-        });
+    if query_embedding.is_none()
+        && let Some(client) = session_embedding_client(session)
+    {
         match client.embed(&query).await {
             Ok(embedding) => query_embedding = Some(embedding),
             Err(e) => tracing::debug!("context segment query embedding skipped: {e}"),
@@ -2719,15 +2812,9 @@ async fn handle_upsert_entity<S: crate::storage::Storage>(
     let confidence = args.get("confidence").and_then(|v| v.as_f64());
 
     // Auto-generate embedding if not provided and Ollama is configured.
-    if embedding.is_none() && !session.ollama_base_url.is_empty() {
-        let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
-            provider: "ollama".into(),
-            ollama_base_url: session.ollama_base_url.clone(),
-            model: session.embed_model.clone(),
-            dimensions: session.embed_dimensions,
-            max_input_chars: crate::config::EmbeddingConfig::default().max_input_chars,
-            ner_model: String::new(),
-        });
+    if embedding.is_none()
+        && let Some(client) = session_embedding_client(session)
+    {
         match client.embed(context_snippet).await {
             Ok(emb) => embedding = Some(emb),
             Err(e) => tracing::debug!("embedding generation skipped: {e}"),
@@ -3020,23 +3107,39 @@ fn validate_json_object(value: Option<&Value>, field: &str) -> Result<(), String
     }
 }
 
+fn embedding_provider_is_disabled(provider: &str) -> bool {
+    let provider = provider.trim();
+    provider.is_empty()
+        || provider.eq_ignore_ascii_case("disabled")
+        || provider.eq_ignore_ascii_case("none")
+}
+
+fn embedding_provider_requires_url(provider: &str) -> bool {
+    !provider.eq_ignore_ascii_case("synthetic")
+}
+
 fn build_ingest_embedding_client(
     session: &SessionState,
     override_model: Option<&str>,
 ) -> Option<crate::embedding::EmbeddingClient> {
-    if session.ollama_base_url.is_empty() {
+    if embedding_provider_is_disabled(&session.embed_provider) {
+        return None;
+    }
+    if embedding_provider_requires_url(&session.embed_provider)
+        && session.ollama_base_url.is_empty()
+    {
         return None;
     }
     let model = override_model
         .filter(|m| !m.is_empty())
         .unwrap_or(&session.embed_model)
         .to_string();
-    if model.is_empty() {
+    if model.is_empty() && !session.embed_provider.eq_ignore_ascii_case("synthetic") {
         return None;
     }
     Some(crate::embedding::EmbeddingClient::new(
         &crate::config::EmbeddingConfig {
-            provider: "ollama".into(),
+            provider: session.embed_provider.clone(),
             ollama_base_url: session.ollama_base_url.clone(),
             model,
             dimensions: session.embed_dimensions,
@@ -3044,6 +3147,10 @@ fn build_ingest_embedding_client(
             ner_model: String::new(),
         },
     ))
+}
+
+fn session_embedding_client(session: &SessionState) -> Option<crate::embedding::EmbeddingClient> {
+    build_ingest_embedding_client(session, None)
 }
 
 #[derive(Default)]
@@ -4230,15 +4337,9 @@ async fn handle_retrieve_entities<S: crate::storage::Storage>(
     let mut embedding = optional_f32_array(&args, "embedding")?;
 
     // Auto-generate query embedding for ANN search if Ollama is configured.
-    if embedding.is_none() && !session.ollama_base_url.is_empty() {
-        let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
-            provider: "ollama".into(),
-            ollama_base_url: session.ollama_base_url.clone(),
-            model: session.embed_model.clone(),
-            dimensions: session.embed_dimensions,
-            max_input_chars: crate::config::EmbeddingConfig::default().max_input_chars,
-            ner_model: String::new(),
-        });
+    if embedding.is_none()
+        && let Some(client) = session_embedding_client(session)
+    {
         match client.embed(query).await {
             Ok(emb) => embedding = Some(emb),
             Err(e) => tracing::debug!("query embedding generation skipped: {e}"),
@@ -4547,19 +4648,28 @@ fn workspace_feedback_key(cwd: &str) -> String {
     format!("cwd:{}", hex::encode(&digest[..8]))
 }
 
+struct WorkspaceFeedbackUpdate<'a> {
+    session_id: uuid::Uuid,
+    entity_id: uuid::Uuid,
+    cwd: &'a str,
+    source: &'a str,
+    judge_source: &'a str,
+    score_delta: Option<f64>,
+    judgment: Option<i64>,
+}
+
 async fn update_workspace_feedback<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
-    session_id: uuid::Uuid,
-    entity_id: uuid::Uuid,
-    cwd: &str,
-    source: &str,
-    score_delta: f64,
+    update: WorkspaceFeedbackUpdate<'_>,
 ) -> anyhow::Result<bool> {
-    if cwd.trim().is_empty() {
+    if update.cwd.trim().is_empty() {
         return Ok(false);
     }
-    let Some(mut entity) = storage.entity_get_by_id(ctx, session_id, entity_id).await? else {
+    let Some(mut entity) = storage
+        .entity_get_by_id(ctx, update.session_id, update.entity_id)
+        .await?
+    else {
         return Ok(false);
     };
     let mut properties = entity.properties.clone();
@@ -4574,39 +4684,46 @@ async fn update_workspace_feedback<S: crate::storage::Storage>(
         *feedback = serde_json::json!({});
     }
     let feedback_obj = feedback.as_object_mut().expect("object set above");
-    let key = workspace_feedback_key(cwd);
+    let key = workspace_feedback_key(update.cwd);
     let entry = feedback_obj.entry(key).or_insert_with(|| {
         serde_json::json!({
-            "cwd": cwd,
+            "cwd": update.cwd,
             "score": 0.0,
             "positives": 0,
             "negatives": 0,
+            "neutrals": 0,
+            "abstentions": 0,
             "mechanisms": {}
         })
     });
     if !entry.is_object() {
         *entry = serde_json::json!({
-            "cwd": cwd,
+            "cwd": update.cwd,
             "score": 0.0,
             "positives": 0,
             "negatives": 0,
+            "neutrals": 0,
+            "abstentions": 0,
             "mechanisms": {}
         });
     }
     let entry_obj = entry.as_object_mut().expect("object set above");
-    entry_obj.insert("cwd".into(), Value::String(cwd.to_string()));
-    let current_score = entry_obj
-        .get("score")
-        .and_then(|value| value.as_f64())
-        .unwrap_or(0.0);
-    entry_obj.insert(
-        "score".into(),
-        serde_json::json!((current_score + score_delta).clamp(-1.0, 1.0)),
-    );
-    let count_key = if score_delta >= 0.0 {
-        "positives"
-    } else {
-        "negatives"
+    entry_obj.insert("cwd".into(), Value::String(update.cwd.to_string()));
+    if let Some(score_delta) = update.score_delta {
+        let current_score = entry_obj
+            .get("score")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0);
+        entry_obj.insert(
+            "score".into(),
+            serde_json::json!(current_score + score_delta),
+        );
+    }
+    let count_key = match update.judgment {
+        Some(score) if score > 0 => "positives",
+        Some(score) if score < 0 => "negatives",
+        Some(_) => "neutrals",
+        None => "abstentions",
     };
     let count = entry_obj
         .get(count_key)
@@ -4620,34 +4737,85 @@ async fn update_workspace_feedback<S: crate::storage::Storage>(
         *mechanisms = serde_json::json!({});
     }
     let mechanisms_obj = mechanisms.as_object_mut().expect("object set above");
-    let mechanism = mechanisms_obj.entry(source.to_string()).or_insert_with(|| {
-        serde_json::json!({
-            "score": 0.0,
-            "positives": 0,
-            "negatives": 0
-        })
-    });
+    let mechanism = mechanisms_obj
+        .entry(update.source.to_string())
+        .or_insert_with(|| {
+            serde_json::json!({
+                "score": 0.0,
+                "positives": 0,
+                "negatives": 0,
+                "neutrals": 0,
+                "abstentions": 0,
+                "judges": {}
+            })
+        });
     if !mechanism.is_object() {
         *mechanism = serde_json::json!({
             "score": 0.0,
             "positives": 0,
-            "negatives": 0
+            "negatives": 0,
+            "neutrals": 0,
+            "abstentions": 0,
+            "judges": {}
         });
     }
     let mechanism_obj = mechanism.as_object_mut().expect("object set above");
-    let mechanism_score = mechanism_obj
-        .get("score")
-        .and_then(|value| value.as_f64())
-        .unwrap_or(0.0);
-    mechanism_obj.insert(
-        "score".into(),
-        serde_json::json!((mechanism_score + score_delta).clamp(-1.0, 1.0)),
-    );
+    if let Some(score_delta) = update.score_delta {
+        let mechanism_score = mechanism_obj
+            .get("score")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0);
+        mechanism_obj.insert(
+            "score".into(),
+            serde_json::json!(mechanism_score + score_delta),
+        );
+    }
     let count = mechanism_obj
         .get(count_key)
         .and_then(|value| value.as_i64())
         .unwrap_or(0);
     mechanism_obj.insert(count_key.into(), serde_json::json!(count + 1));
+
+    let judges = mechanism_obj
+        .entry("judges")
+        .or_insert_with(|| serde_json::json!({}));
+    if !judges.is_object() {
+        *judges = serde_json::json!({});
+    }
+    let judges_obj = judges.as_object_mut().expect("object set above");
+    let judge = judges_obj
+        .entry(update.judge_source.to_string())
+        .or_insert_with(|| {
+            serde_json::json!({
+                "score": 0.0,
+                "positives": 0,
+                "negatives": 0,
+                "neutrals": 0,
+                "abstentions": 0
+            })
+        });
+    if !judge.is_object() {
+        *judge = serde_json::json!({
+            "score": 0.0,
+            "positives": 0,
+            "negatives": 0,
+            "neutrals": 0,
+            "abstentions": 0
+        });
+    }
+    let judge_obj = judge.as_object_mut().expect("object set above");
+    if let Some(score_delta) = update.score_delta {
+        let judge_score = judge_obj
+            .get("score")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0);
+        judge_obj.insert("score".into(), serde_json::json!(judge_score + score_delta));
+    }
+    let count = judge_obj
+        .get(count_key)
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0);
+    judge_obj.insert(count_key.into(), serde_json::json!(count + 1));
 
     entity.properties = properties;
     entity.updated_at = Some(chrono::Utc::now());
@@ -4719,11 +4887,15 @@ async fn handle_record_outcome<S: crate::storage::Storage>(
                             match update_workspace_feedback(
                                 storage,
                                 ctx,
-                                session_id,
-                                eid,
-                                cwd,
-                                source,
-                                if succeeded { 0.10 } else { -0.20 },
+                                WorkspaceFeedbackUpdate {
+                                    session_id,
+                                    entity_id: eid,
+                                    cwd,
+                                    source,
+                                    judge_source: "outcome",
+                                    score_delta: Some(if succeeded { 0.10 } else { -0.20 }),
+                                    judgment: Some(if succeeded { 1 } else { -1 }),
+                                },
                             )
                             .await
                             {
@@ -4764,7 +4936,7 @@ async fn handle_record_outcome<S: crate::storage::Storage>(
     });
     if program_type == "retrieval_miss" {
         response["_hint"] = serde_json::json!(
-            "Retrieval miss logged. The system will learn to store this kind of information. Consider using smart_ingest now to store what you found via grep/read."
+            "Retrieval miss logged. The system will learn to store this kind of information. Consider using ingest now to store what you found via grep/read."
         );
     } else {
         response["_hint"] = serde_json::json!(
@@ -4798,14 +4970,10 @@ async fn handle_record_feedback<S: crate::storage::Storage>(
                 .filter_map(|value| value.as_str()?.parse::<uuid::Uuid>().ok())
                 .collect()
         });
-    let scores: Vec<i64> = args
+    let scores: Vec<Option<i64>> = args
         .get("scores")
         .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .map(|value| value.as_i64().unwrap_or(0).clamp(-1, 1))
-                .collect()
-        })
+        .map(|arr| arr.iter().map(parse_judge_score_value).collect())
         .unwrap_or_default();
     let fallback_score = args
         .get("relevant")
@@ -4823,9 +4991,16 @@ async fn handle_record_feedback<S: crate::storage::Storage>(
         .or(last.cwd.as_deref())
         .unwrap_or("");
     let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+    let judge_source = args
+        .get("judge")
+        .or_else(|| args.get("feedback_source"))
+        .or_else(|| args.get("source"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("caller_llm");
 
     let mut updated = Vec::new();
     let mut skipped = 0usize;
+    let mut abstained = 0usize;
     for (idx, result) in last.results.iter().enumerate() {
         if requested_subset
             .as_ref()
@@ -4834,14 +5009,59 @@ async fn handle_record_feedback<S: crate::storage::Storage>(
             skipped += 1;
             continue;
         }
-        let score = scores
-            .get(idx)
-            .copied()
-            .or(fallback_score)
-            .unwrap_or(0)
-            .clamp(-1, 1);
+        let score = scores.get(idx).copied().flatten().or(fallback_score);
+        let Some(score) = score else {
+            abstained += 1;
+            if !cwd.is_empty()
+                && let Err(e) = update_workspace_feedback(
+                    storage,
+                    ctx,
+                    WorkspaceFeedbackUpdate {
+                        session_id,
+                        entity_id: result.entity_id,
+                        cwd,
+                        source: &result.source,
+                        judge_source,
+                        score_delta: None,
+                        judgment: None,
+                    },
+                )
+                .await
+            {
+                tracing::warn!(entity_id = %result.entity_id, error = %e, "workspace feedback abstention update failed");
+            }
+            updated.push(serde_json::json!({
+                "entity_id": result.entity_id,
+                "source": result.source,
+                "score": "-"
+            }));
+            continue;
+        };
+        let score = score.clamp(-1, 1);
         if score == 0 {
-            skipped += 1;
+            if !cwd.is_empty()
+                && let Err(e) = update_workspace_feedback(
+                    storage,
+                    ctx,
+                    WorkspaceFeedbackUpdate {
+                        session_id,
+                        entity_id: result.entity_id,
+                        cwd,
+                        source: &result.source,
+                        judge_source,
+                        score_delta: Some(0.0),
+                        judgment: Some(0),
+                    },
+                )
+                .await
+            {
+                tracing::warn!(entity_id = %result.entity_id, error = %e, "workspace neutral feedback update failed");
+            }
+            updated.push(serde_json::json!({
+                "entity_id": result.entity_id,
+                "source": result.source,
+                "score": 0
+            }));
             continue;
         }
         let succeeded = score > 0;
@@ -4861,11 +5081,15 @@ async fn handle_record_feedback<S: crate::storage::Storage>(
             && let Err(e) = update_workspace_feedback(
                 storage,
                 ctx,
-                session_id,
-                result.entity_id,
-                cwd,
-                &result.source,
-                if succeeded { 0.10 } else { -0.20 },
+                WorkspaceFeedbackUpdate {
+                    session_id,
+                    entity_id: result.entity_id,
+                    cwd,
+                    source: &result.source,
+                    judge_source,
+                    score_delta: Some(if succeeded { 0.10 } else { -0.20 }),
+                    judgment: Some(score),
+                },
             )
             .await
         {
@@ -4902,9 +5126,11 @@ async fn handle_record_feedback<S: crate::storage::Storage>(
         "query_id": last.query_id,
         "query": last.query,
         "cwd": cwd,
+        "judge": judge_source,
         "updated": updated,
         "skipped": skipped,
-        "hint": "Feedback recorded. Future hybrid_search calls with the same cwd will boost +1 items and demote -1 items."
+        "abstained": abstained,
+        "hint": "Feedback recorded. Future hybrid_search calls with the same cwd will sum valid judge scores and track '-' abstentions separately."
     }))
 }
 
@@ -4971,15 +5197,9 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
     let source_fold_id = optional_uuid(&args, "source_fold_id")?;
 
     // Auto-generate embedding if not provided and Ollama is configured.
-    if embedding.is_none() && !session.ollama_base_url.is_empty() {
-        let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
-            provider: "ollama".into(),
-            ollama_base_url: session.ollama_base_url.clone(),
-            model: session.embed_model.clone(),
-            dimensions: session.embed_dimensions,
-            max_input_chars: crate::config::EmbeddingConfig::default().max_input_chars,
-            ner_model: String::new(),
-        });
+    if embedding.is_none()
+        && let Some(client) = session_embedding_client(session)
+    {
         match client.embed(content).await {
             Ok(emb) => embedding = Some(emb),
             Err(e) => tracing::debug!("embedding generation skipped: {e}"),
@@ -5234,20 +5454,7 @@ async fn handle_ingest_skill<S: crate::storage::Storage>(
 
     // Build an embedding client from session config so description_embedding
     // is populated alongside the skill entity.
-    let embed_client = if !session.ollama_base_url.is_empty() {
-        Some(crate::embedding::EmbeddingClient::new(
-            &crate::config::EmbeddingConfig {
-                provider: "ollama".into(),
-                ollama_base_url: session.ollama_base_url.clone(),
-                model: session.embed_model.clone(),
-                dimensions: session.embed_dimensions,
-                max_input_chars: crate::config::EmbeddingConfig::default().max_input_chars,
-                ner_model: String::new(),
-            },
-        ))
-    } else {
-        None
-    };
+    let embed_client = session_embedding_client(session);
 
     let action = crate::skill::ingest_skill(
         storage,
@@ -5299,18 +5506,11 @@ async fn handle_retrieve_skills_for_context<S: crate::storage::Storage>(
             .filter_map(|n| n.as_f64().map(|f| f as f32))
             .collect::<Vec<f32>>()
     });
-    if query_embedding.is_none() && !session.ollama_base_url.is_empty() {
-        let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
-            provider: "ollama".into(),
-            ollama_base_url: session.ollama_base_url.clone(),
-            model: session.embed_model.clone(),
-            dimensions: session.embed_dimensions,
-            max_input_chars: crate::config::EmbeddingConfig::default().max_input_chars,
-            ner_model: String::new(),
-        });
-        if let Ok(emb) = client.embed(&context).await {
-            query_embedding = Some(emb);
-        }
+    if query_embedding.is_none()
+        && let Some(client) = session_embedding_client(session)
+        && let Ok(emb) = client.embed(&context).await
+    {
+        query_embedding = Some(emb);
     }
 
     // Used-in-session signal — retrieval_tracker records which entity_ids
@@ -5780,6 +5980,788 @@ async fn handle_explore_connections<S: crate::storage::Storage>(
 
 // --- Hybrid search handler ---
 
+#[derive(Debug, Clone)]
+struct LlmRerankReport {
+    enabled: bool,
+    applied: bool,
+    mode: String,
+    provider: String,
+    model: String,
+    candidate_count: usize,
+    returned_ids: Vec<uuid::Uuid>,
+    judged_ids: Vec<uuid::Uuid>,
+    judge_scores: Vec<Option<i64>>,
+    score_sum: i64,
+    abstentions: usize,
+    batches: Vec<LlmRerankBatchReport>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LlmRerankBatchReport {
+    start_rank: usize,
+    candidate_count: usize,
+    returned_ids: Vec<uuid::Uuid>,
+    judge_scores: Vec<Option<i64>>,
+    score_sum: i64,
+    abstentions: usize,
+    error: Option<String>,
+}
+
+impl LlmRerankReport {
+    fn disabled(config: &crate::config::JudgeConfig) -> Self {
+        Self {
+            enabled: false,
+            applied: false,
+            mode: "disabled".to_string(),
+            provider: config.provider.clone(),
+            model: config.model.clone(),
+            candidate_count: 0,
+            returned_ids: Vec::new(),
+            judged_ids: Vec::new(),
+            judge_scores: Vec::new(),
+            score_sum: 0,
+            abstentions: 0,
+            batches: Vec::new(),
+            error: None,
+        }
+    }
+
+    fn skipped(config: &crate::config::JudgeConfig, reason: impl Into<String>) -> Self {
+        Self {
+            enabled: config.enabled,
+            applied: false,
+            mode: "skipped".to_string(),
+            provider: config.provider.clone(),
+            model: config.model.clone(),
+            candidate_count: 0,
+            returned_ids: Vec::new(),
+            judged_ids: Vec::new(),
+            judge_scores: Vec::new(),
+            score_sum: 0,
+            abstentions: 0,
+            batches: Vec::new(),
+            error: Some(reason.into()),
+        }
+    }
+
+    fn skipped_with_count(
+        config: &crate::config::JudgeConfig,
+        candidate_count: usize,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            enabled: config.enabled,
+            applied: false,
+            mode: "skipped".to_string(),
+            provider: config.provider.clone(),
+            model: config.model.clone(),
+            candidate_count,
+            returned_ids: Vec::new(),
+            judged_ids: Vec::new(),
+            judge_scores: vec![None; candidate_count],
+            score_sum: 0,
+            abstentions: candidate_count,
+            batches: Vec::new(),
+            error: Some(reason.into()),
+        }
+    }
+}
+
+fn truncate_for_llm(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    text.chars().take(max_chars).collect::<String>()
+}
+
+fn rerank_candidate_content(result: &crate::hybrid_search::SearchResult) -> String {
+    if result.expanded_context.is_empty() {
+        return truncate_for_llm(&result.content, 500);
+    }
+    let mut text = format!("Hit chunk:\n{}", truncate_for_llm(&result.content, 360));
+    text.push_str("\n\nExpanded neighboring chunks:");
+    for chunk in &result.expanded_context {
+        text.push_str(&format!(
+            "\n[{}:{} tokens={}]\n{}",
+            chunk.position,
+            chunk.distance,
+            chunk.token_count,
+            truncate_for_llm(&chunk.content, 260)
+        ));
+    }
+    truncate_for_llm(&text, 1200)
+}
+
+fn parse_llm_rerank_json(raw: &str) -> Option<Value> {
+    let trimmed = raw.trim();
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        return Some(value);
+    }
+    let object = trimmed
+        .find('{')
+        .zip(trimmed.rfind('}'))
+        .and_then(|(start, end)| trimmed.get(start..=end))
+        .and_then(|slice| serde_json::from_str::<Value>(slice).ok());
+    if object.is_some() {
+        return object;
+    }
+    trimmed
+        .find('[')
+        .zip(trimmed.rfind(']'))
+        .and_then(|(start, end)| trimmed.get(start..=end))
+        .and_then(|slice| serde_json::from_str::<Value>(slice).ok())
+}
+
+fn parse_llm_rerank_order(raw: &str, candidate_ids: &[uuid::Uuid]) -> Vec<uuid::Uuid> {
+    let Some(value) = parse_llm_rerank_json(raw) else {
+        return Vec::new();
+    };
+    let candidate_set: std::collections::HashSet<uuid::Uuid> =
+        candidate_ids.iter().copied().collect();
+    let mut ordered = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    collect_rerank_ids(
+        &value,
+        candidate_ids,
+        &candidate_set,
+        &mut seen,
+        &mut ordered,
+    );
+    ordered
+}
+
+fn parse_llm_judge_scores(raw: &str, candidate_count: usize) -> Vec<Option<i64>> {
+    let Some(value) = parse_llm_rerank_json(raw) else {
+        return vec![None; candidate_count];
+    };
+    let scores_value = value.get("scores").or_else(|| value.get("judgments"));
+    match scores_value {
+        Some(Value::Array(values)) => {
+            let mut scores = values
+                .iter()
+                .take(candidate_count)
+                .map(parse_judge_score_value)
+                .collect::<Vec<_>>();
+            scores.resize(candidate_count, None);
+            scores
+        }
+        Some(Value::Object(values)) => {
+            let mut scores = vec![None; candidate_count];
+            for (key, value) in values {
+                let Ok(rank) = key.parse::<usize>() else {
+                    continue;
+                };
+                if rank == 0 || rank > candidate_count {
+                    continue;
+                }
+                scores[rank - 1] = parse_judge_score_value(value);
+            }
+            scores
+        }
+        _ => vec![None; candidate_count],
+    }
+}
+
+fn parse_judge_score_value(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) => number.as_i64().map(|score| score.clamp(-1, 1)),
+        Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed == "-" || trimmed.eq_ignore_ascii_case("abstain") {
+                None
+            } else {
+                trimmed.parse::<i64>().ok().map(|score| score.clamp(-1, 1))
+            }
+        }
+        Value::Bool(relevant) => Some(if *relevant { 1 } else { -1 }),
+        Value::Null => None,
+        _ => None,
+    }
+}
+
+fn collect_rerank_ids(
+    value: &Value,
+    candidate_ids: &[uuid::Uuid],
+    candidate_set: &std::collections::HashSet<uuid::Uuid>,
+    seen: &mut std::collections::HashSet<uuid::Uuid>,
+    ordered: &mut Vec<uuid::Uuid>,
+) {
+    match value {
+        Value::String(raw) => {
+            let trimmed = raw.trim().trim_matches('"');
+            if let Ok(id) = trimmed.parse::<uuid::Uuid>()
+                && candidate_set.contains(&id)
+                && seen.insert(id)
+            {
+                ordered.push(id);
+            }
+        }
+        Value::Number(number) => {
+            if let Some(raw) = number.as_u64()
+                && raw > 0
+                && let Some(id) = candidate_ids.get(raw as usize - 1).copied()
+                && seen.insert(id)
+            {
+                ordered.push(id);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_rerank_ids(value, candidate_ids, candidate_set, seen, ordered);
+            }
+        }
+        Value::Object(map) => {
+            for key in ["order", "ranking", "ids", "results", "ranked_ids"] {
+                if let Some(value) = map.get(key) {
+                    collect_rerank_ids(value, candidate_ids, candidate_set, seen, ordered);
+                    return;
+                }
+            }
+            if let Some(value) = map.get("id").or_else(|| map.get("entity_id")) {
+                collect_rerank_ids(value, candidate_ids, candidate_set, seen, ordered);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn apply_llm_rerank_order(
+    results: Vec<crate::hybrid_search::SearchResult>,
+    order: &[uuid::Uuid],
+    candidate_count: usize,
+) -> Vec<crate::hybrid_search::SearchResult> {
+    if order.is_empty() || candidate_count == 0 {
+        return results;
+    }
+    let split_at = results.len().min(candidate_count);
+    let mut top = results[..split_at].to_vec();
+    let tail = results[split_at..].to_vec();
+    let mut reranked = Vec::with_capacity(results.len());
+    for id in order {
+        if let Some(pos) = top.iter().position(|result| &result.id == id) {
+            reranked.push(top.remove(pos));
+        }
+    }
+    reranked.extend(top);
+    reranked.extend(tail);
+    reranked
+}
+
+fn apply_llm_rerank_decision(
+    results: Vec<crate::hybrid_search::SearchResult>,
+    order: &[uuid::Uuid],
+    judge_scores: &[Option<i64>],
+    candidate_count: usize,
+) -> Vec<crate::hybrid_search::SearchResult> {
+    if order.is_empty() || candidate_count == 0 {
+        return results;
+    }
+    let split_at = results.len().min(candidate_count);
+    let top = results[..split_at].to_vec();
+    let tail = results[split_at..].to_vec();
+    let order_rank = order
+        .iter()
+        .enumerate()
+        .map(|(idx, id)| (*id, idx))
+        .collect::<std::collections::HashMap<_, _>>();
+    let score_bucket = |idx: usize| match judge_scores.get(idx).copied().flatten() {
+        Some(score) if score > 0 => 0,
+        Some(score) if score < 0 => 2,
+        _ => 1,
+    };
+    let mut scored = top
+        .into_iter()
+        .enumerate()
+        .map(|(idx, result)| {
+            let bucket = score_bucket(idx);
+            let rank = order_rank
+                .get(&result.id)
+                .copied()
+                .unwrap_or(candidate_count + idx);
+            (bucket, rank, idx, result)
+        })
+        .collect::<Vec<_>>();
+    let scored_count = judge_scores
+        .iter()
+        .take(split_at)
+        .filter(|score| score.is_some())
+        .count();
+    let has_negative = judge_scores
+        .iter()
+        .take(split_at)
+        .any(|score| score.is_some_and(|score| score < 0));
+    let has_score_contrast = scored
+        .iter()
+        .map(|(bucket, _, _, _)| *bucket)
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        > 1
+        && (has_negative || scored_count >= split_at.min(LLM_RERANK_MIN_SCORE_COVERAGE));
+    if !has_score_contrast {
+        return apply_llm_rerank_order(
+            scored
+                .into_iter()
+                .map(|(_, _, _, result)| result)
+                .chain(tail)
+                .collect(),
+            order,
+            candidate_count,
+        );
+    }
+    scored.sort_by_key(|(bucket, rank, original_idx, _)| (*bucket, *rank, *original_idx));
+    scored
+        .into_iter()
+        .map(|(_, _, _, result)| result)
+        .chain(tail)
+        .collect()
+}
+
+fn judge_scores_for_response(scores: &[Option<i64>]) -> Vec<Value> {
+    scores
+        .iter()
+        .map(|score| match score {
+            Some(score) => serde_json::json!(score),
+            None => serde_json::json!("-"),
+        })
+        .collect()
+}
+
+async fn generate_judge_text(
+    config: &crate::config::JudgeConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+    max_tokens: usize,
+) -> anyhow::Result<String> {
+    let provider = config.provider.trim().to_ascii_lowercase();
+    if provider == "mock" {
+        return Ok(r#"{"order":[2,1],"scores":[1,1]}"#.to_string());
+    }
+    let timeout = std::time::Duration::from_secs(config.timeout_seconds.clamp(1, 300));
+    let client = reqwest::Client::builder().timeout(timeout).build()?;
+    let base_url = config.base_url.trim_end_matches('/');
+    anyhow::ensure!(!base_url.is_empty(), "judge base_url is empty");
+    let mut request = match provider.as_str() {
+        "ollama" | "ollama.com" => {
+            client
+                .post(format!("{base_url}/api/generate"))
+                .json(&serde_json::json!({
+                    "model": config.model,
+                    "prompt": format!("{system_prompt}\n\n{user_prompt}"),
+                    "stream": false,
+                    "format": "json",
+                    "options": {
+                        "temperature": 0.0,
+                        "num_predict": max_tokens.clamp(128, 2048)
+                    }
+                }))
+        }
+        "lmstudio" | "openai_compatible" | "openai-compatible" | "openai" => client
+            .post(format!("{base_url}/v1/chat/completions"))
+            .json(&serde_json::json!({
+                "model": config.model,
+                "temperature": 0.0,
+                "max_tokens": max_tokens.clamp(128, 2048),
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ]
+            })),
+        "disabled" => anyhow::bail!("judge provider is disabled"),
+        other => anyhow::bail!("unsupported judge provider: {other}"),
+    };
+    if let Some(token) = config.token.as_deref()
+        && !token.is_empty()
+    {
+        request = request.bearer_auth(token);
+    }
+    let value: Value = request.send().await?.error_for_status()?.json().await?;
+    let text = value
+        .get("response")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .get("choices")
+                .and_then(Value::as_array)
+                .and_then(|choices| choices.first())
+                .and_then(|choice| {
+                    choice
+                        .get("message")
+                        .and_then(|message| message.get("content"))
+                        .and_then(Value::as_str)
+                        .or_else(|| choice.get("text").and_then(Value::as_str))
+                })
+        })
+        .ok_or_else(|| anyhow::anyhow!("judge provider returned no text"))?;
+    Ok(text.to_string())
+}
+
+#[derive(Debug)]
+struct LlmRerankDecision {
+    order: Vec<uuid::Uuid>,
+    judge_scores: Vec<Option<i64>>,
+}
+
+async fn judge_rerank_candidates(
+    config: &crate::config::JudgeConfig,
+    query: &str,
+    candidates: &[crate::hybrid_search::SearchResult],
+) -> anyhow::Result<LlmRerankDecision> {
+    let candidate_ids = candidates
+        .iter()
+        .map(|result| result.id)
+        .collect::<Vec<_>>();
+    let candidates_json = candidates
+        .iter()
+        .enumerate()
+        .map(|(idx, result)| {
+            serde_json::json!({
+                "rank": idx + 1,
+                "id": result.id,
+                "type": result.result_type,
+                "source": result.source,
+                "content": rerank_candidate_content(result),
+            })
+        })
+        .collect::<Vec<_>>();
+    let prompt = format!(
+        "Query:\n{query}\n\nCandidates JSON:\n{}\n\n\
+         Rank the candidates by usefulness for answering the query. \
+         Also judge each candidate's relevance as 1 helpful, 0 neutral/unclear, -1 irrelevant/wrong, or \"-\" if you cannot judge. \
+         Return JSON only in this shape: {{\"order\":[rank_number,...],\"scores\":[1|0|-1|\"-\",...]}}. \
+         Use the 1-based rank numbers from the input, not UUIDs. \
+         The scores array must be in the original candidate order.",
+        serde_json::to_string(&candidates_json).unwrap_or_else(|_| "[]".to_string())
+    );
+    let max_tokens = 256 + candidates.len().saturating_mul(24);
+    let raw = generate_judge_text(
+        config,
+        "You are a retrieval reranker. Return compact JSON only.",
+        &prompt,
+        max_tokens,
+    )
+    .await?;
+    Ok(LlmRerankDecision {
+        order: parse_llm_rerank_order(&raw, &candidate_ids),
+        judge_scores: parse_llm_judge_scores(&raw, candidates.len()),
+    })
+}
+
+fn batch_report(
+    start_rank: usize,
+    candidate_count: usize,
+    order: Vec<uuid::Uuid>,
+    judge_scores: Vec<Option<i64>>,
+    error: Option<String>,
+) -> LlmRerankBatchReport {
+    let score_sum = judge_scores.iter().flatten().sum::<i64>();
+    let abstentions = judge_scores.iter().filter(|score| score.is_none()).count();
+    LlmRerankBatchReport {
+        start_rank,
+        candidate_count,
+        returned_ids: order,
+        judge_scores,
+        score_sum,
+        abstentions,
+        error,
+    }
+}
+
+fn rank_batches_by_winner_order(
+    batch_winners: &[uuid::Uuid],
+    final_order: &[uuid::Uuid],
+) -> Vec<usize> {
+    let order_rank = final_order
+        .iter()
+        .enumerate()
+        .map(|(idx, id)| (*id, idx))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut batch_indices = (0..batch_winners.len()).collect::<Vec<_>>();
+    batch_indices.sort_by_key(|idx| {
+        (
+            order_rank
+                .get(&batch_winners[*idx])
+                .copied()
+                .unwrap_or(batch_winners.len() + *idx),
+            *idx,
+        )
+    });
+    batch_indices
+}
+
+async fn batched_llm_rerank_results(
+    query: &str,
+    results: Vec<crate::hybrid_search::SearchResult>,
+    config: &crate::config::JudgeConfig,
+    candidate_count: usize,
+) -> (Vec<crate::hybrid_search::SearchResult>, LlmRerankReport) {
+    let split_at = results.len().min(candidate_count);
+    let top = results[..split_at].to_vec();
+    let tail = results[split_at..].to_vec();
+    let judged_ids = top.iter().map(|result| result.id).collect::<Vec<_>>();
+    let mut aggregate_scores = vec![None; split_at];
+    let mut batches = Vec::new();
+    let mut ordered_batches = Vec::new();
+    let mut batch_winners = Vec::new();
+    let mut any_applied = false;
+
+    for (batch_idx, batch) in top.chunks(LLM_RERANK_BATCH_SIZE).enumerate() {
+        let start_rank = batch_idx * LLM_RERANK_BATCH_SIZE + 1;
+        let batch_vec = batch.to_vec();
+        match judge_rerank_candidates(config, query, &batch_vec).await {
+            Ok(decision) if decision.order.len() >= 2 => {
+                any_applied = true;
+                for (idx, score) in decision.judge_scores.iter().copied().enumerate() {
+                    if let Some(slot) = aggregate_scores.get_mut(start_rank - 1 + idx) {
+                        *slot = score;
+                    }
+                }
+                let batch_order = apply_llm_rerank_decision(
+                    batch_vec,
+                    &decision.order,
+                    &decision.judge_scores,
+                    batch.len(),
+                );
+                if let Some(winner) = batch_order.first() {
+                    batch_winners.push(winner.id);
+                }
+                ordered_batches.push(batch_order);
+                batches.push(batch_report(
+                    start_rank,
+                    batch.len(),
+                    decision.order,
+                    decision.judge_scores,
+                    None,
+                ));
+            }
+            Ok(decision) => {
+                if let Some(winner) = batch_vec.first() {
+                    batch_winners.push(winner.id);
+                }
+                ordered_batches.push(batch_vec);
+                batches.push(batch_report(
+                    start_rank,
+                    batch.len(),
+                    decision.order,
+                    decision.judge_scores,
+                    Some("judge returned fewer than two recognized IDs".to_string()),
+                ));
+            }
+            Err(error) => {
+                let message = error.to_string();
+                tracing::warn!(
+                    provider = %config.provider,
+                    model = %config.model,
+                    batch_start_rank = start_rank,
+                    error = %message,
+                    "LLM rerank batch skipped"
+                );
+                let scores = vec![None; batch.len()];
+                if let Some(winner) = batch_vec.first() {
+                    batch_winners.push(winner.id);
+                }
+                ordered_batches.push(batch_vec);
+                batches.push(batch_report(
+                    start_rank,
+                    batch.len(),
+                    Vec::new(),
+                    scores,
+                    Some(message),
+                ));
+            }
+        }
+    }
+
+    let final_order = if batch_winners.len() >= 2 {
+        let winners = ordered_batches
+            .iter()
+            .filter_map(|batch| batch.first().cloned())
+            .collect::<Vec<_>>();
+        match judge_rerank_candidates(config, query, &winners).await {
+            Ok(decision) if decision.order.len() >= 2 => {
+                any_applied = true;
+                batches.push(batch_report(
+                    1,
+                    winners.len(),
+                    decision.order.clone(),
+                    decision.judge_scores,
+                    None,
+                ));
+                decision.order
+            }
+            Ok(decision) => {
+                batches.push(batch_report(
+                    1,
+                    winners.len(),
+                    decision.order,
+                    decision.judge_scores,
+                    Some("final judge returned fewer than two recognized IDs".to_string()),
+                ));
+                Vec::new()
+            }
+            Err(error) => {
+                let message = error.to_string();
+                tracing::warn!(
+                    provider = %config.provider,
+                    model = %config.model,
+                    error = %message,
+                    "LLM final rerank batch skipped"
+                );
+                batches.push(batch_report(
+                    1,
+                    winners.len(),
+                    Vec::new(),
+                    vec![None; winners.len()],
+                    Some(message),
+                ));
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    if !any_applied {
+        return (
+            results,
+            LlmRerankReport {
+                enabled: true,
+                applied: false,
+                mode: "batched".to_string(),
+                provider: config.provider.clone(),
+                model: config.model.clone(),
+                candidate_count,
+                returned_ids: Vec::new(),
+                judged_ids,
+                judge_scores: aggregate_scores,
+                score_sum: 0,
+                abstentions: split_at,
+                batches,
+                error: Some("all rerank batches failed or returned too few IDs".to_string()),
+            },
+        );
+    }
+
+    let mut reranked_top = Vec::with_capacity(top.len());
+    for batch_idx in rank_batches_by_winner_order(&batch_winners, &final_order) {
+        if let Some(batch) = ordered_batches.get(batch_idx) {
+            reranked_top.extend(batch.iter().cloned());
+        }
+    }
+    let returned_ids = reranked_top
+        .iter()
+        .map(|result| result.id)
+        .collect::<Vec<_>>();
+    let mut reranked = reranked_top;
+    reranked.extend(tail);
+    let score_sum = aggregate_scores.iter().flatten().sum::<i64>();
+    let abstentions = aggregate_scores
+        .iter()
+        .filter(|score| score.is_none())
+        .count();
+    (
+        reranked,
+        LlmRerankReport {
+            enabled: true,
+            applied: true,
+            mode: "batched".to_string(),
+            provider: config.provider.clone(),
+            model: config.model.clone(),
+            candidate_count,
+            returned_ids,
+            judged_ids,
+            judge_scores: aggregate_scores,
+            score_sum,
+            abstentions,
+            batches,
+            error: None,
+        },
+    )
+}
+
+async fn maybe_llm_rerank_results(
+    query: &str,
+    results: Vec<crate::hybrid_search::SearchResult>,
+    session: &SessionState,
+    rerank_override: Option<bool>,
+    candidate_override: Option<usize>,
+) -> (Vec<crate::hybrid_search::SearchResult>, LlmRerankReport) {
+    let config = session.judge_config.lock().await.clone();
+    let enabled = rerank_override.unwrap_or(config.enabled);
+    if !enabled {
+        return (results, LlmRerankReport::disabled(&config));
+    }
+    if results.len() < 2 {
+        return (
+            results,
+            LlmRerankReport::skipped(&config, "fewer than two candidates"),
+        );
+    }
+    let configured_candidates = candidate_override
+        .unwrap_or(config.max_rerank_candidates)
+        .clamp(LLM_RERANK_MIN_CANDIDATES, LLM_RERANK_HARD_MAX_CANDIDATES);
+    let candidate_count = results.len().min(configured_candidates);
+    if candidate_count > LLM_RERANK_BATCH_SIZE {
+        return batched_llm_rerank_results(query, results, &config, candidate_count).await;
+    }
+    let candidate_ids = results
+        .iter()
+        .take(candidate_count)
+        .map(|result| result.id)
+        .collect::<Vec<_>>();
+    let candidates = results
+        .iter()
+        .take(candidate_count)
+        .cloned()
+        .collect::<Vec<_>>();
+    let decision = match judge_rerank_candidates(&config, query, &candidates).await {
+        Ok(decision) => decision,
+        Err(error) => {
+            let message = error.to_string();
+            tracing::warn!(
+                provider = %config.provider,
+                model = %config.model,
+                error = %message,
+                "LLM reranking skipped"
+            );
+            return (results, LlmRerankReport::skipped(&config, message));
+        }
+    };
+    let order = decision.order;
+    let judge_scores = decision.judge_scores;
+    let score_sum = judge_scores.iter().flatten().sum::<i64>();
+    let abstentions = judge_scores.iter().filter(|score| score.is_none()).count();
+    if order.len() < 2 {
+        return (
+            results,
+            LlmRerankReport::skipped_with_count(
+                &config,
+                candidate_count,
+                "judge returned fewer than two recognized IDs",
+            ),
+        );
+    }
+    let reranked = apply_llm_rerank_decision(results, &order, &judge_scores, candidate_count);
+    (
+        reranked,
+        LlmRerankReport {
+            enabled: true,
+            applied: true,
+            mode: "single".to_string(),
+            provider: config.provider,
+            model: config.model,
+            candidate_count,
+            returned_ids: order,
+            judged_ids: candidate_ids,
+            judge_scores,
+            score_sum,
+            abstentions,
+            batches: Vec::new(),
+            error: None,
+        },
+    )
+}
+
 fn parse_hybrid_search_scope(
     args: &Value,
 ) -> Result<crate::hybrid_search::SearchScope, (i32, String)> {
@@ -5805,6 +6787,540 @@ fn parse_hybrid_search_scope(
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct ChunkExpansionReport {
+    mode: String,
+    prev: usize,
+    next: usize,
+    max_tokens: i32,
+    expanded_results: usize,
+    added_chunks: usize,
+    added_tokens: i32,
+}
+
+#[derive(Debug, Clone)]
+struct ChunkExpansionConfig {
+    mode: String,
+    prev: usize,
+    next: usize,
+    max_tokens: i32,
+}
+
+fn parse_chunk_expansion(args: &Value) -> Result<ChunkExpansionConfig, (i32, String)> {
+    let mode = args
+        .get("chunk_expansion")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    match mode {
+        "none" | "neighbors" => {}
+        _ => {
+            return Err((INVALID_PARAMS, format!("unknown chunk_expansion: {mode}")));
+        }
+    }
+    let prev = args
+        .get("chunk_prev")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .min(5) as usize;
+    let next = args
+        .get("chunk_next")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .min(5) as usize;
+    let max_tokens = args
+        .get("chunk_max_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(1600)
+        .clamp(1, 8000) as i32;
+    Ok(ChunkExpansionConfig {
+        mode: mode.to_string(),
+        prev,
+        next,
+        max_tokens,
+    })
+}
+
+fn expanded_chunk_context(
+    chunk: &crate::types::DocumentChunk,
+    position: &str,
+    distance: usize,
+) -> crate::hybrid_search::ExpandedChunkContext {
+    crate::hybrid_search::ExpandedChunkContext {
+        chunk_id: chunk.chunk_id,
+        document_id: chunk.document_id,
+        ordinal: chunk.ordinal,
+        position: position.to_string(),
+        distance,
+        token_count: chunk.token_count,
+        section_path: chunk.section_path.clone(),
+        content: chunk.content.clone(),
+    }
+}
+
+async fn apply_chunk_expansion<S: crate::storage::Storage>(
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session_id: uuid::Uuid,
+    results: &mut [crate::hybrid_search::SearchResult],
+    config: &ChunkExpansionConfig,
+) -> Result<ChunkExpansionReport, (i32, String)> {
+    let mut report = ChunkExpansionReport {
+        mode: config.mode.clone(),
+        prev: config.prev,
+        next: config.next,
+        max_tokens: config.max_tokens,
+        expanded_results: 0,
+        added_chunks: 0,
+        added_tokens: 0,
+    };
+    if config.mode == "none" || (config.prev == 0 && config.next == 0) {
+        return Ok(report);
+    }
+
+    for result in results.iter_mut() {
+        if result.result_type != "document_chunk" {
+            continue;
+        }
+        let mut added = Vec::new();
+        let mut added_tokens = 0i32;
+
+        let mut before = Vec::new();
+        let mut cursor = result.prev_chunk_id;
+        while before.len() < config.prev {
+            let Some(chunk_id) = cursor else { break };
+            let Some(chunk) = storage
+                .document_chunk_get(ctx, session_id, chunk_id)
+                .await
+                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+            else {
+                break;
+            };
+            cursor = chunk.prev_chunk_id;
+            before.push(chunk);
+        }
+        before.reverse();
+        for (idx, chunk) in before.iter().enumerate() {
+            let distance = before.len().saturating_sub(idx);
+            if added_tokens + chunk.token_count.max(0) > config.max_tokens {
+                continue;
+            }
+            added_tokens += chunk.token_count.max(0);
+            added.push(expanded_chunk_context(chunk, "prev", distance));
+        }
+
+        cursor = result.next_chunk_id;
+        let mut distance = 1usize;
+        while distance <= config.next {
+            let Some(chunk_id) = cursor else { break };
+            let Some(chunk) = storage
+                .document_chunk_get(ctx, session_id, chunk_id)
+                .await
+                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+            else {
+                break;
+            };
+            cursor = chunk.next_chunk_id;
+            if added_tokens + chunk.token_count.max(0) <= config.max_tokens {
+                added_tokens += chunk.token_count.max(0);
+                added.push(expanded_chunk_context(&chunk, "next", distance));
+            }
+            distance += 1;
+        }
+
+        if added.is_empty() {
+            continue;
+        }
+
+        let mut expanded_text = String::new();
+        for chunk in &added {
+            expanded_text.push_str(&format!(
+                "\n\n[expanded {} chunk distance={} ordinal={}]\n{}",
+                chunk.position, chunk.distance, chunk.ordinal, chunk.content
+            ));
+        }
+        result.content.push_str(&expanded_text);
+        result.expanded_context = added;
+        result.hint = Some(
+            "This result includes bounded prev/next chunk expansion. Use chunk_ctx if more neighboring context is needed."
+                .into(),
+        );
+        report.expanded_results += 1;
+        report.added_chunks += result.expanded_context.len();
+        report.added_tokens += added_tokens;
+    }
+
+    Ok(report)
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct QueryVariantDiagnostic {
+    query: String,
+    rank: usize,
+    result_count: usize,
+    candidate_fanout: crate::hybrid_search::SearchDiagnostics,
+    embedding_status: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct QueryDecompositionReport {
+    mode: String,
+    task: String,
+    generator_status: String,
+    query_count: usize,
+    unique_results: usize,
+    queries: Vec<QueryVariantDiagnostic>,
+}
+
+struct QueryVariantSearchOutput {
+    query: String,
+    output: crate::hybrid_search::SearchOutput,
+    embedding_status: String,
+}
+
+struct MergedQueryVariantOutput {
+    results: Vec<crate::hybrid_search::SearchResult>,
+    diagnostics: QueryDecompositionReport,
+}
+
+fn query_decomposition_stopwords(token: &str) -> bool {
+    matches!(
+        token,
+        "a" | "an"
+            | "and"
+            | "are"
+            | "as"
+            | "at"
+            | "be"
+            | "by"
+            | "can"
+            | "does"
+            | "for"
+            | "from"
+            | "how"
+            | "in"
+            | "into"
+            | "is"
+            | "it"
+            | "of"
+            | "on"
+            | "or"
+            | "that"
+            | "the"
+            | "their"
+            | "this"
+            | "to"
+            | "what"
+            | "when"
+            | "where"
+            | "which"
+            | "with"
+            | "within"
+    )
+}
+
+fn validate_query_decomposition_task(task: &str) -> Result<&str, (i32, String)> {
+    match task {
+        "general" | "bright_pro" | "memorybench" => Ok(task),
+        _ => Err((INVALID_PARAMS, format!("unknown query_task: {task}"))),
+    }
+}
+
+fn normalize_query_token(token: &str) -> String {
+    token
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_')
+        .to_string()
+}
+
+fn push_unique_query(queries: &mut Vec<String>, seen: &mut HashSet<String>, query: String) {
+    let query = query.trim();
+    if query.is_empty() {
+        return;
+    }
+    let normalized = query.to_ascii_lowercase();
+    if seen.insert(normalized) {
+        queries.push(query.to_string());
+    }
+}
+
+fn keyword_query(query: &str, max_terms: usize) -> Option<String> {
+    let terms = query
+        .split_whitespace()
+        .map(normalize_query_token)
+        .filter(|token| token.len() >= 3)
+        .filter(|token| !query_decomposition_stopwords(&token.to_ascii_lowercase()))
+        .take(max_terms)
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" "))
+    }
+}
+
+fn entity_alias_query(query: &str, max_terms: usize) -> Option<String> {
+    let terms = query
+        .split_whitespace()
+        .map(normalize_query_token)
+        .filter(|token| token.len() >= 2)
+        .filter(|token| {
+            token.chars().any(|ch| ch.is_ascii_uppercase())
+                || token.chars().any(|ch| ch.is_ascii_digit())
+                || token.contains('-')
+                || token.contains('_')
+        })
+        .take(max_terms)
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" "))
+    }
+}
+
+fn build_query_variants(
+    query: &str,
+    mode: &str,
+    task: &str,
+    caller_variants: &[String],
+    max_variants: usize,
+) -> Result<Vec<String>, (i32, String)> {
+    match mode {
+        "none" | "heuristic" | "llm" => {}
+        _ => {
+            return Err((
+                INVALID_PARAMS,
+                format!("unknown query_decomposition: {mode}"),
+            ));
+        }
+    }
+    validate_query_decomposition_task(task)?;
+    let max_variants = max_variants.clamp(1, 8);
+    let mut variants = Vec::new();
+    let mut seen = HashSet::new();
+    push_unique_query(&mut variants, &mut seen, query.to_string());
+
+    for variant in caller_variants {
+        if variants.len() >= max_variants {
+            return Ok(variants);
+        }
+        push_unique_query(&mut variants, &mut seen, variant.to_string());
+    }
+
+    if mode == "heuristic" || mode == "llm" {
+        if variants.len() < max_variants
+            && let Some(keywords) = keyword_query(query, 14)
+        {
+            push_unique_query(&mut variants, &mut seen, keywords.clone());
+            if variants.len() < max_variants {
+                let evidence_query = match task {
+                    "bright_pro" => format!("documents explaining {keywords}"),
+                    "memorybench" => format!("conversation memory feedback about {keywords}"),
+                    _ => format!("supporting evidence for {keywords}"),
+                };
+                push_unique_query(&mut variants, &mut seen, evidence_query);
+            }
+        }
+        if variants.len() < max_variants
+            && let Some(entities) = entity_alias_query(query, 10)
+        {
+            push_unique_query(&mut variants, &mut seen, entities);
+        }
+    }
+
+    Ok(variants)
+}
+
+fn collect_subquery_strings(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(text) => out.push(text.to_string()),
+        Value::Array(values) => {
+            for value in values {
+                collect_subquery_strings(value, out);
+            }
+        }
+        Value::Object(map) => {
+            for key in ["queries", "subqueries", "query_variants", "variants"] {
+                if let Some(value) = map.get(key) {
+                    collect_subquery_strings(value, out);
+                    return;
+                }
+            }
+            if let Some(value) = map.get("query").or_else(|| map.get("text")) {
+                collect_subquery_strings(value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn build_llm_query_variants(query: &str, raw: &str, max_variants: usize) -> Vec<String> {
+    let max_variants = max_variants.clamp(1, 8);
+    let mut variants = Vec::new();
+    let mut seen = HashSet::new();
+    push_unique_query(&mut variants, &mut seen, query.to_string());
+
+    let Some(value) = parse_llm_rerank_json(raw) else {
+        return variants;
+    };
+    let mut generated = Vec::new();
+    collect_subquery_strings(&value, &mut generated);
+    for variant in generated {
+        if variants.len() >= max_variants {
+            break;
+        }
+        push_unique_query(&mut variants, &mut seen, variant);
+    }
+    variants
+}
+
+fn query_decomposition_subject(query: &str, task: &str) -> String {
+    if task == "memorybench"
+        && let Some(question_start) = query.find("[Question]")
+    {
+        let after_question = &query[question_start + "[Question]".len()..];
+        let question = after_question
+            .split("[Answer]")
+            .next()
+            .unwrap_or(after_question)
+            .trim();
+        if !question.is_empty() {
+            return question.to_string();
+        }
+    }
+    query.trim().to_string()
+}
+
+fn query_decomposition_system_prompt(task: &str) -> &'static str {
+    match task {
+        "bright_pro" => {
+            "You generate high-precision retrieval subqueries for BRIGHT-Pro reasoning-intensive retrieval. Return compact JSON only."
+        }
+        "memorybench" => {
+            "You generate high-precision natural-language retrieval subqueries for conversation memory and feedback recall. Return compact JSON only."
+        }
+        _ => "You generate high-precision retrieval subqueries. Return compact JSON only.",
+    }
+}
+
+fn query_decomposition_user_prompt(query: &str, task: &str, max_variants: usize) -> String {
+    let subject = query_decomposition_subject(query, task);
+    let task_guidance = match task {
+        "bright_pro" => {
+            "The goal is to retrieve support documents for a reasoning-heavy question. Generate exact-entity, core-claim, alias/paraphrase, and evidence-focused subqueries. Avoid generic filler and avoid adding unsupported facts."
+        }
+        "memorybench" => {
+            "The goal is to retrieve memories from prior conversations and feedback. Generate natural-language subqueries for entities, dates, user/task context, correction/feedback, and likely answer-bearing memory. Do not write SQL, code, schema names, or database commands."
+        }
+        _ => {
+            "Generate exact-entity, core-concept, alias/paraphrase, and evidence-focused subqueries. Avoid generic filler and avoid adding unsupported facts."
+        }
+    };
+    format!(
+        "{task_guidance}\n\nOriginal query:\n{query}\n\nQuery subject:\n{subject}\n\nReturn JSON only: {{\"queries\":[\"subquery\",...]}}. \
+         Return at most {} subqueries. Do not repeat the original query or write query languages.",
+        max_variants.saturating_sub(1).max(1)
+    )
+}
+
+async fn generate_llm_query_variants(
+    config: &crate::config::JudgeConfig,
+    query: &str,
+    task: &str,
+    max_variants: usize,
+) -> anyhow::Result<Vec<String>> {
+    let raw = generate_judge_text(
+        config,
+        query_decomposition_system_prompt(task),
+        &query_decomposition_user_prompt(query, task, max_variants),
+        384,
+    )
+    .await?;
+    Ok(build_llm_query_variants(query, &raw, max_variants))
+}
+
+fn collapse_duplicate_variant_documents(
+    results: Vec<crate::hybrid_search::SearchResult>,
+) -> Vec<crate::hybrid_search::SearchResult> {
+    let mut seen_documents = HashSet::new();
+    let mut collapsed = Vec::with_capacity(results.len());
+    for result in results {
+        if result.result_type == "document_chunk"
+            && let Some(document_id) = result.document_id
+            && !seen_documents.insert(document_id)
+        {
+            continue;
+        }
+        collapsed.push(result);
+    }
+    collapsed
+}
+
+fn merge_query_variant_outputs(
+    outputs: Vec<QueryVariantSearchOutput>,
+    limit: usize,
+) -> MergedQueryVariantOutput {
+    let mut scores: HashMap<uuid::Uuid, (f64, crate::hybrid_search::SearchResult)> = HashMap::new();
+    let mut unique = HashSet::new();
+    let mut queries = Vec::with_capacity(outputs.len());
+
+    for (variant_rank, variant) in outputs.into_iter().enumerate() {
+        for (rank, result) in variant.output.results.iter().enumerate() {
+            unique.insert(result.id);
+            let variant_weight = if variant_rank == 0 { 4.0 } else { 0.75 };
+            let score = variant_weight / (60.0 + rank as f64 + 1.0);
+            scores
+                .entry(result.id)
+                .and_modify(|(existing_score, existing_result)| {
+                    *existing_score += score;
+                    if result.content.len() > existing_result.content.len() {
+                        *existing_result = result.clone();
+                    }
+                })
+                .or_insert((score, result.clone()));
+        }
+        queries.push(QueryVariantDiagnostic {
+            rank: variant_rank + 1,
+            result_count: variant.output.results.len(),
+            candidate_fanout: variant.output.diagnostics,
+            embedding_status: variant.embedding_status,
+            query: variant.query,
+        });
+    }
+
+    let mut results = scores
+        .into_values()
+        .map(|(score, mut result)| {
+            result.score = score;
+            result
+        })
+        .collect::<Vec<_>>();
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let results = collapse_duplicate_variant_documents(results)
+        .into_iter()
+        .take(limit)
+        .collect::<Vec<_>>();
+
+    MergedQueryVariantOutput {
+        results,
+        diagnostics: QueryDecompositionReport {
+            mode: if queries.len() > 1 {
+                "active".into()
+            } else {
+                "none".into()
+            },
+            task: "general".into(),
+            generator_status: "not_requested".into(),
+            query_count: queries.len(),
+            unique_results: unique.len(),
+            queries,
+        },
+    }
+}
+
 async fn handle_hybrid_search<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
@@ -5814,6 +7330,11 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
     let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
     let query = require_str(&args, "query")?;
     let mut embedding = optional_f32_array(&args, "embedding")?;
+    let mut base_embedding_status = if embedding.is_some() {
+        "provided".to_string()
+    } else {
+        "unavailable".to_string()
+    };
     let limit = optional_retrieval_limit(&args, &["limit"], session)?;
     let offset = args
         .get("offset")
@@ -5821,6 +7342,12 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         .unwrap_or(0)
         .min(49) as usize;
     let search_limit = (limit + offset).min(50);
+    let candidate_limit = args
+        .get("candidate_limit")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .filter(|value| *value > 0)
+        .map(|value| value.min(50));
     let filter = crate::hybrid_search::SearchFilter {
         scope: parse_hybrid_search_scope(&args)?,
         entity_types: None,
@@ -5830,40 +7357,255 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
             .or_else(|| args.get("cwd"))
             .and_then(|v| v.as_str())
             .map(str::to_string),
+        candidate_limit,
     };
-
-    // Auto-generate query embedding for ANN search if Ollama is configured.
-    if embedding.is_none() && !session.ollama_base_url.is_empty() {
-        let client = crate::embedding::EmbeddingClient::new(&crate::config::EmbeddingConfig {
-            provider: "ollama".into(),
-            ollama_base_url: session.ollama_base_url.clone(),
-            model: session.embed_model.clone(),
-            dimensions: session.embed_dimensions,
-            max_input_chars: crate::config::EmbeddingConfig::default().max_input_chars,
-            ner_model: String::new(),
-        });
-        match client.embed(query).await {
-            Ok(emb) => embedding = Some(emb),
-            Err(e) => tracing::debug!("query embedding generation skipped: {e}"),
+    let query_decomposition_mode = args
+        .get("query_decomposition")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    let query_task = args
+        .get("query_task")
+        .and_then(Value::as_str)
+        .unwrap_or("general");
+    validate_query_decomposition_task(query_task)?;
+    let query_variant_limit = args
+        .get("query_variant_limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(5)
+        .clamp(1, 8) as usize;
+    let query_embed_variants = args
+        .get("query_embed_variants")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let caller_query_variants = optional_string_array(&args, "query_variants")?;
+    let mut query_generator_status = "not_requested".to_string();
+    let mut query_variants = build_query_variants(
+        query,
+        if query_decomposition_mode == "llm" {
+            "none"
+        } else {
+            query_decomposition_mode
+        },
+        query_task,
+        &caller_query_variants,
+        query_variant_limit,
+    )?;
+    if query_decomposition_mode == "llm" {
+        let judge_config = session.judge_config.lock().await.clone();
+        match generate_llm_query_variants(&judge_config, query, query_task, query_variant_limit)
+            .await
+        {
+            Ok(generated) if generated.len() > 1 => {
+                query_generator_status = "generated".into();
+                let mut seen = query_variants
+                    .iter()
+                    .map(|variant| variant.to_ascii_lowercase())
+                    .collect::<HashSet<_>>();
+                for variant in generated.into_iter().skip(1) {
+                    if query_variants.len() >= query_variant_limit {
+                        break;
+                    }
+                    push_unique_query(&mut query_variants, &mut seen, variant);
+                }
+            }
+            Ok(_) => {
+                query_generator_status = "empty_fallback_heuristic".into();
+                query_variants = build_query_variants(
+                    query,
+                    "heuristic",
+                    query_task,
+                    &caller_query_variants,
+                    query_variant_limit,
+                )?;
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "LLM query decomposition failed; falling back to heuristic");
+                query_generator_status = "failed_fallback_heuristic".into();
+                query_variants = build_query_variants(
+                    query,
+                    "heuristic",
+                    query_task,
+                    &caller_query_variants,
+                    query_variant_limit,
+                )?;
+            }
         }
     }
 
-    let all_results = crate::hybrid_search::hybrid_search(
+    // Auto-generate query embedding for ANN search if Ollama is configured.
+    let embedding_client = session_embedding_client(session);
+    if embedding.is_none()
+        && let Some(client) = embedding_client.as_ref()
+    {
+        match client.embed(query).await {
+            Ok(emb) => {
+                embedding = Some(emb);
+                base_embedding_status = "generated".into();
+            }
+            Err(e) => {
+                tracing::debug!("query embedding generation skipped: {e}");
+                base_embedding_status = "failed".into();
+            }
+        }
+    }
+
+    let fusion_profile = args
+        .get("fusion_profile")
+        .and_then(Value::as_str)
+        .unwrap_or("all");
+    let mut fusion_config = crate::hybrid_search::FusionConfig::profile(fusion_profile)
+        .ok_or_else(|| {
+            (
+                INVALID_PARAMS,
+                format!("unknown fusion_profile: {fusion_profile}"),
+            )
+        })?;
+    if let Some(weights) = args.get("fusion_weights") {
+        let Some(object) = weights.as_object() else {
+            return Err((INVALID_PARAMS, "fusion_weights must be an object".into()));
+        };
+        for (key, value) in object {
+            let Some(weight) = value.as_f64() else {
+                return Err((
+                    INVALID_PARAMS,
+                    format!("fusion_weights.{key} must be a number"),
+                ));
+            };
+            if !(0.0..=10.0).contains(&weight) {
+                return Err((
+                    INVALID_PARAMS,
+                    format!("fusion_weights.{key} must be between 0 and 10"),
+                ));
+            }
+            if !fusion_config.set_weight(key, weight) {
+                return Err((INVALID_PARAMS, format!("unknown fusion weight key: {key}")));
+            }
+        }
+    }
+
+    let mut query_outputs = Vec::with_capacity(query_variants.len());
+    for (idx, variant_query) in query_variants.iter().enumerate() {
+        let mut variant_embedding = embedding.clone();
+        let mut embedding_status = if idx == 0 {
+            base_embedding_status.clone()
+        } else if variant_embedding.is_some() {
+            "reused".into()
+        } else {
+            "unavailable".into()
+        };
+        if idx > 0
+            && query_embed_variants
+            && let Some(client) = embedding_client.as_ref()
+        {
+            match client.embed(variant_query).await {
+                Ok(emb) => {
+                    variant_embedding = Some(emb);
+                    embedding_status = "generated".into();
+                }
+                Err(e) => {
+                    tracing::debug!(query = %variant_query, "query variant embedding skipped: {e}");
+                    embedding_status = "failed".into();
+                }
+            }
+        }
+
+        let output = crate::hybrid_search::hybrid_search_with_diagnostics(
+            storage,
+            ctx,
+            session_id,
+            variant_query,
+            variant_embedding.as_deref(),
+            search_limit,
+            None,
+            None,
+            None,
+            &fusion_config,
+            Some(&filter),
+        )
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+        query_outputs.push(QueryVariantSearchOutput {
+            query: variant_query.clone(),
+            output,
+            embedding_status,
+        });
+    }
+    let candidate_fanout = query_outputs
+        .first()
+        .map(|variant| variant.output.diagnostics.clone())
+        .unwrap_or(crate::hybrid_search::SearchDiagnostics {
+            requested_limit: search_limit,
+            source_limit: search_limit,
+            total_candidates: 0,
+            unique_candidates: 0,
+            sources: vec![],
+        });
+    let mut query_merged_output = merge_query_variant_outputs(query_outputs, search_limit);
+    query_merged_output.diagnostics.mode = query_decomposition_mode.to_string();
+    query_merged_output.diagnostics.task = query_task.to_string();
+    query_merged_output.diagnostics.generator_status = query_generator_status;
+    let query_decomposition_report = query_merged_output.diagnostics;
+    let mut all_results = query_merged_output.results;
+    let chunk_expansion_config = parse_chunk_expansion(&args)?;
+    let chunk_expansion_report = apply_chunk_expansion(
         storage,
         ctx,
         session_id,
-        query,
-        embedding.as_deref(),
-        search_limit,
-        None,
-        None,
-        None,
-        &crate::hybrid_search::FusionConfig::default(),
-        Some(&filter),
+        &mut all_results,
+        &chunk_expansion_config,
     )
-    .await
-    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    .await?;
 
+    let rerank_override = args.get("rerank").and_then(Value::as_bool);
+    let rerank_candidate_override = args
+        .get("rerank_candidates")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    let (all_results, reranker_report) = maybe_llm_rerank_results(
+        query,
+        all_results,
+        session,
+        rerank_override,
+        rerank_candidate_override,
+    )
+    .await;
+    if let Some(cwd) = filter.workspace_cwd.as_deref() {
+        for (idx, entity_id) in reranker_report.judged_ids.iter().enumerate() {
+            let Some(result) = all_results.iter().find(|result| result.id == *entity_id) else {
+                continue;
+            };
+            if result.result_type != "entity" {
+                continue;
+            }
+            let judgment = reranker_report.judge_scores.get(idx).copied().flatten();
+            let score_delta = judgment.map(|score| {
+                if score > 0 {
+                    0.05
+                } else if score < 0 {
+                    -0.10
+                } else {
+                    0.0
+                }
+            });
+            if let Err(e) = update_workspace_feedback(
+                storage,
+                ctx,
+                WorkspaceFeedbackUpdate {
+                    session_id,
+                    entity_id: *entity_id,
+                    cwd,
+                    source: &result.source,
+                    judge_source: "judge_model",
+                    score_delta,
+                    judgment,
+                },
+            )
+            .await
+            {
+                tracing::warn!(entity_id = %entity_id, error = %e, "judge-model workspace feedback update failed");
+            }
+        }
+    }
     let results: Vec<_> = all_results.into_iter().skip(offset).take(limit).collect();
     let result_count = results.len();
 
@@ -5928,15 +7670,15 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
 
     let hint = if results.is_empty() {
         pick_hint(&[
-            "No matches — this topic is new to memory. Good candidate for smart_ingest.",
-            "Empty search. Ingest what you're learning in this conversation with smart_ingest.",
+            "No matches — this topic is new to memory. Good candidate for ingest.",
+            "Empty search. Ingest what you're learning in this conversation with ingest.",
             "Nothing found. Have you captured the key insights from this session yet?",
         ])
     } else {
         pick_hint(&[
-            "Found prior context. After judging it, call record_feedback with scores like [1,-1,0] so cwd-specific reranking improves.",
-            "Prior context found. Use record_feedback: 1=helpful, -1=irrelevant/wrong, 0=neutral.",
-            "Check if these memories were useful here; send compact feedback with record_feedback scores in result order.",
+            "Found prior context. After judging it, call record_feedback with scores like [1,\"-\",-1,0] so cwd-specific reranking improves.",
+            "Prior context found. Use record_feedback: 1=helpful, -1=irrelevant/wrong, 0=neutral, \"-\"=cannot judge.",
+            "Check if these memories were useful here; send compact feedback with record_feedback scores in result order, using \"-\" for abstain.",
         ])
     };
 
@@ -5945,7 +7687,37 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         "count": result_count,
         "offset": offset,
         "next_offset": if result_count == limit && offset + limit < 50 { Some(offset + limit) } else { None },
-        "hint": hint
+        "hint": hint,
+        "reranker": {
+            "enabled": reranker_report.enabled,
+            "applied": reranker_report.applied,
+            "mode": reranker_report.mode,
+            "provider": reranker_report.provider,
+            "model": reranker_report.model,
+            "candidate_count": reranker_report.candidate_count,
+            "returned_ids": reranker_report.returned_ids,
+            "judged_ids": reranker_report.judged_ids,
+            "judge_scores": judge_scores_for_response(&reranker_report.judge_scores),
+            "score_sum": reranker_report.score_sum,
+            "abstentions": reranker_report.abstentions,
+            "batches": reranker_report.batches.iter().map(|batch| serde_json::json!({
+                "start_rank": batch.start_rank,
+                "candidate_count": batch.candidate_count,
+                "returned_ids": batch.returned_ids,
+                "judge_scores": judge_scores_for_response(&batch.judge_scores),
+                "score_sum": batch.score_sum,
+                "abstentions": batch.abstentions,
+                "error": batch.error,
+            })).collect::<Vec<_>>(),
+            "error": reranker_report.error,
+        },
+        "candidate_fanout": candidate_fanout,
+        "query_decomposition": query_decomposition_report,
+        "chunk_expansion": chunk_expansion_report,
+        "fusion": {
+            "profile": fusion_profile,
+            "weights": fusion_config,
+        },
     });
     if result_count == 0 {
         response["_hint"] = serde_json::json!(
@@ -5957,7 +7729,7 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         );
     } else if result_count == limit && offset + limit < 50 {
         response["_hint"] = serde_json::json!(
-            "After judging this page, call record_feedback with scores like [1,-1,0]. If all useful-looking items are -1 or 0, call hybrid_search again with next_offset."
+            "After judging this page, call record_feedback with scores like [1,\"-\",-1,0]. If all useful-looking items are -1, 0, or \"-\", call hybrid_search again with next_offset."
         );
     }
     Ok(response)
@@ -6028,6 +7800,7 @@ async fn handle_enrich_entities<S: crate::storage::Storage>(
         force,
         dry_run,
         batch_size: 10,
+        embed_provider: session.embed_provider.clone(),
         ollama_base_url: session.ollama_base_url.clone(),
         embed_model: session.embed_model.clone(),
         embed_dimensions: session.embed_dimensions,
@@ -6089,7 +7862,7 @@ async fn handle_get_stats<S: crate::storage::Storage>(
         .cloned();
 
     let hint = if entity_count == 0 {
-        "Memory is empty. Start ingesting entities, decisions, and patterns with smart_ingest."
+        "Memory is empty. Start ingesting entities, decisions, and patterns with ingest."
             .to_string()
     } else if edge_count == 0 {
         "Entities exist but no connections. Run run_consolidation to discover relationships."
@@ -6097,7 +7870,7 @@ async fn handle_get_stats<S: crate::storage::Storage>(
     } else {
         pick_hint(&[
             "Memory healthy. Remember to ingest new insights from this conversation.",
-            "Have you learned anything about the user's preferences? Ingest with smart_ingest.",
+            "Have you learned anything about the user's preferences? Ingest with ingest.",
             "Project context, architecture decisions, and debugging insights are worth remembering.",
         ])
     };
@@ -6457,7 +8230,7 @@ async fn handle_recursive_explore<S: crate::storage::Storage>(
         "converged": result.converged,
         "derived_facts_count": result.derived_facts_count,
         "hint": if results.is_empty() {
-            "No results found. Try smart_ingest to add entities first."
+            "No results found. Try ingest to add entities first."
         } else {
             "Recursive exploration found connected knowledge clusters."
         }
@@ -8078,6 +9851,23 @@ fn optional_f32_array(args: &Value, field: &str) -> Result<Option<Vec<f32>>, (i3
     }
 }
 
+fn optional_string_array(args: &Value, field: &str) -> Result<Vec<String>, (i32, String)> {
+    let Some(value) = args.get(field) else {
+        return Ok(Vec::new());
+    };
+    let Some(values) = value.as_array() else {
+        return Err((INVALID_PARAMS, format!("{field} must be an array")));
+    };
+    let mut parsed = Vec::with_capacity(values.len());
+    for (idx, value) in values.iter().enumerate() {
+        let Some(text) = value.as_str() else {
+            return Err((INVALID_PARAMS, format!("{field}[{idx}] must be a string")));
+        };
+        parsed.push(text.to_string());
+    }
+    Ok(parsed)
+}
+
 fn require_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, (i32, String)> {
     args.get(field)
         .and_then(|v| v.as_str())
@@ -8457,6 +10247,12 @@ mod tests {
         assert!(!names.contains(&"recurse"));
         assert!(!names.contains(&"promote"));
         assert!(!names.contains(&"derived_cache"));
+    }
+
+    #[test]
+    fn memory_guide_uses_default_ingest_tool_name() {
+        assert!(MEMORY_GUIDE.contains("Use ingest for new knowledge"));
+        assert!(!MEMORY_GUIDE.contains("Use smart_ingest"));
     }
 
     #[test]
@@ -10883,6 +12679,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn smart_ingest_uses_synthetic_embeddings_without_provider_url() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            embed_provider: "synthetic".to_string(),
+            ollama_base_url: String::new(),
+            embed_dimensions: 8,
+            ..SessionState::default()
+        };
+        let sid = Uuid::new_v4();
+
+        let params = serde_json::json!({
+            "name": "smart_ingest",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "content": "Synthetic embeddings keep CI semantic paths covered",
+                "entity_type": "concept",
+                "entity_name": "Synthetic Embeddings"
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["action"], "Created");
+
+        let entity_id = Uuid::parse_str(result["entity_id"].as_str().unwrap()).unwrap();
+        let entity = store
+            .entity_get_by_id(&ctx, sid, entity_id)
+            .await
+            .unwrap()
+            .expect("entity should be persisted");
+        assert_eq!(entity.entity_embedding.as_ref().unwrap().len(), 8);
+    }
+
+    #[tokio::test]
     async fn hybrid_search_embedding_fallback_when_ollama_unavailable() {
         // When ollama_base_url is set but unreachable, hybrid_search falls back
         // to phonetic-only search.
@@ -10924,6 +12756,547 @@ mod tests {
             result["count"].as_u64().unwrap() > 0,
             "should find via phonetic fallback"
         );
+    }
+
+    #[tokio::test]
+    async fn record_feedback_reranks_future_searches_for_same_workspace() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            ollama_base_url: String::new(),
+            ..SessionState::default()
+        };
+        let sid = Uuid::new_v4();
+        let cwd = "/repo/ferrosa-memory";
+        let first = crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "Atlas Cache".into(),
+            entity_type: "concept".into(),
+            context_snippet: "Atlas cache stores reusable retrieval hints".into(),
+            entity_embedding: None,
+            confidence: 0.9,
+            state: Default::default(),
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        };
+        let second = crate::types::EntityEntry {
+            entity_id: Uuid::new_v4(),
+            context_snippet: "Atlas cache stores reusable retrieval hints".into(),
+            ..first.clone()
+        };
+        store.entities.lock().await.push(first);
+        store.entities.lock().await.push(second);
+
+        let search = serde_json::json!({
+            "name": "hybrid_search",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "query": "Atlas Cache",
+                "cwd": cwd,
+                "limit": 2
+            }
+        });
+        let result = dispatch("tools/call", search.clone(), &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        let results = result["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        let demoted_id = Uuid::parse_str(results[0]["id"].as_str().unwrap()).unwrap();
+        let promoted_id = Uuid::parse_str(results[1]["id"].as_str().unwrap()).unwrap();
+
+        let feedback = serde_json::json!({
+            "name": "record_feedback",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "scores": [-1, 1],
+                "cwd": cwd
+            }
+        });
+        let feedback = dispatch("tools/call", feedback, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let feedback = unwrap_tool_result(feedback);
+        assert_eq!(feedback["updated"].as_array().unwrap().len(), 2);
+
+        let demoted = store
+            .entity_get_by_id(&ctx, sid, demoted_id)
+            .await
+            .unwrap()
+            .expect("demoted entity should exist");
+        assert!(
+            demoted
+                .properties
+                .get("workspace_feedback")
+                .and_then(|value| value.as_object())
+                .is_some(),
+            "feedback should be persisted on the entity"
+        );
+
+        let reranked = dispatch("tools/call", search, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let reranked = unwrap_tool_result(reranked);
+        let reranked_results = reranked["results"].as_array().unwrap();
+        assert_eq!(
+            reranked_results[0]["id"].as_str().unwrap(),
+            promoted_id.to_string(),
+            "positive feedback should lift this entity for the same cwd"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_feedback_records_abstentions_separately_from_neutral_scores() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            ollama_base_url: String::new(),
+            ..SessionState::default()
+        };
+        let sid = Uuid::new_v4();
+        let cwd = "/repo/ferrosa-memory";
+        let first = crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "Judge Abstention".into(),
+            entity_type: "concept".into(),
+            context_snippet: "Judge abstention should be tracked separately".into(),
+            entity_embedding: None,
+            confidence: 0.9,
+            state: Default::default(),
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        };
+        let second = crate::types::EntityEntry {
+            entity_id: Uuid::new_v4(),
+            entity_name: "Judge Neutral".into(),
+            context_snippet: "Judge neutral should not be treated as abstention".into(),
+            ..first.clone()
+        };
+        store.entities.lock().await.push(first.clone());
+        store.entities.lock().await.push(second.clone());
+
+        let search = serde_json::json!({
+            "name": "hybrid_search",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "query": "Judge",
+                "cwd": cwd,
+                "limit": 2
+            }
+        });
+        let result = dispatch("tools/call", search, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        let results = result["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        let abstained_id = Uuid::parse_str(results[0]["id"].as_str().unwrap()).unwrap();
+        let neutral_id = Uuid::parse_str(results[1]["id"].as_str().unwrap()).unwrap();
+
+        let feedback = serde_json::json!({
+            "name": "record_feedback",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "scores": ["-", 0],
+                "judge": "test_judge",
+                "cwd": cwd
+            }
+        });
+        let feedback = dispatch("tools/call", feedback, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let feedback = unwrap_tool_result(feedback);
+        assert_eq!(feedback["abstained"], 1);
+        assert_eq!(feedback["updated"].as_array().unwrap()[0]["score"], "-");
+        assert_eq!(feedback["updated"].as_array().unwrap()[1]["score"], 0);
+
+        let abstained = store
+            .entity_get_by_id(&ctx, sid, abstained_id)
+            .await
+            .unwrap()
+            .expect("entity should exist");
+        let feedback = abstained
+            .properties
+            .pointer("/workspace_feedback")
+            .and_then(Value::as_object)
+            .expect("workspace feedback should exist");
+        let entry = feedback.values().next().unwrap();
+        assert_eq!(entry["abstentions"], 1);
+        assert_eq!(entry["neutrals"].as_i64().unwrap_or(0), 0);
+        assert_eq!(
+            entry["mechanisms"]["entity_phonetic"]["judges"]["test_judge"]["abstentions"],
+            1
+        );
+
+        let neutral = store
+            .entity_get_by_id(&ctx, sid, neutral_id)
+            .await
+            .unwrap()
+            .expect("entity should exist");
+        let feedback = neutral
+            .properties
+            .pointer("/workspace_feedback")
+            .and_then(Value::as_object)
+            .expect("workspace feedback should exist");
+        let entry = feedback.values().next().unwrap();
+        assert_eq!(entry["neutrals"], 1);
+        assert_eq!(entry["abstentions"].as_i64().unwrap_or(0), 0);
+        assert_eq!(
+            entry["mechanisms"]["entity_phonetic"]["judges"]["test_judge"]["neutrals"],
+            1
+        );
+    }
+
+    #[test]
+    fn parse_llm_rerank_order_accepts_object_array_and_indices() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let third = Uuid::new_v4();
+        let ids = vec![first, second, third];
+
+        let raw = format!(
+            r#"Here is the JSON: {{"order":[{{"id":"{second}"}}, "not-a-candidate", 1, "{third}"]}}"#
+        );
+        let parsed = parse_llm_rerank_order(&raw, &ids);
+
+        assert_eq!(parsed, vec![second, first, third]);
+    }
+
+    #[test]
+    fn parse_llm_judge_scores_preserves_abstentions() {
+        let raw = r#"{"order":[1,2,3,4],"scores":[1,"-",0,-1]}"#;
+        let parsed = parse_llm_judge_scores(raw, 5);
+        assert_eq!(parsed, vec![Some(1), None, Some(0), Some(-1), None]);
+        assert_eq!(
+            Value::Array(judge_scores_for_response(&parsed)),
+            serde_json::json!([1, "-", 0, -1, "-"])
+        );
+    }
+
+    #[test]
+    fn parse_llm_judge_scores_accepts_sparse_rank_object() {
+        let raw = r#"{"order":[3,1],"scores":{"1":1,"3":-1,"5":"-"}}"#;
+        let parsed = parse_llm_judge_scores(raw, 5);
+
+        assert_eq!(parsed, vec![Some(1), None, Some(-1), None, None]);
+    }
+
+    #[test]
+    fn rerank_candidate_content_includes_expanded_chunks() {
+        let id = Uuid::new_v4();
+        let result = crate::hybrid_search::SearchResult {
+            id,
+            source: "document_bm25".into(),
+            content: "hit chunk".into(),
+            score: 1.0,
+            result_type: "document_chunk".into(),
+            document_id: Some(id),
+            prev_chunk_id: None,
+            next_chunk_id: None,
+            hint: None,
+            expanded_context: vec![crate::hybrid_search::ExpandedChunkContext {
+                chunk_id: Uuid::new_v4(),
+                document_id: id,
+                ordinal: 2,
+                position: "next".into(),
+                distance: 1,
+                token_count: 5,
+                section_path: "section".into(),
+                content: "neighbor answer text".into(),
+            }],
+        };
+
+        let content = rerank_candidate_content(&result);
+
+        assert!(content.contains("hit chunk"));
+        assert!(content.contains("Expanded neighboring chunks"));
+        assert!(content.contains("neighbor answer text"));
+    }
+
+    #[test]
+    fn build_query_variants_heuristic_adds_bounded_keyword_and_evidence_queries() {
+        let variants = build_query_variants(
+            "How does BRCA1 repair DNA damage in breast cancer cells?",
+            "heuristic",
+            "bright_pro",
+            &[],
+            5,
+        )
+        .unwrap();
+
+        assert_eq!(
+            variants.first().map(String::as_str),
+            Some("How does BRCA1 repair DNA damage in breast cancer cells?")
+        );
+        assert!(variants.len() <= 5);
+        assert!(variants.iter().any(|query| query.contains("BRCA1")));
+        assert!(
+            variants
+                .iter()
+                .any(|query| query.starts_with("documents explaining "))
+        );
+        let unique = variants.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), variants.len());
+    }
+
+    #[test]
+    fn parse_llm_subqueries_accepts_compact_json_and_dedups_original() {
+        let raw = r#"{
+            "queries": [
+                "BRCA1 DNA repair breast cancer",
+                "support documents for homologous recombination",
+                "BRCA1 DNA repair breast cancer"
+            ]
+        }"#;
+        let variants = build_llm_query_variants(
+            "How does BRCA1 repair DNA damage in breast cancer cells?",
+            raw,
+            4,
+        );
+
+        assert_eq!(
+            variants,
+            vec![
+                "How does BRCA1 repair DNA damage in breast cancer cells?".to_string(),
+                "BRCA1 DNA repair breast cancer".to_string(),
+                "support documents for homologous recombination".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn memorybench_query_decomposition_prompt_extracts_question_subject() {
+        let query = "You are Sheldon.\n\n[Question] Which online game hooked Penny?\n[Answer]";
+
+        assert_eq!(
+            query_decomposition_subject(query, "memorybench"),
+            "Which online game hooked Penny?"
+        );
+
+        let prompt = query_decomposition_user_prompt(query, "memorybench", 5);
+        assert!(prompt.contains("Query subject:\nWhich online game hooked Penny?"));
+        assert!(prompt.contains("Do not write SQL"));
+    }
+
+    #[test]
+    fn build_query_variants_rejects_unknown_task_and_mode() {
+        assert!(build_query_variants("query", "unknown", "general", &[], 5).is_err());
+        assert!(build_query_variants("query", "heuristic", "unknown", &[], 5).is_err());
+    }
+
+    #[test]
+    fn merge_query_variant_outputs_promotes_hits_seen_by_multiple_variants() {
+        let shared = Uuid::new_v4();
+        let original_only = Uuid::new_v4();
+        let variant_only = Uuid::new_v4();
+        let result = |id, label: &str| crate::hybrid_search::SearchResult {
+            id,
+            source: "document_bm25".into(),
+            content: label.into(),
+            score: 1.0,
+            result_type: "document_chunk".into(),
+            document_id: Some(id),
+            prev_chunk_id: None,
+            next_chunk_id: None,
+            hint: None,
+            expanded_context: Vec::new(),
+        };
+        let original = crate::hybrid_search::SearchOutput {
+            results: vec![
+                result(original_only, "original only"),
+                result(shared, "shared"),
+            ],
+            diagnostics: crate::hybrid_search::SearchDiagnostics {
+                requested_limit: 2,
+                source_limit: 2,
+                total_candidates: 2,
+                unique_candidates: 2,
+                sources: vec![],
+            },
+        };
+        let variant = crate::hybrid_search::SearchOutput {
+            results: vec![
+                result(variant_only, "variant only"),
+                result(shared, "shared"),
+            ],
+            diagnostics: crate::hybrid_search::SearchDiagnostics {
+                requested_limit: 2,
+                source_limit: 2,
+                total_candidates: 2,
+                unique_candidates: 2,
+                sources: vec![],
+            },
+        };
+
+        let merged = merge_query_variant_outputs(
+            vec![
+                QueryVariantSearchOutput {
+                    query: "original".into(),
+                    output: original,
+                    embedding_status: "provided".into(),
+                },
+                QueryVariantSearchOutput {
+                    query: "variant".into(),
+                    output: variant,
+                    embedding_status: "provided".into(),
+                },
+            ],
+            3,
+        );
+
+        assert_eq!(merged.results.first().map(|result| result.id), Some(shared));
+        assert_eq!(merged.diagnostics.queries.len(), 2);
+        assert_eq!(merged.diagnostics.unique_results, 3);
+    }
+
+    #[test]
+    fn apply_llm_rerank_order_preserves_omitted_candidates_and_tail() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let third = Uuid::new_v4();
+        let fourth = Uuid::new_v4();
+        let result = |id, content: &str| crate::hybrid_search::SearchResult {
+            id,
+            source: "entity_ann".into(),
+            content: content.into(),
+            score: 1.0,
+            result_type: "entity".into(),
+            document_id: None,
+            prev_chunk_id: None,
+            next_chunk_id: None,
+            hint: None,
+            expanded_context: Vec::new(),
+        };
+        let reranked = apply_llm_rerank_order(
+            vec![
+                result(first, "first"),
+                result(second, "second"),
+                result(third, "third"),
+                result(fourth, "fourth"),
+            ],
+            &[third, first],
+            3,
+        );
+        let ids = reranked.into_iter().map(|r| r.id).collect::<Vec<_>>();
+
+        assert_eq!(ids, vec![third, first, second, fourth]);
+    }
+
+    #[test]
+    fn apply_llm_rerank_decision_promotes_positive_and_demotes_negative_scores() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let third = Uuid::new_v4();
+        let fourth = Uuid::new_v4();
+        let result = |id, content: &str| crate::hybrid_search::SearchResult {
+            id,
+            source: "document_bm25".into(),
+            content: content.into(),
+            score: 1.0,
+            result_type: "document_chunk".into(),
+            document_id: Some(id),
+            prev_chunk_id: None,
+            next_chunk_id: None,
+            hint: None,
+            expanded_context: Vec::new(),
+        };
+
+        let reranked = apply_llm_rerank_decision(
+            vec![
+                result(first, "first"),
+                result(second, "second"),
+                result(third, "third"),
+                result(fourth, "fourth"),
+            ],
+            &[third, first, second],
+            &[Some(0), Some(-1), Some(1)],
+            3,
+        );
+        let ids = reranked.into_iter().map(|r| r.id).collect::<Vec<_>>();
+
+        assert_eq!(ids, vec![third, first, second, fourth]);
+    }
+
+    #[test]
+    fn apply_llm_rerank_decision_keeps_abstentions_below_positive_candidates() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let third = Uuid::new_v4();
+        let result = |id, content: &str| crate::hybrid_search::SearchResult {
+            id,
+            source: "document_bm25".into(),
+            content: content.into(),
+            score: 1.0,
+            result_type: "document_chunk".into(),
+            document_id: Some(id),
+            prev_chunk_id: None,
+            next_chunk_id: None,
+            hint: None,
+            expanded_context: Vec::new(),
+        };
+
+        let reranked = apply_llm_rerank_decision(
+            vec![
+                result(first, "first"),
+                result(second, "second"),
+                result(third, "third"),
+            ],
+            &[second, third, first],
+            &[None, Some(1), Some(0)],
+            3,
+        );
+        let ids = reranked.into_iter().map(|r| r.id).collect::<Vec<_>>();
+
+        assert_eq!(ids, vec![second, third, first]);
+    }
+
+    #[test]
+    fn apply_llm_rerank_decision_uses_order_when_positive_scores_are_sparse() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let third = Uuid::new_v4();
+        let result = |id, content: &str| crate::hybrid_search::SearchResult {
+            id,
+            source: "document_bm25".into(),
+            content: content.into(),
+            score: 1.0,
+            result_type: "document_chunk".into(),
+            document_id: Some(id),
+            prev_chunk_id: None,
+            next_chunk_id: None,
+            hint: None,
+            expanded_context: Vec::new(),
+        };
+
+        let reranked = apply_llm_rerank_decision(
+            vec![
+                result(first, "first"),
+                result(second, "second"),
+                result(third, "third"),
+            ],
+            &[third, second],
+            &[None, Some(1), None],
+            3,
+        );
+        let ids = reranked.into_iter().map(|r| r.id).collect::<Vec<_>>();
+
+        assert_eq!(ids, vec![third, second, first]);
+    }
+
+    #[test]
+    fn rank_batches_by_winner_order_keeps_unranked_batches_stable() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let third = Uuid::new_v4();
+        let fourth = Uuid::new_v4();
+
+        let ranked = rank_batches_by_winner_order(&[first, second, third, fourth], &[third, first]);
+
+        assert_eq!(ranked, vec![2, 0, 1, 3]);
     }
 
     #[tokio::test]

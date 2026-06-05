@@ -31,12 +31,21 @@ admin_password = "ferrosa_admin"
 [embeddings]
 provider = "ollama"
 ollama_base_url = "http://ollama:11434"
-model = "nomic-embed-text"
+model = "nomic-embed-text-v2-moe"
 dimensions = 768
 
 [retrieval]
 # Default ranked results returned by retrieval tools when k/limit is omitted.
 default_limit = 10
+
+[eval]
+# Eval harness defaults. Use higher retrieval depth and candidate fanout for
+# BRIGHT-Pro/MemoryBench scoring than for normal live agent turns.
+retrieval_k = 25
+# Best-known BRIGHT-Pro support-doc-closed MCP slice profile:
+# candidate_limit=50, fusion_profile="all", query_decomposition="llm",
+# query_task="bright_pro", query_variant_limit=5, query_embed_variants=true,
+# chunk_expansion="none", rerank=false.
 
 [graph]
 http_url = "http://ferrosa-node1:7474"
