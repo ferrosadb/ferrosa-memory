@@ -614,7 +614,70 @@ To reduce token usage at runtime, call:
 
 ---
 
-## Phase 14 — Troubleshooting checklist
+## Phase 14 — Long-recall defaults and eval profile
+
+For local 0.13 preview installs, verify the runtime config uses:
+
+```toml
+[retrieval]
+default_limit = 10
+
+[embeddings]
+provider = "ollama"
+model = "nomic-embed-text-v2-moe"
+dimensions = 768
+
+[eval]
+retrieval_k = 25
+```
+
+`default_limit = 10` is the live agent default. It keeps normal memory turns compact. If a user reports token churn, lower it with the `config` MCP tool; if a benchmark needs wider recall, set the eval runner's candidate parameters instead of raising the live default.
+
+The current best-known BRIGHT-Pro support-doc-closed MCP slice settings are:
+
+```text
+candidate_limit=50
+fusion_profile=all
+query_decomposition=llm
+query_task=bright_pro
+query_variant_limit=5
+query_embed_variants=true
+chunk_expansion=none
+rerank=false
+```
+
+That profile measured alpha_nDCG `0.816`, NDCG `0.799`, aspect_recall `0.940`, and recall `0.796` on the 200-document biology support-closed slice. Treat these as preview slice numbers, not a full-corpus paper comparison.
+
+Optional local judge/reranker settings:
+
+```toml
+[judge]
+enabled = false
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+model = "qwen2.5-coder:7b"
+timeout_seconds = 60
+```
+
+Keep live judge disabled unless the machine has a warm local or remote model endpoint. Judge failures or no-decisions should be recorded as abstentions (`"-"`), while agent/user feedback should use `+1` and `-1` scores so the reranker can learn by workspace and retrieval channel.
+
+Useful eval commands:
+
+```bash
+scripts/run-official-evals.sh --self-test
+
+FMEM_EVAL_QUERY_DECOMPOSITION=llm \
+FMEM_EVAL_QUERY_EMBED_VARIANTS=true \
+scripts/run-fusion-ablations.sh
+
+scripts/start-bright-pro-full-load.sh
+```
+
+The full-corpus loader writes `heartbeat.json`, `progress.json`, and `load.log` under `diagnostics/eval-runs/...`. It is intentionally resumable and observable because full BRIGHT-Pro ingestion is large.
+
+---
+
+## Phase 15 — Troubleshooting checklist
 
 | Symptom | First checks |
 |---|---|

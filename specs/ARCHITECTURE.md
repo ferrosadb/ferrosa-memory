@@ -204,7 +204,7 @@ Any tool that writes something semantic (`store_memo_result`,
 
 1. MCP handler receives text.
 2. HTTP POST to Ollama's `/api/embeddings` (default
-   `http://localhost:11434`, model `nomic-embed-text`, 768-d f32). Optional
+   `http://localhost:11434`, model `nomic-embed-text-v2-moe`, 768-d f32). Optional
    small in-process cache by content hash.
 3. Result serialized via [`vector::encode_vector`](../crates/ferrosa-memory-core/src/vector.rs)
    into CQL wire bytes for the VECTOR column — a workaround for cdrs-tokio
