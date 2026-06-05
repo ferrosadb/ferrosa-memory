@@ -6772,7 +6772,15 @@ struct ChunkExpansionReport {
     added_tokens: i32,
 }
 
-fn parse_chunk_expansion(args: &Value) -> Result<(&str, usize, usize, i32), (i32, String)> {
+#[derive(Debug, Clone)]
+struct ChunkExpansionConfig {
+    mode: String,
+    prev: usize,
+    next: usize,
+    max_tokens: i32,
+}
+
+fn parse_chunk_expansion(args: &Value) -> Result<ChunkExpansionConfig, (i32, String)> {
     let mode = args
         .get("chunk_expansion")
         .and_then(Value::as_str)
@@ -6798,7 +6806,12 @@ fn parse_chunk_expansion(args: &Value) -> Result<(&str, usize, usize, i32), (i32
         .and_then(Value::as_i64)
         .unwrap_or(1600)
         .clamp(1, 8000) as i32;
-    Ok((mode, prev, next, max_tokens))
+    Ok(ChunkExpansionConfig {
+        mode: mode.to_string(),
+        prev,
+        next,
+        max_tokens,
+    })
 }
 
 fn expanded_chunk_context(
@@ -6823,21 +6836,18 @@ async fn apply_chunk_expansion<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session_id: uuid::Uuid,
     results: &mut [crate::hybrid_search::SearchResult],
-    mode: &str,
-    prev: usize,
-    next: usize,
-    max_tokens: i32,
+    config: &ChunkExpansionConfig,
 ) -> Result<ChunkExpansionReport, (i32, String)> {
     let mut report = ChunkExpansionReport {
-        mode: mode.to_string(),
-        prev,
-        next,
-        max_tokens,
+        mode: config.mode.clone(),
+        prev: config.prev,
+        next: config.next,
+        max_tokens: config.max_tokens,
         expanded_results: 0,
         added_chunks: 0,
         added_tokens: 0,
     };
-    if mode == "none" || (prev == 0 && next == 0) {
+    if config.mode == "none" || (config.prev == 0 && config.next == 0) {
         return Ok(report);
     }
 
@@ -6850,7 +6860,7 @@ async fn apply_chunk_expansion<S: crate::storage::Storage>(
 
         let mut before = Vec::new();
         let mut cursor = result.prev_chunk_id;
-        while before.len() < prev {
+        while before.len() < config.prev {
             let Some(chunk_id) = cursor else { break };
             let Some(chunk) = storage
                 .document_chunk_get(ctx, session_id, chunk_id)
@@ -6865,7 +6875,7 @@ async fn apply_chunk_expansion<S: crate::storage::Storage>(
         before.reverse();
         for (idx, chunk) in before.iter().enumerate() {
             let distance = before.len().saturating_sub(idx);
-            if added_tokens + chunk.token_count.max(0) > max_tokens {
+            if added_tokens + chunk.token_count.max(0) > config.max_tokens {
                 continue;
             }
             added_tokens += chunk.token_count.max(0);
@@ -6874,7 +6884,7 @@ async fn apply_chunk_expansion<S: crate::storage::Storage>(
 
         cursor = result.next_chunk_id;
         let mut distance = 1usize;
-        while distance <= next {
+        while distance <= config.next {
             let Some(chunk_id) = cursor else { break };
             let Some(chunk) = storage
                 .document_chunk_get(ctx, session_id, chunk_id)
@@ -6884,7 +6894,7 @@ async fn apply_chunk_expansion<S: crate::storage::Storage>(
                 break;
             };
             cursor = chunk.next_chunk_id;
-            if added_tokens + chunk.token_count.max(0) <= max_tokens {
+            if added_tokens + chunk.token_count.max(0) <= config.max_tokens {
                 added_tokens += chunk.token_count.max(0);
                 added.push(expanded_chunk_context(&chunk, "next", distance));
             }
@@ -7011,17 +7021,13 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
     let candidate_fanout = search_output.diagnostics;
     let mut all_results = search_output.results;
-    let (chunk_expansion_mode, chunk_prev, chunk_next, chunk_max_tokens) =
-        parse_chunk_expansion(&args)?;
+    let chunk_expansion_config = parse_chunk_expansion(&args)?;
     let chunk_expansion_report = apply_chunk_expansion(
         storage,
         ctx,
         session_id,
         &mut all_results,
-        chunk_expansion_mode,
-        chunk_prev,
-        chunk_next,
-        chunk_max_tokens,
+        &chunk_expansion_config,
     )
     .await?;
 
