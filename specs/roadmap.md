@@ -15,6 +15,12 @@
   - Implemented: eval scripts accept `--mcp-candidate-limit`; `scripts/run-long-recall-baseline.sh` defaults `FMEM_EVAL_CANDIDATE_LIMIT=50` for long-recall runs.
   - Measurement on BRIGHT-Pro biology 200-doc support-closed 5-case slice, no LLM rerank, reused corpus session: candidate limit 25 -> 50 improved alpha-nDCG `0.703 -> 0.720`, aspect recall `0.84 -> 0.94`, recall `0.736 -> 0.796`; one single case regressed in rank quality, so fusion ablations remain necessary.
 
+- [x] **RRF / weighted fusion needs reproducible ablations.**
+  - Implemented: `hybrid_search` accepts `fusion_profile` plus optional `fusion_weights`; responses include the active fusion profile and weights.
+  - Implemented: eval scripts accept `--mcp-fusion-profile`; `scripts/run-fusion-ablations.sh` sweeps named profiles against a fixed BRIGHT-Pro MCP slice.
+  - Measurement on BRIGHT-Pro biology 200-doc support-closed 5-case slice, candidate_limit=50, reused corpus session: `all+LLM` led alpha-nDCG (`0.796`) while preserving aspect recall (`0.94`) and recall (`0.796`); `bm25-only` led plain NDCG (`0.797`) but lower aspect recall (`0.88`); `semantic-only` was weak (`alpha=0.418`, `recall=0.209`).
+  - Interpretation: BM25 is still the strongest ranker on this slice, phonetic/fanout improves support coverage, and LLM rerank recovers rank quality from the broader candidate pool. Workspace and graph effects were not exercised in this benchmark slice because no cwd/graph candidate signals were present.
+
 - [ ] **Hybrid search needs an async judge-rerank mode with streamed status.**
   - Current: live LLM reranking can be enabled and works against local Ollama (`qwen2.5-coder:7b` hot path is ~2-3s for 8 candidates), but it is still in-band with the MCP request.
   - Implemented: judge-model reranking asks for per-candidate relevance scores and records `"-"` abstentions separately from valid `-1/0/1` judgments. `record_feedback` also accepts `"-"` and tracks per-judge sums so caller LLM, human, and judge-model feedback can accumulate without losing abstention/error evidence.

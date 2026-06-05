@@ -24,6 +24,7 @@ batch_size="${FMEM_EVAL_MCP_BATCH_SIZE:-25}"
 k="${FMEM_EVAL_K:-25}"
 rerank_candidates="${FMEM_EVAL_RERANK_CANDIDATES:-25}"
 candidate_limit="${FMEM_EVAL_CANDIDATE_LIMIT:-50}"
+fusion_profile="${FMEM_EVAL_FUSION_PROFILE:-all}"
 
 common_mcp_args=(
   --mcp-url "${mcp_url}"
@@ -33,6 +34,7 @@ common_mcp_args=(
   --mcp-batch-size "${batch_size}"
   --mcp-rerank-candidates "${rerank_candidates}"
   --mcp-candidate-limit "${candidate_limit}"
+  --mcp-fusion-profile "${fusion_profile}"
   --mcp-embed-missing
   --progress
 )

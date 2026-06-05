@@ -107,6 +107,14 @@ The BRIGHT-Pro full-corpus profile runs against the complete official support co
 
 The MemoryBench profile is currently an MCP retrieval-proxy baseline: it ingests official dialog and feedback rows, then measures whether retrieved evidence contains each row's `golden_answer` when one is present. It does not reproduce the paper's task-native generation/judge metrics yet.
 
+Run fusion ablations over a fixed support-closed BRIGHT-Pro slice with:
+
+```bash
+scripts/run-fusion-ablations.sh
+```
+
+Use `FMEM_EVAL_INCLUDE_LLM_RERANK=true` to add the slower `all-llm-rerank` profile.
+
 ## CI Shape
 
 ### Required PR Gate

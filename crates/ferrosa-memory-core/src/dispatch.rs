@@ -1192,6 +1192,15 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                         "maximum": 50,
                         "description": "Per-source candidate fanout before fusion. Defaults to min(limit*2, 50); lower it to reduce retrieval work."
                     },
+                    "fusion_profile": {
+                        "type": "string",
+                        "enum": ["default", "all", "bm25-only", "semantic-only", "bm25-semantic", "bm25-semantic-phonetic", "bm25-semantic-phonetic-workspace"],
+                        "description": "Named source-weight profile for ablations. Defaults to all."
+                    },
+                    "fusion_weights": {
+                        "type": "object",
+                        "description": "Optional numeric source weight overrides, e.g. {\"document_bm25\":2.5,\"document_ann\":1.5,\"document_phonetic\":0}."
+                    },
                     "scope": {
                         "type": "string",
                         "enum": ["session", "global", "both"],
@@ -6755,6 +6764,40 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         }
     }
 
+    let fusion_profile = args
+        .get("fusion_profile")
+        .and_then(Value::as_str)
+        .unwrap_or("all");
+    let mut fusion_config = crate::hybrid_search::FusionConfig::profile(fusion_profile)
+        .ok_or_else(|| {
+            (
+                INVALID_PARAMS,
+                format!("unknown fusion_profile: {fusion_profile}"),
+            )
+        })?;
+    if let Some(weights) = args.get("fusion_weights") {
+        let Some(object) = weights.as_object() else {
+            return Err((INVALID_PARAMS, "fusion_weights must be an object".into()));
+        };
+        for (key, value) in object {
+            let Some(weight) = value.as_f64() else {
+                return Err((
+                    INVALID_PARAMS,
+                    format!("fusion_weights.{key} must be a number"),
+                ));
+            };
+            if !(0.0..=10.0).contains(&weight) {
+                return Err((
+                    INVALID_PARAMS,
+                    format!("fusion_weights.{key} must be between 0 and 10"),
+                ));
+            }
+            if !fusion_config.set_weight(key, weight) {
+                return Err((INVALID_PARAMS, format!("unknown fusion weight key: {key}")));
+            }
+        }
+    }
+
     let search_output = crate::hybrid_search::hybrid_search_with_diagnostics(
         storage,
         ctx,
@@ -6765,7 +6808,7 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         None,
         None,
         None,
-        &crate::hybrid_search::FusionConfig::default(),
+        &fusion_config,
         Some(&filter),
     )
     .await
@@ -6929,6 +6972,10 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
             "error": reranker_report.error,
         },
         "candidate_fanout": candidate_fanout,
+        "fusion": {
+            "profile": fusion_profile,
+            "weights": fusion_config,
+        },
     });
     if result_count == 0 {
         response["_hint"] = serde_json::json!(

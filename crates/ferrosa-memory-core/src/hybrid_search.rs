@@ -50,7 +50,7 @@ pub struct SearchOutput {
 
 /// Configuration for 6-signal RRF fusion weights.
 /// Default weight 1.0 for all signals. Set to 0.0 to disable a signal.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FusionConfig {
     pub phonetic_weight: f64,
     pub ann_weight: f64,
@@ -85,6 +85,134 @@ impl Default for FusionConfig {
             pagerank_weight: 1.0,
             reputation_weight: 0.5,
             workspace_weight: 2.0,
+        }
+    }
+}
+
+impl FusionConfig {
+    pub fn profile(name: &str) -> Option<Self> {
+        let mut config = Self::default();
+        match name {
+            "default" | "all" => Some(config),
+            "bm25-only" => {
+                config.zero_all();
+                config.context_bm25_weight = 1.5;
+                config.document_bm25_weight = 2.5;
+                Some(config)
+            }
+            "semantic-only" => {
+                config.zero_all();
+                config.ann_weight = 1.0;
+                config.fold_weight = 1.0;
+                config.context_ann_weight = 1.0;
+                config.document_ann_weight = 1.5;
+                Some(config)
+            }
+            "bm25-semantic" => {
+                config.zero_all();
+                config.context_bm25_weight = 1.5;
+                config.document_bm25_weight = 2.5;
+                config.ann_weight = 1.0;
+                config.fold_weight = 1.0;
+                config.context_ann_weight = 1.0;
+                config.document_ann_weight = 1.5;
+                Some(config)
+            }
+            "bm25-semantic-phonetic" => {
+                config.zero_all();
+                config.context_bm25_weight = 1.5;
+                config.document_bm25_weight = 2.5;
+                config.ann_weight = 1.0;
+                config.fold_weight = 1.0;
+                config.context_ann_weight = 1.0;
+                config.document_ann_weight = 1.5;
+                config.phonetic_weight = 1.0;
+                config.document_phonetic_weight = 1.0;
+                Some(config)
+            }
+            "bm25-semantic-phonetic-workspace" => {
+                config.zero_all();
+                config.context_bm25_weight = 1.5;
+                config.document_bm25_weight = 2.5;
+                config.ann_weight = 1.0;
+                config.fold_weight = 1.0;
+                config.context_ann_weight = 1.0;
+                config.document_ann_weight = 1.5;
+                config.phonetic_weight = 1.0;
+                config.document_phonetic_weight = 1.0;
+                config.workspace_weight = 2.0;
+                Some(config)
+            }
+            _ => None,
+        }
+    }
+
+    fn zero_all(&mut self) {
+        self.phonetic_weight = 0.0;
+        self.ann_weight = 0.0;
+        self.fold_weight = 0.0;
+        self.context_bm25_weight = 0.0;
+        self.context_ann_weight = 0.0;
+        self.document_bm25_weight = 0.0;
+        self.document_ann_weight = 0.0;
+        self.document_phonetic_weight = 0.0;
+        self.warmth_weight = 0.0;
+        self.pagerank_weight = 0.0;
+        self.reputation_weight = 0.0;
+        self.workspace_weight = 0.0;
+    }
+
+    pub fn set_weight(&mut self, key: &str, weight: f64) -> bool {
+        match key {
+            "phonetic" | "entity_phonetic" | "phonetic_weight" => {
+                self.phonetic_weight = weight;
+                true
+            }
+            "ann" | "entity_ann" | "ann_weight" => {
+                self.ann_weight = weight;
+                true
+            }
+            "fold" | "fold_ann" | "fold_weight" => {
+                self.fold_weight = weight;
+                true
+            }
+            "context_bm25" | "context_bm25_weight" => {
+                self.context_bm25_weight = weight;
+                true
+            }
+            "context_ann" | "context_ann_weight" => {
+                self.context_ann_weight = weight;
+                true
+            }
+            "document_bm25" | "document_bm25_weight" => {
+                self.document_bm25_weight = weight;
+                true
+            }
+            "document_ann" | "document_ann_weight" => {
+                self.document_ann_weight = weight;
+                true
+            }
+            "document_phonetic" | "document_phonetic_weight" => {
+                self.document_phonetic_weight = weight;
+                true
+            }
+            "warmth" | "warmth_weight" => {
+                self.warmth_weight = weight;
+                true
+            }
+            "pagerank" | "graph" | "pagerank_weight" => {
+                self.pagerank_weight = weight;
+                true
+            }
+            "reputation" | "reputation_weight" => {
+                self.reputation_weight = weight;
+                true
+            }
+            "workspace" | "workspace_weight" => {
+                self.workspace_weight = weight;
+                true
+            }
+            _ => false,
         }
     }
 }
@@ -896,6 +1024,37 @@ mod tests {
         assert_eq!(source_limit(10, None), 20);
         assert_eq!(source_limit(25, None), 50);
         assert_eq!(source_limit(50, None), 50);
+    }
+
+    #[test]
+    fn fusion_profiles_select_expected_source_families() {
+        let bm25 = FusionConfig::profile("bm25-only").unwrap();
+        assert!(bm25.document_bm25_weight > 0.0);
+        assert!(bm25.context_bm25_weight > 0.0);
+        assert_eq!(bm25.document_ann_weight, 0.0);
+        assert_eq!(bm25.document_phonetic_weight, 0.0);
+
+        let semantic = FusionConfig::profile("semantic-only").unwrap();
+        assert!(semantic.document_ann_weight > 0.0);
+        assert_eq!(semantic.document_bm25_weight, 0.0);
+        assert_eq!(semantic.document_phonetic_weight, 0.0);
+
+        let combined = FusionConfig::profile("bm25-semantic-phonetic-workspace").unwrap();
+        assert!(combined.document_bm25_weight > 0.0);
+        assert!(combined.document_ann_weight > 0.0);
+        assert!(combined.document_phonetic_weight > 0.0);
+        assert!(combined.workspace_weight > 0.0);
+        assert!(FusionConfig::profile("not-a-profile").is_none());
+    }
+
+    #[test]
+    fn fusion_weight_overrides_accept_supported_keys() {
+        let mut config = FusionConfig::profile("bm25-only").unwrap();
+        assert!(config.set_weight("document_ann", 3.0));
+        assert_eq!(config.document_ann_weight, 3.0);
+        assert!(config.set_weight("graph", 1.25));
+        assert_eq!(config.pagerank_weight, 1.25);
+        assert!(!config.set_weight("unknown_source", 1.0));
     }
 
     #[test]

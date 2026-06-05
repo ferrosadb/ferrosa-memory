@@ -532,6 +532,7 @@ class McpBrightRetriever:
         self.entity_to_doc: dict[str, str] = {}
         self.last_reranker: dict[str, Any] | None = None
         self.last_candidate_fanout: dict[str, Any] | None = None
+        self.last_fusion: dict[str, Any] | None = None
         self.client.initialize()
 
     def ingest_documents(self, rows: list[dict[str, Any]], split: str) -> dict[str, Any]:
@@ -662,11 +663,14 @@ class McpBrightRetriever:
             arguments["rerank_candidates"] = self.args.mcp_rerank_candidates
         if self.args.mcp_candidate_limit is not None:
             arguments["candidate_limit"] = self.args.mcp_candidate_limit
+        if self.args.mcp_fusion_profile is not None:
+            arguments["fusion_profile"] = self.args.mcp_fusion_profile
         if self.args.mcp_rerank is not None:
             arguments["rerank"] = self.args.mcp_rerank
         response = self.client.call_tool("hybrid_search", arguments)
         self.last_reranker = response.get("reranker")
         self.last_candidate_fanout = response.get("candidate_fanout")
+        self.last_fusion = response.get("fusion")
         hits = []
         for result in response.get("results", []):
             entity_id = result_entity_id_for_mapping(result)
@@ -908,6 +912,7 @@ def run_bright_pro(args: argparse.Namespace) -> int:
             if mcp_retriever:
                 case["reranker"] = mcp_retriever.last_reranker
                 case["candidate_fanout"] = mcp_retriever.last_candidate_fanout
+                case["fusion"] = mcp_retriever.last_fusion
             split_cases.append(case)
             all_cases.append(case)
 
@@ -964,6 +969,9 @@ def run_bright_pro(args: argparse.Namespace) -> int:
         ),
         "mcp_candidate_limit": (
             args.mcp_candidate_limit if args.backend == "mcp-http" else None
+        ),
+        "mcp_fusion_profile": (
+            args.mcp_fusion_profile if args.backend == "mcp-http" else None
         ),
         "document_indexing_mode": ingest_summary["document_indexing_mode"],
         "k": args.k,
@@ -1209,6 +1217,7 @@ class McpMemoryBenchRetriever:
         self.entity_to_text: dict[str, str] = {}
         self.last_reranker: dict[str, Any] | None = None
         self.last_candidate_fanout: dict[str, Any] | None = None
+        self.last_fusion: dict[str, Any] | None = None
         self.client.initialize()
 
     def ingest_documents(self, documents: list[MemoryBenchDocument]) -> dict[str, Any]:
@@ -1335,11 +1344,14 @@ class McpMemoryBenchRetriever:
             arguments["rerank_candidates"] = self.args.mcp_rerank_candidates
         if self.args.mcp_candidate_limit is not None:
             arguments["candidate_limit"] = self.args.mcp_candidate_limit
+        if self.args.mcp_fusion_profile is not None:
+            arguments["fusion_profile"] = self.args.mcp_fusion_profile
         if self.args.mcp_rerank is not None:
             arguments["rerank"] = self.args.mcp_rerank
         response = self.client.call_tool("hybrid_search", arguments)
         self.last_reranker = response.get("reranker")
         self.last_candidate_fanout = response.get("candidate_fanout")
+        self.last_fusion = response.get("fusion")
         hits = []
         for result in response.get("results", []):
             entity_id = result_entity_id_for_mapping(result)
@@ -1511,6 +1523,7 @@ def run_memorybench(args: argparse.Namespace) -> int:
                 "retrieved_count": len(hits),
                 "reranker": mcp_retriever.last_reranker,
                 "candidate_fanout": mcp_retriever.last_candidate_fanout,
+                "fusion": mcp_retriever.last_fusion,
                 "hits": [
                     {
                         "id": hit.id,
@@ -1569,6 +1582,9 @@ def run_memorybench(args: argparse.Namespace) -> int:
         ),
         "mcp_candidate_limit": (
             args.mcp_candidate_limit if args.backend == "mcp-http" else None
+        ),
+        "mcp_fusion_profile": (
+            args.mcp_fusion_profile if args.backend == "mcp-http" else None
         ),
         "k": args.k if args.backend == "mcp-http" else None,
         "dataset_count": len(summaries),
@@ -1769,6 +1785,19 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Override per-source hybrid_search candidate fanout before fusion, e.g. 50.",
     )
+    bright.add_argument(
+        "--mcp-fusion-profile",
+        choices=[
+            "default",
+            "all",
+            "bm25-only",
+            "semantic-only",
+            "bm25-semantic",
+            "bm25-semantic-phonetic",
+            "bm25-semantic-phonetic-workspace",
+        ],
+        help="Named hybrid_search source-weight profile for ablations.",
+    )
     rerank_group = bright.add_mutually_exclusive_group()
     rerank_group.add_argument(
         "--mcp-rerank",
@@ -1850,6 +1879,19 @@ def parse_args() -> argparse.Namespace:
         "--mcp-candidate-limit",
         type=int,
         help="Override per-source hybrid_search candidate fanout before fusion, e.g. 50.",
+    )
+    memory.add_argument(
+        "--mcp-fusion-profile",
+        choices=[
+            "default",
+            "all",
+            "bm25-only",
+            "semantic-only",
+            "bm25-semantic",
+            "bm25-semantic-phonetic",
+            "bm25-semantic-phonetic-workspace",
+        ],
+        help="Named hybrid_search source-weight profile for ablations.",
     )
     memory_rerank_group = memory.add_mutually_exclusive_group()
     memory_rerank_group.add_argument(
