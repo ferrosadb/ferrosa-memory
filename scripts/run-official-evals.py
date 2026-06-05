@@ -295,9 +295,18 @@ class Bm25Index:
 
 
 class McpHttpClient:
-    def __init__(self, url: str, username: str, password: str, timeout_seconds: float):
+    def __init__(
+        self,
+        url: str,
+        username: str,
+        password: str,
+        timeout_seconds: float,
+        *,
+        max_rate_limit_retries: int = 5,
+    ):
         self.url = url
         self.timeout_seconds = timeout_seconds
+        self.max_rate_limit_retries = max_rate_limit_retries
         self.next_id = 1
         token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
         self.headers = {
@@ -327,12 +336,24 @@ class McpHttpClient:
         request = urllib.request.Request(
             self.url, data=body, headers=self.headers, method="POST"
         )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"MCP HTTP {exc.code}: {detail}") from exc
+        for attempt in range(self.max_rate_limit_retries + 1):
+            try:
+                with urllib.request.urlopen(
+                    request, timeout=self.timeout_seconds
+                ) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                if exc.code == 429 and attempt < self.max_rate_limit_retries:
+                    retry_after = exc.headers.get("Retry-After")
+                    try:
+                        sleep_seconds = float(retry_after) if retry_after else 60.0
+                    except ValueError:
+                        sleep_seconds = 60.0
+                    time.sleep(max(1.0, sleep_seconds))
+                    continue
+                raise RuntimeError(f"MCP HTTP {exc.code}: {detail}") from exc
         if "error" in payload:
             raise RuntimeError(f"MCP JSON-RPC error: {payload['error']}")
         result = payload.get("result", {})
@@ -525,7 +546,11 @@ class McpBrightRetriever:
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.client = McpHttpClient(
-            args.mcp_url, args.mcp_user, args.mcp_password, args.mcp_timeout_seconds
+            args.mcp_url,
+            args.mcp_user,
+            args.mcp_password,
+            args.mcp_timeout_seconds,
+            max_rate_limit_retries=args.mcp_rate_limit_retries,
         )
         self.session_id = args.mcp_session_id or str(uuid.uuid4())
         self.tenant_id = args.mcp_tenant_id
@@ -685,6 +710,8 @@ class McpBrightRetriever:
         if self.args.mcp_rerank is not None:
             arguments["rerank"] = self.args.mcp_rerank
         response = self.client.call_tool("hybrid_search", arguments)
+        if self.args.mcp_search_delay_seconds > 0:
+            time.sleep(self.args.mcp_search_delay_seconds)
         self.last_reranker = response.get("reranker")
         self.last_candidate_fanout = response.get("candidate_fanout")
         self.last_fusion = response.get("fusion")
@@ -1251,7 +1278,11 @@ class McpMemoryBenchRetriever:
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.client = McpHttpClient(
-            args.mcp_url, args.mcp_user, args.mcp_password, args.mcp_timeout_seconds
+            args.mcp_url,
+            args.mcp_user,
+            args.mcp_password,
+            args.mcp_timeout_seconds,
+            max_rate_limit_retries=args.mcp_rate_limit_retries,
         )
         self.session_id = args.mcp_session_id or str(uuid.uuid4())
         self.tenant_id = args.mcp_tenant_id
@@ -1408,6 +1439,8 @@ class McpMemoryBenchRetriever:
         if self.args.mcp_rerank is not None:
             arguments["rerank"] = self.args.mcp_rerank
         response = self.client.call_tool("hybrid_search", arguments)
+        if self.args.mcp_search_delay_seconds > 0:
+            time.sleep(self.args.mcp_search_delay_seconds)
         self.last_reranker = response.get("reranker")
         self.last_candidate_fanout = response.get("candidate_fanout")
         self.last_fusion = response.get("fusion")
@@ -1838,6 +1871,18 @@ def parse_args() -> argparse.Namespace:
     )
     bright.add_argument("--mcp-session-id")
     bright.add_argument("--mcp-timeout-seconds", type=float, default=60.0)
+    bright.add_argument(
+        "--mcp-rate-limit-retries",
+        type=int,
+        default=5,
+        help="Retry MCP HTTP 429 responses this many times, honoring Retry-After.",
+    )
+    bright.add_argument(
+        "--mcp-search-delay-seconds",
+        type=float,
+        default=0.0,
+        help="Sleep after each MCP retrieval call to avoid local HTTP rate limits.",
+    )
     bright.add_argument("--mcp-batch-size", type=int, default=100)
     bright.add_argument(
         "--mcp-entity-type",
@@ -1964,6 +2009,18 @@ def parse_args() -> argparse.Namespace:
     )
     memory.add_argument("--mcp-session-id")
     memory.add_argument("--mcp-timeout-seconds", type=float, default=60.0)
+    memory.add_argument(
+        "--mcp-rate-limit-retries",
+        type=int,
+        default=5,
+        help="Retry MCP HTTP 429 responses this many times, honoring Retry-After.",
+    )
+    memory.add_argument(
+        "--mcp-search-delay-seconds",
+        type=float,
+        default=0.0,
+        help="Sleep after each MCP retrieval call to avoid local HTTP rate limits.",
+    )
     memory.add_argument("--mcp-batch-size", type=int, default=100)
     memory.add_argument(
         "--mcp-entity-type",

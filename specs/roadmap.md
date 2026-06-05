@@ -38,6 +38,8 @@
   - MemoryBench retrieval-proxy smoke on 2 `DialSim-bigbang` rows regressed answer-term recall from `0.75` to `0.50`; exact-answer hit rate stayed `0.50`.
   - Implemented follow-up: task-aware LLM decomposition uses `query_task=bright_pro|memorybench`, extracts the MemoryBench `[Question]` subject, forbids SQL/query-language output, and falls back to heuristic variants if the generator fails or returns no usable subqueries.
   - Measurement with task-aware LLM decomposition on the same BRIGHT-Pro slice, no LLM rerank: alpha-nDCG improved `0.720 -> 0.811`, NDCG improved `0.725 -> 0.792`, while aspect recall (`0.94`) and recall (`0.796`) were unchanged.
+  - Tuning sweep on the same slice: best balanced profile was `candidate_limit=50`, `fusion_profile=all|default`, `query_decomposition=llm`, `query_task=bright_pro`, `query_variant_limit=5`, `query_embed_variants=true`, no chunk expansion, no rerank. It improved alpha-nDCG to `0.816` and NDCG to `0.799`, with aspect recall `0.94` and recall `0.796`.
+  - Tradeoffs observed: `bm25-only` reached similar alpha-nDCG (`0.812`) and higher plain NDCG (`0.801`) but lower aspect recall (`0.88`) and recall (`0.776`); `query_variant_limit=6|7` improved recall (`0.818-0.841`) but lowered alpha-nDCG; candidate fanout above `50` did not change this slice.
   - Measurement with task-aware LLM decomposition plus in-band LLM rerank: alpha-nDCG dropped `0.796 -> 0.714`, so the current judge reranker interacts poorly with variant-union output.
   - MemoryBench retrieval-proxy smoke with task-aware LLM decomposition is neutral after prompt hardening: answer-term recall `0.75`, exact-answer hit rate `0.50`.
   - Interpretation: deterministic heuristic decomposition currently broadens the candidate pool but injects noisy lexical variants that hurt ranking. Task-aware LLM subqueries are the first positive BRIGHT-Pro ranking result, but should be used as an opt-in no-rerank eval profile until reranker training/ablation separates original-query rank, variant rank, and judge score.
@@ -66,9 +68,12 @@ These came up while wiring official BRIGHT-Pro / MemoryBench eval corpora. They 
 
 - [ ] **Eval corpus isolation and baselines need hardening.**
   - Observed: capped BRIGHT-Pro MCP runs can score 0.0 when relevant support docs are outside the capped ingest window.
+  - Observed: true all-split BRIGHT-Pro MCP full-corpus runs require loading `526,319` support documents. The deterministic full-corpus session was not populated on 2026-06-05; a skip-ingest probe returned zero hits, and a fresh no-embedding ingest reached only `200/59,513` biology docs after several minutes. Full MCP comparison is blocked on a faster bulk corpus loader or offline index import path.
   - Impact: small live slices validate wiring but cannot be compared to paper systems unless the official support corpus is fully ingested or the harness ingests support-closed subsets.
   - Implemented: `scripts/run-official-evals.py bright-pro --backend mcp-http --mcp-max-docs N` now samples only examples whose support docs are fully inside the capped ingest window.
+  - Implemented: eval MCP HTTP client now honors `Retry-After` on 429 responses and supports `--mcp-search-delay-seconds`; long-recall profiles can set `FMEM_EVAL_EMBED_MISSING=false` to avoid accidental full-corpus Ollama embedding backfill.
   - Implemented: full-corpus MCP profiles use deterministic persisted corpus sessions for BRIGHT-Pro and MemoryBench via `scripts/run-long-recall-baseline.sh`.
+  - Measurement: full all-split local BM25 diagnostic over 739 BRIGHT-Pro examples scored alpha-nDCG `0.310`, aspect recall `0.459`, NDCG `0.292`, recall `0.352`. This is a scorer/parser reference, not an MCP result.
   - Implemented: MemoryBench now has an MCP retrieval-proxy baseline that ingests official dialog/feedback rows and reports answer-containing evidence retrieval. This is intentionally separate from the paper's task-native judge score.
   - Next: add JSON baseline comparison and CI/manual-dispatch gates before treating BRIGHT-Pro or MemoryBench scores as regression blockers.
 

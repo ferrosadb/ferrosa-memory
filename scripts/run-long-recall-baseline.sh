@@ -20,6 +20,8 @@ bright_session_id="${FMEM_EVAL_BRIGHT_SESSION_ID:-00000000-0000-0000-0000-000000
 memorybench_session_id="${FMEM_EVAL_MEMORYBENCH_SESSION_ID:-00000000-0000-0000-0000-00000000b7f2}"
 memorybench_variant="${FMEM_EVAL_MEMORYBENCH_VARIANT:-full}"
 timeout_seconds="${FMEM_EVAL_MCP_TIMEOUT_SECONDS:-180}"
+rate_limit_retries="${FMEM_EVAL_MCP_RATE_LIMIT_RETRIES:-5}"
+search_delay_seconds="${FMEM_EVAL_MCP_SEARCH_DELAY_SECONDS:-0}"
 batch_size="${FMEM_EVAL_MCP_BATCH_SIZE:-25}"
 k="${FMEM_EVAL_K:-25}"
 rerank_candidates="${FMEM_EVAL_RERANK_CANDIDATES:-25}"
@@ -33,12 +35,15 @@ chunk_expansion="${FMEM_EVAL_CHUNK_EXPANSION:-none}"
 chunk_prev="${FMEM_EVAL_CHUNK_PREV:-1}"
 chunk_next="${FMEM_EVAL_CHUNK_NEXT:-1}"
 chunk_max_tokens="${FMEM_EVAL_CHUNK_MAX_TOKENS:-1600}"
+embed_missing="${FMEM_EVAL_EMBED_MISSING:-true}"
 
 common_mcp_args=(
   --mcp-url "${mcp_url}"
   --mcp-user "${mcp_user}"
   --mcp-password "${mcp_password}"
   --mcp-timeout-seconds "${timeout_seconds}"
+  --mcp-rate-limit-retries "${rate_limit_retries}"
+  --mcp-search-delay-seconds "${search_delay_seconds}"
   --mcp-batch-size "${batch_size}"
   --mcp-rerank-candidates "${rerank_candidates}"
   --mcp-candidate-limit "${candidate_limit}"
@@ -49,9 +54,12 @@ common_mcp_args=(
   --mcp-chunk-prev "${chunk_prev}"
   --mcp-chunk-next "${chunk_next}"
   --mcp-chunk-max-tokens "${chunk_max_tokens}"
-  --mcp-embed-missing
   --progress
 )
+
+if [[ "${embed_missing}" == "true" ]]; then
+  common_mcp_args+=(--mcp-embed-missing)
+fi
 
 if [[ "${query_embed_variants}" == "true" ]]; then
   common_mcp_args+=(--mcp-query-embed-variants)

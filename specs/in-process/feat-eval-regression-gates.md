@@ -149,6 +149,24 @@ scripts/run-long-recall-baseline.sh bright-pro
 
 Current measurement: task-aware LLM decomposition is the first positive query-decomposition profile on the BRIGHT-Pro 200-doc support-closed slice. With `candidate_limit=50`, `fusion_profile=all`, `query_task=bright_pro`, and no in-band LLM rerank, alpha-nDCG improved `0.720 -> 0.811` and NDCG improved `0.725 -> 0.792`; aspect recall (`0.94`) and recall (`0.796`) were unchanged. Combining the same generated variants with the current in-band LLM reranker regressed alpha-nDCG (`0.796 -> 0.714`), so use the no-rerank profile until reranker ablations separate original-query rank, variant rank, and judge score. On the two-row MemoryBench retrieval proxy, `query_task=memorybench` was neutral after prompt hardening: answer-term recall `0.75`, exact-answer hit rate `0.50`.
 
+Tuning update: the best balanced BRIGHT-Pro support-closed slice profile found on 2026-06-05 was:
+
+```bash
+FMEM_EVAL_CANDIDATE_LIMIT=50 \
+FMEM_EVAL_FUSION_PROFILE=all \
+FMEM_EVAL_QUERY_DECOMPOSITION=llm \
+FMEM_EVAL_QUERY_TASK=bright_pro \
+FMEM_EVAL_QUERY_VARIANT_LIMIT=5 \
+FMEM_EVAL_QUERY_EMBED_VARIANTS=true \
+FMEM_EVAL_CHUNK_EXPANSION=none \
+FMEM_EVAL_INCLUDE_LLM_RERANK=false \
+scripts/run-long-recall-baseline.sh bright-pro
+```
+
+On the same 5-case/200-doc slice this reached alpha-nDCG `0.816`, NDCG `0.799`, aspect recall `0.94`, and recall `0.796`. `bm25-only` had similar alpha-nDCG (`0.812`) and higher plain NDCG (`0.801`) but lower aspect recall (`0.88`) and recall (`0.776`). Variant limits `6` and `7` increased recall but reduced alpha-nDCG. Candidate limits `75` and `100` did not move results beyond `50`.
+
+Full all-split MCP comparison is currently blocked by ingestion throughput, not metrics. The official BRIGHT-Pro corpus has `526,319` support documents and the deterministic full-corpus MCP session was not populated; a skip-ingest probe returned zero hits. A fresh no-embedding MCP ingest reached only `200/59,513` biology documents after several minutes. Full all-split local BM25 diagnostic over 739 examples scored alpha-nDCG `0.310`, aspect recall `0.459`, NDCG `0.292`, recall `0.352`; this is a parser/scorer reference, not an MCP result.
+
 ## CI Shape
 
 ### Required PR Gate
