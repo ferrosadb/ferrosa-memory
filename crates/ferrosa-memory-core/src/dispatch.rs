@@ -1203,8 +1203,13 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                     },
                     "query_decomposition": {
                         "type": "string",
-                        "enum": ["none", "heuristic"],
-                        "description": "Generate bounded query variants and RRF-union their candidate sets before reranking. Default none."
+                        "enum": ["none", "heuristic", "llm"],
+                        "description": "Generate bounded query variants and RRF-union their candidate sets before reranking. llm uses the configured judge model. Default none."
+                    },
+                    "query_task": {
+                        "type": "string",
+                        "enum": ["general", "bright_pro", "memorybench"],
+                        "description": "Task hint for query decomposition prompt shaping. Default general."
                     },
                     "query_variants": {
                         "type": "array",
@@ -6959,6 +6964,8 @@ struct QueryVariantDiagnostic {
 #[derive(Debug, Clone, serde::Serialize)]
 struct QueryDecompositionReport {
     mode: String,
+    task: String,
+    generator_status: String,
     query_count: usize,
     unique_results: usize,
     queries: Vec<QueryVariantDiagnostic>,
@@ -7009,6 +7016,13 @@ fn query_decomposition_stopwords(token: &str) -> bool {
             | "with"
             | "within"
     )
+}
+
+fn validate_query_decomposition_task(task: &str) -> Result<&str, (i32, String)> {
+    match task {
+        "general" | "bright_pro" | "memorybench" => Ok(task),
+        _ => Err((INVALID_PARAMS, format!("unknown query_task: {task}"))),
+    }
 }
 
 fn normalize_query_token(token: &str) -> String {
@@ -7066,11 +7080,12 @@ fn entity_alias_query(query: &str, max_terms: usize) -> Option<String> {
 fn build_query_variants(
     query: &str,
     mode: &str,
+    task: &str,
     caller_variants: &[String],
     max_variants: usize,
 ) -> Result<Vec<String>, (i32, String)> {
     match mode {
-        "none" | "heuristic" => {}
+        "none" | "heuristic" | "llm" => {}
         _ => {
             return Err((
                 INVALID_PARAMS,
@@ -7078,6 +7093,7 @@ fn build_query_variants(
             ));
         }
     }
+    validate_query_decomposition_task(task)?;
     let max_variants = max_variants.clamp(1, 8);
     let mut variants = Vec::new();
     let mut seen = HashSet::new();
@@ -7090,17 +7106,18 @@ fn build_query_variants(
         push_unique_query(&mut variants, &mut seen, variant.to_string());
     }
 
-    if mode == "heuristic" {
+    if mode == "heuristic" || mode == "llm" {
         if variants.len() < max_variants
             && let Some(keywords) = keyword_query(query, 14)
         {
             push_unique_query(&mut variants, &mut seen, keywords.clone());
             if variants.len() < max_variants {
-                push_unique_query(
-                    &mut variants,
-                    &mut seen,
-                    format!("supporting evidence for {keywords}"),
-                );
+                let evidence_query = match task {
+                    "bright_pro" => format!("documents explaining {keywords}"),
+                    "memorybench" => format!("conversation memory feedback about {keywords}"),
+                    _ => format!("supporting evidence for {keywords}"),
+                };
+                push_unique_query(&mut variants, &mut seen, evidence_query);
             }
         }
         if variants.len() < max_variants
@@ -7111,6 +7128,114 @@ fn build_query_variants(
     }
 
     Ok(variants)
+}
+
+fn collect_subquery_strings(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(text) => out.push(text.to_string()),
+        Value::Array(values) => {
+            for value in values {
+                collect_subquery_strings(value, out);
+            }
+        }
+        Value::Object(map) => {
+            for key in ["queries", "subqueries", "query_variants", "variants"] {
+                if let Some(value) = map.get(key) {
+                    collect_subquery_strings(value, out);
+                    return;
+                }
+            }
+            if let Some(value) = map.get("query").or_else(|| map.get("text")) {
+                collect_subquery_strings(value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn build_llm_query_variants(query: &str, raw: &str, max_variants: usize) -> Vec<String> {
+    let max_variants = max_variants.clamp(1, 8);
+    let mut variants = Vec::new();
+    let mut seen = HashSet::new();
+    push_unique_query(&mut variants, &mut seen, query.to_string());
+
+    let Some(value) = parse_llm_rerank_json(raw) else {
+        return variants;
+    };
+    let mut generated = Vec::new();
+    collect_subquery_strings(&value, &mut generated);
+    for variant in generated {
+        if variants.len() >= max_variants {
+            break;
+        }
+        push_unique_query(&mut variants, &mut seen, variant);
+    }
+    variants
+}
+
+fn query_decomposition_subject(query: &str, task: &str) -> String {
+    if task == "memorybench"
+        && let Some(question_start) = query.find("[Question]")
+    {
+        let after_question = &query[question_start + "[Question]".len()..];
+        let question = after_question
+            .split("[Answer]")
+            .next()
+            .unwrap_or(after_question)
+            .trim();
+        if !question.is_empty() {
+            return question.to_string();
+        }
+    }
+    query.trim().to_string()
+}
+
+fn query_decomposition_system_prompt(task: &str) -> &'static str {
+    match task {
+        "bright_pro" => {
+            "You generate high-precision retrieval subqueries for BRIGHT-Pro reasoning-intensive retrieval. Return compact JSON only."
+        }
+        "memorybench" => {
+            "You generate high-precision natural-language retrieval subqueries for conversation memory and feedback recall. Return compact JSON only."
+        }
+        _ => "You generate high-precision retrieval subqueries. Return compact JSON only.",
+    }
+}
+
+fn query_decomposition_user_prompt(query: &str, task: &str, max_variants: usize) -> String {
+    let subject = query_decomposition_subject(query, task);
+    let task_guidance = match task {
+        "bright_pro" => {
+            "The goal is to retrieve support documents for a reasoning-heavy question. Generate exact-entity, core-claim, alias/paraphrase, and evidence-focused subqueries. Avoid generic filler and avoid adding unsupported facts."
+        }
+        "memorybench" => {
+            "The goal is to retrieve memories from prior conversations and feedback. Generate natural-language subqueries for entities, dates, user/task context, correction/feedback, and likely answer-bearing memory. Do not write SQL, code, schema names, or database commands."
+        }
+        _ => {
+            "Generate exact-entity, core-concept, alias/paraphrase, and evidence-focused subqueries. Avoid generic filler and avoid adding unsupported facts."
+        }
+    };
+    format!(
+        "{task_guidance}\n\nOriginal query:\n{query}\n\nQuery subject:\n{subject}\n\nReturn JSON only: {{\"queries\":[\"subquery\",...]}}. \
+         Return at most {} subqueries. Do not repeat the original query or write query languages.",
+        max_variants.saturating_sub(1).max(1)
+    )
+}
+
+async fn generate_llm_query_variants(
+    config: &crate::config::JudgeConfig,
+    query: &str,
+    task: &str,
+    max_variants: usize,
+) -> anyhow::Result<Vec<String>> {
+    let raw = generate_judge_text(
+        config,
+        query_decomposition_system_prompt(task),
+        &query_decomposition_user_prompt(query, task, max_variants),
+        384,
+    )
+    .await?;
+    Ok(build_llm_query_variants(query, &raw, max_variants))
 }
 
 fn collapse_duplicate_variant_documents(
@@ -7187,6 +7312,8 @@ fn merge_query_variant_outputs(
             } else {
                 "none".into()
             },
+            task: "general".into(),
+            generator_status: "not_requested".into(),
             query_count: queries.len(),
             unique_results: unique.len(),
             queries,
@@ -7236,6 +7363,11 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         .get("query_decomposition")
         .and_then(Value::as_str)
         .unwrap_or("none");
+    let query_task = args
+        .get("query_task")
+        .and_then(Value::as_str)
+        .unwrap_or("general");
+    validate_query_decomposition_task(query_task)?;
     let query_variant_limit = args
         .get("query_variant_limit")
         .and_then(Value::as_u64)
@@ -7246,12 +7378,59 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let caller_query_variants = optional_string_array(&args, "query_variants")?;
-    let query_variants = build_query_variants(
+    let mut query_generator_status = "not_requested".to_string();
+    let mut query_variants = build_query_variants(
         query,
-        query_decomposition_mode,
+        if query_decomposition_mode == "llm" {
+            "none"
+        } else {
+            query_decomposition_mode
+        },
+        query_task,
         &caller_query_variants,
         query_variant_limit,
     )?;
+    if query_decomposition_mode == "llm" {
+        let judge_config = session.judge_config.lock().await.clone();
+        match generate_llm_query_variants(&judge_config, query, query_task, query_variant_limit)
+            .await
+        {
+            Ok(generated) if generated.len() > 1 => {
+                query_generator_status = "generated".into();
+                let mut seen = query_variants
+                    .iter()
+                    .map(|variant| variant.to_ascii_lowercase())
+                    .collect::<HashSet<_>>();
+                for variant in generated.into_iter().skip(1) {
+                    if query_variants.len() >= query_variant_limit {
+                        break;
+                    }
+                    push_unique_query(&mut query_variants, &mut seen, variant);
+                }
+            }
+            Ok(_) => {
+                query_generator_status = "empty_fallback_heuristic".into();
+                query_variants = build_query_variants(
+                    query,
+                    "heuristic",
+                    query_task,
+                    &caller_query_variants,
+                    query_variant_limit,
+                )?;
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "LLM query decomposition failed; falling back to heuristic");
+                query_generator_status = "failed_fallback_heuristic".into();
+                query_variants = build_query_variants(
+                    query,
+                    "heuristic",
+                    query_task,
+                    &caller_query_variants,
+                    query_variant_limit,
+                )?;
+            }
+        }
+    }
 
     // Auto-generate query embedding for ANN search if Ollama is configured.
     let embedding_client = session_embedding_client(session);
@@ -7363,6 +7542,8 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         });
     let mut query_merged_output = merge_query_variant_outputs(query_outputs, search_limit);
     query_merged_output.diagnostics.mode = query_decomposition_mode.to_string();
+    query_merged_output.diagnostics.task = query_task.to_string();
+    query_merged_output.diagnostics.generator_status = query_generator_status;
     let query_decomposition_report = query_merged_output.diagnostics;
     let mut all_results = query_merged_output.results;
     let chunk_expansion_config = parse_chunk_expansion(&args)?;
@@ -12841,6 +13022,7 @@ mod tests {
         let variants = build_query_variants(
             "How does BRCA1 repair DNA damage in breast cancer cells?",
             "heuristic",
+            "bright_pro",
             &[],
             5,
         )
@@ -12855,10 +13037,55 @@ mod tests {
         assert!(
             variants
                 .iter()
-                .any(|query| query.starts_with("supporting evidence for "))
+                .any(|query| query.starts_with("documents explaining "))
         );
         let unique = variants.iter().collect::<std::collections::HashSet<_>>();
         assert_eq!(unique.len(), variants.len());
+    }
+
+    #[test]
+    fn parse_llm_subqueries_accepts_compact_json_and_dedups_original() {
+        let raw = r#"{
+            "queries": [
+                "BRCA1 DNA repair breast cancer",
+                "support documents for homologous recombination",
+                "BRCA1 DNA repair breast cancer"
+            ]
+        }"#;
+        let variants = build_llm_query_variants(
+            "How does BRCA1 repair DNA damage in breast cancer cells?",
+            raw,
+            4,
+        );
+
+        assert_eq!(
+            variants,
+            vec![
+                "How does BRCA1 repair DNA damage in breast cancer cells?".to_string(),
+                "BRCA1 DNA repair breast cancer".to_string(),
+                "support documents for homologous recombination".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn memorybench_query_decomposition_prompt_extracts_question_subject() {
+        let query = "You are Sheldon.\n\n[Question] Which online game hooked Penny?\n[Answer]";
+
+        assert_eq!(
+            query_decomposition_subject(query, "memorybench"),
+            "Which online game hooked Penny?"
+        );
+
+        let prompt = query_decomposition_user_prompt(query, "memorybench", 5);
+        assert!(prompt.contains("Query subject:\nWhich online game hooked Penny?"));
+        assert!(prompt.contains("Do not write SQL"));
+    }
+
+    #[test]
+    fn build_query_variants_rejects_unknown_task_and_mode() {
+        assert!(build_query_variants("query", "unknown", "general", &[], 5).is_err());
+        assert!(build_query_variants("query", "heuristic", "unknown", &[], 5).is_err());
     }
 
     #[test]

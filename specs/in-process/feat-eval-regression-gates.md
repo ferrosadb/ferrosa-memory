@@ -135,7 +135,19 @@ FMEM_EVAL_QUERY_VARIANT_LIMIT=5 \
 scripts/run-long-recall-baseline.sh bright-pro
 ```
 
-Current measurement: deterministic heuristic decomposition is not a default. On the BRIGHT-Pro 200-doc support-closed slice it broadened the candidate pool but reduced alpha-nDCG (`0.720 -> 0.669` no rerank, `0.796 -> 0.697` with LLM rerank). MemoryBench's two-row retrieval proxy also regressed answer-term recall (`0.75 -> 0.50`). Treat this as ablation infrastructure; the next useful policy needs task-aware/LLM-generated subqueries or candidate-reservoir-only decomposition.
+Current measurement: deterministic heuristic decomposition is not a default. On the BRIGHT-Pro 200-doc support-closed slice it broadened the candidate pool but reduced alpha-nDCG (`0.720 -> 0.669` no rerank, `0.796 -> 0.697` with LLM rerank). MemoryBench's two-row retrieval proxy also regressed answer-term recall (`0.75 -> 0.50`). Treat this as ablation infrastructure only.
+
+Task-aware LLM subqueries can be exercised with:
+
+```bash
+FMEM_EVAL_QUERY_DECOMPOSITION=llm \
+FMEM_EVAL_QUERY_TASK=bright_pro \
+FMEM_EVAL_QUERY_VARIANT_LIMIT=5 \
+FMEM_EVAL_INCLUDE_LLM_RERANK=false \
+scripts/run-long-recall-baseline.sh bright-pro
+```
+
+Current measurement: task-aware LLM decomposition is the first positive query-decomposition profile on the BRIGHT-Pro 200-doc support-closed slice. With `candidate_limit=50`, `fusion_profile=all`, `query_task=bright_pro`, and no in-band LLM rerank, alpha-nDCG improved `0.720 -> 0.811` and NDCG improved `0.725 -> 0.792`; aspect recall (`0.94`) and recall (`0.796`) were unchanged. Combining the same generated variants with the current in-band LLM reranker regressed alpha-nDCG (`0.796 -> 0.714`), so use the no-rerank profile until reranker ablations separate original-query rank, variant rank, and judge score. On the two-row MemoryBench retrieval proxy, `query_task=memorybench` was neutral after prompt hardening: answer-term recall `0.75`, exact-answer hit rate `0.50`.
 
 ## CI Shape
 

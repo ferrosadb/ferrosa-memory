@@ -669,6 +669,8 @@ class McpBrightRetriever:
             arguments["fusion_profile"] = self.args.mcp_fusion_profile
         if self.args.mcp_query_decomposition is not None:
             arguments["query_decomposition"] = self.args.mcp_query_decomposition
+        if self.args.mcp_query_task is not None:
+            arguments["query_task"] = self.args.mcp_query_task
         if self.args.mcp_query_variant:
             arguments["query_variants"] = self.args.mcp_query_variant
         if self.args.mcp_query_variant_limit is not None:
@@ -995,6 +997,7 @@ def run_bright_pro(args: argparse.Namespace) -> int:
         "mcp_query_decomposition": (
             args.mcp_query_decomposition if args.backend == "mcp-http" else None
         ),
+        "mcp_query_task": args.mcp_query_task if args.backend == "mcp-http" else None,
         "mcp_query_variant": (
             args.mcp_query_variant if args.backend == "mcp-http" else None
         ),
@@ -1389,6 +1392,8 @@ class McpMemoryBenchRetriever:
             arguments["fusion_profile"] = self.args.mcp_fusion_profile
         if self.args.mcp_query_decomposition is not None:
             arguments["query_decomposition"] = self.args.mcp_query_decomposition
+        if self.args.mcp_query_task is not None:
+            arguments["query_task"] = self.args.mcp_query_task
         if self.args.mcp_query_variant:
             arguments["query_variants"] = self.args.mcp_query_variant
         if self.args.mcp_query_variant_limit is not None:
@@ -1647,6 +1652,7 @@ def run_memorybench(args: argparse.Namespace) -> int:
         "mcp_query_decomposition": (
             args.mcp_query_decomposition if args.backend == "mcp-http" else None
         ),
+        "mcp_query_task": args.mcp_query_task if args.backend == "mcp-http" else None,
         "mcp_query_variant": (
             args.mcp_query_variant if args.backend == "mcp-http" else None
         ),
@@ -1878,8 +1884,14 @@ def parse_args() -> argparse.Namespace:
     )
     bright.add_argument(
         "--mcp-query-decomposition",
-        choices=["none", "heuristic"],
+        choices=["none", "heuristic", "llm"],
         help="Enable bounded query decomposition in MCP hybrid_search.",
+    )
+    bright.add_argument(
+        "--mcp-query-task",
+        choices=["general", "bright_pro", "memorybench"],
+        default="bright_pro",
+        help="Task hint for MCP query decomposition.",
     )
     bright.add_argument(
         "--mcp-query-variant",
@@ -1997,8 +2009,14 @@ def parse_args() -> argparse.Namespace:
     )
     memory.add_argument(
         "--mcp-query-decomposition",
-        choices=["none", "heuristic"],
+        choices=["none", "heuristic", "llm"],
         help="Enable bounded query decomposition in MCP hybrid_search.",
+    )
+    memory.add_argument(
+        "--mcp-query-task",
+        choices=["general", "bright_pro", "memorybench"],
+        default="memorybench",
+        help="Task hint for MCP query decomposition.",
     )
     memory.add_argument(
         "--mcp-query-variant",

@@ -12,6 +12,7 @@ max_docs="${FMEM_EVAL_MCP_MAX_DOCS:-200}"
 candidate_limit="${FMEM_EVAL_CANDIDATE_LIMIT:-50}"
 rerank_candidates="${FMEM_EVAL_RERANK_CANDIDATES:-25}"
 query_decomposition="${FMEM_EVAL_QUERY_DECOMPOSITION:-none}"
+query_task="${FMEM_EVAL_QUERY_TASK:-bright_pro}"
 query_variant_limit="${FMEM_EVAL_QUERY_VARIANT_LIMIT:-5}"
 query_embed_variants="${FMEM_EVAL_QUERY_EMBED_VARIANTS:-false}"
 chunk_expansion="${FMEM_EVAL_CHUNK_EXPANSION:-none}"
@@ -36,6 +37,7 @@ for profile in ${profiles}; do
     --mcp-candidate-limit "${candidate_limit}" \
     --mcp-fusion-profile "${profile}" \
     --mcp-query-decomposition "${query_decomposition}" \
+    --mcp-query-task "${query_task}" \
     --mcp-query-variant-limit "${query_variant_limit}" \
     --mcp-chunk-expansion "${chunk_expansion}" \
     --mcp-chunk-prev "${chunk_prev}" \
@@ -59,6 +61,7 @@ if [[ "${FMEM_EVAL_INCLUDE_LLM_RERANK:-false}" == "true" ]]; then
     --mcp-candidate-limit "${candidate_limit}" \
     --mcp-fusion-profile all \
     --mcp-query-decomposition "${query_decomposition}" \
+    --mcp-query-task "${query_task}" \
     --mcp-query-variant-limit "${query_variant_limit}" \
     --mcp-chunk-expansion "${chunk_expansion}" \
     --mcp-chunk-prev "${chunk_prev}" \
@@ -90,6 +93,7 @@ for report_path in sorted(root.glob("*/bright-pro-report.json")):
         "cases": report["case_count"],
         "failures": report["failure_count"],
         "query_decomposition": report.get("mcp_query_decomposition"),
+        "query_task": report.get("mcp_query_task"),
         "query_variant_limit": report.get("mcp_query_variant_limit"),
         "query_embed_variants": report.get("mcp_query_embed_variants"),
     })
