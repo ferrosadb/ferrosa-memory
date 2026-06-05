@@ -341,6 +341,33 @@ def response_indexing_mode(response: dict[str, Any]) -> str | None:
 
 
 def parse_ingest_response(response: dict[str, Any]) -> dict[str, Any]:
+    chunks_indexed = int_counter(
+        response,
+        (
+            ("document_index", "chunks_indexed"),
+            ("document_index", "chunks", "indexed"),
+            ("chunks_indexed",),
+        ),
+    )
+    chunk_embeddings_computed = int_counter(
+        response,
+        (
+            ("document_index", "chunk_embeddings_computed"),
+            ("document_index", "embeddings", "computed"),
+            ("chunk_embeddings_computed",),
+        ),
+    )
+    chunk_embeddings_failed = int_counter(
+        response,
+        (
+            ("document_index", "chunk_embeddings_failed"),
+            ("document_index", "embeddings", "failed"),
+            ("chunk_embeddings_failed",),
+        ),
+    )
+    document_indexing_mode = response_indexing_mode(response)
+    if document_indexing_mode is None and chunks_indexed > 0:
+        document_indexing_mode = "semantic-chunks"
     return {
         "entity_inserted": int_counter(
             response,
@@ -400,7 +427,10 @@ def parse_ingest_response(response: dict[str, Any]) -> dict[str, Any]:
                 ("embedding_failed",),
             ),
         ),
-        "document_indexing_mode": response_indexing_mode(response),
+        "document_indexing_mode": document_indexing_mode,
+        "document_chunks_indexed": chunks_indexed,
+        "document_chunk_embeddings_computed": chunk_embeddings_computed,
+        "document_chunk_embeddings_failed": chunk_embeddings_failed,
     }
 
 
@@ -426,6 +456,7 @@ class McpBrightRetriever:
         self.session_id = args.mcp_session_id or str(uuid.uuid4())
         self.tenant_id = args.mcp_tenant_id
         self.entity_to_doc: dict[str, str] = {}
+        self.last_reranker: dict[str, Any] | None = None
         self.client.initialize()
 
     def ingest_documents(self, rows: list[dict[str, Any]], split: str) -> dict[str, Any]:
@@ -437,6 +468,9 @@ class McpBrightRetriever:
         skipped = 0
         embeddings_computed = 0
         embeddings_received = 0
+        document_chunks_indexed = 0
+        document_chunk_embeddings_computed = 0
+        document_chunk_embeddings_failed = 0
         document_indexing_modes: set[str] = set()
         rows_to_ingest = rows
         if self.args.mcp_max_docs is not None:
@@ -497,6 +531,11 @@ class McpBrightRetriever:
             skipped += parsed["entity_skipped"]
             embeddings_computed += parsed["embeddings_computed"]
             embeddings_received += parsed["embeddings_received"]
+            document_chunks_indexed += parsed["document_chunks_indexed"]
+            document_chunk_embeddings_computed += parsed[
+                "document_chunk_embeddings_computed"
+            ]
+            document_chunk_embeddings_failed += parsed["document_chunk_embeddings_failed"]
             entity_failed.extend(parsed["entity_failed"])
             embedding_failed.extend(parsed["embeddings_failed"])
             if parsed["document_indexing_mode"]:
@@ -509,6 +548,7 @@ class McpBrightRetriever:
                     f"entity_failed={len(entity_failed)} "
                     f"embeddings computed={embeddings_computed} "
                     f"received={embeddings_received} failed={len(embedding_failed)}",
+                    f"chunks={document_chunks_indexed}",
                     flush=True,
                 )
         document_indexing_mode = None
@@ -529,20 +569,26 @@ class McpBrightRetriever:
             "embeddings_received": embeddings_received,
             "embeddings_failed": len(embedding_failed),
             "embeddings_failed_samples": embedding_failed[:20],
+            "document_chunks_indexed": document_chunks_indexed,
+            "document_chunk_embeddings_computed": document_chunk_embeddings_computed,
+            "document_chunk_embeddings_failed": document_chunk_embeddings_failed,
             "document_indexing_mode": document_indexing_mode,
             "elapsed_seconds": time.time() - started,
         }
 
     def search(self, query: str, k: int) -> list[Hit]:
-        response = self.client.call_tool(
-            "hybrid_search",
-            {
-                "session_id": self.session_id,
-                "query": query,
-                "limit": k,
-                "scope": "session",
-            },
-        )
+        arguments = {
+            "session_id": self.session_id,
+            "query": query,
+            "limit": k,
+            "scope": "session",
+        }
+        if self.args.mcp_rerank_candidates is not None:
+            arguments["rerank_candidates"] = self.args.mcp_rerank_candidates
+        if self.args.mcp_rerank is not None:
+            arguments["rerank"] = self.args.mcp_rerank
+        response = self.client.call_tool("hybrid_search", arguments)
+        self.last_reranker = response.get("reranker")
         hits = []
         for result in response.get("results", []):
             entity_id = result_entity_id_for_mapping(result)
@@ -753,6 +799,8 @@ def run_bright_pro(args: argparse.Namespace) -> int:
                 "aspect_count": len(aspects),
                 "hits": [{"id": hit.id, "score": hit.score} for hit in hits[: args.failure_hits]],
             }
+            if mcp_retriever:
+                case["reranker"] = mcp_retriever.last_reranker
             split_cases.append(case)
             all_cases.append(case)
 
@@ -775,6 +823,7 @@ def run_bright_pro(args: argparse.Namespace) -> int:
                         "recall": case["recall"],
                         "ndcg": case["ndcg"],
                         "failure_reasons": failure_reasons(case, args),
+                        "reranker": case.get("reranker"),
                         "missing_aspects": [
                             {
                                 "id": aspect.id,
@@ -800,6 +849,10 @@ def run_bright_pro(args: argparse.Namespace) -> int:
         "mcp_url": args.mcp_url if args.backend == "mcp-http" else None,
         "mcp_session_id": mcp_retriever.session_id if mcp_retriever else None,
         "mcp_embed_missing": args.mcp_embed_missing if args.backend == "mcp-http" else None,
+        "mcp_rerank": args.mcp_rerank if args.backend == "mcp-http" else None,
+        "mcp_rerank_candidates": (
+            args.mcp_rerank_candidates if args.backend == "mcp-http" else None
+        ),
         "document_indexing_mode": ingest_summary["document_indexing_mode"],
         "k": args.k,
         "alpha": args.alpha,
@@ -1050,6 +1103,11 @@ def run_self_test() -> int:
                 "counts": {"computed": 4, "received": 5},
                 "failed": [{"id": "no-embedding"}],
             },
+            "document_index": {
+                "chunks_indexed": 6,
+                "chunk_embeddings_computed": 7,
+                "chunk_embeddings_failed": 1,
+            },
             "document_indexing": {"mode": "storage-ann"},
         }
     )
@@ -1061,6 +1119,9 @@ def run_self_test() -> int:
     assert parsed["embeddings_received"] == 5
     assert len(parsed["embeddings_failed"]) == 1
     assert parsed["document_indexing_mode"] == "storage-ann"
+    assert parsed["document_chunks_indexed"] == 6
+    assert parsed["document_chunk_embeddings_computed"] == 7
+    assert parsed["document_chunk_embeddings_failed"] == 1
     print("self-test passed")
     return 0
 
@@ -1122,6 +1183,25 @@ def parse_args() -> argparse.Namespace:
         "--mcp-skip-ingest",
         action="store_true",
         help="Reuse an existing deterministic session corpus; only rebuild ID mapping locally.",
+    )
+    bright.add_argument(
+        "--mcp-rerank-candidates",
+        type=int,
+        help="Override hybrid_search rerank_candidates for MCP runs, e.g. 25 for BRIGHT-Pro.",
+    )
+    rerank_group = bright.add_mutually_exclusive_group()
+    rerank_group.add_argument(
+        "--mcp-rerank",
+        dest="mcp_rerank",
+        action="store_true",
+        default=None,
+        help="Force MCP hybrid_search rerank=true.",
+    )
+    rerank_group.add_argument(
+        "--mcp-no-rerank",
+        dest="mcp_rerank",
+        action="store_false",
+        help="Force MCP hybrid_search rerank=false.",
     )
     bright.add_argument("--progress", action="store_true")
 

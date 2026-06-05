@@ -34,7 +34,10 @@ const BATCH_MUTATION_CONCURRENCY: usize = 16;
 const MIN_RETRIEVAL_LIMIT: usize = 1;
 const MAX_RETRIEVAL_LIMIT: usize = 50;
 const DEFAULT_RETRIEVAL_LIMIT: usize = 10;
-const LLM_RERANK_MAX_CANDIDATES: usize = 8;
+const LLM_RERANK_MIN_CANDIDATES: usize = 2;
+const LLM_RERANK_HARD_MAX_CANDIDATES: usize = 50;
+const LLM_RERANK_MIN_SCORE_COVERAGE: usize = 5;
+const LLM_RERANK_BATCH_SIZE: usize = 5;
 
 type ToolDispatchFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Value, (i32, String)>> + Send + 'a>>;
@@ -81,7 +84,7 @@ const INGEST_HINTS: &[&str] = &[
     "People, roles, and relationships mentioned? Those build context over time.",
     "Debugging insights — what caused a bug, what fixed it — save future you the trouble.",
     "Configuration gotchas and environment details are easy to forget. Ingest them.",
-    "What did you learn about how this codebase works? That's worth a smart_ingest.",
+    "What did you learn about how this codebase works? That's worth an ingest.",
     "Any surprising behavior or non-obvious design choices? Those are prime memory candidates.",
 ];
 
@@ -1122,7 +1125,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
         // --- Temporal fact tools ---
         ToolDef {
             name: "write_temporal_fact".into(),
-            description: "Records a timestamped fact about an entity. Auto-supersedes the previous fact, preserving history.\n\nCALL WHEN facts change over time — this is how you track evolution:\n- Role changes: 'Alice is now VP' supersedes 'Alice is Director'\n- Status updates: 'deploy succeeded' supersedes 'deploy in progress'\n- Project state: 'using Rust 1.82' supersedes 'using Rust 1.78'\n- Preference changes: 'user prefers dark mode' supersedes 'user likes light mode'\n- Bug status: 'fixed in commit abc' supersedes 'investigating OOM'\n\nFirst call smart_ingest to create the entity, then write_temporal_fact for facts that evolve. The supersession chain is queryable — you can answer 'what was X before?'\n\nReturns: event_id of the new fact.\nCost: ~5ms.".into(),
+            description: "Records a timestamped fact about an entity. Auto-supersedes the previous fact, preserving history.\n\nCALL WHEN facts change over time — this is how you track evolution:\n- Role changes: 'Alice is now VP' supersedes 'Alice is Director'\n- Status updates: 'deploy succeeded' supersedes 'deploy in progress'\n- Project state: 'using Rust 1.82' supersedes 'using Rust 1.78'\n- Preference changes: 'user prefers dark mode' supersedes 'user likes light mode'\n- Bug status: 'fixed in commit abc' supersedes 'investigating OOM'\n\nFirst call ingest to create the entity, then write_temporal_fact for facts that evolve. The supersession chain is queryable — you can answer 'what was X before?'\n\nReturns: event_id of the new fact.\nCost: ~5ms.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1205,6 +1208,12 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                     "rerank": {
                         "type": "boolean",
                         "description": "Override live LLM reranking for this call. Defaults to [judge].enabled."
+                    },
+                    "rerank_candidates": {
+                        "type": "integer",
+                        "minimum": 2,
+                        "maximum": 50,
+                        "description": "Override how many top candidates the judge reranker sees. Keep small for token economy; evals may use 25."
                     }
                 },
                 "required": ["query"]
@@ -1713,13 +1722,13 @@ SESSION START: (1) check_intentions with current context, (2) hybrid_search for 
 
 SEARCHING: hybrid_search first. If it returns what you need, you're done — no need to grep or read files. For document_chunk hits, call chunk_ctx when adjacent chunks or split list items could contain the rest of the answer. If the first page is irrelevant, send compact +1/-1 item feedback with feedback, then request the next page before falling back to grep/find/read.
 
-STORING: Use smart_ingest for new knowledge. It decides CREATE/UPDATE/SUPERSEDE/SKIP. Store insights, decisions, relationships, and facts — not raw file contents.
+STORING: Use ingest for new knowledge. It decides CREATE/UPDATE/SUPERSEDE/SKIP. Store insights, decisions, relationships, and facts — not raw file contents.
 
 CONNECTING: After learning 2+ related facts, use create_edge to link them. Types: depends_on, contains, part_of, related_to, calls, implements, uses, references. Connected facts are knowledge; isolated facts are just data.
 
 INTENTIONS: set_intention for deferred actions. check_intentions at session start. Triggers: Topic, FilePattern, Duration, Context.
 
-CONSOLIDATION: The server automatically queues consolidation after enough new smart_ingest entities. Use run_consolidation only to force a background consolidation request, such as at wrap-up.
+CONSOLIDATION: The server automatically queues consolidation after enough new ingest-created entities. Use run_consolidation only to force a background consolidation request, such as at wrap-up.
 
 FEEDBACK: If you had to use grep, find, or read files to get context that SHOULD have been in memory, call record_outcome with program_type="retrieval_miss" and include what you were looking for. This trains the system to store that kind of information in the future. Every retrieval miss is a signal to improve."#;
 
@@ -4575,21 +4584,28 @@ fn workspace_feedback_key(cwd: &str) -> String {
     format!("cwd:{}", hex::encode(&digest[..8]))
 }
 
+struct WorkspaceFeedbackUpdate<'a> {
+    session_id: uuid::Uuid,
+    entity_id: uuid::Uuid,
+    cwd: &'a str,
+    source: &'a str,
+    judge_source: &'a str,
+    score_delta: Option<f64>,
+    judgment: Option<i64>,
+}
+
 async fn update_workspace_feedback<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
-    session_id: uuid::Uuid,
-    entity_id: uuid::Uuid,
-    cwd: &str,
-    source: &str,
-    judge_source: &str,
-    score_delta: Option<f64>,
-    judgment: Option<i64>,
+    update: WorkspaceFeedbackUpdate<'_>,
 ) -> anyhow::Result<bool> {
-    if cwd.trim().is_empty() {
+    if update.cwd.trim().is_empty() {
         return Ok(false);
     }
-    let Some(mut entity) = storage.entity_get_by_id(ctx, session_id, entity_id).await? else {
+    let Some(mut entity) = storage
+        .entity_get_by_id(ctx, update.session_id, update.entity_id)
+        .await?
+    else {
         return Ok(false);
     };
     let mut properties = entity.properties.clone();
@@ -4604,10 +4620,10 @@ async fn update_workspace_feedback<S: crate::storage::Storage>(
         *feedback = serde_json::json!({});
     }
     let feedback_obj = feedback.as_object_mut().expect("object set above");
-    let key = workspace_feedback_key(cwd);
+    let key = workspace_feedback_key(update.cwd);
     let entry = feedback_obj.entry(key).or_insert_with(|| {
         serde_json::json!({
-            "cwd": cwd,
+            "cwd": update.cwd,
             "score": 0.0,
             "positives": 0,
             "negatives": 0,
@@ -4618,7 +4634,7 @@ async fn update_workspace_feedback<S: crate::storage::Storage>(
     });
     if !entry.is_object() {
         *entry = serde_json::json!({
-            "cwd": cwd,
+            "cwd": update.cwd,
             "score": 0.0,
             "positives": 0,
             "negatives": 0,
@@ -4628,8 +4644,8 @@ async fn update_workspace_feedback<S: crate::storage::Storage>(
         });
     }
     let entry_obj = entry.as_object_mut().expect("object set above");
-    entry_obj.insert("cwd".into(), Value::String(cwd.to_string()));
-    if let Some(score_delta) = score_delta {
+    entry_obj.insert("cwd".into(), Value::String(update.cwd.to_string()));
+    if let Some(score_delta) = update.score_delta {
         let current_score = entry_obj
             .get("score")
             .and_then(|value| value.as_f64())
@@ -4639,7 +4655,7 @@ async fn update_workspace_feedback<S: crate::storage::Storage>(
             serde_json::json!(current_score + score_delta),
         );
     }
-    let count_key = match judgment {
+    let count_key = match update.judgment {
         Some(score) if score > 0 => "positives",
         Some(score) if score < 0 => "negatives",
         Some(_) => "neutrals",
@@ -4657,16 +4673,18 @@ async fn update_workspace_feedback<S: crate::storage::Storage>(
         *mechanisms = serde_json::json!({});
     }
     let mechanisms_obj = mechanisms.as_object_mut().expect("object set above");
-    let mechanism = mechanisms_obj.entry(source.to_string()).or_insert_with(|| {
-        serde_json::json!({
-            "score": 0.0,
-            "positives": 0,
-            "negatives": 0,
-            "neutrals": 0,
-            "abstentions": 0,
-            "judges": {}
-        })
-    });
+    let mechanism = mechanisms_obj
+        .entry(update.source.to_string())
+        .or_insert_with(|| {
+            serde_json::json!({
+                "score": 0.0,
+                "positives": 0,
+                "negatives": 0,
+                "neutrals": 0,
+                "abstentions": 0,
+                "judges": {}
+            })
+        });
     if !mechanism.is_object() {
         *mechanism = serde_json::json!({
             "score": 0.0,
@@ -4678,7 +4696,7 @@ async fn update_workspace_feedback<S: crate::storage::Storage>(
         });
     }
     let mechanism_obj = mechanism.as_object_mut().expect("object set above");
-    if let Some(score_delta) = score_delta {
+    if let Some(score_delta) = update.score_delta {
         let mechanism_score = mechanism_obj
             .get("score")
             .and_then(|value| value.as_f64())
@@ -4702,7 +4720,7 @@ async fn update_workspace_feedback<S: crate::storage::Storage>(
     }
     let judges_obj = judges.as_object_mut().expect("object set above");
     let judge = judges_obj
-        .entry(judge_source.to_string())
+        .entry(update.judge_source.to_string())
         .or_insert_with(|| {
             serde_json::json!({
                 "score": 0.0,
@@ -4722,7 +4740,7 @@ async fn update_workspace_feedback<S: crate::storage::Storage>(
         });
     }
     let judge_obj = judge.as_object_mut().expect("object set above");
-    if let Some(score_delta) = score_delta {
+    if let Some(score_delta) = update.score_delta {
         let judge_score = judge_obj
             .get("score")
             .and_then(|value| value.as_f64())
@@ -4805,13 +4823,15 @@ async fn handle_record_outcome<S: crate::storage::Storage>(
                             match update_workspace_feedback(
                                 storage,
                                 ctx,
-                                session_id,
-                                eid,
-                                cwd,
-                                source,
-                                "outcome",
-                                Some(if succeeded { 0.10 } else { -0.20 }),
-                                Some(if succeeded { 1 } else { -1 }),
+                                WorkspaceFeedbackUpdate {
+                                    session_id,
+                                    entity_id: eid,
+                                    cwd,
+                                    source,
+                                    judge_source: "outcome",
+                                    score_delta: Some(if succeeded { 0.10 } else { -0.20 }),
+                                    judgment: Some(if succeeded { 1 } else { -1 }),
+                                },
                             )
                             .await
                             {
@@ -4852,7 +4872,7 @@ async fn handle_record_outcome<S: crate::storage::Storage>(
     });
     if program_type == "retrieval_miss" {
         response["_hint"] = serde_json::json!(
-            "Retrieval miss logged. The system will learn to store this kind of information. Consider using smart_ingest now to store what you found via grep/read."
+            "Retrieval miss logged. The system will learn to store this kind of information. Consider using ingest now to store what you found via grep/read."
         );
     } else {
         response["_hint"] = serde_json::json!(
@@ -4932,13 +4952,15 @@ async fn handle_record_feedback<S: crate::storage::Storage>(
                 && let Err(e) = update_workspace_feedback(
                     storage,
                     ctx,
-                    session_id,
-                    result.entity_id,
-                    cwd,
-                    &result.source,
-                    judge_source,
-                    None,
-                    None,
+                    WorkspaceFeedbackUpdate {
+                        session_id,
+                        entity_id: result.entity_id,
+                        cwd,
+                        source: &result.source,
+                        judge_source,
+                        score_delta: None,
+                        judgment: None,
+                    },
                 )
                 .await
             {
@@ -4957,13 +4979,15 @@ async fn handle_record_feedback<S: crate::storage::Storage>(
                 && let Err(e) = update_workspace_feedback(
                     storage,
                     ctx,
-                    session_id,
-                    result.entity_id,
-                    cwd,
-                    &result.source,
-                    judge_source,
-                    Some(0.0),
-                    Some(0),
+                    WorkspaceFeedbackUpdate {
+                        session_id,
+                        entity_id: result.entity_id,
+                        cwd,
+                        source: &result.source,
+                        judge_source,
+                        score_delta: Some(0.0),
+                        judgment: Some(0),
+                    },
                 )
                 .await
             {
@@ -4993,13 +5017,15 @@ async fn handle_record_feedback<S: crate::storage::Storage>(
             && let Err(e) = update_workspace_feedback(
                 storage,
                 ctx,
-                session_id,
-                result.entity_id,
-                cwd,
-                &result.source,
-                judge_source,
-                Some(if succeeded { 0.10 } else { -0.20 }),
-                Some(score),
+                WorkspaceFeedbackUpdate {
+                    session_id,
+                    entity_id: result.entity_id,
+                    cwd,
+                    source: &result.source,
+                    judge_source,
+                    score_delta: Some(if succeeded { 0.10 } else { -0.20 }),
+                    judgment: Some(score),
+                },
             )
             .await
         {
@@ -5894,11 +5920,24 @@ async fn handle_explore_connections<S: crate::storage::Storage>(
 struct LlmRerankReport {
     enabled: bool,
     applied: bool,
+    mode: String,
     provider: String,
     model: String,
     candidate_count: usize,
     returned_ids: Vec<uuid::Uuid>,
     judged_ids: Vec<uuid::Uuid>,
+    judge_scores: Vec<Option<i64>>,
+    score_sum: i64,
+    abstentions: usize,
+    batches: Vec<LlmRerankBatchReport>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LlmRerankBatchReport {
+    start_rank: usize,
+    candidate_count: usize,
+    returned_ids: Vec<uuid::Uuid>,
     judge_scores: Vec<Option<i64>>,
     score_sum: i64,
     abstentions: usize,
@@ -5910,6 +5949,7 @@ impl LlmRerankReport {
         Self {
             enabled: false,
             applied: false,
+            mode: "disabled".to_string(),
             provider: config.provider.clone(),
             model: config.model.clone(),
             candidate_count: 0,
@@ -5918,6 +5958,7 @@ impl LlmRerankReport {
             judge_scores: Vec::new(),
             score_sum: 0,
             abstentions: 0,
+            batches: Vec::new(),
             error: None,
         }
     }
@@ -5926,6 +5967,7 @@ impl LlmRerankReport {
         Self {
             enabled: config.enabled,
             applied: false,
+            mode: "skipped".to_string(),
             provider: config.provider.clone(),
             model: config.model.clone(),
             candidate_count: 0,
@@ -5934,6 +5976,7 @@ impl LlmRerankReport {
             judge_scores: Vec::new(),
             score_sum: 0,
             abstentions: 0,
+            batches: Vec::new(),
             error: Some(reason.into()),
         }
     }
@@ -5946,6 +5989,7 @@ impl LlmRerankReport {
         Self {
             enabled: config.enabled,
             applied: false,
+            mode: "skipped".to_string(),
             provider: config.provider.clone(),
             model: config.model.clone(),
             candidate_count,
@@ -5954,6 +5998,7 @@ impl LlmRerankReport {
             judge_scores: vec![None; candidate_count],
             score_sum: 0,
             abstentions: candidate_count,
+            batches: Vec::new(),
             error: Some(reason.into()),
         }
     }
@@ -6009,16 +6054,31 @@ fn parse_llm_judge_scores(raw: &str, candidate_count: usize) -> Vec<Option<i64>>
         return vec![None; candidate_count];
     };
     let scores_value = value.get("scores").or_else(|| value.get("judgments"));
-    let Some(values) = scores_value.and_then(Value::as_array) else {
-        return vec![None; candidate_count];
-    };
-    let mut scores = values
-        .iter()
-        .take(candidate_count)
-        .map(parse_judge_score_value)
-        .collect::<Vec<_>>();
-    scores.resize(candidate_count, None);
-    scores
+    match scores_value {
+        Some(Value::Array(values)) => {
+            let mut scores = values
+                .iter()
+                .take(candidate_count)
+                .map(parse_judge_score_value)
+                .collect::<Vec<_>>();
+            scores.resize(candidate_count, None);
+            scores
+        }
+        Some(Value::Object(values)) => {
+            let mut scores = vec![None; candidate_count];
+            for (key, value) in values {
+                let Ok(rank) = key.parse::<usize>() else {
+                    continue;
+                };
+                if rank == 0 || rank > candidate_count {
+                    continue;
+                }
+                scores[rank - 1] = parse_judge_score_value(value);
+            }
+            scores
+        }
+        _ => vec![None; candidate_count],
+    }
 }
 
 fn parse_judge_score_value(value: &Value) -> Option<i64> {
@@ -6106,6 +6166,75 @@ fn apply_llm_rerank_order(
     reranked
 }
 
+fn apply_llm_rerank_decision(
+    results: Vec<crate::hybrid_search::SearchResult>,
+    order: &[uuid::Uuid],
+    judge_scores: &[Option<i64>],
+    candidate_count: usize,
+) -> Vec<crate::hybrid_search::SearchResult> {
+    if order.is_empty() || candidate_count == 0 {
+        return results;
+    }
+    let split_at = results.len().min(candidate_count);
+    let top = results[..split_at].to_vec();
+    let tail = results[split_at..].to_vec();
+    let order_rank = order
+        .iter()
+        .enumerate()
+        .map(|(idx, id)| (*id, idx))
+        .collect::<std::collections::HashMap<_, _>>();
+    let score_bucket = |idx: usize| match judge_scores.get(idx).copied().flatten() {
+        Some(score) if score > 0 => 0,
+        Some(score) if score < 0 => 2,
+        _ => 1,
+    };
+    let mut scored = top
+        .into_iter()
+        .enumerate()
+        .map(|(idx, result)| {
+            let bucket = score_bucket(idx);
+            let rank = order_rank
+                .get(&result.id)
+                .copied()
+                .unwrap_or(candidate_count + idx);
+            (bucket, rank, idx, result)
+        })
+        .collect::<Vec<_>>();
+    let scored_count = judge_scores
+        .iter()
+        .take(split_at)
+        .filter(|score| score.is_some())
+        .count();
+    let has_negative = judge_scores
+        .iter()
+        .take(split_at)
+        .any(|score| score.is_some_and(|score| score < 0));
+    let has_score_contrast = scored
+        .iter()
+        .map(|(bucket, _, _, _)| *bucket)
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        > 1
+        && (has_negative || scored_count >= split_at.min(LLM_RERANK_MIN_SCORE_COVERAGE));
+    if !has_score_contrast {
+        return apply_llm_rerank_order(
+            scored
+                .into_iter()
+                .map(|(_, _, _, result)| result)
+                .chain(tail)
+                .collect(),
+            order,
+            candidate_count,
+        );
+    }
+    scored.sort_by_key(|(bucket, rank, original_idx, _)| (*bucket, *rank, *original_idx));
+    scored
+        .into_iter()
+        .map(|(_, _, _, result)| result)
+        .chain(tail)
+        .collect()
+}
+
 fn judge_scores_for_response(scores: &[Option<i64>]) -> Vec<Value> {
     scores
         .iter()
@@ -6120,6 +6249,7 @@ async fn generate_judge_text(
     config: &crate::config::JudgeConfig,
     system_prompt: &str,
     user_prompt: &str,
+    max_tokens: usize,
 ) -> anyhow::Result<String> {
     let provider = config.provider.trim().to_ascii_lowercase();
     if provider == "mock" {
@@ -6140,7 +6270,7 @@ async fn generate_judge_text(
                     "format": "json",
                     "options": {
                         "temperature": 0.0,
-                        "num_predict": 128
+                        "num_predict": max_tokens.clamp(128, 2048)
                     }
                 }))
         }
@@ -6149,6 +6279,7 @@ async fn generate_judge_text(
             .json(&serde_json::json!({
                 "model": config.model,
                 "temperature": 0.0,
+                "max_tokens": max_tokens.clamp(128, 2048),
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
@@ -6183,32 +6314,23 @@ async fn generate_judge_text(
     Ok(text.to_string())
 }
 
-async fn maybe_llm_rerank_results(
+#[derive(Debug)]
+struct LlmRerankDecision {
+    order: Vec<uuid::Uuid>,
+    judge_scores: Vec<Option<i64>>,
+}
+
+async fn judge_rerank_candidates(
+    config: &crate::config::JudgeConfig,
     query: &str,
-    results: Vec<crate::hybrid_search::SearchResult>,
-    session: &SessionState,
-    rerank_override: Option<bool>,
-) -> (Vec<crate::hybrid_search::SearchResult>, LlmRerankReport) {
-    let config = session.judge_config.lock().await.clone();
-    let enabled = rerank_override.unwrap_or(config.enabled);
-    if !enabled {
-        return (results, LlmRerankReport::disabled(&config));
-    }
-    if results.len() < 2 {
-        return (
-            results,
-            LlmRerankReport::skipped(&config, "fewer than two candidates"),
-        );
-    }
-    let candidate_count = results.len().min(LLM_RERANK_MAX_CANDIDATES);
-    let candidate_ids = results
+    candidates: &[crate::hybrid_search::SearchResult],
+) -> anyhow::Result<LlmRerankDecision> {
+    let candidate_ids = candidates
         .iter()
-        .take(candidate_count)
         .map(|result| result.id)
         .collect::<Vec<_>>();
-    let candidates = results
+    let candidates_json = candidates
         .iter()
-        .take(candidate_count)
         .enumerate()
         .map(|(idx, result)| {
             serde_json::json!({
@@ -6227,16 +6349,291 @@ async fn maybe_llm_rerank_results(
          Return JSON only in this shape: {{\"order\":[rank_number,...],\"scores\":[1|0|-1|\"-\",...]}}. \
          Use the 1-based rank numbers from the input, not UUIDs. \
          The scores array must be in the original candidate order.",
-        serde_json::to_string(&candidates).unwrap_or_else(|_| "[]".to_string())
+        serde_json::to_string(&candidates_json).unwrap_or_else(|_| "[]".to_string())
     );
-    let raw = match generate_judge_text(
-        &config,
+    let max_tokens = 256 + candidates.len().saturating_mul(24);
+    let raw = generate_judge_text(
+        config,
         "You are a retrieval reranker. Return compact JSON only.",
         &prompt,
+        max_tokens,
     )
-    .await
-    {
-        Ok(raw) => raw,
+    .await?;
+    Ok(LlmRerankDecision {
+        order: parse_llm_rerank_order(&raw, &candidate_ids),
+        judge_scores: parse_llm_judge_scores(&raw, candidates.len()),
+    })
+}
+
+fn batch_report(
+    start_rank: usize,
+    candidate_count: usize,
+    order: Vec<uuid::Uuid>,
+    judge_scores: Vec<Option<i64>>,
+    error: Option<String>,
+) -> LlmRerankBatchReport {
+    let score_sum = judge_scores.iter().flatten().sum::<i64>();
+    let abstentions = judge_scores.iter().filter(|score| score.is_none()).count();
+    LlmRerankBatchReport {
+        start_rank,
+        candidate_count,
+        returned_ids: order,
+        judge_scores,
+        score_sum,
+        abstentions,
+        error,
+    }
+}
+
+fn rank_batches_by_winner_order(
+    batch_winners: &[uuid::Uuid],
+    final_order: &[uuid::Uuid],
+) -> Vec<usize> {
+    let order_rank = final_order
+        .iter()
+        .enumerate()
+        .map(|(idx, id)| (*id, idx))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut batch_indices = (0..batch_winners.len()).collect::<Vec<_>>();
+    batch_indices.sort_by_key(|idx| {
+        (
+            order_rank
+                .get(&batch_winners[*idx])
+                .copied()
+                .unwrap_or(batch_winners.len() + *idx),
+            *idx,
+        )
+    });
+    batch_indices
+}
+
+async fn batched_llm_rerank_results(
+    query: &str,
+    results: Vec<crate::hybrid_search::SearchResult>,
+    config: &crate::config::JudgeConfig,
+    candidate_count: usize,
+) -> (Vec<crate::hybrid_search::SearchResult>, LlmRerankReport) {
+    let split_at = results.len().min(candidate_count);
+    let top = results[..split_at].to_vec();
+    let tail = results[split_at..].to_vec();
+    let judged_ids = top.iter().map(|result| result.id).collect::<Vec<_>>();
+    let mut aggregate_scores = vec![None; split_at];
+    let mut batches = Vec::new();
+    let mut ordered_batches = Vec::new();
+    let mut batch_winners = Vec::new();
+    let mut any_applied = false;
+
+    for (batch_idx, batch) in top.chunks(LLM_RERANK_BATCH_SIZE).enumerate() {
+        let start_rank = batch_idx * LLM_RERANK_BATCH_SIZE + 1;
+        let batch_vec = batch.to_vec();
+        match judge_rerank_candidates(config, query, &batch_vec).await {
+            Ok(decision) if decision.order.len() >= 2 => {
+                any_applied = true;
+                for (idx, score) in decision.judge_scores.iter().copied().enumerate() {
+                    if let Some(slot) = aggregate_scores.get_mut(start_rank - 1 + idx) {
+                        *slot = score;
+                    }
+                }
+                let batch_order = apply_llm_rerank_decision(
+                    batch_vec,
+                    &decision.order,
+                    &decision.judge_scores,
+                    batch.len(),
+                );
+                if let Some(winner) = batch_order.first() {
+                    batch_winners.push(winner.id);
+                }
+                ordered_batches.push(batch_order);
+                batches.push(batch_report(
+                    start_rank,
+                    batch.len(),
+                    decision.order,
+                    decision.judge_scores,
+                    None,
+                ));
+            }
+            Ok(decision) => {
+                if let Some(winner) = batch_vec.first() {
+                    batch_winners.push(winner.id);
+                }
+                ordered_batches.push(batch_vec);
+                batches.push(batch_report(
+                    start_rank,
+                    batch.len(),
+                    decision.order,
+                    decision.judge_scores,
+                    Some("judge returned fewer than two recognized IDs".to_string()),
+                ));
+            }
+            Err(error) => {
+                let message = error.to_string();
+                tracing::warn!(
+                    provider = %config.provider,
+                    model = %config.model,
+                    batch_start_rank = start_rank,
+                    error = %message,
+                    "LLM rerank batch skipped"
+                );
+                let scores = vec![None; batch.len()];
+                if let Some(winner) = batch_vec.first() {
+                    batch_winners.push(winner.id);
+                }
+                ordered_batches.push(batch_vec);
+                batches.push(batch_report(
+                    start_rank,
+                    batch.len(),
+                    Vec::new(),
+                    scores,
+                    Some(message),
+                ));
+            }
+        }
+    }
+
+    let final_order = if batch_winners.len() >= 2 {
+        let winners = ordered_batches
+            .iter()
+            .filter_map(|batch| batch.first().cloned())
+            .collect::<Vec<_>>();
+        match judge_rerank_candidates(config, query, &winners).await {
+            Ok(decision) if decision.order.len() >= 2 => {
+                any_applied = true;
+                batches.push(batch_report(
+                    1,
+                    winners.len(),
+                    decision.order.clone(),
+                    decision.judge_scores,
+                    None,
+                ));
+                decision.order
+            }
+            Ok(decision) => {
+                batches.push(batch_report(
+                    1,
+                    winners.len(),
+                    decision.order,
+                    decision.judge_scores,
+                    Some("final judge returned fewer than two recognized IDs".to_string()),
+                ));
+                Vec::new()
+            }
+            Err(error) => {
+                let message = error.to_string();
+                tracing::warn!(
+                    provider = %config.provider,
+                    model = %config.model,
+                    error = %message,
+                    "LLM final rerank batch skipped"
+                );
+                batches.push(batch_report(
+                    1,
+                    winners.len(),
+                    Vec::new(),
+                    vec![None; winners.len()],
+                    Some(message),
+                ));
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    if !any_applied {
+        return (
+            results,
+            LlmRerankReport {
+                enabled: true,
+                applied: false,
+                mode: "batched".to_string(),
+                provider: config.provider.clone(),
+                model: config.model.clone(),
+                candidate_count,
+                returned_ids: Vec::new(),
+                judged_ids,
+                judge_scores: aggregate_scores,
+                score_sum: 0,
+                abstentions: split_at,
+                batches,
+                error: Some("all rerank batches failed or returned too few IDs".to_string()),
+            },
+        );
+    }
+
+    let mut reranked_top = Vec::with_capacity(top.len());
+    for batch_idx in rank_batches_by_winner_order(&batch_winners, &final_order) {
+        if let Some(batch) = ordered_batches.get(batch_idx) {
+            reranked_top.extend(batch.iter().cloned());
+        }
+    }
+    let returned_ids = reranked_top
+        .iter()
+        .map(|result| result.id)
+        .collect::<Vec<_>>();
+    let mut reranked = reranked_top;
+    reranked.extend(tail);
+    let score_sum = aggregate_scores.iter().flatten().sum::<i64>();
+    let abstentions = aggregate_scores
+        .iter()
+        .filter(|score| score.is_none())
+        .count();
+    (
+        reranked,
+        LlmRerankReport {
+            enabled: true,
+            applied: true,
+            mode: "batched".to_string(),
+            provider: config.provider.clone(),
+            model: config.model.clone(),
+            candidate_count,
+            returned_ids,
+            judged_ids,
+            judge_scores: aggregate_scores,
+            score_sum,
+            abstentions,
+            batches,
+            error: None,
+        },
+    )
+}
+
+async fn maybe_llm_rerank_results(
+    query: &str,
+    results: Vec<crate::hybrid_search::SearchResult>,
+    session: &SessionState,
+    rerank_override: Option<bool>,
+    candidate_override: Option<usize>,
+) -> (Vec<crate::hybrid_search::SearchResult>, LlmRerankReport) {
+    let config = session.judge_config.lock().await.clone();
+    let enabled = rerank_override.unwrap_or(config.enabled);
+    if !enabled {
+        return (results, LlmRerankReport::disabled(&config));
+    }
+    if results.len() < 2 {
+        return (
+            results,
+            LlmRerankReport::skipped(&config, "fewer than two candidates"),
+        );
+    }
+    let configured_candidates = candidate_override
+        .unwrap_or(config.max_rerank_candidates)
+        .clamp(LLM_RERANK_MIN_CANDIDATES, LLM_RERANK_HARD_MAX_CANDIDATES);
+    let candidate_count = results.len().min(configured_candidates);
+    if candidate_count > LLM_RERANK_BATCH_SIZE {
+        return batched_llm_rerank_results(query, results, &config, candidate_count).await;
+    }
+    let candidate_ids = results
+        .iter()
+        .take(candidate_count)
+        .map(|result| result.id)
+        .collect::<Vec<_>>();
+    let candidates = results
+        .iter()
+        .take(candidate_count)
+        .cloned()
+        .collect::<Vec<_>>();
+    let decision = match judge_rerank_candidates(&config, query, &candidates).await {
+        Ok(decision) => decision,
         Err(error) => {
             let message = error.to_string();
             tracing::warn!(
@@ -6248,8 +6645,8 @@ async fn maybe_llm_rerank_results(
             return (results, LlmRerankReport::skipped(&config, message));
         }
     };
-    let order = parse_llm_rerank_order(&raw, &candidate_ids);
-    let judge_scores = parse_llm_judge_scores(&raw, candidate_count);
+    let order = decision.order;
+    let judge_scores = decision.judge_scores;
     let score_sum = judge_scores.iter().flatten().sum::<i64>();
     let abstentions = judge_scores.iter().filter(|score| score.is_none()).count();
     if order.len() < 2 {
@@ -6262,12 +6659,13 @@ async fn maybe_llm_rerank_results(
             ),
         );
     }
-    let reranked = apply_llm_rerank_order(results, &order, candidate_count);
+    let reranked = apply_llm_rerank_decision(results, &order, &judge_scores, candidate_count);
     (
         reranked,
         LlmRerankReport {
             enabled: true,
             applied: true,
+            mode: "single".to_string(),
             provider: config.provider,
             model: config.model,
             candidate_count,
@@ -6276,6 +6674,7 @@ async fn maybe_llm_rerank_results(
             judge_scores,
             score_sum,
             abstentions,
+            batches: Vec::new(),
             error: None,
         },
     )
@@ -6360,8 +6759,18 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
     let rerank_override = args.get("rerank").and_then(Value::as_bool);
-    let (all_results, reranker_report) =
-        maybe_llm_rerank_results(query, all_results, session, rerank_override).await;
+    let rerank_candidate_override = args
+        .get("rerank_candidates")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    let (all_results, reranker_report) = maybe_llm_rerank_results(
+        query,
+        all_results,
+        session,
+        rerank_override,
+        rerank_candidate_override,
+    )
+    .await;
     if let Some(cwd) = filter.workspace_cwd.as_deref() {
         for (idx, entity_id) in reranker_report.judged_ids.iter().enumerate() {
             let Some(result) = all_results.iter().find(|result| result.id == *entity_id) else {
@@ -6383,13 +6792,15 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
             if let Err(e) = update_workspace_feedback(
                 storage,
                 ctx,
-                session_id,
-                *entity_id,
-                cwd,
-                &result.source,
-                "judge_model",
-                score_delta,
-                judgment,
+                WorkspaceFeedbackUpdate {
+                    session_id,
+                    entity_id: *entity_id,
+                    cwd,
+                    source: &result.source,
+                    judge_source: "judge_model",
+                    score_delta,
+                    judgment,
+                },
             )
             .await
             {
@@ -6461,8 +6872,8 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
 
     let hint = if results.is_empty() {
         pick_hint(&[
-            "No matches — this topic is new to memory. Good candidate for smart_ingest.",
-            "Empty search. Ingest what you're learning in this conversation with smart_ingest.",
+            "No matches — this topic is new to memory. Good candidate for ingest.",
+            "Empty search. Ingest what you're learning in this conversation with ingest.",
             "Nothing found. Have you captured the key insights from this session yet?",
         ])
     } else {
@@ -6482,6 +6893,7 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         "reranker": {
             "enabled": reranker_report.enabled,
             "applied": reranker_report.applied,
+            "mode": reranker_report.mode,
             "provider": reranker_report.provider,
             "model": reranker_report.model,
             "candidate_count": reranker_report.candidate_count,
@@ -6490,6 +6902,15 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
             "judge_scores": judge_scores_for_response(&reranker_report.judge_scores),
             "score_sum": reranker_report.score_sum,
             "abstentions": reranker_report.abstentions,
+            "batches": reranker_report.batches.iter().map(|batch| serde_json::json!({
+                "start_rank": batch.start_rank,
+                "candidate_count": batch.candidate_count,
+                "returned_ids": batch.returned_ids,
+                "judge_scores": judge_scores_for_response(&batch.judge_scores),
+                "score_sum": batch.score_sum,
+                "abstentions": batch.abstentions,
+                "error": batch.error,
+            })).collect::<Vec<_>>(),
             "error": reranker_report.error,
         }
     });
@@ -6636,7 +7057,7 @@ async fn handle_get_stats<S: crate::storage::Storage>(
         .cloned();
 
     let hint = if entity_count == 0 {
-        "Memory is empty. Start ingesting entities, decisions, and patterns with smart_ingest."
+        "Memory is empty. Start ingesting entities, decisions, and patterns with ingest."
             .to_string()
     } else if edge_count == 0 {
         "Entities exist but no connections. Run run_consolidation to discover relationships."
@@ -6644,7 +7065,7 @@ async fn handle_get_stats<S: crate::storage::Storage>(
     } else {
         pick_hint(&[
             "Memory healthy. Remember to ingest new insights from this conversation.",
-            "Have you learned anything about the user's preferences? Ingest with smart_ingest.",
+            "Have you learned anything about the user's preferences? Ingest with ingest.",
             "Project context, architecture decisions, and debugging insights are worth remembering.",
         ])
     };
@@ -7004,7 +7425,7 @@ async fn handle_recursive_explore<S: crate::storage::Storage>(
         "converged": result.converged,
         "derived_facts_count": result.derived_facts_count,
         "hint": if results.is_empty() {
-            "No results found. Try smart_ingest to add entities first."
+            "No results found. Try ingest to add entities first."
         } else {
             "Recursive exploration found connected knowledge clusters."
         }
@@ -9004,6 +9425,12 @@ mod tests {
         assert!(!names.contains(&"recurse"));
         assert!(!names.contains(&"promote"));
         assert!(!names.contains(&"derived_cache"));
+    }
+
+    #[test]
+    fn memory_guide_uses_default_ingest_tool_name() {
+        assert!(MEMORY_GUIDE.contains("Use ingest for new knowledge"));
+        assert!(!MEMORY_GUIDE.contains("Use smart_ingest"));
     }
 
     #[test]
@@ -11729,6 +12156,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_llm_judge_scores_accepts_sparse_rank_object() {
+        let raw = r#"{"order":[3,1],"scores":{"1":1,"3":-1,"5":"-"}}"#;
+        let parsed = parse_llm_judge_scores(raw, 5);
+
+        assert_eq!(parsed, vec![Some(1), None, Some(-1), None, None]);
+    }
+
+    #[test]
     fn apply_llm_rerank_order_preserves_omitted_candidates_and_tail() {
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
@@ -11758,6 +12193,116 @@ mod tests {
         let ids = reranked.into_iter().map(|r| r.id).collect::<Vec<_>>();
 
         assert_eq!(ids, vec![third, first, second, fourth]);
+    }
+
+    #[test]
+    fn apply_llm_rerank_decision_promotes_positive_and_demotes_negative_scores() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let third = Uuid::new_v4();
+        let fourth = Uuid::new_v4();
+        let result = |id, content: &str| crate::hybrid_search::SearchResult {
+            id,
+            source: "document_bm25".into(),
+            content: content.into(),
+            score: 1.0,
+            result_type: "document_chunk".into(),
+            document_id: Some(id),
+            prev_chunk_id: None,
+            next_chunk_id: None,
+            hint: None,
+        };
+
+        let reranked = apply_llm_rerank_decision(
+            vec![
+                result(first, "first"),
+                result(second, "second"),
+                result(third, "third"),
+                result(fourth, "fourth"),
+            ],
+            &[third, first, second],
+            &[Some(0), Some(-1), Some(1)],
+            3,
+        );
+        let ids = reranked.into_iter().map(|r| r.id).collect::<Vec<_>>();
+
+        assert_eq!(ids, vec![third, first, second, fourth]);
+    }
+
+    #[test]
+    fn apply_llm_rerank_decision_keeps_abstentions_below_positive_candidates() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let third = Uuid::new_v4();
+        let result = |id, content: &str| crate::hybrid_search::SearchResult {
+            id,
+            source: "document_bm25".into(),
+            content: content.into(),
+            score: 1.0,
+            result_type: "document_chunk".into(),
+            document_id: Some(id),
+            prev_chunk_id: None,
+            next_chunk_id: None,
+            hint: None,
+        };
+
+        let reranked = apply_llm_rerank_decision(
+            vec![
+                result(first, "first"),
+                result(second, "second"),
+                result(third, "third"),
+            ],
+            &[second, third, first],
+            &[None, Some(1), Some(0)],
+            3,
+        );
+        let ids = reranked.into_iter().map(|r| r.id).collect::<Vec<_>>();
+
+        assert_eq!(ids, vec![second, third, first]);
+    }
+
+    #[test]
+    fn apply_llm_rerank_decision_uses_order_when_positive_scores_are_sparse() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let third = Uuid::new_v4();
+        let result = |id, content: &str| crate::hybrid_search::SearchResult {
+            id,
+            source: "document_bm25".into(),
+            content: content.into(),
+            score: 1.0,
+            result_type: "document_chunk".into(),
+            document_id: Some(id),
+            prev_chunk_id: None,
+            next_chunk_id: None,
+            hint: None,
+        };
+
+        let reranked = apply_llm_rerank_decision(
+            vec![
+                result(first, "first"),
+                result(second, "second"),
+                result(third, "third"),
+            ],
+            &[third, second],
+            &[None, Some(1), None],
+            3,
+        );
+        let ids = reranked.into_iter().map(|r| r.id).collect::<Vec<_>>();
+
+        assert_eq!(ids, vec![third, second, first]);
+    }
+
+    #[test]
+    fn rank_batches_by_winner_order_keeps_unranked_batches_stable() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let third = Uuid::new_v4();
+        let fourth = Uuid::new_v4();
+
+        let ranked = rank_batches_by_winner_order(&[first, second, third, fourth], &[third, first]);
+
+        assert_eq!(ranked, vec![2, 0, 1, 3]);
     }
 
     #[tokio::test]

@@ -986,9 +986,9 @@ async fn feedback_outcomes_uuid_write_probe(
     if !table_exists(session, keyspace, table).await? {
         return Ok(false);
     }
-    let tenant_id = Uuid::from_u128(0xfeed_bacc_0000_4000_8000_000000000036);
-    let session_id = Uuid::from_u128(0xfeed_bacc_0000_4000_8000_000000000037);
-    let query_id = Uuid::from_u128(0xfeed_bacc_0000_4000_8000_000000000038);
+    let tenant_id = Uuid::from_u128(0xfeed_bacc_0000_4000_8000_0000_0000_0036);
+    let session_id = Uuid::from_u128(0xfeed_bacc_0000_4000_8000_0000_0000_0037);
+    let query_id = Uuid::from_u128(0xfeed_bacc_0000_4000_8000_0000_0000_0038);
     let created_at = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
     let insert_result = session
         .query_unpaged(

@@ -572,7 +572,10 @@ contact_points = ["localhost:9042"]
         assert_eq!(cfg.retrieval_k, 25);
         assert_eq!(cfg.judge_provider, "ollama");
         assert_eq!(cfg.judge_url, "http://127.0.0.1:11434");
-        assert_eq!(cfg.judge_model, "qwen3.5:27b");
+        assert_eq!(
+            cfg.judge_model,
+            ferrosa_memory_core::config::JudgeConfig::default().model
+        );
         assert_eq!(cfg.judge_timeout_seconds, 30);
         assert!((cfg.judge_temperature - 0.0).abs() < f64::EPSILON);
         assert_eq!(

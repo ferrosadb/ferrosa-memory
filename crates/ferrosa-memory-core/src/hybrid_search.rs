@@ -1,6 +1,6 @@
 //! Hybrid search — multi-strategy retrieval with Reciprocal Rank Fusion.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -99,6 +99,21 @@ fn rrf_merge(lists: Vec<Vec<SearchResult>>, k: f64, weights: &[f64]) -> Vec<Sear
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     merged
+}
+
+fn collapse_duplicate_document_chunks(results: Vec<SearchResult>) -> Vec<SearchResult> {
+    let mut seen_documents = HashSet::new();
+    let mut collapsed = Vec::with_capacity(results.len());
+    for result in results {
+        if result.result_type == "document_chunk"
+            && let Some(document_id) = result.document_id
+            && !seen_documents.insert(document_id)
+        {
+            continue;
+        }
+        collapsed.push(result);
+    }
+    collapsed
 }
 
 /// Which partitions to query. Defaults to `SessionOnly` for backward compat
@@ -621,7 +636,10 @@ pub async fn hybrid_search(
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
     }
-    Ok(merged.into_iter().take(limit).collect())
+    Ok(collapse_duplicate_document_chunks(merged)
+        .into_iter()
+        .take(limit)
+        .collect())
 }
 
 #[cfg(test)]
@@ -784,6 +802,28 @@ mod tests {
         assert!((merged[1].score - 1.0 / 62.0).abs() < 1e-10);
         assert_eq!(merged[0].id, id1);
         assert_eq!(merged[1].id, id2);
+    }
+
+    #[test]
+    fn collapse_duplicate_document_chunks_keeps_best_chunk_per_document() {
+        let doc_a = Uuid::new_v4();
+        let doc_b = Uuid::new_v4();
+        let mut first_a = make_result(Uuid::new_v4(), "document_bm25", 0.9);
+        first_a.result_type = "document_chunk".into();
+        first_a.document_id = Some(doc_a);
+        let mut second_a = make_result(Uuid::new_v4(), "document_bm25", 0.8);
+        second_a.result_type = "document_chunk".into();
+        second_a.document_id = Some(doc_a);
+        let mut first_b = make_result(Uuid::new_v4(), "document_bm25", 0.7);
+        first_b.result_type = "document_chunk".into();
+        first_b.document_id = Some(doc_b);
+
+        let collapsed =
+            collapse_duplicate_document_chunks(vec![first_a.clone(), second_a, first_b.clone()]);
+
+        assert_eq!(collapsed.len(), 2);
+        assert_eq!(collapsed[0].id, first_a.id);
+        assert_eq!(collapsed[1].id, first_b.id);
     }
 
     #[test]

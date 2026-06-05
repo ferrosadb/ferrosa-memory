@@ -295,6 +295,9 @@ pub struct JudgeConfig {
     /// Request timeout for judge/model discovery calls.
     #[serde(default = "default_judge_timeout_seconds")]
     pub timeout_seconds: u64,
+    /// Maximum candidates sent to the judge reranker per retrieval call.
+    #[serde(default = "default_judge_max_rerank_candidates")]
+    pub max_rerank_candidates: usize,
 }
 
 impl Default for JudgeConfig {
@@ -306,8 +309,13 @@ impl Default for JudgeConfig {
             model: default_judge_model(),
             token: None,
             timeout_seconds: default_judge_timeout_seconds(),
+            max_rerank_candidates: default_judge_max_rerank_candidates(),
         }
     }
+}
+
+fn default_judge_max_rerank_candidates() -> usize {
+    8
 }
 
 /// Runtime retrieval defaults shared by MCP tools that return ranked context.
@@ -1497,6 +1505,7 @@ port = 9999
         assert_eq!(cfg.model, "qwen2.5-coder:7b");
         assert_eq!(cfg.token, None);
         assert_eq!(cfg.timeout_seconds, 30);
+        assert_eq!(cfg.max_rerank_candidates, 8);
     }
 
     #[test]
@@ -1512,12 +1521,14 @@ base_url = "http://127.0.0.1:1234"
 model = "qwen3"
 token = "secret"
 timeout_seconds = 12
+max_rerank_candidates = 25
 "#;
         let config = parse_config(toml).expect("should parse judge config");
         assert!(config.judge.enabled);
         assert_eq!(config.judge.provider, "lmstudio");
         assert_eq!(config.judge.base_url, "http://127.0.0.1:1234");
         assert_eq!(config.judge.model, "qwen3");
+        assert_eq!(config.judge.max_rerank_candidates, 25);
         assert_eq!(config.judge.token.as_deref(), Some("secret"));
         assert_eq!(config.judge.timeout_seconds, 12);
     }

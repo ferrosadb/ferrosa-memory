@@ -90,6 +90,15 @@ fn origin_for_host(scheme: &str, host: &str, port: u16) -> String {
 /// Credential validator: takes (username, password), returns tenant_id if valid.
 pub type CredentialValidator = dyn Fn(&str, &str) -> Option<uuid::Uuid> + Send + Sync;
 
+struct ConnectionContext<'a> {
+    metrics: &'a MemoryMetrics,
+    credential_validator: &'a CredentialValidator,
+    readiness_checker: &'a (dyn Fn() -> bool + Send + Sync),
+    shell_routes: &'a ShellRouteConfig,
+    session: &'a dispatch::SessionState,
+    request_budget: std::time::Duration,
+}
+
 /// Per-IP connection rate limiter.
 ///
 /// Tracks connection counts per source IP within a rolling one-minute window.
@@ -148,6 +157,7 @@ const TLS_ACCEPT_BUDGET: std::time::Duration = std::time::Duration::from_secs(10
 /// pressure RAM on a per-connection basis under spawned tasks.
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const VIZ_DERIVED_FACT_CHUNK_SIZE: usize = 128;
+const VIZ_STREAM_IDLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Default test request budget matching the production config default.
 #[cfg(test)]
@@ -340,12 +350,14 @@ pub async fn serve_http<S: Storage + OperatorQuerySurface + 'static>(
                         serve_one_connection_with_session(
                             &mut tls,
                             storage.as_ref(),
-                            &metrics,
-                            validator.as_ref(),
-                            readiness.as_ref(),
-                            &shell_routes,
-                            session.as_ref(),
-                            request_budget,
+                            ConnectionContext {
+                                metrics: &metrics,
+                                credential_validator: validator.as_ref(),
+                                readiness_checker: readiness.as_ref(),
+                                shell_routes: &shell_routes,
+                                session: session.as_ref(),
+                                request_budget,
+                            },
                         )
                         .await
                     }
@@ -359,12 +371,14 @@ pub async fn serve_http<S: Storage + OperatorQuerySurface + 'static>(
                     serve_one_connection_with_session(
                         &mut stream,
                         storage.as_ref(),
-                        &metrics,
-                        validator.as_ref(),
-                        readiness.as_ref(),
-                        &shell_routes,
-                        session.as_ref(),
-                        request_budget,
+                        ConnectionContext {
+                            metrics: &metrics,
+                            credential_validator: validator.as_ref(),
+                            readiness_checker: readiness.as_ref(),
+                            shell_routes: &shell_routes,
+                            session: session.as_ref(),
+                            request_budget,
+                        },
                     )
                     .await
                 }
@@ -441,12 +455,14 @@ where
     serve_one_connection_with_session(
         stream,
         storage,
-        metrics,
-        credential_validator,
-        readiness_checker,
-        shell_routes,
-        &session,
-        DEFAULT_REQUEST_BUDGET,
+        ConnectionContext {
+            metrics,
+            credential_validator,
+            readiness_checker,
+            shell_routes,
+            session: &session,
+            request_budget: DEFAULT_REQUEST_BUDGET,
+        },
     )
     .await
 }
@@ -454,12 +470,7 @@ where
 async fn serve_one_connection_with_session<S, T>(
     stream: &mut T,
     storage: &S,
-    metrics: &MemoryMetrics,
-    credential_validator: &CredentialValidator,
-    readiness_checker: &(dyn Fn() -> bool + Send + Sync),
-    shell_routes: &ShellRouteConfig,
-    session: &dispatch::SessionState,
-    request_budget: std::time::Duration,
+    connection: ConnectionContext<'_>,
 ) -> anyhow::Result<()>
 where
     S: Storage + OperatorQuerySurface,
@@ -469,21 +480,24 @@ where
         let handler = handle_connection_rw(
             stream,
             storage,
-            metrics,
-            credential_validator,
-            readiness_checker,
-            shell_routes,
-            session,
+            connection.metrics,
+            connection.credential_validator,
+            connection.readiness_checker,
+            connection.shell_routes,
+            connection.session,
         );
-        let keep_alive = match tokio::time::timeout(request_budget, handler).await {
+        let keep_alive = match tokio::time::timeout(connection.request_budget, handler).await {
             Ok(res) => res?,
             Err(_) => {
-                let body = format!("request exceeded {:?}", request_budget);
+                let body = format!("request exceeded {:?}", connection.request_budget);
                 let resp = text_response("504 Gateway Timeout", &body);
                 // Best-effort notify the client; ignore write errors since
                 // the peer may already be gone.
                 let _ = stream.write_all(resp.as_bytes()).await;
-                return Err(anyhow::anyhow!("request exceeded {:?}", request_budget));
+                return Err(anyhow::anyhow!(
+                    "request exceeded {:?}",
+                    connection.request_budget
+                ));
             }
         };
         if !keep_alive {
@@ -1114,6 +1128,7 @@ fn redacted_judge_config(config: &crate::config::JudgeConfig) -> Value {
         "base_url": &config.base_url,
         "model": &config.model,
         "timeout_seconds": config.timeout_seconds,
+        "max_rerank_candidates": config.max_rerank_candidates,
         "token_configured": config.token.as_deref().is_some_and(|token| !token.is_empty()),
     })
 }
@@ -1166,6 +1181,18 @@ async fn handle_judge_config_put(
     let provider = sanitized_config_string(&payload, "provider", &config.provider, 64)?;
     let base_url = sanitized_config_string(&payload, "base_url", &config.base_url, 2048)?;
     let model = sanitized_config_string(&payload, "model", &config.model, 512)?;
+    let max_rerank_candidates = match payload.get("max_rerank_candidates") {
+        None | Some(Value::Null) => config.max_rerank_candidates,
+        Some(Value::Number(number)) => {
+            let raw = number.as_u64().ok_or_else(|| {
+                anyhow::anyhow!("max_rerank_candidates must be a positive integer")
+            })? as usize;
+            anyhow::ensure!(raw >= 2, "max_rerank_candidates must be >= 2");
+            anyhow::ensure!(raw <= 50, "max_rerank_candidates must be <= 50");
+            raw
+        }
+        Some(_) => anyhow::bail!("max_rerank_candidates must be a positive integer"),
+    };
     let enabled = payload
         .get("enabled")
         .and_then(Value::as_bool)
@@ -1188,6 +1215,7 @@ async fn handle_judge_config_put(
         model,
         token,
         timeout_seconds,
+        max_rerank_candidates,
     };
     Ok(json_response(
         "200 OK",
@@ -2295,13 +2323,23 @@ async fn send_streaming_viz_snapshot<S: Storage>(
             let (tx, mut rx) = tokio::sync::mpsc::channel(4);
             let producer = storage.entity_stream_all(ctx.clone(), VIZ_CHUNK_SIZE, tx);
             tokio::pin!(producer);
+            let idle_deadline = tokio::time::sleep(VIZ_STREAM_IDLE_BUDGET);
+            tokio::pin!(idle_deadline);
             let mut producer_done = false;
             loop {
                 tokio::select! {
                     _ = &mut producer, if !producer_done => producer_done = true,
+                    _ = &mut idle_deadline, if !producer_done => {
+                        tracing::warn!(
+                            timeout_ms = VIZ_STREAM_IDLE_BUDGET.as_millis() as u64,
+                            "viz: entity stream idle timeout; serving partial snapshot"
+                        );
+                        break;
+                    }
                     chunk = rx.recv() => {
                         match chunk {
                             Some(Ok(entities)) => {
+                                idle_deadline.as_mut().reset(tokio::time::Instant::now() + VIZ_STREAM_IDLE_BUDGET);
                                 let nodes: Vec<_> = entities.iter().map(viz::entity_to_viz_node).collect();
                                 total_nodes += nodes.len();
                                 if !nodes.is_empty()
@@ -2342,13 +2380,24 @@ async fn send_streaming_viz_snapshot<S: Storage>(
                 let (tx, mut rx) = tokio::sync::mpsc::channel(4);
                 let producer = storage.entity_stream_session(ctx.clone(), sid, VIZ_CHUNK_SIZE, tx);
                 tokio::pin!(producer);
+                let idle_deadline = tokio::time::sleep(VIZ_STREAM_IDLE_BUDGET);
+                tokio::pin!(idle_deadline);
                 let mut producer_done = false;
                 loop {
                     tokio::select! {
                         _ = &mut producer, if !producer_done => producer_done = true,
+                        _ = &mut idle_deadline, if !producer_done => {
+                            tracing::warn!(
+                                session_id = %sid,
+                                timeout_ms = VIZ_STREAM_IDLE_BUDGET.as_millis() as u64,
+                                "viz: scoped entity stream idle timeout; serving partial snapshot"
+                            );
+                            break;
+                        }
                         chunk = rx.recv() => {
                             match chunk {
                                 Some(Ok(entities)) => {
+                                    idle_deadline.as_mut().reset(tokio::time::Instant::now() + VIZ_STREAM_IDLE_BUDGET);
                                     let nodes: Vec<_> = entities.iter().map(viz::entity_to_viz_node).collect();
                             total_nodes += nodes.len();
                             if !nodes.is_empty()
@@ -2384,13 +2433,23 @@ async fn send_streaming_viz_snapshot<S: Storage>(
     let (tx, mut rx) = tokio::sync::mpsc::channel(4);
     let producer = storage.fold_stream_all(ctx.clone(), VIZ_CHUNK_SIZE, tx);
     tokio::pin!(producer);
+    let idle_deadline = tokio::time::sleep(VIZ_STREAM_IDLE_BUDGET);
+    tokio::pin!(idle_deadline);
     let mut producer_done = false;
     loop {
         tokio::select! {
             _ = &mut producer, if !producer_done => producer_done = true,
+            _ = &mut idle_deadline, if !producer_done => {
+                tracing::warn!(
+                    timeout_ms = VIZ_STREAM_IDLE_BUDGET.as_millis() as u64,
+                    "viz: fold stream idle timeout; serving partial snapshot"
+                );
+                break;
+            }
             chunk = rx.recv() => {
                 match chunk {
                     Some(Ok(folds)) => {
+                        idle_deadline.as_mut().reset(tokio::time::Instant::now() + VIZ_STREAM_IDLE_BUDGET);
                         let nodes: Vec<_> = folds.iter().map(viz::fold_to_viz_node).collect();
                         total_nodes += nodes.len();
                         if !nodes.is_empty()
@@ -2443,13 +2502,24 @@ async fn send_streaming_viz_snapshot<S: Storage>(
                 let (tx, mut rx) = tokio::sync::mpsc::channel(4);
                 let producer = storage.typed_edge_stream_all(edge_ctx, VIZ_CHUNK_SIZE, tx);
                 tokio::pin!(producer);
+                let idle_deadline = tokio::time::sleep(VIZ_STREAM_IDLE_BUDGET);
+                tokio::pin!(idle_deadline);
                 let mut producer_done = false;
                 loop {
                     tokio::select! {
                         _ = &mut producer, if !producer_done => producer_done = true,
+                        _ = &mut idle_deadline, if !producer_done => {
+                            tracing::warn!(
+                                edge_context = label,
+                                timeout_ms = VIZ_STREAM_IDLE_BUDGET.as_millis() as u64,
+                                "viz: all-scope typed edge stream idle timeout; serving partial snapshot"
+                            );
+                            break;
+                        }
                         chunk = rx.recv() => {
                             match chunk {
                                 Some(Ok(typed_edges)) => {
+                                    idle_deadline.as_mut().reset(tokio::time::Instant::now() + VIZ_STREAM_IDLE_BUDGET);
                                     for te in typed_edges {
                                         edge_chunk.push(VizEdge {
                                             source: te.src_id.to_string(),
@@ -2513,13 +2583,24 @@ async fn send_streaming_viz_snapshot<S: Storage>(
                         tx,
                     );
                     tokio::pin!(producer);
+                    let idle_deadline = tokio::time::sleep(VIZ_STREAM_IDLE_BUDGET);
+                    tokio::pin!(idle_deadline);
                     let mut producer_done = false;
                     loop {
                         tokio::select! {
                             _ = &mut producer, if !producer_done => producer_done = true,
+                            _ = &mut idle_deadline, if !producer_done => {
+                                tracing::warn!(
+                                    session_id = %sid,
+                                    timeout_ms = VIZ_STREAM_IDLE_BUDGET.as_millis() as u64,
+                                    "viz: session typed edge stream idle timeout; serving partial snapshot"
+                                );
+                                break;
+                            }
                             chunk = rx.recv() => {
                                 match chunk {
                                     Some(Ok(typed_edges)) => {
+                                        idle_deadline.as_mut().reset(tokio::time::Instant::now() + VIZ_STREAM_IDLE_BUDGET);
                                         for te in typed_edges {
                                             edge_chunk.push(VizEdge {
                                                 source: te.src_id.to_string(),
@@ -4126,6 +4207,11 @@ mod tests {
                 && streaming_snapshot.contains("typed_edge_stream_all(edge_ctx"),
             "all-scope streaming must preserve the old snapshot's legacy swapped-tenant typed edge fallback: {streaming_snapshot}"
         );
+        assert!(
+            streaming_snapshot.contains("VIZ_STREAM_IDLE_BUDGET")
+                && streaming_snapshot.contains("serving partial snapshot"),
+            "viz snapshot streams must fail soft under backend lane contention instead of hanging the browser: {streaming_snapshot}"
+        );
     }
 
     #[test]
@@ -4291,6 +4377,7 @@ mod tests {
     fn workbench_html_includes_judge_config_tab() {
         assert!(WORKBENCH_HTML.contains(r#"data-section="judge""#));
         assert!(WORKBENCH_HTML.contains(r#"id="judgeForm""#));
+        assert!(WORKBENCH_HTML.contains(r#"id="judgeRerankCandidates""#));
         assert!(WORKBENCH_HTML.contains("/workbench/api/judge/config"));
         assert!(WORKBENCH_HTML.contains("/workbench/api/judge/models"));
     }
@@ -4728,7 +4815,7 @@ mod tests {
             "POST",
             "/workbench/api/judge/config",
             &headers,
-            r#"{"enabled":true,"provider":"lmstudio","base_url":"http://127.0.0.1:1234","model":"local-judge","token":"super-secret","timeout_seconds":7}"#,
+            r#"{"enabled":true,"provider":"lmstudio","base_url":"http://127.0.0.1:1234","model":"local-judge","token":"super-secret","timeout_seconds":7,"max_rerank_candidates":25}"#,
             &storage,
             &metrics,
             &validator,
@@ -4763,6 +4850,7 @@ mod tests {
         assert!(get_response.contains("\"base_url\":\"http://127.0.0.1:1234\""));
         assert!(get_response.contains("\"model\":\"local-judge\""));
         assert!(get_response.contains("\"timeout_seconds\":7"));
+        assert!(get_response.contains("\"max_rerank_candidates\":25"));
         assert!(get_response.contains("\"token_configured\":true"));
         assert!(!get_response.contains("super-secret"));
     }

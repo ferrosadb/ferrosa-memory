@@ -56,6 +56,10 @@ struct ReconnectingStorage {
     reconnect_signal: tokio::sync::Notify,
     /// Config needed to reconnect (stashed at creation time).
     cql_config: FerrosaCqlConfig,
+    /// Whether this storage owner is responsible for schema migrations before
+    /// opening a runtime CQL session. Secondary readers rely on the primary
+    /// watcher so startup DDL is ordered and not duplicated.
+    run_migrations_on_connect: bool,
     graph: Option<Arc<GraphClient>>,
     sparql: Option<SparqlPassthrough>,
 }
@@ -305,11 +309,34 @@ impl ReconnectingStorage {
         graph: Option<Arc<GraphClient>>,
         sparql: Option<SparqlPassthrough>,
     ) -> Self {
+        Self::disconnected_with_migration_mode(config, graph, sparql, true)
+    }
+
+    /// Create a reconnecting storage wrapper for an independent read path.
+    ///
+    /// Viz uses this to avoid sharing the primary MCP CQL session/RPC lanes
+    /// with bulk ingest while still relying on the primary watcher to run
+    /// ordered schema migrations.
+    fn disconnected_secondary_reader(
+        config: FerrosaCqlConfig,
+        graph: Option<Arc<GraphClient>>,
+        sparql: Option<SparqlPassthrough>,
+    ) -> Self {
+        Self::disconnected_with_migration_mode(config, graph, sparql, false)
+    }
+
+    fn disconnected_with_migration_mode(
+        config: FerrosaCqlConfig,
+        graph: Option<Arc<GraphClient>>,
+        sparql: Option<SparqlPassthrough>,
+        run_migrations_on_connect: bool,
+    ) -> Self {
         Self {
             inner: RwLock::new(None),
             generation: AtomicU64::new(0),
             reconnect_signal: tokio::sync::Notify::new(),
             cql_config: config,
+            run_migrations_on_connect,
             graph,
             sparql,
         }
@@ -1867,7 +1894,13 @@ async fn cql_reconnect_watcher(storage: Arc<ReconnectingStorage>) {
             );
             tokio::time::sleep(delay).await;
 
-            run_schema_migrations_if_enabled(&storage.cql_config).await;
+            if storage.run_migrations_on_connect {
+                run_schema_migrations_if_enabled(&storage.cql_config).await;
+            } else {
+                tracing::debug!(
+                    "secondary CQL reader reconnect skips migrations; primary watcher owns schema"
+                );
+            }
 
             match CqlStorage::connect(&storage.cql_config).await {
                 Ok(cql) => {
@@ -2189,7 +2222,16 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|| default_bind.to_string());
         let viz_bus = Arc::clone(&shared_event_bus);
         let viz_port = config.viz.port;
-        let viz_storage = Arc::clone(&storage);
+        let viz_storage = Arc::new(ReconnectingStorage::disconnected_secondary_reader(
+            config.ferrosa.clone(),
+            graph_client.clone(),
+            sparql.clone(),
+        ));
+        tokio::spawn(cql_reconnect_watcher(Arc::clone(&viz_storage)));
+        viz_storage.reconnect_signal.notify_one();
+        tracing::info!(
+            "viz server using dedicated CQL reader connection isolated from MCP ingest traffic"
+        );
         let viz_ctx = Arc::new(auth::authenticate_stdio(viz_tenant_id));
         let viz_session_id = default_session_id.unwrap_or_else(uuid::Uuid::nil);
         let shell_routes = http::ShellRouteConfig {
@@ -2913,6 +2955,50 @@ auth_file = "{}"
         assert!(
             migration_pos < connect_pos,
             "migrations must run before runtime CQL prepare/connect attempts"
+        );
+    }
+
+    #[test]
+    fn reconnect_watcher_can_skip_migrations_for_secondary_readers() {
+        let source = include_str!("main.rs");
+        let watcher_start = source
+            .find("async fn cql_reconnect_watcher")
+            .expect("reconnect watcher must exist");
+        let watcher_source = &source[watcher_start..];
+
+        assert!(
+            watcher_source.contains("if storage.run_migrations_on_connect"),
+            "secondary readers must be able to connect without running duplicate migrations"
+        );
+        assert!(
+            watcher_source.contains("run_schema_migrations_if_enabled(&storage.cql_config).await"),
+            "primary reconnect watcher must still run migrations before CQL connect"
+        );
+    }
+
+    #[test]
+    fn viz_server_uses_dedicated_reconnecting_storage() {
+        let source = include_str!("main.rs");
+        let viz_start = source
+            .find("// Start visualization server if enabled.")
+            .expect("viz startup block must exist");
+        let viz_tail = &source[viz_start..];
+        let next_section = viz_tail
+            .find("// Start idle consolidation")
+            .unwrap_or(viz_tail.len());
+        let viz_source = &viz_tail[..next_section];
+
+        assert!(
+            viz_source.contains("ReconnectingStorage::disconnected_secondary_reader("),
+            "viz must use its own reconnecting storage so graph scans do not share the primary ingest CQL session"
+        );
+        assert!(
+            viz_source.contains("tokio::spawn(cql_reconnect_watcher(Arc::clone(&viz_storage)))"),
+            "viz storage must have its own reconnect watcher and CQL session"
+        );
+        assert!(
+            !viz_source.contains("let viz_storage = Arc::clone(&storage);"),
+            "viz must not clone the primary MCP storage handle"
         );
     }
 

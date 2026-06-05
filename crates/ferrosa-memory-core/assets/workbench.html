@@ -1052,6 +1052,10 @@
                 <label for="judgeTimeout">Timeout Seconds</label>
                 <input class="input" id="judgeTimeout" type="number" min="1" max="300" step="1" value="30">
               </div>
+              <div class="field" style="flex:1;min-width:180px;">
+                <label for="judgeRerankCandidates">Rerank Candidates</label>
+                <input class="input" id="judgeRerankCandidates" type="number" min="2" max="50" step="1" value="8">
+              </div>
             </div>
             <label for="judgeBaseUrl">Provider URL</label>
             <input id="judgeBaseUrl" class="input mono" type="url" placeholder="http://127.0.0.1:11434" required>
@@ -1413,6 +1417,7 @@
       judgeToken: document.getElementById('judgeToken'),
       judgeClearToken: document.getElementById('judgeClearToken'),
       judgeTimeout: document.getElementById('judgeTimeout'),
+      judgeRerankCandidates: document.getElementById('judgeRerankCandidates'),
       judgeProbeModels: document.getElementById('judgeProbeModels'),
       judgeReload: document.getElementById('judgeReload'),
       judgeStatus: document.getElementById('judgeStatus'),
@@ -1988,6 +1993,7 @@
       selectors.judgeModel.value = payload.model || 'qwen2.5-coder:7b';
       selectors.judgeEnabled.checked = Boolean(payload.enabled);
       selectors.judgeTimeout.value = String(payload.timeout_seconds || 30);
+      selectors.judgeRerankCandidates.value = String(payload.max_rerank_candidates || 8);
       selectors.judgeToken.value = '';
       selectors.judgeToken.placeholder = payload.token_configured
         ? 'token configured; leave blank to keep'
@@ -2020,6 +2026,7 @@
         base_url: selectors.judgeBaseUrl.value.trim(),
         model: selectors.judgeModel.value.trim(),
         timeout_seconds: Number(selectors.judgeTimeout.value || 30),
+        max_rerank_candidates: Number(selectors.judgeRerankCandidates.value || 8),
       };
       if (selectors.judgeClearToken.checked) {
         payload.token = null;
