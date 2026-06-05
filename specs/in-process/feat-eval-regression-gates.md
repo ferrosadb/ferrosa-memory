@@ -127,6 +127,16 @@ scripts/run-long-recall-baseline.sh bright-pro
 
 Current measurement: unconditional `neighbors` expansion is not a default. On the BRIGHT-Pro 200-doc support-closed slice it preserved recall but reduced LLM-reranked alpha-nDCG (`0.796 -> 0.744`), so follow-up tuning should use conditional/list-aware expansion or structured neighbor summaries.
 
+Query decomposition can be exercised with:
+
+```bash
+FMEM_EVAL_QUERY_DECOMPOSITION=heuristic \
+FMEM_EVAL_QUERY_VARIANT_LIMIT=5 \
+scripts/run-long-recall-baseline.sh bright-pro
+```
+
+Current measurement: deterministic heuristic decomposition is not a default. On the BRIGHT-Pro 200-doc support-closed slice it broadened the candidate pool but reduced alpha-nDCG (`0.720 -> 0.669` no rerank, `0.796 -> 0.697` with LLM rerank). MemoryBench's two-row retrieval proxy also regressed answer-term recall (`0.75 -> 0.50`). Treat this as ablation infrastructure; the next useful policy needs task-aware/LLM-generated subqueries or candidate-reservoir-only decomposition.
+
 ## CI Shape
 
 ### Required PR Gate

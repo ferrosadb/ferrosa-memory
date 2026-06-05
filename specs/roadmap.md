@@ -29,6 +29,15 @@
   - MemoryBench retrieval-proxy smoke on 2 `DialSim-bigbang` rows was unchanged by neighbor expansion: answer-term recall `0.75`, exact-answer hit rate `0.50`.
   - Interpretation: unconditional neighbor text is currently neutral without rerank and noisy for judge rerank. Keep the default `none`; next improvement should make expansion conditional/list-aware or pass structured neighbor summaries to the judge instead of raw appended text.
 
+- [x] **Query decomposition needs reproducible candidate-union ablations.**
+  - Implemented: `hybrid_search` accepts `query_decomposition=none|heuristic`, caller-provided `query_variants`, `query_variant_limit`, and `query_embed_variants`; responses include per-variant `query_decomposition` diagnostics with fanout, embedding status, query count, and unique result count.
+  - Implemented: eval scripts and long-recall/fusion shell profiles accept matching MCP flags so decomposition policies can be swept against BRIGHT-Pro and MemoryBench.
+  - Measurement on BRIGHT-Pro biology 200-doc support-closed 5-case slice, candidate_limit=50, `fusion_profile=all`, no LLM rerank: baseline `none` had alpha-nDCG `0.720`, aspect recall `0.94`, recall `0.796`; initial equal-weight heuristic dropped alpha-nDCG to `0.624` and aspect recall to `0.82`; weighted original-anchor heuristic recovered aspect recall but still dropped alpha-nDCG to `0.669`.
+  - Measurement with weighted heuristic and LLM rerank on the same slice: alpha-nDCG `0.697`, below the current no-decomposition LLM baseline `0.796`.
+  - Measurement with `query_variant_limit=3`: alpha-nDCG `0.692`, still below baseline.
+  - MemoryBench retrieval-proxy smoke on 2 `DialSim-bigbang` rows regressed answer-term recall from `0.75` to `0.50`; exact-answer hit rate stayed `0.50`.
+  - Interpretation: deterministic heuristic decomposition currently broadens the candidate pool but injects noisy lexical variants that hurt ranking. Keep the default `none`; next query-decomposition work should be task-aware and judge/LLM-generated, or should use decomposition only as a pre-rerank candidate reservoir without variant-only hits competing directly in final rank.
+
 - [ ] **Hybrid search needs an async judge-rerank mode with streamed status.**
   - Current: live LLM reranking can be enabled and works against local Ollama (`qwen2.5-coder:7b` hot path is ~2-3s for 8 candidates), but it is still in-band with the MCP request.
   - Implemented: judge-model reranking asks for per-candidate relevance scores and records `"-"` abstentions separately from valid `-1/0/1` judgments. `record_feedback` also accepts `"-"` and tracks per-judge sums so caller LLM, human, and judge-model feedback can accumulate without losing abstention/error evidence.

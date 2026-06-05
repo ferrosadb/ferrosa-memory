@@ -10,7 +10,7 @@
 //! - `tools/call` — dispatches to the named tool handler
 //! - `notifications/initialized` — client acknowledgment (no-op)
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -1200,6 +1200,27 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                     "fusion_weights": {
                         "type": "object",
                         "description": "Optional numeric source weight overrides, e.g. {\"document_bm25\":2.5,\"document_ann\":1.5,\"document_phonetic\":0}."
+                    },
+                    "query_decomposition": {
+                        "type": "string",
+                        "enum": ["none", "heuristic"],
+                        "description": "Generate bounded query variants and RRF-union their candidate sets before reranking. Default none."
+                    },
+                    "query_variants": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": {"type": "string", "maxLength": 2048},
+                        "description": "Caller-provided extra query variants to union with the primary query."
+                    },
+                    "query_variant_limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 8,
+                        "description": "Maximum total query variants, including the original query. Default 5."
+                    },
+                    "query_embed_variants": {
+                        "type": "boolean",
+                        "description": "When true and an embedding provider is configured, embed each query variant separately. Default false."
                     },
                     "chunk_expansion": {
                         "type": "string",
@@ -6926,6 +6947,253 @@ async fn apply_chunk_expansion<S: crate::storage::Storage>(
     Ok(report)
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct QueryVariantDiagnostic {
+    query: String,
+    rank: usize,
+    result_count: usize,
+    candidate_fanout: crate::hybrid_search::SearchDiagnostics,
+    embedding_status: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct QueryDecompositionReport {
+    mode: String,
+    query_count: usize,
+    unique_results: usize,
+    queries: Vec<QueryVariantDiagnostic>,
+}
+
+struct QueryVariantSearchOutput {
+    query: String,
+    output: crate::hybrid_search::SearchOutput,
+    embedding_status: String,
+}
+
+struct MergedQueryVariantOutput {
+    results: Vec<crate::hybrid_search::SearchResult>,
+    diagnostics: QueryDecompositionReport,
+}
+
+fn query_decomposition_stopwords(token: &str) -> bool {
+    matches!(
+        token,
+        "a" | "an"
+            | "and"
+            | "are"
+            | "as"
+            | "at"
+            | "be"
+            | "by"
+            | "can"
+            | "does"
+            | "for"
+            | "from"
+            | "how"
+            | "in"
+            | "into"
+            | "is"
+            | "it"
+            | "of"
+            | "on"
+            | "or"
+            | "that"
+            | "the"
+            | "their"
+            | "this"
+            | "to"
+            | "what"
+            | "when"
+            | "where"
+            | "which"
+            | "with"
+            | "within"
+    )
+}
+
+fn normalize_query_token(token: &str) -> String {
+    token
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_')
+        .to_string()
+}
+
+fn push_unique_query(queries: &mut Vec<String>, seen: &mut HashSet<String>, query: String) {
+    let query = query.trim();
+    if query.is_empty() {
+        return;
+    }
+    let normalized = query.to_ascii_lowercase();
+    if seen.insert(normalized) {
+        queries.push(query.to_string());
+    }
+}
+
+fn keyword_query(query: &str, max_terms: usize) -> Option<String> {
+    let terms = query
+        .split_whitespace()
+        .map(normalize_query_token)
+        .filter(|token| token.len() >= 3)
+        .filter(|token| !query_decomposition_stopwords(&token.to_ascii_lowercase()))
+        .take(max_terms)
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" "))
+    }
+}
+
+fn entity_alias_query(query: &str, max_terms: usize) -> Option<String> {
+    let terms = query
+        .split_whitespace()
+        .map(normalize_query_token)
+        .filter(|token| token.len() >= 2)
+        .filter(|token| {
+            token.chars().any(|ch| ch.is_ascii_uppercase())
+                || token.chars().any(|ch| ch.is_ascii_digit())
+                || token.contains('-')
+                || token.contains('_')
+        })
+        .take(max_terms)
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" "))
+    }
+}
+
+fn build_query_variants(
+    query: &str,
+    mode: &str,
+    caller_variants: &[String],
+    max_variants: usize,
+) -> Result<Vec<String>, (i32, String)> {
+    match mode {
+        "none" | "heuristic" => {}
+        _ => {
+            return Err((
+                INVALID_PARAMS,
+                format!("unknown query_decomposition: {mode}"),
+            ));
+        }
+    }
+    let max_variants = max_variants.clamp(1, 8);
+    let mut variants = Vec::new();
+    let mut seen = HashSet::new();
+    push_unique_query(&mut variants, &mut seen, query.to_string());
+
+    for variant in caller_variants {
+        if variants.len() >= max_variants {
+            return Ok(variants);
+        }
+        push_unique_query(&mut variants, &mut seen, variant.to_string());
+    }
+
+    if mode == "heuristic" {
+        if variants.len() < max_variants
+            && let Some(keywords) = keyword_query(query, 14)
+        {
+            push_unique_query(&mut variants, &mut seen, keywords.clone());
+            if variants.len() < max_variants {
+                push_unique_query(
+                    &mut variants,
+                    &mut seen,
+                    format!("supporting evidence for {keywords}"),
+                );
+            }
+        }
+        if variants.len() < max_variants
+            && let Some(entities) = entity_alias_query(query, 10)
+        {
+            push_unique_query(&mut variants, &mut seen, entities);
+        }
+    }
+
+    Ok(variants)
+}
+
+fn collapse_duplicate_variant_documents(
+    results: Vec<crate::hybrid_search::SearchResult>,
+) -> Vec<crate::hybrid_search::SearchResult> {
+    let mut seen_documents = HashSet::new();
+    let mut collapsed = Vec::with_capacity(results.len());
+    for result in results {
+        if result.result_type == "document_chunk"
+            && let Some(document_id) = result.document_id
+            && !seen_documents.insert(document_id)
+        {
+            continue;
+        }
+        collapsed.push(result);
+    }
+    collapsed
+}
+
+fn merge_query_variant_outputs(
+    outputs: Vec<QueryVariantSearchOutput>,
+    limit: usize,
+) -> MergedQueryVariantOutput {
+    let mut scores: HashMap<uuid::Uuid, (f64, crate::hybrid_search::SearchResult)> = HashMap::new();
+    let mut unique = HashSet::new();
+    let mut queries = Vec::with_capacity(outputs.len());
+
+    for (variant_rank, variant) in outputs.into_iter().enumerate() {
+        for (rank, result) in variant.output.results.iter().enumerate() {
+            unique.insert(result.id);
+            let variant_weight = if variant_rank == 0 { 4.0 } else { 0.75 };
+            let score = variant_weight / (60.0 + rank as f64 + 1.0);
+            scores
+                .entry(result.id)
+                .and_modify(|(existing_score, existing_result)| {
+                    *existing_score += score;
+                    if result.content.len() > existing_result.content.len() {
+                        *existing_result = result.clone();
+                    }
+                })
+                .or_insert((score, result.clone()));
+        }
+        queries.push(QueryVariantDiagnostic {
+            rank: variant_rank + 1,
+            result_count: variant.output.results.len(),
+            candidate_fanout: variant.output.diagnostics,
+            embedding_status: variant.embedding_status,
+            query: variant.query,
+        });
+    }
+
+    let mut results = scores
+        .into_values()
+        .map(|(score, mut result)| {
+            result.score = score;
+            result
+        })
+        .collect::<Vec<_>>();
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let results = collapse_duplicate_variant_documents(results)
+        .into_iter()
+        .take(limit)
+        .collect::<Vec<_>>();
+
+    MergedQueryVariantOutput {
+        results,
+        diagnostics: QueryDecompositionReport {
+            mode: if queries.len() > 1 {
+                "active".into()
+            } else {
+                "none".into()
+            },
+            query_count: queries.len(),
+            unique_results: unique.len(),
+            queries,
+        },
+    }
+}
+
 async fn handle_hybrid_search<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
@@ -6935,6 +7203,11 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
     let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
     let query = require_str(&args, "query")?;
     let mut embedding = optional_f32_array(&args, "embedding")?;
+    let mut base_embedding_status = if embedding.is_some() {
+        "provided".to_string()
+    } else {
+        "unavailable".to_string()
+    };
     let limit = optional_retrieval_limit(&args, &["limit"], session)?;
     let offset = args
         .get("offset")
@@ -6959,14 +7232,41 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
             .map(str::to_string),
         candidate_limit,
     };
+    let query_decomposition_mode = args
+        .get("query_decomposition")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    let query_variant_limit = args
+        .get("query_variant_limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(5)
+        .clamp(1, 8) as usize;
+    let query_embed_variants = args
+        .get("query_embed_variants")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let caller_query_variants = optional_string_array(&args, "query_variants")?;
+    let query_variants = build_query_variants(
+        query,
+        query_decomposition_mode,
+        &caller_query_variants,
+        query_variant_limit,
+    )?;
 
     // Auto-generate query embedding for ANN search if Ollama is configured.
+    let embedding_client = session_embedding_client(session);
     if embedding.is_none()
-        && let Some(client) = session_embedding_client(session)
+        && let Some(client) = embedding_client.as_ref()
     {
         match client.embed(query).await {
-            Ok(emb) => embedding = Some(emb),
-            Err(e) => tracing::debug!("query embedding generation skipped: {e}"),
+            Ok(emb) => {
+                embedding = Some(emb);
+                base_embedding_status = "generated".into();
+            }
+            Err(e) => {
+                tracing::debug!("query embedding generation skipped: {e}");
+                base_embedding_status = "failed".into();
+            }
         }
     }
 
@@ -7004,23 +7304,67 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         }
     }
 
-    let search_output = crate::hybrid_search::hybrid_search_with_diagnostics(
-        storage,
-        ctx,
-        session_id,
-        query,
-        embedding.as_deref(),
-        search_limit,
-        None,
-        None,
-        None,
-        &fusion_config,
-        Some(&filter),
-    )
-    .await
-    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
-    let candidate_fanout = search_output.diagnostics;
-    let mut all_results = search_output.results;
+    let mut query_outputs = Vec::with_capacity(query_variants.len());
+    for (idx, variant_query) in query_variants.iter().enumerate() {
+        let mut variant_embedding = embedding.clone();
+        let mut embedding_status = if idx == 0 {
+            base_embedding_status.clone()
+        } else if variant_embedding.is_some() {
+            "reused".into()
+        } else {
+            "unavailable".into()
+        };
+        if idx > 0
+            && query_embed_variants
+            && let Some(client) = embedding_client.as_ref()
+        {
+            match client.embed(variant_query).await {
+                Ok(emb) => {
+                    variant_embedding = Some(emb);
+                    embedding_status = "generated".into();
+                }
+                Err(e) => {
+                    tracing::debug!(query = %variant_query, "query variant embedding skipped: {e}");
+                    embedding_status = "failed".into();
+                }
+            }
+        }
+
+        let output = crate::hybrid_search::hybrid_search_with_diagnostics(
+            storage,
+            ctx,
+            session_id,
+            variant_query,
+            variant_embedding.as_deref(),
+            search_limit,
+            None,
+            None,
+            None,
+            &fusion_config,
+            Some(&filter),
+        )
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+        query_outputs.push(QueryVariantSearchOutput {
+            query: variant_query.clone(),
+            output,
+            embedding_status,
+        });
+    }
+    let candidate_fanout = query_outputs
+        .first()
+        .map(|variant| variant.output.diagnostics.clone())
+        .unwrap_or(crate::hybrid_search::SearchDiagnostics {
+            requested_limit: search_limit,
+            source_limit: search_limit,
+            total_candidates: 0,
+            unique_candidates: 0,
+            sources: vec![],
+        });
+    let mut query_merged_output = merge_query_variant_outputs(query_outputs, search_limit);
+    query_merged_output.diagnostics.mode = query_decomposition_mode.to_string();
+    let query_decomposition_report = query_merged_output.diagnostics;
+    let mut all_results = query_merged_output.results;
     let chunk_expansion_config = parse_chunk_expansion(&args)?;
     let chunk_expansion_report = apply_chunk_expansion(
         storage,
@@ -7187,6 +7531,7 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
             "error": reranker_report.error,
         },
         "candidate_fanout": candidate_fanout,
+        "query_decomposition": query_decomposition_report,
         "chunk_expansion": chunk_expansion_report,
         "fusion": {
             "profile": fusion_profile,
@@ -9323,6 +9668,23 @@ fn optional_f32_array(args: &Value, field: &str) -> Result<Option<Vec<f32>>, (i3
         Some(_) => Err((INVALID_PARAMS, format!("{field} must be an array"))),
         None => Ok(None),
     }
+}
+
+fn optional_string_array(args: &Value, field: &str) -> Result<Vec<String>, (i32, String)> {
+    let Some(value) = args.get(field) else {
+        return Ok(Vec::new());
+    };
+    let Some(values) = value.as_array() else {
+        return Err((INVALID_PARAMS, format!("{field} must be an array")));
+    };
+    let mut parsed = Vec::with_capacity(values.len());
+    for (idx, value) in values.iter().enumerate() {
+        let Some(text) = value.as_str() else {
+            return Err((INVALID_PARAMS, format!("{field}[{idx}] must be a string")));
+        };
+        parsed.push(text.to_string());
+    }
+    Ok(parsed)
 }
 
 fn require_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, (i32, String)> {
@@ -12472,6 +12834,96 @@ mod tests {
         assert!(content.contains("hit chunk"));
         assert!(content.contains("Expanded neighboring chunks"));
         assert!(content.contains("neighbor answer text"));
+    }
+
+    #[test]
+    fn build_query_variants_heuristic_adds_bounded_keyword_and_evidence_queries() {
+        let variants = build_query_variants(
+            "How does BRCA1 repair DNA damage in breast cancer cells?",
+            "heuristic",
+            &[],
+            5,
+        )
+        .unwrap();
+
+        assert_eq!(
+            variants.first().map(String::as_str),
+            Some("How does BRCA1 repair DNA damage in breast cancer cells?")
+        );
+        assert!(variants.len() <= 5);
+        assert!(variants.iter().any(|query| query.contains("BRCA1")));
+        assert!(
+            variants
+                .iter()
+                .any(|query| query.starts_with("supporting evidence for "))
+        );
+        let unique = variants.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), variants.len());
+    }
+
+    #[test]
+    fn merge_query_variant_outputs_promotes_hits_seen_by_multiple_variants() {
+        let shared = Uuid::new_v4();
+        let original_only = Uuid::new_v4();
+        let variant_only = Uuid::new_v4();
+        let result = |id, label: &str| crate::hybrid_search::SearchResult {
+            id,
+            source: "document_bm25".into(),
+            content: label.into(),
+            score: 1.0,
+            result_type: "document_chunk".into(),
+            document_id: Some(id),
+            prev_chunk_id: None,
+            next_chunk_id: None,
+            hint: None,
+            expanded_context: Vec::new(),
+        };
+        let original = crate::hybrid_search::SearchOutput {
+            results: vec![
+                result(original_only, "original only"),
+                result(shared, "shared"),
+            ],
+            diagnostics: crate::hybrid_search::SearchDiagnostics {
+                requested_limit: 2,
+                source_limit: 2,
+                total_candidates: 2,
+                unique_candidates: 2,
+                sources: vec![],
+            },
+        };
+        let variant = crate::hybrid_search::SearchOutput {
+            results: vec![
+                result(variant_only, "variant only"),
+                result(shared, "shared"),
+            ],
+            diagnostics: crate::hybrid_search::SearchDiagnostics {
+                requested_limit: 2,
+                source_limit: 2,
+                total_candidates: 2,
+                unique_candidates: 2,
+                sources: vec![],
+            },
+        };
+
+        let merged = merge_query_variant_outputs(
+            vec![
+                QueryVariantSearchOutput {
+                    query: "original".into(),
+                    output: original,
+                    embedding_status: "provided".into(),
+                },
+                QueryVariantSearchOutput {
+                    query: "variant".into(),
+                    output: variant,
+                    embedding_status: "provided".into(),
+                },
+            ],
+            3,
+        );
+
+        assert_eq!(merged.results.first().map(|result| result.id), Some(shared));
+        assert_eq!(merged.diagnostics.queries.len(), 2);
+        assert_eq!(merged.diagnostics.unique_results, 3);
     }
 
     #[test]

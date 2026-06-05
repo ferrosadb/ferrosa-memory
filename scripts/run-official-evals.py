@@ -534,6 +534,7 @@ class McpBrightRetriever:
         self.last_candidate_fanout: dict[str, Any] | None = None
         self.last_fusion: dict[str, Any] | None = None
         self.last_chunk_expansion: dict[str, Any] | None = None
+        self.last_query_decomposition: dict[str, Any] | None = None
         self.client.initialize()
 
     def ingest_documents(self, rows: list[dict[str, Any]], split: str) -> dict[str, Any]:
@@ -666,6 +667,14 @@ class McpBrightRetriever:
             arguments["candidate_limit"] = self.args.mcp_candidate_limit
         if self.args.mcp_fusion_profile is not None:
             arguments["fusion_profile"] = self.args.mcp_fusion_profile
+        if self.args.mcp_query_decomposition is not None:
+            arguments["query_decomposition"] = self.args.mcp_query_decomposition
+        if self.args.mcp_query_variant:
+            arguments["query_variants"] = self.args.mcp_query_variant
+        if self.args.mcp_query_variant_limit is not None:
+            arguments["query_variant_limit"] = self.args.mcp_query_variant_limit
+        if self.args.mcp_query_embed_variants:
+            arguments["query_embed_variants"] = True
         if self.args.mcp_chunk_expansion is not None:
             arguments["chunk_expansion"] = self.args.mcp_chunk_expansion
             arguments["chunk_prev"] = self.args.mcp_chunk_prev
@@ -678,6 +687,7 @@ class McpBrightRetriever:
         self.last_candidate_fanout = response.get("candidate_fanout")
         self.last_fusion = response.get("fusion")
         self.last_chunk_expansion = response.get("chunk_expansion")
+        self.last_query_decomposition = response.get("query_decomposition")
         hits = []
         for result in response.get("results", []):
             entity_id = result_entity_id_for_mapping(result)
@@ -921,6 +931,7 @@ def run_bright_pro(args: argparse.Namespace) -> int:
                 case["candidate_fanout"] = mcp_retriever.last_candidate_fanout
                 case["fusion"] = mcp_retriever.last_fusion
                 case["chunk_expansion"] = mcp_retriever.last_chunk_expansion
+                case["query_decomposition"] = mcp_retriever.last_query_decomposition
             split_cases.append(case)
             all_cases.append(case)
 
@@ -980,6 +991,18 @@ def run_bright_pro(args: argparse.Namespace) -> int:
         ),
         "mcp_fusion_profile": (
             args.mcp_fusion_profile if args.backend == "mcp-http" else None
+        ),
+        "mcp_query_decomposition": (
+            args.mcp_query_decomposition if args.backend == "mcp-http" else None
+        ),
+        "mcp_query_variant": (
+            args.mcp_query_variant if args.backend == "mcp-http" else None
+        ),
+        "mcp_query_variant_limit": (
+            args.mcp_query_variant_limit if args.backend == "mcp-http" else None
+        ),
+        "mcp_query_embed_variants": (
+            args.mcp_query_embed_variants if args.backend == "mcp-http" else None
         ),
         "mcp_chunk_expansion": (
             args.mcp_chunk_expansion if args.backend == "mcp-http" else None
@@ -1235,6 +1258,7 @@ class McpMemoryBenchRetriever:
         self.last_candidate_fanout: dict[str, Any] | None = None
         self.last_fusion: dict[str, Any] | None = None
         self.last_chunk_expansion: dict[str, Any] | None = None
+        self.last_query_decomposition: dict[str, Any] | None = None
         self.client.initialize()
 
     def ingest_documents(self, documents: list[MemoryBenchDocument]) -> dict[str, Any]:
@@ -1363,6 +1387,14 @@ class McpMemoryBenchRetriever:
             arguments["candidate_limit"] = self.args.mcp_candidate_limit
         if self.args.mcp_fusion_profile is not None:
             arguments["fusion_profile"] = self.args.mcp_fusion_profile
+        if self.args.mcp_query_decomposition is not None:
+            arguments["query_decomposition"] = self.args.mcp_query_decomposition
+        if self.args.mcp_query_variant:
+            arguments["query_variants"] = self.args.mcp_query_variant
+        if self.args.mcp_query_variant_limit is not None:
+            arguments["query_variant_limit"] = self.args.mcp_query_variant_limit
+        if self.args.mcp_query_embed_variants:
+            arguments["query_embed_variants"] = True
         if self.args.mcp_chunk_expansion is not None:
             arguments["chunk_expansion"] = self.args.mcp_chunk_expansion
             arguments["chunk_prev"] = self.args.mcp_chunk_prev
@@ -1375,6 +1407,7 @@ class McpMemoryBenchRetriever:
         self.last_candidate_fanout = response.get("candidate_fanout")
         self.last_fusion = response.get("fusion")
         self.last_chunk_expansion = response.get("chunk_expansion")
+        self.last_query_decomposition = response.get("query_decomposition")
         hits = []
         for result in response.get("results", []):
             entity_id = result_entity_id_for_mapping(result)
@@ -1548,6 +1581,7 @@ def run_memorybench(args: argparse.Namespace) -> int:
                 "candidate_fanout": mcp_retriever.last_candidate_fanout,
                 "fusion": mcp_retriever.last_fusion,
                 "chunk_expansion": mcp_retriever.last_chunk_expansion,
+                "query_decomposition": mcp_retriever.last_query_decomposition,
                 "hits": [
                     {
                         "id": hit.id,
@@ -1609,6 +1643,18 @@ def run_memorybench(args: argparse.Namespace) -> int:
         ),
         "mcp_fusion_profile": (
             args.mcp_fusion_profile if args.backend == "mcp-http" else None
+        ),
+        "mcp_query_decomposition": (
+            args.mcp_query_decomposition if args.backend == "mcp-http" else None
+        ),
+        "mcp_query_variant": (
+            args.mcp_query_variant if args.backend == "mcp-http" else None
+        ),
+        "mcp_query_variant_limit": (
+            args.mcp_query_variant_limit if args.backend == "mcp-http" else None
+        ),
+        "mcp_query_embed_variants": (
+            args.mcp_query_embed_variants if args.backend == "mcp-http" else None
         ),
         "mcp_chunk_expansion": (
             args.mcp_chunk_expansion if args.backend == "mcp-http" else None
@@ -1831,6 +1877,22 @@ def parse_args() -> argparse.Namespace:
         help="Named hybrid_search source-weight profile for ablations.",
     )
     bright.add_argument(
+        "--mcp-query-decomposition",
+        choices=["none", "heuristic"],
+        help="Enable bounded query decomposition in MCP hybrid_search.",
+    )
+    bright.add_argument(
+        "--mcp-query-variant",
+        action="append",
+        help="Extra caller-provided query variant. Can be passed multiple times.",
+    )
+    bright.add_argument("--mcp-query-variant-limit", type=int)
+    bright.add_argument(
+        "--mcp-query-embed-variants",
+        action="store_true",
+        help="Ask MCP to embed each query variant separately when configured.",
+    )
+    bright.add_argument(
         "--mcp-chunk-expansion",
         choices=["none", "neighbors"],
         help="Expand document chunk hits before reranking/returning.",
@@ -1932,6 +1994,22 @@ def parse_args() -> argparse.Namespace:
             "bm25-semantic-phonetic-workspace",
         ],
         help="Named hybrid_search source-weight profile for ablations.",
+    )
+    memory.add_argument(
+        "--mcp-query-decomposition",
+        choices=["none", "heuristic"],
+        help="Enable bounded query decomposition in MCP hybrid_search.",
+    )
+    memory.add_argument(
+        "--mcp-query-variant",
+        action="append",
+        help="Extra caller-provided query variant. Can be passed multiple times.",
+    )
+    memory.add_argument("--mcp-query-variant-limit", type=int)
+    memory.add_argument(
+        "--mcp-query-embed-variants",
+        action="store_true",
+        help="Ask MCP to embed each query variant separately when configured.",
     )
     memory.add_argument(
         "--mcp-chunk-expansion",

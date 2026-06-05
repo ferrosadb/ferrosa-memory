@@ -11,10 +11,17 @@ limit_examples="${FMEM_EVAL_LIMIT_EXAMPLES:-5}"
 max_docs="${FMEM_EVAL_MCP_MAX_DOCS:-200}"
 candidate_limit="${FMEM_EVAL_CANDIDATE_LIMIT:-50}"
 rerank_candidates="${FMEM_EVAL_RERANK_CANDIDATES:-25}"
+query_decomposition="${FMEM_EVAL_QUERY_DECOMPOSITION:-none}"
+query_variant_limit="${FMEM_EVAL_QUERY_VARIANT_LIMIT:-5}"
+query_embed_variants="${FMEM_EVAL_QUERY_EMBED_VARIANTS:-false}"
 chunk_expansion="${FMEM_EVAL_CHUNK_EXPANSION:-none}"
 chunk_prev="${FMEM_EVAL_CHUNK_PREV:-1}"
 chunk_next="${FMEM_EVAL_CHUNK_NEXT:-1}"
 chunk_max_tokens="${FMEM_EVAL_CHUNK_MAX_TOKENS:-1600}"
+query_embed_args=()
+if [[ "${query_embed_variants}" == "true" ]]; then
+  query_embed_args+=(--mcp-query-embed-variants)
+fi
 
 mkdir -p "${output_root}"
 
@@ -28,6 +35,8 @@ for profile in ${profiles}; do
     --mcp-skip-ingest \
     --mcp-candidate-limit "${candidate_limit}" \
     --mcp-fusion-profile "${profile}" \
+    --mcp-query-decomposition "${query_decomposition}" \
+    --mcp-query-variant-limit "${query_variant_limit}" \
     --mcp-chunk-expansion "${chunk_expansion}" \
     --mcp-chunk-prev "${chunk_prev}" \
     --mcp-chunk-next "${chunk_next}" \
@@ -35,7 +44,8 @@ for profile in ${profiles}; do
     --mcp-no-rerank \
     --mcp-rerank-candidates "${rerank_candidates}" \
     --output-dir "${output_root}/${profile}" \
-    --include-cases
+    --include-cases \
+    "${query_embed_args[@]}"
 done
 
 if [[ "${FMEM_EVAL_INCLUDE_LLM_RERANK:-false}" == "true" ]]; then
@@ -48,6 +58,8 @@ if [[ "${FMEM_EVAL_INCLUDE_LLM_RERANK:-false}" == "true" ]]; then
     --mcp-skip-ingest \
     --mcp-candidate-limit "${candidate_limit}" \
     --mcp-fusion-profile all \
+    --mcp-query-decomposition "${query_decomposition}" \
+    --mcp-query-variant-limit "${query_variant_limit}" \
     --mcp-chunk-expansion "${chunk_expansion}" \
     --mcp-chunk-prev "${chunk_prev}" \
     --mcp-chunk-next "${chunk_next}" \
@@ -55,7 +67,8 @@ if [[ "${FMEM_EVAL_INCLUDE_LLM_RERANK:-false}" == "true" ]]; then
     --mcp-rerank \
     --mcp-rerank-candidates "${rerank_candidates}" \
     --output-dir "${output_root}/all-llm-rerank" \
-    --include-cases
+    --include-cases \
+    "${query_embed_args[@]}"
 fi
 
 python3 - "${output_root}" <<'PY'
@@ -76,6 +89,9 @@ for report_path in sorted(root.glob("*/bright-pro-report.json")):
         "ndcg": summary["ndcg"]["mean"],
         "cases": report["case_count"],
         "failures": report["failure_count"],
+        "query_decomposition": report.get("mcp_query_decomposition"),
+        "query_variant_limit": report.get("mcp_query_variant_limit"),
+        "query_embed_variants": report.get("mcp_query_embed_variants"),
     })
 
 print(json.dumps(rows, indent=2, sort_keys=True))

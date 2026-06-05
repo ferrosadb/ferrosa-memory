@@ -25,6 +25,9 @@ k="${FMEM_EVAL_K:-25}"
 rerank_candidates="${FMEM_EVAL_RERANK_CANDIDATES:-25}"
 candidate_limit="${FMEM_EVAL_CANDIDATE_LIMIT:-50}"
 fusion_profile="${FMEM_EVAL_FUSION_PROFILE:-all}"
+query_decomposition="${FMEM_EVAL_QUERY_DECOMPOSITION:-none}"
+query_variant_limit="${FMEM_EVAL_QUERY_VARIANT_LIMIT:-5}"
+query_embed_variants="${FMEM_EVAL_QUERY_EMBED_VARIANTS:-false}"
 chunk_expansion="${FMEM_EVAL_CHUNK_EXPANSION:-none}"
 chunk_prev="${FMEM_EVAL_CHUNK_PREV:-1}"
 chunk_next="${FMEM_EVAL_CHUNK_NEXT:-1}"
@@ -39,6 +42,8 @@ common_mcp_args=(
   --mcp-rerank-candidates "${rerank_candidates}"
   --mcp-candidate-limit "${candidate_limit}"
   --mcp-fusion-profile "${fusion_profile}"
+  --mcp-query-decomposition "${query_decomposition}"
+  --mcp-query-variant-limit "${query_variant_limit}"
   --mcp-chunk-expansion "${chunk_expansion}"
   --mcp-chunk-prev "${chunk_prev}"
   --mcp-chunk-next "${chunk_next}"
@@ -46,6 +51,10 @@ common_mcp_args=(
   --mcp-embed-missing
   --progress
 )
+
+if [[ "${query_embed_variants}" == "true" ]]; then
+  common_mcp_args+=(--mcp-query-embed-variants)
+fi
 
 if [[ -n "${FMEM_EVAL_MCP_TENANT_ID:-}" ]]; then
   common_mcp_args+=(--mcp-tenant-id "${FMEM_EVAL_MCP_TENANT_ID}")
