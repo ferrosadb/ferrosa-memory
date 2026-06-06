@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -157,6 +158,6 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" \
             --repo "${{ github.repository }}" \
             --title "Ferrosa Memory ${GITHUB_REF_NAME}" \
-            --draft \
+            --latest \
             --notes "Automated release. Verify SHA256SUMS before installing." \
             dist/ferrosa-memory-*.tar.gz dist/SHA256SUMS
