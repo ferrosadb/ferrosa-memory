@@ -5,6 +5,14 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      prerelease:
+        description: >-
+          Mark the GitHub release as a prerelease (the "nightly" channel).
+          Stable releases are promoted separately via promote-release.yml.
+        required: false
+        type: boolean
+        default: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -155,9 +163,20 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Channel policy: every freshly built release is a prerelease (the
+          # "nightly" channel). A release becomes "stable" only when a human
+          # promotes it (promote-release.yml -> marks it --latest, not pre).
+          # Tag-push events carry no input, so they default to prerelease too.
+          PRERELEASE="${{ github.event.inputs.prerelease }}"
+          if [ "${PRERELEASE}" = "false" ]; then
+            REL_FLAGS=(--latest)
+          else
+            REL_FLAGS=(--prerelease)
+          fi
+
           gh release create "${GITHUB_REF_NAME}" \
             --repo "${{ github.repository }}" \
             --title "Ferrosa Memory ${GITHUB_REF_NAME}" \
-            --latest \
             --notes "Automated release. Verify SHA256SUMS before installing." \
+            "${REL_FLAGS[@]}" \
             dist/ferrosa-memory-*.tar.gz dist/SHA256SUMS
