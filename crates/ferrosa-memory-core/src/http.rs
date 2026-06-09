@@ -183,6 +183,17 @@ where
     }
 }
 
+/// Whether a rate-limited connection should be answered with a plaintext
+/// HTTP 429.
+///
+/// Only for plaintext HTTP. Under TLS the peer is still negotiating the
+/// handshake and expects a TLS ServerHello; writing plaintext HTTP to the raw
+/// socket corrupts the handshake and hangs the client. Such connections are
+/// dropped instead.
+fn rate_limited_should_send_plaintext_429(tls_enabled: bool) -> bool {
+    !tls_enabled
+}
+
 async fn accept_tls_with_budget<IO>(
     acceptor: &tokio_rustls::TlsAcceptor,
     stream: IO,
@@ -315,19 +326,30 @@ pub async fn serve_http<S: Storage + OperatorQuerySurface + 'static>(
         let (stream, peer) = listener.accept().await?;
 
         if !rate_limiter.check(peer.ip()) {
-            tracing::warn!("rate limit exceeded for {peer}, sending 429");
-            // A bare `drop(stream)` leaves any request bytes the
-            // client has already written sitting in the recv buffer,
-            // which on macOS (and Linux with SO_LINGER defaults)
-            // makes close() emit RST instead of FIN — Python's
-            // http.client surfaces that as `ConnectionResetError`.
-            // Spawn a short task that drains the request, writes a
-            // proper 429, and half-closes before drop so the peer
-            // sees a normal EOF.
-            tokio::spawn(async move {
-                let mut stream = stream;
-                write_rate_limit_response(&mut stream).await;
-            });
+            if rate_limited_should_send_plaintext_429(tls_acceptor.is_some()) {
+                tracing::warn!("rate limit exceeded for {peer}, sending 429");
+                // A bare `drop(stream)` leaves any request bytes the
+                // client has already written sitting in the recv buffer,
+                // which on macOS (and Linux with SO_LINGER defaults)
+                // makes close() emit RST instead of FIN — Python's
+                // http.client surfaces that as `ConnectionResetError`.
+                // Spawn a short task that drains the request, writes a
+                // proper 429, and half-closes before drop so the peer
+                // sees a normal EOF.
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    write_rate_limit_response(&mut stream).await;
+                });
+            } else {
+                // Under TLS the client is mid-handshake, waiting for a
+                // ServerHello. Writing a *plaintext* HTTP 429 to the raw socket
+                // injects non-TLS bytes into that handshake, so the client never
+                // sees a valid ServerHello and hangs until its own connect
+                // timeout (observed as a `tls=0.000s` stall). A rate-limited TLS
+                // peer should instead see a clean connection close.
+                tracing::warn!("rate limit exceeded for {peer} (TLS); dropping connection");
+                drop(stream);
+            }
             continue;
         }
 
@@ -4441,6 +4463,22 @@ mod tests {
             "ip_b second connection should be allowed"
         );
         assert!(!limiter.check(ip_b), "ip_b should be rejected at limit");
+    }
+
+    #[test]
+    fn rate_limited_tls_connection_is_dropped_not_sent_plaintext() {
+        // Plaintext HTTP: a rate-limited client speaks HTTP, so a 429 is correct.
+        assert!(
+            rate_limited_should_send_plaintext_429(false),
+            "plaintext HTTP should receive a 429"
+        );
+        // TLS: writing a plaintext 429 onto the raw socket corrupts the client's
+        // in-flight TLS handshake (the bug that made HTTPS clients hang). A
+        // rate-limited TLS connection must be dropped, never written plaintext.
+        assert!(
+            !rate_limited_should_send_plaintext_429(true),
+            "TLS connection must not receive a plaintext 429"
+        );
     }
 
     #[test]
