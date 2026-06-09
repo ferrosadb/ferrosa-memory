@@ -4523,7 +4523,10 @@ mod tests {
         // fd exhaustion is survivable but should trigger a backoff.
         assert!(is_fd_exhaustion(&Error::from_raw_os_error(EMFILE)));
         assert!(is_fd_exhaustion(&Error::from_raw_os_error(ENFILE)));
-        assert!(!is_fd_exhaustion(&Error::new(ErrorKind::ConnectionAborted, "x")));
+        assert!(!is_fd_exhaustion(&Error::new(
+            ErrorKind::ConnectionAborted,
+            "x"
+        )));
     }
 
     #[test]

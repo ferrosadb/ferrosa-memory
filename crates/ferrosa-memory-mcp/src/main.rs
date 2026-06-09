@@ -2552,8 +2552,8 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_critical_runs_the_task() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
         let ran = Arc::new(AtomicBool::new(false));
         let ran2 = Arc::clone(&ran);
         spawn_critical("test_task", async move {
@@ -2561,7 +2561,10 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(ran.load(Ordering::SeqCst), "spawn_critical must drive the future");
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "spawn_critical must drive the future"
+        );
     }
 
     #[test]
