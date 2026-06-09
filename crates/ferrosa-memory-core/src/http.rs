@@ -194,6 +194,28 @@ fn rate_limited_should_send_plaintext_429(tls_enabled: bool) -> bool {
     !tls_enabled
 }
 
+// POSIX `accept(2)` errno values — identical on macOS and Linux.
+const EBADF: i32 = 9; // listener fd is not valid
+const EINVAL: i32 = 22; // listener is not listening / bad argument
+const ENFILE: i32 = 23; // system-wide fd table full
+const EMFILE: i32 = 24; // per-process fd table full
+
+/// Whether an `accept()` error should terminate the accept loop.
+///
+/// Only a broken *listener* fd (`EBADF`/`EINVAL`) is fatal. Every other error
+/// is per-connection or transient (peer aborted before accept, fd/buffer
+/// pressure, `EINTR`) and must not stop the server from accepting future
+/// connections.
+fn is_fatal_accept_error(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(EBADF) | Some(EINVAL))
+}
+
+/// File-descriptor exhaustion (`EMFILE`/`ENFILE`): keep accepting, but back off
+/// briefly so the loop doesn't spin while descriptors are freed.
+fn is_fd_exhaustion(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(EMFILE) | Some(ENFILE))
+}
+
 async fn accept_tls_with_budget<IO>(
     acceptor: &tokio_rustls::TlsAcceptor,
     stream: IO,
@@ -323,7 +345,28 @@ pub async fn serve_http<S: Storage + OperatorQuerySurface + 'static>(
     tracing::info!("{protocol} server listening on {addr}");
 
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                // A per-connection accept() error must NEVER tear down the
+                // server. `serve_http` is the process's main future, so
+                // returning here stops serving every future client while the
+                // process stays alive with a bound-but-unserviced listener —
+                // new connections then pile in the kernel backlog, completing
+                // the TCP handshake but never being accepted (observed as a
+                // hung TLS handshake with the box at 0% CPU). Only a broken
+                // listener fd is fatal; otherwise log, back off on fd
+                // exhaustion so we don't spin, and keep accepting.
+                if is_fatal_accept_error(&e) {
+                    return Err(anyhow::anyhow!("listener accept failed fatally: {e}"));
+                }
+                tracing::warn!(error = %e, os = ?e.raw_os_error(), "accept error; continuing");
+                if is_fd_exhaustion(&e) {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                continue;
+            }
+        };
 
         if !rate_limiter.check(peer.ip()) {
             if rate_limited_should_send_plaintext_429(tls_acceptor.is_some()) {
@@ -4463,6 +4506,32 @@ mod tests {
             "ip_b second connection should be allowed"
         );
         assert!(!limiter.check(ip_b), "ip_b should be rejected at limit");
+    }
+
+    #[test]
+    fn accept_loop_treats_per_connection_errors_as_non_fatal() {
+        use std::io::{Error, ErrorKind};
+        // The failure mode we hit: under connection churn, a transient accept
+        // error tore down the whole HTTP server. These must all be survivable.
+        assert!(!is_fatal_accept_error(&Error::from_raw_os_error(EMFILE)));
+        assert!(!is_fatal_accept_error(&Error::from_raw_os_error(ENFILE)));
+        assert!(!is_fatal_accept_error(&Error::from_raw_os_error(4))); // EINTR
+        assert!(!is_fatal_accept_error(&Error::new(
+            ErrorKind::ConnectionAborted,
+            "peer aborted before accept",
+        )));
+        // fd exhaustion is survivable but should trigger a backoff.
+        assert!(is_fd_exhaustion(&Error::from_raw_os_error(EMFILE)));
+        assert!(is_fd_exhaustion(&Error::from_raw_os_error(ENFILE)));
+        assert!(!is_fd_exhaustion(&Error::new(ErrorKind::ConnectionAborted, "x")));
+    }
+
+    #[test]
+    fn accept_loop_only_dies_on_broken_listener() {
+        use std::io::Error;
+        // A broken/invalid listener fd is the only fatal accept error.
+        assert!(is_fatal_accept_error(&Error::from_raw_os_error(EBADF)));
+        assert!(is_fatal_accept_error(&Error::from_raw_os_error(EINVAL)));
     }
 
     #[test]
