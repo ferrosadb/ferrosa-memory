@@ -2023,6 +2023,66 @@ async fn run_idle_consolidation<S: Storage>(
     }
 }
 
+/// Extract a human-readable message from a panic payload.
+fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+/// Install a process-wide panic hook so no panic is ever silent.
+///
+/// Tokio swallows panics in spawned tasks — they vanish into a dropped
+/// `JoinHandle` — which is exactly how a degraded fmem keeps "running" while a
+/// supervisory task is dead, forcing long phantom hunts. This logs every panic
+/// loudly (thread, location, payload) before delegating to the default hook.
+fn install_fail_loud_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("<unnamed>")
+            .to_string();
+        tracing::error!(
+            target: "fail_loud",
+            thread = %thread,
+            location = %location,
+            payload = %panic_payload_str(info.payload()),
+            "PANIC — a thread or task panicked (fail-loud)"
+        );
+        default_hook(info);
+    }));
+}
+
+/// Spawn a task expected to run for the lifetime of the process.
+///
+/// If it ever returns (its loop exited) that is logged at ERROR — a supervisory
+/// task quietly ending is a fail-loud violation and the root cause of many
+/// "why did fmem silently stop doing X" investigations. Panics inside `fut` are
+/// caught by [`install_fail_loud_panic_hook`].
+fn spawn_critical<F>(name: &'static str, fut: F) -> tokio::task::JoinHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        fut.await;
+        tracing::error!(
+            target: "fail_loud",
+            task = name,
+            "CRITICAL TASK EXITED — a task that should run for the process \
+             lifetime returned; fmem is now degraded (fail-loud)"
+        );
+    })
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let debug = std::env::args().any(|a| a == "--debug");
@@ -2039,6 +2099,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
+
+    // Fail loud: make every panic (including in spawned tasks tokio would
+    // otherwise swallow) a visible ERROR log line. Installed before any task
+    // is spawned.
+    install_fail_loud_panic_hook();
 
     if debug {
         tracing::info!("ferrosa-memory-mcp starting (debug mode)");
@@ -2111,7 +2176,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Always spawn the reconnect watcher — it handles both initial failure
     // and mid-operation connection loss (rolling restarts, network blips).
-    tokio::spawn(cql_reconnect_watcher(Arc::clone(&storage)));
+    spawn_critical(
+        "cql_reconnect_watcher",
+        cql_reconnect_watcher(Arc::clone(&storage)),
+    );
     storage.reconnect_signal.notify_one();
 
     // Load dynamic type registry from the database (falls back to defaults).
@@ -2227,7 +2295,10 @@ async fn main() -> anyhow::Result<()> {
             graph_client.clone(),
             sparql.clone(),
         ));
-        tokio::spawn(cql_reconnect_watcher(Arc::clone(&viz_storage)));
+        spawn_critical(
+            "cql_reconnect_watcher_viz",
+            cql_reconnect_watcher(Arc::clone(&viz_storage)),
+        );
         viz_storage.reconnect_signal.notify_one();
         tracing::info!(
             "viz server using dedicated CQL reader connection isolated from MCP ingest traffic"
@@ -2349,12 +2420,10 @@ async fn main() -> anyhow::Result<()> {
                 let idle_session = Arc::clone(&session);
                 let idle_storage = Arc::clone(&storage);
                 let idle_ctx = Arc::clone(&ctx);
-                tokio::spawn(idle_consolidation_loop(
-                    idle_session,
-                    idle_storage,
-                    idle_ctx,
-                    idle_cfg,
-                ));
+                spawn_critical(
+                    "idle_consolidation_loop",
+                    idle_consolidation_loop(idle_session, idle_storage, idle_ctx, idle_cfg),
+                );
                 tracing::info!(
                     idle_seconds = config.server.idle_consolidation_seconds,
                     decay_factor = config.server.edge_decay_factor,
@@ -2468,6 +2537,32 @@ mod tests {
     use std::fs;
 
     // --- is_connection_error tests ---
+
+    // --- fail-loud hardening ---
+
+    #[test]
+    fn panic_payload_extracts_str_and_string_and_falls_back() {
+        let as_str: &str = "boom";
+        assert_eq!(panic_payload_str(&as_str), "boom");
+        let owned: String = "kaboom".to_string();
+        assert_eq!(panic_payload_str(&owned), "kaboom");
+        let other: i32 = 42;
+        assert_eq!(panic_payload_str(&other), "<non-string panic payload>");
+    }
+
+    #[tokio::test]
+    async fn spawn_critical_runs_the_task() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran2 = Arc::clone(&ran);
+        spawn_critical("test_task", async move {
+            ran2.store(true, Ordering::SeqCst);
+        })
+        .await
+        .unwrap();
+        assert!(ran.load(Ordering::SeqCst), "spawn_critical must drive the future");
+    }
 
     #[test]
     fn is_connection_error_broken_pipe() {
@@ -2929,8 +3024,10 @@ auth_file = "{}"
             "main should start with reconnecting storage and let the watcher connect in the background"
         );
         assert!(
-            main_source.contains("tokio::spawn(cql_reconnect_watcher"),
-            "main should spawn the background CQL reconnect watcher before serving transports"
+            main_source.contains("spawn_critical(")
+                && main_source.contains("cql_reconnect_watcher(Arc::clone(&storage))"),
+            "main should spawn the background CQL reconnect watcher (fail-loud supervised) \
+             before serving transports"
         );
         assert!(
             main_source.contains("tokio::spawn(async move {\n        let embed_health"),
@@ -2993,7 +3090,7 @@ auth_file = "{}"
             "viz must use its own reconnecting storage so graph scans do not share the primary ingest CQL session"
         );
         assert!(
-            viz_source.contains("tokio::spawn(cql_reconnect_watcher(Arc::clone(&viz_storage)))"),
+            viz_source.contains("cql_reconnect_watcher(Arc::clone(&viz_storage))"),
             "viz storage must have its own reconnect watcher and CQL session"
         );
         assert!(
