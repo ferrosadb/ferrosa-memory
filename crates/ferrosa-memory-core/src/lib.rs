@@ -66,6 +66,7 @@ pub mod smart_ingest;
 pub mod speculative;
 pub mod spreading;
 pub mod storage;
+pub mod system_describe;
 pub mod temporal;
 pub mod test_cluster;
 pub mod transport;

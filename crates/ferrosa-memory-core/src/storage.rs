@@ -1302,6 +1302,42 @@ pub trait Storage: Send + Sync {
             })
         }
     }
+
+    /// Live cluster metadata read from the ferrosa CQL system tables
+    /// (`system.local`, `system.peers_v2`, `system_schema.keyspaces`).
+    ///
+    /// Read-only. The default implementation fails loudly: backends that are
+    /// not backed by a real CQL cluster cannot fabricate this, so callers see
+    /// an explicit error rather than invented topology.
+    fn cluster_info(
+        &self,
+        _keyspace: &str,
+    ) -> impl std::future::Future<Output = anyhow::Result<ClusterInfo>> + Send {
+        async move { anyhow::bail!("cluster_info is only available on a live CQL backend") }
+    }
+}
+
+/// Live cluster metadata sourced from the ferrosa CQL system tables. All
+/// fields are queried, never hardcoded; absent columns remain `None`.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClusterInfo {
+    pub cluster_name: Option<String>,
+    pub release_version: Option<String>,
+    pub cql_version: Option<String>,
+    pub native_protocol_version: Option<String>,
+    pub partitioner: Option<String>,
+    pub data_center: Option<String>,
+    pub rack: Option<String>,
+    pub host_id: Option<String>,
+    pub schema_version: Option<String>,
+    /// Total nodes in the cluster (local node + discovered peers).
+    pub node_count: usize,
+    /// Discovered peer nodes (excludes the local node).
+    pub peer_count: usize,
+    /// Replication strategy/options for the active keyspace, as reported by
+    /// `system_schema.keyspaces`.
+    pub replication: std::collections::BTreeMap<String, String>,
 }
 
 /// In-memory mock storage for unit tests.

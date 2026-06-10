@@ -112,6 +112,23 @@ impl GraphClient {
         Ok(graph)
     }
 
+    /// Probe the graph HTTP health endpoint without mutating anything.
+    ///
+    /// Read-only liveness check used by `system.describe`. Fails loudly with a
+    /// specific error (non-2xx status or transport failure) so the caller can
+    /// report `degraded`/`error` rather than a fabricated `ready`.
+    pub async fn health_check(&self) -> anyhow::Result<()> {
+        let resp = self
+            .client
+            .get(format!("{}/graph/health", self.base_url))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("graph health check failed: {}", resp.status());
+        }
+        Ok(())
+    }
+
     /// Execute a Cypher MATCH query against the graph endpoint.
     async fn query(&self, cypher: &str) -> anyhow::Result<CypherResponse> {
         let req = CypherRequest {

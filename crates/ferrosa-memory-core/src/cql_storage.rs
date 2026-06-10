@@ -70,6 +70,89 @@ where
     T::from_cql(val).map_err(|e| anyhow::anyhow!("column '{}': {}", name, e))
 }
 
+/// Read live cluster metadata from the ferrosa CQL system tables.
+///
+/// Queries `system.local` (node identity), `system.peers_v2` (peer discovery),
+/// and `system_schema.keyspaces` (active-keyspace replication). Read-only.
+/// A failure of any query propagates so the caller reports degraded health
+/// rather than fabricating topology.
+pub async fn query_cluster_info(
+    session: &CqlSession,
+    keyspace: &str,
+) -> anyhow::Result<crate::storage::ClusterInfo> {
+    let mut info = crate::storage::ClusterInfo::default();
+    read_local_node(session, &mut info).await?;
+    info.peer_count = count_peers(session).await?;
+    info.node_count = info.peer_count + 1;
+    info.replication = read_keyspace_replication(session, keyspace).await?;
+    Ok(info)
+}
+
+/// Populate node-identity fields from `system.local`. Per-column reads are
+/// best-effort (`.ok()`) so an unexpected null does not fail the whole probe;
+/// the query itself failing still propagates.
+async fn read_local_node(
+    session: &CqlSession,
+    info: &mut crate::storage::ClusterInfo,
+) -> anyhow::Result<()> {
+    #[allow(deprecated)]
+    let result = session
+        .query_unpaged(
+            "SELECT cluster_name, release_version, cql_version, native_protocol_version, \
+             partitioner, data_center, rack, host_id, schema_version FROM system.local",
+            (),
+        )
+        .await?;
+    let cm = build_col_map(result.col_specs());
+    if let Some(row) = result.rows_or_empty().into_iter().next() {
+        info.cluster_name = cql_get::<String>(&row, &cm, "cluster_name").ok();
+        info.release_version = cql_get::<String>(&row, &cm, "release_version").ok();
+        info.cql_version = cql_get::<String>(&row, &cm, "cql_version").ok();
+        info.native_protocol_version =
+            cql_get::<String>(&row, &cm, "native_protocol_version").ok();
+        info.partitioner = cql_get::<String>(&row, &cm, "partitioner").ok();
+        info.data_center = cql_get::<String>(&row, &cm, "data_center").ok();
+        info.rack = cql_get::<String>(&row, &cm, "rack").ok();
+        info.host_id = cql_get::<uuid::Uuid>(&row, &cm, "host_id")
+            .ok()
+            .map(|u| u.to_string());
+        info.schema_version = cql_get::<uuid::Uuid>(&row, &cm, "schema_version")
+            .ok()
+            .map(|u| u.to_string());
+    }
+    Ok(())
+}
+
+/// Count discovered peer nodes from `system.peers_v2` (empty on single node).
+async fn count_peers(session: &CqlSession) -> anyhow::Result<usize> {
+    #[allow(deprecated)]
+    let result = session
+        .query_unpaged("SELECT peer FROM system.peers_v2", ())
+        .await?;
+    Ok(result.rows_or_empty().len())
+}
+
+/// Read the replication map for `keyspace` from `system_schema.keyspaces`.
+async fn read_keyspace_replication(
+    session: &CqlSession,
+    keyspace: &str,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    #[allow(deprecated)]
+    let result = session
+        .query_unpaged(
+            "SELECT replication FROM system_schema.keyspaces WHERE keyspace_name = ?",
+            (keyspace,),
+        )
+        .await?;
+    let cm = build_col_map(result.col_specs());
+    if let Some(row) = result.rows_or_empty().into_iter().next()
+        && let Ok(map) = cql_get::<HashMap<String, String>>(&row, &cm, "replication")
+    {
+        return Ok(map.into_iter().collect());
+    }
+    Ok(std::collections::BTreeMap::new())
+}
+
 fn sprint1_seed_insert_statements(ks: &str) -> (String, String) {
     let entity_q = format!(
         "INSERT INTO {ks}.entity_types (type_name, description, created_at) \
@@ -1770,6 +1853,13 @@ impl CqlStorage {
 impl Storage for CqlStorage {
     async fn migration_status(&self) -> anyhow::Result<crate::migration::MigrationStatus> {
         crate::migration::migration_status(&self.session, &self.keyspace).await
+    }
+
+    async fn cluster_info(
+        &self,
+        keyspace: &str,
+    ) -> anyhow::Result<crate::storage::ClusterInfo> {
+        query_cluster_info(&self.session, keyspace).await
     }
 
     async fn memo_get(

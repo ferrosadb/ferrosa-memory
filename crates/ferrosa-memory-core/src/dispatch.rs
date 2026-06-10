@@ -221,6 +221,8 @@ pub struct SessionState {
     pub judge_config: Arc<Mutex<crate::config::JudgeConfig>>,
     /// Runtime default ranked-result count for retrieval tools when omitted by the caller.
     pub retrieval_default_limit: Arc<AtomicUsize>,
+    /// Immutable startup snapshot used by the `system_describe` management tool.
+    pub system_info: Arc<crate::system_describe::SystemInfo>,
 }
 
 impl Default for SessionState {
@@ -250,6 +252,7 @@ impl Default for SessionState {
             enrich_llm_model: "google/gemma-4-31b".to_string(),
             judge_config: Arc::new(Mutex::new(crate::config::JudgeConfig::default())),
             retrieval_default_limit: Arc::new(AtomicUsize::new(DEFAULT_RETRIEVAL_LIMIT)),
+            system_info: Arc::new(crate::system_describe::SystemInfo::default()),
         }
     }
 }
@@ -429,6 +432,9 @@ fn canonical_tool_name(name: &str) -> &str {
         "ruleset" => "get_effective_rule_set",
         "pred_promote" => "promote_predicate",
         "derived_cache" => "list_derived_cache",
+        // Management self-description. Canonical name is `describe`; also accept
+        // the dotted contract names from the spec as aliases.
+        "system_describe" | "system.describe" | "ferrosa_memory.system.describe" => "describe",
         other => other,
     }
 }
@@ -1353,6 +1359,45 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "describe".into(),
+            description: "Read-only, management-safe self-description of this ferrosa-memory server (contract ferrosa-memory.system.describe.v1): identity, runtime health, redacted effective config, dependent-store health, live ferrosa cluster info (queried from the CQL system tables), summary memory statistics, schema drift, binary/release state, capabilities, and allowed management actions.\n\nCALL WHEN: A management client (e.g. Ferrosa Workbench) discovers or is pointed at this endpoint and needs the authoritative cluster descriptor instead of inferring it from local files. Secrets are never returned; their key paths appear under configuration.redactedKeys.\nCost: ~10-3000ms (bounded dependency probes).".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "include": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": [
+                                "identity", "runtime", "configuration", "stores",
+                                "schema", "statistics", "binaries", "harnesses",
+                                "capabilities", "managementActions"
+                            ]
+                        },
+                        "description": "Optional list of sections to return. Omit for all sections."
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session to scope the statistics section to (defaults to the nil session)."
+                    },
+                    "redaction": {
+                        "type": "string",
+                        "enum": ["management-safe"],
+                        "description": "Redaction mode. Only management-safe is supported; secrets are always redacted."
+                    },
+                    "caller": {
+                        "type": "object",
+                        "description": "Optional calling client identity, logged for diagnostics.",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "version": { "type": "string" }
+                        }
+                    }
+                },
+                "required": []
+            }),
+        },
+        ToolDef {
             name: "count_entities_by_type".into(),
             description: "Return a per-session entity histogram broken down by entity_type, by state, and by the joint (type,state) buckets.\n\nCALL WHEN: You need status/diagnostic counts like 'how many bugs are active in this session?' without coupling the client to entity_store columns.\nCost: ~5-10ms.".into(),
             input_schema: serde_json::json!({
@@ -1950,6 +1995,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "enrich_entities" => Box::pin(handle_enrich_entities(args, storage, ctx, session)),
         "get_stats" => Box::pin(handle_get_stats(args, storage, ctx, session)),
         "migration_status" => Box::pin(handle_migration_status(args, storage)),
+        "describe" => Box::pin(handle_system_describe(args, storage, ctx, session)),
         "count_entities_by_type" => Box::pin(handle_count_entities_by_type(args, storage, ctx)),
         "promote_memory" => Box::pin(handle_promote_memory(args, storage, ctx, session)),
         "demote_memory" => Box::pin(handle_demote_memory(args, storage, ctx, session)),
@@ -7920,6 +7966,74 @@ async fn handle_migration_status<S: crate::storage::Storage>(
             .map_err(|e| (INTERNAL_ERROR, e.to_string()))?,
     )
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
+/// `system_describe` — management-safe self-description of this server.
+///
+/// Read-only. Combines the immutable startup snapshot (`session.system_info`)
+/// with fresh, bounded probes of the dependent stores and schema. Secrets are
+/// never returned; only their key paths appear in `configuration.redactedKeys`.
+async fn handle_system_describe<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    // Only management-safe redaction is supported in v1.
+    if let Some(mode) = args.get("redaction").and_then(|v| v.as_str())
+        && mode != "management-safe"
+    {
+        return Err((
+            INVALID_PARAMS,
+            format!("unsupported redaction mode '{mode}'; only 'management-safe' is supported"),
+        ));
+    }
+
+    if let Some(caller) = args.get("caller").and_then(|v| v.as_object()) {
+        let name = caller.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+        let version = caller.get("version").and_then(|v| v.as_str()).unwrap_or("?");
+        tracing::info!(caller = name, caller_version = version, "describe called");
+    }
+
+    let include: Option<Vec<String>> = args
+        .get("include")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+    let sections = crate::system_describe::SectionSet::from_include(include.as_deref());
+
+    let tool_names = if sections.capabilities {
+        tool_definitions(&session.entity_types)
+            .into_iter()
+            .map(|t| t.name)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // Statistics are scoped to a session; default to the nil session like
+    // get_stats so they report the same data the agent loop sees.
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+    let intention_count = if sections.statistics {
+        session.intentions.lock().await.list().len()
+    } else {
+        0
+    };
+
+    let descriptor = crate::system_describe::build_descriptor(
+        crate::system_describe::DescribeRequest {
+            info: &session.system_info,
+            storage,
+            ctx,
+            graph: session.graph.as_deref(),
+            tool_names,
+            session_id,
+            intention_count,
+            sections,
+        },
+    )
+    .await;
+
+    serde_json::to_value(descriptor).map_err(|e| (INTERNAL_ERROR, e.to_string()))
 }
 
 async fn handle_count_entities_by_type<S: crate::storage::Storage>(
