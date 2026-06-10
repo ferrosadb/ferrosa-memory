@@ -7991,14 +7991,18 @@ async fn handle_system_describe<S: crate::storage::Storage>(
 
     if let Some(caller) = args.get("caller").and_then(|v| v.as_object()) {
         let name = caller.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-        let version = caller.get("version").and_then(|v| v.as_str()).unwrap_or("?");
+        let version = caller
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
         tracing::info!(caller = name, caller_version = version, "describe called");
     }
 
-    let include: Option<Vec<String>> = args
-        .get("include")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+    let include: Option<Vec<String>> = args.get("include").and_then(|v| v.as_array()).map(|arr| {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
+    });
     let sections = crate::system_describe::SectionSet::from_include(include.as_deref());
 
     let tool_names = if sections.capabilities {
@@ -8019,8 +8023,8 @@ async fn handle_system_describe<S: crate::storage::Storage>(
         0
     };
 
-    let descriptor = crate::system_describe::build_descriptor(
-        crate::system_describe::DescribeRequest {
+    let descriptor =
+        crate::system_describe::build_descriptor(crate::system_describe::DescribeRequest {
             info: &session.system_info,
             storage,
             ctx,
@@ -8029,9 +8033,8 @@ async fn handle_system_describe<S: crate::storage::Storage>(
             session_id,
             intention_count,
             sections,
-        },
-    )
-    .await;
+        })
+        .await;
 
     serde_json::to_value(descriptor).map_err(|e| (INTERNAL_ERROR, e.to_string()))
 }

@@ -366,10 +366,17 @@ impl SystemInfo {
         session_id: uuid::Uuid,
         started_at: String,
     ) -> Self {
-        let config_path = crate::config::resolve_config_path()
-            .map(|p| p.to_string_lossy().to_string());
+        let config_path =
+            crate::config::resolve_config_path().map(|p| p.to_string_lossy().to_string());
         let config_hash = config_path.as_deref().and_then(hash_config_file);
-        Self::from_parts(config, tenant_id, session_id, started_at, config_path, config_hash)
+        Self::from_parts(
+            config,
+            tenant_id,
+            session_id,
+            started_at,
+            config_path,
+            config_hash,
+        )
     }
 
     /// Assemble a snapshot from already-resolved parts. Performs no I/O, so it
@@ -450,10 +457,9 @@ impl Default for SystemInfo {
         // Source every value from the config layer's own defaults rather than
         // re-declaring literals here. A minimal config (only the required
         // contact_points) yields serde defaults for everything else. No I/O.
-        let config = crate::config::parse_config(
-            "[ferrosa]\ncontact_points = [\"localhost:9042\"]\n",
-        )
-        .expect("minimal default config parses");
+        let config =
+            crate::config::parse_config("[ferrosa]\ncontact_points = [\"localhost:9042\"]\n")
+                .expect("minimal default config parses");
         Self::from_parts(
             &config,
             uuid::Uuid::nil(),
@@ -477,7 +483,10 @@ fn build_commit() -> Option<String> {
 /// file cannot be read (e.g. config came from defaults).
 fn hash_config_file(path: &str) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
-    Some(format!("sha256:{}", hex::encode(sha2::Sha256::digest(&bytes))))
+    Some(format!(
+        "sha256:{}",
+        hex::encode(sha2::Sha256::digest(&bytes))
+    ))
 }
 
 /// Curated list of always-compiled capabilities. Honest and static — not
@@ -522,10 +531,7 @@ fn effective_config(config: &Config) -> serde_json::Value {
 /// Dotted key paths of secret values present in the config. Only keys whose
 /// secret is actually set are listed.
 fn redacted_keys(config: &Config) -> Vec<String> {
-    let mut keys = vec![
-        "ferrosa.password".to_string(),
-        "graph.password".to_string(),
-    ];
+    let mut keys = vec!["ferrosa.password".to_string(), "graph.password".to_string()];
     if config.ferrosa.admin_password.is_some() {
         keys.push("ferrosa.admin_password".to_string());
     }
@@ -639,7 +645,10 @@ fn expected_schema_version() -> u32 {
 /// Probe the graph store health endpoint with a bounded timeout.
 async fn probe_graph_health(graph: Option<&GraphClient>) -> (StoreHealth, Option<String>) {
     let Some(graph) = graph else {
-        return (StoreHealth::Unknown, Some("graph client not configured".to_string()));
+        return (
+            StoreHealth::Unknown,
+            Some("graph client not configured".to_string()),
+        );
     };
     match bounded(graph.health_check()).await {
         Ok(Ok(())) => (StoreHealth::Ready, None),
@@ -661,14 +670,18 @@ async fn probe_embeddings_health(
         Ok(Err(e)) => (StoreHealth::Degraded, Some(format!("embeddings: {e}"))),
         Err(()) => (
             StoreHealth::Degraded,
-            Some(format!("embeddings: probe timed out after {PROBE_TIMEOUT:?}")),
+            Some(format!(
+                "embeddings: probe timed out after {PROBE_TIMEOUT:?}"
+            )),
         ),
     }
 }
 
 /// Run a future under the shared probe timeout. `Err(())` signals timeout.
 async fn bounded<T>(fut: impl std::future::Future<Output = T>) -> Result<T, ()> {
-    tokio::time::timeout(PROBE_TIMEOUT, fut).await.map_err(|_| ())
+    tokio::time::timeout(PROBE_TIMEOUT, fut)
+        .await
+        .map_err(|_| ())
 }
 
 /// Aggregate per-store health into runtime health + readiness.
@@ -1090,7 +1103,11 @@ port = 18766
         // Embeddings degraded alone does not block readiness... it does per
         // current rule (embeddings error blocks; degraded does not).
         assert_eq!(
-            aggregate_health(StoreHealth::Ready, StoreHealth::Ready, StoreHealth::Degraded),
+            aggregate_health(
+                StoreHealth::Ready,
+                StoreHealth::Ready,
+                StoreHealth::Degraded
+            ),
             (OverallHealth::Ready, Readiness::Ready)
         );
     }
@@ -1100,10 +1117,7 @@ port = 18766
         let all = SectionSet::from_include(None);
         assert!(all.identity && all.stores && all.management_actions);
 
-        let some = SectionSet::from_include(Some(&[
-            "identity".to_string(),
-            "runtime".to_string(),
-        ]));
+        let some = SectionSet::from_include(Some(&["identity".to_string(), "runtime".to_string()]));
         assert!(some.identity && some.runtime);
         assert!(!some.stores && !some.schema && !some.capabilities);
     }
@@ -1211,8 +1225,7 @@ port = 18766
         let ctx = test_ctx();
         let sections = SectionSet::from_include(Some(&["identity".to_string()]));
 
-        let descriptor =
-            build_descriptor(req(&info, &storage, &ctx, Vec::new(), sections)).await;
+        let descriptor = build_descriptor(req(&info, &storage, &ctx, Vec::new(), sections)).await;
         let json = serde_json::to_value(&descriptor).expect("serialize");
 
         assert!(json.get("identity").is_some());

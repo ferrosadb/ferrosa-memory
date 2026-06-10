@@ -108,8 +108,7 @@ async fn read_local_node(
         info.cluster_name = cql_get::<String>(&row, &cm, "cluster_name").ok();
         info.release_version = cql_get::<String>(&row, &cm, "release_version").ok();
         info.cql_version = cql_get::<String>(&row, &cm, "cql_version").ok();
-        info.native_protocol_version =
-            cql_get::<String>(&row, &cm, "native_protocol_version").ok();
+        info.native_protocol_version = cql_get::<String>(&row, &cm, "native_protocol_version").ok();
         info.partitioner = cql_get::<String>(&row, &cm, "partitioner").ok();
         info.data_center = cql_get::<String>(&row, &cm, "data_center").ok();
         info.rack = cql_get::<String>(&row, &cm, "rack").ok();
@@ -1855,10 +1854,7 @@ impl Storage for CqlStorage {
         crate::migration::migration_status(&self.session, &self.keyspace).await
     }
 
-    async fn cluster_info(
-        &self,
-        keyspace: &str,
-    ) -> anyhow::Result<crate::storage::ClusterInfo> {
+    async fn cluster_info(&self, keyspace: &str) -> anyhow::Result<crate::storage::ClusterInfo> {
         query_cluster_info(&self.session, keyspace).await
     }
 
