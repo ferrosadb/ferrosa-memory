@@ -52,7 +52,7 @@
 //! entirely on re-ingest, so this function is never called twice for the same
 //! turn entity.
 //!
-//! [`temporal_edge_put`] is an upsert by primary key
+//! `temporal_edge_put` is an upsert by primary key
 //! `(tenant_id, session_id, src_id, edge_type, dst_id)`, so even if this
 //! function were called twice it would write identical rows rather than
 //! creating duplicates.
