@@ -1,0 +1,105 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Ferrosa Loom Discord logo</title>
+  <desc id="desc">A Ferrosa-family periodic-table monogram mark for Ferrosa Loom, rendered in amethyst and molten thread tones with an Fl symbol, atomic-number nod, orbital ring, and woven agent-runner thread paths.</desc>
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="42%" r="74%">
+      <stop offset="0%" stop-color="#24143a"/>
+      <stop offset="52%" stop-color="#100b1b"/>
+      <stop offset="100%" stop-color="#07060c"/>
+    </radialGradient>
+    <linearGradient id="loom" x1="15%" y1="8%" x2="88%" y2="92%">
+      <stop offset="0%" stop-color="#fff0b8"/>
+      <stop offset="20%" stop-color="#f3b35f"/>
+      <stop offset="52%" stop-color="#c882f0"/>
+      <stop offset="100%" stop-color="#6d7cff"/>
+    </linearGradient>
+    <linearGradient id="threadA" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fff0b8" stop-opacity="0.95"/>
+      <stop offset="45%" stop-color="#c882f0" stop-opacity="0.72"/>
+      <stop offset="100%" stop-color="#6d7cff" stop-opacity="0.28"/>
+    </linearGradient>
+    <linearGradient id="threadB" x1="100%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#7ee7ff" stop-opacity="0.88"/>
+      <stop offset="55%" stop-color="#c882f0" stop-opacity="0.68"/>
+      <stop offset="100%" stop-color="#f3b35f" stop-opacity="0.30"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f3b35f" stop-opacity="0.58"/>
+      <stop offset="48%" stop-color="#c882f0" stop-opacity="0.26"/>
+      <stop offset="100%" stop-color="#6d7cff" stop-opacity="0.08"/>
+    </linearGradient>
+    <filter id="glow" x="-45%" y="-45%" width="190%" height="190%">
+      <feGaussianBlur stdDeviation="8" result="blur"/>
+      <feColorMatrix in="blur" type="matrix" values="0 0 0 0 0.78  0 0 0 0 0.34  0 0 0 0 1.00  0 0 0 0.82 0" result="purpleGlow"/>
+      <feMerge>
+        <feMergeNode in="purpleGlow"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="soft-shadow" x="-25%" y="-25%" width="150%" height="150%">
+      <feDropShadow dx="0" dy="22" stdDeviation="24" flood-color="#000000" flood-opacity="0.48"/>
+    </filter>
+  </defs>
+
+  <!-- Discord-safe square field. -->
+  <rect width="1024" height="1024" rx="228" fill="url(#bg)"/>
+
+  <!-- Subtle loom grid: warp threads in the field, muted so the avatar stays clean. -->
+  <g opacity="0.18" stroke="#c882f0" stroke-width="2">
+    <path d="M180 184v656"/>
+    <path d="M844 184v656"/>
+    <path d="M184 180h656"/>
+    <path d="M184 844h656"/>
+  </g>
+
+  <!-- Ferrosa-family orbital ring. -->
+  <g filter="url(#glow)">
+    <ellipse cx="512" cy="512" rx="404" ry="404" fill="none" stroke="url(#ring)" stroke-width="15" stroke-linecap="round" stroke-dasharray="1220 470" transform="rotate(-23 512 512)"/>
+    <ellipse cx="512" cy="512" rx="354" ry="354" fill="none" stroke="#4d3a72" stroke-width="3" stroke-opacity="0.64" stroke-dasharray="20 30" transform="rotate(18 512 512)"/>
+  </g>
+
+  <!-- Periodic-table frame: same Ferrosa grammar, creative Loom palette. -->
+  <g filter="url(#soft-shadow)">
+    <rect x="172" y="172" width="680" height="680" rx="142" fill="#0d0818" fill-opacity="0.86" stroke="#2b1b42" stroke-width="10"/>
+    <rect x="194" y="194" width="636" height="636" rx="123" fill="none" stroke="url(#loom)" stroke-width="26"/>
+    <rect x="232" y="232" width="560" height="560" rx="94" fill="none" stroke="#fff0b8" stroke-width="3" stroke-opacity="0.30"/>
+  </g>
+
+  <!-- Woven runner/creator threads. Crossing paths evoke agent lanes and creative composition. -->
+  <g fill="none" stroke-linecap="round" filter="url(#glow)">
+    <path d="M244 384 C360 316 441 333 512 404 C590 482 666 491 782 418" stroke="url(#threadA)" stroke-width="17"/>
+    <path d="M242 512 C356 575 438 570 512 512 C592 450 672 462 784 540" stroke="url(#threadB)" stroke-width="15"/>
+    <path d="M244 642 C358 585 444 605 520 686 C598 768 674 750 780 654" stroke="url(#threadA)" stroke-width="15" opacity="0.86"/>
+    <path d="M372 260 C386 400 386 520 372 760" stroke="#7ee7ff" stroke-width="7" opacity="0.44"/>
+    <path d="M650 262 C632 410 638 548 662 764" stroke="#fff0b8" stroke-width="7" opacity="0.40"/>
+  </g>
+
+  <!-- Agent lane nodes/shuttles. -->
+  <g filter="url(#glow)">
+    <circle cx="244" cy="384" r="19" fill="#fff0b8"/>
+    <circle cx="512" cy="404" r="18" fill="#c882f0"/>
+    <circle cx="782" cy="418" r="19" fill="#6d7cff"/>
+    <circle cx="242" cy="512" r="17" fill="#7ee7ff"/>
+    <circle cx="512" cy="512" r="24" fill="#fff0b8"/>
+    <circle cx="784" cy="540" r="17" fill="#c882f0"/>
+    <circle cx="244" cy="642" r="17" fill="#f3b35f"/>
+    <circle cx="520" cy="686" r="18" fill="#c882f0"/>
+    <circle cx="780" cy="654" r="17" fill="#fff0b8"/>
+  </g>
+
+  <!-- Monogram: Fl = Ferrosa Loom and Flerovium periodic-table nod. -->
+  <text x="512" y="590" text-anchor="middle"
+        font-family="Georgia, 'Times New Roman', serif"
+        font-size="360" font-weight="700" letter-spacing="-18"
+        fill="url(#loom)" filter="url(#glow)">Fl</text>
+
+  <!-- Flerovium atomic-number nod: keeps the chemistry/periodic grammar coherent. -->
+  <text x="268" y="315" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+        font-size="76" font-weight="800" fill="#a58bd5" letter-spacing="-2">114</text>
+
+  <!-- Tiny loom shuttle cue, readable at large sizes and harmless at small sizes. -->
+  <g transform="translate(642 704) rotate(-8)" opacity="0.92">
+    <path d="M4 24 C40 -8 100 -8 136 24 C100 56 40 56 4 24Z" fill="#0b0714" stroke="url(#loom)" stroke-width="7"/>
+    <path d="M38 24h64" stroke="#fff0b8" stroke-width="8" stroke-linecap="round"/>
+  </g>
+</svg>
