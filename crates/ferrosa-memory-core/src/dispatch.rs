@@ -2139,14 +2139,22 @@ async fn dispatch_tool<S: crate::storage::Storage>(
             serde_json::to_string(&value).unwrap_or_else(|_| value.to_string())
         };
         let duration_ms = elapsed.as_millis() as u64;
-        serde_json::json!({
-            "content": [{"type": "text", "text": text}],
-            "structuredContent": {
+        let mut structured_content = serde_json::json!({
             "tool": canonical_name,
             "requested_tool": name,
-                "duration_ms": duration_ms,
-                "is_error": false
+            "duration_ms": duration_ms,
+            "is_error": false
+        });
+        if let (Some(structured), Some(result)) =
+            (structured_content.as_object_mut(), value.as_object())
+        {
+            for (key, value) in result {
+                structured.insert(key.clone(), value.clone());
             }
+        }
+        serde_json::json!({
+            "content": [{"type": "text", "text": text}],
+            "structuredContent": structured_content
         })
     });
 
@@ -8080,12 +8088,13 @@ async fn handle_get_stats<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    // Default to the nil UUID session — this matches what smart_ingest /
-    // hybrid_search / retrieve_entities use when session_id is omitted, so
-    // get_stats reports the same data those tools see. Returning 0 here
-    // (the prior behavior) made default-session entities look like
-    // phantoms even when they were correctly persisted.
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+    // Default to the server-owned runtime/default session — this matches what
+    // smart_ingest / hybrid_search / retrieve_entities use after the
+    // SessionStart hook configures fmem. Falling back to nil made live stats
+    // look empty even when the active session had correctly persisted rows.
+    let session_id = optional_uuid(&args, "session_id")?
+        .or_else(|| session.effective_default_session_id())
+        .unwrap_or(uuid::Uuid::nil());
 
     let memo_count = storage.memo_count(ctx).await.unwrap_or(0);
     let memo_total_hits = storage.memo_total_hits(ctx).await.unwrap_or(0);
@@ -12122,19 +12131,23 @@ mod tests {
     #[tokio::test]
     async fn get_stats_without_session_id_counts_default_session_entities() {
         // Regression: get_stats previously returned entity_count=0 hardcoded
-        // when session_id was omitted, instead of querying the default
-        // (nil) session that smart_ingest writes to when session_id is
-        // omitted from its arguments. The two tools must agree on the
+        // when session_id was omitted, instead of querying the server-owned
+        // runtime/default session that ordinary tools use when session_id is
+        // omitted from their arguments. The tools must agree on the
         // implicit session — otherwise ingested entities look like phantoms.
         let store = MockStorage::new();
         let ctx = test_ctx();
-        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+        let session = SessionState {
+            default_session_id: Some(sid),
+            ..SessionState::default()
+        };
 
         for i in 0..2 {
             let entity = crate::types::EntityEntry {
                 tenant_id: ctx.tenant_id,
                 entity_id: Uuid::new_v4(),
-                session_id: Uuid::nil(),
+                session_id: sid,
                 entity_name: format!("DefaultSessionEntity{i}"),
                 entity_type: "concept".into(),
                 source_fold_id: None,
@@ -12159,6 +12172,51 @@ mod tests {
         assert_eq!(
             result["entity_count"], 2,
             "get_stats with no session_id should count default-session entities, not return 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_stats_structured_content_serializes_stats_payload() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let sid = Uuid::new_v4();
+        let session = SessionState {
+            default_session_id: Some(sid),
+            ..SessionState::default()
+        };
+        store.entities.lock().await.push(crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "StructuredStatsEntity".into(),
+            entity_type: "concept".into(),
+            context_snippet: "entity visible in structured stats".into(),
+            confidence: 0.9,
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        });
+
+        let result = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "get_stats",
+                "arguments": {}
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["structuredContent"]["entity_count"], 1);
+        assert_eq!(result["structuredContent"]["tool"], "get_stats");
+        assert_eq!(result["structuredContent"]["requested_tool"], "get_stats");
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("entity_count")
         );
     }
 
