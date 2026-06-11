@@ -74,9 +74,10 @@ Analogy: talking to PostgreSQL over its wire protocol is fine; writing directly 
 
 ## Tools
 
-61 MCP tools are defined in `crates/ferrosa-memory-core/src/dispatch.rs` and
+62 MCP tools are defined in `crates/ferrosa-memory-core/src/dispatch.rs` and
 returned by `tools/list`. Keep this section aligned with the dispatch registry
-when adding or removing tools.
+when adding or removing tools. (`describe` is a management tool excluded from
+the tier-1 default `tools/list`; request it with `include_all`.)
 
 | Group | Tools | Purpose |
 |-------|-------|---------|
@@ -90,7 +91,8 @@ when adding or removing tools.
 | Batch ops | `batch_update_entities`, `batch_delete_entities`, `delete_session` | Bulk entity updates, deletions, and scoped cleanup |
 | Knowledge plane | `run_consolidation`, `enrich_entities`, `importance_score`, `predict_needed`, `spread_activation`, `find_duplicates`, `recursive_explore`, `query_derived`, `list_derived_cache` | Consolidation, scoring, associative recall, recursive search, and derived-fact access |
 | Governance | `manage_rules`, `manage_claims`, `manage_approvals`, `manage_aliases`, `explain_derived`, `get_effective_rule_set`, `promote_predicate`, `promote_memory`, `demote_memory` | Rule governance, claims, approvals, explanations, and memory promotion |
-| Maintenance | `get_stats`, `record_outcome`, `ensure_parent_tag` | Health stats, strategy feedback, and tag hierarchy |
+| Maintenance | `get_stats`, `migration_status`, `record_outcome`, `ensure_parent_tag` | Health stats, schema status, strategy feedback, and tag hierarchy |
+| Management | `describe` | Read-only, management-safe self-description (contract `ferrosa-memory.system.describe.v1`): identity, runtime/store health, redacted config, live ferrosa cluster info, summary statistics, schema drift, capabilities, and management actions |
 
 ## Quick Start
 

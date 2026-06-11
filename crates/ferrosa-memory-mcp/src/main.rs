@@ -578,6 +578,24 @@ impl Storage for ReconnectingStorage {
         delegate!(self, memo_put, ctx, entry)
     }
 
+    // Delegate to the live CQL session so schema status reflects the actual
+    // database, not the binary default. When disconnected this fails loudly
+    // (NOT_CONNECTED_MSG) rather than reporting a fabricated db_version.
+    async fn migration_status(
+        &self,
+    ) -> anyhow::Result<ferrosa_memory_core::migration::MigrationStatus> {
+        delegate!(self, migration_status)
+    }
+
+    // Live cluster metadata from the ferrosa system tables. Fails loudly when
+    // disconnected rather than fabricating topology.
+    async fn cluster_info(
+        &self,
+        keyspace: &str,
+    ) -> anyhow::Result<ferrosa_memory_core::storage::ClusterInfo> {
+        delegate!(self, cluster_info, keyspace)
+    }
+
     async fn plan_put(&self, ctx: &TenantContext, node: &PlanNode) -> anyhow::Result<()> {
         delegate!(self, plan_put, ctx, node)
     }
@@ -2130,6 +2148,16 @@ async fn main() -> anyhow::Result<()> {
         .as_ref()
         .and_then(|s| uuid::Uuid::parse_str(s).ok());
 
+    // Immutable startup snapshot for the `system_describe` management tool.
+    // Captured here, while the full effective config and resolved identity are
+    // in scope; dynamic store/schema health is probed per call.
+    let system_info = Arc::new(ferrosa_memory_core::system_describe::SystemInfo::build(
+        &config,
+        tenant_id,
+        default_session_id.unwrap_or_else(uuid::Uuid::nil),
+        chrono::Utc::now().to_rfc3339(),
+    ));
+
     // Resolve repo for intention scoping: CLAUDE_PROJECT_DIR env > config > empty.
     let repo = std::env::var("CLAUDE_PROJECT_DIR").unwrap_or_else(|_| String::new());
     if repo.is_empty() {
@@ -2371,6 +2399,7 @@ async fn main() -> anyhow::Result<()> {
                 retrieval_default_limit: Arc::new(std::sync::atomic::AtomicUsize::new(
                     config.retrieval.default_limit.clamp(1, 50),
                 )),
+                system_info: Arc::clone(&system_info),
                 ..dispatch::SessionState::default()
             });
             if let Some(sid) = default_session_id {
@@ -2488,6 +2517,7 @@ async fn main() -> anyhow::Result<()> {
                 retrieval_default_limit: Arc::new(std::sync::atomic::AtomicUsize::new(
                     config.retrieval.default_limit.clamp(1, 50),
                 )),
+                system_info: Arc::clone(&system_info),
                 ..dispatch::SessionState::default()
             });
 
