@@ -1,9 +1,9 @@
 ---
 type: bug
 priority: P2
-status: draft
+status: partial
 created: 2026-04-20
-updated: 2026-04-20
+updated: 2026-06-11
 reported-by: 2026-04-20 architecture review during post-incident monitoring
 ---
 
@@ -12,6 +12,25 @@ reported-by: 2026-04-20 architecture review during post-incident monitoring
 This bug is one concrete slice of the broader graph-boundary and query-passthrough refactor tracked in [feat-endpoint-only-ferrosa-client.md](./feat-endpoint-only-ferrosa-client.md).
 
 ## Observed
+
+**2026-06-11 update:** the normal MCP serving path no longer writes graph-owned
+edge rows through direct `CqlStorage`. `ReconnectingStorage` routes
+`typed_edges`, `folded_into`, `mentioned_in`, `co_occurs_with`, and
+`supersedes` mutations through `GraphClient`, while direct `CqlStorage` graph
+writer methods return explicit graph-write errors. Live smoke now verifies MCP
+edge write, CQL readback, direct graph readback/traversal, MCP chain traversal,
+direct graph API mutation, and CQL readback of the graph-created edge.
+
+The remaining scope is cleanup/enforcement, not the main serving path:
+
+- maintenance tool `crates/ferrosa-memory-mcp/src/tools/fix_edge_sessions.rs`
+  still intentionally repairs `typed_edges` rows directly;
+- role-level CQL enforcement still needs to prevent accidental graph-table
+  `MODIFY` from normal serving credentials;
+- Ferrosa graph still rejects variable-length `TYPED_EDGE*` traversal, so
+  `find_memory_chain` handles multi-hop verification over typed-edge reads.
+
+Original 2026-04-20 observation:
 
 `ferrosa-memory` (the MCP-facing memory/knowledge-graph service that sits
 alongside the ferrosa cluster) writes graph edges to the cluster via CQL

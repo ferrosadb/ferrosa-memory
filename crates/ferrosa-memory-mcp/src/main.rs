@@ -516,6 +516,68 @@ fn stdio_tenant_id(config: &Config) -> uuid::Uuid {
         .unwrap_or_else(uuid::Uuid::new_v4)
 }
 
+fn parse_session_id(source: &str, raw: &str) -> anyhow::Result<uuid::Uuid> {
+    uuid::Uuid::parse_str(raw).map_err(|e| anyhow::anyhow!("{source} is not a valid UUID: {e}"))
+}
+
+fn configured_or_env_session_id(config: &Config) -> anyhow::Result<Option<uuid::Uuid>> {
+    if let Some(session_id) = configured_session_id(config)? {
+        return Ok(Some(session_id));
+    }
+
+    if let Ok(raw) = std::env::var("FERROSA_MEMORY_SESSION_ID")
+        && !raw.trim().is_empty()
+    {
+        return parse_session_id("FERROSA_MEMORY_SESSION_ID", raw.trim()).map(Some);
+    }
+
+    Ok(None)
+}
+
+fn configured_session_id(config: &Config) -> anyhow::Result<Option<uuid::Uuid>> {
+    config
+        .server
+        .session_id
+        .as_deref()
+        .map(|s| parse_session_id("[server] session_id", s))
+        .transpose()
+}
+
+fn startup_default_session_id(config: &Config, repo: &str) -> anyhow::Result<uuid::Uuid> {
+    if let Some(session_id) = configured_or_env_session_id(config)? {
+        return Ok(session_id);
+    }
+
+    let external = std::env::var("FERROSA_MEMORY_AGENT_SESSION_ID")
+        .ok()
+        .or_else(|| std::env::var("CLAUDE_CODE_SESSION_ID").ok())
+        .or_else(|| std::env::var("CODEX_THREAD_ID").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if let Some(external) = external {
+        let agent = std::env::var("FERROSA_MEMORY_AGENT")
+            .ok()
+            .or_else(|| {
+                std::env::var("CLAUDECODE")
+                    .ok()
+                    .map(|_| "claude".to_string())
+            })
+            .unwrap_or_else(|| "unknown-agent".to_string());
+        let workspace = if repo.is_empty() {
+            "unknown-workspace"
+        } else {
+            repo
+        };
+        return Ok(uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_URL,
+            format!("ferrosa-memory:agent-session:v1:{agent}:{workspace}:{external}").as_bytes(),
+        ));
+    }
+
+    Ok(uuid::Uuid::new_v4())
+}
+
 #[cfg(test)]
 fn build_http_validator(config: &Config) -> anyhow::Result<Arc<http::CredentialValidator>> {
     validate_shared_http_config(config)?;
@@ -1969,7 +2031,7 @@ async fn idle_consolidation_loop<S: Storage + Send + Sync + 'static>(
 
         let session_ids = drain_consolidation_queue(&session).await;
         let session_ids = if session_ids.is_empty() {
-            match session.default_session_id {
+            match session.effective_default_session_id() {
                 Some(id) => vec![id],
                 None => continue,
             }
@@ -2142,11 +2204,19 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let tenant_id = stdio_tenant_id(&config);
-    let default_session_id = config
-        .server
-        .session_id
-        .as_ref()
-        .and_then(|s| uuid::Uuid::parse_str(s).ok());
+
+    // Resolve repo for intention scoping and session-start identity:
+    // CLAUDE_PROJECT_DIR env > empty. Other harnesses can set
+    // FERROSA_MEMORY_AGENT_SESSION_ID/FERROSA_MEMORY_AGENT and call configure
+    // from their session-start hook to rotate the runtime session.
+    let repo = std::env::var("CLAUDE_PROJECT_DIR").unwrap_or_else(|_| String::new());
+    if repo.is_empty() {
+        tracing::warn!("CLAUDE_PROJECT_DIR not set — intentions will require explicit repo param");
+    } else {
+        tracing::info!(repo = %repo, "intention scoping: repo from CLAUDE_PROJECT_DIR");
+    }
+
+    let default_session_id = startup_default_session_id(&config, &repo)?;
 
     // Immutable startup snapshot for the `system_describe` management tool.
     // Captured here, while the full effective config and resolved identity are
@@ -2154,17 +2224,9 @@ async fn main() -> anyhow::Result<()> {
     let system_info = Arc::new(ferrosa_memory_core::system_describe::SystemInfo::build(
         &config,
         tenant_id,
-        default_session_id.unwrap_or_else(uuid::Uuid::nil),
+        default_session_id,
         chrono::Utc::now().to_rfc3339(),
     ));
-
-    // Resolve repo for intention scoping: CLAUDE_PROJECT_DIR env > config > empty.
-    let repo = std::env::var("CLAUDE_PROJECT_DIR").unwrap_or_else(|_| String::new());
-    if repo.is_empty() {
-        tracing::warn!("CLAUDE_PROJECT_DIR not set — intentions will require explicit repo param");
-    } else {
-        tracing::info!(repo = %repo, "intention scoping: repo from CLAUDE_PROJECT_DIR");
-    }
     let metrics = Arc::new(ferrosa_memory_core::metrics::MemoryMetrics::new()?);
     tracing::info!("metrics registered");
     let sparql = config.sparql.enabled.then(|| {
@@ -2332,7 +2394,7 @@ async fn main() -> anyhow::Result<()> {
             "viz server using dedicated CQL reader connection isolated from MCP ingest traffic"
         );
         let viz_ctx = Arc::new(auth::authenticate_stdio(viz_tenant_id));
-        let viz_session_id = default_session_id.unwrap_or_else(uuid::Uuid::nil);
+        let viz_session_id = default_session_id;
         let shell_routes = http::ShellRouteConfig {
             workbench_scheme: if config.server.require_tls {
                 "https".into()
@@ -2383,7 +2445,7 @@ async fn main() -> anyhow::Result<()> {
             }
             let session = Arc::new(dispatch::SessionState {
                 event_bus: Arc::clone(&shared_event_bus),
-                default_session_id,
+                default_session_id: Some(default_session_id),
                 repo: repo_lock,
                 embed_provider: config.embeddings.provider.clone(),
                 ollama_base_url: config.embeddings.ollama_base_url.clone(),
@@ -2402,9 +2464,7 @@ async fn main() -> anyhow::Result<()> {
                 system_info: Arc::clone(&system_info),
                 ..dispatch::SessionState::default()
             });
-            if let Some(sid) = default_session_id {
-                tracing::info!(session_id = %sid, "using configured default session_id");
-            }
+            tracing::info!(session_id = %default_session_id, "using server-owned default session_id");
 
             // Load persisted intentions from CQL (repo-scoped).
             if !repo.is_empty() {
@@ -2501,7 +2561,7 @@ async fn main() -> anyhow::Result<()> {
             }
             let session = Arc::new(dispatch::SessionState {
                 event_bus: Arc::clone(&shared_event_bus),
-                default_session_id,
+                default_session_id: Some(default_session_id),
                 repo: repo_lock,
                 embed_provider: config.embeddings.provider.clone(),
                 ollama_base_url: config.embeddings.ollama_base_url.clone(),

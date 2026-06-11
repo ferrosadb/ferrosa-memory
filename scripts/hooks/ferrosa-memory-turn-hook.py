@@ -252,6 +252,77 @@ def cwd_from_payload(payload: dict[str, Any]) -> str:
     return str(value)
 
 
+def first_string(payload: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    extra = payload.get("extra")
+    if isinstance(extra, dict):
+        for key in keys:
+            value = extra.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def agent_session_id(payload: dict[str, Any]) -> str:
+    return (
+        first_string(
+            payload,
+            (
+                "session_id",
+                "transcript_path",
+                "conversation_id",
+                "thread_id",
+                "run_id",
+                "codex_thread_id",
+                "claude_session_id",
+            ),
+        )
+        or os.environ.get("FERROSA_MEMORY_AGENT_SESSION_ID", "").strip()
+        or os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+        or os.environ.get("CODEX_THREAD_ID", "").strip()
+    )
+
+
+def configure_session_start(client: McpClient, payload: dict[str, Any], args: argparse.Namespace) -> str:
+    cwd = cwd_from_payload(payload)
+    metadata = {
+        "agent": args.harness,
+        "workspace": cwd,
+        "cwd": cwd,
+    }
+    external = agent_session_id(payload)
+    if external:
+        metadata["agent_session_id"] = external
+    result = client.call_tool("configure", {"session_start": metadata})
+    blocks = content_blocks(result)
+    for block in blocks:
+        try:
+            parsed = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        sid = parsed.get("session_id")
+        if isinstance(sid, str) and sid:
+            return sid
+    return ""
+
+
+def current_fmem_session_id(client: McpClient) -> str:
+    result = client.call_tool("configure", {})
+    blocks = content_blocks(result)
+    for block in blocks:
+        try:
+            parsed = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        sid = parsed.get("session_id")
+        if isinstance(sid, str) and sid:
+            return sid
+    return DEFAULT_SESSION_ID
+
+
 def stable_turn_id(payload: dict[str, Any], harness: str, prompt: str, response: str) -> str:
     for key in ("turn_id", "tool_use_id"):
         value = payload.get(key)
@@ -325,7 +396,7 @@ def ingest_turn(client: McpClient, payload: dict[str, Any], args: argparse.Names
     if not prompt and not response:
         return
     cwd = cwd_from_payload(payload)
-    session_id = str(payload.get("session_id") or DEFAULT_SESSION_ID)
+    session_id = current_fmem_session_id(client)
     turn_id = stable_turn_id(payload, args.harness, prompt, response)
     entity_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"ferrosa-memory-hook:{args.harness}:{session_id}:{turn_id}"))
     text = "\n\n".join(
@@ -357,10 +428,9 @@ def ingest_turn(client: McpClient, payload: dict[str, Any], args: argparse.Names
     }
     try:
         client.call_tool(
-            "ingest",
+            "ingest_entities",
             {
                 "tenant_id": os.environ.get("FERROSA_MEMORY_TENANT_ID", DEFAULT_TENANT_ID),
-                "session_id": session_id,
                 "entities": [
                     {
                         "id": entity_id,
@@ -371,6 +441,7 @@ def ingest_turn(client: McpClient, payload: dict[str, Any], args: argparse.Names
                         "attrs": common_attrs,
                     }
                 ],
+                "edges": [],
                 "options": {
                     "embed_missing": False,
                     "on_conflict": "skip",
@@ -461,7 +532,7 @@ def emit_context(context: str, output_format: str, event: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["recall", "ingest-turn"], default="recall")
+    parser.add_argument("--mode", choices=["session-start", "recall", "ingest-turn"], default="recall")
     parser.add_argument("--harness", choices=["codex", "claude", "hermes", "generic"], default="generic")
     parser.add_argument("--event", default="")
     parser.add_argument("--format", choices=["plain", "codex-json", "hermes-json"], default="plain")
@@ -478,7 +549,13 @@ def main() -> int:
     try:
         client = McpClient(args.mcp_url, args.timeout)
         client.initialize()
-        if args.mode == "recall":
+        if args.mode == "session-start":
+            session_id = configure_session_start(client, payload, args)
+            if args.format == "hermes-json":
+                print(json.dumps({"session_id": session_id}))
+            elif args.format == "codex-json":
+                print(json.dumps({"session_id": session_id}))
+        elif args.mode == "recall":
             context = recall_context(client, payload, args)
             emit_context(context, args.format, payload.get("hook_event_name") or args.event)
         else:

@@ -70,6 +70,7 @@ pub mod system_describe;
 pub mod temporal;
 pub mod test_cluster;
 pub mod transport;
+pub mod turn_chain;
 pub mod types;
 pub mod vector;
 pub mod viz;

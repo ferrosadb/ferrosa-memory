@@ -40,14 +40,20 @@ graph LR
 **Boundary rule:** `ferrosa-memory` may use Ferrosa's public wire protocols, including direct CQL via the Rust driver, but it must not treat graph-owned backing tables as a public API. Workbench query surfaces should be passthrough clients, and bugs in those public interfaces should be fixed in Ferrosa rather than papered over locally.
 
 **Current implementation note:** direct `CqlStorage` remains the app-table client
-for server-owned memory tables. Graph reads/writes go through the graph client
-seam; the remaining blocker is Ferrosa public `TYPED_EDGE` MERGE materialization.
-See [overview.md](overview.md) and [dsm-analysis.md](dsm-analysis.md).
+for server-owned memory tables. Serving-path graph reads and graph-owned edge
+writes go through the graph client seam behind `ReconnectingStorage`; direct
+`CqlStorage` graph-edge writers fail loud. Maintenance tooling may still repair
+graph backing rows explicitly, but that path is not part of normal MCP serving.
+See [overview.md](overview.md), [components.md](components.md), and
+[dsm-analysis.md](dsm-analysis.md).
 
-**61 MCP tools** are defined in `crates/ferrosa-memory-core/src/dispatch.rs`.
+**68 MCP tools** are exposed through the full tool catalog in
+`crates/ferrosa-memory-core/src/dispatch.rs`; the compact default list remains
+smaller for agent token economy.
 The registry covers context segments, memoization, plan state, trajectory folds,
-entity graph, bulk ingest, temporal chains, feedback/routing, skills,
-intentions, cognitive memory, governance, derived facts, and hybrid search.
+entity graph, bulk ingest, temporal chains, captured-turn chains,
+feedback/routing, skills, intentions, cognitive memory, governance, derived
+facts, and hybrid search.
 Entity type schemas are dynamic — loaded from the `entity_types` registry table
 at startup.
 
@@ -81,3 +87,4 @@ All specs derived from `ferrosa-memory-mcp-spec.md` (v0.1, 2026-03-21).
 - **2026-04-01 (update):** Dynamic type registry (DDL 019), multiselect filter UI in viz, extended entity/edge color mapping, CO_OCCURS noise filtering, ghost row resilience, stale prepared statement recovery, NER module, frg ingest data flow, markdown docs ingestion support
 - **2026-04-10 (update):** Shared HTTP deployment blueprint: real auth boundary, TLS/secret handling, multi-tenant policy, liveness/readiness probes, and viz exposure decision
 - **2026-04-19 (update):** Expert-system knowledge plane review: effective-rule-set gap, core ownership of claims/approvals/aliases, operator console above viz, explanation API risks, and Sprint 8 planning
+- **2026-06-11 (update):** Graph edge reconciliation and turn-chain capture: serving-path graph writes route through the graph client, typed edges are visible through graph/CQL/MCP traversal APIs, hooks use `ingest_entities`, and captured turns link through `next_turn` / `previous_turn` temporal edges.

@@ -36,6 +36,7 @@ pub struct MemoryChain {
 pub async fn find_chain(
     storage: &(impl Storage + ?Sized),
     ctx: &TenantContext,
+    session_id: Uuid,
     source: Uuid,
     destination: Uuid,
     max_hops: usize,
@@ -64,7 +65,7 @@ pub async fn find_chain(
             continue;
         }
 
-        let neighbors = storage.edge_list_for_entity(ctx, current).await?;
+        let neighbors = chain_neighbors(storage, ctx, session_id, current).await?;
         for (neighbor_id, edge_type) in neighbors {
             if visited.contains_key(&neighbor_id) {
                 continue;
@@ -89,6 +90,24 @@ pub async fn find_chain(
     }
 
     Ok(None)
+}
+
+async fn chain_neighbors(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    session_id: Uuid,
+    entity_id: Uuid,
+) -> anyhow::Result<Vec<(Uuid, String)>> {
+    let mut neighbors = storage.edge_list_for_entity(ctx, entity_id).await?;
+    for edge in storage
+        .typed_edge_list_from(ctx, session_id, entity_id)
+        .await?
+    {
+        neighbors.push((edge.dst_id, edge.edge_type));
+    }
+    neighbors.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    neighbors.dedup();
+    Ok(neighbors)
 }
 
 /// Walk the visited map backwards from destination to source to reconstruct
@@ -135,7 +154,9 @@ mod tests {
         let ctx = test_ctx();
         let id = Uuid::new_v4();
 
-        let chain = find_chain(&store, &ctx, id, id, 5).await.unwrap();
+        let chain = find_chain(&store, &ctx, Uuid::new_v4(), id, id, 5)
+            .await
+            .unwrap();
         let chain = chain.expect("should find trivial self-path");
         assert_eq!(chain.hop_count, 0);
         assert!(chain.steps.is_empty());
@@ -155,7 +176,7 @@ mod tests {
             .await
             .unwrap();
 
-        let chain = find_chain(&store, &ctx, a, b, 5).await.unwrap();
+        let chain = find_chain(&store, &ctx, session, a, b, 5).await.unwrap();
         let chain = chain.expect("should find direct path");
         assert_eq!(chain.hop_count, 1);
         assert_eq!(chain.steps.len(), 1);
@@ -183,7 +204,7 @@ mod tests {
             .await
             .unwrap();
 
-        let chain = find_chain(&store, &ctx, a, c, 5).await.unwrap();
+        let chain = find_chain(&store, &ctx, session, a, c, 5).await.unwrap();
         let chain = chain.expect("should find 2-hop path");
         assert_eq!(chain.hop_count, 2);
         assert_eq!(chain.steps.len(), 2);
@@ -201,7 +222,9 @@ mod tests {
         let b = Uuid::new_v4();
 
         // No edges at all
-        let chain = find_chain(&store, &ctx, a, b, 5).await.unwrap();
+        let chain = find_chain(&store, &ctx, Uuid::new_v4(), a, b, 5)
+            .await
+            .unwrap();
         assert!(chain.is_none(), "should return None when no path exists");
     }
 
@@ -224,7 +247,7 @@ mod tests {
             .await
             .unwrap();
 
-        let chain = find_chain(&store, &ctx, a, c, 1).await.unwrap();
+        let chain = find_chain(&store, &ctx, session, a, c, 1).await.unwrap();
         assert!(chain.is_none(), "should not find path beyond max_hops");
     }
 
@@ -235,10 +258,40 @@ mod tests {
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
 
-        let err = find_chain(&store, &ctx, a, b, 0).await;
+        let err = find_chain(&store, &ctx, Uuid::new_v4(), a, b, 0).await;
         assert!(err.is_err(), "max_hops=0 should be rejected");
 
-        let err = find_chain(&store, &ctx, a, b, 11).await;
+        let err = find_chain(&store, &ctx, Uuid::new_v4(), a, b, 11).await;
         assert!(err.is_err(), "max_hops=11 should be rejected");
+    }
+
+    #[tokio::test]
+    async fn typed_edge_connection_one_hop() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = Uuid::new_v4();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+
+        crate::graph_write::create_typed_edge(
+            &store,
+            &ctx,
+            session,
+            a,
+            "references",
+            b,
+            0.75,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let chain = find_chain(&store, &ctx, session, a, b, 5)
+            .await
+            .unwrap()
+            .expect("typed edge should be traversable");
+        assert_eq!(chain.hop_count, 1);
+        assert_eq!(chain.steps[0].entity_id, b);
+        assert_eq!(chain.steps[0].edge_type, "references");
     }
 }

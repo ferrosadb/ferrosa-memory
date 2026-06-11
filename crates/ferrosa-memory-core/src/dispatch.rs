@@ -182,8 +182,9 @@ pub struct SessionState {
     pub retrieval_tracker: Arc<Mutex<RetrievalTracker>>,
     pub co_access: Arc<Mutex<crate::speculative::CoAccessTracker>>,
     /// Configured default session_id for cross-session memory continuity.
-    /// Falls back to random UUID if not set.
     pub default_session_id: Option<uuid::Uuid>,
+    /// Runtime session_id selected by a mechanical session-start hook.
+    pub runtime_session_id: Arc<std::sync::RwLock<Option<uuid::Uuid>>>,
     /// Repository path for intention scoping (from CLAUDE_PROJECT_DIR, config, or MCP initialize roots).
     pub repo: std::sync::OnceLock<String>,
     /// Notified on every tool call; used by the idle consolidation timer.
@@ -234,6 +235,7 @@ impl Default for SessionState {
             retrieval_tracker: Arc::new(Mutex::new(RetrievalTracker::new())),
             co_access: Arc::new(Mutex::new(crate::speculative::CoAccessTracker::new(10))),
             default_session_id: None,
+            runtime_session_id: Arc::new(std::sync::RwLock::new(None)),
             repo: std::sync::OnceLock::new(),
             last_activity: Arc::new(tokio::sync::Notify::new()),
             dirty: Arc::new(AtomicBool::new(false)),
@@ -254,6 +256,27 @@ impl Default for SessionState {
             retrieval_default_limit: Arc::new(AtomicUsize::new(DEFAULT_RETRIEVAL_LIMIT)),
             system_info: Arc::new(crate::system_describe::SystemInfo::default()),
         }
+    }
+}
+
+impl SessionState {
+    pub fn effective_default_session_id(&self) -> Option<uuid::Uuid> {
+        self.runtime_session_id
+            .read()
+            .ok()
+            .and_then(|guard| *guard)
+            .or(self.default_session_id)
+    }
+
+    fn set_runtime_session_id(&self, session_id: uuid::Uuid) -> Result<(), (i32, String)> {
+        let mut guard = self.runtime_session_id.write().map_err(|_| {
+            (
+                INTERNAL_ERROR,
+                "runtime session_id lock poisoned".to_string(),
+            )
+        })?;
+        *guard = Some(session_id);
+        Ok(())
     }
 }
 
@@ -310,6 +333,7 @@ fn short_tool_name(canonical: &str) -> Option<&'static str> {
         "search_context_segments" => Some("ctx_search"),
         "get_context_window" => Some("ctx_window"),
         "get_chunk_context" => Some("chunk_ctx"),
+        "get_turn_chain" => Some("turn_chain"),
         "upsert_entity" => Some("upsert"),
         "batch_ingest" => Some("ingest_batch"),
         "ingest_entities" => Some("ingest_many"),
@@ -381,6 +405,7 @@ fn canonical_tool_name(name: &str) -> &str {
         "ctx_search" => "search_context_segments",
         "ctx_window" => "get_context_window",
         "chunk_ctx" => "get_chunk_context",
+        "turn_chain" => "get_turn_chain",
         "upsert" => "upsert_entity",
         "ingest_batch" => "batch_ingest",
         "ingest_many" => "ingest_entities",
@@ -517,6 +542,19 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                     "max_tokens": { "type": "integer", "minimum": 1, "maximum": 100000 }
                 },
                 "required": ["segment_id"]
+            }),
+        },
+        ToolDef {
+            name: "get_turn_chain".into(),
+            description: "Walk the next_turn temporal edge chain from a starting turn entity, returning turns in forward (chronological arrival) order.\n\nCALL WHEN: You need to reconstruct what happened in an agent session after a known turn, follow a conversation thread, or inspect the sequence of turns the harness hook captured.\nRETURNS: ordered list of turn entities from start_turn_id forward, up to limit turns.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Session partition for the turn chain. Omit or pass \"default\" to use the configured default session." },
+                    "start_turn_id": { "type": "string", "format": "uuid", "description": "Entity ID of the first turn to include" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 20, "description": "Maximum number of turns to return" }
+                },
+                "required": ["start_turn_id"]
             }),
         },
         ToolDef {
@@ -923,10 +961,37 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "configure".into(),
-            description: "Read or update compact runtime defaults. Use retrieval_limit to reduce or expand default search results when omitted by retrieval calls.".into(),
+            description: "Read or update compact runtime defaults. Session-start hooks call this to let fmem create and store the active session_id; retrieval_limit controls default search result count.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
+                    "session_start": {
+                        "oneOf": [
+                            { "type": "boolean" },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "agent": { "type": "string", "maxLength": 128 },
+                                    "agent_session_id": { "type": "string", "maxLength": 512 },
+                                    "external_session_id": { "type": "string", "maxLength": 512 },
+                                    "thread_id": { "type": "string", "maxLength": 512 },
+                                    "workspace": { "type": "string", "maxLength": 2048 },
+                                    "cwd": { "type": "string", "maxLength": 2048 }
+                                }
+                            }
+                        ],
+                        "description": "Set by a deterministic agent SessionStart hook. fmem creates/stores the active session_id from this metadata."
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Optional explicit fmem UUID to install as the active runtime session. Hooks normally omit this."
+                    },
+                    "agent": { "type": "string", "maxLength": 128 },
+                    "agent_session_id": { "type": "string", "maxLength": 512 },
+                    "external_session_id": { "type": "string", "maxLength": 512 },
+                    "thread_id": { "type": "string", "maxLength": 512 },
+                    "workspace": { "type": "string", "maxLength": 2048 },
+                    "cwd": { "type": "string", "maxLength": 2048 },
                     "retrieval_limit": {
                         "type": "integer",
                         "minimum": MIN_RETRIEVAL_LIMIT,
@@ -1924,7 +1989,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         .cloned()
         .unwrap_or(Value::Object(serde_json::Map::new()));
 
-    resolve_session_id(&mut args, session.default_session_id)?;
+    resolve_session_id(&mut args, session.effective_default_session_id())?;
 
     tracing::debug!(
         tool = canonical_name,
@@ -1963,6 +2028,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         }
         "get_context_window" => Box::pin(handle_get_context_window(args, storage, ctx)),
         "get_chunk_context" => Box::pin(handle_get_chunk_context(args, storage, ctx)),
+        "get_turn_chain" => Box::pin(handle_get_turn_chain(args, storage, ctx)),
         "upsert_entity" => Box::pin(handle_upsert_entity(args, storage, ctx, session)),
         "batch_ingest" => Box::pin(handle_batch_ingest(args, storage, ctx, session)),
         "ingest_entities" => Box::pin(handle_ingest_entities(args, storage, ctx, session)),
@@ -2073,14 +2139,22 @@ async fn dispatch_tool<S: crate::storage::Storage>(
             serde_json::to_string(&value).unwrap_or_else(|_| value.to_string())
         };
         let duration_ms = elapsed.as_millis() as u64;
-        serde_json::json!({
-            "content": [{"type": "text", "text": text}],
-            "structuredContent": {
+        let mut structured_content = serde_json::json!({
             "tool": canonical_name,
             "requested_tool": name,
-                "duration_ms": duration_ms,
-                "is_error": false
+            "duration_ms": duration_ms,
+            "is_error": false
+        });
+        if let (Some(structured), Some(result)) =
+            (structured_content.as_object_mut(), value.as_object())
+        {
+            for (key, value) in result {
+                structured.insert(key.clone(), value.clone());
             }
+        }
+        serde_json::json!({
+            "content": [{"type": "text", "text": text}],
+            "structuredContent": structured_content
         })
     });
 
@@ -2122,6 +2196,7 @@ fn is_tier1(name: &str) -> bool {
             | "hybrid_search"
             | "configure"
             | "get_chunk_context"
+            | "get_turn_chain"
             | "record_feedback"
             | "create_edge"
             | "check_intentions"
@@ -2701,6 +2776,38 @@ async fn handle_search_context_segments<S: crate::storage::Storage>(
     .await
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
     serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
+async fn handle_get_turn_chain<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = require_uuid(&args, "session_id")?;
+    let start_turn_id = require_uuid(&args, "start_turn_id")?;
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20)
+        .clamp(1, 50) as usize;
+
+    let turns =
+        crate::turn_chain::walk_turn_chain_forward(storage, ctx, session_id, start_turn_id, limit)
+            .await
+            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    Ok(serde_json::json!({
+        "session_id": session_id.to_string(),
+        "start_turn_id": start_turn_id.to_string(),
+        "count": turns.len(),
+        "turns": turns.iter().map(|t| serde_json::json!({
+            "entity_id": t.entity_id.to_string(),
+            "entity_name": t.entity_name,
+            "created_at": t.created_at.to_rfc3339(),
+            "context_snippet": t.context_snippet,
+            "properties": t.properties,
+        })).collect::<Vec<_>>(),
+    }))
 }
 
 async fn handle_get_context_window<S: crate::storage::Storage>(
@@ -3361,6 +3468,7 @@ async fn handle_ingest_entities<S: crate::storage::Storage>(
     let mut document_chunk_embeddings_computed = 0usize;
     let mut document_chunk_embeddings_failed = 0usize;
     let mut document_index_failed = Vec::new();
+    let mut turn_chain_edges_created = 0usize;
 
     let mut available_entities = std::collections::HashSet::new();
     let mut seen_entity_ids = std::collections::HashSet::new();
@@ -3565,6 +3673,32 @@ async fn handle_ingest_entities<S: crate::storage::Storage>(
             entity_updated += 1;
         } else {
             entity_inserted += 1;
+            // Auto-chain turn entities: link the new turn to its predecessor
+            // in the same session so agent sessions form traversable threads.
+            // This mirrors the next/previous_context_segment edge pattern.
+            // Only fires for freshly-inserted turns; updates and dry-runs skip
+            // this block entirely.
+            if !request.options.dry_run && entry.entity_type == "turn" {
+                match crate::turn_chain::link_turn_to_predecessor(
+                    storage,
+                    ctx,
+                    request.session_id,
+                    &entry,
+                )
+                .await
+                {
+                    Ok(true) => turn_chain_edges_created += 2,
+                    Ok(false) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            entity_id = %entry.entity_id,
+                            session_id = %request.session_id,
+                            error = %err,
+                            "turn chain edge creation failed (non-fatal)"
+                        );
+                    }
+                }
+            }
         }
         available_entities.insert(entity.id);
 
@@ -3759,6 +3893,10 @@ async fn handle_ingest_entities<S: crate::storage::Storage>(
             "chunk_embeddings_failed": document_chunk_embeddings_failed,
             "failed": document_index_failed,
             "hint": "Document chunks are semantic and linked with prev/next IDs. Search results may suggest chunk_ctx expansion when adjacent context matters."
+        },
+        "turn_chain": {
+            "edges_created": turn_chain_edges_created,
+            "hint": "next_turn / previous_turn temporal edges link successive turn entities into traversable session threads. Use get_turn_chain to walk."
         },
         "schema_version": "2026-03-01",
         "progress": {
@@ -5180,12 +5318,75 @@ async fn handle_record_feedback<S: crate::storage::Storage>(
     }))
 }
 
+fn nested_or_flat_str(args: &Value, field: &str) -> Option<String> {
+    args.get("session_start")
+        .and_then(|v| v.as_object())
+        .and_then(|obj| obj.get(field))
+        .or_else(|| args.get(field))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn configure_requests_session_start(args: &Value) -> bool {
+    matches!(args.get("session_start"), Some(Value::Bool(true)))
+        || args
+            .get("session_start")
+            .and_then(|v| v.as_object())
+            .is_some()
+        || args.get("session_id").is_some()
+        || nested_or_flat_str(args, "agent_session_id").is_some()
+        || nested_or_flat_str(args, "external_session_id").is_some()
+        || nested_or_flat_str(args, "thread_id").is_some()
+}
+
+fn configured_runtime_session_id(
+    args: &Value,
+) -> Result<Option<(uuid::Uuid, String)>, (i32, String)> {
+    if !configure_requests_session_start(args) {
+        return Ok(None);
+    }
+
+    if let Some(raw) = nested_or_flat_str(args, "session_id") {
+        let session_id = uuid::Uuid::parse_str(&raw).map_err(|e| {
+            (
+                INVALID_PARAMS,
+                format!("session_id is not a valid UUID: {e}"),
+            )
+        })?;
+        return Ok(Some((session_id, "explicit_session_id".to_string())));
+    }
+
+    let agent = nested_or_flat_str(args, "agent").unwrap_or_else(|| "unknown-agent".to_string());
+    let workspace = nested_or_flat_str(args, "workspace")
+        .or_else(|| nested_or_flat_str(args, "cwd"))
+        .unwrap_or_else(|| "unknown-workspace".to_string());
+    let external = nested_or_flat_str(args, "agent_session_id")
+        .or_else(|| nested_or_flat_str(args, "external_session_id"))
+        .or_else(|| nested_or_flat_str(args, "thread_id"));
+
+    let Some(external) = external else {
+        return Ok(Some((
+            uuid::Uuid::new_v4(),
+            "generated_session_start".to_string(),
+        )));
+    };
+
+    let key = format!("ferrosa-memory:agent-session:v1:{agent}:{workspace}:{external}");
+    Ok(Some((
+        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, key.as_bytes()),
+        "derived_from_agent_session".to_string(),
+    )))
+}
+
 async fn handle_configure(args: Value, session: &SessionState) -> Result<Value, (i32, String)> {
     let requested = args
         .get("retrieval_limit")
         .or_else(|| args.get("default_limit"))
         .and_then(|v| v.as_u64());
-    let updated = if let Some(raw) = requested {
+    let mut updated = false;
+    if let Some(raw) = requested {
         let value = raw as usize;
         if !(MIN_RETRIEVAL_LIMIT..=MAX_RETRIEVAL_LIMIT).contains(&value) {
             return Err((
@@ -5198,17 +5399,25 @@ async fn handle_configure(args: Value, session: &SessionState) -> Result<Value, 
         session
             .retrieval_default_limit
             .store(value, Ordering::Relaxed);
-        true
-    } else {
-        false
-    };
+        updated = true;
+    }
+
+    let session_update = configured_runtime_session_id(&args)?;
+    let session_source = session_update.as_ref().map(|(_, source)| source.clone());
+    if let Some((session_id, _)) = session_update {
+        session.set_runtime_session_id(session_id)?;
+        updated = true;
+    }
+    let effective_session_id = session.effective_default_session_id();
 
     Ok(serde_json::json!({
         "updated": updated,
         "retrieval_limit": retrieval_default_limit(session),
         "min_retrieval_limit": MIN_RETRIEVAL_LIMIT,
         "max_retrieval_limit": MAX_RETRIEVAL_LIMIT,
-        "hint": "Pass retrieval_limit when searches are too sparse or too token-heavy. Individual calls can still override with limit/k."
+        "session_id": effective_session_id.map(|id| id.to_string()),
+        "session_source": session_source,
+        "hint": "SessionStart hooks should call configure with session_start metadata once; fmem stores the active session_id. Individual retrieval calls can still override limit/k."
     }))
 }
 
@@ -5927,7 +6136,7 @@ async fn handle_explore_connections<S: crate::storage::Storage>(
             // be logged so operators can see silent fall-through.
             let graph_results = if let Some(graph) = session.graph.as_ref() {
                 match graph
-                    .find_related_entities(entity_id, session_id, max_depth)
+                    .find_related_entities(ctx.tenant_id, entity_id, session_id, max_depth)
                     .await
                 {
                     Ok(v) => v,
@@ -5949,11 +6158,23 @@ async fn handle_explore_connections<S: crate::storage::Storage>(
                 r.truncate(limit);
                 r
             } else {
-                // CQL fallback: query typed_edges for direct connections
-                let edges = storage
+                // CQL fallback: query legacy edges plus the canonical typed_edges
+                // table used by create_edge / batch_create_edges.
+                let mut edges = storage
                     .edge_list_for_entity(ctx, entity_id)
                     .await
                     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+                let typed_edges = storage
+                    .typed_edge_list_from(ctx, session_id, entity_id)
+                    .await
+                    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+                edges.extend(
+                    typed_edges
+                        .into_iter()
+                        .map(|edge| (edge.dst_id, edge.edge_type)),
+                );
+                edges.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                edges.dedup();
                 let mut results: Vec<String> = Vec::new();
                 for (other_id, edge_type) in edges.into_iter().take(limit) {
                     let name = storage
@@ -7867,12 +8088,13 @@ async fn handle_get_stats<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    // Default to the nil UUID session — this matches what smart_ingest /
-    // hybrid_search / retrieve_entities use when session_id is omitted, so
-    // get_stats reports the same data those tools see. Returning 0 here
-    // (the prior behavior) made default-session entities look like
-    // phantoms even when they were correctly persisted.
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+    // Default to the server-owned runtime/default session — this matches what
+    // smart_ingest / hybrid_search / retrieve_entities use after the
+    // SessionStart hook configures fmem. Falling back to nil made live stats
+    // look empty even when the active session had correctly persisted rows.
+    let session_id = optional_uuid(&args, "session_id")?
+        .or_else(|| session.effective_default_session_id())
+        .unwrap_or(uuid::Uuid::nil());
 
     let memo_count = storage.memo_count(ctx).await.unwrap_or(0);
     let memo_total_hits = storage.memo_total_hits(ctx).await.unwrap_or(0);
@@ -8135,7 +8357,7 @@ async fn handle_find_memory_chain<S: crate::storage::Storage>(
         .map(|v| v as usize)
         .unwrap_or(5);
 
-    let chain = crate::chains::find_chain(storage, ctx, source, destination, max_hops)
+    let chain = crate::chains::find_chain(storage, ctx, session_id, source, destination, max_hops)
         .await
         .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
@@ -8289,7 +8511,7 @@ async fn handle_recursive_explore<S: crate::storage::Storage>(
 ) -> Result<Value, (i32, String)> {
     let query = require_str(&args, "query")?;
     let session_id = optional_uuid(&args, "session_id")?
-        .or(session.default_session_id)
+        .or_else(|| session.effective_default_session_id())
         .unwrap_or(uuid::Uuid::nil());
 
     // Parse optional embedding
@@ -10339,7 +10561,7 @@ mod tests {
             expected_tier1,
             "default tools/list should return all tier-1 tools"
         );
-        assert_eq!(tools.len(), 11, "tier-1 tool surface should stay compact");
+        assert_eq!(tools.len(), 12, "tier-1 tool surface should stay compact");
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         // All default tools must be compact public names.
@@ -10347,6 +10569,7 @@ mod tests {
         assert!(names.contains(&"ingest"));
         assert!(names.contains(&"search"));
         assert!(names.contains(&"chunk_ctx"));
+        assert!(names.contains(&"turn_chain"));
         assert!(names.contains(&"feedback"));
         assert!(names.contains(&"config"));
         assert!(names.contains(&"edge"));
@@ -11589,6 +11812,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explore_connections_cql_fallback_returns_typed_edge_neighbors() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session_id = Uuid::new_v4();
+        let source = test_entity(&ctx, session_id, "source", "concept", serde_json::json!({}));
+        let destination = test_entity(
+            &ctx,
+            session_id,
+            "destination",
+            "concept",
+            serde_json::json!({}),
+        );
+        store.entity_put(&ctx, &source).await.unwrap();
+        store.entity_put(&ctx, &destination).await.unwrap();
+        crate::graph_write::create_typed_edge(
+            &store,
+            &ctx,
+            session_id,
+            source.entity_id,
+            "references",
+            destination.entity_id,
+            0.75,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let session = SessionState::default(); // graph is None — uses CQL fallback
+        let params = serde_json::json!({
+            "name": "explore_connections",
+            "arguments": {
+                "traversal": "related_entities",
+                "session_id": session_id.to_string(),
+                "entity_id": source.entity_id.to_string()
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["count"], 1);
+        let first = result["results"][0].as_str().unwrap();
+        let first: Value = serde_json::from_str(first).unwrap();
+        assert_eq!(first["entity_id"], destination.entity_id.to_string());
+        assert_eq!(first["entity_name"], "destination");
+        assert_eq!(first["edge_type"], "references");
+    }
+
+    #[tokio::test]
+    async fn find_memory_chain_returns_typed_edge_path() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session_id = Uuid::new_v4();
+        let source = Uuid::new_v4();
+        let destination = Uuid::new_v4();
+        crate::graph_write::create_typed_edge(
+            &store,
+            &ctx,
+            session_id,
+            source,
+            "references",
+            destination,
+            0.75,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let session = SessionState::default();
+        let params = serde_json::json!({
+            "name": "find_memory_chain",
+            "arguments": {
+                "session_id": session_id.to_string(),
+                "source": source.to_string(),
+                "destination": destination.to_string(),
+                "max_hops": 2
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["source"], source.to_string());
+        assert_eq!(result["destination"], destination.to_string());
+        assert_eq!(result["hop_count"], 1);
+        assert_eq!(result["steps"][0]["entity_id"], destination.to_string());
+        assert_eq!(result["steps"][0]["edge_type"], "references");
+    }
+
+    #[tokio::test]
     async fn explore_connections_fold_requires_graph() {
         let store = MockStorage::new();
         let ctx = test_ctx();
@@ -11818,19 +12131,23 @@ mod tests {
     #[tokio::test]
     async fn get_stats_without_session_id_counts_default_session_entities() {
         // Regression: get_stats previously returned entity_count=0 hardcoded
-        // when session_id was omitted, instead of querying the default
-        // (nil) session that smart_ingest writes to when session_id is
-        // omitted from its arguments. The two tools must agree on the
+        // when session_id was omitted, instead of querying the server-owned
+        // runtime/default session that ordinary tools use when session_id is
+        // omitted from their arguments. The tools must agree on the
         // implicit session — otherwise ingested entities look like phantoms.
         let store = MockStorage::new();
         let ctx = test_ctx();
-        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+        let session = SessionState {
+            default_session_id: Some(sid),
+            ..SessionState::default()
+        };
 
         for i in 0..2 {
             let entity = crate::types::EntityEntry {
                 tenant_id: ctx.tenant_id,
                 entity_id: Uuid::new_v4(),
-                session_id: Uuid::nil(),
+                session_id: sid,
                 entity_name: format!("DefaultSessionEntity{i}"),
                 entity_type: "concept".into(),
                 source_fold_id: None,
@@ -11855,6 +12172,51 @@ mod tests {
         assert_eq!(
             result["entity_count"], 2,
             "get_stats with no session_id should count default-session entities, not return 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_stats_structured_content_serializes_stats_payload() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let sid = Uuid::new_v4();
+        let session = SessionState {
+            default_session_id: Some(sid),
+            ..SessionState::default()
+        };
+        store.entities.lock().await.push(crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "StructuredStatsEntity".into(),
+            entity_type: "concept".into(),
+            context_snippet: "entity visible in structured stats".into(),
+            confidence: 0.9,
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        });
+
+        let result = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "get_stats",
+                "arguments": {}
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["structuredContent"]["entity_count"], 1);
+        assert_eq!(result["structuredContent"]["tool"], "get_stats");
+        assert_eq!(result["structuredContent"]["requested_tool"], "get_stats");
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("entity_count")
         );
     }
 
@@ -12482,6 +12844,71 @@ mod tests {
         .unwrap();
         let narrowed = unwrap_tool_result(narrowed);
         assert_eq!(narrowed["count"], 1);
+    }
+
+    #[tokio::test]
+    async fn configure_session_start_sets_runtime_session_without_llm_supplied_uuid() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            ollama_base_url: String::new(),
+            ..SessionState::default()
+        };
+
+        let configured = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "config",
+                "arguments": {
+                    "session_start": {
+                        "agent": "claude",
+                        "agent_session_id": "claude-runtime-session-1",
+                        "workspace": "/repo/ferrosa-memory"
+                    }
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let configured = unwrap_tool_result(configured);
+        let sid = Uuid::parse_str(configured["session_id"].as_str().unwrap()).unwrap();
+        let expected = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            b"ferrosa-memory:agent-session:v1:claude:/repo/ferrosa-memory:claude-runtime-session-1",
+        );
+        assert_eq!(sid, expected);
+
+        store.entities.lock().await.push(crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "HookSessionMemory".into(),
+            entity_type: "concept".into(),
+            context_snippet: "memory written under the hook-configured session".into(),
+            confidence: 0.9,
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        });
+
+        let found = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "hybrid_search",
+                "arguments": {
+                    "query": "HookSessionMemory"
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let found = unwrap_tool_result(found);
+        assert_eq!(found["count"], 1);
     }
 
     #[tokio::test]

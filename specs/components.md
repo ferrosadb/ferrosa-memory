@@ -1,7 +1,7 @@
 # Component Architecture
 
-> Last updated: 2026-04-22
-> Status: 38 modules plus graph-boundary correction. Shared HTTP and expert-system work are real, but the runtime still mutates graph-owned backing tables directly.
+> Last updated: 2026-06-11
+> Status: Graph-boundary serving path corrected; remaining risk is hotspot concentration in dispatch/storage and maintenance-only backing-table tooling.
 
 ## Module Map
 
@@ -18,14 +18,17 @@ graph TB
     D --> I[fold_tools]
     D --> J[entity_tools]
     D --> K[feedback_tools]
+    D --> TC[turn_chain]
     D --> RE[recursive_explore]
     G --> L[cql_client]
     H --> L
     I --> L
     I --> M[graph_client]
     J --> L
-    J --> M
+    J --> GW[graph_write]
+    GW --> M
     K --> L
+    TC --> L
     RE --> DL[datalog]
     RE --> W[warmth]
     RE --> HS[hybrid_search]
@@ -43,9 +46,13 @@ graph TB
     P --> Q[http]
 ```
 
-**Note:** Shows the current code path, not the desired final boundary. Full dependency analysis and refactor direction are in `dsm-analysis.md`.
+**Note:** Shows the current serving path. Full dependency analysis and refactor direction are in `dsm-analysis.md`.
 
-**Boundary correction:** `graph_client` (M11) already uses a public Ferrosa query interface. The main remaining violation is direct mutation of graph-owned backing tables. Direct CQL for app-owned tables remains acceptable, and operator query surfaces should remain passthroughs for public query APIs.
+**Boundary correction:** Serving-path graph mutations now flow through
+`graph_write` and `GraphClient` behind `ReconnectingStorage`. Direct
+`CqlStorage` graph-edge writer methods fail loud, while CQL remains acceptable
+for app-owned tables. A maintenance utility still has explicit graph backing-row
+repair code; keep that isolated from runtime serving paths.
 
 ## Target Module Boundary
 
@@ -238,11 +245,14 @@ The workbench and MCP layers should orchestrate auth, tenant mapping, request sh
 
 ---
 
-### 10. `cql_client` — Current Direct Storage Coupling
+### 10. `cql_client` — App-Table Storage Client
 
 **Current responsibility:** Manages a direct CQL connection pool, prepared statements, and table-level query execution against Ferrosa. Loads dynamic type registry at startup.
 
-**Architectural problem:** this module makes `ferrosa-memory` act like an embedded Ferrosa storage implementation rather than a client to Ferrosa public interfaces.
+**Boundary:** this module is the serving-path client for app-owned tables. Graph
+edge mutation methods intentionally return graph-write errors in direct
+`CqlStorage`; production serving paths use `ReconnectingStorage` to route graph
+writes through `GraphClient`.
 
 **Interface:**
 - `connect(config) -> Result<CqlClient>`
@@ -259,26 +269,36 @@ The workbench and MCP layers should orchestrate auth, tenant mapping, request sh
 
 **Dependencies:** `cdrs-tokio`, `vector`, `metrics`
 
-**Target correction:** keep direct prepared statements where they operate on app-owned tables under the supported CQL role boundary, but remove any serving-path reliance on graph-owned table mutations and local operator-query emulation.
+**Target correction:** keep direct prepared statements where they operate on
+app-owned tables under the supported CQL role boundary. Do not reintroduce
+serving-path graph-owned table mutations here.
 
 **Size estimate:** ~1,680 lines
 
 ---
 
-### 11. `graph_client` — HTTP Cypher Client
+### 11. `graph_client` — HTTP Graph Client
 
-**Responsibility:** Executes Cypher MATCH queries against Ferrosa's HTTP graph endpoint for multi-hop traversals.
+**Responsibility:** Executes graph reads and graph-owned edge mutations against
+Ferrosa's HTTP graph endpoint.
 
-**Implementation note (updated 2026-04-20):** This module is only partially at the intended boundary. Graph reads already use Ferrosa's public HTTP graph API, but graph writes still bypass that interface elsewhere in the serving path and target graph-owned backing tables through direct CQL. The correction is to route all graph mutations through the public Cypher/graph interface as well.
+**Implementation note (updated 2026-06-11):** Serving-path graph writes for
+`typed_edges`, `folded_into`, `mentioned_in`, `co_occurs_with`, and
+`supersedes` route through this client via `ReconnectingStorage`. The graph
+endpoint accepts scoped one-hop `TYPED_EDGE` traversals; multi-hop typed-edge
+path discovery is implemented in the MCP `chains` module over typed-edge reads.
 
 **Interface:**
 - `connect(config) -> Result<GraphClient>` — HTTP connection with Basic auth
 - `get_fold_ancestors(fold_id) -> Result<Vec<Uuid>>` — `FOLDED_INTO` traversal
-- `find_related_entities(entity_id, hops) -> Result<Vec<Value>>` — `CO_OCCURS_WITH` N-hop
+- `find_related_entities(tenant_id, entity_id, session_id, hops) -> Result<Vec<Value>>` — scoped one-hop `TYPED_EDGE` graph lookup
+- `put_typed_edge(...)` / `delete_typed_edge(...)` — typed entity-edge mutation
+- `put_folded_into_edge(...)`, `put_mentioned_in_edge(...)`, `put_co_occurs_edge(...)`, `put_supersedes_edge(...)` — specialized graph edge mutation
 - `get_entities_in_fold(fold_id) -> Result<Vec<Value>>` — `MENTIONED_IN` lookup
 - `get_supersession_chain(event_id) -> Result<Vec<Value>>` — `SUPERSEDES` chain
 
-**Edge types queried:** `FOLDED_INTO`, `CO_OCCURS_WITH`, `MENTIONED_IN`, `SUPERSEDES`
+**Edge types queried/written:** `TYPED_EDGE`, `FOLDED_INTO`,
+`CO_OCCURS_WITH`, `MENTIONED_IN`, `SUPERSEDES`
 
 **Dependencies:** `reqwest` (HTTP), `serde_json` — no dependency on `cql_client` or `metrics`
 
@@ -416,12 +436,34 @@ The workbench and MCP layers should orchestrate auth, tenant mapping, request sh
 **Responsibility:** BFS traversal to find shortest paths between two entities via graph edges. Explains how concepts are connected through the knowledge graph.
 
 **Interface:**
-- `find_chain(storage, ctx, source_id, dest_id, max_depth) -> Option<MemoryChain>`
+- `find_chain(storage, ctx, session_id, source_id, dest_id, max_depth) -> Option<MemoryChain>`
 - Returns path steps with edge types; confidence decays with hop count
+
+**Current behavior:** combines legacy `edge_list_for_entity` neighbors with
+session-scoped outgoing `typed_edge_list_from` neighbors, so edges created by
+MCP `edge` / `create_edge` or the graph API are traversable by
+`find_memory_chain`.
 
 **Dependencies:** `cql_client`
 
 **Size estimate:** ~230 lines
+
+### 20b. `turn_chain` — Captured Agent Turn Threading
+
+**Responsibility:** Links newly ingested `turn` entities into a temporal
+session thread and walks that thread for inspection.
+
+**Interface:**
+- `link_turn_to_predecessor(storage, ctx, session_id, new_turn)` — creates
+  bidirectional `next_turn` / `previous_turn` temporal edges when a prior turn
+  exists with an earlier timestamp
+- `walk_turn_chain_forward(storage, ctx, session_id, start_turn_id, limit)` —
+  returns turn entities in chronological arrival order
+- MCP tool: `get_turn_chain` / compact alias `turn_chain`
+
+**Dependencies:** `storage`, `types`
+
+**Size estimate:** ~500 lines including tests
 
 ---
 

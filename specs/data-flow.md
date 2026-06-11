@@ -4,10 +4,19 @@
 
 These diagrams distinguish between:
 
-- **current implementation** — where `ferrosa-memory` has completed public CQL/SPARQL/Cypher adaptation in operator surfaces, but still needs graph-boundary cleanup in serving-path writes
-- **target implementation** — where `ferrosa-memory` uses public protocols/contracts at the right abstraction level
+- **current serving implementation** — where `ferrosa-memory` uses direct CQL
+  for app-owned tables, public graph API calls for graph-owned edge writes, and
+  public query passthroughs for operator CQL/SPARQL surfaces
+- **remaining transition-state tooling** — maintenance utilities and older docs
+  that may still name graph-owned backing tables explicitly
 
-The target boundary is defined in [ADR-005](./decisions/adr-005-endpoint-only-ferrosa-client.md). Direct CQL is acceptable where `ferrosa-memory` is acting as an application client over app-owned tables. The remaining boundary gap is direct mutation of graph-owned backing tables from serving-path writes. If Ferrosa public query interfaces do not satisfy the required semantics, that is a Ferrosa bug and `ferrosa-memory` should fail loudly instead of papering over behavior locally.
+The target boundary is defined in [ADR-005](./decisions/adr-005-endpoint-only-ferrosa-client.md). Direct CQL is acceptable where `ferrosa-memory` is acting as an application client over app-owned tables. The previous serving-path boundary gap was direct mutation of graph-owned backing tables; that path now fails loud in direct `CqlStorage` and is routed through `GraphClient` in the running MCP service. If Ferrosa public query interfaces do not satisfy the required semantics, that is a Ferrosa bug and `ferrosa-memory` should fail loudly instead of papering over behavior locally.
+
+As of 2026-06-11, normal MCP serving-path graph edge writes use
+`GraphClient` behind `ReconnectingStorage`. Direct `CqlStorage` graph-edge
+writer methods return explicit graph-write errors, and tests/smoke coverage
+verify the same `typed_edges` rows are visible through MCP, graph API, and CQL
+read surfaces.
 
 ## 1. Tool Call Flow (All Tools)
 
@@ -40,9 +49,14 @@ sequenceDiagram
     T-->>C: result
 ```
 
-Current implementation note: the serving path still includes graph-table writes through direct `CqlStorage` access while Datalog remains an explicit local inference layer.
+Current implementation note: the serving path writes app-owned rows through
+`CqlStorage` and graph-owned edge rows through the graph client. Datalog remains
+an explicit local inference layer.
 
-Unless otherwise labeled as target-state, the remaining diagrams document the current implementation paths that still need to be refactored behind graph/public interfaces. They should not be read as the desired long-term architecture.
+Unless otherwise labeled as target-state, the remaining diagrams document the
+current implementation paths. Some operator query surfaces and maintenance
+tools still need cleanup behind public interfaces, but serving-path graph edge
+writes are already on the graph client boundary.
 
 ## 1b. Bulk `ingest_entities` Flow
 
@@ -72,7 +86,7 @@ sequenceDiagram
             E-->>BI: vectors or per-row failures
         end
         BI->>DB: UPSERT app-owned entity rows
-        BI->>G: write typed edges / graph-owned mutations
+        BI->>G: MERGE typed edges / graph-owned mutations
         BI-->>D: inserted/updated/skipped + failed[] + duration_ms
     end
     D-->>C: MCP result + progress notifications
@@ -82,6 +96,72 @@ Current implementation note: `ingest_entities` is implemented as the
 server-owned contract for semantic entities plus typed edges, with schema
 mapping, dry-run behavior, strict edge validation, and structured row-level
 failures owned by `ferrosa-memory`.
+
+## 1c. Typed Edge Write + Readback Flow
+
+```mermaid
+sequenceDiagram
+    participant A as Agent / Eval
+    participant D as dispatch
+    participant GW as graph_write
+    participant RS as ReconnectingStorage
+    participant G as Ferrosa Graph API
+    participant CQL as Ferrosa CQL typed_edges
+    participant CH as chains/explore
+
+    A->>D: edge/create_edge(session, src, type, dst)
+    D->>GW: create_typed_edge(...)
+    GW->>RS: typed_edge_put(edge)
+    RS->>G: MERGE scoped TYPED_EDGE
+    G-->>RS: mutation accepted
+    RS-->>GW: ok
+    D-->>A: {created: true}
+
+    A->>G: scoped graph MATCH
+    G-->>A: TYPED_EDGE row
+    A->>CQL: SELECT typed_edges
+    CQL-->>A: same row
+    A->>D: find_memory_chain / explore_connections
+    D->>CH: typed_edge_list_from + legacy neighbors
+    CH-->>D: traversable path/neighborhood
+    D-->>A: MCP traversal result
+```
+
+Important constraints:
+
+- Graph API reads require scoped `tenant_id`, `session_id`, and entity IDs on
+  `Entity` patterns.
+- Ferrosa graph currently accepts scoped one-hop `TYPED_EDGE` traversals. The
+  MCP `find_memory_chain` tool performs multi-hop traversal over typed-edge
+  reads so evaluation can still verify graph paths.
+- `CqlStorage::typed_edge_put` fails loud; production serving writes must pass
+  through `ReconnectingStorage`.
+
+## 1d. Captured Turn Chain Flow
+
+```mermaid
+sequenceDiagram
+    participant H as Agent Hook
+    participant D as dispatch
+    participant DB as entity_store
+    participant T as temporal_edges
+    participant TC as turn_chain
+    participant A as Agent
+
+    H->>D: ingest_entities(turn entity)
+    D->>DB: insert turn row
+    D->>TC: link_turn_to_predecessor(session, turn)
+    TC->>DB: list earlier turn entities in session
+    alt predecessor exists
+        TC->>T: next_turn predecessor -> turn
+        TC->>T: previous_turn turn -> predecessor
+    end
+    A->>D: turn_chain(start_turn_id)
+    D->>TC: walk_turn_chain_forward(...)
+    TC->>T: follow next_turn edges
+    TC->>DB: load each turn entity
+    D-->>A: ordered turn list
+```
 
 ## 2. Memoization Write Path
 

@@ -66,7 +66,9 @@ curl -fsSL https://ferrosadb.com/setup-memory.sh | bash
 
 `setup-memory.sh` should use this `ONBOARDING.md` as its source of truth for skills, hints, hooks, prompts, runtime choices, credentials, and ports. It should not require users to clone either repo manually unless they choose a source build or local development workflow.
 
-If the user already has a repository checkout, use the repo-local setup script. It builds the MCP binary by default, installs/restarts the macOS LaunchAgent when available, writes Codex/Claude/Hermes hook wrappers, patches supported harness config files, and verifies the default MCP tool list includes `ingest`:
+If the user already has a repository checkout, use the repo-local setup script. It builds the MCP binary by default, installs/restarts the macOS LaunchAgent when available, writes Codex/Claude/Hermes hook wrappers, patches supported harness config files, and verifies the default MCP tool list includes `ingest`.
+
+The compact tool list should also include `edge` and `turn_chain`; use `all_tools` when a harness needs the full catalog.
 
 ```bash
 cd ~/src/ferrosa-suite/ferrosa-memory
@@ -331,6 +333,7 @@ Success criteria:
 - `/healthz/ready` returns `ready`.
 - `/viz` returns HTML.
 - `tools/list` includes memory tools.
+- Compact `tools/list` includes `edge` for typed edge creation and `turn_chain` for captured-turn traversal.
 - `get_stats` returns JSON, not a timeout.
 
 ---
@@ -465,22 +468,25 @@ The installer detects local Codex, Claude, and Hermes harnesses. It writes wrapp
 Generated wrappers:
 
 ```text
+<harness>-session-start.sh
 <harness>-recall.sh
 <harness>-ingest-turn.sh
 ```
 
-The recall wrapper calls `check_intentions` and `hybrid_search` with the current working directory. The ingest wrapper stores:
+The session-start wrapper calls `configure` once with harness session metadata so the MCP server creates and stores the active Ferrosa Memory `session_id`. Agents should not generate or remember Ferrosa Memory UUIDs in prompts. The recall wrapper calls `check_intentions` and `hybrid_search` with the current working directory. The ingest wrapper asks Ferrosa Memory for the active session and stores:
 
 - a durable `turn` entity with `cwd`, `workspace`, and `working_directory` attributes;
+- automatic temporal `next_turn` and `previous_turn` links between successive captured turns in the same session, queryable through `turn_chain`;
 - deterministic context segments through `ctx_ingest`, including user, assistant, and tool artifacts when the harness payload exposes them;
 - session, turn, harness, and cwd metadata so later retrieval and reranking can prefer knowledge learned in the same repo.
 
 This is the intended session-memory loop:
 
-1. Pre-turn recall injects relevant memories for the active working directory.
-2. Turn-end capture stores the trajectory and surrounding context.
-3. Search/rerank uses cwd/workspace metadata and later `feedback`/`outcome` signals to adjust future rankings.
-4. The agent should call `feedback` with `+1`/`-1` item feedback after retrieval, and call `outcome` for broader task success/failure when it can identify the relevant entity IDs.
+1. Session-start hook establishes the active Ferrosa Memory session mechanically.
+2. Pre-turn recall injects relevant memories for the active working directory.
+3. Turn-end capture stores the trajectory and surrounding context.
+4. Search/rerank uses cwd/workspace metadata and later `feedback`/`outcome` signals to adjust future rankings.
+5. The agent should call `feedback` with `+1`/`-1` item feedback after retrieval, and call `outcome` for broader task success/failure when it can identify the relevant entity IDs.
 
 Default endpoint:
 
@@ -508,9 +514,9 @@ export FERROSA_MEMORY_AUTH_HEADER='Basic <base64 user:password>'
 
 Harness config behavior:
 
-- Claude Code: patches `~/.claude/settings.json` with `UserPromptSubmit`, `Stop`, `SubagentStop`, and `PreCompact` hooks, with a timestamped backup.
-- Hermes: patches `~/.hermes/config.yaml` only when the existing `hooks` block is empty, with a timestamped backup.
-- Codex: patches `~/.codex/hooks.json` with `UserPromptSubmit`, `Stop`, `SubagentStop`, and `PreCompact` hooks when that file is available or can be created, with a timestamped backup when modifying an existing file.
+- Claude Code: patches `~/.claude/settings.json` with `SessionStart`, `UserPromptSubmit`, `Stop`, `SubagentStop`, and `PreCompact` hooks, with a timestamped backup.
+- Hermes: patches `~/.hermes/config.yaml` only when the existing `hooks` block is empty, adding session-start, recall, and turn-finalization hooks with a timestamped backup.
+- Codex: patches `~/.codex/hooks.json` with `SessionStart`, `UserPromptSubmit`, `Stop`, `SubagentStop`, and `PreCompact` hooks when that file is available or can be created, with a timestamped backup when modifying an existing file.
 
 For a config-only dry run that still refreshes wrapper scripts but does not patch harness config files:
 
@@ -540,6 +546,8 @@ export FERROSA_MEMORY_HOOK_SEARCH_LIMIT=${FERROSA_MEMORY_HOOK_SEARCH_LIMIT:-5}
 export FERROSA_MEMORY_HOOK_CAPTURE_SEGMENTS=${FERROSA_MEMORY_HOOK_CAPTURE_SEGMENTS:-true}
 export FERROSA_MEMORY_HOOK_EMBED_MISSING=${FERROSA_MEMORY_HOOK_EMBED_MISSING:-false}
 ```
+
+The hook installer configures supported harness hook timeouts at 10 seconds by default. The hook script remains best-effort and exits zero on recoverable failures, but a local override can still lower or raise `FERROSA_MEMORY_HOOK_TIMEOUT`.
 
 Hook safety rules:
 
@@ -610,6 +618,29 @@ To reduce token usage at runtime, call:
   "tool": "get_stats",
   "arguments": {}
 }
+```
+
+### Connect graph entities
+
+The compact `edge` tool is the default way to insert typed graph edges from an agent. It writes through Ferrosa's graph API in the serving path and is readable through CQL-backed typed-edge APIs, graph queries, `explore_connections`, and `find_memory_chain`.
+
+```json
+{
+  "tool": "edge",
+  "arguments": {
+    "session_id": "<session UUID>",
+    "src_entity_id": "<source entity UUID>",
+    "dst_entity_id": "<destination entity UUID>",
+    "edge_type": "references",
+    "weight": 0.75
+  }
+}
+```
+
+To verify graph and MCP traversal in one command against the default local stack:
+
+```bash
+bash scripts/smoke-18765.sh
 ```
 
 ---

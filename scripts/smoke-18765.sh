@@ -76,24 +76,41 @@ PY
 }
 
 auth_curl() {
-  curl -sS "${CURL_TLS_OPTS[@]}" -u "${USERNAME}:${PASSWORD}" "$@"
+  if [[ ${#CURL_TLS_OPTS[@]} -gt 0 ]]; then
+    curl -sS "${CURL_TLS_OPTS[@]}" -u "${USERNAME}:${PASSWORD}" "$@"
+  else
+    curl -sS -u "${USERNAME}:${PASSWORD}" "$@"
+  fi
 }
 
 admin_curl() {
-  curl -sS "${CURL_TLS_OPTS[@]}" -u "${ADMIN_USER}:${ADMIN_PASSWORD}" "$@"
+  if [[ ${#CURL_TLS_OPTS[@]} -gt 0 ]]; then
+    curl -sS "${CURL_TLS_OPTS[@]}" -u "${ADMIN_USER}:${ADMIN_PASSWORD}" "$@"
+  else
+    curl -sS -u "${ADMIN_USER}:${ADMIN_PASSWORD}" "$@"
+  fi
+}
+
+health_curl() {
+  if [[ ${#CURL_TLS_OPTS[@]} -gt 0 ]]; then
+    curl -sS "${CURL_TLS_OPTS[@]}" "$@"
+  else
+    curl -sS "$@"
+  fi
 }
 
 say "== Ferrosa Memory smoke on ${BASE_URL} =="
 
-LIVE="$(curl -sS "${CURL_TLS_OPTS[@]}" "${BASE_URL}/healthz/live" || true)"
+LIVE="$(health_curl "${BASE_URL}/healthz/live" || true)"
 [[ "${LIVE}" == "ok" ]] || fail "live probe failed: ${LIVE}"
 say "live: ok"
 
-READY="$(curl -sS "${CURL_TLS_OPTS[@]}" "${BASE_URL}/healthz/ready" || true)"
+READY="$(health_curl "${BASE_URL}/healthz/ready" || true)"
 [[ "${READY}" == "ready" ]] || fail "ready probe failed: ${READY}"
 say "ready: ready"
 
-VIZ_HEAD="$(curl -sS "${VIZ_URL}" | head -c 64 || true)"
+VIZ_HEAD="$(curl -sS "${VIZ_URL}" || true)"
+VIZ_HEAD="${VIZ_HEAD:0:64}"
 [[ "${VIZ_HEAD}" == *"<!DOCTYPE html>"* ]] || fail "viz did not return HTML"
 say "viz: html"
 
@@ -104,7 +121,8 @@ python3 - "${TMP_DIR}/tools.json" <<'PY'
 import json, sys
 data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
 tools = data["result"]["tools"]
-assert any(tool["name"] == "create_edge" for tool in tools), "create_edge missing from tools/list"
+assert any(tool["name"] == "edge" for tool in tools), "edge missing from compact tools/list"
+assert any(tool["name"] == "turn_chain" for tool in tools), "turn_chain missing from tools/list"
 print(f"tools/list: {len(tools)} tools")
 PY
 
@@ -148,7 +166,7 @@ else
 fi
 
 cat > "${TMP_DIR}/create-edge.json" <<EOF
-{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_edge","arguments":{"session_id":"${SESSION_ID}","src_entity_id":"${SRC_ID}","dst_entity_id":"${DST_ID}","edge_type":"references","weight":0.75}}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"edge","arguments":{"session_id":"${SESSION_ID}","src_entity_id":"${SRC_ID}","dst_entity_id":"${DST_ID}","edge_type":"references","weight":0.75}}}
 EOF
 auth_curl -H 'content-type: application/json' \
   --data @"${TMP_DIR}/create-edge.json" \
@@ -173,20 +191,71 @@ EDGE_COUNT="$(json_get "${TMP_DIR}/edge-cql.json" count)"
 say "create_edge CQL readback: pass"
 
 cat > "${TMP_DIR}/graph-readback.json" <<EOF
-{"query":"MATCH (a:Entity {entity_id: '${SRC_ID}'})-[r:TYPED_EDGE]->(b:Entity {entity_id: '${DST_ID}'}) WHERE r.edge_type = 'references' RETURN r.edge_type, r.weight","keyspace":"agent_memory"}
+{"query":"MATCH (a:Entity {tenant_id: '${TENANT_ID}', session_id: '${SESSION_ID}', entity_id: '${SRC_ID}'})-[r:TYPED_EDGE {tenant_id: '${TENANT_ID}', session_id: '${SESSION_ID}', edge_type: 'references'}]->(b:Entity {tenant_id: '${TENANT_ID}', session_id: '${SESSION_ID}', entity_id: '${DST_ID}'}) RETURN r.edge_type, r.weight","keyspace":"agent_memory"}
 EOF
-if admin_curl -H 'content-type: application/json' \
+admin_curl -H 'content-type: application/json' \
   --data @"${TMP_DIR}/graph-readback.json" \
-  "${GRAPH_URL}/graph/query" > "${TMP_DIR}/graph-readback-result.json"; then
-  python3 - "${TMP_DIR}/graph-readback-result.json" <<'PY' || true
+  "${GRAPH_URL}/graph/query" > "${TMP_DIR}/graph-readback-result.json"
+python3 - "${TMP_DIR}/graph-readback-result.json" <<'PY'
 import json, sys
 data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
 rows = data.get("rows", [])
-if rows:
-    print("graph readback: pass")
-else:
-    print("graph readback: KNOWN ISSUE rows=[]")
+assert rows, f"graph readback returned no rows: {data}"
+print("graph readback: pass")
 PY
-fi
+
+cat > "${TMP_DIR}/graph-traversal.json" <<EOF
+{"query":"MATCH (start:Entity {tenant_id: '${TENANT_ID}', session_id: '${SESSION_ID}', entity_id: '${SRC_ID}'})-[r:TYPED_EDGE {tenant_id: '${TENANT_ID}', session_id: '${SESSION_ID}'}]->(related:Entity {tenant_id: '${TENANT_ID}', session_id: '${SESSION_ID}'}) RETURN DISTINCT related.entity_id AS related_id","keyspace":"agent_memory"}
+EOF
+admin_curl -H 'content-type: application/json' \
+  --data @"${TMP_DIR}/graph-traversal.json" \
+  "${GRAPH_URL}/graph/query" > "${TMP_DIR}/graph-traversal-result.json"
+python3 - "${TMP_DIR}/graph-traversal-result.json" "${DST_ID}" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+dst = sys.argv[2]
+rows = data.get("rows", [])
+assert any(row and row[0] == dst for row in rows), f"graph traversal missing destination {dst}: {data}"
+print("graph typed-edge one-hop traversal: pass")
+PY
+
+cat > "${TMP_DIR}/chain-readback.json" <<EOF
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"chain","arguments":{"session_id":"${SESSION_ID}","source":"${SRC_ID}","destination":"${DST_ID}","max_hops":2}}}
+EOF
+auth_curl -H 'content-type: application/json' \
+  --data @"${TMP_DIR}/chain-readback.json" \
+  "${BASE_URL}/mcp" > "${TMP_DIR}/chain-readback-result.json"
+python3 - "${TMP_DIR}/chain-readback-result.json" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+payload = json.loads(data["result"]["content"][0]["text"])
+assert payload.get("hop_count") == 1, payload
+assert payload["steps"][0]["edge_type"] == "references", payload
+print("find_memory_chain typed edge readback: pass")
+PY
+
+cat > "${TMP_DIR}/graph-mutation.json" <<EOF
+{"query":"MERGE (a:Entity {tenant_id: '${TENANT_ID}', session_id: '${SESSION_ID}', entity_id: '${SRC_ID}'}) MERGE (b:Entity {tenant_id: '${TENANT_ID}', session_id: '${SESSION_ID}', entity_id: '${DST_ID}'}) MERGE (a)-[r:TYPED_EDGE {tenant_id: '${TENANT_ID}', session_id: '${SESSION_ID}', edge_type: 'graph_api_smoke'}]->(b) SET r.weight = 0.33, r.metadata = 'smoke', r.created_at = '$(date -u +"%Y-%m-%dT%H:%M:%SZ")' RETURN r.edge_type","keyspace":"agent_memory"}
+EOF
+admin_curl -H 'content-type: application/json' \
+  --data @"${TMP_DIR}/graph-mutation.json" \
+  "${GRAPH_URL}/graph/query" > "${TMP_DIR}/graph-mutation-result.json"
+python3 - "${TMP_DIR}/graph-mutation-result.json" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+assert not data.get("error"), data
+assert data.get("rows"), data
+print("graph API mutation: pass")
+PY
+
+cat > "${TMP_DIR}/graph-edge-query.json" <<EOF
+{"query":"SELECT tenant_id, session_id, src_id, edge_type, dst_id, weight FROM agent_memory.typed_edges WHERE tenant_id = ${TENANT_ID} AND session_id = ${SESSION_ID} AND src_id = ${SRC_ID} AND edge_type = 'graph_api_smoke' AND dst_id = ${DST_ID}"}
+EOF
+auth_curl -H 'content-type: application/json' \
+  --data @"${TMP_DIR}/graph-edge-query.json" \
+  "${BASE_URL}/workbench/api/cql/query" > "${TMP_DIR}/graph-edge-cql.json"
+GRAPH_EDGE_COUNT="$(json_get "${TMP_DIR}/graph-edge-cql.json" count)"
+[[ "${GRAPH_EDGE_COUNT}" -ge 1 ]] || fail "graph API edge row not found in typed_edges"
+say "graph API CQL readback: pass"
 
 say "== smoke complete =="

@@ -2235,6 +2235,16 @@ pub mod mock {
                     neighbors.push((e.source, e.edge_type.clone()));
                 }
             }
+            drop(edges);
+
+            let typed_edges = self.typed_edges.lock().await;
+            for e in typed_edges.iter() {
+                if e.src_id == entity_id {
+                    neighbors.push((e.dst_id, e.edge_type.clone()));
+                } else if e.dst_id == entity_id {
+                    neighbors.push((e.src_id, e.edge_type.clone()));
+                }
+            }
             Ok(neighbors)
         }
 
