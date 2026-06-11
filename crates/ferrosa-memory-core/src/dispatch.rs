@@ -182,8 +182,9 @@ pub struct SessionState {
     pub retrieval_tracker: Arc<Mutex<RetrievalTracker>>,
     pub co_access: Arc<Mutex<crate::speculative::CoAccessTracker>>,
     /// Configured default session_id for cross-session memory continuity.
-    /// Falls back to random UUID if not set.
     pub default_session_id: Option<uuid::Uuid>,
+    /// Runtime session_id selected by a mechanical session-start hook.
+    pub runtime_session_id: Arc<std::sync::RwLock<Option<uuid::Uuid>>>,
     /// Repository path for intention scoping (from CLAUDE_PROJECT_DIR, config, or MCP initialize roots).
     pub repo: std::sync::OnceLock<String>,
     /// Notified on every tool call; used by the idle consolidation timer.
@@ -234,6 +235,7 @@ impl Default for SessionState {
             retrieval_tracker: Arc::new(Mutex::new(RetrievalTracker::new())),
             co_access: Arc::new(Mutex::new(crate::speculative::CoAccessTracker::new(10))),
             default_session_id: None,
+            runtime_session_id: Arc::new(std::sync::RwLock::new(None)),
             repo: std::sync::OnceLock::new(),
             last_activity: Arc::new(tokio::sync::Notify::new()),
             dirty: Arc::new(AtomicBool::new(false)),
@@ -254,6 +256,27 @@ impl Default for SessionState {
             retrieval_default_limit: Arc::new(AtomicUsize::new(DEFAULT_RETRIEVAL_LIMIT)),
             system_info: Arc::new(crate::system_describe::SystemInfo::default()),
         }
+    }
+}
+
+impl SessionState {
+    pub fn effective_default_session_id(&self) -> Option<uuid::Uuid> {
+        self.runtime_session_id
+            .read()
+            .ok()
+            .and_then(|guard| *guard)
+            .or(self.default_session_id)
+    }
+
+    fn set_runtime_session_id(&self, session_id: uuid::Uuid) -> Result<(), (i32, String)> {
+        let mut guard = self.runtime_session_id.write().map_err(|_| {
+            (
+                INTERNAL_ERROR,
+                "runtime session_id lock poisoned".to_string(),
+            )
+        })?;
+        *guard = Some(session_id);
+        Ok(())
     }
 }
 
@@ -527,11 +550,11 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "format": "uuid", "description": "Session partition for the turn chain" },
+                    "session_id": { "type": "string", "description": "Session partition for the turn chain. Omit or pass \"default\" to use the configured default session." },
                     "start_turn_id": { "type": "string", "format": "uuid", "description": "Entity ID of the first turn to include" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 20, "description": "Maximum number of turns to return" }
                 },
-                "required": ["session_id", "start_turn_id"]
+                "required": ["start_turn_id"]
             }),
         },
         ToolDef {
@@ -938,10 +961,37 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "configure".into(),
-            description: "Read or update compact runtime defaults. Use retrieval_limit to reduce or expand default search results when omitted by retrieval calls.".into(),
+            description: "Read or update compact runtime defaults. Session-start hooks call this to let fmem create and store the active session_id; retrieval_limit controls default search result count.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
+                    "session_start": {
+                        "oneOf": [
+                            { "type": "boolean" },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "agent": { "type": "string", "maxLength": 128 },
+                                    "agent_session_id": { "type": "string", "maxLength": 512 },
+                                    "external_session_id": { "type": "string", "maxLength": 512 },
+                                    "thread_id": { "type": "string", "maxLength": 512 },
+                                    "workspace": { "type": "string", "maxLength": 2048 },
+                                    "cwd": { "type": "string", "maxLength": 2048 }
+                                }
+                            }
+                        ],
+                        "description": "Set by a deterministic agent SessionStart hook. fmem creates/stores the active session_id from this metadata."
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Optional explicit fmem UUID to install as the active runtime session. Hooks normally omit this."
+                    },
+                    "agent": { "type": "string", "maxLength": 128 },
+                    "agent_session_id": { "type": "string", "maxLength": 512 },
+                    "external_session_id": { "type": "string", "maxLength": 512 },
+                    "thread_id": { "type": "string", "maxLength": 512 },
+                    "workspace": { "type": "string", "maxLength": 2048 },
+                    "cwd": { "type": "string", "maxLength": 2048 },
                     "retrieval_limit": {
                         "type": "integer",
                         "minimum": MIN_RETRIEVAL_LIMIT,
@@ -1939,7 +1989,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         .cloned()
         .unwrap_or(Value::Object(serde_json::Map::new()));
 
-    resolve_session_id(&mut args, session.default_session_id)?;
+    resolve_session_id(&mut args, session.effective_default_session_id())?;
 
     tracing::debug!(
         tool = canonical_name,
@@ -5260,12 +5310,75 @@ async fn handle_record_feedback<S: crate::storage::Storage>(
     }))
 }
 
+fn nested_or_flat_str(args: &Value, field: &str) -> Option<String> {
+    args.get("session_start")
+        .and_then(|v| v.as_object())
+        .and_then(|obj| obj.get(field))
+        .or_else(|| args.get(field))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn configure_requests_session_start(args: &Value) -> bool {
+    matches!(args.get("session_start"), Some(Value::Bool(true)))
+        || args
+            .get("session_start")
+            .and_then(|v| v.as_object())
+            .is_some()
+        || args.get("session_id").is_some()
+        || nested_or_flat_str(args, "agent_session_id").is_some()
+        || nested_or_flat_str(args, "external_session_id").is_some()
+        || nested_or_flat_str(args, "thread_id").is_some()
+}
+
+fn configured_runtime_session_id(
+    args: &Value,
+) -> Result<Option<(uuid::Uuid, String)>, (i32, String)> {
+    if !configure_requests_session_start(args) {
+        return Ok(None);
+    }
+
+    if let Some(raw) = nested_or_flat_str(args, "session_id") {
+        let session_id = uuid::Uuid::parse_str(&raw).map_err(|e| {
+            (
+                INVALID_PARAMS,
+                format!("session_id is not a valid UUID: {e}"),
+            )
+        })?;
+        return Ok(Some((session_id, "explicit_session_id".to_string())));
+    }
+
+    let agent = nested_or_flat_str(args, "agent").unwrap_or_else(|| "unknown-agent".to_string());
+    let workspace = nested_or_flat_str(args, "workspace")
+        .or_else(|| nested_or_flat_str(args, "cwd"))
+        .unwrap_or_else(|| "unknown-workspace".to_string());
+    let external = nested_or_flat_str(args, "agent_session_id")
+        .or_else(|| nested_or_flat_str(args, "external_session_id"))
+        .or_else(|| nested_or_flat_str(args, "thread_id"));
+
+    let Some(external) = external else {
+        return Ok(Some((
+            uuid::Uuid::new_v4(),
+            "generated_session_start".to_string(),
+        )));
+    };
+
+    let key = format!("ferrosa-memory:agent-session:v1:{agent}:{workspace}:{external}");
+    Ok(Some((
+        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, key.as_bytes()),
+        "derived_from_agent_session".to_string(),
+    )))
+}
+
 async fn handle_configure(args: Value, session: &SessionState) -> Result<Value, (i32, String)> {
     let requested = args
         .get("retrieval_limit")
         .or_else(|| args.get("default_limit"))
         .and_then(|v| v.as_u64());
-    let updated = if let Some(raw) = requested {
+    let mut updated = false;
+    if let Some(raw) = requested {
         let value = raw as usize;
         if !(MIN_RETRIEVAL_LIMIT..=MAX_RETRIEVAL_LIMIT).contains(&value) {
             return Err((
@@ -5278,17 +5391,25 @@ async fn handle_configure(args: Value, session: &SessionState) -> Result<Value, 
         session
             .retrieval_default_limit
             .store(value, Ordering::Relaxed);
-        true
-    } else {
-        false
-    };
+        updated = true;
+    }
+
+    let session_update = configured_runtime_session_id(&args)?;
+    let session_source = session_update.as_ref().map(|(_, source)| source.clone());
+    if let Some((session_id, _)) = session_update {
+        session.set_runtime_session_id(session_id)?;
+        updated = true;
+    }
+    let effective_session_id = session.effective_default_session_id();
 
     Ok(serde_json::json!({
         "updated": updated,
         "retrieval_limit": retrieval_default_limit(session),
         "min_retrieval_limit": MIN_RETRIEVAL_LIMIT,
         "max_retrieval_limit": MAX_RETRIEVAL_LIMIT,
-        "hint": "Pass retrieval_limit when searches are too sparse or too token-heavy. Individual calls can still override with limit/k."
+        "session_id": effective_session_id.map(|id| id.to_string()),
+        "session_source": session_source,
+        "hint": "SessionStart hooks should call configure with session_start metadata once; fmem stores the active session_id. Individual retrieval calls can still override limit/k."
     }))
 }
 
@@ -8381,7 +8502,7 @@ async fn handle_recursive_explore<S: crate::storage::Storage>(
 ) -> Result<Value, (i32, String)> {
     let query = require_str(&args, "query")?;
     let session_id = optional_uuid(&args, "session_id")?
-        .or(session.default_session_id)
+        .or_else(|| session.effective_default_session_id())
         .unwrap_or(uuid::Uuid::nil());
 
     // Parse optional embedding
@@ -12665,6 +12786,71 @@ mod tests {
         .unwrap();
         let narrowed = unwrap_tool_result(narrowed);
         assert_eq!(narrowed["count"], 1);
+    }
+
+    #[tokio::test]
+    async fn configure_session_start_sets_runtime_session_without_llm_supplied_uuid() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            ollama_base_url: String::new(),
+            ..SessionState::default()
+        };
+
+        let configured = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "config",
+                "arguments": {
+                    "session_start": {
+                        "agent": "claude",
+                        "agent_session_id": "claude-runtime-session-1",
+                        "workspace": "/repo/ferrosa-memory"
+                    }
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let configured = unwrap_tool_result(configured);
+        let sid = Uuid::parse_str(configured["session_id"].as_str().unwrap()).unwrap();
+        let expected = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            b"ferrosa-memory:agent-session:v1:claude:/repo/ferrosa-memory:claude-runtime-session-1",
+        );
+        assert_eq!(sid, expected);
+
+        store.entities.lock().await.push(crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "HookSessionMemory".into(),
+            entity_type: "concept".into(),
+            context_snippet: "memory written under the hook-configured session".into(),
+            confidence: 0.9,
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        });
+
+        let found = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "hybrid_search",
+                "arguments": {
+                    "query": "HookSessionMemory"
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let found = unwrap_tool_result(found);
+        assert_eq!(found["count"], 1);
     }
 
     #[tokio::test]

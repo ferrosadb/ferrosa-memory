@@ -468,11 +468,12 @@ The installer detects local Codex, Claude, and Hermes harnesses. It writes wrapp
 Generated wrappers:
 
 ```text
+<harness>-session-start.sh
 <harness>-recall.sh
 <harness>-ingest-turn.sh
 ```
 
-The recall wrapper calls `check_intentions` and `hybrid_search` with the current working directory. The ingest wrapper stores:
+The session-start wrapper calls `configure` once with harness session metadata so the MCP server creates and stores the active Ferrosa Memory `session_id`. Agents should not generate or remember Ferrosa Memory UUIDs in prompts. The recall wrapper calls `check_intentions` and `hybrid_search` with the current working directory. The ingest wrapper asks Ferrosa Memory for the active session and stores:
 
 - a durable `turn` entity with `cwd`, `workspace`, and `working_directory` attributes;
 - automatic temporal `next_turn` and `previous_turn` links between successive captured turns in the same session, queryable through `turn_chain`;
@@ -481,10 +482,11 @@ The recall wrapper calls `check_intentions` and `hybrid_search` with the current
 
 This is the intended session-memory loop:
 
-1. Pre-turn recall injects relevant memories for the active working directory.
-2. Turn-end capture stores the trajectory and surrounding context.
-3. Search/rerank uses cwd/workspace metadata and later `feedback`/`outcome` signals to adjust future rankings.
-4. The agent should call `feedback` with `+1`/`-1` item feedback after retrieval, and call `outcome` for broader task success/failure when it can identify the relevant entity IDs.
+1. Session-start hook establishes the active Ferrosa Memory session mechanically.
+2. Pre-turn recall injects relevant memories for the active working directory.
+3. Turn-end capture stores the trajectory and surrounding context.
+4. Search/rerank uses cwd/workspace metadata and later `feedback`/`outcome` signals to adjust future rankings.
+5. The agent should call `feedback` with `+1`/`-1` item feedback after retrieval, and call `outcome` for broader task success/failure when it can identify the relevant entity IDs.
 
 Default endpoint:
 
@@ -512,9 +514,9 @@ export FERROSA_MEMORY_AUTH_HEADER='Basic <base64 user:password>'
 
 Harness config behavior:
 
-- Claude Code: patches `~/.claude/settings.json` with `UserPromptSubmit`, `Stop`, `SubagentStop`, and `PreCompact` hooks, with a timestamped backup.
-- Hermes: patches `~/.hermes/config.yaml` only when the existing `hooks` block is empty, with a timestamped backup.
-- Codex: patches `~/.codex/hooks.json` with `UserPromptSubmit`, `Stop`, `SubagentStop`, and `PreCompact` hooks when that file is available or can be created, with a timestamped backup when modifying an existing file.
+- Claude Code: patches `~/.claude/settings.json` with `SessionStart`, `UserPromptSubmit`, `Stop`, `SubagentStop`, and `PreCompact` hooks, with a timestamped backup.
+- Hermes: patches `~/.hermes/config.yaml` only when the existing `hooks` block is empty, adding session-start, recall, and turn-finalization hooks with a timestamped backup.
+- Codex: patches `~/.codex/hooks.json` with `SessionStart`, `UserPromptSubmit`, `Stop`, `SubagentStop`, and `PreCompact` hooks when that file is available or can be created, with a timestamped backup when modifying an existing file.
 
 For a config-only dry run that still refreshes wrapper scripts but does not patch harness config files:
 

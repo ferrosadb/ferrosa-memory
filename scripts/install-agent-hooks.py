@@ -124,6 +124,7 @@ def create_wrappers(install_dir: Path, hook_path: Path, mcp_url: str, harnesses:
     wrappers: dict[str, dict[str, str]] = {}
     for harness in harnesses:
         fmt = wrapper_format(harness)
+        start = install_dir / f"{harness}-session-start.sh"
         recall = install_dir / f"{harness}-recall.sh"
         ingest = install_dir / f"{harness}-ingest-turn.sh"
         common = "\n".join(
@@ -137,6 +138,12 @@ def create_wrappers(install_dir: Path, hook_path: Path, mcp_url: str, harnesses:
             ]
         )
         write_executable(
+            start,
+            common
+            + "exec python3 \"$HOOK\" "
+            + f"--harness {harness} --format {fmt} --mode session-start --event session-start \"$@\"\n",
+        )
+        write_executable(
             recall,
             common
             + "exec python3 \"$HOOK\" "
@@ -148,7 +155,11 @@ def create_wrappers(install_dir: Path, hook_path: Path, mcp_url: str, harnesses:
             + "exec python3 \"$HOOK\" "
             + f"--harness {harness} --format plain --mode ingest-turn --event turn-end \"$@\"\n",
         )
-        wrappers[harness] = {"recall": str(recall), "ingest_turn": str(ingest)}
+        wrappers[harness] = {
+            "session_start": str(start),
+            "recall": str(recall),
+            "ingest_turn": str(ingest),
+        }
     return wrappers
 
 
@@ -233,6 +244,7 @@ def patch_claude(settings_path: Path, wrappers: dict[str, str], dry_run: bool) -
         return f"Claude settings not found at {settings_path}; snippet written only."
     settings = json.loads(settings_path.read_text())
     changed = False
+    changed |= ensure_hook(settings, "SessionStart", wrappers["session_start"])
     changed |= ensure_hook(settings, "UserPromptSubmit", wrappers["recall"])
     changed |= ensure_hook(settings, "Stop", wrappers["ingest_turn"])
     changed |= ensure_hook(settings, "SubagentStop", wrappers["ingest_turn"])
@@ -255,6 +267,12 @@ def patch_codex(hooks_path: Path, wrappers: dict[str, str], dry_run: bool) -> st
     else:
         settings = {}
     changed = False
+    changed |= ensure_hook_with_entry(
+        settings,
+        "SessionStart",
+        wrappers["session_start"],
+        codex_hook_entry(wrappers["session_start"], "Starting Ferrosa Memory session"),
+    )
     changed |= ensure_hook_with_entry(
         settings,
         "UserPromptSubmit",
@@ -295,6 +313,9 @@ def hermes_block(wrappers: dict[str, str]) -> str:
     return "\n".join(
         [
             "hooks:",
+            "  on_session_start:",
+            f"    - command: {json.dumps(wrappers['session_start'])}",
+            f"      timeout: {DEFAULT_HOOK_TIMEOUT_SECONDS}",
             "  pre_llm_call:",
             f"    - command: {json.dumps(wrappers['recall'])}",
             f"      timeout: {DEFAULT_HOOK_TIMEOUT_SECONDS}",
@@ -333,6 +354,7 @@ def write_snippets(install_dir: Path, wrappers: dict[str, dict[str, str]]) -> No
             json.dumps(
                 {
                     "hooks": {
+                        "SessionStart": [{"hooks": [hook_entry(wrappers["claude"]["session_start"])]}],
                         "UserPromptSubmit": [{"hooks": [hook_entry(wrappers["claude"]["recall"])]}],
                         "Stop": [{"hooks": [hook_entry(wrappers["claude"]["ingest_turn"])]}],
                         "SubagentStop": [{"hooks": [hook_entry(wrappers["claude"]["ingest_turn"])]}],
@@ -350,6 +372,16 @@ def write_snippets(install_dir: Path, wrappers: dict[str, dict[str, str]]) -> No
             json.dumps(
                 {
                     "hooks": {
+                        "SessionStart": [
+                            {
+                                "hooks": [
+                                    codex_hook_entry(
+                                        wrappers["codex"]["session_start"],
+                                        "Starting Ferrosa Memory session",
+                                    )
+                                ]
+                            }
+                        ],
                         "UserPromptSubmit": [
                             {
                                 "hooks": [
@@ -481,6 +513,7 @@ def main() -> int:
         log(result)
     if args.verify:
         for harness, commands in wrappers.items():
+            log(f"{harness} session-start verification: {verify_wrapper(commands['session_start'], 'session-start')}")
             log(f"{harness} recall verification: {verify_wrapper(commands['recall'], 'recall')}")
             log(f"{harness} ingest verification: {verify_wrapper(commands['ingest_turn'], 'ingest-turn')}")
     log(f"wrote manifest: {manifest_path}")
