@@ -159,11 +159,18 @@ def backup(path: Path) -> Path:
     return backup_path
 
 
-def hook_entry(command: str, timeout: int = 3) -> dict[str, object]:
+DEFAULT_HOOK_TIMEOUT_SECONDS = 10
+
+
+def hook_entry(command: str, timeout: int = DEFAULT_HOOK_TIMEOUT_SECONDS) -> dict[str, object]:
     return {"type": "command", "command": command, "timeout": timeout}
 
 
-def codex_hook_entry(command: str, status_message: str, timeout: int = 3) -> dict[str, object]:
+def codex_hook_entry(
+    command: str,
+    status_message: str,
+    timeout: int = DEFAULT_HOOK_TIMEOUT_SECONDS,
+) -> dict[str, object]:
     return {"type": "command", "command": command, "timeout": timeout, "statusMessage": status_message}
 
 
@@ -179,6 +186,9 @@ def ensure_hook(settings: dict[str, object], event: str, command: str, matcher: 
             continue
         for hook in entry.get("hooks", []) or []:
             if isinstance(hook, dict) and hook.get("command") == command:
+                if hook.get("timeout") != DEFAULT_HOOK_TIMEOUT_SECONDS:
+                    hook["timeout"] = DEFAULT_HOOK_TIMEOUT_SECONDS
+                    return True
                 return False
     new_entry: dict[str, object] = {"hooks": [hook_entry(command)]}
     if matcher is not None:
@@ -205,7 +215,12 @@ def ensure_hook_with_entry(
             continue
         for hook in existing.get("hooks", []) or []:
             if isinstance(hook, dict) and hook.get("command") == command:
-                return False
+                changed = False
+                for key, value in entry.items():
+                    if hook.get(key) != value:
+                        hook[key] = value
+                        changed = True
+                return changed
     new_entry: dict[str, object] = {"hooks": [entry]}
     if matcher is not None:
         new_entry["matcher"] = matcher
@@ -282,13 +297,13 @@ def hermes_block(wrappers: dict[str, str]) -> str:
             "hooks:",
             "  pre_llm_call:",
             f"    - command: {json.dumps(wrappers['recall'])}",
-            "      timeout: 3",
+            f"      timeout: {DEFAULT_HOOK_TIMEOUT_SECONDS}",
             "  on_session_end:",
             f"    - command: {json.dumps(wrappers['ingest_turn'])}",
-            "      timeout: 3",
+            f"      timeout: {DEFAULT_HOOK_TIMEOUT_SECONDS}",
             "  on_session_finalize:",
             f"    - command: {json.dumps(wrappers['ingest_turn'])}",
-            "      timeout: 3",
+            f"      timeout: {DEFAULT_HOOK_TIMEOUT_SECONDS}",
             "",
         ]
     )

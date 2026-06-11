@@ -357,7 +357,7 @@ def ingest_turn(client: McpClient, payload: dict[str, Any], args: argparse.Names
     }
     try:
         client.call_tool(
-            "ingest",
+            "ingest_entities",
             {
                 "tenant_id": os.environ.get("FERROSA_MEMORY_TENANT_ID", DEFAULT_TENANT_ID),
                 "session_id": session_id,
@@ -371,6 +371,7 @@ def ingest_turn(client: McpClient, payload: dict[str, Any], args: argparse.Names
                         "attrs": common_attrs,
                     }
                 ],
+                "edges": [],
                 "options": {
                     "embed_missing": False,
                     "on_conflict": "skip",

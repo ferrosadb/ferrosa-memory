@@ -3819,33 +3819,15 @@ impl Storage for CqlStorage {
             neighbors.push((new_id, "SUPERSEDES".into()));
         }
 
-        // Typed edges (contains, references, calls, depends_on, etc.)
-        // Query the nil session (used by frg ingest) and the default session.
-        let nil_session = Uuid::nil();
-        let query = format!(
-            "SELECT src_id, edge_type, dst_id FROM {}.typed_edges \
-             WHERE tenant_id = ? AND session_id = ?",
-            self.keyspace
-        );
-        let prepared = self.session.prepare(query).await?;
-        let (col_map, rows) = self
-            .exec_prepared_rows(&prepared, (ctx.tenant_id, nil_session))
-            .await
-            .unwrap_or_default();
-        for row in rows {
-            let src: Uuid = match cql_get(&row, &col_map, "src_id") {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let dst: Uuid = match cql_get(&row, &col_map, "dst_id") {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let edge_type: String = cql_get(&row, &col_map, "edge_type").unwrap_or_default();
-            if src == entity_id {
-                neighbors.push((dst, edge_type));
-            } else if dst == entity_id {
-                neighbors.push((src, edge_type));
+        // Typed edges are the canonical entity -> entity graph edge table.
+        // This Storage-level neighbor API has no session parameter, so it
+        // exposes tenant-wide typed-edge neighbors for callers that cannot
+        // make a session-scoped typed_edge_list_from call.
+        for edge in self.typed_edge_list_all(ctx).await? {
+            if edge.src_id == entity_id {
+                neighbors.push((edge.dst_id, edge.edge_type));
+            } else if edge.dst_id == entity_id {
+                neighbors.push((edge.src_id, edge.edge_type));
             }
         }
 

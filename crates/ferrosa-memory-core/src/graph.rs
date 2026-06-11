@@ -11,7 +11,8 @@
 //! ## Edge types
 //!
 //! - `FOLDED_INTO` — child fold -> parent fold
-//! - `CO_OCCURS_WITH` — entity <-> entity (same fold)
+//! - `TYPED_EDGE` — canonical typed entity -> entity edge table
+//! - `CO_OCCURS_WITH` — legacy entity <-> entity (same fold)
 //! - `MENTIONED_IN` — entity -> fold
 //! - `SUPERSEDES` — new temporal fact -> old fact
 
@@ -181,15 +182,26 @@ impl GraphClient {
     /// Find entities related to a given entity within N hops.
     pub async fn find_related_entities(
         &self,
+        tenant_id: Uuid,
         entity_id: Uuid,
         session_id: Uuid,
-        max_hops: usize,
+        _max_hops: usize,
     ) -> anyhow::Result<Vec<String>> {
+        // Ferrosa graph currently accepts scoped one-hop TYPED_EDGE traversals
+        // but rejects variable-length TYPED_EDGE* patterns. Multi-hop path
+        // discovery is handled by the MCP chain tool over typed_edge storage.
         let cypher = format!(
-            "MATCH (start:Entity {{entity_id: '{entity_id}', session_id: '{session_id}'}})\
-             -[:CO_OCCURS_WITH*1..{max_hops}]-(related) \
-             WHERE related <> start \
-             RETURN DISTINCT related.entity_id AS related_id"
+            "MATCH (start:Entity {{tenant_id: {}, session_id: {}, entity_id: {}}})\
+             -[r:TYPED_EDGE {{tenant_id: {}, session_id: {}}}]->\
+             (related:Entity {{tenant_id: {}, session_id: {}}}) \
+             RETURN DISTINCT related.entity_id AS related_id",
+            quote_cypher(&tenant_id.to_string()),
+            quote_cypher(&session_id.to_string()),
+            quote_cypher(&entity_id.to_string()),
+            quote_cypher(&tenant_id.to_string()),
+            quote_cypher(&session_id.to_string()),
+            quote_cypher(&tenant_id.to_string()),
+            quote_cypher(&session_id.to_string()),
         );
         let resp = self.query(&cypher).await?;
         Ok(extract_string_column(&resp))

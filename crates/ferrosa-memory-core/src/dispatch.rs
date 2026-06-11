@@ -310,6 +310,7 @@ fn short_tool_name(canonical: &str) -> Option<&'static str> {
         "search_context_segments" => Some("ctx_search"),
         "get_context_window" => Some("ctx_window"),
         "get_chunk_context" => Some("chunk_ctx"),
+        "get_turn_chain" => Some("turn_chain"),
         "upsert_entity" => Some("upsert"),
         "batch_ingest" => Some("ingest_batch"),
         "ingest_entities" => Some("ingest_many"),
@@ -381,6 +382,7 @@ fn canonical_tool_name(name: &str) -> &str {
         "ctx_search" => "search_context_segments",
         "ctx_window" => "get_context_window",
         "chunk_ctx" => "get_chunk_context",
+        "turn_chain" => "get_turn_chain",
         "upsert" => "upsert_entity",
         "ingest_batch" => "batch_ingest",
         "ingest_many" => "ingest_entities",
@@ -517,6 +519,19 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                     "max_tokens": { "type": "integer", "minimum": 1, "maximum": 100000 }
                 },
                 "required": ["segment_id"]
+            }),
+        },
+        ToolDef {
+            name: "get_turn_chain".into(),
+            description: "Walk the next_turn temporal edge chain from a starting turn entity, returning turns in forward (chronological arrival) order.\n\nCALL WHEN: You need to reconstruct what happened in an agent session after a known turn, follow a conversation thread, or inspect the sequence of turns the harness hook captured.\nRETURNS: ordered list of turn entities from start_turn_id forward, up to limit turns.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "format": "uuid", "description": "Session partition for the turn chain" },
+                    "start_turn_id": { "type": "string", "format": "uuid", "description": "Entity ID of the first turn to include" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 20, "description": "Maximum number of turns to return" }
+                },
+                "required": ["session_id", "start_turn_id"]
             }),
         },
         ToolDef {
@@ -1963,6 +1978,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         }
         "get_context_window" => Box::pin(handle_get_context_window(args, storage, ctx)),
         "get_chunk_context" => Box::pin(handle_get_chunk_context(args, storage, ctx)),
+        "get_turn_chain" => Box::pin(handle_get_turn_chain(args, storage, ctx)),
         "upsert_entity" => Box::pin(handle_upsert_entity(args, storage, ctx, session)),
         "batch_ingest" => Box::pin(handle_batch_ingest(args, storage, ctx, session)),
         "ingest_entities" => Box::pin(handle_ingest_entities(args, storage, ctx, session)),
@@ -2122,6 +2138,7 @@ fn is_tier1(name: &str) -> bool {
             | "hybrid_search"
             | "configure"
             | "get_chunk_context"
+            | "get_turn_chain"
             | "record_feedback"
             | "create_edge"
             | "check_intentions"
@@ -2701,6 +2718,38 @@ async fn handle_search_context_segments<S: crate::storage::Storage>(
     .await
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
     serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
+async fn handle_get_turn_chain<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = require_uuid(&args, "session_id")?;
+    let start_turn_id = require_uuid(&args, "start_turn_id")?;
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20)
+        .clamp(1, 50) as usize;
+
+    let turns =
+        crate::turn_chain::walk_turn_chain_forward(storage, ctx, session_id, start_turn_id, limit)
+            .await
+            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+
+    Ok(serde_json::json!({
+        "session_id": session_id.to_string(),
+        "start_turn_id": start_turn_id.to_string(),
+        "count": turns.len(),
+        "turns": turns.iter().map(|t| serde_json::json!({
+            "entity_id": t.entity_id.to_string(),
+            "entity_name": t.entity_name,
+            "created_at": t.created_at.to_rfc3339(),
+            "context_snippet": t.context_snippet,
+            "properties": t.properties,
+        })).collect::<Vec<_>>(),
+    }))
 }
 
 async fn handle_get_context_window<S: crate::storage::Storage>(
@@ -3361,6 +3410,7 @@ async fn handle_ingest_entities<S: crate::storage::Storage>(
     let mut document_chunk_embeddings_computed = 0usize;
     let mut document_chunk_embeddings_failed = 0usize;
     let mut document_index_failed = Vec::new();
+    let mut turn_chain_edges_created = 0usize;
 
     let mut available_entities = std::collections::HashSet::new();
     let mut seen_entity_ids = std::collections::HashSet::new();
@@ -3565,6 +3615,32 @@ async fn handle_ingest_entities<S: crate::storage::Storage>(
             entity_updated += 1;
         } else {
             entity_inserted += 1;
+            // Auto-chain turn entities: link the new turn to its predecessor
+            // in the same session so agent sessions form traversable threads.
+            // This mirrors the next/previous_context_segment edge pattern.
+            // Only fires for freshly-inserted turns; updates and dry-runs skip
+            // this block entirely.
+            if !request.options.dry_run && entry.entity_type == "turn" {
+                match crate::turn_chain::link_turn_to_predecessor(
+                    storage,
+                    ctx,
+                    request.session_id,
+                    &entry,
+                )
+                .await
+                {
+                    Ok(true) => turn_chain_edges_created += 2,
+                    Ok(false) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            entity_id = %entry.entity_id,
+                            session_id = %request.session_id,
+                            error = %err,
+                            "turn chain edge creation failed (non-fatal)"
+                        );
+                    }
+                }
+            }
         }
         available_entities.insert(entity.id);
 
@@ -3759,6 +3835,10 @@ async fn handle_ingest_entities<S: crate::storage::Storage>(
             "chunk_embeddings_failed": document_chunk_embeddings_failed,
             "failed": document_index_failed,
             "hint": "Document chunks are semantic and linked with prev/next IDs. Search results may suggest chunk_ctx expansion when adjacent context matters."
+        },
+        "turn_chain": {
+            "edges_created": turn_chain_edges_created,
+            "hint": "next_turn / previous_turn temporal edges link successive turn entities into traversable session threads. Use get_turn_chain to walk."
         },
         "schema_version": "2026-03-01",
         "progress": {
@@ -5927,7 +6007,7 @@ async fn handle_explore_connections<S: crate::storage::Storage>(
             // be logged so operators can see silent fall-through.
             let graph_results = if let Some(graph) = session.graph.as_ref() {
                 match graph
-                    .find_related_entities(entity_id, session_id, max_depth)
+                    .find_related_entities(ctx.tenant_id, entity_id, session_id, max_depth)
                     .await
                 {
                     Ok(v) => v,
@@ -5949,11 +6029,23 @@ async fn handle_explore_connections<S: crate::storage::Storage>(
                 r.truncate(limit);
                 r
             } else {
-                // CQL fallback: query typed_edges for direct connections
-                let edges = storage
+                // CQL fallback: query legacy edges plus the canonical typed_edges
+                // table used by create_edge / batch_create_edges.
+                let mut edges = storage
                     .edge_list_for_entity(ctx, entity_id)
                     .await
                     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+                let typed_edges = storage
+                    .typed_edge_list_from(ctx, session_id, entity_id)
+                    .await
+                    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+                edges.extend(
+                    typed_edges
+                        .into_iter()
+                        .map(|edge| (edge.dst_id, edge.edge_type)),
+                );
+                edges.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                edges.dedup();
                 let mut results: Vec<String> = Vec::new();
                 for (other_id, edge_type) in edges.into_iter().take(limit) {
                     let name = storage
@@ -8135,7 +8227,7 @@ async fn handle_find_memory_chain<S: crate::storage::Storage>(
         .map(|v| v as usize)
         .unwrap_or(5);
 
-    let chain = crate::chains::find_chain(storage, ctx, source, destination, max_hops)
+    let chain = crate::chains::find_chain(storage, ctx, session_id, source, destination, max_hops)
         .await
         .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
@@ -10339,7 +10431,7 @@ mod tests {
             expected_tier1,
             "default tools/list should return all tier-1 tools"
         );
-        assert_eq!(tools.len(), 11, "tier-1 tool surface should stay compact");
+        assert_eq!(tools.len(), 12, "tier-1 tool surface should stay compact");
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         // All default tools must be compact public names.
@@ -10347,6 +10439,7 @@ mod tests {
         assert!(names.contains(&"ingest"));
         assert!(names.contains(&"search"));
         assert!(names.contains(&"chunk_ctx"));
+        assert!(names.contains(&"turn_chain"));
         assert!(names.contains(&"feedback"));
         assert!(names.contains(&"config"));
         assert!(names.contains(&"edge"));
@@ -11586,6 +11679,96 @@ mod tests {
             .unwrap();
         let result = unwrap_tool_result(result);
         assert_eq!(result["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn explore_connections_cql_fallback_returns_typed_edge_neighbors() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session_id = Uuid::new_v4();
+        let source = test_entity(&ctx, session_id, "source", "concept", serde_json::json!({}));
+        let destination = test_entity(
+            &ctx,
+            session_id,
+            "destination",
+            "concept",
+            serde_json::json!({}),
+        );
+        store.entity_put(&ctx, &source).await.unwrap();
+        store.entity_put(&ctx, &destination).await.unwrap();
+        crate::graph_write::create_typed_edge(
+            &store,
+            &ctx,
+            session_id,
+            source.entity_id,
+            "references",
+            destination.entity_id,
+            0.75,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let session = SessionState::default(); // graph is None — uses CQL fallback
+        let params = serde_json::json!({
+            "name": "explore_connections",
+            "arguments": {
+                "traversal": "related_entities",
+                "session_id": session_id.to_string(),
+                "entity_id": source.entity_id.to_string()
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["count"], 1);
+        let first = result["results"][0].as_str().unwrap();
+        let first: Value = serde_json::from_str(first).unwrap();
+        assert_eq!(first["entity_id"], destination.entity_id.to_string());
+        assert_eq!(first["entity_name"], "destination");
+        assert_eq!(first["edge_type"], "references");
+    }
+
+    #[tokio::test]
+    async fn find_memory_chain_returns_typed_edge_path() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session_id = Uuid::new_v4();
+        let source = Uuid::new_v4();
+        let destination = Uuid::new_v4();
+        crate::graph_write::create_typed_edge(
+            &store,
+            &ctx,
+            session_id,
+            source,
+            "references",
+            destination,
+            0.75,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let session = SessionState::default();
+        let params = serde_json::json!({
+            "name": "find_memory_chain",
+            "arguments": {
+                "session_id": session_id.to_string(),
+                "source": source.to_string(),
+                "destination": destination.to_string(),
+                "max_hops": 2
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["source"], source.to_string());
+        assert_eq!(result["destination"], destination.to_string());
+        assert_eq!(result["hop_count"], 1);
+        assert_eq!(result["steps"][0]["entity_id"], destination.to_string());
+        assert_eq!(result["steps"][0]["edge_type"], "references");
     }
 
     #[tokio::test]
