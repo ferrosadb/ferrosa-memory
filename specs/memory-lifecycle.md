@@ -1,7 +1,7 @@
 # Memory Lifecycle — Consolidation & Forgetting
 
-> Last updated: 2026-03-25
-> Status: Documents implemented behavior as of Sprint 4.9
+> Last updated: 2026-06-11
+> Status: Documents implemented behavior including graph-edge serving boundary and captured-turn chains
 
 This document describes how memories enter the system, get consolidated into a coherent knowledge graph, and eventually fade or get removed. The design draws on neuroscience-inspired models (spreading activation, importance scoring, dream consolidation) adapted for an LLM agent memory store.
 
@@ -81,6 +81,19 @@ Additional write-time guards:
 - **Session quota**: max 1,000 entities per session (storage flood defense)
 - **Phonetic dedup**: on `upsert_entity`, checks for Double Metaphone matches before creating duplicates
 
+### Hook-Ingested Turns and Context Segments
+
+Agent lifecycle hooks store durable `turn` entities through `ingest_entities`.
+Freshly inserted turn entities are linked to the previous turn in the same
+session with temporal `next_turn` and `previous_turn` edges. The compact
+`turn_chain` tool walks those edges to reconstruct an agent session from a
+known starting turn.
+
+Context segments are stored separately through `ctx_ingest` and maintain their
+own deterministic `next_context_segment` / `previous_context_segment` temporal
+links. Turn chains give the session-level thread; context-segment chains give
+chunk-level prev/next expansion for recall.
+
 ---
 
 ## Phase 2: Consolidation — Dream Cycles
@@ -92,7 +105,10 @@ Consolidation discovers relationships between memories that weren't explicit at 
 A background task monitors tool call activity. When the session has been idle for **20 seconds** (configurable via `idle_consolidation_seconds`) and at least one write has occurred since the last consolidation (tracked by a `dirty` flag), it automatically triggers a dream cycle.
 
 **Write operations that set the dirty flag:**
-`store_memo_result`, `upsert_entity`, `smart_ingest`, `write_plan_node`, `update_plan_node`, `start_fold`, `append_to_fold`, `complete_fold`, `write_temporal_fact`, `set_intention`, `complete_intention`
+`store_memo_result`, `upsert_entity`, `ingest_entities`, `smart_ingest`,
+`create_edge`, `batch_create_edges`, `write_plan_node`, `update_plan_node`,
+`start_fold`, `append_to_fold`, `complete_fold`, `write_temporal_fact`,
+`set_intention`, `complete_intention`
 
 ### Manual (`run_consolidation`)
 
@@ -127,7 +143,7 @@ graph TD
 
 **Phase 1 — Triage:** Loads all entities for the session from the entity store.
 
-**Phase 2 — Connection Discovery:** Groups entities by their `source_fold_id` (entities mentioned in the same fold are candidates for connection). For each pair of co-located entities, computes Jaccard similarity on their word tokens. If similarity ≥ 0.05, creates a `CO_OCCURS` edge in the graph layer. During idle consolidation, also prunes `CO_OCCURS` edges older than 7 days to prevent stale connections from accumulating.
+**Phase 2 — Connection Discovery:** Groups entities by their `source_fold_id` (entities mentioned in the same fold are candidates for connection). For each pair of co-located entities, computes Jaccard similarity on their word tokens. If similarity ≥ 0.05, creates a `CO_OCCURS` edge through the graph write seam. During idle consolidation, also prunes `CO_OCCURS` edges older than 7 days to prevent stale connections from accumulating.
 
 **Phase 3 — Insight Generation:** Identifies clusters of 3+ entities connected by `CO_OCCURS` edges and generates natural-language insights describing the cluster (e.g., "These 4 entities relate to the authentication refactor").
 

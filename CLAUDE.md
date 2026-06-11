@@ -33,6 +33,8 @@ Do not wait for the user to ask — this is automatic.
 
 This project is a test program for the Ferrosa database. Never build workarounds, fallback logic, or compatibility shims in this repo for missing or broken Ferrosa functionality. If the database has a bug, file a report in `../ferrosa/specs/` and fix it upstream. Working around database bugs here hides them and defeats the purpose of this project.
 
+Serving-path graph writes must use Ferrosa's graph API through `GraphClient` / `ReconnectingStorage`. Do not add direct CQL writes to graph-owned backing tables such as `typed_edges`, `folded_into`, `mentioned_in`, `co_occurs_with`, or `supersedes` to make tests pass. Direct CQL is only appropriate for app-owned Ferrosa Memory tables.
+
 ## Related Projects
 
 - `../ferrosa/` — Ferrosa DB engine. Architecture specs at `../ferrosa/specs/` (CQL protocol, SUBSCRIBE semantics, storage engine, graph engine, consensus).

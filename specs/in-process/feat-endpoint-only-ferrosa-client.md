@@ -3,7 +3,7 @@ type: feat
 priority: P0
 status: in-process
 created: 2026-04-20
-updated: 2026-04-20
+updated: 2026-06-11
 reported-by: dsm-analysis refactor request (2026-04-20)
 ---
 
@@ -24,11 +24,14 @@ Make `ferrosa-memory` a client to Ferrosa at the correct abstraction level: dire
 
 ## Why now
 
-The current runtime has become tightly coupled to Ferrosa internals:
+The runtime has been tightly coupled to Ferrosa internals:
 
 - `CqlStorage` construction in `ferrosa-memory-mcp`
 - local read-only query parsing for the workbench CQL surface
-- graph reads use the public Cypher endpoint while graph writes still bypass it and target graph-owned backing tables directly
+- historical graph writes bypassed the graph API and targeted graph-owned
+  backing tables directly; the normal serving path now routes graph writes
+  through `GraphClient`, but maintenance tooling and least-privilege
+  enforcement still need cleanup
 - mixed ownership of graph/query semantics across local code and Ferrosa
 
 This undermines the intended product position: `ferrosa-memory` should orchestrate memory workflows and UI composition, not re-implement Ferrosa storage behavior.

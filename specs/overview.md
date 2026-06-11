@@ -32,9 +32,9 @@ graph LR
     TP -->|MCP HTTP+SSE| TR
     TR --> AT
     AT --> WB
-    WB -->|public query + write calls| CQL
+    WB -->|app-table reads/writes| CQL
     WB -->|public query calls| SPQ
-    WB -->|public query calls| CYP
+    WB -->|graph reads/writes| CYP
 ```
 
 | Layer | Role | Owns |
@@ -48,14 +48,17 @@ graph LR
 The role-scoped boundary is now implemented in the main serving path.
 
 - **Current reality:** the runtime uses the Scylla Rust driver through
-  `CqlStorage` for app-owned tables; graph traversals and graph writes route
-  through the public graph client seam. Workbench CQL and SPARQL routes are
-  authenticated passthrough surfaces, while Datalog remains a local
-  ferrosa-memory inference engine over Ferrosa-backed data.
-- **Remaining blocker:** Ferrosa's public `TYPED_EDGE` MERGE path can return
-  success without materializing the expected typed-edge row. `ferrosa-memory`
-  treats that as a Ferrosa public-interface bug rather than writing graph-owned
-  backing tables directly.
+  `CqlStorage` for app-owned tables. Serving-path graph writes route through
+  `GraphClient` behind `ReconnectingStorage`; direct `CqlStorage` graph-edge
+  writers return explicit graph-write errors instead of mutating backing
+  tables. Workbench CQL and SPARQL routes are authenticated passthrough
+  surfaces, while Datalog remains a local ferrosa-memory inference engine over
+  Ferrosa-backed data.
+- **Remaining caveat:** Ferrosa's graph endpoint currently accepts scoped
+  one-hop `TYPED_EDGE` traversals and direct scoped edge lookups, but rejects
+  the variable-length `TYPED_EDGE*` shape. `explore_connections` uses the
+  accepted graph query plus CQL typed-edge fallback; `find_memory_chain`
+  performs multi-hop BFS over typed-edge reads.
 
 This correction is tracked in [ADR-005](./decisions/adr-005-endpoint-only-ferrosa-client.md).
 
@@ -68,6 +71,10 @@ typed-edge ingest.
 - clients send semantic entities and typed edges in one `ingest_entities` MCP call
 - `ferrosa-memory` owns schema mapping, idempotency, dry-run behavior, and structured per-row failures
 - direct CQL remains a server-internal implementation detail for app-owned tables
+- typed-edge mutations are routed through the graph write seam, so edge rows
+  are insertable through MCP and graph APIs and queryable through CQL-backed
+  typed-edge lists, graph lookups, `explore_connections`, and
+  `find_memory_chain`
 - clients stop owning CQL schema details, subprocess loaders, or Ollama access for required embeddings
 
 This keeps CQL ownership where it belongs: inside `ferrosa-memory` for app tables, while still keeping graph mutations behind public graph interfaces.
@@ -97,7 +104,7 @@ The rule-loader convergence and governance backend surfaces are now implemented 
 - **Language:** Rust (Tokio async runtime)
 - **MCP protocol:** JSON-RPC over stdio or HTTP+SSE
 - **Current storage implementation:** direct CQL driver via the Scylla Rust driver in the runtime path
-- **Current graph client:** HTTP POST to Ferrosa's public Cypher endpoint via `reqwest` for reads and graph-write seam calls
+- **Current graph client:** HTTP POST to Ferrosa's public graph endpoint via `reqwest` for scoped graph reads and serving-path graph writes
 - **Target Ferrosa integration:** direct CQL for app tables, graph writes through Cypher/graph interfaces, public CQL/SPARQL passthrough for operator inspection, repo-owned Datalog evaluation in `ferrosa-memory`, and the server-owned `ingest_entities` bulk ingest contract for app data
 - **Compression:** Rust-native implementation (no Python — LLMLingua algorithm ported to Rust)
 - **Embedding:** HTTP call to Ollama endpoint (nomic-embed-text, 768 dimensions)
@@ -137,6 +144,19 @@ Entity and edge types are stored in `entity_types` and `edge_types` tables rathe
 
 Seeded types include: person, place, event, concept, org, decision, pattern, preference, bug, document, section. Edge types: depends_on, contains, calls, references, CO_OCCURS, MENTIONED_IN, FOLDED_INTO, SUPERSEDES.
 
+## Captured Turn Chains
+
+Agent lifecycle hooks ingest durable `turn` entities through `ingest_entities`.
+When a new turn entity is inserted, `ferrosa-memory` links it to the immediately
+previous turn in the same session with temporal `next_turn` and `previous_turn`
+edges. The compact `turn_chain` tool walks those edges from a known
+`start_turn_id` and returns captured turns in chronological arrival order.
+
+Context segments still use their own deterministic segment IDs and
+`next_context_segment` / `previous_context_segment` temporal edges. Turn chains
+sit above those segments: a turn can have associated context-segment rows, and
+the turn edge gives the session-level prev/next navigation the hook needs.
+
 ## Datalog and Recursive Exploration
 
 Current code reality:
@@ -166,7 +186,7 @@ The key distinction is not "CQL good" or "CQL bad." It is whether `ferrosa-memor
 | Layer | Example | Classification |
 |-------|---------|----------------|
 | Wire protocol | CQL over port `9042` via `cdrs-tokio` | Public protocol |
-| Graph engine contract | Cypher / graph API queries and mutations | Public graph interface |
+| Graph engine contract | Graph API queries and mutations | Public graph interface |
 | Graph backing tables | `typed_edges`, `folded_into`, `mentioned_in`, `co_occurs_with`, `supersedes`, `derived_edges_by_pred`, `derived_edges_by_src` | Internal `ferrosa-graph` storage schema |
 
 Analogy: using PostgreSQL over its wire protocol is public; writing directly to `pg_index` instead of issuing `CREATE INDEX` is not. Ferrosa's graph tables are closer to `pg_index` than to a supported application table.

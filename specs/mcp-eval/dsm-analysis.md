@@ -1,10 +1,13 @@
 # MCP Eval Framework — DSM Analysis
 
+> Last updated: 2026-06-11
+> Status: Updated for graph-backed edge writes and captured-turn chains.
+
 ## Tool Dependency Clusters (9 clusters, 50 tools)
 
 ### Cluster 1: Core Data Operations (CRUD)
 - `upsert_entity`, `batch_ingest`, `start_fold`, `append_to_fold`, `complete_fold`, `write_temporal_fact`, `create_edge`, `batch_create_edges`
-- Backend: CQL Storage only. No graph or embedding deps.
+- Backend: CQL Storage for app rows plus Graph HTTP for graph-owned edge writes. No embedding deps.
 
 ### Cluster 2: Embedding/Vector Search (Ollama + Storage)
 - `hybrid_search` (5-signal RRF: phonetic + ANN + fold + warmth + PageRank)
@@ -20,7 +23,8 @@
 - `query_derived` (Datalog inference with caching)
 - `manage_rules` (Datalog rule CRUD)
 - `promote_predicate` (materialize derived predicate)
-- Backend: CQL Storage + Datalog engine (in-memory)
+- Backend: Graph HTTP one-hop typed-edge lookup, CQL typed-edge reads for
+  traversal fallback/BFS, plus Datalog engine (in-memory)
 
 ### Cluster 4: Memory Lifecycle & Smart Ingest
 - `smart_ingest` (NER + prediction error gating: CREATE/UPDATE/SUPERSEDE/SKIP)
@@ -57,7 +61,7 @@
 | **Ollama HTTP** | upsert_entity, smart_ingest, hybrid_search, recursive_explore | Graceful: fallback to phonetic search |
 | **HNSW Vector** | hybrid_search, retrieve_entities, retrieve_fold_context, recursive_explore | ANN disabled, phonetic-only |
 | **Datalog Engine** | hybrid_search, recursive_explore, query_derived, promote_predicate, run_consolidation | No derived facts, base facts only |
-| **Graph HTTP** | (Currently unused — all graph via CQL edge tables) | N/A |
+| **Graph HTTP** | create_edge/batch_create_edges, fold/entity/supersession edge writes, explore_connections one-hop graph lookup | Graph-edge writes fail loud; CQL typed-edge reads can still verify already-written rows |
 | **Warmth/PageRank** | hybrid_search, recursive_explore, run_consolidation | Ranking degraded, no personalization |
 
 ## DIKW Tool Mapping

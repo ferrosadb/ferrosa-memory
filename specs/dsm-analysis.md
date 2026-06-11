@@ -1,7 +1,7 @@
 # Design Structure Matrix — ferrosa-memory-mcp
 
-> Last updated: 2026-04-20
-> Status: Full inventory plus graph-boundary correction. The dominant architectural problem is no longer just overloaded runtime orchestration; it is tight coupling between `ferrosa-memory` and Ferrosa graph/query internals.
+> Last updated: 2026-06-11
+> Status: Full inventory plus graph-boundary review. Serving-path graph writes now route through `GraphClient`; the dominant remaining architectural risk is hotspot concentration in dispatch/storage plus maintenance-only graph backing-table tooling.
 
 ## DSM Summary (2026-04-20)
 
@@ -13,17 +13,28 @@ Forge crate-level DSM on the current workspace reports:
 
 The cycle count is fine. The real issue is concentration: `ferrosa-memory-core` acts as a large, sticky hub while also embedding direct Ferrosa graph/storage ownership. That makes changes to Ferrosa graph schema/query behavior propagate into this repo instead of staying behind supported boundaries.
 
-## Endpoint Boundary Violations
+## Endpoint Boundary Review
 
-Concrete coupling points found in the current codebase:
+Concrete coupling points found in the current codebase and their current state:
 
-1. `ferrosa-memory-mcp/src/main.rs` constructs `CqlStorage` directly and treats it as the serving backend.
+1. `ferrosa-memory-mcp/src/main.rs` constructs `ReconnectingStorage` over direct
+   `CqlStorage` for app tables and routes graph-owned edge writes through
+   `GraphClient`.
 2. `ferrosa-memory-core/src/cql_storage.rs` embeds `cdrs-tokio`, prepared statements, and table-level Ferrosa knowledge throughout the runtime path.
 3. `ferrosa-memory-core/src/expert_system.rs` implements a local read-only query interpreter for the workbench "CQL" surface.
-4. `ferrosa-memory-core/src/graph.rs` correctly uses the HTTP Cypher endpoint for reads, but the serving path still writes graph edges via direct CQL into graph-owned backing tables rather than through the public graph interface.
-5. Existing specs and UI text still describe local query/storage ownership as normal behavior.
+4. `ferrosa-memory-core/src/graph.rs` uses the HTTP graph endpoint for graph
+   reads and graph-owned edge writes. Ferrosa currently accepts scoped one-hop
+   `TYPED_EDGE` traversals; multi-hop path discovery is implemented in
+   `chains` over typed-edge reads.
+5. `crates/ferrosa-memory-mcp/src/tools/fix_edge_sessions.rs` remains a
+   maintenance-only tool that directly repairs `typed_edges` rows. It must not
+   be promoted into normal serving-path behavior.
+6. Existing specs and UI text can still drift toward local query/storage
+   ownership; architecture docs should be updated with code changes that alter
+   public Ferrosa boundary behavior.
 
-This is the wrong abstraction boundary. `ferrosa-memory` should be a role-scoped client to Ferrosa, not an alternate graph storage implementation.
+The architectural direction remains the same: `ferrosa-memory` should be a
+role-scoped client to Ferrosa, not an alternate graph storage implementation.
 
 ## Target Refactor Direction
 
@@ -54,10 +65,27 @@ Suggested migration order:
 
 1. Introduce public-endpoint client traits and DTOs without changing MCP/workbench contracts
 2. Move `/workbench/api/cql/query` and `/workbench/api/datalog/query` to passthrough adapters
-3. Move graph writes onto the public Cypher/graph API so reads and writes share one graph boundary
+3. Keep graph writes on the public graph API so reads and writes share one graph boundary
 4. Make startup/readiness succeed under the least-privilege serving role without graph-table `MODIFY`
 5. Push graph-table bootstrap or maintenance scripts out of the serving path
 6. Retire local query emulators and direct graph-table runtime code after contract coverage is in place
+
+## 2026-06-11 Hotspot Review
+
+Git history over the last year still identifies the highest-churn and
+bug-fix-heavy files as:
+
+- `crates/ferrosa-memory-mcp/src/main.rs`
+- `crates/ferrosa-memory-core/src/dispatch.rs`
+- `crates/ferrosa-memory-core/src/cql_storage.rs`
+- `crates/ferrosa-memory-core/src/http.rs`
+- `crates/ferrosa-memory-core/src/storage.rs`
+- `crates/ferrosa-memory-core/src/config.rs`
+
+The graph-edge reconciliation intentionally touched several of these hotspots.
+Risk is controlled by focused tests and live smoke coverage, but future graph
+boundary changes should keep adding contract tests that exercise all three
+surfaces: MCP tools, Ferrosa graph API, and CQL readback.
 
 ## Module Inventory
 

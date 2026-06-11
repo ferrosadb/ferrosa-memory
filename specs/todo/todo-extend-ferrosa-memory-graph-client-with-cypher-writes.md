@@ -1,9 +1,9 @@
 ---
 type: todo
 priority: P2
-status: draft
+status: partial
 created: 2026-04-20
-updated: 2026-04-20
+updated: 2026-06-11
 ---
 
 # Extend ferrosa-memory's graph client to route edge writes through Cypher instead of CQL
@@ -12,7 +12,22 @@ This todo is the implementation half of [bug-ferrosa-memory-bypasses-graph-api-f
 
 ## Why
 
-ferrosa-memory writes edges to `typed_edges` and related graph tables
+**2026-06-11 update:** the serving-path implementation slice is now in place.
+`GraphClient` exposes graph edge write/delete helpers, `ReconnectingStorage`
+routes graph-owned edge writes through those helpers, and direct `CqlStorage`
+graph writer methods fail loud. `typed_edges` are insertable through MCP
+`edge`/`create_edge` and through the graph API, then queryable through graph
+lookups, CQL typed-edge reads, `explore_connections`, and `find_memory_chain`.
+
+Remaining work before this todo can move out of `todo/`:
+
+- remove or explicitly isolate maintenance-only direct `typed_edges` repair in
+  `crates/ferrosa-memory-mcp/src/tools/fix_edge_sessions.rs`;
+- add least-privilege role enforcement so normal serving credentials cannot
+  `MODIFY` graph backing tables;
+- keep live graph smoke coverage for MCP, graph API, and CQL readback.
+
+Original 2026-04-20 state: ferrosa-memory wrote edges to `typed_edges` and related graph tables
 with raw CQL `INSERT` statements today — see
 `bug-ferrosa-memory-bypasses-graph-api-for-writes.md`. The right fix is
 to reuse the Cypher HTTP channel it already uses for reads.
