@@ -5030,6 +5030,22 @@ async fn handle_batch_delete_entities<S: crate::storage::Storage>(
                 }
             };
 
+            // Remove this entity's edges first — while its :Entity node still
+            // exists — so the graph-anchored delete can reach them. Skipping
+            // this is what orphaned ~5.5k CO_OCCURS_WITH edges and crashed the
+            // viz. Best-effort: a cleanup failure must not block the delete.
+            match crate::smart_ingest::delete_typed_edges_referencing_entity_tenant_wide(
+                storage, ctx, entity_id,
+            )
+            .await
+            {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(%entity_id, edges = n, "cleaned edges before entity delete"),
+                Err(err) => {
+                    tracing::warn!(%entity_id, error = %err, "edge cleanup before entity delete failed")
+                }
+            }
+
             match storage.entity_delete(ctx, session_id, entity_id).await {
                 Ok(true) => {
                     session.dirty.store(true, Ordering::Relaxed);
