@@ -1145,6 +1145,20 @@ pub trait Storage: Send + Sync {
         src_id: Uuid,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<TypedEdge>>> + Send;
 
+    /// List INBOUND typed edges pointing at a specific destination entity.
+    ///
+    /// Reads come from the CQL `typed_edges` table (see `typed_edge_list_from`).
+    /// Because `dst_id` is not part of the partition key, this is a
+    /// single-partition `ALLOW FILTERING` scan within `(tenant_id, session_id)`.
+    /// Used by the forget/cascade path to find references *into* a victim
+    /// entity that must be torn down.
+    fn typed_edge_list_to(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        dst_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<TypedEdge>>> + Send;
+
     /// Delete a typed edge by composite key.
     fn typed_edge_delete(
         &self,
@@ -1283,6 +1297,81 @@ pub trait Storage: Send + Sync {
         entity_id: Uuid,
         fact_hash: &str,
     ) -> impl std::future::Future<Output = anyhow::Result<Option<ConfidenceScore>>> + Send;
+
+    // --- Forget / cascade-cleanup operations ---
+
+    /// Delete all confidence-score rows for an entity.
+    ///
+    /// `confidence_scores` is partitioned by `(entity_id)` (see
+    /// `ddl/026_confidence_scoring.cql`), so this is a single-partition DELETE.
+    /// The default no-op exists for in-memory backends that don't track
+    /// confidence scores.
+    fn confidence_delete_by_entity(
+        &self,
+        ctx: &TenantContext,
+        entity_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send {
+        async move {
+            let _ = (ctx, entity_id);
+            Ok(())
+        }
+    }
+
+    /// Hard-delete all temporal events for an entity. Returns the number of
+    /// rows removed.
+    ///
+    /// `temporal_events` is partitioned by `(tenant_id, entity_id)` (see
+    /// `ddl/030_temporal_events_uuid_columns.cql`), so this drops the whole
+    /// partition. The default no-op returns 0 for backends without temporal
+    /// storage.
+    fn temporal_delete_by_entity(
+        &self,
+        ctx: &TenantContext,
+        entity_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send {
+        async move {
+            let _ = (ctx, entity_id);
+            Ok(0)
+        }
+    }
+
+    /// Best-effort delete of derivation-provenance rows referencing an entity.
+    ///
+    /// `derivation_provenance` is partitioned by `(tenant_id, derived_edge_id)`
+    /// and has no index on entity ids (see `ddl/014_derivation_provenance.cql`):
+    /// the entity can only appear inside the `parent_src` / `parent_dst` /
+    /// `derived_edge_id` text columns, none of which are queryable by value.
+    /// There is therefore no clean by-entity delete. The default is a logged
+    /// no-op returning 0; CQL storage documents the same and does not scan the
+    /// full table.
+    fn provenance_delete_by_entity(
+        &self,
+        ctx: &TenantContext,
+        entity_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send {
+        async move {
+            let _ = (ctx, entity_id);
+            Ok(0)
+        }
+    }
+
+    /// Delete derived-cache rows whose `src_id` or `dst_id` equals the entity.
+    /// Returns the number of rows removed.
+    ///
+    /// `derived_cache_by_query` is partitioned by `(tenant_id, cache_key)` and
+    /// keyed by `seq`; `src_id`/`dst_id` are non-key columns, so this scans the
+    /// tenant's cache and deletes matching `(cache_key, seq)` rows one by one.
+    /// The default no-op returns 0 for backends without a derived cache.
+    fn derived_cache_delete_by_entity(
+        &self,
+        ctx: &TenantContext,
+        entity_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send {
+        async move {
+            let _ = (ctx, entity_id);
+            Ok(0)
+        }
+    }
 
     /// Read-only migration status for operator diagnostics.
     fn migration_status(
@@ -2883,6 +2972,22 @@ pub mod mock {
                 .collect())
         }
 
+        async fn typed_edge_list_to(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+            dst_id: Uuid,
+        ) -> anyhow::Result<Vec<TypedEdge>> {
+            let edges = self.typed_edges.lock().await;
+            Ok(edges
+                .iter()
+                .filter(|e| {
+                    e.tenant_id == ctx.tenant_id && e.session_id == session_id && e.dst_id == dst_id
+                })
+                .cloned()
+                .collect())
+        }
+
         async fn typed_edge_delete(
             &self,
             ctx: &TenantContext,
@@ -3082,6 +3187,46 @@ pub mod mock {
                 .iter()
                 .find(|s| s.entity_id == entity_id && s.fact_hash == fact_hash)
                 .cloned())
+        }
+
+        // --- Forget / cascade-cleanup operations ---
+
+        async fn confidence_delete_by_entity(
+            &self,
+            _ctx: &TenantContext,
+            entity_id: Uuid,
+        ) -> anyhow::Result<()> {
+            let mut scores = self.confidence_scores.lock().await;
+            scores.retain(|s| s.entity_id != entity_id);
+            Ok(())
+        }
+
+        async fn temporal_delete_by_entity(
+            &self,
+            ctx: &TenantContext,
+            entity_id: Uuid,
+        ) -> anyhow::Result<usize> {
+            let mut events = self.temporal_events.lock().await;
+            let before = events.len();
+            events.retain(|e| !(e.tenant_id == ctx.tenant_id && e.entity_id == entity_id));
+            Ok(before - events.len())
+        }
+
+        async fn derived_cache_delete_by_entity(
+            &self,
+            _ctx: &TenantContext,
+            entity_id: Uuid,
+        ) -> anyhow::Result<usize> {
+            let target = entity_id.to_string();
+            let mut cache = self.derived_cache.lock().await;
+            let mut removed = 0usize;
+            for facts in cache.values_mut() {
+                let before = facts.len();
+                facts.retain(|f| f.src_id != target && f.dst_id != target);
+                removed += before - facts.len();
+            }
+            cache.retain(|_, facts| !facts.is_empty());
+            Ok(removed)
         }
     }
 

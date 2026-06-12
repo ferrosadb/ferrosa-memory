@@ -1431,6 +1431,40 @@ impl Storage for ReconnectingStorage {
         delegate!(self, confidence_get, ctx, entity_id, fact_hash)
     }
 
+    // --- Forget / cascade-cleanup operations (CQL-backed) ---
+
+    async fn confidence_delete_by_entity(
+        &self,
+        ctx: &TenantContext,
+        entity_id: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        delegate!(self, confidence_delete_by_entity, ctx, entity_id)
+    }
+
+    async fn temporal_delete_by_entity(
+        &self,
+        ctx: &TenantContext,
+        entity_id: uuid::Uuid,
+    ) -> anyhow::Result<usize> {
+        delegate!(self, temporal_delete_by_entity, ctx, entity_id)
+    }
+
+    async fn provenance_delete_by_entity(
+        &self,
+        ctx: &TenantContext,
+        entity_id: uuid::Uuid,
+    ) -> anyhow::Result<usize> {
+        delegate!(self, provenance_delete_by_entity, ctx, entity_id)
+    }
+
+    async fn derived_cache_delete_by_entity(
+        &self,
+        ctx: &TenantContext,
+        entity_id: uuid::Uuid,
+    ) -> anyhow::Result<usize> {
+        delegate!(self, derived_cache_delete_by_entity, ctx, entity_id)
+    }
+
     // --- Rule registry operations (Sprint 5) ---
 
     async fn rule_put(
@@ -1729,6 +1763,17 @@ impl Storage for ReconnectingStorage {
         src_id: uuid::Uuid,
     ) -> anyhow::Result<Vec<TypedEdge>> {
         delegate!(self, typed_edge_list_from, ctx, session_id, src_id)
+    }
+
+    async fn typed_edge_list_to(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        dst_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<TypedEdge>> {
+        // Reads are CQL-backed (the typed_edges table); routing matches
+        // typed_edge_list_from.
+        delegate!(self, typed_edge_list_to, ctx, session_id, dst_id)
     }
 
     async fn typed_edge_delete(

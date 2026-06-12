@@ -5351,6 +5351,51 @@ impl Storage for CqlStorage {
         Ok(edges)
     }
 
+    async fn typed_edge_list_to(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        dst_id: Uuid,
+    ) -> anyhow::Result<Vec<TypedEdge>> {
+        // dst_id is not part of the partition key, so this is a single-partition
+        // ALLOW FILTERING scan within (tenant_id, session_id). Mirror of
+        // typed_edge_list_from with the predicate on dst_id.
+        let query = format!(
+            "SELECT src_id, edge_type, dst_id, weight, metadata, created_at \
+             FROM {}.typed_edges \
+             WHERE tenant_id = ? AND session_id = ? AND dst_id = ? ALLOW FILTERING",
+            self.keyspace
+        );
+        let prepared = self.session.prepare(query).await?;
+        let (col_map, rows) =
+            exec_paged_rows!(self.session, prepared, (ctx.tenant_id, session_id, dst_id))?;
+
+        let mut edges = Vec::new();
+        for row in rows {
+            let created = cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
+                .unwrap_or_else(|e| {
+                    tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
+                    Default::default()
+                });
+            let Some(weight) = decode_edge_weight(&row, &col_map, "typed_edges") else {
+                continue;
+            };
+            edges.push(TypedEdge {
+                tenant_id: ctx.tenant_id,
+                session_id,
+                src_id: cql_get(&row, &col_map, "src_id")?,
+                edge_type: cql_get::<String>(&row, &col_map, "edge_type").unwrap_or_default(),
+                dst_id,
+                weight,
+                metadata: cql_get::<String>(&row, &col_map, "metadata")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
+                created_at: created,
+            });
+        }
+        Ok(edges)
+    }
+
     async fn typed_edge_delete(
         &self,
         _ctx: &TenantContext,
@@ -5977,6 +6022,124 @@ impl Storage for CqlStorage {
         } else {
             Ok(None)
         }
+    }
+
+    // --- Forget / cascade-cleanup operations ---
+
+    async fn confidence_delete_by_entity(
+        &self,
+        _ctx: &TenantContext,
+        entity_id: Uuid,
+    ) -> anyhow::Result<()> {
+        // confidence_scores is partitioned by (entity_id), so a single-partition
+        // DELETE removes every fact_hash row for the entity. There is no
+        // tenant_id column on this table.
+        let query = format!(
+            "DELETE FROM {}.confidence_scores WHERE entity_id = ?",
+            self.keyspace
+        );
+        self.session.query_unpaged(query, (entity_id,)).await?;
+        Ok(())
+    }
+
+    async fn temporal_delete_by_entity(
+        &self,
+        ctx: &TenantContext,
+        entity_id: Uuid,
+    ) -> anyhow::Result<usize> {
+        // temporal_events is partitioned by (tenant_id, entity_id). Count the
+        // partition first (clustering rows aren't individually addressable for a
+        // post-delete diff), then drop the whole partition in one DELETE.
+        let count_query = format!(
+            "SELECT COUNT(*) FROM {}.temporal_events WHERE tenant_id = ? AND entity_id = ?",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        let result = self
+            .session
+            .query_unpaged(count_query, (ctx.tenant_id, entity_id))
+            .await?;
+        let col_map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
+        let count = match rows.first() {
+            Some(row) => cql_get_i64_from_single_aggregate(
+                row,
+                &col_map,
+                &["system.count", "count", "count(*)"],
+            )?
+            .max(0) as usize,
+            None => 0,
+        };
+
+        let delete_query = format!(
+            "DELETE FROM {}.temporal_events WHERE tenant_id = ? AND entity_id = ?",
+            self.keyspace
+        );
+        self.session
+            .query_unpaged(delete_query, (ctx.tenant_id, entity_id))
+            .await?;
+        Ok(count)
+    }
+
+    async fn provenance_delete_by_entity(
+        &self,
+        _ctx: &TenantContext,
+        entity_id: Uuid,
+    ) -> anyhow::Result<usize> {
+        // derivation_provenance is partitioned by (tenant_id, derived_edge_id)
+        // and has no index keyed on an entity id. The entity can only appear
+        // inside the parent_src/parent_dst/derived_edge_id *text* columns, none
+        // of which are queryable by value, so there is no clean by-entity
+        // delete. We deliberately do NOT full-table scan here (cost +
+        // ambiguous string matching against derived_edge_id composites). This
+        // is a documented no-op; provenance rows are TTL-free but harmless
+        // (they only reference the forgotten entity by string).
+        tracing::debug!(
+            %entity_id,
+            "provenance_delete_by_entity: no-op (derivation_provenance has no entity index)"
+        );
+        Ok(0)
+    }
+
+    async fn derived_cache_delete_by_entity(
+        &self,
+        ctx: &TenantContext,
+        entity_id: Uuid,
+    ) -> anyhow::Result<usize> {
+        // derived_cache_by_query is partitioned by (tenant_id, cache_key) and
+        // keyed by seq; src_id/dst_id are non-key columns. Scan the tenant's
+        // cache rows, then delete each (cache_key, seq) whose src_id or dst_id
+        // matches the forgotten entity.
+        let scan_query = format!(
+            "SELECT cache_key, seq, src_id, dst_id FROM {}.derived_cache_by_query \
+             WHERE tenant_id = ? ALLOW FILTERING",
+            self.keyspace
+        );
+        let (col_map, rows) = query_paged_rows!(self.session, scan_query, (ctx.tenant_id,))?;
+
+        let mut victims: Vec<(String, i32)> = Vec::new();
+        for row in rows {
+            let src_id: Uuid = cql_get(&row, &col_map, "src_id").unwrap_or_default();
+            let dst_id: Uuid = cql_get(&row, &col_map, "dst_id").unwrap_or_default();
+            if src_id == entity_id || dst_id == entity_id {
+                let cache_key: String = cql_get(&row, &col_map, "cache_key").unwrap_or_default();
+                let seq: i32 = cql_get(&row, &col_map, "seq").unwrap_or_default();
+                victims.push((cache_key, seq));
+            }
+        }
+
+        let delete_query = format!(
+            "DELETE FROM {}.derived_cache_by_query \
+             WHERE tenant_id = ? AND cache_key = ? AND seq = ?",
+            self.keyspace
+        );
+        let removed = victims.len();
+        for (cache_key, seq) in victims {
+            self.session
+                .query_unpaged(delete_query.clone(), (ctx.tenant_id, cache_key, seq))
+                .await?;
+        }
+        Ok(removed)
     }
 }
 

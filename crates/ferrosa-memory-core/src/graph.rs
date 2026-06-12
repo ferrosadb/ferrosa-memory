@@ -207,6 +207,48 @@ impl GraphClient {
         Ok(extract_string_column(&resp))
     }
 
+    /// List INBOUND typed edges pointing at `dst_id`, returning
+    /// `(src_entity_id, edge_type)` pairs.
+    ///
+    /// Mirror of `find_related_entities` with the arrow reversed: instead of
+    /// "edges out of `entity_id`" this finds "edges into `dst_id`". Used by the
+    /// forget/cascade-cleanup path to discover which source entities reference
+    /// the victim so their typed edges can be torn down.
+    pub async fn list_typed_edges_to(
+        &self,
+        tenant_id: Uuid,
+        session_id: Uuid,
+        dst_id: Uuid,
+    ) -> anyhow::Result<Vec<(Uuid, String)>> {
+        let cypher = format!(
+            "MATCH (src:Entity {{tenant_id: {}, session_id: {}}})\
+             -[r:TYPED_EDGE {{tenant_id: {}, session_id: {}}}]->\
+             (victim:Entity {{tenant_id: {}, session_id: {}, entity_id: {}}}) \
+             RETURN DISTINCT src.entity_id AS src_id, r.edge_type AS edge_type",
+            quote_cypher(&tenant_id.to_string()),
+            quote_cypher(&session_id.to_string()),
+            quote_cypher(&tenant_id.to_string()),
+            quote_cypher(&session_id.to_string()),
+            quote_cypher(&tenant_id.to_string()),
+            quote_cypher(&session_id.to_string()),
+            quote_cypher(&dst_id.to_string()),
+        );
+        let resp = self.query(&cypher).await?;
+        let mut edges = Vec::with_capacity(resp.rows.len());
+        for row in resp.rows {
+            let src_id = row
+                .first()
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| anyhow::anyhow!("missing src_id from graph response"))?;
+            let edge_type = row
+                .get(1)
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| anyhow::anyhow!("missing edge_type from graph response"))?;
+            edges.push((Uuid::parse_str(src_id)?, edge_type.to_string()));
+        }
+        Ok(edges)
+    }
+
     /// Check whether adding an edge `src -[edge_type]-> dst` would create a
     /// cycle in the existing DAG. Used before emitting `PARENT_TAG`
     /// (tag hierarchy) and `REQUIRES` (skill prerequisite) edges.
