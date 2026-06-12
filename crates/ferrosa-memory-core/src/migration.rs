@@ -145,6 +145,16 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "fix feedback_outcomes query_id timeuuid → uuid",
         ddl: include_str!("../../../ddl/036_feedback_outcomes_query_uuid.cql"),
     },
+    Migration {
+        version: 37,
+        description: "forget journal store (durable, replayable forget operations)",
+        ddl: include_str!("../../../ddl/037_forget_journal.cql"),
+    },
+    Migration {
+        version: 38,
+        description: "entity/object retraction records (forget audit + restore metadata)",
+        ddl: include_str!("../../../ddl/038_retraction_record.cql"),
+    },
 ];
 
 /// Pre-versioning DDLs. Applied in order when `run_migrations` detects a
@@ -1183,6 +1193,8 @@ async fn migration_postcondition_satisfied(
     version: u32,
 ) -> anyhow::Result<bool> {
     match version {
+        38 => table_exists(session, keyspace, "retraction").await,
+        37 => table_exists(session, keyspace, "forget_journal").await,
         36 => feedback_outcomes_uuid_write_probe(session, keyspace, "feedback_outcomes").await,
         35 => {
             for table in [
