@@ -16,6 +16,10 @@ path = "src/tools/migrate.rs"
 name = "ferrosa-memory"
 path = "src/tools/ferrosa_memory.rs"
 
+[[bin]]
+name = "reconcile-dangling-edges"
+path = "src/tools/reconcile_dangling_edges.rs"
+
 [dependencies]
 ferrosa-memory-core = { path = "../ferrosa-memory-core" }
 tokio = { workspace = true }
