@@ -78,7 +78,13 @@ def ensure_env_line(lines: list[str], key: str, line: str, replace: bool = False
     lines.append(line)
 
 
-def write_hook_env(env_path: Path, mcp_url: str) -> None:
+def write_hook_env(
+    env_path: Path,
+    mcp_url: str,
+    auth_header: str | None = None,
+    mcp_user: str | None = None,
+    mcp_password: str | None = None,
+) -> None:
     if env_path.exists():
         lines = env_path.read_text().splitlines()
     else:
@@ -91,6 +97,12 @@ def write_hook_env(env_path: Path, mcp_url: str) -> None:
             "# Set FERROSA_MEMORY_HOOK_EMBED_MISSING=true after configuring an embedding provider.",
         ]
     ensure_env_line(lines, "FERROSA_MEMORY_MCP_URL", f"export FERROSA_MEMORY_MCP_URL={shell_quote(mcp_url)}", replace=True)
+    if auth_header is not None:
+        ensure_env_line(lines, "FERROSA_MEMORY_AUTH_HEADER", f"export FERROSA_MEMORY_AUTH_HEADER={shell_quote(auth_header)}", replace=True)
+    if mcp_user is not None:
+        ensure_env_line(lines, "FERROSA_MEMORY_MCP_USER", f"export FERROSA_MEMORY_MCP_USER={shell_quote(mcp_user)}", replace=True)
+    if mcp_password is not None:
+        ensure_env_line(lines, "FERROSA_MEMORY_MCP_PASSWORD", f"export FERROSA_MEMORY_MCP_PASSWORD={shell_quote(mcp_password)}", replace=True)
     ensure_env_line(
         lines,
         "FERROSA_MEMORY_HOOK_TIMEOUT",
@@ -116,10 +128,18 @@ def wrapper_format(harness: str) -> str:
     return "plain"
 
 
-def create_wrappers(install_dir: Path, hook_path: Path, mcp_url: str, harnesses: list[str]) -> dict[str, dict[str, str]]:
+def create_wrappers(
+    install_dir: Path,
+    hook_path: Path,
+    mcp_url: str,
+    harnesses: list[str],
+    auth_header: str | None = None,
+    mcp_user: str | None = None,
+    mcp_password: str | None = None,
+) -> dict[str, dict[str, str]]:
     install_dir.mkdir(parents=True, exist_ok=True)
     env_path = install_dir / "env"
-    write_hook_env(env_path, mcp_url)
+    write_hook_env(env_path, mcp_url, auth_header=auth_header, mcp_user=mcp_user, mcp_password=mcp_password)
 
     wrappers: dict[str, dict[str, str]] = {}
     for harness in harnesses:
@@ -459,9 +479,13 @@ def verify_wrapper(command: str, mode: str) -> str:
         )
     except Exception as exc:
         return f"{command}: verification failed to launch: {exc}"
-    if proc.returncode == 0:
-        return f"{command}: ok"
-    return f"{command}: exited {proc.returncode}: {proc.stderr.strip()[:300]}"
+    if proc.returncode != 0:
+        return f"{command}: exited {proc.returncode}: {proc.stderr.strip()[:300]}"
+    combined = f"{proc.stdout}\n{proc.stderr}"
+    if "skipped:" in combined:
+        skip_line = next((line for line in combined.splitlines() if "skipped:" in line), "skipped")
+        return f"{command}: FAILED (hook degraded to skip): {skip_line.strip()[:300]}"
+    return f"{command}: ok"
 
 
 def main() -> int:
@@ -469,6 +493,13 @@ def main() -> int:
     parser.add_argument("--harness", choices=["auto", "all", "codex", "claude", "hermes", "generic"], default="auto")
     parser.add_argument("--install-dir", type=Path, default=DEFAULT_INSTALL_DIR)
     parser.add_argument("--mcp-url", default=os.environ.get("FERROSA_MEMORY_MCP_URL", DEFAULT_MCP_URL))
+    parser.add_argument(
+        "--auth-header",
+        default=os.environ.get("FERROSA_MEMORY_AUTH_HEADER"),
+        help="Full Authorization header value (e.g. 'Basic <base64>') written to the hook env file.",
+    )
+    parser.add_argument("--mcp-user", default=os.environ.get("FERROSA_MEMORY_MCP_USER"))
+    parser.add_argument("--mcp-password", default=os.environ.get("FERROSA_MEMORY_MCP_PASSWORD"))
     parser.add_argument("--claude-settings", type=Path, default=Path.home() / ".claude" / "settings.json")
     parser.add_argument("--hermes-config", type=Path, default=Path.home() / ".hermes" / "config.yaml")
     parser.add_argument("--codex-hooks", type=Path, default=Path.home() / ".codex" / "hooks.json")
@@ -484,7 +515,15 @@ def main() -> int:
 
     harnesses = selected_harnesses(args.harness)
     log(f"harnesses: {', '.join(harnesses)}")
-    wrappers = create_wrappers(args.install_dir, hook_path, args.mcp_url, harnesses)
+    wrappers = create_wrappers(
+        args.install_dir,
+        hook_path,
+        args.mcp_url,
+        harnesses,
+        auth_header=args.auth_header,
+        mcp_user=args.mcp_user,
+        mcp_password=args.mcp_password,
+    )
     write_snippets(args.install_dir, wrappers)
 
     results: list[str] = []
