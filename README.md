@@ -245,7 +245,7 @@ Current local defaults:
 
 - Live retrieval keeps `[retrieval].default_limit = 10` so ordinary agent turns do not overfill context. Agents or users can lower it at runtime with the `config` MCP tool when token use is too high.
 - Semantic retrieval uses Ollama `nomic-embed-text-v2-moe` with 768-dimensional embeddings when Ollama is available. If the embedding provider is absent, the server logs a warning and continues with lexical, phonetic, graph, and exact lookup behavior.
-- The optional live LLM judge/reranker is disabled by default. Enable `[judge]` only when a local or OpenAI-compatible model endpoint is available; failed or abstained judgments are recorded as abstentions, not false positives or negatives.
+- The live LLM judge/reranker is enabled by default with local Ollama `qwen2.5-coder:7b`. If that model or endpoint is unavailable, retrieval still returns the fused baseline results and reports the judge failure in rerank diagnostics; set `[judge].enabled = false` to opt out explicitly.
 
 ## 0.13 Long-Recall Evaluation Profile
 
