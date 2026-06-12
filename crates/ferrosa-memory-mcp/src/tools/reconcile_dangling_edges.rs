@@ -10,6 +10,14 @@
 //!   cargo run --bin reconcile-dangling-edges -- --dry-run   # report only
 //!   cargo run --bin reconcile-dangling-edges                # delete dangling
 //!
+//! IMPORTANT — deletion limitation: deletes go through the graph engine, whose
+//! Cypher must anchor on an endpoint `:Entity` node. An edge with BOTH endpoints
+//! already deleted cannot be matched (the engine rejects relationship-only
+//! patterns), so this binary cannot remove fully-orphaned historical rows — it
+//! reports them. The durable fix is upstream: entity deletion now cleans an
+//! entity's edges first (see delete_typed_edges_referencing_entity_tenant_wide),
+//! preventing new orphans. Dry-run is the reliable use of this tool.
+//!
 //! Scope: the `typed_edges` table, which holds every edge_type streamed to the
 //! viz (including CO_OCCURS_WITH and `references` rows). A separate
 //! `co_occurs_with` backing table, if maintained, is not scanned here — but the
@@ -19,6 +27,7 @@ use std::collections::HashSet;
 
 use ferrosa_memory_core::config::load_config;
 use ferrosa_memory_core::cql_storage::CqlStorage;
+use ferrosa_memory_core::graph::{GraphClient, GraphConfig};
 use ferrosa_memory_core::reconcile::edge_is_dangling;
 use ferrosa_memory_core::storage::Storage;
 use ferrosa_memory_core::types::TenantContext;
@@ -47,6 +56,22 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(%tenant_id, dry_run, "connecting to Ferrosa");
     let storage = CqlStorage::connect(&config.ferrosa).await?;
+    // Deletes MUST route through the graph engine — direct CQL writes to
+    // graph-owned tables are rejected by the storage layer. Build the same
+    // GraphClient the server uses (only needed for the mutating path).
+    let graph = if dry_run {
+        None
+    } else {
+        Some(
+            GraphClient::connect(&GraphConfig {
+                http_url: config.graph.http_url.clone(),
+                username: config.graph.username.clone(),
+                password: config.graph.password.clone(),
+                keyspace: config.ferrosa.keyspace.clone(),
+            })
+            .await?,
+        )
+    };
 
     // 1. Every existing entity id for the tenant.
     let entities = storage.entity_list_all(&ctx).await?;
@@ -82,11 +107,12 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let graph = graph.expect("graph client is constructed for non-dry-run");
     let mut deleted = 0usize;
     let mut failed = 0usize;
     for e in &dangling {
-        match storage
-            .typed_edge_delete(&ctx, e.session_id, e.src_id, &e.edge_type, e.dst_id)
+        match graph
+            .delete_typed_edge(tenant_id, e.session_id, e.src_id, &e.edge_type, e.dst_id)
             .await
         {
             Ok(_) => deleted += 1,
