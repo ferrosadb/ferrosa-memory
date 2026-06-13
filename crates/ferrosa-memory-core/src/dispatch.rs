@@ -2179,31 +2179,8 @@ async fn dispatch_tool<S: crate::storage::Storage>(
     // Wrap in MCP CallToolResult format: { content: [{type: "text", text: "..."}] }
     // MCP clients expect this structure; without it, tool output is invisible.
     let is_err = result.is_err();
-    let wrapped = result.map(|value| {
-        let text = if value.is_string() {
-            value.as_str().unwrap().to_string()
-        } else {
-            serde_json::to_string(&value).unwrap_or_else(|_| value.to_string())
-        };
-        let duration_ms = elapsed.as_millis() as u64;
-        let mut structured_content = serde_json::json!({
-            "tool": canonical_name,
-            "requested_tool": name,
-            "duration_ms": duration_ms,
-            "is_error": false
-        });
-        if let (Some(structured), Some(result)) =
-            (structured_content.as_object_mut(), value.as_object())
-        {
-            for (key, value) in result {
-                structured.insert(key.clone(), value.clone());
-            }
-        }
-        serde_json::json!({
-            "content": [{"type": "text", "text": text}],
-            "structuredContent": structured_content
-        })
-    });
+    let wrapped = result
+        .map(|value| wrap_tool_result(canonical_name, name, &value, elapsed.as_millis() as u64));
 
     // Log tool usage (best-effort).
     let output_bytes = wrapped
@@ -2230,6 +2207,76 @@ async fn dispatch_tool<S: crate::storage::Storage>(
     }
 
     wrapped
+}
+
+/// Wrap a tool result in MCP `CallToolResult` shape.
+///
+/// `structuredContent` carries call metadata plus the tool's result: **object**
+/// results are flattened in (back-compat with existing clients/evals); **non-object**
+/// results (arrays, strings, scalars) are placed under `result` so their payload is
+/// never hidden from clients that render `structuredContent`. `content[0].text` is the
+/// textual fallback for clients that don't.
+fn wrap_tool_result(
+    canonical_name: &str,
+    requested_name: &str,
+    value: &serde_json::Value,
+    duration_ms: u64,
+) -> serde_json::Value {
+    let text = if let Some(s) = value.as_str() {
+        s.to_string()
+    } else {
+        serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+    };
+    let mut structured_content = serde_json::json!({
+        "tool": canonical_name,
+        "requested_tool": requested_name,
+        "duration_ms": duration_ms,
+        "is_error": false
+    });
+    if let Some(structured) = structured_content.as_object_mut() {
+        match value.as_object() {
+            Some(obj) => {
+                for (key, v) in obj {
+                    structured.insert(key.clone(), v.clone());
+                }
+            }
+            None => {
+                structured.insert("result".to_string(), value.clone());
+            }
+        }
+    }
+    serde_json::json!({
+        "content": [{"type": "text", "text": text}],
+        "structuredContent": structured_content
+    })
+}
+
+#[cfg(test)]
+mod wrap_tool_result_tests {
+    use super::wrap_tool_result;
+    use serde_json::json;
+
+    #[test]
+    fn object_result_is_flattened_into_structured_content() {
+        let r = wrap_tool_result("get_stats", "get_stats", &json!({"entity_count": 1}), 5);
+        assert_eq!(r["structuredContent"]["entity_count"], 1);
+        assert_eq!(r["structuredContent"]["tool"], "get_stats");
+        assert_eq!(r["structuredContent"]["requested_tool"], "get_stats");
+    }
+
+    #[test]
+    fn array_result_is_surfaced_under_result() {
+        let r = wrap_tool_result("all_tools", "all_tools", &json!(["a", "b"]), 5);
+        assert_eq!(r["structuredContent"]["result"], json!(["a", "b"]));
+        assert_eq!(r["structuredContent"]["tool"], "all_tools");
+    }
+
+    #[test]
+    fn string_result_is_surfaced_under_result() {
+        let r = wrap_tool_result("ping", "ping", &json!("ok"), 5);
+        assert_eq!(r["structuredContent"]["result"], "ok");
+        assert_eq!(r["content"][0]["text"], "ok");
+    }
 }
 
 /// Returns true for tier-1 tools (always visible in tools/list).
