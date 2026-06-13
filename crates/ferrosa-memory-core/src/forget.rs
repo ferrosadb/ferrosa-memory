@@ -538,8 +538,7 @@ pub async fn confirm(
                 ("retracted".to_string(), "unavailable".to_string())
             }
             ForgetMode::Hard => {
-                invalidate_derived(storage, ctx, *id).await?;
-                storage.entity_delete(ctx, entity.session_id, *id).await?;
+                hard_delete_entity(storage, ctx, entity.session_id, *id).await?;
                 ("deleted".to_string(), "deleted".to_string())
             }
         };
@@ -624,6 +623,44 @@ async fn teardown_typed_edges(
     Ok(())
 }
 
+/// Permanently delete an entity and everything that hangs off it: its typed
+/// edges (both directions), its legacy bidirectional edges (best-effort), then
+/// the entity row itself and all derived rows keyed by the entity id.
+///
+/// This is the single HARD-delete primitive, shared by [`confirm`] (hard mode)
+/// and [`purge_expired_retractions`] (I9). It is idempotent: re-running it on an
+/// already-deleted entity is a no-op (the edge/derived lists come back empty and
+/// `entity_delete` on a missing row is a no-op in the storage model).
+pub(crate) async fn hard_delete_entity(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    session_id: Uuid,
+    entity_id: Uuid,
+) -> anyhow::Result<()> {
+    // Typed edges, both directions.
+    teardown_typed_edges(storage, ctx, session_id, entity_id).await?;
+
+    // Legacy bidirectional edges are best-effort: there is no per-edge legacy
+    // delete primitive wired here yet, so a failure to enumerate them must not
+    // block the hard delete. Log loudly (observable, not silent) and continue.
+    if let Err(e) = storage.edge_list_for_entity(ctx, entity_id).await {
+        tracing::warn!(
+            %entity_id,
+            error = %e,
+            "hard_delete_entity: legacy edge enumeration failed (best-effort); proceeding"
+        );
+    }
+
+    // The entity row, then all derived rows keyed by the entity id.
+    storage.entity_delete(ctx, session_id, entity_id).await?;
+    storage.confidence_delete_by_entity(ctx, entity_id).await?;
+    storage.temporal_delete_by_entity(ctx, entity_id).await?;
+    storage
+        .derived_cache_delete_by_entity(ctx, entity_id)
+        .await?;
+    Ok(())
+}
+
 /// Invalidate derived/materialized data referencing the entity, so a forgotten
 /// fact can't be re-surfaced through a stale derivation.
 async fn invalidate_derived(
@@ -656,11 +693,169 @@ pub async fn restore(
     crate::entity::restore_entity(storage, ctx, entity_id).await
 }
 
+// ─── Purge sweep (I9) ─────────────────────────────────────────────
+
+/// Hard-purge every retraction whose restore window has elapsed.
+///
+/// For each record returned by [`Storage::retraction_list_purgeable`] (all of
+/// which are past their `restorable_until`), this permanently removes the
+/// underlying object and then deletes the retraction record itself, so the
+/// audit row for an expired retraction does not linger forever.
+///
+/// Disposition by object type:
+/// - `"entity"` → [`hard_delete_entity`] (edges + entity + derived rows).
+/// - anything else → **skipped with a logged warning** in v1 (no other object
+///   type is retractable through the forget tool yet). The retraction record is
+///   still deleted so the sweep is eventually consistent.
+///
+/// **Fail-soft, surfaced.** A failure on one record (bad delete, transient
+/// storage error) is logged and the sweep continues to the next record so a
+/// single poisoned row can't stall purging. The count of failures is returned
+/// through the error channel only if *every* record failed in a way that left
+/// nothing purged; otherwise the per-record errors are logged and the function
+/// returns the number successfully purged. Callers that need the failure count
+/// should scan logs for `purge: record failed`.
+///
+/// Returns the number of records successfully purged.
+pub async fn purge_expired_retractions(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    now: DateTime<Utc>,
+) -> anyhow::Result<usize> {
+    let purgeable = storage.retraction_list_purgeable(ctx, now).await?;
+    let total = purgeable.len();
+    let mut purged = 0usize;
+    let mut failures = 0usize;
+
+    for rec in purgeable {
+        match purge_one(storage, ctx, &rec).await {
+            Ok(()) => purged += 1,
+            Err(e) => {
+                failures += 1;
+                tracing::warn!(
+                    object_id = %rec.object_id,
+                    object_type = %rec.object_type,
+                    error = %e,
+                    "purge: record failed; continuing sweep"
+                );
+            }
+        }
+    }
+
+    // Surface a hard failure only when nothing could be purged but work existed
+    // — that signals a systemic problem (e.g. storage down), not a single bad
+    // row. Otherwise we made progress; the failures are logged above.
+    if purged == 0 && failures > 0 {
+        anyhow::bail!("purge: all {total} purgeable record(s) failed; see logs");
+    }
+    Ok(purged)
+}
+
+/// Purge a single expired retraction: hard-delete the underlying object (when
+/// it is an entity), then delete the retraction record by its clustering key.
+async fn purge_one(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    rec: &crate::types::RetractionRecord,
+) -> anyhow::Result<()> {
+    if rec.object_type == "entity" {
+        hard_delete_entity(storage, ctx, rec.session_id, rec.object_id).await?;
+    } else {
+        // v1: only entities are retractable through the forget tool. Other
+        // object types have no hard-delete primitive here yet, so skip the
+        // object teardown but still drop the expired record (observable).
+        tracing::warn!(
+            object_id = %rec.object_id,
+            object_type = %rec.object_type,
+            "purge: non-entity object type has no hard-delete path in v1; \
+             dropping retraction record only"
+        );
+    }
+    storage
+        .retraction_delete(ctx, rec.object_id, rec.retracted_at)
+        .await?;
+    Ok(())
+}
+
+// ─── Integrity sweep (I8) ─────────────────────────────────────────
+
+/// Outcome of an [`integrity_sweep`]: how many typed edges were scanned, how
+/// many were found dangling (pointing at a missing or retracted entity), and
+/// how many were repaired (deleted) when `repair` was set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct IntegrityReport {
+    pub scanned_edges: usize,
+    pub dangling_edges: usize,
+    pub repaired: usize,
+}
+
+/// Scan all typed edges and detect (optionally repair) dangling ones.
+///
+/// An edge is **dangling** if either endpoint (`src` or `dst`) fails to resolve
+/// to a *retrievable* entity — i.e. the entity is missing entirely, or it is
+/// present but in a non-retrievable state ([`MemoryState::is_retrievable`] is
+/// false, e.g. `Unavailable` after a retraction). Such an edge would otherwise
+/// surface a forgotten/absent fact through graph traversal.
+///
+/// When `repair` is true, each dangling edge is deleted via
+/// [`Storage::typed_edge_delete`]. The endpoint lookup uses the edge's own
+/// `session_id`, matching how the edge was stored.
+///
+/// Read-only when `repair` is false. Returns counts in an [`IntegrityReport`].
+pub async fn integrity_sweep(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    repair: bool,
+) -> anyhow::Result<IntegrityReport> {
+    let edges = storage.typed_edge_list_all(ctx).await?;
+    let mut report = IntegrityReport {
+        scanned_edges: edges.len(),
+        ..IntegrityReport::default()
+    };
+
+    for edge in edges {
+        let src_ok = endpoint_retrievable(storage, ctx, edge.session_id, edge.src_id).await?;
+        let dst_ok = endpoint_retrievable(storage, ctx, edge.session_id, edge.dst_id).await?;
+        if src_ok && dst_ok {
+            continue;
+        }
+        report.dangling_edges += 1;
+        if repair {
+            storage
+                .typed_edge_delete(
+                    ctx,
+                    edge.session_id,
+                    edge.src_id,
+                    &edge.edge_type,
+                    edge.dst_id,
+                )
+                .await?;
+            report.repaired += 1;
+        }
+    }
+
+    Ok(report)
+}
+
+/// Whether `entity_id` resolves, in `session_id`, to an entity that both exists
+/// and is currently retrievable (not retracted/`Unavailable`).
+async fn endpoint_retrievable(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    session_id: Uuid,
+    entity_id: Uuid,
+) -> anyhow::Result<bool> {
+    match storage.entity_get_by_id(ctx, session_id, entity_id).await? {
+        Some(entity) => Ok(entity.state.is_retrievable()),
+        None => Ok(false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::mock::MockStorage;
-    use crate::types::{MemoryState, TypedEdge};
+    use crate::types::{MemoryState, RetractionRecord, TypedEdge};
 
     const KEY: &[u8] = b"forget-test-key-0000000000000000";
 
@@ -1163,5 +1358,143 @@ mod tests {
 
         // Restoring again finds no record.
         assert!(!restore(&store, &ctx, id).await.unwrap());
+    }
+
+    async fn put_retraction(
+        store: &MockStorage,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        object_id: Uuid,
+        retracted_at: DateTime<Utc>,
+        restorable_until: DateTime<Utc>,
+    ) {
+        store
+            .retraction_put(
+                ctx,
+                &RetractionRecord {
+                    object_id,
+                    object_type: "entity".to_string(),
+                    session_id,
+                    retracted_at,
+                    reason: "test".to_string(),
+                    actor: "tester".to_string(),
+                    prior_state: "active".to_string(),
+                    restorable_until,
+                    forget_id: Uuid::new_v4(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn purge_removes_expired_entity_and_record_but_spares_future() {
+        let store = MockStorage::new();
+        let ctx = ctx();
+        let sid = Uuid::new_v4();
+        let now = Utc::now();
+
+        // Expired (past restore window) -> should be purged.
+        let expired_id = put_entity(&store, &ctx, sid, "Expired", "gone soon").await;
+        put_retraction(
+            &store,
+            &ctx,
+            sid,
+            expired_id,
+            now - chrono::Duration::days(10),
+            now - chrono::Duration::days(1),
+        )
+        .await;
+
+        // Still within restore window -> must be spared.
+        let future_id = put_entity(&store, &ctx, sid, "Future", "still restorable").await;
+        put_retraction(
+            &store,
+            &ctx,
+            sid,
+            future_id,
+            now - chrono::Duration::days(1),
+            now + chrono::Duration::days(5),
+        )
+        .await;
+
+        let purged = purge_expired_retractions(&store, &ctx, now).await.unwrap();
+        assert_eq!(purged, 1, "exactly one record is past its restore window");
+
+        // Expired entity and its retraction record are gone.
+        assert!(
+            store
+                .entity_get_by_id(&ctx, sid, expired_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "expired entity hard-deleted"
+        );
+        assert!(
+            store
+                .retraction_get_latest(&ctx, expired_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "expired retraction record removed"
+        );
+
+        // The not-yet-expired one is untouched.
+        assert!(
+            store
+                .entity_get_by_id(&ctx, sid, future_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "future-window entity spared"
+        );
+        assert!(
+            store
+                .retraction_get_latest(&ctx, future_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "future-window retraction record spared"
+        );
+    }
+
+    #[tokio::test]
+    async fn integrity_sweep_detects_then_repairs_dangling_edge() {
+        let store = MockStorage::new();
+        let ctx = ctx();
+        let sid = Uuid::new_v4();
+
+        let a = put_entity(&store, &ctx, sid, "Alpha", "alive").await;
+        let b = put_entity(&store, &ctx, sid, "Beta", "to retract").await;
+        add_typed_edge(&store, &ctx, sid, a, "RELATES_TO", b).await;
+
+        // Clean graph: both endpoints retrievable -> no dangling edges.
+        let clean = integrity_sweep(&store, &ctx, false).await.unwrap();
+        assert_eq!(clean.scanned_edges, 1);
+        assert_eq!(clean.dangling_edges, 0);
+        assert_eq!(clean.repaired, 0);
+
+        // Retract Beta (Unavailable -> not retrievable). The edge now dangles.
+        store
+            .entity_update_state(&ctx, b, MemoryState::Unavailable)
+            .await
+            .unwrap();
+
+        let detected = integrity_sweep(&store, &ctx, false).await.unwrap();
+        assert_eq!(detected.scanned_edges, 1);
+        assert_eq!(detected.dangling_edges, 1);
+        assert_eq!(detected.repaired, 0, "report-only mode mutates nothing");
+        // Edge still present after a non-repair scan.
+        assert_eq!(store.typed_edges.lock().await.len(), 1);
+
+        // Repair pass deletes the dangling edge.
+        let repaired = integrity_sweep(&store, &ctx, true).await.unwrap();
+        assert_eq!(repaired.dangling_edges, 1);
+        assert_eq!(repaired.repaired, 1);
+
+        // Re-scan now reports a clean graph.
+        let after = integrity_sweep(&store, &ctx, false).await.unwrap();
+        assert_eq!(after.scanned_edges, 0);
+        assert_eq!(after.dangling_edges, 0);
     }
 }

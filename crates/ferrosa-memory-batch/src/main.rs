@@ -333,6 +333,15 @@ async fn run_decay_and_forget(config: &ferrosa_memory_core::config::Config) -> a
         warmth::prune_forgotten(&storage, &ctx, session_id, rmh.forget_threshold, rmh).await?;
     tracing::info!(pruned, "entities forgotten");
 
+    // Forget maintenance: hard-purge retractions whose restore window has
+    // elapsed. Runs on this job's cadence and only after a successful CQL
+    // connect above, so it is gated on being connected. Fail-soft inside the
+    // sweep (per-record), but a systemic failure (nothing purged) propagates.
+    let purged =
+        ferrosa_memory_core::forget::purge_expired_retractions(&storage, &ctx, chrono::Utc::now())
+            .await?;
+    tracing::info!(purged, "expired retractions purged");
+
     Ok(())
 }
 
