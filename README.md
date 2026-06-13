@@ -74,7 +74,7 @@ Analogy: talking to PostgreSQL over its wire protocol is fine; writing directly 
 
 ## Tools
 
-62 MCP tools are defined in `crates/ferrosa-memory-core/src/dispatch.rs` and
+64 MCP tools are defined in `crates/ferrosa-memory-core/src/dispatch.rs` and
 returned by `tools/list`. Keep this section aligned with the dispatch registry
 when adding or removing tools. (`describe` is a management tool excluded from
 the tier-1 default `tools/list`; request it with `include_all`.)
@@ -93,6 +93,7 @@ the tier-1 default `tools/list`; request it with `include_all`.)
 | Governance | `manage_rules`, `manage_claims`, `manage_approvals`, `manage_aliases`, `explain_derived`, `get_effective_rule_set`, `promote_predicate`, `promote_memory`, `demote_memory` | Rule governance, claims, approvals, explanations, and memory promotion |
 | Maintenance | `get_stats`, `migration_status`, `record_outcome`, `ensure_parent_tag` | Health stats, schema status, strategy feedback, and tag hierarchy |
 | Management | `describe` | Read-only, management-safe self-description (contract `ferrosa-memory.system.describe.v1`): identity, runtime/store health, redacted config, live ferrosa cluster info, summary statistics, schema drift, capabilities, and management actions |
+| Forgetting | `forget`, `restore_forgotten` | Candidate-confirmed forgetting: propose candidates (with blast radius) → confirm to retract (reversible, audited, restorable) or hard-delete; `restore_forgotten` reverses a retraction |
 
 ## Quick Start
 

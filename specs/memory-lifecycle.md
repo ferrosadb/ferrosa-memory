@@ -212,8 +212,11 @@ Memories leave the system through several mechanisms, operating at different tim
 
 | Mechanism | Trigger | Effect |
 |-----------|---------|--------|
+| `forget` (propose → confirm) | User asks to forget specific memories | Candidate-confirmed: search candidates + blast radius, then retract (→ Unavailable, audited, restorable for `retract_purge_days`) or hard-delete the confirmed ids, cascading edge/derived cleanup. See [feat-forget-memory](todo/feat-forget-memory.md). |
+| `restore_forgotten` | User undoes a forget | Reverses a retraction: restores the entity's prior state (within the restore window) |
 | `demote_memory` | Agent decides memory is irrelevant | State moves down one level (Active → Dormant → Silent → Unavailable) |
 | `delete_session` | Session cleanup or right-to-deletion | Cascade deletes all memory objects: plans, folds, entities, feedback, audit logs |
+| `purge_expired_retractions` (batch) | `restorable_until` elapsed | Hard-deletes retracted objects past their restore window (`decay-forget` job) |
 
 ### Passive Forgetting (Time-Based)
 
