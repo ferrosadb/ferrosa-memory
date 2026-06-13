@@ -405,6 +405,17 @@ pub async fn run_migrations(session: &CqlSession, keyspace: &str) -> Result<usiz
 
     if pending.is_empty() {
         tracing::debug!(current, "schema up to date");
+        // Even when no table migrations are pending, re-assert role grants
+        // every startup so a rebuilt/restored cluster (greenfield bootstrap
+        // skipped) and newly-added table grants always converge. Idempotent.
+        apply_roles_grants(session, keyspace)
+            .await
+            .map_err(|source| MigrationError::Statement {
+                version: current,
+                stmt_index: 0,
+                last_good: current,
+                source,
+            })?;
         return Ok(0);
     }
 
@@ -500,6 +511,17 @@ pub async fn run_migrations(session: &CqlSession, keyspace: &str) -> Result<usiz
         applied += 1;
     }
 
+    // Re-assert role grants after all table migrations so every granted
+    // table exists (incl. newly-added ones). Idempotent; runs every startup.
+    apply_roles_grants(session, keyspace)
+        .await
+        .map_err(|source| MigrationError::Statement {
+            version: last_good,
+            stmt_index: 0,
+            last_good,
+            source,
+        })?;
+
     tracing::info!(
         applied,
         current_version = last_good,
@@ -576,17 +598,37 @@ async fn apply_bootstrap(session: &CqlSession, keyspace: &str) -> anyhow::Result
         }
     }
 
-    // Role/grant DDL is gated — see ROLES_DDL doc comment. Running it
-    // without auth enabled would fail because system_auth isn't usable.
-    if should_apply_roles_ddl() {
-        let rewritten = qualify_ddl(ROLES_DDL, keyspace);
-        for (i, stmt) in split_cql(&rewritten).iter().enumerate() {
-            #[allow(deprecated)]
-            if let Err(e) = session.query_unpaged(stmt.as_str(), ()).await {
-                anyhow::bail!("roles DDL statement {i} failed: {e}\n--- statement ---\n{stmt}");
-            }
+    Ok(())
+}
+
+/// Apply the role-auth seed + grants (`ROLES_DDL`) idempotently.
+///
+/// Run on EVERY startup (not just greenfield) so a cluster that was rebuilt
+/// or restored with an existing keyspace — where the greenfield bootstrap is
+/// skipped — still converges to the correct grants. `CREATE ROLE IF NOT
+/// EXISTS` and `GRANT` are idempotent, so re-running is a cheap no-op when
+/// already applied, and it is how newly-added table grants (e.g. the forget
+/// feature's `retraction` / `forget_journal`) reach an already-migrated
+/// cluster. Must run under a superuser session (migrations connect as
+/// `ferrosa_admin`). Gated on `FERROSA_AUTH_ENABLED`; only call AFTER all
+/// table migrations so every granted table exists.
+async fn apply_roles_grants(session: &CqlSession, keyspace: &str) -> anyhow::Result<()> {
+    if !should_apply_roles_ddl() {
+        return Ok(());
+    }
+    let rewritten = qualify_ddl(ROLES_DDL, keyspace);
+    let stmts = split_cql(&rewritten);
+    for (i, stmt) in stmts.iter().enumerate() {
+        #[allow(deprecated)]
+        if let Err(e) = session.query_unpaged(stmt.as_str(), ()).await {
+            anyhow::bail!("roles DDL statement {i} failed: {e}\n--- statement ---\n{stmt}");
         }
     }
+    tracing::info!(
+        keyspace,
+        statements = stmts.len(),
+        "applied role-auth seed + grants"
+    );
     Ok(())
 }
 
@@ -1696,6 +1738,20 @@ mod tests {
             msg.contains("control plane") || msg.contains("provisioning"),
             "error must point operator at the provisioning path, got: {msg}"
         );
+    }
+
+    /// The forget feature (v0.16) writes new application-owned tables; their
+    /// grants must be present in ROLES_DDL or writes fail under auth once the
+    /// roles step runs. Guards against adding a write-path table without its
+    /// grant.
+    #[test]
+    fn roles_ddl_grants_forget_and_confidence_tables() {
+        for table in ["retraction", "forget_journal", "confidence_scores"] {
+            assert!(
+                ROLES_DDL.contains(&format!("GRANT MODIFY ON agent_memory.{table}")),
+                "ROLES_DDL must GRANT MODIFY on {table} to ferrosa_user"
+            );
+        }
     }
 
     /// P0-11/W-03: In DBaaS mode the bootstrap DDL registry must produce zero
