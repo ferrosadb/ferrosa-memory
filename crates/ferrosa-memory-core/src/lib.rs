@@ -41,6 +41,7 @@ pub mod entity;
 pub mod expert_system;
 pub mod feedback;
 pub mod fold;
+pub mod forget;
 pub mod graph;
 pub mod graph_write;
 pub mod http;

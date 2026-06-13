@@ -224,6 +224,12 @@ pub struct SessionState {
     pub retrieval_default_limit: Arc<AtomicUsize>,
     /// Immutable startup snapshot used by the `system_describe` management tool.
     pub system_info: Arc<crate::system_describe::SystemInfo>,
+    /// Forget-feature configuration (`[forget]` section): purge window,
+    /// candidate caps, token TTL, high-impact threshold.
+    pub forget: crate::config::ForgetConfig,
+    /// Secret key for signing/verifying stateless `forget` tokens. Keyed-SHA256
+    /// over the token payload; rotating it invalidates outstanding tokens.
+    pub forget_token_key: Vec<u8>,
 }
 
 impl Default for SessionState {
@@ -255,6 +261,10 @@ impl Default for SessionState {
             judge_config: Arc::new(Mutex::new(crate::config::JudgeConfig::default())),
             retrieval_default_limit: Arc::new(AtomicUsize::new(DEFAULT_RETRIEVAL_LIMIT)),
             system_info: Arc::new(crate::system_describe::SystemInfo::default()),
+            forget: crate::config::ForgetConfig::default(),
+            // Fixed, deterministic key for tests; production overrides this with
+            // random bytes in the MCP server's SessionState constructors.
+            forget_token_key: b"forget-test-key-0000000000000000".to_vec(),
         }
     }
 }

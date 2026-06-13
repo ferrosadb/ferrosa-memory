@@ -169,6 +169,36 @@ pub struct RetractionRecord {
     pub forget_id: Uuid,
 }
 
+/// A forget-journal entry: the durable, replayable record of a single forget
+/// operation and its per-step progress. Mirrors `ddl/037_forget_journal.cql`.
+///
+/// The journal is the source of truth for atomicity: a multi-target /
+/// multi-store forget writes this entry FIRST (single partition, the one place
+/// durability is required) with `status = "in_progress"`, then drives
+/// disposition of the item + edges + temporal links + derived rows, advancing
+/// `step_states` and finally marking `status = "completed"`. A crash mid-forget
+/// leaves an unfinished journal that a resumable sweep can finish or roll back.
+///
+/// `target_ids` and `step_states` are stored as JSON text columns (CQL has no
+/// rich nested types here); the typed accessors below parse them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForgetJournalEntry {
+    pub tenant_id: Uuid,
+    pub forget_id: Uuid,
+    /// JSON array of `{object_type, object_id, session_id}` — the forget targets.
+    pub target_ids: String,
+    /// `"retract"` | `"hard"`.
+    pub mode: String,
+    /// JSON map `step_name -> "pending"|"done"|"failed"`.
+    pub step_states: String,
+    /// `"in_progress"` | `"completed"` | `"failed"`.
+    pub status: String,
+    pub reason: String,
+    pub actor: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Scope of an entity: session-local (default) or global to the tenant.
 ///
 /// Session-scoped entities live in their session's partition and are

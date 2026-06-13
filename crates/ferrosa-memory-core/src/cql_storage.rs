@@ -897,6 +897,21 @@ fn row_to_entity_entry(
 
 /// Decode a row into a [`RetractionRecord`], returning `None` when a required
 /// column is NULL/corrupt (skip rather than poison the whole listing).
+fn row_to_forget_journal_entry(row: &Row, col_map: &ColMap) -> Option<ForgetJournalEntry> {
+    Some(ForgetJournalEntry {
+        tenant_id: cql_get::<Uuid>(row, col_map, "tenant_id").ok()?,
+        forget_id: cql_get::<Uuid>(row, col_map, "forget_id").ok()?,
+        target_ids: cql_get::<String>(row, col_map, "target_ids").unwrap_or_default(),
+        mode: cql_get::<String>(row, col_map, "mode").unwrap_or_default(),
+        step_states: cql_get::<String>(row, col_map, "step_states").unwrap_or_default(),
+        status: cql_get::<String>(row, col_map, "status").unwrap_or_default(),
+        reason: cql_get::<String>(row, col_map, "reason").unwrap_or_default(),
+        actor: cql_get::<String>(row, col_map, "actor").unwrap_or_default(),
+        created_at: cql_get::<chrono::DateTime<chrono::Utc>>(row, col_map, "created_at").ok()?,
+        updated_at: cql_get::<chrono::DateTime<chrono::Utc>>(row, col_map, "updated_at").ok()?,
+    })
+}
+
 fn row_to_retraction_record(row: &Row, col_map: &ColMap) -> Option<RetractionRecord> {
     Some(RetractionRecord {
         object_id: cql_get::<Uuid>(row, col_map, "object_id").ok()?,
@@ -3402,6 +3417,116 @@ impl Storage for CqlStorage {
             .query_unpaged(query, (ctx.tenant_id, object_id, retracted_at))
             .await?;
         Ok(())
+    }
+
+    // --- Forget journal ---
+
+    async fn forget_journal_put(
+        &self,
+        ctx: &TenantContext,
+        entry: &ForgetJournalEntry,
+    ) -> anyhow::Result<()> {
+        let query = format!(
+            "INSERT INTO {}.forget_journal \
+             (tenant_id, forget_id, target_ids, mode, step_states, status, reason, actor, \
+              created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        self.session
+            .query_unpaged(
+                query,
+                (
+                    ctx.tenant_id,
+                    entry.forget_id,
+                    entry.target_ids.clone(),
+                    entry.mode.clone(),
+                    entry.step_states.clone(),
+                    entry.status.clone(),
+                    entry.reason.clone(),
+                    entry.actor.clone(),
+                    entry.created_at,
+                    entry.updated_at,
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn forget_journal_update_status(
+        &self,
+        ctx: &TenantContext,
+        forget_id: Uuid,
+        status: &str,
+        step_states_json: &str,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<()> {
+        // `created_at` is part of the clustering key, so the row can only be
+        // rewritten once we know it. Recover it via the `forget_id` index.
+        let Some(existing) = self.forget_journal_get(ctx, forget_id).await? else {
+            anyhow::bail!("forget_journal entry not found: {forget_id}");
+        };
+        let query = format!(
+            "UPDATE {}.forget_journal SET status = ?, step_states = ?, updated_at = ? \
+             WHERE tenant_id = ? AND created_at = ? AND forget_id = ?",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        self.session
+            .query_unpaged(
+                query,
+                (
+                    status.to_string(),
+                    step_states_json.to_string(),
+                    updated_at,
+                    ctx.tenant_id,
+                    existing.created_at,
+                    forget_id,
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn forget_journal_get(
+        &self,
+        ctx: &TenantContext,
+        forget_id: Uuid,
+    ) -> anyhow::Result<Option<ForgetJournalEntry>> {
+        // Point lookup via the `idx_forget_journal_id` secondary index.
+        let query = format!(
+            "SELECT tenant_id, forget_id, target_ids, mode, step_states, status, reason, actor, \
+             created_at, updated_at \
+             FROM {}.forget_journal WHERE tenant_id = ? AND forget_id = ?",
+            self.keyspace
+        );
+        let (col_map, rows) = query_paged_rows!(self.session, query, (ctx.tenant_id, forget_id))?;
+        Ok(rows
+            .into_iter()
+            .next()
+            .and_then(|row| row_to_forget_journal_entry(&row, &col_map)))
+    }
+
+    async fn forget_journal_list_unfinished(
+        &self,
+        ctx: &TenantContext,
+    ) -> anyhow::Result<Vec<ForgetJournalEntry>> {
+        // Scan this tenant's journal partition and filter unfinished rows in
+        // Rust. The `idx_forget_journal_status` index could narrow this, but a
+        // single-partition scan is simple and the journal stays small.
+        let query = format!(
+            "SELECT tenant_id, forget_id, target_ids, mode, step_states, status, reason, actor, \
+             created_at, updated_at \
+             FROM {}.forget_journal WHERE tenant_id = ?",
+            self.keyspace
+        );
+        let (col_map, rows) = query_paged_rows!(self.session, query, (ctx.tenant_id,))?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| row_to_forget_journal_entry(&row, &col_map))
+            .filter(|entry| entry.status != "completed")
+            .collect())
     }
 
     // --- Temporal operations ---

@@ -18,9 +18,9 @@ use crate::migration::{MIGRATIONS, MigrationStatus, PRE_VERSIONING_BASELINE};
 use crate::types::{
     AliasEntry, ApprovalEntry, AuditEntry, ConfidenceScore, DerivedFact, DocumentChunk,
     EntityEntry, EntityListQuery, EntityListScope, EntityTypeStateCount, FeedbackOutcome,
-    FoldEntry, FoldSummary, MaterializedEdge, MemoEntry, MemoryState, PlanNode, PlanStatus,
-    PromotedPredicate, ProvenanceStep, RetractionRecord, RuleEntry, RuleState, TemporalEvent,
-    TenantContext, ToolUsageRow, TypedEdge, WarmthEntry,
+    FoldEntry, FoldSummary, ForgetJournalEntry, MaterializedEdge, MemoEntry, MemoryState, PlanNode,
+    PlanStatus, PromotedPredicate, ProvenanceStep, RetractionRecord, RuleEntry, RuleState,
+    TemporalEvent, TenantContext, ToolUsageRow, TypedEdge, WarmthEntry,
 };
 
 pub(crate) fn entity_list_sessions(
@@ -585,6 +585,43 @@ pub trait Storage: Send + Sync {
         object_id: Uuid,
         retracted_at: chrono::DateTime<chrono::Utc>,
     ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    // --- Forget journal (forget feature, atomicity backstop) ---
+
+    /// Persist a forget-journal entry. INSERT into the `forget_journal` table.
+    /// Written BEFORE any mutation so a crash mid-forget leaves a recoverable
+    /// `in_progress` record.
+    fn forget_journal_put(
+        &self,
+        ctx: &TenantContext,
+        entry: &ForgetJournalEntry,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// Advance a journal entry's `status` + `step_states` (and `updated_at`).
+    /// Looks up the entry by `forget_id` to recover its clustering key
+    /// (`created_at`), then rewrites the row.
+    fn forget_journal_update_status(
+        &self,
+        ctx: &TenantContext,
+        forget_id: Uuid,
+        status: &str,
+        step_states_json: &str,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// Look up a single journal entry by `forget_id`, or `None`.
+    fn forget_journal_get(
+        &self,
+        ctx: &TenantContext,
+        forget_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<ForgetJournalEntry>>> + Send;
+
+    /// All journal entries whose `status != "completed"` (resume / crash
+    /// recovery sweep).
+    fn forget_journal_list_unfinished(
+        &self,
+        ctx: &TenantContext,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<ForgetJournalEntry>>> + Send;
 
     // --- Temporal event operations (Sprint 3) ---
 
@@ -1496,6 +1533,7 @@ pub mod mock {
         pub folds: Mutex<Vec<FoldEntry>>,
         pub entities: Mutex<Vec<EntityEntry>>,
         pub retractions: Mutex<Vec<RetractionRecord>>,
+        pub forget_journal: Mutex<Vec<ForgetJournalEntry>>,
         pub temporal_events: Mutex<Vec<TemporalEvent>>,
         pub feedback: Mutex<Vec<FeedbackOutcome>>,
         pub intentions: Mutex<Vec<crate::intention::Intention>>,
@@ -2182,6 +2220,61 @@ pub mod mock {
             let mut retractions = self.retractions.lock().await;
             retractions.retain(|r| !(r.object_id == object_id && r.retracted_at == retracted_at));
             Ok(())
+        }
+
+        // --- Forget journal ---
+
+        async fn forget_journal_put(
+            &self,
+            _ctx: &TenantContext,
+            entry: &ForgetJournalEntry,
+        ) -> anyhow::Result<()> {
+            self.forget_journal.lock().await.push(entry.clone());
+            Ok(())
+        }
+
+        async fn forget_journal_update_status(
+            &self,
+            ctx: &TenantContext,
+            forget_id: Uuid,
+            status: &str,
+            step_states_json: &str,
+            updated_at: chrono::DateTime<chrono::Utc>,
+        ) -> anyhow::Result<()> {
+            let mut journal = self.forget_journal.lock().await;
+            if let Some(entry) = journal
+                .iter_mut()
+                .find(|e| e.tenant_id == ctx.tenant_id && e.forget_id == forget_id)
+            {
+                entry.status = status.to_string();
+                entry.step_states = step_states_json.to_string();
+                entry.updated_at = updated_at;
+            }
+            Ok(())
+        }
+
+        async fn forget_journal_get(
+            &self,
+            ctx: &TenantContext,
+            forget_id: Uuid,
+        ) -> anyhow::Result<Option<ForgetJournalEntry>> {
+            let journal = self.forget_journal.lock().await;
+            Ok(journal
+                .iter()
+                .find(|e| e.tenant_id == ctx.tenant_id && e.forget_id == forget_id)
+                .cloned())
+        }
+
+        async fn forget_journal_list_unfinished(
+            &self,
+            ctx: &TenantContext,
+        ) -> anyhow::Result<Vec<ForgetJournalEntry>> {
+            let journal = self.forget_journal.lock().await;
+            Ok(journal
+                .iter()
+                .filter(|e| e.tenant_id == ctx.tenant_id && e.status != "completed")
+                .cloned()
+                .collect())
         }
 
         // --- Temporal operations ---
