@@ -30,6 +30,19 @@ use tracing_subscriber::EnvFilter;
 
 const SPARQL_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
+/// Generate a 32-byte random key for signing stateless `forget` tokens.
+///
+/// No `rand` dependency is in this crate, so we derive the bytes from two
+/// fresh v4 UUIDs (16 random bytes each). The key lives only in process memory
+/// and is regenerated on each server start, so outstanding tokens are
+/// invalidated by a restart.
+fn random_forget_token_key() -> Vec<u8> {
+    let mut key = Vec::with_capacity(32);
+    key.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    key.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    key
+}
+
 /// Storage wrapper that holds an `Option<CqlStorage>` behind a `RwLock`.
 ///
 /// When `inner` is `None`, the server is still reconnecting — all Storage
@@ -872,6 +885,81 @@ impl Storage for ReconnectingStorage {
         delegate!(self, entity_delete, ctx, session_id, entity_id)
     }
 
+    async fn retraction_put(
+        &self,
+        ctx: &TenantContext,
+        rec: &RetractionRecord,
+    ) -> anyhow::Result<()> {
+        delegate!(self, retraction_put, ctx, rec)
+    }
+
+    async fn retraction_get_latest(
+        &self,
+        ctx: &TenantContext,
+        object_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<RetractionRecord>> {
+        delegate!(self, retraction_get_latest, ctx, object_id)
+    }
+
+    async fn retraction_list_purgeable(
+        &self,
+        ctx: &TenantContext,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<Vec<RetractionRecord>> {
+        delegate!(self, retraction_list_purgeable, ctx, now)
+    }
+
+    async fn retraction_delete(
+        &self,
+        ctx: &TenantContext,
+        object_id: uuid::Uuid,
+        retracted_at: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<()> {
+        delegate!(self, retraction_delete, ctx, object_id, retracted_at)
+    }
+
+    async fn forget_journal_put(
+        &self,
+        ctx: &TenantContext,
+        entry: &ForgetJournalEntry,
+    ) -> anyhow::Result<()> {
+        delegate!(self, forget_journal_put, ctx, entry)
+    }
+
+    async fn forget_journal_update_status(
+        &self,
+        ctx: &TenantContext,
+        forget_id: uuid::Uuid,
+        status: &str,
+        step_states_json: &str,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<()> {
+        delegate!(
+            self,
+            forget_journal_update_status,
+            ctx,
+            forget_id,
+            status,
+            step_states_json,
+            updated_at
+        )
+    }
+
+    async fn forget_journal_get(
+        &self,
+        ctx: &TenantContext,
+        forget_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<ForgetJournalEntry>> {
+        delegate!(self, forget_journal_get, ctx, forget_id)
+    }
+
+    async fn forget_journal_list_unfinished(
+        &self,
+        ctx: &TenantContext,
+    ) -> anyhow::Result<Vec<ForgetJournalEntry>> {
+        delegate!(self, forget_journal_list_unfinished, ctx)
+    }
+
     async fn entity_list_session(
         &self,
         ctx: &TenantContext,
@@ -1431,6 +1519,40 @@ impl Storage for ReconnectingStorage {
         delegate!(self, confidence_get, ctx, entity_id, fact_hash)
     }
 
+    // --- Forget / cascade-cleanup operations (CQL-backed) ---
+
+    async fn confidence_delete_by_entity(
+        &self,
+        ctx: &TenantContext,
+        entity_id: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        delegate!(self, confidence_delete_by_entity, ctx, entity_id)
+    }
+
+    async fn temporal_delete_by_entity(
+        &self,
+        ctx: &TenantContext,
+        entity_id: uuid::Uuid,
+    ) -> anyhow::Result<usize> {
+        delegate!(self, temporal_delete_by_entity, ctx, entity_id)
+    }
+
+    async fn provenance_delete_by_entity(
+        &self,
+        ctx: &TenantContext,
+        entity_id: uuid::Uuid,
+    ) -> anyhow::Result<usize> {
+        delegate!(self, provenance_delete_by_entity, ctx, entity_id)
+    }
+
+    async fn derived_cache_delete_by_entity(
+        &self,
+        ctx: &TenantContext,
+        entity_id: uuid::Uuid,
+    ) -> anyhow::Result<usize> {
+        delegate!(self, derived_cache_delete_by_entity, ctx, entity_id)
+    }
+
     // --- Rule registry operations (Sprint 5) ---
 
     async fn rule_put(
@@ -1729,6 +1851,17 @@ impl Storage for ReconnectingStorage {
         src_id: uuid::Uuid,
     ) -> anyhow::Result<Vec<TypedEdge>> {
         delegate!(self, typed_edge_list_from, ctx, session_id, src_id)
+    }
+
+    async fn typed_edge_list_to(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        dst_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<TypedEdge>> {
+        // Reads are CQL-backed (the typed_edges table); routing matches
+        // typed_edge_list_from.
+        delegate!(self, typed_edge_list_to, ctx, session_id, dst_id)
     }
 
     async fn typed_edge_delete(
@@ -2462,6 +2595,8 @@ async fn main() -> anyhow::Result<()> {
                     config.retrieval.default_limit.clamp(1, 50),
                 )),
                 system_info: Arc::clone(&system_info),
+                forget: config.forget.clone(),
+                forget_token_key: random_forget_token_key(),
                 ..dispatch::SessionState::default()
             });
             tracing::info!(session_id = %default_session_id, "using server-owned default session_id");
@@ -2578,6 +2713,8 @@ async fn main() -> anyhow::Result<()> {
                     config.retrieval.default_limit.clamp(1, 50),
                 )),
                 system_info: Arc::clone(&system_info),
+                forget: config.forget.clone(),
+                forget_token_key: random_forget_token_key(),
                 ..dispatch::SessionState::default()
             });
 

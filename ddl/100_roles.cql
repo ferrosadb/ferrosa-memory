@@ -48,5 +48,12 @@ GRANT MODIFY ON agent_memory.derived_cache_by_query  TO ferrosa_user;
 GRANT MODIFY ON agent_memory.derived_cache_by_pred   TO ferrosa_user;
 GRANT MODIFY ON agent_memory.derived_cache_ttl_track TO ferrosa_user;
 GRANT MODIFY ON agent_memory.derivation_provenance   TO ferrosa_user;
+GRANT MODIFY ON agent_memory.confidence_scores       TO ferrosa_user;
+
+-- Forget feature (v0.16): retraction audit/restore records + the forget
+-- journal are application-owned and written by ferrosa_user via the forget
+-- tool and its purge sweep.
+GRANT MODIFY ON agent_memory.retraction    TO ferrosa_user;
+GRANT MODIFY ON agent_memory.forget_journal TO ferrosa_user;
 
 -- graph-owned tables: NOT GRANTED to ferrosa_user on purpose.

@@ -18,9 +18,9 @@ use crate::migration::{MIGRATIONS, MigrationStatus, PRE_VERSIONING_BASELINE};
 use crate::types::{
     AliasEntry, ApprovalEntry, AuditEntry, ConfidenceScore, DerivedFact, DocumentChunk,
     EntityEntry, EntityListQuery, EntityListScope, EntityTypeStateCount, FeedbackOutcome,
-    FoldEntry, FoldSummary, MaterializedEdge, MemoEntry, MemoryState, PlanNode, PlanStatus,
-    PromotedPredicate, ProvenanceStep, RuleEntry, RuleState, TemporalEvent, TenantContext,
-    ToolUsageRow, TypedEdge, WarmthEntry,
+    FoldEntry, FoldSummary, ForgetJournalEntry, MaterializedEdge, MemoEntry, MemoryState, PlanNode,
+    PlanStatus, PromotedPredicate, ProvenanceStep, RetractionRecord, RuleEntry, RuleState,
+    TemporalEvent, TenantContext, ToolUsageRow, TypedEdge, WarmthEntry,
 };
 
 pub(crate) fn entity_list_sessions(
@@ -369,6 +369,10 @@ pub trait Storage: Send + Sync {
             });
             Ok(candidates
                 .into_iter()
+                // Exclude retracted (Unavailable) entities from recall. CQL's
+                // override filters these in collect_entity_matches_from_paged_iter;
+                // mirror it here so non-CQL backends stay consistent.
+                .filter(|entry| entry.state.is_retrievable())
                 .filter(|entry| entity_matches_list_query(entry, ctx, &query))
                 .take(limit)
                 .collect())
@@ -546,6 +550,78 @@ pub trait Storage: Send + Sync {
         session_id: Uuid,
         entity_id: Uuid,
     ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send;
+
+    // --- Retraction records (forget feature) ---
+
+    /// Persist a retraction record (audit + restore metadata for a
+    /// soft-forgotten object). INSERT into the `retraction` table.
+    fn retraction_put(
+        &self,
+        ctx: &TenantContext,
+        rec: &RetractionRecord,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// Latest retraction record for an object, or `None` if it was never
+    /// retracted. Clustering order is `retracted_at DESC`, so `LIMIT 1`
+    /// returns the most recent retraction.
+    fn retraction_get_latest(
+        &self,
+        ctx: &TenantContext,
+        object_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<RetractionRecord>>> + Send;
+
+    /// All retraction records whose restore window has elapsed
+    /// (`restorable_until < now`) and are therefore eligible for hard purge.
+    fn retraction_list_purgeable(
+        &self,
+        ctx: &TenantContext,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<RetractionRecord>>> + Send;
+
+    /// Delete a specific retraction record by its full clustering key.
+    fn retraction_delete(
+        &self,
+        ctx: &TenantContext,
+        object_id: Uuid,
+        retracted_at: chrono::DateTime<chrono::Utc>,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    // --- Forget journal (forget feature, atomicity backstop) ---
+
+    /// Persist a forget-journal entry. INSERT into the `forget_journal` table.
+    /// Written BEFORE any mutation so a crash mid-forget leaves a recoverable
+    /// `in_progress` record.
+    fn forget_journal_put(
+        &self,
+        ctx: &TenantContext,
+        entry: &ForgetJournalEntry,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// Advance a journal entry's `status` + `step_states` (and `updated_at`).
+    /// Looks up the entry by `forget_id` to recover its clustering key
+    /// (`created_at`), then rewrites the row.
+    fn forget_journal_update_status(
+        &self,
+        ctx: &TenantContext,
+        forget_id: Uuid,
+        status: &str,
+        step_states_json: &str,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// Look up a single journal entry by `forget_id`, or `None`.
+    fn forget_journal_get(
+        &self,
+        ctx: &TenantContext,
+        forget_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<ForgetJournalEntry>>> + Send;
+
+    /// All journal entries whose `status != "completed"` (resume / crash
+    /// recovery sweep).
+    fn forget_journal_list_unfinished(
+        &self,
+        ctx: &TenantContext,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<ForgetJournalEntry>>> + Send;
 
     // --- Temporal event operations (Sprint 3) ---
 
@@ -1145,6 +1221,20 @@ pub trait Storage: Send + Sync {
         src_id: Uuid,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<TypedEdge>>> + Send;
 
+    /// List INBOUND typed edges pointing at a specific destination entity.
+    ///
+    /// Reads come from the CQL `typed_edges` table (see `typed_edge_list_from`).
+    /// Because `dst_id` is not part of the partition key, this is a
+    /// single-partition `ALLOW FILTERING` scan within `(tenant_id, session_id)`.
+    /// Used by the forget/cascade path to find references *into* a victim
+    /// entity that must be torn down.
+    fn typed_edge_list_to(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        dst_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<TypedEdge>>> + Send;
+
     /// Delete a typed edge by composite key.
     fn typed_edge_delete(
         &self,
@@ -1284,6 +1374,81 @@ pub trait Storage: Send + Sync {
         fact_hash: &str,
     ) -> impl std::future::Future<Output = anyhow::Result<Option<ConfidenceScore>>> + Send;
 
+    // --- Forget / cascade-cleanup operations ---
+
+    /// Delete all confidence-score rows for an entity.
+    ///
+    /// `confidence_scores` is partitioned by `(entity_id)` (see
+    /// `ddl/026_confidence_scoring.cql`), so this is a single-partition DELETE.
+    /// The default no-op exists for in-memory backends that don't track
+    /// confidence scores.
+    fn confidence_delete_by_entity(
+        &self,
+        ctx: &TenantContext,
+        entity_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send {
+        async move {
+            let _ = (ctx, entity_id);
+            Ok(())
+        }
+    }
+
+    /// Hard-delete all temporal events for an entity. Returns the number of
+    /// rows removed.
+    ///
+    /// `temporal_events` is partitioned by `(tenant_id, entity_id)` (see
+    /// `ddl/030_temporal_events_uuid_columns.cql`), so this drops the whole
+    /// partition. The default no-op returns 0 for backends without temporal
+    /// storage.
+    fn temporal_delete_by_entity(
+        &self,
+        ctx: &TenantContext,
+        entity_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send {
+        async move {
+            let _ = (ctx, entity_id);
+            Ok(0)
+        }
+    }
+
+    /// Best-effort delete of derivation-provenance rows referencing an entity.
+    ///
+    /// `derivation_provenance` is partitioned by `(tenant_id, derived_edge_id)`
+    /// and has no index on entity ids (see `ddl/014_derivation_provenance.cql`):
+    /// the entity can only appear inside the `parent_src` / `parent_dst` /
+    /// `derived_edge_id` text columns, none of which are queryable by value.
+    /// There is therefore no clean by-entity delete. The default is a logged
+    /// no-op returning 0; CQL storage documents the same and does not scan the
+    /// full table.
+    fn provenance_delete_by_entity(
+        &self,
+        ctx: &TenantContext,
+        entity_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send {
+        async move {
+            let _ = (ctx, entity_id);
+            Ok(0)
+        }
+    }
+
+    /// Delete derived-cache rows whose `src_id` or `dst_id` equals the entity.
+    /// Returns the number of rows removed.
+    ///
+    /// `derived_cache_by_query` is partitioned by `(tenant_id, cache_key)` and
+    /// keyed by `seq`; `src_id`/`dst_id` are non-key columns, so this scans the
+    /// tenant's cache and deletes matching `(cache_key, seq)` rows one by one.
+    /// The default no-op returns 0 for backends without a derived cache.
+    fn derived_cache_delete_by_entity(
+        &self,
+        ctx: &TenantContext,
+        entity_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send {
+        async move {
+            let _ = (ctx, entity_id);
+            Ok(0)
+        }
+    }
+
     /// Read-only migration status for operator diagnostics.
     fn migration_status(
         &self,
@@ -1367,6 +1532,8 @@ pub mod mock {
         pub plans: Mutex<Vec<PlanNode>>,
         pub folds: Mutex<Vec<FoldEntry>>,
         pub entities: Mutex<Vec<EntityEntry>>,
+        pub retractions: Mutex<Vec<RetractionRecord>>,
+        pub forget_journal: Mutex<Vec<ForgetJournalEntry>>,
         pub temporal_events: Mutex<Vec<TemporalEvent>>,
         pub feedback: Mutex<Vec<FeedbackOutcome>>,
         pub intentions: Mutex<Vec<crate::intention::Intention>>,
@@ -1692,6 +1859,8 @@ pub mod mock {
             let mut scored: Vec<(u8, &EntityEntry)> = entities
                 .iter()
                 .filter(|e| e.session_id == session_id)
+                // Exclude retracted (Unavailable) entities from recall.
+                .filter(|e| e.state.is_retrievable())
                 .filter_map(|e| {
                     let en = e.entity_name.to_lowercase();
                     if en == lower {
@@ -1768,6 +1937,8 @@ pub mod mock {
             Ok(entities
                 .iter()
                 .filter(|e| e.session_id == session_id)
+                // Exclude retracted (Unavailable) entities from recall.
+                .filter(|e| e.state.is_retrievable())
                 .take(k)
                 .cloned()
                 .collect())
@@ -1829,6 +2000,10 @@ pub mod mock {
             Ok(entities
                 .iter()
                 .filter(|e| e.tenant_id == ctx.tenant_id && e.session_id == session_id)
+                // Exclude retracted (Unavailable) entities from recall. Mirrors
+                // CqlStorage::entity_list_session; bulk paths (entity_list_all)
+                // intentionally keep all states.
+                .filter(|e| e.state.is_retrievable())
                 .cloned()
                 .collect())
         }
@@ -1997,6 +2172,109 @@ pub mod mock {
             } else {
                 anyhow::bail!("entity not found: {entity_id}")
             }
+        }
+
+        // --- Retraction records ---
+
+        async fn retraction_put(
+            &self,
+            _ctx: &TenantContext,
+            rec: &RetractionRecord,
+        ) -> anyhow::Result<()> {
+            self.retractions.lock().await.push(rec.clone());
+            Ok(())
+        }
+
+        async fn retraction_get_latest(
+            &self,
+            _ctx: &TenantContext,
+            object_id: Uuid,
+        ) -> anyhow::Result<Option<RetractionRecord>> {
+            let retractions = self.retractions.lock().await;
+            Ok(retractions
+                .iter()
+                .filter(|r| r.object_id == object_id)
+                .max_by_key(|r| r.retracted_at)
+                .cloned())
+        }
+
+        async fn retraction_list_purgeable(
+            &self,
+            _ctx: &TenantContext,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> anyhow::Result<Vec<RetractionRecord>> {
+            let retractions = self.retractions.lock().await;
+            Ok(retractions
+                .iter()
+                .filter(|r| r.restorable_until < now)
+                .cloned()
+                .collect())
+        }
+
+        async fn retraction_delete(
+            &self,
+            _ctx: &TenantContext,
+            object_id: Uuid,
+            retracted_at: chrono::DateTime<chrono::Utc>,
+        ) -> anyhow::Result<()> {
+            let mut retractions = self.retractions.lock().await;
+            retractions.retain(|r| !(r.object_id == object_id && r.retracted_at == retracted_at));
+            Ok(())
+        }
+
+        // --- Forget journal ---
+
+        async fn forget_journal_put(
+            &self,
+            _ctx: &TenantContext,
+            entry: &ForgetJournalEntry,
+        ) -> anyhow::Result<()> {
+            self.forget_journal.lock().await.push(entry.clone());
+            Ok(())
+        }
+
+        async fn forget_journal_update_status(
+            &self,
+            ctx: &TenantContext,
+            forget_id: Uuid,
+            status: &str,
+            step_states_json: &str,
+            updated_at: chrono::DateTime<chrono::Utc>,
+        ) -> anyhow::Result<()> {
+            let mut journal = self.forget_journal.lock().await;
+            if let Some(entry) = journal
+                .iter_mut()
+                .find(|e| e.tenant_id == ctx.tenant_id && e.forget_id == forget_id)
+            {
+                entry.status = status.to_string();
+                entry.step_states = step_states_json.to_string();
+                entry.updated_at = updated_at;
+            }
+            Ok(())
+        }
+
+        async fn forget_journal_get(
+            &self,
+            ctx: &TenantContext,
+            forget_id: Uuid,
+        ) -> anyhow::Result<Option<ForgetJournalEntry>> {
+            let journal = self.forget_journal.lock().await;
+            Ok(journal
+                .iter()
+                .find(|e| e.tenant_id == ctx.tenant_id && e.forget_id == forget_id)
+                .cloned())
+        }
+
+        async fn forget_journal_list_unfinished(
+            &self,
+            ctx: &TenantContext,
+        ) -> anyhow::Result<Vec<ForgetJournalEntry>> {
+            let journal = self.forget_journal.lock().await;
+            Ok(journal
+                .iter()
+                .filter(|e| e.tenant_id == ctx.tenant_id && e.status != "completed")
+                .cloned()
+                .collect())
         }
 
         // --- Temporal operations ---
@@ -2883,6 +3161,22 @@ pub mod mock {
                 .collect())
         }
 
+        async fn typed_edge_list_to(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+            dst_id: Uuid,
+        ) -> anyhow::Result<Vec<TypedEdge>> {
+            let edges = self.typed_edges.lock().await;
+            Ok(edges
+                .iter()
+                .filter(|e| {
+                    e.tenant_id == ctx.tenant_id && e.session_id == session_id && e.dst_id == dst_id
+                })
+                .cloned()
+                .collect())
+        }
+
         async fn typed_edge_delete(
             &self,
             ctx: &TenantContext,
@@ -3082,6 +3376,46 @@ pub mod mock {
                 .iter()
                 .find(|s| s.entity_id == entity_id && s.fact_hash == fact_hash)
                 .cloned())
+        }
+
+        // --- Forget / cascade-cleanup operations ---
+
+        async fn confidence_delete_by_entity(
+            &self,
+            _ctx: &TenantContext,
+            entity_id: Uuid,
+        ) -> anyhow::Result<()> {
+            let mut scores = self.confidence_scores.lock().await;
+            scores.retain(|s| s.entity_id != entity_id);
+            Ok(())
+        }
+
+        async fn temporal_delete_by_entity(
+            &self,
+            ctx: &TenantContext,
+            entity_id: Uuid,
+        ) -> anyhow::Result<usize> {
+            let mut events = self.temporal_events.lock().await;
+            let before = events.len();
+            events.retain(|e| !(e.tenant_id == ctx.tenant_id && e.entity_id == entity_id));
+            Ok(before - events.len())
+        }
+
+        async fn derived_cache_delete_by_entity(
+            &self,
+            _ctx: &TenantContext,
+            entity_id: Uuid,
+        ) -> anyhow::Result<usize> {
+            let target = entity_id.to_string();
+            let mut cache = self.derived_cache.lock().await;
+            let mut removed = 0usize;
+            for facts in cache.values_mut() {
+                let before = facts.len();
+                facts.retain(|f| f.src_id != target && f.dst_id != target);
+                removed += before - facts.len();
+            }
+            cache.retain(|_, facts| !facts.is_empty());
+            Ok(removed)
         }
     }
 

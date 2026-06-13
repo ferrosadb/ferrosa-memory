@@ -51,6 +51,8 @@ pub struct Config {
     pub judge: JudgeConfig,
     #[serde(default)]
     pub retrieval: RetrievalConfig,
+    #[serde(default)]
+    pub forget: ForgetConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -336,6 +338,56 @@ impl Default for RetrievalConfig {
 
 fn default_retrieval_limit() -> usize {
     10
+}
+
+/// Configuration for the `forget` / `restore_forgotten` memory tools.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct ForgetConfig {
+    /// Days a retracted (soft-forgotten) object remains restorable before the
+    /// purge sweep hard-deletes it. Never hardcoded at call sites.
+    #[serde(default = "default_retract_purge_days")]
+    pub retract_purge_days: u32,
+    /// Default number of candidates returned by a forget propose call.
+    #[serde(default = "default_forget_candidate_limit")]
+    pub candidate_limit: usize,
+    /// Hard cap on candidates a single propose call may return.
+    #[serde(default = "default_forget_candidate_max")]
+    pub candidate_max: usize,
+    /// Lifetime of a propose `forget_token` before confirm must re-propose.
+    #[serde(default = "default_forget_token_ttl_seconds")]
+    pub token_ttl_seconds: u64,
+    /// Edge/reference count above which a candidate is flagged high_impact and
+    /// requires explicit acknowledgement to forget.
+    #[serde(default = "default_high_impact_edge_threshold")]
+    pub high_impact_edge_threshold: usize,
+}
+
+impl Default for ForgetConfig {
+    fn default() -> Self {
+        Self {
+            retract_purge_days: default_retract_purge_days(),
+            candidate_limit: default_forget_candidate_limit(),
+            candidate_max: default_forget_candidate_max(),
+            token_ttl_seconds: default_forget_token_ttl_seconds(),
+            high_impact_edge_threshold: default_high_impact_edge_threshold(),
+        }
+    }
+}
+
+fn default_retract_purge_days() -> u32 {
+    7
+}
+fn default_forget_candidate_limit() -> usize {
+    10
+}
+fn default_forget_candidate_max() -> usize {
+    50
+}
+fn default_forget_token_ttl_seconds() -> u64 {
+    600
+}
+fn default_high_impact_edge_threshold() -> usize {
+    25
 }
 
 fn default_judge_provider() -> String {

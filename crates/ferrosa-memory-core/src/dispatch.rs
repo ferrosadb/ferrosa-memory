@@ -224,6 +224,12 @@ pub struct SessionState {
     pub retrieval_default_limit: Arc<AtomicUsize>,
     /// Immutable startup snapshot used by the `system_describe` management tool.
     pub system_info: Arc<crate::system_describe::SystemInfo>,
+    /// Forget-feature configuration (`[forget]` section): purge window,
+    /// candidate caps, token TTL, high-impact threshold.
+    pub forget: crate::config::ForgetConfig,
+    /// Secret key for signing/verifying stateless `forget` tokens. Keyed-SHA256
+    /// over the token payload; rotating it invalidates outstanding tokens.
+    pub forget_token_key: Vec<u8>,
 }
 
 impl Default for SessionState {
@@ -255,6 +261,10 @@ impl Default for SessionState {
             judge_config: Arc::new(Mutex::new(crate::config::JudgeConfig::default())),
             retrieval_default_limit: Arc::new(AtomicUsize::new(DEFAULT_RETRIEVAL_LIMIT)),
             system_info: Arc::new(crate::system_describe::SystemInfo::default()),
+            forget: crate::config::ForgetConfig::default(),
+            // Fixed, deterministic key for tests; production overrides this with
+            // random bytes in the MCP server's SessionState constructors.
+            forget_token_key: b"forget-test-key-0000000000000000".to_vec(),
         }
     }
 }
@@ -386,6 +396,7 @@ fn short_tool_name(canonical: &str) -> Option<&'static str> {
         "get_effective_rule_set" => Some("ruleset"),
         "promote_predicate" => Some("pred_promote"),
         "list_derived_cache" => Some("derived_cache"),
+        "restore_forgotten" => Some("restore"),
         _ => None,
     }
 }
@@ -460,6 +471,7 @@ fn canonical_tool_name(name: &str) -> &str {
         // Management self-description. Canonical name is `describe`; also accept
         // the dotted contract names from the spec as aliases.
         "system_describe" | "system.describe" | "ferrosa_memory.system.describe" => "describe",
+        "restore" => "restore_forgotten",
         other => other,
     }
 }
@@ -1463,6 +1475,37 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "forget".into(),
+            description: "Candidate-confirmed forgetting, in two phases. PROPOSE (pass `query`, no token): searches memory across sessions for candidates matching the intent, returns each candidate's blast radius (edges/temporal/derived it references) plus a signed `forget_token` — mutates nothing. CONFIRM (pass `forget_token` + `selected_ids` + `confirm: true`): forgets only the approved ids. Defaults to reversible RETRACT (excluded from recall, audited, restorable via restore_forgotten for `retract_purge_days`); pass `mode: \"hard\"` for permanent deletion. Never forgets without explicit confirmation; skips any candidate that changed since proposal.\n\nCALL WHEN: the user asks to forget/remove specific memories. Always propose first, show the candidates, and only confirm the ids the user approves — never pass confirm:true on the user's behalf.\nCost: propose ~20ms + search; confirm ~10-50ms per item.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Propose phase: natural-language description of what to forget." },
+                    "scope": { "type": "array", "items": { "type": "string" }, "description": "Optional candidate filters (entity types, etc.)." },
+                    "session_id": { "type": "string" },
+                    "limit": { "type": "integer", "description": "Max candidates to propose." },
+                    "forget_token": { "type": "string", "description": "Confirm phase: the token returned by a prior propose call." },
+                    "selected_ids": { "type": "array", "items": { "type": "string", "format": "uuid" }, "description": "Confirm phase: the candidate ids the user approved." },
+                    "mode": { "type": "string", "enum": ["retract", "hard"], "description": "retract (default, reversible) or hard (permanent)." },
+                    "acknowledge_high_impact": { "type": "boolean", "description": "Required to forget a high-impact (highly-connected) candidate." },
+                    "reason": { "type": "string" },
+                    "confirm": { "type": "boolean", "description": "Must be true (with forget_token) to execute the forget." }
+                },
+                "required": []
+            }),
+        },
+        ToolDef {
+            name: "restore_forgotten".into(),
+            description: "Reverse a retraction: restore a soft-forgotten entity to its prior memory state so it is recalled again. Works only for retract-mode forgets that have not yet been purged (within retract_purge_days); hard deletes are irreversible. Note: edges removed at forget time are not auto-recreated in v1.\n\nCALL WHEN: the user wants to undo a forget / bring back a retracted memory.\nCost: ~10ms.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "entity_id": { "type": "string", "format": "uuid", "description": "The entity to restore." }
+                },
+                "required": ["entity_id"]
+            }),
+        },
+        ToolDef {
             name: "count_entities_by_type".into(),
             description: "Return a per-session entity histogram broken down by entity_type, by state, and by the joint (type,state) buckets.\n\nCALL WHEN: You need status/diagnostic counts like 'how many bugs are active in this session?' without coupling the client to entity_store columns.\nCost: ~5-10ms.".into(),
             input_schema: serde_json::json!({
@@ -1904,6 +1947,8 @@ INTENTIONS: set_intention for deferred actions. check_intentions at session star
 
 CONSOLIDATION: The server automatically queues consolidation after enough new ingest-created entities. Use run_consolidation only to force a background consolidation request, such as at wrap-up.
 
+FORGETTING: When the user asks to forget or remove specific memories, call forget with a query to PROPOSE candidates, show them what was found (with blast radius), and only call forget again with confirm=true and the user-approved selected_ids. Never pass confirm=true on the user's behalf. Default mode retract is reversible (restore_forgotten); mode hard is permanent.
+
 FEEDBACK: If you had to use grep, find, or read files to get context that SHOULD have been in memory, call record_outcome with program_type="retrieval_miss" and include what you were looking for. This trains the system to store that kind of information in the future. Every retrieval miss is a signal to improve."#;
 
 /// Server info returned during initialize.
@@ -2062,6 +2107,8 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "get_stats" => Box::pin(handle_get_stats(args, storage, ctx, session)),
         "migration_status" => Box::pin(handle_migration_status(args, storage)),
         "describe" => Box::pin(handle_system_describe(args, storage, ctx, session)),
+        "forget" => Box::pin(handle_forget(args, storage, ctx, session)),
+        "restore_forgotten" => Box::pin(handle_restore_forgotten(args, storage, ctx)),
         "count_entities_by_type" => Box::pin(handle_count_entities_by_type(args, storage, ctx)),
         "promote_memory" => Box::pin(handle_promote_memory(args, storage, ctx, session)),
         "demote_memory" => Box::pin(handle_demote_memory(args, storage, ctx, session)),
@@ -2203,6 +2250,7 @@ fn is_tier1(name: &str) -> bool {
             | "get_stats"
             | "retrieve_entities"
             | "list_entities"
+            | "forget"
     )
 }
 
@@ -8261,6 +8309,151 @@ async fn handle_system_describe<S: crate::storage::Storage>(
     serde_json::to_value(descriptor).map_err(|e| (INTERNAL_ERROR, e.to_string()))
 }
 
+/// `forget` — two-phase candidate-confirmed forgetting.
+///
+/// Propose (no `forget_token`): searches candidates, returns a signed token +
+/// blast radius, mutates nothing. Confirm (`forget_token` + `confirm: true`):
+/// retracts (default, reversible) or hard-deletes the explicitly selected ids.
+async fn handle_forget<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let now = chrono::Utc::now();
+    let key = session.forget_token_key.as_slice();
+    let cfg = &session.forget;
+
+    let token = args.get("forget_token").and_then(|v| v.as_str());
+    let confirming = args
+        .get("confirm")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if let Some(token_str) = token.filter(|_| confirming) {
+        let selected: Vec<uuid::Uuid> = args
+            .get("selected_ids")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .filter_map(|s| uuid::Uuid::parse_str(s).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if selected.is_empty() {
+            return Err((
+                INVALID_PARAMS,
+                "confirm requires a non-empty selected_ids drawn from the proposed candidates"
+                    .into(),
+            ));
+        }
+        let mode = match args
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("retract")
+        {
+            "retract" => crate::forget::ForgetMode::Retract,
+            "hard" => crate::forget::ForgetMode::Hard,
+            other => {
+                return Err((
+                    INVALID_PARAMS,
+                    format!("invalid mode '{other}'; use 'retract' (default) or 'hard'"),
+                ));
+            }
+        };
+        let ack = args
+            .get("acknowledge_high_impact")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+        let actor = args
+            .get("actor")
+            .and_then(|v| v.as_str())
+            .unwrap_or(ctx.session_origin.as_str());
+        let result = crate::forget::confirm(
+            storage,
+            ctx,
+            token_str,
+            &selected,
+            mode,
+            ack,
+            reason,
+            actor,
+            key,
+            cfg.token_ttl_seconds,
+            cfg.retract_purge_days,
+            cfg.high_impact_edge_threshold,
+            now,
+        )
+        .await
+        .map_err(|e| (INVALID_PARAMS, e.to_string()))?;
+        return serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()));
+    }
+
+    // Propose phase (read-only).
+    let query = args.get("query").and_then(|v| v.as_str()).ok_or((
+        INVALID_PARAMS,
+        "forget requires 'query' to propose candidates, or 'forget_token' + 'confirm: true' to \
+         execute a prior proposal"
+            .to_string(),
+    ))?;
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+    let scope: Vec<String> = args
+        .get("scope")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(cfg.candidate_limit);
+    let result = crate::forget::propose(
+        storage,
+        ctx,
+        session_id,
+        query,
+        &scope,
+        limit,
+        cfg.candidate_max,
+        cfg.high_impact_edge_threshold,
+        key,
+        now,
+    )
+    .await
+    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
+/// `restore_forgotten` — reverse a retraction (un-retract an entity).
+async fn handle_restore_forgotten<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let entity_id = optional_uuid(&args, "entity_id")?.ok_or((
+        INVALID_PARAMS,
+        "restore_forgotten requires 'entity_id'".into(),
+    ))?;
+    let restored = crate::forget::restore(storage, ctx, entity_id)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    Ok(serde_json::json!({
+        "restored": restored,
+        "entity_id": entity_id.to_string(),
+        "hint": if restored {
+            "Entity restored to its prior state. Note: edges removed at forget time are not auto-recreated in v1."
+        } else {
+            "No active retraction found for this entity (already restored, never retracted, or purged)."
+        }
+    }))
+}
+
 async fn handle_count_entities_by_type<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
@@ -10297,6 +10490,94 @@ mod tests {
         }
     }
 
+    // T-FORGET-003 (wiring): the forget tool routes propose → confirm through
+    // dispatch, and refuses a call with neither query nor token.
+    #[tokio::test]
+    async fn forget_tool_propose_confirm_roundtrip_via_dispatch() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::nil();
+
+        // Seed an entity to forget (direct put, like the module tests).
+        let entry = crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "outbound port exhaustion".to_string(),
+            entity_type: "concept".to_string(),
+            source_fold_id: None,
+            context_snippet: "sockets held on sleep".to_string(),
+            entity_embedding: None,
+            confidence: 1.0,
+            state: crate::types::MemoryState::Active,
+            created_at: chrono::Utc::now(),
+            description: None,
+            description_embedding: None,
+            tags: Vec::new(),
+            properties: serde_json::Value::Null,
+            content_hash: None,
+            updated_at: None,
+            scope: Default::default(),
+            ingested_by_session: None,
+        };
+        store.entity_put(&ctx, &entry).await.unwrap();
+
+        // Propose (read-only) returns a token + candidates.
+        let propose = unwrap_tool_result(
+            dispatch(
+                "tools/call",
+                serde_json::json!({
+                    "name": "forget",
+                    "arguments": { "query": "outbound port exhaustion", "session_id": sid.to_string() }
+                }),
+                &store,
+                &ctx,
+                &session,
+            )
+            .await
+            .unwrap(),
+        );
+        let token = propose["forget_token"].as_str().expect("forget_token");
+        let candidates = propose["candidates"].as_array().expect("candidates");
+        assert!(!candidates.is_empty(), "expected a candidate to forget");
+        let object_id = candidates[0]["object_id"].as_str().unwrap().to_string();
+
+        // Confirm (retract) the selected candidate.
+        let confirm = unwrap_tool_result(
+            dispatch(
+                "tools/call",
+                serde_json::json!({
+                    "name": "forget",
+                    "arguments": {
+                        "forget_token": token,
+                        "selected_ids": [object_id],
+                        "confirm": true
+                    }
+                }),
+                &store,
+                &ctx,
+                &session,
+            )
+            .await
+            .unwrap(),
+        );
+        let forgotten = confirm["forgotten"].as_array().expect("forgotten");
+        assert_eq!(forgotten.len(), 1);
+        assert_eq!(forgotten[0]["outcome"], "retracted");
+
+        // A forget call with neither query nor token is rejected.
+        let err = dispatch(
+            "tools/call",
+            serde_json::json!({ "name": "forget", "arguments": {} }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await;
+        assert!(err.is_err(), "forget with no query/token must error");
+    }
+
     #[tokio::test]
     async fn list_entities_filters_properties_across_sessions_by_default() {
         let store = MockStorage::new();
@@ -10561,7 +10842,11 @@ mod tests {
             expected_tier1,
             "default tools/list should return all tier-1 tools"
         );
-        assert_eq!(tools.len(), 12, "tier-1 tool surface should stay compact");
+        assert_eq!(tools.len(), 13, "tier-1 tool surface should stay compact");
+        assert!(
+            tools.iter().any(|t| t["name"].as_str() == Some("forget")),
+            "forget is a tier-1 tool"
+        );
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         // All default tools must be compact public names.

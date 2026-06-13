@@ -895,6 +895,43 @@ fn row_to_entity_entry(
     }))
 }
 
+/// Decode a row into a [`RetractionRecord`], returning `None` when a required
+/// column is NULL/corrupt (skip rather than poison the whole listing).
+fn row_to_forget_journal_entry(row: &Row, col_map: &ColMap) -> Option<ForgetJournalEntry> {
+    Some(ForgetJournalEntry {
+        tenant_id: cql_get::<Uuid>(row, col_map, "tenant_id").ok()?,
+        forget_id: cql_get::<Uuid>(row, col_map, "forget_id").ok()?,
+        target_ids: cql_get::<String>(row, col_map, "target_ids").unwrap_or_default(),
+        mode: cql_get::<String>(row, col_map, "mode").unwrap_or_default(),
+        step_states: cql_get::<String>(row, col_map, "step_states").unwrap_or_default(),
+        status: cql_get::<String>(row, col_map, "status").unwrap_or_default(),
+        reason: cql_get::<String>(row, col_map, "reason").unwrap_or_default(),
+        actor: cql_get::<String>(row, col_map, "actor").unwrap_or_default(),
+        created_at: cql_get::<chrono::DateTime<chrono::Utc>>(row, col_map, "created_at").ok()?,
+        updated_at: cql_get::<chrono::DateTime<chrono::Utc>>(row, col_map, "updated_at").ok()?,
+    })
+}
+
+fn row_to_retraction_record(row: &Row, col_map: &ColMap) -> Option<RetractionRecord> {
+    Some(RetractionRecord {
+        object_id: cql_get::<Uuid>(row, col_map, "object_id").ok()?,
+        object_type: cql_get::<String>(row, col_map, "object_type").ok()?,
+        session_id: cql_get::<Uuid>(row, col_map, "session_id").ok()?,
+        retracted_at: cql_get::<chrono::DateTime<chrono::Utc>>(row, col_map, "retracted_at")
+            .ok()?,
+        reason: cql_get::<String>(row, col_map, "reason").unwrap_or_default(),
+        actor: cql_get::<String>(row, col_map, "actor").unwrap_or_default(),
+        prior_state: cql_get::<String>(row, col_map, "prior_state").unwrap_or_default(),
+        restorable_until: cql_get::<chrono::DateTime<chrono::Utc>>(
+            row,
+            col_map,
+            "restorable_until",
+        )
+        .ok()?,
+        forget_id: cql_get::<Uuid>(row, col_map, "forget_id").ok()?,
+    })
+}
+
 fn entity_list_result_order(a: &EntityEntry, b: &EntityEntry) -> std::cmp::Ordering {
     let a_time = a.updated_at.unwrap_or(a.created_at);
     let b_time = b.updated_at.unwrap_or(b.created_at);
@@ -1628,6 +1665,10 @@ impl CqlStorage {
             let Some(entry) = row_to_entity_entry(ctx, &row, &col_map)? else {
                 continue;
             };
+            // Exclude retracted (Unavailable) entities from recall.
+            if !entry.state.is_retrievable() {
+                continue;
+            }
             if crate::storage::entity_matches_list_query(&entry, ctx, query) {
                 matches.push(entry);
                 if matches.len() > limit {
@@ -2500,10 +2541,14 @@ impl Storage for CqlStorage {
                     tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
                     Default::default()
                 });
-            let state = cql_get::<String>(&row, &col_map, "state")
+            let state: MemoryState = cql_get::<String>(&row, &col_map, "state")
                 .ok()
                 .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
                 .unwrap_or_default();
+            // Exclude retracted (Unavailable) entities from recall.
+            if !state.is_retrievable() {
+                continue;
+            }
 
             scored.push((
                 rank,
@@ -2754,10 +2799,14 @@ impl Storage for CqlStorage {
                     tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
                     Default::default()
                 });
-            let state = cql_get::<String>(&row, &col_map, "state")
+            let state: MemoryState = cql_get::<String>(&row, &col_map, "state")
                 .ok()
                 .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
                 .unwrap_or_default();
+            // Exclude retracted (Unavailable) entities from recall.
+            if !state.is_retrievable() {
+                continue;
+            }
             results.push(EntityEntry {
                 tenant_id: ctx.tenant_id,
                 entity_id,
@@ -2863,13 +2912,20 @@ impl Storage for CqlStorage {
         ctx: &TenantContext,
         session_id: Uuid,
     ) -> anyhow::Result<Vec<EntityEntry>> {
-        self.collect_entity_entries_from_paged_iter(
-            ctx,
-            self.stmts.entity_list_session.clone(),
-            (ctx.tenant_id, session_id),
-            "entity_list_session",
-        )
-        .await
+        let mut entries = self
+            .collect_entity_entries_from_paged_iter(
+                ctx,
+                self.stmts.entity_list_session.clone(),
+                (ctx.tenant_id, session_id),
+                "entity_list_session",
+            )
+            .await?;
+        // Exclude retracted (Unavailable) entities from recall. This is a recall
+        // path; the bulk/admin paths (entity_list_all/stream_*) deliberately keep
+        // all states and share the same paged-iter helper, so the filter lives
+        // here rather than inside collect_entity_entries_from_paged_iter.
+        entries.retain(|e| e.state.is_retrievable());
+        Ok(entries)
     }
 
     async fn entity_list_matching(
@@ -2938,6 +2994,8 @@ impl Storage for CqlStorage {
     }
 
     async fn entity_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<EntityEntry>> {
+        // Bulk/admin path: intentionally includes all states (Unavailable too)
+        // for consolidation/reindex; no is_retrievable() filter here.
         self.collect_entity_entries_from_paged_iter(
             ctx,
             self.stmts.entity_list_all.clone(),
@@ -2953,6 +3011,8 @@ impl Storage for CqlStorage {
         chunk_size: usize,
         tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<EntityEntry>>>,
     ) {
+        // Bulk/admin path: intentionally includes all states (Unavailable too)
+        // for consolidation/reindex; no is_retrievable() filter here.
         let chunk_size = chunk_size.max(1);
         let mut iter = match self
             .session
@@ -3002,6 +3062,8 @@ impl Storage for CqlStorage {
         chunk_size: usize,
         tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<EntityEntry>>>,
     ) {
+        // Bulk/admin path: intentionally includes all states (Unavailable too)
+        // for consolidation/reindex; no is_retrievable() filter here.
         let chunk_size = chunk_size.max(1);
         let mut iter = match self
             .session
@@ -3259,6 +3321,212 @@ impl Storage for CqlStorage {
             .query_unpaged(query, (ctx.tenant_id, session_id, entity_id))
             .await?;
         Ok(true)
+    }
+
+    // --- Retraction records (forget feature) ---
+
+    async fn retraction_put(
+        &self,
+        ctx: &TenantContext,
+        rec: &RetractionRecord,
+    ) -> anyhow::Result<()> {
+        let query = format!(
+            "INSERT INTO {}.retraction \
+             (tenant_id, object_id, object_type, session_id, retracted_at, reason, actor, \
+              prior_state, restorable_until, forget_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        self.session
+            .query_unpaged(
+                query,
+                (
+                    ctx.tenant_id,
+                    rec.object_id,
+                    rec.object_type.clone(),
+                    rec.session_id,
+                    rec.retracted_at,
+                    rec.reason.clone(),
+                    rec.actor.clone(),
+                    rec.prior_state.clone(),
+                    rec.restorable_until,
+                    rec.forget_id,
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn retraction_get_latest(
+        &self,
+        ctx: &TenantContext,
+        object_id: Uuid,
+    ) -> anyhow::Result<Option<RetractionRecord>> {
+        // Clustering order is `retracted_at DESC`, so LIMIT 1 yields the latest.
+        let query = format!(
+            "SELECT object_id, object_type, session_id, retracted_at, reason, actor, \
+             prior_state, restorable_until, forget_id \
+             FROM {}.retraction WHERE tenant_id = ? AND object_id = ? LIMIT 1",
+            self.keyspace
+        );
+        let (col_map, rows) = query_paged_rows!(self.session, query, (ctx.tenant_id, object_id))?;
+        Ok(rows
+            .into_iter()
+            .next()
+            .and_then(|row| row_to_retraction_record(&row, &col_map)))
+    }
+
+    async fn retraction_list_purgeable(
+        &self,
+        ctx: &TenantContext,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<Vec<RetractionRecord>> {
+        // v1 limitation: `restorable_until` is not part of the primary key and
+        // has no secondary index, so we full-table scan this tenant's
+        // retractions and filter `restorable_until < now` in Rust. Acceptable
+        // for the expected low retraction volume; revisit with a time-bucketed
+        // index if this grows.
+        let query = format!(
+            "SELECT object_id, object_type, session_id, retracted_at, reason, actor, \
+             prior_state, restorable_until, forget_id \
+             FROM {}.retraction WHERE tenant_id = ? ALLOW FILTERING",
+            self.keyspace
+        );
+        let (col_map, rows) = query_paged_rows!(self.session, query, (ctx.tenant_id,))?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| row_to_retraction_record(&row, &col_map))
+            .filter(|rec| rec.restorable_until < now)
+            .collect())
+    }
+
+    async fn retraction_delete(
+        &self,
+        ctx: &TenantContext,
+        object_id: Uuid,
+        retracted_at: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<()> {
+        let query = format!(
+            "DELETE FROM {}.retraction \
+             WHERE tenant_id = ? AND object_id = ? AND retracted_at = ?",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        self.session
+            .query_unpaged(query, (ctx.tenant_id, object_id, retracted_at))
+            .await?;
+        Ok(())
+    }
+
+    // --- Forget journal ---
+
+    async fn forget_journal_put(
+        &self,
+        ctx: &TenantContext,
+        entry: &ForgetJournalEntry,
+    ) -> anyhow::Result<()> {
+        let query = format!(
+            "INSERT INTO {}.forget_journal \
+             (tenant_id, forget_id, target_ids, mode, step_states, status, reason, actor, \
+              created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        self.session
+            .query_unpaged(
+                query,
+                (
+                    ctx.tenant_id,
+                    entry.forget_id,
+                    entry.target_ids.clone(),
+                    entry.mode.clone(),
+                    entry.step_states.clone(),
+                    entry.status.clone(),
+                    entry.reason.clone(),
+                    entry.actor.clone(),
+                    entry.created_at,
+                    entry.updated_at,
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn forget_journal_update_status(
+        &self,
+        ctx: &TenantContext,
+        forget_id: Uuid,
+        status: &str,
+        step_states_json: &str,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<()> {
+        // `created_at` is part of the clustering key, so the row can only be
+        // rewritten once we know it. Recover it via the `forget_id` index.
+        let Some(existing) = self.forget_journal_get(ctx, forget_id).await? else {
+            anyhow::bail!("forget_journal entry not found: {forget_id}");
+        };
+        let query = format!(
+            "UPDATE {}.forget_journal SET status = ?, step_states = ?, updated_at = ? \
+             WHERE tenant_id = ? AND created_at = ? AND forget_id = ?",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        self.session
+            .query_unpaged(
+                query,
+                (
+                    status.to_string(),
+                    step_states_json.to_string(),
+                    updated_at,
+                    ctx.tenant_id,
+                    existing.created_at,
+                    forget_id,
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn forget_journal_get(
+        &self,
+        ctx: &TenantContext,
+        forget_id: Uuid,
+    ) -> anyhow::Result<Option<ForgetJournalEntry>> {
+        // Point lookup via the `idx_forget_journal_id` secondary index.
+        let query = format!(
+            "SELECT tenant_id, forget_id, target_ids, mode, step_states, status, reason, actor, \
+             created_at, updated_at \
+             FROM {}.forget_journal WHERE tenant_id = ? AND forget_id = ?",
+            self.keyspace
+        );
+        let (col_map, rows) = query_paged_rows!(self.session, query, (ctx.tenant_id, forget_id))?;
+        Ok(rows
+            .into_iter()
+            .next()
+            .and_then(|row| row_to_forget_journal_entry(&row, &col_map)))
+    }
+
+    async fn forget_journal_list_unfinished(
+        &self,
+        ctx: &TenantContext,
+    ) -> anyhow::Result<Vec<ForgetJournalEntry>> {
+        // Scan this tenant's journal partition and filter unfinished rows in
+        // Rust. The `idx_forget_journal_status` index could narrow this, but a
+        // single-partition scan is simple and the journal stays small.
+        let query = format!(
+            "SELECT tenant_id, forget_id, target_ids, mode, step_states, status, reason, actor, \
+             created_at, updated_at \
+             FROM {}.forget_journal WHERE tenant_id = ?",
+            self.keyspace
+        );
+        let (col_map, rows) = query_paged_rows!(self.session, query, (ctx.tenant_id,))?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| row_to_forget_journal_entry(&row, &col_map))
+            .filter(|entry| entry.status != "completed")
+            .collect())
     }
 
     // --- Temporal operations ---
@@ -5351,6 +5619,51 @@ impl Storage for CqlStorage {
         Ok(edges)
     }
 
+    async fn typed_edge_list_to(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        dst_id: Uuid,
+    ) -> anyhow::Result<Vec<TypedEdge>> {
+        // dst_id is not part of the partition key, so this is a single-partition
+        // ALLOW FILTERING scan within (tenant_id, session_id). Mirror of
+        // typed_edge_list_from with the predicate on dst_id.
+        let query = format!(
+            "SELECT src_id, edge_type, dst_id, weight, metadata, created_at \
+             FROM {}.typed_edges \
+             WHERE tenant_id = ? AND session_id = ? AND dst_id = ? ALLOW FILTERING",
+            self.keyspace
+        );
+        let prepared = self.session.prepare(query).await?;
+        let (col_map, rows) =
+            exec_paged_rows!(self.session, prepared, (ctx.tenant_id, session_id, dst_id))?;
+
+        let mut edges = Vec::new();
+        for row in rows {
+            let created = cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
+                .unwrap_or_else(|e| {
+                    tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
+                    Default::default()
+                });
+            let Some(weight) = decode_edge_weight(&row, &col_map, "typed_edges") else {
+                continue;
+            };
+            edges.push(TypedEdge {
+                tenant_id: ctx.tenant_id,
+                session_id,
+                src_id: cql_get(&row, &col_map, "src_id")?,
+                edge_type: cql_get::<String>(&row, &col_map, "edge_type").unwrap_or_default(),
+                dst_id,
+                weight,
+                metadata: cql_get::<String>(&row, &col_map, "metadata")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
+                created_at: created,
+            });
+        }
+        Ok(edges)
+    }
+
     async fn typed_edge_delete(
         &self,
         _ctx: &TenantContext,
@@ -5977,6 +6290,124 @@ impl Storage for CqlStorage {
         } else {
             Ok(None)
         }
+    }
+
+    // --- Forget / cascade-cleanup operations ---
+
+    async fn confidence_delete_by_entity(
+        &self,
+        _ctx: &TenantContext,
+        entity_id: Uuid,
+    ) -> anyhow::Result<()> {
+        // confidence_scores is partitioned by (entity_id), so a single-partition
+        // DELETE removes every fact_hash row for the entity. There is no
+        // tenant_id column on this table.
+        let query = format!(
+            "DELETE FROM {}.confidence_scores WHERE entity_id = ?",
+            self.keyspace
+        );
+        self.session.query_unpaged(query, (entity_id,)).await?;
+        Ok(())
+    }
+
+    async fn temporal_delete_by_entity(
+        &self,
+        ctx: &TenantContext,
+        entity_id: Uuid,
+    ) -> anyhow::Result<usize> {
+        // temporal_events is partitioned by (tenant_id, entity_id). Count the
+        // partition first (clustering rows aren't individually addressable for a
+        // post-delete diff), then drop the whole partition in one DELETE.
+        let count_query = format!(
+            "SELECT COUNT(*) FROM {}.temporal_events WHERE tenant_id = ? AND entity_id = ?",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        let result = self
+            .session
+            .query_unpaged(count_query, (ctx.tenant_id, entity_id))
+            .await?;
+        let col_map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
+        let count = match rows.first() {
+            Some(row) => cql_get_i64_from_single_aggregate(
+                row,
+                &col_map,
+                &["system.count", "count", "count(*)"],
+            )?
+            .max(0) as usize,
+            None => 0,
+        };
+
+        let delete_query = format!(
+            "DELETE FROM {}.temporal_events WHERE tenant_id = ? AND entity_id = ?",
+            self.keyspace
+        );
+        self.session
+            .query_unpaged(delete_query, (ctx.tenant_id, entity_id))
+            .await?;
+        Ok(count)
+    }
+
+    async fn provenance_delete_by_entity(
+        &self,
+        _ctx: &TenantContext,
+        entity_id: Uuid,
+    ) -> anyhow::Result<usize> {
+        // derivation_provenance is partitioned by (tenant_id, derived_edge_id)
+        // and has no index keyed on an entity id. The entity can only appear
+        // inside the parent_src/parent_dst/derived_edge_id *text* columns, none
+        // of which are queryable by value, so there is no clean by-entity
+        // delete. We deliberately do NOT full-table scan here (cost +
+        // ambiguous string matching against derived_edge_id composites). This
+        // is a documented no-op; provenance rows are TTL-free but harmless
+        // (they only reference the forgotten entity by string).
+        tracing::debug!(
+            %entity_id,
+            "provenance_delete_by_entity: no-op (derivation_provenance has no entity index)"
+        );
+        Ok(0)
+    }
+
+    async fn derived_cache_delete_by_entity(
+        &self,
+        ctx: &TenantContext,
+        entity_id: Uuid,
+    ) -> anyhow::Result<usize> {
+        // derived_cache_by_query is partitioned by (tenant_id, cache_key) and
+        // keyed by seq; src_id/dst_id are non-key columns. Scan the tenant's
+        // cache rows, then delete each (cache_key, seq) whose src_id or dst_id
+        // matches the forgotten entity.
+        let scan_query = format!(
+            "SELECT cache_key, seq, src_id, dst_id FROM {}.derived_cache_by_query \
+             WHERE tenant_id = ? ALLOW FILTERING",
+            self.keyspace
+        );
+        let (col_map, rows) = query_paged_rows!(self.session, scan_query, (ctx.tenant_id,))?;
+
+        let mut victims: Vec<(String, i32)> = Vec::new();
+        for row in rows {
+            let src_id: Uuid = cql_get(&row, &col_map, "src_id").unwrap_or_default();
+            let dst_id: Uuid = cql_get(&row, &col_map, "dst_id").unwrap_or_default();
+            if src_id == entity_id || dst_id == entity_id {
+                let cache_key: String = cql_get(&row, &col_map, "cache_key").unwrap_or_default();
+                let seq: i32 = cql_get(&row, &col_map, "seq").unwrap_or_default();
+                victims.push((cache_key, seq));
+            }
+        }
+
+        let delete_query = format!(
+            "DELETE FROM {}.derived_cache_by_query \
+             WHERE tenant_id = ? AND cache_key = ? AND seq = ?",
+            self.keyspace
+        );
+        let removed = victims.len();
+        for (cache_key, seq) in victims {
+            self.session
+                .query_unpaged(delete_query.clone(), (ctx.tenant_id, cache_key, seq))
+                .await?;
+        }
+        Ok(removed)
     }
 }
 
