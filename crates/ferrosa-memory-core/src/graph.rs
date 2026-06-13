@@ -339,6 +339,25 @@ impl GraphClient {
         self.execute_mutation(&cypher).await
     }
 
+    /// Hard-delete an entity's graph node and ALL its incident edges atomically.
+    ///
+    /// Issues a `DETACH DELETE` against the `:Entity` node identified by
+    /// `(tenant_id, session_id, entity_id)`. `DETACH DELETE` removes the node
+    /// together with every relationship touching it — typed edges and legacy
+    /// bidirectional edges (`CO_OCCURS_WITH`/`MENTIONED_IN`/`SUPERSEDES`), in
+    /// both directions — in a single engine operation, so no orphaned node or
+    /// dangling edge survives the forget. Idempotent: a `MATCH` that resolves to
+    /// no node is a no-op.
+    pub async fn delete_entity_node(
+        &self,
+        tenant_id: Uuid,
+        session_id: Uuid,
+        entity_id: Uuid,
+    ) -> anyhow::Result<()> {
+        let cypher = build_entity_node_detach_query(tenant_id, session_id, entity_id);
+        self.execute_mutation(&cypher).await
+    }
+
     pub async fn put_folded_into_edge(
         &self,
         tenant_id: Uuid,
@@ -591,6 +610,24 @@ fn build_typed_edge_delete_query(
         quote_cypher(&tenant_id.to_string()),
         quote_cypher(&session_id.to_string()),
         quote_cypher(&dst_id.to_string()),
+    )
+}
+
+/// Build the Cypher `DETACH DELETE` for an entity node. Extracted so unit tests
+/// can assert on the exact query shape without a live graph endpoint.
+///
+/// Matches the `:Entity` node by its scoped identity — `tenant_id`,
+/// `session_id`, `entity_id` — using the SAME property keys that
+/// `build_typed_edge_merge_query`/`find_related_entities` use to MERGE/MATCH
+/// Entity nodes, so the node the writer created is the node the deleter targets.
+/// `DETACH DELETE` removes the node plus every incident relationship atomically.
+fn build_entity_node_detach_query(tenant_id: Uuid, session_id: Uuid, entity_id: Uuid) -> String {
+    format!(
+        "MATCH (n:Entity {{tenant_id: {}, session_id: {}, entity_id: {}}}) \
+         DETACH DELETE n",
+        quote_cypher(&tenant_id.to_string()),
+        quote_cypher(&session_id.to_string()),
+        quote_cypher(&entity_id.to_string()),
     )
 }
 
@@ -892,6 +929,63 @@ mod tests {
         assert!(query.contains("edge_type: 'related'"));
         assert!(query.contains("DELETE r"));
         assert!(!query.contains("RETURN"));
+    }
+
+    #[test]
+    fn entity_node_detach_query_matches_entity_and_detach_deletes() {
+        let tenant_id = Uuid::from_u128(0x1);
+        let session_id = Uuid::from_u128(0x2);
+        let entity_id = Uuid::from_u128(0x3);
+        let query = build_entity_node_detach_query(tenant_id, session_id, entity_id);
+        assert!(query.contains("MATCH (n:Entity"));
+        assert!(query.contains("DETACH DELETE n"));
+        // Must match by the SAME scoped identity used to MERGE Entity nodes.
+        assert!(query.contains("tenant_id: '00000000-0000-0000-0000-000000000001'"));
+        assert!(query.contains("session_id: '00000000-0000-0000-0000-000000000002'"));
+        assert!(query.contains("entity_id: '00000000-0000-0000-0000-000000000003'"));
+        // No stray RETURN on a delete.
+        assert!(!query.contains("RETURN"));
+    }
+
+    #[test]
+    fn entity_node_detach_query_escapes_id_injection() {
+        // The ids are stringified UUIDs in production, but the builder must not
+        // permit a crafted id to break out of the literal and inject a second
+        // Cypher clause. quote_cypher escapes backslash and single-quote, so an
+        // injected `'; ... //` payload stays *inside* the quoted literal: the
+        // closing quote is rendered as `\'`, never a bare `'` that would end the
+        // string literal and start a new statement.
+        let payload = "x'; MATCH (m) DETACH DELETE m; //";
+        let query = build_entity_node_detach_query_raw(payload);
+        // The single quote in the payload must be backslash-escaped, so the
+        // hostile clause never escapes the string literal.
+        assert!(
+            query.contains("'x\\'; MATCH (m) DETACH DELETE m; //'"),
+            "the entire payload must stay inside one escaped literal: {query}"
+        );
+        // There must be exactly one DETACH DELETE — the real one — not a second
+        // statement smuggled in via the payload breaking out of the literal.
+        // (The injected `DETACH DELETE m` text is present but quoted/inert.)
+        assert!(
+            query.ends_with("DETACH DELETE n"),
+            "query must end with the single real DETACH DELETE n: {query}"
+        );
+        // The nil-uuid (normal) path still produces a well-formed query.
+        let nil_q = build_entity_node_detach_query(Uuid::nil(), Uuid::nil(), Uuid::nil());
+        assert!(nil_q.contains("DETACH DELETE n"));
+    }
+
+    /// Test-only helper: build a detach query where the entity_id is an
+    /// arbitrary string (not a parsed UUID), so we can assert escaping of a
+    /// hostile literal the same way the cycle/edge injection tests do.
+    fn build_entity_node_detach_query_raw(entity_id: &str) -> String {
+        format!(
+            "MATCH (n:Entity {{tenant_id: {}, session_id: {}, entity_id: {}}}) \
+             DETACH DELETE n",
+            quote_cypher("00000000-0000-0000-0000-000000000000"),
+            quote_cypher("00000000-0000-0000-0000-000000000000"),
+            quote_cypher(entity_id),
+        )
     }
 
     #[test]

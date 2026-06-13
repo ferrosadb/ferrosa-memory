@@ -1,7 +1,7 @@
 # Forget Memory — Candidate-Confirmed Forgetting
 
-> Last updated: 2026-06-12
-> Status: Implemented (v1) on branch `feat/forget-memory`, including the journal crash-recovery sweep (T-FORGET-012: `recover_unfinished_forgets`, idempotent, wired into the `decay-forget` maintenance job). Known v1 limits: edges are deleted (not soft-marked) on retract and not auto-recreated on restore; full node+edge teardown completes once graph `DETACH DELETE` lands (ferrosa QEC Milestone 1).
+> Last updated: 2026-06-13
+> Status: Implemented (v1) on branch `feat/forget-memory`, including the journal crash-recovery sweep (T-FORGET-012: `recover_unfinished_forgets`, idempotent, wired into the `decay-forget` maintenance job). **Hard-delete now performs full node+edge teardown via graph `DETACH DELETE`** (ferrosa QEC Milestone 1 landed): `hard_delete_entity` calls `Storage::delete_entity_node`, which removes the `:Entity` node and ALL incident edges — typed *and* legacy (`CO_OCCURS_WITH`/`MENTIONED_IN`/`SUPERSEDES`), both directions — in one atomic engine op, replacing the prior best-effort per-edge teardown that left the node and legacy edges orphaned. Remaining v1 limit: on *retract* mode, edges are removed (not soft-marked) and are NOT auto-recreated on restore.
 
 ## Overview
 

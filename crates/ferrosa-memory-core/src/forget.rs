@@ -35,12 +35,17 @@
 //!   only soft-retracted. On [`restore`] the entity returns to its prior state
 //!   but its edges are **NOT** recreated. This is a known v1 gap; see the spec
 //!   note on referential integrity.
-//! - **Typed edges only.** Edge teardown here uses the `typed_edge_*` Storage
-//!   primitives. Legacy bidirectional edges (`CO_OCCURS`/`MENTIONED_IN`/
-//!   `SUPERSEDES`) are *counted* in the blast radius via `edge_list_for_entity`
-//!   but their per-edge deletion routes through the graph API, which is wired
-//!   in a later stage. The blast radius still reports them so the user sees the
-//!   true reference count.
+//! - **Retract-mode edge teardown is typed-only.** The *retract* path tears
+//!   down edges via the `typed_edge_*` Storage primitives
+//!   (`teardown_typed_edges`); legacy bidirectional edges
+//!   (`CO_OCCURS`/`MENTIONED_IN`/`SUPERSEDES`) are *counted* in the blast radius
+//!   via `edge_list_for_entity` but not individually removed on retract (the
+//!   entity is only soft-retracted, so its node — and thus its legacy edges —
+//!   stays). **Hard-delete is complete:** `hard_delete_entity` issues a graph
+//!   `DETACH DELETE` ([`crate::storage::Storage::delete_entity_node`]) that
+//!   removes the `:Entity` node and ALL incident edges (typed + legacy, both
+//!   directions) in one atomic engine op. The blast radius reports legacy edges
+//!   either way so the user sees the true reference count.
 
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
@@ -623,33 +628,35 @@ async fn teardown_typed_edges(
     Ok(())
 }
 
-/// Permanently delete an entity and everything that hangs off it: its typed
-/// edges (both directions), its legacy bidirectional edges (best-effort), then
-/// the entity row itself and all derived rows keyed by the entity id.
+/// Permanently delete an entity and everything that hangs off it.
+///
+/// Teardown of the **graph node and all its incident edges** is a single atomic
+/// engine op: [`Storage::delete_entity_node`] issues a Cypher `DETACH DELETE`
+/// against the `:Entity` node, removing it together with every relationship that
+/// touches it — typed edges *and* legacy bidirectional edges
+/// (`CO_OCCURS_WITH`/`MENTIONED_IN`/`SUPERSEDES`), in both directions. This
+/// supersedes the prior best-effort per-edge teardown, which left the node and
+/// legacy edges orphaned. The CQL-side rows (entity_store row, confidence,
+/// temporal, derived cache) live in separate stores from the graph node and are
+/// still deleted explicitly below.
 ///
 /// This is the single HARD-delete primitive, shared by [`confirm`] (hard mode)
 /// and [`purge_expired_retractions`] (I9). It is idempotent: re-running it on an
-/// already-deleted entity is a no-op (the edge/derived lists come back empty and
-/// `entity_delete` on a missing row is a no-op in the storage model).
+/// already-deleted entity is a no-op (`DETACH DELETE` on a missing node matches
+/// nothing, and `entity_delete` on a missing row is a no-op in the storage
+/// model). On non-graph backends (`CqlStorage`/`MockStorage`),
+/// `delete_entity_node` is the default no-op and only the CQL rows are removed.
 pub(crate) async fn hard_delete_entity(
     storage: &(impl Storage + ?Sized),
     ctx: &TenantContext,
     session_id: Uuid,
     entity_id: Uuid,
 ) -> anyhow::Result<()> {
-    // Typed edges, both directions.
-    teardown_typed_edges(storage, ctx, session_id, entity_id).await?;
-
-    // Legacy bidirectional edges are best-effort: there is no per-edge legacy
-    // delete primitive wired here yet, so a failure to enumerate them must not
-    // block the hard delete. Log loudly (observable, not silent) and continue.
-    if let Err(e) = storage.edge_list_for_entity(ctx, entity_id).await {
-        tracing::warn!(
-            %entity_id,
-            error = %e,
-            "hard_delete_entity: legacy edge enumeration failed (best-effort); proceeding"
-        );
-    }
+    // Graph node + ALL incident edges (typed + legacy, both directions) in one
+    // atomic DETACH DELETE. Fails loud if the graph op fails (no swallow).
+    storage
+        .delete_entity_node(ctx, session_id, entity_id)
+        .await?;
 
     // The entity row, then all derived rows keyed by the entity id.
     storage.entity_delete(ctx, session_id, entity_id).await?;
