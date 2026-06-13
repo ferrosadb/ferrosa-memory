@@ -703,7 +703,7 @@ pub async fn restore(
 /// audit row for an expired retraction does not linger forever.
 ///
 /// Disposition by object type:
-/// - `"entity"` → [`hard_delete_entity`] (edges + entity + derived rows).
+/// - `"entity"` → `hard_delete_entity` (edges + entity + derived rows).
 /// - anything else → **skipped with a logged warning** in v1 (no other object
 ///   type is retractable through the forget tool yet). The retraction record is
 ///   still deleted so the sweep is eventually consistent.
@@ -793,7 +793,7 @@ pub struct IntegrityReport {
 ///
 /// An edge is **dangling** if either endpoint (`src` or `dst`) fails to resolve
 /// to a *retrievable* entity — i.e. the entity is missing entirely, or it is
-/// present but in a non-retrievable state ([`MemoryState::is_retrievable`] is
+/// present but in a non-retrievable state (`MemoryState::is_retrievable` is
 /// false, e.g. `Unavailable` after a retraction). Such an edge would otherwise
 /// surface a forgotten/absent fact through graph traversal.
 ///

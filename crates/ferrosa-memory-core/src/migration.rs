@@ -235,6 +235,10 @@ pub enum MigrationError {
     )]
     Downgrade { keyspace: u32, code: u32 },
     #[error(
+        "migration {version} contains a destructive statement against non-empty data and was refused to prevent silent data loss: {detail}. Back up first, then set FERROSA_ALLOW_DESTRUCTIVE_MIGRATION=true to proceed."
+    )]
+    DestructiveRefused { version: u32, detail: String },
+    #[error(
         "migration {version} failed on statement {stmt_index}: {source}. Schema remains at v{last_good}."
     )]
     Statement {
@@ -461,6 +465,11 @@ pub async fn run_migrations(session: &CqlSession, keyspace: &str) -> Result<usiz
             // uses so the modern migrations are deployable into any
             // configured keyspace (agent_memory_test, per-tenant ks, etc.).
             let qualified = qualify_ddl(m.ddl, keyspace);
+            // Auto-apply additive DDL; refuse a statement that would delete
+            // populated data (drop/truncate/delete a non-empty table, drop a
+            // keyspace, or drop a column) unless the operator opted in. Empty
+            // tables and additive changes pass through.
+            refuse_unsafe_destruction(session, keyspace, m.version, &qualified).await?;
             for (i, stmt) in split_cql(&qualified).iter().enumerate() {
                 #[allow(deprecated)]
                 if let Err(source) = session.query_unpaged(stmt.as_str(), ()).await {
@@ -629,6 +638,135 @@ async fn apply_roles_grants(session: &CqlSession, keyspace: &str) -> anyhow::Res
         statements = stmts.len(),
         "applied role-auth seed + grants"
     );
+    Ok(())
+}
+
+/// A destructive (data-deleting) statement detected in a migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DestructiveStmt {
+    /// The operation kind, e.g. "DROP TABLE", "TRUNCATE", "DELETE FROM".
+    pub kind: &'static str,
+    /// Target table name (unqualified, lowercased), or the keyspace for
+    /// DROP KEYSPACE. Empty if it couldn't be parsed.
+    pub target: String,
+    /// When true, the op is unsafe regardless of whether the table has rows
+    /// (DROP KEYSPACE, ALTER … DROP column) — we cannot prove no data is lost.
+    pub always_unsafe: bool,
+}
+
+/// Detect data-deleting statements in a DDL string. Pure and testable.
+///
+/// Recognizes `DROP TABLE`, `TRUNCATE`, `DELETE FROM` (data loss only if the
+/// target holds rows), and `DROP KEYSPACE` / `ALTER … DROP` (always unsafe).
+/// Derived objects (`DROP INDEX`, `DROP MATERIALIZED VIEW`) are intentionally
+/// NOT treated as destructive — they're rebuildable, not source data.
+pub fn destructive_statements(ddl: &str) -> Vec<DestructiveStmt> {
+    let mut found = Vec::new();
+    for stmt in split_cql(ddl) {
+        let upper = stmt.trim().to_uppercase();
+        let last_ident = |s: &str| {
+            s.split_whitespace()
+                .last()
+                .unwrap_or("")
+                .trim_end_matches(';')
+                .rsplit('.')
+                .next()
+                .unwrap_or("")
+                .to_lowercase()
+        };
+        if upper.starts_with("DROP KEYSPACE") {
+            found.push(DestructiveStmt {
+                kind: "DROP KEYSPACE",
+                target: last_ident(&stmt),
+                always_unsafe: true,
+            });
+        } else if upper.starts_with("DROP TABLE") {
+            found.push(DestructiveStmt {
+                kind: "DROP TABLE",
+                target: last_ident(&stmt),
+                always_unsafe: false,
+            });
+        } else if upper.starts_with("TRUNCATE") {
+            found.push(DestructiveStmt {
+                kind: "TRUNCATE",
+                target: last_ident(&stmt),
+                always_unsafe: false,
+            });
+        } else if upper.starts_with("DELETE FROM") {
+            // target is the token after FROM
+            let target = upper
+                .split_whitespace()
+                .nth(2)
+                .map(|t| t.rsplit('.').next().unwrap_or(t).to_lowercase())
+                .unwrap_or_default();
+            found.push(DestructiveStmt {
+                kind: "DELETE FROM",
+                target,
+                always_unsafe: false,
+            });
+        } else if upper.starts_with("ALTER TABLE") && upper.contains(" DROP ") {
+            let target = upper
+                .split_whitespace()
+                .nth(2)
+                .map(|t| t.rsplit('.').next().unwrap_or(t).to_lowercase())
+                .unwrap_or_default();
+            found.push(DestructiveStmt {
+                kind: "ALTER DROP",
+                target,
+                always_unsafe: true,
+            });
+        }
+    }
+    found
+}
+
+/// Operator opt-in to apply destructive migrations against populated data.
+pub fn allow_destructive_migrations() -> bool {
+    matches!(
+        std::env::var("FERROSA_ALLOW_DESTRUCTIVE_MIGRATION")
+            .ok()
+            .as_deref(),
+        Some("true" | "1" | "on" | "yes")
+    )
+}
+
+/// Returns true if `table` exists in `keyspace` and holds at least one row.
+/// A missing table (or a transient read error) is treated as empty — a
+/// `DROP TABLE IF EXISTS` on a non-existent table loses nothing.
+async fn table_nonempty(session: &CqlSession, keyspace: &str, table: &str) -> bool {
+    if table.is_empty() {
+        return false;
+    }
+    let q = format!("SELECT * FROM {keyspace}.{table} LIMIT 1");
+    #[allow(deprecated)]
+    match session.query_unpaged(q, ()).await {
+        Ok(res) => !res.rows_or_empty().is_empty(),
+        Err(_) => false,
+    }
+}
+
+/// Refuse a migration that would delete populated data unless the operator
+/// has opted in via `FERROSA_ALLOW_DESTRUCTIVE_MIGRATION`. Additive DDL and
+/// drops of empty/absent tables pass through untouched, so greenfield and
+/// up-to-date clusters are never blocked.
+async fn refuse_unsafe_destruction(
+    session: &CqlSession,
+    keyspace: &str,
+    version: u32,
+    qualified_ddl: &str,
+) -> Result<(), MigrationError> {
+    if allow_destructive_migrations() {
+        return Ok(());
+    }
+    for d in destructive_statements(qualified_ddl) {
+        let unsafe_now = d.always_unsafe || table_nonempty(session, keyspace, &d.target).await;
+        if unsafe_now {
+            return Err(MigrationError::DestructiveRefused {
+                version,
+                detail: format!("{} {}", d.kind, d.target),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -1738,6 +1876,37 @@ mod tests {
             msg.contains("control plane") || msg.contains("provisioning"),
             "error must point operator at the provisioning path, got: {msg}"
         );
+    }
+
+    #[test]
+    fn destructive_classifier_flags_data_loss_not_additive() {
+        // Additive / derived-object DDL is NOT destructive.
+        assert!(destructive_statements("CREATE TABLE x (a int PRIMARY KEY);").is_empty());
+        assert!(destructive_statements("ALTER TABLE x ADD col text;").is_empty());
+        assert!(destructive_statements("CREATE INDEX i ON x (a);").is_empty());
+        assert!(destructive_statements("DROP INDEX IF EXISTS i;").is_empty());
+
+        // Data-deleting DDL is flagged, with the right target + safety level.
+        let drop = destructive_statements("DROP TABLE IF EXISTS agent_memory.intentions;");
+        assert_eq!(drop.len(), 1);
+        assert_eq!(drop[0].kind, "DROP TABLE");
+        assert_eq!(drop[0].target, "intentions");
+        assert!(!drop[0].always_unsafe); // empty-table drop is allowed
+
+        let trunc = destructive_statements("TRUNCATE agent_memory.entity_store;");
+        assert_eq!(trunc[0].kind, "TRUNCATE");
+        assert_eq!(trunc[0].target, "entity_store");
+
+        let del = destructive_statements("DELETE FROM agent_memory.memo_cache WHERE k = 1;");
+        assert_eq!(del[0].kind, "DELETE FROM");
+        assert_eq!(del[0].target, "memo_cache");
+
+        // Column drop and keyspace drop are always unsafe (can't prove no loss).
+        let altd = destructive_statements("ALTER TABLE agent_memory.x DROP old_col;");
+        assert_eq!(altd[0].kind, "ALTER DROP");
+        assert!(altd[0].always_unsafe);
+        let dk = destructive_statements("DROP KEYSPACE agent_memory;");
+        assert!(dk[0].always_unsafe);
     }
 
     /// The forget feature (v0.16) writes new application-owned tables; their
