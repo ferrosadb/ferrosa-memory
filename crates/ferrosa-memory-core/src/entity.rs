@@ -17,8 +17,10 @@
 
 use uuid::Uuid;
 
+use chrono::{DateTime, Utc};
+
 use crate::storage::Storage;
-use crate::types::{EntityEntry, MemoryState, TenantContext};
+use crate::types::{EntityEntry, MemoryState, RetractionRecord, TenantContext};
 
 /// Maximum entities per session (configurable via config, hardcoded default).
 const DEFAULT_MAX_ENTITIES_PER_SESSION: usize = 50_000;
@@ -209,10 +211,12 @@ pub async fn promote_memory(
     session_id: Uuid,
     entity_id: Uuid,
 ) -> anyhow::Result<MemoryState> {
-    let entities = storage.entity_list_session(ctx, session_id).await?;
-    let entity = entities
-        .iter()
-        .find(|e| e.entity_id == entity_id)
+    // Lifecycle lookup uses the targeted by-id read, not entity_list_session:
+    // the latter now hides Unavailable (retracted) entities from recall, but
+    // promote/demote must still see every state to drive the state machine.
+    let entity = storage
+        .entity_get_by_id(ctx, session_id, entity_id)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("entity not found: {entity_id}"))?;
 
     let new_state = match entity.state {
@@ -247,10 +251,12 @@ pub async fn demote_memory(
     session_id: Uuid,
     entity_id: Uuid,
 ) -> anyhow::Result<MemoryState> {
-    let entities = storage.entity_list_session(ctx, session_id).await?;
-    let entity = entities
-        .iter()
-        .find(|e| e.entity_id == entity_id)
+    // Lifecycle lookup uses the targeted by-id read, not entity_list_session:
+    // the latter now hides Unavailable (retracted) entities from recall, but
+    // promote/demote must still see every state to drive the state machine.
+    let entity = storage
+        .entity_get_by_id(ctx, session_id, entity_id)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("entity not found: {entity_id}"))?;
 
     let new_state = match entity.state {
@@ -273,6 +279,93 @@ pub async fn demote_memory(
     }
 
     Ok(new_state)
+}
+
+/// Retract ("forget") an entity: move it to `Unavailable` and write a
+/// [`RetractionRecord`] capturing its prior state, so the operation is audited
+/// and reversible via [`restore_entity`].
+///
+/// `now` is passed in (rather than calling `Utc::now()`) so the retraction
+/// timestamp is deterministic and testable; it becomes the record's clustering
+/// key. Returns the entity's prior state. Errors if the entity does not exist.
+#[allow(clippy::too_many_arguments)]
+pub async fn retract_entity(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    session_id: Uuid,
+    entity_id: Uuid,
+    reason: &str,
+    actor: &str,
+    forget_id: Uuid,
+    restorable_until: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> anyhow::Result<MemoryState> {
+    let entity = storage
+        .entity_get_by_id(ctx, session_id, entity_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("entity not found: {entity_id}"))?;
+    let prior_state = entity.state.clone();
+
+    storage
+        .entity_update_state(ctx, entity_id, MemoryState::Unavailable)
+        .await?;
+
+    let rec = RetractionRecord {
+        object_id: entity_id,
+        object_type: "entity".to_string(),
+        session_id,
+        retracted_at: now,
+        reason: reason.to_string(),
+        actor: actor.to_string(),
+        prior_state: prior_state.to_string(),
+        restorable_until,
+        forget_id,
+    };
+    storage.retraction_put(ctx, &rec).await?;
+
+    tracing::info!(
+        %entity_id,
+        prior_state = %prior_state,
+        %actor,
+        %forget_id,
+        "entity retracted"
+    );
+
+    Ok(prior_state)
+}
+
+/// Restore a previously retracted entity to the state it held before
+/// retraction, then delete the retraction record.
+///
+/// Returns `Ok(false)` when there is no retraction record for `entity_id`
+/// (nothing to restore); `Ok(true)` after a successful restore.
+pub async fn restore_entity(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    entity_id: Uuid,
+) -> anyhow::Result<bool> {
+    let Some(rec) = storage.retraction_get_latest(ctx, entity_id).await? else {
+        return Ok(false);
+    };
+
+    let prior_state: MemoryState =
+        serde_json::from_str(&format!("\"{}\"", rec.prior_state)).unwrap_or_default();
+
+    storage
+        .entity_update_state(ctx, entity_id, prior_state.clone())
+        .await?;
+    storage
+        .retraction_delete(ctx, entity_id, rec.retracted_at)
+        .await?;
+
+    tracing::info!(
+        %entity_id,
+        restored_state = %prior_state,
+        forget_id = %rec.forget_id,
+        "entity restored"
+    );
+
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -639,5 +732,157 @@ mod tests {
             "exact segment match should rank first, got: {}",
             results[0].entity_name
         );
+    }
+
+    // --- Retraction (forget) helpers ---
+
+    #[tokio::test]
+    async fn retract_sets_unavailable_writes_record_and_hides_entity() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let sid = Uuid::new_v4();
+
+        let created = upsert_entity(
+            &store, &ctx, sid, "Secret", "person", "ctx", None, None, None,
+        )
+        .await
+        .unwrap();
+        let entity_id = created.entity_id;
+
+        // Visible before retraction.
+        let before = retrieve_entities(&store, &ctx, sid, "secret", None, "phonetic", None)
+            .await
+            .unwrap();
+        assert_eq!(before.len(), 1);
+
+        let now = Utc::now();
+        let forget_id = Uuid::new_v4();
+        let prior = retract_entity(
+            &store,
+            &ctx,
+            sid,
+            entity_id,
+            "test forget",
+            "tester",
+            forget_id,
+            now + chrono::Duration::days(7),
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(prior, MemoryState::Active);
+
+        // Entity is now Unavailable.
+        let entity = store
+            .entity_get_by_id(&ctx, sid, entity_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entity.state, MemoryState::Unavailable);
+
+        // A retraction record was written with the captured prior state.
+        let rec = store
+            .retraction_get_latest(&ctx, entity_id)
+            .await
+            .unwrap()
+            .expect("retraction record present");
+        assert_eq!(rec.object_type, "entity");
+        assert_eq!(rec.prior_state, "active");
+        assert_eq!(rec.forget_id, forget_id);
+        assert_eq!(rec.retracted_at, now);
+
+        // No longer returned from phonetic recall or session listing.
+        let after = retrieve_entities(&store, &ctx, sid, "secret", None, "phonetic", None)
+            .await
+            .unwrap();
+        assert!(after.is_empty());
+        let listed = store.entity_list_session(&ctx, sid).await.unwrap();
+        assert!(listed.iter().all(|e| e.entity_id != entity_id));
+    }
+
+    #[tokio::test]
+    async fn restore_brings_entity_back_to_prior_state() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let sid = Uuid::new_v4();
+
+        let created = upsert_entity(
+            &store, &ctx, sid, "Recall", "person", "ctx", None, None, None,
+        )
+        .await
+        .unwrap();
+        let entity_id = created.entity_id;
+
+        // Put it in a non-default prior state so restore must read the record.
+        store
+            .entity_update_state(&ctx, entity_id, MemoryState::Dormant)
+            .await
+            .unwrap();
+
+        let now = Utc::now();
+        retract_entity(
+            &store,
+            &ctx,
+            sid,
+            entity_id,
+            "test forget",
+            "tester",
+            Uuid::new_v4(),
+            now + chrono::Duration::days(7),
+            now,
+        )
+        .await
+        .unwrap();
+
+        let restored = restore_entity(&store, &ctx, entity_id).await.unwrap();
+        assert!(restored);
+
+        let entity = store
+            .entity_get_by_id(&ctx, sid, entity_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entity.state, MemoryState::Dormant);
+
+        // Record consumed by restore.
+        assert!(
+            store
+                .retraction_get_latest(&ctx, entity_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Visible again (Dormant is retrievable).
+        let listed = store.entity_list_session(&ctx, sid).await.unwrap();
+        assert!(listed.iter().any(|e| e.entity_id == entity_id));
+    }
+
+    #[tokio::test]
+    async fn restore_returns_false_when_no_retraction() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let restored = restore_entity(&store, &ctx, Uuid::new_v4()).await.unwrap();
+        assert!(!restored);
+    }
+
+    #[tokio::test]
+    async fn retract_missing_entity_errors() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let now = Utc::now();
+        let result = retract_entity(
+            &store,
+            &ctx,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "r",
+            "a",
+            Uuid::new_v4(),
+            now,
+            now,
+        )
+        .await;
+        assert!(result.is_err());
     }
 }

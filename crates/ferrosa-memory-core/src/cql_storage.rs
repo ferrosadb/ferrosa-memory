@@ -895,6 +895,28 @@ fn row_to_entity_entry(
     }))
 }
 
+/// Decode a row into a [`RetractionRecord`], returning `None` when a required
+/// column is NULL/corrupt (skip rather than poison the whole listing).
+fn row_to_retraction_record(row: &Row, col_map: &ColMap) -> Option<RetractionRecord> {
+    Some(RetractionRecord {
+        object_id: cql_get::<Uuid>(row, col_map, "object_id").ok()?,
+        object_type: cql_get::<String>(row, col_map, "object_type").ok()?,
+        session_id: cql_get::<Uuid>(row, col_map, "session_id").ok()?,
+        retracted_at: cql_get::<chrono::DateTime<chrono::Utc>>(row, col_map, "retracted_at")
+            .ok()?,
+        reason: cql_get::<String>(row, col_map, "reason").unwrap_or_default(),
+        actor: cql_get::<String>(row, col_map, "actor").unwrap_or_default(),
+        prior_state: cql_get::<String>(row, col_map, "prior_state").unwrap_or_default(),
+        restorable_until: cql_get::<chrono::DateTime<chrono::Utc>>(
+            row,
+            col_map,
+            "restorable_until",
+        )
+        .ok()?,
+        forget_id: cql_get::<Uuid>(row, col_map, "forget_id").ok()?,
+    })
+}
+
 fn entity_list_result_order(a: &EntityEntry, b: &EntityEntry) -> std::cmp::Ordering {
     let a_time = a.updated_at.unwrap_or(a.created_at);
     let b_time = b.updated_at.unwrap_or(b.created_at);
@@ -1628,6 +1650,10 @@ impl CqlStorage {
             let Some(entry) = row_to_entity_entry(ctx, &row, &col_map)? else {
                 continue;
             };
+            // Exclude retracted (Unavailable) entities from recall.
+            if !entry.state.is_retrievable() {
+                continue;
+            }
             if crate::storage::entity_matches_list_query(&entry, ctx, query) {
                 matches.push(entry);
                 if matches.len() > limit {
@@ -2500,10 +2526,14 @@ impl Storage for CqlStorage {
                     tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
                     Default::default()
                 });
-            let state = cql_get::<String>(&row, &col_map, "state")
+            let state: MemoryState = cql_get::<String>(&row, &col_map, "state")
                 .ok()
                 .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
                 .unwrap_or_default();
+            // Exclude retracted (Unavailable) entities from recall.
+            if !state.is_retrievable() {
+                continue;
+            }
 
             scored.push((
                 rank,
@@ -2754,10 +2784,14 @@ impl Storage for CqlStorage {
                     tracing::warn!(col = "created_at", err = %e, "row has null/corrupt timestamp; defaulting to epoch");
                     Default::default()
                 });
-            let state = cql_get::<String>(&row, &col_map, "state")
+            let state: MemoryState = cql_get::<String>(&row, &col_map, "state")
                 .ok()
                 .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
                 .unwrap_or_default();
+            // Exclude retracted (Unavailable) entities from recall.
+            if !state.is_retrievable() {
+                continue;
+            }
             results.push(EntityEntry {
                 tenant_id: ctx.tenant_id,
                 entity_id,
@@ -2863,13 +2897,20 @@ impl Storage for CqlStorage {
         ctx: &TenantContext,
         session_id: Uuid,
     ) -> anyhow::Result<Vec<EntityEntry>> {
-        self.collect_entity_entries_from_paged_iter(
-            ctx,
-            self.stmts.entity_list_session.clone(),
-            (ctx.tenant_id, session_id),
-            "entity_list_session",
-        )
-        .await
+        let mut entries = self
+            .collect_entity_entries_from_paged_iter(
+                ctx,
+                self.stmts.entity_list_session.clone(),
+                (ctx.tenant_id, session_id),
+                "entity_list_session",
+            )
+            .await?;
+        // Exclude retracted (Unavailable) entities from recall. This is a recall
+        // path; the bulk/admin paths (entity_list_all/stream_*) deliberately keep
+        // all states and share the same paged-iter helper, so the filter lives
+        // here rather than inside collect_entity_entries_from_paged_iter.
+        entries.retain(|e| e.state.is_retrievable());
+        Ok(entries)
     }
 
     async fn entity_list_matching(
@@ -2938,6 +2979,8 @@ impl Storage for CqlStorage {
     }
 
     async fn entity_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<EntityEntry>> {
+        // Bulk/admin path: intentionally includes all states (Unavailable too)
+        // for consolidation/reindex; no is_retrievable() filter here.
         self.collect_entity_entries_from_paged_iter(
             ctx,
             self.stmts.entity_list_all.clone(),
@@ -2953,6 +2996,8 @@ impl Storage for CqlStorage {
         chunk_size: usize,
         tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<EntityEntry>>>,
     ) {
+        // Bulk/admin path: intentionally includes all states (Unavailable too)
+        // for consolidation/reindex; no is_retrievable() filter here.
         let chunk_size = chunk_size.max(1);
         let mut iter = match self
             .session
@@ -3002,6 +3047,8 @@ impl Storage for CqlStorage {
         chunk_size: usize,
         tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<EntityEntry>>>,
     ) {
+        // Bulk/admin path: intentionally includes all states (Unavailable too)
+        // for consolidation/reindex; no is_retrievable() filter here.
         let chunk_size = chunk_size.max(1);
         let mut iter = match self
             .session
@@ -3259,6 +3306,102 @@ impl Storage for CqlStorage {
             .query_unpaged(query, (ctx.tenant_id, session_id, entity_id))
             .await?;
         Ok(true)
+    }
+
+    // --- Retraction records (forget feature) ---
+
+    async fn retraction_put(
+        &self,
+        ctx: &TenantContext,
+        rec: &RetractionRecord,
+    ) -> anyhow::Result<()> {
+        let query = format!(
+            "INSERT INTO {}.retraction \
+             (tenant_id, object_id, object_type, session_id, retracted_at, reason, actor, \
+              prior_state, restorable_until, forget_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        self.session
+            .query_unpaged(
+                query,
+                (
+                    ctx.tenant_id,
+                    rec.object_id,
+                    rec.object_type.clone(),
+                    rec.session_id,
+                    rec.retracted_at,
+                    rec.reason.clone(),
+                    rec.actor.clone(),
+                    rec.prior_state.clone(),
+                    rec.restorable_until,
+                    rec.forget_id,
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn retraction_get_latest(
+        &self,
+        ctx: &TenantContext,
+        object_id: Uuid,
+    ) -> anyhow::Result<Option<RetractionRecord>> {
+        // Clustering order is `retracted_at DESC`, so LIMIT 1 yields the latest.
+        let query = format!(
+            "SELECT object_id, object_type, session_id, retracted_at, reason, actor, \
+             prior_state, restorable_until, forget_id \
+             FROM {}.retraction WHERE tenant_id = ? AND object_id = ? LIMIT 1",
+            self.keyspace
+        );
+        let (col_map, rows) = query_paged_rows!(self.session, query, (ctx.tenant_id, object_id))?;
+        Ok(rows
+            .into_iter()
+            .next()
+            .and_then(|row| row_to_retraction_record(&row, &col_map)))
+    }
+
+    async fn retraction_list_purgeable(
+        &self,
+        ctx: &TenantContext,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<Vec<RetractionRecord>> {
+        // v1 limitation: `restorable_until` is not part of the primary key and
+        // has no secondary index, so we full-table scan this tenant's
+        // retractions and filter `restorable_until < now` in Rust. Acceptable
+        // for the expected low retraction volume; revisit with a time-bucketed
+        // index if this grows.
+        let query = format!(
+            "SELECT object_id, object_type, session_id, retracted_at, reason, actor, \
+             prior_state, restorable_until, forget_id \
+             FROM {}.retraction WHERE tenant_id = ? ALLOW FILTERING",
+            self.keyspace
+        );
+        let (col_map, rows) = query_paged_rows!(self.session, query, (ctx.tenant_id,))?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| row_to_retraction_record(&row, &col_map))
+            .filter(|rec| rec.restorable_until < now)
+            .collect())
+    }
+
+    async fn retraction_delete(
+        &self,
+        ctx: &TenantContext,
+        object_id: Uuid,
+        retracted_at: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<()> {
+        let query = format!(
+            "DELETE FROM {}.retraction \
+             WHERE tenant_id = ? AND object_id = ? AND retracted_at = ?",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        self.session
+            .query_unpaged(query, (ctx.tenant_id, object_id, retracted_at))
+            .await?;
+        Ok(())
     }
 
     // --- Temporal operations ---

@@ -872,6 +872,39 @@ impl Storage for ReconnectingStorage {
         delegate!(self, entity_delete, ctx, session_id, entity_id)
     }
 
+    async fn retraction_put(
+        &self,
+        ctx: &TenantContext,
+        rec: &RetractionRecord,
+    ) -> anyhow::Result<()> {
+        delegate!(self, retraction_put, ctx, rec)
+    }
+
+    async fn retraction_get_latest(
+        &self,
+        ctx: &TenantContext,
+        object_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<RetractionRecord>> {
+        delegate!(self, retraction_get_latest, ctx, object_id)
+    }
+
+    async fn retraction_list_purgeable(
+        &self,
+        ctx: &TenantContext,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<Vec<RetractionRecord>> {
+        delegate!(self, retraction_list_purgeable, ctx, now)
+    }
+
+    async fn retraction_delete(
+        &self,
+        ctx: &TenantContext,
+        object_id: uuid::Uuid,
+        retracted_at: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<()> {
+        delegate!(self, retraction_delete, ctx, object_id, retracted_at)
+    }
+
     async fn entity_list_session(
         &self,
         ctx: &TenantContext,

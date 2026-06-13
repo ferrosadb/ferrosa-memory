@@ -140,6 +140,35 @@ impl std::fmt::Display for MemoryState {
     }
 }
 
+impl MemoryState {
+    /// Whether an entity in this state may be returned from recall/search.
+    ///
+    /// `Unavailable` is "logically deleted, audit-only" — the state a retracted
+    /// (forgotten) entity is moved to — and is excluded from all recall. The
+    /// other states remain retrievable (`Dormant`/`Silent` only affect ranking
+    /// today), so this filter is the single guard that hides forgotten memory
+    /// without changing demotion semantics.
+    pub fn is_retrievable(&self) -> bool {
+        !matches!(self, Self::Unavailable)
+    }
+}
+
+/// A retraction record: audit + restore metadata for a soft-forgotten object.
+/// Persisted to the `retraction` table; mirrors ddl/038_retraction_record.cql.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetractionRecord {
+    pub object_id: Uuid,
+    pub object_type: String,
+    pub session_id: Uuid,
+    pub retracted_at: chrono::DateTime<chrono::Utc>,
+    pub reason: String,
+    pub actor: String,
+    /// State the object was in before retraction, so restore can put it back.
+    pub prior_state: String,
+    pub restorable_until: chrono::DateTime<chrono::Utc>,
+    pub forget_id: Uuid,
+}
+
 /// Scope of an entity: session-local (default) or global to the tenant.
 ///
 /// Session-scoped entities live in their session's partition and are

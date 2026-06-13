@@ -19,8 +19,8 @@ use crate::types::{
     AliasEntry, ApprovalEntry, AuditEntry, ConfidenceScore, DerivedFact, DocumentChunk,
     EntityEntry, EntityListQuery, EntityListScope, EntityTypeStateCount, FeedbackOutcome,
     FoldEntry, FoldSummary, MaterializedEdge, MemoEntry, MemoryState, PlanNode, PlanStatus,
-    PromotedPredicate, ProvenanceStep, RuleEntry, RuleState, TemporalEvent, TenantContext,
-    ToolUsageRow, TypedEdge, WarmthEntry,
+    PromotedPredicate, ProvenanceStep, RetractionRecord, RuleEntry, RuleState, TemporalEvent,
+    TenantContext, ToolUsageRow, TypedEdge, WarmthEntry,
 };
 
 pub(crate) fn entity_list_sessions(
@@ -369,6 +369,10 @@ pub trait Storage: Send + Sync {
             });
             Ok(candidates
                 .into_iter()
+                // Exclude retracted (Unavailable) entities from recall. CQL's
+                // override filters these in collect_entity_matches_from_paged_iter;
+                // mirror it here so non-CQL backends stay consistent.
+                .filter(|entry| entry.state.is_retrievable())
                 .filter(|entry| entity_matches_list_query(entry, ctx, &query))
                 .take(limit)
                 .collect())
@@ -546,6 +550,41 @@ pub trait Storage: Send + Sync {
         session_id: Uuid,
         entity_id: Uuid,
     ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send;
+
+    // --- Retraction records (forget feature) ---
+
+    /// Persist a retraction record (audit + restore metadata for a
+    /// soft-forgotten object). INSERT into the `retraction` table.
+    fn retraction_put(
+        &self,
+        ctx: &TenantContext,
+        rec: &RetractionRecord,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// Latest retraction record for an object, or `None` if it was never
+    /// retracted. Clustering order is `retracted_at DESC`, so `LIMIT 1`
+    /// returns the most recent retraction.
+    fn retraction_get_latest(
+        &self,
+        ctx: &TenantContext,
+        object_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<RetractionRecord>>> + Send;
+
+    /// All retraction records whose restore window has elapsed
+    /// (`restorable_until < now`) and are therefore eligible for hard purge.
+    fn retraction_list_purgeable(
+        &self,
+        ctx: &TenantContext,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<RetractionRecord>>> + Send;
+
+    /// Delete a specific retraction record by its full clustering key.
+    fn retraction_delete(
+        &self,
+        ctx: &TenantContext,
+        object_id: Uuid,
+        retracted_at: chrono::DateTime<chrono::Utc>,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     // --- Temporal event operations (Sprint 3) ---
 
@@ -1456,6 +1495,7 @@ pub mod mock {
         pub plans: Mutex<Vec<PlanNode>>,
         pub folds: Mutex<Vec<FoldEntry>>,
         pub entities: Mutex<Vec<EntityEntry>>,
+        pub retractions: Mutex<Vec<RetractionRecord>>,
         pub temporal_events: Mutex<Vec<TemporalEvent>>,
         pub feedback: Mutex<Vec<FeedbackOutcome>>,
         pub intentions: Mutex<Vec<crate::intention::Intention>>,
@@ -1781,6 +1821,8 @@ pub mod mock {
             let mut scored: Vec<(u8, &EntityEntry)> = entities
                 .iter()
                 .filter(|e| e.session_id == session_id)
+                // Exclude retracted (Unavailable) entities from recall.
+                .filter(|e| e.state.is_retrievable())
                 .filter_map(|e| {
                     let en = e.entity_name.to_lowercase();
                     if en == lower {
@@ -1857,6 +1899,8 @@ pub mod mock {
             Ok(entities
                 .iter()
                 .filter(|e| e.session_id == session_id)
+                // Exclude retracted (Unavailable) entities from recall.
+                .filter(|e| e.state.is_retrievable())
                 .take(k)
                 .cloned()
                 .collect())
@@ -1918,6 +1962,10 @@ pub mod mock {
             Ok(entities
                 .iter()
                 .filter(|e| e.tenant_id == ctx.tenant_id && e.session_id == session_id)
+                // Exclude retracted (Unavailable) entities from recall. Mirrors
+                // CqlStorage::entity_list_session; bulk paths (entity_list_all)
+                // intentionally keep all states.
+                .filter(|e| e.state.is_retrievable())
                 .cloned()
                 .collect())
         }
@@ -2086,6 +2134,54 @@ pub mod mock {
             } else {
                 anyhow::bail!("entity not found: {entity_id}")
             }
+        }
+
+        // --- Retraction records ---
+
+        async fn retraction_put(
+            &self,
+            _ctx: &TenantContext,
+            rec: &RetractionRecord,
+        ) -> anyhow::Result<()> {
+            self.retractions.lock().await.push(rec.clone());
+            Ok(())
+        }
+
+        async fn retraction_get_latest(
+            &self,
+            _ctx: &TenantContext,
+            object_id: Uuid,
+        ) -> anyhow::Result<Option<RetractionRecord>> {
+            let retractions = self.retractions.lock().await;
+            Ok(retractions
+                .iter()
+                .filter(|r| r.object_id == object_id)
+                .max_by_key(|r| r.retracted_at)
+                .cloned())
+        }
+
+        async fn retraction_list_purgeable(
+            &self,
+            _ctx: &TenantContext,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> anyhow::Result<Vec<RetractionRecord>> {
+            let retractions = self.retractions.lock().await;
+            Ok(retractions
+                .iter()
+                .filter(|r| r.restorable_until < now)
+                .cloned()
+                .collect())
+        }
+
+        async fn retraction_delete(
+            &self,
+            _ctx: &TenantContext,
+            object_id: Uuid,
+            retracted_at: chrono::DateTime<chrono::Utc>,
+        ) -> anyhow::Result<()> {
+            let mut retractions = self.retractions.lock().await;
+            retractions.retain(|r| !(r.object_id == object_id && r.retracted_at == retracted_at));
+            Ok(())
         }
 
         // --- Temporal operations ---
