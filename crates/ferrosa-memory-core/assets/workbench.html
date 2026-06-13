@@ -743,7 +743,6 @@
         <a href="/#sparql" data-section="sparql">SPARQL Explorer</a>
         <a href="/#datalog" data-section="datalog">Datalog Explorer</a>
         <a href="/#judge" data-section="judge">Judge Config</a>
-        <a href="/#aliases" data-section="aliases">Aliases</a>
         <a href="/#rules" data-section="rules">Rules</a>
         <a href="/#approvals" data-section="approvals">Approvals / Explanations</a>
       </nav>
@@ -795,7 +794,6 @@
               <button class="btn" data-open="sparql" type="button">Open SPARQL</button>
               <button class="btn" data-open="datalog" type="button">Open Datalog</button>
               <button class="btn secondary" data-open="judge" type="button">Judge Config</button>
-              <button class="btn secondary" data-open="aliases" type="button">Open Aliases</button>
               <button class="btn secondary" data-open="rules" type="button">Review Rules</button>
             </div>
             <p class="tiny-note">Navigation is internal for query/workbench areas; visualization remains available via /viz.</p>
@@ -808,7 +806,6 @@
               <li>SPARQL passthrough endpoint: <code>/workbench/api/sparql/query</code> (wire contract forwarded)</li>
               <li>Local Datalog inference endpoint: <code>/workbench/api/datalog/query</code> (ferrosa-memory engine)</li>
               <li>Judge config endpoint: <code>/workbench/api/judge/config</code></li>
-              <li>Aliases endpoint: <code>/workbench/api/aliases</code></li>
               <li>Explanation drilldown: <code>/workbench/api/explanations/query</code></li>
               <li>Rules endpoint: <code>/workbench/api/rules</code></li>
               <li>Approvals endpoint: <code>/workbench/api/approvals</code></li>
@@ -834,7 +831,6 @@
             <div class="pill-row">
               <button class="action" type="button" data-template-target="cqlQuery" data-template="SELECT * FROM agent_memory.entity_store LIMIT 25">Entities</button>
               <button class="action" type="button" data-template-target="cqlQuery" data-template="SELECT * FROM agent_memory.rules_by_id LIMIT 25">Rules</button>
-              <button class="action" type="button" data-template-target="cqlQuery" data-template="SELECT * FROM agent_memory.aliases_by_name WHERE alias_name = 'query_derived' LIMIT 25">Aliases</button>
               <button class="action" type="button" data-template-target="cqlQuery" data-template="SELECT * FROM agent_memory.derived_cache_by_pred LIMIT 25">Derived Cache</button>
             </div>
             <label for="cqlQuery">CQL Text</label>
@@ -1090,89 +1086,6 @@
       </div>
     </section>
 
-    <section id="aliases" class="panel" data-panel="aliases">
-      <div class="panel-head">
-        <div>
-          <h2>Aliases</h2>
-          <p>Search and register alias mappings without leaving the operator shell.</p>
-        </div>
-        <div class="toolbar-row">
-          <button class="btn secondary" id="aliasesRefresh" type="button">Refresh aliases</button>
-        </div>
-      </div>
-      <div class="panel-body query-row">
-        <div class="grid cols-2">
-          <form id="aliasSearchForm" class="card query-form">
-            <h3>Lookup Alias</h3>
-            <label for="aliasSearchName">Alias name</label>
-            <input id="aliasSearchName" class="input" type="text" placeholder="Acme / acme-inc / @acme">
-            <div class="toolbar-row">
-              <button class="btn" type="submit">Search</button>
-              <button class="btn secondary" id="aliasSearchClear" type="button">Clear Filter</button>
-            </div>
-            <div class="status" id="aliasSearchStatus">Ready.</div>
-          </form>
-          <form id="aliasCreateForm" class="card query-form">
-            <h3>Create Alias</h3>
-            <label for="aliasCreateName">Alias name</label>
-            <input id="aliasCreateName" class="input" type="text" placeholder="alias_name" required>
-            <label for="aliasCanonicalTool">Canonical tool</label>
-            <input id="aliasCanonicalTool" class="input" type="text" placeholder="query_derived" required>
-            <div class="inline">
-              <div class="field" style="flex:1;">
-                <label for="aliasScopeKind">Scope</label>
-                <select id="aliasScopeKind">
-                  <option value="global">Global</option>
-                  <option value="workspace">Workspace</option>
-                  <option value="session">Session</option>
-                </select>
-              </div>
-              <div class="field" style="flex:1;">
-                <label for="aliasStatus">Status</label>
-                <select id="aliasStatus">
-                  <option value="proposed">Proposed</option>
-                  <option value="approved">Approved</option>
-                  <option value="rejected">Rejected</option>
-                </select>
-              </div>
-            </div>
-            <label for="aliasScopeRef">Scope Ref</label>
-            <input id="aliasScopeRef" class="input mono" type="text" placeholder="* or workspace/session id as needed">
-            <div class="toolbar-row">
-              <button class="btn" type="submit">Create Alias</button>
-            </div>
-            <div class="status" id="aliasFormStatus">Ready.</div>
-          </form>
-        </div>
-        <div class="card">
-          <div class="toolbar-row" style="justify-content:space-between;margin-bottom:10px;">
-            <span class="muted">Alias mappings returned by <code>/workbench/api/aliases</code>.</span>
-            <span id="aliasesCount" class="badge">0 rows</span>
-          </div>
-          <div class="table-wrap">
-            <table aria-label="Aliases table">
-              <thead>
-                <tr>
-                  <th>Alias</th>
-                  <th>Tool</th>
-                  <th style="width: 120px;">Scope</th>
-                  <th style="width: 210px;">Scope Ref</th>
-                  <th style="width: 120px;">Status</th>
-                  <th style="width: 170px;">Updated</th>
-                </tr>
-              </thead>
-              <tbody id="aliasesTable">
-                <tr>
-                  <td colspan="6" style="text-align:center;color:var(--subtle)">Loading aliases…</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-          <p class="tiny-note" id="aliasesEmptyNote" style="display:none;">No aliases returned by endpoint.</p>
-        </div>
-      </div>
-    </section>
-
     <section id="rules" class="panel" data-panel="rules">
       <div class="panel-head">
         <div>
@@ -1341,7 +1254,6 @@
       currentSection: 'home',
       rules: [],
       approvals: [],
-      aliases: [],
       sessionId: localStorage.getItem('ferrosa_memory_session') || '',
       queryCount: 0,
       lastCqlPayload: null,
@@ -1360,7 +1272,7 @@
     };
 
     const API_BASE = '/workbench/api';
-    const sections = ['home', 'cql', 'sparql', 'datalog', 'judge', 'aliases', 'rules', 'approvals'];
+    const sections = ['home', 'cql', 'sparql', 'datalog', 'judge', 'rules', 'approvals'];
 
     const selectors = {
       navLinks: [...document.querySelectorAll('.nav a[data-section]')],
@@ -1423,21 +1335,6 @@
       judgeStatus: document.getElementById('judgeStatus'),
       judgeOutput: document.getElementById('judgeOutput'),
       judgeResultMeta: document.getElementById('judgeResultMeta'),
-      aliasSearchForm: document.getElementById('aliasSearchForm'),
-      aliasSearchName: document.getElementById('aliasSearchName'),
-      aliasSearchStatus: document.getElementById('aliasSearchStatus'),
-      aliasSearchClear: document.getElementById('aliasSearchClear'),
-      aliasCreateForm: document.getElementById('aliasCreateForm'),
-      aliasFormStatus: document.getElementById('aliasFormStatus'),
-      aliasCreateName: document.getElementById('aliasCreateName'),
-      aliasCanonicalTool: document.getElementById('aliasCanonicalTool'),
-      aliasScopeKind: document.getElementById('aliasScopeKind'),
-      aliasStatus: document.getElementById('aliasStatus'),
-      aliasScopeRef: document.getElementById('aliasScopeRef'),
-      aliasesTable: document.getElementById('aliasesTable'),
-      aliasesEmptyNote: document.getElementById('aliasesEmptyNote'),
-      aliasesCount: document.getElementById('aliasesCount'),
-      aliasesRefresh: document.getElementById('aliasesRefresh'),
       ruleForm: document.getElementById('ruleForm'),
       ruleFormStatus: document.getElementById('ruleFormStatus'),
       ruleName: document.getElementById('ruleName'),
@@ -1596,8 +1493,6 @@
       location.hash = section;
       if (section === 'rules') {
         loadRules();
-      } else if (section === 'aliases') {
-        loadAliases();
       } else if (section === 'approvals') {
         loadApprovals();
       } else if (section === 'judge') {
@@ -1836,40 +1731,6 @@
       });
     };
 
-    const renderAliases = () => {
-      selectors.aliasesTable.innerHTML = '';
-      selectors.aliasesCount.textContent = `${state.aliases.length} row${state.aliases.length === 1 ? '' : 's'}`;
-
-      if (!state.aliases.length) {
-        selectors.aliasesEmptyNote.style.display = 'block';
-        const row = document.createElement('tr');
-        row.innerHTML = '<td colspan="6" style="text-align:center;color:var(--subtle)">No aliases found.</td>';
-        selectors.aliasesTable.appendChild(row);
-        return;
-      }
-
-      selectors.aliasesEmptyNote.style.display = 'none';
-      state.aliases.forEach((entry) => {
-        const aliasName = entry.alias_name || entry.alias || entry.name || '—';
-        const canonicalTool = entry.canonical_tool || entry.canonical_name || entry.canonical || '—';
-        const scopeKind = entry.scope_kind || entry.scope || 'global';
-        const scopeRef = entry.scope_ref || entry.workspace_scope || entry.session_scope || '—';
-        const status = entry.status || entry.state || 'proposed';
-        const updated = entry.updated_at || entry.updated || entry.created_at || '';
-
-        const row = document.createElement('tr');
-        row.innerHTML = `
-          <td><strong>${escapeHtml(aliasName)}</strong></td>
-          <td class="mono">${escapeHtml(canonicalTool)}</td>
-          <td>${escapeHtml(scopeKind)}</td>
-          <td class="mono">${escapeHtml(scopeRef)}</td>
-          <td>${escapeHtml(status)}</td>
-          <td>${escapeHtml(updated ? formatTime(updated) : 'n/a')}</td>
-        `;
-        selectors.aliasesTable.appendChild(row);
-      });
-    };
-
     const renderApprovals = () => {
       selectors.approvalsTable.innerHTML = '';
       const filterValue = selectors.approvalsFilter.value || 'all';
@@ -1912,30 +1773,6 @@
         approveBtn.addEventListener('click', () => handleApproval(item.id || item.request_id, 'approved'));
         rejectBtn.addEventListener('click', () => handleApproval(item.id || item.request_id, 'rejected'));
         selectors.approvalsTable.appendChild(row);
-      }
-    };
-
-    const loadAliases = async (aliasName = selectors.aliasSearchName.value.trim()) => {
-      try {
-        renderStatus(
-          selectors.aliasSearchStatus,
-          aliasName ? `Searching aliases for "${aliasName}"…` : 'Loading aliases…',
-          'warn'
-        );
-        const suffix = aliasName ? `?alias_name=${encodeURIComponent(aliasName)}` : '';
-        const payload = await request(`/aliases${suffix}`, { method: 'GET' });
-        state.aliases = extractArray(payload, ['aliases', 'items', 'rows', 'results']);
-        renderAliases();
-        renderStatus(
-          selectors.aliasSearchStatus,
-          state.aliases.length ? `Loaded ${state.aliases.length} alias row${state.aliases.length === 1 ? '' : 's'}.` : 'No aliases matched the current filter.',
-          'ok'
-        );
-      } catch (error) {
-        selectors.aliasesEmptyNote.style.display = 'block';
-        selectors.aliasesTable.innerHTML = `<tr><td colspan="6" class="status err">${escapeHtml(error.message)}</td></tr>`;
-        selectors.aliasesCount.textContent = '0 rows';
-        renderStatus(selectors.aliasSearchStatus, error.message || 'Failed to load aliases.', 'err');
       }
     };
 
@@ -2217,36 +2054,6 @@
       }
     };
 
-    const submitAlias = async (event) => {
-      event.preventDefault();
-      try {
-        renderStatus(selectors.aliasFormStatus, 'Submitting alias…', 'warn');
-        const scopeKind = selectors.aliasScopeKind.value || 'global';
-        const scopeRef = selectors.aliasScopeRef.value.trim();
-        await request('/aliases', {
-          method: 'POST',
-          body: JSON.stringify({
-            alias_name: selectors.aliasCreateName.value.trim(),
-            canonical_tool: selectors.aliasCanonicalTool.value.trim(),
-            scope_kind: scopeKind,
-            status: selectors.aliasStatus.value || 'proposed',
-            scope_ref: scopeRef || undefined,
-            workspace_scope: scopeKind === 'workspace' ? (scopeRef || undefined) : undefined,
-            session_scope: scopeKind === 'session' ? (scopeRef || state.sessionId || undefined) : undefined,
-          }),
-        });
-        selectors.aliasCreateName.value = '';
-        selectors.aliasCanonicalTool.value = '';
-        selectors.aliasScopeKind.value = 'global';
-        selectors.aliasStatus.value = 'proposed';
-        selectors.aliasScopeRef.value = '';
-        renderStatus(selectors.aliasFormStatus, 'Alias submitted.', 'ok');
-        await loadAliases(selectors.aliasSearchName.value.trim());
-      } catch (error) {
-        renderStatus(selectors.aliasFormStatus, error.message || 'Failed to submit alias.', 'err');
-      }
-    };
-
     const queryExplanation = async (event) => {
       if (event) {
         event.preventDefault();
@@ -2414,11 +2221,6 @@
     selectors.judgeForm.addEventListener('submit', saveJudgeConfig);
     selectors.judgeProbeModels.addEventListener('click', probeJudgeModels);
     selectors.judgeReload.addEventListener('click', loadJudgeConfig);
-    selectors.aliasSearchForm.addEventListener('submit', async (event) => {
-      event.preventDefault();
-      await loadAliases(selectors.aliasSearchName.value.trim());
-    });
-    selectors.aliasCreateForm.addEventListener('submit', submitAlias);
     selectors.ruleForm.addEventListener('submit', submitRule);
     selectors.rulesFilterForm.addEventListener('submit', async (event) => {
       event.preventDefault();
@@ -2462,13 +2264,6 @@
         state.sessionId ? 'ok' : 'warn'
       );
     });
-    selectors.aliasSearchClear.addEventListener('click', async () => {
-      selectors.aliasSearchName.value = '';
-      await loadAliases('');
-    });
-    selectors.aliasesRefresh.addEventListener('click', async () => {
-      await loadAliases(selectors.aliasSearchName.value.trim());
-    });
     selectors.rulesRefresh.addEventListener('click', loadRules);
     selectors.approvalsRefresh.addEventListener('click', loadApprovals);
     selectors.approvalsFilter.addEventListener('change', renderApprovals);
@@ -2503,9 +2298,7 @@
     const refreshCurrent = async () => {
       await ensureAuthToken();
       await loadHomeSummary();
-      if (state.currentSection === 'aliases') {
-        await loadAliases();
-      } else if (state.currentSection === 'rules') {
+      if (state.currentSection === 'rules') {
         await loadRules();
       } else if (state.currentSection === 'approvals') {
         await loadApprovals();
@@ -2522,7 +2315,6 @@
       await ensureAuthToken();
       await loadHomeSummary();
       await loadJudgeConfig();
-      await loadAliases();
       await loadRules();
       await loadApprovals();
     };
