@@ -342,6 +342,17 @@ async fn run_decay_and_forget(config: &ferrosa_memory_core::config::Config) -> a
             .await?;
     tracing::info!(purged, "expired retractions purged");
 
+    // Replay any forget operations left in_progress by a crash mid-forget so
+    // the system converges (idempotent — completed journals are skipped).
+    let recovered = ferrosa_memory_core::forget::recover_unfinished_forgets(
+        &storage,
+        &ctx,
+        config.forget.retract_purge_days,
+        chrono::Utc::now(),
+    )
+    .await?;
+    tracing::info!(recovered, "unfinished forgets recovered");
+
     Ok(())
 }
 

@@ -693,6 +693,129 @@ pub async fn restore(
     crate::entity::restore_entity(storage, ctx, entity_id).await
 }
 
+// ─── Journal crash-recovery (T-FORGET-012) ────────────────────────
+
+/// One target parsed from a `forget_journal` entry's `target_ids` JSON.
+#[derive(serde::Deserialize)]
+struct JournalTarget {
+    object_type: String,
+    object_id: String,
+    session_id: String,
+}
+
+/// Replay forget operations left `in_progress` by a crash mid-forget so the
+/// system converges — the durability guarantee that justifies the journal
+/// (Accord being unusable for atomic multi-row writes).
+///
+/// **Idempotent.** A target already disposed (retraction record present, or the
+/// entity already gone) is skipped, so recovery never writes a duplicate
+/// retraction and never errors on a half-applied forget. Safe to run on every
+/// startup and from the maintenance job. Returns the number of journal entries
+/// recovered (marked `completed`).
+pub async fn recover_unfinished_forgets(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    purge_days: u32,
+    now: DateTime<Utc>,
+) -> anyhow::Result<usize> {
+    let unfinished = storage.forget_journal_list_unfinished(ctx).await?;
+    let mut recovered = 0usize;
+    for entry in unfinished {
+        let mode = if entry.mode == "hard" {
+            ForgetMode::Hard
+        } else {
+            ForgetMode::Retract
+        };
+        let targets: Vec<JournalTarget> =
+            serde_json::from_str(&entry.target_ids).unwrap_or_default();
+        for t in targets {
+            if t.object_type != "entity" {
+                continue; // only entities are forgettable in v1
+            }
+            let Ok(object_id) = Uuid::parse_str(&t.object_id) else {
+                continue;
+            };
+            let session_id = Uuid::parse_str(&t.session_id).unwrap_or_else(|_| Uuid::nil());
+            recover_entity_target(
+                storage, ctx, mode, session_id, object_id, &entry, purge_days, now,
+            )
+            .await?;
+        }
+        storage
+            .forget_journal_update_status(
+                ctx,
+                entry.forget_id,
+                "completed",
+                r#"{"recovered":"done"}"#,
+                now,
+            )
+            .await?;
+        recovered += 1;
+    }
+    Ok(recovered)
+}
+
+/// Idempotently finish the disposition of a single entity target.
+#[allow(clippy::too_many_arguments)]
+async fn recover_entity_target(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    mode: ForgetMode,
+    session_id: Uuid,
+    object_id: Uuid,
+    entry: &ForgetJournalEntry,
+    purge_days: u32,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    match mode {
+        ForgetMode::Retract => {
+            // Already retracted (crash after disposition) → don't duplicate.
+            if storage
+                .retraction_get_latest(ctx, object_id)
+                .await?
+                .is_some()
+            {
+                return Ok(());
+            }
+            // Entity already gone entirely → nothing to retract.
+            if storage
+                .entity_get_by_id(ctx, session_id, object_id)
+                .await?
+                .is_none()
+            {
+                return Ok(());
+            }
+            teardown_typed_edges(storage, ctx, session_id, object_id).await?;
+            let restorable_until = now + chrono::Duration::days(purge_days as i64);
+            crate::entity::retract_entity(
+                storage,
+                ctx,
+                session_id,
+                object_id,
+                &entry.reason,
+                &entry.actor,
+                entry.forget_id,
+                restorable_until,
+                now,
+            )
+            .await?;
+            invalidate_derived(storage, ctx, object_id).await?;
+        }
+        ForgetMode::Hard => {
+            // Already gone → idempotent no-op.
+            if storage
+                .entity_get_by_id(ctx, session_id, object_id)
+                .await?
+                .is_none()
+            {
+                return Ok(());
+            }
+            hard_delete_entity(storage, ctx, session_id, object_id).await?;
+        }
+    }
+    Ok(())
+}
+
 // ─── Purge sweep (I9) ─────────────────────────────────────────────
 
 /// Hard-purge every retraction whose restore window has elapsed.
@@ -1496,5 +1619,244 @@ mod tests {
         let after = integrity_sweep(&store, &ctx, false).await.unwrap();
         assert_eq!(after.scanned_edges, 0);
         assert_eq!(after.dangling_edges, 0);
+    }
+
+    // ─── Journal crash-recovery (T-FORGET-012) ───────────────────────
+
+    #[allow(clippy::too_many_arguments)]
+    async fn put_journal(
+        store: &MockStorage,
+        ctx: &TenantContext,
+        forget_id: Uuid,
+        targets: &[(Uuid, Uuid)], // (object_id, session_id)
+        mode: &str,
+        status: &str,
+        created_at: DateTime<Utc>,
+    ) {
+        let arr: Vec<_> = targets
+            .iter()
+            .map(|(oid, sid)| {
+                serde_json::json!({
+                    "object_type": "entity",
+                    "object_id": oid.to_string(),
+                    "session_id": sid.to_string(),
+                })
+            })
+            .collect();
+        store
+            .forget_journal_put(
+                ctx,
+                &ForgetJournalEntry {
+                    tenant_id: ctx.tenant_id,
+                    forget_id,
+                    target_ids: serde_json::to_string(&arr).unwrap(),
+                    mode: mode.to_string(),
+                    step_states: "{}".to_string(),
+                    status: status.to_string(),
+                    reason: "test".to_string(),
+                    actor: "tester".to_string(),
+                    created_at,
+                    updated_at: created_at,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // T1 (starter): no unfinished journals → no-op, returns 0.
+    #[tokio::test]
+    async fn recover_no_unfinished_journals_is_noop() {
+        let store = MockStorage::new();
+        let ctx = ctx();
+        let n = recover_unfinished_forgets(&store, &ctx, 7, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    // T2: in_progress retract journal + live target → entity retracted
+    // (Unavailable + retraction record) and the journal is marked completed.
+    #[tokio::test]
+    async fn recover_completes_inprogress_retract() {
+        let store = MockStorage::new();
+        let ctx = ctx();
+        let sid = Uuid::new_v4();
+        let id = put_entity(&store, &ctx, sid, "doomed concept", "snip").await;
+        put_journal(
+            &store,
+            &ctx,
+            Uuid::new_v4(),
+            &[(id, sid)],
+            "retract",
+            "in_progress",
+            Utc::now(),
+        )
+        .await;
+
+        let n = recover_unfinished_forgets(&store, &ctx, 7, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        let e = store
+            .entity_get_by_id(&ctx, sid, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(e.state, MemoryState::Unavailable);
+        assert!(
+            store
+                .retraction_get_latest(&ctx, id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .forget_journal_list_unfinished(&ctx)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // T3: in_progress hard journal + live target → entity hard-deleted.
+    #[tokio::test]
+    async fn recover_completes_inprogress_hard() {
+        let store = MockStorage::new();
+        let ctx = ctx();
+        let sid = Uuid::new_v4();
+        let id = put_entity(&store, &ctx, sid, "doomed hard", "snip").await;
+        put_journal(
+            &store,
+            &ctx,
+            Uuid::new_v4(),
+            &[(id, sid)],
+            "hard",
+            "in_progress",
+            Utc::now(),
+        )
+        .await;
+
+        let n = recover_unfinished_forgets(&store, &ctx, 7, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        assert!(
+            store
+                .entity_get_by_id(&ctx, sid, id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // T4 (idempotency driver): crash AFTER retraction but before the status
+    // write → recovery must NOT write a second retraction record.
+    #[tokio::test]
+    async fn recover_is_idempotent_when_already_retracted() {
+        let store = MockStorage::new();
+        let ctx = ctx();
+        let sid = Uuid::new_v4();
+        let id = put_entity(&store, &ctx, sid, "already gone", "snip").await;
+        let original_ts = Utc::now();
+        put_retraction(
+            &store,
+            &ctx,
+            sid,
+            id,
+            original_ts,
+            original_ts + chrono::Duration::days(7),
+        )
+        .await;
+        put_journal(
+            &store,
+            &ctx,
+            Uuid::new_v4(),
+            &[(id, sid)],
+            "retract",
+            "in_progress",
+            original_ts,
+        )
+        .await;
+
+        // Recover with a LATER clock; if it wrongly re-retracted, the latest
+        // record's timestamp would advance.
+        let later = original_ts + chrono::Duration::hours(1);
+        let n = recover_unfinished_forgets(&store, &ctx, 7, later)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        let rec = store
+            .retraction_get_latest(&ctx, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rec.retracted_at, original_ts,
+            "recovery must not duplicate/overwrite the existing retraction"
+        );
+    }
+
+    // T5: completed journals are not reprocessed.
+    #[tokio::test]
+    async fn recover_ignores_completed_journals() {
+        let store = MockStorage::new();
+        let ctx = ctx();
+        let sid = Uuid::new_v4();
+        let id = put_entity(&store, &ctx, sid, "kept", "snip").await;
+        put_journal(
+            &store,
+            &ctx,
+            Uuid::new_v4(),
+            &[(id, sid)],
+            "retract",
+            "completed",
+            Utc::now(),
+        )
+        .await;
+
+        let n = recover_unfinished_forgets(&store, &ctx, 7, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+        // The entity is untouched.
+        assert!(
+            store
+                .entity_get_by_id(&ctx, sid, id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    // T6 (edge): target already gone → recovery completes without error.
+    #[tokio::test]
+    async fn recover_handles_missing_target() {
+        let store = MockStorage::new();
+        let ctx = ctx();
+        let sid = Uuid::new_v4();
+        let gone = Uuid::new_v4(); // never created
+        put_journal(
+            &store,
+            &ctx,
+            Uuid::new_v4(),
+            &[(gone, sid)],
+            "hard",
+            "in_progress",
+            Utc::now(),
+        )
+        .await;
+
+        let n = recover_unfinished_forgets(&store, &ctx, 7, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        assert!(
+            store
+                .forget_journal_list_unfinished(&ctx)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

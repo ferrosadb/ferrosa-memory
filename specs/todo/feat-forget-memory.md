@@ -1,7 +1,7 @@
 # Forget Memory — Candidate-Confirmed Forgetting
 
 > Last updated: 2026-06-12
-> Status: Implemented (v1) on branch `feat/forget-memory`. Known v1 limits: edges are deleted (not soft-marked) on retract and not auto-recreated on restore; full node+edge teardown completes once graph `DETACH DELETE` lands (ferrosa QEC Milestone 1); journal crash-recovery sweep (T-FORGET-012) is a follow-up.
+> Status: Implemented (v1) on branch `feat/forget-memory`, including the journal crash-recovery sweep (T-FORGET-012: `recover_unfinished_forgets`, idempotent, wired into the `decay-forget` maintenance job). Known v1 limits: edges are deleted (not soft-marked) on retract and not auto-recreated on restore; full node+edge teardown completes once graph `DETACH DELETE` lands (ferrosa QEC Milestone 1).
 
 ## Overview
 
