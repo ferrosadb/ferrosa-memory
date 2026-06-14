@@ -1245,6 +1245,25 @@ pub trait Storage: Send + Sync {
         dst_id: Uuid,
     ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send;
 
+    /// Hard-delete an entity's graph node and ALL its incident edges via the
+    /// graph engine's `DETACH DELETE` (typed + legacy, both directions, atomic).
+    ///
+    /// The default is a **no-op** because only the graph-backed storage
+    /// (`ReconnectingStorage`, which wraps a `GraphClient`) has `:Entity` nodes.
+    /// `CqlStorage` and `MockStorage` carry no graph, so there is no node to
+    /// detach and the default `Ok(())` is correct, not a swallowed failure.
+    fn delete_entity_node(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        entity_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send {
+        async move {
+            let _ = (ctx, session_id, entity_id);
+            Ok(())
+        }
+    }
+
     // --- Durable materialization operations (B10) ---
 
     /// Store a materialized edge (durable).

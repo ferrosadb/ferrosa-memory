@@ -1885,6 +1885,17 @@ impl Storage for ReconnectingStorage {
             .await?;
         Ok(true)
     }
+
+    async fn delete_entity_node(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        entity_id: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        self.graph_client()?
+            .delete_entity_node(ctx.tenant_id, session_id, entity_id)
+            .await
+    }
 }
 
 impl http::OperatorQuerySurface for ReconnectingStorage {
