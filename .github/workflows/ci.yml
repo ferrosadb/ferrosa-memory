@@ -560,6 +560,17 @@ jobs:
           FERROSA_TEST_GRAPH_URL: "http://127.0.0.1:17974"
           FERROSA_TEST_KEYSPACE: "agent_memory_test"
           FERROSA_TEST_S3_ENDPOINT: "http://127.0.0.1:19500"
+        # Runs at full parallelism on purpose. The earlier flake here
+        # (transient LOCAL_QUORUM write timeouts / KeepaliveTimeout / "pool is
+        # broken" under the 2-vCPU runner) was NOT a CI-tuning problem — it was
+        # a real ferrosa defect: blocking work ran on tokio async worker
+        # threads (a per-write `statvfs` in the storage write-admission check,
+        # synchronous point-read storage access, and synchronous `engine.write`
+        # inside the raft apply path). Under load a worker would park in a
+        # blocking syscall and starve Raft heartbeats / CQL handshakes. Fixed
+        # upstream in ferrosa (commits 6ef9d313 / a6cf1ed5 / 57ba8ec3); this
+        # job exercises the full concurrent load against the fixed engine so a
+        # regression would surface here rather than being masked by serializing.
         run: cargo test --workspace -- --ignored
       - name: Run system pytest suite against live cluster
         env:
