@@ -560,17 +560,18 @@ jobs:
           FERROSA_TEST_GRAPH_URL: "http://127.0.0.1:17974"
           FERROSA_TEST_KEYSPACE: "agent_memory_test"
           FERROSA_TEST_S3_ENDPOINT: "http://127.0.0.1:19500"
-        # --test-threads=1 serializes the cluster-gated tests. By default
-        # `cargo test` runs the harness multi-threaded, so the test client
-        # spawns many concurrent CQL writers that compete with the 3 ferrosa
-        # nodes + rustfs for the runner's 2 vCPUs. Under that overcommit the
-        # nodes can't get scheduled to service Raft heartbeats, peers flap
-        # ("suspected dead: N missed heartbeats"), and writes fail transient
-        # LOCAL_QUORUM (received=1, required=2) / KeepaliveTimeout — a pure
-        # CPU-starvation flake, not a ferrosa fault (pre-vote correctly
-        # suppresses any election storm; no node crashes). Serializing the
-        # client removes the contention so heartbeats stay timely.
-        run: cargo test --workspace -- --ignored --test-threads=1
+        # Runs at full parallelism on purpose. The earlier flake here
+        # (transient LOCAL_QUORUM write timeouts / KeepaliveTimeout / "pool is
+        # broken" under the 2-vCPU runner) was NOT a CI-tuning problem — it was
+        # a real ferrosa defect: blocking work ran on tokio async worker
+        # threads (a per-write `statvfs` in the storage write-admission check,
+        # synchronous point-read storage access, and synchronous `engine.write`
+        # inside the raft apply path). Under load a worker would park in a
+        # blocking syscall and starve Raft heartbeats / CQL handshakes. Fixed
+        # upstream in ferrosa (commits 6ef9d313 / a6cf1ed5 / 57ba8ec3); this
+        # job exercises the full concurrent load against the fixed engine so a
+        # regression would surface here rather than being masked by serializing.
+        run: cargo test --workspace -- --ignored
       - name: Run system pytest suite against live cluster
         env:
           FERROSA_BASE_URL: "http://127.0.0.1:19090"
