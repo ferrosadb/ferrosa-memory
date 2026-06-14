@@ -54,7 +54,6 @@ def test_t_s_003_workbench_home_renders_shared_navigation():
     assert 'href="/#cql"' in html
     assert 'href="/#sparql"' in html
     assert 'href="/#datalog"' in html
-    assert 'href="/#aliases"' in html
     assert 'href="/#rules"' in html
     assert 'href="/#approvals"' in html
     assert "/workbench/api/sparql/query" in html
@@ -124,9 +123,9 @@ def test_t_s_008_alias_workbench_slice_exposes_governed_browse_and_management():
     """T-S-008: alias workbench slice exposes governed browse and management."""
     dispatch = DISPATCH_RS.read_text()
     http = HTTP_RS.read_text()
-    html = WORKBENCH_HTML.read_text()
 
-    assert "/workbench/api/aliases" in html
+    # Aliases UI tab removed (chore/remove-aliases-tab); the governed-write
+    # backend — route + manage_aliases tool — is retained and still guarded.
     assert '("GET", "/workbench/api/aliases")' in http
     assert '("POST", "/workbench/api/aliases")' in http
     assert '"manage_aliases"' in http
@@ -216,7 +215,6 @@ def test_t_s_012_viz_surface_uses_shared_nav_and_ferrosa_brand_tokens():
     assert 'data-shell-nav="viz"' in html
     assert 'data-shell-nav="cql"' in html
     assert 'data-shell-nav="sparql"' in html
-    assert 'data-shell-nav="aliases"' in html
     assert 'data-shell-nav="rules"' in html
     assert "window.__FMEM_WORKBENCH_SCHEME__" in html
     assert "window.__FMEM_WORKBENCH_PORT__" in html

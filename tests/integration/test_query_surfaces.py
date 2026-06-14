@@ -56,12 +56,16 @@ def test_t_i_012_query_status_text_reflects_transport_contracts():
 
 
 def test_t_i_009_alias_surface_exposes_browse_and_governed_writes():
-    """T-I-009: alias surface exposes browse and governed writes."""
-    html = WORKBENCH_HTML.read_text()
+    """T-I-009: the alias backend (API route + manage_aliases tool) is retained.
+
+    The Aliases *UI tab* was intentionally removed (we don't use runtime
+    aliases — see chore/remove-aliases-tab), so it is no longer asserted in the
+    workbench HTML. The governed-write backend — the `/workbench/api/aliases`
+    routes and the `manage_aliases` tool — is kept and still guarded here.
+    """
     http = HTTP_RS.read_text()
     dispatch = DISPATCH_RS.read_text()
 
-    assert "/workbench/api/aliases" in html
     assert '("GET", "/workbench/api/aliases")' in http
     assert '("POST", "/workbench/api/aliases")' in http
     assert '"manage_aliases"' in http
