@@ -400,6 +400,21 @@ fn edge_count_query(ks: &str, table: &str) -> anyhow::Result<String> {
     ))
 }
 
+fn tenant_count_query(ks: &str, table: &str, session_scoped: bool) -> anyhow::Result<String> {
+    match table {
+        "document_chunks" | "context_segments" | "temporal_edges" => {}
+        other => anyhow::bail!("unsupported tenant-count table: {other}"),
+    }
+    let session_clause = if session_scoped {
+        " AND session_id = ?"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "SELECT count(*) FROM {ks}.{table} WHERE tenant_id = ?{session_clause} ALLOW FILTERING"
+    ))
+}
+
 fn derived_cache_count_query(ks: &str) -> String {
     format!("SELECT count(*) FROM {ks}.derived_cache_by_query WHERE tenant_id = ? ALLOW FILTERING")
 }
@@ -1169,6 +1184,34 @@ impl CqlStorage {
         anyhow::anyhow!(
             "{op} must go through a GraphClient-backed storage adapter; direct graph-table writes are disabled"
         )
+    }
+
+    async fn count_tenant_rows_with_ctx(
+        &self,
+        ctx: &TenantContext,
+        table: &str,
+        session_id: Option<Uuid>,
+    ) -> anyhow::Result<usize> {
+        let query = tenant_count_query(&self.keyspace, table, session_id.is_some())?;
+        #[allow(deprecated)]
+        let result = if let Some(session_id) = session_id {
+            self.session
+                .query_unpaged(query, (ctx.tenant_id, session_id))
+                .await?
+        } else {
+            self.session.query_unpaged(query, (ctx.tenant_id,)).await?
+        };
+        let col_map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
+        let Some(row) = rows.first() else {
+            return Ok(0);
+        };
+        let count = cql_get_i64_from_single_aggregate(
+            row,
+            &col_map,
+            &["system.count", "count", "count(*)"],
+        )?;
+        Ok(count.max(0) as usize)
     }
 
     /// Connect to a Ferrosa/Cassandra cluster and prepare all statements.
@@ -4246,13 +4289,21 @@ impl Storage for CqlStorage {
     }
 
     async fn edge_count(&self, ctx: &TenantContext) -> anyhow::Result<usize> {
-        let mut total = 0usize;
-        for table in [
-            "co_occurs_with",
-            "mentioned_in",
-            "folded_into",
-            "supersedes",
-            "typed_edges",
+        let bucket_counts = self.edge_counts_by_bucket(ctx).await?;
+        Ok(bucket_counts.values().sum())
+    }
+
+    async fn edge_counts_by_bucket(
+        &self,
+        ctx: &TenantContext,
+    ) -> anyhow::Result<std::collections::BTreeMap<String, usize>> {
+        let mut counts = std::collections::BTreeMap::new();
+        for (bucket, table) in [
+            ("co_occurs", "co_occurs_with"),
+            ("mentioned_in", "mentioned_in"),
+            ("folded_into", "folded_into"),
+            ("supersedes", "supersedes"),
+            ("typed", "typed_edges"),
         ] {
             let query = edge_count_query(&self.keyspace, table)?;
             #[allow(deprecated)]
@@ -4265,10 +4316,14 @@ impl Storage for CqlStorage {
                     &col_map,
                     &["system.count", "count", "count(*)"],
                 )?;
-                total += count.max(0) as usize;
+                counts.insert(bucket.to_string(), count.max(0) as usize);
             }
         }
-        Ok(total)
+        counts.insert(
+            "temporal_links".to_string(),
+            self.temporal_edge_count(ctx, None).await?,
+        );
+        Ok(counts)
     }
 
     async fn delete_session(&self, ctx: &TenantContext, session_id: Uuid) -> anyhow::Result<usize> {
@@ -6594,6 +6649,15 @@ impl Storage for CqlStorage {
             .collect()
     }
 
+    async fn document_chunk_count(
+        &self,
+        ctx: &TenantContext,
+        session_id: Option<Uuid>,
+    ) -> anyhow::Result<usize> {
+        self.count_tenant_rows_with_ctx(ctx, "document_chunks", session_id)
+            .await
+    }
+
     async fn context_segment_get(
         &self,
         ctx: &TenantContext,
@@ -6736,6 +6800,15 @@ impl Storage for CqlStorage {
             .collect()
     }
 
+    async fn context_segment_count(
+        &self,
+        ctx: &TenantContext,
+        session_id: Option<Uuid>,
+    ) -> anyhow::Result<usize> {
+        self.count_tenant_rows_with_ctx(ctx, "context_segments", session_id)
+            .await
+    }
+
     async fn temporal_edge_put(
         &self,
         ctx: &TenantContext,
@@ -6789,6 +6862,15 @@ impl Storage for CqlStorage {
             .collect::<anyhow::Result<_>>()?;
         edges.sort_by_key(|edge| edge.ordinal);
         Ok(edges)
+    }
+
+    async fn temporal_edge_count(
+        &self,
+        ctx: &TenantContext,
+        session_id: Option<Uuid>,
+    ) -> anyhow::Result<usize> {
+        self.count_tenant_rows_with_ctx(ctx, "temporal_edges", session_id)
+            .await
     }
 
     async fn confidence_put(

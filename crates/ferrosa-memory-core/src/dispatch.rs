@@ -387,6 +387,7 @@ fn short_tool_name(canonical: &str) -> Option<&'static str> {
         "run_consolidation" => Some("consolidate"),
         "enrich_entities" => Some("enrich"),
         "get_stats" => Some("stats"),
+        "memory_metrics" => Some("metrics"),
         "migration_status" => Some("migrations"),
         "count_entities_by_type" => Some("type_counts"),
         "promote_memory" => Some("promote"),
@@ -468,6 +469,7 @@ fn canonical_tool_name(name: &str) -> &str {
         "consolidate" => "run_consolidation",
         "enrich" => "enrich_entities",
         "stats" => "get_stats",
+        "metrics" => "memory_metrics",
         "migrations" => "migration_status",
         "type_counts" => "count_entities_by_type",
         "promote" => "promote_memory",
@@ -1609,6 +1611,15 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "memory_metrics".into(),
+            description: "Returns a compact tenant-wide memory size report: total node/edge counts plus node and edge buckets, including legacy nil-session knowledge in the tenant totals.\n\nCALL WHEN: A user asks how much knowledge is stored, how many nodes/edges memory has, or whether database-backed memory has outgrown flat files.\nCost: ~10-100ms (tenant-scoped count queries).".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        },
+        ToolDef {
             name: "migration_status".into(),
             description: "Returns read-only schema migration status for the connected memory database: db_version, binary_version, pending versions, and last applied timestamp.\n\nCALL WHEN: Startup logs or graph writes suggest schema drift, or an operator asks whether the database schema is current.\nCost: ~5ms.".into(),
             input_schema: serde_json::json!({
@@ -2307,6 +2318,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "run_consolidation" => Box::pin(handle_run_consolidation(args, storage, ctx, session)),
         "enrich_entities" => Box::pin(handle_enrich_entities(args, storage, ctx, session)),
         "get_stats" => Box::pin(handle_get_stats(args, storage, ctx, session)),
+        "memory_metrics" => Box::pin(handle_memory_metrics(storage, ctx, session)),
         "migration_status" => Box::pin(handle_migration_status(args, storage)),
         "describe" => Box::pin(handle_system_describe(args, storage, ctx, session)),
         "forget" => Box::pin(handle_forget(args, storage, ctx, session)),
@@ -2496,6 +2508,7 @@ fn is_tier1(name: &str) -> bool {
             | "record_feedback"
             | "create_edge"
             | "check_intentions"
+            | "memory_metrics"
             | "session_task_put"
             | "session_task_get"
             | "session_task_current"
@@ -8989,7 +9002,137 @@ async fn handle_enrich_entities<S: crate::storage::Storage>(
     serde_json::to_value(&result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
 }
 
-// --- Stats handler ---
+// --- Metrics / stats handlers ---
+
+async fn handle_memory_metrics<S: crate::storage::Storage>(
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    macro_rules! metric_count {
+        ($label:literal, $future:expr) => {
+            $future.await.map_err(|e| {
+                (
+                    INTERNAL_ERROR,
+                    format!("memory_metrics {} count failed: {e}", $label),
+                )
+            })?
+        };
+    }
+
+    let nil_session_id = uuid::Uuid::nil();
+    let global_session_id = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
+    let tenant_entity_count = metric_count!(
+        "entity",
+        storage.entity_count_matching(
+            ctx,
+            crate::types::EntityListQuery {
+                scope: crate::types::EntityListScope::All,
+                limit: 0,
+                ..Default::default()
+            },
+        )
+    );
+    let legacy_nil_entity_count = metric_count!(
+        "legacy nil entity",
+        storage.entity_count(ctx, nil_session_id)
+    );
+
+    let document_chunk_count =
+        metric_count!("document chunk", storage.document_chunk_count(ctx, None));
+    let legacy_nil_document_chunk_count = metric_count!(
+        "legacy nil document chunk",
+        storage.document_chunk_count(ctx, Some(nil_session_id))
+    );
+    let context_segment_count =
+        metric_count!("context segment", storage.context_segment_count(ctx, None));
+    let legacy_nil_context_segment_count = metric_count!(
+        "legacy nil context segment",
+        storage.context_segment_count(ctx, Some(nil_session_id))
+    );
+
+    let active_fold_count = metric_count!(
+        "active fold",
+        storage.fold_count_by_status(ctx, crate::types::FoldStatus::Active)
+    );
+    let folded_count = metric_count!(
+        "folded fold",
+        storage.fold_count_by_status(ctx, crate::types::FoldStatus::Folded)
+    );
+    let archived_fold_count = metric_count!(
+        "archived fold",
+        storage.fold_count_by_status(ctx, crate::types::FoldStatus::Archived)
+    );
+    let fold_count = active_fold_count + folded_count + archived_fold_count;
+    let legacy_nil_fold_count =
+        metric_count!("legacy nil fold", storage.fold_count(ctx, nil_session_id));
+
+    let memo_count = metric_count!("memo", storage.memo_count(ctx));
+    let temporal_fact_count = metric_count!("temporal fact", storage.temporal_count(ctx));
+    let edge_counts = metric_count!("edge bucket", storage.edge_counts_by_bucket(ctx));
+    let edge_count: usize = edge_counts.values().sum();
+    let legacy_nil_temporal_link_count = metric_count!(
+        "legacy nil temporal link",
+        storage.temporal_edge_count(ctx, Some(nil_session_id))
+    );
+    let intention_count = session.intentions.lock().await.list().len();
+
+    let node_count = tenant_entity_count
+        + document_chunk_count
+        + context_segment_count
+        + fold_count
+        + memo_count
+        + temporal_fact_count;
+    let legacy_nil_node_count = legacy_nil_entity_count
+        + legacy_nil_document_chunk_count
+        + legacy_nil_context_segment_count
+        + legacy_nil_fold_count;
+
+    Ok(serde_json::json!({
+        "scope": "tenant",
+        "tenant_id": ctx.tenant_id.to_string(),
+        "node_count": node_count,
+        "edge_count": edge_count,
+        "nodes": {
+            "entities": tenant_entity_count,
+            "document_chunks": document_chunk_count,
+            "context_segments": context_segment_count,
+            "folds": fold_count,
+            "memos": memo_count,
+            "temporal_facts": temporal_fact_count
+        },
+        "folds": {
+            "active": active_fold_count,
+            "folded": folded_count,
+            "archived": archived_fold_count
+        },
+        "edges": edge_counts,
+        "runtime": {
+            "intention_count": intention_count,
+            "retrieval_default_limit": retrieval_default_limit(session)
+        },
+        "legacy_nil_session": {
+            "session_id": nil_session_id.to_string(),
+            "included_in_tenant_totals": true,
+            "migration_mode": "reported_as_tenant_global_legacy",
+            "node_count": legacy_nil_node_count,
+            "edge_count": legacy_nil_temporal_link_count,
+            "nodes": {
+                "entities": legacy_nil_entity_count,
+                "document_chunks": legacy_nil_document_chunk_count,
+                "context_segments": legacy_nil_context_segment_count,
+                "folds": legacy_nil_fold_count
+            },
+            "edges": {
+                "temporal_links": legacy_nil_temporal_link_count
+            }
+        },
+        "sessions": {
+            "tenant_global_session_id": global_session_id.to_string(),
+            "legacy_nil_session_id": nil_session_id.to_string()
+        }
+    }))
+}
 
 async fn handle_get_stats<S: crate::storage::Storage>(
     args: Value,
@@ -13544,6 +13687,168 @@ mod tests {
             result["entity_count"], 2,
             "get_stats with no session_id should count default-session entities, not return 0"
         );
+    }
+
+    #[tokio::test]
+    async fn memory_metrics_reports_tenant_wide_nodes_edges_and_legacy_nil() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let sid = Uuid::new_v4();
+        let global_sid = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
+        let nil_sid = Uuid::nil();
+        let now = chrono::Utc::now();
+        let session = SessionState {
+            default_session_id: Some(sid),
+            ..SessionState::default()
+        };
+
+        for (session_id, name) in [
+            (sid, "session entity"),
+            (global_sid, "global entity"),
+            (nil_sid, "legacy nil entity"),
+        ] {
+            store.entities.lock().await.push(crate::types::EntityEntry {
+                tenant_id: ctx.tenant_id,
+                entity_id: Uuid::new_v4(),
+                session_id,
+                entity_name: name.into(),
+                entity_type: "concept".into(),
+                context_snippet: name.into(),
+                confidence: 0.9,
+                created_at: now,
+                ..Default::default()
+            });
+        }
+        store
+            .document_chunks
+            .lock()
+            .await
+            .push(crate::types::DocumentChunk {
+                tenant_id: ctx.tenant_id,
+                session_id: nil_sid,
+                document_id: Uuid::new_v4(),
+                chunk_id: Uuid::new_v4(),
+                ordinal: 0,
+                source_doc_id: "legacy-doc".into(),
+                title: "legacy doc".into(),
+                section_path: String::new(),
+                semantic_kind: "text".into(),
+                content: "legacy document chunk".into(),
+                bm25_text: "legacy document chunk".into(),
+                chunk_embedding: None,
+                token_count: 3,
+                content_hash: "legacy-doc-chunk".into(),
+                prev_chunk_id: None,
+                next_chunk_id: None,
+                overlap_from_prev: false,
+                overlap_to_next: false,
+                metadata: serde_json::Value::Null,
+                created_at: now,
+                updated_at: now,
+            });
+        store
+            .context_segments
+            .lock()
+            .await
+            .push(crate::context_segment::ContextSegment {
+                tenant_id: ctx.tenant_id,
+                session_id: sid,
+                segment_id: Uuid::new_v4(),
+                source_session: sid,
+                source_fold_id: None,
+                conversation_id: "metrics-test".into(),
+                segment_index: 0,
+                start_turn: 0,
+                end_turn: 1,
+                start_time: Some(now),
+                end_time: Some(now),
+                segment_text: "session context segment".into(),
+                segment_summary: None,
+                bm25_text: "session context segment".into(),
+                segment_embedding: None,
+                token_count: 3,
+                content_hash: "session-context-segment".into(),
+                prev_segment_id: None,
+                next_segment_id: None,
+                created_at: now,
+            });
+        store.folds.lock().await.push(crate::types::FoldEntry {
+            session_id: nil_sid,
+            fold_id: Uuid::new_v4(),
+            tenant_id: ctx.tenant_id,
+            depth: 0,
+            parent_fold_id: None,
+            raw_trajectory: "legacy fold".into(),
+            fold_summary: Some("legacy fold".into()),
+            fold_embedding: None,
+            token_count: 2,
+            compression_ratio: None,
+            status: crate::types::FoldStatus::Active,
+            created_at: now,
+            folded_at: None,
+        });
+        store.memos.lock().await.push(crate::types::MemoEntry {
+            content_hash: "memo".into(),
+            model_version: "test".into(),
+            result: "cached result".into(),
+            result_embedding: None,
+            hit_count: 0,
+            created_at: now,
+            last_hit_at: None,
+            expires_at: None,
+        });
+        store
+            .temporal_edges
+            .lock()
+            .await
+            .push(crate::context_segment::TemporalEdge {
+                tenant_id: ctx.tenant_id,
+                session_id: nil_sid,
+                src_id: Uuid::new_v4(),
+                edge_type: "next".into(),
+                dst_id: Uuid::new_v4(),
+                relation_time: now,
+                ordinal: 0,
+                metadata: "{}".into(),
+                created_at: now,
+            });
+        store
+            .edge_co_occurs(&ctx, Uuid::new_v4(), Uuid::new_v4(), sid, 0.5)
+            .await
+            .unwrap();
+
+        let result = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "memory_metrics",
+                "arguments": {}
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let result = unwrap_tool_result(result);
+
+        assert_eq!(result["scope"], "tenant");
+        assert_eq!(result["nodes"]["entities"], 3);
+        assert_eq!(result["nodes"]["document_chunks"], 1);
+        assert_eq!(result["nodes"]["context_segments"], 1);
+        assert_eq!(result["nodes"]["folds"], 1);
+        assert_eq!(result["nodes"]["memos"], 1);
+        assert_eq!(result["node_count"], 7);
+        assert_eq!(result["edges"]["co_occurs"], 1);
+        assert_eq!(result["edges"]["temporal_links"], 1);
+        assert_eq!(result["edge_count"], 2);
+        assert_eq!(
+            result["legacy_nil_session"]["included_in_tenant_totals"],
+            true
+        );
+        assert_eq!(result["legacy_nil_session"]["nodes"]["entities"], 1);
+        assert_eq!(result["legacy_nil_session"]["nodes"]["document_chunks"], 1);
+        assert_eq!(result["legacy_nil_session"]["nodes"]["folds"], 1);
+        assert_eq!(result["legacy_nil_session"]["edge_count"], 1);
     }
 
     #[tokio::test]

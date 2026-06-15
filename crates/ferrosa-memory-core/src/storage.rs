@@ -506,6 +506,13 @@ pub trait Storage: Send + Sync {
         k: usize,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<DocumentChunk>>> + Send;
 
+    /// Count document chunks for the tenant, optionally scoped to one session.
+    fn document_chunk_count(
+        &self,
+        ctx: &TenantContext,
+        session_id: Option<Uuid>,
+    ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send;
+
     /// List all entities for a tenant (for viz snapshot).
     fn entity_list_all(
         &self,
@@ -884,6 +891,25 @@ pub trait Storage: Send + Sync {
         &self,
         ctx: &TenantContext,
     ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send;
+
+    /// Count graph edges by durable relationship bucket for a tenant.
+    fn edge_counts_by_bucket(
+        &self,
+        ctx: &TenantContext,
+    ) -> impl std::future::Future<Output = anyhow::Result<std::collections::BTreeMap<String, usize>>>
+    + Send {
+        async move {
+            let mut counts = std::collections::BTreeMap::new();
+            for (_, _, edge_type) in self.edge_list_all(ctx).await? {
+                *counts.entry(edge_type.to_ascii_lowercase()).or_insert(0) += 1;
+            }
+            let temporal_links = self.temporal_edge_count(ctx, None).await?;
+            if temporal_links > 0 {
+                counts.insert("temporal_links".to_string(), temporal_links);
+            }
+            Ok(counts)
+        }
+    }
 
     // --- Intention operations ---
 
@@ -1436,6 +1462,13 @@ pub trait Storage: Send + Sync {
         k: usize,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<ContextSegment>>> + Send;
 
+    /// Count raw context segments for the tenant, optionally scoped to one session.
+    fn context_segment_count(
+        &self,
+        ctx: &TenantContext,
+        session_id: Option<Uuid>,
+    ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send;
+
     /// Store a temporal edge between two context artifacts.
     fn temporal_edge_put(
         &self,
@@ -1451,6 +1484,13 @@ pub trait Storage: Send + Sync {
         src_id: Uuid,
         edge_type: &str,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<TemporalEdge>>> + Send;
+
+    /// Count temporal traversal links for the tenant, optionally scoped to one session.
+    fn temporal_edge_count(
+        &self,
+        ctx: &TenantContext,
+        session_id: Option<Uuid>,
+    ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send;
 
     // --- Confidence operations ---
 
@@ -2397,6 +2437,21 @@ pub mod mock {
                 .collect())
         }
 
+        async fn document_chunk_count(
+            &self,
+            ctx: &TenantContext,
+            session_id: Option<Uuid>,
+        ) -> anyhow::Result<usize> {
+            let chunks = self.document_chunks.lock().await;
+            Ok(chunks
+                .iter()
+                .filter(|chunk| {
+                    chunk.tenant_id == ctx.tenant_id
+                        && session_id.is_none_or(|sid| chunk.session_id == sid)
+                })
+                .count())
+        }
+
         async fn entity_list_all(&self, _ctx: &TenantContext) -> anyhow::Result<Vec<EntityEntry>> {
             if let Some(message) = self.force_entity_list_all_error.lock().await.clone() {
                 anyhow::bail!(message);
@@ -2794,19 +2849,58 @@ pub mod mock {
 
         async fn fold_count_by_status(
             &self,
-            _ctx: &TenantContext,
+            ctx: &TenantContext,
             status: FoldStatus,
         ) -> anyhow::Result<usize> {
             let folds = self.folds.lock().await;
-            Ok(folds.iter().filter(|f| f.status == status).count())
+            Ok(folds
+                .iter()
+                .filter(|f| f.tenant_id == ctx.tenant_id && f.status == status)
+                .count())
         }
 
-        async fn temporal_count(&self, _ctx: &TenantContext) -> anyhow::Result<usize> {
-            Ok(self.temporal_events.lock().await.len())
+        async fn temporal_count(&self, ctx: &TenantContext) -> anyhow::Result<usize> {
+            let events = self.temporal_events.lock().await;
+            Ok(events
+                .iter()
+                .filter(|event| event.tenant_id == ctx.tenant_id)
+                .count())
         }
 
-        async fn edge_count(&self, _ctx: &TenantContext) -> anyhow::Result<usize> {
-            Ok(self.edges.lock().await.len())
+        async fn edge_count(&self, ctx: &TenantContext) -> anyhow::Result<usize> {
+            let bucket_counts = self.edge_counts_by_bucket(ctx).await?;
+            Ok(bucket_counts.values().sum())
+        }
+
+        async fn edge_counts_by_bucket(
+            &self,
+            ctx: &TenantContext,
+        ) -> anyhow::Result<std::collections::BTreeMap<String, usize>> {
+            let mut counts = std::collections::BTreeMap::new();
+            {
+                let edges = self.edges.lock().await;
+                for edge in edges.iter() {
+                    *counts
+                        .entry(edge.edge_type.to_ascii_lowercase())
+                        .or_insert(0) += 1;
+                }
+            }
+            {
+                let typed_edges = self.typed_edges.lock().await;
+                for edge in typed_edges
+                    .iter()
+                    .filter(|edge| edge.tenant_id == ctx.tenant_id)
+                {
+                    *counts
+                        .entry(format!("typed:{}", edge.edge_type.to_ascii_lowercase()))
+                        .or_insert(0) += 1;
+                }
+            }
+            let temporal_links = self.temporal_edge_count(ctx, None).await?;
+            if temporal_links > 0 {
+                counts.insert("temporal_links".to_string(), temporal_links);
+            }
+            Ok(counts)
         }
 
         // --- Intention operations ---
@@ -3567,6 +3661,21 @@ pub mod mock {
             Ok(scored.into_iter().take(k).map(|(_, s)| s).collect())
         }
 
+        async fn context_segment_count(
+            &self,
+            ctx: &TenantContext,
+            session_id: Option<Uuid>,
+        ) -> anyhow::Result<usize> {
+            let segments = self.context_segments.lock().await;
+            Ok(segments
+                .iter()
+                .filter(|segment| {
+                    segment.tenant_id == ctx.tenant_id
+                        && session_id.is_none_or(|sid| segment.session_id == sid)
+                })
+                .count())
+        }
+
         async fn temporal_edge_put(
             &self,
             ctx: &TenantContext,
@@ -3605,6 +3714,21 @@ pub mod mock {
                 .collect();
             found.sort_by_key(|e| e.ordinal);
             Ok(found)
+        }
+
+        async fn temporal_edge_count(
+            &self,
+            ctx: &TenantContext,
+            session_id: Option<Uuid>,
+        ) -> anyhow::Result<usize> {
+            let edges = self.temporal_edges.lock().await;
+            Ok(edges
+                .iter()
+                .filter(|edge| {
+                    edge.tenant_id == ctx.tenant_id
+                        && session_id.is_none_or(|sid| edge.session_id == sid)
+                })
+                .count())
         }
 
         async fn confidence_put(

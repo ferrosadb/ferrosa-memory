@@ -1163,6 +1163,14 @@ impl Storage for ReconnectingStorage {
         )
     }
 
+    async fn document_chunk_count(
+        &self,
+        ctx: &TenantContext,
+        session_id: Option<uuid::Uuid>,
+    ) -> anyhow::Result<usize> {
+        delegate!(self, document_chunk_count, ctx, session_id)
+    }
+
     async fn entity_list_all(&self, ctx: &TenantContext) -> anyhow::Result<Vec<EntityEntry>> {
         delegate!(self, entity_list_all, ctx)
     }
@@ -1491,6 +1499,13 @@ impl Storage for ReconnectingStorage {
         delegate!(self, edge_count, ctx)
     }
 
+    async fn edge_counts_by_bucket(
+        &self,
+        ctx: &TenantContext,
+    ) -> anyhow::Result<std::collections::BTreeMap<String, usize>> {
+        delegate!(self, edge_counts_by_bucket, ctx)
+    }
+
     // --- Warmth operations (Sprint 5) ---
 
     async fn warmth_get(
@@ -1603,6 +1618,14 @@ impl Storage for ReconnectingStorage {
         )
     }
 
+    async fn context_segment_count(
+        &self,
+        ctx: &TenantContext,
+        session_id: Option<uuid::Uuid>,
+    ) -> anyhow::Result<usize> {
+        delegate!(self, context_segment_count, ctx, session_id)
+    }
+
     async fn temporal_edge_put(
         &self,
         ctx: &TenantContext,
@@ -1626,6 +1649,14 @@ impl Storage for ReconnectingStorage {
             src_id,
             edge_type
         )
+    }
+
+    async fn temporal_edge_count(
+        &self,
+        ctx: &TenantContext,
+        session_id: Option<uuid::Uuid>,
+    ) -> anyhow::Result<usize> {
+        delegate!(self, temporal_edge_count, ctx, session_id)
     }
 
     async fn confidence_put(
