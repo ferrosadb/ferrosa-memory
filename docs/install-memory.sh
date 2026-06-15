@@ -73,10 +73,12 @@ say "verifying SHA256"
   || die "checksum verification FAILED"
 
 say "installing to $INSTALL_ROOT"
-mkdir -p "$BIN_DIR" "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR"
+mkdir -p "$BIN_DIR" "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR" "$INSTALL_ROOT/run"
 tar -xzf "$TMP/$TARBALL" -C "$TMP"
 
+cp "$TMP/ferrosa-memory" "$BIN_DIR/"
 cp "$TMP/ferrosa-memory-mcp" "$BIN_DIR/"
+chmod +x "$BIN_DIR/ferrosa-memory"
 chmod +x "$BIN_DIR/ferrosa-memory-mcp"
 
 if [ ! -f "$CONFIG_DIR/ferrosa-memory.toml" ]; then
@@ -135,8 +137,13 @@ cat <<EOF >&2
 
 ferrosa-memory $VERSION installed.
 
+  setup:  $BIN_DIR/ferrosa-memory
   binary: $BIN_DIR/ferrosa-memory-mcp
   config: $CONFIG_DIR/ferrosa-memory.toml
+
+Run the native setup reconciler any time you want to change local choices:
+
+  $BIN_DIR/ferrosa-memory setup
 
 This MCP server connects to a running Ferrosa instance at localhost:9042
 (default from https://ferrosadb.com/install.sh). Ensure Ferrosa is up:
