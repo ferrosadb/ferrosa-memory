@@ -384,14 +384,17 @@ def agent_session_id(payload: dict[str, Any]) -> str:
 
 def configure_session_start(client: McpClient, payload: dict[str, Any], args: argparse.Namespace) -> str:
     cwd = cwd_from_payload(payload)
+    agent = getattr(args, "harness", "generic")
     metadata = {
-        "agent": args.harness,
+        "agent": agent,
         "workspace": cwd,
         "cwd": cwd,
     }
-    external = agent_session_id(payload)
-    if external:
-        metadata["agent_session_id"] = external
+    external = agent_session_id(payload) or f"workspace:{cwd}"
+    metadata["agent_session_id"] = external
+    metadata["session_id"] = str(
+        uuid.uuid5(uuid.NAMESPACE_URL, f"ferrosa-memory:agent-session:v1:{agent}:{cwd}:{external}")
+    )
     result = client.call_tool("configure", {"session_start": metadata})
     blocks = content_blocks(result)
     for block in blocks:
@@ -417,6 +420,13 @@ def current_fmem_session_id(client: McpClient) -> str:
         if isinstance(sid, str) and sid:
             return sid
     return DEFAULT_SESSION_ID
+
+
+def fmem_session_id_for_payload(client: McpClient, payload: dict[str, Any], args: argparse.Namespace) -> str:
+    configured = configure_session_start(client, payload, args)
+    if configured:
+        return configured
+    return current_fmem_session_id(client)
 
 
 def stable_turn_id(payload: dict[str, Any], harness: str, prompt: str, response: str) -> str:
@@ -707,7 +717,7 @@ def recall_context(client: McpClient, payload: dict[str, Any], args: argparse.Na
     if not prompt:
         return ""
     cwd = cwd_from_payload(payload)
-    session_id = current_fmem_session_id(client)
+    session_id = fmem_session_id_for_payload(client, payload, args)
     min_score = max(0.0, args.min_score)
     min_judge_score = args.min_judge_score
     require_judgment = args.require_judgment
@@ -722,7 +732,10 @@ def recall_context(client: McpClient, payload: dict[str, Any], args: argparse.Na
         require_judgment_for_scope: bool,
         scope_min_score: float,
         scope_min_query_terms: int,
+        allowed_kinds_for_scope: set[str] | None,
     ) -> list[str]:
+        if allowed_kinds_for_scope is not None and not allowed_kinds_for_scope:
+            return []
         search_args = {
             "session_id": session_id,
             "query": prompt[:4000],
@@ -731,8 +744,8 @@ def recall_context(client: McpClient, payload: dict[str, Any], args: argparse.Na
             "cwd": cwd,
             "min_score": scope_min_score,
         }
-        if allowed_kinds is not None:
-            search_args["memory_kinds"] = sorted(allowed_kinds)
+        if allowed_kinds_for_scope is not None:
+            search_args["memory_kinds"] = sorted(allowed_kinds_for_scope)
         search = client.call_tool(
             "hybrid_search",
             search_args,
@@ -743,7 +756,7 @@ def recall_context(client: McpClient, payload: dict[str, Any], args: argparse.Na
             min_judge_score=min_judge_score,
             require_judgment=require_judgment_for_scope,
             include_hints=include_hints,
-            allowed_kinds=allowed_kinds,
+            allowed_kinds=allowed_kinds_for_scope,
         )
         if scope_min_query_terms > 0:
             search_pieces = [
@@ -779,13 +792,20 @@ def recall_context(client: McpClient, payload: dict[str, Any], args: argparse.Na
             require_judgment_for_scope=False,
             scope_min_score=min_score,
             scope_min_query_terms=min_query_terms,
+            allowed_kinds_for_scope=allowed_kinds,
         )
         if not search_pieces:
+            cross_session_kinds = {"procedural"}
+            if getattr(args, "allow_cross_session_semantic", False):
+                cross_session_kinds.add("semantic")
+            if allowed_kinds is not None:
+                cross_session_kinds &= allowed_kinds
             search_pieces = search_recall(
                 "both",
                 require_judgment_for_scope=require_judgment,
                 scope_min_score=max(min_score, 0.35),
                 scope_min_query_terms=max(min_query_terms, 3),
+                allowed_kinds_for_scope=cross_session_kinds,
             )
         pieces.extend(search_pieces)
     except Exception as exc:
@@ -806,7 +826,7 @@ def ingest_turn(client: McpClient, payload: dict[str, Any], args: argparse.Names
     if not prompt and not response:
         return
     cwd = cwd_from_payload(payload)
-    session_id = current_fmem_session_id(client)
+    session_id = fmem_session_id_for_payload(client, payload, args)
     turn_id = stable_turn_id(payload, args.harness, prompt, response)
     entity_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"ferrosa-memory-hook:{args.harness}:{session_id}:{turn_id}"))
     text = "\n\n".join(
@@ -977,6 +997,11 @@ def parse_args() -> argparse.Namespace:
             "FERROSA_MEMORY_HOOK_ALLOWED_KINDS",
             {"episodic", "procedural", "semantic"},
         ),
+    )
+    parser.add_argument(
+        "--allow-cross-session-semantic",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("FERROSA_MEMORY_HOOK_ALLOW_CROSS_SESSION_SEMANTIC", False),
     )
     parser.add_argument("--max-context-chars", type=int, default=4000)
     return parser.parse_args()

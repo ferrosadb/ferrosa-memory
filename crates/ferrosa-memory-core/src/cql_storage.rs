@@ -328,6 +328,7 @@ const CQL_LEGACY_EDGE_LIST_MAX_ROWS: usize = 200_000;
 const CQL_TEMPORAL_LIST_MAX_ROWS: usize = 100_000;
 const CQL_FEEDBACK_LIST_MAX_ROWS: usize = 100_000;
 const CQL_INTENTION_LIST_MAX_ROWS: usize = 100_000;
+const CQL_ENTITY_FTS_CANDIDATES: usize = 512;
 
 struct LegacyEdgeProjection<'a> {
     src_col: &'a str,
@@ -355,6 +356,40 @@ fn context_segment_terms_query(ks: &str, candidate_limit: usize) -> String {
     )
 }
 
+fn cql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn native_fts_query_text(query: &str) -> Option<String> {
+    let terms = tokenize_context_terms(query);
+    (!terms.is_empty()).then(|| terms.join(" "))
+}
+
+fn native_fts_select_query(
+    ks: &str,
+    table: &str,
+    column: &str,
+    query_text: &str,
+    limit: usize,
+) -> String {
+    format!(
+        "SELECT * FROM {ks}.{table} \
+         WHERE tenant_id = ? AND session_id = ? AND {column} = fts_match({query}) \
+         LIMIT {limit} ALLOW FILTERING",
+        query = cql_string_literal(query_text)
+    )
+}
+
+fn native_entity_name_fts_query(ks: &str, query_text: &str) -> String {
+    format!(
+        "SELECT entity_id, entity_name, entity_type, confidence, state, created_at \
+         FROM {ks}.entity_store \
+         WHERE tenant_id = ? AND session_id = ? AND entity_name = fts_match({query}) \
+         LIMIT {CQL_ENTITY_FTS_CANDIDATES} ALLOW FILTERING",
+        query = cql_string_literal(query_text)
+    )
+}
+
 fn edge_count_query(ks: &str, table: &str) -> anyhow::Result<String> {
     match table {
         "co_occurs_with" | "mentioned_in" | "folded_into" | "supersedes" | "typed_edges" => {}
@@ -362,6 +397,21 @@ fn edge_count_query(ks: &str, table: &str) -> anyhow::Result<String> {
     }
     Ok(format!(
         "SELECT count(*) FROM {ks}.{table} WHERE tenant_id = ? ALLOW FILTERING"
+    ))
+}
+
+fn tenant_count_query(ks: &str, table: &str, session_scoped: bool) -> anyhow::Result<String> {
+    match table {
+        "document_chunks" | "context_segments" | "temporal_edges" => {}
+        other => anyhow::bail!("unsupported tenant-count table: {other}"),
+    }
+    let session_clause = if session_scoped {
+        " AND session_id = ?"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "SELECT count(*) FROM {ks}.{table} WHERE tenant_id = ?{session_clause} ALLOW FILTERING"
     ))
 }
 
@@ -1134,6 +1184,34 @@ impl CqlStorage {
         anyhow::anyhow!(
             "{op} must go through a GraphClient-backed storage adapter; direct graph-table writes are disabled"
         )
+    }
+
+    async fn count_tenant_rows_with_ctx(
+        &self,
+        ctx: &TenantContext,
+        table: &str,
+        session_id: Option<Uuid>,
+    ) -> anyhow::Result<usize> {
+        let query = tenant_count_query(&self.keyspace, table, session_id.is_some())?;
+        #[allow(deprecated)]
+        let result = if let Some(session_id) = session_id {
+            self.session
+                .query_unpaged(query, (ctx.tenant_id, session_id))
+                .await?
+        } else {
+            self.session.query_unpaged(query, (ctx.tenant_id,)).await?
+        };
+        let col_map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
+        let Some(row) = rows.first() else {
+            return Ok(0);
+        };
+        let count = cql_get_i64_from_single_aggregate(
+            row,
+            &col_map,
+            &["system.count", "count", "count(*)"],
+        )?;
+        Ok(count.max(0) as usize)
     }
 
     /// Connect to a Ferrosa/Cassandra cluster and prepare all statements.
@@ -2947,16 +3025,36 @@ impl Storage for CqlStorage {
         session_id: Uuid,
         name: &str,
     ) -> anyhow::Result<Vec<EntityEntry>> {
-        // TODO: use Ferrosa fts_match() when available in the cluster build.
-        // Lightweight scan: only fetch columns needed for name matching.
-        // Excludes context_snippet (~4KB) and entity_embedding (~3KB) per row.
-        let query = format!(
-            "SELECT entity_id, entity_name, entity_type, confidence, state, created_at \
-             FROM {}.entity_store WHERE tenant_id = ? AND session_id = ? ALLOW FILTERING",
-            self.keyspace
-        );
-        let (col_map, rows) = query_paged_rows!(self.session, query, (ctx.tenant_id, session_id))?;
         let lower = name.to_lowercase();
+        let native_rows = if let Some(fts_query) = native_fts_query_text(name) {
+            let query = native_entity_name_fts_query(&self.keyspace, &fts_query);
+            match query_paged_rows!(self.session, query, (ctx.tenant_id, session_id)) {
+                Ok((col_map, rows)) if !rows.is_empty() => Some((col_map, rows)),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "entity name native FTS query failed, falling back to bounded scan"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let (col_map, rows) = if let Some(result) = native_rows {
+            result
+        } else {
+            // Lightweight compatibility scan: only fetch columns needed for name matching.
+            // Excludes context_snippet (~4KB) and entity_embedding (~3KB) per row.
+            let query = format!(
+                "SELECT entity_id, entity_name, entity_type, confidence, state, created_at \
+                 FROM {}.entity_store WHERE tenant_id = ? AND session_id = ? ALLOW FILTERING",
+                self.keyspace
+            );
+            query_paged_rows!(self.session, query, (ctx.tenant_id, session_id))?
+        };
 
         // Collect matches with rank: 0=exact, 1=segment (after ::), 2=substring
         let mut scored: Vec<(u8, EntityEntry)> = Vec::new();
@@ -4191,13 +4289,21 @@ impl Storage for CqlStorage {
     }
 
     async fn edge_count(&self, ctx: &TenantContext) -> anyhow::Result<usize> {
-        let mut total = 0usize;
-        for table in [
-            "co_occurs_with",
-            "mentioned_in",
-            "folded_into",
-            "supersedes",
-            "typed_edges",
+        let bucket_counts = self.edge_counts_by_bucket(ctx).await?;
+        Ok(bucket_counts.values().sum())
+    }
+
+    async fn edge_counts_by_bucket(
+        &self,
+        ctx: &TenantContext,
+    ) -> anyhow::Result<std::collections::BTreeMap<String, usize>> {
+        let mut counts = std::collections::BTreeMap::new();
+        for (bucket, table) in [
+            ("co_occurs", "co_occurs_with"),
+            ("mentioned_in", "mentioned_in"),
+            ("folded_into", "folded_into"),
+            ("supersedes", "supersedes"),
+            ("typed", "typed_edges"),
         ] {
             let query = edge_count_query(&self.keyspace, table)?;
             #[allow(deprecated)]
@@ -4210,10 +4316,14 @@ impl Storage for CqlStorage {
                     &col_map,
                     &["system.count", "count", "count(*)"],
                 )?;
-                total += count.max(0) as usize;
+                counts.insert(bucket.to_string(), count.max(0) as usize);
             }
         }
-        Ok(total)
+        counts.insert(
+            "temporal_links".to_string(),
+            self.temporal_edge_count(ctx, None).await?,
+        );
+        Ok(counts)
     }
 
     async fn delete_session(&self, ctx: &TenantContext, session_id: Uuid) -> anyhow::Result<usize> {
@@ -6380,6 +6490,30 @@ impl Storage for CqlStorage {
         if k == 0 {
             return Ok(Vec::new());
         }
+        if let Some(fts_query) = native_fts_query_text(query) {
+            let q = native_fts_select_query(
+                &self.keyspace,
+                "document_chunks",
+                "bm25_text",
+                &fts_query,
+                k,
+            );
+            match query_paged_rows!(self.session, q, (ctx.tenant_id, session_id)) {
+                Ok((col_map, rows)) if !rows.is_empty() => {
+                    return rows
+                        .into_iter()
+                        .map(|row| document_chunk_from_row(ctx, &row, &col_map))
+                        .collect();
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "document chunk native FTS query failed, falling back to term index"
+                    );
+                }
+            }
+        }
         let query_terms = tokenize_context_terms(query)
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>();
@@ -6515,6 +6649,15 @@ impl Storage for CqlStorage {
             .collect()
     }
 
+    async fn document_chunk_count(
+        &self,
+        ctx: &TenantContext,
+        session_id: Option<Uuid>,
+    ) -> anyhow::Result<usize> {
+        self.count_tenant_rows_with_ctx(ctx, "document_chunks", session_id)
+            .await
+    }
+
     async fn context_segment_get(
         &self,
         ctx: &TenantContext,
@@ -6569,6 +6712,30 @@ impl Storage for CqlStorage {
     ) -> anyhow::Result<Vec<ContextSegment>> {
         if k == 0 {
             return Ok(Vec::new());
+        }
+        if let Some(fts_query) = native_fts_query_text(query) {
+            let q = native_fts_select_query(
+                &self.keyspace,
+                "context_segments",
+                "bm25_text",
+                &fts_query,
+                k,
+            );
+            match query_paged_rows!(self.session, q, (ctx.tenant_id, session_id)) {
+                Ok((col_map, rows)) if !rows.is_empty() => {
+                    return rows
+                        .into_iter()
+                        .map(|row| context_segment_from_row(ctx, &row, &col_map))
+                        .collect();
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "context segment native FTS query failed, falling back to term index"
+                    );
+                }
+            }
         }
         let mut scores: HashMap<Uuid, i32> = HashMap::new();
         let term_q =
@@ -6633,6 +6800,15 @@ impl Storage for CqlStorage {
             .collect()
     }
 
+    async fn context_segment_count(
+        &self,
+        ctx: &TenantContext,
+        session_id: Option<Uuid>,
+    ) -> anyhow::Result<usize> {
+        self.count_tenant_rows_with_ctx(ctx, "context_segments", session_id)
+            .await
+    }
+
     async fn temporal_edge_put(
         &self,
         ctx: &TenantContext,
@@ -6686,6 +6862,15 @@ impl Storage for CqlStorage {
             .collect::<anyhow::Result<_>>()?;
         edges.sort_by_key(|edge| edge.ordinal);
         Ok(edges)
+    }
+
+    async fn temporal_edge_count(
+        &self,
+        ctx: &TenantContext,
+        session_id: Option<Uuid>,
+    ) -> anyhow::Result<usize> {
+        self.count_tenant_rows_with_ctx(ctx, "temporal_edges", session_id)
+            .await
     }
 
     async fn confidence_put(
@@ -7026,6 +7211,47 @@ mod cql_storage_tests {
             context_segment_bm25_candidate_limit(10) <= CONTEXT_SEGMENT_BM25_MAX_CANDIDATES,
             "BM25 candidate cap must remain bounded even for large top-k requests"
         );
+    }
+
+    #[test]
+    fn native_fts_queries_use_ferrosa_column_match_syntax() {
+        let query = native_fts_select_query(
+            "agent_memory",
+            "document_chunks",
+            "bm25_text",
+            "distributed database",
+            7,
+        );
+
+        assert!(
+            query.contains("bm25_text = fts_match('distributed database')"),
+            "Ferrosa native FTS syntax is column = fts_match('query'): {query}"
+        );
+        assert!(
+            query.contains("tenant_id = ? AND session_id = ?"),
+            "native FTS queries must remain tenant/session scoped: {query}"
+        );
+        assert!(query.contains("LIMIT 7"));
+    }
+
+    #[test]
+    fn native_fts_query_literals_escape_single_quotes() {
+        let query = native_entity_name_fts_query("agent_memory", "bob's parser");
+
+        assert!(
+            query.contains("entity_name = fts_match('bob''s parser')"),
+            "single quotes in FTS query text must be escaped as CQL string literals: {query}"
+        );
+    }
+
+    #[test]
+    fn native_fts_query_text_reuses_context_tokenization() {
+        let query = native_fts_query_text(
+            "Why do I only breathe out of one nostril, and what is the nasal cycle?",
+        )
+        .expect("meaningful query terms");
+
+        assert_eq!(query, "breathe nostril nasal cycle");
     }
 
     #[test]
