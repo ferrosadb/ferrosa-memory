@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib.util
-import os
 import stat
 import sys
 import tempfile
@@ -74,6 +73,34 @@ class WriteHookEnvAuthTests(unittest.TestCase):
         self.module.write_hook_env(self.env_path, "http://127.0.0.1:18765/mcp")
         text = self.env_path.read_text()
         self.assertIn("export FERROSA_MEMORY_AUTH_HEADER='Basic dXNlcjpwYXNz'", text)
+
+    def test_min_score_env_default_is_written(self):
+        self.module.write_hook_env(self.env_path, "http://127.0.0.1:18765/mcp")
+        text = self.env_path.read_text()
+        self.assertIn(
+            "export FERROSA_MEMORY_HOOK_MIN_SCORE=${FERROSA_MEMORY_HOOK_MIN_SCORE:-0.0}",
+            text,
+        )
+        self.assertIn(
+            "export FERROSA_MEMORY_HOOK_MIN_JUDGE_SCORE=${FERROSA_MEMORY_HOOK_MIN_JUDGE_SCORE:-1.0}",
+            text,
+        )
+        self.assertIn(
+            "export FERROSA_MEMORY_HOOK_REQUIRE_JUDGMENT=${FERROSA_MEMORY_HOOK_REQUIRE_JUDGMENT:-true}",
+            text,
+        )
+        self.assertIn(
+            "export FERROSA_MEMORY_HOOK_INCLUDE_HINTS=${FERROSA_MEMORY_HOOK_INCLUDE_HINTS:-false}",
+            text,
+        )
+        self.assertIn(
+            "export FERROSA_MEMORY_HOOK_MIN_QUERY_TERMS=${FERROSA_MEMORY_HOOK_MIN_QUERY_TERMS:-2}",
+            text,
+        )
+        self.assertIn(
+            "export FERROSA_MEMORY_HOOK_ALLOWED_KINDS=${FERROSA_MEMORY_HOOK_ALLOWED_KINDS:-episodic,procedural,semantic}",
+            text,
+        )
 
 
 class VerifyWrapperHonestyTests(unittest.TestCase):

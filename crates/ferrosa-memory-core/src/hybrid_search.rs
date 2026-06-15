@@ -24,6 +24,7 @@ pub struct ExpandedChunkContext {
 pub struct SearchResult {
     pub id: Uuid,
     pub source: String,
+    pub memory_kind: String,
     pub content: String,
     pub score: f64,
     pub result_type: String,
@@ -37,6 +38,24 @@ pub struct SearchResult {
     pub hint: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expanded_context: Vec<ExpandedChunkContext>,
+}
+
+pub fn classify_memory_kind(
+    result_type: &str,
+    source: &str,
+    entity_type: Option<&str>,
+) -> &'static str {
+    match result_type {
+        "context_segment" | "fold" => "episodic",
+        "entity" => match entity_type.unwrap_or_default() {
+            "procedure" | "policy_preference" | "decision" | "pattern" | "skill" => "procedural",
+            "conversation" | "message" | "turn" => "episodic",
+            _ => "semantic",
+        },
+        "document_chunk" if source.contains("procedure") => "procedural",
+        "document_chunk" => "semantic",
+        _ => "semantic",
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -311,6 +330,10 @@ pub struct SearchFilter {
     pub workspace_cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_score: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_kinds: Option<Vec<String>>,
 }
 
 fn source_limit(limit: usize, filter: Option<&SearchFilter>) -> usize {
@@ -355,6 +378,210 @@ fn candidate_source_stats(
         unique_candidates: all_unique.len(),
         sources,
     }
+}
+
+fn relevance_stopword(token: &str) -> bool {
+    matches!(
+        token,
+        "about"
+            | "after"
+            | "again"
+            | "also"
+            | "and"
+            | "are"
+            | "because"
+            | "been"
+            | "before"
+            | "but"
+            | "can"
+            | "did"
+            | "does"
+            | "for"
+            | "from"
+            | "get"
+            | "had"
+            | "has"
+            | "have"
+            | "how"
+            | "into"
+            | "its"
+            | "just"
+            | "like"
+            | "now"
+            | "our"
+            | "out"
+            | "should"
+            | "that"
+            | "the"
+            | "then"
+            | "there"
+            | "these"
+            | "this"
+            | "those"
+            | "through"
+            | "was"
+            | "were"
+            | "what"
+            | "when"
+            | "where"
+            | "with"
+            | "would"
+            | "you"
+            | "your"
+    )
+}
+
+fn relevance_terms(text: &str) -> HashSet<String> {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-')
+        .filter_map(|part| {
+            let token = part.trim().to_ascii_lowercase();
+            (token.len() >= 3 && !relevance_stopword(&token)).then_some(token)
+        })
+        .collect()
+}
+
+fn source_is_lexical(source: &str) -> bool {
+    source.contains("bm25") || source.contains("phonetic")
+}
+
+fn source_is_ann(source: &str) -> bool {
+    source.contains("ann")
+}
+
+#[derive(Debug, Clone, Default)]
+struct CandidateEvidence {
+    sources: HashSet<String>,
+    lexical_sources: usize,
+    ann_sources: usize,
+    lexical_hits: usize,
+    lexical_coverage: f64,
+}
+
+impl CandidateEvidence {
+    fn source_count(&self) -> usize {
+        self.sources.len()
+    }
+
+    fn ann_only_without_terms(&self) -> bool {
+        self.ann_sources > 0 && self.lexical_sources == 0 && self.lexical_hits == 0
+    }
+}
+
+fn collect_candidate_evidence(
+    query: &str,
+    lists: &[Vec<SearchResult>],
+) -> HashMap<Uuid, CandidateEvidence> {
+    let query_terms = relevance_terms(query);
+    let query_term_count = query_terms.len().max(1);
+    let mut evidence: HashMap<Uuid, CandidateEvidence> = HashMap::new();
+    for result in lists.iter().flatten() {
+        let result_terms = relevance_terms(&result.content);
+        let lexical_hits = query_terms.intersection(&result_terms).count();
+        let entry = evidence.entry(result.id).or_default();
+        entry.sources.insert(result.source.clone());
+        if source_is_lexical(&result.source) {
+            entry.lexical_sources += 1;
+        }
+        if source_is_ann(&result.source) {
+            entry.ann_sources += 1;
+        }
+        entry.lexical_hits = entry.lexical_hits.max(lexical_hits);
+        entry.lexical_coverage = entry
+            .lexical_coverage
+            .max(lexical_hits as f64 / query_term_count as f64);
+    }
+    evidence
+}
+
+fn apply_source_aware_scoring(
+    query: &str,
+    results: Vec<SearchResult>,
+    evidence: &HashMap<Uuid, CandidateEvidence>,
+) -> Vec<SearchResult> {
+    if relevance_terms(query).is_empty() {
+        return results;
+    }
+    let mut scored = Vec::with_capacity(results.len());
+    for mut result in results {
+        let Some(ev) = evidence.get(&result.id) else {
+            scored.push(result);
+            continue;
+        };
+        if ev.ann_only_without_terms() {
+            continue;
+        }
+        let source_bonus = (ev.source_count().saturating_sub(1) as f64 * 0.035).min(0.14);
+        let lexical_bonus = ev.lexical_coverage * 0.30;
+        let lexical_source_bonus = if ev.lexical_sources > 0 { 0.04 } else { 0.0 };
+        let ann_only_penalty = if ev.ann_sources > 0 && ev.lexical_sources == 0 {
+            0.04
+        } else {
+            0.0
+        };
+        result.score = (result.score + source_bonus + lexical_bonus + lexical_source_bonus
+            - ann_only_penalty)
+            .max(0.0);
+        scored.push(result);
+    }
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    scored
+}
+
+fn apply_authority_adjustments(
+    results: Vec<SearchResult>,
+    pagerank_scores: Option<&HashMap<Uuid, f64>>,
+    reputation_scores: Option<&HashMap<Uuid, f64>>,
+) -> Vec<SearchResult> {
+    if pagerank_scores.is_none() && reputation_scores.is_none() {
+        return results;
+    }
+
+    let mut adjusted = Vec::with_capacity(results.len());
+    for mut result in results {
+        if let Some(score) = pagerank_scores.and_then(|scores| scores.get(&result.id)) {
+            result.score += score.clamp(0.0, 1.0) * 0.20;
+        }
+        if let Some(score) = reputation_scores.and_then(|scores| scores.get(&result.id)) {
+            let score = score.clamp(-1.0, 1.0);
+            if score <= -1.0 {
+                continue;
+            }
+            result.score = (result.score + score * 0.45).max(0.0);
+        }
+        adjusted.push(result);
+    }
+    adjusted.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    adjusted
+}
+
+fn filter_relevant_results(
+    results: Vec<SearchResult>,
+    min_score: Option<f64>,
+    memory_kinds: Option<&[String]>,
+) -> Vec<SearchResult> {
+    let allowed_kinds = memory_kinds.map(|kinds| {
+        kinds
+            .iter()
+            .map(|kind| kind.to_ascii_lowercase())
+            .collect::<HashSet<_>>()
+    });
+    results
+        .into_iter()
+        .filter(|result| min_score.is_none_or(|threshold| result.score >= threshold))
+        .filter(|result| {
+            allowed_kinds
+                .as_ref()
+                .is_none_or(|kinds| kinds.contains(&result.memory_kind.to_ascii_lowercase()))
+        })
+        .collect()
 }
 
 fn normalize_workspace_path(path: &str) -> String {
@@ -525,6 +752,12 @@ pub async fn hybrid_search_with_diagnostics(
                     .map(|(i, e)| SearchResult {
                         id: e.entity_id,
                         source: "entity_phonetic".into(),
+                        memory_kind: classify_memory_kind(
+                            "entity",
+                            "entity_phonetic",
+                            Some(&e.entity_type),
+                        )
+                        .into(),
                         content: if e.context_snippet.trim().is_empty() {
                             e.entity_name.clone()
                         } else {
@@ -554,6 +787,12 @@ pub async fn hybrid_search_with_diagnostics(
                     .map(|e| SearchResult {
                         id: e.entity_id,
                         source: "entity_ann".into(),
+                        memory_kind: classify_memory_kind(
+                            "entity",
+                            "entity_ann",
+                            Some(&e.entity_type),
+                        )
+                        .into(),
                         content: e.context_snippet,
                         score: 1.0,
                         result_type: "entity".into(),
@@ -581,6 +820,7 @@ pub async fn hybrid_search_with_diagnostics(
                     .map(|f| SearchResult {
                         id: f.fold_id,
                         source: "fold_ann".into(),
+                        memory_kind: classify_memory_kind("fold", "fold_ann", None).into(),
                         content: f.fold_summary,
                         score: f.similarity.unwrap_or(0.0),
                         result_type: "fold".into(),
@@ -608,6 +848,7 @@ pub async fn hybrid_search_with_diagnostics(
                     .map(|(i, segment)| SearchResult {
                         id: segment.segment_id,
                         source: "context_bm25".into(),
+                        memory_kind: classify_memory_kind("context_segment", "context_bm25", None).into(),
                         content: segment.segment_text,
                         score: 1.0 - (i as f64 * 0.1),
                         result_type: "context_segment".into(),
@@ -635,6 +876,7 @@ pub async fn hybrid_search_with_diagnostics(
                     .map(|segment| SearchResult {
                         id: segment.segment_id,
                         source: "context_ann".into(),
+                        memory_kind: classify_memory_kind("context_segment", "context_ann", None).into(),
                         content: segment.segment_text,
                         score: 1.0,
                         result_type: "context_segment".into(),
@@ -662,6 +904,7 @@ pub async fn hybrid_search_with_diagnostics(
                     .map(|(i, chunk)| SearchResult {
                         id: chunk.chunk_id,
                         source: "document_bm25".into(),
+                        memory_kind: classify_memory_kind("document_chunk", "document_bm25", None).into(),
                         content: chunk.content,
                         score: 1.0 - (i as f64 * 0.1),
                         result_type: "document_chunk".into(),
@@ -690,6 +933,8 @@ pub async fn hybrid_search_with_diagnostics(
                     .map(|(i, chunk)| SearchResult {
                         id: chunk.chunk_id,
                         source: "document_phonetic".into(),
+                        memory_kind: classify_memory_kind("document_chunk", "document_phonetic", None)
+                            .into(),
                         content: chunk.content,
                         score: 1.0 - (i as f64 * 0.1),
                         result_type: "document_chunk".into(),
@@ -717,6 +962,7 @@ pub async fn hybrid_search_with_diagnostics(
                     .map(|chunk| SearchResult {
                         id: chunk.chunk_id,
                         source: "document_ann".into(),
+                        memory_kind: classify_memory_kind("document_chunk", "document_ann", None).into(),
                         content: chunk.content,
                         score: 1.0,
                         result_type: "document_chunk".into(),
@@ -741,6 +987,7 @@ pub async fn hybrid_search_with_diagnostics(
                 warmth.get(&r.id).map(|score| SearchResult {
                     id: r.id,
                     source: "warmth".to_string(),
+                    memory_kind: r.memory_kind.clone(),
                     content: r.content.clone(),
                     score: *score,
                     result_type: r.result_type.clone(),
@@ -771,6 +1018,7 @@ pub async fn hybrid_search_with_diagnostics(
                 pagerank.get(&r.id).map(|score| SearchResult {
                     id: r.id,
                     source: "pagerank".to_string(),
+                    memory_kind: r.memory_kind.clone(),
                     content: r.content.clone(),
                     score: *score,
                     result_type: r.result_type.clone(),
@@ -803,6 +1051,7 @@ pub async fn hybrid_search_with_diagnostics(
                 reputation.get(&r.id).map(|score| SearchResult {
                     id: r.id,
                     source: "reputation".to_string(),
+                    memory_kind: r.memory_kind.clone(),
                     content: r.content.clone(),
                     score: score + 1.0, // shift [-1,1] to [0,2] for ranking
                     result_type: r.result_type.clone(),
@@ -848,6 +1097,7 @@ pub async fn hybrid_search_with_diagnostics(
                         workspace_ranked.push(SearchResult {
                             id: candidate.id,
                             source: "workspace".to_string(),
+                            memory_kind: candidate.memory_kind.clone(),
                             content: candidate.content.clone(),
                             score,
                             result_type: candidate.result_type.clone(),
@@ -874,7 +1124,12 @@ pub async fn hybrid_search_with_diagnostics(
     }
 
     let diagnostics = candidate_source_stats(&lists, &weights, limit, source_limit);
-    let mut merged = rrf_merge(lists, 60.0, &weights);
+    let evidence = collect_candidate_evidence(query, &lists);
+    let mut merged = apply_authority_adjustments(
+        apply_source_aware_scoring(query, rrf_merge(lists, 60.0, &weights), &evidence),
+        pagerank_scores,
+        reputation_scores,
+    );
     if let Some(workspace_cwd) = filter.and_then(|f| f.workspace_cwd.as_deref())
         && !workspace_cwd.trim().is_empty()
     {
@@ -896,10 +1151,14 @@ pub async fn hybrid_search_with_diagnostics(
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
     }
-    let results = collapse_duplicate_document_chunks(merged)
-        .into_iter()
-        .take(limit)
-        .collect();
+    let results = filter_relevant_results(
+        collapse_duplicate_document_chunks(merged),
+        filter.and_then(|f| f.min_score),
+        filter.and_then(|f| f.memory_kinds.as_deref()),
+    )
+    .into_iter()
+    .take(limit)
+    .collect();
     Ok(SearchOutput {
         results,
         diagnostics,
@@ -914,6 +1173,7 @@ mod tests {
         SearchResult {
             id,
             source: source.into(),
+            memory_kind: classify_memory_kind("entity", source, None).into(),
             content: format!("content-{source}"),
             score,
             result_type: "entity".into(),
@@ -923,6 +1183,31 @@ mod tests {
             hint: None,
             expanded_context: Vec::new(),
         }
+    }
+
+    #[test]
+    fn classify_memory_kind_maps_recall_categories() {
+        assert_eq!(
+            classify_memory_kind("context_segment", "context_bm25", None),
+            "episodic"
+        );
+        assert_eq!(classify_memory_kind("fold", "fold_ann", None), "episodic");
+        assert_eq!(
+            classify_memory_kind("entity", "entity_phonetic", Some("procedure")),
+            "procedural"
+        );
+        assert_eq!(
+            classify_memory_kind("entity", "entity_ann", Some("decision")),
+            "procedural"
+        );
+        assert_eq!(
+            classify_memory_kind("entity", "entity_ann", Some("turn")),
+            "episodic"
+        );
+        assert_eq!(
+            classify_memory_kind("document_chunk", "document_bm25", None),
+            "semantic"
+        );
     }
 
     #[test]
@@ -1036,14 +1321,147 @@ mod tests {
             tags: Some(vec!["testing".into(), "quality".into()]),
             workspace_cwd: Some("/repo/project".into()),
             candidate_limit: Some(25),
+            min_score: Some(0.062),
+            memory_kinds: Some(vec!["procedural".into(), "semantic".into()]),
         };
         let json = serde_json::to_string(&filter).unwrap();
         let back: SearchFilter = serde_json::from_str(&json).unwrap();
         assert_eq!(back.scope, SearchScope::Both);
         assert_eq!(back.workspace_cwd.as_deref(), Some("/repo/project"));
         assert_eq!(back.candidate_limit, Some(25));
+        assert_eq!(back.min_score, Some(0.062));
+        assert_eq!(
+            back.memory_kinds,
+            Some(vec!["procedural".into(), "semantic".into()])
+        );
         assert_eq!(back.entity_types, Some(vec!["skill".into()]));
         assert_eq!(back.tags, Some(vec!["testing".into(), "quality".into()]));
+    }
+
+    #[test]
+    fn filter_relevant_results_drops_low_score_and_wrong_memory_kind() {
+        let keep = Uuid::new_v4();
+        let low = Uuid::new_v4();
+        let episodic = Uuid::new_v4();
+        let mut keep_result = make_result(keep, "document_bm25", 0.08);
+        keep_result.memory_kind = "semantic".into();
+        let mut low_result = make_result(low, "context_bm25", 0.03);
+        low_result.memory_kind = "semantic".into();
+        let mut episodic_result = make_result(episodic, "context_ann", 0.09);
+        episodic_result.memory_kind = "episodic".into();
+
+        let results = filter_relevant_results(
+            vec![low_result, keep_result, episodic_result],
+            Some(0.062),
+            Some(&["semantic".to_string(), "procedural".to_string()]),
+        );
+
+        assert_eq!(
+            results.iter().map(|result| result.id).collect::<Vec<_>>(),
+            vec![keep]
+        );
+    }
+
+    #[test]
+    fn source_aware_scoring_drops_ann_only_without_lexical_overlap() {
+        let ann_id = Uuid::new_v4();
+        let lexical_id = Uuid::new_v4();
+        let mut ann = make_result(ann_id, "context_ann", 0.07);
+        ann.content = "unrelated previous workflow output".into();
+        let mut lexical = make_result(lexical_id, "context_bm25", 0.065);
+        lexical.content = "memory hook installer search cleanup".into();
+        let lists = vec![vec![ann.clone()], vec![lexical.clone()]];
+        let evidence = collect_candidate_evidence("memory hook installer", &lists);
+
+        let scored =
+            apply_source_aware_scoring("memory hook installer", vec![ann, lexical], &evidence);
+
+        assert_eq!(
+            scored.iter().map(|result| result.id).collect::<Vec<_>>(),
+            vec![lexical_id]
+        );
+        assert!(scored[0].score > 0.20);
+    }
+
+    #[test]
+    fn source_aware_scoring_boosts_bm25_ann_corroboration() {
+        let shared = Uuid::new_v4();
+        let ann_only = Uuid::new_v4();
+        let mut shared_bm25 = make_result(shared, "context_bm25", 0.06);
+        shared_bm25.content = "session context sentinel retrieval".into();
+        let mut shared_ann = make_result(shared, "context_ann", 0.06);
+        shared_ann.content = "session context sentinel retrieval".into();
+        let mut weak_ann = make_result(ann_only, "document_ann", 0.07);
+        weak_ann.content = "corpus metadata unrelated topic".into();
+        let lists = vec![
+            vec![shared_bm25.clone()],
+            vec![shared_ann.clone()],
+            vec![weak_ann.clone()],
+        ];
+        let evidence = collect_candidate_evidence("session context sentinel", &lists);
+
+        let scored = apply_source_aware_scoring(
+            "session context sentinel",
+            vec![weak_ann, shared_bm25],
+            &evidence,
+        );
+
+        assert_eq!(scored.first().map(|result| result.id), Some(shared));
+        assert!(scored.iter().all(|result| result.id != ann_only));
+    }
+
+    #[test]
+    fn authority_adjustments_boost_positive_and_penalize_negative_reputation() {
+        let trusted = Uuid::new_v4();
+        let distrusted = Uuid::new_v4();
+        let neutral = Uuid::new_v4();
+        let mut reputation = HashMap::new();
+        reputation.insert(trusted, 1.0);
+        reputation.insert(distrusted, -1.0);
+
+        let scored = apply_authority_adjustments(
+            vec![
+                make_result(distrusted, "document_bm25", 0.20),
+                make_result(neutral, "document_bm25", 0.20),
+                make_result(trusted, "document_bm25", 0.20),
+            ],
+            None,
+            Some(&reputation),
+        );
+
+        assert_eq!(scored.first().map(|result| result.id), Some(trusted));
+        let trusted_score = scored
+            .iter()
+            .find(|result| result.id == trusted)
+            .unwrap()
+            .score;
+        let neutral_score = scored
+            .iter()
+            .find(|result| result.id == neutral)
+            .unwrap()
+            .score;
+        assert!(trusted_score > neutral_score);
+        assert!(scored.iter().all(|result| result.id != distrusted));
+    }
+
+    #[test]
+    fn authority_adjustments_boost_pagerank_without_negative_values() {
+        let authority = Uuid::new_v4();
+        let ordinary = Uuid::new_v4();
+        let mut pagerank = HashMap::new();
+        pagerank.insert(authority, 1.0);
+
+        let scored = apply_authority_adjustments(
+            vec![
+                make_result(ordinary, "document_bm25", 0.20),
+                make_result(authority, "document_bm25", 0.20),
+            ],
+            Some(&pagerank),
+            None,
+        );
+
+        assert_eq!(scored.first().map(|result| result.id), Some(authority));
+        assert!(scored[0].score > scored[1].score);
     }
 
     #[test]
@@ -1491,5 +1909,84 @@ mod tests {
                 "trusted entity should rank higher than penalized entity"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_min_score_keeps_corroborated_hit_and_drops_singleton_noise() {
+        use crate::storage::mock::MockStorage;
+        use crate::types::{DocumentChunk, TenantContext};
+
+        let storage = MockStorage::new();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "test".into(),
+        };
+        let sid = Uuid::new_v4();
+        let relevant_id = Uuid::new_v4();
+        let stale_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let chunk = |chunk_id, ordinal, content: &str, embedding| DocumentChunk {
+            tenant_id: ctx.tenant_id,
+            session_id: sid,
+            document_id: chunk_id,
+            chunk_id,
+            ordinal,
+            source_doc_id: format!("doc-{ordinal}"),
+            title: format!("doc {ordinal}"),
+            section_path: String::new(),
+            semantic_kind: "text".into(),
+            content: content.into(),
+            bm25_text: content.into(),
+            chunk_embedding: embedding,
+            token_count: 16,
+            content_hash: chunk_id.to_string(),
+            prev_chunk_id: None,
+            next_chunk_id: None,
+            overlap_from_prev: false,
+            overlap_to_next: false,
+            metadata: serde_json::Value::Null,
+            created_at: now,
+            updated_at: now,
+        };
+        storage.document_chunks.lock().await.extend([
+            chunk(
+                relevant_id,
+                0,
+                "memory hook installer should pass min_score and memory_kinds to search",
+                Some(vec![1.0, 0.0]),
+            ),
+            chunk(
+                stale_id,
+                1,
+                "release notes from an unrelated stale workspace",
+                None,
+            ),
+        ]);
+        let filter = SearchFilter {
+            scope: SearchScope::SessionOnly,
+            min_score: Some(0.062),
+            memory_kinds: Some(vec!["semantic".into()]),
+            ..Default::default()
+        };
+
+        let results = hybrid_search(
+            &storage,
+            &ctx,
+            sid,
+            "memory hook installer search",
+            Some(&[1.0, 0.0]),
+            5,
+            None,
+            None,
+            None,
+            &FusionConfig::default(),
+            Some(&filter),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, relevant_id);
+        assert!(results[0].score >= 0.062);
     }
 }

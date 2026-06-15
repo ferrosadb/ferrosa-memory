@@ -4,6 +4,13 @@
 The hook is intentionally best-effort: failures are logged to stderr and the
 agent turn continues. Use `recall` for pre-turn context injection and
 `ingest-turn` for opt-in turn artifact capture.
+
+Correctness: Correct when lifecycle events keep agent turns running, recall
+context is compact and human-usable, and ingestion preserves enough turn
+evidence for later search.
+Last revised: 2026-06-15
+Last changed: Emit recall context only when a result has a positive reranker
+judgment, keeping unjudged or low-confidence searches silent.
 """
 
 from __future__ import annotations
@@ -13,6 +20,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -25,6 +33,61 @@ from typing import Any
 DEFAULT_URL = "http://127.0.0.1:18765/mcp"
 DEFAULT_TENANT_ID = "9a5f8fbf-d842-4d30-8ea5-1aa931e618a8"
 DEFAULT_SESSION_ID = "00000000-0000-0000-0000-000000000000"
+RAW_CONTEXT_LINE = re.compile(r"^(?P<prefix>[A-Za-z_]+)\[\d+\]:\s*(?P<payload>\{.*\})$")
+RAW_CONTEXT_ANY_LINE = re.compile(r"^(?P<prefix>[A-Za-z_]+)\[\d+\]:\s*(?P<payload>.*)$")
+RAW_CONTEXT_PREFIX = re.compile(r"^[A-Za-z_]+\[\d+\]:")
+TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,}")
+QUERY_STOPWORDS = {
+    "about",
+    "after",
+    "again",
+    "also",
+    "and",
+    "are",
+    "because",
+    "been",
+    "before",
+    "better",
+    "but",
+    "can",
+    "did",
+    "does",
+    "doing",
+    "done",
+    "for",
+    "from",
+    "get",
+    "had",
+    "has",
+    "have",
+    "how",
+    "into",
+    "its",
+    "just",
+    "let",
+    "like",
+    "now",
+    "our",
+    "out",
+    "should",
+    "that",
+    "the",
+    "then",
+    "there",
+    "these",
+    "this",
+    "those",
+    "through",
+    "was",
+    "were",
+    "what",
+    "when",
+    "where",
+    "with",
+    "would",
+    "you",
+    "your",
+}
 
 
 def eprint(message: str) -> None:
@@ -63,6 +126,39 @@ def env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        eprint(f"invalid {name}={value!r}; using {default}")
+        return default
+
+
+def env_csv(name: str, default: set[str]) -> set[str]:
+    value = os.environ.get(name)
+    if value is None:
+        return set(default)
+    return parse_csv_set(value, default)
+
+
+def parse_csv_set(value: str, default: set[str]) -> set[str]:
+    parsed = {item.strip().lower() for item in value.split(",") if item.strip()}
+    return parsed or set(default)
+
+
+def query_terms(text: str) -> set[str]:
+    return {token.lower() for token in TOKEN_RE.findall(text) if token.lower() not in QUERY_STOPWORDS}
+
+
+def query_overlap_count(prompt_terms: set[str], text: str) -> int:
+    if not prompt_terms:
+        return 0
+    return len(prompt_terms & query_terms(text))
 
 
 class McpClient:
@@ -353,31 +449,345 @@ def content_blocks(result: Any) -> list[str]:
     return blocks
 
 
+def clean_recall_text(value: str) -> str:
+    return "\n".join(
+        line for line in value.strip().splitlines() if not RAW_CONTEXT_PREFIX.match(line.strip())
+    ).strip()
+
+
+def content_texts(value: Any) -> list[str]:
+    texts: list[str] = []
+    if isinstance(value, str) and value.strip():
+        cleaned = clean_recall_text(value)
+        if cleaned:
+            texts.append(cleaned)
+    elif isinstance(value, dict):
+        for key in ("text", "content", "stdout", "stderr"):
+            text = value.get(key)
+            if isinstance(text, str) and text.strip():
+                cleaned = clean_recall_text(text)
+                if cleaned:
+                    texts.append(cleaned)
+        for key in ("message", "toolUseResult"):
+            texts.extend(content_texts(value.get(key)))
+    elif isinstance(value, list):
+        for item in value:
+            texts.extend(content_texts(item))
+    return texts
+
+
+def transcript_entry_text(prefix: str, entry: dict[str, Any]) -> str:
+    message = entry.get("message")
+    role = prefix
+    if isinstance(message, dict) and isinstance(message.get("role"), str):
+        role = message["role"]
+
+    content = message.get("content") if isinstance(message, dict) else None
+    texts = content_texts(content)
+    if not texts:
+        texts = content_texts(entry.get("toolUseResult"))
+    if not texts:
+        return ""
+
+    label = "Assistant" if role == "assistant" else "User"
+    if role == "user" and isinstance(content, list):
+        if any(isinstance(item, dict) and item.get("type") == "tool_result" for item in content):
+            label = "Tool result"
+    return f"{label}: {' '.join(texts)[:1200]}"
+
+
+def compact_raw_context_segment(text: str) -> list[str]:
+    pieces: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        match = RAW_CONTEXT_LINE.match(stripped)
+        if match:
+            try:
+                entry = json.loads(match.group("payload"))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(entry, dict):
+                rendered = transcript_entry_text(match.group("prefix"), entry)
+                if rendered:
+                    pieces.append(rendered)
+            continue
+
+        plain_match = RAW_CONTEXT_ANY_LINE.match(stripped)
+        if not plain_match:
+            continue
+        payload = plain_match.group("payload").strip()
+        if not payload:
+            continue
+        prefix = plain_match.group("prefix").lower()
+        label = "Assistant" if prefix == "assistant" else "User"
+        if "tool" in prefix:
+            label = "Tool result"
+        pieces.append(f"{label}: {payload[:1200]}")
+    return pieces
+
+
+def compact_result_content(content: str) -> list[str]:
+    compacted = compact_raw_context_segment(content)
+    if compacted:
+        return compacted
+    if any(RAW_CONTEXT_PREFIX.match(line.strip()) for line in content.splitlines()):
+        return []
+    return [content.strip()] if content.strip() else []
+
+
+def result_memory_kind(result: dict[str, Any]) -> str:
+    kind = result.get("memory_kind")
+    if isinstance(kind, str) and kind.strip():
+        return kind.strip().lower()
+    result_type = result.get("result_type")
+    source = result.get("source")
+    if result_type == "context_segment" or source in {"context_bm25", "context_ann", "fold_ann"}:
+        return "episodic"
+    if result_type == "document_chunk":
+        return "semantic"
+    return "semantic"
+
+
+def label_memory_piece(kind: str, text: str) -> str:
+    labels = {
+        "episodic": "Episodic memory",
+        "procedural": "Procedural memory",
+        "semantic": "Semantic memory",
+    }
+    return f"{labels.get(kind, 'Memory')}: {text}"
+
+
+def result_score(result: dict[str, Any]) -> float | None:
+    score = result.get("score")
+    if isinstance(score, int | float):
+        return float(score)
+    if isinstance(score, str):
+        try:
+            return float(score)
+        except ValueError:
+            return None
+    return None
+
+
+def judge_score(value: Any) -> float | None:
+    if isinstance(value, int | float):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+def reranker_judgments(parsed: dict[str, Any], min_judge_score: float) -> dict[str, bool]:
+    reranker = parsed.get("reranker")
+    if not isinstance(reranker, dict) or not reranker.get("applied"):
+        return {}
+    judged_ids = reranker.get("judged_ids")
+    judge_scores = reranker.get("judge_scores")
+    if not isinstance(judged_ids, list) or not isinstance(judge_scores, list):
+        return {}
+
+    judgments: dict[str, bool] = {}
+    for result_id, score_value in zip(judged_ids, judge_scores, strict=False):
+        if not isinstance(result_id, str):
+            continue
+        score = judge_score(score_value)
+        judgments[result_id] = score is not None and score >= min_judge_score
+    return judgments
+
+
+def triggered_intentions(parsed: dict[str, Any]) -> list[str]:
+    triggered = parsed.get("triggered")
+    if not isinstance(triggered, list):
+        return []
+
+    pieces: list[str] = []
+    for item in triggered:
+        if isinstance(item, dict):
+            text = (
+                item.get("description")
+                or item.get("content")
+                or item.get("context")
+                or item.get("name")
+                or item.get("id")
+            )
+            if isinstance(text, str) and text.strip():
+                pieces.append(f"Intention: {text.strip()[:1200]}")
+        elif isinstance(item, str) and item.strip():
+            pieces.append(f"Intention: {item.strip()[:1200]}")
+    return pieces
+
+
+def compact_recall_block(
+    text: str,
+    min_score: float = 0.0,
+    min_judge_score: float = 1.0,
+    require_judgment: bool = True,
+    include_hints: bool = False,
+    allowed_kinds: set[str] | None = None,
+) -> list[str]:
+    """Extract only agent-useful context from a tool result text block."""
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return [text] if text.strip() else []
+    if not isinstance(parsed, dict):
+        return [text] if text.strip() else []
+
+    intention_pieces = triggered_intentions(parsed)
+    if intention_pieces:
+        return intention_pieces
+
+    hints: list[str] = []
+    for key in ("_hint", "hint"):
+        value = parsed.get(key)
+        if isinstance(value, str) and value.strip():
+            hints.append(value.strip())
+
+    judgments = reranker_judgments(parsed, min_judge_score)
+    result_pieces: list[str] = []
+    results = parsed.get("results")
+    if isinstance(results, list):
+        for result in results:
+            if isinstance(result, dict):
+                kind = result_memory_kind(result)
+                if allowed_kinds is not None and kind not in allowed_kinds:
+                    continue
+                result_id = result.get("id")
+                if judgments:
+                    if not isinstance(result_id, str) or not judgments.get(result_id, False):
+                        continue
+                elif require_judgment:
+                    continue
+                score = result_score(result)
+                if score is None and min_score > 0:
+                    continue
+                if score is not None and score < min_score:
+                    continue
+                content = result.get("content")
+                if isinstance(content, str) and content.strip():
+                    result_pieces.extend(
+                        label_memory_piece(kind, piece) for piece in compact_result_content(content)
+                    )
+
+    if not result_pieces:
+        return []
+    if include_hints:
+        return hints + result_pieces
+    return result_pieces
+
+
+def recall_blocks(
+    result: Any,
+    min_score: float = 0.0,
+    min_judge_score: float = 1.0,
+    require_judgment: bool = True,
+    include_hints: bool = False,
+    allowed_kinds: set[str] | None = None,
+) -> list[str]:
+    pieces: list[str] = []
+    for block in content_blocks(result):
+        pieces.extend(
+            compact_recall_block(
+                block,
+                min_score=min_score,
+                min_judge_score=min_judge_score,
+                require_judgment=require_judgment,
+                include_hints=include_hints,
+                allowed_kinds=allowed_kinds,
+            )
+        )
+    return pieces
+
+
 def recall_context(client: McpClient, payload: dict[str, Any], args: argparse.Namespace) -> str:
     prompt = extract_prompt(payload)
     if not prompt:
         return ""
     cwd = cwd_from_payload(payload)
+    session_id = current_fmem_session_id(client)
+    min_score = max(0.0, args.min_score)
+    min_judge_score = args.min_judge_score
+    require_judgment = args.require_judgment
+    include_hints = args.include_hints
+    allowed_kinds = args.allowed_kinds
+    min_query_terms = max(0, args.min_query_terms)
+    prompt_terms = query_terms(prompt)
     pieces: list[str] = []
+
+    def search_recall(
+        scope: str,
+        require_judgment_for_scope: bool,
+        scope_min_score: float,
+        scope_min_query_terms: int,
+    ) -> list[str]:
+        search_args = {
+            "session_id": session_id,
+            "query": prompt[:4000],
+            "limit": args.limit,
+            "scope": scope,
+            "cwd": cwd,
+            "min_score": scope_min_score,
+        }
+        if allowed_kinds is not None:
+            search_args["memory_kinds"] = sorted(allowed_kinds)
+        search = client.call_tool(
+            "hybrid_search",
+            search_args,
+        )
+        search_pieces = recall_blocks(
+            search,
+            min_score=scope_min_score,
+            min_judge_score=min_judge_score,
+            require_judgment=require_judgment_for_scope,
+            include_hints=include_hints,
+            allowed_kinds=allowed_kinds,
+        )
+        if scope_min_query_terms > 0:
+            search_pieces = [
+                piece
+                for piece in search_pieces
+                if query_overlap_count(prompt_terms, piece) >= scope_min_query_terms
+            ]
+        return search_pieces
+
     try:
         intentions = client.call_tool(
             "check_intentions",
             {"context": prompt[:2000], "repo": cwd},
         )
-        pieces.extend(content_blocks(intentions))
+        pieces.extend(
+            recall_blocks(
+                intentions,
+                min_score=min_score,
+                min_judge_score=min_judge_score,
+                require_judgment=False,
+                include_hints=False,
+                allowed_kinds=None,
+            )
+        )
     except Exception as exc:
         eprint(f"check_intentions failed: {exc}")
     try:
-        search = client.call_tool(
-            "hybrid_search",
-            {
-                "query": prompt[:4000],
-                "limit": args.limit,
-                "scope": "both",
-                "cwd": cwd,
-            },
+        # Session-local recall is already scoped to the current conversation,
+        # so query overlap + score is a stronger guard than a small reranker set
+        # that may abstain on single-result searches.
+        search_pieces = search_recall(
+            "session",
+            require_judgment_for_scope=False,
+            scope_min_score=min_score,
+            scope_min_query_terms=min_query_terms,
         )
-        pieces.extend(content_blocks(search))
+        if not search_pieces:
+            search_pieces = search_recall(
+                "both",
+                require_judgment_for_scope=require_judgment,
+                scope_min_score=max(min_score, 0.35),
+                scope_min_query_terms=max(min_query_terms, 3),
+            )
+        pieces.extend(search_pieces)
     except Exception as exc:
         eprint(f"hybrid_search failed: {exc}")
     if not pieces:
@@ -539,6 +949,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mcp-url", default=os.environ.get("FERROSA_MEMORY_MCP_URL", DEFAULT_URL))
     parser.add_argument("--timeout", type=float, default=float(os.environ.get("FERROSA_MEMORY_HOOK_TIMEOUT", "8")))
     parser.add_argument("--limit", type=int, default=int(os.environ.get("FERROSA_MEMORY_HOOK_SEARCH_LIMIT", "5")))
+    parser.add_argument("--min-score", type=float, default=env_float("FERROSA_MEMORY_HOOK_MIN_SCORE", 0.0))
+    parser.add_argument(
+        "--min-judge-score",
+        type=float,
+        default=env_float("FERROSA_MEMORY_HOOK_MIN_JUDGE_SCORE", 1.0),
+    )
+    parser.add_argument(
+        "--require-judgment",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("FERROSA_MEMORY_HOOK_REQUIRE_JUDGMENT", True),
+    )
+    parser.add_argument(
+        "--include-hints",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("FERROSA_MEMORY_HOOK_INCLUDE_HINTS", False),
+    )
+    parser.add_argument(
+        "--min-query-terms",
+        type=int,
+        default=int(os.environ.get("FERROSA_MEMORY_HOOK_MIN_QUERY_TERMS", "2")),
+    )
+    parser.add_argument(
+        "--allowed-kinds",
+        type=lambda value: parse_csv_set(value, {"episodic", "procedural", "semantic"}),
+        default=env_csv(
+            "FERROSA_MEMORY_HOOK_ALLOWED_KINDS",
+            {"episodic", "procedural", "semantic"},
+        ),
+    )
     parser.add_argument("--max-context-chars", type=int, default=4000)
     return parser.parse_args()
 

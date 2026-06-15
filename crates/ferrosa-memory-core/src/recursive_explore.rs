@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::config::{DatalogConfig, RmhConfig};
 use crate::datalog;
-use crate::hybrid_search::{self, FusionConfig, SearchResult};
+use crate::hybrid_search::{self, FusionConfig, SearchResult, classify_memory_kind};
 use crate::storage::Storage;
 use crate::types::*;
 use crate::warmth;
@@ -195,6 +195,8 @@ pub async fn explore(
                     SearchResult {
                         id: *new_id,
                         source: "datalog_discovery".to_string(),
+                        memory_kind: classify_memory_kind("entity", "datalog_discovery", None)
+                            .into(),
                         content: String::new(), // Will be enriched by caller
                         score: 0.5 * (1.0 / (1.0 + pass_idx as f64)), // Decay score by pass
                         result_type: "entity".to_string(),
