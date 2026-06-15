@@ -1421,6 +1421,34 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                         "items": { "type": "string", "enum": ["episodic", "procedural", "semantic"] },
                         "description": "Optional result category filter applied before return."
                     },
+                    "datalog_frontier": {
+                        "type": "boolean",
+                        "description": "Enable bounded Datalog-style graph frontier expansion from entity seeds. Default true when the fusion profile includes datalog_frontier."
+                    },
+                    "datalog_frontier_seed_limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "description": "Maximum entity seeds to expand from initial candidates. Defaults to candidate source limit."
+                    },
+                    "datalog_frontier_edge_limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "description": "Maximum typed edges considered per frontier node. Defaults to 12."
+                    },
+                    "datalog_frontier_max_hops": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 3,
+                        "description": "Maximum graph hops for inferred recall. Defaults to 2."
+                    },
+                    "datalog_frontier_min_confidence": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "description": "Suppress derived frontier candidates below this edge/derived confidence. Defaults to 0.30."
+                    },
                     "fusion_profile": {
                         "type": "string",
                         "enum": ["default", "all", "bm25-only", "semantic-only", "bm25-semantic", "bm25-semantic-phonetic", "bm25-semantic-phonetic-workspace"],
@@ -8527,6 +8555,26 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         candidate_limit,
         min_score,
         memory_kinds,
+        datalog_frontier: args.get("datalog_frontier").and_then(Value::as_bool),
+        datalog_frontier_seed_limit: args
+            .get("datalog_frontier_seed_limit")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .filter(|value| *value > 0),
+        datalog_frontier_edge_limit: args
+            .get("datalog_frontier_edge_limit")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .filter(|value| *value > 0),
+        datalog_frontier_max_hops: args
+            .get("datalog_frontier_max_hops")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .filter(|value| *value > 0),
+        datalog_frontier_min_confidence: args
+            .get("datalog_frontier_min_confidence")
+            .and_then(Value::as_f64)
+            .filter(|value| (0.0..=1.0).contains(value)),
     };
     let query_decomposition_mode = args
         .get("query_decomposition")
