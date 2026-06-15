@@ -2508,7 +2508,6 @@ fn is_tier1(name: &str) -> bool {
             | "record_feedback"
             | "create_edge"
             | "check_intentions"
-            | "memory_metrics"
             | "session_task_put"
             | "session_task_get"
             | "session_task_current"

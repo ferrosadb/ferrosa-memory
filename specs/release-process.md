@@ -46,6 +46,29 @@ anything else→patch. Non-conventional subjects degrade to **patch**.
 - **UI:** Actions → *Promote Release to Stable* → enter the tag.
 - **CLI:** `gh release edit vX.Y.Z --repo ferrosadb/ferrosa-memory --prerelease=false --latest`
 
+## Runbook — cut the next 0.15 patch release
+
+Use this path when the current stable channel should stay on the 0.15 line even
+though unreleased commits contain `feat(...)` subjects that would make the
+automatic release script choose `v0.16.0`.
+
+1. Confirm CI is green on the release candidate PR and merge it to `main`.
+2. Fetch tags and verify the current 0.15 base:
+   `git fetch --tags origin && git tag --sort=-v:refname | head`.
+3. Dry-run the patch calculation from a checkout that has current tags:
+   `bash .github/scripts/next-release-version.sh patch false`.
+   As of the `v0.15.2` base, this should report `next_tag=v0.15.3`.
+4. In GitHub Actions, run *Release (on-merge + nightly)* manually with:
+   `bump=patch`, `force=false`.
+5. Wait for the dispatched *Release* workflow to publish the new prerelease.
+   Verify the release assets include all target tarballs plus `SHA256SUMS`.
+6. Promote the validated tag to stable with *Promote Release to Stable*, or:
+   `gh release edit v0.15.3 --repo ferrosadb/ferrosa-memory --prerelease=false --latest`.
+
+Do not re-tag or mutate an existing `v0.15.x` tag. If `v0.15.3` already exists
+by the time this runbook is used, re-run step 3 and use the next computed patch
+tag.
+
 ## Runbook — the release failed
 
 1. `gh run list --workflow=nightly-release.yml` → open the failed run.
