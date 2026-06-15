@@ -14,6 +14,7 @@ use ferrosa_memory_eval::memorybench::{
     LocalLlmConfig, MemoryBenchCase, MemoryBenchFixture, SyntheticConversationSpec,
     generate_two_agent_conversation, run_memorybench_fixture, synthetic_memorybench_fixture,
 };
+use ferrosa_memory_eval::rlm_evermemos::{ContextEvalMode, ControllerPolicy, MemoryLane};
 use serde::Serialize;
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -26,6 +27,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Run deterministic local fixture suites without a live MCP server.
     FixtureSmoke {
@@ -85,6 +87,11 @@ enum Command {
         /// Ranked retrieval depth for fixture scoring.
         #[arg(long, default_value_t = 25)]
         retrieval_k: usize,
+    },
+    /// Print the RLM + EverMemOS context-quality evaluation skeleton.
+    RlmEvermemosPlan {
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -188,12 +195,93 @@ async fn main() -> anyhow::Result<()> {
                 render_fixture_smoke_text(&report);
             }
         }
+        Some(Command::RlmEvermemosPlan { json }) => {
+            let report = RlmEvermemosPlanReport::default();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                render_rlm_evermemos_plan_text(&report);
+            }
+        }
         None => {
             eprintln!("ferrosa-memory-eval: use `fixture-smoke` for local benchmark fixtures");
             std::process::exit(2);
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct RlmEvermemosPlanReport {
+    modes: Vec<ContextEvalMode>,
+    lanes: Vec<MemoryLanePolicy>,
+    controller: ControllerPlanSummary,
+    metrics: Vec<&'static str>,
+}
+
+impl Default for RlmEvermemosPlanReport {
+    fn default() -> Self {
+        let policy = ControllerPolicy::combined_default();
+        Self {
+            modes: ContextEvalMode::roadmap_suite(),
+            lanes: MemoryLane::all()
+                .into_iter()
+                .map(|lane| MemoryLanePolicy {
+                    lane,
+                    min_score: policy.threshold_for(lane),
+                })
+                .collect(),
+            controller: ControllerPlanSummary {
+                max_accepted: policy.max_accepted,
+                max_injected_tokens: policy.max_injected_tokens,
+                require_provenance: policy.require_provenance,
+                allow_raw_episodic: policy.allow_raw_episodic,
+            },
+            metrics: vec![
+                "precision",
+                "recall",
+                "accepted_tokens",
+                "clutter_tokens",
+                "clutter_token_ratio",
+                "good_silence",
+                "sufficiency",
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryLanePolicy {
+    lane: MemoryLane,
+    min_score: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct ControllerPlanSummary {
+    max_accepted: usize,
+    max_injected_tokens: usize,
+    require_provenance: bool,
+    allow_raw_episodic: bool,
+}
+
+fn render_rlm_evermemos_plan_text(report: &RlmEvermemosPlanReport) {
+    println!("RLM + EverMemOS context-quality eval skeleton");
+    println!("Modes:");
+    for mode in &report.modes {
+        println!("  - {mode:?}");
+    }
+    println!("Lane thresholds:");
+    for lane in &report.lanes {
+        println!("  - {:?}: {:.2}", lane.lane, lane.min_score);
+    }
+    println!(
+        "Controller: max_accepted={}, max_injected_tokens={}, require_provenance={}, allow_raw_episodic={}",
+        report.controller.max_accepted,
+        report.controller.max_injected_tokens,
+        report.controller.require_provenance,
+        report.controller.allow_raw_episodic
+    );
+    println!("Metrics: {}", report.metrics.join(", "));
 }
 
 async fn run_fixture_smoke(config: FixtureSmokeConfig<'_>) -> anyhow::Result<FixtureSmokeReport> {

@@ -8,6 +8,7 @@ pub mod memory_quality;
 pub mod memorybench;
 pub mod metrics;
 pub mod report;
+pub mod rlm_evermemos;
 pub mod runner;
 pub mod scenario;
 pub mod task_agent;

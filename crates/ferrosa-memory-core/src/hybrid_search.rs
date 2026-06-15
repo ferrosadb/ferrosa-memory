@@ -630,6 +630,40 @@ fn workspace_candidate_paths(properties: &serde_json::Value) -> Vec<&str> {
     .collect()
 }
 
+fn context_segment_workspace(segment: &crate::context_segment::ContextSegment) -> Option<&str> {
+    // Hook-ingested context uses "<harness>:<session_id>:<cwd>". Preserve
+    // compatibility with existing rows by deriving workspace from that stable
+    // conversation id until context segments carry structured metadata.
+    segment
+        .conversation_id
+        .rsplit_once(':')
+        .map(|(_, workspace)| workspace)
+        .filter(|workspace| !workspace.trim().is_empty())
+}
+
+fn context_segment_allowed_for_workspace(
+    caller_session: Uuid,
+    queried_session: Uuid,
+    filter: Option<&SearchFilter>,
+    segment: &crate::context_segment::ContextSegment,
+) -> bool {
+    if segment.session_id == caller_session || segment.source_session == caller_session {
+        return true;
+    }
+    if queried_session == caller_session {
+        return true;
+    }
+    let Some(workspace_cwd) = filter.and_then(|f| f.workspace_cwd.as_deref()) else {
+        return true;
+    };
+    if workspace_cwd.trim().is_empty() {
+        return true;
+    }
+    context_segment_workspace(segment)
+        .and_then(|workspace| workspace_affinity_score(workspace_cwd, workspace))
+        .is_some()
+}
+
 fn workspace_feedback_adjustment(query_cwd: &str, properties: &serde_json::Value) -> f64 {
     let Some(feedback) = properties
         .get("workspace_feedback")
@@ -844,6 +878,9 @@ pub async fn hybrid_search_with_diagnostics(
             lists.push(
                 segments
                     .into_iter()
+                    .filter(|segment| {
+                        context_segment_allowed_for_workspace(session_id, sid, filter, segment)
+                    })
                     .enumerate()
                     .map(|(i, segment)| SearchResult {
                         id: segment.segment_id,
@@ -873,6 +910,9 @@ pub async fn hybrid_search_with_diagnostics(
             lists.push(
                 segments
                     .into_iter()
+                    .filter(|segment| {
+                        context_segment_allowed_for_workspace(session_id, sid, filter, segment)
+                    })
                     .map(|segment| SearchResult {
                         id: segment.segment_id,
                         source: "context_ann".into(),
@@ -1241,6 +1281,119 @@ mod tests {
         assert_eq!(paths.len(), 5);
         assert!(paths.contains(&"/repo/current"));
         assert!(paths.contains(&"/repo/root"));
+    }
+
+    #[test]
+    fn context_segment_workspace_reads_hook_conversation_id() {
+        let segment = crate::context_segment::ContextSegment {
+            tenant_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            segment_id: Uuid::new_v4(),
+            source_session: Uuid::new_v4(),
+            source_fold_id: None,
+            conversation_id:
+                "claude:11111111-1111-1111-1111-111111111111:/Users/bkearns/src/research".into(),
+            segment_index: 0,
+            start_turn: 0,
+            end_turn: 0,
+            start_time: None,
+            end_time: None,
+            segment_text: "marketing context".into(),
+            segment_summary: None,
+            bm25_text: "marketing context".into(),
+            segment_embedding: None,
+            token_count: 2,
+            content_hash: "hash".into(),
+            prev_segment_id: None,
+            next_segment_id: None,
+            created_at: chrono::Utc::now(),
+        };
+
+        assert_eq!(
+            context_segment_workspace(&segment),
+            Some("/Users/bkearns/src/research")
+        );
+    }
+
+    #[test]
+    fn context_segment_workspace_guard_blocks_unrelated_legacy_raw_context() {
+        let caller = Uuid::new_v4();
+        let segment = crate::context_segment::ContextSegment {
+            tenant_id: Uuid::new_v4(),
+            session_id: Uuid::nil(),
+            segment_id: Uuid::new_v4(),
+            source_session: Uuid::nil(),
+            source_fold_id: None,
+            conversation_id:
+                "claude:11111111-1111-1111-1111-111111111111:/Users/bkearns/src/research".into(),
+            segment_index: 0,
+            start_turn: 0,
+            end_turn: 0,
+            start_time: None,
+            end_time: None,
+            segment_text: "LinkedIn marketing context".into(),
+            segment_summary: None,
+            bm25_text: "linkedin marketing context".into(),
+            segment_embedding: None,
+            token_count: 3,
+            content_hash: "hash".into(),
+            prev_segment_id: None,
+            next_segment_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        let filter = SearchFilter {
+            scope: SearchScope::Both,
+            workspace_cwd: Some("/Users/bkearns/src/ferrosa-suite".into()),
+            ..SearchFilter::default()
+        };
+
+        assert!(!context_segment_allowed_for_workspace(
+            caller,
+            Uuid::nil(),
+            Some(&filter),
+            &segment
+        ));
+    }
+
+    #[test]
+    fn context_segment_workspace_guard_allows_same_tree_raw_context() {
+        let caller = Uuid::new_v4();
+        let segment = crate::context_segment::ContextSegment {
+            tenant_id: Uuid::new_v4(),
+            session_id: Uuid::nil(),
+            segment_id: Uuid::new_v4(),
+            source_session: Uuid::nil(),
+            source_fold_id: None,
+            conversation_id:
+                "claude:11111111-1111-1111-1111-111111111111:/Users/bkearns/src/ferrosa-suite"
+                    .into(),
+            segment_index: 0,
+            start_turn: 0,
+            end_turn: 0,
+            start_time: None,
+            end_time: None,
+            segment_text: "memory hook context".into(),
+            segment_summary: None,
+            bm25_text: "memory hook context".into(),
+            segment_embedding: None,
+            token_count: 3,
+            content_hash: "hash".into(),
+            prev_segment_id: None,
+            next_segment_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        let filter = SearchFilter {
+            scope: SearchScope::Both,
+            workspace_cwd: Some("/Users/bkearns/src/ferrosa-suite/crate".into()),
+            ..SearchFilter::default()
+        };
+
+        assert!(context_segment_allowed_for_workspace(
+            caller,
+            Uuid::nil(),
+            Some(&filter),
+            &segment
+        ));
     }
 
     #[test]
@@ -1909,6 +2062,95 @@ mod tests {
                 "trusted entity should rank higher than penalized entity"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_scope_both_drops_raw_context_from_unrelated_workspace() {
+        use crate::storage::mock::MockStorage;
+        use crate::types::TenantContext;
+
+        let storage = MockStorage::new();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "test".into(),
+        };
+        let sid = Uuid::new_v4();
+        let leaked_id = Uuid::new_v4();
+        let local_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        storage.context_segments.lock().await.extend([
+            crate::context_segment::ContextSegment {
+                tenant_id: ctx.tenant_id,
+                session_id: Uuid::nil(),
+                segment_id: leaked_id,
+                source_session: Uuid::nil(),
+                source_fold_id: None,
+                conversation_id: format!("claude:{}:/Users/bkearns/src/research", Uuid::new_v4()),
+                segment_index: 0,
+                start_turn: 0,
+                end_turn: 0,
+                start_time: None,
+                end_time: None,
+                segment_text: "FERROSA_LEAK_SENTINEL LinkedIn marketing context".into(),
+                segment_summary: None,
+                bm25_text: "FERROSA_LEAK_SENTINEL LinkedIn marketing context".to_ascii_lowercase(),
+                segment_embedding: None,
+                token_count: 5,
+                content_hash: leaked_id.to_string(),
+                prev_segment_id: None,
+                next_segment_id: None,
+                created_at: now,
+            },
+            crate::context_segment::ContextSegment {
+                tenant_id: ctx.tenant_id,
+                session_id: Uuid::nil(),
+                segment_id: local_id,
+                source_session: Uuid::nil(),
+                source_fold_id: None,
+                conversation_id: format!(
+                    "claude:{}:/Users/bkearns/src/ferrosa-suite",
+                    Uuid::new_v4()
+                ),
+                segment_index: 1,
+                start_turn: 0,
+                end_turn: 0,
+                start_time: None,
+                end_time: None,
+                segment_text: "FERROSA_LEAK_SENTINEL memory hook context".into(),
+                segment_summary: None,
+                bm25_text: "FERROSA_LEAK_SENTINEL memory hook context".to_ascii_lowercase(),
+                segment_embedding: None,
+                token_count: 5,
+                content_hash: local_id.to_string(),
+                prev_segment_id: None,
+                next_segment_id: None,
+                created_at: now,
+            },
+        ]);
+        let filter = SearchFilter {
+            scope: SearchScope::Both,
+            workspace_cwd: Some("/Users/bkearns/src/ferrosa-suite".into()),
+            ..SearchFilter::default()
+        };
+
+        let results = hybrid_search(
+            &storage,
+            &ctx,
+            sid,
+            "FERROSA_LEAK_SENTINEL",
+            None,
+            10,
+            None,
+            None,
+            None,
+            &FusionConfig::profile("all").unwrap(),
+            Some(&filter),
+        )
+        .await
+        .unwrap();
+
+        assert!(results.iter().any(|result| result.id == local_id));
+        assert!(!results.iter().any(|result| result.id == leaked_id));
     }
 
     #[tokio::test]

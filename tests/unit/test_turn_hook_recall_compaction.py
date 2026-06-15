@@ -304,6 +304,40 @@ class RecallCompactionTests(unittest.TestCase):
         self.assertEqual(search_call[1]["min_score"], 0.062)
         self.assertEqual(search_call[1]["memory_kinds"], ["procedural", "semantic"])
 
+    def test_recall_context_derives_session_from_payload_workspace(self) -> None:
+        args = Namespace(
+            limit=5,
+            max_context_chars=4000,
+            min_score=0.062,
+            min_judge_score=1.0,
+            require_judgment=True,
+            include_hints=False,
+            min_query_terms=0,
+            allowed_kinds={"semantic"},
+            harness="claude",
+        )
+        client = FakeClient()
+
+        self.module.recall_context(
+            client,
+            {
+                "prompt": "memory hook installer",
+                "cwd": "/Users/bkearns/src/ferrosa-suite",
+                "session_id": "claude-marketing-session",
+            },
+            args,
+        )
+
+        configure_call = [call for call in client.calls if call[0] == "configure"][0]
+        self.assertEqual(
+            configure_call[1]["session_start"]["workspace"],
+            "/Users/bkearns/src/ferrosa-suite",
+        )
+        self.assertEqual(
+            configure_call[1]["session_start"]["agent_session_id"],
+            "claude-marketing-session",
+        )
+
     def test_recall_context_falls_back_to_cross_session_when_session_search_is_empty(self) -> None:
         class SessionThenGlobalClient(FakeClient):
             def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -357,6 +391,65 @@ class RecallCompactionTests(unittest.TestCase):
         search_scores = [call[1]["min_score"] for call in client.calls if call[0] == "hybrid_search"]
         self.assertEqual(search_scores, [0.062, 0.35])
         self.assertIn("Semantic memory: memory hook installer global fallback", context)
+
+    def test_cross_session_fallback_does_not_request_episodic_memory(self) -> None:
+        class SessionThenGlobalClient(FakeClient):
+            def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                self.calls.append((name, arguments))
+                if name == "configure":
+                    return tool_result({"session_id": "33333333-3333-3333-3333-333333333333"})
+                if name == "check_intentions":
+                    return tool_result({"triggered": []})
+                if name == "hybrid_search" and arguments["scope"] == "session":
+                    return tool_result({"results": []})
+                if name == "hybrid_search" and arguments["scope"] == "both":
+                    return tool_result(
+                        {
+                            "reranker": {
+                                "applied": True,
+                                "judged_ids": ["episodic", "semantic"],
+                                "judge_scores": [1, 1],
+                            },
+                            "results": [
+                                {
+                                    "id": "episodic",
+                                    "content": "Assistant: unrelated LinkedIn profile copy",
+                                    "memory_kind": "episodic",
+                                    "score": 0.8,
+                                },
+                                {
+                                    "id": "semantic",
+                                    "content": "ferrosa memory hook installer policy",
+                                    "memory_kind": "semantic",
+                                    "score": 0.8,
+                                },
+                            ],
+                        }
+                    )
+                raise AssertionError(f"unexpected tool call: {name}")
+
+        args = Namespace(
+            limit=5,
+            max_context_chars=4000,
+            min_score=0.062,
+            min_judge_score=1.0,
+            require_judgment=True,
+            include_hints=False,
+            min_query_terms=2,
+            allowed_kinds={"episodic", "procedural", "semantic"},
+        )
+        client = SessionThenGlobalClient()
+
+        context = self.module.recall_context(
+            client,
+            {"prompt": "ferrosa memory hook installer", "cwd": "/Users/bkearns/src/ferrosa-suite"},
+            args,
+        )
+
+        both_call = [call for call in client.calls if call[0] == "hybrid_search" and call[1]["scope"] == "both"][0]
+        self.assertEqual(both_call[1]["memory_kinds"], ["procedural", "semantic"])
+        self.assertIn("Semantic memory: ferrosa memory hook installer policy", context)
+        self.assertNotIn("LinkedIn", context)
 
 
 if __name__ == "__main__":

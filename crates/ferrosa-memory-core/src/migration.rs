@@ -160,6 +160,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "durable active session tasks and focus stack",
         ddl: include_str!("../../../ddl/039_session_tasks.cql"),
     },
+    Migration {
+        version: 40,
+        description: "native full-text indexes for lexical recall",
+        ddl: include_str!("../../../ddl/040_native_fulltext_indexes.cql"),
+    },
 ];
 
 /// Pre-versioning DDLs. Applied in order when `run_migrations` detects a

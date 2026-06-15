@@ -38,6 +38,7 @@ const LLM_RERANK_MIN_CANDIDATES: usize = 2;
 const LLM_RERANK_HARD_MAX_CANDIDATES: usize = 50;
 const LLM_RERANK_MIN_SCORE_COVERAGE: usize = 5;
 const LLM_RERANK_BATCH_SIZE: usize = 5;
+const EDGE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 type ToolDispatchFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Value, (i32, String)>> + Send + 'a>>;
@@ -2215,13 +2216,14 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         .cloned()
         .unwrap_or(Value::Object(serde_json::Map::new()));
 
-    resolve_session_id(&mut args, session.effective_default_session_id())?;
-
     tracing::debug!(
         tool = canonical_name,
         requested_tool = name,
         "dispatching tool call"
     );
+    if canonical_name != "configure" {
+        resolve_session_id(&mut args, session.effective_default_session_id())?;
+    }
     let input_bytes = serde_json::to_string(&args).map(|s| s.len()).unwrap_or(0) as i32;
     let start = std::time::Instant::now();
     tracing::info!(
@@ -10597,6 +10599,40 @@ async fn handle_promote_predicate<S: crate::storage::Storage>(
 
 // --- Typed edge handlers ---
 
+fn edge_write_timeout_message(operation: &str, budget: std::time::Duration) -> String {
+    format!(
+        "{operation} timed out after {}s while writing typed_edges. \
+         Ferrosa may still be warming ANN indexes and blocking CQL; retry after \
+         /healthz/ready is healthy or after a successful get_stats call.",
+        budget.as_secs()
+    )
+}
+
+async fn edge_write_with_timeout<T, F>(operation: &str, fut: F) -> Result<T, (i32, String)>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    edge_write_with_timeout_budget(operation, EDGE_WRITE_TIMEOUT, fut).await
+}
+
+async fn edge_write_with_timeout_budget<T, F>(
+    operation: &str,
+    budget: std::time::Duration,
+    fut: F,
+) -> Result<T, (i32, String)>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    match tokio::time::timeout(budget, fut).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err((INTERNAL_ERROR, e.to_string())),
+        Err(_) => Err((
+            INTERNAL_ERROR,
+            edge_write_timeout_message(operation, budget),
+        )),
+    }
+}
+
 async fn handle_create_edge<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
@@ -10613,11 +10649,13 @@ async fn handle_create_edge<S: crate::storage::Storage>(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    crate::graph_write::create_typed_edge(
-        storage, ctx, session_id, src_id, edge_type, dst_id, weight, metadata,
+    edge_write_with_timeout(
+        "create_edge",
+        crate::graph_write::create_typed_edge(
+            storage, ctx, session_id, src_id, edge_type, dst_id, weight, metadata,
+        ),
     )
-    .await
-    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    .await?;
 
     session.dirty.store(true, Ordering::Relaxed);
     session.last_activity.notify_waiters();
@@ -10695,16 +10733,29 @@ async fn handle_batch_create_edges<S: crate::storage::Storage>(
     let writes = parsed_edges
         .into_iter()
         .map(|(src_id, edge_type, dst_id, weight)| async move {
-            crate::graph_write::create_typed_edge(
-                storage, ctx, session_id, src_id, edge_type, dst_id, weight, None,
+            edge_write_with_timeout(
+                "batch_create_edges",
+                crate::graph_write::create_typed_edge(
+                    storage, ctx, session_id, src_id, edge_type, dst_id, weight, None,
+                ),
             )
             .await
         });
 
+    let mut timeout_errors = 0usize;
+    let mut last_error: Option<String> = None;
     for result in join_all(writes).await {
         match result {
             Ok(_) => created += 1,
-            Err(_) => errors += 1,
+            Err((_, message)) => {
+                if message.contains("timed out after") {
+                    timeout_errors += 1;
+                }
+                if last_error.is_none() {
+                    last_error = Some(message);
+                }
+                errors += 1;
+            }
         }
     }
 
@@ -10714,7 +10765,14 @@ async fn handle_batch_create_edges<S: crate::storage::Storage>(
     Ok(serde_json::json!({
         "created": created,
         "errors": errors,
+        "timeout_errors": timeout_errors,
         "total": edges.len(),
+        "last_error": last_error,
+        "_hint": if timeout_errors > 0 {
+            "Some edge writes timed out while CQL was blocked. Ferrosa may still be warming ANN indexes; retry after /healthz/ready is healthy or get_stats succeeds."
+        } else {
+            "Batch edge creation completed."
+        },
     }))
 }
 
@@ -14225,6 +14283,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configure_session_start_derives_session_even_when_default_exists() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let default_sid = Uuid::new_v4();
+        let session = SessionState {
+            ollama_base_url: String::new(),
+            default_session_id: Some(default_sid),
+            ..SessionState::default()
+        };
+
+        let configured = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "config",
+                "arguments": {
+                    "session_start": {
+                        "agent": "codex",
+                        "agent_session_id": "codex-ferrosa-suite-leak-check",
+                        "workspace": "/Users/bkearns/src/ferrosa-suite"
+                    }
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let configured = unwrap_tool_result(configured);
+        let sid = Uuid::parse_str(configured["session_id"].as_str().unwrap()).unwrap();
+        let expected = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            b"ferrosa-memory:agent-session:v1:codex:/Users/bkearns/src/ferrosa-suite:codex-ferrosa-suite-leak-check",
+        );
+
+        assert_eq!(sid, expected);
+        assert_ne!(sid, default_sid);
+        assert_eq!(configured["session_source"], "derived_from_agent_session");
+    }
+
+    #[tokio::test]
     async fn hybrid_search_min_score_uses_post_merge_score_for_session_context() {
         let store = MockStorage::new();
         let ctx = test_ctx();
@@ -16049,6 +16148,29 @@ mod speculative_tests {
             result.is_ok(),
             "expected 'default' to resolve to configured session, got: {:?}",
             result
+        );
+    }
+
+    #[tokio::test]
+    async fn edge_write_timeout_reports_ann_warmup_hint() {
+        let result: Result<(), (i32, String)> = edge_write_with_timeout_budget(
+            "create_edge",
+            std::time::Duration::from_millis(1),
+            std::future::pending::<anyhow::Result<()>>(),
+        )
+        .await;
+
+        let err = result.expect_err("pending edge write should time out");
+        assert_eq!(err.0, INTERNAL_ERROR);
+        assert!(
+            err.1.contains("Ferrosa may still be warming ANN indexes"),
+            "timeout should explain likely ANN warmup cause: {}",
+            err.1
+        );
+        assert!(
+            err.1.contains("get_stats"),
+            "timeout should include an actionable readiness probe: {}",
+            err.1
         );
     }
 }

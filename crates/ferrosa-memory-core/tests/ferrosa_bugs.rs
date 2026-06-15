@@ -33,6 +33,18 @@ async fn connect_test_cluster(cfg: &TestClusterConfig) -> LegacySession {
         .expect("session build failed")
 }
 
+async fn connect_test_cluster_maybe_auth(cfg: &TestClusterConfig) -> LegacySession {
+    let mut builder = SessionBuilder::new().known_node(cfg.contact_point());
+    if let (Ok(username), Ok(password)) = (
+        std::env::var("FERROSA_TEST_USERNAME"),
+        std::env::var("FERROSA_TEST_PASSWORD"),
+    ) {
+        builder = builder.user(username, password);
+    }
+    #[allow(deprecated)]
+    builder.build_legacy().await.expect("session build failed")
+}
+
 // ---- FIXED: Vector PREPARE + ANN ----
 
 /// Creates a test-only vector table. Each test gets a distinct table so
@@ -572,4 +584,74 @@ async fn ghost_rows_do_not_crash_queries() {
             (),
         )
         .await;
+}
+
+// ---- OPEN: Fulltext index returns inserted rows ----
+
+#[tokio::test]
+#[ignore = "requires live Ferrosa test cluster; run with --ignored and FERROSA_TEST_CQL_PORT set"]
+async fn open_fulltext_index_returns_inserted_rows() {
+    let Some(cfg) = test_cluster() else { return };
+    let session = connect_test_cluster_maybe_auth(&cfg).await;
+    let ks = &cfg.keyspace;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let table = format!("fts_probe_{}", &suffix[..16]);
+    let index = format!("idx_{table}_body_fts");
+    let tenant_id = Uuid::new_v4();
+    let row_id = Uuid::new_v4();
+    let token = format!("ferrosaftstdd{}", &suffix[..16]);
+
+    #[allow(deprecated)]
+    session
+        .query_unpaged(format!("DROP TABLE IF EXISTS {ks}.{table}"), ())
+        .await
+        .expect("DROP TABLE fulltext probe");
+    #[allow(deprecated)]
+    session
+        .query_unpaged(
+            format!(
+                "CREATE TABLE {ks}.{table} \
+                 (tenant_id uuid, id uuid, body text, PRIMARY KEY ((tenant_id), id))"
+            ),
+            (),
+        )
+        .await
+        .expect("CREATE TABLE fulltext probe");
+    #[allow(deprecated)]
+    session
+        .query_unpaged(
+            format!("CREATE INDEX {index} ON {ks}.{table} (body) USING 'fulltext'"),
+            (),
+        )
+        .await
+        .expect("CREATE fulltext index");
+    #[allow(deprecated)]
+    session
+        .query_unpaged(
+            format!("INSERT INTO {ks}.{table} (tenant_id, id, body) VALUES (?, ?, ?)"),
+            (tenant_id, row_id, format!("{token} native fts probe body")),
+        )
+        .await
+        .expect("INSERT fulltext probe row");
+
+    #[allow(deprecated)]
+    let result = session
+        .query_unpaged(
+            format!(
+                "SELECT id, body FROM {ks}.{table} \
+                 WHERE tenant_id = ? AND body = fts_match('{token}') \
+                 LIMIT 5 ALLOW FILTERING"
+            ),
+            (tenant_id,),
+        )
+        .await
+        .expect("SELECT fulltext probe");
+    let rows = result.rows_or_empty();
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "fulltext index should return the row inserted after CREATE INDEX; \
+         zero rows means native FTS is not usable for ferrosa-memory lexical recall"
+    );
 }

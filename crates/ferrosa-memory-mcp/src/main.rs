@@ -8,7 +8,7 @@
 //! Never falls back to mock storage — mock silently loses data.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use ferrosa_memory_core::auth;
@@ -62,6 +62,9 @@ fn random_forget_token_key() -> Vec<u8> {
 /// held so the signal cannot be lost to cancellation.
 struct ReconnectingStorage {
     inner: RwLock<Option<Arc<CqlStorage>>>,
+    /// Last bounded CQL probe result. `inner.is_some()` means a session exists;
+    /// this flag means the session has answered a cheap read recently.
+    cql_probe_ready: AtomicBool,
     /// Monotonically increasing generation — bumped on every `set_connected`.
     /// Prevents stale errors from disconnecting a fresh session.
     generation: AtomicU64,
@@ -346,6 +349,7 @@ impl ReconnectingStorage {
     ) -> Self {
         Self {
             inner: RwLock::new(None),
+            cql_probe_ready: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             reconnect_signal: tokio::sync::Notify::new(),
             cql_config: config,
@@ -359,6 +363,7 @@ impl ReconnectingStorage {
     async fn set_connected(&self, cql: CqlStorage) {
         let mut guard = self.inner.write().await;
         *guard = Some(Arc::new(cql));
+        self.cql_probe_ready.store(true, Ordering::Release);
         self.generation.fetch_add(1, Ordering::Release);
     }
 
@@ -374,10 +379,39 @@ impl ReconnectingStorage {
     }
 
     fn is_ready(&self) -> bool {
+        if !self.cql_probe_ready.load(Ordering::Acquire) {
+            return false;
+        }
         self.inner
             .try_read()
             .map(|guard| guard.is_some())
             .unwrap_or(false)
+    }
+
+    fn set_cql_probe_ready(&self, ready: bool) {
+        self.cql_probe_ready.store(ready, Ordering::Release);
+    }
+
+    async fn probe_cql_readiness(&self, budget: Duration) -> bool {
+        let conn_gen = self.current_generation();
+        let Some(cql) = self.current_cql().await else {
+            return false;
+        };
+
+        #[allow(deprecated)]
+        let probe = cql
+            .session()
+            .query_unpaged("SELECT peer FROM system.local", ());
+        match tokio::time::timeout(budget, probe).await {
+            Ok(Ok(_)) => true,
+            Ok(Err(e)) => {
+                if is_connection_error(&e) {
+                    self.mark_disconnected(conn_gen).await;
+                }
+                false
+            }
+            Err(_) => false,
+        }
     }
 
     async fn current_cql(&self) -> Option<Arc<CqlStorage>> {
@@ -2233,6 +2267,24 @@ async fn cql_reconnect_watcher(storage: Arc<ReconnectingStorage>) {
     }
 }
 
+/// Periodically verifies that the published CQL session can answer a cheap
+/// read within budget. This catches Ferrosa ANN cold-load stalls where the
+/// TCP/session handle exists but every query blocks long enough to make MCP
+/// tools unusable.
+async fn cql_readiness_probe_loop(storage: Arc<ReconnectingStorage>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    loop {
+        interval.tick().await;
+        let ready = storage.probe_cql_readiness(Duration::from_secs(2)).await;
+        storage.set_cql_probe_ready(ready);
+        if !ready {
+            tracing::warn!(
+                "CQL readiness probe failed or timed out; /healthz/ready will report not ready"
+            );
+        }
+    }
+}
+
 /// Idle-consolidation configuration passed from `main()`.
 struct IdleConsolidationConfig {
     idle_seconds: u64,
@@ -2506,6 +2558,10 @@ async fn main() -> anyhow::Result<()> {
         "cql_reconnect_watcher",
         cql_reconnect_watcher(Arc::clone(&storage)),
     );
+    spawn_critical(
+        "cql_readiness_probe_loop",
+        cql_readiness_probe_loop(Arc::clone(&storage)),
+    );
     storage.reconnect_signal.notify_one();
 
     // Load dynamic type registry from the database (falls back to defaults).
@@ -2624,6 +2680,10 @@ async fn main() -> anyhow::Result<()> {
         spawn_critical(
             "cql_reconnect_watcher_viz",
             cql_reconnect_watcher(Arc::clone(&viz_storage)),
+        );
+        spawn_critical(
+            "cql_readiness_probe_loop_viz",
+            cql_readiness_probe_loop(Arc::clone(&viz_storage)),
         );
         viz_storage.reconnect_signal.notify_one();
         tracing::info!(
@@ -3102,6 +3162,11 @@ auth_file = "{}"
         };
         let storage = ReconnectingStorage::disconnected(cfg, None, None);
         assert!(!storage.is_ready());
+        storage.set_cql_probe_ready(true);
+        assert!(
+            !storage.is_ready(),
+            "readiness still requires a connected CQL handle"
+        );
     }
 
     #[tokio::test]
@@ -3361,6 +3426,10 @@ auth_file = "{}"
                 && main_source.contains("cql_reconnect_watcher(Arc::clone(&storage))"),
             "main should spawn the background CQL reconnect watcher (fail-loud supervised) \
              before serving transports"
+        );
+        assert!(
+            main_source.contains("cql_readiness_probe_loop(Arc::clone(&storage))"),
+            "main should spawn a bounded CQL readiness probe so /healthz/ready catches ANN cold-load stalls"
         );
         assert!(
             main_source.contains("tokio::spawn(async move {\n        let embed_health"),
