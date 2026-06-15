@@ -382,6 +382,7 @@ fn short_tool_name(canonical: &str) -> Option<&'static str> {
         "get_temporal_chain" => Some("history"),
         "explore_connections" => Some("explore"),
         "hybrid_search" => Some("search"),
+        "manage_authority" => Some("authority"),
         "run_consolidation" => Some("consolidate"),
         "enrich_entities" => Some("enrich"),
         "get_stats" => Some("stats"),
@@ -462,6 +463,7 @@ fn canonical_tool_name(name: &str) -> &str {
         "history" => "get_temporal_chain",
         "explore" => "explore_connections",
         "search" => "hybrid_search",
+        "authority" => "manage_authority",
         "consolidate" => "run_consolidation",
         "enrich" => "enrich_entities",
         "stats" => "get_stats",
@@ -1405,6 +1407,17 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                         "maximum": 50,
                         "description": "Per-source candidate fanout before fusion. Defaults to min(limit*2, 50); lower it to reduce retrieval work."
                     },
+                    "min_score": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "description": "Drop fused results below this score before returning them. Useful for hooks where silence is better than weak recall."
+                    },
+                    "memory_kinds": {
+                        "type": "array",
+                        "items": { "type": "string", "enum": ["episodic", "procedural", "semantic"] },
+                        "description": "Optional result category filter applied before return."
+                    },
                     "fusion_profile": {
                         "type": "string",
                         "enum": ["default", "all", "bm25-only", "semantic-only", "bm25-semantic", "bm25-semantic-phonetic", "bm25-semantic-phonetic-workspace"],
@@ -1494,6 +1507,44 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                     }
                 },
                 "required": ["query"]
+            }),
+        },
+        ToolDef {
+            name: "manage_authority".into(),
+            description: "Set user-managed authority for retrieved memories. Use this to mark curated corpus chunks, skills, or other memory IDs as high reputation/PageRank, or to demote known clutter. Authority is applied to future hybrid_search ranking after normal relevance scoring.\n\nCALL WHEN: The user explicitly says a result/source is curated, authoritative, trusted, or noisy. Prefer global scope for curated corpus/skills and session scope for local one-off preferences.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "target_id": { "type": "string", "description": "Memory result ID to update." },
+                    "target_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Multiple memory result IDs to update with the same authority values."
+                    },
+                    "reputation": {
+                        "type": "number",
+                        "minimum": -1.0,
+                        "maximum": 1.0,
+                        "description": "User-managed trust score. 1.0=curated/highest trust, 0=neutral, -1.0=known clutter."
+                    },
+                    "pagerank": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "description": "Authority/PageRank seed. 1.0 strongly boosts authoritative curated material."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["session", "global"],
+                        "description": "Where to store this authority. global applies to tenant-global searches; session applies to the current session. Default session unless global=true."
+                    },
+                    "global": {
+                        "type": "boolean",
+                        "description": "Compatibility shortcut for scope=global."
+                    },
+                    "reason": { "type": "string", "maxLength": 2048 }
+                }
             }),
         },
         // --- Dream consolidation ---
@@ -2250,6 +2301,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "get_temporal_chain" => Box::pin(handle_get_temporal_chain(args, storage, ctx)),
         "explore_connections" => Box::pin(handle_explore_connections(args, storage, ctx, session)),
         "hybrid_search" => Box::pin(handle_hybrid_search(args, storage, ctx, session)),
+        "manage_authority" => Box::pin(handle_manage_authority(args, storage, ctx)),
         "run_consolidation" => Box::pin(handle_run_consolidation(args, storage, ctx, session)),
         "enrich_entities" => Box::pin(handle_enrich_entities(args, storage, ctx, session)),
         "get_stats" => Box::pin(handle_get_stats(args, storage, ctx, session)),
@@ -2480,6 +2532,7 @@ fn is_write_tool(name: &str) -> bool {
             | "ingest_entities"
             | "record_outcome"
             | "record_feedback"
+            | "manage_authority"
             | "delete_session"
             | "smart_ingest"
             | "set_intention"
@@ -3083,6 +3136,65 @@ async fn handle_retrieve_fold<S: crate::storage::Storage>(
     serde_json::to_value(&folds).map_err(|e| (INTERNAL_ERROR, e.to_string()))
 }
 
+fn is_explicit_remember_directive(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    [
+        "remember ",
+        "remember:",
+        "please remember ",
+        "please remember:",
+        "can you remember ",
+        "could you remember ",
+        "make a note ",
+        "make a note:",
+        "note that ",
+        "note:",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
+}
+
+fn explicit_remember_turns(messages: &[ContextMessage]) -> HashSet<i32> {
+    messages
+        .iter()
+        .filter(|message| message.role.eq_ignore_ascii_case("user"))
+        .filter(|message| is_explicit_remember_directive(&message.content))
+        .map(|message| message.turn_index)
+        .collect()
+}
+
+async fn apply_explicit_remember_authority<S: crate::storage::Storage>(
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session_id: uuid::Uuid,
+    result: &crate::context_segment::SegmentIngestResult,
+    remember_turns: &HashSet<i32>,
+) -> Result<usize, (i32, String)> {
+    if remember_turns.is_empty() {
+        return Ok(0);
+    }
+    let mut count = 0usize;
+    for segment in &result.segments {
+        let covers_remember_turn = remember_turns
+            .iter()
+            .any(|turn| *turn >= segment.start_turn && *turn <= segment.end_turn);
+        if !covers_remember_turn {
+            continue;
+        }
+        set_memory_authority(
+            storage,
+            ctx,
+            segment.segment_id,
+            session_id,
+            Some(1.0),
+            Some(0.85),
+        )
+        .await?;
+        count += 1;
+    }
+    Ok(count)
+}
+
 async fn handle_ingest_context_segments<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
@@ -3100,6 +3212,7 @@ async fn handle_ingest_context_segments<S: crate::storage::Storage>(
     if messages.is_empty() {
         return Err((INVALID_PARAMS, "messages must not be empty".into()));
     }
+    let remember_turns = explicit_remember_turns(&messages);
     let segmentation: SegmentationConfig = match args.get("segmentation") {
         Some(v) if !v.is_null() => serde_json::from_value(v.clone())
             .map_err(|e| (INVALID_PARAMS, format!("invalid segmentation: {e}")))?,
@@ -3118,46 +3231,31 @@ async fn handle_ingest_context_segments<S: crate::storage::Storage>(
             &segmentation,
         )
         .map_err(|e| (INVALID_PARAMS, e.to_string()))?;
-        let Some(client) = session_embedding_client(session) else {
-            return serde_json::to_value(
-                crate::context_segment::ingest_context_segments(
-                    storage,
-                    ctx,
-                    IngestContextSegmentsParams {
-                        session_id,
-                        conversation_id,
-                        messages,
-                        segmentation,
-                        embed_missing,
-                    },
-                    None,
-                )
-                .await
-                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?,
-            )
-            .map_err(|e| (INTERNAL_ERROR, e.to_string()));
-        };
-        let mut vectors = Vec::with_capacity(preview.len());
-        let mut failed = false;
-        for segment in preview {
-            match client.embed(&segment.segment_text).await {
-                Ok(vector) => vectors.push(vector),
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "context segment embedding generation failed; storing segments without vectors"
-                    );
-                    failed = true;
-                    break;
+        if let Some(client) = session_embedding_client(session) {
+            let mut vectors = Vec::with_capacity(preview.len());
+            let mut failed = false;
+            for segment in preview {
+                match client.embed(&segment.segment_text).await {
+                    Ok(vector) => vectors.push(vector),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "context segment embedding generation failed; storing segments without vectors"
+                        );
+                        failed = true;
+                        break;
+                    }
                 }
             }
+            if failed { None } else { Some(vectors) }
+        } else {
+            None
         }
-        if failed { None } else { Some(vectors) }
     } else {
         None
     };
 
-    let result = crate::context_segment::ingest_context_segments(
+    let mut result = crate::context_segment::ingest_context_segments(
         storage,
         ctx,
         IngestContextSegmentsParams {
@@ -3171,6 +3269,14 @@ async fn handle_ingest_context_segments<S: crate::storage::Storage>(
     )
     .await
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    let remembered_segments =
+        apply_explicit_remember_authority(storage, ctx, session_id, &result, &remember_turns)
+            .await?;
+    if remembered_segments > 0 {
+        result.warnings.push(format!(
+            "authority_seeded_for_explicit_remember:{remembered_segments}"
+        ));
+    }
     serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
 }
 
@@ -6781,8 +6887,88 @@ fn truncate_for_llm(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect::<String>()
 }
 
+fn collect_transcript_text(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(text) if !text.trim().is_empty() => {
+            out.push(text.trim().to_string());
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_transcript_text(item, out);
+            }
+        }
+        Value::Object(map) => {
+            for key in ["text", "content", "stdout", "stderr"] {
+                if let Some(value) = map.get(key) {
+                    collect_transcript_text(value, out);
+                }
+            }
+            for key in ["message", "toolUseResult"] {
+                if let Some(value) = map.get(key) {
+                    collect_transcript_text(value, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn contains_tool_result_block(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(contains_tool_result_block),
+        Value::Object(map) => {
+            map.get("type").and_then(Value::as_str) == Some("tool_result")
+                || map.values().any(contains_tool_result_block)
+        }
+        _ => false,
+    }
+}
+
+fn compact_transcript_context_for_rerank(text: &str) -> Option<String> {
+    let mut pieces = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let Some((prefix, payload)) = trimmed.split_once(": ") else {
+            continue;
+        };
+        if !prefix.contains('[') || !prefix.ends_with(']') {
+            continue;
+        }
+        let Ok(parsed) = serde_json::from_str::<Value>(payload) else {
+            continue;
+        };
+        let mut texts = Vec::new();
+        collect_transcript_text(&parsed, &mut texts);
+        if texts.is_empty() {
+            continue;
+        }
+        let label = if contains_tool_result_block(&parsed)
+            || texts
+                .iter()
+                .any(|text| text.contains("[This command modified"))
+        {
+            "tool result"
+        } else if prefix.starts_with("assistant") {
+            "assistant turn"
+        } else {
+            "user turn"
+        };
+        pieces.push(format!("{label}: {}", texts.join(" ")));
+    }
+    if pieces.is_empty() {
+        None
+    } else {
+        Some(truncate_for_llm(&pieces.join("\n"), 500))
+    }
+}
+
 fn rerank_candidate_content(result: &crate::hybrid_search::SearchResult) -> String {
     if result.expanded_context.is_empty() {
+        if result.memory_kind == "episodic"
+            && let Some(compacted) = compact_transcript_context_for_rerank(&result.content)
+        {
+            return compacted;
+        }
         return truncate_for_llm(&result.content, 500);
     }
     let mut text = format!("Hit chunk:\n{}", truncate_for_llm(&result.content, 360));
@@ -7023,6 +7209,41 @@ fn apply_llm_rerank_decision(
         .collect()
 }
 
+fn apply_llm_judge_authority(
+    results: &mut Vec<crate::hybrid_search::SearchResult>,
+    report: &LlmRerankReport,
+) {
+    if !report.applied {
+        return;
+    }
+    let judgments = report
+        .judged_ids
+        .iter()
+        .copied()
+        .zip(report.judge_scores.iter().copied())
+        .collect::<HashMap<_, _>>();
+    results.retain_mut(
+        |result| match judgments.get(&result.id).copied().flatten() {
+            Some(score) if score > 0 => {
+                result.score += 0.20;
+                true
+            }
+            Some(score) if score < 0 => false,
+            Some(_) => true,
+            None if judgments.contains_key(&result.id) => {
+                result.score = (result.score - 0.02).max(0.0);
+                true
+            }
+            None => true,
+        },
+    );
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
 fn judge_scores_for_response(scores: &[Option<i64>]) -> Vec<Value> {
     scores
         .iter()
@@ -7126,6 +7347,7 @@ async fn judge_rerank_candidates(
                 "id": result.id,
                 "type": result.result_type,
                 "source": result.source,
+                "memory_kind": result.memory_kind,
                 "content": rerank_candidate_content(result),
             })
         })
@@ -7133,6 +7355,8 @@ async fn judge_rerank_candidates(
     let prompt = format!(
         "Query:\n{query}\n\nCandidates JSON:\n{}\n\n\
          Rank the candidates by usefulness for answering the query. \
+         Treat memory_kind as a recall category: episodic is prior conversation/tool context, procedural is how-to/decision/process memory, and semantic is durable factual/document memory. \
+         Prefer candidates that directly answer the query; raw tool output is irrelevant unless the query asks about that exact prior action. \
          Also judge each candidate's relevance as 1 helpful, 0 neutral/unclear, -1 irrelevant/wrong, or \"-\" if you cannot judge. \
          Return JSON only in this shape: {{\"order\":[rank_number,...],\"scores\":[1|0|-1|\"-\",...]}}. \
          Use the 1-based rank numbers from the input, not UUIDs. \
@@ -7491,6 +7715,50 @@ fn parse_hybrid_search_scope(
     } else {
         Ok(crate::hybrid_search::SearchScope::SessionOnly)
     }
+}
+
+fn authority_sessions_to_query(
+    caller_session: uuid::Uuid,
+    tenant_id: uuid::Uuid,
+    scope: crate::hybrid_search::SearchScope,
+) -> Vec<uuid::Uuid> {
+    let global = crate::scope::tenant_global_session_uuid(tenant_id);
+    let nil = uuid::Uuid::nil();
+    let mut sessions = match scope {
+        crate::hybrid_search::SearchScope::SessionOnly => vec![caller_session],
+        crate::hybrid_search::SearchScope::GlobalOnly => vec![global, nil],
+        crate::hybrid_search::SearchScope::Both => vec![caller_session, global, nil],
+    };
+    sessions.sort_unstable();
+    sessions.dedup();
+    sessions
+}
+
+async fn load_authority_score_maps<S: crate::storage::Storage>(
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session_id: uuid::Uuid,
+    scope: crate::hybrid_search::SearchScope,
+) -> anyhow::Result<(HashMap<uuid::Uuid, f64>, HashMap<uuid::Uuid, f64>)> {
+    let mut pagerank_scores: HashMap<uuid::Uuid, f64> = HashMap::new();
+    let mut reputation_scores: HashMap<uuid::Uuid, f64> = HashMap::new();
+    for sid in authority_sessions_to_query(session_id, ctx.tenant_id, scope) {
+        for entry in storage.warmth_list_session(ctx, sid).await? {
+            if entry.pagerank != 0.0 {
+                pagerank_scores
+                    .entry(entry.entity_id)
+                    .and_modify(|score| *score = score.max(entry.pagerank))
+                    .or_insert(entry.pagerank);
+            }
+            if entry.reputation != 0.0 {
+                reputation_scores
+                    .entry(entry.entity_id)
+                    .and_modify(|score| *score = (*score + entry.reputation).clamp(-1.0, 1.0))
+                    .or_insert(entry.reputation.clamp(-1.0, 1.0));
+            }
+        }
+    }
+    Ok((pagerank_scores, reputation_scores))
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -7961,6 +8229,25 @@ fn collapse_duplicate_variant_documents(
     collapsed
 }
 
+fn apply_result_filters(
+    results: &mut Vec<crate::hybrid_search::SearchResult>,
+    min_score: Option<f64>,
+    memory_kinds: Option<&[String]>,
+) {
+    let allowed_kinds = memory_kinds.map(|kinds| {
+        kinds
+            .iter()
+            .map(|kind| kind.to_ascii_lowercase())
+            .collect::<HashSet<_>>()
+    });
+    results.retain(|result| {
+        min_score.is_none_or(|threshold| result.score >= threshold)
+            && allowed_kinds
+                .as_ref()
+                .is_none_or(|kinds| kinds.contains(&result.memory_kind.to_ascii_lowercase()))
+    });
+}
+
 fn merge_query_variant_outputs(
     outputs: Vec<QueryVariantSearchOutput>,
     limit: usize,
@@ -7973,7 +8260,7 @@ fn merge_query_variant_outputs(
         for (rank, result) in variant.output.results.iter().enumerate() {
             unique.insert(result.id);
             let variant_weight = if variant_rank == 0 { 4.0 } else { 0.75 };
-            let score = variant_weight / (60.0 + rank as f64 + 1.0);
+            let score = result.score + variant_weight / (60.0 + rank as f64 + 1.0);
             scores
                 .entry(result.id)
                 .and_modify(|(existing_score, existing_result)| {
@@ -8027,6 +8314,154 @@ fn merge_query_variant_outputs(
     }
 }
 
+async fn set_memory_authority<S: crate::storage::Storage>(
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    target_id: uuid::Uuid,
+    session_id: uuid::Uuid,
+    reputation: Option<f64>,
+    pagerank: Option<f64>,
+) -> Result<crate::types::WarmthEntry, (i32, String)> {
+    let now = chrono::Utc::now();
+    let mut entry = storage
+        .warmth_get(ctx, target_id)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+        .unwrap_or(crate::types::WarmthEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: target_id,
+            session_id,
+            warmth: 0.0,
+            pagerank: 0.0,
+            reputation: 0.0,
+            last_accessed_at: now,
+            access_count: 0,
+            decay_zone: crate::types::DecayZone::Knowledge,
+            updated_at: now,
+        });
+    entry.session_id = session_id;
+    if let Some(score) = reputation {
+        entry.reputation = score.clamp(-1.0, 1.0);
+    }
+    if let Some(score) = pagerank {
+        entry.pagerank = score.clamp(0.0, 1.0);
+    }
+    entry.updated_at = now;
+    storage
+        .warmth_put(ctx, &entry)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    Ok(entry)
+}
+
+fn authority_target_ids(args: &Value) -> Result<Vec<uuid::Uuid>, (i32, String)> {
+    let mut target_ids = Vec::new();
+    if let Some(target_id) = args.get("target_id").and_then(Value::as_str) {
+        target_ids.push(uuid::Uuid::parse_str(target_id).map_err(|e| {
+            (
+                INVALID_PARAMS,
+                format!("target_id is not a valid UUID: {e}"),
+            )
+        })?);
+    }
+    if let Some(values) = args.get("target_ids").and_then(Value::as_array) {
+        for value in values {
+            let Some(raw) = value.as_str() else {
+                return Err((
+                    INVALID_PARAMS,
+                    "target_ids entries must be UUID strings".into(),
+                ));
+            };
+            target_ids.push(uuid::Uuid::parse_str(raw).map_err(|e| {
+                (
+                    INVALID_PARAMS,
+                    format!("target_ids contains an invalid UUID: {e}"),
+                )
+            })?);
+        }
+    }
+    target_ids.sort_unstable();
+    target_ids.dedup();
+    if target_ids.is_empty() {
+        return Err((
+            INVALID_PARAMS,
+            "manage_authority requires target_id or target_ids".into(),
+        ));
+    }
+    Ok(target_ids)
+}
+
+fn authority_session_id(
+    args: &Value,
+    ctx: &crate::types::TenantContext,
+) -> Result<(uuid::Uuid, &'static str), (i32, String)> {
+    let requested_scope = if args.get("global").and_then(Value::as_bool).unwrap_or(false) {
+        "global"
+    } else {
+        args.get("scope")
+            .and_then(Value::as_str)
+            .unwrap_or("session")
+    };
+    match requested_scope {
+        "global" => Ok((
+            crate::scope::tenant_global_session_uuid(ctx.tenant_id),
+            "global",
+        )),
+        "session" => Ok((
+            optional_uuid(args, "session_id")?.unwrap_or(uuid::Uuid::nil()),
+            "session",
+        )),
+        other => Err((
+            INVALID_PARAMS,
+            format!("invalid authority scope: expected session|global, got {other}"),
+        )),
+    }
+}
+
+async fn handle_manage_authority<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let target_ids = authority_target_ids(&args)?;
+    let reputation = args
+        .get("reputation")
+        .and_then(Value::as_f64)
+        .map(|score| score.clamp(-1.0, 1.0));
+    let pagerank = args
+        .get("pagerank")
+        .and_then(Value::as_f64)
+        .map(|score| score.clamp(0.0, 1.0));
+    if reputation.is_none() && pagerank.is_none() {
+        return Err((
+            INVALID_PARAMS,
+            "manage_authority requires reputation and/or pagerank".into(),
+        ));
+    }
+    let (session_id, scope) = authority_session_id(&args, ctx)?;
+    let mut updated = Vec::with_capacity(target_ids.len());
+    for target_id in target_ids {
+        let entry =
+            set_memory_authority(storage, ctx, target_id, session_id, reputation, pagerank).await?;
+        updated.push(serde_json::json!({
+            "target_id": target_id,
+            "session_id": session_id,
+            "scope": scope,
+            "reputation": entry.reputation,
+            "pagerank": entry.pagerank
+        }));
+    }
+
+    Ok(serde_json::json!({
+        "updated": updated,
+        "count": updated.len(),
+        "scope": scope,
+        "session_id": session_id,
+        "reason": args.get("reason").and_then(Value::as_str),
+        "hint": "Authority updated. Future hybrid_search calls that include this scope will boost trusted IDs and demote negative-reputation IDs after relevance scoring."
+    }))
+}
+
 async fn handle_hybrid_search<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
@@ -8054,6 +8489,18 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         .map(|value| value as usize)
         .filter(|value| *value > 0)
         .map(|value| value.min(50));
+    let min_score = args
+        .get("min_score")
+        .and_then(Value::as_f64)
+        .filter(|value| *value >= 0.0);
+    let memory_kinds = {
+        let kinds = optional_string_array(&args, "memory_kinds")?
+            .into_iter()
+            .map(|kind| kind.to_ascii_lowercase())
+            .filter(|kind| matches!(kind.as_str(), "episodic" | "procedural" | "semantic"))
+            .collect::<Vec<_>>();
+        (!kinds.is_empty()).then_some(kinds)
+    };
     let filter = crate::hybrid_search::SearchFilter {
         scope: parse_hybrid_search_scope(&args)?,
         entity_types: None,
@@ -8064,6 +8511,8 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
             .and_then(|v| v.as_str())
             .map(str::to_string),
         candidate_limit,
+        min_score,
+        memory_kinds,
     };
     let query_decomposition_mode = args
         .get("query_decomposition")
@@ -8189,6 +8638,19 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         }
     }
 
+    // The MCP handler recomputes scores when it merges query variants, so
+    // `min_score` must be applied after that final score is known. Keep lower
+    // search broad enough to contribute candidates; category filters are safe
+    // because they do not depend on score scale.
+    let mut pre_merge_filter = filter.clone();
+    pre_merge_filter.min_score = None;
+    let (pagerank_scores, reputation_scores) =
+        load_authority_score_maps(storage, ctx, session_id, filter.scope)
+            .await
+            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    let pagerank_scores_ref = (!pagerank_scores.is_empty()).then_some(&pagerank_scores);
+    let reputation_scores_ref = (!reputation_scores.is_empty()).then_some(&reputation_scores);
+
     let mut query_outputs = Vec::with_capacity(query_variants.len());
     for (idx, variant_query) in query_variants.iter().enumerate() {
         let mut variant_embedding = embedding.clone();
@@ -8223,10 +8685,10 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
             variant_embedding.as_deref(),
             search_limit,
             None,
-            None,
-            None,
+            pagerank_scores_ref,
+            reputation_scores_ref,
             &fusion_config,
-            Some(&filter),
+            Some(&pre_merge_filter),
         )
         .await
         .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
@@ -8252,6 +8714,11 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
     query_merged_output.diagnostics.generator_status = query_generator_status;
     let query_decomposition_report = query_merged_output.diagnostics;
     let mut all_results = query_merged_output.results;
+    apply_result_filters(
+        &mut all_results,
+        filter.min_score,
+        filter.memory_kinds.as_deref(),
+    );
     let chunk_expansion_config = parse_chunk_expansion(&args)?;
     let chunk_expansion_report = apply_chunk_expansion(
         storage,
@@ -8267,7 +8734,7 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         .get("rerank_candidates")
         .and_then(Value::as_u64)
         .map(|value| value as usize);
-    let (all_results, reranker_report) = maybe_llm_rerank_results(
+    let (mut all_results, reranker_report) = maybe_llm_rerank_results(
         query,
         all_results,
         session,
@@ -8312,6 +8779,7 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
             }
         }
     }
+    apply_llm_judge_authority(&mut all_results, &reranker_report);
     let results: Vec<_> = all_results.into_iter().skip(offset).take(limit).collect();
     let result_count = results.len();
 
@@ -8705,6 +9173,76 @@ async fn handle_system_describe<S: crate::storage::Storage>(
 /// Propose (no `forget_token`): searches candidates, returns a signed token +
 /// blast radius, mutates nothing. Confirm (`forget_token` + `confirm: true`):
 /// retracts (default, reversible) or hard-deletes the explicitly selected ids.
+async fn collect_forget_dependent_authority_targets<S: crate::storage::Storage>(
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    token: &crate::forget::ForgetToken,
+    selected_ids: &[uuid::Uuid],
+) -> Result<HashSet<uuid::Uuid>, (i32, String)> {
+    let selected = selected_ids.iter().copied().collect::<HashSet<_>>();
+    let mut dependents = HashSet::new();
+    for candidate in token
+        .candidates
+        .iter()
+        .filter(|candidate| selected.contains(&candidate.object_id))
+    {
+        let inbound = storage
+            .typed_edge_list_to(ctx, candidate.session_id, candidate.object_id)
+            .await
+            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+        for edge in inbound {
+            if !selected.contains(&edge.src_id) {
+                dependents.insert(edge.src_id);
+            }
+        }
+    }
+    Ok(dependents)
+}
+
+async fn apply_forget_authority<S: crate::storage::Storage>(
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    token: &crate::forget::ForgetToken,
+    forgotten: &[crate::forget::ForgottenItem],
+    dependent_ids: &HashSet<uuid::Uuid>,
+) -> Result<Value, (i32, String)> {
+    let sessions = token
+        .candidates
+        .iter()
+        .map(|candidate| (candidate.object_id, candidate.session_id))
+        .collect::<HashMap<_, _>>();
+    let mut forgotten_updated = Vec::new();
+    for item in forgotten {
+        let session_id = sessions
+            .get(&item.id)
+            .copied()
+            .unwrap_or_else(uuid::Uuid::nil);
+        set_memory_authority(storage, ctx, item.id, session_id, Some(-1.0), Some(0.0)).await?;
+        forgotten_updated.push(item.id);
+    }
+
+    let mut dependent_updated = Vec::new();
+    for dependent_id in dependent_ids {
+        set_memory_authority(
+            storage,
+            ctx,
+            *dependent_id,
+            uuid::Uuid::nil(),
+            Some(-0.35),
+            None,
+        )
+        .await?;
+        dependent_updated.push(*dependent_id);
+    }
+    dependent_updated.sort_unstable();
+
+    Ok(serde_json::json!({
+        "forgotten_hard_negative": forgotten_updated,
+        "dependents_demoted": dependent_updated,
+        "dependent_reputation": -0.35
+    }))
+}
+
 async fn handle_forget<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
@@ -8762,6 +9300,11 @@ async fn handle_forget<S: crate::storage::Storage>(
             .get("actor")
             .and_then(|v| v.as_str())
             .unwrap_or(ctx.session_origin.as_str());
+        let authority_token = crate::forget::decode(token_str, key, cfg.token_ttl_seconds, now)
+            .map_err(|e| (INVALID_PARAMS, e.to_string()))?;
+        let dependent_authority_targets =
+            collect_forget_dependent_authority_targets(storage, ctx, &authority_token, &selected)
+                .await?;
         let result = crate::forget::confirm(
             storage,
             ctx,
@@ -8779,7 +9322,27 @@ async fn handle_forget<S: crate::storage::Storage>(
         )
         .await
         .map_err(|e| (INVALID_PARAMS, e.to_string()))?;
-        return serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()));
+        let authority = apply_forget_authority(
+            storage,
+            ctx,
+            &authority_token,
+            &result.forgotten,
+            &dependent_authority_targets,
+        )
+        .await?;
+        let mut value =
+            serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("authority".into(), authority);
+            obj.insert(
+                "hint".into(),
+                Value::String(
+                    "Forget confirmed. Forgotten IDs are now hard-negative authority; inbound dependents were demoted for review."
+                        .into(),
+                ),
+            );
+        }
+        return Ok(value);
     }
 
     // Propose phase (read-only).
@@ -8818,7 +9381,17 @@ async fn handle_forget<S: crate::storage::Storage>(
     )
     .await
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
-    serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+    let mut value = serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "hint".into(),
+            Value::String(
+                "Review candidates and blast radius with the user. Only call forget again with confirm:true for user-approved selected_ids."
+                    .into(),
+            ),
+        );
+    }
+    Ok(value)
 }
 
 /// `restore_forgotten` — reverse a retraction (un-retract an entity).
@@ -12733,8 +13306,8 @@ mod tests {
             tenant_id: ctx.tenant_id,
             depth: 0,
             parent_fold_id: None,
-            raw_trajectory: "discussed architecture".into(),
-            fold_summary: Some("Architecture discussion summary".into()),
+            raw_trajectory: "Bob discussed architecture".into(),
+            fold_summary: Some("Bob architecture discussion summary".into()),
             fold_embedding: Some(vec![0.1, 0.2, 0.3]),
             token_count: 100,
             compression_ratio: Some(0.5),
@@ -13652,6 +14225,376 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hybrid_search_min_score_uses_post_merge_score_for_session_context() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            ollama_base_url: String::new(),
+            ..SessionState::default()
+        };
+        let configured = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "config",
+                "arguments": {
+                    "session_start": {
+                        "agent": "codex",
+                        "agent_session_id": "session-context-score-probe",
+                        "workspace": "/repo/ferrosa-memory"
+                    }
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let configured = unwrap_tool_result(configured);
+        let sid = Uuid::parse_str(configured["session_id"].as_str().unwrap()).unwrap();
+        let segment_id = Uuid::new_v4();
+        store
+            .context_segments
+            .lock()
+            .await
+            .push(crate::context_segment::ContextSegment {
+                tenant_id: ctx.tenant_id,
+                session_id: sid,
+                segment_id,
+                source_session: sid,
+                source_fold_id: None,
+                conversation_id: "codex:score-probe".into(),
+                segment_index: 0,
+                start_turn: 0,
+                end_turn: 1,
+                start_time: None,
+                end_time: None,
+                segment_text:
+                    "SESSION_CONTEXT_SCORE_PROBE should survive final min_score filtering".into(),
+                segment_summary: None,
+                bm25_text: "SESSION_CONTEXT_SCORE_PROBE should survive final min_score filtering"
+                    .into(),
+                segment_embedding: None,
+                token_count: 12,
+                content_hash: segment_id.to_string(),
+                prev_segment_id: None,
+                next_segment_id: None,
+                created_at: chrono::Utc::now(),
+            });
+
+        let found = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "hybrid_search",
+                "arguments": {
+                    "query": "SESSION_CONTEXT_SCORE_PROBE",
+                    "scope": "session",
+                    "min_score": 0.065
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let found = unwrap_tool_result(found);
+
+        assert_eq!(found["count"], 1);
+        assert_eq!(found["results"][0]["id"], segment_id.to_string());
+        assert!(found["results"][0]["score"].as_f64().unwrap() >= 0.065);
+    }
+
+    #[tokio::test]
+    async fn manage_authority_sets_global_reputation_and_pagerank() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let target_id = Uuid::new_v4();
+
+        let updated = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "manage_authority",
+                "arguments": {
+                    "target_id": target_id.to_string(),
+                    "reputation": 1.0,
+                    "pagerank": 0.8,
+                    "scope": "global",
+                    "reason": "curated corpus"
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let updated = unwrap_tool_result(updated);
+        assert_eq!(updated["count"], 1);
+        assert_eq!(updated["scope"], "global");
+
+        let entry = store.warmth_get(&ctx, target_id).await.unwrap().unwrap();
+        assert_eq!(
+            entry.session_id,
+            crate::scope::tenant_global_session_uuid(ctx.tenant_id)
+        );
+        assert_eq!(entry.reputation, 1.0);
+        assert_eq!(entry.pagerank, 0.8);
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_applies_persisted_global_authority_to_document_chunks() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            ollama_base_url: String::new(),
+            ..SessionState::default()
+        };
+        let global_session = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
+        let noisy_id = Uuid::new_v4();
+        let curated_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let chunk = |chunk_id, ordinal, content: &str| crate::types::DocumentChunk {
+            tenant_id: ctx.tenant_id,
+            session_id: global_session,
+            document_id: chunk_id,
+            chunk_id,
+            ordinal,
+            source_doc_id: format!("authority-doc-{ordinal}"),
+            title: format!("authority doc {ordinal}"),
+            section_path: String::new(),
+            semantic_kind: "text".into(),
+            content: content.into(),
+            bm25_text: content.into(),
+            chunk_embedding: None,
+            token_count: 16,
+            content_hash: chunk_id.to_string(),
+            prev_chunk_id: None,
+            next_chunk_id: None,
+            overlap_from_prev: false,
+            overlap_to_next: false,
+            metadata: serde_json::Value::Null,
+            created_at: now,
+            updated_at: now,
+        };
+        store.document_chunks.lock().await.extend([
+            chunk(
+                noisy_id,
+                0,
+                "curated authority corpus stale transcript clutter",
+            ),
+            chunk(
+                curated_id,
+                1,
+                "curated authority corpus trusted skill documentation",
+            ),
+        ]);
+
+        dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "manage_authority",
+                "arguments": {
+                    "target_ids": [curated_id.to_string()],
+                    "reputation": 1.0,
+                    "pagerank": 1.0,
+                    "scope": "global"
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "manage_authority",
+                "arguments": {
+                    "target_id": noisy_id.to_string(),
+                    "reputation": -1.0,
+                    "scope": "global"
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+
+        let found = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "hybrid_search",
+                "arguments": {
+                    "query": "curated authority corpus",
+                    "scope": "global",
+                    "limit": 2
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let found = unwrap_tool_result(found);
+        assert_eq!(found["count"], 1);
+        assert_eq!(found["results"][0]["id"], curated_id.to_string());
+        let curated_score = found["results"][0]["score"].as_f64().unwrap();
+        assert!(curated_score > 0.5);
+    }
+
+    #[tokio::test]
+    async fn context_ingest_marks_explicit_remember_turns_as_authoritative() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+
+        let result = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "ingest_context_segments",
+                "arguments": {
+                    "session_id": sid.to_string(),
+                    "conversation_id": "remember-authority-test",
+                    "embed_missing": false,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "Please remember PROJECT_AUTHORITY_SIGNAL_42: curated corpus should win.",
+                            "turn_index": 0
+                        },
+                        {
+                            "role": "assistant",
+                            "content": "I will remember PROJECT_AUTHORITY_SIGNAL_42.",
+                            "turn_index": 1
+                        }
+                    ]
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let result = unwrap_tool_result(result);
+        let segment_id =
+            Uuid::parse_str(result["segments"][0]["segment_id"].as_str().unwrap()).unwrap();
+
+        let entry = store.warmth_get(&ctx, segment_id).await.unwrap().unwrap();
+        assert_eq!(entry.session_id, sid);
+        assert_eq!(entry.reputation, 1.0);
+        assert_eq!(entry.pagerank, 0.85);
+        assert!(
+            result["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning
+                    .as_str()
+                    .unwrap()
+                    .contains("authority_seeded_for_explicit_remember"))
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_confirm_applies_negative_authority_to_forgotten_and_dependents() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+        let victim = test_entity(
+            &ctx,
+            sid,
+            "obsolete endpoint secret",
+            "concept",
+            serde_json::json!({}),
+        );
+        let dependent = test_entity(
+            &ctx,
+            sid,
+            "client behavior depending on obsolete endpoint secret",
+            "concept",
+            serde_json::json!({}),
+        );
+        let victim_id = victim.entity_id;
+        let dependent_id = dependent.entity_id;
+        store.entity_put(&ctx, &victim).await.unwrap();
+        store.entity_put(&ctx, &dependent).await.unwrap();
+        store
+            .typed_edges
+            .lock()
+            .await
+            .push(crate::types::TypedEdge {
+                tenant_id: ctx.tenant_id,
+                session_id: sid,
+                src_id: dependent_id,
+                edge_type: "depends_on".into(),
+                dst_id: victim_id,
+                weight: 1.0,
+                metadata: None,
+                created_at: chrono::Utc::now(),
+            });
+
+        let propose = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "forget",
+                "arguments": {
+                    "session_id": sid.to_string(),
+                    "query": "obsolete endpoint secret"
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let propose = unwrap_tool_result(propose);
+        let token = propose["forget_token"].as_str().unwrap();
+
+        let confirmed = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "forget",
+                "arguments": {
+                    "forget_token": token,
+                    "selected_ids": [victim_id.to_string()],
+                    "confirm": true,
+                    "reason": "user said forget obsolete endpoint secret"
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let confirmed = unwrap_tool_result(confirmed);
+
+        assert_eq!(
+            confirmed["authority"]["forgotten_hard_negative"][0],
+            victim_id.to_string()
+        );
+        assert_eq!(
+            confirmed["authority"]["dependents_demoted"][0],
+            dependent_id.to_string()
+        );
+        let victim_authority = store.warmth_get(&ctx, victim_id).await.unwrap().unwrap();
+        let dependent_authority = store.warmth_get(&ctx, dependent_id).await.unwrap().unwrap();
+        assert_eq!(victim_authority.reputation, -1.0);
+        assert_eq!(victim_authority.pagerank, 0.0);
+        assert_eq!(dependent_authority.reputation, -0.35);
+    }
+
+    #[tokio::test]
     async fn explore_connections_hint_few_results() {
         let store = MockStorage::new();
         let ctx = test_ctx();
@@ -14275,6 +15218,7 @@ mod tests {
         let result = crate::hybrid_search::SearchResult {
             id,
             source: "document_bm25".into(),
+            memory_kind: "semantic".into(),
             content: "hit chunk".into(),
             score: 1.0,
             result_type: "document_chunk".into(),
@@ -14299,6 +15243,31 @@ mod tests {
         assert!(content.contains("hit chunk"));
         assert!(content.contains("Expanded neighboring chunks"));
         assert!(content.contains("neighbor answer text"));
+    }
+
+    #[test]
+    fn rerank_candidate_content_compacts_episodic_transcript_json() {
+        let id = Uuid::new_v4();
+        let raw = r#"user[0]: {"parentUuid":"noise","message":{"role":"user","content":[{"type":"tool_result","content":"FMT_NOW_CLEAN\n M ferrosa/src/main.rs"}]},"toolUseResult":{"stdout":"FMT_NOW_CLEAN\n M ferrosa/src/main.rs"}}"#;
+        let result = crate::hybrid_search::SearchResult {
+            id,
+            source: "context_bm25".into(),
+            memory_kind: "episodic".into(),
+            content: raw.into(),
+            score: 1.0,
+            result_type: "context_segment".into(),
+            document_id: None,
+            prev_chunk_id: None,
+            next_chunk_id: None,
+            hint: None,
+            expanded_context: Vec::new(),
+        };
+
+        let content = rerank_candidate_content(&result);
+
+        assert!(content.contains("tool result: FMT_NOW_CLEAN"));
+        assert!(!content.contains("parentUuid"));
+        assert!(!content.contains("user[0]"));
     }
 
     #[test]
@@ -14380,6 +15349,7 @@ mod tests {
         let result = |id, label: &str| crate::hybrid_search::SearchResult {
             id,
             source: "document_bm25".into(),
+            memory_kind: "semantic".into(),
             content: label.into(),
             score: 1.0,
             result_type: "document_chunk".into(),
@@ -14438,6 +15408,91 @@ mod tests {
     }
 
     #[test]
+    fn apply_result_filters_drops_post_merge_low_scores_and_wrong_kinds() {
+        let keep = Uuid::new_v4();
+        let low = Uuid::new_v4();
+        let episodic = Uuid::new_v4();
+        let result = |id, score, kind: &str| crate::hybrid_search::SearchResult {
+            id,
+            source: "document_bm25".into(),
+            memory_kind: kind.into(),
+            content: "candidate".into(),
+            score,
+            result_type: "document_chunk".into(),
+            document_id: Some(id),
+            prev_chunk_id: None,
+            next_chunk_id: None,
+            hint: None,
+            expanded_context: Vec::new(),
+        };
+        let mut results = vec![
+            result(keep, 0.07, "semantic"),
+            result(low, 0.065574, "semantic"),
+            result(episodic, 0.08, "episodic"),
+        ];
+
+        apply_result_filters(
+            &mut results,
+            Some(0.067),
+            Some(&["semantic".into(), "procedural".into()]),
+        );
+
+        assert_eq!(
+            results.iter().map(|result| result.id).collect::<Vec<_>>(),
+            vec![keep]
+        );
+    }
+
+    #[test]
+    fn apply_llm_judge_authority_boosts_positive_and_removes_negative() {
+        let positive = Uuid::new_v4();
+        let negative = Uuid::new_v4();
+        let abstain = Uuid::new_v4();
+        let result = |id, score| crate::hybrid_search::SearchResult {
+            id,
+            source: "document_bm25".into(),
+            memory_kind: "semantic".into(),
+            content: "candidate".into(),
+            score,
+            result_type: "document_chunk".into(),
+            document_id: Some(id),
+            prev_chunk_id: None,
+            next_chunk_id: None,
+            hint: None,
+            expanded_context: Vec::new(),
+        };
+        let mut results = vec![
+            result(negative, 0.50),
+            result(positive, 0.40),
+            result(abstain, 0.30),
+        ];
+        let report = LlmRerankReport {
+            enabled: true,
+            applied: true,
+            mode: "single".into(),
+            provider: "mock".into(),
+            model: "mock".into(),
+            candidate_count: 3,
+            returned_ids: vec![positive, negative, abstain],
+            judged_ids: vec![positive, negative, abstain],
+            judge_scores: vec![Some(1), Some(-1), None],
+            score_sum: 0,
+            abstentions: 1,
+            batches: Vec::new(),
+            error: None,
+        };
+
+        apply_llm_judge_authority(&mut results, &report);
+
+        assert_eq!(
+            results.iter().map(|result| result.id).collect::<Vec<_>>(),
+            vec![positive, abstain]
+        );
+        assert!(results[0].score > 0.59);
+        assert!(results[1].score < 0.30);
+    }
+
+    #[test]
     fn apply_llm_rerank_order_preserves_omitted_candidates_and_tail() {
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
@@ -14446,6 +15501,7 @@ mod tests {
         let result = |id, content: &str| crate::hybrid_search::SearchResult {
             id,
             source: "entity_ann".into(),
+            memory_kind: "semantic".into(),
             content: content.into(),
             score: 1.0,
             result_type: "entity".into(),
@@ -14479,6 +15535,7 @@ mod tests {
         let result = |id, content: &str| crate::hybrid_search::SearchResult {
             id,
             source: "document_bm25".into(),
+            memory_kind: "semantic".into(),
             content: content.into(),
             score: 1.0,
             result_type: "document_chunk".into(),
@@ -14513,6 +15570,7 @@ mod tests {
         let result = |id, content: &str| crate::hybrid_search::SearchResult {
             id,
             source: "document_bm25".into(),
+            memory_kind: "semantic".into(),
             content: content.into(),
             score: 1.0,
             result_type: "document_chunk".into(),
@@ -14546,6 +15604,7 @@ mod tests {
         let result = |id, content: &str| crate::hybrid_search::SearchResult {
             id,
             source: "document_bm25".into(),
+            memory_kind: "semantic".into(),
             content: content.into(),
             score: 1.0,
             result_type: "document_chunk".into(),

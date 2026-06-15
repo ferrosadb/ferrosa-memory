@@ -16,7 +16,6 @@ import os
 import shutil
 import stat
 import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -110,6 +109,12 @@ def write_hook_env(
         replace_if_contains=":-2.5",
     )
     ensure_env_line(lines, "FERROSA_MEMORY_HOOK_SEARCH_LIMIT", "export FERROSA_MEMORY_HOOK_SEARCH_LIMIT=${FERROSA_MEMORY_HOOK_SEARCH_LIMIT:-5}")
+    ensure_env_line(lines, "FERROSA_MEMORY_HOOK_MIN_SCORE", "export FERROSA_MEMORY_HOOK_MIN_SCORE=${FERROSA_MEMORY_HOOK_MIN_SCORE:-0.0}")
+    ensure_env_line(lines, "FERROSA_MEMORY_HOOK_MIN_JUDGE_SCORE", "export FERROSA_MEMORY_HOOK_MIN_JUDGE_SCORE=${FERROSA_MEMORY_HOOK_MIN_JUDGE_SCORE:-1.0}")
+    ensure_env_line(lines, "FERROSA_MEMORY_HOOK_REQUIRE_JUDGMENT", "export FERROSA_MEMORY_HOOK_REQUIRE_JUDGMENT=${FERROSA_MEMORY_HOOK_REQUIRE_JUDGMENT:-true}")
+    ensure_env_line(lines, "FERROSA_MEMORY_HOOK_INCLUDE_HINTS", "export FERROSA_MEMORY_HOOK_INCLUDE_HINTS=${FERROSA_MEMORY_HOOK_INCLUDE_HINTS:-false}")
+    ensure_env_line(lines, "FERROSA_MEMORY_HOOK_MIN_QUERY_TERMS", "export FERROSA_MEMORY_HOOK_MIN_QUERY_TERMS=${FERROSA_MEMORY_HOOK_MIN_QUERY_TERMS:-2}")
+    ensure_env_line(lines, "FERROSA_MEMORY_HOOK_ALLOWED_KINDS", "export FERROSA_MEMORY_HOOK_ALLOWED_KINDS=${FERROSA_MEMORY_HOOK_ALLOWED_KINDS:-episodic,procedural,semantic}")
     ensure_env_line(lines, "FERROSA_MEMORY_HOOK_CAPTURE_SEGMENTS", "export FERROSA_MEMORY_HOOK_CAPTURE_SEGMENTS=${FERROSA_MEMORY_HOOK_CAPTURE_SEGMENTS:-true}")
     ensure_env_line(lines, "FERROSA_MEMORY_HOOK_EMBED_MISSING", "export FERROSA_MEMORY_HOOK_EMBED_MISSING=${FERROSA_MEMORY_HOOK_EMBED_MISSING:-false}")
     if not any("FERROSA_MEMORY_HOOK_EMBED_MISSING=true" in line for line in lines):
@@ -450,6 +455,18 @@ def write_snippets(install_dir: Path, wrappers: dict[str, dict[str, str]]) -> No
         )
 
 
+def verification_command(command: str) -> list[str]:
+    try:
+        first_line = Path(command).read_text(errors="ignore").splitlines()[0]
+    except (IndexError, OSError):
+        return [command]
+    if first_line.startswith("#!/usr/bin/env bash") or first_line.startswith("#!/bin/bash"):
+        return ["bash", command]
+    if first_line.startswith("#!/usr/bin/env python3") or first_line.startswith("#!/usr/bin/python3"):
+        return ["python3", command]
+    return [command]
+
+
 def verify_wrapper(command: str, mode: str) -> str:
     payload_dict = {
         "prompt": "Ferrosa Memory hook installer verification prompt",
@@ -470,7 +487,7 @@ def verify_wrapper(command: str, mode: str) -> str:
     payload = json.dumps(payload_dict)
     try:
         proc = subprocess.run(
-            [command],
+            verification_command(command),
             input=payload,
             text=True,
             capture_output=True,

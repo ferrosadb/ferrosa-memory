@@ -1474,7 +1474,7 @@ impl CqlStorage {
             // Warmth (Sprint 5)
             warmth_get: session
                 .prepare(format!(
-                    "SELECT entity_id, session_id, warmth, pagerank, last_accessed_at, \
+                    "SELECT entity_id, session_id, warmth, pagerank, reputation, last_accessed_at, \
                      access_count, decay_zone, updated_at \
                      FROM {ks}.entity_warmth WHERE tenant_id = ? AND entity_id = ?"
                 ))
@@ -1489,7 +1489,7 @@ impl CqlStorage {
                 .await?,
             warmth_list_session: session
                 .prepare(format!(
-                    "SELECT entity_id, session_id, warmth, pagerank, last_accessed_at, \
+                    "SELECT entity_id, session_id, warmth, pagerank, reputation, last_accessed_at, \
                      access_count, decay_zone, updated_at \
                      FROM {ks}.entity_warmth WHERE session_id = ?"
                 ))
