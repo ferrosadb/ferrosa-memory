@@ -155,6 +155,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "entity/object retraction records (forget audit + restore metadata)",
         ddl: include_str!("../../../ddl/038_retraction_record.cql"),
     },
+    Migration {
+        version: 39,
+        description: "durable active session tasks and focus stack",
+        ddl: include_str!("../../../ddl/039_session_tasks.cql"),
+    },
 ];
 
 /// Pre-versioning DDLs. Applied in order when `run_migrations` detects a

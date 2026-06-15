@@ -335,6 +335,14 @@ fn short_tool_name(canonical: &str) -> Option<&'static str> {
         "write_plan_node" => Some("plan_write"),
         "get_plan_context" => Some("plan"),
         "update_plan_node" => Some("plan_update"),
+        "session_task_put" => Some("task_put"),
+        "session_task_get" => Some("task_get"),
+        "session_task_current" => Some("task_current"),
+        "session_task_list" => Some("task_list"),
+        "session_task_complete" => Some("task_done"),
+        "session_task_cancel" => Some("task_cancel"),
+        "session_task_focus" => Some("task_focus"),
+        "session_task_observe" => Some("task_observe"),
         "start_fold" => Some("fold_start"),
         "append_to_fold" => Some("fold_append"),
         "complete_fold" => Some("fold_done"),
@@ -408,6 +416,14 @@ fn canonical_tool_name(name: &str) -> &str {
         "plan_write" => "write_plan_node",
         "plan" => "get_plan_context",
         "plan_update" => "update_plan_node",
+        "task_put" => "session_task_put",
+        "task_get" => "session_task_get",
+        "task_current" => "session_task_current",
+        "task_list" => "session_task_list",
+        "task_done" => "session_task_complete",
+        "task_cancel" => "session_task_cancel",
+        "task_focus" => "session_task_focus",
+        "task_observe" => "session_task_observe",
         "fold_start" => "start_fold",
         "fold_append" => "append_to_fold",
         "fold_done" => "complete_fold",
@@ -656,6 +672,120 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                     "outcome_summary": { "type": "string", "maxLength": 4096 }
                 },
                 "required": ["depth", "subtask_id", "status"]
+            }),
+        },
+        ToolDef {
+            name: "session_task_put".into(),
+            description: "Creates or upserts a durable fmem-owned session task. If task_id is omitted, fmem generates the canonical id. Use aliases only as scoped client-visible references.\n\nCALL WHEN: Starting work, updating visible work-item metadata, or switching focus to a new task. Prefer this over plan tools for current-task continuity across compaction.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "task_id": { "type": "string", "format": "uuid", "description": "Optional canonical id returned by fmem for updates; omit on create." },
+                    "title": { "type": "string", "maxLength": 512 },
+                    "description": { "type": "string", "maxLength": 8192 },
+                    "status": { "type": "string", "enum": ["pending", "in_progress", "blocked", "completed", "cancelled", "superseded"] },
+                    "priority": { "type": "integer", "minimum": 0, "maximum": 1000 },
+                    "tags": { "type": "array", "items": { "type": "string" } },
+                    "parent_task_id": { "type": "string", "format": "uuid" },
+                    "alias_scope": { "type": "string", "maxLength": 256 },
+                    "alias": { "type": "string", "maxLength": 256 },
+                    "focus": { "type": "boolean", "description": "Default true. Pushes current focus down the stack and focuses this task." },
+                    "client_agent": { "type": "string" },
+                    "workspace": { "type": "string" },
+                    "thread_id": { "type": "string" },
+                    "external_session_id": { "type": "string" }
+                },
+                "required": ["title"]
+            }),
+        },
+        ToolDef {
+            name: "session_task_get".into(),
+            description: "Reads a durable session task by canonical task_id, or by scoped alias when task_id is omitted.\n\nCALL WHEN: Rehydrating task detail after compaction or resolving a client-visible work-item alias.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "task_id": { "type": "string", "format": "uuid" },
+                    "alias_scope": { "type": "string" },
+                    "alias": { "type": "string" }
+                },
+                "required": []
+            }),
+        },
+        ToolDef {
+            name: "session_task_current".into(),
+            description: "Returns the deterministic current-task snapshot: foreground task, active working set, focus stack, and recovery hints.\n\nCALL WHEN: Session starts, after compaction, before writing if the agent may be lost, or before deciding to plan more work.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "session_id": { "type": "string" } },
+                "required": []
+            }),
+        },
+        ToolDef {
+            name: "session_task_list".into(),
+            description: "Lists durable session tasks, optionally filtered by lifecycle status. Returns focus/priority sorted tasks.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "status": { "type": "string", "enum": ["pending", "in_progress", "blocked", "completed", "cancelled", "superseded"] }
+                },
+                "required": []
+            }),
+        },
+        ToolDef {
+            name: "session_task_complete".into(),
+            description: "Marks a task completed without hard delete. If a suspended task is on the focus stack, returns a resume candidate and action according to policy.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "task_id": { "type": "string", "format": "uuid" },
+                    "outcome_summary": { "type": "string", "maxLength": 4096 }
+                },
+                "required": ["task_id"]
+            }),
+        },
+        ToolDef {
+            name: "session_task_cancel".into(),
+            description: "Marks a task cancelled without hard delete and updates focus stack recovery state.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "task_id": { "type": "string", "format": "uuid" },
+                    "outcome_summary": { "type": "string", "maxLength": 4096 }
+                },
+                "required": ["task_id"]
+            }),
+        },
+        ToolDef {
+            name: "session_task_focus".into(),
+            description: "Moves an existing non-terminal task to foreground and pushes the previous foreground down the focus stack.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "task_id": { "type": "string", "format": "uuid" },
+                    "reason": { "type": "string", "maxLength": 512 }
+                },
+                "required": ["task_id"]
+            }),
+        },
+        ToolDef {
+            name: "session_task_observe".into(),
+            description: "Deterministic v1 observation hook for clients/hook code. Handles explicit task-shift, completion, and lost-agent signals; returns actions and hints without requiring an LLM judge.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "event_type": { "type": "string", "enum": ["user_requested_new_task", "user_requested_switch", "task_completed", "agent_lost", "context_reset"] },
+                    "task_id": { "type": "string", "format": "uuid" },
+                    "title": { "type": "string" },
+                    "payload": { "type": "object" }
+                },
+                "required": ["event_type"]
             }),
         },
         // --- Fold tools (Sprint 2) ---
@@ -2061,6 +2191,24 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "write_plan_node" => Box::pin(handle_write_plan(args, storage, ctx)),
         "get_plan_context" => Box::pin(handle_get_plan(args, storage, ctx)),
         "update_plan_node" => Box::pin(handle_update_plan(args, storage, ctx)),
+        "session_task_put" => Box::pin(handle_session_task_put(args, storage, ctx)),
+        "session_task_get" => Box::pin(handle_session_task_get(args, storage, ctx)),
+        "session_task_current" => Box::pin(handle_session_task_current(args, storage, ctx)),
+        "session_task_list" => Box::pin(handle_session_task_list(args, storage, ctx)),
+        "session_task_complete" => Box::pin(handle_session_task_lifecycle(
+            args,
+            storage,
+            ctx,
+            crate::types::SessionTaskStatus::Completed,
+        )),
+        "session_task_cancel" => Box::pin(handle_session_task_lifecycle(
+            args,
+            storage,
+            ctx,
+            crate::types::SessionTaskStatus::Cancelled,
+        )),
+        "session_task_focus" => Box::pin(handle_session_task_focus(args, storage, ctx)),
+        "session_task_observe" => Box::pin(handle_session_task_observe(args, storage, ctx)),
         "start_fold" => Box::pin(handle_start_fold(args, storage, ctx)),
         "append_to_fold" => Box::pin(handle_append_fold(args, storage, ctx)),
         "complete_fold" => Box::pin(handle_complete_fold(args, storage, ctx, session)),
@@ -2294,6 +2442,14 @@ fn is_tier1(name: &str) -> bool {
             | "record_feedback"
             | "create_edge"
             | "check_intentions"
+            | "session_task_put"
+            | "session_task_get"
+            | "session_task_current"
+            | "session_task_list"
+            | "session_task_complete"
+            | "session_task_cancel"
+            | "session_task_focus"
+            | "session_task_observe"
             | "get_stats"
             | "retrieve_entities"
             | "list_entities"
@@ -2310,6 +2466,11 @@ fn is_write_tool(name: &str) -> bool {
         "store_memo_result"
             | "write_plan_node"
             | "update_plan_node"
+            | "session_task_put"
+            | "session_task_complete"
+            | "session_task_cancel"
+            | "session_task_focus"
+            | "session_task_observe"
             | "start_fold"
             | "append_to_fold"
             | "complete_fold"
@@ -2614,6 +2775,189 @@ async fn handle_update_plan<S: crate::storage::Storage>(
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
     Ok(serde_json::json!({ "updated": updated }))
+}
+
+async fn handle_session_task_put<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+    let title = require_str(&args, "title")?.to_string();
+    let status = match args.get("status").and_then(|value| value.as_str()) {
+        Some(value) => Some(parse_session_task_status_param(value)?),
+        None => None,
+    };
+    let input = crate::session_task::SessionTaskUpsert {
+        session_id,
+        task_id: optional_uuid(&args, "task_id")?,
+        title,
+        description: args
+            .get("description")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        status,
+        priority: args
+            .get("priority")
+            .and_then(|value| value.as_i64())
+            .map(|value| value as i32),
+        tags: optional_string_array(&args, "tags")?,
+        parent_task_id: optional_uuid(&args, "parent_task_id")?,
+        client: crate::types::SessionTaskClient {
+            agent: args
+                .get("client_agent")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            workspace: args
+                .get("workspace")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            thread_id: args
+                .get("thread_id")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            external_session_id: args
+                .get("external_session_id")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+        },
+        alias_scope: args
+            .get("alias_scope")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        alias: args
+            .get("alias")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        focus: args
+            .get("focus")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true),
+    };
+    let result = crate::session_task::put_task(storage, ctx, input)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
+async fn handle_session_task_get<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+    let task = if let Some(task_id) = optional_uuid(&args, "task_id")? {
+        crate::session_task::get_task(storage, ctx, session_id, task_id)
+            .await
+            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+    } else if let (Some(alias_scope), Some(alias)) = (
+        args.get("alias_scope").and_then(|value| value.as_str()),
+        args.get("alias").and_then(|value| value.as_str()),
+    ) {
+        crate::session_task::resolve_alias(storage, ctx, session_id, alias_scope, alias)
+            .await
+            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+    } else {
+        return Err((
+            INVALID_PARAMS,
+            "task_id or alias_scope+alias is required".to_string(),
+        ));
+    };
+    Ok(serde_json::json!({ "task": task }))
+}
+
+async fn handle_session_task_current<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+    let snapshot = crate::session_task::current_tasks(storage, ctx, session_id)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    serde_json::to_value(snapshot).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
+async fn handle_session_task_list<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+    let status = match args.get("status").and_then(|value| value.as_str()) {
+        Some(value) => Some(parse_session_task_status_param(value)?),
+        None => None,
+    };
+    let tasks = crate::session_task::list_tasks(storage, ctx, session_id, status)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    Ok(serde_json::json!({ "tasks": tasks }))
+}
+
+async fn handle_session_task_lifecycle<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    status: crate::types::SessionTaskStatus,
+) -> Result<Value, (i32, String)> {
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+    let task_id = require_uuid(&args, "task_id")?;
+    let outcome_summary = args
+        .get("outcome_summary")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let result = crate::session_task::update_status(
+        storage,
+        ctx,
+        session_id,
+        task_id,
+        status,
+        outcome_summary,
+    )
+    .await
+    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
+async fn handle_session_task_focus<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+    let task_id = require_uuid(&args, "task_id")?;
+    let reason = args
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .unwrap_or("client_focus");
+    let snapshot = crate::session_task::focus_task(storage, ctx, session_id, task_id, reason)
+        .await
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    serde_json::to_value(snapshot).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
+async fn handle_session_task_observe<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+    let event_type = require_str(&args, "event_type")?;
+    let task_id = optional_uuid(&args, "task_id")?;
+    let title = args
+        .get("title")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let payload = args
+        .get("payload")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let result = crate::session_task::observe(
+        storage, ctx, session_id, event_type, title, task_id, payload,
+    )
+    .await
+    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
 }
 
 // --- Fold handlers ---
@@ -10447,6 +10791,17 @@ fn optional_string_array(args: &Value, field: &str) -> Result<Vec<String>, (i32,
     Ok(parsed)
 }
 
+fn parse_session_task_status_param(
+    status: &str,
+) -> Result<crate::types::SessionTaskStatus, (i32, String)> {
+    serde_json::from_value(Value::String(status.to_string())).map_err(|_| {
+        (
+            INVALID_PARAMS,
+            format!("invalid session task status: {status}"),
+        )
+    })
+}
+
 fn require_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, (i32, String)> {
     args.get(field)
         .and_then(|v| v.as_str())
@@ -10889,7 +11244,7 @@ mod tests {
             expected_tier1,
             "default tools/list should return all tier-1 tools"
         );
-        assert_eq!(tools.len(), 13, "tier-1 tool surface should stay compact");
+        assert_eq!(tools.len(), 21, "tier-1 tool surface should stay compact");
         assert!(
             tools.iter().any(|t| t["name"].as_str() == Some("forget")),
             "forget is a tier-1 tool"
@@ -10902,6 +11257,9 @@ mod tests {
         assert!(names.contains(&"search"));
         assert!(names.contains(&"chunk_ctx"));
         assert!(names.contains(&"turn_chain"));
+        assert!(names.contains(&"task_current"));
+        assert!(names.contains(&"task_put"));
+        assert!(names.contains(&"task_done"));
         assert!(names.contains(&"feedback"));
         assert!(names.contains(&"config"));
         assert!(names.contains(&"edge"));
@@ -11992,6 +12350,56 @@ mod tests {
             .unwrap();
         let result = unwrap_tool_result(result);
         assert_eq!(result["nodes"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_task_round_trip_through_dispatch() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = Uuid::new_v4();
+
+        let put_params = serde_json::json!({
+            "name": "task_put",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "title": "Keep active task durable",
+                "description": "Recover foreground task after compaction",
+                "alias_scope": "thread:test",
+                "alias": "current",
+                "tags": ["continuity"]
+            }
+        });
+        let result = dispatch("tools/call", put_params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["generated_task_id"], true);
+        let task_id = result["task"]["task_id"].as_str().unwrap().to_string();
+
+        let current_params = serde_json::json!({
+            "name": "task_current",
+            "arguments": { "session_id": sid.to_string() }
+        });
+        let current = dispatch("tools/call", current_params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let current = unwrap_tool_result(current);
+        assert_eq!(current["foreground"]["task_id"], task_id);
+
+        let done_params = serde_json::json!({
+            "name": "task_done",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "task_id": task_id,
+                "outcome_summary": "done"
+            }
+        });
+        let done = dispatch("tools/call", done_params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let done = unwrap_tool_result(done);
+        assert_eq!(done["task"]["status"], "completed");
     }
 
     #[tokio::test]

@@ -75,6 +75,7 @@ at startup.
 | [fmea.md](fmea.md) | Failure Mode and Effects Analysis with RPN scoring |
 | [lsp-code-indexing.md](lsp-code-indexing.md) | LSP-based code indexing spec for structural codebase ingestion |
 | [expert-system-knowledge-plane.md](expert-system-knowledge-plane.md) | ferrosa-memory-side expert-system architecture — rule registry, claims, approvals, aliases, derived facts, explanations |
+| [in-process/feat-session-task-continuity.md](in-process/feat-session-task-continuity.md) | Durable client-visible session task continuity, focus stack, aliases, recovery hints, and compact recall injection |
 
 ## Source
 
@@ -88,3 +89,4 @@ All specs derived from `ferrosa-memory-mcp-spec.md` (v0.1, 2026-03-21).
 - **2026-04-10 (update):** Shared HTTP deployment blueprint: real auth boundary, TLS/secret handling, multi-tenant policy, liveness/readiness probes, and viz exposure decision
 - **2026-04-19 (update):** Expert-system knowledge plane review: effective-rule-set gap, core ownership of claims/approvals/aliases, operator console above viz, explanation API risks, and Sprint 8 planning
 - **2026-06-11 (update):** Graph edge reconciliation and turn-chain capture: serving-path graph writes route through the graph client, typed edges are visible through graph/CQL/MCP traversal APIs, hooks use `ingest_entities`, and captured turns link through `next_turn` / `previous_turn` temporal edges.
+- **2026-06-15 (blueprint):** Session task continuity Phase 0 decisions captured: fmem-owned canonical task IDs, scoped aliases, multiple active tasks, persisted focus stack, deterministic v1 task observation, recovery hints, and compact recall injection with temporal-link pointers.

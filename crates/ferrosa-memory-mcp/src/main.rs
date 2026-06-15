@@ -705,6 +705,98 @@ impl Storage for ReconnectingStorage {
         )
     }
 
+    async fn session_task_put(
+        &self,
+        ctx: &TenantContext,
+        task: &SessionTask,
+    ) -> anyhow::Result<()> {
+        delegate!(self, session_task_put, ctx, task)
+    }
+
+    async fn session_task_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        task_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<SessionTask>> {
+        delegate!(self, session_task_get, ctx, session_id, task_id)
+    }
+
+    async fn session_task_list(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        status: Option<SessionTaskStatus>,
+    ) -> anyhow::Result<Vec<SessionTask>> {
+        delegate!(self, session_task_list, ctx, session_id, status)
+    }
+
+    async fn session_task_alias_put(
+        &self,
+        ctx: &TenantContext,
+        alias: &SessionTaskAlias,
+    ) -> anyhow::Result<()> {
+        delegate!(self, session_task_alias_put, ctx, alias)
+    }
+
+    async fn session_task_alias_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        alias_scope: &str,
+        alias: &str,
+    ) -> anyhow::Result<Option<SessionTaskAlias>> {
+        delegate!(
+            self,
+            session_task_alias_get,
+            ctx,
+            session_id,
+            alias_scope,
+            alias
+        )
+    }
+
+    async fn session_task_focus_set(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        entries: &[SessionTaskFocusEntry],
+    ) -> anyhow::Result<()> {
+        delegate!(self, session_task_focus_set, ctx, session_id, entries)
+    }
+
+    async fn session_task_focus_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<SessionTaskFocusEntry>> {
+        delegate!(self, session_task_focus_get, ctx, session_id)
+    }
+
+    async fn session_task_event_put(
+        &self,
+        ctx: &TenantContext,
+        event: &SessionTaskEvent,
+    ) -> anyhow::Result<()> {
+        delegate!(self, session_task_event_put, ctx, event)
+    }
+
+    async fn session_task_policy_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<SessionTaskPolicy>> {
+        delegate!(self, session_task_policy_get, ctx, session_id)
+    }
+
+    async fn session_task_policy_put(
+        &self,
+        ctx: &TenantContext,
+        policy: &SessionTaskPolicy,
+    ) -> anyhow::Result<()> {
+        delegate!(self, session_task_policy_put, ctx, policy)
+    }
+
     async fn fold_put(&self, ctx: &TenantContext, entry: &FoldEntry) -> anyhow::Result<()> {
         delegate!(self, fold_put, ctx, entry)
     }

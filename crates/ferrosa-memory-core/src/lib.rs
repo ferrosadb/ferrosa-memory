@@ -62,6 +62,7 @@ pub mod scope;
 #[cfg(test)]
 mod security_tests;
 pub mod session;
+pub mod session_task;
 pub mod skill;
 pub mod smart_ingest;
 pub mod speculative;

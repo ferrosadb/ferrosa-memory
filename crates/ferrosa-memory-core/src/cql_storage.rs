@@ -70,6 +70,41 @@ where
     T::from_cql(val).map_err(|e| anyhow::anyhow!("column '{}': {}", name, e))
 }
 
+fn session_task_status_string(status: &SessionTaskStatus) -> anyhow::Result<String> {
+    Ok(serde_json::to_string(status)?.trim_matches('"').to_string())
+}
+
+fn parse_session_task_status(status: &str) -> SessionTaskStatus {
+    serde_json::from_str(&format!("\"{status}\"")).unwrap_or(SessionTaskStatus::Pending)
+}
+
+fn row_to_session_task(
+    session_id: Uuid,
+    row: &Row,
+    col_map: &ColMap,
+) -> anyhow::Result<SessionTask> {
+    let status: String = cql_get(row, col_map, "status")?;
+    Ok(SessionTask {
+        session_id,
+        task_id: cql_get(row, col_map, "task_id")?,
+        title: cql_get(row, col_map, "title")?,
+        description: cql_get(row, col_map, "description").unwrap_or_default(),
+        status: parse_session_task_status(&status),
+        priority: cql_get(row, col_map, "priority").unwrap_or(100),
+        tags: cql_get::<Vec<String>>(row, col_map, "tags").unwrap_or_default(),
+        parent_task_id: cql_get(row, col_map, "parent_task_id").ok(),
+        focus_rank: cql_get(row, col_map, "focus_rank").unwrap_or(i32::MAX),
+        client: cql_get::<String>(row, col_map, "client")
+            .ok()
+            .and_then(|client| serde_json::from_str(&client).ok())
+            .unwrap_or_default(),
+        outcome_summary: cql_get(row, col_map, "outcome_summary").ok(),
+        created_at: cql_get(row, col_map, "created_at").unwrap_or_else(|_| chrono::Utc::now()),
+        updated_at: cql_get(row, col_map, "updated_at").unwrap_or_else(|_| chrono::Utc::now()),
+        completed_at: cql_get(row, col_map, "completed_at").ok(),
+    })
+}
+
 /// Read live cluster metadata from the ferrosa CQL system tables.
 ///
 /// Queries `system.local` (node identity), `system.peers_v2` (peer discovery),
@@ -1003,6 +1038,21 @@ struct PreparedStatements {
     plan_get: PreparedStatement,
     plan_get_depth: PreparedStatement,
     plan_update: PreparedStatement,
+    // Session tasks
+    session_task_put_by_id: PreparedStatement,
+    session_task_get_by_id: PreparedStatement,
+    session_task_list_by_session: PreparedStatement,
+    session_task_put_by_status: PreparedStatement,
+    session_task_delete_by_status: PreparedStatement,
+    session_task_list_by_status: PreparedStatement,
+    session_task_alias_put: PreparedStatement,
+    session_task_alias_get: PreparedStatement,
+    session_task_focus_delete: PreparedStatement,
+    session_task_focus_put: PreparedStatement,
+    session_task_focus_get: PreparedStatement,
+    session_task_event_put: PreparedStatement,
+    session_task_policy_get: PreparedStatement,
+    session_task_policy_put: PreparedStatement,
     // Fold
     fold_put: PreparedStatement,
     fold_get: PreparedStatement,
@@ -1135,6 +1185,101 @@ impl CqlStorage {
                 .prepare(format!(
                     "UPDATE {ks}.plan_state SET status = ?, outcome_summary = ?, completed_at = ? \
                      WHERE session_id = ? AND tenant_id = ? AND depth = ? AND subtask_id = ?"
+                ))
+                .await?,
+            session_task_put_by_id: session
+                .prepare(format!(
+                    "INSERT INTO {ks}.session_tasks_by_id \
+                     (tenant_id, session_id, task_id, title, description, status, priority, tags, \
+                      parent_task_id, focus_rank, client, outcome_summary, created_at, updated_at, completed_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                ))
+                .await?,
+            session_task_get_by_id: session
+                .prepare(format!(
+                    "SELECT task_id, title, description, status, priority, tags, parent_task_id, \
+                            focus_rank, client, outcome_summary, created_at, updated_at, completed_at \
+                     FROM {ks}.session_tasks_by_id \
+                     WHERE tenant_id = ? AND session_id = ? AND task_id = ?"
+                ))
+                .await?,
+            session_task_list_by_session: session
+                .prepare(format!(
+                    "SELECT task_id, title, description, status, priority, tags, parent_task_id, \
+                            focus_rank, client, outcome_summary, created_at, updated_at, completed_at \
+                     FROM {ks}.session_tasks_by_id WHERE tenant_id = ? AND session_id = ?"
+                ))
+                .await?,
+            session_task_put_by_status: session
+                .prepare(format!(
+                    "INSERT INTO {ks}.session_tasks_by_status \
+                     (tenant_id, session_id, status, priority, updated_at, task_id, title, parent_task_id, focus_rank) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                ))
+                .await?,
+            session_task_delete_by_status: session
+                .prepare(format!(
+                    "DELETE FROM {ks}.session_tasks_by_status \
+                     WHERE tenant_id = ? AND session_id = ? AND status = ? AND priority = ? AND updated_at = ? AND task_id = ?"
+                ))
+                .await?,
+            session_task_list_by_status: session
+                .prepare(format!(
+                    "SELECT task_id FROM {ks}.session_tasks_by_status \
+                     WHERE tenant_id = ? AND session_id = ? AND status = ?"
+                ))
+                .await?,
+            session_task_alias_put: session
+                .prepare(format!(
+                    "INSERT INTO {ks}.session_task_aliases \
+                     (tenant_id, session_id, alias_scope, alias, task_id, created_at, updated_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?)"
+                ))
+                .await?,
+            session_task_alias_get: session
+                .prepare(format!(
+                    "SELECT task_id, created_at, updated_at FROM {ks}.session_task_aliases \
+                     WHERE tenant_id = ? AND session_id = ? AND alias_scope = ? AND alias = ?"
+                ))
+                .await?,
+            session_task_focus_delete: session
+                .prepare(format!(
+                    "DELETE FROM {ks}.session_task_focus_stack WHERE tenant_id = ? AND session_id = ?"
+                ))
+                .await?,
+            session_task_focus_put: session
+                .prepare(format!(
+                    "INSERT INTO {ks}.session_task_focus_stack \
+                     (tenant_id, session_id, stack_index, task_id, reason, created_at) \
+                     VALUES (?, ?, ?, ?, ?, ?)"
+                ))
+                .await?,
+            session_task_focus_get: session
+                .prepare(format!(
+                    "SELECT stack_index, task_id, reason, created_at \
+                     FROM {ks}.session_task_focus_stack WHERE tenant_id = ? AND session_id = ?"
+                ))
+                .await?,
+            session_task_event_put: session
+                .prepare(format!(
+                    "INSERT INTO {ks}.session_task_events \
+                     (tenant_id, session_id, created_at, event_id, task_id, event_type, payload) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?)"
+                ))
+                .await?,
+            session_task_policy_get: session
+                .prepare(format!(
+                    "SELECT auto_task_detection, auto_resume, max_active_before_subagents, \
+                            max_children_before_subagents, confidence_threshold, updated_at \
+                     FROM {ks}.session_task_policies WHERE tenant_id = ? AND session_id = ?"
+                ))
+                .await?,
+            session_task_policy_put: session
+                .prepare(format!(
+                    "INSERT INTO {ks}.session_task_policies \
+                     (tenant_id, session_id, auto_task_detection, auto_resume, max_active_before_subagents, \
+                      max_children_before_subagents, confidence_threshold, updated_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
                 ))
                 .await?,
             fold_put: session
@@ -2091,6 +2236,308 @@ impl Storage for CqlStorage {
                 ctx.tenant_id,
                 depth,
                 subtask_id.to_string(),
+            ),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn session_task_put(
+        &self,
+        ctx: &TenantContext,
+        task: &SessionTask,
+    ) -> anyhow::Result<()> {
+        if let Some(existing) = self
+            .session_task_get(ctx, task.session_id, task.task_id)
+            .await?
+        {
+            let old_status = session_task_status_string(&existing.status)?;
+            self.exec_prepared_rows(
+                &self.stmts.session_task_delete_by_status,
+                (
+                    ctx.tenant_id,
+                    existing.session_id,
+                    old_status,
+                    existing.priority,
+                    existing.updated_at,
+                    existing.task_id,
+                ),
+            )
+            .await?;
+        }
+
+        let status = session_task_status_string(&task.status)?;
+        self.exec_prepared_rows(
+            &self.stmts.session_task_put_by_id,
+            (
+                ctx.tenant_id,
+                task.session_id,
+                task.task_id,
+                task.title.clone(),
+                task.description.clone(),
+                status.clone(),
+                task.priority,
+                task.tags.clone(),
+                task.parent_task_id,
+                task.focus_rank,
+                serde_json::to_string(&task.client)?,
+                task.outcome_summary.clone(),
+                task.created_at,
+                task.updated_at,
+                task.completed_at,
+            ),
+        )
+        .await?;
+
+        self.exec_prepared_rows(
+            &self.stmts.session_task_put_by_status,
+            (
+                ctx.tenant_id,
+                task.session_id,
+                status,
+                task.priority,
+                task.updated_at,
+                task.task_id,
+                task.title.clone(),
+                task.parent_task_id,
+                task.focus_rank,
+            ),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn session_task_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        task_id: Uuid,
+    ) -> anyhow::Result<Option<SessionTask>> {
+        let (col_map, rows) = self
+            .exec_prepared_rows(
+                &self.stmts.session_task_get_by_id,
+                (ctx.tenant_id, session_id, task_id),
+            )
+            .await?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        Ok(Some(row_to_session_task(session_id, &row, &col_map)?))
+    }
+
+    async fn session_task_list(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        status: Option<SessionTaskStatus>,
+    ) -> anyhow::Result<Vec<SessionTask>> {
+        let mut tasks = Vec::new();
+        if let Some(status) = status {
+            let status = session_task_status_string(&status)?;
+            let (col_map, rows) = self
+                .exec_prepared_rows(
+                    &self.stmts.session_task_list_by_status,
+                    (ctx.tenant_id, session_id, status),
+                )
+                .await?;
+            for row in rows {
+                let task_id: Uuid = cql_get(&row, &col_map, "task_id")?;
+                if let Some(task) = self.session_task_get(ctx, session_id, task_id).await? {
+                    tasks.push(task);
+                }
+            }
+        } else {
+            let (col_map, rows) = self
+                .exec_prepared_rows(
+                    &self.stmts.session_task_list_by_session,
+                    (ctx.tenant_id, session_id),
+                )
+                .await?;
+            for row in rows {
+                tasks.push(row_to_session_task(session_id, &row, &col_map)?);
+            }
+        }
+        tasks.sort_by(|a, b| {
+            a.focus_rank
+                .cmp(&b.focus_rank)
+                .then(a.priority.cmp(&b.priority))
+                .then(b.updated_at.cmp(&a.updated_at))
+                .then(a.task_id.cmp(&b.task_id))
+        });
+        Ok(tasks)
+    }
+
+    async fn session_task_alias_put(
+        &self,
+        ctx: &TenantContext,
+        alias: &SessionTaskAlias,
+    ) -> anyhow::Result<()> {
+        self.exec_prepared_rows(
+            &self.stmts.session_task_alias_put,
+            (
+                ctx.tenant_id,
+                alias.session_id,
+                alias.alias_scope.clone(),
+                alias.alias.clone(),
+                alias.task_id,
+                alias.created_at,
+                alias.updated_at,
+            ),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn session_task_alias_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        alias_scope: &str,
+        alias: &str,
+    ) -> anyhow::Result<Option<SessionTaskAlias>> {
+        let (col_map, rows) = self
+            .exec_prepared_rows(
+                &self.stmts.session_task_alias_get,
+                (
+                    ctx.tenant_id,
+                    session_id,
+                    alias_scope.to_string(),
+                    alias.to_string(),
+                ),
+            )
+            .await?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        Ok(Some(SessionTaskAlias {
+            session_id,
+            alias_scope: alias_scope.to_string(),
+            alias: alias.to_string(),
+            task_id: cql_get(&row, &col_map, "task_id")?,
+            created_at: cql_get(&row, &col_map, "created_at")?,
+            updated_at: cql_get(&row, &col_map, "updated_at")?,
+        }))
+    }
+
+    async fn session_task_focus_set(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        entries: &[SessionTaskFocusEntry],
+    ) -> anyhow::Result<()> {
+        self.exec_prepared_rows(
+            &self.stmts.session_task_focus_delete,
+            (ctx.tenant_id, session_id),
+        )
+        .await?;
+        for entry in entries {
+            self.exec_prepared_rows(
+                &self.stmts.session_task_focus_put,
+                (
+                    ctx.tenant_id,
+                    entry.session_id,
+                    entry.stack_index,
+                    entry.task_id,
+                    entry.reason.clone(),
+                    entry.created_at,
+                ),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn session_task_focus_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<SessionTaskFocusEntry>> {
+        let (col_map, rows) = self
+            .exec_prepared_rows(
+                &self.stmts.session_task_focus_get,
+                (ctx.tenant_id, session_id),
+            )
+            .await?;
+        let mut entries = Vec::with_capacity(rows.len());
+        for row in rows {
+            entries.push(SessionTaskFocusEntry {
+                session_id,
+                stack_index: cql_get(&row, &col_map, "stack_index")?,
+                task_id: cql_get(&row, &col_map, "task_id")?,
+                reason: cql_get(&row, &col_map, "reason")?,
+                created_at: cql_get(&row, &col_map, "created_at")?,
+            });
+        }
+        entries.sort_by_key(|entry| entry.stack_index);
+        Ok(entries)
+    }
+
+    async fn session_task_event_put(
+        &self,
+        ctx: &TenantContext,
+        event: &SessionTaskEvent,
+    ) -> anyhow::Result<()> {
+        self.exec_prepared_rows(
+            &self.stmts.session_task_event_put,
+            (
+                ctx.tenant_id,
+                event.session_id,
+                event.created_at,
+                event.event_id,
+                event.task_id,
+                event.event_type.clone(),
+                serde_json::to_string(&event.payload)?,
+            ),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn session_task_policy_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> anyhow::Result<Option<SessionTaskPolicy>> {
+        let (col_map, rows) = self
+            .exec_prepared_rows(
+                &self.stmts.session_task_policy_get,
+                (ctx.tenant_id, session_id),
+            )
+            .await?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        Ok(Some(SessionTaskPolicy {
+            session_id,
+            auto_task_detection: cql_get(&row, &col_map, "auto_task_detection")?,
+            auto_resume: cql_get(&row, &col_map, "auto_resume")?,
+            max_active_before_subagents: cql_get(&row, &col_map, "max_active_before_subagents")?,
+            max_children_before_subagents: cql_get(
+                &row,
+                &col_map,
+                "max_children_before_subagents",
+            )?,
+            confidence_threshold: cql_get(&row, &col_map, "confidence_threshold")?,
+            updated_at: cql_get(&row, &col_map, "updated_at")?,
+        }))
+    }
+
+    async fn session_task_policy_put(
+        &self,
+        ctx: &TenantContext,
+        policy: &SessionTaskPolicy,
+    ) -> anyhow::Result<()> {
+        self.exec_prepared_rows(
+            &self.stmts.session_task_policy_put,
+            (
+                ctx.tenant_id,
+                policy.session_id,
+                policy.auto_task_detection.clone(),
+                policy.auto_resume.clone(),
+                policy.max_active_before_subagents,
+                policy.max_children_before_subagents,
+                policy.confidence_threshold,
+                policy.updated_at,
             ),
         )
         .await?;
