@@ -2585,12 +2585,12 @@ async fn send_streaming_viz_snapshot<S: Storage>(
                             match chunk {
                                 Some(Ok(typed_edges)) => {
                                     idle_deadline.as_mut().reset(tokio::time::Instant::now() + VIZ_STREAM_IDLE_BUDGET);
-                                    for te in typed_edges {
+                                    for typed_edge in typed_edges {
                                         edge_chunk.push(VizEdge {
-                                            source: te.src_id.to_string(),
-                                            target: te.dst_id.to_string(),
-                                            edge_type: te.edge_type,
-                                            strength: Some(te.weight as f32),
+                                            source: typed_edge.src_id.to_string(),
+                                            target: typed_edge.dst_id.to_string(),
+                                            edge_type: typed_edge.edge_type,
+                                            strength: Some(typed_edge.weight as f32),
                                         });
                                         total_edges += 1;
                                         if edge_chunk.len() >= VIZ_CHUNK_SIZE {
@@ -2666,12 +2666,12 @@ async fn send_streaming_viz_snapshot<S: Storage>(
                                 match chunk {
                                     Some(Ok(typed_edges)) => {
                                         idle_deadline.as_mut().reset(tokio::time::Instant::now() + VIZ_STREAM_IDLE_BUDGET);
-                                        for te in typed_edges {
+                                        for typed_edge in typed_edges {
                                             edge_chunk.push(VizEdge {
-                                                source: te.src_id.to_string(),
-                                                target: te.dst_id.to_string(),
-                                                edge_type: te.edge_type,
-                                                strength: Some(te.weight as f32),
+                                                source: typed_edge.src_id.to_string(),
+                                                target: typed_edge.dst_id.to_string(),
+                                                edge_type: typed_edge.edge_type,
+                                                strength: Some(typed_edge.weight as f32),
                                             });
                                             total_edges += 1;
                                             if edge_chunk.len() >= VIZ_CHUNK_SIZE {
@@ -3007,12 +3007,12 @@ async fn build_snapshot<S: Storage>(
     // requested, probe only the sessions that scope covers.
     let mut typed_edges = match scope {
         VizSnapshotScope::All => match storage.typed_edge_list_all(ctx).await {
-            Ok(te) => {
+            Ok(typed_edge_rows) => {
                 tracing::info!(
-                    count = te.len(),
+                    count = typed_edge_rows.len(),
                     "viz: loaded typed edges across all sessions"
                 );
-                te
+                typed_edge_rows
             }
             Err(e) => {
                 tracing::warn!(error = %e, "viz: typed_edge_list_all failed");
@@ -3034,13 +3034,13 @@ async fn build_snapshot<S: Storage>(
             let mut acc = Vec::new();
             for sid in probe {
                 match storage.typed_edge_list_session(ctx, sid).await {
-                    Ok(mut te) => {
+                    Ok(mut typed_edge_rows) => {
                         tracing::info!(
                             session_id = %sid,
-                            count = te.len(),
+                            count = typed_edge_rows.len(),
                             "viz: loaded typed edges for session"
                         );
-                        acc.append(&mut te);
+                        acc.append(&mut typed_edge_rows);
                     }
                     Err(e) => {
                         tracing::warn!(session_id = %sid, error = %e, "viz: typed_edge_list_session failed");
@@ -3093,18 +3093,22 @@ async fn build_snapshot<S: Storage>(
     }
 
     let mut seen_typed_edges = std::collections::HashSet::new();
-    for te in typed_edges {
-        if !seen_typed_edges.insert((te.src_id, te.edge_type.clone(), te.dst_id)) {
+    for typed_edge in typed_edges {
+        if !seen_typed_edges.insert((
+            typed_edge.src_id,
+            typed_edge.edge_type.clone(),
+            typed_edge.dst_id,
+        )) {
             continue;
         }
-        let src_s = te.src_id.to_string();
-        let dst_s = te.dst_id.to_string();
+        let src_s = typed_edge.src_id.to_string();
+        let dst_s = typed_edge.dst_id.to_string();
         if node_ids.contains(src_s.as_str()) && node_ids.contains(dst_s.as_str()) {
             edges.push(VizEdge {
                 source: src_s,
                 target: dst_s,
-                edge_type: te.edge_type,
-                strength: Some(te.weight as f32),
+                edge_type: typed_edge.edge_type,
+                strength: Some(typed_edge.weight as f32),
             });
         }
     }
@@ -5428,7 +5432,10 @@ mod tests {
         assert!(response.contains("\"node_count_scope\":\"session\""));
         assert!(response.contains("\"derived_fact_count\":1005"));
         assert!(response.contains("\"pending_approvals\":1"));
-        assert!(response.contains("\"rule_count\":10"));
+        assert!(response.contains(&format!(
+            "\"rule_count\":{}",
+            crate::datalog::builtin_rules().len()
+        )));
 
         let degraded_response = handle_http_request(
             "GET",
