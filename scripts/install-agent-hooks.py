@@ -17,6 +17,8 @@ import shutil
 import stat
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 
@@ -30,6 +32,77 @@ def log(message: str) -> None:
 
 def shell_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+# Documentation placeholder that must never be written as an active credential, and
+# must be rejected if a caller passes it (e.g. by accidentally capturing the commented
+# template line). HTTP headers are single-line, so an embedded newline is always invalid.
+AUTH_HEADER_PLACEHOLDER = "Basic <base64 user:password>"
+
+
+def validate_auth_header(value: str) -> str:
+    """Validate an Authorization header value before it is persisted to the hook env.
+
+    Guards the 2026-06-15 footgun where ``grep``-ing the env for the auth header also
+    matched the commented placeholder, producing a two-line value that urllib later
+    rejects at request time with ``ValueError: Invalid header value``. Returns the
+    stripped header; raises ``ValueError`` for empty, multi-line, or placeholder input.
+    """
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValueError("auth header is empty")
+    if "\n" in cleaned or "\r" in cleaned:
+        raise ValueError(
+            "auth header must be a single line (found an embedded newline) — you likely "
+            "captured the commented placeholder too; pass only the real header value"
+        )
+    if "<base64" in cleaned or cleaned == AUTH_HEADER_PLACEHOLDER:
+        raise ValueError("auth header is the documentation placeholder, not a real credential")
+    return cleaned
+
+
+def has_usable_auth(auth_header: str | None, mcp_user: str | None, mcp_password: str | None) -> bool:
+    """True when the configured env can authenticate: a non-empty header, or a full
+    user+password pair (a lone user or lone password cannot build a Basic header)."""
+    if auth_header and auth_header.strip():
+        return True
+    return bool(mcp_user and mcp_password)
+
+
+def auth_consistency_error(
+    server_requires_auth: bool,
+    auth_header: str | None,
+    mcp_user: str | None,
+    mcp_password: str | None,
+) -> str | None:
+    """Return an error message if the auth posture is inconsistent, else ``None``.
+
+    The failure we guard against: the MCP endpoint requires auth (401 unauthenticated)
+    but the hook env has no usable credentials, which installs hooks that silently 401.
+    """
+    if server_requires_auth and not has_usable_auth(auth_header, mcp_user, mcp_password):
+        return (
+            "MCP endpoint requires auth (responds 401 unauthenticated) but no usable "
+            "credentials are configured. Pass --auth-header, or --mcp-user with "
+            "--mcp-password. Installing now would produce hooks that silently fail with 401."
+        )
+    return None
+
+
+def probe_auth_required(mcp_url: str, timeout: float = 5.0) -> bool | None:
+    """Probe the MCP endpoint unauthenticated. Returns True if it rejects the request
+    (401/403), False if it accepts it, or None if the endpoint is unreachable."""
+    body = json.dumps({"jsonrpc": "2.0", "method": "tools/list", "id": 1}).encode()
+    req = urllib.request.Request(
+        mcp_url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status in (401, 403)
+    except urllib.error.HTTPError as exc:
+        return exc.code in (401, 403)
+    except (urllib.error.URLError, OSError):
+        return None
 
 
 def repo_root() -> Path:
@@ -84,6 +157,8 @@ def write_hook_env(
     mcp_user: str | None = None,
     mcp_password: str | None = None,
 ) -> None:
+    if auth_header is not None:
+        auth_header = validate_auth_header(auth_header)
     if env_path.exists():
         lines = env_path.read_text().splitlines()
     else:
@@ -92,7 +167,7 @@ def write_hook_env(
             "# Uncomment one auth style if your MCP endpoint requires auth.",
             "# export FERROSA_MEMORY_MCP_USER='ferrosa_user'",
             "# export FERROSA_MEMORY_MCP_PASSWORD='ferrosa_user'",
-            "# export FERROSA_MEMORY_AUTH_HEADER='Basic <base64 user:password>'",
+            "# Set FERROSA_MEMORY_AUTH_HEADER to your full Authorization header value if the endpoint requires it.",
             "# Set FERROSA_MEMORY_HOOK_EMBED_MISSING=true after configuring an embedding provider.",
         ]
     ensure_env_line(lines, "FERROSA_MEMORY_MCP_URL", f"export FERROSA_MEMORY_MCP_URL={shell_quote(mcp_url)}", replace=True)
@@ -523,12 +598,39 @@ def main() -> int:
     parser.add_argument("--no-apply-config", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verify", action="store_true")
+    parser.add_argument(
+        "--skip-auth-check",
+        action="store_true",
+        help="Skip the MCP auth-consistency preflight (probe endpoint + match against configured creds).",
+    )
     args = parser.parse_args()
 
     root = repo_root()
     hook_path = root / "scripts" / "hooks" / "ferrosa-memory-turn-hook.py"
     if not hook_path.exists():
         raise SystemExit(f"missing hook helper: {hook_path}")
+
+    if args.auth_header is not None:
+        try:
+            args.auth_header = validate_auth_header(args.auth_header)
+        except ValueError as exc:
+            log(f"invalid --auth-header: {exc}")
+            return 2
+
+    if not args.skip_auth_check:
+        required = probe_auth_required(args.mcp_url)
+        if required is None:
+            log(
+                f"WARNING: could not reach {args.mcp_url} to probe its auth requirement; "
+                "skipping consistency check (pass --skip-auth-check to silence)"
+            )
+        elif (err := auth_consistency_error(required, args.auth_header, args.mcp_user, args.mcp_password)):
+            log(f"auth consistency check FAILED: {err}")
+            log("Refusing to install inconsistent hooks. Re-run with --skip-auth-check to override.")
+            return 3
+        else:
+            configured = "yes" if has_usable_auth(args.auth_header, args.mcp_user, args.mcp_password) else "no"
+            log(f"auth consistency OK: server_requires_auth={required}, credentials_configured={configured}")
 
     harnesses = selected_harnesses(args.harness)
     log(f"harnesses: {', '.join(harnesses)}")
