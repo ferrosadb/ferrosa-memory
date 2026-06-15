@@ -12,6 +12,10 @@ path = "src/tools/fix_edge_sessions.rs"
 name = "migrate"
 path = "src/tools/migrate.rs"
 
+[[bin]]
+name = "ferrosa-memory"
+path = "src/tools/ferrosa_memory.rs"
+
 [dependencies]
 ferrosa-memory-core = { path = "../ferrosa-memory-core" }
 tokio = { workspace = true }
