@@ -2368,9 +2368,22 @@ function nodeColor(d) {
 
 // === Render graph ===
 function render() {
+  // Defensive guard: only render/simulate edges whose BOTH endpoints exist in
+  // the current node set. Orphaned typed_edges (endpoint entity deleted) would
+  // otherwise reach d3.forceLink, which leaves the unresolved id as a string and
+  // crashes on the first tick ("Cannot create property 'vx' on string '<uuid>'"),
+  // breaking the entire graph render. See fix/viz-dangling-link-guard.
+  const nodeIds = new Set(nodes.map(n => n.id));
+  const endpointId = v => (v && v.id) || v;
+  const liveEdges = edges.filter(e => nodeIds.has(endpointId(e.source)) && nodeIds.has(endpointId(e.target)));
+  const droppedEdges = edges.length - liveEdges.length;
+  if (droppedEdges > 0) {
+    console.warn(`viz: skipped ${droppedEdges} dangling edge(s) referencing missing nodes`);
+  }
+
   // Links
   const link = linkGroup.selectAll('line')
-    .data(edges, d => `${d.source.id || d.source}-${d.target.id || d.target}`);
+    .data(liveEdges, d => `${d.source.id || d.source}-${d.target.id || d.target}`);
 
   link.exit().transition().duration(300).attr('stroke-opacity', 0).remove();
 
@@ -2458,7 +2471,7 @@ function render() {
 
   // Update simulation
   simulation.nodes(nodes);
-  simulation.force('link').links(edges);
+  simulation.force('link').links(liveEdges);
   simulation.alpha(0.3).restart();
 }
 
