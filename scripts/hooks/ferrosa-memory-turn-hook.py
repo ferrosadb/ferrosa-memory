@@ -390,12 +390,11 @@ def configure_session_start(client: McpClient, payload: dict[str, Any], args: ar
         "workspace": cwd,
         "cwd": cwd,
     }
-    external = agent_session_id(payload)
-    if external:
-        metadata["agent_session_id"] = external
-        metadata["session_id"] = str(
-            uuid.uuid5(uuid.NAMESPACE_URL, f"ferrosa-memory:agent-session:v1:{agent}:{cwd}:{external}")
-        )
+    external = agent_session_id(payload) or f"workspace:{cwd}"
+    metadata["agent_session_id"] = external
+    metadata["session_id"] = str(
+        uuid.uuid5(uuid.NAMESPACE_URL, f"ferrosa-memory:agent-session:v1:{agent}:{cwd}:{external}")
+    )
     result = client.call_tool("configure", {"session_start": metadata})
     blocks = content_blocks(result)
     for block in blocks:
@@ -424,10 +423,9 @@ def current_fmem_session_id(client: McpClient) -> str:
 
 
 def fmem_session_id_for_payload(client: McpClient, payload: dict[str, Any], args: argparse.Namespace) -> str:
-    if agent_session_id(payload):
-        configured = configure_session_start(client, payload, args)
-        if configured:
-            return configured
+    configured = configure_session_start(client, payload, args)
+    if configured:
+        return configured
     return current_fmem_session_id(client)
 
 
@@ -797,11 +795,11 @@ def recall_context(client: McpClient, payload: dict[str, Any], args: argparse.Na
             allowed_kinds_for_scope=allowed_kinds,
         )
         if not search_pieces:
-            cross_session_kinds = None
+            cross_session_kinds = {"procedural"}
+            if getattr(args, "allow_cross_session_semantic", False):
+                cross_session_kinds.add("semantic")
             if allowed_kinds is not None:
-                cross_session_kinds = allowed_kinds - {"episodic"}
-                if not cross_session_kinds:
-                    cross_session_kinds = set()
+                cross_session_kinds &= allowed_kinds
             search_pieces = search_recall(
                 "both",
                 require_judgment_for_scope=require_judgment,
@@ -999,6 +997,11 @@ def parse_args() -> argparse.Namespace:
             "FERROSA_MEMORY_HOOK_ALLOWED_KINDS",
             {"episodic", "procedural", "semantic"},
         ),
+    )
+    parser.add_argument(
+        "--allow-cross-session-semantic",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("FERROSA_MEMORY_HOOK_ALLOW_CROSS_SESSION_SEMANTIC", False),
     )
     parser.add_argument("--max-context-chars", type=int, default=4000)
     return parser.parse_args()
