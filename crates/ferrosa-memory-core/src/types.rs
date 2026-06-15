@@ -39,6 +39,124 @@ pub struct PlanNode {
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Durable lifecycle state for a session task.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionTaskStatus {
+    Pending,
+    InProgress,
+    Blocked,
+    Completed,
+    Cancelled,
+    Superseded,
+}
+
+impl SessionTaskStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            SessionTaskStatus::Completed
+                | SessionTaskStatus::Cancelled
+                | SessionTaskStatus::Superseded
+        )
+    }
+}
+
+/// Client identity carried with a task for scoped aliases and cross-client
+/// recovery. These fields are descriptive; tenant/session remain authoritative.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionTaskClient {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_session_id: Option<String>,
+}
+
+/// A durable, fmem-owned work item for a session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionTask {
+    pub session_id: Uuid,
+    pub task_id: Uuid,
+    pub title: String,
+    pub description: String,
+    pub status: SessionTaskStatus,
+    pub priority: i32,
+    pub tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<Uuid>,
+    pub focus_rank: i32,
+    pub client: SessionTaskClient,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome_summary: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// A scoped, caller-friendly alias that resolves to a canonical fmem task id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionTaskAlias {
+    pub session_id: Uuid,
+    pub alias_scope: String,
+    pub alias: String,
+    pub task_id: Uuid,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Explicit focus stack entry. Lower `stack_index` is closer to the foreground.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionTaskFocusEntry {
+    pub session_id: Uuid,
+    pub stack_index: i32,
+    pub task_id: Uuid,
+    pub reason: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Append-only audit/recovery event for task lifecycle changes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionTaskEvent {
+    pub session_id: Uuid,
+    pub event_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<Uuid>,
+    pub event_type: String,
+    pub payload: serde_json::Value,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Per-session behavior knobs for deterministic v1 task observation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionTaskPolicy {
+    pub session_id: Uuid,
+    pub auto_task_detection: String,
+    pub auto_resume: String,
+    pub max_active_before_subagents: i32,
+    pub max_children_before_subagents: i32,
+    pub confidence_threshold: f64,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl Default for SessionTaskPolicy {
+    fn default() -> Self {
+        Self {
+            session_id: Uuid::nil(),
+            auto_task_detection: "suggest".to_string(),
+            auto_resume: "ask".to_string(),
+            max_active_before_subagents: 5,
+            max_children_before_subagents: 4,
+            confidence_threshold: 0.72,
+            updated_at: chrono::Utc::now(),
+        }
+    }
+}
+
 /// A memoized sub-call result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoEntry {

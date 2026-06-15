@@ -20,7 +20,8 @@ use crate::types::{
     EntityEntry, EntityListQuery, EntityListScope, EntityTypeStateCount, FeedbackOutcome,
     FoldEntry, FoldSummary, ForgetJournalEntry, MaterializedEdge, MemoEntry, MemoryState, PlanNode,
     PlanStatus, PromotedPredicate, ProvenanceStep, RetractionRecord, RuleEntry, RuleState,
-    TemporalEvent, TenantContext, ToolUsageRow, TypedEdge, WarmthEntry,
+    SessionTask, SessionTaskAlias, SessionTaskEvent, SessionTaskFocusEntry, SessionTaskPolicy,
+    SessionTaskStatus, TemporalEvent, TenantContext, ToolUsageRow, TypedEdge, WarmthEntry,
 };
 
 pub(crate) fn entity_list_sessions(
@@ -181,6 +182,81 @@ pub trait Storage: Send + Sync {
         subtask_id: &str,
         status: PlanStatus,
         outcome_summary: Option<&str>,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// Upsert a durable session task and its status index.
+    fn session_task_put(
+        &self,
+        ctx: &TenantContext,
+        task: &SessionTask,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// Get one durable session task by canonical fmem-generated task id.
+    fn session_task_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        task_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<SessionTask>>> + Send;
+
+    /// List durable session tasks for a session, optionally filtered by status.
+    fn session_task_list(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        status: Option<SessionTaskStatus>,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<SessionTask>>> + Send;
+
+    /// Upsert a scoped alias for a canonical task id.
+    fn session_task_alias_put(
+        &self,
+        ctx: &TenantContext,
+        alias: &SessionTaskAlias,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// Resolve a scoped alias to a canonical task id.
+    fn session_task_alias_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        alias_scope: &str,
+        alias: &str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<SessionTaskAlias>>> + Send;
+
+    /// Replace the deterministic focus stack for a session.
+    fn session_task_focus_set(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        entries: &[SessionTaskFocusEntry],
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// Read the deterministic focus stack for a session.
+    fn session_task_focus_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<SessionTaskFocusEntry>>> + Send;
+
+    /// Append a task lifecycle/recovery event.
+    fn session_task_event_put(
+        &self,
+        ctx: &TenantContext,
+        event: &SessionTaskEvent,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// Read deterministic task behavior policy for a session.
+    fn session_task_policy_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<SessionTaskPolicy>>> + Send;
+
+    /// Upsert deterministic task behavior policy for a session.
+    fn session_task_policy_put(
+        &self,
+        ctx: &TenantContext,
+        policy: &SessionTaskPolicy,
     ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     // --- Fold operations (Sprint 2) ---
@@ -1549,6 +1625,11 @@ pub mod mock {
     pub struct MockStorage {
         pub memos: Mutex<Vec<MemoEntry>>,
         pub plans: Mutex<Vec<PlanNode>>,
+        pub session_tasks: Mutex<Vec<SessionTask>>,
+        pub session_task_aliases: Mutex<Vec<SessionTaskAlias>>,
+        pub session_task_focus: Mutex<Vec<SessionTaskFocusEntry>>,
+        pub session_task_events: Mutex<Vec<SessionTaskEvent>>,
+        pub session_task_policies: Mutex<Vec<SessionTaskPolicy>>,
         pub folds: Mutex<Vec<FoldEntry>>,
         pub entities: Mutex<Vec<EntityEntry>>,
         pub retractions: Mutex<Vec<RetractionRecord>>,
@@ -1732,6 +1813,165 @@ pub mod mock {
                 if p.status == PlanStatus::Complete || p.status == PlanStatus::Failed {
                     p.completed_at = Some(chrono::Utc::now());
                 }
+            }
+            Ok(())
+        }
+
+        async fn session_task_put(
+            &self,
+            _ctx: &TenantContext,
+            task: &SessionTask,
+        ) -> anyhow::Result<()> {
+            let mut tasks = self.session_tasks.lock().await;
+            if let Some(existing) = tasks
+                .iter_mut()
+                .find(|t| t.session_id == task.session_id && t.task_id == task.task_id)
+            {
+                *existing = task.clone();
+            } else {
+                tasks.push(task.clone());
+            }
+            Ok(())
+        }
+
+        async fn session_task_get(
+            &self,
+            _ctx: &TenantContext,
+            session_id: Uuid,
+            task_id: Uuid,
+        ) -> anyhow::Result<Option<SessionTask>> {
+            let tasks = self.session_tasks.lock().await;
+            Ok(tasks
+                .iter()
+                .find(|t| t.session_id == session_id && t.task_id == task_id)
+                .cloned())
+        }
+
+        async fn session_task_list(
+            &self,
+            _ctx: &TenantContext,
+            session_id: Uuid,
+            status: Option<SessionTaskStatus>,
+        ) -> anyhow::Result<Vec<SessionTask>> {
+            let tasks = self.session_tasks.lock().await;
+            let mut tasks: Vec<_> = tasks
+                .iter()
+                .filter(|t| {
+                    t.session_id == session_id
+                        && status.as_ref().is_none_or(|expected| &t.status == expected)
+                })
+                .cloned()
+                .collect();
+            tasks.sort_by(|a, b| {
+                a.focus_rank
+                    .cmp(&b.focus_rank)
+                    .then(a.priority.cmp(&b.priority))
+                    .then(b.updated_at.cmp(&a.updated_at))
+                    .then(a.task_id.cmp(&b.task_id))
+            });
+            Ok(tasks)
+        }
+
+        async fn session_task_alias_put(
+            &self,
+            _ctx: &TenantContext,
+            alias: &SessionTaskAlias,
+        ) -> anyhow::Result<()> {
+            let mut aliases = self.session_task_aliases.lock().await;
+            if let Some(existing) = aliases.iter_mut().find(|a| {
+                a.session_id == alias.session_id
+                    && a.alias_scope == alias.alias_scope
+                    && a.alias == alias.alias
+            }) {
+                *existing = alias.clone();
+            } else {
+                aliases.push(alias.clone());
+            }
+            Ok(())
+        }
+
+        async fn session_task_alias_get(
+            &self,
+            _ctx: &TenantContext,
+            session_id: Uuid,
+            alias_scope: &str,
+            alias: &str,
+        ) -> anyhow::Result<Option<SessionTaskAlias>> {
+            let aliases = self.session_task_aliases.lock().await;
+            Ok(aliases
+                .iter()
+                .find(|a| {
+                    a.session_id == session_id && a.alias_scope == alias_scope && a.alias == alias
+                })
+                .cloned())
+        }
+
+        async fn session_task_focus_set(
+            &self,
+            _ctx: &TenantContext,
+            session_id: Uuid,
+            entries: &[SessionTaskFocusEntry],
+        ) -> anyhow::Result<()> {
+            let mut focus = self.session_task_focus.lock().await;
+            focus.retain(|entry| entry.session_id != session_id);
+            focus.extend(entries.iter().cloned());
+            focus.sort_by(|a, b| {
+                a.session_id
+                    .cmp(&b.session_id)
+                    .then(a.stack_index.cmp(&b.stack_index))
+            });
+            Ok(())
+        }
+
+        async fn session_task_focus_get(
+            &self,
+            _ctx: &TenantContext,
+            session_id: Uuid,
+        ) -> anyhow::Result<Vec<SessionTaskFocusEntry>> {
+            let focus = self.session_task_focus.lock().await;
+            let mut entries: Vec<_> = focus
+                .iter()
+                .filter(|entry| entry.session_id == session_id)
+                .cloned()
+                .collect();
+            entries.sort_by_key(|entry| entry.stack_index);
+            Ok(entries)
+        }
+
+        async fn session_task_event_put(
+            &self,
+            _ctx: &TenantContext,
+            event: &SessionTaskEvent,
+        ) -> anyhow::Result<()> {
+            self.session_task_events.lock().await.push(event.clone());
+            Ok(())
+        }
+
+        async fn session_task_policy_get(
+            &self,
+            _ctx: &TenantContext,
+            session_id: Uuid,
+        ) -> anyhow::Result<Option<SessionTaskPolicy>> {
+            let policies = self.session_task_policies.lock().await;
+            Ok(policies
+                .iter()
+                .find(|policy| policy.session_id == session_id)
+                .cloned())
+        }
+
+        async fn session_task_policy_put(
+            &self,
+            _ctx: &TenantContext,
+            policy: &SessionTaskPolicy,
+        ) -> anyhow::Result<()> {
+            let mut policies = self.session_task_policies.lock().await;
+            if let Some(existing) = policies
+                .iter_mut()
+                .find(|existing| existing.session_id == policy.session_id)
+            {
+                *existing = policy.clone();
+            } else {
+                policies.push(policy.clone());
             }
             Ok(())
         }
