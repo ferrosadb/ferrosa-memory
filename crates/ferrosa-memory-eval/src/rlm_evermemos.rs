@@ -7,7 +7,12 @@
 //! MemScenes, profiles, time-bounded foresight, and sufficiency-checked
 //! recollection.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    fs::{File, OpenOptions},
+    io::{BufRead, BufReader, Write},
+    path::Path,
+};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -299,6 +304,231 @@ pub struct ControllerTrace {
     pub accepted: Vec<AcceptedEvidence>,
     pub dropped: Vec<DroppedEvidence>,
     pub sufficiency: SufficiencyVerdict,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetrievalTraceRecord {
+    pub trace_id: String,
+    pub query: String,
+    pub created_at: DateTime<Utc>,
+    pub mode: ContextEvalMode,
+    pub candidates_seen: usize,
+    pub accepted: Vec<AcceptedEvidence>,
+    pub dropped: Vec<DroppedEvidence>,
+    pub sufficiency: SufficiencyVerdict,
+}
+
+impl RetrievalTraceRecord {
+    pub fn from_controller_trace(
+        trace_id: impl Into<String>,
+        query: impl Into<String>,
+        trace: ControllerTrace,
+        created_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            trace_id: trace_id.into(),
+            query: query.into(),
+            created_at,
+            mode: trace.mode,
+            candidates_seen: trace.candidates_seen,
+            accepted: trace.accepted,
+            dropped: trace.dropped,
+            sufficiency: trace.sufficiency,
+        }
+    }
+
+    pub fn final_useful(&self) -> bool {
+        self.sufficiency.sufficient && !self.accepted.is_empty()
+    }
+}
+
+pub fn append_retrieval_trace_jsonl(
+    path: impl AsRef<Path>,
+    record: &RetrievalTraceRecord,
+) -> anyhow::Result<()> {
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    serde_json::to_writer(&mut file, record)?;
+    file.write_all(b"\n")?;
+    Ok(())
+}
+
+pub fn read_retrieval_trace_jsonl(
+    path: impl AsRef<Path>,
+) -> anyhow::Result<Vec<RetrievalTraceRecord>> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut records = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        records.push(serde_json::from_str(&line)?);
+    }
+    Ok(records)
+}
+
+fn scene_key(cell: &MemCell) -> String {
+    cell.metadata
+        .session_id
+        .clone()
+        .or_else(|| cell.metadata.source_id.clone())
+        .unwrap_or_else(|| "global".into())
+}
+
+fn scene_title(cell: &MemCell) -> String {
+    cell.atomic_facts
+        .first()
+        .map(String::as_str)
+        .or_else(|| cell.episode.lines().next())
+        .map(|line| {
+            let mut title = line.trim().to_string();
+            title.truncate(80);
+            title
+        })
+        .filter(|line| !line.is_empty())
+        .unwrap_or_else(|| "Untitled memory scene".into())
+}
+
+fn scene_summary(cells: &[MemCell]) -> String {
+    cells
+        .iter()
+        .flat_map(|cell| {
+            if cell.atomic_facts.is_empty() {
+                vec![cell.episode.trim().to_string()]
+            } else {
+                cell.atomic_facts.clone()
+            }
+        })
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn scene_profile_delta(cells: &[MemCell]) -> Option<String> {
+    let deltas = cells
+        .iter()
+        .flat_map(|cell| {
+            cell.atomic_facts
+                .iter()
+                .chain(std::iter::once(&cell.episode))
+        })
+        .filter(|fact| {
+            let lower = fact.to_ascii_lowercase();
+            lower.contains("preference")
+                || lower.contains("prefers")
+                || lower.contains("working style")
+                || lower.contains("should remember")
+        })
+        .map(|fact| fact.trim().to_string())
+        .filter(|fact| !fact.is_empty())
+        .collect::<Vec<_>>();
+    (!deltas.is_empty()).then(|| deltas.join(" "))
+}
+
+pub fn consolidate_mem_scenes(cells: &[MemCell], max_cells_per_scene: usize) -> Vec<MemScene> {
+    let max_cells_per_scene = max_cells_per_scene.max(1);
+    let mut groups: BTreeMap<String, Vec<MemCell>> = BTreeMap::new();
+    for cell in cells {
+        groups
+            .entry(scene_key(cell))
+            .or_default()
+            .push(cell.clone());
+    }
+
+    let mut scenes = Vec::new();
+    for (key, mut grouped) in groups {
+        grouped.sort_by(|left, right| {
+            left.metadata
+                .created_at
+                .cmp(&right.metadata.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        for (idx, chunk) in grouped.chunks(max_cells_per_scene).enumerate() {
+            let first = &chunk[0];
+            scenes.push(MemScene {
+                id: format!("scene:{key}:{idx}"),
+                title: scene_title(first),
+                summary: scene_summary(chunk),
+                memcell_ids: chunk.iter().map(|cell| cell.id.clone()).collect(),
+                profile_delta: scene_profile_delta(chunk),
+            });
+        }
+    }
+    scenes
+}
+
+pub fn active_foresight_candidates(cells: &[MemCell], now: DateTime<Utc>) -> Vec<ContextCandidate> {
+    cells
+        .iter()
+        .flat_map(|cell| {
+            cell.foresight
+                .iter()
+                .filter(move |foresight| foresight.is_valid_at(now))
+                .enumerate()
+                .map(move |(idx, foresight)| {
+                    ContextCandidate::new(
+                        format!("{}:foresight:{idx}", cell.id),
+                        MemoryLane::Foresight,
+                        0.9,
+                        foresight.content.clone(),
+                    )
+                    .sourced("foresight")
+                    .provenance(cell.metadata.has_provenance())
+                    .validity(foresight.valid_from, foresight.valid_until)
+                })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileWorkspaceSummary {
+    pub profile_summary: String,
+    pub workspace_state_summary: String,
+    pub source_scene_ids: Vec<String>,
+}
+
+pub fn build_profile_workspace_summary(scenes: &[MemScene]) -> ProfileWorkspaceSummary {
+    let mut profile_parts = Vec::new();
+    let mut workspace_parts = Vec::new();
+    let mut source_scene_ids = Vec::new();
+
+    for scene in scenes {
+        let mut used = false;
+        if let Some(delta) = scene.profile_delta.as_deref()
+            && !delta.trim().is_empty()
+        {
+            profile_parts.push(delta.trim().to_string());
+            used = true;
+        }
+
+        let lower = scene.summary.to_ascii_lowercase();
+        if lower.contains("workspace")
+            || lower.contains("repo")
+            || lower.contains("branch")
+            || lower.contains("task")
+            || lower.contains("cluster")
+        {
+            workspace_parts.push(scene.summary.trim().to_string());
+            used = true;
+        }
+
+        if used {
+            source_scene_ids.push(scene.id.clone());
+        }
+    }
+
+    source_scene_ids.sort();
+    source_scene_ids.dedup();
+    ProfileWorkspaceSummary {
+        profile_summary: profile_parts.join(" "),
+        workspace_state_summary: workspace_parts.join(" "),
+        source_scene_ids,
+    }
 }
 
 pub fn evaluate_context_candidates(
@@ -670,5 +900,137 @@ mod tests {
         assert!(cell.metadata.has_provenance());
         assert_eq!(cell.atomic_facts, vec!["RLM distillation is retrievable"]);
         assert!(cell.foresight[0].is_valid_at(now()));
+    }
+
+    #[test]
+    fn retrieval_trace_records_round_trip_to_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retrieval-traces.jsonl");
+        let policy = ControllerPolicy::combined_default();
+        let trace = evaluate_context_candidates(
+            &[
+                ContextCandidate::new("kept", MemoryLane::Corpus, 0.95, "curated result")
+                    .sourced("document_bm25")
+                    .provenance(true)
+                    .tokens(42),
+                ContextCandidate::new("dropped", MemoryLane::Semantic, 0.10, "noise")
+                    .sourced("entity_ann")
+                    .provenance(true)
+                    .tokens(100),
+            ],
+            &policy,
+            now(),
+        );
+        let record =
+            RetrievalTraceRecord::from_controller_trace("trace-1", "curated result", trace, now());
+
+        append_retrieval_trace_jsonl(&path, &record).unwrap();
+        let records = read_retrieval_trace_jsonl(&path).unwrap();
+
+        assert_eq!(records, vec![record]);
+        assert!(records[0].final_useful());
+        assert_eq!(records[0].accepted[0].id, "kept");
+        assert_eq!(records[0].dropped[0].reason, DropReason::LowScore);
+    }
+
+    #[test]
+    fn memscene_consolidation_groups_cells_by_provenance_and_bounds_scene_size() {
+        let metadata = |session: &str, minute| MemoryMetadata {
+            source_id: Some(format!("turn-{minute}")),
+            session_id: Some(session.into()),
+            created_at: Some(Utc.with_ymd_and_hms(2026, 6, 15, 12, minute, 0).unwrap()),
+        };
+        let cells = vec![
+            MemCell::new("a", "User preference: better silent than noisy context")
+                .with_fact("User preference is better silent than noisy context")
+                .with_metadata(metadata("s1", 0)),
+            MemCell::new("b", "Repo task: fix retrieval traces")
+                .with_fact("Workspace task is retrieval trace persistence")
+                .with_metadata(metadata("s1", 1)),
+            MemCell::new("c", "Separate session")
+                .with_fact("Different session should form another scene")
+                .with_metadata(metadata("s2", 2)),
+        ];
+
+        let scenes = consolidate_mem_scenes(&cells, 2);
+
+        assert_eq!(scenes.len(), 2);
+        assert_eq!(scenes[0].memcell_ids, vec!["a", "b"]);
+        assert!(scenes[0].summary.contains("retrieval trace persistence"));
+        assert!(
+            scenes[0]
+                .profile_delta
+                .as_deref()
+                .unwrap_or_default()
+                .contains("better silent")
+        );
+        assert_eq!(scenes[1].memcell_ids, vec!["c"]);
+    }
+
+    #[test]
+    fn active_foresight_candidates_include_only_valid_time_windows() {
+        let valid_until = Utc.with_ymd_and_hms(2026, 6, 16, 0, 0, 0).unwrap();
+        let expired_until = Utc.with_ymd_and_hms(2026, 6, 14, 0, 0, 0).unwrap();
+        let future_start = Utc.with_ymd_and_hms(2026, 6, 20, 0, 0, 0).unwrap();
+        let cell = MemCell::new("cell", "Plan eval follow-up")
+            .with_metadata(MemoryMetadata {
+                source_id: Some("turn-1".into()),
+                session_id: Some("session-1".into()),
+                created_at: Some(now()),
+            })
+            .with_foresight(ForesightSignal {
+                content: "Run phase-two eval after traces persist".into(),
+                valid_from: None,
+                valid_until: Some(valid_until),
+            })
+            .with_foresight(ForesightSignal {
+                content: "Expired reminder".into(),
+                valid_from: None,
+                valid_until: Some(expired_until),
+            })
+            .with_foresight(ForesightSignal {
+                content: "Future reminder".into(),
+                valid_from: Some(future_start),
+                valid_until: None,
+            });
+
+        let candidates = active_foresight_candidates(&[cell], now());
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].lane, MemoryLane::Foresight);
+        assert_eq!(
+            candidates[0].content,
+            "Run phase-two eval after traces persist"
+        );
+        assert!(candidates[0].has_provenance);
+    }
+
+    #[test]
+    fn profile_workspace_summary_extracts_user_and_repo_state_from_scenes() {
+        let scenes = vec![
+            MemScene {
+                id: "scene:profile:0".into(),
+                title: "Preference".into(),
+                summary: "User preference is concise context.".into(),
+                memcell_ids: vec!["a".into()],
+                profile_delta: Some("User preference: concise context.".into()),
+            },
+            MemScene {
+                id: "scene:workspace:0".into(),
+                title: "Workspace".into(),
+                summary: "Workspace repo is ferrosa-memory on branch feat/recall.".into(),
+                memcell_ids: vec!["b".into()],
+                profile_delta: None,
+            },
+        ];
+
+        let summary = build_profile_workspace_summary(&scenes);
+
+        assert!(summary.profile_summary.contains("concise context"));
+        assert!(summary.workspace_state_summary.contains("ferrosa-memory"));
+        assert_eq!(
+            summary.source_scene_ids,
+            vec!["scene:profile:0", "scene:workspace:0"]
+        );
     }
 }
