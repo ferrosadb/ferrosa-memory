@@ -15563,7 +15563,14 @@ mod tests {
                 "session_id": sid.to_string(),
                 "query": "Judge",
                 "cwd": cwd,
-                "limit": 2
+                "limit": 2,
+                // This test asserts feedback accounting over a fixed two-result
+                // set. With judge rerank enabled by default, hybrid_search would
+                // make a live LLM call to the configured judge (config.base_url),
+                // which can reorder/veto candidates — non-hermetic and host-
+                // dependent. Pin rerank off so the setup is deterministic; the
+                // judge-authority drop behavior is covered by its own tests.
+                "rerank": false
             }
         });
         let result = dispatch("tools/call", search, &store, &ctx, &session)
