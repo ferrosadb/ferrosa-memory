@@ -2356,6 +2356,80 @@ async fn send_viz_event(
     write.send(Message::Text(json.into())).await.is_ok()
 }
 
+/// Drain a temporal-edge producer into the viz snapshot edge stream, mirroring
+/// the typed-edge consume loop: each `TemporalEdge` becomes a `VizEdge` (temporal
+/// edges have no weight, so `strength` is `None`) and bounded chunks are flushed
+/// as `SnapshotStreamChunk`s. The producer is a paged cursor, so the full edge
+/// set is never materialized. Returns `false` if a websocket send failed (the
+/// caller should propagate by returning `false`).
+async fn drain_temporal_edges_into_snapshot(
+    write: &mut futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        Message,
+    >,
+    producer: impl std::future::Future<Output = ()>,
+    rx: &mut tokio::sync::mpsc::Receiver<anyhow::Result<Vec<crate::context_segment::TemporalEdge>>>,
+    edge_chunk: &mut Vec<VizEdge>,
+    total_edges: &mut usize,
+    chunk_size: usize,
+    label: &str,
+) -> bool {
+    tokio::pin!(producer);
+    let idle_deadline = tokio::time::sleep(VIZ_STREAM_IDLE_BUDGET);
+    tokio::pin!(idle_deadline);
+    let mut producer_done = false;
+    loop {
+        tokio::select! {
+            _ = &mut producer, if !producer_done => producer_done = true,
+            _ = &mut idle_deadline, if !producer_done => {
+                tracing::warn!(
+                    edge_context = label,
+                    timeout_ms = VIZ_STREAM_IDLE_BUDGET.as_millis() as u64,
+                    "viz: temporal edge stream idle timeout; serving partial snapshot"
+                );
+                break;
+            }
+            chunk = rx.recv() => {
+                match chunk {
+                    Some(Ok(temporal_edges)) => {
+                        idle_deadline.as_mut().reset(tokio::time::Instant::now() + VIZ_STREAM_IDLE_BUDGET);
+                        for temporal_edge in temporal_edges {
+                            edge_chunk.push(VizEdge {
+                                source: temporal_edge.src_id.to_string(),
+                                target: temporal_edge.dst_id.to_string(),
+                                edge_type: temporal_edge.edge_type,
+                                strength: None,
+                            });
+                            *total_edges += 1;
+                            if edge_chunk.len() >= chunk_size {
+                                let edges = std::mem::take(edge_chunk);
+                                if !send_viz_event(
+                                    write,
+                                    &VizEvent::SnapshotStreamChunk { nodes: Vec::new(), edges },
+                                )
+                                .await
+                                {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                    Some(Err(e)) => {
+                        tracing::warn!(error = %e, edge_context = label, "viz: temporal edge stream failed");
+                        break;
+                    }
+                    None if producer_done => break,
+                    None => {}
+                }
+            }
+        }
+        if producer_done && rx.is_empty() {
+            break;
+        }
+    }
+    true
+}
+
 async fn send_streaming_viz_snapshot<S: Storage>(
     write: &mut futures_util::stream::SplitSink<
         tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
@@ -2585,12 +2659,12 @@ async fn send_streaming_viz_snapshot<S: Storage>(
                             match chunk {
                                 Some(Ok(typed_edges)) => {
                                     idle_deadline.as_mut().reset(tokio::time::Instant::now() + VIZ_STREAM_IDLE_BUDGET);
-                                    for te in typed_edges {
+                                    for typed_edge in typed_edges {
                                         edge_chunk.push(VizEdge {
-                                            source: te.src_id.to_string(),
-                                            target: te.dst_id.to_string(),
-                                            edge_type: te.edge_type,
-                                            strength: Some(te.weight as f32),
+                                            source: typed_edge.src_id.to_string(),
+                                            target: typed_edge.dst_id.to_string(),
+                                            edge_type: typed_edge.edge_type,
+                                            strength: Some(typed_edge.weight as f32),
                                         });
                                         total_edges += 1;
                                         if edge_chunk.len() >= VIZ_CHUNK_SIZE {
@@ -2621,6 +2695,32 @@ async fn send_streaming_viz_snapshot<S: Storage>(
                     if producer_done && rx.is_empty() {
                         break;
                     }
+                }
+            }
+            // Stream temporal_edges (next_turn/previous_turn and *_context_segment)
+            // tenant-wide so turn/segment chains render in the all-scope graph.
+            // Same paged-cursor + idle-budget contract as the typed-edge stream.
+            for (edge_ctx, label) in [
+                (ctx.clone(), "current"),
+                (swapped_ctx.clone(), "legacy-swapped"),
+            ] {
+                if label == "legacy-swapped" && edge_ctx.tenant_id == ctx.tenant_id {
+                    continue;
+                }
+                let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+                let producer = storage.temporal_edge_stream_all(edge_ctx, VIZ_CHUNK_SIZE, tx);
+                if !drain_temporal_edges_into_snapshot(
+                    write,
+                    producer,
+                    &mut rx,
+                    &mut edge_chunk,
+                    &mut total_edges,
+                    VIZ_CHUNK_SIZE,
+                    label,
+                )
+                .await
+                {
+                    return false;
                 }
             }
         }
@@ -2666,12 +2766,12 @@ async fn send_streaming_viz_snapshot<S: Storage>(
                                 match chunk {
                                     Some(Ok(typed_edges)) => {
                                         idle_deadline.as_mut().reset(tokio::time::Instant::now() + VIZ_STREAM_IDLE_BUDGET);
-                                        for te in typed_edges {
+                                        for typed_edge in typed_edges {
                                             edge_chunk.push(VizEdge {
-                                                source: te.src_id.to_string(),
-                                                target: te.dst_id.to_string(),
-                                                edge_type: te.edge_type,
-                                                strength: Some(te.weight as f32),
+                                                source: typed_edge.src_id.to_string(),
+                                                target: typed_edge.dst_id.to_string(),
+                                                edge_type: typed_edge.edge_type,
+                                                strength: Some(typed_edge.weight as f32),
                                             });
                                             total_edges += 1;
                                             if edge_chunk.len() >= VIZ_CHUNK_SIZE {
@@ -2702,6 +2802,32 @@ async fn send_streaming_viz_snapshot<S: Storage>(
                         if producer_done && rx.is_empty() {
                             break;
                         }
+                    }
+                }
+            }
+            // Stream temporal_edges per probed session so turn/segment chains
+            // (next_turn/previous_turn, *_context_segment) render in this scope.
+            for probe_ctx in [ctx, &swapped_ctx] {
+                for sid in &probe {
+                    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+                    let producer = storage.temporal_edge_stream_session(
+                        (*probe_ctx).clone(),
+                        *sid,
+                        VIZ_CHUNK_SIZE,
+                        tx,
+                    );
+                    if !drain_temporal_edges_into_snapshot(
+                        write,
+                        producer,
+                        &mut rx,
+                        &mut edge_chunk,
+                        &mut total_edges,
+                        VIZ_CHUNK_SIZE,
+                        "session-temporal",
+                    )
+                    .await
+                    {
+                        return false;
                     }
                 }
             }
@@ -3007,12 +3133,12 @@ async fn build_snapshot<S: Storage>(
     // requested, probe only the sessions that scope covers.
     let mut typed_edges = match scope {
         VizSnapshotScope::All => match storage.typed_edge_list_all(ctx).await {
-            Ok(te) => {
+            Ok(typed_edge_rows) => {
                 tracing::info!(
-                    count = te.len(),
+                    count = typed_edge_rows.len(),
                     "viz: loaded typed edges across all sessions"
                 );
-                te
+                typed_edge_rows
             }
             Err(e) => {
                 tracing::warn!(error = %e, "viz: typed_edge_list_all failed");
@@ -3034,13 +3160,13 @@ async fn build_snapshot<S: Storage>(
             let mut acc = Vec::new();
             for sid in probe {
                 match storage.typed_edge_list_session(ctx, sid).await {
-                    Ok(mut te) => {
+                    Ok(mut typed_edge_rows) => {
                         tracing::info!(
                             session_id = %sid,
-                            count = te.len(),
+                            count = typed_edge_rows.len(),
                             "viz: loaded typed edges for session"
                         );
-                        acc.append(&mut te);
+                        acc.append(&mut typed_edge_rows);
                     }
                     Err(e) => {
                         tracing::warn!(session_id = %sid, error = %e, "viz: typed_edge_list_session failed");
@@ -3093,18 +3219,93 @@ async fn build_snapshot<S: Storage>(
     }
 
     let mut seen_typed_edges = std::collections::HashSet::new();
-    for te in typed_edges {
-        if !seen_typed_edges.insert((te.src_id, te.edge_type.clone(), te.dst_id)) {
+    for typed_edge in typed_edges {
+        if !seen_typed_edges.insert((
+            typed_edge.src_id,
+            typed_edge.edge_type.clone(),
+            typed_edge.dst_id,
+        )) {
             continue;
         }
-        let src_s = te.src_id.to_string();
-        let dst_s = te.dst_id.to_string();
+        let src_s = typed_edge.src_id.to_string();
+        let dst_s = typed_edge.dst_id.to_string();
         if node_ids.contains(src_s.as_str()) && node_ids.contains(dst_s.as_str()) {
             edges.push(VizEdge {
                 source: src_s,
                 target: dst_s,
-                edge_type: te.edge_type,
-                strength: Some(te.weight as f32),
+                edge_type: typed_edge.edge_type,
+                strength: Some(typed_edge.weight as f32),
+            });
+        }
+    }
+
+    // Load temporal_edges (next_turn/previous_turn, *_context_segment) so turn
+    // and segment chains render — mirrors the production /viz/ws streamer. This
+    // test helper exercises the real streaming temporal_edge_stream_* methods,
+    // draining their bounded channel into memory for assertions.
+    let mut temporal_edges: Vec<crate::context_segment::TemporalEdge> = Vec::new();
+    match scope {
+        VizSnapshotScope::All => {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+            let producer = storage.temporal_edge_stream_all(ctx.clone(), 500, tx);
+            let collector = async {
+                let mut out = Vec::new();
+                while let Some(item) = rx.recv().await {
+                    if let Ok(chunk) = item {
+                        out.extend(chunk);
+                    }
+                }
+                out
+            };
+            let (_, collected) = tokio::join!(producer, collector);
+            temporal_edges.extend(collected);
+        }
+        _ => {
+            let mut probe = vec![session_id];
+            let nil = Uuid::nil();
+            if session_id != nil {
+                probe.push(nil);
+            }
+            if matches!(scope, VizSnapshotScope::GlobalOnly) {
+                let global = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
+                if !probe.contains(&global) {
+                    probe.push(global);
+                }
+            }
+            for sid in probe {
+                let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+                let producer = storage.temporal_edge_stream_session(ctx.clone(), sid, 500, tx);
+                let collector = async {
+                    let mut out = Vec::new();
+                    while let Some(item) = rx.recv().await {
+                        if let Ok(chunk) = item {
+                            out.extend(chunk);
+                        }
+                    }
+                    out
+                };
+                let (_, collected) = tokio::join!(producer, collector);
+                temporal_edges.extend(collected);
+            }
+        }
+    }
+    let mut seen_temporal = std::collections::HashSet::new();
+    for temporal_edge in temporal_edges {
+        if !seen_temporal.insert((
+            temporal_edge.src_id,
+            temporal_edge.edge_type.clone(),
+            temporal_edge.dst_id,
+        )) {
+            continue;
+        }
+        let src_s = temporal_edge.src_id.to_string();
+        let dst_s = temporal_edge.dst_id.to_string();
+        if node_ids.contains(src_s.as_str()) && node_ids.contains(dst_s.as_str()) {
+            edges.push(VizEdge {
+                source: src_s,
+                target: dst_s,
+                edge_type: temporal_edge.edge_type,
+                strength: None,
             });
         }
     }
@@ -5428,7 +5629,10 @@ mod tests {
         assert!(response.contains("\"node_count_scope\":\"session\""));
         assert!(response.contains("\"derived_fact_count\":1005"));
         assert!(response.contains("\"pending_approvals\":1"));
-        assert!(response.contains("\"rule_count\":10"));
+        assert!(response.contains(&format!(
+            "\"rule_count\":{}",
+            crate::datalog::builtin_rules().len()
+        )));
 
         let degraded_response = handle_http_request(
             "GET",
@@ -5775,6 +5979,49 @@ mod tests {
         };
         assert_eq!(edges.len(), 1, "typed edge under nil session should appear");
         assert_eq!(edges[0].edge_type, "depends_on");
+    }
+
+    #[tokio::test]
+    async fn snapshot_includes_next_turn_temporal_edge() {
+        // Turn/segment chains live in the temporal_edges table (next_turn,
+        // previous_turn, *_context_segment), separate from typed_edges. The viz
+        // snapshot must stream them too, or linked turn chains render as nothing.
+        let ctx = test_tenant();
+        let sid = Uuid::new_v4();
+        let e1 = Uuid::new_v4();
+        let e2 = Uuid::new_v4();
+
+        let storage = MockStorage::new();
+        storage.entities.lock().await.extend(vec![
+            test_entity(ctx.tenant_id, sid, e1, "turn one"),
+            test_entity(ctx.tenant_id, sid, e2, "turn two"),
+        ]);
+        storage
+            .temporal_edges
+            .lock()
+            .await
+            .push(crate::context_segment::TemporalEdge {
+                tenant_id: ctx.tenant_id,
+                session_id: sid,
+                src_id: e1,
+                edge_type: "next_turn".into(),
+                dst_id: e2,
+                relation_time: chrono::Utc::now(),
+                ordinal: 0,
+                metadata: format!("session_id={sid}"),
+                created_at: chrono::Utc::now(),
+            });
+
+        let snap = build_snapshot(&storage, &ctx, sid, VizSnapshotScope::SessionOnly).await;
+        let VizEvent::Snapshot { edges, .. } = snap else {
+            panic!("expected Snapshot");
+        };
+        let next = edges
+            .iter()
+            .find(|e| e.edge_type == "next_turn")
+            .expect("next_turn temporal edge must appear in the viz snapshot");
+        assert_eq!(next.source, e1.to_string());
+        assert_eq!(next.target, e2.to_string());
     }
 
     #[tokio::test]

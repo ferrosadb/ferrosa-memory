@@ -56,6 +56,7 @@ pub mod pagerank;
 pub mod plan;
 pub mod promotion;
 pub mod quota;
+pub mod reconcile;
 pub mod recursive_explore;
 pub mod router;
 pub mod scope;

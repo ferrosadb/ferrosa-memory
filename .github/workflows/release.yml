@@ -41,7 +41,9 @@ jobs:
       - name: Build
         run: |
           cargo build --release --target x86_64-unknown-linux-musl -p ferrosa-memory-mcp
+          strip target/x86_64-unknown-linux-musl/release/ferrosa-memory
           strip target/x86_64-unknown-linux-musl/release/ferrosa-memory-mcp
+          file target/x86_64-unknown-linux-musl/release/ferrosa-memory
           file target/x86_64-unknown-linux-musl/release/ferrosa-memory-mcp
 
       - name: Stage tarball
@@ -79,9 +81,11 @@ jobs:
         run: |
           cross build --release --target aarch64-unknown-linux-musl -p ferrosa-memory-mcp
           if command -v aarch64-linux-gnu-strip >/dev/null 2>&1; then
+            aarch64-linux-gnu-strip target/aarch64-unknown-linux-musl/release/ferrosa-memory
             aarch64-linux-gnu-strip target/aarch64-unknown-linux-musl/release/ferrosa-memory-mcp
           else
             sudo apt-get update && sudo apt-get install -y binutils-aarch64-linux-gnu
+            aarch64-linux-gnu-strip target/aarch64-unknown-linux-musl/release/ferrosa-memory
             aarch64-linux-gnu-strip target/aarch64-unknown-linux-musl/release/ferrosa-memory-mcp
           fi
 
@@ -114,6 +118,7 @@ jobs:
       - name: Build
         run: |
           cargo build --release --target aarch64-apple-darwin -p ferrosa-memory-mcp
+          strip target/aarch64-apple-darwin/release/ferrosa-memory
           strip target/aarch64-apple-darwin/release/ferrosa-memory-mcp
 
       - name: Stage tarball

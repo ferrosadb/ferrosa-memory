@@ -4,6 +4,7 @@
 # Produces:  dist/ferrosa-memory-${GITHUB_REF_NAME}-<target>.tar.gz
 #
 # Top-level layout inside the tarball (no wrapper directory):
+#   ferrosa-memory
 #   ferrosa-memory-mcp
 #   LICENSE
 #   NOTICE
@@ -30,11 +31,17 @@ if [[ ! -x "${BIN_DIR}/ferrosa-memory-mcp" ]]; then
   echo "ERROR: missing ferrosa-memory-mcp binary at ${BIN_DIR}/ferrosa-memory-mcp" >&2
   exit 1
 fi
+if [[ ! -x "${BIN_DIR}/ferrosa-memory" ]]; then
+  echo "ERROR: missing ferrosa-memory management binary at ${BIN_DIR}/ferrosa-memory" >&2
+  exit 1
+fi
 
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 
+cp "${BIN_DIR}/ferrosa-memory" "${STAGE}/ferrosa-memory"
 cp "${BIN_DIR}/ferrosa-memory-mcp" "${STAGE}/ferrosa-memory-mcp"
+chmod 755 "${STAGE}/ferrosa-memory"
 chmod 755 "${STAGE}/ferrosa-memory-mcp"
 
 for f in LICENSE NOTICE README.md; do

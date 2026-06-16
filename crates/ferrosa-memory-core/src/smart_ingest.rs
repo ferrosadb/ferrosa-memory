@@ -382,6 +382,41 @@ async fn delete_typed_edges_referencing_entity<S: Storage + ?Sized>(
     Ok(deleted)
 }
 
+/// Delete every typed edge that references `entity_id` (as src or dst) across
+/// the WHOLE tenant, not just one session. Session-scoped cleanup misses edges
+/// whose `session_id` drifted (see `fix_edge_sessions`), which is how deleted
+/// entities leave dangling `CO_OCCURS_WITH` edges behind.
+///
+/// Call this BEFORE deleting the entity: the graph-backed `typed_edge_delete`
+/// anchors its Cypher on the endpoint `:Entity` nodes, so it only works while
+/// at least the surviving endpoint still exists. Returns edges removed.
+pub(crate) async fn delete_typed_edges_referencing_entity_tenant_wide<S: Storage + ?Sized>(
+    storage: &S,
+    ctx: &TenantContext,
+    entity_id: Uuid,
+) -> anyhow::Result<usize> {
+    let edges = storage.typed_edge_list_all(ctx).await?;
+    let mut deleted = 0;
+    for edge in edges
+        .into_iter()
+        .filter(|edge| edge.src_id == entity_id || edge.dst_id == entity_id)
+    {
+        if storage
+            .typed_edge_delete(
+                ctx,
+                edge.session_id,
+                edge.src_id,
+                &edge.edge_type,
+                edge.dst_id,
+            )
+            .await?
+        {
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
+}
+
 /// Extract candidate entities from text using simple heuristics.
 /// Returns (name, entity_type) pairs.
 ///
@@ -762,6 +797,58 @@ pub fn compute_text_similarity(a: &str, b: &str) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tenant_wide_edge_cleanup_removes_cross_session_edges() {
+        use crate::storage::Storage;
+        use crate::storage::mock::MockStorage;
+        use crate::types::TypedEdge;
+
+        let store = MockStorage::new();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "test".into(),
+        };
+        let target = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let drift_session = Uuid::new_v4(); // edges stored under a mismatched session
+
+        let mk = |src, etype: &str, dst| TypedEdge {
+            tenant_id: ctx.tenant_id,
+            session_id: drift_session,
+            src_id: src,
+            edge_type: etype.to_string(),
+            dst_id: dst,
+            weight: 1.0,
+            metadata: None,
+            created_at: chrono::Utc::now(),
+        };
+        // Two edges touch `target` (as src, then as dst), under a drifted session.
+        store
+            .typed_edge_put(&ctx, &mk(target, "CO_OCCURS_WITH", other))
+            .await
+            .unwrap();
+        store
+            .typed_edge_put(&ctx, &mk(other, "references", target))
+            .await
+            .unwrap();
+        // One unrelated edge must survive.
+        let keep_a = Uuid::new_v4();
+        let keep_b = Uuid::new_v4();
+        store
+            .typed_edge_put(&ctx, &mk(keep_a, "references", keep_b))
+            .await
+            .unwrap();
+
+        let deleted = delete_typed_edges_referencing_entity_tenant_wide(&store, &ctx, target)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 2, "both edges touching the target must be removed");
+
+        let remaining = store.typed_edge_list_all(&ctx).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].src_id, keep_a);
+    }
 
     #[test]
     fn text_similarity_identical() {

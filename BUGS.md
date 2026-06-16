@@ -121,7 +121,7 @@ configuration, never `http://localhost:18765`.
 
 ### BUG-F-001 · P1 · ANN index cold-load blocks all CQL queries for ~300s after restart
 
-**Component:** ferrosa  
+**Component:** ferrosa
 **Version:** ≤ 0.11.0
 
 **Description:** On restart with a large entity store (3,600+ entities), ferrosa
@@ -140,7 +140,7 @@ health probe) before starting dependent services.
 
 ### BUG-F-003 · P2 · PREPARE returns malformed metadata — breaks cassandra-driver
 
-**Component:** ferrosa  
+**Component:** ferrosa
 **Version:** ≤ 0.11.0
 
 **Description:** The PREPARE response returns malformed column metadata.
@@ -152,6 +152,32 @@ prepare queries will fail.
 
 **Workaround:** Use literal string-interpolated CQL only. Escape single quotes
 by doubling them (`'` → `''`). Never call `session.prepare()`.
+
+---
+
+### BUG-F-007 · P1 · Full-text indexes do not return inserted rows via `fts_match`
+
+**Component:** ferrosa.
+**Version:** ≤ 0.11.0
+
+**Description:** A table can be created, indexed with
+`CREATE INDEX ... USING 'fulltext'`, and populated successfully, but
+`SELECT ... WHERE body = fts_match('<unique-token>')` returns zero rows even
+when a normal scan of the same table returns the inserted row.
+
+**Reproduce:** Run
+`cargo test -p ferrosa-memory-core --test ferrosa_bugs open_fulltext_index_returns_inserted_rows -- --ignored --nocapture`
+against a live Ferrosa cluster. On June 15, 2026, this failed against the local
+cluster on port `19042`: the probe row was visible via a normal scan but
+`fts_match` returned `0` rows.
+
+**Impact:** ferrosa-memory can create native FTS indexes, but native lexical
+recall is not usable. Search must continue to rely on the deterministic
+`document_terms` / `context_segment_terms` fallback until Ferrosa FTS returns
+inserted rows.
+
+**Workaround:** Keep the memory term-table fallback enabled. Do not treat
+native FTS zero-row responses as proof that no lexical match exists.
 
 ---
 

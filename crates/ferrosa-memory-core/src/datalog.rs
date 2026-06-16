@@ -988,7 +988,7 @@ fn format_rule_id(rule: &DatalogRule) -> String {
 ///
 /// These rules derive transitive relationships, clusters, reachability,
 /// taxonomy hierarchies, and part-of ancestry from base graph predicates.
-const BUILTIN_RULES_TEXT: [&str; 10] = [
+const BUILTIN_RULES_TEXT: &[&str] = &[
     "related(X, Z) :- co_occurs(X, Y), co_occurs(Y, Z), X != Z.",
     "cluster(X, Y) :- related(X, Y), related(Y, X).",
     "reachable(X, Z) :- edge(X, _, Z).",
@@ -999,6 +999,21 @@ const BUILTIN_RULES_TEXT: [&str; 10] = [
     "isa(E, P) :- instance_of(E, C), class_ancestor(C, P).",
     "ancestor_part(X, Y) :- part_of(X, Y).",
     "ancestor_part(X, Z) :- part_of(X, Y), ancestor_part(Y, Z).",
+    "current(X, X) :- active(X).",
+    "stale(X, X) :- dormant(X).",
+    "stale(X, X) :- silent(X).",
+    "stale(X, X) :- unavailable(X).",
+    "authoritative(X, X) :- confidence(X, S), S >= 0.8.",
+    "authoritative(X, X) :- tag(X, \"curated\").",
+    "authoritative(X, X) :- tag(X, \"remembered\").",
+    "authoritative(X, X) :- tag(X, \"skill\").",
+    "task_relevant(X, Y) :- depends_on(X, Y).",
+    "task_relevant(X, Y) :- implements(X, Y).",
+    "task_relevant(X, Y) :- uses(X, Y).",
+    "task_relevant(X, Y) :- references(X, Y).",
+    "task_relevant(X, Y) :- related_to(X, Y).",
+    "bridge_memory(X, Z) :- task_relevant(X, Y), reachable(Y, Z), X != Z.",
+    "bridge_memory(X, Z) :- task_relevant(X, Y), related(Y, Z), X != Z.",
 ];
 
 pub fn builtin_rules() -> Vec<DatalogRule> {
@@ -1107,6 +1122,33 @@ pub async fn load_session_facts(
     for e in &entities {
         facts.insert("node", vec![Term::Const(e.entity_id)]);
         facts.insert(
+            "confidence",
+            vec![
+                Term::Const(e.entity_id),
+                Term::ConstFloat(OrderedFloat(e.confidence)),
+            ],
+        );
+        for tag in &e.tags {
+            facts.insert(
+                "tag",
+                vec![Term::Const(e.entity_id), Term::ConstStr(tag.clone())],
+            );
+        }
+        match e.state {
+            crate::types::MemoryState::Active => {
+                facts.insert("active", vec![Term::Const(e.entity_id)]);
+            }
+            crate::types::MemoryState::Dormant => {
+                facts.insert("dormant", vec![Term::Const(e.entity_id)]);
+            }
+            crate::types::MemoryState::Silent => {
+                facts.insert("silent", vec![Term::Const(e.entity_id)]);
+            }
+            crate::types::MemoryState::Unavailable => {
+                facts.insert("unavailable", vec![Term::Const(e.entity_id)]);
+            }
+        }
+        facts.insert(
             "node_label",
             vec![
                 Term::Const(e.entity_id),
@@ -1146,15 +1188,21 @@ pub async fn load_session_facts(
 
     // Load typed edges as specific predicates
     let typed_edges = storage.typed_edge_list_session(ctx, session_id).await?;
-    for te in &typed_edges {
-        let pred = &te.edge_type;
-        facts.insert(pred, vec![Term::Const(te.src_id), Term::Const(te.dst_id)]);
+    for typed_edge in &typed_edges {
+        let pred = &typed_edge.edge_type;
+        facts.insert(
+            pred,
+            vec![
+                Term::Const(typed_edge.src_id),
+                Term::Const(typed_edge.dst_id),
+            ],
+        );
         facts.insert(
             "edge",
             vec![
-                Term::Const(te.src_id),
+                Term::Const(typed_edge.src_id),
                 Term::ConstStr(pred.clone()),
-                Term::Const(te.dst_id),
+                Term::Const(typed_edge.dst_id),
             ],
         );
     }
@@ -1473,8 +1521,8 @@ mod tests {
         let rules = builtin_rules();
         assert_eq!(
             rules.len(),
-            10,
-            "expected 10 builtin rules, got {}",
+            BUILTIN_RULES_TEXT.len(),
+            "expected all builtin rules to parse, got {}",
             rules.len()
         );
     }
@@ -1922,6 +1970,56 @@ mod tests {
             all_facts.contains("cluster", &[Term::Const(a), Term::Const(c)]),
             "should derive cluster(a, c)"
         );
+    }
+
+    #[test]
+    fn test_hot_memory_predicate_derivations() {
+        let active = Uuid::new_v4();
+        let dormant = Uuid::new_v4();
+        let trusted = Uuid::new_v4();
+        let curated = Uuid::new_v4();
+
+        let mut facts = FactSet::new();
+        facts.insert("active", vec![Term::Const(active)]);
+        facts.insert("dormant", vec![Term::Const(dormant)]);
+        facts.insert(
+            "confidence",
+            vec![Term::Const(trusted), Term::ConstFloat(OrderedFloat(0.85))],
+        );
+        facts.insert(
+            "tag",
+            vec![Term::Const(curated), Term::ConstStr("curated".into())],
+        );
+        facts.insert("uses", vec![Term::Const(active), Term::Const(trusted)]);
+        facts.insert(
+            "edge",
+            vec![
+                Term::Const(trusted),
+                Term::ConstStr("references".into()),
+                Term::Const(curated),
+            ],
+        );
+
+        let (all_facts, _) = evaluate(&builtin_rules(), &facts, 100, 50000);
+
+        assert!(all_facts.contains("current", &[Term::Const(active), Term::Const(active)]));
+        assert!(all_facts.contains("stale", &[Term::Const(dormant), Term::Const(dormant)]));
+        assert!(all_facts.contains(
+            "authoritative",
+            &[Term::Const(trusted), Term::Const(trusted)]
+        ));
+        assert!(all_facts.contains(
+            "authoritative",
+            &[Term::Const(curated), Term::Const(curated)]
+        ));
+        assert!(all_facts.contains(
+            "task_relevant",
+            &[Term::Const(active), Term::Const(trusted)]
+        ));
+        assert!(all_facts.contains(
+            "bridge_memory",
+            &[Term::Const(active), Term::Const(curated)]
+        ));
     }
 
     #[test]

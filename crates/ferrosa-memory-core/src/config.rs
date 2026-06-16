@@ -280,7 +280,13 @@ fn default_enrich_max_tokens() -> u32 {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct JudgeConfig {
     /// Enable judge-model reranking in live retrieval paths.
-    #[serde(default)]
+    ///
+    /// Defaults to true because the local Ollama judge configuration below is
+    /// also fully specified by default. If the configured judge endpoint is not
+    /// actually available at runtime, retrieval still succeeds and reports the
+    /// judge failure as a skipped rerank diagnostic rather than failing the
+    /// search.
+    #[serde(default = "default_judge_enabled")]
     pub enabled: bool,
     /// Provider family. Supported UI probes include `ollama`, `lmstudio`, and `openai_compatible`.
     #[serde(default = "default_judge_provider")]
@@ -305,7 +311,7 @@ pub struct JudgeConfig {
 impl Default for JudgeConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: default_judge_enabled(),
             provider: default_judge_provider(),
             base_url: default_judge_base_url(),
             model: default_judge_model(),
@@ -318,6 +324,10 @@ impl Default for JudgeConfig {
 
 fn default_judge_max_rerank_candidates() -> usize {
     8
+}
+
+fn default_judge_enabled() -> bool {
+    true
 }
 
 /// Runtime retrieval defaults shared by MCP tools that return ranked context.
@@ -1551,13 +1561,44 @@ port = 9999
     #[test]
     fn judge_config_defaults_to_local_ollama_without_token() {
         let cfg = JudgeConfig::default();
-        assert!(!cfg.enabled);
+        assert!(cfg.enabled);
         assert_eq!(cfg.provider, "ollama");
         assert_eq!(cfg.base_url, "http://127.0.0.1:11434");
         assert_eq!(cfg.model, "qwen2.5-coder:7b");
         assert_eq!(cfg.token, None);
         assert_eq!(cfg.timeout_seconds, 30);
         assert_eq!(cfg.max_rerank_candidates, 8);
+    }
+
+    #[test]
+    fn parse_judge_config_missing_enabled_defaults_to_live_rerank() {
+        let toml = r#"
+[ferrosa]
+contact_points = ["localhost:9042"]
+
+[judge]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+model = "qwen2.5-coder:7b"
+"#;
+        let config = parse_config(toml).expect("should parse judge config");
+        assert!(config.judge.enabled);
+    }
+
+    #[test]
+    fn parse_judge_config_explicit_false_disables_live_rerank() {
+        let toml = r#"
+[ferrosa]
+contact_points = ["localhost:9042"]
+
+[judge]
+enabled = false
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+model = "qwen2.5-coder:7b"
+"#;
+        let config = parse_config(toml).expect("should parse judge config");
+        assert!(!config.judge.enabled);
     }
 
     #[test]

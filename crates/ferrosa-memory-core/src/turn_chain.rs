@@ -73,6 +73,16 @@ use crate::context_segment::TemporalEdge;
 use crate::storage::Storage;
 use crate::types::{EntityEntry, EntityListQuery, EntityListScope, TenantContext};
 
+/// Canonical set of turn-like entity types that the auto-chainer links into
+/// session threads. The Claude turn-hook ingests `turn`; the Hermes harness
+/// ingests `conversation_turn`. Both must be chained identically.
+pub const TURN_TYPES: &[&str] = &["turn", "conversation_turn"];
+
+/// True if `entity_type` is a turn-like type the chainer should link.
+pub fn is_turn_type(entity_type: &str) -> bool {
+    TURN_TYPES.contains(&entity_type)
+}
+
 /// Write `next_turn` / `previous_turn` temporal edges linking `new_turn` to
 /// the most recently inserted prior turn in the same session, if one exists.
 ///
@@ -87,20 +97,24 @@ pub async fn link_turn_to_predecessor<S: Storage + ?Sized>(
     session_id: Uuid,
     new_turn: &EntityEntry,
 ) -> anyhow::Result<bool> {
-    debug_assert_eq!(
-        new_turn.entity_type, "turn",
-        "link_turn_to_predecessor called with non-turn entity"
+    debug_assert!(
+        is_turn_type(&new_turn.entity_type),
+        "link_turn_to_predecessor called with non-turn entity: {}",
+        new_turn.entity_type
     );
 
-    // List all turn entities in this session partition, then find the most
-    // recent one that was created strictly before the new turn.
+    // List prior turns of the SAME turn-like type in this session partition,
+    // then find the most recent one created strictly before the new turn. We
+    // filter by the new turn's own type so a `conversation_turn` chain links to
+    // `conversation_turn` predecessors (and `turn` to `turn`) rather than
+    // missing them under the limit when a session mixes families.
     //
     // `entity_list_matching` returns results sorted descending by
     // updated_at/created_at (see storage.rs ~line 362), so the first hit
     // with created_at < new_turn.created_at is exactly what we need.
     let query = EntityListQuery {
         session_id,
-        entity_type: Some("turn".into()),
+        entity_type: Some(new_turn.entity_type.clone()),
         filters: Default::default(),
         scope: EntityListScope::Session,
         // We only need the immediate predecessor; fetch a small page.
@@ -249,6 +263,49 @@ mod tests {
             .entity_put(ctx, entry)
             .await
             .expect("entity_put should succeed");
+    }
+
+    /// Build a turn-like entity with an explicit `entity_type` (e.g. the
+    /// Hermes harness's `conversation_turn`) at a deterministic created_at.
+    fn turn_entity_typed(
+        ctx: &TenantContext,
+        session_id: Uuid,
+        created_offset_secs: i64,
+        entity_type: &str,
+    ) -> EntityEntry {
+        let mut e = turn_entity(ctx, session_id, created_offset_secs);
+        e.entity_type = entity_type.into();
+        e
+    }
+
+    // -----------------------------------------------------------------------
+    // Hermes ingests turns as entity_type="conversation_turn"; the chainer
+    // must link those exactly like canonical "turn" entities.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn conversation_turns_link_via_predecessor() {
+        let storage = MockStorage::new();
+        let ctx = ctx();
+        let sid = Uuid::new_v4();
+
+        let t1 = turn_entity_typed(&ctx, sid, 1000, "conversation_turn");
+        let t2 = turn_entity_typed(&ctx, sid, 2000, "conversation_turn");
+        store_turn(&storage, &ctx, &t1).await;
+        store_turn(&storage, &ctx, &t2).await;
+
+        let linked = link_turn_to_predecessor(&storage, &ctx, sid, &t2)
+            .await
+            .expect("link should succeed");
+        assert!(linked, "conversation_turn should link to its predecessor");
+
+        let edges = storage.temporal_edges.lock().await;
+        let next = edges
+            .iter()
+            .find(|e| e.edge_type == "next_turn")
+            .expect("next_turn edge must exist for conversation_turn");
+        assert_eq!(next.src_id, t1.entity_id);
+        assert_eq!(next.dst_id, t2.entity_id);
     }
 
     // -----------------------------------------------------------------------

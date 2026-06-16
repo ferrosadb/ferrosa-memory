@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::importance::{DerivedImportanceInput, compute_derived_importance};
 use crate::storage::Storage;
 use crate::types::TenantContext;
 
@@ -93,6 +94,7 @@ pub struct FusionConfig {
     pub document_bm25_weight: f64,
     pub document_ann_weight: f64,
     pub document_phonetic_weight: f64,
+    pub datalog_frontier_weight: f64,
     pub warmth_weight: f64,
     pub pagerank_weight: f64,
     /// Reputation signal weight. Moderate (0.5) to demote bad entities
@@ -114,6 +116,7 @@ impl Default for FusionConfig {
             document_bm25_weight: 2.5,
             document_ann_weight: 1.5,
             document_phonetic_weight: 1.0,
+            datalog_frontier_weight: 4.0,
             warmth_weight: 1.0,
             pagerank_weight: 1.0,
             reputation_weight: 0.5,
@@ -161,6 +164,7 @@ impl FusionConfig {
                 config.document_ann_weight = 1.5;
                 config.phonetic_weight = 1.0;
                 config.document_phonetic_weight = 1.0;
+                config.datalog_frontier_weight = 4.0;
                 Some(config)
             }
             "bm25-semantic-phonetic-workspace" => {
@@ -174,6 +178,7 @@ impl FusionConfig {
                 config.phonetic_weight = 1.0;
                 config.document_phonetic_weight = 1.0;
                 config.workspace_weight = 2.0;
+                config.datalog_frontier_weight = 4.0;
                 Some(config)
             }
             _ => None,
@@ -189,6 +194,7 @@ impl FusionConfig {
         self.document_bm25_weight = 0.0;
         self.document_ann_weight = 0.0;
         self.document_phonetic_weight = 0.0;
+        self.datalog_frontier_weight = 0.0;
         self.warmth_weight = 0.0;
         self.pagerank_weight = 0.0;
         self.reputation_weight = 0.0;
@@ -227,6 +233,10 @@ impl FusionConfig {
             }
             "document_phonetic" | "document_phonetic_weight" => {
                 self.document_phonetic_weight = weight;
+                true
+            }
+            "datalog_frontier" | "datalog" | "datalog_frontier_weight" => {
+                self.datalog_frontier_weight = weight;
                 true
             }
             "warmth" | "warmth_weight" => {
@@ -334,6 +344,16 @@ pub struct SearchFilter {
     pub min_score: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_kinds: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub datalog_frontier: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub datalog_frontier_seed_limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub datalog_frontier_edge_limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub datalog_frontier_max_hops: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub datalog_frontier_min_confidence: Option<f64>,
 }
 
 fn source_limit(limit: usize, filter: Option<&SearchFilter>) -> usize {
@@ -448,11 +468,16 @@ fn source_is_ann(source: &str) -> bool {
     source.contains("ann")
 }
 
+fn source_is_datalog_frontier(source: &str) -> bool {
+    source.starts_with("datalog_frontier:")
+}
+
 #[derive(Debug, Clone, Default)]
 struct CandidateEvidence {
     sources: HashSet<String>,
     lexical_sources: usize,
     ann_sources: usize,
+    datalog_frontier_sources: usize,
     lexical_hits: usize,
     lexical_coverage: f64,
 }
@@ -463,7 +488,10 @@ impl CandidateEvidence {
     }
 
     fn ann_only_without_terms(&self) -> bool {
-        self.ann_sources > 0 && self.lexical_sources == 0 && self.lexical_hits == 0
+        self.ann_sources > 0
+            && self.lexical_sources == 0
+            && self.datalog_frontier_sources == 0
+            && self.lexical_hits == 0
     }
 }
 
@@ -484,6 +512,9 @@ fn collect_candidate_evidence(
         }
         if source_is_ann(&result.source) {
             entry.ann_sources += 1;
+        }
+        if source_is_datalog_frontier(&result.source) {
+            entry.datalog_frontier_sources += 1;
         }
         entry.lexical_hits = entry.lexical_hits.max(lexical_hits);
         entry.lexical_coverage = entry
@@ -513,11 +544,12 @@ fn apply_source_aware_scoring(
         let source_bonus = (ev.source_count().saturating_sub(1) as f64 * 0.035).min(0.14);
         let lexical_bonus = ev.lexical_coverage * 0.30;
         let lexical_source_bonus = if ev.lexical_sources > 0 { 0.04 } else { 0.0 };
-        let ann_only_penalty = if ev.ann_sources > 0 && ev.lexical_sources == 0 {
-            0.04
-        } else {
-            0.0
-        };
+        let ann_only_penalty =
+            if ev.ann_sources > 0 && ev.lexical_sources == 0 && ev.datalog_frontier_sources == 0 {
+                0.04
+            } else {
+                0.0
+            };
         result.score = (result.score + source_bonus + lexical_bonus + lexical_source_bonus
             - ann_only_penalty)
             .max(0.0);
@@ -551,6 +583,80 @@ fn apply_authority_adjustments(
                 continue;
             }
             result.score = (result.score + score * 0.45).max(0.0);
+        }
+        adjusted.push(result);
+    }
+    adjusted.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    adjusted
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DerivedSearchSignals {
+    derived_confidence: f64,
+    support_count: usize,
+    path_distance: usize,
+    predicate_weight: f64,
+    scope_guard: bool,
+}
+
+impl DerivedSearchSignals {
+    fn importance(self) -> f64 {
+        compute_derived_importance(DerivedImportanceInput {
+            derived_confidence: self.derived_confidence,
+            support_count: self.support_count,
+            path_distance: self.path_distance,
+            predicate_weight: self.predicate_weight,
+            scope_guard: self.scope_guard,
+        })
+    }
+}
+
+fn predicate_weight(predicate: &str) -> f64 {
+    match predicate {
+        "remembered" | "authoritative" | "curated" | "implements" | "depends_on" => 1.0,
+        "uses" | "references" | "part_of" | "contains" | "current" | "task_relevant" => 0.85,
+        "related_to" | "bridge_memory" | "reachable" => 0.65,
+        "co_occurs" | "co_occurs_with" | "CO_OCCURS" | "CO_OCCURS_WITH" => 0.25,
+        "supersedes" | "contradicts" | "stale" => 0.0,
+        _ => 0.55,
+    }
+}
+
+fn derived_metadata_usize(metadata: Option<&str>, key: &str) -> Option<usize> {
+    let value = serde_json::from_str::<serde_json::Value>(metadata?).ok()?;
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .map(|n| n as usize)
+}
+
+fn derived_metadata_f64(metadata: Option<&str>, key: &str) -> Option<f64> {
+    let value = serde_json::from_str::<serde_json::Value>(metadata?).ok()?;
+    value.get(key).and_then(serde_json::Value::as_f64)
+}
+
+fn should_suppress_derived_predicate(predicate: &str) -> bool {
+    matches!(
+        predicate,
+        "supersedes" | "contradicts" | "stale" | "wrong_workspace" | "negative_reputation"
+    )
+}
+
+fn apply_derived_importance_adjustments(
+    results: Vec<SearchResult>,
+    derived_signals: &HashMap<Uuid, DerivedSearchSignals>,
+) -> Vec<SearchResult> {
+    if derived_signals.is_empty() {
+        return results;
+    }
+    let mut adjusted = Vec::with_capacity(results.len());
+    for mut result in results {
+        if let Some(signals) = derived_signals.get(&result.id) {
+            result.score += signals.importance() * 0.08;
         }
         adjusted.push(result);
     }
@@ -628,6 +734,229 @@ fn workspace_candidate_paths(properties: &serde_json::Value) -> Vec<&str> {
     .iter()
     .filter_map(|key| properties.get(*key).and_then(|v| v.as_str()))
     .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn datalog_frontier_candidates<S: Storage + ?Sized>(
+    storage: &S,
+    ctx: &TenantContext,
+    sessions: &[Uuid],
+    seed_candidates: &[SearchResult],
+    source_limit: usize,
+    filter: Option<&SearchFilter>,
+) -> anyhow::Result<(Vec<SearchResult>, HashMap<Uuid, DerivedSearchSignals>)> {
+    if filter.and_then(|f| f.datalog_frontier) == Some(false) {
+        return Ok((Vec::new(), HashMap::new()));
+    }
+
+    let seed_limit = filter
+        .and_then(|f| f.datalog_frontier_seed_limit)
+        .unwrap_or(source_limit)
+        .clamp(1, 50);
+    let edge_limit = filter
+        .and_then(|f| f.datalog_frontier_edge_limit)
+        .unwrap_or(12)
+        .clamp(1, 50);
+    let max_hops = filter
+        .and_then(|f| f.datalog_frontier_max_hops)
+        .unwrap_or(2)
+        .clamp(1, 3);
+    let min_confidence = filter
+        .and_then(|f| f.datalog_frontier_min_confidence)
+        .unwrap_or(0.30)
+        .clamp(0.0, 1.0);
+
+    let seeds = seed_candidates
+        .iter()
+        .filter(|candidate| candidate.result_type == "entity")
+        .map(|candidate| candidate.id)
+        .take(seed_limit)
+        .collect::<Vec<_>>();
+    if seeds.is_empty() {
+        return Ok((Vec::new(), HashMap::new()));
+    }
+
+    let mut best: HashMap<Uuid, (SearchResult, DerivedSearchSignals)> = HashMap::new();
+    for &sid in sessions {
+        let mut frontier = seeds
+            .iter()
+            .copied()
+            .map(|id| (id, 0usize))
+            .collect::<Vec<_>>();
+        let mut visited = seeds.iter().copied().collect::<HashSet<_>>();
+        let mut offset = 0usize;
+        while offset < frontier.len() {
+            let (current, depth) = frontier[offset];
+            offset += 1;
+            if depth >= max_hops {
+                continue;
+            }
+
+            let mut edges = storage.typed_edge_list_from(ctx, sid, current).await?;
+            edges.extend(storage.typed_edge_list_to(ctx, sid, current).await?);
+            edges.sort_by(|left, right| {
+                right
+                    .weight
+                    .partial_cmp(&left.weight)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            edges.truncate(edge_limit);
+
+            for edge in edges {
+                if should_suppress_derived_predicate(&edge.edge_type) {
+                    continue;
+                }
+                let neighbor = if edge.src_id == current {
+                    edge.dst_id
+                } else {
+                    edge.src_id
+                };
+                if neighbor == current {
+                    continue;
+                }
+                let path_distance = depth + 1;
+                let derived_confidence =
+                    derived_metadata_f64(edge.metadata.as_deref(), "confidence")
+                        .unwrap_or(edge.weight)
+                        .clamp(0.0, 1.0);
+                if derived_confidence < min_confidence {
+                    continue;
+                }
+                let support_count =
+                    derived_metadata_usize(edge.metadata.as_deref(), "support_count").unwrap_or(1);
+                let signals = DerivedSearchSignals {
+                    derived_confidence,
+                    support_count,
+                    path_distance,
+                    predicate_weight: derived_metadata_f64(
+                        edge.metadata.as_deref(),
+                        "predicate_weight",
+                    )
+                    .unwrap_or_else(|| predicate_weight(&edge.edge_type)),
+                    scope_guard: edge.session_id == sid,
+                };
+                if signals.importance() <= 0.0 {
+                    continue;
+                }
+
+                let Some(entity) = storage.entity_get_by_id(ctx, sid, neighbor).await? else {
+                    continue;
+                };
+                if !entity.state.is_retrievable() {
+                    continue;
+                }
+                if !visited.contains(&neighbor) && path_distance < max_hops {
+                    visited.insert(neighbor);
+                    frontier.push((neighbor, path_distance));
+                }
+
+                let content = if entity.context_snippet.trim().is_empty() {
+                    entity.entity_name.clone()
+                } else {
+                    entity.context_snippet.clone()
+                };
+                let candidate = SearchResult {
+                    id: entity.entity_id,
+                    source: format!("datalog_frontier:{}", edge.edge_type),
+                    memory_kind: classify_memory_kind(
+                        "entity",
+                        "datalog_frontier",
+                        Some(&entity.entity_type),
+                    )
+                    .into(),
+                    content,
+                    score: signals.importance(),
+                    result_type: "entity".into(),
+                    document_id: None,
+                    prev_chunk_id: None,
+                    next_chunk_id: None,
+                    hint: Some(format!(
+                        "Derived via {} at {} hop(s), confidence {:.2}, support {}.",
+                        edge.edge_type, path_distance, derived_confidence, support_count
+                    )),
+                    expanded_context: Vec::new(),
+                };
+
+                best.entry(entity.entity_id)
+                    .and_modify(|(existing, existing_signals)| {
+                        let combined = DerivedSearchSignals {
+                            derived_confidence: existing_signals
+                                .derived_confidence
+                                .max(signals.derived_confidence),
+                            support_count: existing_signals
+                                .support_count
+                                .saturating_add(signals.support_count),
+                            path_distance: existing_signals
+                                .path_distance
+                                .min(signals.path_distance),
+                            predicate_weight: existing_signals
+                                .predicate_weight
+                                .max(signals.predicate_weight),
+                            scope_guard: existing_signals.scope_guard && signals.scope_guard,
+                        };
+                        if combined.importance() > existing_signals.importance() {
+                            *existing = candidate.clone();
+                        }
+                        *existing_signals = combined;
+                    })
+                    .or_insert((candidate, signals));
+            }
+        }
+    }
+
+    let mut candidates = best
+        .values()
+        .map(|(candidate, signals)| {
+            let mut candidate = candidate.clone();
+            candidate.score = signals.importance();
+            candidate
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    candidates.truncate(source_limit);
+    let signals = best
+        .into_iter()
+        .map(|(id, (_candidate, signals))| (id, signals))
+        .collect();
+    Ok((candidates, signals))
+}
+
+fn context_segment_workspace(segment: &crate::context_segment::ContextSegment) -> Option<&str> {
+    // Hook-ingested context uses "<harness>:<session_id>:<cwd>". Preserve
+    // compatibility with existing rows by deriving workspace from that stable
+    // conversation id until context segments carry structured metadata.
+    segment
+        .conversation_id
+        .rsplit_once(':')
+        .map(|(_, workspace)| workspace)
+        .filter(|workspace| !workspace.trim().is_empty())
+}
+
+fn context_segment_allowed_for_workspace(
+    caller_session: Uuid,
+    queried_session: Uuid,
+    filter: Option<&SearchFilter>,
+    segment: &crate::context_segment::ContextSegment,
+) -> bool {
+    if segment.session_id == caller_session || segment.source_session == caller_session {
+        return true;
+    }
+    if queried_session == caller_session {
+        return true;
+    }
+    let Some(workspace_cwd) = filter.and_then(|f| f.workspace_cwd.as_deref()) else {
+        return true;
+    };
+    if workspace_cwd.trim().is_empty() {
+        return true;
+    }
+    context_segment_workspace(segment)
+        .and_then(|workspace| workspace_affinity_score(workspace_cwd, workspace))
+        .is_some()
 }
 
 fn workspace_feedback_adjustment(query_cwd: &str, properties: &serde_json::Value) -> f64 {
@@ -844,6 +1173,9 @@ pub async fn hybrid_search_with_diagnostics(
             lists.push(
                 segments
                     .into_iter()
+                    .filter(|segment| {
+                        context_segment_allowed_for_workspace(session_id, sid, filter, segment)
+                    })
                     .enumerate()
                     .map(|(i, segment)| SearchResult {
                         id: segment.segment_id,
@@ -873,6 +1205,9 @@ pub async fn hybrid_search_with_diagnostics(
             lists.push(
                 segments
                     .into_iter()
+                    .filter(|segment| {
+                        context_segment_allowed_for_workspace(session_id, sid, filter, segment)
+                    })
                     .map(|segment| SearchResult {
                         id: segment.segment_id,
                         source: "context_ann".into(),
@@ -975,6 +1310,32 @@ pub async fn hybrid_search_with_diagnostics(
                     .collect(),
             );
             weights.push(config.document_ann_weight);
+        }
+    }
+
+    let mut derived_signals = HashMap::new();
+    if config.datalog_frontier_weight > 0.0 {
+        let mut seen_seed = HashSet::new();
+        let seed_candidates = lists
+            .iter()
+            .flatten()
+            .filter(|candidate| candidate.result_type == "entity")
+            .filter(|candidate| seen_seed.insert(candidate.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let (frontier, signals) = datalog_frontier_candidates(
+            storage,
+            ctx,
+            &sessions,
+            &seed_candidates,
+            source_limit,
+            filter,
+        )
+        .await?;
+        if !frontier.is_empty() {
+            lists.push(frontier);
+            weights.push(config.datalog_frontier_weight);
+            derived_signals = signals;
         }
     }
 
@@ -1126,7 +1487,10 @@ pub async fn hybrid_search_with_diagnostics(
     let diagnostics = candidate_source_stats(&lists, &weights, limit, source_limit);
     let evidence = collect_candidate_evidence(query, &lists);
     let mut merged = apply_authority_adjustments(
-        apply_source_aware_scoring(query, rrf_merge(lists, 60.0, &weights), &evidence),
+        apply_derived_importance_adjustments(
+            apply_source_aware_scoring(query, rrf_merge(lists, 60.0, &weights), &evidence),
+            &derived_signals,
+        ),
         pagerank_scores,
         reputation_scores,
     );
@@ -1244,6 +1608,119 @@ mod tests {
     }
 
     #[test]
+    fn context_segment_workspace_reads_hook_conversation_id() {
+        let segment = crate::context_segment::ContextSegment {
+            tenant_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            segment_id: Uuid::new_v4(),
+            source_session: Uuid::new_v4(),
+            source_fold_id: None,
+            conversation_id:
+                "claude:11111111-1111-1111-1111-111111111111:/Users/bkearns/src/research".into(),
+            segment_index: 0,
+            start_turn: 0,
+            end_turn: 0,
+            start_time: None,
+            end_time: None,
+            segment_text: "marketing context".into(),
+            segment_summary: None,
+            bm25_text: "marketing context".into(),
+            segment_embedding: None,
+            token_count: 2,
+            content_hash: "hash".into(),
+            prev_segment_id: None,
+            next_segment_id: None,
+            created_at: chrono::Utc::now(),
+        };
+
+        assert_eq!(
+            context_segment_workspace(&segment),
+            Some("/Users/bkearns/src/research")
+        );
+    }
+
+    #[test]
+    fn context_segment_workspace_guard_blocks_unrelated_legacy_raw_context() {
+        let caller = Uuid::new_v4();
+        let segment = crate::context_segment::ContextSegment {
+            tenant_id: Uuid::new_v4(),
+            session_id: Uuid::nil(),
+            segment_id: Uuid::new_v4(),
+            source_session: Uuid::nil(),
+            source_fold_id: None,
+            conversation_id:
+                "claude:11111111-1111-1111-1111-111111111111:/Users/bkearns/src/research".into(),
+            segment_index: 0,
+            start_turn: 0,
+            end_turn: 0,
+            start_time: None,
+            end_time: None,
+            segment_text: "LinkedIn marketing context".into(),
+            segment_summary: None,
+            bm25_text: "linkedin marketing context".into(),
+            segment_embedding: None,
+            token_count: 3,
+            content_hash: "hash".into(),
+            prev_segment_id: None,
+            next_segment_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        let filter = SearchFilter {
+            scope: SearchScope::Both,
+            workspace_cwd: Some("/Users/bkearns/src/ferrosa-suite".into()),
+            ..SearchFilter::default()
+        };
+
+        assert!(!context_segment_allowed_for_workspace(
+            caller,
+            Uuid::nil(),
+            Some(&filter),
+            &segment
+        ));
+    }
+
+    #[test]
+    fn context_segment_workspace_guard_allows_same_tree_raw_context() {
+        let caller = Uuid::new_v4();
+        let segment = crate::context_segment::ContextSegment {
+            tenant_id: Uuid::new_v4(),
+            session_id: Uuid::nil(),
+            segment_id: Uuid::new_v4(),
+            source_session: Uuid::nil(),
+            source_fold_id: None,
+            conversation_id:
+                "claude:11111111-1111-1111-1111-111111111111:/Users/bkearns/src/ferrosa-suite"
+                    .into(),
+            segment_index: 0,
+            start_turn: 0,
+            end_turn: 0,
+            start_time: None,
+            end_time: None,
+            segment_text: "memory hook context".into(),
+            segment_summary: None,
+            bm25_text: "memory hook context".into(),
+            segment_embedding: None,
+            token_count: 3,
+            content_hash: "hash".into(),
+            prev_segment_id: None,
+            next_segment_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        let filter = SearchFilter {
+            scope: SearchScope::Both,
+            workspace_cwd: Some("/Users/bkearns/src/ferrosa-suite/crate".into()),
+            ..SearchFilter::default()
+        };
+
+        assert!(context_segment_allowed_for_workspace(
+            caller,
+            Uuid::nil(),
+            Some(&filter),
+            &segment
+        ));
+    }
+
+    #[test]
     fn workspace_feedback_adjustment_demotes_current_workspace_only() {
         let properties = serde_json::json!({
             "workspace_feedback": {
@@ -1323,6 +1800,7 @@ mod tests {
             candidate_limit: Some(25),
             min_score: Some(0.062),
             memory_kinds: Some(vec!["procedural".into(), "semantic".into()]),
+            ..SearchFilter::default()
         };
         let json = serde_json::to_string(&filter).unwrap();
         let back: SearchFilter = serde_json::from_str(&json).unwrap();
@@ -1411,6 +1889,22 @@ mod tests {
     }
 
     #[test]
+    fn source_aware_scoring_keeps_datalog_corroborated_ann_candidate() {
+        let candidate_id = Uuid::new_v4();
+        let mut ann = make_result(candidate_id, "entity_ann", 0.03);
+        ann.content = "graph connected but lexically distant memory".into();
+        let mut frontier = make_result(candidate_id, "datalog_frontier:uses", 0.04);
+        frontier.content = "graph connected but lexically distant memory".into();
+        let lists = vec![vec![ann.clone()], vec![frontier]];
+        let evidence = collect_candidate_evidence("lexical seed phrase", &lists);
+
+        let scored = apply_source_aware_scoring("lexical seed phrase", vec![ann], &evidence);
+
+        assert_eq!(scored.first().map(|result| result.id), Some(candidate_id));
+        assert!(scored[0].score > 0.03);
+    }
+
+    #[test]
     fn authority_adjustments_boost_positive_and_penalize_negative_reputation() {
         let trusted = Uuid::new_v4();
         let distrusted = Uuid::new_v4();
@@ -1462,6 +1956,46 @@ mod tests {
 
         assert_eq!(scored.first().map(|result| result.id), Some(authority));
         assert!(scored[0].score > scored[1].score);
+    }
+
+    #[test]
+    fn derived_importance_adjustments_promote_confident_scoped_frontier_hits() {
+        let inferred = Uuid::new_v4();
+        let wrong_scope = Uuid::new_v4();
+        let mut signals = HashMap::new();
+        signals.insert(
+            inferred,
+            DerivedSearchSignals {
+                derived_confidence: 0.9,
+                support_count: 3,
+                path_distance: 1,
+                predicate_weight: 0.85,
+                scope_guard: true,
+            },
+        );
+        signals.insert(
+            wrong_scope,
+            DerivedSearchSignals {
+                derived_confidence: 0.9,
+                support_count: 3,
+                path_distance: 1,
+                predicate_weight: 0.85,
+                scope_guard: false,
+            },
+        );
+
+        let adjusted = apply_derived_importance_adjustments(
+            vec![
+                make_result(inferred, "datalog_frontier:task_relevant", 0.02),
+                make_result(wrong_scope, "datalog_frontier:task_relevant", 0.02),
+            ],
+            &signals,
+        );
+
+        let inferred_score = adjusted.iter().find(|r| r.id == inferred).unwrap().score;
+        let wrong_scope_score = adjusted.iter().find(|r| r.id == wrong_scope).unwrap().score;
+        assert!(inferred_score > 0.08);
+        assert_eq!(wrong_scope_score, 0.02);
     }
 
     #[test]
@@ -1912,6 +2446,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hybrid_search_scope_both_drops_raw_context_from_unrelated_workspace() {
+        use crate::storage::mock::MockStorage;
+        use crate::types::TenantContext;
+
+        let storage = MockStorage::new();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "test".into(),
+        };
+        let sid = Uuid::new_v4();
+        let leaked_id = Uuid::new_v4();
+        let local_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        storage.context_segments.lock().await.extend([
+            crate::context_segment::ContextSegment {
+                tenant_id: ctx.tenant_id,
+                session_id: Uuid::nil(),
+                segment_id: leaked_id,
+                source_session: Uuid::nil(),
+                source_fold_id: None,
+                conversation_id: format!("claude:{}:/Users/bkearns/src/research", Uuid::new_v4()),
+                segment_index: 0,
+                start_turn: 0,
+                end_turn: 0,
+                start_time: None,
+                end_time: None,
+                segment_text: "FERROSA_LEAK_SENTINEL LinkedIn marketing context".into(),
+                segment_summary: None,
+                bm25_text: "FERROSA_LEAK_SENTINEL LinkedIn marketing context".to_ascii_lowercase(),
+                segment_embedding: None,
+                token_count: 5,
+                content_hash: leaked_id.to_string(),
+                prev_segment_id: None,
+                next_segment_id: None,
+                created_at: now,
+            },
+            crate::context_segment::ContextSegment {
+                tenant_id: ctx.tenant_id,
+                session_id: Uuid::nil(),
+                segment_id: local_id,
+                source_session: Uuid::nil(),
+                source_fold_id: None,
+                conversation_id: format!(
+                    "claude:{}:/Users/bkearns/src/ferrosa-suite",
+                    Uuid::new_v4()
+                ),
+                segment_index: 1,
+                start_turn: 0,
+                end_turn: 0,
+                start_time: None,
+                end_time: None,
+                segment_text: "FERROSA_LEAK_SENTINEL memory hook context".into(),
+                segment_summary: None,
+                bm25_text: "FERROSA_LEAK_SENTINEL memory hook context".to_ascii_lowercase(),
+                segment_embedding: None,
+                token_count: 5,
+                content_hash: local_id.to_string(),
+                prev_segment_id: None,
+                next_segment_id: None,
+                created_at: now,
+            },
+        ]);
+        let filter = SearchFilter {
+            scope: SearchScope::Both,
+            workspace_cwd: Some("/Users/bkearns/src/ferrosa-suite".into()),
+            ..SearchFilter::default()
+        };
+
+        let results = hybrid_search(
+            &storage,
+            &ctx,
+            sid,
+            "FERROSA_LEAK_SENTINEL",
+            None,
+            10,
+            None,
+            None,
+            None,
+            &FusionConfig::profile("all").unwrap(),
+            Some(&filter),
+        )
+        .await
+        .unwrap();
+
+        assert!(results.iter().any(|result| result.id == local_id));
+        assert!(!results.iter().any(|result| result.id == leaked_id));
+    }
+
+    #[tokio::test]
     async fn hybrid_search_min_score_keeps_corroborated_hit_and_drops_singleton_noise() {
         use crate::storage::mock::MockStorage;
         use crate::types::{DocumentChunk, TenantContext};
@@ -1988,5 +2611,267 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, relevant_id);
         assert!(results[0].score >= 0.062);
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_returns_memory_reachable_through_datalog_frontier() {
+        use crate::storage::mock::MockStorage;
+        use crate::types::{EntityEntry, MemoryState, TenantContext, TypedEdge};
+
+        let storage = MockStorage::new();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "test".into(),
+        };
+        let sid = Uuid::new_v4();
+        let seed_id = Uuid::new_v4();
+        let inferred_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+
+        storage
+            .entity_put(
+                &ctx,
+                &EntityEntry {
+                    tenant_id: ctx.tenant_id,
+                    entity_id: seed_id,
+                    session_id: sid,
+                    entity_name: "Atlas cache".into(),
+                    entity_type: "concept".into(),
+                    context_snippet: "Atlas cache routes durable recall requests".into(),
+                    confidence: 1.0,
+                    state: MemoryState::Active,
+                    created_at: now,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        storage
+            .entity_put(
+                &ctx,
+                &EntityEntry {
+                    tenant_id: ctx.tenant_id,
+                    entity_id: inferred_id,
+                    session_id: sid,
+                    entity_name: "Borealis routing note".into(),
+                    entity_type: "decision".into(),
+                    context_snippet:
+                        "Use the durable graph note when the routing cache cannot answer directly."
+                            .into(),
+                    confidence: 1.0,
+                    state: MemoryState::Active,
+                    created_at: now,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        storage
+            .typed_edge_put(
+                &ctx,
+                &TypedEdge {
+                    tenant_id: ctx.tenant_id,
+                    session_id: sid,
+                    src_id: seed_id,
+                    edge_type: "task_relevant".into(),
+                    dst_id: inferred_id,
+                    weight: 0.9,
+                    metadata: Some(r#"{"support_count":3}"#.into()),
+                    created_at: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        let filter = SearchFilter {
+            scope: SearchScope::SessionOnly,
+            min_score: Some(0.062),
+            datalog_frontier_min_confidence: Some(0.3),
+            ..Default::default()
+        };
+        let results = hybrid_search(
+            &storage,
+            &ctx,
+            sid,
+            "Atlas cache",
+            None,
+            10,
+            None,
+            None,
+            None,
+            &FusionConfig::default(),
+            Some(&filter),
+        )
+        .await
+        .unwrap();
+
+        let inferred = results
+            .iter()
+            .find(|result| result.id == inferred_id)
+            .expect("graph-reachable memory should be returned");
+        assert!(inferred.source.starts_with("datalog_frontier:"));
+        assert!(inferred.score >= 0.062);
+        assert!(
+            inferred
+                .hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Derived via task_relevant")
+        );
+    }
+
+    #[tokio::test]
+    async fn datalog_frontier_can_corroborate_existing_weak_seed_candidates() {
+        use crate::storage::mock::MockStorage;
+        use crate::types::{EntityEntry, MemoryState, TenantContext, TypedEdge};
+
+        let storage = MockStorage::new();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "test".into(),
+        };
+        let sid = Uuid::new_v4();
+        let lexical_seed_id = Uuid::new_v4();
+        let weak_ann_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+
+        for (entity_id, entity_name, context_snippet) in [
+            (
+                lexical_seed_id,
+                "Datalog frontier seed",
+                "The lexical seed is directly query visible.",
+            ),
+            (
+                weak_ann_id,
+                "Datalog frontier neighbor",
+                "This memory is useful only because the graph connects it.",
+            ),
+        ] {
+            storage
+                .entity_put(
+                    &ctx,
+                    &EntityEntry {
+                        tenant_id: ctx.tenant_id,
+                        entity_id,
+                        session_id: sid,
+                        entity_name: entity_name.into(),
+                        entity_type: "concept".into(),
+                        context_snippet: context_snippet.into(),
+                        confidence: 1.0,
+                        state: MemoryState::Active,
+                        created_at: now,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        storage
+            .typed_edge_put(
+                &ctx,
+                &TypedEdge {
+                    tenant_id: ctx.tenant_id,
+                    session_id: sid,
+                    src_id: lexical_seed_id,
+                    edge_type: "uses".into(),
+                    dst_id: weak_ann_id,
+                    weight: 0.9,
+                    metadata: Some(r#"{"support_count":2}"#.into()),
+                    created_at: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        let seed_candidates = vec![
+            make_result(lexical_seed_id, "entity_phonetic", 1.0),
+            make_result(weak_ann_id, "entity_ann", 1.0),
+        ];
+        let filter = SearchFilter {
+            scope: SearchScope::SessionOnly,
+            datalog_frontier_min_confidence: Some(0.3),
+            ..Default::default()
+        };
+        let (frontier, signals) = datalog_frontier_candidates(
+            &storage,
+            &ctx,
+            &[sid],
+            &seed_candidates,
+            10,
+            Some(&filter),
+        )
+        .await
+        .unwrap();
+
+        let corroborated = frontier
+            .iter()
+            .find(|candidate| candidate.id == weak_ann_id)
+            .expect("frontier should corroborate a weak candidate already seen by ANN");
+        assert_eq!(corroborated.source, "datalog_frontier:uses");
+        assert!(signals.contains_key(&weak_ann_id));
+    }
+
+    #[tokio::test]
+    async fn datalog_frontier_suppresses_weak_candidates_before_hook_min_score() {
+        use crate::storage::mock::MockStorage;
+        use crate::types::{EntityEntry, MemoryState, TenantContext, TypedEdge};
+
+        let storage = MockStorage::new();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "test".into(),
+        };
+        let sid = Uuid::new_v4();
+        let seed_id = Uuid::new_v4();
+        let weak_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+
+        storage
+            .entity_put(
+                &ctx,
+                &EntityEntry {
+                    tenant_id: ctx.tenant_id,
+                    entity_id: weak_id,
+                    session_id: sid,
+                    entity_name: "Low confidence derived note".into(),
+                    entity_type: "decision".into(),
+                    context_snippet: "This should not clutter hook context.".into(),
+                    confidence: 1.0,
+                    state: MemoryState::Active,
+                    created_at: now,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        storage
+            .typed_edge_put(
+                &ctx,
+                &TypedEdge {
+                    tenant_id: ctx.tenant_id,
+                    session_id: sid,
+                    src_id: seed_id,
+                    edge_type: "task_relevant".into(),
+                    dst_id: weak_id,
+                    weight: 0.1,
+                    metadata: None,
+                    created_at: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        let seed = make_result(seed_id, "entity_phonetic", 1.0);
+        let filter = SearchFilter {
+            datalog_frontier_min_confidence: Some(0.3),
+            ..Default::default()
+        };
+        let (frontier, signals) =
+            datalog_frontier_candidates(&storage, &ctx, &[sid], &[seed], 10, Some(&filter))
+                .await
+                .unwrap();
+
+        assert!(frontier.is_empty());
+        assert!(signals.is_empty());
     }
 }

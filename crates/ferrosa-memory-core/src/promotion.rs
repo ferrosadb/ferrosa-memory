@@ -12,6 +12,20 @@ use crate::datalog;
 use crate::storage::Storage;
 use crate::types::*;
 
+const KNOWN_PROMOTION_PREDICATES: &[&str] = &[
+    "related",
+    "cluster",
+    "reachable",
+    "isa",
+    "class_ancestor",
+    "ancestor_part",
+    "current",
+    "stale",
+    "authoritative",
+    "task_relevant",
+    "bridge_memory",
+];
+
 /// Compute the promotion score for a predicate based on heat telemetry.
 ///
 /// Formula: query_count x avg_compute_ms x reuse_factor / max(update_rate, 1)
@@ -137,17 +151,9 @@ pub async fn check_and_promote(
     config: &PromotionConfig,
 ) -> anyhow::Result<Vec<String>> {
     // Get heat data for known predicates
-    let known_predicates = [
-        "related",
-        "cluster",
-        "reachable",
-        "isa",
-        "class_ancestor",
-        "ancestor_part",
-    ];
     let mut promoted = Vec::new();
 
-    for pred in &known_predicates {
+    for pred in KNOWN_PROMOTION_PREDICATES {
         let (hits, compute_ms) = storage.heat_get(ctx, pred, config.window_days).await?;
         if hits == 0 {
             continue;
@@ -269,6 +275,22 @@ mod tests {
             ..Default::default()
         };
         assert!(!should_promote(&heat, 1000, &config)); // 1000 > budget 10
+    }
+
+    #[test]
+    fn known_promotion_predicates_include_hot_memory_predicates() {
+        for pred in [
+            "current",
+            "stale",
+            "authoritative",
+            "task_relevant",
+            "bridge_memory",
+        ] {
+            assert!(
+                KNOWN_PROMOTION_PREDICATES.contains(&pred),
+                "{pred} should be scanned for materialization"
+            );
+        }
     }
 
     #[tokio::test]

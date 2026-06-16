@@ -38,6 +38,11 @@ const LLM_RERANK_MIN_CANDIDATES: usize = 2;
 const LLM_RERANK_HARD_MAX_CANDIDATES: usize = 50;
 const LLM_RERANK_MIN_SCORE_COVERAGE: usize = 5;
 const LLM_RERANK_BATCH_SIZE: usize = 5;
+/// Connection-establishment budget for the judge endpoint. Kept small so a
+/// judge-on-by-default search skips quickly when the endpoint is down, rather
+/// than blocking on the much longer generation timeout.
+const JUDGE_CONNECT_TIMEOUT_SECONDS: u64 = 2;
+const EDGE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 type ToolDispatchFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Value, (i32, String)>> + Send + 'a>>;
@@ -386,6 +391,7 @@ fn short_tool_name(canonical: &str) -> Option<&'static str> {
         "run_consolidation" => Some("consolidate"),
         "enrich_entities" => Some("enrich"),
         "get_stats" => Some("stats"),
+        "memory_metrics" => Some("metrics"),
         "migration_status" => Some("migrations"),
         "count_entities_by_type" => Some("type_counts"),
         "promote_memory" => Some("promote"),
@@ -467,6 +473,7 @@ fn canonical_tool_name(name: &str) -> &str {
         "consolidate" => "run_consolidation",
         "enrich" => "enrich_entities",
         "stats" => "get_stats",
+        "metrics" => "memory_metrics",
         "migrations" => "migration_status",
         "type_counts" => "count_entities_by_type",
         "promote" => "promote_memory",
@@ -1418,6 +1425,34 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                         "items": { "type": "string", "enum": ["episodic", "procedural", "semantic"] },
                         "description": "Optional result category filter applied before return."
                     },
+                    "datalog_frontier": {
+                        "type": "boolean",
+                        "description": "Enable bounded Datalog-style graph frontier expansion from entity seeds. Default true when the fusion profile includes datalog_frontier."
+                    },
+                    "datalog_frontier_seed_limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "description": "Maximum entity seeds to expand from initial candidates. Defaults to candidate source limit."
+                    },
+                    "datalog_frontier_edge_limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "description": "Maximum typed edges considered per frontier node. Defaults to 12."
+                    },
+                    "datalog_frontier_max_hops": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 3,
+                        "description": "Maximum graph hops for inferred recall. Defaults to 2."
+                    },
+                    "datalog_frontier_min_confidence": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "description": "Suppress derived frontier candidates below this edge/derived confidence. Defaults to 0.30."
+                    },
                     "fusion_profile": {
                         "type": "string",
                         "enum": ["default", "all", "bm25-only", "semantic-only", "bm25-semantic", "bm25-semantic-phonetic", "bm25-semantic-phonetic-workspace"],
@@ -1604,6 +1639,15 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                 "properties": {
                     "session_id": { "type": "string" }
                 },
+                "required": []
+            }),
+        },
+        ToolDef {
+            name: "memory_metrics".into(),
+            description: "Returns a compact tenant-wide memory size report: total node/edge counts plus node and edge buckets, including legacy nil-session knowledge in the tenant totals.\n\nCALL WHEN: A user asks how much knowledge is stored, how many nodes/edges memory has, or whether database-backed memory has outgrown flat files.\nCost: ~10-100ms (tenant-scoped count queries).".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {},
                 "required": []
             }),
         },
@@ -2215,13 +2259,14 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         .cloned()
         .unwrap_or(Value::Object(serde_json::Map::new()));
 
-    resolve_session_id(&mut args, session.effective_default_session_id())?;
-
     tracing::debug!(
         tool = canonical_name,
         requested_tool = name,
         "dispatching tool call"
     );
+    if canonical_name != "configure" {
+        resolve_session_id(&mut args, session.effective_default_session_id())?;
+    }
     let input_bytes = serde_json::to_string(&args).map(|s| s.len()).unwrap_or(0) as i32;
     let start = std::time::Instant::now();
     tracing::info!(
@@ -2305,6 +2350,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "run_consolidation" => Box::pin(handle_run_consolidation(args, storage, ctx, session)),
         "enrich_entities" => Box::pin(handle_enrich_entities(args, storage, ctx, session)),
         "get_stats" => Box::pin(handle_get_stats(args, storage, ctx, session)),
+        "memory_metrics" => Box::pin(handle_memory_metrics(storage, ctx, session)),
         "migration_status" => Box::pin(handle_migration_status(args, storage)),
         "describe" => Box::pin(handle_system_describe(args, storage, ctx, session)),
         "forget" => Box::pin(handle_forget(args, storage, ctx, session)),
@@ -4222,8 +4268,9 @@ async fn handle_ingest_entities<S: crate::storage::Storage>(
             // in the same session so agent sessions form traversable threads.
             // This mirrors the next/previous_context_segment edge pattern.
             // Only fires for freshly-inserted turns; updates and dry-runs skip
-            // this block entirely.
-            if !request.options.dry_run && entry.entity_type == "turn" {
+            // this block entirely. Covers every turn-like type (canonical
+            // "turn" from the Claude hook and "conversation_turn" from Hermes).
+            if !request.options.dry_run && crate::turn_chain::is_turn_type(&entry.entity_type) {
                 match crate::turn_chain::link_turn_to_predecessor(
                     storage,
                     ctx,
@@ -4987,6 +5034,22 @@ async fn handle_batch_delete_entities<S: crate::storage::Storage>(
                     };
                 }
             };
+
+            // Remove this entity's edges first — while its :Entity node still
+            // exists — so the graph-anchored delete can reach them. Skipping
+            // this is what orphaned ~5.5k CO_OCCURS_WITH edges and crashed the
+            // viz. Best-effort: a cleanup failure must not block the delete.
+            match crate::smart_ingest::delete_typed_edges_referencing_entity_tenant_wide(
+                storage, ctx, entity_id,
+            )
+            .await
+            {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(%entity_id, edges = n, "cleaned edges before entity delete"),
+                Err(err) => {
+                    tracing::warn!(%entity_id, error = %err, "edge cleanup before entity delete failed")
+                }
+            }
 
             match storage.entity_delete(ctx, session_id, entity_id).await {
                 Ok(true) => {
@@ -7265,7 +7328,17 @@ async fn generate_judge_text(
         return Ok(r#"{"order":[2,1],"scores":[1,1]}"#.to_string());
     }
     let timeout = std::time::Duration::from_secs(config.timeout_seconds.clamp(1, 300));
-    let client = reqwest::Client::builder().timeout(timeout).build()?;
+    // Bound connection establishment separately from the (longer) generation
+    // timeout: when the judge endpoint is down/unreachable, fail fast so a
+    // judge-on-by-default search skips the rerank in ~seconds instead of
+    // hanging for the full request timeout. A reachable-but-slow judge still
+    // gets the full `timeout` to generate once connected.
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(std::time::Duration::from_secs(
+            JUDGE_CONNECT_TIMEOUT_SECONDS,
+        ))
+        .build()?;
     let base_url = config.base_url.trim_end_matches('/');
     anyhow::ensure!(!base_url.is_empty(), "judge base_url is empty");
     let mut request = match provider.as_str() {
@@ -8513,6 +8586,26 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         candidate_limit,
         min_score,
         memory_kinds,
+        datalog_frontier: args.get("datalog_frontier").and_then(Value::as_bool),
+        datalog_frontier_seed_limit: args
+            .get("datalog_frontier_seed_limit")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .filter(|value| *value > 0),
+        datalog_frontier_edge_limit: args
+            .get("datalog_frontier_edge_limit")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .filter(|value| *value > 0),
+        datalog_frontier_max_hops: args
+            .get("datalog_frontier_max_hops")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .filter(|value| *value > 0),
+        datalog_frontier_min_confidence: args
+            .get("datalog_frontier_min_confidence")
+            .and_then(Value::as_f64)
+            .filter(|value| (0.0..=1.0).contains(value)),
     };
     let query_decomposition_mode = args
         .get("query_decomposition")
@@ -8987,7 +9080,137 @@ async fn handle_enrich_entities<S: crate::storage::Storage>(
     serde_json::to_value(&result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
 }
 
-// --- Stats handler ---
+// --- Metrics / stats handlers ---
+
+async fn handle_memory_metrics<S: crate::storage::Storage>(
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    macro_rules! metric_count {
+        ($label:literal, $future:expr) => {
+            $future.await.map_err(|e| {
+                (
+                    INTERNAL_ERROR,
+                    format!("memory_metrics {} count failed: {e}", $label),
+                )
+            })?
+        };
+    }
+
+    let nil_session_id = uuid::Uuid::nil();
+    let global_session_id = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
+    let tenant_entity_count = metric_count!(
+        "entity",
+        storage.entity_count_matching(
+            ctx,
+            crate::types::EntityListQuery {
+                scope: crate::types::EntityListScope::All,
+                limit: 0,
+                ..Default::default()
+            },
+        )
+    );
+    let legacy_nil_entity_count = metric_count!(
+        "legacy nil entity",
+        storage.entity_count(ctx, nil_session_id)
+    );
+
+    let document_chunk_count =
+        metric_count!("document chunk", storage.document_chunk_count(ctx, None));
+    let legacy_nil_document_chunk_count = metric_count!(
+        "legacy nil document chunk",
+        storage.document_chunk_count(ctx, Some(nil_session_id))
+    );
+    let context_segment_count =
+        metric_count!("context segment", storage.context_segment_count(ctx, None));
+    let legacy_nil_context_segment_count = metric_count!(
+        "legacy nil context segment",
+        storage.context_segment_count(ctx, Some(nil_session_id))
+    );
+
+    let active_fold_count = metric_count!(
+        "active fold",
+        storage.fold_count_by_status(ctx, crate::types::FoldStatus::Active)
+    );
+    let folded_count = metric_count!(
+        "folded fold",
+        storage.fold_count_by_status(ctx, crate::types::FoldStatus::Folded)
+    );
+    let archived_fold_count = metric_count!(
+        "archived fold",
+        storage.fold_count_by_status(ctx, crate::types::FoldStatus::Archived)
+    );
+    let fold_count = active_fold_count + folded_count + archived_fold_count;
+    let legacy_nil_fold_count =
+        metric_count!("legacy nil fold", storage.fold_count(ctx, nil_session_id));
+
+    let memo_count = metric_count!("memo", storage.memo_count(ctx));
+    let temporal_fact_count = metric_count!("temporal fact", storage.temporal_count(ctx));
+    let edge_counts = metric_count!("edge bucket", storage.edge_counts_by_bucket(ctx));
+    let edge_count: usize = edge_counts.values().sum();
+    let legacy_nil_temporal_link_count = metric_count!(
+        "legacy nil temporal link",
+        storage.temporal_edge_count(ctx, Some(nil_session_id))
+    );
+    let intention_count = session.intentions.lock().await.list().len();
+
+    let node_count = tenant_entity_count
+        + document_chunk_count
+        + context_segment_count
+        + fold_count
+        + memo_count
+        + temporal_fact_count;
+    let legacy_nil_node_count = legacy_nil_entity_count
+        + legacy_nil_document_chunk_count
+        + legacy_nil_context_segment_count
+        + legacy_nil_fold_count;
+
+    Ok(serde_json::json!({
+        "scope": "tenant",
+        "tenant_id": ctx.tenant_id.to_string(),
+        "node_count": node_count,
+        "edge_count": edge_count,
+        "nodes": {
+            "entities": tenant_entity_count,
+            "document_chunks": document_chunk_count,
+            "context_segments": context_segment_count,
+            "folds": fold_count,
+            "memos": memo_count,
+            "temporal_facts": temporal_fact_count
+        },
+        "folds": {
+            "active": active_fold_count,
+            "folded": folded_count,
+            "archived": archived_fold_count
+        },
+        "edges": edge_counts,
+        "runtime": {
+            "intention_count": intention_count,
+            "retrieval_default_limit": retrieval_default_limit(session)
+        },
+        "legacy_nil_session": {
+            "session_id": nil_session_id.to_string(),
+            "included_in_tenant_totals": true,
+            "migration_mode": "reported_as_tenant_global_legacy",
+            "node_count": legacy_nil_node_count,
+            "edge_count": legacy_nil_temporal_link_count,
+            "nodes": {
+                "entities": legacy_nil_entity_count,
+                "document_chunks": legacy_nil_document_chunk_count,
+                "context_segments": legacy_nil_context_segment_count,
+                "folds": legacy_nil_fold_count
+            },
+            "edges": {
+                "temporal_links": legacy_nil_temporal_link_count
+            }
+        },
+        "sessions": {
+            "tenant_global_session_id": global_session_id.to_string(),
+            "legacy_nil_session_id": nil_session_id.to_string()
+        }
+    }))
+}
 
 async fn handle_get_stats<S: crate::storage::Storage>(
     args: Value,
@@ -10597,6 +10820,40 @@ async fn handle_promote_predicate<S: crate::storage::Storage>(
 
 // --- Typed edge handlers ---
 
+fn edge_write_timeout_message(operation: &str, budget: std::time::Duration) -> String {
+    format!(
+        "{operation} timed out after {}s while writing typed_edges. \
+         Ferrosa may still be warming ANN indexes and blocking CQL; retry after \
+         /healthz/ready is healthy or after a successful get_stats call.",
+        budget.as_secs()
+    )
+}
+
+async fn edge_write_with_timeout<T, F>(operation: &str, fut: F) -> Result<T, (i32, String)>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    edge_write_with_timeout_budget(operation, EDGE_WRITE_TIMEOUT, fut).await
+}
+
+async fn edge_write_with_timeout_budget<T, F>(
+    operation: &str,
+    budget: std::time::Duration,
+    fut: F,
+) -> Result<T, (i32, String)>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    match tokio::time::timeout(budget, fut).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err((INTERNAL_ERROR, e.to_string())),
+        Err(_) => Err((
+            INTERNAL_ERROR,
+            edge_write_timeout_message(operation, budget),
+        )),
+    }
+}
+
 async fn handle_create_edge<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
@@ -10613,11 +10870,13 @@ async fn handle_create_edge<S: crate::storage::Storage>(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    crate::graph_write::create_typed_edge(
-        storage, ctx, session_id, src_id, edge_type, dst_id, weight, metadata,
+    edge_write_with_timeout(
+        "create_edge",
+        crate::graph_write::create_typed_edge(
+            storage, ctx, session_id, src_id, edge_type, dst_id, weight, metadata,
+        ),
     )
-    .await
-    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    .await?;
 
     session.dirty.store(true, Ordering::Relaxed);
     session.last_activity.notify_waiters();
@@ -10695,16 +10954,29 @@ async fn handle_batch_create_edges<S: crate::storage::Storage>(
     let writes = parsed_edges
         .into_iter()
         .map(|(src_id, edge_type, dst_id, weight)| async move {
-            crate::graph_write::create_typed_edge(
-                storage, ctx, session_id, src_id, edge_type, dst_id, weight, None,
+            edge_write_with_timeout(
+                "batch_create_edges",
+                crate::graph_write::create_typed_edge(
+                    storage, ctx, session_id, src_id, edge_type, dst_id, weight, None,
+                ),
             )
             .await
         });
 
+    let mut timeout_errors = 0usize;
+    let mut last_error: Option<String> = None;
     for result in join_all(writes).await {
         match result {
             Ok(_) => created += 1,
-            Err(_) => errors += 1,
+            Err((_, message)) => {
+                if message.contains("timed out after") {
+                    timeout_errors += 1;
+                }
+                if last_error.is_none() {
+                    last_error = Some(message);
+                }
+                errors += 1;
+            }
         }
     }
 
@@ -10714,7 +10986,14 @@ async fn handle_batch_create_edges<S: crate::storage::Storage>(
     Ok(serde_json::json!({
         "created": created,
         "errors": errors,
+        "timeout_errors": timeout_errors,
         "total": edges.len(),
+        "last_error": last_error,
+        "_hint": if timeout_errors > 0 {
+            "Some edge writes timed out while CQL was blocked. Ferrosa may still be warming ANN indexes; retry after /healthz/ready is healthy or get_stats succeeds."
+        } else {
+            "Batch edge creation completed."
+        },
     }))
 }
 
@@ -12562,6 +12841,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ingest_entities_chains_conversation_turns() {
+        // The Hermes harness ingests turns as entity_type="conversation_turn".
+        // handle_ingest_entities must auto-chain them into next_turn temporal
+        // edges, exactly like canonical "turn" entities (t_9c78b122).
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            ollama_base_url: String::new(),
+            entity_types: vec!["conversation_turn".into()],
+            ..SessionState::default()
+        };
+        let sid = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+        let t2 = Uuid::new_v4();
+
+        // Two separate ingests in the same session (as the real harness does),
+        // so the second turn's created_at is strictly after the first's.
+        for (id, name) in [(t1, "turn one"), (t2, "turn two")] {
+            dispatch(
+                "tools/call",
+                serde_json::json!({
+                    "name": "ingest_entities",
+                    "arguments": {
+                        "tenant_id": ctx.tenant_id.to_string(),
+                        "session_id": sid.to_string(),
+                        "entities": [{
+                            "id": id.to_string(),
+                            "name": name,
+                            "entity_type": "conversation_turn",
+                            "context": name
+                        }],
+                        "options": { "embed_missing": false }
+                    }
+                }),
+                &store,
+                &ctx,
+                &session,
+            )
+            .await
+            .unwrap();
+        }
+
+        let edges = store.temporal_edges.lock().await;
+        let next = edges
+            .iter()
+            .find(|e| e.edge_type == "next_turn")
+            .expect("ingesting two conversation_turns must create a next_turn edge");
+        assert_eq!(
+            next.src_id, t1,
+            "next_turn must point from the earlier turn"
+        );
+        assert_eq!(next.dst_id, t2, "...to the later turn");
+    }
+
+    #[tokio::test]
     async fn ingest_entities_fails_loudly_when_section_write_is_not_visible() {
         let store = MockStorage::new();
         store
@@ -13489,6 +13823,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_metrics_reports_tenant_wide_nodes_edges_and_legacy_nil() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let sid = Uuid::new_v4();
+        let global_sid = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
+        let nil_sid = Uuid::nil();
+        let now = chrono::Utc::now();
+        let session = SessionState {
+            default_session_id: Some(sid),
+            ..SessionState::default()
+        };
+
+        for (session_id, name) in [
+            (sid, "session entity"),
+            (global_sid, "global entity"),
+            (nil_sid, "legacy nil entity"),
+        ] {
+            store.entities.lock().await.push(crate::types::EntityEntry {
+                tenant_id: ctx.tenant_id,
+                entity_id: Uuid::new_v4(),
+                session_id,
+                entity_name: name.into(),
+                entity_type: "concept".into(),
+                context_snippet: name.into(),
+                confidence: 0.9,
+                created_at: now,
+                ..Default::default()
+            });
+        }
+        store
+            .document_chunks
+            .lock()
+            .await
+            .push(crate::types::DocumentChunk {
+                tenant_id: ctx.tenant_id,
+                session_id: nil_sid,
+                document_id: Uuid::new_v4(),
+                chunk_id: Uuid::new_v4(),
+                ordinal: 0,
+                source_doc_id: "legacy-doc".into(),
+                title: "legacy doc".into(),
+                section_path: String::new(),
+                semantic_kind: "text".into(),
+                content: "legacy document chunk".into(),
+                bm25_text: "legacy document chunk".into(),
+                chunk_embedding: None,
+                token_count: 3,
+                content_hash: "legacy-doc-chunk".into(),
+                prev_chunk_id: None,
+                next_chunk_id: None,
+                overlap_from_prev: false,
+                overlap_to_next: false,
+                metadata: serde_json::Value::Null,
+                created_at: now,
+                updated_at: now,
+            });
+        store
+            .context_segments
+            .lock()
+            .await
+            .push(crate::context_segment::ContextSegment {
+                tenant_id: ctx.tenant_id,
+                session_id: sid,
+                segment_id: Uuid::new_v4(),
+                source_session: sid,
+                source_fold_id: None,
+                conversation_id: "metrics-test".into(),
+                segment_index: 0,
+                start_turn: 0,
+                end_turn: 1,
+                start_time: Some(now),
+                end_time: Some(now),
+                segment_text: "session context segment".into(),
+                segment_summary: None,
+                bm25_text: "session context segment".into(),
+                segment_embedding: None,
+                token_count: 3,
+                content_hash: "session-context-segment".into(),
+                prev_segment_id: None,
+                next_segment_id: None,
+                created_at: now,
+            });
+        store.folds.lock().await.push(crate::types::FoldEntry {
+            session_id: nil_sid,
+            fold_id: Uuid::new_v4(),
+            tenant_id: ctx.tenant_id,
+            depth: 0,
+            parent_fold_id: None,
+            raw_trajectory: "legacy fold".into(),
+            fold_summary: Some("legacy fold".into()),
+            fold_embedding: None,
+            token_count: 2,
+            compression_ratio: None,
+            status: crate::types::FoldStatus::Active,
+            created_at: now,
+            folded_at: None,
+        });
+        store.memos.lock().await.push(crate::types::MemoEntry {
+            content_hash: "memo".into(),
+            model_version: "test".into(),
+            result: "cached result".into(),
+            result_embedding: None,
+            hit_count: 0,
+            created_at: now,
+            last_hit_at: None,
+            expires_at: None,
+        });
+        store
+            .temporal_edges
+            .lock()
+            .await
+            .push(crate::context_segment::TemporalEdge {
+                tenant_id: ctx.tenant_id,
+                session_id: nil_sid,
+                src_id: Uuid::new_v4(),
+                edge_type: "next".into(),
+                dst_id: Uuid::new_v4(),
+                relation_time: now,
+                ordinal: 0,
+                metadata: "{}".into(),
+                created_at: now,
+            });
+        store
+            .edge_co_occurs(&ctx, Uuid::new_v4(), Uuid::new_v4(), sid, 0.5)
+            .await
+            .unwrap();
+
+        let result = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "memory_metrics",
+                "arguments": {}
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let result = unwrap_tool_result(result);
+
+        assert_eq!(result["scope"], "tenant");
+        assert_eq!(result["nodes"]["entities"], 3);
+        assert_eq!(result["nodes"]["document_chunks"], 1);
+        assert_eq!(result["nodes"]["context_segments"], 1);
+        assert_eq!(result["nodes"]["folds"], 1);
+        assert_eq!(result["nodes"]["memos"], 1);
+        assert_eq!(result["node_count"], 7);
+        assert_eq!(result["edges"]["co_occurs"], 1);
+        assert_eq!(result["edges"]["temporal_links"], 1);
+        assert_eq!(result["edge_count"], 2);
+        assert_eq!(
+            result["legacy_nil_session"]["included_in_tenant_totals"],
+            true
+        );
+        assert_eq!(result["legacy_nil_session"]["nodes"]["entities"], 1);
+        assert_eq!(result["legacy_nil_session"]["nodes"]["document_chunks"], 1);
+        assert_eq!(result["legacy_nil_session"]["nodes"]["folds"], 1);
+        assert_eq!(result["legacy_nil_session"]["edge_count"], 1);
+    }
+
+    #[tokio::test]
     async fn get_stats_structured_content_serializes_stats_payload() {
         let store = MockStorage::new();
         let ctx = test_ctx();
@@ -14222,6 +14718,47 @@ mod tests {
         .unwrap();
         let found = unwrap_tool_result(found);
         assert_eq!(found["count"], 1);
+    }
+
+    #[tokio::test]
+    async fn configure_session_start_derives_session_even_when_default_exists() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let default_sid = Uuid::new_v4();
+        let session = SessionState {
+            ollama_base_url: String::new(),
+            default_session_id: Some(default_sid),
+            ..SessionState::default()
+        };
+
+        let configured = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "config",
+                "arguments": {
+                    "session_start": {
+                        "agent": "codex",
+                        "agent_session_id": "codex-ferrosa-suite-leak-check",
+                        "workspace": "/Users/bkearns/src/ferrosa-suite"
+                    }
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let configured = unwrap_tool_result(configured);
+        let sid = Uuid::parse_str(configured["session_id"].as_str().unwrap()).unwrap();
+        let expected = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            b"ferrosa-memory:agent-session:v1:codex:/Users/bkearns/src/ferrosa-suite:codex-ferrosa-suite-leak-check",
+        );
+
+        assert_eq!(sid, expected);
+        assert_ne!(sid, default_sid);
+        assert_eq!(configured["session_source"], "derived_from_agent_session");
     }
 
     #[tokio::test]
@@ -15112,7 +15649,14 @@ mod tests {
                 "session_id": sid.to_string(),
                 "query": "Judge",
                 "cwd": cwd,
-                "limit": 2
+                "limit": 2,
+                // This test asserts feedback accounting over a fixed two-result
+                // set. With judge rerank enabled by default, hybrid_search would
+                // make a live LLM call to the configured judge (config.base_url),
+                // which can reorder/veto candidates — non-hermetic and host-
+                // dependent. Pin rerank off so the setup is deterministic; the
+                // judge-authority drop behavior is covered by its own tests.
+                "rerank": false
             }
         });
         let result = dispatch("tools/call", search, &store, &ctx, &session)
@@ -15175,6 +15719,67 @@ mod tests {
         assert_eq!(
             entry["mechanisms"]["entity_phonetic"]["judges"]["test_judge"]["neutrals"],
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_preserves_all_results_when_judge_unavailable() {
+        // Judge rerank is on by default. If the judge endpoint can't be reached,
+        // hybrid_search must SKIP the rerank and return every candidate — it must
+        // never drop results just because the judge is down. Regression guard for
+        // the judge-default-on flip (the judge has authority to remove results, so
+        // an unreachable judge must not be allowed to silently shrink the set).
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            ollama_base_url: String::new(),
+            ..SessionState::default()
+        };
+        {
+            let mut judge = session.judge_config.lock().await;
+            judge.enabled = true;
+            judge.base_url = String::new(); // unreachable judge -> rerank errors -> skip
+        }
+        let sid = Uuid::new_v4();
+        let first = crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "Judge One".into(),
+            entity_type: "concept".into(),
+            context_snippet: "Judge one candidate".into(),
+            entity_embedding: None,
+            confidence: 0.9,
+            state: Default::default(),
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        };
+        let second = crate::types::EntityEntry {
+            entity_id: Uuid::new_v4(),
+            entity_name: "Judge Two".into(),
+            context_snippet: "Judge two candidate".into(),
+            ..first.clone()
+        };
+        store.entities.lock().await.push(first);
+        store.entities.lock().await.push(second);
+
+        let search = serde_json::json!({
+            "name": "hybrid_search",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "query": "Judge",
+                "limit": 2
+            }
+        });
+        let result = dispatch("tools/call", search, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        let results = result["results"].as_array().unwrap();
+        assert_eq!(
+            results.len(),
+            2,
+            "judge unavailable must skip rerank and preserve all candidates, not drop any"
         );
     }
 
@@ -16049,6 +16654,29 @@ mod speculative_tests {
             result.is_ok(),
             "expected 'default' to resolve to configured session, got: {:?}",
             result
+        );
+    }
+
+    #[tokio::test]
+    async fn edge_write_timeout_reports_ann_warmup_hint() {
+        let result: Result<(), (i32, String)> = edge_write_with_timeout_budget(
+            "create_edge",
+            std::time::Duration::from_millis(1),
+            std::future::pending::<anyhow::Result<()>>(),
+        )
+        .await;
+
+        let err = result.expect_err("pending edge write should time out");
+        assert_eq!(err.0, INTERNAL_ERROR);
+        assert!(
+            err.1.contains("Ferrosa may still be warming ANN indexes"),
+            "timeout should explain likely ANN warmup cause: {}",
+            err.1
+        );
+        assert!(
+            err.1.contains("get_stats"),
+            "timeout should include an actionable readiness probe: {}",
+            err.1
         );
     }
 }

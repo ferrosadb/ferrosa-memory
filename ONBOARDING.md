@@ -679,18 +679,18 @@ rerank=false
 
 That profile measured alpha_nDCG `0.816`, NDCG `0.799`, aspect_recall `0.940`, and recall `0.796` on the 200-document biology support-closed slice. Treat these as preview slice numbers, not a full-corpus paper comparison.
 
-Optional local judge/reranker settings:
+Local judge/reranker settings:
 
 ```toml
 [judge]
-enabled = false
+enabled = true
 provider = "ollama"
 base_url = "http://127.0.0.1:11434"
 model = "qwen2.5-coder:7b"
 timeout_seconds = 60
 ```
 
-Keep live judge disabled unless the machine has a warm local or remote model endpoint. Judge failures or no-decisions should be recorded as abstentions (`"-"`), while agent/user feedback should use `+1` and `-1` scores so the reranker can learn by workspace and retrieval channel.
+Live judge reranking is on by default when the configured local or remote model endpoint is available. If the model is absent or cold, retrieval still succeeds with fused baseline ranking and reports the failure in rerank diagnostics; set `enabled = false` on hosts where live judge calls are not desired. Judge failures or no-decisions should be recorded as abstentions (`"-"`), while agent/user feedback should use `+1` and `-1` scores so the reranker can learn by workspace and retrieval channel.
 
 Useful eval commands:
 
