@@ -4264,8 +4264,9 @@ async fn handle_ingest_entities<S: crate::storage::Storage>(
             // in the same session so agent sessions form traversable threads.
             // This mirrors the next/previous_context_segment edge pattern.
             // Only fires for freshly-inserted turns; updates and dry-runs skip
-            // this block entirely.
-            if !request.options.dry_run && entry.entity_type == "turn" {
+            // this block entirely. Covers every turn-like type (canonical
+            // "turn" from the Claude hook and "conversation_turn" from Hermes).
+            if !request.options.dry_run && crate::turn_chain::is_turn_type(&entry.entity_type) {
                 match crate::turn_chain::link_turn_to_predecessor(
                     storage,
                     ctx,
@@ -12807,6 +12808,61 @@ mod tests {
         assert_eq!(stored.context_snippet, "updated bug context");
         assert_eq!(stored.properties["severity"], "critical");
         assert_eq!(store.typed_edges.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ingest_entities_chains_conversation_turns() {
+        // The Hermes harness ingests turns as entity_type="conversation_turn".
+        // handle_ingest_entities must auto-chain them into next_turn temporal
+        // edges, exactly like canonical "turn" entities (t_9c78b122).
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            ollama_base_url: String::new(),
+            entity_types: vec!["conversation_turn".into()],
+            ..SessionState::default()
+        };
+        let sid = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+        let t2 = Uuid::new_v4();
+
+        // Two separate ingests in the same session (as the real harness does),
+        // so the second turn's created_at is strictly after the first's.
+        for (id, name) in [(t1, "turn one"), (t2, "turn two")] {
+            dispatch(
+                "tools/call",
+                serde_json::json!({
+                    "name": "ingest_entities",
+                    "arguments": {
+                        "tenant_id": ctx.tenant_id.to_string(),
+                        "session_id": sid.to_string(),
+                        "entities": [{
+                            "id": id.to_string(),
+                            "name": name,
+                            "entity_type": "conversation_turn",
+                            "context": name
+                        }],
+                        "options": { "embed_missing": false }
+                    }
+                }),
+                &store,
+                &ctx,
+                &session,
+            )
+            .await
+            .unwrap();
+        }
+
+        let edges = store.temporal_edges.lock().await;
+        let next = edges
+            .iter()
+            .find(|e| e.edge_type == "next_turn")
+            .expect("ingesting two conversation_turns must create a next_turn edge");
+        assert_eq!(
+            next.src_id, t1,
+            "next_turn must point from the earlier turn"
+        );
+        assert_eq!(next.dst_id, t2, "...to the later turn");
     }
 
     #[tokio::test]
