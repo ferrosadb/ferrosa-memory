@@ -6839,6 +6839,119 @@ impl Storage for CqlStorage {
         Ok(())
     }
 
+    async fn temporal_edge_stream_session(
+        &self,
+        ctx: TenantContext,
+        session_id: Uuid,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<TemporalEdge>>>,
+    ) {
+        let chunk_size = chunk_size.max(1);
+        // Single `(tenant_id, session_id)` partition; paged cursor, never
+        // materialized — chunks flush to the consumer as rows arrive.
+        let query = format!(
+            "SELECT * FROM {}.temporal_edges WHERE tenant_id = ? AND session_id = ?",
+            self.keyspace
+        );
+        let mut iter = match self
+            .session
+            .query_iter(query, (ctx.tenant_id, session_id))
+            .await
+        {
+            Ok(iter) => iter,
+            Err(e) => {
+                let _ = tx.send(Err(e.into())).await;
+                return;
+            }
+        };
+        let col_map = build_col_map(iter.get_column_specs());
+        let mut chunk = Vec::with_capacity(chunk_size);
+        while let Some(row) = iter.next().await {
+            match row
+                .map_err(anyhow::Error::from)
+                .and_then(|row| temporal_edge_from_row(&ctx, &row, &col_map))
+            {
+                Ok(edge) => {
+                    chunk.push(edge);
+                    if chunk.len() >= chunk_size {
+                        let out = std::mem::take(&mut chunk);
+                        if tx.send(Ok(out)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    if !chunk.is_empty() {
+                        let out = std::mem::take(&mut chunk);
+                        if tx.send(Ok(out)).await.is_err() {
+                            return;
+                        }
+                    }
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            }
+        }
+        if !chunk.is_empty() {
+            let _ = tx.send(Ok(chunk)).await;
+        }
+    }
+
+    async fn temporal_edge_stream_all(
+        &self,
+        ctx: TenantContext,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<TemporalEdge>>>,
+    ) {
+        let chunk_size = chunk_size.max(1);
+        // Tenant-wide: temporal_edges' partition key is (tenant_id, session_id),
+        // so a tenant-only filter needs ALLOW FILTERING — same paged-cursor
+        // streaming contract as typed_edge_stream_all (guarded by the viz idle
+        // budget). Never materialized.
+        let query = format!(
+            "SELECT * FROM {}.temporal_edges WHERE tenant_id = ? ALLOW FILTERING",
+            self.keyspace
+        );
+        let mut iter = match self.session.query_iter(query, (ctx.tenant_id,)).await {
+            Ok(iter) => iter,
+            Err(e) => {
+                let _ = tx.send(Err(e.into())).await;
+                return;
+            }
+        };
+        let col_map = build_col_map(iter.get_column_specs());
+        let mut chunk = Vec::with_capacity(chunk_size);
+        while let Some(row) = iter.next().await {
+            match row
+                .map_err(anyhow::Error::from)
+                .and_then(|row| temporal_edge_from_row(&ctx, &row, &col_map))
+            {
+                Ok(edge) => {
+                    chunk.push(edge);
+                    if chunk.len() >= chunk_size {
+                        let out = std::mem::take(&mut chunk);
+                        if tx.send(Ok(out)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    if !chunk.is_empty() {
+                        let out = std::mem::take(&mut chunk);
+                        if tx.send(Ok(out)).await.is_err() {
+                            return;
+                        }
+                    }
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            }
+        }
+        if !chunk.is_empty() {
+            let _ = tx.send(Ok(chunk)).await;
+        }
+    }
+
     async fn temporal_edge_list_from(
         &self,
         ctx: &TenantContext,
@@ -7569,6 +7682,43 @@ mod cql_storage_tests {
             source.contains("CQL_LEGACY_EDGE_LIST_MAX_ROWS"),
             "legacy edge list APIs must have a named maximum and clear failure mode"
         );
+    }
+
+    #[test]
+    fn temporal_edge_stream_methods_use_paged_cursor_not_materialization() {
+        // The viz /viz/ws snapshot streams temporal edges; these methods must
+        // page a `query_iter` cursor and flush chunks, never materialize the
+        // whole edge set (e.g. via query_paged_rows!) into memory.
+        let source = include_str!("cql_storage.rs");
+        for (method, next_method) in [
+            (
+                "temporal_edge_stream_session",
+                "async fn temporal_edge_stream_all",
+            ),
+            (
+                "temporal_edge_stream_all",
+                "async fn temporal_edge_list_from",
+            ),
+        ] {
+            let start = source
+                .find(&format!("async fn {method}"))
+                .unwrap_or_else(|| panic!("{method} must exist"));
+            let tail = &source[start..];
+            let end = tail.find(next_method).unwrap_or(tail.len());
+            let body = &tail[..end];
+            assert!(
+                body.contains("query_iter"),
+                "{method} must stream via a paged query_iter cursor"
+            );
+            assert!(
+                body.contains("tx.send(Ok("),
+                "{method} must push chunks to the consumer channel as the cursor advances"
+            );
+            assert!(
+                !body.contains("query_paged_rows!"),
+                "{method} must not materialize all rows via query_paged_rows!"
+            );
+        }
     }
 
     #[test]

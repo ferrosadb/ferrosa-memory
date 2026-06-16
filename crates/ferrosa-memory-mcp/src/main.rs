@@ -1651,6 +1651,43 @@ impl Storage for ReconnectingStorage {
         )
     }
 
+    async fn temporal_edge_stream_session(
+        &self,
+        ctx: TenantContext,
+        session_id: uuid::Uuid,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<TemporalEdge>>>,
+    ) {
+        // Clone the CQL backend (drops the reconnect read lock) before awaiting
+        // stream sends, then delegate to CqlStorage's paged-cursor override so
+        // production never materializes the temporal edge set.
+        let cql = self.current_cql().await;
+        match cql {
+            Some(cql) => {
+                cql.temporal_edge_stream_session(ctx, session_id, chunk_size, tx)
+                    .await
+            }
+            None => {
+                let _ = tx.send(Err(anyhow::anyhow!(NOT_CONNECTED_MSG))).await;
+            }
+        }
+    }
+
+    async fn temporal_edge_stream_all(
+        &self,
+        ctx: TenantContext,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<TemporalEdge>>>,
+    ) {
+        let cql = self.current_cql().await;
+        match cql {
+            Some(cql) => cql.temporal_edge_stream_all(ctx, chunk_size, tx).await,
+            None => {
+                let _ = tx.send(Err(anyhow::anyhow!(NOT_CONNECTED_MSG))).await;
+            }
+        }
+    }
+
     async fn temporal_edge_count(
         &self,
         ctx: &TenantContext,
@@ -3277,6 +3314,7 @@ auth_file = "{}"
             "entity_stream_all",
             "edge_stream_all",
             "typed_edge_stream_all",
+            "temporal_edge_stream_all",
         ] {
             let needle = format!("cql.{method}(ctx, chunk_size, tx).await");
             assert!(
@@ -3284,6 +3322,11 @@ auth_file = "{}"
                 "ReconnectingStorage must delegate {method} to CqlStorage streaming override, not fall back to Storage's materializing default"
             );
         }
+        assert!(
+            impl_source
+                .contains("cql.temporal_edge_stream_session(ctx, session_id, chunk_size, tx)"),
+            "ReconnectingStorage must delegate temporal_edge_stream_session to CqlStorage's paged-cursor override (session-scoped sig)"
+        );
         assert!(
             impl_source.contains("cql.derived_cache_stream(ctx, cache_key, chunk_size, limit, tx)"),
             "ReconnectingStorage must delegate derived_cache_stream to CqlStorage streaming override, not fall back to Storage's materializing default"
@@ -3301,6 +3344,8 @@ auth_file = "{}"
             ("entity_stream_all", "fold_list_all"),
             ("edge_stream_all", "edge_list_for_entity"),
             ("typed_edge_stream_all", "typed_edge_list_from"),
+            ("temporal_edge_stream_session", "temporal_edge_stream_all"),
+            ("temporal_edge_stream_all", "temporal_edge_count"),
             ("derived_cache_stream", "derived_cache_put"),
         ] {
             let method_start = impl_source

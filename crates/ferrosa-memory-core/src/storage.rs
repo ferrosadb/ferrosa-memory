@@ -1492,6 +1492,30 @@ pub trait Storage: Send + Sync {
         session_id: Option<Uuid>,
     ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send;
 
+    /// Stream all temporal edges for one session partition in bounded chunks.
+    ///
+    /// Backed by a paged cursor (single `(tenant_id, session_id)` partition), so
+    /// callers never materialize the full edge set: chunks are pushed to `tx` as
+    /// the cursor advances. Required (no materializing default) so every backend
+    /// — including the production `ReconnectingStorage` wrapper — streams.
+    fn temporal_edge_stream_session(
+        &self,
+        ctx: TenantContext,
+        session_id: Uuid,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<TemporalEdge>>>,
+    ) -> impl std::future::Future<Output = ()> + Send;
+
+    /// Stream every temporal edge for the tenant in bounded chunks via a paged
+    /// full-table cursor. Like `temporal_edge_stream_session` but tenant-wide;
+    /// must not materialize — used by the all-scope viz snapshot.
+    fn temporal_edge_stream_all(
+        &self,
+        ctx: TenantContext,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<TemporalEdge>>>,
+    ) -> impl std::future::Future<Output = ()> + Send;
+
     // --- Confidence operations ---
 
     /// Store or update a confidence score for a fact.
@@ -3714,6 +3738,53 @@ pub mod mock {
                 .collect();
             found.sort_by_key(|e| e.ordinal);
             Ok(found)
+        }
+
+        async fn temporal_edge_stream_session(
+            &self,
+            ctx: TenantContext,
+            session_id: Uuid,
+            chunk_size: usize,
+            tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<TemporalEdge>>>,
+        ) {
+            let chunk_size = chunk_size.max(1);
+            // Collect then drop the lock before awaiting sends (no lock held
+            // across .await); bounded test data, so this is fine for the mock.
+            let matching: Vec<TemporalEdge> = {
+                let edges = self.temporal_edges.lock().await;
+                edges
+                    .iter()
+                    .filter(|e| e.tenant_id == ctx.tenant_id && e.session_id == session_id)
+                    .cloned()
+                    .collect()
+            };
+            for chunk in matching.chunks(chunk_size) {
+                if tx.send(Ok(chunk.to_vec())).await.is_err() {
+                    break;
+                }
+            }
+        }
+
+        async fn temporal_edge_stream_all(
+            &self,
+            ctx: TenantContext,
+            chunk_size: usize,
+            tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<TemporalEdge>>>,
+        ) {
+            let chunk_size = chunk_size.max(1);
+            let matching: Vec<TemporalEdge> = {
+                let edges = self.temporal_edges.lock().await;
+                edges
+                    .iter()
+                    .filter(|e| e.tenant_id == ctx.tenant_id)
+                    .cloned()
+                    .collect()
+            };
+            for chunk in matching.chunks(chunk_size) {
+                if tx.send(Ok(chunk.to_vec())).await.is_err() {
+                    break;
+                }
+            }
         }
 
         async fn temporal_edge_count(
