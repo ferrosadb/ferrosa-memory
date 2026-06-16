@@ -38,6 +38,10 @@ const LLM_RERANK_MIN_CANDIDATES: usize = 2;
 const LLM_RERANK_HARD_MAX_CANDIDATES: usize = 50;
 const LLM_RERANK_MIN_SCORE_COVERAGE: usize = 5;
 const LLM_RERANK_BATCH_SIZE: usize = 5;
+/// Connection-establishment budget for the judge endpoint. Kept small so a
+/// judge-on-by-default search skips quickly when the endpoint is down, rather
+/// than blocking on the much longer generation timeout.
+const JUDGE_CONNECT_TIMEOUT_SECONDS: u64 = 2;
 const EDGE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 type ToolDispatchFuture<'a> =
@@ -7323,7 +7327,17 @@ async fn generate_judge_text(
         return Ok(r#"{"order":[2,1],"scores":[1,1]}"#.to_string());
     }
     let timeout = std::time::Duration::from_secs(config.timeout_seconds.clamp(1, 300));
-    let client = reqwest::Client::builder().timeout(timeout).build()?;
+    // Bound connection establishment separately from the (longer) generation
+    // timeout: when the judge endpoint is down/unreachable, fail fast so a
+    // judge-on-by-default search skips the rerank in ~seconds instead of
+    // hanging for the full request timeout. A reachable-but-slow judge still
+    // gets the full `timeout` to generate once connected.
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(std::time::Duration::from_secs(
+            JUDGE_CONNECT_TIMEOUT_SECONDS,
+        ))
+        .build()?;
     let base_url = config.base_url.trim_end_matches('/');
     anyhow::ensure!(!base_url.is_empty(), "judge base_url is empty");
     let mut request = match provider.as_str() {
@@ -15579,7 +15593,14 @@ mod tests {
                 "session_id": sid.to_string(),
                 "query": "Judge",
                 "cwd": cwd,
-                "limit": 2
+                "limit": 2,
+                // This test asserts feedback accounting over a fixed two-result
+                // set. With judge rerank enabled by default, hybrid_search would
+                // make a live LLM call to the configured judge (config.base_url),
+                // which can reorder/veto candidates — non-hermetic and host-
+                // dependent. Pin rerank off so the setup is deterministic; the
+                // judge-authority drop behavior is covered by its own tests.
+                "rerank": false
             }
         });
         let result = dispatch("tools/call", search, &store, &ctx, &session)
@@ -15642,6 +15663,67 @@ mod tests {
         assert_eq!(
             entry["mechanisms"]["entity_phonetic"]["judges"]["test_judge"]["neutrals"],
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_preserves_all_results_when_judge_unavailable() {
+        // Judge rerank is on by default. If the judge endpoint can't be reached,
+        // hybrid_search must SKIP the rerank and return every candidate — it must
+        // never drop results just because the judge is down. Regression guard for
+        // the judge-default-on flip (the judge has authority to remove results, so
+        // an unreachable judge must not be allowed to silently shrink the set).
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            ollama_base_url: String::new(),
+            ..SessionState::default()
+        };
+        {
+            let mut judge = session.judge_config.lock().await;
+            judge.enabled = true;
+            judge.base_url = String::new(); // unreachable judge -> rerank errors -> skip
+        }
+        let sid = Uuid::new_v4();
+        let first = crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "Judge One".into(),
+            entity_type: "concept".into(),
+            context_snippet: "Judge one candidate".into(),
+            entity_embedding: None,
+            confidence: 0.9,
+            state: Default::default(),
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        };
+        let second = crate::types::EntityEntry {
+            entity_id: Uuid::new_v4(),
+            entity_name: "Judge Two".into(),
+            context_snippet: "Judge two candidate".into(),
+            ..first.clone()
+        };
+        store.entities.lock().await.push(first);
+        store.entities.lock().await.push(second);
+
+        let search = serde_json::json!({
+            "name": "hybrid_search",
+            "arguments": {
+                "session_id": sid.to_string(),
+                "query": "Judge",
+                "limit": 2
+            }
+        });
+        let result = dispatch("tools/call", search, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        let results = result["results"].as_array().unwrap();
+        assert_eq!(
+            results.len(),
+            2,
+            "judge unavailable must skip rerank and preserve all candidates, not drop any"
         );
     }
 

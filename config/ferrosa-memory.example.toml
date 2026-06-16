@@ -103,10 +103,11 @@ judge_timeout_seconds = 60
 judge_temperature = 0.0
 
 [judge]
-# Optional live LLM reranker used by hybrid_search. Keep disabled for CI/offline
-# installs. When enabled, LLM failures are logged and hybrid_search falls back
-# to normal hybrid fusion order.
-enabled = false
+# Live LLM reranker used by hybrid_search. Defaults to on for local installs
+# with Ollama qwen2.5-coder:7b available. On CI/offline hosts, set
+# enabled=false; if the model call fails, hybrid_search still falls back to
+# normal hybrid fusion order and reports the skipped rerank in diagnostics.
+enabled = true
 provider = "ollama"
 base_url = "http://127.0.0.1:11434"
 model = "qwen2.5-coder:7b"
