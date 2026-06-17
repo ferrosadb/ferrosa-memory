@@ -4874,7 +4874,9 @@ mod tests {
         // Memory branding swap (no terracotta accent, Fm mark)
         assert!(WORKBENCH_HTML.contains("--accent: #348cff;"));
         assert!(!WORKBENCH_HTML.contains("#e2725b"));
-        assert!(WORKBENCH_HTML.contains(r#"class="shell-brand-mark">Fm<"#));
+        // Topbar mark uses the brand logo-icon SVG art, not a text placeholder.
+        assert!(WORKBENCH_HTML.contains(r#"class="shell-brand-mark"><svg"#));
+        assert!(WORKBENCH_HTML.contains(r#"aria-label="Ferrosa Memory""#));
     }
 
     #[test]

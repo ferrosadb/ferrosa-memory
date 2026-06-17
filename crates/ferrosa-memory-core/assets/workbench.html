@@ -731,6 +731,9 @@
     .tool-arg-field .req { color: var(--danger); margin-left: 2px; }
     .tool-arg-field .hint { color: var(--muted); font-size: 0.72rem; margin-top: 3px; line-height: 1.4; }
     .tool-arg-field .checkbox-row { margin: 0; }
+    .tool-optional { margin: 6px 0 10px; border-top: 1px solid var(--line); padding-top: 10px; }
+    .tool-optional > summary { cursor: pointer; color: var(--subtle); font-size: 0.8rem; margin-bottom: 10px; user-select: none; }
+    .tool-optional[open] > summary { color: var(--text); }
 
     /* Forget — candidate review cards */
     .forget-candidate {
@@ -758,7 +761,7 @@
   <header class="topbar">
     <div class="topbar-inner">
       <div class="shell-brand">
-        <div class="shell-brand-mark">Fm</div>
+        <div class="shell-brand-mark"><svg width="30" height="30" viewBox="0 0 100 100" aria-label="Ferrosa Memory"><defs><linearGradient id="fmIg" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#7ee7ff"/><stop offset="55%" stop-color="#348cff"/><stop offset="100%" stop-color="#516d92"/></linearGradient><linearGradient id="fmRg" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#7ee7ff" stop-opacity="0.32"/><stop offset="100%" stop-color="#348cff" stop-opacity="0.08"/></linearGradient><linearGradient id="fmNg" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#f4feff"/><stop offset="45%" stop-color="#7ee7ff"/><stop offset="100%" stop-color="#2f7cff"/></linearGradient></defs><ellipse cx="50" cy="50" rx="47" ry="47" fill="none" stroke="url(#fmRg)" stroke-width="1.5" stroke-dasharray="216 80" transform="rotate(-20, 50, 50)"/><g opacity="0.55" stroke="url(#fmRg)" stroke-width="2" stroke-linecap="round" fill="none"><path d="M22 72 C36 60 46 60 58 64"/><path d="M24 32 C38 42 50 42 62 36"/></g><g fill="url(#fmNg)" opacity="0.85"><circle cx="22" cy="72" r="3"/><circle cx="24" cy="32" r="2.5"/><circle cx="72" cy="40" r="3"/></g><rect x="14" y="14" width="72" height="72" rx="15" ry="15" fill="none" stroke="url(#fmIg)" stroke-width="2.5"/><text x="50" y="61" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-size="36" font-weight="700" fill="url(#fmIg)" letter-spacing="-1">Fm</text><text x="24" y="30" font-family="Inter, sans-serif" font-size="9" font-weight="600" fill="#7d9fca">100</text></svg></div>
         <div class="shell-brand-copy">
           <b>Ferrosa Memory</b>
           <span>Knowledge Graph Console</span>
@@ -2607,13 +2610,19 @@
       try {
         const payload = await request('/tools/list');
         const tools = Array.isArray(payload.tools) ? payload.tools.slice() : [];
-        tools.sort((a, b) => a.name.localeCompare(b.name));
+        // Surface the most-used tools first; `search` is the primary entry point.
+        const PRIMARY = ['search', 'find', 'ingest', 'stats', 'check', 'turn_chain', 'chunk_ctx', 'forget', 'edge', 'list', 'config'];
+        const rank = (n) => { const i = PRIMARY.indexOf(n); return i === -1 ? 999 : i; };
+        tools.sort((a, b) => (rank(a.name) - rank(b.name)) || a.name.localeCompare(b.name));
         runner.tools = tools;
         runner.toolsLoaded = true;
-        el('toolSelect').innerHTML = '<option value="">Select a tool…</option>' +
+        el('toolSelect').innerHTML =
           tools.map((t) => `<option value="${escapeAttr(t.name)}">${escapeHtml(t.name)}</option>`).join('');
         el('toolsCountBadge').textContent = `${tools.length} tools`;
-        renderStatus(el('toolStatus'), 'Pick a tool to begin.', 'ok');
+        // Default to the primary tool so the main argument (e.g. query) is front-and-center.
+        const def = tools.find((t) => t.name === 'search') || tools[0];
+        if (def) { el('toolSelect').value = def.name; renderToolForm(); }
+        renderStatus(el('toolStatus'), 'Ready — edit arguments and run.', 'ok');
       } catch (e) {
         el('toolsCountBadge').textContent = 'error';
         renderStatus(el('toolStatus'), `Failed to load tools: ${e.message}`, 'bad');
@@ -2623,27 +2632,32 @@
     const toolFieldHtml = (key, spec, isRequired) => {
       spec = spec || {};
       const id = `toolarg_${key}`;
+      const hasDefault = spec.default !== undefined && spec.default !== null;
+      // Optional fields left blank fall back to the tool's own server-side default.
+      const ph = isRequired ? '' : ' placeholder="default"';
       const label = `<label for="${id}">${escapeHtml(key)}${isRequired ? '<span class="req">*</span>' : ''}</label>`;
       const hint = spec.description ? `<div class="hint">${escapeHtml(spec.description)}</div>` : '';
       const type = Array.isArray(spec.type) ? spec.type[0] : spec.type;
       let control;
       if (Array.isArray(spec.enum)) {
         const opts = (isRequired ? [] : ['']).concat(spec.enum)
-          .map((v) => `<option value="${escapeAttr(v)}">${v === '' ? '— unset —' : escapeHtml(v)}</option>`).join('');
+          .map((v) => `<option value="${escapeAttr(v)}"${hasDefault && v === spec.default ? ' selected' : ''}>${v === '' ? '— default —' : escapeHtml(v)}</option>`).join('');
         control = `<select id="${id}" class="input" data-arg="${escapeAttr(key)}" data-kind="enum">${opts}</select>`;
       } else if (type === 'boolean') {
-        control = `<label class="checkbox-row"><input id="${id}" type="checkbox" data-arg="${escapeAttr(key)}" data-kind="boolean"><span>${escapeHtml(key)}</span></label>`;
+        const chk = spec.default === true ? ' checked' : '';
+        control = `<label class="checkbox-row"><input id="${id}" type="checkbox" data-arg="${escapeAttr(key)}" data-kind="boolean"${chk}><span>${escapeHtml(key)}</span></label>`;
         return `<div class="tool-arg-field">${control}${hint}</div>`;
       } else if (type === 'integer' || type === 'number') {
-        const def = (spec.default !== undefined && spec.default !== null) ? ` value="${escapeAttr(spec.default)}"` : '';
-        control = `<input id="${id}" class="input" type="number" step="${type === 'integer' ? '1' : 'any'}" data-arg="${escapeAttr(key)}" data-kind="${type}"${def}>`;
+        const def = hasDefault ? ` value="${escapeAttr(spec.default)}"` : '';
+        control = `<input id="${id}" class="input" type="number" step="${type === 'integer' ? '1' : 'any'}" data-arg="${escapeAttr(key)}" data-kind="${type}"${def}${ph}>`;
       } else if (type === 'array' || type === 'object') {
-        control = `<textarea id="${id}" class="input mono" rows="3" data-arg="${escapeAttr(key)}" data-kind="json" placeholder="${type === 'array' ? '[]' : '{}'}"></textarea>`;
+        const def = hasDefault ? escapeHtml(JSON.stringify(spec.default)) : '';
+        control = `<textarea id="${id}" class="input mono" rows="2" data-arg="${escapeAttr(key)}" data-kind="json" placeholder="${type === 'array' ? '[] (default)' : '{} (default)'}">${def}</textarea>`;
       } else {
         const big = /query|context|text|content|body|snippet|prompt|description/i.test(key);
         control = big
-          ? `<textarea id="${id}" class="input" rows="3" data-arg="${escapeAttr(key)}" data-kind="string"></textarea>`
-          : `<input id="${id}" class="input" type="text" data-arg="${escapeAttr(key)}" data-kind="string">`;
+          ? `<textarea id="${id}" class="input" rows="3" data-arg="${escapeAttr(key)}" data-kind="string"${ph}>${hasDefault ? escapeHtml(spec.default) : ''}</textarea>`
+          : `<input id="${id}" class="input" type="text" data-arg="${escapeAttr(key)}" data-kind="string" value="${hasDefault ? escapeAttr(spec.default) : ''}"${ph}>`;
       }
       return `<div class="tool-arg-field">${label}${control}${hint}</div>`;
     };
@@ -2656,9 +2670,18 @@
       const props = (schema && schema.properties) || {};
       const required = new Set(schema.required || []);
       const keys = Object.keys(props);
-      fields.innerHTML = keys.length
-        ? keys.map((key) => toolFieldHtml(key, props[key], required.has(key))).join('')
-        : '<p class="muted">This tool takes no arguments.</p>';
+      if (!keys.length) { fields.innerHTML = '<p class="muted">This tool takes no arguments.</p>'; return; }
+      // Required args first (the primary call surface, e.g. query); the long
+      // optional tail is collapsed and defaults to each tool's server-side values.
+      const req = keys.filter((k) => required.has(k));
+      const opt = keys.filter((k) => !required.has(k));
+      let html = req.map((k) => toolFieldHtml(k, props[k], true)).join('');
+      if (opt.length) {
+        html += `<details class="tool-optional"><summary>Optional arguments · ${opt.length} (blank uses each tool's default)</summary>`
+          + opt.map((k) => toolFieldHtml(k, props[k], false)).join('')
+          + `</details>`;
+      }
+      fields.innerHTML = html;
     };
     const collectToolArgs = () => {
       const args = {};
