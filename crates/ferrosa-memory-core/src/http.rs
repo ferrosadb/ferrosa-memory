@@ -1186,6 +1186,64 @@ async fn call_tool_http<S: Storage>(
     serde_json::from_str(text).map_err(|e| anyhow::anyhow!("invalid tool response JSON: {e}"))
 }
 
+/// Operator tool runner: list every registered tool (tier-1 and tier-2) with its
+/// inputSchema so the workbench can render a form per tool.
+async fn handle_tools_list<S: Storage>(
+    storage: &S,
+    ctx: &TenantContext,
+    session: &dispatch::SessionState,
+) -> anyhow::Result<String> {
+    let result = dispatch::dispatch(
+        "tools/list",
+        serde_json::json!({ "include_all": true }),
+        storage,
+        ctx,
+        session,
+    )
+    .await
+    .map_err(|(_, message)| anyhow::anyhow!(message))?;
+    Ok(json_response("200 OK", &result.to_string()))
+}
+
+/// Operator tool runner: invoke a single tool by name with caller-supplied
+/// arguments. Tool-level errors are surfaced inline (HTTP 200, `ok: false`) so
+/// the debugging UI can render them instead of failing the whole request.
+async fn handle_tool_call<S: Storage>(
+    storage: &S,
+    ctx: &TenantContext,
+    session: &dispatch::SessionState,
+    body: &str,
+) -> anyhow::Result<String> {
+    let payload = parse_json_body(body)?;
+    let name = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing tool name"))?;
+    let arguments = match payload.get("arguments") {
+        None | Some(Value::Null) => serde_json::json!({}),
+        Some(value @ Value::Object(_)) => value.clone(),
+        Some(_) => anyhow::bail!("arguments must be a JSON object"),
+    };
+
+    let body = match dispatch::dispatch(
+        "tools/call",
+        serde_json::json!({ "name": name, "arguments": arguments }),
+        storage,
+        ctx,
+        session,
+    )
+    .await
+    {
+        Ok(result) => serde_json::json!({ "ok": true, "tool": name, "result": result }),
+        Err((code, message)) => {
+            serde_json::json!({ "ok": false, "tool": name, "code": code, "error": message })
+        }
+    };
+    Ok(json_response("200 OK", &body.to_string()))
+}
+
 fn redacted_judge_config(config: &crate::config::JudgeConfig) -> Value {
     serde_json::json!({
         "enabled": config.enabled,
@@ -1224,40 +1282,47 @@ async fn handle_judge_config_get(session: &dispatch::SessionState) -> anyhow::Re
     ))
 }
 
-async fn handle_judge_config_put(
-    session: &dispatch::SessionState,
-    body: &str,
-) -> anyhow::Result<String> {
-    let payload = parse_json_body(body)?;
-    let mut config = session.judge_config.lock().await;
-    let timeout_seconds = match payload.get("timeout_seconds") {
-        None | Some(Value::Null) => config.timeout_seconds,
+/// Read an optional integer field within [min, max], keeping `current` when the
+/// field is absent or null. Out-of-range or non-integer values fail loudly.
+fn opt_u64_in_range(
+    payload: &Value,
+    key: &str,
+    current: u64,
+    min: u64,
+    max: u64,
+) -> anyhow::Result<u64> {
+    match payload.get(key) {
+        None | Some(Value::Null) => Ok(current),
         Some(Value::Number(number)) => {
             let raw = number
                 .as_u64()
-                .ok_or_else(|| anyhow::anyhow!("timeout_seconds must be a positive integer"))?;
-            anyhow::ensure!(raw > 0, "timeout_seconds must be greater than zero");
-            anyhow::ensure!(raw <= 300, "timeout_seconds must be <= 300");
-            raw
+                .ok_or_else(|| anyhow::anyhow!("{key} must be a non-negative integer"))?;
+            anyhow::ensure!(raw >= min, "{key} must be >= {min}");
+            anyhow::ensure!(raw <= max, "{key} must be <= {max}");
+            Ok(raw)
         }
-        Some(_) => anyhow::bail!("timeout_seconds must be a positive integer"),
-    };
+        Some(_) => anyhow::bail!("{key} must be an integer"),
+    }
+}
 
-    let provider = sanitized_config_string(&payload, "provider", &config.provider, 64)?;
-    let base_url = sanitized_config_string(&payload, "base_url", &config.base_url, 2048)?;
-    let model = sanitized_config_string(&payload, "model", &config.model, 512)?;
-    let max_rerank_candidates = match payload.get("max_rerank_candidates") {
-        None | Some(Value::Null) => config.max_rerank_candidates,
-        Some(Value::Number(number)) => {
-            let raw = number.as_u64().ok_or_else(|| {
-                anyhow::anyhow!("max_rerank_candidates must be a positive integer")
-            })? as usize;
-            anyhow::ensure!(raw >= 2, "max_rerank_candidates must be >= 2");
-            anyhow::ensure!(raw <= 50, "max_rerank_candidates must be <= 50");
-            raw
-        }
-        Some(_) => anyhow::bail!("max_rerank_candidates must be a positive integer"),
-    };
+/// Validate and apply a judge-config JSON payload onto `config` in place.
+/// Shared by the dedicated judge endpoint and the unified config editor.
+fn apply_judge_payload(
+    config: &mut crate::config::JudgeConfig,
+    payload: &Value,
+) -> anyhow::Result<()> {
+    let timeout_seconds =
+        opt_u64_in_range(payload, "timeout_seconds", config.timeout_seconds, 1, 300)?;
+    let provider = sanitized_config_string(payload, "provider", &config.provider, 64)?;
+    let base_url = sanitized_config_string(payload, "base_url", &config.base_url, 2048)?;
+    let model = sanitized_config_string(payload, "model", &config.model, 512)?;
+    let max_rerank_candidates = opt_u64_in_range(
+        payload,
+        "max_rerank_candidates",
+        config.max_rerank_candidates as u64,
+        2,
+        50,
+    )? as usize;
     let enabled = payload
         .get("enabled")
         .and_then(Value::as_bool)
@@ -1282,6 +1347,16 @@ async fn handle_judge_config_put(
         timeout_seconds,
         max_rerank_candidates,
     };
+    Ok(())
+}
+
+async fn handle_judge_config_put(
+    session: &dispatch::SessionState,
+    body: &str,
+) -> anyhow::Result<String> {
+    let payload = parse_json_body(body)?;
+    let mut config = session.judge_config.lock().await;
+    apply_judge_payload(&mut config, &payload)?;
     Ok(json_response(
         "200 OK",
         &serde_json::json!({
@@ -1290,6 +1365,132 @@ async fn handle_judge_config_put(
         })
         .to_string(),
     ))
+}
+
+/// Snapshot the workbench-editable tunables (search, retrieval, forget) for the
+/// config editor. Judge config is read via the dedicated judge endpoint.
+async fn handle_config_tunables_get(session: &dispatch::SessionState) -> anyhow::Result<String> {
+    let search = session.search.lock().await.clone();
+    let forget = session.forget.lock().await.clone();
+    let default_limit = session
+        .retrieval_default_limit
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let body = serde_json::json!({
+        "search": serde_json::to_value(&search)?,
+        "retrieval": { "default_limit": default_limit },
+        "forget": serde_json::to_value(&forget)?,
+        "config_path": session.config_path.as_ref().map(|p| p.display().to_string()),
+    });
+    Ok(json_response("200 OK", &body.to_string()))
+}
+
+/// Apply judge + search + retrieval + forget edits to the running server, then
+/// persist them to the managed block of `ferrosa-memory.toml` when a config file
+/// was resolved at startup. Reports `persisted: false` (rather than faking it)
+/// when there is no config file to write to.
+async fn handle_config_tunables_put(
+    session: &dispatch::SessionState,
+    body: &str,
+) -> anyhow::Result<String> {
+    let payload = parse_json_body(body)?;
+
+    if let Some(judge_payload) = payload.get("judge").filter(|v| !v.is_null()) {
+        let mut judge = session.judge_config.lock().await;
+        apply_judge_payload(&mut judge, judge_payload)?;
+    }
+    if let Some(retrieval) = payload.get("retrieval").filter(|v| !v.is_null()) {
+        let current = session
+            .retrieval_default_limit
+            .load(std::sync::atomic::Ordering::Relaxed) as u64;
+        let limit = opt_u64_in_range(retrieval, "default_limit", current, 1, 50)? as usize;
+        session
+            .retrieval_default_limit
+            .store(limit, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(s) = payload.get("search").filter(|v| !v.is_null()) {
+        let mut search = session.search.lock().await;
+        search.rerank_min_candidates = opt_u64_in_range(
+            s,
+            "rerank_min_candidates",
+            search.rerank_min_candidates as u64,
+            1,
+            50,
+        )? as usize;
+        search.rerank_max_candidates = opt_u64_in_range(
+            s,
+            "rerank_max_candidates",
+            search.rerank_max_candidates as u64,
+            search.rerank_min_candidates as u64,
+            50,
+        )? as usize;
+        search.rerank_batch_size = opt_u64_in_range(
+            s,
+            "rerank_batch_size",
+            search.rerank_batch_size as u64,
+            1,
+            50,
+        )? as usize;
+        search.rerank_min_score_coverage = opt_u64_in_range(
+            s,
+            "rerank_min_score_coverage",
+            search.rerank_min_score_coverage as u64,
+            1,
+            50,
+        )? as usize;
+    }
+    if let Some(f) = payload.get("forget").filter(|v| !v.is_null()) {
+        let mut forget = session.forget.lock().await;
+        forget.retract_purge_days = opt_u64_in_range(
+            f,
+            "retract_purge_days",
+            forget.retract_purge_days as u64,
+            0,
+            3650,
+        )? as u32;
+        forget.candidate_limit =
+            opt_u64_in_range(f, "candidate_limit", forget.candidate_limit as u64, 1, 200)? as usize;
+        forget.candidate_max = opt_u64_in_range(
+            f,
+            "candidate_max",
+            forget.candidate_max as u64,
+            forget.candidate_limit as u64,
+            1000,
+        )? as usize;
+        forget.token_ttl_seconds =
+            opt_u64_in_range(f, "token_ttl_seconds", forget.token_ttl_seconds, 1, 86400)?;
+        forget.high_impact_edge_threshold = opt_u64_in_range(
+            f,
+            "high_impact_edge_threshold",
+            forget.high_impact_edge_threshold as u64,
+            1,
+            1000,
+        )? as usize;
+    }
+
+    let judge = session.judge_config.lock().await.clone();
+    let search = session.search.lock().await.clone();
+    let forget = session.forget.lock().await.clone();
+    let retrieval = crate::config::RetrievalConfig {
+        default_limit: session
+            .retrieval_default_limit
+            .load(std::sync::atomic::Ordering::Relaxed),
+    };
+    let persisted = if let Some(path) = session.config_path.as_ref() {
+        crate::config::write_managed_config_block(path, &judge, &search, &retrieval, &forget)?;
+        true
+    } else {
+        false
+    };
+
+    let body = serde_json::json!({
+        "persisted": persisted,
+        "config_path": session.config_path.as_ref().map(|p| p.display().to_string()),
+        "judge": redacted_judge_config(&judge),
+        "search": serde_json::to_value(&search)?,
+        "retrieval": { "default_limit": retrieval.default_limit },
+        "forget": serde_json::to_value(&forget)?,
+    });
+    Ok(json_response("200 OK", &body.to_string()))
 }
 
 async fn handle_judge_models_get(
@@ -1503,6 +1704,14 @@ async fn handle_operator_request<S: Storage + OperatorQuerySurface>(
         ("GET", "/workbench/api/judge/models") => handle_judge_models_get(session, path).await,
         ("GET", models_path) if models_path.starts_with("/workbench/api/judge/models?") => {
             handle_judge_models_get(session, models_path).await
+        }
+        ("GET", "/workbench/api/tools/list") => handle_tools_list(storage, ctx, session).await,
+        ("POST", "/workbench/api/tools/call") => {
+            handle_tool_call(storage, ctx, session, body).await
+        }
+        ("GET", "/workbench/api/config/tunables") => handle_config_tunables_get(session).await,
+        ("POST", "/workbench/api/config/tunables") | ("PUT", "/workbench/api/config/tunables") => {
+            handle_config_tunables_put(session, body).await
         }
         ("POST", "/workbench/api/cql/query") => {
             let payload = parse_json_body(body)?;
@@ -4646,6 +4855,26 @@ mod tests {
         assert!(WORKBENCH_HTML.contains(r#"id="judgeRerankCandidates""#));
         assert!(WORKBENCH_HTML.contains("/workbench/api/judge/config"));
         assert!(WORKBENCH_HTML.contains("/workbench/api/judge/models"));
+    }
+
+    #[test]
+    fn workbench_html_includes_tool_runner_config_and_forget_panels() {
+        // Panels
+        assert!(WORKBENCH_HTML.contains(r#"data-panel="tools""#));
+        assert!(WORKBENCH_HTML.contains(r#"data-panel="config""#));
+        assert!(WORKBENCH_HTML.contains(r#"data-panel="forget""#));
+        // Nav entries
+        assert!(WORKBENCH_HTML.contains(r#"data-section="tools""#));
+        assert!(WORKBENCH_HTML.contains(r#"data-section="config""#));
+        assert!(WORKBENCH_HTML.contains(r#"data-section="forget""#));
+        // Endpoints the panels call (request() prefixes /workbench/api)
+        assert!(WORKBENCH_HTML.contains("/tools/list"));
+        assert!(WORKBENCH_HTML.contains("/tools/call"));
+        assert!(WORKBENCH_HTML.contains("/config/tunables"));
+        // Memory branding swap (no terracotta accent, Fm mark)
+        assert!(WORKBENCH_HTML.contains("--accent: #348cff;"));
+        assert!(!WORKBENCH_HTML.contains("#e2725b"));
+        assert!(WORKBENCH_HTML.contains(r#"class="shell-brand-mark">Fm<"#));
     }
 
     #[test]

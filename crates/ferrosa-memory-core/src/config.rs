@@ -52,6 +52,8 @@ pub struct Config {
     #[serde(default)]
     pub retrieval: RetrievalConfig,
     #[serde(default)]
+    pub search: SearchConfig,
+    #[serde(default)]
     pub forget: ForgetConfig,
 }
 
@@ -348,6 +350,50 @@ impl Default for RetrievalConfig {
 
 fn default_retrieval_limit() -> usize {
     10
+}
+
+/// Search & rerank tunables (`[search]` section) that shape retrieval quality.
+/// Promoted from former dispatch-layer constants so operators can tune them at
+/// runtime via the workbench and persist them to the config file. Defaults
+/// preserve the original hardcoded behaviour exactly.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct SearchConfig {
+    /// Minimum number of candidates required before the LLM judge reranks.
+    #[serde(default = "default_rerank_min_candidates")]
+    pub rerank_min_candidates: usize,
+    /// Hard cap on candidates sent to the judge reranker, regardless of request.
+    #[serde(default = "default_rerank_max_candidates")]
+    pub rerank_max_candidates: usize,
+    /// Minimum number of scored candidates needed to trust judge score contrast.
+    #[serde(default = "default_rerank_min_score_coverage")]
+    pub rerank_min_score_coverage: usize,
+    /// Batch size for chunked judge reranking of large candidate sets.
+    #[serde(default = "default_rerank_batch_size")]
+    pub rerank_batch_size: usize,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            rerank_min_candidates: default_rerank_min_candidates(),
+            rerank_max_candidates: default_rerank_max_candidates(),
+            rerank_min_score_coverage: default_rerank_min_score_coverage(),
+            rerank_batch_size: default_rerank_batch_size(),
+        }
+    }
+}
+
+fn default_rerank_min_candidates() -> usize {
+    2
+}
+fn default_rerank_max_candidates() -> usize {
+    50
+}
+fn default_rerank_min_score_coverage() -> usize {
+    5
+}
+fn default_rerank_batch_size() -> usize {
+    5
 }
 
 /// Configuration for the `forget` / `restore_forgotten` memory tools.
@@ -827,6 +873,110 @@ pub fn parse_config(toml_str: &str) -> Result<Config, toml::de::Error> {
     toml::from_str(toml_str)
 }
 
+/// Sentinels delimiting the workbench-managed config block.
+const MANAGED_BEGIN: &str = "# >>> ferrosa-memory workbench-managed (do not edit by hand) >>>";
+const MANAGED_END: &str = "# <<< ferrosa-memory workbench-managed <<<";
+
+/// Top-level TOML tables the workbench config editor owns and regenerates inside
+/// the managed block. Hand-edited copies of these tables are removed on save so
+/// the file stays valid (TOML forbids duplicate table headers).
+const MANAGED_TABLES: [&str; 4] = ["judge", "search", "retrieval", "forget"];
+
+/// Detect a top-level table header `[name]` (not an array-of-tables `[[name]]`),
+/// returning the table name. Returns `None` for any other line.
+fn parse_table_header(line: &str) -> Option<&str> {
+    let line = line.trim();
+    if line.starts_with('[') && !line.starts_with("[[") && line.ends_with(']') {
+        Some(line[1..line.len() - 1].trim())
+    } else {
+        None
+    }
+}
+
+/// Remove the prior managed block (between sentinels, inclusive) and any
+/// top-level managed tables, preserving every other line and comment verbatim.
+fn strip_managed_and_tables(input: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut in_managed = false;
+    let mut skipping_table = false;
+    for line in input.lines() {
+        let trimmed = line.trim();
+        if trimmed == MANAGED_BEGIN {
+            in_managed = true;
+            continue;
+        }
+        if trimmed == MANAGED_END {
+            in_managed = false;
+            continue;
+        }
+        if in_managed {
+            continue;
+        }
+        if let Some(header) = parse_table_header(trimmed) {
+            let top = header.split('.').next().unwrap_or(header);
+            skipping_table = MANAGED_TABLES.contains(&top);
+        } else if trimmed.starts_with("[[") {
+            skipping_table = false;
+        }
+        if skipping_table {
+            continue;
+        }
+        out.push(line);
+    }
+    out.join("\n")
+}
+
+/// Render a single named TOML table (e.g. `[judge]`) from a serializable value.
+fn render_managed_table<T: Serialize>(name: &str, value: &T) -> anyhow::Result<String> {
+    let mut doc = toml::Table::new();
+    doc.insert(name.to_string(), toml::Value::try_from(value)?);
+    let body =
+        toml::to_string_pretty(&doc).map_err(|e| anyhow::anyhow!("serialize [{name}]: {e}"))?;
+    Ok(format!("\n{body}"))
+}
+
+/// Persist the workbench-managed config tables (`[judge]`, `[search]`,
+/// `[retrieval]`, `[forget]`) to `path` inside a delimited managed block,
+/// preserving all other file content and comments. Writes atomically via a
+/// temp file + rename. Fails loudly if the file cannot be read or written.
+pub fn write_managed_config_block(
+    path: &Path,
+    judge: &JudgeConfig,
+    search: &SearchConfig,
+    retrieval: &RetrievalConfig,
+    forget: &ForgetConfig,
+) -> anyhow::Result<()> {
+    let existing = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("read config {}: {e}", path.display()))?;
+    let preserved = strip_managed_and_tables(&existing);
+
+    let mut block = String::new();
+    block.push_str(MANAGED_BEGIN);
+    block.push('\n');
+    block.push_str("# Generated by the Ferrosa Memory workbench config editor.\n");
+    block.push_str("# Edits inside this block are overwritten on the next save;\n");
+    block.push_str("# hand-tune other sections above this block.\n");
+    block.push_str(&render_managed_table("judge", judge)?);
+    block.push_str(&render_managed_table("search", search)?);
+    block.push_str(&render_managed_table("retrieval", retrieval)?);
+    block.push_str(&render_managed_table("forget", forget)?);
+    block.push_str(MANAGED_END);
+    block.push('\n');
+
+    let mut out = preserved.trim_end().to_string();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(&block);
+
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, out.as_bytes())
+        .map_err(|e| anyhow::anyhow!("write temp config {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| anyhow::anyhow!("commit config {}: {e}", path.display()))?;
+    Ok(())
+}
+
 pub fn validate_shared_http_config(config: &Config) -> anyhow::Result<()> {
     if config.server.transport != "http" {
         return Ok(());
@@ -1063,6 +1213,68 @@ mod tests {
     fn loopback_connection_count_exposes_counter() {
         let baseline = loopback_connection_count();
         assert!(loopback_connection_count() >= baseline);
+    }
+
+    #[test]
+    fn search_config_defaults_match_legacy_rerank_constants() {
+        let s = SearchConfig::default();
+        assert_eq!(s.rerank_min_candidates, 2);
+        assert_eq!(s.rerank_max_candidates, 50);
+        assert_eq!(s.rerank_min_score_coverage, 5);
+        assert_eq!(s.rerank_batch_size, 5);
+    }
+
+    #[test]
+    fn managed_block_preserves_other_content_and_stays_valid_and_idempotent() {
+        let path =
+            std::env::temp_dir().join(format!("fmem_managed_block_{}.toml", std::process::id()));
+        let original = "# hand-written header comment\n\
+            [ferrosa]\nendpoint = \"127.0.0.1:9042\"\n\n\
+            [judge]\nmodel = \"stale-model\"\n";
+        std::fs::write(&path, original).unwrap();
+
+        let judge = JudgeConfig {
+            model: "fresh-model".into(),
+            ..JudgeConfig::default()
+        };
+        write_managed_config_block(
+            &path,
+            &judge,
+            &SearchConfig::default(),
+            &RetrievalConfig::default(),
+            &ForgetConfig::default(),
+        )
+        .unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+
+        // Non-managed content + comments preserved.
+        assert!(after.contains("# hand-written header comment"));
+        assert!(after.contains("[ferrosa]"));
+        assert!(after.contains("endpoint = \"127.0.0.1:9042\""));
+        // Managed block written with fresh value; stale hand-written [judge] removed.
+        assert!(after.contains(MANAGED_BEGIN));
+        assert!(after.contains(MANAGED_END));
+        assert!(after.contains("fresh-model"));
+        assert!(!after.contains("stale-model"));
+        assert_eq!(after.matches("[judge]").count(), 1);
+        // Result must still be valid TOML (no duplicate-table error).
+        let _: toml::Table = toml::from_str(&after).expect("managed output is valid TOML");
+
+        // Idempotent: a second write keeps exactly one managed block / table.
+        write_managed_config_block(
+            &path,
+            &judge,
+            &SearchConfig::default(),
+            &RetrievalConfig::default(),
+            &ForgetConfig::default(),
+        )
+        .unwrap();
+        let after2 = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after2.matches(MANAGED_BEGIN).count(), 1);
+        assert_eq!(after2.matches("[judge]").count(), 1);
+        assert_eq!(after2.matches("[search]").count(), 1);
+
+        std::fs::remove_file(&path).ok();
     }
 
     /// P0-11: localhost contact_points are refused without the explicit
