@@ -1938,9 +1938,9 @@ function syncShellMetrics() {
 const entityColors = {
   concept: '#7c9cf5',
   person: '#c882f0',
-  decision: '#e2725b',
+  decision: '#e25b5b',
   pattern: '#f4a261',
-  org: '#d4a574',
+  org: '#f4a261',
   event: '#6bc9a0',
   place: '#9cb8f7',
   preference: '#f7be7e',
@@ -1954,7 +1954,7 @@ const entityColors = {
 };
 
 const edgeColors = {
-  CO_OCCURS: '#d4a574',
+  CO_OCCURS: '#f4a261',
   MENTIONED_IN: '#7c9cf5',
   FOLDED_INTO: '#c882f0',
   SUPERSEDES: '#e25b5b',
@@ -1965,7 +1965,7 @@ const edgeColors = {
   implements: '#c97eff',
   uses: '#7effda',
   subclass_of: '#ff9d7e',
-  related_to: '#d4a574',
+  related_to: '#f4a261',
   references: '#87ceeb',
 };
 let activeEdgeTypes = new Set(); // empty = show all
@@ -3458,7 +3458,7 @@ function rebuildFilters() {
   // Project filter
   const projects = new Set(allNodes.map(n => getProject(n)).filter(Boolean));
   const projectColors = {};
-  const palette = ['#e2725b', '#5ba3e2', '#5be27b', '#c95be2', '#e2c45b', '#5be2c4', '#e25b8a', '#8ae25b'];
+  const palette = ['#e25b5b', '#5ba3e2', '#5be27b', '#c95be2', '#e2c45b', '#5be2c4', '#e25b8a', '#8ae25b'];
   let pi = 0;
   for (const p of [...projects].sort()) { projectColors[p] = palette[pi++ % palette.length]; }
   buildFilterMenu('project-menu', 'project-count', projects, activeProjects, projectColors, () => {
