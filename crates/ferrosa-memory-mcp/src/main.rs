@@ -2826,8 +2826,10 @@ async fn main() -> anyhow::Result<()> {
                     config.retrieval.default_limit.clamp(1, 50),
                 )),
                 system_info: Arc::clone(&system_info),
-                forget: config.forget.clone(),
+                search: Arc::new(tokio::sync::Mutex::new(config.search.clone())),
+                forget: Arc::new(tokio::sync::Mutex::new(config.forget.clone())),
                 forget_token_key: random_forget_token_key(),
+                config_path: ferrosa_memory_core::config::resolve_config_path(),
                 ..dispatch::SessionState::default()
             });
             tracing::info!(session_id = %default_session_id, "using server-owned default session_id");
@@ -2944,8 +2946,10 @@ async fn main() -> anyhow::Result<()> {
                     config.retrieval.default_limit.clamp(1, 50),
                 )),
                 system_info: Arc::clone(&system_info),
-                forget: config.forget.clone(),
+                search: Arc::new(tokio::sync::Mutex::new(config.search.clone())),
+                forget: Arc::new(tokio::sync::Mutex::new(config.forget.clone())),
                 forget_token_key: random_forget_token_key(),
+                config_path: ferrosa_memory_core::config::resolve_config_path(),
                 ..dispatch::SessionState::default()
             });
 

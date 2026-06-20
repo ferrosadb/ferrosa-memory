@@ -4,27 +4,27 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Ferrosa Memory Viz</title>
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='fg' x1='0%25' y1='0%25' x2='100%25' y2='100%25'%3E%3Cstop offset='0%25' stop-color='%23e2725b'/%3E%3Cstop offset='100%25' stop-color='%23d4a574'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='7' fill='%230a0a0f'/%3E%3Crect x='3' y='3' width='26' height='26' rx='5.5' fill='none' stroke='url(%23fg)' stroke-width='1.5'/%3E%3Ctext x='16' y='21.5' text-anchor='middle' font-family='Georgia,serif' font-size='15' font-weight='700' fill='url(%23fg)'%3EFe%3C/text%3E%3Ctext x='7.5' y='10.5' font-family='sans-serif' font-size='5' font-weight='600' fill='%236b6b7a'%3E26%3C/text%3E%3C/svg%3E">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='fg' x1='0%25' y1='0%25' x2='100%25' y2='100%25'%3E%3Cstop offset='0%25' stop-color='%237ee7ff'/%3E%3Cstop offset='100%25' stop-color='%23348cff'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='7' fill='%2305070c'/%3E%3Crect x='3' y='3' width='26' height='26' rx='5.5' fill='none' stroke='url(%23fg)' stroke-width='1.5'/%3E%3Ctext x='16' y='21.5' text-anchor='middle' font-family='Georgia,serif' font-size='14' font-weight='700' fill='url(%23fg)'%3EFm%3C/text%3E%3Ctext x='6' y='10.5' font-family='sans-serif' font-size='5' font-weight='600' fill='%237d9fca'%3E100%3C/text%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <script src="https://d3js.org/d3.v7.min.js"></script>
 <style>
   :root {
-    --bg-primary: #0a0a0f;
-    --bg-secondary: #111118;
-    --bg-card: #16161f;
-    --bg-card-hover: #1c1c28;
-    --text-primary: #e8e8ed;
-    --text-secondary: #9494a3;
-    --text-muted: #6b6b7a;
-    --accent: #e2725b;
-    --accent-warm: #d4a574;
+    --bg-primary: #05070c;
+    --bg-secondary: #09111f;
+    --bg-card: #0e1726;
+    --bg-card-hover: #16243a;
+    --text-primary: #e8f4ff;
+    --text-secondary: #9bb3cf;
+    --text-muted: #6b8199;
+    --accent: #348cff;
+    --accent-warm: #7ee7ff;
     --accent-green: #6bc9a0;
-    --accent-cool: #7c9cf5;
-    --accent-purple: #c882f0;
+    --accent-cool: #5aa6ff;
+    --accent-purple: #8a9bff;
     --accent-amber: #f4a261;
     --accent-red: #e25b5b;
-    --border: #1e1e2a;
+    --border: #17263b;
     --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     --font-serif: 'Georgia', 'Times New Roman', serif;
     --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
@@ -48,8 +48,8 @@
     gap: 16px;
     padding: 12px 18px;
     background:
-      radial-gradient(circle at top left, rgba(226, 114, 91, 0.18), transparent 38%),
-      linear-gradient(180deg, #111118, #0d0d14);
+      radial-gradient(circle at top left, rgba(52, 140, 255, 0.18), transparent 38%),
+      linear-gradient(180deg, #09111f, #070c16);
     border-bottom: 1px solid var(--border);
     flex-shrink: 0;
   }
@@ -129,8 +129,8 @@
 
   .top-nav a.active {
     color: var(--accent-warm);
-    background: linear-gradient(110deg, rgba(226, 114, 91, 0.15), rgba(212, 165, 116, 0.15));
-    border-color: rgba(212, 165, 116, 0.4);
+    background: linear-gradient(110deg, rgba(52, 140, 255, 0.15), rgba(126, 231, 255, 0.15));
+    border-color: rgba(126, 231, 255, 0.4);
   }
 
   .topbar-chip {
@@ -343,18 +343,18 @@
   }
 
   .settings-action:hover {
-    border-color: rgba(212, 165, 116, 0.55);
+    border-color: rgba(126, 231, 255, 0.55);
     transform: translateY(-1px);
   }
 
   .settings-action-primary {
-    background: linear-gradient(110deg, rgba(107, 201, 160, 0.18), rgba(124, 156, 245, 0.16));
+    background: linear-gradient(110deg, rgba(107, 201, 160, 0.18), rgba(90, 166, 255, 0.16));
     border-color: rgba(107, 201, 160, 0.38);
   }
 
   .settings-action-warm {
-    background: linear-gradient(110deg, rgba(226, 114, 91, 0.16), rgba(212, 165, 116, 0.16));
-    border-color: rgba(212, 165, 116, 0.42);
+    background: linear-gradient(110deg, rgba(52, 140, 255, 0.16), rgba(126, 231, 255, 0.16));
+    border-color: rgba(126, 231, 255, 0.42);
   }
 
   .settings-status {
@@ -539,7 +539,7 @@
   }
 
   .search-result .result-snippet mark {
-    background: rgba(226, 114, 91, 0.3);
+    background: rgba(52, 140, 255, 0.3);
     color: var(--accent);
     padding: 0 2px;
     border-radius: 2px;
@@ -767,7 +767,7 @@
     letter-spacing: 0.05em;
     padding: 2px 6px;
     border-radius: 3px;
-    background: rgba(212, 165, 116, 0.15);
+    background: rgba(126, 231, 255, 0.15);
     color: var(--accent-warm);
     white-space: nowrap;
     flex-shrink: 0;
@@ -916,7 +916,7 @@
     flex-shrink: 0;
     border-right: 1px solid var(--border);
     background:
-      radial-gradient(circle at top left, rgba(226, 114, 91, 0.18), transparent 36%),
+      radial-gradient(circle at top left, rgba(52, 140, 255, 0.18), transparent 36%),
       linear-gradient(180deg, rgba(17, 17, 24, 0.98), rgba(11, 11, 18, 0.98));
     transition: width 0.2s ease;
     overflow: hidden;
@@ -1036,8 +1036,8 @@
     width: 10px;
     height: 10px;
     border-radius: 999px;
-    border: 1px solid rgba(212, 165, 116, 0.5);
-    background: rgba(212, 165, 116, 0.1);
+    border: 1px solid rgba(126, 231, 255, 0.5);
+    background: rgba(126, 231, 255, 0.1);
     flex-shrink: 0;
   }
 
@@ -1465,7 +1465,7 @@
   }
   .view-toggle:hover { border-color: var(--accent); color: var(--text-primary); }
   .view-toggle:active { transform: scale(0.96); }
-  .view-toggle.active { border-color: var(--accent); color: var(--accent); background: rgba(226, 114, 91, 0.1); }
+  .view-toggle.active { border-color: var(--accent); color: var(--accent); background: rgba(52, 140, 255, 0.1); }
 
   /* Preset buttons */
   .preset-buttons {
@@ -1489,7 +1489,7 @@
   }
   .preset-btn:hover { border-color: var(--accent); color: var(--text-primary); }
   .preset-btn:active { transform: scale(0.96); }
-  .preset-btn.active { border-color: var(--accent); color: var(--accent); background: rgba(226, 114, 91, 0.1); }
+  .preset-btn.active { border-color: var(--accent); color: var(--accent); background: rgba(52, 140, 255, 0.1); }
 
   /* Explore controls in info panel */
   .explore-controls {
@@ -1521,7 +1521,7 @@
     align-items: center;
     justify-content: center;
   }
-  .explore-btn:hover { background: rgba(226, 114, 91, 0.15); color: var(--text-primary); }
+  .explore-btn:hover { background: rgba(52, 140, 255, 0.15); color: var(--text-primary); }
   .explore-btn:active { transform: scale(0.96); }
   .hop-slider-label {
     font-size: 10px;
@@ -1575,7 +1575,7 @@
     align-items: center;
     gap: 8px;
     padding: 6px 16px;
-    background: rgba(226, 114, 91, 0.1);
+    background: rgba(52, 140, 255, 0.1);
     border-bottom: 1px solid var(--accent);
     flex-shrink: 0;
     font-size: 12px;
@@ -1592,7 +1592,7 @@
     transition: all 0.15s ease;
     -webkit-tap-highlight-color: transparent;
   }
-  #explore-back-bar .explore-back-btn:hover { background: rgba(226, 114, 91, 0.15); }
+  #explore-back-bar .explore-back-btn:hover { background: rgba(52, 140, 255, 0.15); }
   #explore-back-bar .explore-back-btn:active { transform: scale(0.96); }
   #explore-back-bar .explore-label {
     color: var(--text-secondary);
@@ -1662,7 +1662,7 @@
 <div id="app">
   <div id="topbar">
     <div class="shell-brand">
-      <div class="shell-brand-mark">Fe</div>
+      <div class="shell-brand-mark"><svg width="30" height="30" viewBox="0 0 100 100" aria-label="Ferrosa Memory"><defs><linearGradient id="fmIg" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#7ee7ff"/><stop offset="55%" stop-color="#348cff"/><stop offset="100%" stop-color="#516d92"/></linearGradient><linearGradient id="fmRg" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#7ee7ff" stop-opacity="0.32"/><stop offset="100%" stop-color="#348cff" stop-opacity="0.08"/></linearGradient><linearGradient id="fmNg" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#f4feff"/><stop offset="45%" stop-color="#7ee7ff"/><stop offset="100%" stop-color="#2f7cff"/></linearGradient></defs><ellipse cx="50" cy="50" rx="47" ry="47" fill="none" stroke="url(#fmRg)" stroke-width="1.5" stroke-dasharray="216 80" transform="rotate(-20, 50, 50)"/><g opacity="0.55" stroke="url(#fmRg)" stroke-width="2" stroke-linecap="round" fill="none"><path d="M22 72 C36 60 46 60 58 64"/><path d="M24 32 C38 42 50 42 62 36"/></g><g fill="url(#fmNg)" opacity="0.85"><circle cx="22" cy="72" r="3"/><circle cx="24" cy="32" r="2.5"/><circle cx="72" cy="40" r="3"/></g><rect x="14" y="14" width="72" height="72" rx="15" ry="15" fill="none" stroke="url(#fmIg)" stroke-width="2.5"/><text x="50" y="61" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-size="36" font-weight="700" fill="url(#fmIg)" letter-spacing="-1">Fm</text><text x="24" y="30" font-family="Inter, sans-serif" font-size="9" font-weight="600" fill="#7d9fca">100</text></svg></div>
       <div class="shell-brand-copy">
         <b>Ferrosa Memory</b>
         <span>Knowledge Graph Console</span>
@@ -1721,7 +1721,7 @@
       </div>
     </div>
     <div class="logo">
-      <span class="fe">Fe</span>
+      <span class="fe">Fm</span>
       <span class="label">memory</span>
     </div>
     <div class="header-buttons right">
@@ -1934,17 +1934,17 @@ function syncShellMetrics() {
   document.documentElement.style.setProperty('--panel-top', `${Math.ceil(header.getBoundingClientRect().bottom)}px`);
 }
 
-// === Color mappings (Ferrosa brand) ===
+// === Color mappings (Ferrosa Memory brand) ===
 const entityColors = {
   concept: '#7c9cf5',
   person: '#c882f0',
-  decision: '#e2725b',
+  decision: '#e25b5b',
   pattern: '#f4a261',
-  org: '#d4a574',
+  org: '#f4a261',
   event: '#6bc9a0',
   place: '#9cb8f7',
   preference: '#f7be7e',
-  fold: '#16161f',
+  fold: '#0e1726',
   document: '#4ecdc4',
   section: '#45b7aa',
   crate: '#ff6b6b',
@@ -1954,7 +1954,7 @@ const entityColors = {
 };
 
 const edgeColors = {
-  CO_OCCURS: '#d4a574',
+  CO_OCCURS: '#f4a261',
   MENTIONED_IN: '#7c9cf5',
   FOLDED_INTO: '#c882f0',
   SUPERSEDES: '#e25b5b',
@@ -1965,7 +1965,7 @@ const edgeColors = {
   implements: '#c97eff',
   uses: '#7effda',
   subclass_of: '#ff9d7e',
-  related_to: '#d4a574',
+  related_to: '#f4a261',
   references: '#87ceeb',
 };
 let activeEdgeTypes = new Set(); // empty = show all
@@ -2000,7 +2000,7 @@ const stateOpacity = {
 const stateColorMap = {
   active: '#6bc9a0',
   dormant: '#f4a261',
-  silent: '#6b6b7a',
+  silent: '#6b8199',
   unavailable: '#e25b5b',
 };
 
@@ -2410,7 +2410,7 @@ function render() {
       if (selectedNode && selectedNode.id === d.id) return '#fff';
       // Global-scope nodes (skills, tags, shared concepts) get a warm
       // stroke so they're visually distinct from session-local nodes.
-      if (d.is_global) return '#e2725b';
+      if (d.is_global) return '#348cff';
       if (d.child_count != null) return 'rgba(255,255,255,0.4)';
       return 'rgba(255,255,255,0.15)';
     })
@@ -2524,7 +2524,7 @@ function highlightConnections(node) {
     .attr('opacity', d => neighborIds.has(d.id) ? 1.0 : 0.15)
     .attr('stroke', d => {
       if (d.id === node.id) return '#fff';
-      if (neighborIds.has(d.id)) return '#e2725b';
+      if (neighborIds.has(d.id)) return '#348cff';
       return 'rgba(255,255,255,0.1)';
     })
     .attr('stroke-width', d => d.id === node.id ? 3 : neighborIds.has(d.id) ? 2 : 1);
@@ -2532,7 +2532,7 @@ function highlightConnections(node) {
   labelGroup.selectAll('text')
     .transition().duration(200)
     .attr('opacity', d => neighborIds.has(d.id) ? 1.0 : 0.1)
-    .attr('fill', d => neighborIds.has(d.id) ? '#e8e8ed' : '#9494a3');
+    .attr('fill', d => neighborIds.has(d.id) ? '#e8f4ff' : '#9bb3cf');
 
   linkGroup.selectAll('line')
     .transition().duration(200)
@@ -2558,7 +2558,7 @@ function clearSelectionHighlight() {
   labelGroup.selectAll('text')
     .transition().duration(200)
     .attr('opacity', 1.0)
-    .attr('fill', '#9494a3');
+    .attr('fill', '#9bb3cf');
 
   linkGroup.selectAll('line')
     .transition().duration(200)
@@ -2604,13 +2604,13 @@ function highlightByType(type, rowEl) {
   nodeGroup.selectAll('circle')
     .transition().duration(200)
     .attr('opacity', d => typeNodeIds.has(d.id) ? 1.0 : connectedIds.has(d.id) ? 0.6 : 0.1)
-    .attr('stroke', d => typeNodeIds.has(d.id) ? '#fff' : connectedIds.has(d.id) ? '#e2725b' : 'rgba(255,255,255,0.05)')
+    .attr('stroke', d => typeNodeIds.has(d.id) ? '#fff' : connectedIds.has(d.id) ? '#348cff' : 'rgba(255,255,255,0.05)')
     .attr('stroke-width', d => typeNodeIds.has(d.id) ? 2.5 : connectedIds.has(d.id) ? 1.5 : 1);
 
   labelGroup.selectAll('text')
     .transition().duration(200)
     .attr('opacity', d => connectedIds.has(d.id) ? 1.0 : 0.05)
-    .attr('fill', d => typeNodeIds.has(d.id) ? '#e8e8ed' : '#9494a3');
+    .attr('fill', d => typeNodeIds.has(d.id) ? '#e8f4ff' : '#9bb3cf');
 
   linkGroup.selectAll('line')
     .transition().duration(200)
@@ -2676,7 +2676,7 @@ function highlightSearchResults() {
       return matchIds.has(d.id) ? 1.0 : 0.1;
     })
     .attr('stroke', d => {
-      if (matchIds.has(d.id)) return '#e2725b';
+      if (matchIds.has(d.id)) return '#348cff';
       if (selectedNode && selectedNode.id === d.id) return '#fff';
       return 'none';
     })
@@ -2687,7 +2687,7 @@ function highlightSearchResults() {
       if (!searchQuery) return 1.0;
       return matchIds.has(d.id) ? 1.0 : 0.1;
     })
-    .attr('fill', d => matchIds.has(d.id) ? '#e8e8ed' : '#9494a3');
+    .attr('fill', d => matchIds.has(d.id) ? '#e8f4ff' : '#9bb3cf');
 
   linkGroup.selectAll('line')
     .attr('stroke-opacity', d => {
@@ -2706,7 +2706,7 @@ function clearSearchHighlight() {
 
   labelGroup.selectAll('text')
     .attr('opacity', 1.0)
-    .attr('fill', '#9494a3');
+    .attr('fill', '#9bb3cf');
 
   linkGroup.selectAll('line')
     .attr('stroke-opacity', 0.35);
@@ -2817,7 +2817,7 @@ function renderInfoPanel() {
 
     html += `<div class="stat-row"><span class="label">Type</span><span class="value" style="text-transform:capitalize">${selectedNode.entity_type}</span></div>`;
     html += `<div class="stat-row"><span class="label">Kind</span><span class="value">${selectedNode.node_type}</span></div>`;
-    html += `<div class="stat-row"><span class="label">State</span><span class="value" style="color:${stateColorMap[selectedNode.state] || '#9494a3'}">${selectedNode.state}</span></div>`;
+    html += `<div class="stat-row"><span class="label">State</span><span class="value" style="color:${stateColorMap[selectedNode.state] || '#9bb3cf'}">${selectedNode.state}</span></div>`;
     html += `<div class="stat-row"><span class="label">Confidence</span><span class="value">${selectedNode.confidence.toFixed(2)}</span></div>`;
     html += `<div class="stat-row"><span class="label">Created</span><span class="value">${selectedNode.created_at ? new Date(selectedNode.created_at).toLocaleString() : '—'}</span></div>`;
 
@@ -2871,7 +2871,7 @@ function showTooltip(event, d) {
   // user see where a node lives at a glance.
   let scopeBadge = '';
   if (d.is_global) {
-    scopeBadge = ' &middot; <span style="color:#e2725b">global</span>';
+    scopeBadge = ' &middot; <span style="color:#348cff">global</span>';
   } else if (d.session_id) {
     const short = d.session_id.length > 8 ? d.session_id.slice(0, 8) : d.session_id;
     scopeBadge = ` &middot; session ${short}`;
@@ -3291,7 +3291,7 @@ function flashNode(nodeId) {
   nodeGroup.selectAll('circle')
     .filter(d => d.id === nodeId)
     .transition().duration(200)
-    .attr('stroke', '#e2725b')
+    .attr('stroke', '#348cff')
     .attr('stroke-width', 4)
     .transition().duration(800)
     .attr('stroke', selectedNode && selectedNode.id === nodeId ? '#fff' : 'none')
@@ -3458,7 +3458,7 @@ function rebuildFilters() {
   // Project filter
   const projects = new Set(allNodes.map(n => getProject(n)).filter(Boolean));
   const projectColors = {};
-  const palette = ['#e2725b', '#5ba3e2', '#5be27b', '#c95be2', '#e2c45b', '#5be2c4', '#e25b8a', '#8ae25b'];
+  const palette = ['#e25b5b', '#5ba3e2', '#5be27b', '#c95be2', '#e2c45b', '#5be2c4', '#e25b8a', '#8ae25b'];
   let pi = 0;
   for (const p of [...projects].sort()) { projectColors[p] = palette[pi++ % palette.length]; }
   buildFilterMenu('project-menu', 'project-count', projects, activeProjects, projectColors, () => {
@@ -3492,7 +3492,7 @@ function rebuildFilters() {
   const sessionPalette = ['#5ba3e2', '#5be27b', '#e2c45b', '#c95be2', '#e25b8a', '#5be2c4', '#8ae25b'];
   let si = 0;
   for (const s of [...sessionSet].sort()) {
-    sessionColors[s] = s === '(global)' ? '#e2725b' : sessionPalette[si++ % sessionPalette.length];
+    sessionColors[s] = s === '(global)' ? '#348cff' : sessionPalette[si++ % sessionPalette.length];
   }
   buildFilterMenu('session-menu', 'session-count', sessionSet, activeSessions, sessionColors, () => {
     // Translate "(global)" back to the sentinel node set via the is_global flag.

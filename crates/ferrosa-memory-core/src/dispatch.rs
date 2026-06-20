@@ -34,10 +34,8 @@ const BATCH_MUTATION_CONCURRENCY: usize = 16;
 const MIN_RETRIEVAL_LIMIT: usize = 1;
 const MAX_RETRIEVAL_LIMIT: usize = 50;
 const DEFAULT_RETRIEVAL_LIMIT: usize = 10;
-const LLM_RERANK_MIN_CANDIDATES: usize = 2;
-const LLM_RERANK_HARD_MAX_CANDIDATES: usize = 50;
-const LLM_RERANK_MIN_SCORE_COVERAGE: usize = 5;
-const LLM_RERANK_BATCH_SIZE: usize = 5;
+// LLM rerank tunables were promoted to `[search]` config; see
+// `crate::config::SearchConfig` and `RerankTunables`. Defaults preserved there.
 /// Connection-establishment budget for the judge endpoint. Kept small so a
 /// judge-on-by-default search skips quickly when the endpoint is down, rather
 /// than blocking on the much longer generation timeout.
@@ -227,14 +225,20 @@ pub struct SessionState {
     pub judge_config: Arc<Mutex<crate::config::JudgeConfig>>,
     /// Runtime default ranked-result count for retrieval tools when omitted by the caller.
     pub retrieval_default_limit: Arc<AtomicUsize>,
+    /// Runtime search & rerank tunables (`[search]` section), editable via the workbench.
+    pub search: Arc<Mutex<crate::config::SearchConfig>>,
     /// Immutable startup snapshot used by the `system_describe` management tool.
     pub system_info: Arc<crate::system_describe::SystemInfo>,
     /// Forget-feature configuration (`[forget]` section): purge window,
-    /// candidate caps, token TTL, high-impact threshold.
-    pub forget: crate::config::ForgetConfig,
+    /// candidate caps, token TTL, high-impact threshold. Editable via the workbench.
+    pub forget: Arc<Mutex<crate::config::ForgetConfig>>,
     /// Secret key for signing/verifying stateless `forget` tokens. Keyed-SHA256
     /// over the token payload; rotating it invalidates outstanding tokens.
     pub forget_token_key: Vec<u8>,
+    /// Path to the config file used for workbench persistence (managed block).
+    /// `None` when no config file was resolved at startup; persistence is then
+    /// skipped and reported to the operator rather than silently faked.
+    pub config_path: Option<std::path::PathBuf>,
 }
 
 impl Default for SessionState {
@@ -265,11 +269,13 @@ impl Default for SessionState {
             enrich_llm_model: "google/gemma-4-31b".to_string(),
             judge_config: Arc::new(Mutex::new(crate::config::JudgeConfig::default())),
             retrieval_default_limit: Arc::new(AtomicUsize::new(DEFAULT_RETRIEVAL_LIMIT)),
+            search: Arc::new(Mutex::new(crate::config::SearchConfig::default())),
             system_info: Arc::new(crate::system_describe::SystemInfo::default()),
-            forget: crate::config::ForgetConfig::default(),
+            forget: Arc::new(Mutex::new(crate::config::ForgetConfig::default())),
             // Fixed, deterministic key for tests; production overrides this with
             // random bytes in the MCP server's SessionState constructors.
             forget_token_key: b"forget-test-key-0000000000000000".to_vec(),
+            config_path: None,
         }
     }
 }
@@ -7203,11 +7209,35 @@ fn apply_llm_rerank_order(
     reranked
 }
 
+/// Runtime snapshot of the `[search]` rerank tunables, read once per rerank call
+/// from `SessionState::search` and threaded through the rerank helpers. Defaults
+/// preserve the original hardcoded constant behaviour.
+#[derive(Clone, Copy)]
+struct RerankTunables {
+    min_candidates: usize,
+    max_candidates: usize,
+    min_score_coverage: usize,
+    batch_size: usize,
+}
+
+impl RerankTunables {
+    fn from_search(search: &crate::config::SearchConfig) -> Self {
+        let min_candidates = search.rerank_min_candidates.max(1);
+        Self {
+            min_candidates,
+            max_candidates: search.rerank_max_candidates.max(min_candidates),
+            min_score_coverage: search.rerank_min_score_coverage.max(1),
+            batch_size: search.rerank_batch_size.max(1),
+        }
+    }
+}
+
 fn apply_llm_rerank_decision(
     results: Vec<crate::hybrid_search::SearchResult>,
     order: &[uuid::Uuid],
     judge_scores: &[Option<i64>],
     candidate_count: usize,
+    min_score_coverage: usize,
 ) -> Vec<crate::hybrid_search::SearchResult> {
     if order.is_empty() || candidate_count == 0 {
         return results;
@@ -7252,7 +7282,7 @@ fn apply_llm_rerank_decision(
         .collect::<std::collections::HashSet<_>>()
         .len()
         > 1
-        && (has_negative || scored_count >= split_at.min(LLM_RERANK_MIN_SCORE_COVERAGE));
+        && (has_negative || scored_count >= split_at.min(min_score_coverage));
     if !has_score_contrast {
         return apply_llm_rerank_order(
             scored
@@ -7497,6 +7527,7 @@ async fn batched_llm_rerank_results(
     results: Vec<crate::hybrid_search::SearchResult>,
     config: &crate::config::JudgeConfig,
     candidate_count: usize,
+    tunables: RerankTunables,
 ) -> (Vec<crate::hybrid_search::SearchResult>, LlmRerankReport) {
     let split_at = results.len().min(candidate_count);
     let top = results[..split_at].to_vec();
@@ -7508,8 +7539,8 @@ async fn batched_llm_rerank_results(
     let mut batch_winners = Vec::new();
     let mut any_applied = false;
 
-    for (batch_idx, batch) in top.chunks(LLM_RERANK_BATCH_SIZE).enumerate() {
-        let start_rank = batch_idx * LLM_RERANK_BATCH_SIZE + 1;
+    for (batch_idx, batch) in top.chunks(tunables.batch_size).enumerate() {
+        let start_rank = batch_idx * tunables.batch_size + 1;
         let batch_vec = batch.to_vec();
         match judge_rerank_candidates(config, query, &batch_vec).await {
             Ok(decision) if decision.order.len() >= 2 => {
@@ -7524,6 +7555,7 @@ async fn batched_llm_rerank_results(
                     &decision.order,
                     &decision.judge_scores,
                     batch.len(),
+                    tunables.min_score_coverage,
                 );
                 if let Some(winner) = batch_order.first() {
                     batch_winners.push(winner.id);
@@ -7690,6 +7722,7 @@ async fn maybe_llm_rerank_results(
     candidate_override: Option<usize>,
 ) -> (Vec<crate::hybrid_search::SearchResult>, LlmRerankReport) {
     let config = session.judge_config.lock().await.clone();
+    let tunables = RerankTunables::from_search(&session.search.lock().await.clone());
     let enabled = rerank_override.unwrap_or(config.enabled);
     if !enabled {
         return (results, LlmRerankReport::disabled(&config));
@@ -7702,10 +7735,11 @@ async fn maybe_llm_rerank_results(
     }
     let configured_candidates = candidate_override
         .unwrap_or(config.max_rerank_candidates)
-        .clamp(LLM_RERANK_MIN_CANDIDATES, LLM_RERANK_HARD_MAX_CANDIDATES);
+        .clamp(tunables.min_candidates, tunables.max_candidates);
     let candidate_count = results.len().min(configured_candidates);
-    if candidate_count > LLM_RERANK_BATCH_SIZE {
-        return batched_llm_rerank_results(query, results, &config, candidate_count).await;
+    if candidate_count > tunables.batch_size {
+        return batched_llm_rerank_results(query, results, &config, candidate_count, tunables)
+            .await;
     }
     let candidate_ids = results
         .iter()
@@ -7744,7 +7778,13 @@ async fn maybe_llm_rerank_results(
             ),
         );
     }
-    let reranked = apply_llm_rerank_decision(results, &order, &judge_scores, candidate_count);
+    let reranked = apply_llm_rerank_decision(
+        results,
+        &order,
+        &judge_scores,
+        candidate_count,
+        tunables.min_score_coverage,
+    );
     (
         reranked,
         LlmRerankReport {
@@ -9474,7 +9514,7 @@ async fn handle_forget<S: crate::storage::Storage>(
 ) -> Result<Value, (i32, String)> {
     let now = chrono::Utc::now();
     let key = session.forget_token_key.as_slice();
-    let cfg = &session.forget;
+    let cfg = session.forget.lock().await.clone();
 
     let token = args.get("forget_token").and_then(|v| v.as_str());
     let confirming = args
@@ -16161,6 +16201,7 @@ mod tests {
             &[third, first, second],
             &[Some(0), Some(-1), Some(1)],
             3,
+            5,
         );
         let ids = reranked.into_iter().map(|r| r.id).collect::<Vec<_>>();
 
@@ -16195,6 +16236,7 @@ mod tests {
             &[second, third, first],
             &[None, Some(1), Some(0)],
             3,
+            5,
         );
         let ids = reranked.into_iter().map(|r| r.id).collect::<Vec<_>>();
 
@@ -16229,6 +16271,7 @@ mod tests {
             &[third, second],
             &[None, Some(1), None],
             3,
+            5,
         );
         let ids = reranked.into_iter().map(|r| r.id).collect::<Vec<_>>();
 

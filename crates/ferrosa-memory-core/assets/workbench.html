@@ -4,26 +4,26 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Ferrosa Memory Operator Workbench</title>
-  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='fg' x1='0%25' y1='0%25' x2='100%25' y2='100%25'%3E%3Cstop offset='0%25' stop-color='%23e2725b'/%3E%3Cstop offset='100%25' stop-color='%23d4a574'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='7' fill='%230a0a0f'/%3E%3Crect x='3' y='3' width='26' height='26' rx='5.5' fill='none' stroke='url(%23fg)' stroke-width='1.5'/%3E%3Ctext x='16' y='21.5' text-anchor='middle' font-family='Georgia,serif' font-size='15' font-weight='700' fill='url(%23fg)'%3EFe%3C/text%3E%3Ctext x='7.5' y='10.5' font-family='sans-serif' font-size='5' font-weight='600' fill='%236b6b7a'%3E26%3C/text%3E%3C/svg%3E">
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='fg' x1='0%25' y1='0%25' x2='100%25' y2='100%25'%3E%3Cstop offset='0%25' stop-color='%237ee7ff'/%3E%3Cstop offset='100%25' stop-color='%23348cff'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='7' fill='%2305070c'/%3E%3Crect x='3' y='3' width='26' height='26' rx='5.5' fill='none' stroke='url(%23fg)' stroke-width='1.5'/%3E%3Ctext x='16' y='21.5' text-anchor='middle' font-family='Georgia,serif' font-size='14' font-weight='700' fill='url(%23fg)'%3EFm%3C/text%3E%3Ctext x='6' y='10.5' font-family='sans-serif' font-size='5' font-weight='600' fill='%237d9fca'%3E100%3C/text%3E%3C/svg%3E">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg-primary: #0a0a0f;
-      --bg-secondary: #111118;
-      --bg-card: #16161f;
-      --bg-card-hover: #1c1c28;
-      --text-primary: #e8e8ed;
-      --text-secondary: #9494a3;
-      --text-muted: #6b6b7a;
-      --accent: #e2725b;
-      --accent-warm: #d4a574;
+      --bg-primary: #05070c;
+      --bg-secondary: #09111f;
+      --bg-card: #0e1726;
+      --bg-card-hover: #16243a;
+      --text-primary: #e8f4ff;
+      --text-secondary: #9bb3cf;
+      --text-muted: #6b8199;
+      --accent: #348cff;
+      --accent-warm: #7ee7ff;
       --accent-green: #6bc9a0;
-      --accent-cool: #7c9cf5;
-      --accent-purple: #c882f0;
+      --accent-cool: #5aa6ff;
+      --accent-purple: #8a9bff;
       --warn: #f4a261;
       --danger: #e25b5b;
-      --border: #1e1e2a;
+      --border: #17263b;
       --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
       --font-serif: 'Georgia', 'Times New Roman', serif;
       --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
@@ -50,9 +50,9 @@
       margin: 0;
       min-height: 100%;
       background:
-        radial-gradient(circle at top left, rgba(226, 114, 91, 0.16), transparent 32%),
-        radial-gradient(circle at top right, rgba(124, 156, 245, 0.12), transparent 26%),
-        linear-gradient(180deg, #0e0e14 0%, var(--bg) 42%, #07070b 100%);
+        radial-gradient(circle at top left, rgba(52, 140, 255, 0.18), transparent 32%),
+        radial-gradient(circle at top right, rgba(126, 231, 255, 0.10), transparent 26%),
+        linear-gradient(180deg, #081120 0%, var(--bg) 42%, #04060a 100%);
       color: var(--text);
       font-family: var(--font-sans);
       -webkit-font-smoothing: antialiased;
@@ -75,8 +75,8 @@
       z-index: 12;
       backdrop-filter: blur(14px);
       background:
-        radial-gradient(circle at top left, rgba(226, 114, 91, 0.18), transparent 38%),
-        linear-gradient(180deg, #111118, #0d0d14);
+        radial-gradient(circle at top left, rgba(52, 140, 255, 0.20), transparent 38%),
+        linear-gradient(180deg, #0a1424, #060b14);
       border-bottom: 1px solid var(--line);
     }
 
@@ -168,8 +168,8 @@
     .top-nav a.active,
     .nav a.active {
       color: var(--accent-2);
-      background: linear-gradient(110deg, rgba(226, 114, 91, 0.15), rgba(212, 165, 116, 0.15));
-      border-color: rgba(212, 165, 116, 0.4);
+      background: linear-gradient(110deg, rgba(52, 140, 255, 0.18), rgba(126, 231, 255, 0.15));
+      border-color: rgba(126, 231, 255, 0.4);
     }
 
     .topbar-meta,
@@ -212,7 +212,7 @@
 
     .btn:hover {
       transform: translateY(-1px);
-      border-color: rgba(212, 165, 116, 0.72);
+      border-color: rgba(126, 231, 255, 0.6);
     }
 
     .btn:disabled {
@@ -724,13 +724,44 @@
       from { opacity: 0; transform: translateY(8px); }
       to { opacity: 1; transform: translateY(0); }
     }
+
+    /* Tool runner — generated argument fields */
+    .tool-arg-field { margin-bottom: 10px; }
+    .tool-arg-field > label { display: block; font-size: 0.8rem; color: var(--subtle); margin-bottom: 4px; }
+    .tool-arg-field .req { color: var(--danger); margin-left: 2px; }
+    .tool-arg-field .hint { color: var(--muted); font-size: 0.72rem; margin-top: 3px; line-height: 1.4; }
+    .tool-arg-field .checkbox-row { margin: 0; }
+    .tool-optional { margin: 6px 0 10px; border-top: 1px solid var(--line); padding-top: 10px; }
+    .tool-optional > summary { cursor: pointer; color: var(--subtle); font-size: 0.8rem; margin-bottom: 10px; user-select: none; }
+    .tool-optional[open] > summary { color: var(--text); }
+
+    /* Forget — candidate review cards */
+    .forget-candidate {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px 14px;
+      margin-bottom: 10px;
+      background: var(--panel-2);
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+    }
+    .forget-candidate.selected { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+    .forget-candidate.high-impact { border-left: 3px solid var(--warn); }
+    .forget-candidate input[type="checkbox"] { margin-top: 4px; flex: 0 0 auto; }
+    .forget-candidate .cand-body { flex: 1; min-width: 0; }
+    .forget-candidate .cand-name { font-weight: 600; word-break: break-word; }
+    .forget-candidate .cand-snippet { color: var(--subtle); font-size: 0.85rem; margin: 4px 0; word-break: break-word; }
+    .forget-candidate .cand-meta { color: var(--muted); font-size: 0.72rem; font-family: var(--mono); }
+    .blast { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+    .blast .badge.warn { color: var(--warn); border-color: var(--warn); }
   </style>
 </head>
 <body>
   <header class="topbar">
     <div class="topbar-inner">
       <div class="shell-brand">
-        <div class="shell-brand-mark">Fe</div>
+        <div class="shell-brand-mark"><svg width="30" height="30" viewBox="0 0 100 100" aria-label="Ferrosa Memory"><defs><linearGradient id="fmIg" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#7ee7ff"/><stop offset="55%" stop-color="#348cff"/><stop offset="100%" stop-color="#516d92"/></linearGradient><linearGradient id="fmRg" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#7ee7ff" stop-opacity="0.32"/><stop offset="100%" stop-color="#348cff" stop-opacity="0.08"/></linearGradient><linearGradient id="fmNg" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#f4feff"/><stop offset="45%" stop-color="#7ee7ff"/><stop offset="100%" stop-color="#2f7cff"/></linearGradient></defs><ellipse cx="50" cy="50" rx="47" ry="47" fill="none" stroke="url(#fmRg)" stroke-width="1.5" stroke-dasharray="216 80" transform="rotate(-20, 50, 50)"/><g opacity="0.55" stroke="url(#fmRg)" stroke-width="2" stroke-linecap="round" fill="none"><path d="M22 72 C36 60 46 60 58 64"/><path d="M24 32 C38 42 50 42 62 36"/></g><g fill="url(#fmNg)" opacity="0.85"><circle cx="22" cy="72" r="3"/><circle cx="24" cy="32" r="2.5"/><circle cx="72" cy="40" r="3"/></g><rect x="14" y="14" width="72" height="72" rx="15" ry="15" fill="none" stroke="url(#fmIg)" stroke-width="2.5"/><text x="50" y="61" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-size="36" font-weight="700" fill="url(#fmIg)" letter-spacing="-1">Fm</text><text x="24" y="30" font-family="Inter, sans-serif" font-size="9" font-weight="600" fill="#7d9fca">100</text></svg></div>
         <div class="shell-brand-copy">
           <b>Ferrosa Memory</b>
           <span>Knowledge Graph Console</span>
@@ -742,9 +773,12 @@
         <a href="/#cql" data-section="cql">CQL Explorer</a>
         <a href="/#sparql" data-section="sparql">SPARQL Explorer</a>
         <a href="/#datalog" data-section="datalog">Datalog Explorer</a>
-        <a href="/#judge" data-section="judge">Judge Config</a>
+        <a href="/#tools" data-section="tools">Tools</a>
+        <a href="/#judge" data-section="judge">Judge</a>
+        <a href="/#config" data-section="config">Config</a>
         <a href="/#rules" data-section="rules">Rules</a>
-        <a href="/#approvals" data-section="approvals">Approvals / Explanations</a>
+        <a href="/#approvals" data-section="approvals">Approvals</a>
+        <a href="/#forget" data-section="forget">Forget</a>
       </nav>
       <div class="topbar-meta toolbar">
         <div id="authChip" class="topbar-chip chip">Auth: checking…</div>
@@ -1237,6 +1271,224 @@
         </div>
       </div>
     </section>
+
+    <section id="tools" class="panel" data-panel="tools">
+      <div class="panel-head">
+        <div>
+          <h2>Tool Runner</h2>
+          <p>Call any Ferrosa Memory tool directly and inspect exactly what it would add to an agent's context. Pick a tool, fill the generated form (or edit raw JSON), and run.</p>
+        </div>
+        <span id="toolsCountBadge" class="badge">loading…</span>
+      </div>
+      <div class="panel-body">
+        <div class="grid split">
+          <form id="toolRunForm" class="card query-form">
+            <h3>Invoke</h3>
+            <label for="toolSelect">Tool</label>
+            <select id="toolSelect" class="input"><option value="">Loading tools…</option></select>
+            <p class="muted" id="toolDescription" style="min-height:1.2em;white-space:pre-wrap;"></p>
+            <div class="console-strip">
+              <span class="muted" style="margin:0;">Arguments</span>
+              <label class="checkbox-row" for="toolRawToggle" style="margin:0;">
+                <input id="toolRawToggle" type="checkbox">
+                <span>Edit raw JSON</span>
+              </label>
+            </div>
+            <div id="toolFormFields"></div>
+            <textarea id="toolRawArgs" class="input mono" rows="10" style="display:none;" spellcheck="false" placeholder="{}"></textarea>
+            <div class="toolbar-row">
+              <button class="btn" type="submit">Run Tool</button>
+              <button class="btn secondary" id="toolReload" type="button">Reload Tools</button>
+            </div>
+            <div class="status" id="toolStatus">Ready.</div>
+          </form>
+          <div class="card">
+            <h3>Result</h3>
+            <div class="console-strip">
+              <p class="muted" style="margin:0;">Pretty-printed payload the tool returns — i.e. what would enter context.</p>
+              <span id="toolResultMeta" class="badge">idle</span>
+            </div>
+            <div id="toolOutput" class="output-box">No tool run yet.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="config" class="panel" data-panel="config">
+      <div class="panel-head">
+        <div>
+          <h2>Config Editor</h2>
+          <p>Edit the judge model/endpoint and the retrieval &amp; rerank tunables that shape search quality. Saving applies to the running server and persists to <code>ferrosa-memory.toml</code>.</p>
+        </div>
+        <span id="configPersistBadge" class="badge">idle</span>
+      </div>
+      <div class="panel-body">
+        <div class="grid split">
+          <form id="configForm" class="card query-form">
+            <h3>Judge model</h3>
+            <p class="muted">The model that reranks retrieval candidates. Use the <a href="#judge" data-open="judge">Judge</a> tab to probe available models.</p>
+            <div class="inline">
+              <div class="field" style="flex:1;min-width:160px;">
+                <label for="cfgJudgeProvider">Provider</label>
+                <select id="cfgJudgeProvider" class="input">
+                  <option value="ollama">Ollama local</option>
+                  <option value="ollama.com">Ollama.com</option>
+                  <option value="lmstudio">LM Studio</option>
+                  <option value="openai_compatible">OpenAI-compatible</option>
+                  <option value="custom">Custom</option>
+                </select>
+              </div>
+              <div class="field" style="flex:1;min-width:160px;">
+                <label for="cfgJudgeTimeout">Timeout (s)</label>
+                <input id="cfgJudgeTimeout" class="input" type="number" min="1" max="300" step="1">
+              </div>
+            </div>
+            <label for="cfgJudgeBaseUrl">Judge endpoint URL</label>
+            <input id="cfgJudgeBaseUrl" class="input mono" type="url" placeholder="http://127.0.0.1:11434">
+            <label for="cfgJudgeModel">Judge model</label>
+            <input id="cfgJudgeModel" class="input mono" type="text" placeholder="qwen2.5-coder:7b">
+            <label class="checkbox-row" for="cfgJudgeEnabled">
+              <input id="cfgJudgeEnabled" type="checkbox">
+              <span>Use judge for live retrieval reranking</span>
+            </label>
+            <label for="cfgJudgeToken">Judge token (optional)</label>
+            <input id="cfgJudgeToken" class="input mono" type="password" autocomplete="off" placeholder="leave blank to keep current">
+
+            <h3 style="margin-top:18px;">Search &amp; rerank tunables</h3>
+            <div class="inline">
+              <div class="field" style="flex:1;min-width:150px;">
+                <label for="cfgRetrievalLimit">Default retrieval limit</label>
+                <input id="cfgRetrievalLimit" class="input" type="number" min="1" max="50" step="1">
+                <div class="hint" style="color:var(--muted);font-size:0.72rem;">Results returned when a call omits k/limit (1–50).</div>
+              </div>
+              <div class="field" style="flex:1;min-width:150px;">
+                <label for="cfgRerankMax">Max rerank candidates</label>
+                <input id="cfgRerankMax" class="input" type="number" min="2" max="50" step="1">
+                <div class="hint" style="color:var(--muted);font-size:0.72rem;">Top candidates sent to the judge (2–50).</div>
+              </div>
+            </div>
+            <div class="inline">
+              <div class="field" style="flex:1;min-width:140px;">
+                <label for="cfgRerankMin">Min rerank candidates</label>
+                <input id="cfgRerankMin" class="input" type="number" min="2" max="50" step="1">
+              </div>
+              <div class="field" style="flex:1;min-width:140px;">
+                <label for="cfgRerankBatch">Rerank batch size</label>
+                <input id="cfgRerankBatch" class="input" type="number" min="1" max="50" step="1">
+              </div>
+              <div class="field" style="flex:1;min-width:140px;">
+                <label for="cfgRerankCoverage">Min score coverage</label>
+                <input id="cfgRerankCoverage" class="input" type="number" min="1" max="50" step="1">
+              </div>
+            </div>
+
+            <h3 style="margin-top:18px;">Forget retention</h3>
+            <div class="inline">
+              <div class="field" style="flex:1;min-width:150px;">
+                <label for="cfgForgetPurgeDays">Retract purge (days)</label>
+                <input id="cfgForgetPurgeDays" class="input" type="number" min="0" max="3650" step="1">
+              </div>
+              <div class="field" style="flex:1;min-width:150px;">
+                <label for="cfgForgetCandLimit">Candidate limit</label>
+                <input id="cfgForgetCandLimit" class="input" type="number" min="1" max="200" step="1">
+              </div>
+              <div class="field" style="flex:1;min-width:150px;">
+                <label for="cfgForgetHighImpact">High-impact threshold</label>
+                <input id="cfgForgetHighImpact" class="input" type="number" min="1" max="1000" step="1">
+              </div>
+            </div>
+
+            <div class="toolbar-row">
+              <button class="btn" type="submit">Save &amp; persist to disk</button>
+              <button class="btn secondary" id="configReload" type="button">Reload</button>
+            </div>
+            <div class="status" id="configStatus">Ready.</div>
+          </form>
+          <div class="card">
+            <h3>Effective config</h3>
+            <div class="console-strip">
+              <p class="muted" style="margin:0;">Live values and the on-disk persistence target.</p>
+              <span id="configMeta" class="badge">idle</span>
+            </div>
+            <div id="configOutput" class="output-box">No config loaded yet.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="forget" class="panel" data-panel="forget">
+      <div class="panel-head">
+        <div>
+          <h2>Forget &amp; Curate</h2>
+          <p>Two-phase, safe forgetting. Propose candidates for an intent, review each one's blast radius, then forget only the ids you select. Retract is reversible; hard delete is permanent.</p>
+        </div>
+        <span id="forgetSummaryBadge" class="badge">idle</span>
+      </div>
+      <div class="panel-body">
+        <form id="forgetProposeForm" class="card query-form">
+          <h3>1 · Propose</h3>
+          <p class="muted">This step searches memory and mutates nothing.</p>
+          <label for="forgetQuery">What to forget (intent / query)</label>
+          <textarea id="forgetQuery" class="input" placeholder="e.g. outdated notes about the old auth flow" required></textarea>
+          <div class="inline">
+            <div class="field" style="flex:1;min-width:200px;">
+              <label for="forgetSessionId">Session ID (optional)</label>
+              <input id="forgetSessionId" class="input mono" type="text" placeholder="blank = global / all sessions">
+            </div>
+            <div class="field" style="flex:1;min-width:120px;">
+              <label for="forgetLimit">Max candidates</label>
+              <input id="forgetLimit" class="input" type="number" min="1" max="50" step="1" value="10">
+            </div>
+          </div>
+          <div class="toolbar-row">
+            <button class="btn" type="submit">Propose candidates</button>
+            <button class="btn secondary" id="forgetReset" type="button">Reset</button>
+          </div>
+          <div class="status" id="forgetStatus">Nothing proposed yet.</div>
+        </form>
+
+        <div class="card" id="forgetCandidatesCard" style="display:none;">
+          <div class="console-strip">
+            <h3 style="margin:0;">2 · Review &amp; select</h3>
+            <span id="forgetCandidateMeta" class="badge">0 candidates</span>
+          </div>
+          <div class="toolbar-row" style="margin:10px 0;">
+            <button class="btn secondary" id="forgetSelectAll" type="button">Select all</button>
+            <button class="btn secondary" id="forgetSelectNone" type="button">Select none</button>
+          </div>
+          <div id="forgetCandidates"></div>
+        </div>
+
+        <form class="card" id="forgetConfirmCard" style="display:none;">
+          <div class="console-strip">
+            <h3 style="margin:0;">3 · Confirm</h3>
+            <span id="forgetSelectionBadge" class="badge">0 selected</span>
+          </div>
+          <div class="inline" style="margin-top:10px;">
+            <div class="field" style="flex:1;min-width:220px;">
+              <label for="forgetMode">Mode</label>
+              <select id="forgetMode" class="input">
+                <option value="retract">Retract — reversible, restorable</option>
+                <option value="hard">Hard delete — permanent</option>
+              </select>
+            </div>
+          </div>
+          <label class="checkbox-row" for="forgetAckHighImpact">
+            <input id="forgetAckHighImpact" type="checkbox">
+            <span>Acknowledge high-impact candidates (required to forget highly-connected memories)</span>
+          </label>
+          <label class="checkbox-row" for="forgetHardConfirm" id="forgetHardConfirmRow" style="display:none;">
+            <input id="forgetHardConfirm" type="checkbox">
+            <span style="color:var(--danger);">I understand hard delete is permanent and cannot be restored.</span>
+          </label>
+          <div class="toolbar-row">
+            <button class="btn" id="forgetConfirmBtn" type="submit">Forget selected</button>
+          </div>
+          <div class="status" id="forgetConfirmStatus">Select candidates above to enable confirmation.</div>
+          <div id="forgetConfirmOutput" class="output-box" style="display:none;"></div>
+        </form>
+      </div>
+    </section>
   </main>
 
   <footer>
@@ -1272,7 +1524,7 @@
     };
 
     const API_BASE = '/workbench/api';
-    const sections = ['home', 'cql', 'sparql', 'datalog', 'judge', 'rules', 'approvals'];
+    const sections = ['home', 'cql', 'sparql', 'datalog', 'tools', 'judge', 'config', 'rules', 'approvals', 'forget'];
 
     const selectors = {
       navLinks: [...document.querySelectorAll('.nav a[data-section]')],
@@ -1497,6 +1749,10 @@
         loadApprovals();
       } else if (section === 'judge') {
         loadJudgeConfig();
+      } else if (section === 'tools') {
+        ensureToolsLoaded();
+      } else if (section === 'config') {
+        loadConfigEditor();
       }
     };
 
@@ -2306,6 +2562,415 @@
         await loadJudgeConfig();
       }
     };
+
+    // ──────────────────────────────────────────────────────────────
+    // Tool Runner · Config Editor · Forget — operator panels
+    // ──────────────────────────────────────────────────────────────
+    const el = (id) => document.getElementById(id);
+    const runner = {
+      tools: [],
+      toolsLoaded: false,
+      forgetToken: null,
+      forgetCandidates: [],
+      forgetSelected: new Set(),
+    };
+
+    const numOrNull = (id) => {
+      const value = el(id).value;
+      if (value === '' || value === null || value === undefined) return null;
+      const n = Number(value);
+      return Number.isFinite(n) ? n : null;
+    };
+    const setSelectValue = (id, value) => {
+      const node = el(id);
+      if (node && [...node.options].some((o) => o.value === value)) node.value = value;
+    };
+    const shortPath = (p) => {
+      if (!p) return '';
+      const parts = String(p).split('/');
+      return parts.length > 2 ? `…/${parts.slice(-2).join('/')}` : String(p);
+    };
+    // MCP tool results wrap the JSON payload in content[0].text — unwrap for readability.
+    const unwrapToolResult = (result) => {
+      try {
+        const text = result && result.content && result.content[0] && result.content[0].text;
+        if (typeof text === 'string') {
+          try { return JSON.parse(text); } catch (_) { return text; }
+        }
+      } catch (_) { /* fall through */ }
+      return result;
+    };
+
+    // ---- Tool Runner ----
+    const ensureToolsLoaded = async () => {
+      if (!runner.toolsLoaded) await loadTools();
+    };
+    const loadTools = async () => {
+      renderStatus(el('toolStatus'), 'Loading tools…', 'ok');
+      try {
+        const payload = await request('/tools/list');
+        const tools = Array.isArray(payload.tools) ? payload.tools.slice() : [];
+        // Surface the most-used tools first; `search` is the primary entry point.
+        const PRIMARY = ['search', 'find', 'ingest', 'stats', 'check', 'turn_chain', 'chunk_ctx', 'forget', 'edge', 'list', 'config'];
+        const rank = (n) => { const i = PRIMARY.indexOf(n); return i === -1 ? 999 : i; };
+        tools.sort((a, b) => (rank(a.name) - rank(b.name)) || a.name.localeCompare(b.name));
+        runner.tools = tools;
+        runner.toolsLoaded = true;
+        el('toolSelect').innerHTML =
+          tools.map((t) => `<option value="${escapeAttr(t.name)}">${escapeHtml(t.name)}</option>`).join('');
+        el('toolsCountBadge').textContent = `${tools.length} tools`;
+        // Default to the primary tool so the main argument (e.g. query) is front-and-center.
+        const def = tools.find((t) => t.name === 'search') || tools[0];
+        if (def) { el('toolSelect').value = def.name; renderToolForm(); }
+        renderStatus(el('toolStatus'), 'Ready — edit arguments and run.', 'ok');
+      } catch (e) {
+        el('toolsCountBadge').textContent = 'error';
+        renderStatus(el('toolStatus'), `Failed to load tools: ${e.message}`, 'bad');
+      }
+    };
+    const currentTool = () => runner.tools.find((t) => t.name === el('toolSelect').value) || null;
+    const toolFieldHtml = (key, spec, isRequired) => {
+      spec = spec || {};
+      const id = `toolarg_${key}`;
+      const hasDefault = spec.default !== undefined && spec.default !== null;
+      // Optional fields left blank fall back to the tool's own server-side default.
+      const ph = isRequired ? '' : ' placeholder="default"';
+      const label = `<label for="${id}">${escapeHtml(key)}${isRequired ? '<span class="req">*</span>' : ''}</label>`;
+      const hint = spec.description ? `<div class="hint">${escapeHtml(spec.description)}</div>` : '';
+      const type = Array.isArray(spec.type) ? spec.type[0] : spec.type;
+      let control;
+      if (Array.isArray(spec.enum)) {
+        const opts = (isRequired ? [] : ['']).concat(spec.enum)
+          .map((v) => `<option value="${escapeAttr(v)}"${hasDefault && v === spec.default ? ' selected' : ''}>${v === '' ? '— default —' : escapeHtml(v)}</option>`).join('');
+        control = `<select id="${id}" class="input" data-arg="${escapeAttr(key)}" data-kind="enum">${opts}</select>`;
+      } else if (type === 'boolean') {
+        const chk = spec.default === true ? ' checked' : '';
+        control = `<label class="checkbox-row"><input id="${id}" type="checkbox" data-arg="${escapeAttr(key)}" data-kind="boolean"${chk}><span>${escapeHtml(key)}</span></label>`;
+        return `<div class="tool-arg-field">${control}${hint}</div>`;
+      } else if (type === 'integer' || type === 'number') {
+        const def = hasDefault ? ` value="${escapeAttr(spec.default)}"` : '';
+        control = `<input id="${id}" class="input" type="number" step="${type === 'integer' ? '1' : 'any'}" data-arg="${escapeAttr(key)}" data-kind="${type}"${def}${ph}>`;
+      } else if (type === 'array' || type === 'object') {
+        const def = hasDefault ? escapeHtml(JSON.stringify(spec.default)) : '';
+        control = `<textarea id="${id}" class="input mono" rows="2" data-arg="${escapeAttr(key)}" data-kind="json" placeholder="${type === 'array' ? '[] (default)' : '{} (default)'}">${def}</textarea>`;
+      } else {
+        const big = /query|context|text|content|body|snippet|prompt|description/i.test(key);
+        control = big
+          ? `<textarea id="${id}" class="input" rows="3" data-arg="${escapeAttr(key)}" data-kind="string"${ph}>${hasDefault ? escapeHtml(spec.default) : ''}</textarea>`
+          : `<input id="${id}" class="input" type="text" data-arg="${escapeAttr(key)}" data-kind="string" value="${hasDefault ? escapeAttr(spec.default) : ''}"${ph}>`;
+      }
+      return `<div class="tool-arg-field">${label}${control}${hint}</div>`;
+    };
+    const renderToolForm = () => {
+      const tool = currentTool();
+      el('toolDescription').textContent = tool ? (tool.description || '') : '';
+      const fields = el('toolFormFields');
+      if (!tool) { fields.innerHTML = ''; return; }
+      const schema = tool.inputSchema || {};
+      const props = (schema && schema.properties) || {};
+      const required = new Set(schema.required || []);
+      const keys = Object.keys(props);
+      if (!keys.length) { fields.innerHTML = '<p class="muted">This tool takes no arguments.</p>'; return; }
+      // Required args first (the primary call surface, e.g. query); the long
+      // optional tail is collapsed and defaults to each tool's server-side values.
+      const req = keys.filter((k) => required.has(k));
+      const opt = keys.filter((k) => !required.has(k));
+      let html = req.map((k) => toolFieldHtml(k, props[k], true)).join('');
+      if (opt.length) {
+        html += `<details class="tool-optional"><summary>Optional arguments · ${opt.length} (blank uses each tool's default)</summary>`
+          + opt.map((k) => toolFieldHtml(k, props[k], false)).join('')
+          + `</details>`;
+      }
+      fields.innerHTML = html;
+    };
+    const collectToolArgs = () => {
+      const args = {};
+      el('toolFormFields').querySelectorAll('[data-arg]').forEach((node) => {
+        const key = node.dataset.arg;
+        const kind = node.dataset.kind;
+        if (kind === 'boolean') { if (node.checked) args[key] = true; return; }
+        const raw = node.value;
+        if (raw === '' || raw === null || raw === undefined) return;
+        if (kind === 'integer' || kind === 'number') {
+          const n = Number(raw);
+          if (!Number.isFinite(n)) throw new Error(`Field "${key}" must be a number`);
+          args[key] = kind === 'integer' ? Math.trunc(n) : n;
+        } else if (kind === 'json') {
+          try { args[key] = JSON.parse(raw); }
+          catch (e) { throw new Error(`Field "${key}" must be valid JSON: ${e.message}`); }
+        } else {
+          args[key] = raw;
+        }
+      });
+      return args;
+    };
+    const onRawToggle = () => {
+      const raw = el('toolRawToggle').checked;
+      if (raw) {
+        try { el('toolRawArgs').value = safeJson(collectToolArgs()); }
+        catch (_) { el('toolRawArgs').value = '{}'; }
+      }
+      el('toolRawArgs').style.display = raw ? 'block' : 'none';
+      el('toolFormFields').style.display = raw ? 'none' : 'block';
+    };
+    const runTool = async (event) => {
+      event.preventDefault();
+      const tool = currentTool();
+      if (!tool) { renderStatus(el('toolStatus'), 'Select a tool first.', 'warn'); return; }
+      let args;
+      try {
+        if (el('toolRawToggle').checked) {
+          const txt = el('toolRawArgs').value.trim();
+          args = txt ? JSON.parse(txt) : {};
+          if (typeof args !== 'object' || Array.isArray(args)) throw new Error('arguments must be a JSON object');
+        } else {
+          args = collectToolArgs();
+        }
+      } catch (e) {
+        renderStatus(el('toolStatus'), e.message, 'bad');
+        return;
+      }
+      renderStatus(el('toolStatus'), `Running ${tool.name}…`, 'ok');
+      el('toolResultMeta').textContent = 'running';
+      const started = performance.now();
+      try {
+        const payload = await request('/tools/call', {
+          method: 'POST',
+          body: JSON.stringify({ name: tool.name, arguments: args }),
+        });
+        const ms = Math.round(performance.now() - started);
+        if (payload.ok) {
+          el('toolOutput').textContent = safeJson(unwrapToolResult(payload.result));
+          el('toolResultMeta').textContent = `ok · ${ms} ms`;
+          renderStatus(el('toolStatus'), `${tool.name} succeeded.`, 'ok');
+        } else {
+          el('toolOutput').textContent = safeJson({ error: payload.error, code: payload.code });
+          el('toolResultMeta').textContent = `tool error · ${ms} ms`;
+          renderStatus(el('toolStatus'), `${tool.name} returned an error: ${payload.error}`, 'bad');
+        }
+      } catch (e) {
+        el('toolResultMeta').textContent = 'request failed';
+        renderStatus(el('toolStatus'), `Request failed: ${e.message}`, 'bad');
+      }
+    };
+
+    // ---- Config Editor ----
+    const loadConfigEditor = async () => {
+      renderStatus(el('configStatus'), 'Loading config…', 'ok');
+      try {
+        const [judge, tunables] = await Promise.all([
+          request('/judge/config'),
+          request('/config/tunables'),
+        ]);
+        setSelectValue('cfgJudgeProvider', judge.provider);
+        el('cfgJudgeTimeout').value = judge.timeout_seconds ?? '';
+        el('cfgJudgeBaseUrl').value = judge.base_url || '';
+        el('cfgJudgeModel').value = judge.model || '';
+        el('cfgJudgeEnabled').checked = !!judge.enabled;
+        el('cfgJudgeToken').value = '';
+        el('cfgJudgeToken').placeholder = judge.token_configured ? 'token set — leave blank to keep' : 'optional';
+        const search = tunables.search || {};
+        const retrieval = tunables.retrieval || {};
+        const forget = tunables.forget || {};
+        el('cfgRetrievalLimit').value = retrieval.default_limit ?? '';
+        el('cfgRerankMax').value = judge.max_rerank_candidates ?? '';
+        el('cfgRerankMin').value = search.rerank_min_candidates ?? '';
+        el('cfgRerankBatch').value = search.rerank_batch_size ?? '';
+        el('cfgRerankCoverage').value = search.rerank_min_score_coverage ?? '';
+        el('cfgForgetPurgeDays').value = forget.retract_purge_days ?? '';
+        el('cfgForgetCandLimit').value = forget.candidate_limit ?? '';
+        el('cfgForgetHighImpact').value = forget.high_impact_edge_threshold ?? '';
+        el('configOutput').textContent = safeJson({ judge, tunables });
+        el('configMeta').textContent = tunables.config_path ? 'loaded' : 'loaded (no file)';
+        el('configPersistBadge').textContent = tunables.config_path ? `→ ${shortPath(tunables.config_path)}` : 'no config file';
+        renderStatus(el('configStatus'), 'Loaded. Edit and save to persist.', 'ok');
+      } catch (e) {
+        renderStatus(el('configStatus'), `Failed to load config: ${e.message}`, 'bad');
+      }
+    };
+    const saveConfig = async (event) => {
+      event.preventDefault();
+      const body = {
+        judge: {
+          enabled: el('cfgJudgeEnabled').checked,
+          provider: el('cfgJudgeProvider').value,
+          base_url: el('cfgJudgeBaseUrl').value.trim(),
+          model: el('cfgJudgeModel').value.trim(),
+          timeout_seconds: numOrNull('cfgJudgeTimeout'),
+          max_rerank_candidates: numOrNull('cfgRerankMax'),
+        },
+        retrieval: { default_limit: numOrNull('cfgRetrievalLimit') },
+        search: {
+          rerank_min_candidates: numOrNull('cfgRerankMin'),
+          rerank_batch_size: numOrNull('cfgRerankBatch'),
+          rerank_min_score_coverage: numOrNull('cfgRerankCoverage'),
+        },
+        forget: {
+          retract_purge_days: numOrNull('cfgForgetPurgeDays'),
+          candidate_limit: numOrNull('cfgForgetCandLimit'),
+          high_impact_edge_threshold: numOrNull('cfgForgetHighImpact'),
+        },
+      };
+      const token = el('cfgJudgeToken').value;
+      if (token.trim() !== '') body.judge.token = token;
+      renderStatus(el('configStatus'), 'Saving…', 'ok');
+      try {
+        const payload = await request('/config/tunables', { method: 'POST', body: JSON.stringify(body) });
+        el('configOutput').textContent = safeJson(payload);
+        const persisted = !!payload.persisted;
+        el('configMeta').textContent = persisted ? 'saved to disk' : 'applied (runtime only)';
+        el('configPersistBadge').textContent = persisted ? `saved → ${shortPath(payload.config_path)}` : 'runtime only';
+        renderStatus(
+          el('configStatus'),
+          persisted ? 'Saved and persisted to ferrosa-memory.toml.' : 'Applied to runtime (no config file to persist to).',
+          'ok'
+        );
+        el('cfgJudgeToken').value = '';
+      } catch (e) {
+        renderStatus(el('configStatus'), `Save failed: ${e.message}`, 'bad');
+      }
+    };
+
+    // ---- Forget & Curate ----
+    const resetForget = () => {
+      runner.forgetToken = null;
+      runner.forgetCandidates = [];
+      runner.forgetSelected = new Set();
+      el('forgetCandidatesCard').style.display = 'none';
+      el('forgetConfirmCard').style.display = 'none';
+      el('forgetConfirmOutput').style.display = 'none';
+      el('forgetSummaryBadge').textContent = 'idle';
+      renderStatus(el('forgetStatus'), 'Nothing proposed yet.', 'ok');
+    };
+    const updateForgetSelection = () => {
+      const n = runner.forgetSelected.size;
+      el('forgetSelectionBadge').textContent = `${n} selected`;
+      const anyHigh = runner.forgetCandidates.some((c) => c.high_impact && runner.forgetSelected.has(c.object_id));
+      el('forgetConfirmStatus').textContent = n
+        ? (anyHigh ? 'Selection includes high-impact memories — acknowledge below before forgetting.' : 'Ready to forget the selected candidates.')
+        : 'Select candidates above to enable confirmation.';
+    };
+    const renderForgetCandidates = () => {
+      const cands = runner.forgetCandidates;
+      el('forgetCandidatesCard').style.display = cands.length ? 'block' : 'none';
+      el('forgetConfirmCard').style.display = cands.length ? 'block' : 'none';
+      el('forgetCandidateMeta').textContent = `${cands.length} candidate${cands.length === 1 ? '' : 's'}`;
+      el('forgetCandidates').innerHTML = cands.map((c) => {
+        const b = c.blast_radius || {};
+        const sel = runner.forgetSelected.has(c.object_id);
+        return `<div class="forget-candidate${sel ? ' selected' : ''}${c.high_impact ? ' high-impact' : ''}">
+          <input type="checkbox" data-fcheck="${escapeAttr(c.object_id)}"${sel ? ' checked' : ''}>
+          <div class="cand-body">
+            <div class="cand-name">${escapeHtml(c.name || '(unnamed)')} ${c.high_impact ? '<span class="badge warn">high-impact</span>' : ''}</div>
+            <div class="cand-snippet">${escapeHtml(truncate(c.snippet || '', 220))}</div>
+            <div class="blast">
+              <span class="badge">${escapeHtml(c.object_type || 'entity')}</span>
+              <span class="badge">state: ${escapeHtml(c.state || '?')}</span>
+              <span class="badge">${b.edges || 0} edges</span>
+              <span class="badge">${b.referenced_by || 0} inbound</span>
+              <span class="badge">${b.temporal_chains || 0} temporal</span>
+              <span class="badge">${b.derived_refs || 0} derived</span>
+              <span class="badge">score ${Number(c.match_score || 0).toFixed(2)}</span>
+            </div>
+            <div class="cand-meta">${escapeHtml(c.object_id)}</div>
+          </div>
+        </div>`;
+      }).join('');
+      el('forgetCandidates').querySelectorAll('[data-fcheck]').forEach((node) => {
+        node.addEventListener('change', () => {
+          if (node.checked) runner.forgetSelected.add(node.dataset.fcheck);
+          else runner.forgetSelected.delete(node.dataset.fcheck);
+          node.closest('.forget-candidate').classList.toggle('selected', node.checked);
+          updateForgetSelection();
+        });
+      });
+      updateForgetSelection();
+    };
+    const proposeForget = async (event) => {
+      event.preventDefault();
+      const query = el('forgetQuery').value.trim();
+      if (!query) { renderStatus(el('forgetStatus'), 'Enter what to forget.', 'warn'); return; }
+      const args = { query };
+      const sid = el('forgetSessionId').value.trim();
+      if (sid) args.session_id = sid;
+      const limit = Number(el('forgetLimit').value);
+      if (Number.isFinite(limit) && limit > 0) args.limit = Math.trunc(limit);
+      renderStatus(el('forgetStatus'), 'Proposing…', 'ok');
+      try {
+        const payload = await request('/tools/call', { method: 'POST', body: JSON.stringify({ name: 'forget', arguments: args }) });
+        if (!payload.ok) { renderStatus(el('forgetStatus'), `Propose failed: ${payload.error}`, 'bad'); return; }
+        const result = unwrapToolResult(payload.result);
+        runner.forgetToken = result.forget_token || null;
+        runner.forgetCandidates = Array.isArray(result.candidates) ? result.candidates : [];
+        runner.forgetSelected = new Set();
+        renderForgetCandidates();
+        const summary = result.summary || {};
+        el('forgetSummaryBadge').textContent = `${runner.forgetCandidates.length} found · ${summary.high_impact_count || 0} high-impact`;
+        const warn = (result.warnings || []).length ? ` · ${result.warnings.length} warning(s)` : '';
+        renderStatus(
+          el('forgetStatus'),
+          runner.forgetCandidates.length ? `Proposed ${runner.forgetCandidates.length} candidate(s). Nothing changed yet.${warn}` : 'No candidates matched. Nothing changed.',
+          runner.forgetCandidates.length ? 'ok' : 'warn'
+        );
+      } catch (e) {
+        renderStatus(el('forgetStatus'), `Propose failed: ${e.message}`, 'bad');
+      }
+    };
+    const confirmForget = async (event) => {
+      event.preventDefault();
+      const ids = [...runner.forgetSelected];
+      if (!ids.length) { renderStatus(el('forgetConfirmStatus'), 'Select at least one candidate.', 'warn'); return; }
+      if (!runner.forgetToken) { renderStatus(el('forgetConfirmStatus'), 'Token expired — propose again.', 'bad'); return; }
+      const mode = el('forgetMode').value;
+      if (mode === 'hard' && !el('forgetHardConfirm').checked) {
+        renderStatus(el('forgetConfirmStatus'), 'Confirm permanent deletion to proceed.', 'warn');
+        return;
+      }
+      const args = { forget_token: runner.forgetToken, selected_ids: ids, confirm: true, mode };
+      if (el('forgetAckHighImpact').checked) args.acknowledge_high_impact = true;
+      renderStatus(el('forgetConfirmStatus'), 'Forgetting…', 'ok');
+      try {
+        const payload = await request('/tools/call', { method: 'POST', body: JSON.stringify({ name: 'forget', arguments: args }) });
+        const out = el('forgetConfirmOutput');
+        out.style.display = 'block';
+        if (!payload.ok) {
+          out.textContent = safeJson({ error: payload.error, code: payload.code });
+          renderStatus(el('forgetConfirmStatus'), `Forget failed: ${payload.error}`, 'bad');
+          return;
+        }
+        out.textContent = safeJson(unwrapToolResult(payload.result));
+        renderStatus(el('forgetConfirmStatus'), `Done. ${mode === 'hard' ? 'Hard-deleted' : 'Retracted'} ${ids.length} item(s). Propose again to make further changes.`, 'ok');
+        runner.forgetToken = null;
+      } catch (e) {
+        renderStatus(el('forgetConfirmStatus'), `Forget failed: ${e.message}`, 'bad');
+      }
+    };
+
+    // ---- wiring for the new panels ----
+    el('toolSelect').addEventListener('change', () => {
+      el('toolRawToggle').checked = false;
+      onRawToggle();
+      renderToolForm();
+    });
+    el('toolRawToggle').addEventListener('change', onRawToggle);
+    el('toolRunForm').addEventListener('submit', runTool);
+    el('toolReload').addEventListener('click', () => { runner.toolsLoaded = false; loadTools(); });
+    el('configForm').addEventListener('submit', saveConfig);
+    el('configReload').addEventListener('click', loadConfigEditor);
+    el('forgetProposeForm').addEventListener('submit', proposeForget);
+    el('forgetReset').addEventListener('click', resetForget);
+    el('forgetSelectAll').addEventListener('click', () => {
+      runner.forgetSelected = new Set(runner.forgetCandidates.map((c) => c.object_id));
+      renderForgetCandidates();
+    });
+    el('forgetSelectNone').addEventListener('click', () => {
+      runner.forgetSelected = new Set();
+      renderForgetCandidates();
+    });
+    el('forgetConfirmCard').addEventListener('submit', confirmForget);
+    el('forgetMode').addEventListener('change', () => {
+      el('forgetHardConfirmRow').style.display = el('forgetMode').value === 'hard' ? 'flex' : 'none';
+    });
 
     const boot = async () => {
       configureShellLinks();

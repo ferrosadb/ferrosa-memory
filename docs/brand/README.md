@@ -4,6 +4,19 @@ This directory holds Ferrosa-family Discord/community identity assets for Ferros
 
 Both marks preserve the parent Ferrosa grammar — periodic-table frame, orbital system, serif chemistry monogram — while changing color, symbol, and secondary motif so each sub-product stays visually distinct.
 
+## Brand guide
+
+`brand.html` is the full Ferrosa Memory brand guide — logo, favicon, color palette, typography, voice & tone, logo usage, and naming. Open it in a browser. It mirrors the base Ferrosa brand guide (`../../../ferrosa/docs/brand.html`) with the blued-steel Memory palette.
+
+| Asset | Use |
+|---|---|
+| `brand.html` | The brand guide. Single self-contained HTML page. |
+| `logo.svg` | Full logo with wordmark + tagline (460×120). |
+| `logo-icon.svg` | Icon mark only (100×100) — avatars, badges. |
+| `favicon.svg` | Compact `Fm` mark for 16–64px. Embedded inline by the workbench and viz UIs. |
+
+**Palette (blued steel):** Electric Cyan `#7ee7ff`, Core Blue `#348cff`, Blued Steel `#516d92`, Pale Cyan `#d7fbff`, Deep Field `#05070c` / `#09111f`. Semantic: Verdigris `#6bc9a0`, Amber `#f4a261`, Rust Red `#e25b5b`.
+
 ## Ferrosa Memory Discord logo
 
 Ferrosa Memory uses an electric blued-steel treatment: `Fm / 100`, memory graph paths, and cool blue/cyan tones.

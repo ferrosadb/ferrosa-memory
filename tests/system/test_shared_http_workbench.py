@@ -11,7 +11,11 @@ DISPATCH_RS = REPO_ROOT / "crates/ferrosa-memory-core/src/dispatch.rs"
 STORAGE_RS = REPO_ROOT / "crates/ferrosa-memory-core/src/storage.rs"
 MAIN_RS = REPO_ROOT / "crates/ferrosa-memory-mcp/src/main.rs"
 CONFIG_RS = REPO_ROOT / "crates/ferrosa-memory-core/src/config.rs"
-BRAND_HTML = REPO_ROOT.parent / "ferrosa/docs/brand.html"
+# ferrosa-memory owns its own "blued-steel Fm" brand (distinct from ferrosa's
+# terracotta palette) — defined in-repo, so this always resolves.
+BRAND_HTML = REPO_ROOT / "docs/brand/brand.html"
+# Signature brand tokens: cyan + steel-blue accents, retained typography.
+BRAND_TOKENS = ["#7ee7ff", "#348cff", "Inter", "JetBrains Mono", "Georgia"]
 
 
 def test_t_s_001_shared_https_workflow_serves_real_clients_safely():
@@ -198,10 +202,7 @@ def test_t_s_011_rules_governance_lifecycle_is_exposed_in_http_and_workbench():
 def test_t_s_012_viz_surface_uses_shared_nav_and_ferrosa_brand_tokens():
     """T-S-012: viz keeps global navigation in the top bar and viz utilities in the left rail."""
     if not BRAND_HTML.exists():
-        pytest.skip(
-            f"{BRAND_HTML} not present (sibling ferrosa repo not checked out); "
-            "brand-token coverage needs a co-located ferrosa working copy"
-        )
+        pytest.skip(f"{BRAND_HTML} not present; brand-token coverage needs the in-repo brand file")
     html = VIZ_HTML.read_text()
     http = HTTP_RS.read_text()
     brand = BRAND_HTML.read_text()
@@ -226,7 +227,7 @@ def test_t_s_012_viz_surface_uses_shared_nav_and_ferrosa_brand_tokens():
     assert "28767" not in html
     assert ">Home<" in html
     assert "Viz Controls" in html
-    for token in ["#e2725b", "#d4a574", "Inter", "JetBrains Mono", "Georgia"]:
+    for token in BRAND_TOKENS:
         assert token in brand
         assert token in html
     assert "Ferrosa" in html
@@ -253,15 +254,12 @@ def test_t_s_013_viz_home_kpis_expose_nodes_edges_and_derived_fact_counts():
 def test_t_s_014_workbench_shell_uses_ferrosa_brand_tokens_and_home_graph_kpis():
     """T-S-014: workbench uses the Ferrosa shell and graph KPIs."""
     if not BRAND_HTML.exists():
-        pytest.skip(
-            f"{BRAND_HTML} not present (sibling ferrosa repo not checked out); "
-            "brand-token coverage needs a co-located ferrosa working copy"
-        )
+        pytest.skip(f"{BRAND_HTML} not present; brand-token coverage needs the in-repo brand file")
     html = WORKBENCH_HTML.read_text()
     http = HTTP_RS.read_text()
     brand = BRAND_HTML.read_text()
 
-    for token in ["#e2725b", "#d4a574", "Inter", "JetBrains Mono", "Georgia"]:
+    for token in BRAND_TOKENS:
         assert token in brand
         assert token in html
     assert "Ferrosa Memory" in html
