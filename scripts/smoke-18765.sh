@@ -132,17 +132,64 @@ SUMMARY_STATUS="$(json_get "${TMP_DIR}/summary.json" status)"
 say "summary: ready"
 
 auth_curl -H 'content-type: application/json' \
-  -d '{"query":"SELECT tenant_id, entity_id, session_id FROM agent_memory.entity_store LIMIT 2"}' \
-  "${BASE_URL}/workbench/api/cql/query" > "${TMP_DIR}/entities.json"
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"metrics","arguments":{}}}' \
+  "${BASE_URL}/mcp" > "${TMP_DIR}/metrics.json"
+TENANT_ID="$(python3 - "${TMP_DIR}/metrics.json" <<'PY'
+import json
+import sys
 
-ENTITY_COUNT="$(json_get "${TMP_DIR}/entities.json" count)"
-[[ "${ENTITY_COUNT}" -ge 2 ]] || fail "expected at least 2 entity rows, got ${ENTITY_COUNT}"
+data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+if "error" in data:
+    raise SystemExit(data["error"])
+payload = json.loads(data["result"]["content"][0]["text"])
+print(payload["tenant_id"])
+PY
+)"
+say "metrics: tenant ${TENANT_ID}"
 
-TENANT_ID="$(json_get "${TMP_DIR}/entities.json" rows.0.tenant_id)"
-SESSION_ID="$(json_get "${TMP_DIR}/entities.json" rows.0.session_id)"
-SRC_ID="$(json_get "${TMP_DIR}/entities.json" rows.0.entity_id)"
-DST_ID="$(json_get "${TMP_DIR}/entities.json" rows.1.entity_id)"
-say "cql: 2 entity rows"
+SMOKE_RUN_ID="$(python3 - <<'PY'
+import uuid
+print(uuid.uuid4())
+PY
+)"
+SESSION_ID="$(python3 - <<'PY'
+import uuid
+print(uuid.uuid4())
+PY
+)"
+
+cat > "${TMP_DIR}/upsert-source.json" <<EOF
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"upsert_entity","arguments":{"session_id":"${SESSION_ID}","entity_name":"smoke-${SMOKE_RUN_ID}-source","entity_type":"concept","context_snippet":"Isolated smoke source entity for run ${SMOKE_RUN_ID}","confidence":1.0}}}
+EOF
+auth_curl -H 'content-type: application/json' \
+  --data @"${TMP_DIR}/upsert-source.json" \
+  "${BASE_URL}/mcp" > "${TMP_DIR}/upsert-source-result.json"
+SRC_ID="$(python3 - "${TMP_DIR}/upsert-source-result.json" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+payload = json.loads(data["result"]["content"][0]["text"])
+print(payload["entity_id"])
+PY
+)"
+
+cat > "${TMP_DIR}/upsert-destination.json" <<EOF
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"upsert_entity","arguments":{"session_id":"${SESSION_ID}","entity_name":"smoke-${SMOKE_RUN_ID}-destination","entity_type":"concept","context_snippet":"Isolated smoke destination entity for run ${SMOKE_RUN_ID}","confidence":1.0}}}
+EOF
+auth_curl -H 'content-type: application/json' \
+  --data @"${TMP_DIR}/upsert-destination.json" \
+  "${BASE_URL}/mcp" > "${TMP_DIR}/upsert-destination-result.json"
+DST_ID="$(python3 - "${TMP_DIR}/upsert-destination-result.json" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+payload = json.loads(data["result"]["content"][0]["text"])
+print(payload["entity_id"])
+PY
+)"
+say "upsert_entity smoke fixture: pass"
 
 # SPARQL passthrough is opt-in: only required when the fmem config defines
 # `[sparql] enabled = true`. When the endpoint reports "not configured",
@@ -166,7 +213,7 @@ else
 fi
 
 cat > "${TMP_DIR}/create-edge.json" <<EOF
-{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"edge","arguments":{"session_id":"${SESSION_ID}","src_entity_id":"${SRC_ID}","dst_entity_id":"${DST_ID}","edge_type":"references","weight":0.75}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"edge","arguments":{"session_id":"${SESSION_ID}","src_entity_id":"${SRC_ID}","dst_entity_id":"${DST_ID}","edge_type":"references","weight":0.75}}}
 EOF
 auth_curl -H 'content-type: application/json' \
   --data @"${TMP_DIR}/create-edge.json" \
@@ -220,7 +267,7 @@ print("graph typed-edge one-hop traversal: pass")
 PY
 
 cat > "${TMP_DIR}/chain-readback.json" <<EOF
-{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"chain","arguments":{"session_id":"${SESSION_ID}","source":"${SRC_ID}","destination":"${DST_ID}","max_hops":2}}}
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"chain","arguments":{"session_id":"${SESSION_ID}","source":"${SRC_ID}","destination":"${DST_ID}","max_hops":2}}}
 EOF
 auth_curl -H 'content-type: application/json' \
   --data @"${TMP_DIR}/chain-readback.json" \

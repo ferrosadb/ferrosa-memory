@@ -7830,23 +7830,6 @@ fn parse_hybrid_search_scope(
     }
 }
 
-fn authority_sessions_to_query(
-    caller_session: uuid::Uuid,
-    tenant_id: uuid::Uuid,
-    scope: crate::hybrid_search::SearchScope,
-) -> Vec<uuid::Uuid> {
-    let global = crate::scope::tenant_global_session_uuid(tenant_id);
-    let nil = uuid::Uuid::nil();
-    let mut sessions = match scope {
-        crate::hybrid_search::SearchScope::SessionOnly => vec![caller_session],
-        crate::hybrid_search::SearchScope::GlobalOnly => vec![global, nil],
-        crate::hybrid_search::SearchScope::Both => vec![caller_session, global, nil],
-    };
-    sessions.sort_unstable();
-    sessions.dedup();
-    sessions
-}
-
 async fn load_authority_score_maps<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
@@ -7855,7 +7838,7 @@ async fn load_authority_score_maps<S: crate::storage::Storage>(
 ) -> anyhow::Result<(HashMap<uuid::Uuid, f64>, HashMap<uuid::Uuid, f64>)> {
     let mut pagerank_scores: HashMap<uuid::Uuid, f64> = HashMap::new();
     let mut reputation_scores: HashMap<uuid::Uuid, f64> = HashMap::new();
-    for sid in authority_sessions_to_query(session_id, ctx.tenant_id, scope) {
+    for sid in crate::hybrid_search::sessions_to_query(session_id, ctx.tenant_id, scope) {
         for entry in storage.warmth_list_session(ctx, sid).await? {
             if entry.pagerank != 0.0 {
                 pagerank_scores
@@ -7947,7 +7930,7 @@ fn expanded_chunk_context(
 async fn apply_chunk_expansion<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
-    session_id: uuid::Uuid,
+    sessions: &[uuid::Uuid],
     results: &mut [crate::hybrid_search::SearchResult],
     config: &ChunkExpansionConfig,
 ) -> Result<ChunkExpansionReport, (i32, String)> {
@@ -7975,10 +7958,7 @@ async fn apply_chunk_expansion<S: crate::storage::Storage>(
         let mut cursor = result.prev_chunk_id;
         while before.len() < config.prev {
             let Some(chunk_id) = cursor else { break };
-            let Some(chunk) = storage
-                .document_chunk_get(ctx, session_id, chunk_id)
-                .await
-                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+            let Some(chunk) = get_document_chunk_in_scope(storage, ctx, sessions, chunk_id).await?
             else {
                 break;
             };
@@ -7999,10 +7979,7 @@ async fn apply_chunk_expansion<S: crate::storage::Storage>(
         let mut distance = 1usize;
         while distance <= config.next {
             let Some(chunk_id) = cursor else { break };
-            let Some(chunk) = storage
-                .document_chunk_get(ctx, session_id, chunk_id)
-                .await
-                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+            let Some(chunk) = get_document_chunk_in_scope(storage, ctx, sessions, chunk_id).await?
             else {
                 break;
             };
@@ -8037,6 +8014,24 @@ async fn apply_chunk_expansion<S: crate::storage::Storage>(
     }
 
     Ok(report)
+}
+
+async fn get_document_chunk_in_scope<S: crate::storage::Storage>(
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    sessions: &[uuid::Uuid],
+    chunk_id: uuid::Uuid,
+) -> Result<Option<crate::types::DocumentChunk>, (i32, String)> {
+    for session_id in sessions {
+        if let Some(chunk) = storage
+            .document_chunk_get(ctx, *session_id, chunk_id)
+            .await
+            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+        {
+            return Ok(Some(chunk));
+        }
+    }
+    Ok(None)
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -8853,10 +8848,12 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         filter.memory_kinds.as_deref(),
     );
     let chunk_expansion_config = parse_chunk_expansion(&args)?;
+    let scoped_sessions =
+        crate::hybrid_search::sessions_to_query(session_id, ctx.tenant_id, filter.scope);
     let chunk_expansion_report = apply_chunk_expansion(
         storage,
         ctx,
-        session_id,
+        &scoped_sessions,
         &mut all_results,
         &chunk_expansion_config,
     )
@@ -12381,6 +12378,114 @@ mod tests {
         assert_eq!(chunks[1]["is_hit"], true);
         assert_eq!(chunks[2]["ordinal"], 2);
         assert_eq!(result["document_id"], document_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_expands_global_document_neighbors_with_scope_both() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let live_session = Uuid::new_v4();
+        let global_session = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
+        let document_id = Uuid::new_v4();
+        let ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        let now = chrono::Utc::now();
+
+        for (ordinal, id) in ids.iter().enumerate() {
+            store
+                .document_chunk_put(
+                    &ctx,
+                    &crate::types::DocumentChunk {
+                        tenant_id: ctx.tenant_id,
+                        session_id: global_session,
+                        document_id,
+                        chunk_id: *id,
+                        ordinal: ordinal as i32,
+                        source_doc_id: "global-doc-1".into(),
+                        title: "Global Recall Test".into(),
+                        section_path: "Root".into(),
+                        semantic_kind: "paragraph".into(),
+                        content: match ordinal {
+                            0 => "previous chunk has setup context".into(),
+                            1 => "needle global corpus target".into(),
+                            _ => "next chunk has consequence context".into(),
+                        },
+                        bm25_text: match ordinal {
+                            0 => "previous chunk has setup context".into(),
+                            1 => "needle global corpus target".into(),
+                            _ => "next chunk has consequence context".into(),
+                        },
+                        chunk_embedding: None,
+                        token_count: 5,
+                        content_hash: format!("sha256:global:{ordinal}"),
+                        prev_chunk_id: ordinal.checked_sub(1).map(|i| ids[i]),
+                        next_chunk_id: ids.get(ordinal + 1).copied(),
+                        overlap_from_prev: false,
+                        overlap_to_next: false,
+                        metadata: serde_json::json!({"test": true}),
+                        created_at: now,
+                        updated_at: now,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let scoped = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "hybrid_search",
+                "arguments": {
+                    "session_id": live_session.to_string(),
+                    "query": "needle global corpus target",
+                    "chunk_expansion": "neighbors",
+                    "chunk_prev": 1,
+                    "chunk_next": 1,
+                    "chunk_max_tokens": 100
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        assert_eq!(unwrap_tool_result(scoped)["count"], 0);
+
+        let result = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "hybrid_search",
+                "arguments": {
+                    "session_id": live_session.to_string(),
+                    "query": "needle global corpus target",
+                    "scope": "both",
+                    "chunk_expansion": "neighbors",
+                    "chunk_prev": 1,
+                    "chunk_next": 1,
+                    "chunk_max_tokens": 100
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["count"], 1);
+        assert_eq!(result["chunk_expansion"]["expanded_results"], 1);
+        assert_eq!(result["chunk_expansion"]["added_chunks"], 2);
+
+        let hit = &result["results"][0];
+        assert_eq!(hit["result_type"], "document_chunk");
+        assert_eq!(hit["id"], ids[1].to_string());
+        let expanded = hit["expanded_context"].as_array().unwrap();
+        assert_eq!(expanded.len(), 2);
+        assert_eq!(expanded[0]["position"], "prev");
+        assert_eq!(expanded[0]["ordinal"], 0);
+        assert_eq!(expanded[1]["position"], "next");
+        assert_eq!(expanded[1]["ordinal"], 2);
     }
 
     #[tokio::test]

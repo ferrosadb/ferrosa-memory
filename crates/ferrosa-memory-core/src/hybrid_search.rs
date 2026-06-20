@@ -991,7 +991,11 @@ fn workspace_feedback_adjustment(query_cwd: &str, properties: &serde_json::Value
 
 /// Resolve the list of session partitions to query given the caller's session
 /// and the filter scope.
-fn sessions_to_query(caller_session: Uuid, tenant_id: Uuid, scope: SearchScope) -> Vec<Uuid> {
+pub(crate) fn sessions_to_query(
+    caller_session: Uuid,
+    tenant_id: Uuid,
+    scope: SearchScope,
+) -> Vec<Uuid> {
     let global = crate::scope::tenant_global_session_uuid(tenant_id);
     let nil = Uuid::nil();
     let mut sessions = match scope {
@@ -2611,6 +2615,108 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, relevant_id);
         assert!(results[0].score >= 0.062);
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_scope_both_retrieves_global_and_legacy_nil_corpus_chunks() {
+        use crate::storage::mock::MockStorage;
+        use crate::types::{DocumentChunk, TenantContext};
+
+        let storage = MockStorage::new();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "test".into(),
+        };
+        let caller_session = Uuid::new_v4();
+        let global_session = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
+        let nil_session = Uuid::nil();
+        let now = chrono::Utc::now();
+        let global_chunk_id = Uuid::new_v4();
+        let nil_chunk_id = Uuid::new_v4();
+        let make_chunk = |session_id, chunk_id, content: &str| DocumentChunk {
+            tenant_id: ctx.tenant_id,
+            session_id,
+            document_id: chunk_id,
+            chunk_id,
+            ordinal: 0,
+            source_doc_id: format!("doc-{chunk_id}"),
+            title: "curated corpus".into(),
+            section_path: String::new(),
+            semantic_kind: "text".into(),
+            content: content.into(),
+            bm25_text: content.to_ascii_lowercase(),
+            chunk_embedding: None,
+            token_count: 16,
+            content_hash: chunk_id.to_string(),
+            prev_chunk_id: None,
+            next_chunk_id: None,
+            overlap_from_prev: false,
+            overlap_to_next: false,
+            metadata: serde_json::Value::Null,
+            created_at: now,
+            updated_at: now,
+        };
+        storage.document_chunks.lock().await.extend([
+            make_chunk(
+                global_session,
+                global_chunk_id,
+                "Curated corpus explains RLM trace persistence.",
+            ),
+            make_chunk(
+                nil_session,
+                nil_chunk_id,
+                "Legacy nil corpus explains MemScene consolidation.",
+            ),
+        ]);
+        let both_filter = SearchFilter {
+            scope: SearchScope::Both,
+            ..Default::default()
+        };
+
+        let both_results = hybrid_search(
+            &storage,
+            &ctx,
+            caller_session,
+            "curated corpus explains",
+            None,
+            10,
+            None,
+            None,
+            None,
+            &FusionConfig::default(),
+            Some(&both_filter),
+        )
+        .await
+        .unwrap();
+        let both_ids = both_results
+            .iter()
+            .map(|result| result.id)
+            .collect::<HashSet<_>>();
+
+        assert!(both_ids.contains(&global_chunk_id));
+        assert!(both_ids.contains(&nil_chunk_id));
+
+        let session_filter = SearchFilter {
+            scope: SearchScope::SessionOnly,
+            ..Default::default()
+        };
+        let session_results = hybrid_search(
+            &storage,
+            &ctx,
+            caller_session,
+            "curated corpus explains",
+            None,
+            10,
+            None,
+            None,
+            None,
+            &FusionConfig::default(),
+            Some(&session_filter),
+        )
+        .await
+        .unwrap();
+
+        assert!(session_results.is_empty());
     }
 
     #[tokio::test]

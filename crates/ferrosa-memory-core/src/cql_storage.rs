@@ -419,6 +419,10 @@ fn derived_cache_count_query(ks: &str) -> String {
     format!("SELECT count(*) FROM {ks}.derived_cache_by_query WHERE tenant_id = ? ALLOW FILTERING")
 }
 
+fn memo_count_query(ks: &str) -> String {
+    format!("SELECT count(*) FROM {ks}.memo_cache WHERE tenant_id = ? ALLOW FILTERING")
+}
+
 fn memo_total_hits_query(ks: &str) -> String {
     format!("SELECT sum(hit_count) FROM {ks}.memo_cache WHERE tenant_id = ? ALLOW FILTERING")
 }
@@ -1424,9 +1428,7 @@ impl CqlStorage {
                 ))
                 .await?,
             memo_count: session
-                .prepare(format!(
-                    "SELECT content_hash FROM {ks}.memo_cache WHERE tenant_id = ?"
-                ))
+                .prepare(memo_count_query(ks))
                 .await?,
             temporal_put: session
                 .prepare(format!(
@@ -3446,10 +3448,18 @@ impl Storage for CqlStorage {
     }
 
     async fn memo_count(&self, ctx: &TenantContext) -> anyhow::Result<usize> {
-        let (_col_map, rows) = self
+        let (col_map, rows) = self
             .exec_prepared_rows(&self.stmts.memo_count, (ctx.tenant_id,))
             .await?;
-        Ok(rows.len())
+        let Some(row) = rows.first() else {
+            return Ok(0);
+        };
+        let count = cql_get_i64_from_single_aggregate(
+            row,
+            &col_map,
+            &["system.count", "count", "count(*)"],
+        )?;
+        Ok(count.max(0) as usize)
     }
 
     async fn entity_list_session(
@@ -7291,12 +7301,19 @@ mod cql_storage_tests {
 
     #[test]
     fn observability_count_queries_use_server_side_aggregates() {
+        let memo_count = memo_count_query("agent_memory");
         let memo_hits = memo_total_hits_query("agent_memory");
         let fold_count = fold_count_by_status_query("agent_memory");
         let temporal_count = temporal_count_query("agent_memory");
         let edge_count = edge_count_query("agent_memory", "mentioned_in").unwrap();
 
-        for query in [&memo_hits, &fold_count, &temporal_count, &edge_count] {
+        for query in [
+            &memo_count,
+            &memo_hits,
+            &fold_count,
+            &temporal_count,
+            &edge_count,
+        ] {
             assert!(
                 query.to_ascii_lowercase().contains("count(")
                     || query.to_ascii_lowercase().contains("sum("),
