@@ -1726,11 +1726,11 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                     "scope": {
                         "type": "string",
                         "enum": ["session", "global", "both"],
-                        "description": "session=current session only; global=tenant global plus legacy nil session; both=session+global. Default session."
+                        "description": "session=current session only; global=tenant global plus legacy nil session; both=session+global. Default both, so curated global/skill corpus is retrievable; pass session to restrict to the current session."
                     },
                     "include_cross_session": {
                         "type": "boolean",
-                        "description": "Compatibility flag. true is equivalent to scope=both when scope is omitted."
+                        "description": "Compatibility flag, overridden by an explicit scope. When scope is omitted: the default already spans session+global; pass false to restrict to the current session, true to force both."
                     },
                     "cwd": {
                         "type": "string",
@@ -8040,14 +8040,14 @@ fn parse_hybrid_search_scope(
             )),
         };
     }
-    if args
-        .get("include_cross_session")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        Ok(crate::hybrid_search::SearchScope::Both)
-    } else {
-        Ok(crate::hybrid_search::SearchScope::SessionOnly)
+    // No explicit `scope`: default to Both so curated global + nil corpus is
+    // visible to normal agent searches (session affinity is handled by ranking
+    // weight, not by filtering global knowledge out). An explicit
+    // `include_cross_session: false` is still honored as a session-only opt-out.
+    match args.get("include_cross_session").and_then(|v| v.as_bool()) {
+        Some(true) => Ok(crate::hybrid_search::SearchScope::Both),
+        Some(false) => Ok(crate::hybrid_search::SearchScope::SessionOnly),
+        None => Ok(crate::hybrid_search::SearchScope::Both),
     }
 }
 
@@ -12706,6 +12706,34 @@ mod tests {
     use crate::types::TenantContext;
     use uuid::Uuid;
 
+    #[test]
+    fn hybrid_search_scope_defaults_to_both_so_global_corpus_is_visible() {
+        use crate::hybrid_search::SearchScope;
+        // Regression (t_ae8613ff): curated global/nil corpus was invisible to
+        // normal agent searches because hybrid_search defaulted to SessionOnly.
+        // With no `scope` and no `include_cross_session`, a default search must
+        // span the caller's session PLUS the global + nil curated partitions.
+        assert_eq!(
+            parse_hybrid_search_scope(&serde_json::json!({})).unwrap(),
+            SearchScope::Both,
+        );
+        // An explicit cross-session opt-out is still honored.
+        assert_eq!(
+            parse_hybrid_search_scope(&serde_json::json!({"include_cross_session": false}))
+                .unwrap(),
+            SearchScope::SessionOnly,
+        );
+        // An explicit scope always wins over the default.
+        assert_eq!(
+            parse_hybrid_search_scope(&serde_json::json!({"scope": "session"})).unwrap(),
+            SearchScope::SessionOnly,
+        );
+        assert_eq!(
+            parse_hybrid_search_scope(&serde_json::json!({"scope": "global"})).unwrap(),
+            SearchScope::GlobalOnly,
+        );
+    }
+
     /// Extract the inner tool result from MCP CallToolResult wrapper.
     /// Dispatch wraps results as {"content": [{"type": "text", "text": "..."}]}.
     fn unwrap_tool_result(result: Value) -> Value {
@@ -13771,30 +13799,36 @@ mod tests {
             .await
             .unwrap();
 
-        let scoped_params = serde_json::json!({
+        // Default search (no scope, no flag) now spans the global + nil corpus,
+        // so the legacy nil-session entity is retrievable by a normal agent
+        // search (regression fix t_ae8613ff: curated global corpus must be
+        // visible by default).
+        let default_params = serde_json::json!({
             "name": "hybrid_search",
             "arguments": {
                 "session_id": live_session.to_string(),
                 "query": "beam actor model task"
             }
         });
-        let scoped = dispatch("tools/call", scoped_params, &store, &ctx, &session)
+        let default_result = dispatch("tools/call", default_params, &store, &ctx, &session)
             .await
             .unwrap();
-        assert_eq!(unwrap_tool_result(scoped)["count"], 0);
+        assert_eq!(unwrap_tool_result(default_result)["count"], 1);
 
-        let cross_session_params = serde_json::json!({
+        // An explicit session-only opt-out still scopes the search to the
+        // caller's (empty) session, excluding the nil-session entity.
+        let session_only_params = serde_json::json!({
             "name": "hybrid_search",
             "arguments": {
                 "session_id": live_session.to_string(),
                 "query": "beam actor model task",
-                "include_cross_session": true
+                "include_cross_session": false
             }
         });
-        let cross_session = dispatch("tools/call", cross_session_params, &store, &ctx, &session)
+        let session_only = dispatch("tools/call", session_only_params, &store, &ctx, &session)
             .await
             .unwrap();
-        assert_eq!(unwrap_tool_result(cross_session)["count"], 1);
+        assert_eq!(unwrap_tool_result(session_only)["count"], 0);
     }
 
     #[tokio::test]
@@ -14203,6 +14237,9 @@ mod tests {
                 .unwrap();
         }
 
+        // Explicit session-only scope excludes the global corpus (negative
+        // control). NOTE: the default scope now spans global (t_ae8613ff), so
+        // this must opt out explicitly to demonstrate the session boundary.
         let scoped = dispatch(
             "tools/call",
             serde_json::json!({
@@ -14210,6 +14247,7 @@ mod tests {
                 "arguments": {
                     "session_id": live_session.to_string(),
                     "query": "needle global corpus target",
+                    "scope": "session",
                     "chunk_expansion": "neighbors",
                     "chunk_prev": 1,
                     "chunk_next": 1,
