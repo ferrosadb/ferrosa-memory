@@ -414,7 +414,13 @@ mod tests {
                     || name_lower.contains("get_feedback")
                     || name_lower.contains("query_feedback")
                     || name_lower.contains("list_feedback"))
-                    && !matches!(name_lower.as_str(), "record_feedback" | "feedback")
+                    // record_feedback / feedback / feedback_record are write-only:
+                    // they persist signals (feedback_record writes the remotes-owned
+                    // `memory_feedback` table) and never read `feedback_outcomes`.
+                    && !matches!(
+                        name_lower.as_str(),
+                        "record_feedback" | "feedback" | "feedback_record"
+                    )
             })
             .collect();
 

@@ -165,6 +165,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "native full-text indexes for lexical recall",
         ddl: include_str!("../../../ddl/040_native_fulltext_indexes.cql"),
     },
+    Migration {
+        version: 41,
+        description: "remote teacher/learner memory transfer tables",
+        ddl: include_str!("../../../ddl/041_memory_remotes.cql"),
+    },
 ];
 
 /// Pre-versioning DDLs. Applied in order when `run_migrations` detects a
@@ -1383,6 +1388,24 @@ async fn migration_postcondition_satisfied(
     version: u32,
 ) -> anyhow::Result<bool> {
     match version {
+        41 => {
+            for table in [
+                "memory_remotes",
+                "remote_policy_facts",
+                "teaching_packets",
+                "teaching_items",
+                "remote_stubs",
+                "memory_provenance",
+                "memory_conflicts",
+                "memory_feedback",
+                "import_batches",
+            ] {
+                if !table_exists(session, keyspace, table).await? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
         38 => table_exists(session, keyspace, "retraction").await,
         37 => table_exists(session, keyspace, "forget_journal").await,
         36 => feedback_outcomes_uuid_write_probe(session, keyspace, "feedback_outcomes").await,

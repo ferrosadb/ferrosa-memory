@@ -29,6 +29,10 @@ prometheus = "0.14"
 # Hashing
 sha1 = "0.11"
 sha2 = "0.11"
+
+# Remote-memory signing (Ed25519 envelopes for teaching packets)
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 # digest 0.11 changed finalize() output to hybrid_array::Array, which doesn't
 # implement LowerHex — encode digests via hex::encode instead of "{:x}".
 hex = "0.4"

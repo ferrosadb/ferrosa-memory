@@ -26,6 +26,11 @@ use uuid::Uuid;
 
 use crate::config::FerrosaCqlConfig;
 use crate::context_segment::{ContextSegment, TemporalEdge};
+use crate::remote_identity::{ContentHash, InstanceId, PublicKeyFingerprint};
+use crate::remotes::types::{
+    ImportBatch, ImportState, MemoryConflict, MemoryFeedback, MemoryProvenance, MemoryRemote,
+    RemotePolicyFact, RemoteStub, TeachingItem, TeachingPacket,
+};
 use crate::storage::Storage;
 use crate::types::*;
 
@@ -431,6 +436,118 @@ fn fold_count_by_status_query(ks: &str) -> String {
 
 fn temporal_count_query(ks: &str) -> String {
     format!("SELECT count(*) FROM {ks}.temporal_events WHERE tenant_id = ? ALLOW FILTERING")
+}
+
+// --- Remote teacher/learner query builders and row decoders ---
+
+fn remote_list_query(ks: &str, limit: usize) -> String {
+    format!(
+        "SELECT remote_id, instance_id, name, endpoint, trust_class, public_key_fingerprint, enabled, created_at, updated_at FROM {ks}.memory_remotes WHERE tenant_id = ? LIMIT {}",
+        limit.max(1)
+    )
+}
+
+fn remote_get_query(ks: &str) -> String {
+    format!(
+        "SELECT remote_id, instance_id, name, endpoint, trust_class, public_key_fingerprint, enabled, created_at, updated_at FROM {ks}.memory_remotes WHERE tenant_id = ? AND remote_id = ?"
+    )
+}
+
+fn teaching_items_by_packet_query(ks: &str, limit: usize) -> String {
+    format!(
+        "SELECT item_json FROM {ks}.teaching_items WHERE tenant_id = ? AND packet_id = ? LIMIT {}",
+        limit.max(1)
+    )
+}
+
+fn remote_stubs_by_state_query(ks: &str, limit: usize) -> String {
+    format!(
+        "SELECT stub_json FROM {ks}.remote_stubs WHERE tenant_id = ? AND remote_id = ? AND state = ? LIMIT {}",
+        limit.max(1)
+    )
+}
+
+fn memory_provenance_by_entity_query(ks: &str) -> String {
+    format!(
+        "SELECT provenance_id, local_entity_id, remote_id, packet_id, item_id, content_hash, signature_hash, imported_at FROM {ks}.memory_provenance WHERE tenant_id = ? AND local_entity_id = ?"
+    )
+}
+
+fn memory_conflicts_by_entity_query(ks: &str) -> String {
+    format!(
+        "SELECT conflict_id, local_entity_id, remote_id, item_id, reason, resolved, created_at, resolved_at FROM {ks}.memory_conflicts WHERE tenant_id = ? AND local_entity_id = ?"
+    )
+}
+
+fn memory_feedback_by_target_query(ks: &str) -> String {
+    format!(
+        "SELECT feedback_id, remote_id, target_id, feedback_type, note, created_at FROM {ks}.memory_feedback WHERE tenant_id = ? AND remote_id = ? AND target_id = ?"
+    )
+}
+
+fn parse_trust_class(s: &str) -> anyhow::Result<crate::remotes::types::RemoteTrustClass> {
+    Ok(serde_json::from_str(&format!("\"{s}\""))?)
+}
+fn parse_import_state(s: &str) -> anyhow::Result<ImportState> {
+    Ok(serde_json::from_str(&format!("\"{s}\""))?)
+}
+fn parse_feedback_type(s: &str) -> anyhow::Result<crate::remotes::types::FeedbackType> {
+    Ok(serde_json::from_str(&format!("\"{s}\""))?)
+}
+
+fn remote_from_row(row: &Row, col_map: &ColMap) -> anyhow::Result<MemoryRemote> {
+    Ok(MemoryRemote {
+        remote_id: cql_get(row, col_map, "remote_id")?,
+        instance_id: InstanceId(cql_get(row, col_map, "instance_id")?),
+        name: cql_get(row, col_map, "name")?,
+        endpoint: cql_get(row, col_map, "endpoint")?,
+        trust_class: parse_trust_class(&cql_get::<String>(row, col_map, "trust_class")?)?,
+        public_key_fingerprint: PublicKeyFingerprint(cql_get(
+            row,
+            col_map,
+            "public_key_fingerprint",
+        )?),
+        enabled: cql_get(row, col_map, "enabled")?,
+        created_at: cql_get(row, col_map, "created_at")?,
+        updated_at: cql_get(row, col_map, "updated_at")?,
+    })
+}
+
+fn provenance_from_row(row: &Row, col_map: &ColMap) -> anyhow::Result<MemoryProvenance> {
+    Ok(MemoryProvenance {
+        provenance_id: cql_get(row, col_map, "provenance_id")?,
+        local_entity_id: cql_get(row, col_map, "local_entity_id")?,
+        remote_id: cql_get(row, col_map, "remote_id")?,
+        packet_id: cql_get(row, col_map, "packet_id")?,
+        item_id: cql_get(row, col_map, "item_id")?,
+        content_hash: ContentHash(cql_get(row, col_map, "content_hash")?),
+        signature_hash: ContentHash(cql_get(row, col_map, "signature_hash")?),
+        imported_at: cql_get(row, col_map, "imported_at")?,
+    })
+}
+
+fn conflict_from_row(row: &Row, col_map: &ColMap) -> anyhow::Result<MemoryConflict> {
+    Ok(MemoryConflict {
+        conflict_id: cql_get(row, col_map, "conflict_id")?,
+        local_entity_id: cql_get(row, col_map, "local_entity_id")?,
+        remote_id: cql_get(row, col_map, "remote_id")?,
+        item_id: cql_get(row, col_map, "item_id")?,
+        reason: cql_get(row, col_map, "reason")?,
+        resolved: cql_get(row, col_map, "resolved")?,
+        created_at: cql_get(row, col_map, "created_at")?,
+        resolved_at: cql_get::<chrono::DateTime<chrono::Utc>>(row, col_map, "resolved_at").ok(),
+    })
+}
+
+fn feedback_from_row(row: &Row, col_map: &ColMap) -> anyhow::Result<MemoryFeedback> {
+    Ok(MemoryFeedback {
+        feedback_id: cql_get(row, col_map, "feedback_id")?,
+        remote_id: cql_get(row, col_map, "remote_id")?,
+        target_id: cql_get(row, col_map, "target_id")?,
+        feedback_type: parse_feedback_type(&cql_get::<String>(row, col_map, "feedback_type")?)?,
+        note: cql_get::<String>(row, col_map, "note").ok(),
+        created_at: cql_get(row, col_map, "created_at")?,
+    })
 }
 
 /// Decode the `weight` column from an edge row, returning `None` and emitting
@@ -2120,6 +2237,323 @@ impl Storage for CqlStorage {
 
     async fn cluster_info(&self, keyspace: &str) -> anyhow::Result<crate::storage::ClusterInfo> {
         query_cluster_info(&self.session, keyspace).await
+    }
+
+    // --- Remote teacher/learner storage operations ---
+
+    async fn remote_put(&self, ctx: &TenantContext, remote: &MemoryRemote) -> anyhow::Result<()> {
+        self.session.query_unpaged(format!("INSERT INTO {}.memory_remotes (tenant_id, remote_id, instance_id, name, endpoint, trust_class, public_key_fingerprint, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", self.keyspace), (ctx.tenant_id, remote.remote_id, remote.instance_id.0, &remote.name, &remote.endpoint, serde_json::to_string(&remote.trust_class)?.trim_matches('"').to_string(), &remote.public_key_fingerprint.0, remote.enabled, remote.created_at, remote.updated_at)).await?;
+        Ok(())
+    }
+
+    async fn remote_get(
+        &self,
+        ctx: &TenantContext,
+        remote_id: Uuid,
+    ) -> anyhow::Result<Option<MemoryRemote>> {
+        let (col_map, rows) = query_rows!(
+            self.session,
+            remote_get_query(&self.keyspace),
+            (ctx.tenant_id, remote_id)
+        );
+        rows.first()
+            .map(|r| remote_from_row(r, &col_map))
+            .transpose()
+    }
+
+    async fn remote_list(
+        &self,
+        ctx: &TenantContext,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryRemote>> {
+        let (col_map, rows) = query_paged_rows!(
+            self.session,
+            remote_list_query(&self.keyspace, limit),
+            (ctx.tenant_id,)
+        )?;
+        rows.iter().map(|r| remote_from_row(r, &col_map)).collect()
+    }
+
+    async fn remote_policy_put(
+        &self,
+        ctx: &TenantContext,
+        fact: &RemotePolicyFact,
+    ) -> anyhow::Result<()> {
+        self.session.query_unpaged(format!("INSERT INTO {}.remote_policy_facts (tenant_id, remote_id, fact_id, kind_json, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)", self.keyspace), (ctx.tenant_id, fact.remote_id, fact.fact_id, serde_json::to_string(&fact.kind)?, fact.created_at, fact.expires_at)).await?;
+        Ok(())
+    }
+
+    async fn remote_policy_list(
+        &self,
+        ctx: &TenantContext,
+        remote_id: Uuid,
+    ) -> anyhow::Result<Vec<RemotePolicyFact>> {
+        let (col_map, rows) = query_paged_rows!(
+            self.session,
+            format!(
+                "SELECT fact_id, remote_id, kind_json, created_at, expires_at FROM {}.remote_policy_facts WHERE tenant_id = ? AND remote_id = ?",
+                self.keyspace
+            ),
+            (ctx.tenant_id, remote_id)
+        )?;
+        rows.iter()
+            .map(|r| {
+                Ok(RemotePolicyFact {
+                    fact_id: cql_get(r, &col_map, "fact_id")?,
+                    remote_id: cql_get(r, &col_map, "remote_id")?,
+                    kind: serde_json::from_str(&cql_get::<String>(r, &col_map, "kind_json")?)?,
+                    created_at: cql_get(r, &col_map, "created_at")?,
+                    expires_at: cql_get::<chrono::DateTime<chrono::Utc>>(r, &col_map, "expires_at")
+                        .ok(),
+                })
+            })
+            .collect()
+    }
+
+    async fn teaching_packet_put(
+        &self,
+        ctx: &TenantContext,
+        remote_id: Uuid,
+        packet: &TeachingPacket,
+    ) -> anyhow::Result<()> {
+        self.session.query_unpaged(format!("INSERT INTO {}.teaching_packets (tenant_id, remote_id, packet_id, teacher_instance_id, request_id, source_namespace, query, packet_json, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", self.keyspace), (ctx.tenant_id, remote_id, packet.packet_id, packet.teacher_instance_id.0, packet.request_id, &packet.source_namespace, &packet.query, serde_json::to_string(packet)?, packet.expires_at, packet.created_at)).await?;
+        Ok(())
+    }
+
+    async fn teaching_packet_get(
+        &self,
+        ctx: &TenantContext,
+        remote_id: Uuid,
+        packet_id: Uuid,
+    ) -> anyhow::Result<Option<TeachingPacket>> {
+        let (col_map, rows) = query_rows!(
+            self.session,
+            format!(
+                "SELECT packet_json FROM {}.teaching_packets WHERE tenant_id = ? AND remote_id = ? AND packet_id = ?",
+                self.keyspace
+            ),
+            (ctx.tenant_id, remote_id, packet_id)
+        );
+        rows.first()
+            .map(|r| {
+                Ok(serde_json::from_str(&cql_get::<String>(
+                    r,
+                    &col_map,
+                    "packet_json",
+                )?)?)
+            })
+            .transpose()
+    }
+
+    async fn teaching_items_put(
+        &self,
+        ctx: &TenantContext,
+        remote_id: Uuid,
+        items: &[TeachingItem],
+    ) -> anyhow::Result<()> {
+        for item in items {
+            self.session.query_unpaged(format!("INSERT INTO {}.teaching_items (tenant_id, packet_id, item_id, remote_id, kind, title, summary, item_json, content_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", self.keyspace), (ctx.tenant_id, item.packet_id, item.item_id, remote_id, serde_json::to_string(&item.kind)?.trim_matches('"').to_string(), &item.title, &item.summary, serde_json::to_string(item)?, &item.content_hash.0, item.created_at)).await?;
+        }
+        Ok(())
+    }
+
+    async fn teaching_items_list_by_packet(
+        &self,
+        ctx: &TenantContext,
+        packet_id: Uuid,
+        limit: usize,
+    ) -> anyhow::Result<Vec<TeachingItem>> {
+        let (col_map, rows) = query_paged_rows!(
+            self.session,
+            teaching_items_by_packet_query(&self.keyspace, limit),
+            (ctx.tenant_id, packet_id)
+        )?;
+        rows.iter()
+            .map(|r| {
+                Ok(serde_json::from_str(&cql_get::<String>(
+                    r,
+                    &col_map,
+                    "item_json",
+                )?)?)
+            })
+            .collect()
+    }
+
+    async fn remote_stub_put(&self, ctx: &TenantContext, stub: &RemoteStub) -> anyhow::Result<()> {
+        self.session.query_unpaged(format!("INSERT INTO {}.remote_stubs (tenant_id, remote_id, state, stub_id, packet_id, item_id, local_entity_id, title, summary, stub_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", self.keyspace), (ctx.tenant_id, stub.remote_id, stub.state.to_string(), stub.stub_id, stub.packet_id, stub.item_id, stub.local_entity_id, &stub.title, &stub.summary, serde_json::to_string(stub)?, stub.created_at, stub.updated_at)).await?;
+        Ok(())
+    }
+
+    async fn remote_stub_list_by_state(
+        &self,
+        ctx: &TenantContext,
+        remote_id: Uuid,
+        state: ImportState,
+        limit: usize,
+    ) -> anyhow::Result<Vec<RemoteStub>> {
+        let (col_map, rows) = query_paged_rows!(
+            self.session,
+            remote_stubs_by_state_query(&self.keyspace, limit),
+            (ctx.tenant_id, remote_id, state.to_string())
+        )?;
+        rows.iter()
+            .map(|r| {
+                Ok(serde_json::from_str(&cql_get::<String>(
+                    r,
+                    &col_map,
+                    "stub_json",
+                )?)?)
+            })
+            .collect()
+    }
+
+    async fn remote_stub_update_state(
+        &self,
+        ctx: &TenantContext,
+        remote_id: Uuid,
+        stub_id: Uuid,
+        old_state: ImportState,
+        new_state: ImportState,
+    ) -> anyhow::Result<()> {
+        let stubs = self
+            .remote_stub_list_by_state(ctx, remote_id, old_state, usize::MAX)
+            .await?;
+        if let Some(mut stub) = stubs.into_iter().find(|s| s.stub_id == stub_id) {
+            self.session.query_unpaged(format!("DELETE FROM {}.remote_stubs WHERE tenant_id = ? AND remote_id = ? AND state = ? AND stub_id = ?", self.keyspace), (ctx.tenant_id, remote_id, old_state.to_string(), stub_id)).await?;
+            stub.state = new_state;
+            stub.updated_at = chrono::Utc::now();
+            self.remote_stub_put(ctx, &stub).await?;
+        }
+        Ok(())
+    }
+
+    async fn memory_provenance_put(
+        &self,
+        ctx: &TenantContext,
+        provenance: &MemoryProvenance,
+    ) -> anyhow::Result<()> {
+        self.session.query_unpaged(format!("INSERT INTO {}.memory_provenance (tenant_id, local_entity_id, provenance_id, remote_id, packet_id, item_id, content_hash, signature_hash, imported_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", self.keyspace), (ctx.tenant_id, provenance.local_entity_id, provenance.provenance_id, provenance.remote_id, provenance.packet_id, provenance.item_id, &provenance.content_hash.0, &provenance.signature_hash.0, provenance.imported_at)).await?;
+        Ok(())
+    }
+
+    async fn memory_provenance_list_by_entity(
+        &self,
+        ctx: &TenantContext,
+        local_entity_id: Uuid,
+    ) -> anyhow::Result<Vec<MemoryProvenance>> {
+        let (col_map, rows) = query_paged_rows!(
+            self.session,
+            memory_provenance_by_entity_query(&self.keyspace),
+            (ctx.tenant_id, local_entity_id)
+        )?;
+        rows.iter()
+            .map(|r| provenance_from_row(r, &col_map))
+            .collect()
+    }
+
+    async fn memory_conflict_put(
+        &self,
+        ctx: &TenantContext,
+        conflict: &MemoryConflict,
+    ) -> anyhow::Result<()> {
+        self.session.query_unpaged(format!("INSERT INTO {}.memory_conflicts (tenant_id, local_entity_id, conflict_id, remote_id, item_id, reason, resolved, created_at, resolved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", self.keyspace), (ctx.tenant_id, conflict.local_entity_id, conflict.conflict_id, conflict.remote_id, conflict.item_id, &conflict.reason, conflict.resolved, conflict.created_at, conflict.resolved_at)).await?;
+        Ok(())
+    }
+
+    async fn memory_conflict_list_by_entity(
+        &self,
+        ctx: &TenantContext,
+        local_entity_id: Uuid,
+    ) -> anyhow::Result<Vec<MemoryConflict>> {
+        let (col_map, rows) = query_paged_rows!(
+            self.session,
+            memory_conflicts_by_entity_query(&self.keyspace),
+            (ctx.tenant_id, local_entity_id)
+        )?;
+        rows.iter()
+            .map(|r| conflict_from_row(r, &col_map))
+            .collect()
+    }
+
+    async fn memory_conflict_resolve(
+        &self,
+        ctx: &TenantContext,
+        local_entity_id: Uuid,
+        conflict_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.session.query_unpaged(format!("UPDATE {}.memory_conflicts SET resolved = ?, resolved_at = ? WHERE tenant_id = ? AND local_entity_id = ? AND conflict_id = ?", self.keyspace), (true, chrono::Utc::now(), ctx.tenant_id, local_entity_id, conflict_id)).await?;
+        Ok(())
+    }
+
+    async fn memory_feedback_put(
+        &self,
+        ctx: &TenantContext,
+        feedback: &MemoryFeedback,
+    ) -> anyhow::Result<()> {
+        self.session.query_unpaged(format!("INSERT INTO {}.memory_feedback (tenant_id, remote_id, target_id, feedback_id, feedback_type, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", self.keyspace), (ctx.tenant_id, feedback.remote_id, feedback.target_id, feedback.feedback_id, serde_json::to_string(&feedback.feedback_type)?.trim_matches('"').to_string(), &feedback.note, feedback.created_at)).await?;
+        Ok(())
+    }
+
+    async fn memory_feedback_list_by_target(
+        &self,
+        ctx: &TenantContext,
+        remote_id: Uuid,
+        target_id: Uuid,
+    ) -> anyhow::Result<Vec<MemoryFeedback>> {
+        let (col_map, rows) = query_paged_rows!(
+            self.session,
+            memory_feedback_by_target_query(&self.keyspace),
+            (ctx.tenant_id, remote_id, target_id)
+        )?;
+        rows.iter()
+            .map(|r| feedback_from_row(r, &col_map))
+            .collect()
+    }
+
+    async fn import_batch_put(
+        &self,
+        ctx: &TenantContext,
+        batch: &ImportBatch,
+    ) -> anyhow::Result<()> {
+        self.session.query_unpaged(format!("INSERT INTO {}.import_batches (tenant_id, remote_id, batch_id, packet_id, state, imported_count, rejected_count, conflict_count, explanation, created_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", self.keyspace), (ctx.tenant_id, batch.remote_id, batch.batch_id, batch.packet_id, batch.state.to_string(), batch.imported_count, batch.rejected_count, batch.conflict_count, &batch.explanation, batch.created_at, batch.completed_at)).await?;
+        Ok(())
+    }
+
+    async fn import_batch_get(
+        &self,
+        ctx: &TenantContext,
+        remote_id: Uuid,
+        batch_id: Uuid,
+    ) -> anyhow::Result<Option<ImportBatch>> {
+        let (col_map, rows) = query_rows!(
+            self.session,
+            format!(
+                "SELECT remote_id, batch_id, packet_id, state, imported_count, rejected_count, conflict_count, explanation, created_at, completed_at FROM {}.import_batches WHERE tenant_id = ? AND remote_id = ? AND batch_id = ?",
+                self.keyspace
+            ),
+            (ctx.tenant_id, remote_id, batch_id)
+        );
+        rows.first()
+            .map(|r| {
+                Ok(ImportBatch {
+                    remote_id: cql_get(r, &col_map, "remote_id")?,
+                    batch_id: cql_get(r, &col_map, "batch_id")?,
+                    packet_id: cql_get(r, &col_map, "packet_id")?,
+                    state: parse_import_state(&cql_get::<String>(r, &col_map, "state")?)?,
+                    imported_count: cql_get(r, &col_map, "imported_count")?,
+                    rejected_count: cql_get(r, &col_map, "rejected_count")?,
+                    conflict_count: cql_get(r, &col_map, "conflict_count")?,
+                    explanation: cql_get(r, &col_map, "explanation")?,
+                    created_at: cql_get(r, &col_map, "created_at")?,
+                    completed_at: cql_get::<chrono::DateTime<chrono::Utc>>(
+                        r,
+                        &col_map,
+                        "completed_at",
+                    )
+                    .ok(),
+                })
+            })
+            .transpose()
     }
 
     async fn memo_get(
@@ -7793,6 +8227,53 @@ mod cql_storage_tests {
                     .iter()
                     .any(|entity_type| entity_type == expected),
                 "fallback entity type registry must include {expected}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod remotes_cql_tests {
+    use super::*;
+
+    #[test]
+    fn remote_query_builders_are_tenant_scoped_and_bounded() {
+        let remote_get = remote_get_query("agent_memory");
+        let remote_list = remote_list_query("agent_memory", 25);
+        let items = teaching_items_by_packet_query("agent_memory", 7);
+        let stubs = remote_stubs_by_state_query("agent_memory", 9);
+
+        for query in [&remote_get, &remote_list, &items, &stubs] {
+            assert!(
+                query.contains("tenant_id = ?"),
+                "remote CQL must be tenant-scoped: {query}"
+            );
+        }
+        assert!(remote_get.contains("remote_id = ?"));
+        assert!(items.contains("packet_id = ?") && items.contains("LIMIT 7"));
+        assert!(
+            stubs.contains("remote_id = ?")
+                && stubs.contains("state = ?")
+                && stubs.contains("LIMIT 9")
+        );
+        assert!(
+            !items.contains("ALLOW FILTERING"),
+            "packet item lookup must use its primary key: {items}"
+        );
+    }
+
+    #[test]
+    fn remote_json_blob_columns_are_explicit() {
+        let ddl = include_str!("../../../ddl/041_memory_remotes.cql");
+        for col in [
+            "packet_json text",
+            "item_json text",
+            "stub_json text",
+            "kind_json text",
+        ] {
+            assert!(
+                ddl.contains(col),
+                "intentional JSON blob column missing: {col}"
             );
         }
     }
