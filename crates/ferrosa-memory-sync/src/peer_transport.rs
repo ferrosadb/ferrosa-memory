@@ -52,6 +52,12 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 
+/// Concrete `webrtc-rs` binding for [`DataChannel`] (MAAS-T-25b). Compiled only
+/// under the `webrtc-transport` feature so non-P2P builds stay light.
+#[cfg(feature = "webrtc-transport")]
+#[path = "peer_transport_webrtc.rs"]
+pub mod webrtc;
+
 // ─────────────────────────────────────────────────────────────────────────
 // Wire framing — bounded, never-panicking encode/decode
 // ─────────────────────────────────────────────────────────────────────────

@@ -29,6 +29,16 @@ aead = { workspace = true }
 zeroize = { workspace = true }
 rand = { workspace = true }
 
+# MaaS P2P WebRTC transport (MAAS-T-25b). Optional — only the concrete
+# RTCDataChannel binding needs it; the transport core is dependency-free.
+webrtc = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+
+[features]
+# Pulls the webrtc-rs ICE/DTLS/SCTP/SRTP stack and enables the concrete
+# `peer_transport::webrtc` channel. Off by default to keep non-P2P builds light.
+webrtc-transport = ["dep:webrtc", "dep:bytes"]
+
 [lib]
 name = "ferrosa_memory_sync"
 path = "src/lib.rs"
@@ -39,3 +49,6 @@ path = "src/main.rs"
 
 [dev-dependencies]
 proptest = "1"
+# Loopback webrtc test installs a rustls CryptoProvider explicitly (rustls 0.23
+# requires one when both ring and aws-lc-rs are in the tree).
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
