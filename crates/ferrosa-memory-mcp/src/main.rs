@@ -19,6 +19,10 @@ use ferrosa_memory_core::cql_storage::CqlStorage;
 use ferrosa_memory_core::dispatch;
 use ferrosa_memory_core::graph::GraphClient;
 use ferrosa_memory_core::http;
+use ferrosa_memory_core::remotes::types::{
+    ImportBatch, ImportState, MemoryConflict, MemoryFeedback, MemoryProvenance, MemoryRemote,
+    RemotePolicyFact, RemoteStub, TeachingItem, TeachingPacket,
+};
 use ferrosa_memory_core::storage::Storage;
 use ferrosa_memory_core::transport;
 use ferrosa_memory_core::types::*;
@@ -703,6 +707,207 @@ impl Storage for ReconnectingStorage {
         keyspace: &str,
     ) -> anyhow::Result<ferrosa_memory_core::storage::ClusterInfo> {
         delegate!(self, cluster_info, keyspace)
+    }
+
+    // --- Remote teacher/learner storage operations ---
+
+    async fn remote_put(&self, ctx: &TenantContext, remote: &MemoryRemote) -> anyhow::Result<()> {
+        delegate!(self, remote_put, ctx, remote)
+    }
+
+    async fn remote_get(
+        &self,
+        ctx: &TenantContext,
+        remote_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<MemoryRemote>> {
+        delegate!(self, remote_get, ctx, remote_id)
+    }
+
+    async fn remote_list(
+        &self,
+        ctx: &TenantContext,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryRemote>> {
+        delegate!(self, remote_list, ctx, limit)
+    }
+
+    async fn remote_policy_put(
+        &self,
+        ctx: &TenantContext,
+        fact: &RemotePolicyFact,
+    ) -> anyhow::Result<()> {
+        delegate!(self, remote_policy_put, ctx, fact)
+    }
+
+    async fn remote_policy_list(
+        &self,
+        ctx: &TenantContext,
+        remote_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<RemotePolicyFact>> {
+        delegate!(self, remote_policy_list, ctx, remote_id)
+    }
+
+    async fn teaching_packet_put(
+        &self,
+        ctx: &TenantContext,
+        remote_id: uuid::Uuid,
+        packet: &TeachingPacket,
+    ) -> anyhow::Result<()> {
+        delegate!(self, teaching_packet_put, ctx, remote_id, packet)
+    }
+
+    async fn teaching_packet_get(
+        &self,
+        ctx: &TenantContext,
+        remote_id: uuid::Uuid,
+        packet_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<TeachingPacket>> {
+        delegate!(self, teaching_packet_get, ctx, remote_id, packet_id)
+    }
+
+    async fn teaching_items_put(
+        &self,
+        ctx: &TenantContext,
+        remote_id: uuid::Uuid,
+        items: &[TeachingItem],
+    ) -> anyhow::Result<()> {
+        delegate!(self, teaching_items_put, ctx, remote_id, items)
+    }
+
+    async fn teaching_items_list_by_packet(
+        &self,
+        ctx: &TenantContext,
+        packet_id: uuid::Uuid,
+        limit: usize,
+    ) -> anyhow::Result<Vec<TeachingItem>> {
+        delegate!(self, teaching_items_list_by_packet, ctx, packet_id, limit)
+    }
+
+    async fn remote_stub_put(&self, ctx: &TenantContext, stub: &RemoteStub) -> anyhow::Result<()> {
+        delegate!(self, remote_stub_put, ctx, stub)
+    }
+
+    async fn remote_stub_list_by_state(
+        &self,
+        ctx: &TenantContext,
+        remote_id: uuid::Uuid,
+        state: ImportState,
+        limit: usize,
+    ) -> anyhow::Result<Vec<RemoteStub>> {
+        delegate!(
+            self,
+            remote_stub_list_by_state,
+            ctx,
+            remote_id,
+            state,
+            limit
+        )
+    }
+
+    async fn remote_stub_update_state(
+        &self,
+        ctx: &TenantContext,
+        remote_id: uuid::Uuid,
+        stub_id: uuid::Uuid,
+        old_state: ImportState,
+        new_state: ImportState,
+    ) -> anyhow::Result<()> {
+        delegate!(
+            self,
+            remote_stub_update_state,
+            ctx,
+            remote_id,
+            stub_id,
+            old_state,
+            new_state
+        )
+    }
+
+    async fn memory_provenance_put(
+        &self,
+        ctx: &TenantContext,
+        provenance: &MemoryProvenance,
+    ) -> anyhow::Result<()> {
+        delegate!(self, memory_provenance_put, ctx, provenance)
+    }
+
+    async fn memory_provenance_list_by_entity(
+        &self,
+        ctx: &TenantContext,
+        local_entity_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<MemoryProvenance>> {
+        delegate!(self, memory_provenance_list_by_entity, ctx, local_entity_id)
+    }
+
+    async fn memory_conflict_put(
+        &self,
+        ctx: &TenantContext,
+        conflict: &MemoryConflict,
+    ) -> anyhow::Result<()> {
+        delegate!(self, memory_conflict_put, ctx, conflict)
+    }
+
+    async fn memory_conflict_list_by_entity(
+        &self,
+        ctx: &TenantContext,
+        local_entity_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<MemoryConflict>> {
+        delegate!(self, memory_conflict_list_by_entity, ctx, local_entity_id)
+    }
+
+    async fn memory_conflict_resolve(
+        &self,
+        ctx: &TenantContext,
+        local_entity_id: uuid::Uuid,
+        conflict_id: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        delegate!(
+            self,
+            memory_conflict_resolve,
+            ctx,
+            local_entity_id,
+            conflict_id
+        )
+    }
+
+    async fn memory_feedback_put(
+        &self,
+        ctx: &TenantContext,
+        feedback: &MemoryFeedback,
+    ) -> anyhow::Result<()> {
+        delegate!(self, memory_feedback_put, ctx, feedback)
+    }
+
+    async fn memory_feedback_list_by_target(
+        &self,
+        ctx: &TenantContext,
+        remote_id: uuid::Uuid,
+        target_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<MemoryFeedback>> {
+        delegate!(
+            self,
+            memory_feedback_list_by_target,
+            ctx,
+            remote_id,
+            target_id
+        )
+    }
+
+    async fn import_batch_put(
+        &self,
+        ctx: &TenantContext,
+        batch: &ImportBatch,
+    ) -> anyhow::Result<()> {
+        delegate!(self, import_batch_put, ctx, batch)
+    }
+
+    async fn import_batch_get(
+        &self,
+        ctx: &TenantContext,
+        remote_id: uuid::Uuid,
+        batch_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<ImportBatch>> {
+        delegate!(self, import_batch_get, ctx, remote_id, batch_id)
     }
 
     async fn plan_put(&self, ctx: &TenantContext, node: &PlanNode) -> anyhow::Result<()> {

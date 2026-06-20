@@ -56,4 +56,17 @@ GRANT MODIFY ON agent_memory.confidence_scores       TO ferrosa_user;
 GRANT MODIFY ON agent_memory.retraction    TO ferrosa_user;
 GRANT MODIFY ON agent_memory.forget_journal TO ferrosa_user;
 
+-- Remote knowledge sharing (migration 041): teacher/learner transfer tables.
+-- All application-owned, written by ferrosa_user via the remote-memory tools
+-- (teach/pull/import). Additive grants — additive to the forget feature above.
+GRANT MODIFY ON agent_memory.memory_remotes      TO ferrosa_user;
+GRANT MODIFY ON agent_memory.remote_policy_facts TO ferrosa_user;
+GRANT MODIFY ON agent_memory.teaching_packets    TO ferrosa_user;
+GRANT MODIFY ON agent_memory.teaching_items      TO ferrosa_user;
+GRANT MODIFY ON agent_memory.remote_stubs        TO ferrosa_user;
+GRANT MODIFY ON agent_memory.memory_provenance   TO ferrosa_user;
+GRANT MODIFY ON agent_memory.memory_conflicts    TO ferrosa_user;
+GRANT MODIFY ON agent_memory.memory_feedback     TO ferrosa_user;
+GRANT MODIFY ON agent_memory.import_batches      TO ferrosa_user;
+
 -- graph-owned tables: NOT GRANTED to ferrosa_user on purpose.
