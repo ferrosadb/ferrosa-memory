@@ -8993,10 +8993,23 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
     // because they do not depend on score scale.
     let mut pre_merge_filter = filter.clone();
     pre_merge_filter.min_score = None;
-    let (pagerank_scores, reputation_scores) =
-        load_authority_score_maps(storage, ctx, session_id, filter.scope)
-            .await
-            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    let (pagerank_scores, reputation_scores) = match load_authority_score_maps(
+        storage,
+        ctx,
+        session_id,
+        filter.scope,
+    )
+    .await
+    {
+        Ok(scores) => scores,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "authority score load failed; continuing hybrid_search without authority ranking signals"
+            );
+            (HashMap::new(), HashMap::new())
+        }
+    };
     let pagerank_scores_ref = (!pagerank_scores.is_empty()).then_some(&pagerank_scores);
     let reputation_scores_ref = (!reputation_scores.is_empty()).then_some(&reputation_scores);
 

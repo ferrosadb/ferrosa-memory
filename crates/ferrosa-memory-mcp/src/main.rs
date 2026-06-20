@@ -2431,6 +2431,42 @@ fn migrations_enabled() -> bool {
     )
 }
 
+/// Re-assert required secondary/full-text indexes after the versioned migration
+/// pass. Existing deployments can report an up-to-date `schema_version` while
+/// still missing indexes from pre-versioning or interrupted DDL application;
+/// these idempotent statements repair that drift before runtime prepares search
+/// queries that rely on them.
+async fn ensure_required_indexes(
+    session: &ferrosa_memory_core::cql_storage::CqlSession,
+    keyspace: &str,
+) -> anyhow::Result<usize> {
+    let statements = [
+        format!(
+            "CREATE INDEX IF NOT EXISTS idx_warmth_session ON {keyspace}.entity_warmth (session_id)"
+        ),
+        format!(
+            "CREATE INDEX IF NOT EXISTS idx_entity_name_fts ON {keyspace}.entity_store (entity_name) USING 'fulltext'"
+        ),
+        format!(
+            "CREATE INDEX IF NOT EXISTS idx_context_segments_bm25_text_fts ON {keyspace}.context_segments (bm25_text) USING 'fulltext'"
+        ),
+        format!(
+            "CREATE INDEX IF NOT EXISTS idx_document_chunks_bm25_text_fts ON {keyspace}.document_chunks (bm25_text) USING 'fulltext'"
+        ),
+    ];
+
+    let mut attempted = 0usize;
+    for stmt in statements {
+        #[allow(deprecated)]
+        session.query_unpaged(stmt.as_str(), ()).await?;
+        attempted += 1;
+        if let Err(e) = session.await_schema_agreement().await {
+            tracing::warn!(error = %e, statement = %stmt, "schema agreement timed out after required index ensure");
+        }
+    }
+    Ok(attempted)
+}
+
 async fn run_schema_migrations_if_enabled(config: &FerrosaCqlConfig) {
     if !migrations_enabled() {
         tracing::info!(
@@ -2465,6 +2501,12 @@ async fn run_schema_migrations_if_enabled(config: &FerrosaCqlConfig) {
                     "schema migration status"
                 ),
                 Err(e) => tracing::warn!("schema migration status unavailable: {e}"),
+            }
+            match ensure_required_indexes(&admin_session, &config.keyspace).await {
+                Ok(n) => tracing::info!(attempted = n, "required schema indexes ensured"),
+                Err(e) => tracing::error!(
+                    "required schema index ensure failed: {e}. Runtime search/ranking queries may fail until indexes are rebuilt."
+                ),
             }
         }
         Err(e) => {
@@ -3740,6 +3782,32 @@ auth_file = "{}"
             migration_pos < connect_pos,
             "migrations must run before runtime CQL prepare/connect attempts"
         );
+    }
+
+    #[test]
+    fn startup_migration_pass_repairs_required_indexes() {
+        let source = include_str!("main.rs");
+        let migration_start = source
+            .find("async fn run_schema_migrations_if_enabled")
+            .expect("startup migration function must exist");
+        let migration_source = &source[migration_start..];
+
+        assert!(
+            migration_source
+                .contains("ensure_required_indexes(&admin_session, &config.keyspace).await"),
+            "startup migration pass must re-assert required indexes before runtime CQL connect"
+        );
+        for required in [
+            "idx_warmth_session",
+            "idx_entity_name_fts",
+            "idx_context_segments_bm25_text_fts",
+            "idx_document_chunks_bm25_text_fts",
+        ] {
+            assert!(
+                source.contains(required),
+                "required index {required} must be part of startup index repair"
+            );
+        }
     }
 
     #[test]
