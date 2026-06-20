@@ -33,6 +33,18 @@ sha2 = "0.11"
 # Remote-memory signing (Ed25519 envelopes for teaching packets)
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+
+# MaaS P2P transfer crypto (ferrosa-memory-sync). RustCrypto 0.10/0.12
+# generation — internally consistent AEAD + KDF stack (aead 0.5, digest 0.10).
+# Kept distinct from the workspace `sha2 = "0.11"` above (used by content
+# hashing elsewhere); the AEAD stack must use its own self-consistent digest.
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2_kdf = { package = "sha2", version = "0.10" }
+aead = { version = "0.5", features = ["alloc"] }
+zeroize = { version = "1", features = ["derive"] }
+rand = "0.8"
 # digest 0.11 changed finalize() output to hybrid_array::Array, which doesn't
 # implement LowerHex — encode digests via hex::encode instead of "{:x}".
 hex = "0.4"

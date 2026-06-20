@@ -15,3 +15,27 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+prometheus = { workspace = true }
+
+# MaaS P2P transfer crypto (T-33). See workspace deps for version rationale.
+aes-gcm = { workspace = true }
+chacha20poly1305 = { workspace = true }
+hkdf = { workspace = true }
+sha2_kdf = { workspace = true }
+aead = { workspace = true }
+zeroize = { workspace = true }
+rand = { workspace = true }
+
+[lib]
+name = "ferrosa_memory_sync"
+path = "src/lib.rs"
+
+[[bin]]
+name = "memory-sync"
+path = "src/main.rs"
+
+[dev-dependencies]
+proptest = "1"
