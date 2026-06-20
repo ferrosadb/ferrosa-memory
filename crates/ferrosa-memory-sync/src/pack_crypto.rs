@@ -96,7 +96,7 @@ fn record_downgrade_blocked() {
 /// MR-CRYPTO-05: `{:?}` prints `Secret(<redacted N bytes>)`, never the bytes.
 /// There is no `Display`, no `Serialize`, and no public accessor that returns
 /// the raw bytes outside this module — sealing primitives take `&Secret` and
-/// reach the bytes through the crate-private [`Secret::expose`].
+/// reach the bytes through the crate-private `expose` accessor.
 #[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct Secret(Vec<u8>);
 
