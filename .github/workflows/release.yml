@@ -58,6 +58,55 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
 
+  # ── Container image (GHCR) ───────────────────────────────────────────
+  # Builds and pushes a runtime container image from the x86_64 musl static
+  # binary artifact so deployable images come from the release process, not
+  # hand-built. Independent of the `release` job — it must not block the
+  # GitHub release. Uses only already-pinned actions + shell `docker` so the
+  # actions-pin-guard stays green (no new action pins introduced).
+  build-image:
+    name: Build & push container image
+    needs: build-linux-x86_64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Download x86_64 musl tarball
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: tarball-x86_64-unknown-linux-musl
+          path: dist
+
+      - name: Extract binaries and write runtime Dockerfile
+        run: |
+          mkdir -p build
+          tar -xzf dist/*.tar.gz -C build/
+          chmod 755 build/ferrosa-memory build/ferrosa-memory-mcp
+          cat > build/Dockerfile <<'DOCKERFILE'
+          FROM debian:trixie-slim
+          RUN apt-get update \
+              && apt-get install -y --no-install-recommends ca-certificates curl openssl \
+              && rm -rf /var/lib/apt/lists/*
+          COPY ferrosa-memory-mcp /usr/local/bin/ferrosa-memory-mcp
+          COPY ferrosa-memory /usr/local/bin/ferrosa-memory
+          EXPOSE 8765
+          ENTRYPOINT ["ferrosa-memory-mcp"]
+          DOCKERFILE
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build and push image
+        run: |
+          OWNER="$(printf '%s' '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          IMAGE="ghcr.io/${OWNER}/ferrosa-memory-mcp"
+          docker build -t "${IMAGE}:${GITHUB_REF_NAME}" -t "${IMAGE}:latest" build/
+          docker push "${IMAGE}:${GITHUB_REF_NAME}"
+          docker push "${IMAGE}:latest"
+
   # ── Linux aarch64 (musl, cross) ──────────────────────────────────────
   build-linux-aarch64:
     name: Build Linux aarch64 (musl, cross)
