@@ -295,18 +295,60 @@ fn rrf_merge(lists: Vec<Vec<SearchResult>>, k: f64, weights: &[f64]) -> Vec<Sear
     merged
 }
 
+fn metadata_stub(content: &str) -> bool {
+    content.trim_start().starts_with("BOOK METADATA |")
+}
+
+fn bibliographic_query(query_terms: &HashSet<String>) -> bool {
+    query_terms.iter().any(|term| {
+        matches!(
+            term.as_str(),
+            "book"
+                | "books"
+                | "author"
+                | "authors"
+                | "metadata"
+                | "publisher"
+                | "published"
+                | "edition"
+                | "title"
+                | "titles"
+                | "corpus"
+        )
+    })
+}
+
+fn document_representative_better(candidate: &SearchResult, incumbent: &SearchResult) -> bool {
+    let candidate_metadata = metadata_stub(&candidate.content);
+    let incumbent_metadata = metadata_stub(&incumbent.content);
+    if candidate_metadata != incumbent_metadata {
+        return !candidate_metadata;
+    }
+    candidate.score > incumbent.score
+}
+
 fn collapse_duplicate_document_chunks(results: Vec<SearchResult>) -> Vec<SearchResult> {
-    let mut seen_documents = HashSet::new();
+    let mut document_slots: HashMap<Uuid, usize> = HashMap::new();
     let mut collapsed = Vec::with_capacity(results.len());
     for result in results {
         if result.result_type == "document_chunk"
             && let Some(document_id) = result.document_id
-            && !seen_documents.insert(document_id)
         {
-            continue;
+            if let Some(slot) = document_slots.get(&document_id).copied() {
+                if document_representative_better(&result, &collapsed[slot]) {
+                    collapsed[slot] = result;
+                }
+                continue;
+            }
+            document_slots.insert(document_id, collapsed.len());
         }
         collapsed.push(result);
     }
+    collapsed.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     collapsed
 }
 
@@ -472,6 +514,21 @@ fn source_is_datalog_frontier(source: &str) -> bool {
     source.starts_with("datalog_frontier:")
 }
 
+fn source_family_prior(result: &SearchResult) -> f64 {
+    match result.source.as_str() {
+        source if source_is_datalog_frontier(source) => 0.08,
+        "context_bm25" => 0.07,
+        "context_ann" => 0.04,
+        "entity_phonetic" => 0.04,
+        "entity_ann" => 0.03,
+        "fold_ann" => 0.03,
+        "document_bm25" => 0.0,
+        "document_ann" => -0.01,
+        "document_phonetic" => -0.07,
+        _ => 0.0,
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct CandidateEvidence {
     sources: HashSet<String>,
@@ -529,9 +586,11 @@ fn apply_source_aware_scoring(
     results: Vec<SearchResult>,
     evidence: &HashMap<Uuid, CandidateEvidence>,
 ) -> Vec<SearchResult> {
-    if relevance_terms(query).is_empty() {
+    let query_terms = relevance_terms(query);
+    if query_terms.is_empty() {
         return results;
     }
+    let bibliographic = bibliographic_query(&query_terms);
     let mut scored = Vec::with_capacity(results.len());
     for mut result in results {
         let Some(ev) = evidence.get(&result.id) else {
@@ -550,8 +609,21 @@ fn apply_source_aware_scoring(
             } else {
                 0.0
             };
-        result.score = (result.score + source_bonus + lexical_bonus + lexical_source_bonus
-            - ann_only_penalty)
+        let metadata_penalty = if result.result_type == "document_chunk"
+            && metadata_stub(&result.content)
+            && !bibliographic
+        {
+            0.18
+        } else {
+            0.0
+        };
+        result.score = (result.score
+            + source_bonus
+            + lexical_bonus
+            + lexical_source_bonus
+            + source_family_prior(&result)
+            - ann_only_penalty
+            - metadata_penalty)
             .max(0.0);
         scored.push(result);
     }
@@ -1906,6 +1978,71 @@ mod tests {
 
         assert_eq!(scored.first().map(|result| result.id), Some(candidate_id));
         assert!(scored[0].score > 0.03);
+    }
+
+    #[test]
+    fn source_aware_scoring_demotes_metadata_stubs_for_task_queries() {
+        let metadata_id = Uuid::new_v4();
+        let content_id = Uuid::new_v4();
+        let mut metadata = make_result(metadata_id, "document_bm25", 0.20);
+        metadata.result_type = "document_chunk".into();
+        metadata.memory_kind = "semantic".into();
+        metadata.content =
+            "BOOK METADATA | Title: Rust Web Development | Key topics: memory search cleanup"
+                .into();
+        let mut content = make_result(content_id, "context_bm25", 0.12);
+        content.result_type = "context_segment".into();
+        content.memory_kind = "episodic".into();
+        content.content = "memory search cleanup candidate pool source aware scoring".into();
+        let lists = vec![vec![metadata.clone()], vec![content.clone()]];
+        let evidence = collect_candidate_evidence("memory search cleanup", &lists);
+
+        let scored =
+            apply_source_aware_scoring("memory search cleanup", vec![metadata, content], &evidence);
+
+        assert_eq!(scored.first().map(|result| result.id), Some(content_id));
+    }
+
+    #[test]
+    fn source_aware_scoring_keeps_metadata_for_bibliographic_queries() {
+        let metadata_id = Uuid::new_v4();
+        let content_id = Uuid::new_v4();
+        let mut metadata = make_result(metadata_id, "document_bm25", 0.20);
+        metadata.result_type = "document_chunk".into();
+        metadata.content =
+            "BOOK METADATA | Title: Rust Web Development | Author: Karuna Murti".into();
+        let mut content = make_result(content_id, "context_bm25", 0.12);
+        content.content = "notes mention rust web development author reference".into();
+        let lists = vec![vec![metadata.clone()], vec![content.clone()]];
+        let evidence = collect_candidate_evidence("book author rust web development", &lists);
+
+        let scored = apply_source_aware_scoring(
+            "book author rust web development",
+            vec![metadata, content],
+            &evidence,
+        );
+
+        assert_eq!(scored.first().map(|result| result.id), Some(metadata_id));
+    }
+
+    #[test]
+    fn duplicate_document_collapse_prefers_content_chunk_over_metadata_stub() {
+        let document_id = Uuid::new_v4();
+        let metadata_id = Uuid::new_v4();
+        let content_id = Uuid::new_v4();
+        let mut metadata = make_result(metadata_id, "document_bm25", 0.40);
+        metadata.result_type = "document_chunk".into();
+        metadata.document_id = Some(document_id);
+        metadata.content = "BOOK METADATA | Title: Noisy Metadata".into();
+        let mut content = make_result(content_id, "document_bm25", 0.20);
+        content.result_type = "document_chunk".into();
+        content.document_id = Some(document_id);
+        content.content = "actual implementation detail for candidate cleanup".into();
+
+        let collapsed = collapse_duplicate_document_chunks(vec![metadata, content]);
+
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].id, content_id);
     }
 
     #[test]
