@@ -12,6 +12,10 @@
 //!   per-chunk nonces.
 //! - [`learner_ingest`] — MAAS-T-27: verify → atomic+idempotent apply →
 //!   provenance + TTL.
+//! - [`replication`] — MAAS-T-26: teacher-side selective pack build + emit
+//!   (exact selection, no neighbour bleed, summary-first, provenance on build).
+//! - [`peer_transport`] — MAAS-T-25: bounded, backpressured, cancellation-safe
+//!   WebRTC pack transport over a [`peer_transport::DataChannel`] seam.
 //!
 //! ## T-29 seam
 //!
@@ -25,3 +29,5 @@
 pub mod learner_ingest;
 pub mod pack;
 pub mod pack_crypto;
+pub mod peer_transport;
+pub mod replication;
