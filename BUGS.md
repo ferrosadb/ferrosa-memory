@@ -136,6 +136,15 @@ grows with entity count.
 **Workaround:** Wait for node stabilization (confirmed by a successful CQL
 health probe) before starting dependent services.
 
+**Status (2026-06-20): FIXED — VERIFIED LIVE.** Index rebuild no longer runs
+inline before serving: on restart, `StorageEngine::reload_indexes_from_system_schema`
+re-registers persisted indexes and the backfill runs through the index-build
+**scheduler / `eager_index_build_job` (background)**, so non-vector CQL serves
+immediately. Verified on the rebuilt 3-node cluster (ferrosa `main`,
+`docker.io/library/ferrosa-memory-node:latest` = build `3cec99cc6127`): with
+**77,653 entities**, a CQL session + `COUNT(*)` answered **0.4 s** after restart
+— no ~300 s block. Closed.
+
 ---
 
 ### BUG-F-003 · P2 · PREPARE returns malformed metadata — breaks cassandra-driver
@@ -178,6 +187,27 @@ inserted rows.
 
 **Workaround:** Keep the memory term-table fallback enabled. Do not treat
 native FTS zero-row responses as proof that no lexical match exists.
+
+**Status (2026-06-20): STILL OPEN on the live multi-node path — partial fix only.**
+The memtable-read case is fixed on `main` (in-process tests
+`fulltext_index_fts_match_end_to_end` + `fulltext_index_fts_match_reads_unflushed_memtable_row`
+in `ferrosa-cql/src/router.rs` pass), but those are **single-node, in-process**
+and do not exercise the served 3-node path.
+
+Verified against the **rebuilt** cluster (ferrosa `main`, build `3cec99cc6127`,
+RF=3): `fts_match` is **non-deterministic for a stable, never-changing row** while
+a normal scan is consistently 1. Observed timeline for one inserted row:
+`t=0s→0, 10s→1, 30s→0, 60s→0, 90s→1`. With the driver round-robining across 3
+coordinators, the result depends on which node answers ⇒ the served `fts_match`
+is **coordinator-local and/or the per-SSTable FTI is unavailable while the
+background index rebuild swaps it** (related to the F-001 background-rebuild
+mechanism). It does NOT scatter-gather a consistent match across replicas.
+
+**Net:** native FTS remains unusable for lexical recall on the cluster. Keep the
+`document_terms` / `context_segment_terms` fallback. A real fix needs a
+**multi-node served-path regression test** (the existing tests can't catch this)
+plus consistent cross-replica `fts_match` evaluation / FTI-rebuild atomicity in
+ferrosa.
 
 ---
 
