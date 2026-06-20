@@ -136,6 +136,16 @@ grows with entity count.
 **Workaround:** Wait for node stabilization (confirmed by a successful CQL
 health probe) before starting dependent services.
 
+**Status (2026-06-20): FIXED on ferrosa `main`, pending cluster rebuild to
+deploy.** Index rebuild no longer runs inline before serving. On restart,
+`StorageEngine::reload_indexes_from_system_schema` re-registers persisted
+indexes and the backfill runs through the index-build **scheduler /
+`eager_index_build_job` (background)** — non-vector CQL serves immediately;
+only vector/ANN results are incomplete during the background backfill window,
+instead of all CQL blocking. The deployed cluster predates this (it still shows
+the ≤0.11.0 inline-rebuild behavior). Closes once the live cluster is rebuilt
+from current `main` (ops task t_0a12af4a).
+
 ---
 
 ### BUG-F-003 · P2 · PREPARE returns malformed metadata — breaks cassandra-driver
@@ -178,6 +188,17 @@ inserted rows.
 
 **Workaround:** Keep the memory term-table fallback enabled. Do not treat
 native FTS zero-row responses as proof that no lexical match exists.
+
+**Status (2026-06-20): FIXED on ferrosa `main`, pending cluster rebuild to
+deploy.** Root cause was that `fts_match` only read the on-disk full-text-index
+sidecar (built at flush), so a row still in the memtable (not yet flushed) was
+invisible — exactly the immediate-insert-then-query case in the repro. Current
+`main` reads the memtable too; regression tests `fulltext_index_fts_match_end_to_end`
+and `fulltext_index_fts_match_reads_unflushed_memtable_row`
+(`ferrosa-cql/src/router.rs`) pass. Confirmed the bug still reproduces against
+the *deployed* (4-day-old) cluster — normal scan returned 1 row, `fts_match`
+returned 0 — because it predates the fix. Closes once the live cluster is
+rebuilt from current `main` (ops task t_0a12af4a).
 
 ---
 
