@@ -1,6 +1,41 @@
 # P0 Bug: Acknowledged CQL Writes Silently Lost
 
+> **STATUS: RESOLVED / CLOSED (2026-06-20).** Regression-checked against current
+> ferrosa `main`; both symptoms fixed. See **Resolution** below.
+
 **Filed:** 2026-04-01 | **GitHub:** ferrosadb/ferrosa#92 | **fmem entity:** 046819a9-15f0-48f7-83fa-85c1c2d3b13a
+
+## Resolution (2026-06-20)
+
+Regression-checked on the live 3-node podman cluster (current ferrosa `main`,
+`agent_memory` RF=3, ring fully formed):
+
+- **Symptom B — replication not working** (data on node1 not node2): **FIXED.**
+  200 inserts at `ConsistencyLevel.ALL` (which only acks when every one of the 3
+  replicas has applied the write) all succeeded; `SELECT COUNT(*)` at `ALL`
+  returned 200 immediately and again after 45 s — no silent loss, all replicas
+  agree.
+
+- **Symptom A — acknowledged writes lost across the standalone→pair→cluster
+  join**: **FIXED structurally in ferrosa.** The progressive-join window that
+  dropped unflushed/under-replicated data no longer exists:
+  - `ferrosa-cluster/src/streaming/receiver.rs` streams existing token ranges to
+    a joining node and applies them via `StorageEngine::write` (commit log +
+    memtable — the same durable path as normal writes).
+  - `ferrosa-cluster/src/controller/bootstrap/promote.rs` gates promotion on
+    `stream_completed`: a joining node does not become a NORMAL ring member (and
+    therefore an owner/coordinator for any range) until streaming has completed.
+    This eliminates the "new owner is empty → QUORUM reads miss data → count
+    drops to 0" window described below.
+
+The original report was against an ancient ferrosa (`fix/load-test-bugs`,
+`8a92c63`) whose progressive join predated bootstrap streaming. Closed on the
+in-place replication proof + the streaming/promotion-gate code evidence (a live
+cluster-restart reproduction was deemed unnecessary). If a deeper guarantee is
+ever wanted, add an automated cluster-restart durability test to CI.
+
+---
+
 
 ## What happened
 
