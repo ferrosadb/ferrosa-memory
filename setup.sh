@@ -12,6 +12,12 @@ Options:
       Agent hooks to install. Default: auto.
   --mcp-url URL
       MCP JSON-RPC endpoint. Default: http://127.0.0.1:18765/mcp.
+  --auth-header VALUE
+      Full Authorization header to persist for hooks (for example: 'Basic <base64>').
+  --mcp-user USER
+      HTTP Basic username to persist for hooks when the MCP endpoint requires auth.
+  --mcp-password PASSWORD
+      HTTP Basic password to persist for hooks when the MCP endpoint requires auth.
   --config PATH
       Ferrosa Memory config file for native service install.
       Default: .runtime/ferrosa-memory-http-18765.toml when present.
@@ -45,6 +51,9 @@ cd "$script_dir"
 harness="auto"
 mcp_url="${FERROSA_MEMORY_MCP_URL:-http://127.0.0.1:18765/mcp}"
 config_path="${FERROSA_MEMORY_CONFIG_FILE:-${script_dir}/.runtime/ferrosa-memory-http-18765.toml}"
+auth_header="${FERROSA_MEMORY_AUTH_HEADER:-}"
+mcp_user="${FERROSA_MEMORY_MCP_USER:-}"
+mcp_password="${FERROSA_MEMORY_MCP_PASSWORD:-}"
 skip_build=false
 skip_service=false
 apply_config=true
@@ -61,6 +70,21 @@ while [[ $# -gt 0 ]]; do
         --mcp-url)
             mcp_url="${2:-}"
             [[ -n "$mcp_url" ]] || die "--mcp-url requires a value"
+            shift 2
+            ;;
+        --auth-header)
+            auth_header="${2:-}"
+            [[ -n "$auth_header" ]] || die "--auth-header requires a value"
+            shift 2
+            ;;
+        --mcp-user)
+            mcp_user="${2:-}"
+            [[ -n "$mcp_user" ]] || die "--mcp-user requires a value"
+            shift 2
+            ;;
+        --mcp-password)
+            mcp_password="${2:-}"
+            [[ -n "$mcp_password" ]] || die "--mcp-password requires a value"
             shift 2
             ;;
         --config)
@@ -113,36 +137,92 @@ else
     log "skipping build"
 fi
 
+service_unmanaged=false
+
 if [[ "$skip_service" == false ]]; then
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-        [[ -f "$config_path" ]] || die "config file not found: $config_path"
-        log "installing/restarting macOS LaunchAgent"
-        FERROSA_MEMORY_CONFIG_FILE="$config_path" scripts/install-launch-agent-mcp.sh
-    else
-        log "native service auto-install is only implemented for macOS in this repo"
-        log "start ferrosa-memory-mcp with FERROSA_MEMORY_CONFIG=$config_path before using hooks"
-    fi
+    [[ -f "$config_path" ]] || die "config file not found: $config_path"
+    case "$(uname -s)" in
+        Darwin)
+            log "installing/restarting macOS LaunchAgent"
+            FERROSA_MEMORY_CONFIG_FILE="$config_path" scripts/install-launch-agent-mcp.sh
+            ;;
+        Linux)
+            if command -v systemctl >/dev/null 2>&1; then
+                unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+                unit_path="$unit_dir/ferrosa-memory-mcp.service"
+                binary_path="$script_dir/target/release/ferrosa-memory-mcp"
+                [[ -x "$binary_path" ]] || die "built binary not found or not executable: $binary_path"
+                mkdir -p "$unit_dir"
+                log "installing/restarting Linux systemd user service at $unit_path"
+                cat >"$unit_path" <<EOF_UNIT
+[Unit]
+Description=Ferrosa Memory MCP server
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$script_dir
+Environment=FERROSA_MEMORY_CONFIG=$config_path
+ExecStart=$binary_path
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+EOF_UNIT
+                systemctl --user daemon-reload
+                systemctl --user enable --now ferrosa-memory-mcp.service
+            else
+                service_unmanaged=true
+                log "systemd user services are not available; native Linux service auto-install was skipped"
+                log "manual start: FERROSA_MEMORY_CONFIG=$config_path $script_dir/target/release/ferrosa-memory-mcp"
+            fi
+            ;;
+        *)
+            service_unmanaged=true
+            log "native service auto-install is not implemented for $(uname -s)"
+            log "manual start: FERROSA_MEMORY_CONFIG=$config_path $script_dir/target/release/ferrosa-memory-mcp"
+            ;;
+    esac
 else
     log "skipping service install/restart"
 fi
 
 if [[ "$verify" == true ]]; then
     health_base="${mcp_url%/mcp}"
-    log "checking MCP liveness at ${health_base}/healthz/live"
-    for attempt in {1..30}; do
-        if curl -fsS "${health_base}/healthz/live" >/dev/null 2>&1; then
-            break
-        fi
-        if [[ "$attempt" -eq 30 ]]; then
-            die "MCP liveness check failed at ${health_base}/healthz/live"
-        fi
-        sleep 1
-    done
+    if [[ "$service_unmanaged" == true ]] && ! curl -fsS "${health_base}/healthz/live" >/dev/null 2>&1; then
+        log "MCP is not running and setup did not start a native service on this platform"
+        log "skipping MCP-dependent verification; start the service manually or rerun with --skip-service after it is live"
+        verify=false
+    else
+        log "checking MCP liveness at ${health_base}/healthz/live"
+        for attempt in {1..30}; do
+            if curl -fsS "${health_base}/healthz/live" >/dev/null 2>&1; then
+                break
+            fi
+            if [[ "$attempt" -eq 30 ]]; then
+                die "MCP liveness check failed at ${health_base}/healthz/live"
+            fi
+            sleep 1
+        done
+    fi
 else
     log "skipping MCP health verification"
 fi
 
 installer_args=(--harness "$harness" --mcp-url "$mcp_url")
+if [[ -n "$auth_header" ]]; then
+    installer_args+=(--auth-header "$auth_header")
+fi
+if [[ -n "$mcp_user" ]]; then
+    installer_args+=(--mcp-user "$mcp_user")
+fi
+if [[ -n "$mcp_password" ]]; then
+    installer_args+=(--mcp-password "$mcp_password")
+fi
+if [[ "$verify" == false ]]; then
+    installer_args+=(--skip-auth-check)
+fi
 if [[ "$apply_config" == false ]]; then
     installer_args+=(--no-apply-config)
 fi
