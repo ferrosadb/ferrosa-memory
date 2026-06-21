@@ -982,22 +982,30 @@ pub fn validate_shared_http_config(config: &Config) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let mut errors = Vec::new();
     if !config.server.require_tls && !is_loopback_bind_addr(&config.server.bind_addr) {
-        anyhow::bail!("HTTP transport requires TLS unless server.bind_addr is loopback-only");
+        errors.push("HTTP transport requires TLS unless server.bind_addr is loopback-only");
     }
     if config.server.require_tls
         && (config.server.cert_path.is_none() || config.server.key_path.is_none())
     {
-        anyhow::bail!("HTTP transport requires cert_path and key_path");
+        errors.push("HTTP transport requires cert_path and key_path");
     }
     if config.server.auth_file.is_none() {
-        anyhow::bail!("HTTP transport requires server.auth_file");
+        errors.push("HTTP transport requires server.auth_file");
     }
     if config.server.tenant_id.is_some() {
-        anyhow::bail!("HTTP transport must not use server.tenant_id fallback");
+        errors.push("HTTP transport must not use server.tenant_id fallback");
+    }
+    if config.viz.enabled && config.viz.tenant_id.is_none() {
+        errors.push("HTTP transport with viz.enabled = true requires [viz].tenant_id; set viz.enabled = false for headless HTTP mode");
     }
 
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("invalid HTTP transport config:\n- {}", errors.join("\n- "))
+    }
 }
 
 /// P0-11: process-wide counter of direct-loopback Ferrosa connections that
@@ -1598,6 +1606,8 @@ transport = "http"
 require_tls = true
 cert_path = "/etc/ssl/cert.pem"
 key_path = "/etc/ssl/key.pem"
+[viz]
+enabled = false
 "#;
         let config = parse_config(toml).unwrap();
         let err = validate_shared_http_config(&config).unwrap_err();
@@ -1616,10 +1626,34 @@ cert_path = "/etc/ssl/cert.pem"
 key_path = "/etc/ssl/key.pem"
 auth_file = "/etc/ferrosa/auth.toml"
 tenant_id = "00000000-0000-0000-0000-000000000001"
+[viz]
+enabled = false
 "#;
         let config = parse_config(toml).unwrap();
         let err = validate_shared_http_config(&config).unwrap_err();
         assert!(err.to_string().contains("tenant_id"));
+    }
+
+    #[test]
+    fn validate_shared_http_reports_all_missing_requirements_at_once() {
+        let toml = r#"
+[ferrosa]
+contact_points = ["localhost:19042"]
+[server]
+transport = "http"
+bind_addr = "0.0.0.0"
+require_tls = true
+tenant_id = "00000000-0000-0000-0000-000000000001"
+"#;
+        let config = parse_config(toml).unwrap();
+        let err = validate_shared_http_config(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid HTTP transport config"), "{err}");
+        assert!(err.contains("cert_path and key_path"), "{err}");
+        assert!(err.contains("server.auth_file"), "{err}");
+        assert!(err.contains("server.tenant_id fallback"), "{err}");
+        assert!(err.contains("[viz].tenant_id"), "{err}");
     }
 
     #[test]
@@ -1633,6 +1667,8 @@ require_tls = true
 cert_path = "/etc/ssl/cert.pem"
 key_path = "/etc/ssl/key.pem"
 auth_file = "/etc/ferrosa/auth.toml"
+[viz]
+enabled = false
 "#;
         let config = parse_config(toml).unwrap();
         validate_shared_http_config(&config).expect("shared http config should validate");
@@ -1648,6 +1684,8 @@ transport = "http"
 bind_addr = "127.0.0.1"
 require_tls = false
 auth_file = "/etc/ferrosa/auth.toml"
+[viz]
+enabled = false
 "#;
         let config = parse_config(toml).unwrap();
         validate_shared_http_config(&config).expect("loopback-only http config should validate");
@@ -1663,6 +1701,8 @@ transport = "http"
 bind_addr = "0.0.0.0"
 require_tls = false
 auth_file = "/etc/ferrosa/auth.toml"
+[viz]
+enabled = false
 "#;
         let config = parse_config(toml).unwrap();
         let err = validate_shared_http_config(&config).unwrap_err();
