@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 output_root="${FMEM_EVAL_OUTPUT_DIR:-${repo_root}/diagnostics/eval-runs/fusion-ablations-$(date -u +%Y%m%dT%H%M%SZ)}"
-profiles="${FMEM_EVAL_FUSION_PROFILES:-bm25-only semantic-only bm25-semantic bm25-semantic-phonetic bm25-semantic-phonetic-workspace all}"
+profiles="${FMEM_EVAL_FUSION_PROFILES:-bm25-only semantic-only bm25-semantic bm25-semantic-workspace bm25-semantic-phonetic bm25-semantic-phonetic-workspace all}"
 session_id="${FMEM_EVAL_BRIGHT_SESSION_ID:-00000000-0000-0000-0000-00000000b7f4}"
 split="${FMEM_EVAL_BRIGHT_SPLIT:-biology}"
 limit_examples="${FMEM_EVAL_LIMIT_EXAMPLES:-5}"
