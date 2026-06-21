@@ -134,6 +134,7 @@ impl FusionConfig {
                 config.zero_all();
                 config.context_bm25_weight = 1.5;
                 config.document_bm25_weight = 2.5;
+                config.phonetic_weight = 1.0;
                 config.ann_weight = 1.0;
                 config.fold_weight = 1.0;
                 config.context_ann_weight = 1.0;
@@ -2414,18 +2415,14 @@ mod tests {
         let list1 = vec![make_result(id1, "a", 1.0)];
         let list2 = vec![make_result(id2, "b", 1.0)];
 
-        // Zero weight on list1 means only list2 contributes
+        // Zero weight on list1 means only list2 contributes; disabled-source
+        // candidates must not survive as score-zero rows that later source-aware
+        // priors can resurrect.
         let merged = rrf_merge(vec![list1, list2], 60.0, &[0.0, 1.0]);
-        assert_eq!(merged.len(), 2);
-
-        // id1 should have score 0 (disabled), id2 should have 1/61
-        let id1_result = merged.iter().find(|r| r.id == id1).unwrap();
-        let id2_result = merged.iter().find(|r| r.id == id2).unwrap();
-        assert!((id1_result.score - 0.0).abs() < 1e-10);
-        assert!((id2_result.score - 1.0 / 61.0).abs() < 1e-10);
-
-        // id2 should rank first
+        assert_eq!(merged.len(), 1);
+        assert!(merged.iter().all(|r| r.id != id1));
         assert_eq!(merged[0].id, id2);
+        assert!((merged[0].score - 1.0 / 61.0).abs() < 1e-10);
     }
 
     #[test]

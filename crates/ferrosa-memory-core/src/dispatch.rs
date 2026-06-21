@@ -15564,7 +15564,19 @@ mod tests {
             "arguments": {
                 "session_id": sid.to_string(),
                 "query": "Alice",
-                "limit": 5
+                "limit": 5,
+                "fusion_profile": "all",
+                "fusion_weights": {
+                    "entity_phonetic": 1.0,
+                    "entity_ann": 0.0,
+                    "fold_ann": 0.0,
+                    "context_bm25": 0.0,
+                    "context_ann": 0.0,
+                    "document_bm25": 0.0,
+                    "document_ann": 0.0,
+                    "document_phonetic": 0.0,
+                    "datalog_frontier": 0.0
+                }
             }
         });
         let result = dispatch("tools/call", params, &store, &ctx, &session)
