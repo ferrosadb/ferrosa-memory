@@ -1667,8 +1667,8 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                     },
                     "fusion_profile": {
                         "type": "string",
-                        "enum": ["default", "all", "bm25-only", "semantic-only", "bm25-semantic", "bm25-semantic-phonetic", "bm25-semantic-phonetic-workspace"],
-                        "description": "Named source-weight profile for ablations. Defaults to all."
+                        "enum": ["auto", "default", "all", "bm25-only", "semantic-only", "bm25-semantic", "bm25-semantic-phonetic", "bm25-semantic-phonetic-workspace"],
+                        "description": "Named source-weight profile. Defaults to auto, which favors BM25+semantic sources and excludes broad phonetic corpus expansion. Use all/phonetic profiles for recall-heavy ablations."
                     },
                     "fusion_weights": {
                         "type": "object",
@@ -8956,7 +8956,7 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
     let fusion_profile = args
         .get("fusion_profile")
         .and_then(Value::as_str)
-        .unwrap_or("all");
+        .unwrap_or("auto");
     let mut fusion_config = crate::hybrid_search::FusionConfig::profile(fusion_profile)
         .ok_or_else(|| {
             (
@@ -15564,7 +15564,19 @@ mod tests {
             "arguments": {
                 "session_id": sid.to_string(),
                 "query": "Alice",
-                "limit": 5
+                "limit": 5,
+                "fusion_profile": "all",
+                "fusion_weights": {
+                    "entity_phonetic": 1.0,
+                    "entity_ann": 0.0,
+                    "fold_ann": 0.0,
+                    "context_bm25": 0.0,
+                    "context_ann": 0.0,
+                    "document_bm25": 0.0,
+                    "document_ann": 0.0,
+                    "document_phonetic": 0.0,
+                    "datalog_frontier": 0.0
+                }
             }
         });
         let result = dispatch("tools/call", params, &store, &ctx, &session)

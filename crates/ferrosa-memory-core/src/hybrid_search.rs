@@ -130,6 +130,17 @@ impl FusionConfig {
         let mut config = Self::default();
         match name {
             "default" | "all" => Some(config),
+            "auto" => {
+                config.zero_all();
+                config.context_bm25_weight = 1.5;
+                config.document_bm25_weight = 2.5;
+                config.phonetic_weight = 1.0;
+                config.ann_weight = 1.0;
+                config.fold_weight = 1.0;
+                config.context_ann_weight = 1.0;
+                config.document_ann_weight = 1.5;
+                Some(config)
+            }
             "bm25-only" => {
                 config.zero_all();
                 config.context_bm25_weight = 1.5;
@@ -272,6 +283,9 @@ fn rrf_merge(lists: Vec<Vec<SearchResult>>, k: f64, weights: &[f64]) -> Vec<Sear
     let mut scores: HashMap<Uuid, (f64, SearchResult)> = HashMap::new();
     for (list_idx, list) in lists.iter().enumerate() {
         let weight = weights.get(list_idx).copied().unwrap_or(1.0);
+        if weight <= 0.0 {
+            continue;
+        }
         for (rank, item) in list.iter().enumerate() {
             let rrf_score = weight / (k + rank as f64 + 1.0);
             scores
@@ -295,18 +309,71 @@ fn rrf_merge(lists: Vec<Vec<SearchResult>>, k: f64, weights: &[f64]) -> Vec<Sear
     merged
 }
 
+fn prune_disabled_source_lists(
+    lists: Vec<Vec<SearchResult>>,
+    weights: Vec<f64>,
+) -> (Vec<Vec<SearchResult>>, Vec<f64>) {
+    lists
+        .into_iter()
+        .zip(weights)
+        .filter(|(_, weight)| *weight > 0.0)
+        .unzip()
+}
+
+fn metadata_stub(content: &str) -> bool {
+    content.trim_start().starts_with("BOOK METADATA |")
+}
+
+fn bibliographic_query(query_terms: &HashSet<String>) -> bool {
+    query_terms.iter().any(|term| {
+        matches!(
+            term.as_str(),
+            "book"
+                | "books"
+                | "author"
+                | "authors"
+                | "metadata"
+                | "publisher"
+                | "published"
+                | "edition"
+                | "title"
+                | "titles"
+                | "corpus"
+        )
+    })
+}
+
+fn document_representative_better(candidate: &SearchResult, incumbent: &SearchResult) -> bool {
+    let candidate_metadata = metadata_stub(&candidate.content);
+    let incumbent_metadata = metadata_stub(&incumbent.content);
+    if candidate_metadata != incumbent_metadata {
+        return !candidate_metadata;
+    }
+    candidate.score > incumbent.score
+}
+
 fn collapse_duplicate_document_chunks(results: Vec<SearchResult>) -> Vec<SearchResult> {
-    let mut seen_documents = HashSet::new();
+    let mut document_slots: HashMap<Uuid, usize> = HashMap::new();
     let mut collapsed = Vec::with_capacity(results.len());
     for result in results {
         if result.result_type == "document_chunk"
             && let Some(document_id) = result.document_id
-            && !seen_documents.insert(document_id)
         {
-            continue;
+            if let Some(slot) = document_slots.get(&document_id).copied() {
+                if document_representative_better(&result, &collapsed[slot]) {
+                    collapsed[slot] = result;
+                }
+                continue;
+            }
+            document_slots.insert(document_id, collapsed.len());
         }
         collapsed.push(result);
     }
+    collapsed.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     collapsed
 }
 
@@ -472,6 +539,21 @@ fn source_is_datalog_frontier(source: &str) -> bool {
     source.starts_with("datalog_frontier:")
 }
 
+fn source_family_prior(result: &SearchResult) -> f64 {
+    match result.source.as_str() {
+        source if source_is_datalog_frontier(source) => 0.08,
+        "context_bm25" => 0.07,
+        "context_ann" => 0.04,
+        "entity_phonetic" => 0.04,
+        "entity_ann" => 0.03,
+        "fold_ann" => 0.03,
+        "document_bm25" => 0.0,
+        "document_ann" => -0.01,
+        "document_phonetic" => -0.07,
+        _ => 0.0,
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct CandidateEvidence {
     sources: HashSet<String>,
@@ -529,9 +611,11 @@ fn apply_source_aware_scoring(
     results: Vec<SearchResult>,
     evidence: &HashMap<Uuid, CandidateEvidence>,
 ) -> Vec<SearchResult> {
-    if relevance_terms(query).is_empty() {
+    let query_terms = relevance_terms(query);
+    if query_terms.is_empty() {
         return results;
     }
+    let bibliographic = bibliographic_query(&query_terms);
     let mut scored = Vec::with_capacity(results.len());
     for mut result in results {
         let Some(ev) = evidence.get(&result.id) else {
@@ -550,8 +634,21 @@ fn apply_source_aware_scoring(
             } else {
                 0.0
             };
-        result.score = (result.score + source_bonus + lexical_bonus + lexical_source_bonus
-            - ann_only_penalty)
+        let metadata_penalty = if result.result_type == "document_chunk"
+            && metadata_stub(&result.content)
+            && !bibliographic
+        {
+            0.18
+        } else {
+            0.0
+        };
+        result.score = (result.score
+            + source_bonus
+            + lexical_bonus
+            + lexical_source_bonus
+            + source_family_prior(&result)
+            - ann_only_penalty
+            - metadata_penalty)
             .max(0.0);
         scored.push(result);
     }
@@ -1488,6 +1585,7 @@ pub async fn hybrid_search_with_diagnostics(
         }
     }
 
+    let (lists, weights) = prune_disabled_source_lists(lists, weights);
     let diagnostics = candidate_source_stats(&lists, &weights, limit, source_limit);
     let evidence = collect_candidate_evidence(query, &lists);
     let mut merged = apply_authority_adjustments(
@@ -1909,6 +2007,71 @@ mod tests {
     }
 
     #[test]
+    fn source_aware_scoring_demotes_metadata_stubs_for_task_queries() {
+        let metadata_id = Uuid::new_v4();
+        let content_id = Uuid::new_v4();
+        let mut metadata = make_result(metadata_id, "document_bm25", 0.20);
+        metadata.result_type = "document_chunk".into();
+        metadata.memory_kind = "semantic".into();
+        metadata.content =
+            "BOOK METADATA | Title: Rust Web Development | Key topics: memory search cleanup"
+                .into();
+        let mut content = make_result(content_id, "context_bm25", 0.12);
+        content.result_type = "context_segment".into();
+        content.memory_kind = "episodic".into();
+        content.content = "memory search cleanup candidate pool source aware scoring".into();
+        let lists = vec![vec![metadata.clone()], vec![content.clone()]];
+        let evidence = collect_candidate_evidence("memory search cleanup", &lists);
+
+        let scored =
+            apply_source_aware_scoring("memory search cleanup", vec![metadata, content], &evidence);
+
+        assert_eq!(scored.first().map(|result| result.id), Some(content_id));
+    }
+
+    #[test]
+    fn source_aware_scoring_keeps_metadata_for_bibliographic_queries() {
+        let metadata_id = Uuid::new_v4();
+        let content_id = Uuid::new_v4();
+        let mut metadata = make_result(metadata_id, "document_bm25", 0.20);
+        metadata.result_type = "document_chunk".into();
+        metadata.content =
+            "BOOK METADATA | Title: Rust Web Development | Author: Karuna Murti".into();
+        let mut content = make_result(content_id, "context_bm25", 0.12);
+        content.content = "notes mention rust web development author reference".into();
+        let lists = vec![vec![metadata.clone()], vec![content.clone()]];
+        let evidence = collect_candidate_evidence("book author rust web development", &lists);
+
+        let scored = apply_source_aware_scoring(
+            "book author rust web development",
+            vec![metadata, content],
+            &evidence,
+        );
+
+        assert_eq!(scored.first().map(|result| result.id), Some(metadata_id));
+    }
+
+    #[test]
+    fn duplicate_document_collapse_prefers_content_chunk_over_metadata_stub() {
+        let document_id = Uuid::new_v4();
+        let metadata_id = Uuid::new_v4();
+        let content_id = Uuid::new_v4();
+        let mut metadata = make_result(metadata_id, "document_bm25", 0.40);
+        metadata.result_type = "document_chunk".into();
+        metadata.document_id = Some(document_id);
+        metadata.content = "BOOK METADATA | Title: Noisy Metadata".into();
+        let mut content = make_result(content_id, "document_bm25", 0.20);
+        content.result_type = "document_chunk".into();
+        content.document_id = Some(document_id);
+        content.content = "actual implementation detail for candidate cleanup".into();
+
+        let collapsed = collapse_duplicate_document_chunks(vec![metadata, content]);
+
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].id, content_id);
+    }
+
+    #[test]
     fn authority_adjustments_boost_positive_and_penalize_negative_reputation() {
         let trusted = Uuid::new_v4();
         let distrusted = Uuid::new_v4();
@@ -2003,6 +2166,42 @@ mod tests {
     }
 
     #[test]
+    fn rrf_merge_ignores_zero_weight_source_lists() {
+        let enabled = Uuid::new_v4();
+        let disabled = Uuid::new_v4();
+        let merged = rrf_merge(
+            vec![
+                vec![make_result(disabled, "document_phonetic", 1.0)],
+                vec![make_result(enabled, "document_bm25", 1.0)],
+            ],
+            60.0,
+            &[0.0, 1.0],
+        );
+
+        assert_eq!(
+            merged.iter().map(|result| result.id).collect::<Vec<_>>(),
+            vec![enabled]
+        );
+    }
+
+    #[test]
+    fn prune_disabled_source_lists_removes_zero_weight_evidence_sources() {
+        let enabled = Uuid::new_v4();
+        let disabled = Uuid::new_v4();
+        let (lists, weights) = prune_disabled_source_lists(
+            vec![
+                vec![make_result(disabled, "document_phonetic", 1.0)],
+                vec![make_result(enabled, "document_bm25", 1.0)],
+            ],
+            vec![0.0, 1.0],
+        );
+
+        assert_eq!(weights, vec![1.0]);
+        assert_eq!(lists.len(), 1);
+        assert_eq!(lists[0][0].id, enabled);
+    }
+
+    #[test]
     fn source_limit_defaults_to_bounded_double_limit() {
         assert_eq!(source_limit(10, None), 20);
         assert_eq!(source_limit(25, None), 50);
@@ -2016,6 +2215,13 @@ mod tests {
         assert!(bm25.context_bm25_weight > 0.0);
         assert_eq!(bm25.document_ann_weight, 0.0);
         assert_eq!(bm25.document_phonetic_weight, 0.0);
+
+        let auto = FusionConfig::profile("auto").unwrap();
+        assert!(auto.document_bm25_weight > 0.0);
+        assert!(auto.context_bm25_weight > 0.0);
+        assert!(auto.document_ann_weight > 0.0);
+        assert!(auto.context_ann_weight > 0.0);
+        assert_eq!(auto.document_phonetic_weight, 0.0);
 
         let semantic = FusionConfig::profile("semantic-only").unwrap();
         assert!(semantic.document_ann_weight > 0.0);
@@ -2209,18 +2415,14 @@ mod tests {
         let list1 = vec![make_result(id1, "a", 1.0)];
         let list2 = vec![make_result(id2, "b", 1.0)];
 
-        // Zero weight on list1 means only list2 contributes
+        // Zero weight on list1 means only list2 contributes; disabled-source
+        // candidates must not survive as score-zero rows that later source-aware
+        // priors can resurrect.
         let merged = rrf_merge(vec![list1, list2], 60.0, &[0.0, 1.0]);
-        assert_eq!(merged.len(), 2);
-
-        // id1 should have score 0 (disabled), id2 should have 1/61
-        let id1_result = merged.iter().find(|r| r.id == id1).unwrap();
-        let id2_result = merged.iter().find(|r| r.id == id2).unwrap();
-        assert!((id1_result.score - 0.0).abs() < 1e-10);
-        assert!((id2_result.score - 1.0 / 61.0).abs() < 1e-10);
-
-        // id2 should rank first
+        assert_eq!(merged.len(), 1);
+        assert!(merged.iter().all(|r| r.id != id1));
         assert_eq!(merged[0].id, id2);
+        assert!((merged[0].score - 1.0 / 61.0).abs() < 1e-10);
     }
 
     #[test]
