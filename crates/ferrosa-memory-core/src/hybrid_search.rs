@@ -130,6 +130,16 @@ impl FusionConfig {
         let mut config = Self::default();
         match name {
             "default" | "all" => Some(config),
+            "auto" => {
+                config.zero_all();
+                config.context_bm25_weight = 1.5;
+                config.document_bm25_weight = 2.5;
+                config.ann_weight = 1.0;
+                config.fold_weight = 1.0;
+                config.context_ann_weight = 1.0;
+                config.document_ann_weight = 1.5;
+                Some(config)
+            }
             "bm25-only" => {
                 config.zero_all();
                 config.context_bm25_weight = 1.5;
@@ -272,6 +282,9 @@ fn rrf_merge(lists: Vec<Vec<SearchResult>>, k: f64, weights: &[f64]) -> Vec<Sear
     let mut scores: HashMap<Uuid, (f64, SearchResult)> = HashMap::new();
     for (list_idx, list) in lists.iter().enumerate() {
         let weight = weights.get(list_idx).copied().unwrap_or(1.0);
+        if weight <= 0.0 {
+            continue;
+        }
         for (rank, item) in list.iter().enumerate() {
             let rrf_score = weight / (k + rank as f64 + 1.0);
             scores
@@ -293,6 +306,17 @@ fn rrf_merge(lists: Vec<Vec<SearchResult>>, k: f64, weights: &[f64]) -> Vec<Sear
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     merged
+}
+
+fn prune_disabled_source_lists(
+    lists: Vec<Vec<SearchResult>>,
+    weights: Vec<f64>,
+) -> (Vec<Vec<SearchResult>>, Vec<f64>) {
+    lists
+        .into_iter()
+        .zip(weights)
+        .filter(|(_, weight)| *weight > 0.0)
+        .unzip()
 }
 
 fn metadata_stub(content: &str) -> bool {
@@ -1560,6 +1584,7 @@ pub async fn hybrid_search_with_diagnostics(
         }
     }
 
+    let (lists, weights) = prune_disabled_source_lists(lists, weights);
     let diagnostics = candidate_source_stats(&lists, &weights, limit, source_limit);
     let evidence = collect_candidate_evidence(query, &lists);
     let mut merged = apply_authority_adjustments(
@@ -2140,6 +2165,42 @@ mod tests {
     }
 
     #[test]
+    fn rrf_merge_ignores_zero_weight_source_lists() {
+        let enabled = Uuid::new_v4();
+        let disabled = Uuid::new_v4();
+        let merged = rrf_merge(
+            vec![
+                vec![make_result(disabled, "document_phonetic", 1.0)],
+                vec![make_result(enabled, "document_bm25", 1.0)],
+            ],
+            60.0,
+            &[0.0, 1.0],
+        );
+
+        assert_eq!(
+            merged.iter().map(|result| result.id).collect::<Vec<_>>(),
+            vec![enabled]
+        );
+    }
+
+    #[test]
+    fn prune_disabled_source_lists_removes_zero_weight_evidence_sources() {
+        let enabled = Uuid::new_v4();
+        let disabled = Uuid::new_v4();
+        let (lists, weights) = prune_disabled_source_lists(
+            vec![
+                vec![make_result(disabled, "document_phonetic", 1.0)],
+                vec![make_result(enabled, "document_bm25", 1.0)],
+            ],
+            vec![0.0, 1.0],
+        );
+
+        assert_eq!(weights, vec![1.0]);
+        assert_eq!(lists.len(), 1);
+        assert_eq!(lists[0][0].id, enabled);
+    }
+
+    #[test]
     fn source_limit_defaults_to_bounded_double_limit() {
         assert_eq!(source_limit(10, None), 20);
         assert_eq!(source_limit(25, None), 50);
@@ -2153,6 +2214,13 @@ mod tests {
         assert!(bm25.context_bm25_weight > 0.0);
         assert_eq!(bm25.document_ann_weight, 0.0);
         assert_eq!(bm25.document_phonetic_weight, 0.0);
+
+        let auto = FusionConfig::profile("auto").unwrap();
+        assert!(auto.document_bm25_weight > 0.0);
+        assert!(auto.context_bm25_weight > 0.0);
+        assert!(auto.document_ann_weight > 0.0);
+        assert!(auto.context_ann_weight > 0.0);
+        assert_eq!(auto.document_phonetic_weight, 0.0);
 
         let semantic = FusionConfig::profile("semantic-only").unwrap();
         assert!(semantic.document_ann_weight > 0.0);
