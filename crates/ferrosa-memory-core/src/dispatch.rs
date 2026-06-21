@@ -1667,8 +1667,8 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                     },
                     "fusion_profile": {
                         "type": "string",
-                        "enum": ["auto", "default", "all", "bm25-only", "semantic-only", "bm25-semantic", "bm25-semantic-phonetic", "bm25-semantic-phonetic-workspace"],
-                        "description": "Named source-weight profile. Defaults to auto, which favors BM25+semantic sources and excludes broad phonetic corpus expansion. Use all/phonetic profiles for recall-heavy ablations."
+                        "enum": ["auto", "default", "all", "bm25-only", "semantic-only", "bm25-semantic", "bm25-semantic-workspace", "bm25-semantic-phonetic", "bm25-semantic-phonetic-workspace"],
+                        "description": "Named source-weight profile. Defaults to auto, which cheaply routes query intent to a fast effective profile. Use explicit profiles for deterministic ablations; use all/phonetic profiles for recall-heavy runs."
                     },
                     "fusion_weights": {
                         "type": "object",
@@ -8026,6 +8026,90 @@ async fn maybe_llm_rerank_results(
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AutoFusionSelection {
+    intent: &'static str,
+    profile: &'static str,
+}
+
+fn select_auto_fusion_profile(
+    query: &str,
+    filter: &crate::hybrid_search::SearchFilter,
+) -> AutoFusionSelection {
+    let lower = query.to_ascii_lowercase();
+    let tokens = lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let has_token = |candidates: &[&str]| tokens.iter().any(|token| candidates.contains(token));
+    let has_workspace = filter
+        .workspace_cwd
+        .as_deref()
+        .is_some_and(|cwd| !cwd.is_empty());
+
+    let exact_error_or_symbol = lower.contains("thread '")
+        || lower.contains("panicked at")
+        || lower.contains("traceback")
+        || lower.contains("exception")
+        || lower.contains("error[")
+        || lower.contains("no such file")
+        || lower.contains("undefined symbol")
+        || lower.contains("::")
+        || lower.contains("src/")
+        || lower.contains(".rs:")
+        || lower.contains(".py:")
+        || lower.contains(".ex:")
+        || lower.contains(".tsx:")
+        || lower.contains(".ts:");
+    if exact_error_or_symbol {
+        return AutoFusionSelection {
+            intent: "exact_error_or_symbol",
+            profile: "bm25-only",
+        };
+    }
+
+    let project_bug_or_build = has_workspace
+        && has_token(&[
+            "bug", "fix", "failing", "failed", "fail", "ci", "test", "tests", "build", "pr",
+            "branch", "merge", "deploy",
+        ]);
+    if project_bug_or_build {
+        return AutoFusionSelection {
+            intent: "project_bug_or_build",
+            profile: "bm25-semantic-workspace",
+        };
+    }
+
+    let corpus_reference_or_broad_semantic = [
+        "paper",
+        "corpus",
+        "reference",
+        "research",
+        "rlm",
+        "evermem",
+        "memscene",
+        "architecture",
+        "design",
+        "explain",
+        "compare",
+        "why ",
+        "how ",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    if corpus_reference_or_broad_semantic {
+        return AutoFusionSelection {
+            intent: "corpus_reference_or_broad_semantic",
+            profile: "bm25-semantic",
+        };
+    }
+
+    AutoFusionSelection {
+        intent: "default_balanced",
+        profile: "auto",
+    }
+}
+
 fn parse_hybrid_search_scope(
     args: &Value,
 ) -> Result<crate::hybrid_search::SearchScope, (i32, String)> {
@@ -8953,15 +9037,21 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         }
     }
 
-    let fusion_profile = args
+    let requested_fusion_profile = args
         .get("fusion_profile")
         .and_then(Value::as_str)
         .unwrap_or("auto");
+    let auto_fusion_selection = select_auto_fusion_profile(query, &filter);
+    let fusion_profile = if requested_fusion_profile == "auto" {
+        auto_fusion_selection.profile
+    } else {
+        requested_fusion_profile
+    };
     let mut fusion_config = crate::hybrid_search::FusionConfig::profile(fusion_profile)
         .ok_or_else(|| {
             (
                 INVALID_PARAMS,
-                format!("unknown fusion_profile: {fusion_profile}"),
+                format!("unknown fusion_profile: {requested_fusion_profile}"),
             )
         })?;
     if let Some(weights) = args.get("fusion_weights") {
@@ -9254,6 +9344,8 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         "chunk_expansion": chunk_expansion_report,
         "fusion": {
             "profile": fusion_profile,
+            "requested_profile": requested_fusion_profile,
+            "auto_intent": if requested_fusion_profile == "auto" { auto_fusion_selection.intent } else { "explicit" },
             "weights": fusion_config,
         },
     });
@@ -12745,6 +12837,40 @@ mod tests {
             parse_hybrid_search_scope(&serde_json::json!({"scope": "global"})).unwrap(),
             SearchScope::GlobalOnly,
         );
+    }
+
+    #[test]
+    fn auto_fusion_routes_exact_errors_to_lexical_profile() {
+        let filter = crate::hybrid_search::SearchFilter::default();
+        let selected = select_auto_fusion_profile(
+            "thread 'main' panicked at src/lib.rs:42: unwrap on None",
+            &filter,
+        );
+        assert_eq!(selected.intent, "exact_error_or_symbol");
+        assert_eq!(selected.profile, "bm25-only");
+    }
+
+    #[test]
+    fn auto_fusion_routes_project_bug_queries_to_workspace_profile() {
+        let filter = crate::hybrid_search::SearchFilter {
+            workspace_cwd: Some("/Users/bkearns/src/ferrosa-suite/ferrosa-memory".into()),
+            ..Default::default()
+        };
+        let selected =
+            select_auto_fusion_profile("why did the hybrid search CI test fail?", &filter);
+        assert_eq!(selected.intent, "project_bug_or_build");
+        assert_eq!(selected.profile, "bm25-semantic-workspace");
+    }
+
+    #[test]
+    fn auto_fusion_routes_broad_recall_to_clean_semantic_profile() {
+        let filter = crate::hybrid_search::SearchFilter::default();
+        let selected = select_auto_fusion_profile(
+            "explain the RLM and EverMemOS memory architecture",
+            &filter,
+        );
+        assert_eq!(selected.intent, "corpus_reference_or_broad_semantic");
+        assert_eq!(selected.profile, "bm25-semantic");
     }
 
     /// Extract the inner tool result from MCP CallToolResult wrapper.
@@ -17539,7 +17665,12 @@ mod tests {
                 "session_id": sid.to_string(),
                 "query": "Atlas Cache",
                 "cwd": cwd,
-                "limit": 2
+                "limit": 2,
+                // This test asserts feedback accounting/reranking over a fixed
+                // two-result entity set. Pin live judge rerank off so host-local
+                // judge availability cannot drop or reorder candidates before
+                // record_feedback sees them.
+                "rerank": false
             }
         });
         let result = dispatch("tools/call", search.clone(), &store, &ctx, &session)

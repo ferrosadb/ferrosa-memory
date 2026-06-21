@@ -165,6 +165,18 @@ impl FusionConfig {
                 config.document_ann_weight = 1.5;
                 Some(config)
             }
+            "bm25-semantic-workspace" => {
+                config.zero_all();
+                config.context_bm25_weight = 1.5;
+                config.document_bm25_weight = 2.5;
+                config.ann_weight = 1.0;
+                config.fold_weight = 1.0;
+                config.context_ann_weight = 1.0;
+                config.document_ann_weight = 1.5;
+                config.workspace_weight = 2.0;
+                config.datalog_frontier_weight = 4.0;
+                Some(config)
+            }
             "bm25-semantic-phonetic" => {
                 config.zero_all();
                 config.context_bm25_weight = 1.5;
@@ -2222,6 +2234,13 @@ mod tests {
         assert!(auto.document_ann_weight > 0.0);
         assert!(auto.context_ann_weight > 0.0);
         assert_eq!(auto.document_phonetic_weight, 0.0);
+
+        let workspace = FusionConfig::profile("bm25-semantic-workspace").unwrap();
+        assert!(workspace.document_bm25_weight > 0.0);
+        assert!(workspace.document_ann_weight > 0.0);
+        assert!(workspace.workspace_weight > 0.0);
+        assert!(workspace.datalog_frontier_weight > 0.0);
+        assert_eq!(workspace.document_phonetic_weight, 0.0);
 
         let semantic = FusionConfig::profile("semantic-only").unwrap();
         assert!(semantic.document_ann_weight > 0.0);
