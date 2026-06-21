@@ -171,6 +171,11 @@ def write_hook_env(
             "# Set FERROSA_MEMORY_HOOK_EMBED_MISSING=true after configuring an embedding provider.",
         ]
     ensure_env_line(lines, "FERROSA_MEMORY_MCP_URL", f"export FERROSA_MEMORY_MCP_URL={shell_quote(mcp_url)}", replace=True)
+    ensure_env_line(
+        lines,
+        "FERROSA_MEMORY_TENANT_ID",
+        "export FERROSA_MEMORY_TENANT_ID=${FERROSA_MEMORY_TENANT_ID:-00000000-0000-0000-0000-000000000001}",
+    )
     if auth_header is not None:
         ensure_env_line(lines, "FERROSA_MEMORY_AUTH_HEADER", f"export FERROSA_MEMORY_AUTH_HEADER={shell_quote(auth_header)}", replace=True)
     if mcp_user is not None:

@@ -101,6 +101,10 @@ class WriteHookEnvAuthTests(unittest.TestCase):
             "export FERROSA_MEMORY_HOOK_ALLOWED_KINDS=${FERROSA_MEMORY_HOOK_ALLOWED_KINDS:-episodic,procedural,semantic}",
             text,
         )
+        self.assertIn(
+            "export FERROSA_MEMORY_TENANT_ID=${FERROSA_MEMORY_TENANT_ID:-00000000-0000-0000-0000-000000000001}",
+            text,
+        )
 
 
 class AuthHeaderValidationTests(unittest.TestCase):

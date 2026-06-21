@@ -488,6 +488,34 @@ class RecallCompactionTests(unittest.TestCase):
         )
         self.assertIn("session_id", configure_call[1]["session_start"])
 
+    def test_ingest_turn_uses_config_example_tenant_by_default(self) -> None:
+        class IngestClient(FakeClient):
+            def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                self.calls.append((name, arguments))
+                if name == "configure":
+                    return tool_result({"session_id": "11111111-1111-1111-1111-111111111111"})
+                if name in {"ingest_entities", "ctx_ingest"}:
+                    return tool_result({"ok": True})
+                raise AssertionError(f"unexpected tool call: {name}")
+
+        args = Namespace(harness="generic", event="turn-end")
+        client = IngestClient()
+        payload = {
+            "prompt": "Remember the tenant default.",
+            "assistant_response": "Stored under the documented local tenant.",
+            "cwd": "/repo",
+            "session_id": "agent-session-1",
+        }
+
+        with patch.dict(os.environ, {}, clear=True):
+            self.module.ingest_turn(client, payload, args)
+
+        ingest_call = [call for call in client.calls if call[0] == "ingest_entities"][0]
+        self.assertEqual(
+            ingest_call[1]["tenant_id"],
+            "00000000-0000-0000-0000-000000000001",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

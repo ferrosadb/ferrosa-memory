@@ -31,7 +31,7 @@ from typing import Any
 
 
 DEFAULT_URL = "http://127.0.0.1:18765/mcp"
-DEFAULT_TENANT_ID = "9a5f8fbf-d842-4d30-8ea5-1aa931e618a8"
+DEFAULT_TENANT_ID = "00000000-0000-0000-0000-000000000001"
 DEFAULT_SESSION_ID = "00000000-0000-0000-0000-000000000000"
 RAW_CONTEXT_LINE = re.compile(r"^(?P<prefix>[A-Za-z_]+)\[\d+\]:\s*(?P<payload>\{.*\})$")
 RAW_CONTEXT_ANY_LINE = re.compile(r"^(?P<prefix>[A-Za-z_]+)\[\d+\]:\s*(?P<payload>.*)$")
