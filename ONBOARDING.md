@@ -56,24 +56,47 @@ Native binaries + local filesystem storage for the quickest single-user setup, D
 
 ---
 
-## Phase 1 — Setup script or manual repository checkout
+## Phase 1 — Hosted quick install or source checkout
 
-The fastest path is the hosted setup script. It downloads this onboarding file, optionally clones or updates the public repos, offers to pull the Nomic embedding model, and then hands the user to the selected LLM harness for the `onboard me` flow:
+Choose one setup path. Do not mix the hosted bootstrap command with a source
+checkout unless the user explicitly wants both.
+
+### Hosted quick install
+
+Use the hosted bootstrap for the fastest single-user setup on a machine without
+an existing checkout. The script is published from `ferrosadb.com`; it is not a
+file that should already exist in this repository checkout. It downloads this
+onboarding file, optionally clones or updates the public repos, offers to pull
+the Nomic embedding model, and then hands the user to the selected LLM harness
+for the `onboard me` flow:
 
 ```bash
 curl -fsSL https://ferrosadb.com/setup-memory.sh | bash
 ```
 
-`setup-memory.sh` should use this `ONBOARDING.md` as its source of truth for skills, hints, hooks, prompts, runtime choices, credentials, and ports. It should not require users to clone either repo manually unless they choose a source build or local development workflow.
+The hosted `setup-memory.sh` should use this `ONBOARDING.md` as its source of
+truth for skills, hints, hooks, prompts, runtime choices, credentials, and ports.
+It should not require users to clone either repo manually unless they choose a
+source build or local development workflow.
 
-If the user already has a repository checkout, use the repo-local setup script. It builds the MCP binary by default, installs/restarts the macOS LaunchAgent when available, writes Codex/Claude/Hermes hook wrappers, patches supported harness config files, and verifies the default MCP tool list includes `ingest`.
+### Source checkout setup
 
-The compact tool list should also include `edge` and `turn_chain`; use `all_tools` when a harness needs the full catalog.
+If the user already cloned `ferrosa-memory`, use the repo-local setup script from
+that checkout. This is the right path for contributors, local development, and
+anyone following instructions from inside the repository:
 
 ```bash
 cd ~/src/ferrosa-suite/ferrosa-memory
 ./setup.sh --harness auto
 ```
+
+The repo-local `./setup.sh` builds the MCP binary by default,
+installs/restarts the macOS LaunchAgent when available, writes
+Codex/Claude/Hermes hook wrappers, patches supported harness config files, and
+verifies the default MCP tool list includes `ingest`.
+
+The compact tool list should also include `edge` and `turn_chain`; use
+`all_tools` when a harness needs the full catalog.
 
 Common variants:
 
