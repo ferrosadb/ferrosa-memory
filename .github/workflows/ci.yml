@@ -604,6 +604,10 @@ jobs:
     steps:
       - name: Check all jobs passed
         run: |
+          # The fast stages are always required. `integration` (Cluster
+          # integration tests, ~45 min) only runs on pull_request + main; on a
+          # `merge_group` event it is intentionally skipped, so accept
+          # "skipped" there. On PR/main it always runs and must succeed.
           if [ "${{ needs.fmt-lint.result }}" != "success" ] || \
              [ "${{ needs.advisories.result }}" != "success" ] || \
              [ "${{ needs.build.result }}" != "success" ] || \
@@ -611,7 +615,8 @@ jobs:
              [ "${{ needs.complexity.result }}" != "success" ] || \
              [ "${{ needs.docs.result }}" != "success" ] || \
              [ "${{ needs.python-harness.result }}" != "success" ] || \
-             [ "${{ needs.integration.result }}" != "success" ]; then
+             { [ "${{ needs.integration.result }}" != "success" ] && \
+               [ "${{ needs.integration.result }}" != "skipped" ]; }; then
             echo "::error::One or more CI stages failed"
             exit 1
           fi
