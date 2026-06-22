@@ -68,13 +68,15 @@ Use the hosted bootstrap for the fastest single-user setup on a machine without 
 curl -fsSL https://ferrosadb.com/setup-memory.sh | bash
 ```
 
-The hosted `setup-memory.sh` uses this `ONBOARDING.md` as its source of truth for skills, hints, hooks, prompts, runtime choices, credentials, and ports. It does **not** require cloning either repo: hook installation works without a checkout by fetching the self-contained hook installer pinned to the release tag. Useful flags: `--no-clone` (skip the source checkout), `--harness auto|all|codex|claude|hermes|generic`, `--mcp-url <url>`, `--no-hooks` (skip hook install), `--no-nomic`, `--no-hermes`.
+The hosted `setup-memory.sh` uses this `ONBOARDING.md` as its source of truth for skills, hints, hooks, prompts, runtime choices, credentials, and ports. It does **not** require cloning either repo: hook installation works without a checkout by fetching the self-contained hook installer pinned to the release tag. Useful flags: `--no-clone` (skip the source checkout), `--harness auto|all|codex|claude|hermes|pi|generic`, `--mcp-url <url>`, `--no-hooks` (skip hook install), `--no-nomic`, `--no-hermes`.
+
+Supported harnesses: **Codex**, **Claude** (Desktop/Code), **Hermes**, and **Pi** ([pi.dev](https://pi.dev)). `--harness auto` detects which are installed and wires each. Codex/Claude/Hermes integrate by patching their hook config files; **Pi** has no hook-config file — instead the installer drops a self-loading TypeScript extension at `~/.pi/agent/extensions/ferrosa-memory.ts` that calls the same recall/ingest hooks on Pi's `before_agent_start` and `agent_end` lifecycle events. Remove it (or run `--no-hooks`) to disable.
 
 > Note: there are **two** scripts named `setup.sh`. The hosted `https://ferrosadb.com/setup.sh` installs only the **Ferrosa database** binary. The repo-local `./setup.sh` (below) is the **contributor** harness installer and exists only inside a source checkout. The hosted `setup-memory.sh` is what end users run; it does not depend on the repo-local `./setup.sh`.
 
 ### Source checkout setup
 
-If the user already cloned `ferrosa-memory`, use the repo-local setup script from that checkout — the right path for contributors, local development, and anyone following instructions from inside the repository. It builds the MCP binary by default, installs/restarts the macOS LaunchAgent when available, writes Codex/Claude/Hermes hook wrappers, patches supported harness config files, and verifies the default MCP tool list includes `ingest`:
+If the user already cloned `ferrosa-memory`, use the repo-local setup script from that checkout — the right path for contributors, local development, and anyone following instructions from inside the repository. It builds the MCP binary by default, installs/restarts the macOS LaunchAgent when available, writes Codex/Claude/Hermes/Pi hook wrappers, patches supported harness config files (or drops the Pi extension), and verifies the default MCP tool list includes `ingest`:
 
 ```bash
 cd ~/src/ferrosa-suite/ferrosa-memory
