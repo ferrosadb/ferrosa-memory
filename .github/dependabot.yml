@@ -39,3 +39,22 @@ updates:
     commit-message:
       prefix: "chore(deps)"
       include: "scope"
+    ignore:
+      # RustCrypto next-generation jump (aead 0.6 / digest 0.11 / rand_core 0.9).
+      # These majors can't be merged individually: aes-gcm / chacha20poly1305 only
+      # support aead 0.6 in their 0.11.0-rc releases, and release-candidate crypto
+      # must not enter the security-critical MaaS pack layer (pack_crypto.rs).
+      # Closed as unmergeable: #94 (rand), #95 (hkdf), #96 (aead). Do this as ONE
+      # coordinated upgrade once aes-gcm 0.11 + chacha20poly1305 0.11 + hkdf 0.13
+      # ship stable, then remove this ignore. Minor/patch still flow via
+      # cargo-minor-patch above.
+      - dependency-name: "aead"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "aes-gcm"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "chacha20poly1305"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "hkdf"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "rand"
+        update-types: ["version-update:semver-major"]
