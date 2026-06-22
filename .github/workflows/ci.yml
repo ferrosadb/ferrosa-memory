@@ -208,6 +208,9 @@ jobs:
   integration:
     name: Cluster integration tests
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read # pull the prebuilt ghcr.io/ferrosadb/ferrosa-test-node image
     # Runs on PRs, on main, AND on the merge-queue branch so the queue verifies
     # cluster integration on the actual merged result (catches cross-PR conflicts
     # that only surface when stacked PRs are combined).
@@ -223,22 +226,64 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-on-failure: false
-      - name: Clone ferrosa for cluster image
-        # ferrosa is the source of the Ferrosa server image used by the
-        # cluster. ferrosadb/ferrosa is public — anonymous HTTPS clone works
-        # without a token. clone-ferrosa-src.sh tries each candidate branch
-        # in order; a matched branch is kept only if it isn't strictly older
-        # than main (otherwise CI would build a cluster image missing every
-        # main-only fix — see run 25784440206 where a stale
-        # `chore/integrate-pr12-plus-pr10` mirror on ferrosadb/ferrosa
-        # swallowed the adjacency-write-retry fix). No match → fall back to
-        # main. Cross-repo work pushes a matching branch on ferrosadb/ferrosa.
+      - name: Provision ferrosa node image (prebuilt from GHCR, else build)
+        # ferrosa publishes a prebuilt binary image to GHCR on every main push
+        # (ghcr.io/ferrosadb/ferrosa-test-node:<sha>, built by COPYing release
+        # binaries — not a source compile). Pulling it skips a ~24-min from-
+        # source compile of the whole ferrosa workspace, then we tag it locally
+        # as `ferrosa-memory-node` (the name both compose files use).
+        #
+        # Fall back to building from source when a same-named ferrosa branch is
+        # under test (cross-repo change — the prebuilt main image wouldn't have
+        # it; clone-ferrosa-src.sh picks the matching branch) or when the image
+        # is unavailable (best-effort push skipped, or no package read access).
+        # The fallback makes this non-breaking: worst case == today's behaviour.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ./.github/scripts/clone-ferrosa-src.sh \
-            --remote https://github.com/ferrosadb/ferrosa.git \
-            --dest   /tmp/ferrosa-src \
-            --candidate "${GITHUB_HEAD_REF:-}" \
-            --candidate "${GITHUB_REF_NAME:-}"
+          set -uo pipefail
+          IMAGE="ghcr.io/ferrosadb/ferrosa-test-node"
+          LOCAL_TAG="ferrosa-memory-node"
+          retry() { local n=0; until "$@"; do n=$((n + 1)); [ "$n" -ge 5 ] && return 1; echo "retry ${n}/5 in 5s..."; sleep 5; done; }
+
+          build_from_source() {
+            echo "::notice::Building ferrosa node image from source"
+            ./.github/scripts/clone-ferrosa-src.sh \
+              --remote https://github.com/ferrosadb/ferrosa.git \
+              --dest /tmp/ferrosa-src \
+              --candidate "${GITHUB_HEAD_REF:-}" \
+              --candidate "${GITHUB_REF_NAME:-}"
+            docker build -t "$LOCAL_TAG" /tmp/ferrosa-src
+          }
+
+          # Cross-repo parity: if this PR is paired with a same-named ferrosa
+          # branch, build that branch instead of using the prebuilt main image.
+          paired=""
+          for c in "${GITHUB_HEAD_REF:-}" "${GITHUB_REF_NAME:-}"; do
+            [ -n "$c" ] || continue
+            # `main` is the prebuilt image's own source — not a paired *feature*
+            # branch. Skip it so pushes to main and the merge queue still pull.
+            [ "$c" = "main" ] && continue
+            if git ls-remote --exit-code --heads https://github.com/ferrosadb/ferrosa.git "$c" >/dev/null 2>&1; then
+              paired="$c"; break
+            fi
+          done
+
+          if [ -n "$paired" ]; then
+            echo "::notice::ferrosa branch '${paired}' exists — building from source for cross-repo parity"
+            build_from_source
+          else
+            SHA="$(gh api repos/ferrosadb/ferrosa/commits/main --jq '.sha' 2>/dev/null || true)"
+            if [ -n "$SHA" ] \
+              && echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null 2>&1 \
+              && retry docker pull "${IMAGE}:${SHA}"; then
+              docker tag "${IMAGE}:${SHA}" "$LOCAL_TAG"
+              echo "::notice::Using prebuilt ${IMAGE}:${SHA} (skipped the ~24-min ferrosa compile)"
+            else
+              echo "::warning::Prebuilt ferrosa image unavailable — falling back to a source build"
+              build_from_source
+            fi
+          fi
       - name: Bring up 3-node cluster on ports 19042-19044
         run: |
           # Write a CI compose that maps 9042→19042 etc. so tests that hardcode
@@ -269,9 +314,7 @@ jobs:
                        echo 'bucket ferrosa-test ready'"
               restart: "no"
             node1:
-              build:
-                context: /tmp/ferrosa-src
-                dockerfile: Dockerfile
+              image: ferrosa-memory-node
               depends_on:
                 rustfs-init:
                   condition: service_completed_successfully
@@ -301,9 +344,7 @@ jobs:
                 retries: 30
                 start_period: 20s
             node2:
-              build:
-                context: /tmp/ferrosa-src
-                dockerfile: Dockerfile
+              image: ferrosa-memory-node
               depends_on:
                 node1:
                   condition: service_healthy
@@ -331,9 +372,7 @@ jobs:
                 retries: 30
                 start_period: 20s
             node3:
-              build:
-                context: /tmp/ferrosa-src
-                dockerfile: Dockerfile
+              image: ferrosa-memory-node
               depends_on:
                 node1:
                   condition: service_healthy
@@ -363,7 +402,7 @@ jobs:
                 retries: 30
                 start_period: 20s
           CEOF
-          docker compose -f /tmp/docker-compose.memory-ci.yml up -d --build
+          docker compose -f /tmp/docker-compose.memory-ci.yml up -d
       - name: Wait for all 3 nodes on 19042-19044
         run: |
           for port in 19042 19043 19044; do
@@ -478,10 +517,9 @@ jobs:
         # +500-port-offset compose for exactly this — bring it up
         # alongside the main cluster.
         run: |
-          # The compose file references `image: ferrosa-memory-node`
-          # (no build context), so build it once from the cloned
-          # ferrosa source first.
-          docker build -t ferrosa-memory-node /tmp/ferrosa-src
+          # The compose file references `image: ferrosa-memory-node`, which the
+          # "Provision ferrosa node image" step already tagged (from the prebuilt
+          # GHCR image, or a source build fallback). No rebuild needed here.
           # Compose uses ~/data/ferrosa-memory-test/{minio,node1,..}
           # — make sure the dirs exist on the runner.
           mkdir -p \
