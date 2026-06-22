@@ -11,6 +11,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Required check must also report on the merge-queue branch.
+  merge_group:
 
 permissions:
   contents: read
