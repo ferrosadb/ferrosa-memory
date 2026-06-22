@@ -58,17 +58,19 @@ Native binaries + local filesystem storage for the quickest single-user setup, D
 
 ## Phase 1 — Setup script or manual repository checkout
 
-The fastest path is the hosted setup script. It downloads this onboarding file, optionally clones or updates the public repos, offers to pull the Nomic embedding model, and then hands the user to the selected LLM harness for the `onboard me` flow:
+The fastest path is the hosted setup script. It installs the prebuilt binaries, downloads this onboarding file, **installs the LLM-harness hooks** (session-start / recall / turn-finalization), optionally clones or updates the public repos, offers to pull the Nomic embedding model, and then hands the user to the selected LLM harness for the `onboard me` flow:
 
 ```bash
 curl -fsSL https://ferrosadb.com/setup-memory.sh | bash
 ```
 
-`setup-memory.sh` should use this `ONBOARDING.md` as its source of truth for skills, hints, hooks, prompts, runtime choices, credentials, and ports. It should not require users to clone either repo manually unless they choose a source build or local development workflow.
+`setup-memory.sh` uses this `ONBOARDING.md` as its source of truth for skills, hints, hooks, prompts, runtime choices, credentials, and ports. It does **not** require cloning either repo: hook installation works without a checkout by fetching the self-contained hook installer pinned to the release tag. Useful flags: `--no-clone` (skip the source checkout), `--harness auto|all|codex|claude|hermes|generic`, `--mcp-url <url>`, `--no-hooks` (skip hook install), `--no-nomic`, `--no-hermes`.
 
-If the user already has a repository checkout, use the repo-local setup script. It builds the MCP binary by default, installs/restarts the macOS LaunchAgent when available, writes Codex/Claude/Hermes hook wrappers, patches supported harness config files, and verifies the default MCP tool list includes `ingest`.
+> Note: there are **two** scripts named `setup.sh`. The hosted `https://ferrosadb.com/setup.sh` installs only the **Ferrosa database** binary. The repo-local `./setup.sh` (below) is the **contributor** harness installer and exists only inside a source checkout. The hosted `setup-memory.sh` is what end users run; it does not depend on the repo-local `./setup.sh`.
 
 The compact tool list should also include `edge` and `turn_chain`; use `all_tools` when a harness needs the full catalog.
+
+For contributors with a source checkout, the repo-local setup script builds the MCP binary, installs/restarts the macOS LaunchAgent when available, writes Codex/Claude/Hermes hook wrappers, patches supported harness config files, and verifies the default MCP tool list includes `ingest`:
 
 ```bash
 cd ~/src/ferrosa-suite/ferrosa-memory
@@ -145,11 +147,29 @@ Use this for the smallest single-user setup. It avoids Compose and S3-compatible
 ~/.ferrosa/bin/ferrosa-memory-mcp --help
 ```
 
-If `setup.sh` was not used, fetch the binaries explicitly:
+If the hosted setup scripts were not used, install both directly. The memory
+script installs the binary **and** the harness hooks without a checkout
+(`--no-clone` skips only the optional source clone, not the hooks):
 
 ```bash
 curl -fsSL https://ferrosadb.com/setup.sh | bash -s -- --no-service --no-password
 curl -fsSL https://ferrosadb.com/setup-memory.sh | bash -s -- --no-clone --no-nomic --no-hermes
+```
+
+To (re)install the harness hooks by themselves — e.g. after switching harnesses
+— the simplest path is to re-run `setup-memory.sh` (it is idempotent). To run
+the installer directly, fetch **both** of its self-contained files (the wrappers
+reference the turn hook by path, so it must live somewhere stable) pinned to
+your installed version `$VER`:
+
+```bash
+VER=$(curl -fsSL https://ferrosadb.com/LATEST | tr -d '[:space:]')
+RAW="https://raw.githubusercontent.com/ferrosadb/ferrosa-memory/${VER}"
+DEST="$HOME/.ferrosa/share/ferrosa-memory"
+mkdir -p "$DEST/scripts/hooks"
+curl -fsSL "$RAW/scripts/install-agent-hooks.py"            -o "$DEST/scripts/install-agent-hooks.py"
+curl -fsSL "$RAW/scripts/hooks/ferrosa-memory-turn-hook.py" -o "$DEST/scripts/hooks/ferrosa-memory-turn-hook.py"
+( cd "$DEST" && python3 scripts/install-agent-hooks.py --harness auto --mcp-url http://127.0.0.1:18765/mcp )
 ```
 
 A native setup still needs a Ferrosa node listening on CQL and graph ports, plus a Ferrosa Memory config pointing at those ports. Both setup scripts drop example configs at `~/.ferrosa/config/{ferrosa,ferrosa-memory}.toml`. Keep data under the user-selected data directory, for example:
