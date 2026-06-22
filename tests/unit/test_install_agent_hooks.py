@@ -270,5 +270,60 @@ class MainAuthPreflightTests(unittest.TestCase):
         self.assertEqual(rc, 0)
 
 
+class PiHarnessTests(unittest.TestCase):
+    def setUp(self):
+        self.module = load_installer()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_pi_is_a_known_harness(self):
+        self.assertIn("pi", self.module.selected_harnesses("all"))
+        self.assertEqual(self.module.selected_harnesses("pi"), ["pi"])
+
+    def test_pi_wrapper_format_is_plain(self):
+        # The Pi extension feeds plain {prompt,response} JSON; the turn hook
+        # treats `pi` as a generic harness.
+        self.assertEqual(self.module.wrapper_format("pi"), "plain")
+
+    def test_create_wrappers_generates_pi_scripts(self):
+        install_dir = Path(self.tmp.name) / "hooks"
+        wrappers = self.module.create_wrappers(
+            install_dir, Path("/fake/hook.py"), "http://127.0.0.1:18765/mcp", ["pi"]
+        )
+        self.assertIn("pi", wrappers)
+        for key in ("session_start", "recall", "ingest_turn"):
+            self.assertTrue(Path(wrappers["pi"][key]).exists())
+        # The Pi wrappers invoke the turn hook with --harness pi.
+        recall_body = Path(wrappers["pi"]["recall"]).read_text()
+        self.assertIn("--harness pi", recall_body)
+
+    def test_install_pi_extension_writes_substituted_extension(self):
+        ext_dir = Path(self.tmp.name) / ".pi" / "agent" / "extensions"
+        pi_wrappers = {
+            "session_start": "/h/pi-session-start.sh",
+            "recall": "/h/pi-recall.sh",
+            "ingest_turn": "/h/pi-ingest-turn.sh",
+        }
+        msg = self.module.install_pi_extension(pi_wrappers, dry_run=False, extensions_dir=ext_dir)
+        target = ext_dir / "ferrosa-memory.ts"
+        self.assertTrue(target.exists())
+        self.assertIn(str(target), msg)
+        body = target.read_text()
+        # Wrapper paths are substituted as JSON string literals, and the Pi
+        # lifecycle events the extension subscribes to are present.
+        self.assertIn('"/h/pi-recall.sh"', body)
+        self.assertIn('"/h/pi-ingest-turn.sh"', body)
+        self.assertIn("before_agent_start", body)
+        self.assertIn("agent_end", body)
+        self.assertNotIn("__RECALL_WRAPPER__", body)
+
+    def test_install_pi_extension_dry_run_writes_nothing(self):
+        ext_dir = Path(self.tmp.name) / ".pi" / "agent" / "extensions"
+        pi_wrappers = {"session_start": "/h/s.sh", "recall": "/h/r.sh", "ingest_turn": "/h/i.sh"}
+        msg = self.module.install_pi_extension(pi_wrappers, dry_run=True, extensions_dir=ext_dir)
+        self.assertIn("Dry run", msg)
+        self.assertFalse((ext_dir / "ferrosa-memory.ts").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

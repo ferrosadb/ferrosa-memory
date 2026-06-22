@@ -963,7 +963,11 @@ def emit_context(context: str, output_format: str, event: str) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["session-start", "recall", "ingest-turn"], default="recall")
-    parser.add_argument("--harness", choices=["codex", "claude", "hermes", "generic"], default="generic")
+    parser.add_argument(
+        "--harness",
+        choices=["codex", "claude", "hermes", "pi", "generic"],
+        default="generic",
+    )
     parser.add_argument("--event", default="")
     parser.add_argument("--format", choices=["plain", "codex-json", "hermes-json"], default="plain")
     parser.add_argument("--mcp-url", default=os.environ.get("FERROSA_MEMORY_MCP_URL", DEFAULT_URL))
