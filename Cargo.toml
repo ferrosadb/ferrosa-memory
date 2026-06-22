@@ -40,7 +40,7 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 # hashing elsewhere); the AEAD stack must use its own self-consistent digest.
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
-hkdf = "0.12"
+hkdf = "0.13"
 sha2_kdf = { package = "sha2", version = "0.10" }
 aead = { version = "0.5", features = ["alloc"] }
 zeroize = { version = "1", features = ["derive"] }
