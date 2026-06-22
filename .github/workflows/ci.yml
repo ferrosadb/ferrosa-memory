@@ -216,7 +216,9 @@ jobs:
     # that only surface when stacked PRs are combined).
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.ref == 'refs/heads/main'
     needs: build
-    timeout-minutes: 45
+    # The cluster job routinely completes its tests near the old 45m cap;
+    # leave teardown/log collection headroom so a passing suite is not marked cancelled.
+    timeout-minutes: 60
     defaults:
       run:
         shell: bash
