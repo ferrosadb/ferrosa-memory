@@ -208,7 +208,10 @@ jobs:
   integration:
     name: Cluster integration tests
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    # Runs on PRs, on main, AND on the merge-queue branch so the queue verifies
+    # cluster integration on the actual merged result (catches cross-PR conflicts
+    # that only surface when stacked PRs are combined).
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.ref == 'refs/heads/main'
     needs: build
     timeout-minutes: 45
     defaults:
@@ -604,10 +607,6 @@ jobs:
     steps:
       - name: Check all jobs passed
         run: |
-          # The fast stages are always required. `integration` (Cluster
-          # integration tests, ~45 min) only runs on pull_request + main; on a
-          # `merge_group` event it is intentionally skipped, so accept
-          # "skipped" there. On PR/main it always runs and must succeed.
           if [ "${{ needs.fmt-lint.result }}" != "success" ] || \
              [ "${{ needs.advisories.result }}" != "success" ] || \
              [ "${{ needs.build.result }}" != "success" ] || \
@@ -615,8 +614,7 @@ jobs:
              [ "${{ needs.complexity.result }}" != "success" ] || \
              [ "${{ needs.docs.result }}" != "success" ] || \
              [ "${{ needs.python-harness.result }}" != "success" ] || \
-             { [ "${{ needs.integration.result }}" != "success" ] && \
-               [ "${{ needs.integration.result }}" != "skipped" ]; }; then
+             [ "${{ needs.integration.result }}" != "success" ]; then
             echo "::error::One or more CI stages failed"
             exit 1
           fi
