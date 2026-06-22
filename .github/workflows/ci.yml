@@ -208,7 +208,10 @@ jobs:
   integration:
     name: Cluster integration tests
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    # Runs on PRs, on main, AND on the merge-queue branch so the queue verifies
+    # cluster integration on the actual merged result (catches cross-PR conflicts
+    # that only surface when stacked PRs are combined).
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.ref == 'refs/heads/main'
     needs: build
     timeout-minutes: 45
     defaults:
