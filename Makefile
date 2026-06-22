@@ -1,10 +1,23 @@
-.PHONY: test-unit test-contracts test-integration test-system test-property \
+.PHONY: build-podman test-unit test-contracts test-integration test-system test-property \
 	test-security test-load test-load-smoke test-duration test-baseline \
 	test-live test-all test-coverage-gap
 
 PYTHON ?= python3
 PIP ?= $(PYTHON) -m pip
 PYTEST ?= $(PYTHON) -m pytest
+PODMAN ?= podman
+PODMAN_BUILD_IMAGE ?= docker.io/library/rust:1
+
+build-podman:
+	command -v $(PODMAN) >/dev/null
+	mkdir -p "$(HOME)/.cargo/registry"
+	$(PODMAN) run --rm \
+		-v "$(CURDIR)":/work \
+		-v "$(HOME)/.cargo/registry":/usr/local/cargo/registry \
+		-w /work \
+		-e CARGO_TARGET_DIR=/work/target-podman-linux \
+		$(PODMAN_BUILD_IMAGE) \
+		bash -lc '. /usr/local/cargo/env && export DEBIAN_FRONTEND=noninteractive && apt-get update -qq && apt-get install -y --no-install-recommends cmake >/dev/null && cargo build --release -p ferrosa-memory-mcp'
 
 test-unit:
 	cargo test --workspace --lib

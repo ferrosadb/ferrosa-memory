@@ -1,9 +1,35 @@
-target/
+# VCS and editor state
 .git/
 .claude/
 .vscode/
-*.log
-node_modules/
 **/.hermes/
-**/tmp/
+
+# Local secrets and generated runtime config
+.runtime/
+.env
+.env.*
+
+# Build outputs. Keep the container-specific MCP binary because Containerfile
+# copies it directly from target-podman-linux/release/ferrosa-memory-mcp.
+target/
+target-podman-linux/*
+!target-podman-linux/release/
+target-podman-linux/release/*
+!target-podman-linux/release/ferrosa-memory-mcp
 coverage/
+
+# Local Python/eval caches can be huge and are not part of the image.
+.eval-corpus/
+.venv/
+venv/
+**/.venv/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# JS/dev caches and logs
+node_modules/
+*.log
+**/tmp/

@@ -234,7 +234,8 @@ Docker:
 ```bash
 cd ~/src/ferrosa-suite/ferrosa-memory
 scripts/init-runtime.sh
-make build-podman-binary
+make build-podman
+docker compose build ferrosa-memory-mcp
 docker compose up -d
 ```
 
@@ -243,7 +244,8 @@ Podman:
 ```bash
 cd ~/src/ferrosa-suite/ferrosa-memory
 scripts/init-runtime.sh
-make build-podman-binary
+make build-podman
+podman compose build ferrosa-memory-mcp
 podman compose up -d
 ```
 
