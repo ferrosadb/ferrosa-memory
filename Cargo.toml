@@ -44,7 +44,7 @@ hkdf = "0.12"
 sha2_kdf = { package = "sha2", version = "0.10" }
 aead = { version = "0.5", features = ["alloc"] }
 zeroize = { version = "1", features = ["derive"] }
-rand = "0.8"
+rand = "0.9"
 
 # MaaS P2P WebRTC transport (ferrosa-memory-sync, behind the `webrtc-transport`
 # feature so non-P2P builds don't pull the ICE/DTLS/SCTP/SRTP tree). Provides
