@@ -8047,6 +8047,8 @@ fn select_auto_fusion_profile(
         .as_deref()
         .is_some_and(|cwd| !cwd.is_empty());
 
+    // 1. Exact error / symbol — a pasted stack trace, file:line, or code
+    //    syntax. Exact tokens must match, so route to a lexical-only profile.
     let exact_error_or_symbol = lower.contains("thread '")
         || lower.contains("panicked at")
         || lower.contains("traceback")
@@ -8054,13 +8056,13 @@ fn select_auto_fusion_profile(
         || lower.contains("error[")
         || lower.contains("no such file")
         || lower.contains("undefined symbol")
-        || lower.contains("::")
         || lower.contains("src/")
         || lower.contains(".rs:")
         || lower.contains(".py:")
         || lower.contains(".ex:")
         || lower.contains(".tsx:")
-        || lower.contains(".ts:");
+        || lower.contains(".ts:")
+        || looks_like_code(&lower);
     if exact_error_or_symbol {
         return AutoFusionSelection {
             intent: "exact_error_or_symbol",
@@ -8068,10 +8070,42 @@ fn select_auto_fusion_profile(
         };
     }
 
+    // 2. Session memory — conversational/temporal recall of recent work. Gated
+    //    on explicit deixis, NOT on scope (which defaults to SessionOnly), so
+    //    it doesn't swallow ordinary queries.
+    let session_recall = has_token(&["yesterday", "earlier", "recently"])
+        || lower.contains("last session")
+        || lower.contains("working on")
+        || lower.contains("we discussed")
+        || lower.contains("we decided")
+        || lower.contains("what were we")
+        || lower.contains("what did we")
+        || lower.contains("were we working");
+    if session_recall {
+        return AutoFusionSelection {
+            intent: "session_memory",
+            profile: "session-semantic",
+        };
+    }
+
+    // 3. Project bug / build — a workspace-scoped engineering failure.
     let project_bug_or_build = has_workspace
         && has_token(&[
-            "bug", "fix", "failing", "failed", "fail", "ci", "test", "tests", "build", "pr",
-            "branch", "merge", "deploy",
+            "bug",
+            "fix",
+            "failing",
+            "failed",
+            "fail",
+            "ci",
+            "test",
+            "tests",
+            "build",
+            "pr",
+            "branch",
+            "merge",
+            "deploy",
+            "regression",
+            "flaky",
         ]);
     if project_bug_or_build {
         return AutoFusionSelection {
@@ -8080,26 +8114,48 @@ fn select_auto_fusion_profile(
         };
     }
 
-    let corpus_reference_or_broad_semantic = [
+    // 4. Corpus reference — points at the document corpus (papers, citations).
+    let corpus_reference = has_token(&[
         "paper",
+        "papers",
+        "citation",
+        "cite",
+        "doi",
+        "author",
+        "bibliography",
         "corpus",
-        "reference",
-        "research",
-        "rlm",
-        "evermem",
-        "memscene",
+        "book",
+    ]);
+    if corpus_reference {
+        return AutoFusionSelection {
+            intent: "corpus_reference",
+            profile: "corpus-reference",
+        };
+    }
+
+    // 5. Broad semantic — conceptual / explanatory recall. Lean semantic to
+    //    avoid the noisy bm25-only candidates the eval flagged.
+    let broad_semantic = [
         "architecture",
         "design",
         "explain",
         "compare",
+        "overview",
+        "summarize",
+        "rlm",
+        "evermem",
+        "memscene",
+        "research",
+        "reference",
         "why ",
         "how ",
+        "what is",
     ]
     .iter()
     .any(|needle| lower.contains(needle));
-    if corpus_reference_or_broad_semantic {
+    if broad_semantic {
         return AutoFusionSelection {
-            intent: "corpus_reference_or_broad_semantic",
+            intent: "broad_semantic",
             profile: "bm25-semantic",
         };
     }
@@ -8108,6 +8164,21 @@ fn select_auto_fusion_profile(
         intent: "default_balanced",
         profile: "auto",
     }
+}
+
+/// Cheap heuristic: does the query contain code-like syntax that prose rarely
+/// does? Strengthens exact-error/symbol routing for bare identifiers like
+/// `GraphClient::reconnecting_storage()` that carry no stack-trace markers.
+fn looks_like_code(lower: &str) -> bool {
+    lower.contains("->")
+        || lower.contains("=>")
+        || lower.contains("::")
+        || lower.contains("();")
+        // a function-call shape: an identifier char immediately followed by '('
+        || lower
+            .as_bytes()
+            .windows(2)
+            .any(|w| (w[0] as char).is_ascii_alphanumeric() && w[1] == b'(')
 }
 
 fn parse_hybrid_search_scope(
@@ -12869,8 +12940,61 @@ mod tests {
             "explain the RLM and EverMemOS memory architecture",
             &filter,
         );
-        assert_eq!(selected.intent, "corpus_reference_or_broad_semantic");
+        assert_eq!(selected.intent, "broad_semantic");
         assert_eq!(selected.profile, "bm25-semantic");
+    }
+
+    #[test]
+    fn auto_fusion_routes_session_recall_to_session_profile() {
+        let filter = crate::hybrid_search::SearchFilter::default();
+        let selected =
+            select_auto_fusion_profile("what were we working on earlier in this session", &filter);
+        assert_eq!(selected.intent, "session_memory");
+        assert_eq!(selected.profile, "session-semantic");
+        // The named profile must resolve to real weights.
+        assert!(crate::hybrid_search::FusionConfig::profile("session-semantic").is_some());
+    }
+
+    #[test]
+    fn auto_fusion_separates_corpus_reference_from_broad_semantic() {
+        let filter = crate::hybrid_search::SearchFilter::default();
+
+        let corpus = select_auto_fusion_profile("find the EverMemOS paper citation", &filter);
+        assert_eq!(corpus.intent, "corpus_reference");
+        assert_eq!(corpus.profile, "corpus-reference");
+        assert!(crate::hybrid_search::FusionConfig::profile("corpus-reference").is_some());
+
+        let broad = select_auto_fusion_profile("explain how reciprocal rank fusion works", &filter);
+        assert_eq!(broad.intent, "broad_semantic");
+        assert_eq!(broad.profile, "bm25-semantic");
+    }
+
+    #[test]
+    fn auto_fusion_code_token_density_triggers_exact_error() {
+        let filter = crate::hybrid_search::SearchFilter::default();
+        // No stack-trace markers, but `::` + a call shape => code.
+        let selected = select_auto_fusion_profile("GraphClient::reconnecting_storage()", &filter);
+        assert_eq!(selected.intent, "exact_error_or_symbol");
+        assert_eq!(selected.profile, "bm25-only");
+    }
+
+    #[test]
+    fn auto_fusion_project_bug_requires_workspace() {
+        // Same bug-flavored query: workspace present => project_bug; absent =>
+        // it must NOT be misrouted to the workspace profile.
+        let bug_query = "the integration build keeps failing";
+        let with_ws = select_auto_fusion_profile(
+            bug_query,
+            &crate::hybrid_search::SearchFilter {
+                workspace_cwd: Some("/repo".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(with_ws.intent, "project_bug_or_build");
+
+        let without_ws =
+            select_auto_fusion_profile(bug_query, &crate::hybrid_search::SearchFilter::default());
+        assert_ne!(without_ws.intent, "project_bug_or_build");
     }
 
     /// Extract the inner tool result from MCP CallToolResult wrapper.
