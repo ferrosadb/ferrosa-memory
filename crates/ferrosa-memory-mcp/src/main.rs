@@ -3437,6 +3437,8 @@ require_tls = true
 cert_path = "/etc/ssl/cert.pem"
 key_path = "/etc/ssl/key.pem"
 auth_file = "{}"
+[viz]
+enabled = false
 "#,
             auth_path.display()
         ))
