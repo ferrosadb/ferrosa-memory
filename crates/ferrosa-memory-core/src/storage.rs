@@ -137,6 +137,35 @@ pub(crate) fn entity_matches_list_query(
 /// connections concurrently. `async fn` in trait position would not
 /// imply `Send`; the explicit `impl Future + Send` form is what the
 /// spawn site needs.
+/// Tokenize a query for the bounded lexical fallback ([`Storage::entity_text_scan_bounded`]):
+/// lowercase, split on non-alphanumeric boundaries, keep tokens of length ≥ 3,
+/// and dedup. Short tokens are dropped so the fallback doesn't match on noise
+/// like "is"/"of".
+pub(crate) fn lexical_query_tokens(query: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for tok in query
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 3)
+    {
+        if seen.insert(tok.to_string()) {
+            out.push(tok.to_string());
+        }
+    }
+    out
+}
+
+/// True if any query token is a substring of the entity's name or context
+/// snippet. Used by the bounded lexical fallback only.
+pub(crate) fn entity_matches_query_tokens(entry: &EntityEntry, tokens: &[String]) -> bool {
+    let name = entry.entity_name.to_lowercase();
+    let snippet = entry.context_snippet.to_lowercase();
+    tokens
+        .iter()
+        .any(|t| name.contains(t.as_str()) || snippet.contains(t.as_str()))
+}
+
 #[allow(clippy::manual_async_fn)]
 pub trait Storage: Send + Sync {
     /// Check memo cache by content hash.
@@ -327,6 +356,46 @@ pub trait Storage: Send + Sync {
         session_id: Uuid,
         name: &str,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<EntityEntry>>> + Send;
+
+    /// Bounded lexical fallback for the zero-candidate search case.
+    ///
+    /// Scans this session's entities via the already-bounded
+    /// [`Storage::entity_list_session`] and returns those whose name or context
+    /// snippet contains a query token, capped at `cap`. This exists ONLY so a
+    /// fresh install with no embeddings (ANN unavailable) and no populated
+    /// lexical index isn't left with an empty `hybrid_search` even though
+    /// `find`/`list` can see the entity — an entity's content body is not
+    /// fts-indexed, only its name is. It is NOT a general retrieval path:
+    /// `hybrid_search` calls it solely when every other strategy returned zero
+    /// candidates, and labels the results `entity_store_fallback`. Capped +
+    /// gated so it never becomes an unbounded scan on a large store.
+    ///
+    /// Default implementation composes the bounded session scan; storage
+    /// backends do not need to override it.
+    fn entity_text_scan_bounded(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        query: &str,
+        cap: usize,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<EntityEntry>>> + Send {
+        async move {
+            let tokens = lexical_query_tokens(query);
+            if tokens.is_empty() || cap == 0 {
+                return Ok(Vec::new());
+            }
+            let mut hits = Vec::new();
+            for entry in self.entity_list_session(ctx, session_id).await? {
+                if entry.state.is_retrievable() && entity_matches_query_tokens(&entry, &tokens) {
+                    hits.push(entry);
+                    if hits.len() >= cap {
+                        break;
+                    }
+                }
+            }
+            Ok(hits)
+        }
+    }
 
     /// Exact `(entity_name, entity_type)` lookup inside a session. Returns
     /// the fully-populated entity or `None`. Used as the idempotency key for
