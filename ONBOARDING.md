@@ -93,6 +93,25 @@ Common variants:
 ./setup.sh --harness auto --no-apply-config
 ```
 
+**Linux source checkouts:** native service auto-install is macOS-only here, so
+`setup.sh` does not start a server on Linux. Start `ferrosa-memory-mcp` yourself
+(or install `systemd/ferrosa-memory.service` as a `--user` unit), then install
+hooks without the health gate:
+
+```bash
+# start the server first (foreground example), then in another shell:
+./setup.sh --harness auto --skip-service --no-verify
+```
+
+**Auth-protected HTTP endpoint:** pass credentials so hook installation isn't
+refused (the installer fails loud, exit 3, when the endpoint needs auth and none
+is supplied):
+
+```bash
+./setup.sh --harness auto --mcp-url https://host:18765/mcp \
+  --mcp-user ferrosa_user --mcp-password "$FERROSA_MEMORY_MCP_PASSWORD"
+```
+
 Manual clone/update remains available for contributors:
 
 ```bash

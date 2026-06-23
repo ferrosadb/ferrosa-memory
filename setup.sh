@@ -12,21 +12,37 @@ Options:
       Agent hooks to install. Default: auto.
   --mcp-url URL
       MCP JSON-RPC endpoint. Default: http://127.0.0.1:18765/mcp.
+  --mcp-user USER
+      Basic-auth username for an auth-protected HTTP MCP endpoint.
+      Default: $FERROSA_MEMORY_MCP_USER. Forwarded to the hook installer.
+  --mcp-password PASS
+      Basic-auth password for an auth-protected HTTP MCP endpoint.
+      Default: $FERROSA_MEMORY_MCP_PASSWORD. Forwarded to the hook installer.
+  --auth-header VALUE
+      Full Authorization header value (e.g. "Basic <b64>") for the MCP
+      endpoint. Default: $FERROSA_MEMORY_AUTH_HEADER. Overrides --mcp-user/pass.
   --config PATH
       Ferrosa Memory config file for native service install.
       Default: .runtime/ferrosa-memory-http-18765.toml when present.
   --skip-build
       Do not build ferrosa-memory-mcp.
   --skip-service
-      Do not install/restart the native service.
+      Do not install/restart the native service. On Linux (no auto-install
+      path here) start the server yourself, then re-run with hooks.
   --no-apply-config
       Write hook wrappers/snippets but do not patch harness config files.
   --dry-run
       Show hook changes without patching harness config files.
   --no-verify
-      Skip MCP health and hook verification.
+      Skip MCP health and hook verification. Useful on Linux when you start
+      the service manually after setup (pair with --skip-service).
   --help
       Show this help.
+
+Linux note: native service auto-install is macOS-only here. On a Linux source
+checkout, either start ferrosa-memory-mcp yourself first, or run with
+--skip-service --no-verify and start it afterward. See
+systemd/ferrosa-memory.service for a user-unit template.
 EOF
 }
 
@@ -44,6 +60,9 @@ cd "$script_dir"
 
 harness="auto"
 mcp_url="${FERROSA_MEMORY_MCP_URL:-http://127.0.0.1:18765/mcp}"
+mcp_user="${FERROSA_MEMORY_MCP_USER:-}"
+mcp_password="${FERROSA_MEMORY_MCP_PASSWORD:-}"
+auth_header="${FERROSA_MEMORY_AUTH_HEADER:-}"
 config_path="${FERROSA_MEMORY_CONFIG_FILE:-${script_dir}/.runtime/ferrosa-memory-http-18765.toml}"
 skip_build=false
 skip_service=false
@@ -61,6 +80,21 @@ while [[ $# -gt 0 ]]; do
         --mcp-url)
             mcp_url="${2:-}"
             [[ -n "$mcp_url" ]] || die "--mcp-url requires a value"
+            shift 2
+            ;;
+        --mcp-user)
+            mcp_user="${2:-}"
+            [[ -n "$mcp_user" ]] || die "--mcp-user requires a value"
+            shift 2
+            ;;
+        --mcp-password)
+            mcp_password="${2:-}"
+            [[ -n "$mcp_password" ]] || die "--mcp-password requires a value"
+            shift 2
+            ;;
+        --auth-header)
+            auth_header="${2:-}"
+            [[ -n "$auth_header" ]] || die "--auth-header requires a value"
             shift 2
             ;;
         --config)
@@ -113,20 +147,29 @@ else
     log "skipping build"
 fi
 
+# Track whether THIS run actually installed/started a native service. The
+# health-check loop below must only hard-fail when we installed one — otherwise
+# a Linux checkout (no auto-install path) would always fail setup even though
+# nothing was supposed to be listening yet.
+service_installed=false
 if [[ "$skip_service" == false ]]; then
     if [[ "$(uname -s)" == "Darwin" ]]; then
         [[ -f "$config_path" ]] || die "config file not found: $config_path"
         log "installing/restarting macOS LaunchAgent"
         FERROSA_MEMORY_CONFIG_FILE="$config_path" scripts/install-launch-agent-mcp.sh
+        service_installed=true
     else
-        log "native service auto-install is only implemented for macOS in this repo"
-        log "start ferrosa-memory-mcp with FERROSA_MEMORY_CONFIG=$config_path before using hooks"
+        log "native service auto-install is macOS-only in this repo; not starting a service"
+        log "start it yourself, e.g.:"
+        log "  FERROSA_MEMORY_CONFIG=$config_path target/release/ferrosa-memory-mcp"
+        log "  (or install systemd/ferrosa-memory.service as a --user unit)"
     fi
 else
     log "skipping service install/restart"
 fi
 
-if [[ "$verify" == true ]]; then
+if [[ "$verify" == true && "$service_installed" == true ]]; then
+    # A service was installed here, so it must come up — fail loud if it doesn't.
     health_base="${mcp_url%/mcp}"
     log "checking MCP liveness at ${health_base}/healthz/live"
     for attempt in {1..30}; do
@@ -138,6 +181,17 @@ if [[ "$verify" == true ]]; then
         fi
         sleep 1
     done
+elif [[ "$verify" == true ]]; then
+    # No service was installed (e.g. Linux, or --skip-service). Best-effort probe
+    # so a manually-started server is still detected, but DO NOT fail setup if it
+    # isn't up yet — just tell the user how to proceed.
+    health_base="${mcp_url%/mcp}"
+    if curl -fsS "${health_base}/healthz/live" >/dev/null 2>&1; then
+        log "MCP already live at ${health_base}/healthz/live"
+    else
+        log "no native service was installed and ${health_base}/healthz/live is not responding yet"
+        log "start ferrosa-memory-mcp, then re-run; or pass --no-verify to skip this check"
+    fi
 else
     log "skipping MCP health verification"
 fi
@@ -152,9 +206,32 @@ fi
 if [[ "$verify" == true ]]; then
     installer_args+=(--verify)
 fi
+# Forward HTTP credentials so the installer's auth-consistency preflight passes
+# for auth-protected endpoints instead of refusing (exit 3) and aborting setup.
+if [[ -n "$auth_header" ]]; then
+    installer_args+=(--auth-header "$auth_header")
+fi
+if [[ -n "$mcp_user" ]]; then
+    installer_args+=(--mcp-user "$mcp_user")
+fi
+if [[ -n "$mcp_password" ]]; then
+    installer_args+=(--mcp-password "$mcp_password")
+fi
 
 log "installing agent memory hooks"
+# Don't let `set -e` swallow the installer's exit code: a bare non-zero abort
+# (especially exit 3 = auth required but no credentials) must produce an
+# actionable message, not a silent stop.
+set +e
 python3 scripts/install-agent-hooks.py "${installer_args[@]}"
+installer_rc=$?
+set -e
+if [[ "$installer_rc" -ne 0 ]]; then
+    if [[ "$installer_rc" -eq 3 ]]; then
+        die "hook install refused: the MCP endpoint at ${mcp_url} requires authentication but no credentials were provided. Re-run with --mcp-user USER --mcp-password PASS (or set FERROSA_MEMORY_MCP_USER/FERROSA_MEMORY_MCP_PASSWORD), or pass --auth-header 'Basic <base64>'."
+    fi
+    die "hook install failed (install-agent-hooks.py exit ${installer_rc})"
+fi
 
 if [[ "$verify" == true ]]; then
     log "checking default MCP tool catalog includes ingest"

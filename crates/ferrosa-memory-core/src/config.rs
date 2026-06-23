@@ -982,21 +982,39 @@ pub fn validate_shared_http_config(config: &Config) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Aggregate EVERY problem so an operator fixes the HTTP config in one pass
+    // instead of restarting once per field. Previously each check bailed on the
+    // first failure, which took ~5 restart/error cycles to bring a stdio config
+    // up in HTTP mode (auth_file, bind_addr, tenant fallback, TLS secrets, viz).
+    let mut problems: Vec<&'static str> = Vec::new();
     if !config.server.require_tls && !is_loopback_bind_addr(&config.server.bind_addr) {
-        anyhow::bail!("HTTP transport requires TLS unless server.bind_addr is loopback-only");
+        problems.push("HTTP transport requires TLS unless server.bind_addr is loopback-only");
     }
     if config.server.require_tls
         && (config.server.cert_path.is_none() || config.server.key_path.is_none())
     {
-        anyhow::bail!("HTTP transport requires cert_path and key_path");
+        problems.push("HTTP transport requires cert_path and key_path when require_tls is true");
     }
     if config.server.auth_file.is_none() {
-        anyhow::bail!("HTTP transport requires server.auth_file");
+        problems.push("HTTP transport requires server.auth_file");
     }
     if config.server.tenant_id.is_some() {
-        anyhow::bail!("HTTP transport must not use server.tenant_id fallback");
+        problems.push("HTTP transport must not use server.tenant_id fallback");
+    }
+    // Viz is unauthenticated (loopback-only), so under HTTP it cannot inherit a
+    // request principal's tenant — it needs an explicit one. Surface it here so
+    // it isn't yet another separate restart at viz-spawn time.
+    if config.viz.enabled && config.viz.tenant_id.is_none() {
+        problems.push("viz.tenant_id is required when viz.enabled is true in HTTP mode");
     }
 
+    if !problems.is_empty() {
+        anyhow::bail!(
+            "HTTP-mode config has {} problem(s); fix all before restarting:\n  - {}",
+            problems.len(),
+            problems.join("\n  - ")
+        );
+    }
     Ok(())
 }
 
@@ -1633,6 +1651,8 @@ require_tls = true
 cert_path = "/etc/ssl/cert.pem"
 key_path = "/etc/ssl/key.pem"
 auth_file = "/etc/ferrosa/auth.toml"
+[viz]
+enabled = false
 "#;
         let config = parse_config(toml).unwrap();
         validate_shared_http_config(&config).expect("shared http config should validate");
@@ -1648,9 +1668,42 @@ transport = "http"
 bind_addr = "127.0.0.1"
 require_tls = false
 auth_file = "/etc/ferrosa/auth.toml"
+[viz]
+enabled = false
 "#;
         let config = parse_config(toml).unwrap();
         validate_shared_http_config(&config).expect("loopback-only http config should validate");
+    }
+
+    #[test]
+    fn validate_shared_http_aggregates_all_problems_in_one_error() {
+        // A stdio-style config flipped to HTTP transport with nothing else set:
+        // missing auth_file, non-loopback bind without TLS, and viz enabled
+        // (default) without a viz tenant. The single error must name them all so
+        // the operator fixes everything in one pass (no restart-per-field).
+        let toml = r#"
+[ferrosa]
+contact_points = ["localhost:19042"]
+[server]
+transport = "http"
+bind_addr = "0.0.0.0"
+require_tls = false
+"#;
+        let config = parse_config(toml).unwrap();
+        let err = validate_shared_http_config(&config)
+            .expect_err("incomplete HTTP config must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("auth_file"), "must report auth_file: {msg}");
+        assert!(
+            msg.contains("loopback-only"),
+            "must report bind_addr/TLS: {msg}"
+        );
+        assert!(
+            msg.contains("viz.tenant_id"),
+            "must report viz tenant: {msg}"
+        );
+        // All three surfaced together, not one-at-a-time.
+        assert!(msg.contains("3 problem(s)"), "must aggregate count: {msg}");
     }
 
     #[test]
