@@ -46,6 +46,9 @@ nom-supreme = "0.8"
 ferrosa-memory-core = { path = ".", features = ["mock-storage", "scylla-driver"] }
 tracing-subscriber = { workspace = true }
 serial_test = "3.5"
+# Property/fuzz testing of config parsing + validation (config-robustness
+# initiative). Matches the version used in ferrosa-memory-sync.
+proptest = "1"
 # Self-signed cert generation for HTTPS integration tests — the
 # bug-http-parser-rejects-split-send spec's acceptance criterion
 # is a Python http.client POST over HTTPS, so we need a throwaway
