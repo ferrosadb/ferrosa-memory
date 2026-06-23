@@ -170,7 +170,37 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "remote teacher/learner memory transfer tables",
         ddl: include_str!("../../../ddl/041_memory_remotes.cql"),
     },
+    Migration {
+        version: 42,
+        description: "backfill typed_edges on pre-017 baseline-adopted installs",
+        ddl: include_str!("../../../ddl/042_typed_edges_backfill.cql"),
+    },
 ];
+
+/// `ddl/011_warmth_field.cql` — the `entity_warmth` table + session index.
+///
+/// Re-applied (idempotently) as a prerequisite of migration 25 so that an
+/// install whose pre-versioning baseline (≤19) never created `entity_warmth`
+/// can still apply 025's `ALTER … ADD reputation` instead of failing forever
+/// with "table not found". See the version-25 special case in [`run_migrations`].
+const ENTITY_WARMTH_DDL: &str = include_str!("../../../ddl/011_warmth_field.cql");
+
+/// Recognises ferrosa/scylla/cassandra error strings that mean "this additive
+/// DDL has already been applied; the postcondition is satisfied."
+///
+/// Conservative — only matches additive-DDL outcomes (table/column/index
+/// already exists), never type drift or other shape changes. Mirrors the same
+/// helper in the `migrate` binary so the runtime [`run_migrations`] path and
+/// the one-shot CI/operator binary treat a partially-applied keyspace
+/// identically (re-runnable, never refusing to make progress on a benign
+/// no-op). The migration postcondition check remains the real safety net: a
+/// genuinely missing object still fails the migration loudly.
+fn is_idempotent_already_exists(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("already exists")
+        || m.contains("conflicts with an existing column")
+        || m.contains("duplicate column")
+}
 
 /// Pre-versioning DDLs. Applied in order when `run_migrations` detects a
 /// greenfield keyspace (no keyspace row in `system_schema.keyspaces`).
@@ -474,6 +504,23 @@ pub async fn run_migrations(session: &CqlSession, keyspace: &str) -> Result<usiz
                     source,
                 })?;
         } else {
+            // Migration 25 (`ALTER entity_warmth ADD reputation`) presumes the
+            // table already exists. On an install whose ≤19 baseline never
+            // created `entity_warmth` (adopted before 011 ran), the bare ALTER
+            // fails "table not found" and the runner is stuck at v24 forever.
+            // Ensure the table exists first (idempotent CREATE from 011); the
+            // ALTER below then either adds the column or no-ops as "already
+            // exists". Keeps 025's DDL file untouched (append-only rule).
+            if m.version == 25 {
+                apply_idempotent_ddl(session, keyspace, ENTITY_WARMTH_DDL)
+                    .await
+                    .map_err(|source| MigrationError::Statement {
+                        version: m.version,
+                        stmt_index: 0,
+                        last_good,
+                        source,
+                    })?;
+            }
             // Some DDL files in MIGRATIONS hardcode `agent_memory.<table>`
             // qualified references — `USE keyspace` only helps unqualified
             // names. Run the same qualify_ddl rewrite the bootstrap path
@@ -488,6 +535,19 @@ pub async fn run_migrations(session: &CqlSession, keyspace: &str) -> Result<usiz
             for (i, stmt) in split_cql(&qualified).iter().enumerate() {
                 #[allow(deprecated)]
                 if let Err(source) = session.query_unpaged(stmt.as_str(), ()).await {
+                    // Tolerate benign "already exists" outcomes so a partially
+                    // applied migration is re-runnable to completion. The
+                    // postcondition check below is the real safety net — a
+                    // genuinely missing object still fails the migration loudly.
+                    if is_idempotent_already_exists(&source.to_string()) {
+                        tracing::info!(
+                            version = m.version,
+                            stmt_index = i,
+                            error = %source,
+                            "migration DDL no-op (already applied), continuing"
+                        );
+                        continue;
+                    }
                     return Err(MigrationError::Statement {
                         version: m.version,
                         stmt_index: i,
@@ -608,9 +668,20 @@ async fn apply_bootstrap(session: &CqlSession, keyspace: &str) -> anyhow::Result
             let prepared = prepare_bootstrap_statement(stmt, applied_at);
             #[allow(deprecated)]
             if let Err(e) = session.query_unpaged(prepared.as_str(), ()).await {
-                anyhow::bail!(
-                    "bootstrap DDL[{file_idx}] statement {i} failed: {e}\n--- statement ---\n{prepared}"
-                );
+                // Tolerate benign "already exists" so a re-run against a
+                // partially-bootstrapped keyspace converges instead of aborting.
+                if is_idempotent_already_exists(&e.to_string()) {
+                    tracing::info!(
+                        file_idx,
+                        stmt_index = i,
+                        error = %e,
+                        "bootstrap DDL no-op (already applied), continuing"
+                    );
+                } else {
+                    anyhow::bail!(
+                        "bootstrap DDL[{file_idx}] statement {i} failed: {e}\n--- statement ---\n{prepared}"
+                    );
+                }
             }
             // Wait for schema agreement so subsequent statements don't race
             // against a not-yet-visible table on other nodes.
@@ -622,6 +693,30 @@ async fn apply_bootstrap(session: &CqlSession, keyspace: &str) -> anyhow::Result
         }
     }
 
+    Ok(())
+}
+
+/// Apply a DDL blob (qualified to `keyspace`) statement-by-statement,
+/// tolerating benign "already exists" outcomes via
+/// [`is_idempotent_already_exists`]. Used for idempotent prerequisite DDL —
+/// e.g. ensuring a pre-baseline table exists before a later `ALTER`. Returns
+/// the first non-benign error.
+async fn apply_idempotent_ddl(
+    session: &CqlSession,
+    keyspace: &str,
+    ddl: &str,
+) -> anyhow::Result<()> {
+    let rewritten = qualify_ddl(ddl, keyspace);
+    for stmt in split_cql(&rewritten) {
+        #[allow(deprecated)]
+        if let Err(e) = session.query_unpaged(stmt.as_str(), ()).await {
+            if is_idempotent_already_exists(&e.to_string()) {
+                tracing::info!(error = %e, "prerequisite DDL no-op (already applied), continuing");
+                continue;
+            }
+            return Err(anyhow::anyhow!("{e}"));
+        }
+    }
     Ok(())
 }
 
@@ -1388,6 +1483,7 @@ async fn migration_postcondition_satisfied(
     version: u32,
 ) -> anyhow::Result<bool> {
     match version {
+        42 => table_exists(session, keyspace, "typed_edges").await,
         41 => {
             for table in [
                 "memory_remotes",
@@ -1408,6 +1504,12 @@ async fn migration_postcondition_satisfied(
         }
         38 => table_exists(session, keyspace, "retraction").await,
         37 => table_exists(session, keyspace, "forget_journal").await,
+        // 25 backfills `entity_warmth.reputation`; the version-25 special case
+        // in `run_migrations` also (re)creates the table if a ≤19 baseline
+        // never did. Verified by the column's presence.
+        25 => column_type(session, keyspace, "entity_warmth", "reputation")
+            .await
+            .map(|t| t.is_some()),
         36 => feedback_outcomes_uuid_write_probe(session, keyspace, "feedback_outcomes").await,
         35 => {
             for table in [

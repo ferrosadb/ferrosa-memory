@@ -14,7 +14,7 @@
 use ferrosa_memory_core::config::FerrosaCqlConfig;
 use ferrosa_memory_core::cql_storage::connect_session;
 use ferrosa_memory_core::migration::{
-    MIGRATIONS, Migration, PRE_VERSIONING_BASELINE, run_migrations,
+    MIGRATIONS, Migration, PRE_VERSIONING_BASELINE, ROLES_DDL, run_migrations,
 };
 use ferrosa_memory_core::test_cluster::TestClusterConfig;
 
@@ -280,4 +280,231 @@ async fn t03_old_schema_auto_upgrades_to_v31() {
         .await_schema_agreement()
         .await
         .expect("schema must agree across nodes after migration");
+}
+
+// ---------------------------------------------------------------------------
+// T-08: Migration 42 (typed_edges backfill) is additive and non-destructive
+// ---------------------------------------------------------------------------
+
+/// T-08: Migration 42 re-creates typed_edges idempotently for installs whose
+/// ≤19 baseline predated ddl/017. Must be CREATE TABLE IF NOT EXISTS, never DROP.
+#[test]
+fn t08_migration_42_typed_edges_backfill_is_additive() {
+    let m42: &Migration = MIGRATIONS
+        .iter()
+        .find(|m| m.version == 42)
+        .expect("migration 42 must exist in the registry");
+
+    let ddl_lower = m42.ddl.to_lowercase();
+    assert!(
+        ddl_lower.contains("create table if not exists") && ddl_lower.contains("typed_edges"),
+        "migration 42 must CREATE TABLE IF NOT EXISTS typed_edges. Got:\n{}",
+        m42.ddl
+    );
+    assert!(
+        !ddl_lower.contains("drop"),
+        "migration 42 must not contain DROP (destructive). Got:\n{}",
+        m42.ddl
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T-09: ferrosa_user grant coverage for the core write-path tables
+// ---------------------------------------------------------------------------
+
+/// T-09: Regression guard for the entity_store grant loss (writes silently fail
+/// when ferrosa_user lacks MODIFY). Asserts ROLES_DDL grants MODIFY to
+/// ferrosa_user on entity_store and the documented application-writable set, so
+/// a refactor can't silently drop a grant the ingest path depends on.
+#[test]
+fn t09_roles_ddl_grants_modify_on_core_write_path_tables() {
+    let ddl = ROLES_DDL.to_lowercase();
+    // entity_store is the table from the reported incident; the rest are the
+    // always-on write targets exercised by ingest / forget / warmth.
+    let required = [
+        "entity_store",
+        "tool_usage_log",
+        "temporal_events",
+        "feedback_outcomes",
+        "intentions",
+        "memo_cache",
+        "plan_state",
+        "trajectory_folds",
+        "audit_log",
+        "entity_warmth",
+        "retraction",
+        "forget_journal",
+    ];
+    for table in required {
+        let needle = format!("grant modify on agent_memory.{table}");
+        let granted = ddl
+            .lines()
+            .any(|l| l.contains(&needle) && l.contains("to ferrosa_user"));
+        assert!(
+            granted,
+            "ROLES_DDL must `GRANT MODIFY ON agent_memory.{table} TO ferrosa_user` \
+             — a missing grant makes writes silently fail (see ddl/100_roles.cql)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T-10/T-11: Live partial-migration recovery (entity_warmth + typed_edges)
+// ---------------------------------------------------------------------------
+
+/// True if `keyspace.table.column` exists in system_schema.
+async fn live_column_exists(
+    session: &ferrosa_memory_core::cql_storage::CqlSession,
+    keyspace: &str,
+    table: &str,
+    column: &str,
+) -> bool {
+    let q = format!(
+        "SELECT column_name FROM system_schema.columns WHERE keyspace_name = '{keyspace}' \
+         AND table_name = '{table}' AND column_name = '{column}'"
+    );
+    #[allow(deprecated)]
+    let result = session
+        .query_unpaged(q, ())
+        .await
+        .expect("system_schema.columns query");
+    !result.rows_or_empty().is_empty()
+}
+
+/// True if `keyspace.table` exists in system_schema.
+async fn live_table_exists(
+    session: &ferrosa_memory_core::cql_storage::CqlSession,
+    keyspace: &str,
+    table: &str,
+) -> bool {
+    let q = format!(
+        "SELECT table_name FROM system_schema.tables WHERE keyspace_name = '{keyspace}' \
+         AND table_name = '{table}'"
+    );
+    #[allow(deprecated)]
+    let result = session
+        .query_unpaged(q, ())
+        .await
+        .expect("system_schema.tables query");
+    !result.rows_or_empty().is_empty()
+}
+
+/// True if the schema_version ledger has a row for `version`.
+async fn live_version_recorded(
+    session: &ferrosa_memory_core::cql_storage::CqlSession,
+    keyspace: &str,
+    version: u32,
+) -> bool {
+    let q = format!("SELECT version FROM {keyspace}.schema_version WHERE version = {version}");
+    #[allow(deprecated)]
+    let result = session
+        .query_unpaged(q, ())
+        .await
+        .expect("schema_version query");
+    !result.rows_or_empty().is_empty()
+}
+
+/// T-10: Reproduce the reported partial-run failure (stuck at v24 because
+/// migration 25's `ALTER entity_warmth ADD reputation` hit "table not found").
+/// Drop entity_warmth entirely and delete the v25 ledger row, then re-run: the
+/// runner's version-25 special case must re-create the table, (re)apply
+/// reputation, and record v25.
+#[tokio::test]
+#[ignore = "requires live test cluster; run with --ignored"]
+async fn t10_partial_migration_recovers_missing_entity_warmth() {
+    let test = TestClusterConfig::from_env()
+        .expect("FERROSA_TEST_CQL_PORT must be set; start a test cluster first");
+    let cfg = test_cfg(&test);
+    let session = connect_session(&cfg, &cfg.username, &cfg.password)
+        .await
+        .expect("connect_session must succeed against test cluster");
+
+    run_migrations(&session, &cfg.keyspace)
+        .await
+        .expect("initial migration must succeed");
+
+    // Simulate the broken adopted install: the ≤19 baseline never created
+    // entity_warmth. Drop it AND its v25 ledger row so v25 is pending again
+    // with the prerequisite table absent — exactly the stuck-at-v24 shape.
+    session
+        .query_unpaged(
+            format!("DROP TABLE IF EXISTS {}.entity_warmth", cfg.keyspace),
+            (),
+        )
+        .await
+        .expect("drop entity_warmth");
+    session
+        .query_unpaged(
+            format!(
+                "DELETE FROM {}.schema_version WHERE version = 25",
+                cfg.keyspace
+            ),
+            (),
+        )
+        .await
+        .expect("delete v25 ledger row");
+
+    run_migrations(&session, &cfg.keyspace)
+        .await
+        .expect("migration re-run must recover the missing entity_warmth table");
+
+    assert!(
+        live_column_exists(&session, &cfg.keyspace, "entity_warmth", "reputation").await,
+        "entity_warmth.reputation must exist after recovery"
+    );
+    assert!(
+        live_version_recorded(&session, &cfg.keyspace, 25).await,
+        "schema_version must record v25 after recovery"
+    );
+}
+
+/// T-11: Reproduce the typed_edges baseline gap (an install adopted at baseline
+/// 19 before ddl/017 existed never created typed_edges, so create_edge fails).
+/// Drop typed_edges and delete the v42 ledger row, then re-run: migration 42
+/// must re-create it idempotently and record v42.
+#[tokio::test]
+#[ignore = "requires live test cluster; run with --ignored"]
+async fn t11_baseline_gap_backfills_missing_typed_edges() {
+    let test = TestClusterConfig::from_env()
+        .expect("FERROSA_TEST_CQL_PORT must be set; start a test cluster first");
+    let cfg = test_cfg(&test);
+    let session = connect_session(&cfg, &cfg.username, &cfg.password)
+        .await
+        .expect("connect_session must succeed against test cluster");
+
+    run_migrations(&session, &cfg.keyspace)
+        .await
+        .expect("initial migration must succeed");
+
+    session
+        .query_unpaged(
+            format!("DROP TABLE IF EXISTS {}.typed_edges", cfg.keyspace),
+            (),
+        )
+        .await
+        .expect("drop typed_edges");
+    session
+        .query_unpaged(
+            format!(
+                "DELETE FROM {}.schema_version WHERE version = 42",
+                cfg.keyspace
+            ),
+            (),
+        )
+        .await
+        .expect("delete v42 ledger row");
+
+    let applied = run_migrations(&session, &cfg.keyspace)
+        .await
+        .expect("migration re-run must backfill typed_edges");
+    assert!(applied >= 1, "at least migration 42 should re-apply");
+
+    assert!(
+        live_table_exists(&session, &cfg.keyspace, "typed_edges").await,
+        "typed_edges must exist after backfill"
+    );
+    assert!(
+        live_version_recorded(&session, &cfg.keyspace, 42).await,
+        "schema_version must record v42 after backfill"
+    );
 }
