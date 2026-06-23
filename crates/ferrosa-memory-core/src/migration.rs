@@ -748,6 +748,182 @@ async fn apply_roles_grants(session: &CqlSession, keyspace: &str) -> anyhow::Res
         statements = stmts.len(),
         "applied role-auth seed + grants"
     );
+    // Applying GRANT statements that return OK is not proof the runtime role
+    // actually holds the permissions: Ferrosa does not persist role grants
+    // across a cluster restart, and a swallowed write later would silently
+    // drop data while `ingest` reports success. Verify against the live
+    // `system_auth.role_permissions` and fail loud if anything is missing.
+    verify_runtime_grants(session, keyspace).await?;
+    Ok(())
+}
+
+/// The runtime (least-privilege) role the MCP server authenticates as on the
+/// serving path. The grants for this role are what every `ingest`/write
+/// depends on; a missing one makes writes fail with `Unauthorized`.
+pub const RUNTIME_ROLE: &str = "ferrosa_user";
+
+/// A permission the runtime role must hold for the serving write path to
+/// persist data. `resource` is in the exact string form Ferrosa's
+/// `system_auth.role_permissions.resource` column uses
+/// (`"table agent_memory.entity_store"`, `"keyspace agent_memory"`,
+/// `"ALL KEYSPACES"`), so verification is a direct string comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequiredGrant {
+    /// Permission name, upper-cased (e.g. `"MODIFY"`, `"SELECT"`).
+    pub permission: String,
+    /// Resource string in `Resource::Display` form.
+    pub resource: String,
+}
+
+/// Parse the `GRANT … TO ferrosa_user` statements out of (already keyspace-
+/// qualified) roles DDL into the set of permissions the runtime role must
+/// hold. Pure and testable; the DDL is the single source of truth for the
+/// required set, so a new grant added to `ddl/100_roles.cql` is verified
+/// automatically.
+pub fn required_runtime_grants(ddl: &str) -> Vec<RequiredGrant> {
+    let to_runtime = format!("to {}", RUNTIME_ROLE.to_lowercase());
+    let mut out = Vec::new();
+    for stmt in split_cql(ddl) {
+        let lower = stmt.trim().to_lowercase();
+        if !lower.starts_with("grant ") || !lower.contains(&to_runtime) {
+            continue;
+        }
+        let toks: Vec<&str> = stmt.split_whitespace().collect();
+        let on_idx = toks.iter().position(|t| t.eq_ignore_ascii_case("on"));
+        let to_idx = toks.iter().rposition(|t| t.eq_ignore_ascii_case("to"));
+        let (on_idx, to_idx) = match (on_idx, to_idx) {
+            (Some(a), Some(b)) if b > a + 1 && a >= 2 => (a, b),
+            _ => continue,
+        };
+        let permission = toks[1].to_uppercase();
+        let target: Vec<String> = toks[on_idx + 1..to_idx]
+            .iter()
+            .map(|s| s.trim_end_matches(';').to_string())
+            .collect();
+        let resource = match target.as_slice() {
+            [a, b] if a.eq_ignore_ascii_case("all") && b.eq_ignore_ascii_case("keyspaces") => {
+                "ALL KEYSPACES".to_string()
+            }
+            [kw, ks] if kw.eq_ignore_ascii_case("keyspace") => format!("keyspace {ks}"),
+            [t] if t.contains('.') => format!("table {t}"),
+            _ => continue,
+        };
+        out.push(RequiredGrant {
+            permission,
+            resource,
+        });
+    }
+    out
+}
+
+/// Which `required` grants are NOT satisfied by `granted` (a map of
+/// resource string -> set of upper-cased permission names). Accounts for
+/// keyspace-level and `ALL KEYSPACES` grants covering a table-level
+/// requirement. Pure and testable.
+pub fn missing_runtime_grants(
+    required: &[RequiredGrant],
+    granted: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+) -> Vec<RequiredGrant> {
+    required
+        .iter()
+        .filter(|req| !grant_satisfied(req, granted))
+        .cloned()
+        .collect()
+}
+
+fn grant_satisfied(
+    req: &RequiredGrant,
+    granted: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+) -> bool {
+    let has = |resource: &str| {
+        granted
+            .get(resource)
+            .is_some_and(|perms| perms.contains(&req.permission))
+    };
+    if has(&req.resource) || has("ALL KEYSPACES") {
+        return true;
+    }
+    // A table-level requirement is also covered by a keyspace-level grant.
+    if let Some((ks, _tbl)) = req
+        .resource
+        .strip_prefix("table ")
+        .and_then(|rest| rest.split_once('.'))
+    {
+        return has(&format!("keyspace {ks}"));
+    }
+    false
+}
+
+/// Read the runtime role's currently-effective permissions from Ferrosa's
+/// `system_auth.role_permissions` virtual table, as `resource -> {perm}`.
+async fn fetch_runtime_role_permissions(
+    session: &CqlSession,
+    role: &str,
+) -> anyhow::Result<std::collections::HashMap<String, std::collections::HashSet<String>>> {
+    use anyhow::Context as _;
+    #[allow(deprecated)]
+    let result = session
+        .query_unpaged(
+            "SELECT role, resource, permissions FROM system_auth.role_permissions",
+            (),
+        )
+        .await
+        .context("querying system_auth.role_permissions for grant verification")?;
+    let mut map: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    #[allow(deprecated)]
+    let rows = result
+        .rows_typed::<(String, String, Vec<String>)>()
+        .context("decoding system_auth.role_permissions rows")?;
+    for row in rows {
+        let (role_name, resource, perms) =
+            row.context("decoding a system_auth.role_permissions row")?;
+        if role_name != role {
+            continue;
+        }
+        map.entry(resource)
+            .or_default()
+            .extend(perms.into_iter().map(|p| p.to_uppercase()));
+    }
+    Ok(map)
+}
+
+/// Verify the runtime role actually holds every grant the serving write path
+/// depends on, and FAIL LOUD if any is missing — the guard against silent
+/// data loss where a permission-denied write is swallowed and `ingest`
+/// reports false success. No-op when auth is disabled.
+async fn verify_runtime_grants(session: &CqlSession, keyspace: &str) -> anyhow::Result<()> {
+    if !should_apply_roles_ddl() {
+        return Ok(());
+    }
+    let required = required_runtime_grants(&qualify_ddl(ROLES_DDL, keyspace));
+    if required.is_empty() {
+        anyhow::bail!(
+            "grant verification: ROLES_DDL produced no GRANTs to `{RUNTIME_ROLE}`; \
+             refusing to serve rather than run with an unguarded write path"
+        );
+    }
+    let granted = fetch_runtime_role_permissions(session, RUNTIME_ROLE).await?;
+    let missing = missing_runtime_grants(&required, &granted);
+    if !missing.is_empty() {
+        let list = missing
+            .iter()
+            .map(|g| format!("{} on {}", g.permission, g.resource))
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "FATAL: runtime role `{RUNTIME_ROLE}` is missing required grant(s): {list}. \
+             Writes to these resources fail with Unauthorized, so ingest would report \
+             success while data silently disappears. Ferrosa does not persist role grants \
+             across a cluster restart and the startup re-apply did not take effect — \
+             refusing to serve. Re-apply ddl/100_roles.cql against the cluster."
+        );
+    }
+    tracing::info!(
+        role = RUNTIME_ROLE,
+        grants = required.len(),
+        "verified runtime role holds all required grants"
+    );
     Ok(())
 }
 
@@ -1679,6 +1855,106 @@ pub fn split_cql(ddl: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    // --- t_5beeb5da: runtime-grant verification (silent-data-loss guard) ---
+
+    fn granted_map(pairs: &[(&str, &[&str])]) -> HashMap<String, HashSet<String>> {
+        pairs
+            .iter()
+            .map(|(res, perms)| {
+                (
+                    res.to_string(),
+                    perms.iter().map(|p| p.to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn required_runtime_grants_parses_roles_ddl() {
+        let req = required_runtime_grants(&qualify_ddl(ROLES_DDL, "agent_memory"));
+        // The incident table (entity_store) MODIFY and the keyspace SELECT
+        // must both be derived from the DDL.
+        assert!(
+            req.iter().any(
+                |g| g.permission == "MODIFY" && g.resource == "table agent_memory.entity_store"
+            ),
+            "expected MODIFY on entity_store, got {req:?}"
+        );
+        assert!(
+            req.iter()
+                .any(|g| g.permission == "SELECT" && g.resource == "keyspace agent_memory"),
+            "expected SELECT on keyspace agent_memory, got {req:?}"
+        );
+        // Every parsed grant must be a well-formed (permission, resource) pair.
+        for g in &req {
+            assert!(!g.permission.is_empty(), "empty permission in {g:?}");
+            assert!(
+                g.resource.starts_with("table ")
+                    || g.resource.starts_with("keyspace ")
+                    || g.resource == "ALL KEYSPACES",
+                "malformed resource in {g:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_runtime_grants_detects_absent_modify() {
+        let required = vec![
+            RequiredGrant {
+                permission: "MODIFY".into(),
+                resource: "table agent_memory.entity_store".into(),
+            },
+            RequiredGrant {
+                permission: "SELECT".into(),
+                resource: "keyspace agent_memory".into(),
+            },
+        ];
+        // Only the keyspace SELECT is granted; the entity_store MODIFY is gone
+        // (the post-restart grant-drop scenario).
+        let granted = granted_map(&[("keyspace agent_memory", &["SELECT"])]);
+        let missing = missing_runtime_grants(&required, &granted);
+        assert_eq!(missing.len(), 1, "exactly one missing grant: {missing:?}");
+        assert_eq!(missing[0].permission, "MODIFY");
+        assert_eq!(missing[0].resource, "table agent_memory.entity_store");
+    }
+
+    #[test]
+    fn missing_runtime_grants_keyspace_or_all_covers_table() {
+        let required = vec![RequiredGrant {
+            permission: "MODIFY".into(),
+            resource: "table agent_memory.entity_store".into(),
+        }];
+        // Keyspace-level MODIFY covers the table-level requirement.
+        let ks = granted_map(&[("keyspace agent_memory", &["MODIFY"])]);
+        assert!(missing_runtime_grants(&required, &ks).is_empty());
+        // ALL KEYSPACES MODIFY also covers it.
+        let all = granted_map(&[("ALL KEYSPACES", &["MODIFY"])]);
+        assert!(missing_runtime_grants(&required, &all).is_empty());
+    }
+
+    #[test]
+    fn missing_runtime_grants_empty_when_ddl_fully_satisfied() {
+        let required = required_runtime_grants(&qualify_ddl(ROLES_DDL, "agent_memory"));
+        assert!(!required.is_empty(), "DDL must produce grants");
+        // A blanket ALL KEYSPACES SELECT+MODIFY satisfies every derived grant.
+        let granted = granted_map(&[("ALL KEYSPACES", &["SELECT", "MODIFY"])]);
+        assert!(
+            missing_runtime_grants(&required, &granted).is_empty(),
+            "blanket grant should satisfy all: still missing {:?}",
+            missing_runtime_grants(&required, &granted)
+        );
+    }
+
+    #[test]
+    fn is_permission_denied_classifies_unauthorized_only() {
+        use scylla::transport::errors::{DbError, QueryError};
+        let denied = QueryError::DbError(DbError::Unauthorized, "no grant".to_string());
+        assert!(crate::cql_storage::is_permission_denied(&denied));
+        let overloaded = QueryError::DbError(DbError::Overloaded, "busy".to_string());
+        assert!(!crate::cql_storage::is_permission_denied(&overloaded));
+    }
 
     #[test]
     fn split_cql_strips_line_comments() {
