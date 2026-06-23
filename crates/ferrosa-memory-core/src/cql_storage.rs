@@ -1130,6 +1130,43 @@ fn trim_entity_list_matches(matches: &mut Vec<EntityEntry>, limit: usize) {
 /// cdrs-tokio's frame-based API.
 pub type CqlSession = LegacySession;
 
+/// True if a CQL error is a permission-denied (`Unauthorized`) response — the
+/// runtime role is missing a grant. These MUST fail the operation loud:
+/// swallowing them turns a missing grant into silent data loss (`ingest`
+/// reports success while the write never landed). See task t_5beeb5da.
+pub fn is_permission_denied(err: &scylla::transport::errors::QueryError) -> bool {
+    use scylla::transport::errors::{DbError, QueryError};
+    matches!(err, QueryError::DbError(DbError::Unauthorized, _))
+}
+
+/// Gate a best-effort follow-up write so a missing grant can never masquerade
+/// as a successful ingest. On `Unauthorized` it returns `Err` (aborting the
+/// caller); other (potentially transient) errors keep the historical
+/// warn-and-continue behavior so write tolerance for flaky non-auth failures
+/// is unchanged.
+fn fail_loud_on_denied<T>(
+    result: Result<T, scylla::transport::errors::QueryError>,
+    entity_id: Uuid,
+    field: &str,
+) -> anyhow::Result<()> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) if is_permission_denied(&e) => Err(anyhow::anyhow!(
+            "permission denied writing entity_store.{field} for entity {entity_id}: {e}. \
+             ferrosa_user is missing a grant; aborting ingest to avoid silent data loss"
+        )),
+        Err(e) => {
+            tracing::warn!(
+                entity_id = %entity_id,
+                field,
+                error = %e,
+                "entity_store follow-up write failed (non-permission; continuing)"
+            );
+            Ok(())
+        }
+    }
+}
+
 /// Build a new CQL session with the given username/password against the
 /// contact points in `config`. Shared by `CqlStorage::connect` (runtime
 /// session) and `connect_admin_session` (short-lived migration session).
@@ -3227,13 +3264,16 @@ impl Storage for CqlStorage {
                 self.keyspace
             );
             #[allow(deprecated)]
-            let _ = self
-                .session
-                .query_unpaged(
-                    q,
-                    (fold_id, ctx.tenant_id, entry.session_id, entry.entity_id),
-                )
-                .await;
+            fail_loud_on_denied(
+                self.session
+                    .query_unpaged(
+                        q,
+                        (fold_id, ctx.tenant_id, entry.session_id, entry.entity_id),
+                    )
+                    .await,
+                entry.entity_id,
+                "source_fold_id",
+            )?;
         }
         if let Some(ref emb) = entry.entity_embedding {
             // Ferrosa requires a CQL literal [f32, f32, ...] for VECTOR columns.
@@ -3250,13 +3290,13 @@ impl Storage for CqlStorage {
                 ks = self.keyspace,
             );
             #[allow(deprecated)]
-            if let Err(e) = self
-                .session
-                .query_unpaged(q, (ctx.tenant_id, entry.session_id, entry.entity_id))
-                .await
-            {
-                tracing::warn!(entity_id = %entry.entity_id, error = %e, "failed to store entity_embedding");
-            }
+            fail_loud_on_denied(
+                self.session
+                    .query_unpaged(q, (ctx.tenant_id, entry.session_id, entry.entity_id))
+                    .await,
+                entry.entity_id,
+                "entity_embedding",
+            )?;
         }
 
         // --- Rich entity fields (Sprint 1 slice 1b) ---
@@ -3274,22 +3314,22 @@ impl Storage for CqlStorage {
             ks = self.keyspace,
         );
         #[allow(deprecated)]
-        if let Err(e) = self
-            .session
-            .query_unpaged(
-                q,
-                (
-                    scope_str.to_string(),
-                    updated_at,
-                    ctx.tenant_id,
-                    entry.session_id,
-                    entry.entity_id,
-                ),
-            )
-            .await
-        {
-            tracing::warn!(entity_id = %entry.entity_id, error = %e, "failed to store scope/updated_at");
-        }
+        fail_loud_on_denied(
+            self.session
+                .query_unpaged(
+                    q,
+                    (
+                        scope_str.to_string(),
+                        updated_at,
+                        ctx.tenant_id,
+                        entry.session_id,
+                        entry.entity_id,
+                    ),
+                )
+                .await,
+            entry.entity_id,
+            "scope/updated_at",
+        )?;
 
         if let Some(ingester) = entry.ingested_by_session {
             let q = format!(
@@ -3298,16 +3338,16 @@ impl Storage for CqlStorage {
                 ks = self.keyspace,
             );
             #[allow(deprecated)]
-            if let Err(e) = self
-                .session
-                .query_unpaged(
-                    q,
-                    (ingester, ctx.tenant_id, entry.session_id, entry.entity_id),
-                )
-                .await
-            {
-                tracing::warn!(entity_id = %entry.entity_id, error = %e, "failed to store ingested_by_session");
-            }
+            fail_loud_on_denied(
+                self.session
+                    .query_unpaged(
+                        q,
+                        (ingester, ctx.tenant_id, entry.session_id, entry.entity_id),
+                    )
+                    .await,
+                entry.entity_id,
+                "ingested_by_session",
+            )?;
         }
 
         // Optional text fields.
@@ -3318,21 +3358,21 @@ impl Storage for CqlStorage {
                 ks = self.keyspace,
             );
             #[allow(deprecated)]
-            if let Err(e) = self
-                .session
-                .query_unpaged(
-                    q,
-                    (
-                        desc.clone(),
-                        ctx.tenant_id,
-                        entry.session_id,
-                        entry.entity_id,
-                    ),
-                )
-                .await
-            {
-                tracing::warn!(entity_id = %entry.entity_id, error = %e, "failed to store description");
-            }
+            fail_loud_on_denied(
+                self.session
+                    .query_unpaged(
+                        q,
+                        (
+                            desc.clone(),
+                            ctx.tenant_id,
+                            entry.session_id,
+                            entry.entity_id,
+                        ),
+                    )
+                    .await,
+                entry.entity_id,
+                "description",
+            )?;
         }
 
         if let Some(ref emb) = entry.description_embedding {
@@ -3349,13 +3389,13 @@ impl Storage for CqlStorage {
                 ks = self.keyspace,
             );
             #[allow(deprecated)]
-            if let Err(e) = self
-                .session
-                .query_unpaged(q, (ctx.tenant_id, entry.session_id, entry.entity_id))
-                .await
-            {
-                tracing::warn!(entity_id = %entry.entity_id, error = %e, "failed to store description_embedding");
-            }
+            fail_loud_on_denied(
+                self.session
+                    .query_unpaged(q, (ctx.tenant_id, entry.session_id, entry.entity_id))
+                    .await,
+                entry.entity_id,
+                "description_embedding",
+            )?;
         }
 
         if !entry.tags.is_empty() {
@@ -3366,16 +3406,16 @@ impl Storage for CqlStorage {
                 ks = self.keyspace,
             );
             #[allow(deprecated)]
-            if let Err(e) = self
-                .session
-                .query_unpaged(
-                    q,
-                    (tags_json, ctx.tenant_id, entry.session_id, entry.entity_id),
-                )
-                .await
-            {
-                tracing::warn!(entity_id = %entry.entity_id, error = %e, "failed to store tags");
-            }
+            fail_loud_on_denied(
+                self.session
+                    .query_unpaged(
+                        q,
+                        (tags_json, ctx.tenant_id, entry.session_id, entry.entity_id),
+                    )
+                    .await,
+                entry.entity_id,
+                "tags",
+            )?;
         }
 
         if !entry.properties.is_null() {
@@ -3387,16 +3427,16 @@ impl Storage for CqlStorage {
                 ks = self.keyspace,
             );
             #[allow(deprecated)]
-            if let Err(e) = self
-                .session
-                .query_unpaged(
-                    q,
-                    (props_json, ctx.tenant_id, entry.session_id, entry.entity_id),
-                )
-                .await
-            {
-                tracing::warn!(entity_id = %entry.entity_id, error = %e, "failed to store properties");
-            }
+            fail_loud_on_denied(
+                self.session
+                    .query_unpaged(
+                        q,
+                        (props_json, ctx.tenant_id, entry.session_id, entry.entity_id),
+                    )
+                    .await,
+                entry.entity_id,
+                "properties",
+            )?;
         }
 
         if let Some(ref hash) = entry.content_hash {
@@ -3406,21 +3446,21 @@ impl Storage for CqlStorage {
                 ks = self.keyspace,
             );
             #[allow(deprecated)]
-            if let Err(e) = self
-                .session
-                .query_unpaged(
-                    q,
-                    (
-                        hash.clone(),
-                        ctx.tenant_id,
-                        entry.session_id,
-                        entry.entity_id,
-                    ),
-                )
-                .await
-            {
-                tracing::warn!(entity_id = %entry.entity_id, error = %e, "failed to store content_hash");
-            }
+            fail_loud_on_denied(
+                self.session
+                    .query_unpaged(
+                        q,
+                        (
+                            hash.clone(),
+                            ctx.tenant_id,
+                            entry.session_id,
+                            entry.entity_id,
+                        ),
+                    )
+                    .await,
+                entry.entity_id,
+                "content_hash",
+            )?;
         }
 
         Ok(())
