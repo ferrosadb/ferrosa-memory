@@ -1,0 +1,18 @@
+# cargo-nextest configuration.
+#
+# The CI integration job runs the cluster-gated (`#[ignore]`) tests via
+# `cargo nextest run`, which executes each test in its OWN PROCESS, in parallel.
+# The live tests in `tests/migration_drift.rs` all operate on the SAME shared
+# `agent_memory_test` keyspace and mutate `schema_version` + DROP/CREATE tables
+# to simulate partial-migration recovery. Run concurrently, one test's schema
+# changes break another's migration-count assertions (e.g. dropping
+# `entity_warmth`/`typed_edges` makes a sibling's gap-detector re-apply extra
+# migrations). Serialize the whole migration_drift binary so these tests can't
+# race. (Under `make test-live` / libtest the same serialization is enforced by
+# an in-process async mutex shared by those tests.)
+[test-groups]
+migration-drift = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(ferrosa-memory-core) and binary(migration_drift)'
+test-group = 'migration-drift'

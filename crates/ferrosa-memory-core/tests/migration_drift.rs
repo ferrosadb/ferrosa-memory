@@ -48,6 +48,20 @@ fn test_cfg(test: &TestClusterConfig) -> FerrosaCqlConfig {
     }
 }
 
+/// Serializes the live migration tests. They share one `agent_memory_test`
+/// keyspace and DROP/CREATE tables + rewrite `schema_version` to simulate
+/// partial-migration recovery, so running concurrently lets one test's schema
+/// changes break another's migration-count assertions. Under libtest
+/// (`make test-live`, thread-parallel) this in-process mutex enforces serial
+/// execution; under nextest (process-per-test) the `migration-drift` test-group
+/// in `.config/nextest.toml` does. Both are needed — the mutex can't serialize
+/// across nextest's separate processes, and the test-group doesn't apply to
+/// libtest.
+fn live_migration_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 // ---------------------------------------------------------------------------
 // T-01: Registry invariants — monotonic versions, no gaps, append-only
 // ---------------------------------------------------------------------------
@@ -192,6 +206,7 @@ fn t06_migration_36_is_data_preserving_feedback_outcomes_query_id_repair() {
 #[tokio::test]
 #[ignore = "requires live test cluster; run with --ignored"]
 async fn t03_old_schema_auto_upgrades_to_v31() {
+    let _serial = live_migration_test_lock().lock().await;
     let test = TestClusterConfig::from_env().expect(
         "FERROSA_TEST_CQL_PORT must be set. Start a test cluster with:\n\
          \t  scripts/start-test-cluster.sh\n\
@@ -412,6 +427,7 @@ async fn live_version_recorded(
 #[tokio::test]
 #[ignore = "requires live test cluster; run with --ignored"]
 async fn t10_partial_migration_recovers_missing_entity_warmth() {
+    let _serial = live_migration_test_lock().lock().await;
     let test = TestClusterConfig::from_env()
         .expect("FERROSA_TEST_CQL_PORT must be set; start a test cluster first");
     let cfg = test_cfg(&test);
@@ -465,6 +481,7 @@ async fn t10_partial_migration_recovers_missing_entity_warmth() {
 #[tokio::test]
 #[ignore = "requires live test cluster; run with --ignored"]
 async fn t11_baseline_gap_backfills_missing_typed_edges() {
+    let _serial = live_migration_test_lock().lock().await;
     let test = TestClusterConfig::from_env()
         .expect("FERROSA_TEST_CQL_PORT must be set; start a test cluster first");
     let cfg = test_cfg(&test);
