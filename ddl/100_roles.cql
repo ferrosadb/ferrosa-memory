@@ -69,4 +69,37 @@ GRANT MODIFY ON agent_memory.memory_conflicts    TO ferrosa_user;
 GRANT MODIFY ON agent_memory.memory_feedback     TO ferrosa_user;
 GRANT MODIFY ON agent_memory.import_batches      TO ferrosa_user;
 
+-- Lexical/document indexing: ferrosa_user writes these on the serving path
+-- during document/context ingest (CqlStorage::context_segment_put /
+-- document_chunk_put). Missing grants make document ingest fail under auth.
+GRANT MODIFY ON agent_memory.context_segments        TO ferrosa_user;
+GRANT MODIFY ON agent_memory.context_segment_terms   TO ferrosa_user;
+GRANT MODIFY ON agent_memory.document_chunks         TO ferrosa_user;
+GRANT MODIFY ON agent_memory.document_terms          TO ferrosa_user;
+GRANT MODIFY ON agent_memory.document_phonetic_terms TO ferrosa_user;
+
+-- Session task continuity (migration 039): written by the session-task tools
+-- via CqlStorage on the runtime session.
+GRANT MODIFY ON agent_memory.session_tasks_by_id      TO ferrosa_user;
+GRANT MODIFY ON agent_memory.session_tasks_by_status  TO ferrosa_user;
+GRANT MODIFY ON agent_memory.session_task_events      TO ferrosa_user;
+GRANT MODIFY ON agent_memory.session_task_focus_stack TO ferrosa_user;
+GRANT MODIFY ON agent_memory.session_task_policies    TO ferrosa_user;
+GRANT MODIFY ON agent_memory.session_task_aliases     TO ferrosa_user;
+
+-- Alias + approval stores (CqlStorage::alias_put / approval_append).
+GRANT MODIFY ON agent_memory.aliases_by_name     TO ferrosa_user;
+GRANT MODIFY ON agent_memory.approvals_by_target TO ferrosa_user;
+
+-- Type registry: seeded by the runtime ferrosa_user at MCP server STARTUP
+-- (seed_sprint1_types), not by the migrate binary. Without these grants an
+-- auth-enabled cold start logs `entity insert failed` as a non-fatal warn and
+-- the type/edge registry silently never persists.
+GRANT MODIFY ON agent_memory.entity_types TO ferrosa_user;
+GRANT MODIFY ON agent_memory.edge_types   TO ferrosa_user;
+
+-- Temporal edge stream (CqlStorage::temporal_edge_put). App-owned — NOT the
+-- graph-engine edge tables listed below.
+GRANT MODIFY ON agent_memory.temporal_edges TO ferrosa_user;
+
 -- graph-owned tables: NOT GRANTED to ferrosa_user on purpose.
