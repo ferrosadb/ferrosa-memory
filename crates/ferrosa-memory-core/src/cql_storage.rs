@@ -1167,6 +1167,28 @@ fn fail_loud_on_denied<T>(
     }
 }
 
+/// Same fail-loud-on-`Unauthorized` contract as [`fail_loud_on_denied`], for
+/// write paths not keyed by a single entity id. `what` describes the write for
+/// the error/log (e.g. `"delete_session plan_state"`); build it only at the
+/// call site since these are cold paths. A missing grant aborts the caller;
+/// other errors keep warn-and-continue tolerance.
+pub(crate) fn fail_loud_write<T>(
+    result: Result<T, scylla::transport::errors::QueryError>,
+    what: &str,
+) -> anyhow::Result<()> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) if is_permission_denied(&e) => Err(anyhow::anyhow!(
+            "permission denied on {what}: {e}. ferrosa_user is missing a grant; \
+             aborting to avoid silent data loss"
+        )),
+        Err(e) => {
+            tracing::warn!(what, error = %e, "write failed (non-permission; continuing)");
+            Ok(())
+        }
+    }
+}
+
 /// Build a new CQL session with the given username/password against the
 /// contact points in `config`. Shared by `CqlStorage::connect` (runtime
 /// session) and `connect_admin_session` (short-lived migration session).
@@ -1896,9 +1918,10 @@ impl CqlStorage {
                     .session
                     .query_unpaged(q, (name.clone(), desc, created_at))
                     .await;
-                if let Err(e) = res {
-                    tracing::warn!(type_name = %name, error = %e, "seed_sprint1_types: entity insert failed");
-                }
+                fail_loud_write(
+                    res,
+                    &format!("seed_sprint1_types entity_types insert ({name})"),
+                )
             }
         });
 
@@ -1936,9 +1959,10 @@ impl CqlStorage {
                     .session
                     .query_unpaged(q, (name.clone(), desc, src, dst, created_at))
                     .await;
-                if let Err(e) = res {
-                    tracing::warn!(edge_type = %name, error = %e, "seed_sprint1_types: edge insert failed");
-                }
+                fail_loud_write(
+                    res,
+                    &format!("seed_sprint1_types edge_types insert ({name})"),
+                )
             }
         });
 
@@ -1946,11 +1970,17 @@ impl CqlStorage {
         // single-partition write against a distinct primary key, so
         // there's no ordering requirement. Serially they were ~5 × RTT;
         // this collapses the whole seed to a single RTT window.
-        tokio::join!(
+        let (entity_results, edge_results) = tokio::join!(
             futures_util::future::join_all(entity_writes),
             futures_util::future::join_all(edge_writes),
         );
 
+        // Fail loud if any seed write was permission-denied: a silently-skipped
+        // type-registry seed leaves the registry empty and downstream typed
+        // reads/writes wrong. Non-permission errors were already warned.
+        for res in entity_results.into_iter().chain(edge_results) {
+            res?;
+        }
         Ok(())
     }
 
@@ -4804,15 +4834,18 @@ impl Storage for CqlStorage {
 
         let mut count = 0;
         for (name, query) in &tables {
-            match self
+            #[allow(deprecated)]
+            let res = self
                 .session
                 .query_unpaged(query.as_str(), (session_id, ctx.tenant_id))
-                .await
-            {
-                Ok(_) => count += 1,
-                Err(e) => {
-                    tracing::warn!(table = name, error = %e, "delete_session: table delete failed")
-                }
+                .await;
+            let succeeded = res.is_ok();
+            // A permission-denied delete must fail loud: silently skipping it
+            // leaves the "deleted" session's rows behind (a forget/delete that
+            // lies about what it removed).
+            fail_loud_write(res, &format!("delete_session {name}"))?;
+            if succeeded {
+                count += 1;
             }
         }
         // entity_store and feedback_outcomes have tenant_id as partition key,

@@ -1957,6 +1957,22 @@ mod tests {
     }
 
     #[test]
+    fn fail_loud_write_aborts_only_on_permission_denied() {
+        use scylla::transport::errors::{DbError, QueryError};
+        // Success and non-permission errors do not abort the caller.
+        assert!(crate::cql_storage::fail_loud_write(Ok::<_, QueryError>(()), "w").is_ok());
+        let overloaded: Result<(), _> =
+            Err(QueryError::DbError(DbError::Overloaded, "busy".into()));
+        assert!(crate::cql_storage::fail_loud_write(overloaded, "w").is_ok());
+        // A permission-denied write aborts (fail loud) so it can't silently drop data.
+        let denied: Result<(), _> = Err(QueryError::DbError(
+            DbError::Unauthorized,
+            "no grant".into(),
+        ));
+        assert!(crate::cql_storage::fail_loud_write(denied, "delete_session plan_state").is_err());
+    }
+
+    #[test]
     fn split_cql_strips_line_comments() {
         let ddl = "\
             -- this is a comment\n\
