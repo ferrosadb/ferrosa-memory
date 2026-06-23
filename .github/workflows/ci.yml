@@ -12,7 +12,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-Cinstrument-coverage"
+  # NOTE: coverage instrumentation (`-Cinstrument-coverage`) is intentionally
+  # NOT set workflow-wide. It forces every compile to be instrumented, which
+  # (a) slows fmt-lint/build/docs/integration that don't need coverage and
+  # (b) produces a different artifact fingerprint, defeating cache sharing.
+  # It is scoped to the `test-coverage` job only (12-factor: build artifacts
+  # once, reuse them — instrumented builds are a separate concern).
 
 jobs:
   # Stage 1: Format + Lint
@@ -25,6 +30,12 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          # Shared (non-instrumented) dependency cache, reused by build/docs/
+          # integration. Collapsing the formerly per-job caches into one key
+          # avoids blowing the 10GB repo cache limit (which evicted caches and
+          # forced cold recompiles) and warms deps once for every consumer.
+          shared-key: ws-noinstrument
       - name: Check formatting
         run: cargo fmt --check
       - name: Clippy (warnings as errors)
@@ -58,14 +69,38 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: ws-noinstrument
       - name: Build workspace
         run: cargo build --workspace --all-targets
+      # 12-factor "build once, run many": compile every test binary here and
+      # ship them as an archive. The integration job RUNS them from the archive
+      # instead of recompiling the workspace (~14-min compile eliminated there).
+      # The `--all-targets` build above already compiled these test binaries, so
+      # `nextest archive` is cache-warm and just packages them.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
+        with:
+          tool: nextest
+      - name: Archive test binaries (built once, run in integration)
+        run: cargo nextest archive --workspace --archive-file nextest-archive.tar.zst
+      - name: Upload nextest archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nextest-archive
+          path: nextest-archive.tar.zst
+          retention-days: 1
 
   # Stage 3: Tests + Coverage
   test-coverage:
     name: Tests & Coverage
     runs-on: ubuntu-latest
     needs: build
+    # Coverage instrumentation is scoped here (it was formerly workflow-wide).
+    # cargo-llvm-cov manages the profile env itself; this matches the prior
+    # behaviour for this job while leaving every other job un-instrumented.
+    env:
+      RUSTFLAGS: "-Cinstrument-coverage"
     defaults:
       run:
         shell: bash
@@ -171,6 +206,8 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: ws-noinstrument
       - name: Build documentation
         run: cargo doc --workspace --no-deps --document-private-items
         env:
@@ -203,8 +240,10 @@ jobs:
           pytest tests/duration/test_duration_specs.py -v
 
   # Stage 7: Cluster-backed integration tests (--ignored, Docker)
-  # Cross-repo dependency: clones ferrosa to build the cluster image.
-  # Tests hardcode ports 19042-19044; CI runners are isolated so this is safe.
+  # Cross-repo dependency: PULLS ferrosa's prebuilt test-node image from GHCR
+  # (never compiles ferrosa here). Test binaries come from the build job's
+  # nextest archive (no workspace recompile). Tests hardcode ports 19042-19044;
+  # CI runners are isolated so this is safe.
   integration:
     name: Cluster integration tests
     runs-on: ubuntu-latest
@@ -227,65 +266,67 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
+          shared-key: ws-noinstrument
           cache-on-failure: false
-      - name: Provision ferrosa node image (prebuilt from GHCR, else build)
-        # ferrosa publishes a prebuilt binary image to GHCR on every main push
-        # (ghcr.io/ferrosadb/ferrosa-test-node:<sha>, built by COPYing release
-        # binaries — not a source compile). Pulling it skips a ~24-min from-
-        # source compile of the whole ferrosa workspace, then we tag it locally
-        # as `ferrosa-memory-node` (the name both compose files use).
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
+        with:
+          tool: nextest
+      - name: Download prebuilt test-binary archive (from the build job)
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: nextest-archive
+      - name: Provision ferrosa node image (prebuilt from GHCR — never compiled here)
+        # ferrosa-memory NEVER compiles ferrosa. ferrosa CI publishes a prebuilt
+        # binary image (ghcr.io/ferrosadb/ferrosa-test-node:<sha>, built by
+        # COPYing release binaries — not a source compile) for every main push
+        # AND every ferrosa PR-branch head. We pull the right one and tag it
+        # locally as `ferrosa-memory-node` (the name both compose files use).
         #
-        # Fall back to building from source when a same-named ferrosa branch is
-        # under test (cross-repo change — the prebuilt main image wouldn't have
-        # it; clone-ferrosa-src.sh picks the matching branch) or when the image
-        # is unavailable (best-effort push skipped, or no package read access).
-        # The fallback makes this non-breaking: worst case == today's behaviour.
+        # SHA resolution:
+        #   - cross-repo PR (a same-named ferrosa branch exists): that branch HEAD
+        #   - otherwise: ferrosa main HEAD
+        #
+        # If the image for the resolved SHA is unavailable we FAIL LOUD instead of
+        # building from source. A source build would silently mask a missing
+        # upstream publish and reintroduce the ~24-min compile this repo forbids
+        # (see CLAUDE.md: ferrosa-memory must only consume prebuilt artifacts).
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -uo pipefail
+          set -euo pipefail
           IMAGE="ghcr.io/ferrosadb/ferrosa-test-node"
           LOCAL_TAG="ferrosa-memory-node"
+          FERROSA_REMOTE="https://github.com/ferrosadb/ferrosa.git"
           retry() { local n=0; until "$@"; do n=$((n + 1)); [ "$n" -ge 5 ] && return 1; echo "retry ${n}/5 in 5s..."; sleep 5; done; }
 
-          build_from_source() {
-            echo "::notice::Building ferrosa node image from source"
-            ./.github/scripts/clone-ferrosa-src.sh \
-              --remote https://github.com/ferrosadb/ferrosa.git \
-              --dest /tmp/ferrosa-src \
-              --candidate "${GITHUB_HEAD_REF:-}" \
-              --candidate "${GITHUB_REF_NAME:-}"
-            docker build -t "$LOCAL_TAG" /tmp/ferrosa-src
-          }
-
-          # Cross-repo parity: if this PR is paired with a same-named ferrosa
-          # branch, build that branch instead of using the prebuilt main image.
-          paired=""
+          # Resolve the ferrosa commit whose prebuilt image we need.
+          SHA=""; SRC=""
           for c in "${GITHUB_HEAD_REF:-}" "${GITHUB_REF_NAME:-}"; do
             [ -n "$c" ] || continue
-            # `main` is the prebuilt image's own source — not a paired *feature*
-            # branch. Skip it so pushes to main and the merge queue still pull.
+            # `main` is resolved below as the default, not as a paired *feature*
+            # branch — skip it so pushes to main and the merge queue pull main's image.
             [ "$c" = "main" ] && continue
-            if git ls-remote --exit-code --heads https://github.com/ferrosadb/ferrosa.git "$c" >/dev/null 2>&1; then
-              paired="$c"; break
+            ref="$(git ls-remote --heads "$FERROSA_REMOTE" "$c" 2>/dev/null || true)"
+            if [ -n "$ref" ]; then
+              SHA="$(echo "$ref" | awk 'NR==1{print $1}')"; SRC="paired ferrosa branch '$c'"; break
             fi
           done
-
-          if [ -n "$paired" ]; then
-            echo "::notice::ferrosa branch '${paired}' exists — building from source for cross-repo parity"
-            build_from_source
-          else
-            SHA="$(gh api repos/ferrosadb/ferrosa/commits/main --jq '.sha' 2>/dev/null || true)"
-            if [ -n "$SHA" ] \
-              && echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null 2>&1 \
-              && retry docker pull "${IMAGE}:${SHA}"; then
-              docker tag "${IMAGE}:${SHA}" "$LOCAL_TAG"
-              echo "::notice::Using prebuilt ${IMAGE}:${SHA} (skipped the ~24-min ferrosa compile)"
-            else
-              echo "::warning::Prebuilt ferrosa image unavailable — falling back to a source build"
-              build_from_source
-            fi
+          if [ -z "$SHA" ]; then
+            SHA="$(gh api repos/ferrosadb/ferrosa/commits/main --jq '.sha')"; SRC="ferrosa main"
           fi
+          echo "::notice::Resolved ferrosa image to ${IMAGE}:${SHA} (${SRC})"
+
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          if ! retry docker pull "${IMAGE}:${SHA}"; then
+            echo "::error::Prebuilt ferrosa image ${IMAGE}:${SHA} (${SRC}) is not available."
+            echo "::error::ferrosa-memory does NOT compile ferrosa — it only consumes prebuilt"
+            echo "::error::artifacts. Ensure ferrosa CI has published the test-node image for"
+            echo "::error::${SHA} (push the branch / let its CI finish), then re-run this job."
+            exit 1
+          fi
+          docker tag "${IMAGE}:${SHA}" "$LOCAL_TAG"
+          echo "::notice::Using prebuilt ${IMAGE}:${SHA} — no ferrosa compile"
       - name: Pre-pull external images (retry Docker Hub flakes)
         # The cluster compose files pull rustfs/minio images from Docker Hub at
         # `compose up` time with no retry, so a transient registry timeout fails
@@ -543,8 +584,8 @@ jobs:
         # alongside the main cluster.
         run: |
           # The compose file references `image: ferrosa-memory-node`, which the
-          # "Provision ferrosa node image" step already tagged (from the prebuilt
-          # GHCR image, or a source build fallback). No rebuild needed here.
+          # "Provision ferrosa node image" step already tagged from the prebuilt
+          # GHCR image. No rebuild needed here.
           # Compose uses ~/data/ferrosa-memory-test/{minio,node1,..}
           # — make sure the dirs exist on the runner.
           mkdir -p \
@@ -615,10 +656,13 @@ jobs:
 
       - name: Build ferrosa-memory-mcp binary for eval tests
         # ferrosa-memory-eval's live tests spawn the MCP server via
-        # McpClient::spawn(), which expects the binary at
-        # target/{debug,release}/ferrosa-memory-mcp. The default
-        # `cargo test --workspace -- --ignored` doesn't build binaries
-        # for non-test targets, so we pre-build here.
+        # McpClient::spawn(), which resolves the binary path at COMPILE time
+        # from env!("CARGO_MANIFEST_DIR") → "$GITHUB_WORKSPACE/target/debug/
+        # ferrosa-memory-mcp" (runner.rs). That path is identical in the build
+        # and integration jobs (GH always checks out to /home/runner/work/<repo>/
+        # <repo>), so the archived eval test finds this binary. Test binaries
+        # come from the archive; this MCP *bin* is a runtime spawn target, not a
+        # cargo test dependency, so it must be built explicitly here.
         run: cargo build -p ferrosa-memory-mcp
       - name: Run ignored (cluster-gated) Rust tests
         env:
@@ -641,7 +685,20 @@ jobs:
         # upstream in ferrosa (commits 6ef9d313 / a6cf1ed5 / 57ba8ec3); this
         # job exercises the full concurrent load against the fixed engine so a
         # regression would surface here rather than being masked by serializing.
-        run: cargo test --workspace -- --ignored
+        #
+        # 12-factor build-once: run the test binaries compiled in the `build`
+        # job from the downloaded nextest archive — NO workspace recompile here
+        # (this step used to spend ~14 min rebuilding the workspace). `--run-
+        # ignored ignored-only` reproduces the prior `cargo test -- --ignored`
+        # selection (only #[ignore] cluster-gated tests). `--workspace-remap .`
+        # points the archived binaries at this checkout for any path-relative
+        # fixtures.
+        run: |
+          cargo nextest run \
+            --archive-file nextest-archive.tar.zst \
+            --workspace-remap . \
+            --run-ignored ignored-only \
+            --no-fail-fast
       - name: Run system pytest suite against live cluster
         env:
           FERROSA_BASE_URL: "http://127.0.0.1:19090"
