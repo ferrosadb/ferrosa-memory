@@ -1597,6 +1597,60 @@ pub async fn hybrid_search_with_diagnostics(
         }
     }
 
+    // Zero-candidate fallback. On a fresh install without embeddings, ANN is
+    // skipped and an entity is lexically findable only by its NAME (its content
+    // body is not fts-indexed), so a content-body query against a plain-ingested
+    // entity returns nothing even though find/list can see it. When EVERY
+    // strategy came back empty, do a bounded, labeled scan of the same
+    // entity_store that find/list read, so search isn't silently empty. Gated on
+    // zero candidates so it never runs when normal retrieval works — no scan
+    // cost on a large, healthy store.
+    if lists.iter().all(|l| l.is_empty()) {
+        const FALLBACK_CAP: usize = 25;
+        let mut fallback: Vec<SearchResult> = Vec::new();
+        for &sid in &sessions {
+            let remaining = FALLBACK_CAP - fallback.len();
+            if remaining == 0 {
+                break;
+            }
+            if let Ok(entities) = storage
+                .entity_text_scan_bounded(ctx, sid, query, remaining)
+                .await
+            {
+                for (i, e) in entities.into_iter().enumerate() {
+                    fallback.push(SearchResult {
+                        id: e.entity_id,
+                        source: "entity_store_fallback".into(),
+                        memory_kind: classify_memory_kind(
+                            "entity",
+                            "entity_store_fallback",
+                            Some(&e.entity_type),
+                        )
+                        .into(),
+                        content: if e.context_snippet.trim().is_empty() {
+                            e.entity_name.clone()
+                        } else {
+                            e.context_snippet.clone()
+                        },
+                        score: 1.0 - (i as f64 * 0.1),
+                        result_type: "entity".into(),
+                        document_id: None,
+                        prev_chunk_id: None,
+                        next_chunk_id: None,
+                        hint: None,
+                        expanded_context: Vec::new(),
+                    });
+                }
+            }
+        }
+        if !fallback.is_empty() {
+            lists.push(fallback);
+            // Low weight: any genuine candidate from a real source always
+            // outranks the last-resort fallback when retrieval recovers.
+            weights.push(0.5);
+        }
+    }
+
     let (lists, weights) = prune_disabled_source_lists(lists, weights);
     let diagnostics = candidate_source_stats(&lists, &weights, limit, source_limit);
     let evidence = collect_candidate_evidence(query, &lists);
@@ -2668,6 +2722,102 @@ mod tests {
                 "trusted entity should rank higher than penalized entity"
             );
         }
+    }
+
+    /// Fresh-install regression (t_8b9583b7): a plain-ingested entity (no
+    /// embedding) is visible to find/list but its CONTENT body is not lexically
+    /// indexed — only its name is. A content-body query whose terms don't appear
+    /// in the name would return zero candidates. The bounded entity_store
+    /// fallback must surface it (labeled `entity_store_fallback`), while a query
+    /// with no token overlap must still return nothing (fallback stays bounded
+    /// by relevance, not a blind dump).
+    #[tokio::test]
+    async fn hybrid_search_falls_back_to_entity_store_when_all_sources_empty() {
+        use crate::storage::mock::MockStorage;
+        use crate::types::{EntityEntry, MemoryState, TenantContext};
+
+        let storage = MockStorage::new();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "test".into(),
+        };
+        let sid = Uuid::new_v4();
+        let id = Uuid::new_v4();
+
+        // Name does NOT contain the query terms; the content snippet does.
+        // No embedding => ANN is skipped.
+        storage
+            .entity_put(
+                &ctx,
+                &EntityEntry {
+                    tenant_id: ctx.tenant_id,
+                    entity_id: id,
+                    session_id: sid,
+                    entity_name: "Project Phoenix".into(),
+                    entity_type: "note".into(),
+                    source_fold_id: None,
+                    context_snippet: "the migration runbook for the billing service".into(),
+                    entity_embedding: None,
+                    confidence: 1.0,
+                    state: MemoryState::Active,
+                    created_at: chrono::Utc::now(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let config = FusionConfig::default();
+
+        // Content-body query (no name overlap, no embedding) must still find it
+        // via the fallback.
+        let results = hybrid_search(
+            &storage,
+            &ctx,
+            sid,
+            "billing service runbook",
+            None,
+            10,
+            None,
+            None,
+            None,
+            &config,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            results.iter().any(|r| r.id == id),
+            "fresh-install content query must surface the entity via fallback, got {} results",
+            results.len()
+        );
+        assert!(
+            results.iter().any(|r| r.source == "entity_store_fallback"),
+            "the recovered candidate must be labeled entity_store_fallback for auditability"
+        );
+
+        // Negative control: a query with no token overlap returns nothing —
+        // the fallback is bounded by relevance, not a blind dump of the store.
+        let none = hybrid_search(
+            &storage,
+            &ctx,
+            sid,
+            "kubernetes networking",
+            None,
+            10,
+            None,
+            None,
+            None,
+            &config,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            none.is_empty(),
+            "irrelevant query must not trigger a blind fallback dump, got {} results",
+            none.len()
+        );
     }
 
     #[tokio::test]
