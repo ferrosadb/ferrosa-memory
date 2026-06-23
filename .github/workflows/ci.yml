@@ -286,6 +286,29 @@ jobs:
               build_from_source
             fi
           fi
+      - name: Pre-pull external images (retry Docker Hub flakes)
+        # The cluster compose files pull rustfs/minio images from Docker Hub at
+        # `compose up` time with no retry, so a transient registry timeout fails
+        # the whole job — and this job gates the merge queue. Pre-pull them here
+        # with exponential backoff; the later `compose up` steps then hit the
+        # local image cache instead of the registry.
+        run: |
+          retry() {
+            local n=0 max=5 delay=5
+            until "$@"; do
+              n=$((n + 1))
+              if [ "$n" -ge "$max" ]; then
+                echo "::error::'$*' failed after ${max} attempts"
+                return 1
+              fi
+              echo "attempt ${n}/${max} failed; retrying in ${delay}s..."
+              sleep "$delay"
+              delay=$((delay * 2))
+            done
+          }
+          for img in rustfs/rustfs:latest minio/minio:latest minio/mc:latest; do
+            retry docker pull "$img"
+          done
       - name: Bring up 3-node cluster on ports 19042-19044
         run: |
           # Write a CI compose that maps 9042→19042 etc. so tests that hardcode
