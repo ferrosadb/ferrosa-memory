@@ -31,7 +31,9 @@ from typing import Any
 
 
 DEFAULT_URL = "http://127.0.0.1:18765/mcp"
-DEFAULT_TENANT_ID = "9a5f8fbf-d842-4d30-8ea5-1aa931e618a8"
+# Standard ferrosa_user dev tenant — see examples/http-auth.toml.
+# Set FERROSA_MEMORY_TENANT_ID explicitly for non-default installs.
+DEFAULT_TENANT_ID = "22222222-2222-2222-2222-222222222222"
 DEFAULT_SESSION_ID = "00000000-0000-0000-0000-000000000000"
 RAW_CONTEXT_LINE = re.compile(r"^(?P<prefix>[A-Za-z_]+)\[\d+\]:\s*(?P<payload>\{.*\})$")
 RAW_CONTEXT_ANY_LINE = re.compile(r"^(?P<prefix>[A-Za-z_]+)\[\d+\]:\s*(?P<payload>.*)$")
@@ -856,11 +858,19 @@ def ingest_turn(client: McpClient, payload: dict[str, Any], args: argparse.Names
         "working_directory": cwd,
         "captured_at_ms": int(time.time() * 1000),
     }
+    _tenant_id = os.environ.get("FERROSA_MEMORY_TENANT_ID")
+    if _tenant_id is None:
+        eprint(
+            "warning: FERROSA_MEMORY_TENANT_ID not set; "
+            "using default dev tenant (22222222-...). "
+            "Set this env var for non-default installs."
+        )
+        _tenant_id = DEFAULT_TENANT_ID
     try:
         client.call_tool(
             "ingest_entities",
             {
-                "tenant_id": os.environ.get("FERROSA_MEMORY_TENANT_ID", DEFAULT_TENANT_ID),
+                "tenant_id": _tenant_id,
                 "entities": [
                     {
                         "id": entity_id,

@@ -489,5 +489,32 @@ class RecallCompactionTests(unittest.TestCase):
         self.assertIn("session_id", configure_call[1]["session_start"])
 
 
+class TenantIdFallbackTests(unittest.TestCase):
+    def setUp(self):
+        self.module = load_hook()
+
+    def test_default_tenant_id_is_ferrosa_user_dev_tenant(self):
+        self.assertEqual(
+            self.module.DEFAULT_TENANT_ID,
+            "22222222-2222-2222-2222-222222222222",
+        )
+
+    def test_env_var_overrides_default(self):
+        custom = "aaaabbbb-0000-0000-0000-ccccddddeeee"
+        with patch.dict(os.environ, {"FERROSA_MEMORY_TENANT_ID": custom}):
+            tenant_id = os.environ.get(
+                "FERROSA_MEMORY_TENANT_ID", self.module.DEFAULT_TENANT_ID
+            )
+        self.assertEqual(tenant_id, custom)
+
+    def test_missing_env_var_falls_back_to_default(self):
+        env = {k: v for k, v in os.environ.items() if k != "FERROSA_MEMORY_TENANT_ID"}
+        with patch.dict(os.environ, env, clear=True):
+            tenant_id = os.environ.get(
+                "FERROSA_MEMORY_TENANT_ID", self.module.DEFAULT_TENANT_ID
+            )
+        self.assertEqual(tenant_id, "22222222-2222-2222-2222-222222222222")
+
+
 if __name__ == "__main__":
     unittest.main()
