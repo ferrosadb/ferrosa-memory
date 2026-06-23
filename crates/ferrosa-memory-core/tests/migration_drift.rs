@@ -14,7 +14,7 @@
 use ferrosa_memory_core::config::FerrosaCqlConfig;
 use ferrosa_memory_core::cql_storage::connect_session;
 use ferrosa_memory_core::migration::{
-    MIGRATIONS, Migration, PRE_VERSIONING_BASELINE, ROLES_DDL, run_migrations,
+    BOOTSTRAP_DDLS, MIGRATIONS, Migration, PRE_VERSIONING_BASELINE, ROLES_DDL, run_migrations,
 };
 use ferrosa_memory_core::test_cluster::TestClusterConfig;
 
@@ -523,5 +523,99 @@ async fn t11_baseline_gap_backfills_missing_typed_edges() {
     assert!(
         live_version_recorded(&session, &cfg.keyspace, 42).await,
         "schema_version must record v42 after backfill"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T-12: Exhaustive grant coverage — every created app table is granted or exempt
+// ---------------------------------------------------------------------------
+
+/// Extract `CREATE TABLE [IF NOT EXISTS] [keyspace.]<name>` table names from a
+/// DDL blob, lowercased and unqualified.
+fn created_table_names(ddl: &str) -> Vec<String> {
+    let lower = ddl.to_lowercase();
+    let mut names = Vec::new();
+    for (i, _) in lower.match_indices("create table") {
+        let rest = lower[i + "create table".len()..].trim_start();
+        let rest = rest
+            .strip_prefix("if not exists")
+            .unwrap_or(rest)
+            .trim_start();
+        let tok: String = rest
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != '(')
+            .collect();
+        let name = tok.rsplit('.').next().unwrap_or(&tok).trim().to_string();
+        if !name.is_empty() {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// T-12: every table CREATEd by the schema must EITHER be `GRANT MODIFY … TO
+/// ferrosa_user` in ROLES_DDL OR be in an explicit exempt list. This turns a
+/// forgotten grant on a newly-added app table into a CI failure — the root
+/// cause behind the entity_store grant incident (writes silently fail under
+/// auth when the runtime role lacks MODIFY).
+#[test]
+fn t12_every_created_table_is_granted_or_explicitly_exempt() {
+    // Graph-owned: writes go through GraphClient as ferrosa_admin, never via
+    // direct ferrosa_user CQL — intentionally ungranted.
+    const GRAPH_OWNED: &[&str] = &[
+        "typed_edges",
+        "folded_into",
+        "mentioned_in",
+        "co_occurs_with",
+        "supersedes",
+        "derived_edges_by_pred",
+        "derived_edges_by_src",
+    ];
+    // No serving-path ferrosa_user write today: migration bookkeeping (admin
+    // session), genuinely unused tables, or write paths stubbed for the "B10"
+    // sprint. If a runtime write path is added, add a GRANT and drop from here.
+    const NO_RUNTIME_WRITE: &[&str] = &[
+        "schema_version",
+        "contradictions",
+        "consolidation_history",
+        "consolidation_queue",
+        "domain_schemas",
+        "entity_retrieval_counts",
+        "promoted_predicates",
+        "routing_guidelines",
+        "query_heat_by_predicate_day",
+        "compute_cost_by_predicate_day",
+    ];
+
+    let roles = ROLES_DDL.to_lowercase();
+    let granted = |t: &str| {
+        let needle = format!("grant modify on agent_memory.{t}");
+        roles
+            .lines()
+            .any(|l| l.contains(&needle) && l.contains("to ferrosa_user"))
+    };
+
+    let mut tables: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for ddl in BOOTSTRAP_DDLS {
+        tables.extend(created_table_names(ddl));
+    }
+    for m in MIGRATIONS {
+        tables.extend(created_table_names(m.ddl));
+    }
+
+    let unexpected: Vec<&String> = tables
+        .iter()
+        .filter(|t| {
+            !granted(t)
+                && !GRAPH_OWNED.contains(&t.as_str())
+                && !NO_RUNTIME_WRITE.contains(&t.as_str())
+        })
+        .collect();
+
+    assert!(
+        unexpected.is_empty(),
+        "these CREATEd tables are neither GRANTed MODIFY to ferrosa_user nor explicitly \
+         exempt (graph-owned / no-runtime-write). Add a GRANT to ddl/100_roles.cql or an \
+         entry to the exempt lists: {unexpected:?}"
     );
 }
