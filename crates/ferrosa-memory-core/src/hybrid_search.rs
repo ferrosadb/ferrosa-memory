@@ -155,6 +155,34 @@ impl FusionConfig {
                 config.document_ann_weight = 1.5;
                 Some(config)
             }
+            // Session-memory intent: conversational/temporal recall of recent
+            // work. Weight session context (segments + folds) and warmth up and
+            // leave document_* at zero — the target is the current trajectory,
+            // not the document corpus.
+            "session-semantic" => {
+                config.zero_all();
+                config.context_bm25_weight = 2.0;
+                config.context_ann_weight = 1.5;
+                config.phonetic_weight = 1.0;
+                config.ann_weight = 1.0;
+                config.fold_weight = 1.5;
+                config.warmth_weight = 2.0;
+                config.workspace_weight = 1.0;
+                Some(config)
+            }
+            // Corpus-reference intent: the query points at the document corpus
+            // (papers, citations). Boost document sources; keep a little entity
+            // context so a referenced concept's entity can still surface.
+            "corpus-reference" => {
+                config.zero_all();
+                config.document_bm25_weight = 3.0;
+                config.document_ann_weight = 2.0;
+                config.context_bm25_weight = 1.0;
+                config.context_ann_weight = 1.0;
+                config.ann_weight = 1.0;
+                config.fold_weight = 0.5;
+                Some(config)
+            }
             "bm25-semantic" => {
                 config.zero_all();
                 config.context_bm25_weight = 1.5;
