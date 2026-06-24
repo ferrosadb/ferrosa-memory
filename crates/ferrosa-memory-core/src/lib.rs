@@ -22,6 +22,7 @@
 pub mod audit;
 pub mod auth;
 pub mod batch;
+pub mod capabilities;
 pub mod chains;
 pub mod compression;
 pub mod confidence;
