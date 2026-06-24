@@ -175,6 +175,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "backfill typed_edges on pre-017 baseline-adopted installs",
         ddl: include_str!("../../../ddl/042_typed_edges_backfill.cql"),
     },
+    Migration {
+        version: 43,
+        description: "native full-text index on entity_store.context_snippet for content recall",
+        ddl: include_str!("../../../ddl/043_entity_content_fts.cql"),
+    },
 ];
 
 /// `ddl/011_warmth_field.cql` — the `entity_warmth` table + session index.
@@ -1970,6 +1975,24 @@ mod tests {
             "no grant".into(),
         ));
         assert!(crate::cql_storage::fail_loud_write(denied, "delete_session plan_state").is_err());
+    }
+
+    #[test]
+    fn migration_43_indexes_entity_content_for_lexical_recall() {
+        // t_72c2ce34: entity content (context_snippet) must be native-FTS indexed
+        // so a lexical search returns a plain-ingested entity without embeddings.
+        let m = MIGRATIONS
+            .iter()
+            .find(|m| m.version == 43)
+            .expect("migration v43 registered");
+        let ddl = m.ddl.to_lowercase();
+        assert!(
+            ddl.contains("idx_entity_context_snippet_fts"),
+            "v43 must create the entity content FTS index"
+        );
+        assert!(ddl.contains("entity_store"));
+        assert!(ddl.contains("context_snippet"));
+        assert!(ddl.contains("fulltext"));
     }
 
     #[test]
