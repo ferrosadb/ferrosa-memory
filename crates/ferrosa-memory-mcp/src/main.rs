@@ -2508,6 +2508,32 @@ async fn run_schema_migrations_if_enabled(config: &FerrosaCqlConfig) {
                     "required schema index ensure failed: {e}. Runtime search/ranking queries may fail until indexes are rebuilt."
                 ),
             }
+            // Required-capability gate: the memory schema needs Ferrosa native
+            // full-text search (fts_match) for lexical recall. release_version is
+            // a fixed compat marker, so probe actual behavior. Tiered: fail loud
+            // on a definitive gap (search would break / silently lie), warn on an
+            // ambiguous/transient probe error.
+            use ferrosa_memory_core::capabilities::{CapabilityStatus, probe_native_fts};
+            match probe_native_fts(&admin_session, &config.keyspace).await {
+                CapabilityStatus::Supported => {
+                    tracing::info!(
+                        "Ferrosa capability: native full-text search (fts_match) supported"
+                    )
+                }
+                CapabilityStatus::Unsupported(detail) => {
+                    tracing::error!(
+                        "FATAL: the connected Ferrosa does not support native full-text search \
+                         (fts_match), which this memory build REQUIRES for lexical recall (ddl/040, \
+                         ddl/043). Search would fail or return silently-wrong results. Upgrade Ferrosa \
+                         to a build with native FTS. Probe error: {detail}. Refusing to serve."
+                    );
+                    std::process::exit(1);
+                }
+                CapabilityStatus::Inconclusive(detail) => tracing::warn!(
+                    "Ferrosa native-FTS capability probe inconclusive ({detail}); continuing, but \
+                     lexical search may be degraded if FTS is unavailable."
+                ),
+            }
         }
         Err(e) => {
             tracing::warn!(
