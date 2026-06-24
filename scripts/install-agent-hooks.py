@@ -158,6 +158,7 @@ def write_hook_env(
     auth_header: str | None = None,
     mcp_user: str | None = None,
     mcp_password: str | None = None,
+    tenant_id: str | None = None,
 ) -> None:
     if auth_header is not None:
         auth_header = validate_auth_header(auth_header)
@@ -179,6 +180,12 @@ def write_hook_env(
         ensure_env_line(lines, "FERROSA_MEMORY_MCP_USER", f"export FERROSA_MEMORY_MCP_USER={shell_quote(mcp_user)}", replace=True)
     if mcp_password is not None:
         ensure_env_line(lines, "FERROSA_MEMORY_MCP_PASSWORD", f"export FERROSA_MEMORY_MCP_PASSWORD={shell_quote(mcp_password)}", replace=True)
+    if tenant_id is not None:
+        # The server derives a request's tenant from the authenticated
+        # principal and rejects a mismatched client tenant; the hook must send
+        # THIS install's tenant (from `ferrosa-memory provision-tenant`), not a
+        # shared default, or ingests are silently dropped.
+        ensure_env_line(lines, "FERROSA_MEMORY_TENANT_ID", f"export FERROSA_MEMORY_TENANT_ID={shell_quote(tenant_id)}", replace=True)
     ensure_env_line(
         lines,
         "FERROSA_MEMORY_HOOK_TIMEOUT",
@@ -220,10 +227,11 @@ def create_wrappers(
     auth_header: str | None = None,
     mcp_user: str | None = None,
     mcp_password: str | None = None,
+    tenant_id: str | None = None,
 ) -> dict[str, dict[str, str]]:
     install_dir.mkdir(parents=True, exist_ok=True)
     env_path = install_dir / "env"
-    write_hook_env(env_path, mcp_url, auth_header=auth_header, mcp_user=mcp_user, mcp_password=mcp_password)
+    write_hook_env(env_path, mcp_url, auth_header=auth_header, mcp_user=mcp_user, mcp_password=mcp_password, tenant_id=tenant_id)
 
     wrappers: dict[str, dict[str, str]] = {}
     for harness in harnesses:
@@ -727,6 +735,12 @@ def main() -> int:
     )
     parser.add_argument("--mcp-user", default=os.environ.get("FERROSA_MEMORY_MCP_USER"))
     parser.add_argument("--mcp-password", default=os.environ.get("FERROSA_MEMORY_MCP_PASSWORD"))
+    parser.add_argument(
+        "--tenant-id",
+        default=os.environ.get("FERROSA_MEMORY_TENANT_ID"),
+        help="Per-install tenant UUID (from `ferrosa-memory provision-tenant`) written to the hook env "
+        "as FERROSA_MEMORY_TENANT_ID. Must match the authenticated principal's tenant or ingests are dropped.",
+    )
     parser.add_argument("--claude-settings", type=Path, default=Path.home() / ".claude" / "settings.json")
     parser.add_argument("--hermes-config", type=Path, default=Path.home() / ".hermes" / "config.yaml")
     parser.add_argument("--codex-hooks", type=Path, default=Path.home() / ".codex" / "hooks.json")
@@ -777,6 +791,7 @@ def main() -> int:
         auth_header=args.auth_header,
         mcp_user=args.mcp_user,
         mcp_password=args.mcp_password,
+        tenant_id=args.tenant_id,
     )
     write_snippets(args.install_dir, wrappers)
 

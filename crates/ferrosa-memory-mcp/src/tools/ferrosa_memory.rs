@@ -27,6 +27,7 @@ enum Command {
     Setup,
     Doctor,
     Uninstall,
+    ProvisionTenant,
     Help,
 }
 
@@ -37,6 +38,10 @@ struct Cli {
     dry_run: bool,
     system: bool,
     delete_data: bool,
+    /// MCP config path for `provision-tenant`.
+    config: Option<String>,
+    /// HTTP auth file path for `provision-tenant`.
+    auth_file: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -45,6 +50,7 @@ fn main() -> anyhow::Result<()> {
         Command::Setup => setup(&cli),
         Command::Doctor => doctor(&cli),
         Command::Uninstall => uninstall(&cli),
+        Command::ProvisionTenant => provision_tenant(&cli),
         Command::Help => {
             print_help();
             Ok(())
@@ -62,17 +68,23 @@ where
     let mut dry_run = false;
     let mut system = false;
     let mut delete_data = false;
+    let mut config = None;
+    let mut auth_file = None;
 
-    for arg in args.into_iter().map(Into::into) {
+    let mut it = args.into_iter().map(Into::into);
+    while let Some(arg) = it.next() {
         match arg.as_str() {
             "setup" => command = Command::Setup,
             "doctor" | "status" => command = Command::Doctor,
             "uninstall" => command = Command::Uninstall,
+            "provision-tenant" => command = Command::ProvisionTenant,
             "-h" | "--help" | "help" => command = Command::Help,
             "-y" | "--yes" => yes = true,
             "--dry-run" => dry_run = true,
             "--system" => system = true,
             "--delete-data" => delete_data = true,
+            "--config" => config = it.next(),
+            "--auth-file" => auth_file = it.next(),
             _ => {
                 eprintln!("unknown argument: {arg}");
                 command = Command::Help;
@@ -86,6 +98,8 @@ where
         dry_run,
         system,
         delete_data,
+        config,
+        auth_file,
     }
 }
 
@@ -95,8 +109,123 @@ fn print_help() {
          Usage:\n\
            ferrosa-memory setup [--system] [--dry-run] [--yes]\n\
            ferrosa-memory doctor\n\
-           ferrosa-memory uninstall [--delete-data] [--dry-run] [--yes]\n"
+           ferrosa-memory uninstall [--delete-data] [--dry-run] [--yes]\n\
+           ferrosa-memory provision-tenant --config <path> [--auth-file <path>]\n"
     );
+}
+
+/// Provision a unique per-install tenant + credentials, idempotently.
+///
+/// Reads the MCP config (and auth file if present), resolves the tenant
+/// (reusing an existing real one, else generating a fresh UUID), and writes it
+/// consistently into `[server].tenant_id`, `[viz].tenant_id`, and every auth
+/// principal. If the auth file is absent it generates one with random
+/// per-install credentials. Emits `KEY=VALUE` lines on stdout for the
+/// installer to thread into the hook env (the plaintext password is shown
+/// once here and is otherwise unrecoverable).
+fn provision_tenant(cli: &Cli) -> anyhow::Result<()> {
+    use ferrosa_memory_core::tenant_provision as tp;
+    use uuid::Uuid;
+
+    let config_path = cli
+        .config
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("provision-tenant requires --config <path>"))?;
+    let config_doc = fs::read_to_string(config_path)
+        .map_err(|e| anyhow::anyhow!("reading config {config_path}: {e}"))?;
+
+    // The ferrosa_user principal's tenant in an existing auth file is the
+    // authoritative existing identity; fall back to the config's [server].
+    let auth_path = cli.auth_file.as_deref();
+    let existing_auth = auth_path.and_then(|p| fs::read_to_string(p).ok());
+    let existing = existing_auth
+        .as_deref()
+        .and_then(first_principal_tenant)
+        .or_else(|| section_value(&config_doc, "server", "tenant_id"))
+        .and_then(|s| Uuid::parse_str(&s).ok());
+
+    let tenant = tp::resolve_tenant(existing, Uuid::new_v4());
+
+    // Config: [server].tenant_id + [viz].tenant_id.
+    let mut new_config =
+        tp::set_in_section(&config_doc, "server", "tenant_id", &tenant.to_string());
+    new_config = tp::set_in_section(&new_config, "viz", "tenant_id", &tenant.to_string());
+
+    // Auth file: update existing principals, or generate fresh credentials.
+    let mut generated: Vec<tp::GeneratedCredential> = Vec::new();
+    if let Some(path) = auth_path {
+        if let Some(doc) = existing_auth {
+            let updated = tp::set_each_principal_tenant(&doc, &tenant.to_string());
+            write_if_changed(Path::new(path), &updated)?;
+        } else {
+            for username in ["ferrosa_admin", "ferrosa_user"] {
+                generated.push(tp::GeneratedCredential {
+                    username: username.to_string(),
+                    // 128 bits of entropy from a v4 UUID; unique per install.
+                    password: Uuid::new_v4().simple().to_string(),
+                    tenant_id: tenant,
+                });
+            }
+            fs::write(path, tp::render_auth_file(&generated))
+                .map_err(|e| anyhow::anyhow!("writing auth file {path}: {e}"))?;
+            // Point the config at the generated auth file.
+            new_config = tp::set_in_section(&new_config, "server", "auth_file", path);
+        }
+    }
+
+    write_if_changed(Path::new(config_path), &new_config)?;
+
+    // Machine-readable output for the installer.
+    println!("FERROSA_MEMORY_TENANT_ID={tenant}");
+    if let Some(user) = generated.iter().find(|c| c.username == "ferrosa_user") {
+        println!("FERROSA_MEMORY_MCP_USER={}", user.username);
+        println!("FERROSA_MEMORY_MCP_PASSWORD={}", user.password);
+    }
+    eprintln!("provisioned tenant {tenant} (idempotent: re-runs preserve it)");
+    Ok(())
+}
+
+/// First `tenant_id` value under the first `[[principal]]` of an auth doc.
+fn first_principal_tenant(doc: &str) -> Option<String> {
+    let mut in_principal = false;
+    for line in doc.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_principal = trimmed == "[[principal]]";
+            continue;
+        }
+        if in_principal && let Some(v) = line_value(trimmed, "tenant_id") {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Value of `key` inside `[section]` of a TOML doc (first occurrence).
+fn section_value(doc: &str, section: &str, key: &str) -> Option<String> {
+    let header = format!("[{section}]");
+    let mut in_section = false;
+    for line in doc.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_section = trimmed == header;
+            continue;
+        }
+        if in_section && let Some(v) = line_value(trimmed, key) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Parse `key = "value"` (uncommented), returning the unquoted value.
+fn line_value(trimmed: &str, key: &str) -> Option<String> {
+    if trimmed.starts_with('#') {
+        return None;
+    }
+    let rest = trimmed.strip_prefix(key)?.trim_start();
+    let rest = rest.strip_prefix('=')?.trim();
+    Some(rest.trim_matches('"').to_string())
 }
 
 fn setup(cli: &Cli) -> anyhow::Result<()> {
@@ -413,6 +542,40 @@ mod tests {
     fn parse_args_defaults_to_help() {
         let cli = parse_args(std::iter::empty::<&str>());
         assert_eq!(cli.command, Command::Help);
+    }
+
+    #[test]
+    fn parse_provision_tenant_with_value_args() {
+        let cli = parse_args([
+            "provision-tenant",
+            "--config",
+            "/etc/ferrosa/ferrosa-memory.toml",
+            "--auth-file",
+            "/etc/ferrosa/http-auth.toml",
+        ]);
+        assert_eq!(cli.command, Command::ProvisionTenant);
+        assert_eq!(
+            cli.config.as_deref(),
+            Some("/etc/ferrosa/ferrosa-memory.toml")
+        );
+        assert_eq!(
+            cli.auth_file.as_deref(),
+            Some("/etc/ferrosa/http-auth.toml")
+        );
+    }
+
+    #[test]
+    fn toml_value_readers_parse_sections_and_principals() {
+        let config = "[server]\ntransport = \"http\"\ntenant_id = \"abc\"\n";
+        assert_eq!(
+            section_value(config, "server", "tenant_id").as_deref(),
+            Some("abc")
+        );
+        assert_eq!(section_value(config, "server", "missing"), None);
+        let auth = "[[principal]]\nusername = \"u\"\ntenant_id = \"t-1\"\n";
+        assert_eq!(first_principal_tenant(auth).as_deref(), Some("t-1"));
+        // Commented assignments are not read as values.
+        assert_eq!(line_value("# tenant_id = \"x\"", "tenant_id"), None);
     }
 
     #[test]

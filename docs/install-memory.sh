@@ -183,6 +183,29 @@ else
   say "kept existing $CONFIG_DIR/ferrosa-memory.toml"
 fi
 
+# ---------- per-install tenant + credential provisioning ----------
+# Every install gets its OWN tenant UUID instead of sharing the example tenant.
+# The server derives a request's tenant from the authenticated principal and
+# rejects a mismatched client tenant, so the tenant must be consistent across
+# the config, the HTTP auth file, and the hook env. `provision-tenant` is
+# idempotent: a re-install preserves the existing tenant (never orphans data).
+# Requires the native `ferrosa-memory` CLI (releases after v0.16.x).
+TENANT_ID=""; GEN_USER=""; GEN_PASS=""
+AUTH_FILE="$CONFIG_DIR/http-auth.toml"
+if [ "$HAS_SETUP_CLI" = "yes" ]; then
+  say "provisioning per-install tenant"
+  PROV_OUT=$("$BIN_DIR/ferrosa-memory" provision-tenant \
+    --config "$CONFIG_DIR/ferrosa-memory.toml" --auth-file "$AUTH_FILE" 2>/dev/null \
+    | grep '^FERROSA_MEMORY_' || true)
+  TENANT_ID=$(printf '%s\n' "$PROV_OUT" | sed -n 's/^FERROSA_MEMORY_TENANT_ID=//p')
+  GEN_USER=$(printf '%s\n' "$PROV_OUT" | sed -n 's/^FERROSA_MEMORY_MCP_USER=//p')
+  GEN_PASS=$(printf '%s\n' "$PROV_OUT" | sed -n 's/^FERROSA_MEMORY_MCP_PASSWORD=//p')
+  [ -n "$TENANT_ID" ] && say "tenant: ${TENANT_ID}" \
+    || say "warning: tenant provisioning produced no tenant id (continuing)"
+else
+  say "skipping tenant provisioning (this release has no 'ferrosa-memory' CLI); using config defaults"
+fi
+
 # ---------- service registration ----------
 prompt_yes() {
   local q="$1" a
@@ -273,6 +296,31 @@ fi
 cat <<EOF >&2
   binary: $BIN_DIR/ferrosa-memory-mcp
   config: $CONFIG_DIR/ferrosa-memory.toml
+EOF
+
+if [ -n "$TENANT_ID" ]; then
+  cat <<EOF >&2
+
+This install's tenant: $TENANT_ID
+  auth file: $AUTH_FILE
+EOF
+  if [ -n "$GEN_PASS" ]; then
+    cat <<EOF >&2
+
+Generated HTTP credentials (shown ONCE — store them now):
+  user:     $GEN_USER
+  password: $GEN_PASS
+
+Install the agent hooks with this tenant + credentials so ingests aren't
+dropped for tenant mismatch:
+
+  python3 scripts/install-agent-hooks.py \\
+    --tenant-id $TENANT_ID --mcp-user $GEN_USER --mcp-password '$GEN_PASS'
+EOF
+  fi
+fi
+
+cat <<EOF >&2
 
 This MCP server connects to a running Ferrosa instance at localhost:9042
 (default from https://ferrosadb.com/install.sh). Ensure Ferrosa is up:
