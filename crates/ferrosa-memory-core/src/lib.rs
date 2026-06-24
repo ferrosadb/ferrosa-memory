@@ -73,6 +73,7 @@ pub mod spreading;
 pub mod storage;
 pub mod system_describe;
 pub mod temporal;
+pub mod tenant_provision;
 pub mod test_cluster;
 pub mod transport;
 pub mod turn_chain;

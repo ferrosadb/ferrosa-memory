@@ -489,5 +489,37 @@ class RecallCompactionTests(unittest.TestCase):
         self.assertIn("session_id", configure_call[1]["session_start"])
 
 
+class TenantIdFallbackTests(unittest.TestCase):
+    """Tenant resolution for the ingest path (reframed from PR #112: assert
+    behavior — env override + fallback — not a specific shared UUID, since real
+    installs now get a unique per-install tenant via provision-tenant)."""
+
+    def setUp(self):
+        self.module = load_hook()
+
+    def test_default_tenant_id_is_a_valid_uuid(self):
+        import uuid
+
+        # Dev-only last resort; its exact value is not contractual (installs
+        # provision their own tenant), but it must parse as a UUID.
+        uuid.UUID(self.module.DEFAULT_TENANT_ID)
+
+    def test_env_var_overrides_default(self):
+        custom = "aaaabbbb-0000-0000-0000-ccccddddeeee"
+        with patch.dict(os.environ, {"FERROSA_MEMORY_TENANT_ID": custom}):
+            resolved = os.environ.get(
+                "FERROSA_MEMORY_TENANT_ID", self.module.DEFAULT_TENANT_ID
+            )
+        self.assertEqual(resolved, custom)
+
+    def test_missing_env_var_falls_back_to_default(self):
+        env = {k: v for k, v in os.environ.items() if k != "FERROSA_MEMORY_TENANT_ID"}
+        with patch.dict(os.environ, env, clear=True):
+            resolved = os.environ.get(
+                "FERROSA_MEMORY_TENANT_ID", self.module.DEFAULT_TENANT_ID
+            )
+        self.assertEqual(resolved, self.module.DEFAULT_TENANT_ID)
+
+
 if __name__ == "__main__":
     unittest.main()

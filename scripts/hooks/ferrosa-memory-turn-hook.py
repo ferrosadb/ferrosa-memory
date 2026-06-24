@@ -31,6 +31,13 @@ from typing import Any
 
 
 DEFAULT_URL = "http://127.0.0.1:18765/mcp"
+# Dev-only last-resort tenant. Real installs get a UNIQUE per-install tenant
+# from `ferrosa-memory provision-tenant`, which the hook installer writes to
+# FERROSA_MEMORY_TENANT_ID. The server derives a request's tenant from the
+# authenticated principal and rejects a mismatched client tenant, so a wrong
+# hardcoded default silently drops every ingest — hence the loud warning when
+# this fallback fires (idea + tests from bulghur's PR #112, reframed here as
+# per-install provisioning rather than a single shared tenant).
 DEFAULT_TENANT_ID = "9a5f8fbf-d842-4d30-8ea5-1aa931e618a8"
 DEFAULT_SESSION_ID = "00000000-0000-0000-0000-000000000000"
 RAW_CONTEXT_LINE = re.compile(r"^(?P<prefix>[A-Za-z_]+)\[\d+\]:\s*(?P<payload>\{.*\})$")
@@ -856,11 +863,20 @@ def ingest_turn(client: McpClient, payload: dict[str, Any], args: argparse.Names
         "working_directory": cwd,
         "captured_at_ms": int(time.time() * 1000),
     }
+    tenant_id = os.environ.get("FERROSA_MEMORY_TENANT_ID")
+    if tenant_id is None:
+        eprint(
+            "warning: FERROSA_MEMORY_TENANT_ID not set; using dev fallback tenant "
+            f"({DEFAULT_TENANT_ID}). Run `ferrosa-memory provision-tenant` and reinstall "
+            "hooks (install-agent-hooks.py --tenant-id ...) so ingests aren't dropped "
+            "for tenant mismatch."
+        )
+        tenant_id = DEFAULT_TENANT_ID
     try:
         client.call_tool(
             "ingest_entities",
             {
-                "tenant_id": os.environ.get("FERROSA_MEMORY_TENANT_ID", DEFAULT_TENANT_ID),
+                "tenant_id": tenant_id,
                 "entities": [
                     {
                         "id": entity_id,
