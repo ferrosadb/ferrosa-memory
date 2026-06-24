@@ -87,6 +87,9 @@ pub struct SearchOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FusionConfig {
     pub phonetic_weight: f64,
+    /// Weight for entity CONTENT-body lexical hits (native FTS on
+    /// context_snippet) — the embeddings-free content recall path.
+    pub entity_content_fts_weight: f64,
     pub ann_weight: f64,
     pub fold_weight: f64,
     pub context_bm25_weight: f64,
@@ -109,6 +112,7 @@ impl Default for FusionConfig {
     fn default() -> Self {
         Self {
             phonetic_weight: 1.0,
+            entity_content_fts_weight: 1.5,
             ann_weight: 1.0,
             fold_weight: 1.0,
             context_bm25_weight: 1.5,
@@ -1244,6 +1248,48 @@ pub async fn hybrid_search_with_diagnostics(
                     .collect(),
             );
             weights.push(config.phonetic_weight);
+        }
+
+        // Strategy 1b: Entity CONTENT-body lexical search via native FTS.
+        // Embeddings-free: makes a content-term `search` return a plain-ingested
+        // entity even with no ANN — the gap that entity_text_scan_bounded only
+        // patched as a labeled last-resort scan. Needs idx_entity_context_snippet_fts
+        // (ddl/043); no-op against clusters/older schema where the index is absent.
+        if let Ok(entities) = storage
+            .entity_find_content_fts(ctx, sid, query, source_limit)
+            .await
+            && !entities.is_empty()
+        {
+            lists.push(
+                entities
+                    .into_iter()
+                    .take(source_limit)
+                    .enumerate()
+                    .map(|(i, e)| SearchResult {
+                        id: e.entity_id,
+                        source: "entity_content_fts".into(),
+                        memory_kind: classify_memory_kind(
+                            "entity",
+                            "entity_content_fts",
+                            Some(&e.entity_type),
+                        )
+                        .into(),
+                        content: if e.context_snippet.trim().is_empty() {
+                            e.entity_name.clone()
+                        } else {
+                            e.context_snippet.clone()
+                        },
+                        score: 1.0 - (i as f64 * 0.1), // rank decay
+                        result_type: "entity".into(),
+                        document_id: None,
+                        prev_chunk_id: None,
+                        next_chunk_id: None,
+                        hint: None,
+                        expanded_context: Vec::new(),
+                    })
+                    .collect(),
+            );
+            weights.push(config.entity_content_fts_weight);
         }
 
         // Strategy 2: ANN entity search

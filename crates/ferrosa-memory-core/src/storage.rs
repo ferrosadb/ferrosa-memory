@@ -357,6 +357,25 @@ pub trait Storage: Send + Sync {
         name: &str,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<EntityEntry>>> + Send;
 
+    /// Find entities whose CONTENT body (`context_snippet`) matches `query` via
+    /// Ferrosa native full-text search (`fts_match`), capped at `k`.
+    ///
+    /// Unlike [`Storage::entity_find_phonetic`] (entity NAME only), this serves
+    /// content-term recall WITHOUT embeddings — closing the gap where a fresh
+    /// install with no ANN returned nothing for a content query. Requires the
+    /// `idx_entity_context_snippet_fts` native FTS index (ddl/043). The default
+    /// returns empty; only the CQL backend implements it.
+    fn entity_find_content_fts(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        query: &str,
+        k: usize,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<EntityEntry>>> + Send {
+        let _ = (ctx, session_id, query, k);
+        async { Ok(Vec::new()) }
+    }
+
     /// Bounded lexical fallback for the zero-candidate search case.
     ///
     /// Scans this session's entities via the already-bounded

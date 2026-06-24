@@ -3597,6 +3597,69 @@ impl Storage for CqlStorage {
         Ok(scored.into_iter().map(|(_, e)| e).collect())
     }
 
+    async fn entity_find_content_fts(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        query: &str,
+        k: usize,
+    ) -> anyhow::Result<Vec<EntityEntry>> {
+        let Some(fts_query) = native_fts_query_text(query) else {
+            return Ok(Vec::new());
+        };
+        // Native FTS on the entity content body (idx_entity_context_snippet_fts,
+        // ddl/043). Lightweight column set — the snippet/embedding bodies aren't
+        // needed to rank a candidate, and hybrid_search re-scores downstream.
+        let cql = format!(
+            "SELECT entity_id, entity_name, entity_type, confidence, state, created_at \
+             FROM {}.entity_store \
+             WHERE tenant_id = ? AND session_id = ? AND context_snippet = fts_match({lit}) \
+             LIMIT {k} ALLOW FILTERING",
+            self.keyspace,
+            lit = cql_string_literal(&fts_query),
+        );
+        let (col_map, rows) =
+            match query_paged_rows!(self.session, cql, (ctx.tenant_id, session_id)) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(error = %e, "entity content native FTS query failed");
+                    return Ok(Vec::new());
+                }
+            };
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let (Ok(entity_id), Ok(entity_name), Ok(entity_type)) = (
+                cql_get::<Uuid>(&row, &col_map, "entity_id"),
+                cql_get::<String>(&row, &col_map, "entity_name"),
+                cql_get::<String>(&row, &col_map, "entity_type"),
+            ) else {
+                continue;
+            };
+            let state: MemoryState = cql_get::<String>(&row, &col_map, "state")
+                .ok()
+                .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
+                .unwrap_or_default();
+            // Exclude retracted (Unavailable) entities from recall.
+            if !state.is_retrievable() {
+                continue;
+            }
+            let created_at = cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
+                .unwrap_or_default();
+            out.push(EntityEntry {
+                tenant_id: ctx.tenant_id,
+                entity_id,
+                session_id,
+                entity_name,
+                entity_type,
+                confidence: f64::from(cql_get::<f32>(&row, &col_map, "confidence").unwrap_or(1.0)),
+                state,
+                created_at,
+                ..Default::default()
+            });
+        }
+        Ok(out)
+    }
+
     async fn entity_find_by_exact_name(
         &self,
         ctx: &TenantContext,
