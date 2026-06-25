@@ -4212,10 +4212,18 @@ impl Storage for CqlStorage {
         ctx: &TenantContext,
         fact: &crate::types::ForesightFact,
     ) -> anyhow::Result<()> {
+        // Set a per-row CQL TTL derived from valid_until (+ grace) so expired
+        // facts are reclaimed by the engine instead of accumulating forever.
+        // Open-ended / far-future facts get no TTL. The read-time is_valid_at
+        // filter remains the correctness guarantee; this just reaps dead rows.
+        let ttl_clause = match fact.storage_ttl_seconds(chrono::Utc::now()) {
+            Some(secs) => format!(" USING TTL {secs}"),
+            None => String::new(),
+        };
         let cql = format!(
             "INSERT INTO {}.foresight_facts \
              (tenant_id, session_id, fact_id, content, valid_from, valid_until, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?){ttl_clause}",
             self.keyspace
         );
         #[allow(deprecated)]

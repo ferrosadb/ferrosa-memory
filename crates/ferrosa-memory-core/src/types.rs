@@ -372,11 +372,43 @@ pub struct ForesightFact {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Grace window kept after a foresight fact's `valid_until` before its storage
+/// row is reclaimed, so a just-expired fact stays inspectable (e.g. for audit /
+/// `foresight_list_session`) for a short while. Retrieval already hides it via
+/// `is_valid_at`, so this only affects raw row lifetime.
+pub const FORESIGHT_TTL_GRACE_SECS: i64 = 7 * 24 * 3600; // 7 days
+
+/// Upper bound on the per-row TTL we will set. Beyond this we set no TTL and let
+/// the row persist — both to stay within engine TTL limits and to never risk
+/// reaping a fact while it is still valid. 20 years is the conservative
+/// Cassandra-compatible maximum.
+pub const FORESIGHT_TTL_MAX_SECS: i64 = 630_720_000; // 20 years
+
 impl ForesightFact {
     /// True when `now` is within `[valid_from, valid_until]` (either bound open).
     pub fn is_valid_at(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
         self.valid_from.is_none_or(|from| from <= now)
             && self.valid_until.is_none_or(|until| now <= until)
+    }
+
+    /// Per-row storage TTL (seconds) to set on write so an expired fact is
+    /// reclaimed by the engine instead of accumulating forever. Returns:
+    /// - `None` for an open-ended fact (no `valid_until`) — it must persist, and
+    ///   for a window so far out the TTL would exceed [`FORESIGHT_TTL_MAX_SECS`]
+    ///   (capping there would risk reaping a still-valid fact);
+    /// - `Some(secs > 0)` otherwise: time until `valid_until`, plus the grace
+    ///   window, clamped to at least 1s (CQL requires a positive TTL, so an
+    ///   already-long-expired fact is reaped almost immediately).
+    ///
+    /// This is a storage-reclamation optimization layered under the read-time
+    /// `is_valid_at` filter, which remains the correctness guarantee.
+    pub fn storage_ttl_seconds(&self, now: chrono::DateTime<chrono::Utc>) -> Option<i64> {
+        let until = self.valid_until?;
+        let secs = (until - now).num_seconds() + FORESIGHT_TTL_GRACE_SECS;
+        if secs > FORESIGHT_TTL_MAX_SECS {
+            return None;
+        }
+        Some(secs.max(1))
     }
 }
 
@@ -1425,5 +1457,42 @@ mod tests {
         }"#;
         let rule: DatalogRule = serde_json::from_str(json).unwrap();
         assert!(rule.aggregates.is_empty());
+    }
+
+    #[test]
+    fn foresight_storage_ttl_seconds_covers_each_window() {
+        let now = chrono::Utc::now();
+        let mk = |valid_from, valid_until| ForesightFact {
+            tenant_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            fact_id: Uuid::nil(),
+            content: String::new(),
+            valid_from,
+            valid_until,
+            created_at: now,
+        };
+
+        // Open-ended (no valid_until) -> no TTL (persists).
+        assert_eq!(mk(None, None).storage_ttl_seconds(now), None);
+
+        // Bounded, in the future -> time-to-expiry + grace.
+        let until = now + chrono::Duration::days(3);
+        let ttl = mk(None, Some(until)).storage_ttl_seconds(now).unwrap();
+        let expected = 3 * 24 * 3600 + FORESIGHT_TTL_GRACE_SECS;
+        assert!((ttl - expected).abs() <= 1, "ttl={ttl} expected≈{expected}");
+
+        // A future valid_from doesn't shorten the TTL (it lives until valid_until).
+        let ttl_future_from = mk(Some(now + chrono::Duration::days(2)), Some(until))
+            .storage_ttl_seconds(now)
+            .unwrap();
+        assert_eq!(ttl_future_from, ttl);
+
+        // Already long-expired (past the grace) -> clamped to a positive minimum.
+        let past = now - chrono::Duration::days(100);
+        assert_eq!(mk(None, Some(past)).storage_ttl_seconds(now), Some(1));
+
+        // Too far out to TTL safely -> None (persist; never risk early reaping).
+        let far = now + chrono::Duration::days(365 * 30);
+        assert_eq!(mk(None, Some(far)).storage_ttl_seconds(now), None);
     }
 }
