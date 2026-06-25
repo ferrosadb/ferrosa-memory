@@ -98,6 +98,10 @@ pub struct FusionConfig {
     /// injected as always-on context). Modest so it informs but doesn't crowd
     /// out query-specific hits.
     pub profile_weight: f64,
+    /// Weight for time-bounded FORESIGHT facts (surfaced only while valid at
+    /// the query's as-of time). Above entity weights — an active deadline or
+    /// constraint should rank prominently when it matches the query.
+    pub foresight_weight: f64,
     pub ann_weight: f64,
     pub fold_weight: f64,
     pub context_bm25_weight: f64,
@@ -123,6 +127,7 @@ impl Default for FusionConfig {
             entity_content_fts_weight: 1.5,
             scene_weight: 1.8,
             profile_weight: 1.0,
+            foresight_weight: 1.6,
             ann_weight: 1.0,
             fold_weight: 1.0,
             context_bm25_weight: 1.5,
@@ -1393,6 +1398,51 @@ pub async fn hybrid_search_with_diagnostics(
                 expanded_context: Vec::new(),
             }]);
             weights.push(config.profile_weight);
+        }
+
+        // Strategy 1e: time-bounded FORESIGHT facts. The key recall behavior is
+        // the validity filter — a fact is surfaced only while valid at NOW, so
+        // expired facts and not-yet-active plans never pollute context. Valid
+        // facts are then scored lexically against the query.
+        if let Ok(facts) = storage.foresight_list_session(ctx, sid).await
+            && !facts.is_empty()
+        {
+            let now = chrono::Utc::now();
+            let q_tokens = crate::storage::lexical_query_tokens(query);
+            let mut scored: Vec<(f64, &crate::types::ForesightFact)> = facts
+                .iter()
+                .filter(|f| f.is_valid_at(now))
+                .filter_map(|f| {
+                    let sc = scene_match_score(&q_tokens, &f.content);
+                    (sc > 0.0).then_some((sc, f))
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            if !scored.is_empty() {
+                lists.push(
+                    scored
+                        .into_iter()
+                        .take(source_limit)
+                        .enumerate()
+                        .map(|(i, (sc, f))| SearchResult {
+                            id: f.fact_id,
+                            source: "foresight".into(),
+                            memory_kind: "semantic".into(),
+                            content: f.content.clone(),
+                            score: sc * (1.0 - (i as f64 * 0.05)),
+                            result_type: "foresight".into(),
+                            document_id: None,
+                            prev_chunk_id: None,
+                            next_chunk_id: None,
+                            hint: f
+                                .valid_until
+                                .map(|u| format!("valid until {}", u.to_rfc3339())),
+                            expanded_context: Vec::new(),
+                        })
+                        .collect(),
+                );
+                weights.push(config.foresight_weight);
+            }
         }
 
         // Strategy 2: ANN entity search
@@ -3098,6 +3148,83 @@ mod tests {
         assert!(
             trace.result_ids.contains(&id),
             "trace records the returned result ids"
+        );
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_surfaces_valid_foresight_and_hides_expired_and_future() {
+        use crate::storage::mock::MockStorage;
+        use crate::types::{ForesightFact, TenantContext};
+
+        let storage = MockStorage::new();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "test".into(),
+        };
+        let sid = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let mk = |fact_id, valid_from, valid_until| ForesightFact {
+            tenant_id: ctx.tenant_id,
+            session_id: sid,
+            fact_id,
+            content: "release deadline freeze the api".into(), // same terms for all
+            valid_from,
+            valid_until,
+            created_at: now,
+        };
+        let valid_id = Uuid::new_v4();
+        let expired_id = Uuid::new_v4();
+        let future_id = Uuid::new_v4();
+        storage
+            .foresight_put(
+                &ctx,
+                &mk(valid_id, None, Some(now + chrono::Duration::days(3))),
+            )
+            .await
+            .unwrap();
+        storage
+            .foresight_put(
+                &ctx,
+                &mk(expired_id, None, Some(now - chrono::Duration::days(3))),
+            )
+            .await
+            .unwrap();
+        storage
+            .foresight_put(
+                &ctx,
+                &mk(future_id, Some(now + chrono::Duration::days(3)), None),
+            )
+            .await
+            .unwrap();
+
+        let config = FusionConfig::default();
+        let results = hybrid_search(
+            &storage,
+            &ctx,
+            sid,
+            "release deadline api",
+            None,
+            10,
+            None,
+            None,
+            None,
+            &config,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            results.iter().any(|r| r.id == valid_id),
+            "a currently-valid foresight fact is surfaced"
+        );
+        assert!(
+            !results.iter().any(|r| r.id == expired_id),
+            "an expired foresight fact is filtered out"
+        );
+        assert!(
+            !results.iter().any(|r| r.id == future_id),
+            "a not-yet-active foresight fact is filtered out"
         );
     }
 

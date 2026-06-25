@@ -550,6 +550,20 @@ pub trait Storage: Send + Sync {
         limit: usize,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<crate::types::RetrievalTrace>>> + Send;
 
+    /// Upsert a time-bounded foresight fact.
+    fn foresight_put(
+        &self,
+        ctx: &TenantContext,
+        fact: &crate::types::ForesightFact,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// List all foresight facts for a session (retrieval filters by validity).
+    fn foresight_list_session(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<crate::types::ForesightFact>>> + Send;
+
     /// List entities with structured equality predicates over entity columns
     /// and JSON `properties`.
     fn entity_list_matching(
@@ -1974,6 +1988,7 @@ pub mod mock {
         pub scenes: Mutex<Vec<crate::types::MemScene>>,
         pub profiles: Mutex<Vec<crate::types::MemProfile>>,
         pub traces: Mutex<Vec<crate::types::RetrievalTrace>>,
+        pub foresight: Mutex<Vec<crate::types::ForesightFact>>,
         pub retractions: Mutex<Vec<RetractionRecord>>,
         pub forget_journal: Mutex<Vec<ForgetJournalEntry>>,
         pub temporal_events: Mutex<Vec<TemporalEvent>>,
@@ -2963,6 +2978,30 @@ pub mod mock {
             out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
             out.truncate(limit);
             Ok(out)
+        }
+
+        async fn foresight_put(
+            &self,
+            ctx: &TenantContext,
+            fact: &crate::types::ForesightFact,
+        ) -> anyhow::Result<()> {
+            let mut facts = self.foresight.lock().await;
+            facts.retain(|f| !(f.tenant_id == ctx.tenant_id && f.fact_id == fact.fact_id));
+            facts.push(fact.clone());
+            Ok(())
+        }
+
+        async fn foresight_list_session(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+        ) -> anyhow::Result<Vec<crate::types::ForesightFact>> {
+            let facts = self.foresight.lock().await;
+            Ok(facts
+                .iter()
+                .filter(|f| f.tenant_id == ctx.tenant_id && f.session_id == session_id)
+                .cloned()
+                .collect())
         }
 
         async fn entity_counts_by_type_and_state(
