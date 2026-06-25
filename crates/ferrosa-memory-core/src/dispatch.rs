@@ -1513,6 +1513,20 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "set_foresight".into(),
+            description: "Time-bounded memory — declare a planned-future fact or temporary constraint with a validity window. Search surfaces it ONLY while valid at the current time; expired and not-yet-active facts are filtered out automatically, so stale deadlines never pollute context.\n\nCALL WHEN a fact only holds for a window:\n- 'Code freeze until 2026-07-01' (valid_until)\n- 'Migration plan goes live on 2026-06-30' (valid_from)\n- 'API v1 is deprecated as of today' (valid_until open-ended past the cutover)\n- 'Use the staging cluster this week' (valid_from + valid_until)\n\nvalid_from/valid_until are optional RFC3339 timestamps; omit either for an open-ended bound. Cost: ~1ms.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "content": { "type": "string", "maxLength": 4096, "description": "The time-bounded fact or constraint" },
+                    "valid_from": { "type": "string", "description": "RFC3339 timestamp; the fact becomes active at this time (optional — omit for 'active now')" },
+                    "valid_until": { "type": "string", "description": "RFC3339 timestamp; the fact expires at this time (optional — omit for 'no expiry')" },
+                    "session_id": { "type": "string", "description": "Session UUID to scope the fact to (defaults to the current session)" }
+                },
+                "required": ["content"]
+            }),
+        },
+        ToolDef {
             name: "check_intentions".into(),
             description: "Checks pending intentions against current context. Call FREQUENTLY — at every topic change, file open, or new task start. Pass a brief description of what you're doing now as context. Returns triggered intentions you should act on.\n\nIntentions are repo-scoped — only intentions for the current repo are checked.\nCost: ~1ms. Call often — it's free.".into(),
             input_schema: serde_json::json!({
@@ -2565,6 +2579,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "ensure_parent_tag" => Box::pin(handle_ensure_parent_tag(args, storage, ctx, session)),
         "verify_skill" => Box::pin(handle_verify_skill(args, storage, ctx, session)),
         "set_intention" => Box::pin(handle_set_intention(args, storage, ctx, session)),
+        "set_foresight" => Box::pin(handle_set_foresight(args, storage, ctx, session)),
         "check_intentions" => Box::pin(handle_check_intentions(args, storage, ctx, session)),
         "complete_intention" => Box::pin(handle_complete_intention(args, storage, ctx, session)),
         "list_intentions" => Box::pin(handle_list_intentions(args, storage, ctx, session)),
@@ -6750,6 +6765,51 @@ async fn handle_set_intention<S: crate::storage::Storage>(
     }
 
     Ok(serde_json::json!({ "intention_id": id.to_string() }))
+}
+
+async fn handle_set_foresight<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let content = require_str(&args, "content")?;
+    let session_id = optional_uuid(&args, "session_id")?
+        .or_else(|| session.effective_default_session_id())
+        .unwrap_or_else(uuid::Uuid::nil);
+    let parse_ts = |key: &str| -> Result<Option<chrono::DateTime<chrono::Utc>>, (i32, String)> {
+        args.get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| {
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .map_err(|e| (INVALID_PARAMS, format!("invalid {key} (want RFC3339): {e}")))
+            })
+            .transpose()
+    };
+    let valid_from = parse_ts("valid_from")?;
+    let valid_until = parse_ts("valid_until")?;
+    if let (Some(from), Some(until)) = (valid_from, valid_until)
+        && from > until
+    {
+        return Err((INVALID_PARAMS, "valid_from must be <= valid_until".into()));
+    }
+    let fact = crate::types::ForesightFact {
+        tenant_id: ctx.tenant_id,
+        session_id,
+        fact_id: uuid::Uuid::new_v4(),
+        content: content.to_string(),
+        valid_from,
+        valid_until,
+        created_at: chrono::Utc::now(),
+    };
+    storage.foresight_put(ctx, &fact).await.map_err(|e| {
+        (
+            INTERNAL_ERROR,
+            format!("failed to store foresight fact: {e}"),
+        )
+    })?;
+    Ok(serde_json::json!({ "fact_id": fact.fact_id.to_string() }))
 }
 
 async fn handle_check_intentions<S: crate::storage::Storage>(
@@ -15599,6 +15659,51 @@ mod tests {
             .unwrap();
         let result = unwrap_tool_result(result);
         assert_eq!(result["triggered"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn set_foresight_stores_a_time_bounded_fact() {
+        use crate::storage::Storage;
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let sid = uuid::Uuid::new_v4();
+
+        let params = serde_json::json!({
+            "name": "set_foresight",
+            "arguments": {
+                "content": "code freeze until release",
+                "valid_until": "2099-01-01T00:00:00Z",
+                "session_id": sid.to_string()
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert!(result["fact_id"].is_string());
+
+        let facts = store.foresight_list_session(&ctx, sid).await.unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].content, "code freeze until release");
+        assert!(facts[0].valid_until.is_some());
+        // Valid until 2099 -> active now, so retrieval would surface it.
+        assert!(facts[0].is_valid_at(chrono::Utc::now()));
+
+        // A malformed timestamp is rejected.
+        let bad = serde_json::json!({
+            "name": "set_foresight",
+            "arguments": { "content": "x", "valid_until": "not-a-date" }
+        });
+        let bad_result = dispatch("tools/call", bad, &store, &ctx, &session).await;
+        assert!(
+            bad_result.is_err()
+                || unwrap_tool_result(bad_result.unwrap())
+                    .get("isError")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            "malformed valid_until should be an error"
+        );
     }
 
     #[tokio::test]
