@@ -194,8 +194,11 @@ pub struct SessionState {
     pub last_activity: Arc<tokio::sync::Notify>,
     /// Set to true when a write tool succeeds; cleared by idle consolidation.
     pub dirty: Arc<AtomicBool>,
-    /// Session IDs explicitly queued for background consolidation.
-    pub consolidation_queue: Arc<Mutex<VecDeque<uuid::Uuid>>>,
+    /// (tenant_id, session_id) pairs explicitly queued for background
+    /// consolidation. The tenant is carried so the background worker runs under
+    /// the same tenant that wrote the data (HTTP requests authenticate
+    /// per-principal, so the process default tenant is not necessarily right).
+    pub consolidation_queue: Arc<Mutex<VecDeque<(uuid::Uuid, uuid::Uuid)>>>,
     /// Per-session count of newly created smart-ingest entities since the
     /// session was last queued for consolidation.
     pub smart_ingest_created_since_consolidation: Arc<Mutex<HashMap<uuid::Uuid, usize>>>,
@@ -2493,6 +2496,12 @@ async fn dispatch_tool<S: crate::storage::Storage>(
     if canonical_name != "configure" {
         resolve_session_id(&mut args, session.effective_default_session_id())?;
     }
+    // Captured before `args` is moved into the handler: the resolved session the
+    // write targets, so we can queue it for background consolidation below.
+    let resolved_session_id = args
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| uuid::Uuid::parse_str(s).ok());
     let input_bytes = serde_json::to_string(&args).map(|s| s.len()).unwrap_or(0) as i32;
     let start = std::time::Instant::now();
     tracing::info!(
@@ -2659,9 +2668,17 @@ async fn dispatch_tool<S: crate::storage::Storage>(
     session.last_activity.notify_one();
 
     // Mark dirty on successful write operations so idle consolidation knows
-    // there is new data worth processing.
+    // there is new data worth processing, and queue the session that actually
+    // received the write. Without this the background worker falls back to the
+    // process default session (effective_default_session_id at tick time),
+    // which may be empty or have changed — so consolidation ran over the wrong
+    // session and built nothing. `args["session_id"]` is the resolved target
+    // (resolve_session_id ran above for every tool but `configure`).
     if result.is_ok() && is_write_tool(canonical_name) {
         session.dirty.store(true, Ordering::Relaxed);
+        if let Some(sid) = resolved_session_id {
+            let _ = queue_session_for_consolidation(session, ctx.tenant_id, sid).await;
+        }
     }
 
     // Wrap in MCP CallToolResult format: { content: [{type: "text", text: "..."}] }
@@ -2844,10 +2861,11 @@ fn is_write_tool(name: &str) -> bool {
 
 async fn queue_session_for_consolidation(
     session: &SessionState,
+    tenant_id: uuid::Uuid,
     session_id: uuid::Uuid,
 ) -> Result<bool, (i32, String)> {
     let mut queue = session.consolidation_queue.lock().await;
-    if queue.contains(&session_id) {
+    if queue.contains(&(tenant_id, session_id)) {
         Ok(false)
     } else if queue.len() >= CONSOLIDATION_QUEUE_CAPACITY {
         Err((
@@ -2857,7 +2875,7 @@ async fn queue_session_for_consolidation(
             ),
         ))
     } else {
-        queue.push_back(session_id);
+        queue.push_back((tenant_id, session_id));
         Ok(true)
     }
 }
@@ -2936,6 +2954,7 @@ pub async fn record_consolidation_finished(
 
 async fn mark_smart_ingest_created_for_consolidation(
     session: &SessionState,
+    tenant_id: uuid::Uuid,
     session_id: uuid::Uuid,
 ) -> Result<bool, (i32, String)> {
     let should_queue = {
@@ -2952,7 +2971,10 @@ async fn mark_smart_ingest_created_for_consolidation(
         return Ok(false);
     }
 
-    let queued = queue_session_for_consolidation(session, session_id).await?;
+    // Idempotent: the per-write path may already have queued this session, so
+    // ignore the "newly added" bool — reaching the threshold means consolidation
+    // is queued for this session either way.
+    queue_session_for_consolidation(session, tenant_id, session_id).await?;
     record_consolidation_queued(session, session_id).await;
     session
         .dirty
@@ -2964,7 +2986,7 @@ async fn mark_smart_ingest_created_for_consolidation(
         .lock()
         .await;
     counters.insert(session_id, 0);
-    Ok(queued)
+    Ok(true)
 }
 
 // --- Tool handlers ---
@@ -6401,7 +6423,8 @@ async fn handle_smart_ingest<S: crate::storage::Storage>(
     }
 
     let auto_consolidation_queued = if action == "Created" {
-        match mark_smart_ingest_created_for_consolidation(session, session_id).await {
+        match mark_smart_ingest_created_for_consolidation(session, ctx.tenant_id, session_id).await
+        {
             Ok(queued) => queued,
             Err((_, msg)) => {
                 tracing::warn!(error = %msg, "smart_ingest auto-consolidation queue failed");
@@ -9502,12 +9525,12 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
 async fn handle_run_consolidation<S: crate::storage::Storage>(
     args: Value,
     _storage: &S,
-    _ctx: &crate::types::TenantContext,
+    ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
     let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
 
-    let queued = queue_session_for_consolidation(session, session_id).await?;
+    let queued = queue_session_for_consolidation(session, ctx.tenant_id, session_id).await?;
     record_consolidation_queued(session, session_id).await;
     session
         .dirty
@@ -14195,7 +14218,7 @@ mod tests {
                 .iter()
                 .copied()
                 .collect::<Vec<_>>(),
-            vec![session_id]
+            vec![(ctx.tenant_id, session_id)]
         );
     }
 
@@ -14216,10 +14239,10 @@ mod tests {
                 .unwrap();
         }
 
-        let duplicate = session.consolidation_queue.lock().await[0];
+        let (_, duplicate_sid) = session.consolidation_queue.lock().await[0];
         let duplicate_params = serde_json::json!({
             "name": "run_consolidation",
-            "arguments": {"session_id": duplicate.to_string()}
+            "arguments": {"session_id": duplicate_sid.to_string()}
         });
         dispatch("tools/call", duplicate_params, &store, &ctx, &session)
             .await
@@ -17559,7 +17582,7 @@ mod tests {
                 .iter()
                 .copied()
                 .collect::<Vec<_>>(),
-            vec![sid]
+            vec![(ctx.tenant_id, sid)]
         );
         assert_eq!(
             session
