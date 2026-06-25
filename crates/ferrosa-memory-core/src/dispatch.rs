@@ -2782,6 +2782,7 @@ fn is_tier1(name: &str) -> bool {
             | "record_feedback"
             | "create_edge"
             | "check_intentions"
+            | "set_foresight"
             | "session_task_put"
             | "session_task_get"
             | "session_task_current"
@@ -14262,7 +14263,7 @@ mod tests {
             expected_tier1,
             "default tools/list should return all tier-1 tools"
         );
-        assert_eq!(tools.len(), 21, "tier-1 tool surface should stay compact");
+        assert_eq!(tools.len(), 22, "tier-1 tool surface should stay compact");
         assert!(
             tools.iter().any(|t| t["name"].as_str() == Some("forget")),
             "forget is a tier-1 tool"
