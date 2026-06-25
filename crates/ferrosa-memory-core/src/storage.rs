@@ -2975,7 +2975,7 @@ pub mod mock {
                 .filter(|t| t.tenant_id == ctx.tenant_id && t.session_id == session_id)
                 .cloned()
                 .collect();
-            out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            out.sort_by_key(|t| std::cmp::Reverse(t.created_at));
             out.truncate(limit);
             Ok(out)
         }
