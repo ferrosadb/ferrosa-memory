@@ -345,6 +345,10 @@ pub struct MemScene {
     pub member_ids: Vec<Uuid>,
     /// Human-readable summary of what the scene is about.
     pub summary: String,
+    /// Centroid of the member entity embeddings (mean vector), enabling semantic
+    /// scene matching. `None` when no member carried an embedding.
+    #[serde(default)]
+    pub scene_embedding: Option<Vec<f32>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 

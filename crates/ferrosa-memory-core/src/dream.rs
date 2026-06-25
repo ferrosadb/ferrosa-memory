@@ -59,6 +59,7 @@ async fn persist_scene(
         scene_id,
         member_ids: members.iter().map(|e| e.entity_id).collect(),
         summary: format!("{} ({} related entities)", names.join(", "), members.len()),
+        scene_embedding: mean_embedding(members),
         created_at: chrono::Utc::now(),
     };
     match storage.scene_put(ctx, &scene).await {
@@ -68,6 +69,37 @@ async fn persist_scene(
             false
         }
     }
+}
+
+/// Centroid (mean) of the member entity embeddings, for semantic scene matching.
+/// Returns `None` when no member carried an embedding; ignores any whose
+/// dimensionality disagrees with the first embedded member (defensive — all
+/// share one model in practice).
+fn mean_embedding(members: &[&crate::types::EntityEntry]) -> Option<Vec<f32>> {
+    let mut sum: Vec<f32> = Vec::new();
+    let mut count = 0usize;
+    for e in members {
+        let Some(emb) = e.entity_embedding.as_ref() else {
+            continue;
+        };
+        if sum.is_empty() {
+            sum = emb.clone();
+            count = 1;
+        } else if emb.len() == sum.len() {
+            for (s, v) in sum.iter_mut().zip(emb) {
+                *s += *v;
+            }
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return None;
+    }
+    let inv = 1.0 / count as f32;
+    for s in &mut sum {
+        *s *= inv;
+    }
+    Some(sum)
 }
 
 /// Build/refresh the per-session workspace profile from its scenes: a compact
@@ -378,6 +410,28 @@ mod tests {
             created_at: chrono::Utc::now(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn mean_embedding_averages_embedded_members_and_skips_none() {
+        let t = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        let mut a = make_entity(t, s, "A", None);
+        a.entity_embedding = Some(vec![2.0, 0.0, 0.0]);
+        let mut b = make_entity(t, s, "B", None);
+        b.entity_embedding = Some(vec![4.0, 0.0, 0.0]);
+        let c = make_entity(t, s, "C", None); // no embedding
+
+        let centroid = mean_embedding(&[&a, &b, &c]).expect("centroid from embedded members");
+        assert_eq!(
+            centroid,
+            vec![3.0, 0.0, 0.0],
+            "mean of [2,..] and [4,..], None skipped"
+        );
+        assert!(
+            mean_embedding(&[&c]).is_none(),
+            "no embedded members -> no centroid"
+        );
     }
 
     #[tokio::test]

@@ -1320,20 +1320,28 @@ pub async fn hybrid_search_with_diagnostics(
         }
 
         // Strategy 1c: Consolidation SCENES — coherent multi-entity clusters
-        // built by dream consolidation (ddl/044). A scene summary lists its
-        // member entity names, so we lexically score scenes against the query
-        // and surface the best as semantic units; `hint` carries member_ids so
-        // a caller can expand a scene to its full cluster. Embeddings-free; a
-        // no-op against sessions that haven't been consolidated yet.
+        // built by dream consolidation (ddl/044). Scenes are scored two ways and
+        // the stronger wins: lexically (token overlap on the summary, which lists
+        // member names) and SEMANTICALLY (cosine of the query embedding vs the
+        // scene's member-centroid embedding, ddl/048) — so a scene whose wording
+        // differs from the query still surfaces. `hint` carries member_ids so a
+        // caller can expand a scene; a no-op until the session is consolidated.
         if let Ok(scenes) = storage.scene_list_session(ctx, sid).await
             && !scenes.is_empty()
         {
             let q_tokens = crate::storage::lexical_query_tokens(query);
-            if !q_tokens.is_empty() {
+            if !q_tokens.is_empty() || embedding.is_some() {
                 let mut scored: Vec<(f64, &crate::types::MemScene)> = scenes
                     .iter()
                     .filter_map(|s| {
-                        let sc = scene_match_score(&q_tokens, &s.summary);
+                        let lex = scene_match_score(&q_tokens, &s.summary);
+                        let sem = match (embedding, s.scene_embedding.as_deref()) {
+                            (Some(qe), Some(se)) => crate::context_segment::cosine(qe, se).max(0.0),
+                            _ => 0.0,
+                        };
+                        // Require a meaningful cosine before a purely-semantic hit
+                        // counts, so weak vector noise can't surface a scene.
+                        let sc = if sem > 0.5 { lex.max(sem) } else { lex };
                         (sc > 0.0).then_some((sc, s))
                     })
                     .collect();
@@ -3320,6 +3328,7 @@ mod tests {
                     scene_id: Uuid::new_v4(),
                     member_ids: vec![zid, gid, wid],
                     summary: "Zorblax Glorptastic Wibblewobble".into(),
+                    scene_embedding: None,
                     created_at: chrono::Utc::now(),
                 },
             )
@@ -3345,6 +3354,82 @@ mod tests {
                 "scene member {label} should surface via inline expansion"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn scene_matches_semantically_via_embedding_with_no_token_overlap() {
+        use crate::storage::mock::MockStorage;
+        use crate::types::{MemScene, TenantContext};
+
+        let storage = MockStorage::new();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "test".into(),
+        };
+        let sid = Uuid::new_v4();
+        let scene_id = Uuid::new_v4();
+        // Summary shares NO tokens with the query; only the embedding connects them.
+        storage
+            .scene_put(
+                &ctx,
+                &MemScene {
+                    tenant_id: ctx.tenant_id,
+                    session_id: sid,
+                    scene_id,
+                    member_ids: vec![Uuid::new_v4()],
+                    summary: "Glorptastic Wibblewobble planning cluster".into(),
+                    scene_embedding: Some(vec![1.0, 0.0, 0.0]),
+                    created_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let config = FusionConfig::default();
+        // Query embedding aligned with the scene centroid (cosine 1.0).
+        let aligned = [1.0_f32, 0.0, 0.0];
+        let hit = hybrid_search(
+            &storage,
+            &ctx,
+            sid,
+            "zxqv unrelated lexical terms",
+            Some(&aligned),
+            10,
+            None,
+            None,
+            None,
+            &config,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            hit.iter()
+                .any(|r| r.id == scene_id && r.result_type == "scene"),
+            "scene surfaces via embedding cosine despite zero token overlap"
+        );
+
+        // Control: an orthogonal query embedding (cosine 0) must NOT surface it.
+        let orthogonal = [0.0_f32, 1.0, 0.0];
+        let miss = hybrid_search(
+            &storage,
+            &ctx,
+            sid,
+            "zxqv unrelated lexical terms",
+            Some(&orthogonal),
+            10,
+            None,
+            None,
+            None,
+            &config,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !miss.iter().any(|r| r.id == scene_id),
+            "orthogonal embedding (cosine 0) must not surface the scene"
+        );
     }
 
     #[tokio::test]

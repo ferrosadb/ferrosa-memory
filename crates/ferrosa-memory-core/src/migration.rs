@@ -200,6 +200,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "foresight_facts table — time-bounded planned-future facts (valid_from/valid_until)",
         ddl: include_str!("../../../ddl/047_foresight_facts.cql"),
     },
+    Migration {
+        version: 48,
+        description: "mem_scenes.scene_embedding — member-centroid vector for semantic scene matching",
+        ddl: include_str!("../../../ddl/048_scene_embedding.cql"),
+    },
 ];
 
 /// `ddl/011_warmth_field.cql` — the `entity_warmth` table + session index.
