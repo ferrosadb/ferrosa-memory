@@ -4028,8 +4028,9 @@ impl Storage for CqlStorage {
     ) -> anyhow::Result<()> {
         let cql = format!(
             "INSERT INTO {}.mem_scenes \
-             (tenant_id, session_id, scene_id, member_ids, summary, member_count, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             (tenant_id, session_id, scene_id, member_ids, summary, member_count, \
+              scene_embedding, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             self.keyspace
         );
         #[allow(deprecated)]
@@ -4044,6 +4045,7 @@ impl Storage for CqlStorage {
                     &scene.member_ids,
                     &scene.summary,
                     scene.member_count(),
+                    &scene.scene_embedding,
                     scene.created_at,
                 ),
             )
@@ -4057,7 +4059,7 @@ impl Storage for CqlStorage {
         session_id: Uuid,
     ) -> anyhow::Result<Vec<crate::types::MemScene>> {
         let cql = format!(
-            "SELECT scene_id, member_ids, summary, created_at \
+            "SELECT scene_id, member_ids, summary, scene_embedding, created_at \
              FROM {}.mem_scenes WHERE tenant_id = ? AND session_id = ?",
             self.keyspace
         );
@@ -4073,6 +4075,9 @@ impl Storage for CqlStorage {
                 scene_id,
                 member_ids: cql_get::<Vec<Uuid>>(&row, &col_map, "member_ids").unwrap_or_default(),
                 summary: cql_get::<String>(&row, &col_map, "summary").unwrap_or_default(),
+                scene_embedding: cql_get::<Vec<f32>>(&row, &col_map, "scene_embedding")
+                    .ok()
+                    .filter(|v| !v.is_empty()),
                 created_at: cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
                     .unwrap_or_default(),
             });
