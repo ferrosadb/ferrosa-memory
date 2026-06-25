@@ -144,13 +144,41 @@ impl GraphClient {
             .header("Content-Type", "application/json")
             .json(&req)
             .send()
-            .await?;
+            .await
+            .map_err(|e| {
+                // Distinguish "graph engine is off / unreachable" from a schema
+                // problem so operators don't chase typed_edges DDL when the
+                // engine itself isn't running. The graph engine is a SEPARATE
+                // Ferrosa subsystem from the CQL/storage engine — CQL being up
+                // on 19042 says nothing about whether the graph engine is on.
+                if e.is_connect() || e.is_timeout() {
+                    anyhow::anyhow!(
+                        "graph engine unreachable at {} ({e}). Ferrosa's graph engine is \
+                         separate from the CQL/storage engine — ensure it is enabled on the \
+                         Ferrosa side and that [graph] (bolt_uri/http_url) in \
+                         ferrosa-memory.toml points at it. This is NOT a typed_edges \
+                         schema/migration problem.",
+                        self.base_url
+                    )
+                } else {
+                    anyhow::anyhow!("graph request to {} failed: {e}", self.base_url)
+                }
+            })?;
 
         let body = resp.text().await?;
         let parsed: CypherResponse = serde_json::from_str(&body)
             .map_err(|e| anyhow::anyhow!("graph response parse error: {e}, body: {body}"))?;
 
         if let Some(err) = &parsed.error {
+            // The engine is REACHABLE (it answered) but rejected the query. If
+            // it's a missing label/table, point at migrations, not the engine.
+            if graph_error_is_missing_schema(err) {
+                anyhow::bail!(
+                    "graph query rejected by a reachable graph engine: {err}. The graph \
+                     engine is running but the typed_edges schema/label is missing — run \
+                     the ferrosa-memory migrations (ddl) against the cluster."
+                );
+            }
             anyhow::bail!("graph query error: {err}");
         }
 
@@ -525,6 +553,19 @@ fn build_cycle_query(src: Uuid, dst: Uuid, edge_type: &str) -> String {
     )
 }
 
+/// Classify a graph-engine query error: does it indicate a missing
+/// schema/label (typed_edges DDL not applied) rather than a bad query? Used to
+/// point operators at migrations vs. the engine. Pure + testable so the
+/// classification stays honest as the engine's error wording evolves.
+fn graph_error_is_missing_schema(err: &str) -> bool {
+    let lc = err.to_lowercase();
+    lc.contains("graph.label")
+        || lc.contains("no table with graph.label")
+        || lc.contains("does not exist")
+        || lc.contains("unknown label")
+        || (lc.contains("typed_edges") && (lc.contains("missing") || lc.contains("not found")))
+}
+
 /// Extract first column as strings from a Cypher response.
 fn extract_string_column(resp: &CypherResponse) -> Vec<String> {
     resp.rows
@@ -873,6 +914,34 @@ mod tests {
         let dst = Uuid::from_u128(0x2);
         let q = build_cycle_query(src, dst, "TAGGED_AS");
         assert!(q.contains("edge_type: 'TAGGED_AS'"));
+    }
+
+    #[test]
+    fn graph_error_classifier_distinguishes_missing_schema_from_other_errors() {
+        // Missing typed_edges schema / label → points operators at migrations.
+        for msg in [
+            "no table with graph.label 'TYPED_EDGE'",
+            "Unknown label: TYPED_EDGE",
+            "table typed_edges not found",
+            "relation does not exist",
+        ] {
+            assert!(
+                super::graph_error_is_missing_schema(msg),
+                "should classify as missing-schema: {msg}"
+            );
+        }
+        // Real query errors that are NOT a missing-schema condition → keep the
+        // generic message (don't misdirect to migrations).
+        for msg in [
+            "syntax error near 'MATCH'",
+            "parameter binding failed",
+            "transaction conflict",
+        ] {
+            assert!(
+                !super::graph_error_is_missing_schema(msg),
+                "should NOT classify as missing-schema: {msg}"
+            );
+        }
     }
 
     #[test]
