@@ -692,6 +692,50 @@ To verify graph and MCP traversal in one command against the default local stack
 bash scripts/smoke-18765.sh
 ```
 
+### Declare a time-bounded fact (foresight)
+
+```json
+{
+  "tool": "set_foresight",
+  "arguments": {
+    "content": "Use the staging cluster for onboarding tests until next Monday",
+    "valid_until": "2026-07-06T00:00:00Z"
+  }
+}
+```
+
+A later `hybrid_search` for "staging cluster" surfaces it (as `result_type: "foresight"`)
+only while valid; once `valid_until` passes it is filtered out automatically. See
+[`docs/recall-quality.md`](docs/recall-quality.md#time-bounded-foresight).
+
+### Build scenes and a profile (consolidation)
+
+Ingest a few related entities, then force a consolidation pass (it also runs automatically
+on a periodic tick):
+
+```json
+{ "tool": "run_consolidation", "arguments": {} }
+```
+
+Afterward, `hybrid_search` results include a session **profile** (`source: "profile"`) and,
+once you have 3+ related entities, retrievable **scenes** (`result_type: "scene"`) that
+expand to their member entities. See
+[`docs/recall-quality.md`](docs/recall-quality.md#automatic-consolidation).
+
+### Install the agent skills
+
+The installer copies the bundled skills into `~/.claude/skills/` by default. From a source
+checkout you can install them manually:
+
+```bash
+cp -R skills/* ~/.claude/skills/
+```
+
+Then invoke them in your agent: `/memory-session-start`, `/set-foresight`,
+`/consolidate-wrapup` (and `/defer`, `/whats-next`, `/roadmap` with the
+[`forge`](https://github.com/ferrosadb/forge) task board).
+See [`skills/README.md`](skills/README.md).
+
 ---
 
 ## Phase 14 — Long-recall defaults and eval profile

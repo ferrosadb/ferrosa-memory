@@ -40,6 +40,10 @@ VERSION=""
 CHANNEL="stable"   # stable|nightly
 FORCE="no"
 WANT_SERVICE=""    # ask|yes|no
+# Portable agent skills (slash-command playbooks) are copied into the agent skill
+# directory so `/memory-session-start`, `/set-foresight`, etc. are available.
+WANT_SKILLS="yes"
+SKILLS_DIR="${FERROSA_MEMORY_SKILLS_DIR:-${HOME}/.claude/skills}"
 # Install from a local release tarball instead of downloading from GitHub.
 # Used by the install smoke test (and devs) to exercise THIS script against a
 # just-built binary before it is published. Honors the
@@ -56,6 +60,8 @@ while [ $# -gt 0 ]; do
     --force)        FORCE="yes"; shift ;;
     --no-service)   WANT_SERVICE="no"; shift ;;
     --service)      WANT_SERVICE="yes"; shift ;;
+    --no-skills)    WANT_SKILLS="no"; shift ;;
+    --skills-dir)   SKILLS_DIR="$2"; shift 2 ;;
     -h|--help)
       cat <<EOF
 ferrosa-memory installer
@@ -63,6 +69,8 @@ ferrosa-memory installer
   --channel stable|nightly   release channel (default: stable)
   --force                    reinstall even if already up to date
   --service / --no-service   enable or skip system-service install
+  --no-skills                skip installing the bundled agent skills
+  --skills-dir <path>        agent skill dir (default: ~/.claude/skills)
 EOF
       exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
@@ -181,6 +189,26 @@ if [ ! -f "$CONFIG_DIR/ferrosa-memory.toml" ]; then
   say "wrote default config to $CONFIG_DIR/ferrosa-memory.toml"
 else
   say "kept existing $CONFIG_DIR/ferrosa-memory.toml"
+fi
+
+# ---------- agent skills ----------
+# Copy the bundled slash-command skills (memory-session-start, set-foresight,
+# consolidate-wrapup, defer, whats-next, roadmap) into the agent skill directory.
+# Idempotent: each shipped skill is replaced so a re-install upgrades it; other
+# skills in the directory are left untouched.
+if [ "$WANT_SKILLS" = "yes" ] && [ -d "$TMP/skills" ]; then
+  mkdir -p "$SKILLS_DIR"
+  n=0
+  for skill in "$TMP"/skills/*/; do
+    [ -d "$skill" ] || continue
+    name=$(basename "$skill")
+    rm -rf "${SKILLS_DIR:?}/$name"
+    cp -R "$skill" "$SKILLS_DIR/$name"
+    n=$((n + 1))
+  done
+  say "installed $n agent skill(s) to $SKILLS_DIR (use --no-skills to skip)"
+elif [ "$WANT_SKILLS" = "yes" ]; then
+  say "this release bundles no skills; skipping skill install"
 fi
 
 # ---------- per-install tenant + credential provisioning ----------
