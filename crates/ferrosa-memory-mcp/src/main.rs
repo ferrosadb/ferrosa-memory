@@ -1180,6 +1180,82 @@ impl Storage for ReconnectingStorage {
         delegate!(self, entity_find_content_fts, ctx, session_id, query, k)
     }
 
+    // The following forwards were also missing from ReconnectingStorage. Each
+    // has an optimized CqlStorage impl that the MCP was silently bypassing in
+    // favor of the trait's slower fallback default (full-scan / load-all-into-
+    // memory). Results stayed correct (the fallbacks delegate to forwarded
+    // list methods) but lost the indexed/streaming optimizations.
+    async fn entity_find_by_exact_name_any_session(
+        &self,
+        ctx: &TenantContext,
+        name: &str,
+        entity_type: &str,
+    ) -> anyhow::Result<Option<EntityEntry>> {
+        delegate!(self, entity_find_by_exact_name_any_session, ctx, name, entity_type)
+    }
+
+    async fn entity_list_matching(
+        &self,
+        ctx: &TenantContext,
+        query: EntityListQuery,
+    ) -> anyhow::Result<Vec<EntityEntry>> {
+        delegate!(self, entity_list_matching, ctx, query)
+    }
+
+    async fn entity_text_scan_bounded(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        query: &str,
+        cap: usize,
+    ) -> anyhow::Result<Vec<EntityEntry>> {
+        delegate!(self, entity_text_scan_bounded, ctx, session_id, query, cap)
+    }
+
+    async fn entity_stream_session(
+        &self,
+        ctx: TenantContext,
+        session_id: uuid::Uuid,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<EntityEntry>>>,
+    ) {
+        match self.current_cql().await {
+            Some(cql) => cql.entity_stream_session(ctx, session_id, chunk_size, tx).await,
+            None => {
+                let _ = tx.send(Err(anyhow::anyhow!(NOT_CONNECTED_MSG))).await;
+            }
+        }
+    }
+
+    async fn fold_stream_all(
+        &self,
+        ctx: TenantContext,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<FoldEntry>>>,
+    ) {
+        match self.current_cql().await {
+            Some(cql) => cql.fold_stream_all(ctx, chunk_size, tx).await,
+            None => {
+                let _ = tx.send(Err(anyhow::anyhow!(NOT_CONNECTED_MSG))).await;
+            }
+        }
+    }
+
+    async fn typed_edge_stream_session(
+        &self,
+        ctx: TenantContext,
+        session_id: uuid::Uuid,
+        chunk_size: usize,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<TypedEdge>>>,
+    ) {
+        match self.current_cql().await {
+            Some(cql) => cql.typed_edge_stream_session(ctx, session_id, chunk_size, tx).await,
+            None => {
+                let _ = tx.send(Err(anyhow::anyhow!(NOT_CONNECTED_MSG))).await;
+            }
+        }
+    }
+
     async fn entity_count(
         &self,
         ctx: &TenantContext,
