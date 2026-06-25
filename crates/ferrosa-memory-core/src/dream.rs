@@ -52,13 +52,12 @@ async fn persist_scene(
     scene_id: Uuid,
     members: &[&crate::types::EntityEntry],
 ) -> bool {
-    let names: Vec<&str> = members.iter().map(|e| e.entity_name.as_str()).collect();
     let scene = crate::types::MemScene {
         tenant_id: ctx.tenant_id,
         session_id,
         scene_id,
         member_ids: members.iter().map(|e| e.entity_id).collect(),
-        summary: format!("{} ({} related entities)", names.join(", "), members.len()),
+        summary: scene_summary(members),
         scene_embedding: mean_embedding(members),
         created_at: chrono::Utc::now(),
     };
@@ -68,6 +67,27 @@ async fn persist_scene(
             tracing::warn!(error = %e, "failed to persist consolidation scene");
             false
         }
+    }
+}
+
+/// Maximum member names listed verbatim in a scene summary; the rest are
+/// summarized as "+N more" so a large cluster doesn't bloat every search result
+/// and the session profile.
+const SCENE_SUMMARY_NAME_CAP: usize = 8;
+
+/// Build a bounded, lexically-searchable scene summary from member names.
+fn scene_summary(members: &[&crate::types::EntityEntry]) -> String {
+    let names: Vec<&str> = members.iter().map(|e| e.entity_name.as_str()).collect();
+    let total = members.len();
+    if names.len() > SCENE_SUMMARY_NAME_CAP {
+        format!(
+            "{} +{} more ({} related entities)",
+            names[..SCENE_SUMMARY_NAME_CAP].join(", "),
+            names.len() - SCENE_SUMMARY_NAME_CAP,
+            total
+        )
+    } else {
+        format!("{} ({} related entities)", names.join(", "), total)
     }
 }
 
@@ -432,6 +452,29 @@ mod tests {
             mean_embedding(&[&c]).is_none(),
             "no embedded members -> no centroid"
         );
+    }
+
+    #[test]
+    fn scene_summary_bounds_large_clusters() {
+        let t = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        let entities: Vec<EntityEntry> = (0..12)
+            .map(|i| make_entity(t, s, &format!("E{i}"), None))
+            .collect();
+        let refs: Vec<&EntityEntry> = entities.iter().collect();
+
+        let big = scene_summary(&refs);
+        assert!(big.contains("+4 more"), "caps at 8 names: {big}");
+        assert!(big.contains("(12 related entities)"), "{big}");
+        assert_eq!(
+            big.matches(", ").count(),
+            7,
+            "exactly 8 names listed: {big}"
+        );
+
+        let small = scene_summary(&refs[..3]);
+        assert!(!small.contains("more"), "small cluster lists all: {small}");
+        assert!(small.contains("(3 related entities)"), "{small}");
     }
 
     #[tokio::test]
