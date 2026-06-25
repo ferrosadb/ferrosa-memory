@@ -1191,7 +1191,13 @@ impl Storage for ReconnectingStorage {
         name: &str,
         entity_type: &str,
     ) -> anyhow::Result<Option<EntityEntry>> {
-        delegate!(self, entity_find_by_exact_name_any_session, ctx, name, entity_type)
+        delegate!(
+            self,
+            entity_find_by_exact_name_any_session,
+            ctx,
+            name,
+            entity_type
+        )
     }
 
     async fn entity_list_matching(
@@ -1220,7 +1226,10 @@ impl Storage for ReconnectingStorage {
         tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<EntityEntry>>>,
     ) {
         match self.current_cql().await {
-            Some(cql) => cql.entity_stream_session(ctx, session_id, chunk_size, tx).await,
+            Some(cql) => {
+                cql.entity_stream_session(ctx, session_id, chunk_size, tx)
+                    .await
+            }
             None => {
                 let _ = tx.send(Err(anyhow::anyhow!(NOT_CONNECTED_MSG))).await;
             }
@@ -1249,7 +1258,10 @@ impl Storage for ReconnectingStorage {
         tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<TypedEdge>>>,
     ) {
         match self.current_cql().await {
-            Some(cql) => cql.typed_edge_stream_session(ctx, session_id, chunk_size, tx).await,
+            Some(cql) => {
+                cql.typed_edge_stream_session(ctx, session_id, chunk_size, tx)
+                    .await
+            }
             None => {
                 let _ = tx.send(Err(anyhow::anyhow!(NOT_CONNECTED_MSG))).await;
             }
@@ -3695,6 +3707,61 @@ enabled = false
         assert!(
             impl_source.contains("cql.derived_cache_stream(ctx, cache_key, chunk_size, limit, tx)"),
             "ReconnectingStorage must delegate derived_cache_stream to CqlStorage streaming override, not fall back to Storage's materializing default"
+        );
+    }
+
+    /// Completeness guard for the whole forwarding-gap class. The `Storage`
+    /// trait gives some methods a default impl; `ReconnectingStorage` (the
+    /// wrapper the MCP uses) MUST override every defaulted method so calls reach
+    /// `CqlStorage`'s real/optimized impl. A forgotten forward silently falls
+    /// back to the default (an empty result, or a materializing/full-scan
+    /// fallback) — the exact bug behind PR #115 (entity_find_content_fts + 6
+    /// more), which the older hardcoded-subset tests above did not catch.
+    ///
+    /// This derives the method list from the trait source itself, so it can
+    /// never go stale: add a new defaulted trait method without forwarding it
+    /// and this test fails.
+    #[test]
+    fn reconnecting_storage_forwards_every_defaulted_storage_method() {
+        let trait_src = include_str!("../../ferrosa-memory-core/src/storage.rs");
+        let main_src = include_str!("main.rs");
+        let impl_start = main_src
+            .find("impl Storage for ReconnectingStorage")
+            .expect("ReconnectingStorage must implement Storage");
+        let impl_src = &main_src[impl_start..];
+
+        // Bound the trait body: `pub trait Storage` .. the first column-0 `}`
+        // (default bodies close at indented `    }` / `        }`, never `\n}`).
+        let t_start = trait_src
+            .find("pub trait Storage")
+            .expect("Storage trait must exist");
+        let t_len = trait_src[t_start..]
+            .find("\n}")
+            .expect("Storage trait must close");
+        let trait_body = &trait_src[t_start..t_start + t_len];
+
+        // Each method decl is `\n    fn NAME(` at 4-space indent (bodies are
+        // indented deeper, so this only matches top-level decls). A method is
+        // defaulted iff its signature ends with `+ Send {` rather than `+ Send;`
+        // — and that terminator is the first such token after the `fn`.
+        let mut missing = Vec::new();
+        for chunk in trait_body.split("\n    fn ").skip(1) {
+            let name = chunk[..chunk.find('(').expect("fn must have params")].trim();
+            let semi = chunk.find("+ Send;");
+            let brace = chunk.find("+ Send {");
+            let defaulted = match (semi, brace) {
+                (Some(s), Some(b)) => b < s,
+                (None, Some(_)) => true,
+                _ => false, // required (no default) — the compiler enforces it
+            };
+            if defaulted && !impl_src.contains(&format!("async fn {name}(")) {
+                missing.push(name.to_string());
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "ReconnectingStorage must forward every defaulted Storage method; a \
+             missing forward silently uses the trait default. Missing: {missing:?}"
         );
     }
 
