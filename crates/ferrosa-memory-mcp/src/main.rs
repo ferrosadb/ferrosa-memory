@@ -2785,48 +2785,63 @@ struct IdleConsolidationConfig {
     edge_decay_factor: f64,
 }
 
-/// Background task that runs dream consolidation and edge maintenance after
-/// a period of tool-call inactivity. Resets the timer on every tool call.
-/// Only runs when the dirty flag indicates new writes since the last run.
+/// Background task that periodically runs dream consolidation and edge
+/// maintenance. Fires on a fixed `idle_seconds` cadence and consolidates only
+/// when the dirty flag indicates new writes since the last run.
+///
+/// A fixed periodic tick (rather than waiting for a lull in tool activity)
+/// guarantees consolidation runs on a busy always-on service where total quiet
+/// across all connected clients may never occur — the earlier idle-gated model
+/// could starve indefinitely under continuous activity.
 async fn idle_consolidation_loop<S: Storage + Send + Sync + 'static>(
     session: Arc<dispatch::SessionState>,
     storage: Arc<S>,
     ctx: Arc<TenantContext>,
     cfg: IdleConsolidationConfig,
 ) {
-    let timeout_dur = Duration::from_secs(cfg.idle_seconds);
+    let mut ticker = tokio::time::interval(Duration::from_secs(cfg.idle_seconds.max(1)));
+    // The first tick fires immediately; the dirty gate makes that a no-op at
+    // startup. Delay (not Burst) so a slow consolidation doesn't cause catch-up
+    // ticks to stack.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        // Wait for the first tool call activity.
-        session.last_activity.notified().await;
-
-        // Reset timer on each subsequent activity until we hit a timeout.
-        while tokio::time::timeout(timeout_dur, session.last_activity.notified())
-            .await
-            .is_ok()
-        {}
+        ticker.tick().await;
 
         // Only consolidate if there were writes since the last run.
         if !session.dirty.swap(false, Ordering::Relaxed) {
             continue;
         }
 
-        let session_ids = drain_consolidation_queue(&session).await;
-        let session_ids = if session_ids.is_empty() {
+        let pairs = drain_consolidation_queue(&session).await;
+        let pairs = if pairs.is_empty() {
+            // Nothing specific queued — fall back to the process default session
+            // under the loop's default tenant.
             match session.effective_default_session_id() {
-                Some(id) => vec![id],
+                Some(id) => vec![(ctx.tenant_id, id)],
                 None => continue,
             }
         } else {
-            session_ids
+            pairs
         };
 
-        for sid in session_ids {
-            run_idle_consolidation(&session, storage.as_ref(), &ctx, sid, &cfg).await;
+        for (tenant_id, sid) in pairs {
+            // Consolidate under the tenant that wrote the data. HTTP requests
+            // authenticate per-principal, so the queued tenant may differ from
+            // the loop's default; build a matching ctx for it (reuse the loop
+            // ctx when the tenant already matches).
+            if tenant_id == ctx.tenant_id {
+                run_idle_consolidation(&session, storage.as_ref(), &ctx, sid, &cfg).await;
+            } else {
+                let item_ctx = auth::authenticate_stdio(tenant_id);
+                run_idle_consolidation(&session, storage.as_ref(), &item_ctx, sid, &cfg).await;
+            }
         }
     }
 }
 
-async fn drain_consolidation_queue(session: &dispatch::SessionState) -> Vec<uuid::Uuid> {
+async fn drain_consolidation_queue(
+    session: &dispatch::SessionState,
+) -> Vec<(uuid::Uuid, uuid::Uuid)> {
     let mut queue = session.consolidation_queue.lock().await;
     queue.drain(..).collect()
 }
@@ -2859,6 +2874,7 @@ async fn run_idle_consolidation<S: Storage>(
         Ok(r) => {
             dispatch::record_consolidation_finished(session, session_id, Ok(&r)).await;
             tracing::info!(
+                session = %session_id,
                 entities = r.entities_processed,
                 connections = r.connections_created,
                 "idle consolidation complete"
@@ -3658,17 +3674,18 @@ enabled = false
     #[tokio::test]
     async fn idle_queue_drain_returns_explicit_sessions_and_clears_queue() {
         let session = dispatch::SessionState::default();
+        let tenant = uuid::Uuid::new_v4();
         let first = uuid::Uuid::new_v4();
         let second = uuid::Uuid::new_v4();
         {
             let mut queue = session.consolidation_queue.lock().await;
-            queue.push_back(first);
-            queue.push_back(second);
+            queue.push_back((tenant, first));
+            queue.push_back((tenant, second));
         }
 
         assert_eq!(
             drain_consolidation_queue(&session).await,
-            vec![first, second]
+            vec![(tenant, first), (tenant, second)]
         );
         assert!(drain_consolidation_queue(&session).await.is_empty());
     }
