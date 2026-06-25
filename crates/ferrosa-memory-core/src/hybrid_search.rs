@@ -90,6 +90,10 @@ pub struct FusionConfig {
     /// Weight for entity CONTENT-body lexical hits (native FTS on
     /// context_snippet) — the embeddings-free content recall path.
     pub entity_content_fts_weight: f64,
+    /// Weight for consolidation SCENE hits (coherent multi-entity clusters
+    /// surfaced as semantic units). Slightly above entity weights so a strongly
+    /// matching scene ranks ahead of its individual member entities.
+    pub scene_weight: f64,
     pub ann_weight: f64,
     pub fold_weight: f64,
     pub context_bm25_weight: f64,
@@ -113,6 +117,7 @@ impl Default for FusionConfig {
         Self {
             phonetic_weight: 1.0,
             entity_content_fts_weight: 1.5,
+            scene_weight: 1.8,
             ann_weight: 1.0,
             fold_weight: 1.0,
             context_bm25_weight: 1.5,
@@ -573,6 +578,18 @@ fn relevance_terms(text: &str) -> HashSet<String> {
 
 fn source_is_lexical(source: &str) -> bool {
     source.contains("bm25") || source.contains("phonetic")
+}
+
+/// Fraction of query tokens that appear in a scene summary (case-insensitive).
+/// Cheap lexical relevance for ranking consolidation scenes against a query.
+/// `q_tokens` are already lowercased by `lexical_query_tokens`.
+fn scene_match_score(q_tokens: &[String], summary: &str) -> f64 {
+    if q_tokens.is_empty() {
+        return 0.0;
+    }
+    let lc = summary.to_lowercase();
+    let matched = q_tokens.iter().filter(|t| lc.contains(t.as_str())).count();
+    matched as f64 / q_tokens.len() as f64
 }
 
 fn source_is_ann(source: &str) -> bool {
@@ -1292,6 +1309,59 @@ pub async fn hybrid_search_with_diagnostics(
             weights.push(config.entity_content_fts_weight);
         }
 
+        // Strategy 1c: Consolidation SCENES — coherent multi-entity clusters
+        // built by dream consolidation (ddl/044). A scene summary lists its
+        // member entity names, so we lexically score scenes against the query
+        // and surface the best as semantic units; `hint` carries member_ids so
+        // a caller can expand a scene to its full cluster. Embeddings-free; a
+        // no-op against sessions that haven't been consolidated yet.
+        if let Ok(scenes) = storage.scene_list_session(ctx, sid).await
+            && !scenes.is_empty()
+        {
+            let q_tokens = crate::storage::lexical_query_tokens(query);
+            if !q_tokens.is_empty() {
+                let mut scored: Vec<(f64, &crate::types::MemScene)> = scenes
+                    .iter()
+                    .filter_map(|s| {
+                        let sc = scene_match_score(&q_tokens, &s.summary);
+                        (sc > 0.0).then_some((sc, s))
+                    })
+                    .collect();
+                scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                if !scored.is_empty() {
+                    lists.push(
+                        scored
+                            .into_iter()
+                            .take(source_limit)
+                            .enumerate()
+                            .map(|(i, (sc, s))| SearchResult {
+                                id: s.scene_id,
+                                source: "scene".into(),
+                                memory_kind: "semantic".into(),
+                                content: s.summary.clone(),
+                                score: sc * (1.0 - (i as f64 * 0.05)),
+                                result_type: "scene".into(),
+                                document_id: None,
+                                prev_chunk_id: None,
+                                next_chunk_id: None,
+                                hint: Some(format!(
+                                    "scene of {} entities: {}",
+                                    s.member_ids.len(),
+                                    s.member_ids
+                                        .iter()
+                                        .map(|id| id.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(",")
+                                )),
+                                expanded_context: Vec::new(),
+                            })
+                            .collect(),
+                    );
+                    weights.push(config.scene_weight);
+                }
+            }
+        }
+
         // Strategy 2: ANN entity search
         if let Some(emb) = embedding
             && let Ok(entities) = storage.entity_search_ann(ctx, sid, emb, source_limit).await
@@ -1774,6 +1844,21 @@ pub async fn hybrid_search_with_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scene_match_score_ranks_by_query_token_overlap() {
+        let q = crate::storage::lexical_query_tokens("zorblax protocol calibration");
+        // 2 of 3 query tokens present.
+        let partial = scene_match_score(&q, "Zorblax Protocol, Acme (2 related entities)");
+        assert!(partial > 0.6 && partial < 0.7, "got {partial}");
+        // All tokens present -> full score.
+        let full = scene_match_score(&q, "zorblax protocol calibration sequence");
+        assert!((full - 1.0).abs() < 1e-9, "got {full}");
+        // No overlap -> zero (the scene is not surfaced).
+        assert_eq!(scene_match_score(&q, "completely unrelated summary"), 0.0);
+        // Empty query tokens -> zero (no false matches).
+        assert_eq!(scene_match_score(&[], "anything"), 0.0);
+    }
 
     fn make_result(id: Uuid, source: &str, score: f64) -> SearchResult {
         SearchResult {

@@ -41,6 +41,35 @@ const CO_OCCURS_THRESHOLD: f64 = 0.05;
 /// Caps the O(n²) comparison to keep idle consolidation fast.
 const UNFOLDED_PAIR_CAP: usize = 200;
 
+/// Build a [`crate::types::MemScene`] from a cluster of entities and upsert it.
+/// Returns `true` on a successful persist. The summary lists member names so the
+/// scene is itself lexically searchable; `member_ids` let retrieval expand the
+/// scene back to its full cluster.
+async fn persist_scene(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    session_id: Uuid,
+    scene_id: Uuid,
+    members: &[&crate::types::EntityEntry],
+) -> bool {
+    let names: Vec<&str> = members.iter().map(|e| e.entity_name.as_str()).collect();
+    let scene = crate::types::MemScene {
+        tenant_id: ctx.tenant_id,
+        session_id,
+        scene_id,
+        member_ids: members.iter().map(|e| e.entity_id).collect(),
+        summary: format!("{} ({} related entities)", names.join(", "), members.len()),
+        created_at: chrono::Utc::now(),
+    };
+    match storage.scene_put(ctx, &scene).await {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to persist consolidation scene");
+            false
+        }
+    }
+}
+
 /// Run consolidation over a session's entities.
 ///
 /// Two-pass connection discovery:
@@ -48,7 +77,8 @@ const UNFOLDED_PAIR_CAP: usize = 200;
 /// 2. Entities without a fold ("unfolded") are compared pairwise using text similarity,
 ///    capped at `UNFOLDED_PAIR_CAP` most-recent entities to bound the O(n²) cost.
 ///
-/// Clusters of 3+ co-occurring entities generate insight summaries.
+/// Clusters of 3+ co-occurring entities generate insight summaries and persist a
+/// durable [`crate::types::MemScene`] each.
 pub async fn run_consolidation(
     storage: &(impl Storage + ?Sized),
     ctx: &TenantContext,
@@ -98,8 +128,12 @@ pub async fn run_consolidation(
         .await;
     }
 
-    // Identify clusters (3+ entities in same fold).
+    // Identify clusters (3+ entities) and persist each as a durable, retrievable
+    // MemScene (a coherent semantic unit) in addition to the ephemeral insight
+    // string. `scene_put` is idempotent on a deterministic scene_id, so repeated
+    // consolidation cycles upsert the same scene rather than duplicating it.
     let mut insights = Vec::new();
+    let mut scenes_persisted = 0usize;
     for (fold_id, group) in &fold_groups {
         if group.len() >= 3 {
             let names: Vec<&str> = group.iter().map(|e| e.entity_name.as_str()).collect();
@@ -109,9 +143,12 @@ pub async fn run_consolidation(
                 names.join(", "),
                 group.len()
             ));
+            // A fold IS a scene; reuse its id so the scene is stable across runs.
+            scenes_persisted +=
+                persist_scene(storage, ctx, session_id, *fold_id, group).await as usize;
         }
     }
-    // Cluster insight for unfolded entities too.
+    // Cluster insight + scene for unfolded entities too.
     if unfolded.len() >= 3 {
         let names: Vec<&str> = unfolded.iter().map(|e| e.entity_name.as_str()).collect();
         insights.push(format!(
@@ -119,6 +156,14 @@ pub async fn run_consolidation(
             names.join(", "),
             unfolded.len()
         ));
+        // Deterministic id for the (single) unfolded scene of this session.
+        let unfolded_scene_id =
+            Uuid::from_u128(session_id.as_u128() ^ 0x5cae_5cae_5cae_5cae_5cae_5cae_5cae_5cae);
+        scenes_persisted +=
+            persist_scene(storage, ctx, session_id, unfolded_scene_id, &unfolded).await as usize;
+    }
+    if scenes_persisted > 0 {
+        tracing::debug!(scenes_persisted, session = %session_id, "consolidation persisted scenes");
     }
 
     // Phase 4: Datalog batch inference — derive facts from the updated graph
@@ -348,6 +393,76 @@ mod tests {
         assert_eq!(result.connections_created, 3);
         assert_eq!(result.insights.len(), 1);
         assert!(result.insights[0].contains("3 entities co-occurring"));
+    }
+
+    #[tokio::test]
+    async fn cluster_persists_a_retrievable_idempotent_scene() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session_id = Uuid::new_v4();
+        let fold_id = Uuid::new_v4();
+        let e1 = make_entity(ctx.tenant_id, session_id, "Zorblax", Some(fold_id));
+        let e2 = make_entity(ctx.tenant_id, session_id, "Glorptastic", Some(fold_id));
+        let e3 = make_entity(ctx.tenant_id, session_id, "Wibblewobble", Some(fold_id));
+        let ids = [e1.entity_id, e2.entity_id, e3.entity_id];
+        {
+            let mut entities = store.entities.lock().await;
+            entities.push(e1);
+            entities.push(e2);
+            entities.push(e3);
+        }
+
+        run_consolidation(&store, &ctx, session_id).await.unwrap();
+
+        let scenes = store.scene_list_session(&ctx, session_id).await.unwrap();
+        assert_eq!(scenes.len(), 1, "a 3-entity cluster persists one scene");
+        let scene = &scenes[0];
+        assert_eq!(scene.member_ids.len(), 3);
+        for id in ids {
+            assert!(
+                scene.member_ids.contains(&id),
+                "scene includes every member"
+            );
+        }
+        assert!(
+            scene.summary.contains("Zorblax"),
+            "summary lists member names"
+        );
+        assert_eq!(scene.scene_id, fold_id, "a fold scene reuses the fold id");
+
+        // Idempotent: re-consolidation upserts the same scene, not a duplicate.
+        run_consolidation(&store, &ctx, session_id).await.unwrap();
+        let scenes2 = store.scene_list_session(&ctx, session_id).await.unwrap();
+        assert_eq!(scenes2.len(), 1, "re-consolidation upserts, not duplicates");
+    }
+
+    #[tokio::test]
+    async fn fewer_than_three_entities_persists_no_scene() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session_id = Uuid::new_v4();
+        let fold_id = Uuid::new_v4();
+        {
+            let mut entities = store.entities.lock().await;
+            entities.push(make_entity(
+                ctx.tenant_id,
+                session_id,
+                "Alpha",
+                Some(fold_id),
+            ));
+            entities.push(make_entity(
+                ctx.tenant_id,
+                session_id,
+                "Beta",
+                Some(fold_id),
+            ));
+        }
+        run_consolidation(&store, &ctx, session_id).await.unwrap();
+        let scenes = store.scene_list_session(&ctx, session_id).await.unwrap();
+        assert!(
+            scenes.is_empty(),
+            "clusters need 3+ members to form a scene"
+        );
     }
 
     #[tokio::test]
