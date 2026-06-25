@@ -747,6 +747,115 @@ mod tests {
         );
     }
 
+    /// The headline "is it actually better?" measurement: the same retrieved
+    /// candidate pool scored through the BASELINE (CurrentHooks-style: accept
+    /// everything, no provenance/raw-episodic/threshold/foresight gating) vs the
+    /// ENHANCED controller (combined RLM+EverMemOS policy). Reports recall,
+    /// precision, and clutter-token ratio for both so the win is concrete.
+    #[test]
+    fn enhanced_controller_beats_baseline_on_precision_and_clutter() {
+        let now = now();
+        let candidates = vec![
+            // REQUIRED, relevant evidence — both pipelines must keep these.
+            ContextCandidate::new(
+                "api-decision",
+                MemoryLane::BugDecision,
+                0.88,
+                "chose X over Y because Z",
+            )
+            .sourced("entity_ann")
+            .provenance(true)
+            .tokens(120),
+            ContextCandidate::new(
+                "schema-fact",
+                MemoryLane::Semantic,
+                0.82,
+                "table foo has column bar",
+            )
+            .sourced("entity_content_fts")
+            .provenance(true)
+            .tokens(90),
+            // CLUTTER the enhanced controller should drop:
+            ContextCandidate::new("raw-log", MemoryLane::Episodic, 0.95, "raw noisy user log")
+                .sourced("raw_context") // raw episodic
+                .provenance(true)
+                .tokens(400),
+            ContextCandidate::new("no-prov", MemoryLane::Corpus, 0.85, "unsourced claim")
+                .sourced("document_bm25") // missing provenance
+                .provenance(false)
+                .tokens(150),
+            ContextCandidate::new("weak", MemoryLane::Semantic, 0.30, "barely related")
+                .sourced("entity_ann") // below lane threshold
+                .provenance(true)
+                .tokens(80),
+            ContextCandidate::new(
+                "stale-foresight",
+                MemoryLane::Foresight,
+                0.90,
+                "a deadline that already passed",
+            )
+            .sourced("foresight") // expired (valid_until in the past)
+            .provenance(true)
+            .tokens(60)
+            .validity(None, Some(now - chrono::Duration::days(5))),
+        ];
+        let truth = ContextGroundTruth {
+            required_ids: vec!["api-decision".into(), "schema-fact".into()],
+            irrelevant_ids: vec![
+                "raw-log".into(),
+                "no-prov".into(),
+                "weak".into(),
+                "stale-foresight".into(),
+            ],
+            expect_silence: false,
+        };
+
+        let enhanced_policy = ControllerPolicy::combined_default();
+        // Baseline = current naive behavior: inject everything, no gating.
+        let mut baseline_policy = enhanced_policy.clone();
+        baseline_policy.mode = ContextEvalMode::CurrentHooks;
+        baseline_policy.allow_raw_episodic = true;
+        baseline_policy.require_provenance = false;
+        baseline_policy.max_accepted = 100;
+        baseline_policy.max_injected_tokens = 100_000;
+        for thresh in baseline_policy.lane_thresholds.values_mut() {
+            *thresh = 0.0;
+        }
+
+        let base = score_controller_trace(
+            &evaluate_context_candidates(&candidates, &baseline_policy, now),
+            &truth,
+        );
+        let enh = score_controller_trace(
+            &evaluate_context_candidates(&candidates, &enhanced_policy, now),
+            &truth,
+        );
+
+        println!(
+            "BASELINE  recall={:.2} precision={:.2} clutter_ratio={:.2} accepted_tokens={}",
+            base.recall, base.precision, base.clutter_token_ratio, base.accepted_tokens
+        );
+        println!(
+            "ENHANCED  recall={:.2} precision={:.2} clutter_ratio={:.2} accepted_tokens={}",
+            enh.recall, enh.precision, enh.clutter_token_ratio, enh.accepted_tokens
+        );
+
+        // Same required evidence retained, but far less clutter and higher precision.
+        assert!(
+            enh.recall >= base.recall - 1e-9,
+            "enhanced keeps required evidence"
+        );
+        assert!(enh.precision > base.precision, "enhanced is more precise");
+        assert!(
+            enh.clutter_token_ratio < base.clutter_token_ratio,
+            "enhanced injects less clutter"
+        );
+        assert!(
+            enh.accepted_tokens < base.accepted_tokens,
+            "enhanced is leaner"
+        );
+    }
+
     #[test]
     fn controller_drops_low_score_and_raw_episodic_context() {
         let policy = ControllerPolicy::combined_default();
