@@ -164,10 +164,22 @@ by doubling them (`'` → `''`). Never call `session.prepare()`.
 
 ---
 
-### BUG-F-007 · P1 · Full-text indexes do not return inserted rows via `fts_match`
+### BUG-F-007 · ✅ RESOLVED (2026-06-24) · Full-text indexes do not return inserted rows via `fts_match`
 
 **Component:** ferrosa.
-**Version:** ≤ 0.11.0
+**Version:** ≤ 0.11.0 (resolved on ferrosa `main`)
+
+**Status (2026-06-24): RESOLVED.** The reproduce test
+`open_fulltext_index_returns_inserted_rows` now PASSES against the live 3-node
+cluster, and `fts_match` returns consistent results for real indexed terms
+(context_segments / document_chunks / entity_store each return thousands of rows;
+entity content recall works end-to-end via the MCP). Two ferrosa fixes landed it:
+(1) `coordinate_fulltext_search` scatter-gathers `fts_match` across all replicas and
+unions the matching keys — fixes the coordinator-local non-determinism in the
+2026-06-20 note below; (2) PR #193 replays FullText indexes into the schema registry
+and re-registers them on restart — fixes the FTS-empty-after-restart reload that made
+`fts_match` return 0. The `document_terms` / `context_segment_terms` fallback is no
+longer required for correctness. The older status notes below are superseded.
 
 **Description:** A table can be created, indexed with
 `CREATE INDEX ... USING 'fulltext'`, and populated successfully, but
