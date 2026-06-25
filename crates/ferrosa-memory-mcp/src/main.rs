@@ -3378,6 +3378,32 @@ async fn main() -> anyhow::Result<()> {
                 ..dispatch::SessionState::default()
             });
 
+            // Spawn idle consolidation for the long-running HTTP service too —
+            // not just stdio. Writes on the shared session set `dirty`, queue the
+            // session, and notify `last_activity`, so this loop builds edges,
+            // scenes, and profiles automatically after each burst of activity.
+            // (Single shared tenant ctx, matching the per-process tenant model.)
+            if config.server.idle_consolidation_enabled {
+                let idle_cfg = IdleConsolidationConfig {
+                    idle_seconds: config.server.idle_consolidation_seconds,
+                    stale_edge_max_days: config.server.stale_edge_max_days,
+                    edge_decay_factor: config.server.edge_decay_factor,
+                };
+                let idle_session = Arc::clone(&session);
+                let idle_storage = Arc::clone(&storage);
+                let idle_ctx = Arc::new(auth::authenticate_stdio(tenant_id));
+                spawn_critical(
+                    "idle_consolidation_loop",
+                    idle_consolidation_loop(idle_session, idle_storage, idle_ctx, idle_cfg),
+                );
+                tracing::info!(
+                    idle_seconds = config.server.idle_consolidation_seconds,
+                    decay_factor = config.server.edge_decay_factor,
+                    prune_days = config.server.stale_edge_max_days,
+                    "idle consolidation enabled (http transport)"
+                );
+            }
+
             http::serve_http(
                 http::HttpConfig {
                     bind_addr: config.server.bind_addr.clone(),
