@@ -180,6 +180,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "native full-text index on entity_store.context_snippet for content recall",
         ddl: include_str!("../../../ddl/043_entity_content_fts.cql"),
     },
+    Migration {
+        version: 44,
+        description: "mem_scenes table — durable summarized entity clusters (MemScene consolidation)",
+        ddl: include_str!("../../../ddl/044_mem_scenes.cql"),
+    },
 ];
 
 /// `ddl/011_warmth_field.cql` — the `entity_warmth` table + session index.

@@ -333,6 +333,27 @@ pub enum EntityScope {
     Global,
 }
 
+/// A "scene": a durable, summarized cluster of related entities produced by
+/// dream consolidation. Retrieval can surface a scene as a single coherent
+/// semantic unit (with its member entities) instead of loose individual hits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemScene {
+    pub tenant_id: Uuid,
+    pub session_id: Uuid,
+    pub scene_id: Uuid,
+    /// Entities that make up the scene (the cluster members).
+    pub member_ids: Vec<Uuid>,
+    /// Human-readable summary of what the scene is about.
+    pub summary: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl MemScene {
+    pub fn member_count(&self) -> i32 {
+        self.member_ids.len() as i32
+    }
+}
+
 /// A named entity discovered during trajectory traversal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityEntry {

@@ -507,6 +507,20 @@ pub trait Storage: Send + Sync {
         session_id: Uuid,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<EntityEntry>>> + Send;
 
+    /// Upsert a consolidation scene (a durable, summarized entity cluster).
+    fn scene_put(
+        &self,
+        ctx: &TenantContext,
+        scene: &crate::types::MemScene,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// List all scenes for a session (bounded — scenes are coarse clusters).
+    fn scene_list_session(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<crate::types::MemScene>>> + Send;
+
     /// List entities with structured equality predicates over entity columns
     /// and JSON `properties`.
     fn entity_list_matching(
@@ -1928,6 +1942,7 @@ pub mod mock {
         pub session_task_policies: Mutex<Vec<SessionTaskPolicy>>,
         pub folds: Mutex<Vec<FoldEntry>>,
         pub entities: Mutex<Vec<EntityEntry>>,
+        pub scenes: Mutex<Vec<crate::types::MemScene>>,
         pub retractions: Mutex<Vec<RetractionRecord>>,
         pub forget_journal: Mutex<Vec<ForgetJournalEntry>>,
         pub temporal_events: Mutex<Vec<TemporalEvent>>,
@@ -2841,6 +2856,30 @@ pub mod mock {
                 // CqlStorage::entity_list_session; bulk paths (entity_list_all)
                 // intentionally keep all states.
                 .filter(|e| e.state.is_retrievable())
+                .cloned()
+                .collect())
+        }
+
+        async fn scene_put(
+            &self,
+            ctx: &TenantContext,
+            scene: &crate::types::MemScene,
+        ) -> anyhow::Result<()> {
+            let mut scenes = self.scenes.lock().await;
+            scenes.retain(|s| !(s.tenant_id == ctx.tenant_id && s.scene_id == scene.scene_id));
+            scenes.push(scene.clone());
+            Ok(())
+        }
+
+        async fn scene_list_session(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+        ) -> anyhow::Result<Vec<crate::types::MemScene>> {
+            let scenes = self.scenes.lock().await;
+            Ok(scenes
+                .iter()
+                .filter(|s| s.tenant_id == ctx.tenant_id && s.session_id == session_id)
                 .cloned()
                 .collect())
         }

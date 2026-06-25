@@ -4021,6 +4021,65 @@ impl Storage for CqlStorage {
         Ok(entries)
     }
 
+    async fn scene_put(
+        &self,
+        ctx: &TenantContext,
+        scene: &crate::types::MemScene,
+    ) -> anyhow::Result<()> {
+        let cql = format!(
+            "INSERT INTO {}.mem_scenes \
+             (tenant_id, session_id, scene_id, member_ids, summary, member_count, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        let result = self
+            .session
+            .query_unpaged(
+                cql,
+                (
+                    ctx.tenant_id,
+                    scene.session_id,
+                    scene.scene_id,
+                    &scene.member_ids,
+                    &scene.summary,
+                    scene.member_count(),
+                    scene.created_at,
+                ),
+            )
+            .await;
+        fail_loud_write(result, "scene_put mem_scenes")
+    }
+
+    async fn scene_list_session(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::types::MemScene>> {
+        let cql = format!(
+            "SELECT scene_id, member_ids, summary, created_at \
+             FROM {}.mem_scenes WHERE tenant_id = ? AND session_id = ?",
+            self.keyspace
+        );
+        let (col_map, rows) = query_paged_rows!(self.session, cql, (ctx.tenant_id, session_id))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let Ok(scene_id) = cql_get::<Uuid>(&row, &col_map, "scene_id") else {
+                continue;
+            };
+            out.push(crate::types::MemScene {
+                tenant_id: ctx.tenant_id,
+                session_id,
+                scene_id,
+                member_ids: cql_get::<Vec<Uuid>>(&row, &col_map, "member_ids").unwrap_or_default(),
+                summary: cql_get::<String>(&row, &col_map, "summary").unwrap_or_default(),
+                created_at: cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
+                    .unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    }
+
     async fn entity_list_matching(
         &self,
         ctx: &TenantContext,
