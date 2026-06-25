@@ -1339,6 +1339,13 @@ pub async fn hybrid_search_with_diagnostics(
                     .collect();
                 scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
                 if !scored.is_empty() {
+                    // Capture the best scenes' members before `scored` is consumed,
+                    // so we can expand the coherent cluster (Strategy 1c-expand below).
+                    let expand: Vec<(f64, Vec<Uuid>)> = scored
+                        .iter()
+                        .take(3)
+                        .map(|(sc, s)| (*sc, s.member_ids.clone()))
+                        .collect();
                     lists.push(
                         scored
                             .into_iter()
@@ -1368,6 +1375,44 @@ pub async fn hybrid_search_with_diagnostics(
                             .collect(),
                     );
                     weights.push(config.scene_weight);
+
+                    // Strategy 1c-expand: inline member expansion. Pull the member
+                    // entities of the best-matching scenes so the coherent cluster
+                    // surfaces together — including members that didn't match the
+                    // query individually. Bounded (top scenes, capped members,
+                    // deduped); fusion later merges any overlap with entity hits.
+                    let mut members = Vec::new();
+                    let mut seen = std::collections::HashSet::new();
+                    for (scene_score, member_ids) in &expand {
+                        for mid in member_ids.iter().take(12) {
+                            if !seen.insert(*mid) {
+                                continue;
+                            }
+                            if let Ok(Some(e)) = storage.entity_get_by_id(ctx, sid, *mid).await {
+                                members.push(SearchResult {
+                                    id: e.entity_id,
+                                    source: "scene_member".into(),
+                                    memory_kind: "semantic".into(),
+                                    content: if e.context_snippet.trim().is_empty() {
+                                        e.entity_name.clone()
+                                    } else {
+                                        e.context_snippet.clone()
+                                    },
+                                    score: scene_score * 0.7,
+                                    result_type: "entity".into(),
+                                    document_id: None,
+                                    prev_chunk_id: None,
+                                    next_chunk_id: None,
+                                    hint: Some("surfaced via its scene".into()),
+                                    expanded_context: Vec::new(),
+                                });
+                            }
+                        }
+                    }
+                    if !members.is_empty() {
+                        lists.push(members);
+                        weights.push(config.scene_weight * 0.6);
+                    }
                 }
             }
         }
@@ -3226,6 +3271,80 @@ mod tests {
             !results.iter().any(|r| r.id == future_id),
             "a not-yet-active foresight fact is filtered out"
         );
+    }
+
+    #[tokio::test]
+    async fn scene_match_expands_to_member_entities_that_did_not_match_alone() {
+        use crate::storage::mock::MockStorage;
+        use crate::types::{EntityEntry, MemScene, MemoryState, TenantContext};
+
+        let storage = MockStorage::new();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "test".into(),
+        };
+        let sid = Uuid::new_v4();
+        let mk = |name: &str| {
+            let id = Uuid::new_v4();
+            (
+                id,
+                EntityEntry {
+                    tenant_id: ctx.tenant_id,
+                    entity_id: id,
+                    session_id: sid,
+                    entity_name: name.into(),
+                    entity_type: "note".into(),
+                    source_fold_id: None,
+                    context_snippet: format!("{name} notes"),
+                    entity_embedding: None,
+                    confidence: 1.0,
+                    state: MemoryState::Active,
+                    created_at: chrono::Utc::now(),
+                    ..Default::default()
+                },
+            )
+        };
+        // Only "Zorblax" matches the query; the other two do not on their own.
+        let (zid, ze) = mk("Zorblax");
+        let (gid, ge) = mk("Glorptastic");
+        let (wid, we) = mk("Wibblewobble");
+        for e in [ze, ge, we] {
+            storage.entity_put(&ctx, &e).await.unwrap();
+        }
+        storage
+            .scene_put(
+                &ctx,
+                &MemScene {
+                    tenant_id: ctx.tenant_id,
+                    session_id: sid,
+                    scene_id: Uuid::new_v4(),
+                    member_ids: vec![zid, gid, wid],
+                    summary: "Zorblax Glorptastic Wibblewobble".into(),
+                    created_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let config = FusionConfig::default();
+        let results = hybrid_search(
+            &storage, &ctx, sid, "zorblax", None, 10, None, None, None, &config, None,
+        )
+        .await
+        .unwrap();
+
+        // All three cluster members surface — including the two that don't match
+        // "zorblax" on their own — because their scene matched and expanded.
+        for (id, label) in [
+            (zid, "Zorblax"),
+            (gid, "Glorptastic"),
+            (wid, "Wibblewobble"),
+        ] {
+            assert!(
+                results.iter().any(|r| r.id == id),
+                "scene member {label} should surface via inline expansion"
+            );
+        }
     }
 
     #[tokio::test]
