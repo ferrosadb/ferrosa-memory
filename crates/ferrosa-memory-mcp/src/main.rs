@@ -1170,6 +1170,16 @@ impl Storage for ReconnectingStorage {
         delegate!(self, entity_search_ann, ctx, session_id, query_embedding, k)
     }
 
+    async fn entity_find_content_fts(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        query: &str,
+        k: usize,
+    ) -> anyhow::Result<Vec<EntityEntry>> {
+        delegate!(self, entity_find_content_fts, ctx, session_id, query, k)
+    }
+
     async fn entity_count(
         &self,
         ctx: &TenantContext,
