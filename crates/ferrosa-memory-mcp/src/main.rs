@@ -377,9 +377,14 @@ impl ReconnectingStorage {
     }
 
     fn graph_client(&self) -> anyhow::Result<&Arc<GraphClient>> {
-        self.graph
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("graph client is not configured"))
+        self.graph.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "graph/edge tools are unavailable: the graph client failed to initialize \
+                 from the [graph] config at startup (check bolt_uri/http_url). Note the \
+                 graph engine is a SEPARATE Ferrosa subsystem from CQL — enable it on the \
+                 Ferrosa side and point [graph] in ferrosa-memory.toml at it, then restart."
+            )
+        })
     }
 
     fn is_ready(&self) -> bool {
