@@ -1439,6 +1439,18 @@ impl Storage for ReconnectingStorage {
         delegate!(self, trace_list_session, ctx, session_id, limit)
     }
 
+    async fn foresight_put(&self, ctx: &TenantContext, fact: &ForesightFact) -> anyhow::Result<()> {
+        delegate!(self, foresight_put, ctx, fact)
+    }
+
+    async fn foresight_list_session(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<ForesightFact>> {
+        delegate!(self, foresight_list_session, ctx, session_id)
+    }
+
     async fn entity_counts_by_type_and_state(
         &self,
         ctx: &TenantContext,

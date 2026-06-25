@@ -354,6 +354,28 @@ impl MemScene {
     }
 }
 
+/// A time-bounded prospective fact or temporary constraint. Retrieval surfaces
+/// it only while it is valid at the query's as-of time, so expired facts and
+/// not-yet-active plans don't pollute context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForesightFact {
+    pub tenant_id: Uuid,
+    pub session_id: Uuid,
+    pub fact_id: Uuid,
+    pub content: String,
+    pub valid_from: Option<chrono::DateTime<chrono::Utc>>,
+    pub valid_until: Option<chrono::DateTime<chrono::Utc>>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl ForesightFact {
+    /// True when `now` is within `[valid_from, valid_until]` (either bound open).
+    pub fn is_valid_at(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        self.valid_from.is_none_or(|from| from <= now)
+            && self.valid_until.is_none_or(|until| now <= until)
+    }
+}
+
 /// A durable record of one hybrid_search: query, which sources produced
 /// candidates, and the returned results. Enables offline learning (tune fusion
 /// weights, detect regressions) from successful vs unhelpful retrievals.

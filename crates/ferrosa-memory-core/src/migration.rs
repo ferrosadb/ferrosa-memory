@@ -195,6 +195,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "retrieval_traces table — per-search candidate/result trace for offline learning",
         ddl: include_str!("../../../ddl/046_retrieval_traces.cql"),
     },
+    Migration {
+        version: 47,
+        description: "foresight_facts table — time-bounded planned-future facts (valid_from/valid_until)",
+        ddl: include_str!("../../../ddl/047_foresight_facts.cql"),
+    },
 ];
 
 /// `ddl/011_warmth_field.cql` — the `entity_warmth` table + session index.

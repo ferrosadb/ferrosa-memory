@@ -4202,6 +4202,72 @@ impl Storage for CqlStorage {
         Ok(out)
     }
 
+    async fn foresight_put(
+        &self,
+        ctx: &TenantContext,
+        fact: &crate::types::ForesightFact,
+    ) -> anyhow::Result<()> {
+        let cql = format!(
+            "INSERT INTO {}.foresight_facts \
+             (tenant_id, session_id, fact_id, content, valid_from, valid_until, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        let result = self
+            .session
+            .query_unpaged(
+                cql,
+                (
+                    ctx.tenant_id,
+                    fact.session_id,
+                    fact.fact_id,
+                    &fact.content,
+                    fact.valid_from,
+                    fact.valid_until,
+                    fact.created_at,
+                ),
+            )
+            .await;
+        fail_loud_write(result, "foresight_put foresight_facts")
+    }
+
+    async fn foresight_list_session(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::types::ForesightFact>> {
+        let cql = format!(
+            "SELECT fact_id, content, valid_from, valid_until, created_at \
+             FROM {}.foresight_facts WHERE tenant_id = ? AND session_id = ?",
+            self.keyspace
+        );
+        let (col_map, rows) = query_paged_rows!(self.session, cql, (ctx.tenant_id, session_id))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let Ok(fact_id) = cql_get::<Uuid>(&row, &col_map, "fact_id") else {
+                continue;
+            };
+            out.push(crate::types::ForesightFact {
+                tenant_id: ctx.tenant_id,
+                session_id,
+                fact_id,
+                content: cql_get::<String>(&row, &col_map, "content").unwrap_or_default(),
+                valid_from: cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "valid_from")
+                    .ok(),
+                valid_until: cql_get::<chrono::DateTime<chrono::Utc>>(
+                    &row,
+                    &col_map,
+                    "valid_until",
+                )
+                .ok(),
+                created_at: cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
+                    .unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    }
+
     async fn entity_list_matching(
         &self,
         ctx: &TenantContext,
