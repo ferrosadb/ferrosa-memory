@@ -190,6 +190,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "mem_profiles table — per-session workspace/profile summaries from scenes",
         ddl: include_str!("../../../ddl/045_mem_profiles.cql"),
     },
+    Migration {
+        version: 46,
+        description: "retrieval_traces table — per-search candidate/result trace for offline learning",
+        ddl: include_str!("../../../ddl/046_retrieval_traces.cql"),
+    },
 ];
 
 /// `ddl/011_warmth_field.cql` — the `entity_warmth` table + session index.

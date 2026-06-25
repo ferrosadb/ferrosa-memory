@@ -4131,6 +4131,77 @@ impl Storage for CqlStorage {
         }))
     }
 
+    async fn trace_put(
+        &self,
+        ctx: &TenantContext,
+        trace: &crate::types::RetrievalTrace,
+    ) -> anyhow::Result<()> {
+        let source_counts = serde_json::to_string(&trace.source_counts).unwrap_or_default();
+        let cql = format!(
+            "INSERT INTO {}.retrieval_traces \
+             (tenant_id, session_id, created_at, trace_id, query, source_counts, \
+              result_ids, result_count) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        let result = self
+            .session
+            .query_unpaged(
+                cql,
+                (
+                    ctx.tenant_id,
+                    trace.session_id,
+                    trace.created_at,
+                    trace.trace_id,
+                    &trace.query,
+                    source_counts,
+                    &trace.result_ids,
+                    trace.result_ids.len() as i32,
+                ),
+            )
+            .await;
+        // Traces are best-effort observability; a write failure must not break
+        // the search that produced it. fail_loud_write still aborts on a missing
+        // grant (so a misconfigured principal is caught), warns on transient.
+        fail_loud_write(result, "trace_put retrieval_traces")
+    }
+
+    async fn trace_list_session(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::types::RetrievalTrace>> {
+        let cql = format!(
+            "SELECT created_at, trace_id, query, source_counts, result_ids \
+             FROM {}.retrieval_traces WHERE tenant_id = ? AND session_id = ? LIMIT {limit}",
+            self.keyspace
+        );
+        let (col_map, rows) = query_paged_rows!(self.session, cql, (ctx.tenant_id, session_id))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let Ok(trace_id) = cql_get::<Uuid>(&row, &col_map, "trace_id") else {
+                continue;
+            };
+            let source_counts = cql_get::<String>(&row, &col_map, "source_counts")
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            out.push(crate::types::RetrievalTrace {
+                tenant_id: ctx.tenant_id,
+                session_id,
+                trace_id,
+                query: cql_get::<String>(&row, &col_map, "query").unwrap_or_default(),
+                source_counts,
+                result_ids: cql_get::<Vec<Uuid>>(&row, &col_map, "result_ids").unwrap_or_default(),
+                created_at: cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "created_at")
+                    .unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    }
+
     async fn entity_list_matching(
         &self,
         ctx: &TenantContext,

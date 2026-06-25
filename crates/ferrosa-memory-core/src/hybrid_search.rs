@@ -1860,7 +1860,7 @@ pub async fn hybrid_search_with_diagnostics(
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
     }
-    let results = filter_relevant_results(
+    let results: Vec<SearchResult> = filter_relevant_results(
         collapse_duplicate_document_chunks(merged),
         filter.and_then(|f| f.min_score),
         filter.and_then(|f| f.memory_kinds.as_deref()),
@@ -1868,6 +1868,30 @@ pub async fn hybrid_search_with_diagnostics(
     .into_iter()
     .take(limit)
     .collect();
+
+    // Best-effort retrieval trace for offline learning (tune fusion weights,
+    // detect regressions). Never gates the search: trace_put warns on a
+    // transient failure and only aborts on a missing grant.
+    let source_counts = {
+        let mut counts = std::collections::BTreeMap::new();
+        for s in &diagnostics.sources {
+            *counts.entry(s.source.clone()).or_insert(0) += s.candidates;
+        }
+        counts
+    };
+    let trace = crate::types::RetrievalTrace {
+        tenant_id: ctx.tenant_id,
+        session_id,
+        trace_id: Uuid::new_v4(),
+        query: query.to_string(),
+        source_counts,
+        result_ids: results.iter().map(|r| r.id).collect(),
+        created_at: chrono::Utc::now(),
+    };
+    if let Err(e) = storage.trace_put(ctx, &trace).await {
+        tracing::warn!(error = %e, "failed to persist retrieval trace");
+    }
+
     Ok(SearchOutput {
         results,
         diagnostics,
@@ -3009,6 +3033,71 @@ mod tests {
             none.is_empty(),
             "irrelevant query must not trigger a blind fallback dump, got {} results",
             none.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_writes_a_retrieval_trace() {
+        use crate::storage::mock::MockStorage;
+        use crate::types::{EntityEntry, MemoryState, TenantContext};
+
+        let storage = MockStorage::new();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "test".into(),
+        };
+        let sid = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        storage
+            .entity_put(
+                &ctx,
+                &EntityEntry {
+                    tenant_id: ctx.tenant_id,
+                    entity_id: id,
+                    session_id: sid,
+                    entity_name: "Billing Runbook".into(),
+                    entity_type: "note".into(),
+                    source_fold_id: None,
+                    context_snippet: "billing service migration runbook".into(),
+                    entity_embedding: None,
+                    confidence: 1.0,
+                    state: MemoryState::Active,
+                    created_at: chrono::Utc::now(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let config = FusionConfig::default();
+        let results = hybrid_search(
+            &storage,
+            &ctx,
+            sid,
+            "billing runbook",
+            None,
+            10,
+            None,
+            None,
+            None,
+            &config,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(results.iter().any(|r| r.id == id));
+
+        let traces = storage.trace_list_session(&ctx, sid, 10).await.unwrap();
+        assert_eq!(traces.len(), 1, "each search writes exactly one trace");
+        let trace = &traces[0];
+        assert_eq!(trace.query, "billing runbook");
+        assert!(
+            !trace.source_counts.is_empty(),
+            "trace records which sources produced candidates"
+        );
+        assert!(
+            trace.result_ids.contains(&id),
+            "trace records the returned result ids"
         );
     }
 

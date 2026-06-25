@@ -354,6 +354,21 @@ impl MemScene {
     }
 }
 
+/// A durable record of one hybrid_search: query, which sources produced
+/// candidates, and the returned results. Enables offline learning (tune fusion
+/// weights, detect regressions) from successful vs unhelpful retrievals.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetrievalTrace {
+    pub tenant_id: Uuid,
+    pub session_id: Uuid,
+    pub trace_id: Uuid,
+    pub query: String,
+    /// Compact map of candidate source -> count (e.g. {"entity_ann": 18}).
+    pub source_counts: std::collections::BTreeMap<String, usize>,
+    pub result_ids: Vec<Uuid>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// A compact, durable per-session profile / workspace-state summary derived
 /// from consolidation scenes. Injected into retrieval so an agent always gets
 /// the session's gist (active entities, repo/branch/task context).

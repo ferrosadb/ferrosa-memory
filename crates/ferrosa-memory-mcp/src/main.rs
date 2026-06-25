@@ -1426,6 +1426,19 @@ impl Storage for ReconnectingStorage {
         delegate!(self, profile_get, ctx, session_id)
     }
 
+    async fn trace_put(&self, ctx: &TenantContext, trace: &RetrievalTrace) -> anyhow::Result<()> {
+        delegate!(self, trace_put, ctx, trace)
+    }
+
+    async fn trace_list_session(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        limit: usize,
+    ) -> anyhow::Result<Vec<RetrievalTrace>> {
+        delegate!(self, trace_list_session, ctx, session_id, limit)
+    }
+
     async fn entity_counts_by_type_and_state(
         &self,
         ctx: &TenantContext,

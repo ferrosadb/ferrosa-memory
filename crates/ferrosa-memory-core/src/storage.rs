@@ -535,6 +535,21 @@ pub trait Storage: Send + Sync {
         session_id: Uuid,
     ) -> impl std::future::Future<Output = anyhow::Result<Option<crate::types::MemProfile>>> + Send;
 
+    /// Append a retrieval trace (best-effort; one row per search).
+    fn trace_put(
+        &self,
+        ctx: &TenantContext,
+        trace: &crate::types::RetrievalTrace,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// List recent retrieval traces for a session, newest first (capped).
+    fn trace_list_session(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        limit: usize,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<crate::types::RetrievalTrace>>> + Send;
+
     /// List entities with structured equality predicates over entity columns
     /// and JSON `properties`.
     fn entity_list_matching(
@@ -1958,6 +1973,7 @@ pub mod mock {
         pub entities: Mutex<Vec<EntityEntry>>,
         pub scenes: Mutex<Vec<crate::types::MemScene>>,
         pub profiles: Mutex<Vec<crate::types::MemProfile>>,
+        pub traces: Mutex<Vec<crate::types::RetrievalTrace>>,
         pub retractions: Mutex<Vec<RetractionRecord>>,
         pub forget_journal: Mutex<Vec<ForgetJournalEntry>>,
         pub temporal_events: Mutex<Vec<TemporalEvent>>,
@@ -2921,6 +2937,32 @@ pub mod mock {
                 .iter()
                 .find(|p| p.tenant_id == ctx.tenant_id && p.session_id == session_id)
                 .cloned())
+        }
+
+        async fn trace_put(
+            &self,
+            _ctx: &TenantContext,
+            trace: &crate::types::RetrievalTrace,
+        ) -> anyhow::Result<()> {
+            self.traces.lock().await.push(trace.clone());
+            Ok(())
+        }
+
+        async fn trace_list_session(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+            limit: usize,
+        ) -> anyhow::Result<Vec<crate::types::RetrievalTrace>> {
+            let traces = self.traces.lock().await;
+            let mut out: Vec<_> = traces
+                .iter()
+                .filter(|t| t.tenant_id == ctx.tenant_id && t.session_id == session_id)
+                .cloned()
+                .collect();
+            out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            out.truncate(limit);
+            Ok(out)
         }
 
         async fn entity_counts_by_type_and_state(
