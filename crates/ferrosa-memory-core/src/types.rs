@@ -354,6 +354,18 @@ impl MemScene {
     }
 }
 
+/// A compact, durable per-session profile / workspace-state summary derived
+/// from consolidation scenes. Injected into retrieval so an agent always gets
+/// the session's gist (active entities, repo/branch/task context).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemProfile {
+    pub tenant_id: Uuid,
+    pub session_id: Uuid,
+    pub summary: String,
+    pub scene_count: i32,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// A named entity discovered during trajectory traversal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityEntry {

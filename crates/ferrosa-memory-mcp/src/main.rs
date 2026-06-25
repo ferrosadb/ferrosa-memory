@@ -1414,6 +1414,18 @@ impl Storage for ReconnectingStorage {
         delegate!(self, scene_list_session, ctx, session_id)
     }
 
+    async fn profile_put(&self, ctx: &TenantContext, profile: &MemProfile) -> anyhow::Result<()> {
+        delegate!(self, profile_put, ctx, profile)
+    }
+
+    async fn profile_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<MemProfile>> {
+        delegate!(self, profile_get, ctx, session_id)
+    }
+
     async fn entity_counts_by_type_and_state(
         &self,
         ctx: &TenantContext,

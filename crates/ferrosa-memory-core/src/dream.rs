@@ -70,6 +70,50 @@ async fn persist_scene(
     }
 }
 
+/// Build/refresh the per-session workspace profile from its scenes: a compact
+/// summary retrieval injects so an agent gets the session's gist without
+/// re-deriving it. Prefers workspace/repo/branch/task-flavored scenes; falls
+/// back to all scenes. Bounded by capping the number of scene summaries used.
+async fn persist_profile(
+    storage: &(impl Storage + ?Sized),
+    ctx: &TenantContext,
+    session_id: Uuid,
+    scenes: &[crate::types::MemScene],
+) {
+    if scenes.is_empty() {
+        return;
+    }
+    let is_workspacey = |s: &str| {
+        let l = s.to_ascii_lowercase();
+        ["workspace", "repo", "branch", "task", "cluster"]
+            .iter()
+            .any(|k| l.contains(k))
+    };
+    let mut parts: Vec<&str> = scenes
+        .iter()
+        .filter(|s| is_workspacey(&s.summary))
+        .map(|s| s.summary.as_str())
+        .collect();
+    if parts.is_empty() {
+        parts = scenes.iter().map(|s| s.summary.as_str()).collect();
+    }
+    parts.truncate(30); // bound injected size; scene summaries are short
+    let profile = crate::types::MemProfile {
+        tenant_id: ctx.tenant_id,
+        session_id,
+        summary: format!(
+            "Session covers {} scene(s): {}",
+            scenes.len(),
+            parts.join("; ")
+        ),
+        scene_count: scenes.len() as i32,
+        updated_at: chrono::Utc::now(),
+    };
+    if let Err(e) = storage.profile_put(ctx, &profile).await {
+        tracing::warn!(error = %e, "failed to persist session profile");
+    }
+}
+
 /// Run consolidation over a session's entities.
 ///
 /// Two-pass connection discovery:
@@ -164,6 +208,10 @@ pub async fn run_consolidation(
     }
     if scenes_persisted > 0 {
         tracing::debug!(scenes_persisted, session = %session_id, "consolidation persisted scenes");
+        // Build/refresh the per-session workspace profile from the scenes.
+        if let Ok(scenes) = storage.scene_list_session(ctx, session_id).await {
+            persist_profile(storage, ctx, session_id, &scenes).await;
+        }
     }
 
     // Phase 4: Datalog batch inference — derive facts from the updated graph
@@ -463,6 +511,73 @@ mod tests {
             scenes.is_empty(),
             "clusters need 3+ members to form a scene"
         );
+    }
+
+    #[tokio::test]
+    async fn consolidation_builds_a_session_profile_from_scenes() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session_id = Uuid::new_v4();
+        let fold_id = Uuid::new_v4();
+        {
+            let mut entities = store.entities.lock().await;
+            entities.push(make_entity(
+                ctx.tenant_id,
+                session_id,
+                "Zorblax",
+                Some(fold_id),
+            ));
+            entities.push(make_entity(
+                ctx.tenant_id,
+                session_id,
+                "Glorptastic",
+                Some(fold_id),
+            ));
+            entities.push(make_entity(
+                ctx.tenant_id,
+                session_id,
+                "Wibblewobble",
+                Some(fold_id),
+            ));
+        }
+        run_consolidation(&store, &ctx, session_id).await.unwrap();
+
+        let profile = store
+            .profile_get(&ctx, session_id)
+            .await
+            .unwrap()
+            .expect("a profile is built when scenes exist");
+        assert_eq!(profile.scene_count, 1);
+        assert!(
+            profile.summary.contains("Zorblax"),
+            "profile summarizes scene content"
+        );
+
+        // Idempotent: one profile per session after a second cycle.
+        run_consolidation(&store, &ctx, session_id).await.unwrap();
+        let profiles = store.profiles.lock().await;
+        assert_eq!(
+            profiles
+                .iter()
+                .filter(|p| p.session_id == session_id)
+                .count(),
+            1,
+            "profile is upserted, not duplicated"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_scenes_means_no_profile() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session_id = Uuid::new_v4();
+        {
+            let mut entities = store.entities.lock().await;
+            entities.push(make_entity(ctx.tenant_id, session_id, "Alpha", None));
+            entities.push(make_entity(ctx.tenant_id, session_id, "Beta", None));
+        }
+        run_consolidation(&store, &ctx, session_id).await.unwrap();
+        assert!(store.profile_get(&ctx, session_id).await.unwrap().is_none());
     }
 
     #[tokio::test]

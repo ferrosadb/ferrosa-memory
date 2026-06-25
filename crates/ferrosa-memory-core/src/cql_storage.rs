@@ -4080,6 +4080,57 @@ impl Storage for CqlStorage {
         Ok(out)
     }
 
+    async fn profile_put(
+        &self,
+        ctx: &TenantContext,
+        profile: &crate::types::MemProfile,
+    ) -> anyhow::Result<()> {
+        let cql = format!(
+            "INSERT INTO {}.mem_profiles (tenant_id, session_id, summary, scene_count, updated_at) \
+             VALUES (?, ?, ?, ?, ?)",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        let result = self
+            .session
+            .query_unpaged(
+                cql,
+                (
+                    ctx.tenant_id,
+                    profile.session_id,
+                    &profile.summary,
+                    profile.scene_count,
+                    profile.updated_at,
+                ),
+            )
+            .await;
+        fail_loud_write(result, "profile_put mem_profiles")
+    }
+
+    async fn profile_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> anyhow::Result<Option<crate::types::MemProfile>> {
+        let cql = format!(
+            "SELECT summary, scene_count, updated_at \
+             FROM {}.mem_profiles WHERE tenant_id = ? AND session_id = ?",
+            self.keyspace
+        );
+        let (col_map, rows) = query_paged_rows!(self.session, cql, (ctx.tenant_id, session_id))?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        Ok(Some(crate::types::MemProfile {
+            tenant_id: ctx.tenant_id,
+            session_id,
+            summary: cql_get::<String>(&row, &col_map, "summary").unwrap_or_default(),
+            scene_count: cql_get::<i32>(&row, &col_map, "scene_count").unwrap_or(0),
+            updated_at: cql_get::<chrono::DateTime<chrono::Utc>>(&row, &col_map, "updated_at")
+                .unwrap_or_default(),
+        }))
+    }
+
     async fn entity_list_matching(
         &self,
         ctx: &TenantContext,

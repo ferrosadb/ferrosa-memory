@@ -94,6 +94,10 @@ pub struct FusionConfig {
     /// surfaced as semantic units). Slightly above entity weights so a strongly
     /// matching scene ranks ahead of its individual member entities.
     pub scene_weight: f64,
+    /// Weight for the per-session workspace PROFILE (durable session gist,
+    /// injected as always-on context). Modest so it informs but doesn't crowd
+    /// out query-specific hits.
+    pub profile_weight: f64,
     pub ann_weight: f64,
     pub fold_weight: f64,
     pub context_bm25_weight: f64,
@@ -118,6 +122,7 @@ impl Default for FusionConfig {
             phonetic_weight: 1.0,
             entity_content_fts_weight: 1.5,
             scene_weight: 1.8,
+            profile_weight: 1.0,
             ann_weight: 1.0,
             fold_weight: 1.0,
             context_bm25_weight: 1.5,
@@ -1360,6 +1365,34 @@ pub async fn hybrid_search_with_diagnostics(
                     weights.push(config.scene_weight);
                 }
             }
+        }
+
+        // Strategy 1d: per-session PROFILE — the durable session gist (active
+        // entities, repo/branch/task context) built by consolidation, injected
+        // as always-on context so the agent has the session's frame regardless
+        // of the specific query. No-op until a profile has been consolidated.
+        if let Ok(Some(profile)) = storage.profile_get(ctx, sid).await
+            && !profile.summary.trim().is_empty()
+        {
+            lists.push(vec![SearchResult {
+                id: uuid::Uuid::from_u128(
+                    sid.as_u128() ^ 0x9201_9201_9201_9201_9201_9201_9201_9201,
+                ),
+                source: "profile".into(),
+                memory_kind: "semantic".into(),
+                content: profile.summary.clone(),
+                score: 1.0,
+                result_type: "profile".into(),
+                document_id: None,
+                prev_chunk_id: None,
+                next_chunk_id: None,
+                hint: Some(format!(
+                    "session profile from {} scene(s)",
+                    profile.scene_count
+                )),
+                expanded_context: Vec::new(),
+            }]);
+            weights.push(config.profile_weight);
         }
 
         // Strategy 2: ANN entity search

@@ -185,6 +185,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "mem_scenes table — durable summarized entity clusters (MemScene consolidation)",
         ddl: include_str!("../../../ddl/044_mem_scenes.cql"),
     },
+    Migration {
+        version: 45,
+        description: "mem_profiles table — per-session workspace/profile summaries from scenes",
+        ddl: include_str!("../../../ddl/045_mem_profiles.cql"),
+    },
 ];
 
 /// `ddl/011_warmth_field.cql` — the `entity_warmth` table + session index.
