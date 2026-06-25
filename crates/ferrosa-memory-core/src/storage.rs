@@ -521,6 +521,20 @@ pub trait Storage: Send + Sync {
         session_id: Uuid,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<crate::types::MemScene>>> + Send;
 
+    /// Upsert the per-session workspace/profile summary.
+    fn profile_put(
+        &self,
+        ctx: &TenantContext,
+        profile: &crate::types::MemProfile,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// Get the per-session workspace/profile summary, if one has been built.
+    fn profile_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<crate::types::MemProfile>>> + Send;
+
     /// List entities with structured equality predicates over entity columns
     /// and JSON `properties`.
     fn entity_list_matching(
@@ -1943,6 +1957,7 @@ pub mod mock {
         pub folds: Mutex<Vec<FoldEntry>>,
         pub entities: Mutex<Vec<EntityEntry>>,
         pub scenes: Mutex<Vec<crate::types::MemScene>>,
+        pub profiles: Mutex<Vec<crate::types::MemProfile>>,
         pub retractions: Mutex<Vec<RetractionRecord>>,
         pub forget_journal: Mutex<Vec<ForgetJournalEntry>>,
         pub temporal_events: Mutex<Vec<TemporalEvent>>,
@@ -2882,6 +2897,30 @@ pub mod mock {
                 .filter(|s| s.tenant_id == ctx.tenant_id && s.session_id == session_id)
                 .cloned()
                 .collect())
+        }
+
+        async fn profile_put(
+            &self,
+            ctx: &TenantContext,
+            profile: &crate::types::MemProfile,
+        ) -> anyhow::Result<()> {
+            let mut profiles = self.profiles.lock().await;
+            profiles
+                .retain(|p| !(p.tenant_id == ctx.tenant_id && p.session_id == profile.session_id));
+            profiles.push(profile.clone());
+            Ok(())
+        }
+
+        async fn profile_get(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+        ) -> anyhow::Result<Option<crate::types::MemProfile>> {
+            let profiles = self.profiles.lock().await;
+            Ok(profiles
+                .iter()
+                .find(|p| p.tenant_id == ctx.tenant_id && p.session_id == session_id)
+                .cloned())
         }
 
         async fn entity_counts_by_type_and_state(
