@@ -11,7 +11,7 @@ You have a semantic memory system. Use it BEFORE grep, find, or reading files. I
 
 ## Searching (Memory First)
 
-- **`hybrid_search`** — your primary search. Uses 5 signals (phonetic, vector, fold, warmth, pagerank). If it returns what you need, you're done — no grep/find/read needed.
+- **`hybrid_search`** — your primary search. Fuses many signals (phonetic, vector, fold, **scene**, **profile**, **foresight**, document BM25, warmth, pagerank, Datalog frontier). If it returns what you need, you're done — no grep/find/read needed.
 - If results are insufficient, the response suggests deeper tools
 - Only fall back to file-system tools if memory genuinely doesn't have what you need
 
@@ -35,6 +35,30 @@ You have a semantic memory system. Use it BEFORE grep, find, or reading files. I
 - **`check_intentions`** — At session start and when context changes
 - **`complete_intention`** — Mark done when acted on
 - Trigger types: Topic (keyword match), FilePattern (file glob), Duration (time delay), Context (condition)
+
+## Time-Bounded Facts (Foresight)
+
+- **`set_foresight`** — "X holds until Y" / "plan Z starts on D". Records a fact with a
+  validity window (`valid_from` / `valid_until`, optional RFC3339 timestamps).
+- Search surfaces it **only while valid at now** — expired deadlines and not-yet-active
+  plans are filtered out automatically, so stale facts never pollute context.
+- Use for code freezes, deprecations, deadlines, temporary constraints.
+- Retrieve via normal `hybrid_search` (active facts appear as `result_type: "foresight"`).
+- See [`docs/recall-quality.md`](docs/recall-quality.md#time-bounded-foresight).
+
+## What Happens Automatically
+
+You don't have to manage these — a background **dream cycle** runs periodically and builds
+them for free shortly after you ingest related entities:
+
+- **Scenes** — clusters of 3+ related entities folded into a coherent, retrievable unit. A
+  search that matches a scene returns it *and expands to its members*. Scenes match both
+  lexically and semantically (centroid embedding).
+- **Profiles** — a per-session gist injected into every search as always-on context.
+- **Edges** — `CO_OCCURS` connections discovered between co-occurring entities.
+
+Force a pass at wrap-up with `run_consolidation` (or the `/consolidate-wrapup` skill). See
+[`docs/recall-quality.md`](docs/recall-quality.md#automatic-consolidation).
 
 ## Going Deeper
 
@@ -76,4 +100,4 @@ Every retrieval miss trains the system to store that kind of information in the 
 - Don't store every sentence — store the insight worth remembering
 - Don't skip edge creation — unconnected entities are wasted knowledge
 - Don't ignore `check_intentions` — that's where your future self left you notes
-- Don't call `run_consolidation` after every entity — do it after significant learning
+- Don't call `run_consolidation` after every entity — it already runs automatically on a periodic tick; only *force* it (or `/consolidate-wrapup`) at the end of significant learning

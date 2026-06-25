@@ -12,6 +12,7 @@
 #   config/ferrosa-memory.example.toml   (if present)
 #   launchd/com.ferrosa-memory.mcp.plist (if present)
 #   systemd/ferrosa-memory.service       (if present)
+#   skills/<skill>/SKILL.md              (portable agent skills, if present)
 
 set -euo pipefail
 
@@ -59,6 +60,15 @@ for entry in \
     echo "WARN: $entry not found, skipping" >&2
   fi
 done
+
+# Bundle the portable agent skills (a directory tree) so the installer can place
+# them in the user's agent skill directory.
+if [[ -d skills ]]; then
+  mkdir -p "${STAGE}/skills"
+  cp -R skills/. "${STAGE}/skills/"
+else
+  echo "WARN: skills/ not found, skipping" >&2
+fi
 
 mkdir -p dist
 ( cd "$STAGE" && find . -mindepth 1 -print0 | LC_ALL=C sort -z \

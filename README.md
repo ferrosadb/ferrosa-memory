@@ -11,8 +11,12 @@ ferrosa-memory-mcp fixes this by providing durable, typed memory tools over Ferr
 - **Trajectory folds** — branch-and-collapse pattern with semantic retrieval over fold summaries
 - **Entity graph** — named entity tracking with phonetic deduplication and multi-hop Cypher queries
 - **Temporal chains** — timestamped facts with supersession tracking (most-recent-valid retrieval)
+- **Time-bounded foresight** — planned-future facts and temporary constraints with a `valid_from`/`valid_until` window; search surfaces them only while valid, so stale deadlines never pollute context
+- **Consolidation scenes** — coherent clusters of related entities, folded into durable retrievable units (with a member-centroid embedding for semantic matching) by background consolidation, and expanded back to their members on recall
+- **Workspace profiles** — a compact per-session gist (active entities, repo/branch/task context) injected as always-on context
 - **Document recall** — document/section/chunk entities, chunk adjacency, BM25 + vector + phonetic candidate generation, and task-aware query decomposition
-- **Feedback loop** — retrieval feedback, judge abstentions, cwd/workspace-aware reranking, and offline guideline refinement
+- **Feedback loop** — retrieval feedback, judge abstentions, cwd/workspace-aware reranking, retrieval traces for offline learning, and offline guideline refinement
+- **Automatic upkeep** — a periodic background dream cycle builds edges, scenes, and profiles for free; no manual step required
 
 ## Architecture
 
@@ -74,7 +78,7 @@ Analogy: talking to PostgreSQL over its wire protocol is fine; writing directly 
 
 ## Tools
 
-64 MCP tools are defined in `crates/ferrosa-memory-core/src/dispatch.rs` and
+65 MCP tools are defined in `crates/ferrosa-memory-core/src/dispatch.rs` and
 returned by `tools/list`. Keep this section aligned with the dispatch registry
 when adding or removing tools. (`describe` is a management tool excluded from
 the tier-1 default `tools/list`; request it with `include_all`.)
@@ -85,7 +89,7 @@ the tier-1 default `tools/list`; request it with `include_all`.)
 | Memo and plans | `check_memo_cache`, `store_memo_result`, `write_plan_node`, `get_plan_context`, `update_plan_node` | Cache sub-call results and maintain hierarchical plan state |
 | Core memory | `smart_ingest`, `upsert_entity`, `batch_ingest`, `ingest_entities`, `retrieve_entities`, `list_entities`, `hybrid_search`, `count_entities_by_type` | Ingest, retrieve, and structured-filter entities; semantic + lexical + phonetic + graph search |
 | Graph / edges | `create_edge`, `batch_create_edges`, `batch_update_edges`, `batch_delete_edges`, `explore_connections`, `find_memory_chain` | Build and traverse the knowledge graph |
-| Temporal | `write_temporal_fact`, `get_temporal_chain` | Timestamped facts with supersession tracking |
+| Temporal | `write_temporal_fact`, `get_temporal_chain`, `set_foresight` | Timestamped facts with supersession tracking; `set_foresight` declares time-bounded facts (`valid_from`/`valid_until`) surfaced only while valid |
 | Skills | `ingest_skill`, `invoke_skill`, `verify_skill`, `retrieve_skills_for_context` | Skill lifecycle: ingest, invoke, verify, retrieve |
 | Intentions | `set_intention`, `check_intentions`, `complete_intention`, `list_intentions`, `snooze_intention` | Prospective memory — deferred actions triggered by topic, file pattern, duration, or context |
 | Batch ops | `batch_update_entities`, `batch_delete_entities`, `delete_session` | Bulk entity updates, deletions, and scoped cleanup |
@@ -94,6 +98,53 @@ the tier-1 default `tools/list`; request it with `include_all`.)
 | Maintenance | `get_stats`, `migration_status`, `record_outcome`, `ensure_parent_tag` | Health stats, schema status, strategy feedback, and tag hierarchy |
 | Management | `describe` | Read-only, management-safe self-description (contract `ferrosa-memory.system.describe.v1`): identity, runtime/store health, redacted config, live ferrosa cluster info, summary statistics, schema drift, capabilities, and management actions |
 | Forgetting | `forget`, `restore_forgotten` | Candidate-confirmed forgetting: propose candidates (with blast radius) → confirm to retract (reversible, audited, restorable) or hard-delete; `restore_forgotten` reverses a retraction |
+
+## Recall quality
+
+Beyond raw storage, ferrosa-memory actively improves what comes back from a search. Most
+of this is automatic — a background **dream cycle** runs on a periodic tick (default every
+~20 s when there is new data) and builds the structures below for free. See
+[`docs/recall-quality.md`](docs/recall-quality.md) for the full guide.
+
+**Time-bounded foresight** — declare a fact that only holds for a window; search filters
+it out automatically once it expires (or before it starts):
+
+```jsonc
+set_foresight { "content": "Code freeze on main until the 0.17 cut",
+                "valid_until": "2026-07-01T00:00:00Z" }
+// A later hybrid_search for "freeze" surfaces it (result_type: "foresight") only
+// while valid; set valid_until in the past and it is dropped before fusion.
+```
+
+**Consolidation scenes** — when 3+ related entities cluster, consolidation folds them into
+a durable *scene* (a coherent unit with a member-centroid embedding). A search that matches
+the scene returns it **and expands to its member entities** — including members that didn't
+match the query on their own — so you recall the whole cluster, not loose fragments. Scenes
+match both lexically and **semantically** (cosine vs. the centroid).
+
+**Workspace profiles** — each consolidated session gets a compact profile (active entities,
+repo/branch/task context) that `hybrid_search` injects as always-on context, so every query
+starts with the session's frame.
+
+**Retrieval traces** — every search durably records its query, candidate sources, and
+results, enabling offline tuning of fusion weights and regression detection.
+
+Measured impact of the recall-quality controller on the evaluation corpus: precision
+**0.40 → 1.00**, context clutter **0.75 → 0.00**, accepted tokens **840 → 210** (≈4× leaner),
+with recall held at **1.00**.
+
+## Skills
+
+The [`skills/`](skills/) directory ships portable agent **skills** (slash-command
+playbooks) that the installer copies into your agent skill directory
+(`~/.claude/skills/` by default; `--no-skills` to opt out):
+
+- `/memory-session-start` — restore context (`check_intentions` + `hybrid_search`) at session start
+- `/set-foresight` — declare a time-bounded fact
+- `/consolidate-wrapup` — force a consolidation pass at the end of a session
+- `/defer`, `/whats-next`, `/roadmap` — capture and surface follow-up work (needs the [`forge`](https://github.com/ferrosadb/forge) companion task board)
+
+See [`skills/README.md`](skills/README.md).
 
 ## Quick Start
 
@@ -316,6 +367,8 @@ ddl/                     CQL schema definitions
 specs/                   Architecture, DSM, threat model, FMEA, project plan
 product/                 Product specification
 examples/                Config file templates
+skills/                  Portable agent skills (installed by install-memory.sh)
+docs/                    Guides (recall-quality.md), brand assets, the installer
 ```
 
 ## Security
