@@ -56,11 +56,20 @@ ollama_base_url = "http://127.0.0.1:11434"
 model = "nomic-embed-text-v2-moe"
 dimensions = 768
 
+# Graph / typed-edge backend (create_edge, explore_connections, etc.).
+#
+# IMPORTANT: these endpoints are served by Ferrosa's GRAPH ENGINE, which is a
+# SEPARATE subsystem from the CQL/storage engine and must be enabled on the
+# Ferrosa side too — having CQL up on 19042 does NOT mean the graph engine is
+# running. If Ferrosa's graph engine is off (nothing listening on 7687/7474),
+# edge tools fail; the MCP reports the engine as unreachable rather than a
+# schema error, so you don't waste time chasing typed_edges DDL. Enable the
+# graph engine in Ferrosa's own config, then point bolt_uri/http_url here at it.
 [graph]
-bolt_uri = "bolt://localhost:7687"
+bolt_uri = "bolt://localhost:7687"   # Bolt protocol endpoint (Ferrosa graph engine)
 username = "ferrosa_admin"
 password = "ferrosa_admin"
-http_url = "http://localhost:7474"
+http_url = "http://localhost:7474"   # HTTP health/transaction endpoint
 
 [sparql]
 enabled = true
