@@ -782,6 +782,52 @@ async fn handle_http_request_with_session<S: Storage + OperatorQuerySurface>(
             let body_str = serde_json::to_string(&response_body)?;
             Ok(json_response("200 OK", &body_str))
         }
+        // Unauthenticated loopback introspection (same exposure tier as /health
+        // and /metrics). Lets a local controller (the Ferrosa workbench) map a
+        // running ferrosa-memory server to its ferrosa cluster without the MCP
+        // handshake. Reports config/identity from the startup snapshot plus live
+        // reachability + cluster_info (best-effort). No secrets are included.
+        ("GET", "/introspect") => {
+            let info = &session.system_info;
+            let reachable = readiness_checker();
+            let ferrosa = if reachable {
+                match storage.cluster_info(&info.keyspace).await {
+                    Ok(ci) => serde_json::json!({
+                        "reachable": true,
+                        "cluster_name": ci.cluster_name,
+                        "release_version": ci.release_version,
+                        "node_count": ci.node_count,
+                        "peer_count": ci.peer_count,
+                    }),
+                    Err(_) => serde_json::json!({ "reachable": true }),
+                }
+            } else {
+                serde_json::json!({ "reachable": false })
+            };
+            let body = serde_json::json!({
+                "contract": "ferrosa-memory.introspect.v1",
+                "version": info.version,
+                "commit": info.commit,
+                "pid": info.pid,
+                "started_at": info.started_at,
+                "transport": info.transport,
+                "tenant_id": info.tenant_id,
+                "session_id": info.session_id,
+                "keyspace": info.keyspace,
+                "contact_points": info.contact_points,
+                "http_port": info.http_port,
+                "public_port": info.public_port,
+                "require_tls": info.require_tls,
+                "viz_enabled": info.viz_enabled,
+                "viz_port": info.viz_port,
+                "bolt_uri": info.graph_bolt_uri,
+                "graph_http_url": info.graph_http_url,
+                "config_path": info.config_path,
+                "ferrosa": ferrosa,
+            });
+            let body_str = serde_json::to_string(&body)?;
+            Ok(json_response("200 OK", &body_str))
+        }
         _ => Ok("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".into()),
     }
 }
