@@ -1,24 +1,61 @@
-# ferrosa-memory-mcp
+# Ferrosa Memory
 
-A structured memory backend for LLM agent trajectories, exposed as an [MCP](https://modelcontextprotocol.io/) server over Ferrosa DB.
+Ferrosa Memory is durable working memory for AI agents. It turns one-off agent
+sessions into a long-running, searchable knowledge system: plans survive restarts,
+important facts keep their history, documents become retrievable by meaning, and
+future sessions can pick up work without rebuilding the same context from scratch.
 
-LLM agents running inside Claude Code (and other MCP-compatible clients) currently lose all working context between sessions. Sub-calls re-derive results the parent already computed. Plans evaporate when the REPL tears down. Entities discovered in one trajectory are invisible to the next.
+It runs as an [MCP](https://modelcontextprotocol.io/) server backed by Ferrosa DB.
+Agents call normal MCP tools; Ferrosa Memory handles storage, retrieval,
+consolidation, and governance behind those tools.
 
-ferrosa-memory-mcp fixes this by providing durable, typed memory tools over Ferrosa's public query interfaces and indexed storage capabilities:
+## Why it exists
 
-- **Memoization** — cache sub-call results by content hash, skip redundant LLM invocations
-- **Plan state** — hierarchical plan trees with O(depth) range scans for structured re-injection
-- **Trajectory folds** — branch-and-collapse pattern with semantic retrieval over fold summaries
-- **Entity graph** — named entity tracking with phonetic deduplication and multi-hop Cypher queries
-- **Temporal chains** — timestamped facts with supersession tracking (most-recent-valid retrieval)
-- **Time-bounded foresight** — planned-future facts and temporary constraints with a `valid_from`/`valid_until` window; search surfaces them only while valid, so stale deadlines never pollute context
-- **Consolidation scenes** — coherent clusters of related entities, folded into durable retrievable units (with a member-centroid embedding for semantic matching) by background consolidation, and expanded back to their members on recall
-- **Workspace profiles** — a compact per-session gist (active entities, repo/branch/task context) injected as always-on context
-- **Document recall** — document/section/chunk entities, chunk adjacency, BM25 + vector + phonetic candidate generation, and task-aware query decomposition
-- **Feedback loop** — retrieval feedback, judge abstentions, cwd/workspace-aware reranking, retrieval traces for offline learning, and offline guideline refinement
-- **Automatic upkeep** — a periodic background dream cycle builds edges, scenes, and profiles for free; no manual step required
+Most agent workflows still behave like disposable chat windows. When the process
+ends, the useful context disappears with it:
 
-## Architecture
+- subagents recompute work that already happened;
+- plans and decisions get buried in transcripts;
+- entities discovered in one session are invisible to the next;
+- retrieval returns loose fragments instead of the surrounding project frame;
+- stale deadlines and superseded facts keep polluting prompts.
+
+Ferrosa Memory fixes that by giving agents a typed memory plane instead of a pile
+of logs. It stores facts, plans, folds, documents, graph edges, skills, feedback,
+and future constraints as first-class records that can be searched, explained,
+aged out, superseded, or deleted.
+
+## What it gives agents
+
+- **Context that survives restarts** — restore the active workspace, branch,
+  entities, plan state, and recent decisions at session start.
+- **Less repeated work** — memoize sub-call results by content hash and reuse
+  previously computed answers.
+- **Long-running plans** — keep hierarchical plan nodes in storage and retrieve
+  only the relevant path when work resumes.
+- **Entity-aware recall** — track people, projects, files, concepts, and links
+  with phonetic deduplication and graph traversal.
+- **Temporal memory** — store timestamped facts with supersession so “latest
+  valid answer” beats stale context.
+- **Time-bounded foresight** — represent future constraints with
+  `valid_from`/`valid_until`, then automatically stop surfacing them after they
+  expire.
+- **Document recall** — ingest documents as document, section, and chunk records
+  with BM25, vector, phonetic, and graph-based candidate generation.
+- **Consolidated scenes** — background consolidation folds clusters of related
+  entities into coherent retrievable scenes, then expands them back to member
+  entities during recall.
+- **Retrieval feedback** — record traces, abstentions, judge results, and user
+  feedback for offline tuning and regression detection.
+- **Operational controls** — tenant isolation, audit trails, reversible
+  forgetting, rule governance, and fail-loud health checks.
+
+## How it works
+
+Ferrosa Memory is a thin product layer over Ferrosa's public data interfaces. MCP
+clients talk to Ferrosa Memory; Ferrosa Memory decides which memory tool is being
+used, authenticates the request, writes app-owned memory records through CQL,
+and uses Ferrosa graph/query interfaces for graph-owned data.
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#16161f','primaryTextColor':'#e8e8ed','primaryBorderColor':'#e2725b','lineColor':'#9494a3','secondaryColor':'#1c1c28','tertiaryColor':'#111118','clusterBkg':'#111118','clusterBorder':'#1e1e2a','edgeLabelBackground':'#111118','nodeTextColor':'#e8e8ed'}}}%%
@@ -27,54 +64,57 @@ graph TD
         CC[Claude Code]
         CA[Claude.ai]
         TP[Third-party MCP clients]
+        WB[Workbench]
     end
 
-    subgraph MCP["ferrosa-memory-mcp"]
-        TR[Tool Router]
-        AT[Auth]
-        CU[Compression]
+    subgraph MCP["Ferrosa Memory MCP server"]
+        TR[Tool router]
+        AT[Auth and tenant scope]
+        MEM[Memory tools]
+        DAT[Datalog engine]
+        CU[Compression and upkeep]
     end
 
     subgraph DB["Ferrosa DB"]
-        KS[agent_memory keyspace]
-        IX["HNSW · Phonetic · B-tree"]
-        GR["Property graph (Cypher)"]
+        APP[App-owned memory tables]
+        IDX["BM25 · Vector · Phonetic · B-tree"]
+        GRAPH["Graph interfaces"]
         ST["NVMe → S3 → Glacier"]
     end
 
     CC -->|stdio| TR
     CA -->|HTTP+SSE| TR
     TP -->|HTTP+SSE| TR
+    WB -->|CQL / SPARQL / Datalog surfaces| TR
     TR --> AT
-    AT -->|CQL + Cypher| KS
-    CU -->|compress before write| KS
-    KS --- IX
-    KS --- GR
-    KS --- ST
+    AT --> MEM
+    MEM -->|direct CQL for memory records| APP
+    MEM -->|graph reads/writes| GRAPH
+    DAT -->|local inference over memory data| MEM
+    CU -->|compression and background consolidation| MEM
+    APP --- IDX
+    GRAPH --- IDX
+    APP --- ST
+    GRAPH --- ST
 ```
 
-The server should be a thin adapter that maps MCP and operator-console requests onto Ferrosa at the right abstraction level. All intelligence stays in the LLM; durability and query semantics stay in Ferrosa. If a Ferrosa public interface misbehaves, `ferrosa-memory` should surface the error rather than emulate alternate semantics locally.
+The key boundary is ownership, not syntax. Direct CQL is correct for tables owned
+by Ferrosa Memory, such as entities, folds, context segments, temporal facts,
+feedback, configuration, and retrieval traces. Graph-owned backing tables are not
+a public API; graph reads and writes go through graph interfaces.
 
-What is public vs internal here:
+| Surface | Contract |
+|---------|----------|
+| App-owned memory tables | Direct CQL is allowed. Ferrosa Memory owns the schema and migrations. |
+| Graph reads and writes | Use graph interfaces, not direct mutation of graph backing tables such as `typed_edges`, `folded_into`, `mentioned_in`, `co_occurs_with`, or `supersedes`. |
+| Workbench CQL | Authenticated pass-through to Ferrosa's public CQL contract. Fail loud if Ferrosa rejects the query. |
+| Workbench SPARQL | Authenticated pass-through to Ferrosa's public SPARQL contract. Fail loud if Ferrosa rejects the query. |
+| Workbench Datalog | Local Ferrosa Memory inference over Ferrosa-backed graph and app data. It is not a Ferrosa wire-protocol contract. |
 
-| Layer | What `ferrosa-memory` does | Classification |
-|-------|-----------------------------|----------------|
-| Wire protocol | CQL over port `9042` via `cdrs-tokio` | Public protocol |
-| Graph storage tables | `typed_edges`, `folded_into`, `mentioned_in`, `co_occurs_with`, `supersedes`, `derived_edges_by_pred`, `derived_edges_by_src`, ... | Internal schema owned by `ferrosa-graph` |
-
-CQL itself is not the problem. The problem is crossing the graph-engine boundary and treating graph-owned tables like a public API. The rule is:
-
-- direct CQL usage for app tables is allowed
-- graph reads and writes should go through graph interfaces, not direct table mutation
-- workbench CQL and SPARQL surfaces should be passthrough/fail-loud contract checks
-- Datalog is owned by `ferrosa-memory` and executes locally over Ferrosa-backed graph/app data; it is not a Ferrosa wire-protocol contract
-
-Workbench query contract surfaces are explicit:
-
-- `/workbench/api/cql/query` and `/workbench/api/sparql/query` are authenticated pass-through contracts to Ferrosa public query endpoints.
-- `/workbench/api/datalog/query` is a local ferrosa-memory inference service and remains repo-owned.
-
-Analogy: talking to PostgreSQL over its wire protocol is fine; writing directly to `pg_index` instead of running `CREATE INDEX` is not. Same protocol, wrong abstraction level.
+That keeps the product honest: Ferrosa Memory uses Ferrosa instead of cloning
+Ferrosa behavior locally. If a public Ferrosa interface cannot express a needed
+operation, the fix belongs in Ferrosa's public graph/query surface rather than in
+a private backing-table workaround.
 
 ## Tools
 
