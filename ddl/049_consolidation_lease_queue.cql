@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS agent_memory.consolidation_requests (
 );
 
 -- Allow replicas to find pending work without scanning all sessions.
-CREATE INDEX IF NOT EXISTS agent_memory.consolidation_requests_state_idx
+CREATE INDEX IF NOT EXISTS consolidation_requests_state_idx
     ON agent_memory.consolidation_requests (state);
 
 -- Append-only audit log of consolidation runs. Clustering by run_id (timeuuid)
