@@ -21,9 +21,9 @@ use crate::remotes::types::{
 };
 use crate::types::{
     AliasEntry, ApprovalEntry, AuditEntry, ConfidenceScore, ConsolidationRequest,
-    ConsolidationRequestState, ConsolidationResult, ConsolidationRun, DerivedFact, DocumentChunk,
-    EntityEntry, EntityListQuery, EntityListScope, EntityTypeStateCount, FeedbackOutcome,
-    FoldEntry, FoldSummary, ForgetJournalEntry, MaterializedEdge, MemoEntry, MemoryState, PlanNode,
+    ConsolidationResult, ConsolidationRun, DerivedFact, DocumentChunk, EntityEntry,
+    EntityListQuery, EntityListScope, EntityTypeStateCount, FeedbackOutcome, FoldEntry,
+    FoldSummary, ForgetJournalEntry, MaterializedEdge, MemoEntry, MemoryState, PlanNode,
     PlanStatus, PromotedPredicate, ProvenanceStep, RetractionRecord, RuleEntry, RuleState,
     SessionTask, SessionTaskAlias, SessionTaskEvent, SessionTaskFocusEntry, SessionTaskPolicy,
     SessionTaskStatus, TemporalEvent, TenantContext, ToolUsageRow, TypedEdge, WarmthEntry,
@@ -2024,7 +2024,7 @@ pub struct ClusterInfo {
 pub mod mock {
     use super::*;
     use crate::http::OperatorQuerySurface;
-    use crate::types::{DecayZone, FoldStatus};
+    use crate::types::{ConsolidationRequestState, DecayZone, FoldStatus};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex;

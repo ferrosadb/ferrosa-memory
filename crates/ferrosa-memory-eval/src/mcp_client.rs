@@ -314,6 +314,17 @@ impl McpClient {
         self.next_id
     }
 
+    /// Returns the operating-system process id of the spawned server, if it is
+    /// still available from Tokio's child handle.
+    pub fn process_id(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    /// Kill the spawned server process.
+    pub async fn kill(&mut self) -> std::io::Result<()> {
+        self.child.kill().await
+    }
+
     /// Send the MCP `initialize` request and return the server info response.
     pub async fn initialize(&mut self) -> Result<ToolCallResult, McpClientError> {
         let params = serde_json::json!({
@@ -1090,7 +1101,7 @@ for line in sys.stdin:
         client.initialize().await.expect("initialize failed");
 
         // Kill the child process to simulate crash
-        client.child.kill().await.expect("kill failed");
+        client.kill().await.expect("kill failed");
 
         // Give it a moment to die
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1106,6 +1117,150 @@ for line in sys.stdin:
             McpClientError::PipeClosed => {}           // also acceptable
             McpClientError::Io(_) => {}                // broken pipe is acceptable too
             other => panic!("expected crash-related error, got: {other}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires live ferrosa test cluster; run via make test-live"]
+    #[serial(mcp_live)]
+    async fn live_multi_replica_consolidation_takeover_after_holder_kill() {
+        use ferrosa_memory_core::config::FerrosaCqlConfig;
+        use ferrosa_memory_core::cql_storage::CqlStorage;
+        use ferrosa_memory_core::storage::Storage;
+        use ferrosa_memory_core::types::TenantContext;
+        use uuid::Uuid;
+
+        let (Ok(cql_host), Ok(cql_port)) = (
+            std::env::var("FERROSA_TEST_CQL_HOST"),
+            std::env::var("FERROSA_TEST_CQL_PORT"),
+        ) else {
+            eprintln!(
+                "skip: FERROSA_TEST_CQL_HOST/FERROSA_TEST_CQL_PORT unset — run via make test-live"
+            );
+            return;
+        };
+
+        let binary = find_mcp_binary();
+        let config = live_mcp_consolidation_test_config(&cql_host, &cql_port);
+        let tenant_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let session_id = Uuid::new_v4();
+        let ctx = TenantContext {
+            tenant_id,
+            session_origin: "mcp-live-multi-replica-consolidation-test".to_string(),
+        };
+        let storage_config = FerrosaCqlConfig {
+            contact_points: vec![format!("{cql_host}:{cql_port}")],
+            keyspace: "agent_memory_test".to_string(),
+            replication_factor: 1,
+            consistency: "LOCAL_QUORUM".to_string(),
+            username: "cassandra".to_string(),
+            password: "cassandra".to_string(),
+            admin_username: None,
+            admin_password: None,
+        };
+        let storage = CqlStorage::connect(&storage_config)
+            .await
+            .expect("connect direct CQL storage");
+
+        let mut replica_a = spawn_live_mcp(&binary, &config)
+            .await
+            .expect("failed to spawn MCP replica A");
+        let mut replica_b = spawn_live_mcp(&binary, &config)
+            .await
+            .expect("failed to spawn MCP replica B");
+        let replica_a_pid = replica_a.process_id().expect("replica A pid available");
+        let replica_b_pid = replica_b.process_id().expect("replica B pid available");
+
+        replica_a.initialize().await.expect("initialize replica A");
+        replica_a
+            .send_initialized_notification()
+            .await
+            .expect("initialized notification replica A");
+        replica_b.initialize().await.expect("initialize replica B");
+        replica_b
+            .send_initialized_notification()
+            .await
+            .expect("initialized notification replica B");
+
+        let add_memo_args = serde_json::json!({
+            "tenant_id": tenant_id.to_string(),
+            "session_id": session_id.to_string(),
+            "content": "multi-replica consolidation test payload"
+        });
+        if let Err(err) = replica_a.call_tool("add_memo", add_memo_args.clone()).await {
+            // Older local branches expose the same write path through the public
+            // ingest/smart_ingest tool rather than add_memo. Keep the takeover
+            // test exercising live consolidation on those branches while still
+            // preferring add_memo when present.
+            match err {
+                McpClientError::ServerError { .. } => {
+                    replica_a
+                        .call_tool(
+                            "ingest",
+                            serde_json::json!({
+                                "tenant_id": tenant_id.to_string(),
+                                "session_id": session_id.to_string(),
+                                "content": "multi-replica consolidation test payload",
+                                "entity_type": "concept",
+                                "entity_name": "multi-replica consolidation takeover test"
+                            }),
+                        )
+                        .await
+                        .expect("fallback ingest call failed");
+                }
+                other => panic!("add_memo call failed: {other}"),
+            }
+        }
+
+        let first_owner =
+            wait_for_leased_owner(&storage, &ctx, session_id, Duration::from_secs(10))
+                .await
+                .expect("request should become leased");
+        let latest_run = storage
+            .consolidation_run_get_latest(&ctx, session_id)
+            .await
+            .expect("read latest consolidation run");
+        if let Some(run) = latest_run {
+            assert_eq!(
+                run.lease_owner.as_deref(),
+                Some(first_owner.as_str()),
+                "latest running consolidation run should match request lease owner"
+            );
+        }
+
+        let holder_pid = lease_owner_pid(&first_owner).expect("lease owner should include pid");
+        let survivor_pid = if holder_pid == replica_a_pid {
+            replica_a.kill().await.expect("kill replica A holder");
+            replica_b_pid
+        } else if holder_pid == replica_b_pid {
+            replica_b.kill().await.expect("kill replica B holder");
+            replica_a_pid
+        } else {
+            panic!(
+                "lease owner pid {holder_pid} did not match replica pids A={replica_a_pid} B={replica_b_pid}; owner={first_owner}"
+            );
+        };
+
+        let takeover_owner = wait_for_changed_leased_owner(
+            &storage,
+            &ctx,
+            session_id,
+            &first_owner,
+            Duration::from_secs(6),
+        )
+        .await
+        .expect("surviving replica should take over expired consolidation lease");
+        assert_eq!(
+            lease_owner_pid(&takeover_owner),
+            Some(survivor_pid),
+            "new lease_owner should belong to surviving replica"
+        );
+
+        if replica_a.process_id() == Some(survivor_pid) {
+            let _ = replica_a.kill().await;
+        }
+        if replica_b.process_id() == Some(survivor_pid) {
+            let _ = replica_b.kill().await;
         }
     }
 
@@ -1147,6 +1302,102 @@ dimensions = 768
         .expect("write live MCP test config");
         file.flush().expect("flush live MCP test config");
         file
+    }
+
+    fn live_mcp_consolidation_test_config(host: &str, port: &str) -> tempfile::NamedTempFile {
+        use std::io::Write as _;
+
+        let mut file =
+            tempfile::NamedTempFile::new().expect("create live MCP consolidation config");
+        write!(
+            file,
+            r#"
+[server]
+transport = "stdio"
+tenant_id = "00000000-0000-0000-0000-000000000001"
+
+[ferrosa]
+contact_points = ["{host}:{port}"]
+keyspace = "agent_memory_test"
+username = "cassandra"
+password = "cassandra"
+
+[viz]
+enabled = false
+
+[embeddings]
+provider = "synthetic"
+ollama_base_url = ""
+model = "synthetic-ci"
+dimensions = 768
+
+[consolidation]
+enabled = true
+poll_seconds = 1
+lease_seconds = 3
+min_interval_seconds = 0
+stale_edge_max_days = 0
+edge_decay_factor = 1.0
+"#
+        )
+        .expect("write live MCP consolidation config");
+        file.flush().expect("flush live MCP consolidation config");
+        file
+    }
+
+    async fn wait_for_leased_owner<S: ferrosa_memory_core::storage::Storage>(
+        storage: &S,
+        ctx: &ferrosa_memory_core::types::TenantContext,
+        session_id: uuid::Uuid,
+        timeout: Duration,
+    ) -> Option<String> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let request = storage
+                .consolidation_request_get(ctx, session_id)
+                .await
+                .expect("read consolidation request");
+            if let Some(request) = request {
+                if request.state == ferrosa_memory_core::types::ConsolidationRequestState::Leased {
+                    if let Some(owner) = request.lease_owner {
+                        return Some(owner);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        None
+    }
+
+    async fn wait_for_changed_leased_owner<S: ferrosa_memory_core::storage::Storage>(
+        storage: &S,
+        ctx: &ferrosa_memory_core::types::TenantContext,
+        session_id: uuid::Uuid,
+        old_owner: &str,
+        timeout: Duration,
+    ) -> Option<String> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let request = storage
+                .consolidation_request_get(ctx, session_id)
+                .await
+                .expect("read consolidation request");
+            if let Some(request) = request {
+                if request.state == ferrosa_memory_core::types::ConsolidationRequestState::Leased {
+                    if let Some(owner) = request.lease_owner {
+                        if owner != old_owner {
+                            return Some(owner);
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        None
+    }
+
+    fn lease_owner_pid(owner: &str) -> Option<u32> {
+        owner.rsplit_once('@')?.1.parse().ok()
     }
 
     /// Find the MCP server binary, building it if necessary.

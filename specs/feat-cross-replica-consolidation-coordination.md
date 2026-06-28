@@ -129,6 +129,9 @@ Notes:
 - The global secondary index on `state` lets replicas find pending work.
 - `consolidation_runs` is an append-only audit log; retention is handled by
   `stale_edge_max_days`-style TTL or a future janitor.
+- Both tables are rebuildable coordination state. Operators should pin them to
+  local NVMe / avoid S3-only tiers via the Ferrosa operator's table storage
+  policy, since losing these rows only delays consolidation, never user data.
 
 ## Storage Trait Additions
 
