@@ -1361,12 +1361,11 @@ edge_decay_factor = 1.0
                 .consolidation_request_get(ctx, session_id)
                 .await
                 .expect("read consolidation request");
-            if let Some(request) = request {
-                if request.state == ferrosa_memory_core::types::ConsolidationRequestState::Leased {
-                    if let Some(owner) = request.lease_owner {
-                        return Some(owner);
-                    }
-                }
+            if let Some(request) = request
+                && request.state == ferrosa_memory_core::types::ConsolidationRequestState::Leased
+                && let Some(owner) = request.lease_owner
+            {
+                return Some(owner);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -1386,14 +1385,12 @@ edge_decay_factor = 1.0
                 .consolidation_request_get(ctx, session_id)
                 .await
                 .expect("read consolidation request");
-            if let Some(request) = request {
-                if request.state == ferrosa_memory_core::types::ConsolidationRequestState::Leased {
-                    if let Some(owner) = request.lease_owner {
-                        if owner != old_owner {
-                            return Some(owner);
-                        }
-                    }
-                }
+            if let Some(request) = request
+                && request.state == ferrosa_memory_core::types::ConsolidationRequestState::Leased
+                && let Some(owner) = request.lease_owner
+                && owner != old_owner
+            {
+                return Some(owner);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
