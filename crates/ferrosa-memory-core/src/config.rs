@@ -55,6 +55,57 @@ pub struct Config {
     pub search: SearchConfig,
     #[serde(default)]
     pub forget: ForgetConfig,
+    #[serde(default)]
+    pub consolidation: ConsolidationConfig,
+}
+
+/// Cross-replica consolidation coordination settings.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ConsolidationConfig {
+    /// Enable the global consolidation worker (default: true).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Poll interval for pending consolidation requests, in seconds (default: 20).
+    #[serde(default = "default_consolidation_poll_seconds")]
+    pub poll_seconds: u64,
+    /// Lease duration granted to a worker; must exceed expected run time (default: 300).
+    #[serde(default = "default_consolidation_lease_seconds")]
+    pub lease_seconds: u64,
+    /// Days after which unreinforced CO_OCCURS edges are pruned. 0 = never (default: 0).
+    #[serde(default)]
+    pub stale_edge_max_days: u64,
+    /// Decay factor applied to CO_OCCURS edge weights each cycle (default: 0.95).
+    #[serde(default = "default_decay_factor")]
+    pub edge_decay_factor: f64,
+    /// Run interval between tenant-scoped consolidation attempts, even when idle.
+    /// Keeps the prior "idle_seconds" behavior without relying on actual inactivity.
+    #[serde(default = "default_consolidation_min_interval_seconds")]
+    pub min_interval_seconds: u64,
+}
+
+impl Default for ConsolidationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_seconds: default_consolidation_poll_seconds(),
+            lease_seconds: default_consolidation_lease_seconds(),
+            stale_edge_max_days: 0,
+            edge_decay_factor: default_decay_factor(),
+            min_interval_seconds: default_consolidation_min_interval_seconds(),
+        }
+    }
+}
+
+fn default_consolidation_poll_seconds() -> u64 {
+    20
+}
+
+fn default_consolidation_lease_seconds() -> u64 {
+    300
+}
+
+fn default_consolidation_min_interval_seconds() -> u64 {
+    20
 }
 
 #[derive(Debug, Deserialize)]

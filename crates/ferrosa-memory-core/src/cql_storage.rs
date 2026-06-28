@@ -83,6 +83,18 @@ fn parse_session_task_status(status: &str) -> SessionTaskStatus {
     serde_json::from_str(&format!("\"{status}\"")).unwrap_or(SessionTaskStatus::Pending)
 }
 
+fn consolidation_request_state_string(state: &ConsolidationRequestState) -> anyhow::Result<String> {
+    Ok(serde_json::to_string(state)?.trim_matches('"').to_string())
+}
+
+fn parse_consolidation_request_state(status: &str) -> ConsolidationRequestState {
+    serde_json::from_str(&format!("\"{status}\"")).unwrap_or(ConsolidationRequestState::Pending)
+}
+
+fn lwt_applied(row: &Row, col_map: &ColMap) -> anyhow::Result<bool> {
+    cql_get::<bool>(row, col_map, "[applied]")
+}
+
 fn row_to_session_task(
     session_id: Uuid,
     row: &Row,
@@ -107,6 +119,47 @@ fn row_to_session_task(
         created_at: cql_get(row, col_map, "created_at").unwrap_or_else(|_| chrono::Utc::now()),
         updated_at: cql_get(row, col_map, "updated_at").unwrap_or_else(|_| chrono::Utc::now()),
         completed_at: cql_get(row, col_map, "completed_at").ok(),
+    })
+}
+
+fn consolidation_request_from_row(
+    row: &Row,
+    col_map: &ColMap,
+) -> anyhow::Result<ConsolidationRequest> {
+    let state: String = cql_get(row, col_map, "state")?;
+    Ok(ConsolidationRequest {
+        tenant_id: cql_get(row, col_map, "tenant_id")?,
+        session_id: cql_get(row, col_map, "session_id")?,
+        state: parse_consolidation_request_state(&state),
+        requested_at: cql_get(row, col_map, "requested_at")?,
+        lease_owner: cql_get::<String>(row, col_map, "lease_owner").ok(),
+        lease_expires_at: cql_get::<chrono::DateTime<chrono::Utc>>(
+            row,
+            col_map,
+            "lease_expires_at",
+        )
+        .ok(),
+        attempt_count: cql_get(row, col_map, "attempt_count").unwrap_or_default(),
+        last_error: cql_get::<String>(row, col_map, "last_error").ok(),
+        completed_at: cql_get::<chrono::DateTime<chrono::Utc>>(row, col_map, "completed_at").ok(),
+    })
+}
+
+fn consolidation_run_from_row(row: &Row, col_map: &ColMap) -> anyhow::Result<ConsolidationRun> {
+    let run_id = cql_get::<CqlTimeuuid>(row, col_map, "run_id")
+        .map(Uuid::from)
+        .or_else(|_| cql_get::<Uuid>(row, col_map, "run_id"))?;
+    Ok(ConsolidationRun {
+        tenant_id: cql_get(row, col_map, "tenant_id")?,
+        session_id: cql_get(row, col_map, "session_id")?,
+        run_id,
+        lease_owner: cql_get::<String>(row, col_map, "lease_owner").ok(),
+        started_at: cql_get(row, col_map, "started_at")?,
+        finished_at: cql_get::<chrono::DateTime<chrono::Utc>>(row, col_map, "finished_at").ok(),
+        status: cql_get(row, col_map, "status")?,
+        entities_processed: cql_get(row, col_map, "entities_processed").unwrap_or_default(),
+        connections_created: cql_get(row, col_map, "connections_created").unwrap_or_default(),
+        error: cql_get::<String>(row, col_map, "error").ok(),
     })
 }
 
@@ -7738,6 +7791,335 @@ impl Storage for CqlStorage {
         } else {
             Ok(None)
         }
+    }
+
+    // --- Consolidation coordination operations ---
+
+    async fn consolidation_request_upsert(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> anyhow::Result<()> {
+        let query = format!(
+            "INSERT INTO {}.consolidation_requests \
+             (tenant_id, session_id, state, requested_at, attempt_count) \
+             VALUES (?, ?, 'pending', ?, 0) IF NOT EXISTS",
+            self.keyspace
+        );
+        self.session
+            .query_unpaged(query, (ctx.tenant_id, session_id, chrono::Utc::now()))
+            .await?;
+        Ok(())
+    }
+
+    async fn consolidation_request_claim(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        lease_owner: &str,
+        lease_expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<bool> {
+        let now = chrono::Utc::now();
+        let Some(existing) = self.consolidation_request_get(ctx, session_id).await? else {
+            return Ok(false);
+        };
+
+        let (if_clause, extra_value) = match existing.state {
+            ConsolidationRequestState::Pending => ("state = 'pending'".to_string(), None),
+            ConsolidationRequestState::Leased
+                if existing
+                    .lease_expires_at
+                    .is_some_and(|expires_at| expires_at <= now) =>
+            {
+                (
+                    "state = 'leased' AND lease_expires_at = ?".to_string(),
+                    existing.lease_expires_at,
+                )
+            }
+            _ => return Ok(false),
+        };
+
+        let query = format!(
+            "UPDATE {}.consolidation_requests \
+             SET state = 'leased', lease_owner = ?, lease_expires_at = ?, \
+                 attempt_count = attempt_count + 1, last_error = null, completed_at = null \
+             WHERE tenant_id = ? AND session_id = ? IF {}",
+            self.keyspace, if_clause
+        );
+        let result = if let Some(previous_expires_at) = extra_value {
+            self.session
+                .query_unpaged(
+                    query,
+                    (
+                        lease_owner.to_string(),
+                        lease_expires_at,
+                        ctx.tenant_id,
+                        session_id,
+                        previous_expires_at,
+                    ),
+                )
+                .await?
+        } else {
+            self.session
+                .query_unpaged(
+                    query,
+                    (
+                        lease_owner.to_string(),
+                        lease_expires_at,
+                        ctx.tenant_id,
+                        session_id,
+                    ),
+                )
+                .await?
+        };
+        let col_map = build_col_map(result.col_specs());
+        Ok(result
+            .rows_or_empty()
+            .first()
+            .map(|row| lwt_applied(row, &col_map))
+            .transpose()?
+            .unwrap_or(false))
+    }
+
+    async fn consolidation_request_renew(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        lease_owner: &str,
+        lease_expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<bool> {
+        let query = format!(
+            "UPDATE {}.consolidation_requests SET lease_expires_at = ? \
+             WHERE tenant_id = ? AND session_id = ? \
+             IF state = 'leased' AND lease_owner = ?",
+            self.keyspace
+        );
+        let result = self
+            .session
+            .query_unpaged(
+                query,
+                (
+                    lease_expires_at,
+                    ctx.tenant_id,
+                    session_id,
+                    lease_owner.to_string(),
+                ),
+            )
+            .await?;
+        let col_map = build_col_map(result.col_specs());
+        Ok(result
+            .rows_or_empty()
+            .first()
+            .map(|row| lwt_applied(row, &col_map))
+            .transpose()?
+            .unwrap_or(false))
+    }
+
+    async fn consolidation_request_complete(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        lease_owner: &str,
+        result: ConsolidationResult,
+    ) -> anyhow::Result<()> {
+        let Some(request) = self.consolidation_request_get(ctx, session_id).await? else {
+            anyhow::bail!("consolidation request not found for session {session_id}");
+        };
+        if !matches!(request.state, ConsolidationRequestState::Leased)
+            || request.lease_owner.as_deref() != Some(lease_owner)
+        {
+            anyhow::bail!(
+                "consolidation lease for session {session_id} is not owned by {lease_owner}"
+            );
+        }
+
+        let completed_at = chrono::Utc::now();
+        let next_state = if result.error.is_some() || result.status.eq_ignore_ascii_case("failed") {
+            ConsolidationRequestState::Failed
+        } else {
+            ConsolidationRequestState::Completed
+        };
+        let next_state = consolidation_request_state_string(&next_state)?;
+        let query = format!(
+            "UPDATE {}.consolidation_requests \
+             SET state = ?, lease_owner = null, lease_expires_at = null, \
+                 last_error = ?, completed_at = ? \
+             WHERE tenant_id = ? AND session_id = ? \
+             IF state = 'leased' AND lease_owner = ?",
+            self.keyspace
+        );
+        let update_result = self
+            .session
+            .query_unpaged(
+                query,
+                (
+                    next_state,
+                    result.error.clone(),
+                    completed_at,
+                    ctx.tenant_id,
+                    session_id,
+                    lease_owner.to_string(),
+                ),
+            )
+            .await?;
+        let col_map = build_col_map(update_result.col_specs());
+        let applied = update_result
+            .rows_or_empty()
+            .first()
+            .map(|row| lwt_applied(row, &col_map))
+            .transpose()?
+            .unwrap_or(false);
+        if !applied {
+            anyhow::bail!(
+                "consolidation lease completion failed for session {session_id}: lease owner changed"
+            );
+        }
+
+        let run = ConsolidationRun {
+            tenant_id: ctx.tenant_id,
+            session_id,
+            run_id: Uuid::now_v7(),
+            lease_owner: Some(lease_owner.to_string()),
+            started_at: request.requested_at,
+            finished_at: Some(completed_at),
+            status: result.status,
+            entities_processed: result.entities_processed,
+            connections_created: result.connections_created,
+            error: result.error,
+        };
+        self.consolidation_run_insert(ctx, &run).await
+    }
+
+    async fn consolidation_request_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> anyhow::Result<Option<ConsolidationRequest>> {
+        let query = format!(
+            "SELECT tenant_id, session_id, state, requested_at, lease_owner, lease_expires_at, \
+                    attempt_count, last_error, completed_at \
+             FROM {}.consolidation_requests \
+             WHERE tenant_id = ? AND session_id = ? LIMIT 1",
+            self.keyspace
+        );
+        let result = self
+            .session
+            .query_unpaged(query, (ctx.tenant_id, session_id))
+            .await?;
+        let col_map = build_col_map(result.col_specs());
+        result
+            .rows_or_empty()
+            .first()
+            .map(|row| consolidation_request_from_row(row, &col_map))
+            .transpose()
+    }
+
+    async fn consolidation_request_list_pending(
+        &self,
+        ctx: &TenantContext,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Uuid>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let pending_query = format!(
+            "SELECT session_id, requested_at FROM {}.consolidation_requests \
+             WHERE tenant_id = ? AND state = 'pending' ALLOW FILTERING",
+            self.keyspace
+        );
+        let stale_query = format!(
+            "SELECT session_id, requested_at FROM {}.consolidation_requests \
+             WHERE tenant_id = ? AND state = 'leased' AND lease_expires_at <= ? ALLOW FILTERING",
+            self.keyspace
+        );
+        let now = chrono::Utc::now();
+        let pending = self
+            .session
+            .query_unpaged(pending_query, (ctx.tenant_id,))
+            .await?;
+        let stale = self
+            .session
+            .query_unpaged(stale_query, (ctx.tenant_id, now))
+            .await?;
+
+        let mut items: Vec<(chrono::DateTime<chrono::Utc>, Uuid)> = Vec::new();
+        let pending_col_map = build_col_map(pending.col_specs());
+        for row in pending.rows_or_empty() {
+            items.push((
+                cql_get(&row, &pending_col_map, "requested_at")?,
+                cql_get(&row, &pending_col_map, "session_id")?,
+            ));
+        }
+        let stale_col_map = build_col_map(stale.col_specs());
+        for row in stale.rows_or_empty() {
+            items.push((
+                cql_get(&row, &stale_col_map, "requested_at")?,
+                cql_get(&row, &stale_col_map, "session_id")?,
+            ));
+        }
+        items.sort_by_key(|(requested_at, _)| *requested_at);
+        items.dedup_by_key(|(_, session_id)| *session_id);
+        items.truncate(limit);
+        Ok(items
+            .into_iter()
+            .map(|(_, session_id)| session_id)
+            .collect())
+    }
+
+    async fn consolidation_run_insert(
+        &self,
+        ctx: &TenantContext,
+        run: &ConsolidationRun,
+    ) -> anyhow::Result<()> {
+        let query = format!(
+            "INSERT INTO {}.consolidation_runs \
+             (tenant_id, session_id, run_id, lease_owner, started_at, finished_at, status, \
+              entities_processed, connections_created, error) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            self.keyspace
+        );
+        self.session
+            .query_unpaged(
+                query,
+                (
+                    ctx.tenant_id,
+                    run.session_id,
+                    CqlTimeuuid::from(run.run_id),
+                    run.lease_owner.clone(),
+                    run.started_at,
+                    run.finished_at,
+                    run.status.clone(),
+                    run.entities_processed,
+                    run.connections_created,
+                    run.error.clone(),
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn consolidation_run_get_latest(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> anyhow::Result<Option<ConsolidationRun>> {
+        let query = format!(
+            "SELECT tenant_id, session_id, run_id, lease_owner, started_at, finished_at, status, \
+                    entities_processed, connections_created, error \
+             FROM {}.consolidation_runs \
+             WHERE tenant_id = ? AND session_id = ? LIMIT 1",
+            self.keyspace
+        );
+        let result = self
+            .session
+            .query_unpaged(query, (ctx.tenant_id, session_id))
+            .await?;
+        let col_map = build_col_map(result.col_specs());
+        result
+            .rows_or_empty()
+            .first()
+            .map(|row| consolidation_run_from_row(row, &col_map))
+            .transpose()
     }
 
     // --- Forget / cascade-cleanup operations ---

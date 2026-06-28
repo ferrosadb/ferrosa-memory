@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use ferrosa_memory_core::auth;
 use ferrosa_memory_core::config::FerrosaCqlConfig;
-use ferrosa_memory_core::config::{Config, validate_shared_http_config};
+use ferrosa_memory_core::config::{Config, ConsolidationConfig, validate_shared_http_config};
 use ferrosa_memory_core::context_segment::{ContextSegment, TemporalEdge};
 use ferrosa_memory_core::cql_storage::CqlStorage;
 use ferrosa_memory_core::dispatch;
