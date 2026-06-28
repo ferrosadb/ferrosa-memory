@@ -2872,7 +2872,7 @@ async fn cql_readiness_probe_loop(storage: Arc<ReconnectingStorage>) {
 
 /// Background worker that polls the durable consolidation queue and runs
 /// consolidation under a database-backed lease.
-
+///
 /// The loop is tenant-scoped: it polls `consolidation_request_list_pending`
 /// for the default tenant context. The dispatcher writes a request row on
 /// every successful write tool, so any replica can pick it up.
