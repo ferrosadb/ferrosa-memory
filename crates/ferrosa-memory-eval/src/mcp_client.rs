@@ -1148,20 +1148,10 @@ for line in sys.stdin:
             tenant_id,
             session_origin: "mcp-live-multi-replica-consolidation-test".to_string(),
         };
-        let storage_config = FerrosaCqlConfig {
-            contact_points: vec![format!("{cql_host}:{cql_port}")],
-            keyspace: "agent_memory_test".to_string(),
-            replication_factor: 1,
-            consistency: "LOCAL_QUORUM".to_string(),
-            username: "cassandra".to_string(),
-            password: "cassandra".to_string(),
-            admin_username: None,
-            admin_password: None,
-        };
-        let storage = CqlStorage::connect(&storage_config)
-            .await
-            .expect("connect direct CQL storage");
 
+        // Spawn both replicas first. Their startup runs schema migrations, which
+        // creates the coordination tables in the test keyspace before the test
+        // opens its direct CQL storage connection below.
         let mut replica_a = spawn_live_mcp(&binary, &config)
             .await
             .expect("failed to spawn MCP replica A");
@@ -1181,6 +1171,20 @@ for line in sys.stdin:
             .send_initialized_notification()
             .await
             .expect("initialized notification replica B");
+
+        let storage_config = FerrosaCqlConfig {
+            contact_points: vec![format!("{cql_host}:{cql_port}")],
+            keyspace: "agent_memory_test".to_string(),
+            replication_factor: 1,
+            consistency: "LOCAL_QUORUM".to_string(),
+            username: "cassandra".to_string(),
+            password: "cassandra".to_string(),
+            admin_username: None,
+            admin_password: None,
+        };
+        let storage = CqlStorage::connect(&storage_config)
+            .await
+            .expect("connect direct CQL storage");
 
         let add_memo_args = serde_json::json!({
             "tenant_id": tenant_id.to_string(),
