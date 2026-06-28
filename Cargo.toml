@@ -75,6 +75,6 @@ tempfile = "3"
 # "Support for custom types is not yet implemented".
 # Upstream PR: https://github.com/scylladb/scylla-rust-driver/pull/1624
 [patch.crates-io]
-scylla = { git = "https://github.com/ferrosadb/scylla-rust-driver", rev = "0d9f2f87" }
-scylla-cql = { git = "https://github.com/ferrosadb/scylla-rust-driver", rev = "0d9f2f87" }
-scylla-macros = { git = "https://github.com/ferrosadb/scylla-rust-driver", rev = "0d9f2f87" }
+scylla = { git = "https://github.com/ferrosadb/scylla-rust-driver", rev = "c0c9c242" }
+scylla-cql = { git = "https://github.com/ferrosadb/scylla-rust-driver", rev = "c0c9c242" }
+scylla-macros = { git = "https://github.com/ferrosadb/scylla-rust-driver", rev = "c0c9c242" }
