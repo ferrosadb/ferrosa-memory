@@ -2674,14 +2674,14 @@ async fn dispatch_tool<S: crate::storage::Storage>(
     // consolidation exactly once.
     if result.is_ok() && is_write_tool(canonical_name) {
         session.dirty.store(true, Ordering::Relaxed);
-        if let Some(sid) = resolved_session_id {
-            if let Err(e) = storage.consolidation_request_upsert(ctx, sid).await {
-                tracing::warn!(
-                    session = %sid,
-                    error = %e,
-                    "failed to upsert consolidation request"
-                );
-            }
+        if let Some(sid) = resolved_session_id
+            && let Err(e) = storage.consolidation_request_upsert(ctx, sid).await
+        {
+            tracing::warn!(
+                session = %sid,
+                error = %e,
+                "failed to upsert consolidation request"
+            );
         }
     }
 
