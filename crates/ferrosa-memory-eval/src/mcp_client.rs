@@ -1172,6 +1172,16 @@ for line in sys.stdin:
             .await
             .expect("initialized notification replica B");
 
+        // Wait for both replicas to finish CQL connection setup; otherwise the
+        // first write tool call races the background session build and fails with
+        // "CQL connection not yet established".
+        wait_for_mcp_ready(&mut replica_a, Duration::from_secs(15))
+            .await
+            .expect("replica A CQL readiness");
+        wait_for_mcp_ready(&mut replica_b, Duration::from_secs(15))
+            .await
+            .expect("replica B CQL readiness");
+
         let storage_config = FerrosaCqlConfig {
             contact_points: vec![format!("{cql_host}:{cql_port}")],
             keyspace: "agent_memory_test".to_string(),
@@ -1399,6 +1409,20 @@ edge_decay_factor = 1.0
 
     fn lease_owner_pid(owner: &str) -> Option<u32> {
         owner.rsplit_once('@')?.1.parse().ok()
+    }
+
+    async fn wait_for_mcp_ready(
+        client: &mut McpClient,
+        timeout: Duration,
+    ) -> Result<(), McpClientError> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match client.call_tool("get_stats", serde_json::json!({})).await {
+                Ok(_) => return Ok(()),
+                Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+            }
+        }
+        Err(McpClientError::Timeout(timeout))
     }
 
     /// Find the MCP server binary, building it if necessary.
