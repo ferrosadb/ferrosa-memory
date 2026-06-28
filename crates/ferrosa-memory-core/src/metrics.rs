@@ -26,6 +26,8 @@ pub struct MemoryMetrics {
     pub routing_strategy: CounterVec,
     pub poisoning_flags: CounterVec,
     pub entity_upserts: CounterVec,
+    pub consolidation_runs: CounterVec,
+    pub consolidation_lease_takeovers: CounterVec,
 }
 
 impl MemoryMetrics {
@@ -98,6 +100,22 @@ impl MemoryMetrics {
             &["tenant_id", "result"],
         )?;
 
+        let consolidation_runs = CounterVec::new(
+            Opts::new(
+                "ferrosa_memory_consolidation_runs_total",
+                "Consolidation runs completed",
+            ),
+            &["tenant_id", "status"],
+        )?;
+
+        let consolidation_lease_takeovers = CounterVec::new(
+            Opts::new(
+                "ferrosa_memory_consolidation_lease_takeovers_total",
+                "Times a replica took over a stale lease from a dead peer",
+            ),
+            &["tenant_id"],
+        )?;
+
         registry.register(Box::new(memo_hits.clone()))?;
         registry.register(Box::new(memo_misses.clone()))?;
         registry.register(Box::new(retrieval_latency_ms.clone()))?;
@@ -106,6 +124,8 @@ impl MemoryMetrics {
         registry.register(Box::new(routing_strategy.clone()))?;
         registry.register(Box::new(poisoning_flags.clone()))?;
         registry.register(Box::new(entity_upserts.clone()))?;
+        registry.register(Box::new(consolidation_runs.clone()))?;
+        registry.register(Box::new(consolidation_lease_takeovers.clone()))?;
 
         Ok(Self {
             registry,
@@ -117,6 +137,8 @@ impl MemoryMetrics {
             routing_strategy,
             poisoning_flags,
             entity_upserts,
+            consolidation_runs,
+            consolidation_lease_takeovers,
         })
     }
 }

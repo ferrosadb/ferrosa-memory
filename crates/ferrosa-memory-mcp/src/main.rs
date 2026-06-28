@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ferrosa_memory_core::auth;
 use ferrosa_memory_core::config::FerrosaCqlConfig;
@@ -31,6 +31,7 @@ use scylla::frame::response::result::{CqlValue, Row};
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
 const SPARQL_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -913,6 +914,97 @@ impl Storage for ReconnectingStorage {
         batch_id: uuid::Uuid,
     ) -> anyhow::Result<Option<ImportBatch>> {
         delegate!(self, import_batch_get, ctx, remote_id, batch_id)
+    }
+
+    async fn consolidation_request_upsert(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        delegate!(self, consolidation_request_upsert, ctx, session_id)
+    }
+
+    async fn consolidation_request_claim(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        lease_owner: &str,
+        lease_expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<bool> {
+        delegate!(
+            self,
+            consolidation_request_claim,
+            ctx,
+            session_id,
+            lease_owner,
+            lease_expires_at
+        )
+    }
+
+    async fn consolidation_request_renew(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        lease_owner: &str,
+        lease_expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<bool> {
+        delegate!(
+            self,
+            consolidation_request_renew,
+            ctx,
+            session_id,
+            lease_owner,
+            lease_expires_at
+        )
+    }
+
+    async fn consolidation_request_complete(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+        lease_owner: &str,
+        result: ferrosa_memory_core::types::ConsolidationResult,
+    ) -> anyhow::Result<()> {
+        delegate!(
+            self,
+            consolidation_request_complete,
+            ctx,
+            session_id,
+            lease_owner,
+            result
+        )
+    }
+
+    async fn consolidation_request_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<ferrosa_memory_core::types::ConsolidationRequest>> {
+        delegate!(self, consolidation_request_get, ctx, session_id)
+    }
+
+    async fn consolidation_request_list_pending(
+        &self,
+        ctx: &TenantContext,
+        limit: usize,
+    ) -> anyhow::Result<Vec<uuid::Uuid>> {
+        delegate!(self, consolidation_request_list_pending, ctx, limit)
+    }
+
+    async fn consolidation_run_insert(
+        &self,
+        ctx: &TenantContext,
+        run: &ferrosa_memory_core::types::ConsolidationRun,
+    ) -> anyhow::Result<()> {
+        delegate!(self, consolidation_run_insert, ctx, run)
+    }
+
+    async fn consolidation_run_get_latest(
+        &self,
+        ctx: &TenantContext,
+        session_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<ferrosa_memory_core::types::ConsolidationRun>> {
+        delegate!(self, consolidation_run_get_latest, ctx, session_id)
     }
 
     async fn plan_put(&self, ctx: &TenantContext, node: &PlanNode) -> anyhow::Result<()> {
@@ -2778,86 +2870,169 @@ async fn cql_readiness_probe_loop(storage: Arc<ReconnectingStorage>) {
     }
 }
 
-/// Idle-consolidation configuration passed from `main()`.
-struct IdleConsolidationConfig {
-    idle_seconds: u64,
-    stale_edge_max_days: u64,
-    edge_decay_factor: f64,
-}
+/// Background worker that polls the durable consolidation queue and runs
+/// consolidation under a database-backed lease.
 
-/// Background task that periodically runs dream consolidation and edge
-/// maintenance. Fires on a fixed `idle_seconds` cadence and consolidates only
-/// when the dirty flag indicates new writes since the last run.
-///
-/// A fixed periodic tick (rather than waiting for a lull in tool activity)
-/// guarantees consolidation runs on a busy always-on service where total quiet
-/// across all connected clients may never occur — the earlier idle-gated model
-/// could starve indefinitely under continuous activity.
-async fn idle_consolidation_loop<S: Storage + Send + Sync + 'static>(
+/// The loop is tenant-scoped: it polls `consolidation_request_list_pending`
+/// for the default tenant context. The dispatcher writes a request row on
+/// every successful write tool, so any replica can pick it up.
+async fn consolidation_worker_loop<S: Storage + Send + Sync + 'static>(
     session: Arc<dispatch::SessionState>,
     storage: Arc<S>,
     ctx: Arc<TenantContext>,
-    cfg: IdleConsolidationConfig,
+    lease_owner: String,
+    cfg: ConsolidationConfig,
+    metrics: Arc<ferrosa_memory_core::metrics::MemoryMetrics>,
 ) {
-    let mut ticker = tokio::time::interval(Duration::from_secs(cfg.idle_seconds.max(1)));
-    // The first tick fires immediately; the dirty gate makes that a no-op at
-    // startup. Delay (not Burst) so a slow consolidation doesn't cause catch-up
-    // ticks to stack.
+    let poll_secs = cfg.poll_seconds.max(1);
+    let lease_secs = cfg.lease_seconds.max(poll_secs * 2);
+    let renew_threshold = Duration::from_secs(lease_secs / 2);
+    let tenant_label = ctx.tenant_id.to_string();
+    let mut ticker = tokio::time::interval(Duration::from_secs(poll_secs));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         ticker.tick().await;
 
-        // Only consolidate if there were writes since the last run.
-        if !session.dirty.swap(false, Ordering::Relaxed) {
-            continue;
-        }
-
-        let pairs = drain_consolidation_queue(&session).await;
-        let pairs = if pairs.is_empty() {
-            // Nothing specific queued — fall back to the process default session
-            // under the loop's default tenant.
-            match session.effective_default_session_id() {
-                Some(id) => vec![(ctx.tenant_id, id)],
-                None => continue,
+        let pending = match storage.consolidation_request_list_pending(&ctx, 64).await {
+            Ok(sids) => sids,
+            Err(e) => {
+                tracing::warn!("consolidation list_pending failed: {e}");
+                continue;
             }
-        } else {
-            pairs
         };
 
-        for (tenant_id, sid) in pairs {
-            // Consolidate under the tenant that wrote the data. HTTP requests
-            // authenticate per-principal, so the queued tenant may differ from
-            // the loop's default; build a matching ctx for it (reuse the loop
-            // ctx when the tenant already matches).
-            if tenant_id == ctx.tenant_id {
-                run_idle_consolidation(&session, storage.as_ref(), &ctx, sid, &cfg).await;
-            } else {
-                let item_ctx = auth::authenticate_stdio(tenant_id);
-                run_idle_consolidation(&session, storage.as_ref(), &item_ctx, sid, &cfg).await;
+        for sid in pending {
+            let lease_expires = chrono::Utc::now() + chrono::Duration::seconds(lease_secs as i64);
+            let claimed = match storage
+                .consolidation_request_claim(&ctx, sid, &lease_owner, lease_expires)
+                .await
+            {
+                Ok(true) => true,
+                Ok(false) => {
+                    tracing::debug!(
+                        session = %sid,
+                        "consolidation lease already held by another replica"
+                    );
+                    false
+                }
+                Err(e) => {
+                    tracing::warn!(session = %sid, "consolidation claim failed: {e}");
+                    false
+                }
+            };
+            if !claimed {
+                continue;
+            }
+
+            // Insert run audit record under this lease.
+            let run_id = Uuid::now_v7();
+            let run = ferrosa_memory_core::types::ConsolidationRun {
+                tenant_id: ctx.tenant_id,
+                session_id: sid,
+                run_id,
+                lease_owner: Some(lease_owner.clone()),
+                started_at: chrono::Utc::now(),
+                finished_at: None,
+                status: "running".to_string(),
+                entities_processed: 0,
+                connections_created: 0,
+                error: None,
+            };
+            if let Err(e) = storage.consolidation_run_insert(&ctx, &run).await {
+                tracing::warn!(session = %sid, "consolidation run log insert failed: {e}");
+            }
+            dispatch::record_consolidation_running(&session, sid).await;
+
+            // Run the actual consolidation work under the lease.
+            let result = run_consolidation_with_lease(
+                &session,
+                storage.as_ref(),
+                &ctx,
+                sid,
+                &lease_owner,
+                lease_secs,
+                renew_threshold,
+                &cfg,
+            )
+            .await;
+
+            let consolidation_result = match &result {
+                Ok(r) => ferrosa_memory_core::types::ConsolidationResult {
+                    status: "success".to_string(),
+                    entities_processed: r.entities_processed.min(i32::MAX as usize) as i32,
+                    connections_created: r.connections_created.min(i32::MAX as usize) as i32,
+                    error: None,
+                },
+                Err(e) => ferrosa_memory_core::types::ConsolidationResult {
+                    status: "failed".to_string(),
+                    entities_processed: 0,
+                    connections_created: 0,
+                    error: Some(e.to_string()),
+                },
+            };
+
+            if let Err(e) = storage
+                .consolidation_request_complete(&ctx, sid, &lease_owner, consolidation_result)
+                .await
+            {
+                tracing::warn!(session = %sid, "consolidation complete failed: {e}");
+            }
+
+            match result {
+                Ok(ref r) => {
+                    dispatch::record_consolidation_finished(&session, sid, Ok(r)).await;
+                    metrics
+                        .consolidation_runs
+                        .with_label_values(&[&tenant_label, "success"])
+                        .inc();
+                    tracing::info!(
+                        session = %sid,
+                        entities = r.entities_processed,
+                        connections = r.connections_created,
+                        "consolidation complete"
+                    );
+                }
+                Err(ref e) => {
+                    let error = e.to_string();
+                    dispatch::record_consolidation_finished(&session, sid, Err(error.as_str())).await;
+                    metrics
+                        .consolidation_runs
+                        .with_label_values(&[&tenant_label, "failed"])
+                        .inc();
+                    tracing::warn!(session = %sid, "consolidation failed: {e}");
+                }
             }
         }
     }
 }
 
-async fn drain_consolidation_queue(
-    session: &dispatch::SessionState,
-) -> Vec<(uuid::Uuid, uuid::Uuid)> {
-    let mut queue = session.consolidation_queue.lock().await;
-    queue.drain(..).collect()
-}
-
-/// Executes consolidation, edge weight decay, and optional stale-edge pruning.
-async fn run_idle_consolidation<S: Storage>(
-    session: &dispatch::SessionState,
+/// Runs decay, dream consolidation, and optional stale-edge pruning while
+/// renewing the DB lease before it expires.
+async fn run_consolidation_with_lease<S: Storage>(
+    _session: &dispatch::SessionState,
     storage: &S,
     ctx: &TenantContext,
     session_id: uuid::Uuid,
-    cfg: &IdleConsolidationConfig,
-) {
-    dispatch::record_consolidation_running(session, session_id).await;
+    lease_owner: &str,
+    lease_secs: u64,
+    renew_threshold: Duration,
+    cfg: &ConsolidationConfig,
+) -> anyhow::Result<ferrosa_memory_core::dream::DreamResult> {
+    let mut last_renew = Instant::now();
 
     // 1. Decay existing edge weights so unreinforced edges lose strength.
     if cfg.edge_decay_factor < 1.0 {
+        renew_lease_if_due(
+            storage,
+            ctx,
+            session_id,
+            lease_owner,
+            lease_secs,
+            renew_threshold,
+            &mut last_renew,
+        )
+        .await;
         match storage.edge_decay_weights(ctx, cfg.edge_decay_factor).await {
             Ok(n) if n > 0 => tracing::info!(
                 decayed = n,
@@ -2870,32 +3045,70 @@ async fn run_idle_consolidation<S: Storage>(
     }
 
     // 2. Run consolidation — rediscovered edges get fresh weights.
-    match ferrosa_memory_core::dream::run_consolidation(storage, ctx, session_id).await {
-        Ok(r) => {
-            dispatch::record_consolidation_finished(session, session_id, Ok(&r)).await;
-            tracing::info!(
-                session = %session_id,
-                entities = r.entities_processed,
-                connections = r.connections_created,
-                "idle consolidation complete"
-            );
-        }
-        Err(e) => {
-            let error = e.to_string();
-            dispatch::record_consolidation_finished(session, session_id, Err(error.as_str())).await;
-            tracing::warn!("idle consolidation failed: {e}");
-        }
-    }
+    renew_lease_if_due(
+        storage,
+        ctx,
+        session_id,
+        lease_owner,
+        lease_secs,
+        renew_threshold,
+        &mut last_renew,
+    )
+    .await;
+    let result = ferrosa_memory_core::dream::run_consolidation(storage, ctx, session_id).await;
 
     // 3. Optionally prune stale edges (0 = disabled).
     if cfg.stale_edge_max_days > 0 {
+        renew_lease_if_due(
+            storage,
+            ctx,
+            session_id,
+            lease_owner,
+            lease_secs,
+            renew_threshold,
+            &mut last_renew,
+        )
+        .await;
         let cutoff = chrono::Utc::now() - chrono::Duration::days(cfg.stale_edge_max_days as i64);
         match storage.edge_prune_stale(ctx, cutoff).await {
             Ok(pruned) if pruned > 0 => {
-                tracing::info!(pruned, "idle edge pruning complete")
+                tracing::info!(pruned, "edge pruning complete")
             }
-            Err(e) => tracing::warn!("idle edge pruning failed: {e}"),
+            Err(e) => tracing::warn!("edge pruning failed: {e}"),
             _ => {}
+        }
+    }
+
+    result
+}
+
+async fn renew_lease_if_due<S: Storage>(
+    storage: &S,
+    ctx: &TenantContext,
+    session_id: uuid::Uuid,
+    lease_owner: &str,
+    lease_secs: u64,
+    renew_threshold: Duration,
+    last_renew: &mut Instant,
+) {
+    if last_renew.elapsed() >= renew_threshold {
+        let expires = chrono::Utc::now() + chrono::Duration::seconds(lease_secs as i64);
+        match storage
+            .consolidation_request_renew(ctx, session_id, lease_owner, expires)
+            .await
+        {
+            Ok(true) => {
+                *last_renew = Instant::now();
+                tracing::debug!(session = %session_id, "consolidation lease renewed");
+            }
+            Ok(false) => tracing::warn!(
+                session = %session_id,
+                "consolidation lease renew lost"
+            ),
+            Err(e) => tracing::warn!(
+                session = %session_id,
+                "consolidation lease renew failed: {e}"
+            ),
         }
     }
 }
@@ -3308,25 +3521,29 @@ async fn main() -> anyhow::Result<()> {
                 })
             });
 
-            // Spawn idle consolidation background task.
-            if config.server.idle_consolidation_enabled {
-                let idle_cfg = IdleConsolidationConfig {
-                    idle_seconds: config.server.idle_consolidation_seconds,
-                    stale_edge_max_days: config.server.stale_edge_max_days,
-                    edge_decay_factor: config.server.edge_decay_factor,
-                };
-                let idle_session = Arc::clone(&session);
-                let idle_storage = Arc::clone(&storage);
-                let idle_ctx = Arc::clone(&ctx);
+            // Spawn consolidation background task.
+            if config.consolidation.enabled {
+                let lease_owner = format!("{}@{}", Uuid::new_v4(), std::process::id());
+                let consolidation_session = Arc::clone(&session);
+                let consolidation_storage = Arc::clone(&storage);
+                let consolidation_ctx = Arc::clone(&ctx);
                 spawn_critical(
-                    "idle_consolidation_loop",
-                    idle_consolidation_loop(idle_session, idle_storage, idle_ctx, idle_cfg),
+                    "consolidation_worker_loop",
+                    consolidation_worker_loop(
+                        consolidation_session,
+                        consolidation_storage,
+                        consolidation_ctx,
+                        lease_owner,
+                        config.consolidation.clone(),
+                        Arc::clone(&metrics),
+                    ),
                 );
                 tracing::info!(
-                    idle_seconds = config.server.idle_consolidation_seconds,
-                    decay_factor = config.server.edge_decay_factor,
-                    prune_days = config.server.stale_edge_max_days,
-                    "idle consolidation enabled"
+                    poll_seconds = config.consolidation.poll_seconds,
+                    lease_seconds = config.consolidation.lease_seconds,
+                    decay_factor = config.consolidation.edge_decay_factor,
+                    prune_days = config.consolidation.stale_edge_max_days,
+                    "consolidation worker enabled"
                 );
             }
 
@@ -3394,29 +3611,29 @@ async fn main() -> anyhow::Result<()> {
                 ..dispatch::SessionState::default()
             });
 
-            // Spawn idle consolidation for the long-running HTTP service too —
-            // not just stdio. Writes on the shared session set `dirty`, queue the
-            // session, and notify `last_activity`, so this loop builds edges,
-            // scenes, and profiles automatically after each burst of activity.
-            // (Single shared tenant ctx, matching the per-process tenant model.)
-            if config.server.idle_consolidation_enabled {
-                let idle_cfg = IdleConsolidationConfig {
-                    idle_seconds: config.server.idle_consolidation_seconds,
-                    stale_edge_max_days: config.server.stale_edge_max_days,
-                    edge_decay_factor: config.server.edge_decay_factor,
-                };
-                let idle_session = Arc::clone(&session);
-                let idle_storage = Arc::clone(&storage);
-                let idle_ctx = Arc::new(auth::authenticate_stdio(tenant_id));
+            // Spawn the cross-replica consolidation worker for HTTP too.
+            if config.consolidation.enabled {
+                let lease_owner = format!("{}@{}", Uuid::new_v4(), std::process::id());
+                let consolidation_session = Arc::clone(&session);
+                let consolidation_storage = Arc::clone(&storage);
+                let consolidation_ctx = Arc::new(auth::authenticate_stdio(tenant_id));
                 spawn_critical(
-                    "idle_consolidation_loop",
-                    idle_consolidation_loop(idle_session, idle_storage, idle_ctx, idle_cfg),
+                    "consolidation_worker_loop",
+                    consolidation_worker_loop(
+                        consolidation_session,
+                        consolidation_storage,
+                        consolidation_ctx,
+                        lease_owner,
+                        config.consolidation.clone(),
+                        Arc::clone(&metrics),
+                    ),
                 );
                 tracing::info!(
-                    idle_seconds = config.server.idle_consolidation_seconds,
-                    decay_factor = config.server.edge_decay_factor,
-                    prune_days = config.server.stale_edge_max_days,
-                    "idle consolidation enabled (http transport)"
+                    poll_seconds = config.consolidation.poll_seconds,
+                    lease_seconds = config.consolidation.lease_seconds,
+                    decay_factor = config.consolidation.edge_decay_factor,
+                    prune_days = config.consolidation.stale_edge_max_days,
+                    "consolidation worker enabled (http transport)"
                 );
             }
 
@@ -3669,25 +3886,6 @@ enabled = false
         assert_eq!(validator("alice", "wrong"), None);
 
         let _ = fs::remove_file(auth_path);
-    }
-
-    #[tokio::test]
-    async fn idle_queue_drain_returns_explicit_sessions_and_clears_queue() {
-        let session = dispatch::SessionState::default();
-        let tenant = uuid::Uuid::new_v4();
-        let first = uuid::Uuid::new_v4();
-        let second = uuid::Uuid::new_v4();
-        {
-            let mut queue = session.consolidation_queue.lock().await;
-            queue.push_back((tenant, first));
-            queue.push_back((tenant, second));
-        }
-
-        assert_eq!(
-            drain_consolidation_queue(&session).await,
-            vec![(tenant, first), (tenant, second)]
-        );
-        assert!(drain_consolidation_queue(&session).await.is_empty());
     }
 
     #[tokio::test]
