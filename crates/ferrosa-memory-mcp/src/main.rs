@@ -2995,7 +2995,8 @@ async fn consolidation_worker_loop<S: Storage + Send + Sync + 'static>(
                 }
                 Err(ref e) => {
                     let error = e.to_string();
-                    dispatch::record_consolidation_finished(&session, sid, Err(error.as_str())).await;
+                    dispatch::record_consolidation_finished(&session, sid, Err(error.as_str()))
+                        .await;
                     metrics
                         .consolidation_runs
                         .with_label_values(&[&tenant_label, "failed"])
