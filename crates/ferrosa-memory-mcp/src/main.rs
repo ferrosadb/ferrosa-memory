@@ -2946,7 +2946,6 @@ async fn consolidation_worker_loop<S: Storage + Send + Sync + 'static>(
 
             // Run the actual consolidation work under the lease.
             let result = run_consolidation_with_lease(
-                &session,
                 storage.as_ref(),
                 &ctx,
                 sid,
@@ -3011,7 +3010,6 @@ async fn consolidation_worker_loop<S: Storage + Send + Sync + 'static>(
 /// Runs decay, dream consolidation, and optional stale-edge pruning while
 /// renewing the DB lease before it expires.
 async fn run_consolidation_with_lease<S: Storage>(
-    _session: &dispatch::SessionState,
     storage: &S,
     ctx: &TenantContext,
     session_id: uuid::Uuid,
