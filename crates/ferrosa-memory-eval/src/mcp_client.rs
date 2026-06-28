@@ -1172,15 +1172,30 @@ for line in sys.stdin:
             .await
             .expect("initialized notification replica B");
 
-        // Wait for both replicas to finish CQL connection setup; otherwise the
-        // first write tool call races the background session build and fails with
-        // "CQL connection not yet established".
-        wait_for_mcp_ready(&mut replica_a, Duration::from_secs(15))
+        // Wait for a replica to finish CQL connection setup by retrying the
+        // actual write tool. `get_stats` succeeds before CQL is ready, so we use
+        // `smart_ingest` (which requires CQL) as the readiness probe.
+        let ingest_args = serde_json::json!({
+            "session_id": session_id.to_string(),
+            "content": "multi-replica consolidation test payload",
+            "entity_type": "concept",
+            "entity_name": "multi-replica consolidation takeover test"
+        });
+        wait_for_smart_ingest_ok(
+            &mut replica_a,
+            "smart_ingest",
+            &ingest_args,
+            Duration::from_secs(15),
+        )
+        .await
+        .expect("replica A CQL readiness via smart_ingest");
+
+        // Issue a second write so the consolidation request stays fresh after the
+        // readiness probe. Reuse replica A for deterministic initial ownership.
+        replica_a
+            .call_tool("smart_ingest", ingest_args.clone())
             .await
-            .expect("replica A CQL readiness");
-        wait_for_mcp_ready(&mut replica_b, Duration::from_secs(15))
-            .await
-            .expect("replica B CQL readiness");
+            .expect("second smart_ingest call should succeed");
 
         let storage_config = FerrosaCqlConfig {
             contact_points: vec![format!("{cql_host}:{cql_port}")],
@@ -1195,36 +1210,6 @@ for line in sys.stdin:
         let storage = CqlStorage::connect(&storage_config)
             .await
             .expect("connect direct CQL storage");
-
-        let add_memo_args = serde_json::json!({
-            "tenant_id": tenant_id.to_string(),
-            "session_id": session_id.to_string(),
-            "content": "multi-replica consolidation test payload"
-        });
-        if let Err(err) = replica_a.call_tool("add_memo", add_memo_args.clone()).await {
-            // Older local branches expose the same write path through the public
-            // ingest/smart_ingest tool rather than add_memo. Keep the takeover
-            // test exercising live consolidation on those branches while still
-            // preferring add_memo when present.
-            match err {
-                McpClientError::ServerError { .. } => {
-                    replica_a
-                        .call_tool(
-                            "ingest",
-                            serde_json::json!({
-                                "tenant_id": tenant_id.to_string(),
-                                "session_id": session_id.to_string(),
-                                "content": "multi-replica consolidation test payload",
-                                "entity_type": "concept",
-                                "entity_name": "multi-replica consolidation takeover test"
-                            }),
-                        )
-                        .await
-                        .expect("fallback ingest call failed");
-                }
-                other => panic!("add_memo call failed: {other}"),
-            }
-        }
 
         let first_owner =
             wait_for_leased_owner(&storage, &ctx, session_id, Duration::from_secs(10))
@@ -1411,18 +1396,24 @@ edge_decay_factor = 1.0
         owner.rsplit_once('@')?.1.parse().ok()
     }
 
-    async fn wait_for_mcp_ready(
+    async fn wait_for_smart_ingest_ok(
         client: &mut McpClient,
+        tool: &str,
+        args: &serde_json::Value,
         timeout: Duration,
     ) -> Result<(), McpClientError> {
         let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            match client.call_tool("get_stats", serde_json::json!({})).await {
+        loop {
+            match client.call_tool(tool, args.clone()).await {
                 Ok(_) => return Ok(()),
-                Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+                Err(e) => {
+                    if Instant::now() >= deadline {
+                        return Err(e);
+                    }
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
             }
         }
-        Err(McpClientError::Timeout(timeout))
     }
 
     /// Find the MCP server binary, building it if necessary.
