@@ -2668,16 +2668,20 @@ async fn dispatch_tool<S: crate::storage::Storage>(
     session.last_activity.notify_one();
 
     // Mark dirty on successful write operations so idle consolidation knows
-    // there is new data worth processing, and queue the session that actually
-    // received the write. Without this the background worker falls back to the
-    // process default session (effective_default_session_id at tick time),
-    // which may be empty or have changed — so consolidation ran over the wrong
-    // session and built nothing. `args["session_id"]` is the resolved target
-    // (resolve_session_id ran above for every tool but `configure`).
+    // there is new data worth processing, and upsert a durable coordination
+    // request for the session that actually received the write. Any replica
+    // running the consolidation worker can then claim the lease and run
+    // consolidation exactly once.
     if result.is_ok() && is_write_tool(canonical_name) {
         session.dirty.store(true, Ordering::Relaxed);
         if let Some(sid) = resolved_session_id {
-            let _ = queue_session_for_consolidation(session, ctx.tenant_id, sid).await;
+            if let Err(e) = storage.consolidation_request_upsert(ctx, sid).await {
+                tracing::warn!(
+                    session = %sid,
+                    error = %e,
+                    "failed to upsert consolidation request"
+                );
+            }
         }
     }
 
