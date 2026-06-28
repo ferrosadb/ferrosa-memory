@@ -20,7 +20,8 @@ use crate::remotes::types::{
     RemotePolicyFact, RemoteStub, TeachingItem, TeachingPacket,
 };
 use crate::types::{
-    AliasEntry, ApprovalEntry, AuditEntry, ConfidenceScore, DerivedFact, DocumentChunk,
+    AliasEntry, ApprovalEntry, AuditEntry, ConfidenceScore, ConsolidationRequest,
+    ConsolidationRequestState, ConsolidationResult, ConsolidationRun, DerivedFact, DocumentChunk,
     EntityEntry, EntityListQuery, EntityListScope, EntityTypeStateCount, FeedbackOutcome,
     FoldEntry, FoldSummary, ForgetJournalEntry, MaterializedEdge, MemoEntry, MemoryState, PlanNode,
     PlanStatus, PromotedPredicate, ProvenanceStep, RetractionRecord, RuleEntry, RuleState,
@@ -1928,6 +1929,69 @@ pub trait Storage: Send + Sync {
         remote_id: Uuid,
         batch_id: Uuid,
     ) -> impl std::future::Future<Output = anyhow::Result<Option<ImportBatch>>> + Send;
+
+    /// Upsert a durable consolidation request for a session.
+    fn consolidation_request_upsert(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// Attempt to claim the lease for a session using an atomic compare-and-set.
+    /// Returns true if this caller now owns the lease.
+    fn consolidation_request_claim(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        lease_owner: &str,
+        lease_expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send;
+
+    /// Renew an existing lease owned by this caller.
+    fn consolidation_request_renew(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        lease_owner: &str,
+        lease_expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send;
+
+    /// Mark a consolidation request completed or failed and release the lease.
+    fn consolidation_request_complete(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+        lease_owner: &str,
+        result: ConsolidationResult,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// Read the current coordination row for a session.
+    fn consolidation_request_get(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<ConsolidationRequest>>> + Send;
+
+    /// List sessions with pending consolidation requests, oldest first.
+    fn consolidation_request_list_pending(
+        &self,
+        ctx: &TenantContext,
+        limit: usize,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<Uuid>>> + Send;
+
+    /// Append a consolidation run audit record.
+    fn consolidation_run_insert(
+        &self,
+        ctx: &TenantContext,
+        run: &ConsolidationRun,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// Read the latest consolidation run for a session.
+    fn consolidation_run_get_latest(
+        &self,
+        ctx: &TenantContext,
+        session_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<ConsolidationRun>>> + Send;
 }
 
 /// Live cluster metadata sourced from the ferrosa CQL system tables. All
@@ -2020,6 +2084,8 @@ pub mod mock {
         pub memory_conflicts: Mutex<Vec<MemoryConflict>>,
         pub memory_feedback: Mutex<Vec<MemoryFeedback>>,
         pub import_batches: Mutex<Vec<ImportBatch>>,
+        pub consolidation_requests: Mutex<Vec<ConsolidationRequest>>,
+        pub consolidation_runs: Mutex<Vec<ConsolidationRun>>,
         pub edge_list_all_calls: AtomicUsize,
         pub edge_list_session_calls: AtomicUsize,
         pub edge_list_for_entity_calls: AtomicUsize,
@@ -4544,11 +4610,471 @@ pub mod mock {
             cache.retain(|_, facts| !facts.is_empty());
             Ok(removed)
         }
+
+        async fn consolidation_request_upsert(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+        ) -> anyhow::Result<()> {
+            let mut requests = self.consolidation_requests.lock().await;
+            if requests
+                .iter()
+                .any(|r| r.tenant_id == ctx.tenant_id && r.session_id == session_id)
+            {
+                return Ok(());
+            }
+
+            requests.push(ConsolidationRequest {
+                tenant_id: ctx.tenant_id,
+                session_id,
+                state: ConsolidationRequestState::Pending,
+                requested_at: chrono::Utc::now(),
+                lease_owner: None,
+                lease_expires_at: None,
+                attempt_count: 0,
+                last_error: None,
+                completed_at: None,
+            });
+            Ok(())
+        }
+
+        async fn consolidation_request_claim(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+            lease_owner: &str,
+            lease_expires_at: chrono::DateTime<chrono::Utc>,
+        ) -> anyhow::Result<bool> {
+            let now = chrono::Utc::now();
+            let mut requests = self.consolidation_requests.lock().await;
+            let Some(request) = requests
+                .iter_mut()
+                .find(|r| r.tenant_id == ctx.tenant_id && r.session_id == session_id)
+            else {
+                return Ok(false);
+            };
+
+            let claimable = match request.state {
+                ConsolidationRequestState::Pending => true,
+                ConsolidationRequestState::Leased => request
+                    .lease_expires_at
+                    .is_some_and(|expires_at| expires_at <= now),
+                ConsolidationRequestState::Completed | ConsolidationRequestState::Failed => false,
+            };
+
+            if !claimable {
+                return Ok(false);
+            }
+
+            request.state = ConsolidationRequestState::Leased;
+            request.lease_owner = Some(lease_owner.to_string());
+            request.lease_expires_at = Some(lease_expires_at);
+            request.attempt_count += 1;
+            Ok(true)
+        }
+
+        async fn consolidation_request_renew(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+            lease_owner: &str,
+            lease_expires_at: chrono::DateTime<chrono::Utc>,
+        ) -> anyhow::Result<bool> {
+            let mut requests = self.consolidation_requests.lock().await;
+            let Some(request) = requests
+                .iter_mut()
+                .find(|r| r.tenant_id == ctx.tenant_id && r.session_id == session_id)
+            else {
+                return Ok(false);
+            };
+
+            if request.state == ConsolidationRequestState::Leased
+                && request.lease_owner.as_deref() == Some(lease_owner)
+            {
+                request.lease_expires_at = Some(lease_expires_at);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+
+        async fn consolidation_request_complete(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+            lease_owner: &str,
+            result: ConsolidationResult,
+        ) -> anyhow::Result<()> {
+            let now = chrono::Utc::now();
+            let mut requests = self.consolidation_requests.lock().await;
+            let Some(request) = requests
+                .iter_mut()
+                .find(|r| r.tenant_id == ctx.tenant_id && r.session_id == session_id)
+            else {
+                return Ok(());
+            };
+
+            if request.state != ConsolidationRequestState::Leased
+                || request.lease_owner.as_deref() != Some(lease_owner)
+            {
+                return Ok(());
+            }
+
+            let status = result.status.clone();
+            request.state = if status == "success" {
+                ConsolidationRequestState::Completed
+            } else {
+                ConsolidationRequestState::Failed
+            };
+            request.lease_owner = None;
+            request.lease_expires_at = None;
+            request.completed_at = Some(now);
+            request.last_error = result.error.clone();
+
+            drop(requests);
+            self.consolidation_runs.lock().await.push(ConsolidationRun {
+                tenant_id: ctx.tenant_id,
+                session_id,
+                run_id: Uuid::new_v4(),
+                lease_owner: Some(lease_owner.to_string()),
+                started_at: now,
+                finished_at: Some(now),
+                status,
+                entities_processed: result.entities_processed,
+                connections_created: result.connections_created,
+                error: result.error,
+            });
+            Ok(())
+        }
+
+        async fn consolidation_request_get(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+        ) -> anyhow::Result<Option<ConsolidationRequest>> {
+            Ok(self
+                .consolidation_requests
+                .lock()
+                .await
+                .iter()
+                .find(|r| r.tenant_id == ctx.tenant_id && r.session_id == session_id)
+                .cloned())
+        }
+
+        async fn consolidation_request_list_pending(
+            &self,
+            ctx: &TenantContext,
+            limit: usize,
+        ) -> anyhow::Result<Vec<Uuid>> {
+            let now = chrono::Utc::now();
+            let mut requests: Vec<ConsolidationRequest> = self
+                .consolidation_requests
+                .lock()
+                .await
+                .iter()
+                .filter(|r| {
+                    r.tenant_id == ctx.tenant_id
+                        && (r.state == ConsolidationRequestState::Pending
+                            || (r.state == ConsolidationRequestState::Leased
+                                && r.lease_expires_at
+                                    .is_some_and(|expires_at| expires_at <= now)))
+                })
+                .cloned()
+                .collect();
+            requests.sort_by_key(|r| r.requested_at);
+            Ok(requests
+                .into_iter()
+                .take(limit)
+                .map(|r| r.session_id)
+                .collect())
+        }
+
+        async fn consolidation_run_insert(
+            &self,
+            _ctx: &TenantContext,
+            run: &ConsolidationRun,
+        ) -> anyhow::Result<()> {
+            self.consolidation_runs.lock().await.push(run.clone());
+            Ok(())
+        }
+
+        async fn consolidation_run_get_latest(
+            &self,
+            ctx: &TenantContext,
+            session_id: Uuid,
+        ) -> anyhow::Result<Option<ConsolidationRun>> {
+            Ok(self
+                .consolidation_runs
+                .lock()
+                .await
+                .iter()
+                .filter(|r| r.tenant_id == ctx.tenant_id && r.session_id == session_id)
+                .max_by_key(|r| {
+                    (
+                        r.finished_at.unwrap_or(r.started_at),
+                        r.started_at,
+                        r.run_id,
+                    )
+                })
+                .cloned())
+        }
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn test_ctx() -> TenantContext {
+            TenantContext {
+                tenant_id: Uuid::new_v4(),
+                session_origin: "test".into(),
+            }
+        }
+
+        #[tokio::test]
+        async fn consolidation_claim_wins_on_pending_row() {
+            let storage = MockStorage::new();
+            let ctx = test_ctx();
+            let session_id = Uuid::new_v4();
+            let expires_at = chrono::Utc::now() + chrono::Duration::minutes(5);
+
+            storage
+                .consolidation_request_upsert(&ctx, session_id)
+                .await
+                .unwrap();
+            assert!(
+                storage
+                    .consolidation_request_claim(&ctx, session_id, "replica-a", expires_at)
+                    .await
+                    .unwrap()
+            );
+
+            let request = storage
+                .consolidation_request_get(&ctx, session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(request.state, ConsolidationRequestState::Leased);
+            assert_eq!(request.lease_owner.as_deref(), Some("replica-a"));
+            assert_eq!(request.lease_expires_at, Some(expires_at));
+            assert_eq!(request.attempt_count, 1);
+        }
+
+        #[tokio::test]
+        async fn consolidation_second_claim_loses() {
+            let storage = MockStorage::new();
+            let ctx = test_ctx();
+            let session_id = Uuid::new_v4();
+            let first_expires = chrono::Utc::now() + chrono::Duration::minutes(5);
+            let second_expires = chrono::Utc::now() + chrono::Duration::minutes(10);
+
+            storage
+                .consolidation_request_upsert(&ctx, session_id)
+                .await
+                .unwrap();
+            assert!(
+                storage
+                    .consolidation_request_claim(&ctx, session_id, "replica-a", first_expires)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !storage
+                    .consolidation_request_claim(&ctx, session_id, "replica-b", second_expires)
+                    .await
+                    .unwrap()
+            );
+
+            let request = storage
+                .consolidation_request_get(&ctx, session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(request.lease_owner.as_deref(), Some("replica-a"));
+            assert_eq!(request.lease_expires_at, Some(first_expires));
+            assert_eq!(request.attempt_count, 1);
+        }
+
+        #[tokio::test]
+        async fn consolidation_claim_wins_after_lease_expires() {
+            let storage = MockStorage::new();
+            let ctx = test_ctx();
+            let session_id = Uuid::new_v4();
+            let expired_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+            let renewed_until = chrono::Utc::now() + chrono::Duration::minutes(5);
+
+            storage
+                .consolidation_request_upsert(&ctx, session_id)
+                .await
+                .unwrap();
+            assert!(
+                storage
+                    .consolidation_request_claim(&ctx, session_id, "replica-a", expired_at)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                storage
+                    .consolidation_request_claim(&ctx, session_id, "replica-b", renewed_until)
+                    .await
+                    .unwrap()
+            );
+
+            let request = storage
+                .consolidation_request_get(&ctx, session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(request.lease_owner.as_deref(), Some("replica-b"));
+            assert_eq!(request.lease_expires_at, Some(renewed_until));
+            assert_eq!(request.attempt_count, 2);
+        }
+
+        #[tokio::test]
+        async fn consolidation_renew_extends_lease() {
+            let storage = MockStorage::new();
+            let ctx = test_ctx();
+            let session_id = Uuid::new_v4();
+            let first_expires = chrono::Utc::now() + chrono::Duration::minutes(5);
+            let extended_expires = chrono::Utc::now() + chrono::Duration::minutes(20);
+
+            storage
+                .consolidation_request_upsert(&ctx, session_id)
+                .await
+                .unwrap();
+            storage
+                .consolidation_request_claim(&ctx, session_id, "replica-a", first_expires)
+                .await
+                .unwrap();
+
+            assert!(
+                storage
+                    .consolidation_request_renew(&ctx, session_id, "replica-a", extended_expires)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !storage
+                    .consolidation_request_renew(&ctx, session_id, "replica-b", first_expires)
+                    .await
+                    .unwrap()
+            );
+
+            let request = storage
+                .consolidation_request_get(&ctx, session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(request.lease_owner.as_deref(), Some("replica-a"));
+            assert_eq!(request.lease_expires_at, Some(extended_expires));
+        }
+
+        #[tokio::test]
+        async fn consolidation_complete_releases_lease_and_writes_run() {
+            let storage = MockStorage::new();
+            let ctx = test_ctx();
+            let session_id = Uuid::new_v4();
+
+            storage
+                .consolidation_request_upsert(&ctx, session_id)
+                .await
+                .unwrap();
+            storage
+                .consolidation_request_claim(
+                    &ctx,
+                    session_id,
+                    "replica-a",
+                    chrono::Utc::now() + chrono::Duration::minutes(5),
+                )
+                .await
+                .unwrap();
+            storage
+                .consolidation_request_complete(
+                    &ctx,
+                    session_id,
+                    "replica-a",
+                    ConsolidationResult {
+                        status: "success".into(),
+                        entities_processed: 7,
+                        connections_created: 3,
+                        error: None,
+                    },
+                )
+                .await
+                .unwrap();
+
+            let request = storage
+                .consolidation_request_get(&ctx, session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(request.state, ConsolidationRequestState::Completed);
+            assert_eq!(request.lease_owner, None);
+            assert_eq!(request.lease_expires_at, None);
+            assert!(request.completed_at.is_some());
+
+            let run = storage
+                .consolidation_run_get_latest(&ctx, session_id)
+                .await
+                .unwrap()
+                .expect("completion should write a run");
+            assert_eq!(run.status, "success");
+            assert_eq!(run.lease_owner.as_deref(), Some("replica-a"));
+            assert_eq!(run.entities_processed, 7);
+            assert_eq!(run.connections_created, 3);
+            assert!(run.finished_at.is_some());
+        }
+
+        #[tokio::test]
+        async fn consolidation_list_pending_returns_stale_leased_rows() {
+            let storage = MockStorage::new();
+            let ctx = test_ctx();
+            let stale_session = Uuid::new_v4();
+            let fresh_session = Uuid::new_v4();
+            let pending_session = Uuid::new_v4();
+
+            storage
+                .consolidation_request_upsert(&ctx, stale_session)
+                .await
+                .unwrap();
+            storage
+                .consolidation_request_claim(
+                    &ctx,
+                    stale_session,
+                    "replica-a",
+                    chrono::Utc::now() - chrono::Duration::minutes(1),
+                )
+                .await
+                .unwrap();
+
+            storage
+                .consolidation_request_upsert(&ctx, fresh_session)
+                .await
+                .unwrap();
+            storage
+                .consolidation_request_claim(
+                    &ctx,
+                    fresh_session,
+                    "replica-a",
+                    chrono::Utc::now() + chrono::Duration::minutes(5),
+                )
+                .await
+                .unwrap();
+
+            storage
+                .consolidation_request_upsert(&ctx, pending_session)
+                .await
+                .unwrap();
+
+            let pending = storage
+                .consolidation_request_list_pending(&ctx, 10)
+                .await
+                .unwrap();
+            assert!(pending.contains(&stale_session));
+            assert!(pending.contains(&pending_session));
+            assert!(!pending.contains(&fresh_session));
+            assert_eq!(pending.len(), 2);
+        }
 
         #[tokio::test]
         async fn test_warmth_crud() {

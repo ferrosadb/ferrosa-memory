@@ -1496,3 +1496,54 @@ mod tests {
         assert_eq!(mk(None, Some(far)).storage_ttl_seconds(now), None);
     }
 }
+
+/// Durable coordination state for a single (tenant, session) consolidation
+/// request. Exactly one replica may hold the lease at a time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsolidationRequestState {
+    Pending,
+    Leased,
+    Completed,
+    Failed,
+}
+
+/// Durable consolidation coordination row keyed by (tenant_id, session_id).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsolidationRequest {
+    pub tenant_id: Uuid,
+    pub session_id: Uuid,
+    pub state: ConsolidationRequestState,
+    pub requested_at: chrono::DateTime<chrono::Utc>,
+    pub lease_owner: Option<String>,
+    pub lease_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub attempt_count: i32,
+    pub last_error: Option<String>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Durable consolidation run audit record. `run_id` is a timeuuid so rows
+/// cluster newest-first under each (tenant, session).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsolidationRun {
+    pub tenant_id: Uuid,
+    pub session_id: Uuid,
+    pub run_id: Uuid,
+    pub lease_owner: Option<String>,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub status: String,
+    pub entities_processed: i32,
+    pub connections_created: i32,
+    pub error: Option<String>,
+}
+
+/// Outcome passed to `Storage::consolidation_request_complete` to release the
+/// lease and write the run log in one call.
+#[derive(Debug, Clone)]
+pub struct ConsolidationResult {
+    pub status: String,
+    pub entities_processed: i32,
+    pub connections_created: i32,
+    pub error: Option<String>,
+}

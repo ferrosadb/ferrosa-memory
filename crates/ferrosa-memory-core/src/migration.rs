@@ -205,6 +205,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "mem_scenes.scene_embedding — member-centroid vector for semantic scene matching",
         ddl: include_str!("../../../ddl/048_scene_embedding.cql"),
     },
+    Migration {
+        version: 49,
+        description: "cross-replica consolidation lease queue and run log",
+        ddl: include_str!("../../../ddl/049_consolidation_lease_queue.cql"),
+    },
 ];
 
 /// `ddl/011_warmth_field.cql` — the `entity_warmth` table + session index.
