@@ -3,6 +3,12 @@
 --
 -- Adds a durable work queue and LWT-based lease so that exactly one
 -- ferrosa-memory replica consolidates a given (tenant, session) at a time.
+--
+-- NOTE: Both tables are pure coordination/audit state. They can be rebuilt
+-- from entity and edge data, so operators should pin them to local NVMe
+-- storage where available and avoid S3-only/cold tiers. Use the Ferrosa
+-- operator's table-level storage policy (e.g. `ferrosa.storage = 'local_disk'`
+-- extension or equivalent) rather than the default S3-backed profile.
 
 CREATE TABLE IF NOT EXISTS agent_memory.consolidation_requests (
     tenant_id uuid,
