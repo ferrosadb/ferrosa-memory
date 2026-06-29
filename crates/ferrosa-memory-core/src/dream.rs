@@ -281,9 +281,31 @@ pub async fn run_consolidation(
             );
             let count = derived.len();
             if !derived.is_empty() {
-                let cache_key = format!("consolidation:{}", session_id);
-                if let Err(e) = storage.derived_cache_put(ctx, &cache_key, &derived).await {
-                    tracing::warn!(error = %e, "failed to cache derived facts during consolidation");
+                // `derived_cache_by_query` is UUID-keyed, but the Datalog engine
+                // also derives taxonomy facts whose object is an entity *type*
+                // string, e.g. `isa(<uuid>, "conversation_turn")`. Those cannot be
+                // stored in the UUID cache (issue #129) — caching them errored
+                // mid-batch, leaving a partial, non-atomic write and a fail-loud
+                // warning every pass. Cache only UUID↔UUID facts; the taxonomy
+                // facts are re-derived at query time via the Datalog frontier.
+                let cacheable: Vec<crate::types::DerivedFact> = derived
+                    .iter()
+                    .filter(|f| f.has_uuid_endpoints())
+                    .cloned()
+                    .collect();
+                let skipped = derived.len() - cacheable.len();
+                if skipped > 0 {
+                    tracing::debug!(
+                        skipped,
+                        cached = cacheable.len(),
+                        "consolidation: skipped caching non-UUID-endpoint derived facts (taxonomy); re-derived at query time"
+                    );
+                }
+                if !cacheable.is_empty() {
+                    let cache_key = format!("consolidation:{}", session_id);
+                    if let Err(e) = storage.derived_cache_put(ctx, &cache_key, &cacheable).await {
+                        tracing::warn!(error = %e, "failed to cache derived facts during consolidation");
+                    }
                 }
             }
             count
@@ -1053,6 +1075,69 @@ mod tests {
             result.warmth_decayed <= result.pagerank_updated,
             "should not prune more entries than PageRank created"
         );
+    }
+
+    /// Pure guard for the endpoint classifier behind the #129 fix.
+    #[test]
+    fn derived_fact_has_uuid_endpoints_classifies_taxonomy() {
+        use crate::types::DerivedFact;
+        let mk = |src: String, dst: String| DerivedFact {
+            src_id: src,
+            pred: "p".into(),
+            dst_id: dst,
+            confidence: 1.0,
+            rule_id: "r".into(),
+            support_count: 1,
+            provenance: vec![],
+        };
+        let u1 = Uuid::new_v4().to_string();
+        let u2 = Uuid::new_v4().to_string();
+        assert!(mk(u1.clone(), u2).has_uuid_endpoints());
+        // isa(<uuid>, "conversation_turn") — the dst is an entity-type string.
+        assert!(!mk(u1, "conversation_turn".into()).has_uuid_endpoints());
+    }
+
+    /// Regression for issue #129: consolidation derives taxonomy facts
+    /// `isa(<uuid>, "<entity_type>")` whose dst is a type string, not a UUID.
+    /// Those must NOT be written to the UUID-keyed derived cache (doing so used
+    /// to error mid-batch and leave a partial write). Only UUID↔UUID facts are
+    /// cached; the cache must contain no non-UUID endpoints.
+    #[tokio::test]
+    async fn consolidation_does_not_cache_non_uuid_taxonomy_facts() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let sid = Uuid::new_v4();
+
+        // Entities default to entity_type "concept" (a non-UUID string), so the
+        // Datalog engine derives isa(<uuid>, "concept") taxonomy facts.
+        let fold_id = Uuid::new_v4();
+        let e1 = make_entity(ctx.tenant_id, sid, "alpha", Some(fold_id));
+        let e2 = make_entity(ctx.tenant_id, sid, "beta", Some(fold_id));
+        let id1 = e1.entity_id;
+        let id2 = e2.entity_id;
+        {
+            let mut entities = store.entities.lock().await;
+            entities.push(e1);
+            entities.push(e2);
+        }
+        store
+            .edge_co_occurs(&ctx, id1, id2, sid, 0.8)
+            .await
+            .unwrap();
+
+        run_consolidation(&store, &ctx, sid).await.unwrap();
+
+        let cached = store.derived_cache_list_all(&ctx, 10_000).await.unwrap();
+        for row in &cached {
+            assert!(
+                Uuid::parse_str(&row.source_id).is_ok(),
+                "cached derived fact has non-UUID source_id: {row:?}"
+            );
+            assert!(
+                Uuid::parse_str(&row.target_id).is_ok(),
+                "taxonomy fact leaked into the UUID-keyed cache (issue #129): {row:?}"
+            );
+        }
     }
 
     /// Empty session produces zero for all new consolidation fields.
