@@ -1023,14 +1023,9 @@ fn session_continuity_tools() -> Vec<ToolDef> {
     ]
 }
 
-pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
-    let entity_type_enum: Value = serde_json::json!(entity_types);
-    let mut tools: Vec<ToolDef> = Vec::new();
-    tools.push(all_tools_def());
-    tools.extend(remote_memory_tools());
-    tools.extend(session_continuity_tools());
-    tools.extend(vec![
-        // --- Fold tools (Sprint 2) ---
+// --- Fold tools (Sprint 2) ---
+fn fold_tools() -> Vec<ToolDef> {
+    vec![
         ToolDef {
             name: "start_fold".into(),
             description: "Opens a new trajectory fold for a sub-task. Returns fold_id to append REPL turns as the sub-task executes.\n\nCALL WHEN: Starting any sub-task that involves multiple steps and whose results you want retrievable later. Always call write_plan_node first.\nA fold is the durable equivalent of a REPL scope.".into(),
@@ -1087,6 +1082,17 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                 "required": ["query_embedding"]
             }),
         },
+    ]
+}
+
+pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
+    let entity_type_enum: Value = serde_json::json!(entity_types);
+    let mut tools: Vec<ToolDef> = Vec::new();
+    tools.push(all_tools_def());
+    tools.extend(remote_memory_tools());
+    tools.extend(session_continuity_tools());
+    tools.extend(fold_tools());
+    tools.extend(vec![
         // --- Entity tools (Sprint 3) ---
         ToolDef {
             name: "upsert_entity".into(),
