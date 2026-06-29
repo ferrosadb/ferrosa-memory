@@ -3485,6 +3485,7 @@ async fn main() -> anyhow::Result<()> {
                 config_path: ferrosa_memory_core::config::resolve_config_path(),
                 ..dispatch::SessionState::default()
             });
+            session.set_debug_stop(config.server.debug_stop);
             tracing::info!(session_id = %default_session_id, "using server-owned default session_id");
 
             // Load persisted intentions from CQL (repo-scoped).
@@ -3609,6 +3610,7 @@ async fn main() -> anyhow::Result<()> {
                 config_path: ferrosa_memory_core::config::resolve_config_path(),
                 ..dispatch::SessionState::default()
             });
+            session.set_debug_stop(config.server.debug_stop);
 
             // Spawn the cross-replica consolidation worker for HTTP too.
             if config.consolidation.enabled {
