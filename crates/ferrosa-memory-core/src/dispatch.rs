@@ -2094,6 +2094,26 @@ fn importance_scoring_tools() -> Vec<ToolDef> {
     ]
 }
 
+// --- Memory chains ---
+fn memory_chain_tools() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "find_memory_chain".into(),
+            description: "Discovers the shortest path between two entities through the knowledge graph using BFS traversal. Returns the chain of intermediate entities and edge types connecting source to destination.\n\nCALL WHEN: You need to understand HOW two concepts are related — not just whether they are, but the path of connections between them. Useful for explaining reasoning chains, tracing provenance, or finding indirect relationships.\nRETURNS: Ordered list of steps (entity_id + edge_type) forming the shortest path, plus hop count and confidence score.\nCost: ~5-20ms depending on graph density.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "source": { "type": "string", "format": "uuid", "description": "Entity ID to start from" },
+                    "destination": { "type": "string", "format": "uuid", "description": "Entity ID to find path to" },
+                    "max_hops": { "type": "integer", "minimum": 1, "maximum": 10, "description": "Maximum path length (default: 5)" }
+                },
+                "required": ["source", "destination"]
+            }),
+        },
+    ]
+}
+
 pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
     let entity_type_enum: Value = serde_json::json!(entity_types);
     let mut tools: Vec<ToolDef> = Vec::new();
@@ -2115,22 +2135,8 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
     tools.extend(stats_tools());
     tools.extend(memory_state_tools());
     tools.extend(importance_scoring_tools());
+    tools.extend(memory_chain_tools());
     tools.extend(vec![
-        // --- Memory chains ---
-        ToolDef {
-            name: "find_memory_chain".into(),
-            description: "Discovers the shortest path between two entities through the knowledge graph using BFS traversal. Returns the chain of intermediate entities and edge types connecting source to destination.\n\nCALL WHEN: You need to understand HOW two concepts are related — not just whether they are, but the path of connections between them. Useful for explaining reasoning chains, tracing provenance, or finding indirect relationships.\nRETURNS: Ordered list of steps (entity_id + edge_type) forming the shortest path, plus hop count and confidence score.\nCost: ~5-20ms depending on graph density.".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "session_id": { "type": "string" },
-                    "source": { "type": "string", "format": "uuid", "description": "Entity ID to start from" },
-                    "destination": { "type": "string", "format": "uuid", "description": "Entity ID to find path to" },
-                    "max_hops": { "type": "integer", "minimum": 1, "maximum": 10, "description": "Maximum path length (default: 5)" }
-                },
-                "required": ["source", "destination"]
-            }),
-        },
         // --- Speculative retrieval ---
         ToolDef {
             name: "predict_needed".into(),
