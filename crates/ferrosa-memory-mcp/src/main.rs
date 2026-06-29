@@ -2983,7 +2983,7 @@ async fn consolidation_worker_loop<S: Storage + Send + Sync + 'static>(
                     dispatch::record_consolidation_finished(&session, sid, Ok(r)).await;
                     metrics
                         .consolidation_runs
-                        .with_label_values(&[&tenant_label, "success"])
+                        .with_label_values(&[tenant_label.as_str(), "success"])
                         .inc();
                     tracing::info!(
                         session = %sid,
@@ -2998,7 +2998,7 @@ async fn consolidation_worker_loop<S: Storage + Send + Sync + 'static>(
                         .await;
                     metrics
                         .consolidation_runs
-                        .with_label_values(&[&tenant_label, "failed"])
+                        .with_label_values(&[tenant_label.as_str(), "failed"])
                         .inc();
                     tracing::warn!(session = %sid, "consolidation failed: {e}");
                 }
