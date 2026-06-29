@@ -603,14 +603,20 @@ jobs:
           # keyspaces on; standalone node1-test satisfies that.
           docker compose -f docker-compose.test.yml up -d minio-test minio-test-init node1-test
           echo "Waiting for test cluster CQL on 19542..."
-          for i in $(seq 1 60); do
+          # Wait window is generous on purpose: node1-test now has
+          # `restart: on-failure:5`, so a node that crashes on boot (e.g. a
+          # transient OOM during recovery) gets several restart cycles to come
+          # up. 120 * 2s = 240s leaves room for those restarts instead of
+          # failing the whole job on the first crash.
+          for i in $(seq 1 120); do
             if bash -c "</dev/tcp/127.0.0.1/19542" 2>/dev/null; then
-              echo "  test cluster CQL ready after ${i}s"
+              echo "  test cluster CQL ready after $((i * 2))s"
               break
             fi
-            if [ "$i" -eq 60 ]; then
-              echo "::error::Test cluster did not become ready within 120s"
-              docker compose -f docker-compose.test.yml logs 2>/dev/null | tail -100
+            if [ "$i" -eq 120 ]; then
+              echo "::error::Test cluster did not become ready within 240s"
+              docker compose -f docker-compose.test.yml ps 2>/dev/null || true
+              docker compose -f docker-compose.test.yml logs 2>/dev/null | tail -120
               exit 1
             fi
             sleep 2

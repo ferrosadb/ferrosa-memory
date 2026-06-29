@@ -1,10 +1,10 @@
 #!/bin/bash
 # Start the isolated ferrosa-memory TEST cluster (+500 port offset).
 #
-# Runs alongside the dev cluster — separate data dir
-# (~/data/ferrosa-memory-test/), separate container names, separate
-# keyspace (agent_memory_test). Safe to start and stop without touching
-# any dev state.
+# Uses a separate data dir (~/data/ferrosa-memory-test/), separate container
+# names, and separate keyspace (agent_memory_test). By default this refuses
+# to start while the dev cluster is already running, because two local
+# clusters have caused cgroup OOM kills on constrained Podman VMs.
 #
 # Usage:
 #   scripts/start-test-cluster.sh
@@ -18,6 +18,17 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+if [[ "${1:-}" == "--env" ]]; then
+    cat <<'EOF'
+FERROSA_TEST_CQL_HOST=localhost
+FERROSA_TEST_CQL_PORT=19542
+FERROSA_TEST_GRAPH_URL=http://localhost:17974
+FERROSA_TEST_KEYSPACE=agent_memory_test
+FERROSA_TEST_S3_ENDPOINT=http://localhost:19500
+EOF
+    exit 0
+fi
 
 # --- container engine detection ---
 PODMAN="${PODMAN:-$(command -v podman 2>/dev/null || true)}"
@@ -40,15 +51,30 @@ fi
 
 COMPOSE_FILE="${REPO_ROOT}/docker-compose.test.yml"
 
-if [[ "${1:-}" == "--env" ]]; then
-    cat <<'EOF'
-FERROSA_TEST_CQL_HOST=localhost
-FERROSA_TEST_CQL_PORT=19542
-FERROSA_TEST_GRAPH_URL=http://localhost:17974
-FERROSA_TEST_KEYSPACE=agent_memory_test
-FERROSA_TEST_S3_ENDPOINT=http://localhost:19500
+dev_cluster_running() {
+    local container running
+    for container in \
+        fmem-dev-node1-1 fmem-dev-node2-1 fmem-dev-node3-1 fmem-dev-minio-1 \
+        ferrosa-memory-node1-1 ferrosa-memory-node2-1 ferrosa-memory-node3-1 ferrosa-memory-minio-1
+    do
+        running="$("${PODMAN}" inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true)"
+        if [[ "${running}" == "true" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+if [[ "${FERROSA_ALLOW_PARALLEL_CLUSTERS:-}" != "1" ]] && dev_cluster_running; then
+    cat >&2 <<'EOF'
+ERROR: dev cluster is already running.
+
+Starting the isolated test cluster beside the dev cluster has previously
+caused P0 cgroup OOM kills. Stop the dev cluster first, or set
+FERROSA_ALLOW_PARALLEL_CLUSTERS=1 if you have intentionally provisioned
+enough Podman VM memory for both stacks.
 EOF
-    exit 0
+    exit 2
 fi
 
 echo "starting test cluster via ${COMPOSE_FILE}"

@@ -23,6 +23,11 @@ services:
   minio-test:
     image: minio/minio:latest
     container_name: ferrosa-memory-minio-test
+    # Keep the isolated test stack from consuming unbounded memory when it is
+    # accidentally left running beside the dev cluster.
+    mem_limit: 1g
+    memswap_limit: 1g
+    restart: on-failure:5
     ports:
       - "19500:9000"
       - "19501:9001"
@@ -55,6 +60,11 @@ services:
   node1-test:
     image: ferrosa-memory-node
     container_name: ferrosa-memory-node1-test
+    # Match the dev cluster's hard ceiling so live tests fail loud in their
+    # own cgroup instead of pushing the dev cluster or Podman VM into OOM.
+    mem_limit: 2g
+    memswap_limit: 2g
+    restart: on-failure:5
     stop_grace_period: 35s
     logging:
       driver: json-file
@@ -103,6 +113,9 @@ services:
   node2-test:
     image: ferrosa-memory-node
     container_name: ferrosa-memory-node2-test
+    mem_limit: 2g
+    memswap_limit: 2g
+    restart: on-failure:5
     stop_grace_period: 35s
     logging:
       driver: json-file
@@ -151,6 +164,9 @@ services:
   node3-test:
     image: ferrosa-memory-node
     container_name: ferrosa-memory-node3-test
+    mem_limit: 2g
+    memswap_limit: 2g
+    restart: on-failure:5
     stop_grace_period: 35s
     logging:
       driver: json-file

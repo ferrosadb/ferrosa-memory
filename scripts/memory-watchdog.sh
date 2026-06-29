@@ -23,6 +23,10 @@ STATE_DIR=/tmp/ferrosa-memory-watchdog
 mkdir -p "$STATE_DIR"
 
 CONTAINERS=(
+    fmem-dev-node1-1
+    fmem-dev-node2-1
+    fmem-dev-node3-1
+    fmem-dev-minio-1
     ferrosa-memory-node1-1
     ferrosa-memory-node2-1
     ferrosa-memory-node3-1
