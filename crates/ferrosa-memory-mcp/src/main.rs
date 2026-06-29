@@ -48,6 +48,29 @@ fn random_forget_token_key() -> Vec<u8> {
     key
 }
 
+/// Spawn the background `debug_stop` health monitor: every 10s it TCP-probes the
+/// DB nodes and the configured embedding/LLM providers and publishes the snapshot
+/// the serving-path `debug_stop` injection reads. Runs regardless of the current
+/// flag so a mid-session `config { debug_stop: true }` has fresh data to act on;
+/// the probes are a few cheap TCP connects and the alert only fires when enabled.
+fn spawn_debug_stop_monitor(config: &Config, session: &std::sync::Arc<dispatch::SessionState>) {
+    let db_endpoints = config.ferrosa.contact_points.clone();
+    let embedding =
+        if config.embeddings.provider != "synthetic" && config.embeddings.provider != "disabled" {
+            ferrosa_memory_core::debug_stop::endpoint_authority(&config.embeddings.ollama_base_url)
+        } else {
+            None
+        };
+    let reranker = ferrosa_memory_core::debug_stop::endpoint_authority(&config.enrich.llm_base_url);
+    let monitor = ferrosa_memory_core::debug_stop::HealthMonitor::new(
+        db_endpoints,
+        embedding,
+        reranker,
+        std::sync::Arc::clone(&session.health),
+    );
+    tokio::spawn(monitor.run(std::time::Duration::from_secs(10)));
+}
+
 /// Storage wrapper that holds an `Option<CqlStorage>` behind a `RwLock`.
 ///
 /// When `inner` is `None`, the server is still reconnecting — all Storage
@@ -3486,6 +3509,7 @@ async fn main() -> anyhow::Result<()> {
                 ..dispatch::SessionState::default()
             });
             session.set_debug_stop(config.server.debug_stop);
+            spawn_debug_stop_monitor(&config, &session);
             tracing::info!(session_id = %default_session_id, "using server-owned default session_id");
 
             // Load persisted intentions from CQL (repo-scoped).
@@ -3611,6 +3635,7 @@ async fn main() -> anyhow::Result<()> {
                 ..dispatch::SessionState::default()
             });
             session.set_debug_stop(config.server.debug_stop);
+            spawn_debug_stop_monitor(&config, &session);
 
             // Spawn the cross-replica consolidation worker for HTTP too.
             if config.consolidation.enabled {
