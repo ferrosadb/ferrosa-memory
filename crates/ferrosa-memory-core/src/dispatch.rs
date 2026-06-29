@@ -2192,6 +2192,36 @@ fn duplicate_detection_tools() -> Vec<ToolDef> {
     ]
 }
 
+// --- Recursive exploration ---
+fn recursive_exploration_tools() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "recursive_explore".into(),
+            description: "Recursive multi-pass query exploration with Datalog-driven discovery.\n\n\
+                CALL WHEN:\n\
+                - Complex multi-hop queries that need connected knowledge clusters\n\
+                - Queries involving relationships between entities\n\
+                - When hybrid_search returns too few results\n\n\
+                DO NOT CALL:\n\
+                - For simple name lookups (use retrieve_entities)\n\
+                - For direct entity retrieval by ID\n\n\
+                Cost: Multiple passes × hybrid_search cost. Bounded by max_passes.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Session UUID" },
+                    "query": { "type": "string", "description": "Search query to explore recursively" },
+                    "embedding": { "type": "array", "items": { "type": "number" }, "description": "Optional query embedding vector" },
+                    "max_passes": { "type": "integer", "minimum": 1, "maximum": 5, "description": "Max exploration passes (default 3)" },
+                    "convergence_threshold": { "type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Novelty ratio for convergence (default 0.1)" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Max results (default 20)" }
+                },
+                "required": ["query"]
+            }),
+        },
+    ]
+}
+
 pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
     let entity_type_enum: Value = serde_json::json!(entity_types);
     let mut tools: Vec<ToolDef> = Vec::new();
@@ -2217,32 +2247,8 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
     tools.extend(speculative_retrieval_tools());
     tools.extend(spreading_activation_tools());
     tools.extend(duplicate_detection_tools());
+    tools.extend(recursive_exploration_tools());
     tools.extend(vec![
-        // --- Recursive exploration ---
-        ToolDef {
-            name: "recursive_explore".into(),
-            description: "Recursive multi-pass query exploration with Datalog-driven discovery.\n\n\
-                CALL WHEN:\n\
-                - Complex multi-hop queries that need connected knowledge clusters\n\
-                - Queries involving relationships between entities\n\
-                - When hybrid_search returns too few results\n\n\
-                DO NOT CALL:\n\
-                - For simple name lookups (use retrieve_entities)\n\
-                - For direct entity retrieval by ID\n\n\
-                Cost: Multiple passes × hybrid_search cost. Bounded by max_passes.".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "session_id": { "type": "string", "description": "Session UUID" },
-                    "query": { "type": "string", "description": "Search query to explore recursively" },
-                    "embedding": { "type": "array", "items": { "type": "number" }, "description": "Optional query embedding vector" },
-                    "max_passes": { "type": "integer", "minimum": 1, "maximum": 5, "description": "Max exploration passes (default 3)" },
-                    "convergence_threshold": { "type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Novelty ratio for convergence (default 0.1)" },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Max results (default 20)" }
-                },
-                "required": ["query"]
-            }),
-        },
         // --- Datalog query ---
         ToolDef {
             name: "query_derived".into(),
