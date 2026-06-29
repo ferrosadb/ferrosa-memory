@@ -2169,6 +2169,29 @@ fn spreading_activation_tools() -> Vec<ToolDef> {
     ]
 }
 
+// --- Duplicate detection ---
+fn duplicate_detection_tools() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "find_duplicates".into(),
+            description: "Scans a session\'s entities for potential duplicates using text similarity (Jaccard coefficient) on context snippets. Returns pairs above the threshold, sorted by similarity descending.\n\nCALL WHEN: After bulk entity ingestion, or when you suspect duplicate entities exist in a session. Useful before consolidation to identify merge candidates.\nDO NOT CALL: On sessions with very few entities (< 3). Use retrieve_entities with phonetic matching for single-entity dedup.\nCost: O(n^2) comparisons -- fast for <1000 entities per session.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "threshold": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1,
+                        "description": "Similarity threshold (0-1). Default: 0.7. Higher = fewer, more confident matches."
+                    }
+                },
+                "required": []
+            }),
+        },
+    ]
+}
+
 pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
     let entity_type_enum: Value = serde_json::json!(entity_types);
     let mut tools: Vec<ToolDef> = Vec::new();
@@ -2193,25 +2216,8 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
     tools.extend(memory_chain_tools());
     tools.extend(speculative_retrieval_tools());
     tools.extend(spreading_activation_tools());
+    tools.extend(duplicate_detection_tools());
     tools.extend(vec![
-        // --- Duplicate detection ---
-        ToolDef {
-            name: "find_duplicates".into(),
-            description: "Scans a session\'s entities for potential duplicates using text similarity (Jaccard coefficient) on context snippets. Returns pairs above the threshold, sorted by similarity descending.\n\nCALL WHEN: After bulk entity ingestion, or when you suspect duplicate entities exist in a session. Useful before consolidation to identify merge candidates.\nDO NOT CALL: On sessions with very few entities (< 3). Use retrieve_entities with phonetic matching for single-entity dedup.\nCost: O(n^2) comparisons -- fast for <1000 entities per session.".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "session_id": { "type": "string" },
-                    "threshold": {
-                        "type": "number",
-                        "minimum": 0,
-                        "maximum": 1,
-                        "description": "Similarity threshold (0-1). Default: 0.7. Higher = fewer, more confident matches."
-                    }
-                },
-                "required": []
-            }),
-        },
         // --- Recursive exploration ---
         ToolDef {
             name: "recursive_explore".into(),
