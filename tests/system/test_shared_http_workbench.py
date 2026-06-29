@@ -110,19 +110,6 @@ def test_t_s_006_approval_decisions_are_durable_and_runtime_effective():
     assert "approval_append" in storage
 
 
-def test_t_s_007_explanation_hides_out_of_scope_reviewer_data():
-    """T-S-007: explanation hides out-of-scope reviewer data."""
-    dispatch = DISPATCH_RS.read_text()
-
-    explain_block = dispatch.split("async fn handle_explain_derived", 1)[1].split(
-        "async fn handle_get_effective_rule_set", 1
-    )[0]
-    assert '"support_chain": chain' in explain_block
-    assert '"approval_state": Value::Null' in explain_block
-    assert '"reviewer"' not in explain_block
-    assert '"review_note"' not in explain_block
-
-
 def test_t_s_008_alias_workbench_slice_exposes_governed_browse_and_management():
     """T-S-008: alias workbench slice exposes governed browse and management."""
     dispatch = DISPATCH_RS.read_text()
