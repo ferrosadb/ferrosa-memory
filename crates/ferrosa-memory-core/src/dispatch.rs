@@ -12125,18 +12125,19 @@ fn resolve_session_id(args: &mut Value, default: Option<uuid::Uuid>) -> Result<(
     // UUID so the session stays isolated and reproducible, instead of rejecting
     // it or collapsing it onto the configured default. Empty / "default" / null /
     // missing fall through to the configured default below.
-    if let Some(Value::String(s)) = &caller_value {
-        if !s.is_empty() && !s.eq_ignore_ascii_case("default") && uuid::Uuid::parse_str(s).is_err()
-        {
-            let derived = derive_session_uuid(s);
-            tracing::debug!(
-                provided = %s,
-                derived = %derived,
-                "mapped non-UUID session_id to a stable derived UUID"
-            );
-            obj.insert("session_id".into(), Value::String(derived.to_string()));
-            return Ok(());
-        }
+    if let Some(Value::String(s)) = &caller_value
+        && !s.is_empty()
+        && !s.eq_ignore_ascii_case("default")
+        && uuid::Uuid::parse_str(s).is_err()
+    {
+        let derived = derive_session_uuid(s);
+        tracing::debug!(
+            provided = %s,
+            derived = %derived,
+            "mapped non-UUID session_id to a stable derived UUID"
+        );
+        obj.insert("session_id".into(), Value::String(derived.to_string()));
+        return Ok(());
     }
 
     let needs_fallback = match &caller_value {
