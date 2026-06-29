@@ -52,6 +52,7 @@ pub mod intention;
 pub mod memo;
 pub mod metrics;
 pub mod migration;
+pub mod migration_backfill;
 pub mod ner;
 pub mod pagerank;
 pub mod plan;
