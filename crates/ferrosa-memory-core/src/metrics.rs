@@ -198,4 +198,56 @@ mod tests {
             families.len()
         );
     }
+
+    /// Behavioral coverage for the `consolidation_runs` metric.
+    ///
+    /// This counter (emitted by `consolidation_worker_loop` in
+    /// `ferrosa-memory-mcp`) had no test — `all_eight_metrics_registered`
+    /// touches only the original eight families. The worker increments it with
+    /// an owned `String` tenant id (`ctx.tenant_id.to_string()`) and a `&str`
+    /// status literal; this test exercises that exact mixed-source call and
+    /// asserts both the `tenant_id` and `status` labels are emitted with the
+    /// right values.
+    ///
+    /// Note: PR #134 normalized the call to `tenant_label.as_str()`, but the
+    /// prior `&[&tenant_label, "success"]` form also compiles — array-literal
+    /// LUB coercion unifies `&String` and `&str` into `&str`, which satisfies
+    /// `with_label_values<V: AsRef<str>>`. So this is a coverage/behavior test,
+    /// not a compile guard; the `.as_str()` change is a readability tweak.
+    #[test]
+    fn consolidation_runs_accepts_owned_tenant_label() {
+        let m = MemoryMetrics::new().expect("metrics should register");
+
+        // Owned String tenant id mixed with &str status literals, exactly as
+        // the consolidation worker does.
+        let tenant_label: String = "tenant-42".to_string();
+        m.consolidation_runs
+            .with_label_values(&[tenant_label.as_str(), "success"])
+            .inc();
+        m.consolidation_runs
+            .with_label_values(&[tenant_label.as_str(), "failed"])
+            .inc();
+
+        let mut buf = Vec::new();
+        let encoder = prometheus::TextEncoder::new();
+        encoder.encode(&m.registry.gather(), &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+
+        assert!(
+            output.contains("ferrosa_memory_consolidation_runs_total"),
+            "consolidation_runs metric missing from output:\n{output}"
+        );
+        assert!(
+            output.contains("tenant_id=\"tenant-42\""),
+            "expected tenant label in output:\n{output}"
+        );
+        assert!(
+            output.contains("status=\"success\""),
+            "expected success status label:\n{output}"
+        );
+        assert!(
+            output.contains("status=\"failed\""),
+            "expected failed status label:\n{output}"
+        );
+    }
 }
