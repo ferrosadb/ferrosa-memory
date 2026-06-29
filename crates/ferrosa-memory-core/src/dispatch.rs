@@ -6218,6 +6218,18 @@ fn configure_requests_session_start(args: &Value) -> bool {
         || nested_or_flat_str(args, "thread_id").is_some()
 }
 
+/// Deterministically map a non-UUID session id to a stable UUID.
+///
+/// Some agents (e.g. Hermes) mint session ids that are not UUIDs. ferrosa-memory
+/// stores session ids as UUIDs, so rather than rejecting such ids — or collapsing
+/// every one of them onto the configured default session — we derive a stable
+/// UUIDv5 from the raw string. The same raw id always yields the same UUID, so
+/// distinct agent sessions stay isolated and reproducible across calls.
+fn derive_session_uuid(raw: &str) -> uuid::Uuid {
+    let key = format!("ferrosa-memory:session-id:v1:{raw}");
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, key.as_bytes())
+}
+
 fn configured_runtime_session_id(
     args: &Value,
 ) -> Result<Option<(uuid::Uuid, String)>, (i32, String)> {
@@ -6226,13 +6238,18 @@ fn configured_runtime_session_id(
     }
 
     if let Some(raw) = nested_or_flat_str(args, "session_id") {
-        let session_id = uuid::Uuid::parse_str(&raw).map_err(|e| {
-            (
-                INVALID_PARAMS,
-                format!("session_id is not a valid UUID: {e}"),
-            )
-        })?;
-        return Ok(Some((session_id, "explicit_session_id".to_string())));
+        return Ok(Some(match uuid::Uuid::parse_str(&raw) {
+            Ok(session_id) => (session_id, "explicit_session_id".to_string()),
+            Err(_) => {
+                let derived = derive_session_uuid(&raw);
+                tracing::debug!(
+                    provided = %raw,
+                    derived = %derived,
+                    "session_start: mapped non-UUID session_id to a stable derived UUID"
+                );
+                (derived, "derived_from_session_id".to_string())
+            }
+        }));
     }
 
     let agent = nested_or_flat_str(args, "agent").unwrap_or_else(|| "unknown-agent".to_string());
@@ -12102,12 +12119,32 @@ fn resolve_session_id(args: &mut Value, default: Option<uuid::Uuid>) -> Result<(
     };
 
     let caller_value = obj.get("session_id").cloned();
+
+    // A non-empty, non-"default" string that isn't a UUID is an agent/external
+    // session id (e.g. Hermes mints non-UUID ids). Map it to a stable derived
+    // UUID so the session stays isolated and reproducible, instead of rejecting
+    // it or collapsing it onto the configured default. Empty / "default" / null /
+    // missing fall through to the configured default below.
+    if let Some(Value::String(s)) = &caller_value {
+        if !s.is_empty() && !s.eq_ignore_ascii_case("default") && uuid::Uuid::parse_str(s).is_err()
+        {
+            let derived = derive_session_uuid(s);
+            tracing::debug!(
+                provided = %s,
+                derived = %derived,
+                "mapped non-UUID session_id to a stable derived UUID"
+            );
+            obj.insert("session_id".into(), Value::String(derived.to_string()));
+            return Ok(());
+        }
+    }
+
     let needs_fallback = match &caller_value {
         None => true,
         Some(Value::Null) => true,
-        Some(Value::String(s)) => {
-            s.is_empty() || s.eq_ignore_ascii_case("default") || uuid::Uuid::parse_str(s).is_err()
-        }
+        // Non-UUID strings were handled above; a remaining non-empty,
+        // non-"default" string is a valid UUID and passes through.
+        Some(Value::String(s)) => s.is_empty() || s.eq_ignore_ascii_case("default"),
         Some(_) => true,
     };
 
@@ -19006,11 +19043,45 @@ mod speculative_tests {
     }
 
     #[test]
-    fn resolve_session_id_injects_default_when_invalid_uuid() {
+    fn resolve_session_id_derives_stable_uuid_for_non_uuid() {
+        // A non-UUID session id (e.g. one Hermes mints) maps to a stable derived
+        // UUID, NOT the configured default — so the session stays isolated
+        // instead of colliding with the default session.
         let default_sid = Uuid::new_v4();
-        let mut args = serde_json::json!({ "session_id": "not-a-uuid" });
+        let mut args = serde_json::json!({ "session_id": "hermes-abc-123" });
         resolve_session_id(&mut args, Some(default_sid)).unwrap();
-        assert_eq!(args["session_id"], default_sid.to_string());
+        let got = args["session_id"].as_str().unwrap();
+        assert_ne!(
+            got,
+            default_sid.to_string(),
+            "non-UUID session_id must not collapse onto the default"
+        );
+        assert_eq!(got, derive_session_uuid("hermes-abc-123").to_string());
+        assert!(Uuid::parse_str(got).is_ok(), "derived value must be a UUID");
+    }
+
+    #[test]
+    fn resolve_session_id_derivation_is_stable_and_isolated() {
+        let derive = |s: &str| {
+            let mut a = serde_json::json!({ "session_id": s });
+            // No default configured: a non-UUID id still derives (does not error).
+            resolve_session_id(&mut a, None).unwrap();
+            a["session_id"].as_str().unwrap().to_string()
+        };
+        // Stable: same raw id -> same UUID across calls.
+        assert_eq!(derive("hermes-1"), derive("hermes-1"));
+        // Isolated: distinct raw ids -> distinct UUIDs.
+        assert_ne!(derive("hermes-1"), derive("hermes-2"));
+    }
+
+    #[test]
+    fn configured_runtime_session_id_derives_for_non_uuid_session_id() {
+        // A session_start handshake carrying a non-UUID session_id must not
+        // error; it derives the same stable UUID resolve_session_id would.
+        let args = serde_json::json!({ "session_start": true, "session_id": "hermes-abc-123" });
+        let (sid, source) = configured_runtime_session_id(&args).unwrap().unwrap();
+        assert_eq!(sid, derive_session_uuid("hermes-abc-123"));
+        assert_eq!(source, "derived_from_session_id");
     }
 
     #[test]
