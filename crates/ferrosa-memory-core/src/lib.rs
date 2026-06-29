@@ -53,6 +53,7 @@ pub mod memo;
 pub mod metrics;
 pub mod migration;
 pub mod migration_backfill;
+pub mod migration_backfill_cql;
 pub mod ner;
 pub mod pagerank;
 pub mod plan;
