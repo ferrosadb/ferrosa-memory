@@ -2361,6 +2361,28 @@ fn datalog_rule_tools() -> Vec<ToolDef> {
     ]
 }
 
+// --- Predicate promotion ---
+fn predicate_promotion_tools() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "promote_predicate".into(),
+            description: "Promote a derived predicate to durable materialization.\n\n\
+                CALL WHEN:\n\
+                - A derived predicate is queried frequently and you want faster access\n\
+                - You want to persist inference results beyond the ephemeral cache TTL\n\n\
+                Cost: Runs Datalog evaluation + writes to durable tables.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Session UUID" },
+                    "predicate": { "type": "string", "description": "Predicate to promote (e.g., 'related', 'isa', 'reachable')" }
+                },
+                "required": ["predicate"]
+            }),
+        },
+    ]
+}
+
 pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
     let entity_type_enum: Value = serde_json::json!(entity_types);
     let mut tools: Vec<ToolDef> = Vec::new();
@@ -2389,24 +2411,8 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
     tools.extend(recursive_exploration_tools());
     tools.extend(datalog_query_tools());
     tools.extend(datalog_rule_tools());
+    tools.extend(predicate_promotion_tools());
     tools.extend(vec![
-        // --- Predicate promotion ---
-        ToolDef {
-            name: "promote_predicate".into(),
-            description: "Promote a derived predicate to durable materialization.\n\n\
-                CALL WHEN:\n\
-                - A derived predicate is queried frequently and you want faster access\n\
-                - You want to persist inference results beyond the ephemeral cache TTL\n\n\
-                Cost: Runs Datalog evaluation + writes to durable tables.".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "session_id": { "type": "string", "description": "Session UUID" },
-                    "predicate": { "type": "string", "description": "Predicate to promote (e.g., 'related', 'isa', 'reachable')" }
-                },
-                "required": ["predicate"]
-            }),
-        },
         // --- Typed edge tools ---
         ToolDef {
             name: "create_edge".into(),
