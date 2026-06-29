@@ -512,18 +512,24 @@ fn canonical_tool_name(name: &str) -> &str {
 
 /// Build all tool definitions for the memory server.
 /// Entity types are loaded dynamically from the type registry.
+/// The `all_tools` catalog-expansion tool definition.
+fn all_tools_def() -> ToolDef {
+    ToolDef {
+        name: "all_tools".into(),
+        description: "Return the full Ferrosa Memory tool catalog when the compact default tools are not enough.\n\nCALL WHEN: You need deeper memory operations, batching, folds, derived facts, governance, or diagnostics not exposed in the compact default tool set.".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        }),
+    }
+}
+
 pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
     let entity_type_enum: Value = serde_json::json!(entity_types);
-    let mut tools = vec![
-        ToolDef {
-            name: "all_tools".into(),
-            description: "Return the full Ferrosa Memory tool catalog when the compact default tools are not enough.\n\nCALL WHEN: You need deeper memory operations, batching, folds, derived facts, governance, or diagnostics not exposed in the compact default tool set.".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "required": []
-            }),
-        },
+    let mut tools: Vec<ToolDef> = Vec::new();
+    tools.push(all_tools_def());
+    tools.extend(vec![
         // --- Remote teacher/learner memory tools ---
         ToolDef {
             name: "feedback_record".into(),
@@ -2376,7 +2382,7 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                 "required": ["tenant_id"]
             }),
         },
-    ];
+    ]);
     for tool in &mut tools {
         if let Some(short) = short_tool_name(&tool.name) {
             tool.name = short.to_string();
