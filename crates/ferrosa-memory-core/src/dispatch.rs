@@ -525,12 +525,9 @@ fn all_tools_def() -> ToolDef {
     }
 }
 
-pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
-    let entity_type_enum: Value = serde_json::json!(entity_types);
-    let mut tools: Vec<ToolDef> = Vec::new();
-    tools.push(all_tools_def());
-    tools.extend(vec![
-        // --- Remote teacher/learner memory tools ---
+// --- Remote teacher/learner memory tools ---
+fn remote_memory_tools() -> Vec<ToolDef> {
+    vec![
         ToolDef {
             name: "feedback_record".into(),
             description: "Record terse feedback about a remote-memory candidate, classify it into a structured Packet H signal, and persist a queryable feedback explanation under the authenticated tenant.".into(),
@@ -736,6 +733,15 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                 "required": ["remote_id", "action", "namespace"]
             }),
         },
+    ]
+}
+
+pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
+    let entity_type_enum: Value = serde_json::json!(entity_types);
+    let mut tools: Vec<ToolDef> = Vec::new();
+    tools.push(all_tools_def());
+    tools.extend(remote_memory_tools());
+    tools.extend(vec![
         ToolDef {
             name: "ingest_context_segments".into(),
             description: "Persist raw pre-compaction conversation context as deterministic semantic segments, with Nomic embeddings when configured and temporal prev/next links for later expansion.".into(),
