@@ -510,8 +510,6 @@ fn canonical_tool_name(name: &str) -> &str {
     }
 }
 
-/// Build all tool definitions for the memory server.
-/// Entity types are loaded dynamically from the type registry.
 /// The `all_tools` catalog-expansion tool definition.
 fn all_tools_def() -> ToolDef {
     ToolDef {
@@ -2194,10 +2192,9 @@ fn duplicate_detection_tools() -> Vec<ToolDef> {
 
 // --- Recursive exploration ---
 fn recursive_exploration_tools() -> Vec<ToolDef> {
-    vec![
-        ToolDef {
-            name: "recursive_explore".into(),
-            description: "Recursive multi-pass query exploration with Datalog-driven discovery.\n\n\
+    vec![ToolDef {
+        name: "recursive_explore".into(),
+        description: "Recursive multi-pass query exploration with Datalog-driven discovery.\n\n\
                 CALL WHEN:\n\
                 - Complex multi-hop queries that need connected knowledge clusters\n\
                 - Queries involving relationships between entities\n\
@@ -2205,46 +2202,45 @@ fn recursive_exploration_tools() -> Vec<ToolDef> {
                 DO NOT CALL:\n\
                 - For simple name lookups (use retrieve_entities)\n\
                 - For direct entity retrieval by ID\n\n\
-                Cost: Multiple passes × hybrid_search cost. Bounded by max_passes.".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "session_id": { "type": "string", "description": "Session UUID" },
-                    "query": { "type": "string", "description": "Search query to explore recursively" },
-                    "embedding": { "type": "array", "items": { "type": "number" }, "description": "Optional query embedding vector" },
-                    "max_passes": { "type": "integer", "minimum": 1, "maximum": 5, "description": "Max exploration passes (default 3)" },
-                    "convergence_threshold": { "type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Novelty ratio for convergence (default 0.1)" },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Max results (default 20)" }
-                },
-                "required": ["query"]
-            }),
-        },
-    ]
+                Cost: Multiple passes × hybrid_search cost. Bounded by max_passes."
+            .into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "session_id": { "type": "string", "description": "Session UUID" },
+                "query": { "type": "string", "description": "Search query to explore recursively" },
+                "embedding": { "type": "array", "items": { "type": "number" }, "description": "Optional query embedding vector" },
+                "max_passes": { "type": "integer", "minimum": 1, "maximum": 5, "description": "Max exploration passes (default 3)" },
+                "convergence_threshold": { "type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Novelty ratio for convergence (default 0.1)" },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Max results (default 20)" }
+            },
+            "required": ["query"]
+        }),
+    }]
 }
 
 // --- Datalog query ---
 fn datalog_query_tools() -> Vec<ToolDef> {
-    vec![
-        ToolDef {
-            name: "query_derived".into(),
-            description: "Query Datalog-derived facts with provenance.\n\n\
+    vec![ToolDef {
+        name: "query_derived".into(),
+        description: "Query Datalog-derived facts with provenance.\n\n\
                 CALL WHEN:\n\
                 - You need to explain why entity A relates to entity B\n\
                 - You want transitive closure (related, reachable, isa)\n\
                 - You need derived facts with explanation chains\n\n\
                 DO NOT CALL:\n\
                 - For raw entity retrieval (use retrieve_entities)\n\n\
-                Cost: Cache hit is free. Cache miss computes Datalog evaluation.".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "session_id": { "type": "string", "description": "Session UUID" },
-                    "predicate": { "type": "string", "description": "Derived predicate to query (e.g., 'related', 'reachable', 'isa', 'cluster')" }
-                },
-                "required": ["predicate"]
-            }),
-        },
-    ]
+                Cost: Cache hit is free. Cache miss computes Datalog evaluation."
+            .into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "session_id": { "type": "string", "description": "Session UUID" },
+                "predicate": { "type": "string", "description": "Derived predicate to query (e.g., 'related', 'reachable', 'isa', 'cluster')" }
+            },
+            "required": ["predicate"]
+        }),
+    }]
 }
 
 // --- Datalog rule management ---
@@ -2363,24 +2359,23 @@ fn datalog_rule_tools() -> Vec<ToolDef> {
 
 // --- Predicate promotion ---
 fn predicate_promotion_tools() -> Vec<ToolDef> {
-    vec![
-        ToolDef {
-            name: "promote_predicate".into(),
-            description: "Promote a derived predicate to durable materialization.\n\n\
+    vec![ToolDef {
+        name: "promote_predicate".into(),
+        description: "Promote a derived predicate to durable materialization.\n\n\
                 CALL WHEN:\n\
                 - A derived predicate is queried frequently and you want faster access\n\
                 - You want to persist inference results beyond the ephemeral cache TTL\n\n\
-                Cost: Runs Datalog evaluation + writes to durable tables.".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "session_id": { "type": "string", "description": "Session UUID" },
-                    "predicate": { "type": "string", "description": "Predicate to promote (e.g., 'related', 'isa', 'reachable')" }
-                },
-                "required": ["predicate"]
-            }),
-        },
-    ]
+                Cost: Runs Datalog evaluation + writes to durable tables."
+            .into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "session_id": { "type": "string", "description": "Session UUID" },
+                "predicate": { "type": "string", "description": "Predicate to promote (e.g., 'related', 'isa', 'reachable')" }
+            },
+            "required": ["predicate"]
+        }),
+    }]
 }
 
 // --- Typed edge tools ---
@@ -2494,24 +2489,25 @@ fn typed_edge_tools() -> Vec<ToolDef> {
 
 // --- Derived cache listing ---
 fn derived_cache_tools() -> Vec<ToolDef> {
-    vec![
-        ToolDef {
-            name: "list_derived_cache".into(),
-            description: "List all derived cache entries for inspection/debugging.\n\n\
+    vec![ToolDef {
+        name: "list_derived_cache".into(),
+        description: "List all derived cache entries for inspection/debugging.\n\n\
                 Returns up to `limit` rows sorted by computed_at DESC.\n\n\
-                Use for: audit trail, debugging derivation results, reviewing cache state.".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "tenant_id": { "type": "string", "description": "Tenant UUID" },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Max rows to return (default 100)" }
-                },
-                "required": ["tenant_id"]
-            }),
-        },
-    ]
+                Use for: audit trail, debugging derivation results, reviewing cache state."
+            .into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tenant_id": { "type": "string", "description": "Tenant UUID" },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Max rows to return (default 100)" }
+            },
+            "required": ["tenant_id"]
+        }),
+    }]
 }
 
+/// Build all tool definitions for the memory server.
+/// Entity types are loaded dynamically from the type registry.
 pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
     let entity_type_enum: Value = serde_json::json!(entity_types);
     let mut tools: Vec<ToolDef> = Vec::new();
@@ -2543,8 +2539,6 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
     tools.extend(predicate_promotion_tools());
     tools.extend(typed_edge_tools());
     tools.extend(derived_cache_tools());
-    tools.extend(vec![
-    ]);
     for tool in &mut tools {
         if let Some(short) = short_tool_name(&tool.name) {
             tool.name = short.to_string();
