@@ -17455,4 +17455,30 @@ mod explanation_property_tests {
             }
         }
     }
+
+    /// T-S-007 "explanation hides out-of-scope reviewer data": the bounded
+    /// explanation never leaks approval/reviewer fields — `approval_state` is
+    /// always `Null` and there is no `reviewer` / `review_note` key — while still
+    /// exposing the support chain. (Replaces the former source-grep system test.)
+    #[test]
+    fn explanation_hides_out_of_scope_reviewer_data() {
+        let value = bounded_explanation(&fact_with_provenance(3), 16);
+        let obj = value.as_object().expect("explanation is a JSON object");
+        assert!(
+            value["approval_state"].is_null(),
+            "approval_state must be Null so reviewer data is not exposed"
+        );
+        assert!(
+            !obj.contains_key("reviewer"),
+            "explanation must not expose a reviewer field"
+        );
+        assert!(
+            !obj.contains_key("review_note"),
+            "explanation must not expose a review_note field"
+        );
+        assert!(
+            obj.contains_key("support_chain"),
+            "explanation still includes the support chain"
+        );
+    }
 }
