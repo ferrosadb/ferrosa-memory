@@ -898,6 +898,10 @@ fn feedback_tools() -> Vec<ToolDef> {
                         "minimum": MIN_RETRIEVAL_LIMIT,
                         "maximum": MAX_RETRIEVAL_LIMIT,
                         "description": "Alias for retrieval_limit."
+                    },
+                    "debug_stop": {
+                        "type": "boolean",
+                        "description": "Hidden dev toggle. When true, tool responses carry a degraded-cluster alert (and fail on critical degradation) so you STOP and investigate instead of building on a broken cluster. Leave unset in normal use."
                     }
                 },
                 "required": []

@@ -32,6 +32,7 @@ pub mod contradiction;
 pub mod cql_storage;
 pub mod datalog;
 pub mod datalog_filter_expr;
+pub mod debug_stop;
 pub mod dedup;
 pub mod dispatch;
 pub mod document_chunking;

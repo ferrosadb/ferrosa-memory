@@ -556,6 +556,13 @@ pub struct ServerConfig {
     /// Unreinforced edges gradually lose strength; rediscovered edges are reset to full weight.
     #[serde(default = "default_decay_factor")]
     pub edge_decay_factor: f64,
+    /// Hidden dev-only flag: when set, tool responses surface a `debug_stop`
+    /// alert if any monitored component (DB quorum, embedding, reranker) is
+    /// unhealthy, so the agent stops and investigates instead of building on a
+    /// degraded cluster. Off in production. Seeds the runtime flag, which the
+    /// LLM can also toggle in-session via the `config` tool.
+    #[serde(default)]
+    pub debug_stop: bool,
 }
 
 impl Default for ServerConfig {
@@ -577,6 +584,7 @@ impl Default for ServerConfig {
             idle_consolidation_seconds: default_idle_seconds(),
             stale_edge_max_days: 0,
             edge_decay_factor: default_decay_factor(),
+            debug_stop: false,
         }
     }
 }

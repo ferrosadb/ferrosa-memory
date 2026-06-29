@@ -197,6 +197,11 @@ pub struct SessionState {
     pub last_activity: Arc<tokio::sync::Notify>,
     /// Set to true when a write tool succeeds; cleared by idle consolidation.
     pub dirty: Arc<AtomicBool>,
+    /// Hidden dev-only `debug_stop` flag (seeds from `[server].debug_stop`). When
+    /// set, tool responses surface a degraded-cluster alert (or fail on a
+    /// critical degradation) so the agent stops and investigates. The LLM can
+    /// toggle this at runtime via the `config` tool.
+    pub debug_stop: Arc<AtomicBool>,
     /// (tenant_id, session_id) pairs explicitly queued for background
     /// consolidation. The tenant is carried so the background worker runs under
     /// the same tenant that wrote the data (HTTP requests authenticate
@@ -260,6 +265,7 @@ impl Default for SessionState {
             repo: std::sync::OnceLock::new(),
             last_activity: Arc::new(tokio::sync::Notify::new()),
             dirty: Arc::new(AtomicBool::new(false)),
+            debug_stop: Arc::new(AtomicBool::new(false)),
             consolidation_queue: Arc::new(Mutex::new(VecDeque::new())),
             smart_ingest_created_since_consolidation: Arc::new(Mutex::new(HashMap::new())),
             last_consolidation_status: Arc::new(Mutex::new(HashMap::new())),
@@ -293,6 +299,17 @@ impl SessionState {
             .ok()
             .and_then(|guard| *guard)
             .or(self.default_session_id)
+    }
+
+    /// Whether the hidden `debug_stop` alerting is currently active.
+    pub fn debug_stop(&self) -> bool {
+        self.debug_stop.load(Ordering::Relaxed)
+    }
+
+    /// Toggle `debug_stop` at runtime (seeded from config; settable via the
+    /// `config` tool so the LLM can turn it on mid-session).
+    pub fn set_debug_stop(&self, on: bool) {
+        self.debug_stop.store(on, Ordering::Relaxed);
     }
 
     fn set_runtime_session_id(&self, session_id: uuid::Uuid) -> Result<(), (i32, String)> {
@@ -4423,6 +4440,12 @@ async fn handle_configure(args: Value, session: &SessionState) -> Result<Value, 
     }
     let effective_session_id = session.effective_default_session_id();
 
+    // Hidden dev-only toggle: the LLM can turn debug_stop alerting on/off mid-session.
+    if let Some(on) = args.get("debug_stop").and_then(|v| v.as_bool()) {
+        session.set_debug_stop(on);
+        updated = true;
+    }
+
     Ok(serde_json::json!({
         "updated": updated,
         "retrieval_limit": retrieval_default_limit(session),
@@ -4430,6 +4453,7 @@ async fn handle_configure(args: Value, session: &SessionState) -> Result<Value, 
         "max_retrieval_limit": MAX_RETRIEVAL_LIMIT,
         "session_id": effective_session_id.map(|id| id.to_string()),
         "session_source": session_source,
+        "debug_stop": session.debug_stop(),
         "hint": "SessionStart hooks should call configure with session_start metadata once; fmem stores the active session_id. Individual retrieval calls can still override limit/k."
     }))
 }
@@ -15295,6 +15319,45 @@ mod tests {
         .unwrap();
         let narrowed = unwrap_tool_result(narrowed);
         assert_eq!(narrowed["count"], 1);
+    }
+
+    #[tokio::test]
+    async fn configure_toggles_debug_stop_at_runtime() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        assert!(!session.debug_stop(), "off by default");
+
+        let on = unwrap_tool_result(
+            dispatch(
+                "tools/call",
+                serde_json::json!({ "name": "config", "arguments": { "debug_stop": true } }),
+                &store,
+                &ctx,
+                &session,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(on["debug_stop"], true);
+        assert!(
+            session.debug_stop(),
+            "LLM turned debug_stop on via the config tool"
+        );
+
+        let off = unwrap_tool_result(
+            dispatch(
+                "tools/call",
+                serde_json::json!({ "name": "config", "arguments": { "debug_stop": false } }),
+                &store,
+                &ctx,
+                &session,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(off["debug_stop"], false);
+        assert!(!session.debug_stop());
     }
 
     #[tokio::test]
