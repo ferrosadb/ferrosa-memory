@@ -2492,6 +2492,26 @@ fn typed_edge_tools() -> Vec<ToolDef> {
     ]
 }
 
+// --- Derived cache listing ---
+fn derived_cache_tools() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "list_derived_cache".into(),
+            description: "List all derived cache entries for inspection/debugging.\n\n\
+                Returns up to `limit` rows sorted by computed_at DESC.\n\n\
+                Use for: audit trail, debugging derivation results, reviewing cache state.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tenant_id": { "type": "string", "description": "Tenant UUID" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Max rows to return (default 100)" }
+                },
+                "required": ["tenant_id"]
+            }),
+        },
+    ]
+}
+
 pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
     let entity_type_enum: Value = serde_json::json!(entity_types);
     let mut tools: Vec<ToolDef> = Vec::new();
@@ -2522,22 +2542,8 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
     tools.extend(datalog_rule_tools());
     tools.extend(predicate_promotion_tools());
     tools.extend(typed_edge_tools());
+    tools.extend(derived_cache_tools());
     tools.extend(vec![
-        // --- Derived cache listing ---
-        ToolDef {
-            name: "list_derived_cache".into(),
-            description: "List all derived cache entries for inspection/debugging.\n\n\
-                Returns up to `limit` rows sorted by computed_at DESC.\n\n\
-                Use for: audit trail, debugging derivation results, reviewing cache state.".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "tenant_id": { "type": "string", "description": "Tenant UUID" },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Max rows to return (default 100)" }
-                },
-                "required": ["tenant_id"]
-            }),
-        },
     ]);
     for tool in &mut tools {
         if let Some(short) = short_tool_name(&tool.name) {
