@@ -1889,25 +1889,9 @@ fn dream_consolidation_tools() -> Vec<ToolDef> {
     ]
 }
 
-pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
-    let entity_type_enum: Value = serde_json::json!(entity_types);
-    let mut tools: Vec<ToolDef> = Vec::new();
-    tools.push(all_tools_def());
-    tools.extend(remote_memory_tools());
-    tools.extend(session_continuity_tools());
-    tools.extend(fold_tools());
-    tools.extend(entity_tools(&entity_type_enum));
-    tools.extend(feedback_tools());
-    tools.extend(session_lifecycle_tools());
-    tools.extend(cognitive_memory_tools(&entity_type_enum));
-    tools.extend(skills_tools());
-    tools.extend(intention_tools());
-    tools.extend(temporal_fact_tools());
-    tools.extend(graph_traversal_tools());
-    tools.extend(hybrid_search_tools());
-    tools.extend(dream_consolidation_tools());
-    tools.extend(vec![
-        // --- Enrichment pipeline ---
+// --- Enrichment pipeline ---
+fn enrichment_tools() -> Vec<ToolDef> {
+    vec![
         ToolDef {
             name: "enrich_entities".into(),
             description: "Post-ingest enrichment: generates LLM descriptions for code entities, \
@@ -1943,6 +1927,28 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                 "required": []
             }),
         },
+    ]
+}
+
+pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
+    let entity_type_enum: Value = serde_json::json!(entity_types);
+    let mut tools: Vec<ToolDef> = Vec::new();
+    tools.push(all_tools_def());
+    tools.extend(remote_memory_tools());
+    tools.extend(session_continuity_tools());
+    tools.extend(fold_tools());
+    tools.extend(entity_tools(&entity_type_enum));
+    tools.extend(feedback_tools());
+    tools.extend(session_lifecycle_tools());
+    tools.extend(cognitive_memory_tools(&entity_type_enum));
+    tools.extend(skills_tools());
+    tools.extend(intention_tools());
+    tools.extend(temporal_fact_tools());
+    tools.extend(graph_traversal_tools());
+    tools.extend(hybrid_search_tools());
+    tools.extend(dream_consolidation_tools());
+    tools.extend(enrichment_tools());
+    tools.extend(vec![
         // --- Stats tool ---
         ToolDef {
             name: "get_stats".into(),
