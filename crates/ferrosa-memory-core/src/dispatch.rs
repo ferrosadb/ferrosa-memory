@@ -1862,11 +1862,11 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
         // --- Stats tool ---
         ToolDef {
             name: "get_stats".into(),
-            description: "Returns memory system statistics for the session: entity count, fold count, memo count, intention count, and latest consolidation status.\n\nCALL WHEN: For health monitoring, debugging, or when the user asks about memory usage.\nCost: ~5ms (runs count queries).".into(),
+            description: "Returns memory system statistics. By default, entity/node counts and edge counts are tenant-wide; pass session_id to scope both counts to one session.\n\nCALL WHEN: For health monitoring, debugging, or when the user asks about memory usage.\nCost: ~5ms (runs count queries).".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string" }
+                    "session_id": { "type": "string", "description": "Optional session UUID. Omit for tenant-wide stats; pass to scope entity/node and edge counts to this session." }
                 },
                 "required": []
             }),
@@ -9740,13 +9740,19 @@ async fn handle_get_stats<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
-    // Default to the server-owned runtime/default session — this matches what
-    // smart_ingest / hybrid_search / retrieve_entities use after the
-    // SessionStart hook configures fmem. Falling back to nil made live stats
-    // look empty even when the active session had correctly persisted rows.
-    let session_id = optional_uuid(&args, "session_id")?
+    // Default stats are tenant-wide so node/entity counts and edge counts use
+    // the same scope. Passing `session_id` opts into session-scoped stats for
+    // both counts; this keeps the numbers comparable and avoids the previous
+    // misleading mix of session entity_count with tenant edge_count.
+    let explicit_session_id = optional_uuid(&args, "session_id")?;
+    let session_id = explicit_session_id
         .or_else(|| session.effective_default_session_id())
         .unwrap_or(uuid::Uuid::nil());
+    let scope = if explicit_session_id.is_some() {
+        "session"
+    } else {
+        "tenant"
+    };
 
     let memo_count = storage.memo_count(ctx).await.unwrap_or(0);
     let memo_total_hits = storage.memo_total_hits(ctx).await.unwrap_or(0);
@@ -9756,7 +9762,23 @@ async fn handle_get_stats<S: crate::storage::Storage>(
         0.0
     };
 
-    let entity_count = storage.entity_count(ctx, session_id).await.unwrap_or(0);
+    let entity_count = if explicit_session_id.is_some() {
+        storage.entity_count(ctx, session_id).await.unwrap_or(0)
+    } else {
+        storage
+            .entity_count_matching(
+                ctx,
+                crate::types::EntityListQuery {
+                    session_id,
+                    entity_type: None,
+                    filters: serde_json::Map::new(),
+                    scope: crate::types::EntityListScope::All,
+                    limit: 0,
+                },
+            )
+            .await
+            .unwrap_or(0)
+    };
 
     let active_fold_count = storage
         .fold_count_by_status(ctx, crate::types::FoldStatus::Active)
@@ -9772,7 +9794,25 @@ async fn handle_get_stats<S: crate::storage::Storage>(
         .unwrap_or(0);
 
     let temporal_fact_count = storage.temporal_count(ctx).await.unwrap_or(0);
-    let edge_count = storage.edge_count(ctx).await.unwrap_or(0);
+    let edge_count = if explicit_session_id.is_some() {
+        let legacy_edges = storage
+            .edge_list_session(ctx, session_id)
+            .await
+            .map(|edges| edges.len())
+            .unwrap_or(0);
+        let typed_edges = storage
+            .typed_edge_list_session(ctx, session_id)
+            .await
+            .map(|edges| edges.len())
+            .unwrap_or(0);
+        let temporal_edges = storage
+            .temporal_edge_count(ctx, Some(session_id))
+            .await
+            .unwrap_or(0);
+        legacy_edges + typed_edges + temporal_edges
+    } else {
+        storage.edge_count(ctx).await.unwrap_or(0)
+    };
     let intention_count = session.intentions.lock().await.list().len();
     let last_consolidation_status = session
         .last_consolidation_status
@@ -9796,10 +9836,13 @@ async fn handle_get_stats<S: crate::storage::Storage>(
     };
 
     let mut response = serde_json::json!({
+        "scope": scope,
+        "session_id": if explicit_session_id.is_some() { Some(session_id.to_string()) } else { None },
         "memo_count": memo_count,
         "memo_total_hits": memo_total_hits,
         "memo_hit_rate": memo_hit_rate,
         "entity_count": entity_count,
+        "node_count": entity_count,
         "fold_count": active_fold_count + folded_count + archived_fold_count,
         "active_fold_count": active_fold_count,
         "folded_count": folded_count,
@@ -12967,7 +13010,7 @@ mod tests {
     use super::*;
     use crate::storage::Storage;
     use crate::storage::mock::MockStorage;
-    use crate::types::TenantContext;
+    use crate::types::{TenantContext, TypedEdge};
     use uuid::Uuid;
 
     #[test]
@@ -13099,6 +13142,77 @@ mod tests {
             tenant_id: Uuid::new_v4(),
             session_origin: "test".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn stats_defaults_to_tenant_scope_and_session_id_scopes_both_counts() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let session_a = Uuid::new_v4();
+        let session_b = Uuid::new_v4();
+
+        let a1 = test_entity(&ctx, session_a, "a1", "turn", serde_json::json!({}));
+        let a2 = test_entity(&ctx, session_a, "a2", "turn", serde_json::json!({}));
+        let b1 = test_entity(&ctx, session_b, "b1", "turn", serde_json::json!({}));
+        for entity in [&a1, &a2, &b1] {
+            store.entity_put(&ctx, entity).await.unwrap();
+        }
+        for (src, dst, session_id) in [
+            (a1.entity_id, a2.entity_id, session_a),
+            (a1.entity_id, b1.entity_id, session_b),
+        ] {
+            store
+                .typed_edge_put(
+                    &ctx,
+                    &TypedEdge {
+                        tenant_id: ctx.tenant_id,
+                        session_id,
+                        src_id: src,
+                        edge_type: "related_to".into(),
+                        dst_id: dst,
+                        weight: 1.0,
+                        metadata: None,
+                        created_at: chrono::Utc::now(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let tenant = unwrap_tool_result(
+            dispatch(
+                "tools/call",
+                serde_json::json!({"name": "stats", "arguments": {}}),
+                &store,
+                &ctx,
+                &session,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(tenant["scope"], "tenant");
+        assert!(tenant["session_id"].is_null());
+        assert_eq!(tenant["entity_count"], 3);
+        assert_eq!(tenant["node_count"], 3);
+        assert_eq!(tenant["edge_count"], 2);
+
+        let scoped = unwrap_tool_result(
+            dispatch(
+                "tools/call",
+                serde_json::json!({"name": "stats", "arguments": {"session_id": session_a.to_string()}}),
+                &store,
+                &ctx,
+                &session,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(scoped["scope"], "session");
+        assert_eq!(scoped["session_id"], session_a.to_string());
+        assert_eq!(scoped["entity_count"], 2);
+        assert_eq!(scoped["node_count"], 2);
+        assert_eq!(scoped["edge_count"], 1);
     }
 
     // --- Remote teacher/learner dispatch tests ---
