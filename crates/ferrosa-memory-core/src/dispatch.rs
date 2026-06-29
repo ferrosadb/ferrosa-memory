@@ -1085,15 +1085,9 @@ fn fold_tools() -> Vec<ToolDef> {
     ]
 }
 
-pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
-    let entity_type_enum: Value = serde_json::json!(entity_types);
-    let mut tools: Vec<ToolDef> = Vec::new();
-    tools.push(all_tools_def());
-    tools.extend(remote_memory_tools());
-    tools.extend(session_continuity_tools());
-    tools.extend(fold_tools());
-    tools.extend(vec![
-        // --- Entity tools (Sprint 3) ---
+// --- Entity tools (Sprint 3) ---
+fn entity_tools(entity_type_enum: &Value) -> Vec<ToolDef> {
+    vec![
         ToolDef {
             name: "upsert_entity".into(),
             description: "Writes a discovered named entity to the entity store. Deduplicates via phonetic matching.\n\nCALL WHEN: Any time you identify a named entity (person, place, org, event, concept) from content.\nCheck is_new in response: if false, entity already exists — use the returned entity_id to attach new facts.\n\nNote: source_fold_id is optional — omit if not in a fold context.".into(),
@@ -1299,6 +1293,18 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                 "required": []
             }),
         },
+    ]
+}
+
+pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
+    let entity_type_enum: Value = serde_json::json!(entity_types);
+    let mut tools: Vec<ToolDef> = Vec::new();
+    tools.push(all_tools_def());
+    tools.extend(remote_memory_tools());
+    tools.extend(session_continuity_tools());
+    tools.extend(fold_tools());
+    tools.extend(entity_tools(&entity_type_enum));
+    tools.extend(vec![
         // --- Feedback tool (Sprint 3) ---
         ToolDef {
             name: "record_outcome".into(),
