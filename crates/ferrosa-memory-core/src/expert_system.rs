@@ -327,3 +327,199 @@ impl FromStr for ArtifactKind {
         parse_artifact_kind(s)
     }
 }
+
+// ─── Property tests (T-P-002, T-P-003) ────────────────────────────
+//
+// Replaces the former `tests/property/test_expert_system_properties.py`
+// pseudo-property tests (which only grepped this file's source text) with real
+// proptests that drive the actual `reviewer_from_ctx`, `record_approval`,
+// `alias_scope_rank`, and `resolve_alias` functions.
+#[cfg(test)]
+mod property_tests {
+    use super::*;
+    use crate::storage::mock::MockStorage;
+    use proptest::prelude::*;
+
+    fn alias_entry(
+        tenant_id: Uuid,
+        kind: AliasScopeKind,
+        scope_ref: &str,
+        updated_minutes: i64,
+    ) -> AliasEntry {
+        let base = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let updated_at = base + chrono::Duration::minutes(updated_minutes);
+        AliasEntry {
+            tenant_id,
+            alias_id: Uuid::new_v4(),
+            alias_name: "deploy".to_string(),
+            scope_kind: kind,
+            scope_ref: scope_ref.to_string(),
+            canonical_tool: "deploy_tool".to_string(),
+            parameter_map: json!({}),
+            fixed_arguments: json!({}),
+            args_templates: json!({}),
+            status: ClaimStatus::Approved,
+            created_at: base,
+            updated_at,
+        }
+    }
+
+    /// T-P-003 rank ordering, asserted via the real `alias_scope_rank` function.
+    #[test]
+    fn alias_scope_rank_orders_session_over_workspace_over_global() {
+        assert!(
+            alias_scope_rank(AliasScopeKind::Session) > alias_scope_rank(AliasScopeKind::Workspace)
+        );
+        assert!(
+            alias_scope_rank(AliasScopeKind::Workspace) > alias_scope_rank(AliasScopeKind::Global)
+        );
+        assert_eq!(alias_scope_rank(AliasScopeKind::Session), 3);
+        assert_eq!(alias_scope_rank(AliasScopeKind::Workspace), 2);
+        assert_eq!(alias_scope_rank(AliasScopeKind::Global), 1);
+    }
+
+    proptest! {
+        /// T-P-002 "approval replay preserves auth-derived state": `reviewer_from_ctx`
+        /// is a pure function of `ctx.session_origin` — independent of tenant id, of
+        /// any caller-supplied reviewer (there is none), and of the sequence of
+        /// approval decisions recorded against it.
+        #[test]
+        fn reviewer_is_auth_derived_and_replay_invariant(
+            origin in "[a-z:]{0,15}",
+            decisions in prop::collection::vec(0u8..3, 0..6),
+        ) {
+            let ctx = TenantContext {
+                tenant_id: Uuid::new_v4(),
+                session_origin: origin.clone(),
+            };
+            let expected = reviewer_from_ctx(&ctx);
+
+            // Pure in ctx: same session_origin under a different tenant -> same reviewer.
+            let ctx_other_tenant = TenantContext {
+                tenant_id: Uuid::new_v4(),
+                session_origin: origin.clone(),
+            };
+            prop_assert_eq!(reviewer_from_ctx(&ctx_other_tenant), expected.clone());
+
+            // Replay invariance: recording any sequence of decisions never changes
+            // the auth-derived reviewer stamped on each approval.
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let store = MockStorage::new();
+                for (i, tag) in decisions.iter().enumerate() {
+                    let decision = match tag % 3 {
+                        0 => ApprovalDecision::Proposed,
+                        1 => ApprovalDecision::Approved,
+                        _ => ApprovalDecision::Rejected,
+                    };
+                    let entry = record_approval(
+                        &store,
+                        &ctx,
+                        ArtifactKind::Rule,
+                        &format!("rule-{i}"),
+                        decision,
+                        None,
+                        "global".to_string(),
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(entry.reviewer, expected);
+                    // reviewer_from_ctx remains stable across the replay sequence.
+                    assert_eq!(reviewer_from_ctx(&ctx), expected);
+                }
+            });
+        }
+
+        /// T-P-003 "alias scope resolution is deterministic": `resolve_alias` picks
+        /// the same winner regardless of the order aliases are stored in, and that
+        /// winner has the maximum `alias_scope_rank` present (ties broken by newest
+        /// `updated_at`). Exercises the real comparator inside `resolve_alias`.
+        ///
+        /// Every entry is given a unique (scope_kind, scope_ref) so the store's own
+        /// per-scope dedup never fires — what is under test is `resolve_alias`'s
+        /// comparator, not `alias_put` collision handling. Global scopes match
+        /// unconditionally; a single Workspace ("ws") and a single Session
+        /// (session_id) entry can also match, so rank precedence is exercised.
+        #[test]
+        fn resolve_alias_is_permutation_invariant_and_rank_respecting(
+            global_minutes in prop::collection::vec(0i64..5000, 1..6),
+            include_ws in any::<bool>(),
+            ws_minutes in 0i64..5000,
+            include_sess in any::<bool>(),
+            sess_minutes in 0i64..5000,
+        ) {
+            // Distinct updated_at among Global entries -> unique tie-break winner.
+            let mut seen = std::collections::HashSet::new();
+            let global_minutes: Vec<i64> = global_minutes
+                .into_iter()
+                .filter(|m| seen.insert(*m))
+                .collect();
+            prop_assume!(!global_minutes.is_empty());
+
+            let tenant_id = Uuid::new_v4();
+            let session_id = Uuid::new_v4();
+            let mut entries: Vec<AliasEntry> = global_minutes
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    alias_entry(tenant_id, AliasScopeKind::Global, &format!("g{i}"), *m)
+                })
+                .collect();
+            if include_ws {
+                entries.push(alias_entry(tenant_id, AliasScopeKind::Workspace, "ws", ws_minutes));
+            }
+            if include_sess {
+                let sref = session_id.to_string();
+                entries.push(alias_entry(tenant_id, AliasScopeKind::Session, &sref, sess_minutes));
+            }
+
+            // Expected winner derived via the real `alias_scope_rank`: highest rank
+            // present, then newest updated_at.
+            let max_rank = entries
+                .iter()
+                .map(|e| alias_scope_rank(e.scope_kind))
+                .max()
+                .unwrap();
+            let expected = entries
+                .iter()
+                .filter(|e| alias_scope_rank(e.scope_kind) == max_rank)
+                .max_by_key(|e| e.updated_at)
+                .unwrap()
+                .clone();
+
+            let ctx = TenantContext {
+                tenant_id,
+                session_origin: "tester".into(),
+            };
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let (forward, reversed) = rt.block_on(async {
+                let store_a = MockStorage::new();
+                for e in entries.iter() {
+                    store_a.alias_put(&ctx, e).await.unwrap();
+                }
+                let forward = resolve_alias(&store_a, &ctx, "deploy", Some("ws"), Some(session_id))
+                    .await
+                    .unwrap();
+
+                let store_b = MockStorage::new();
+                for e in entries.iter().rev() {
+                    store_b.alias_put(&ctx, e).await.unwrap();
+                }
+                let reversed = resolve_alias(&store_b, &ctx, "deploy", Some("ws"), Some(session_id))
+                    .await
+                    .unwrap();
+                (forward, reversed)
+            });
+
+            let forward = forward.expect("a matching alias must resolve");
+            let reversed = reversed.expect("a matching alias must resolve");
+            // Permutation invariance: identical winner regardless of store order.
+            prop_assert_eq!(forward.alias_id, reversed.alias_id);
+            // Winner respects rank then recency.
+            prop_assert_eq!(forward.alias_id, expected.alias_id);
+            prop_assert_eq!(alias_scope_rank(forward.scope_kind), max_rank);
+        }
+    }
+}

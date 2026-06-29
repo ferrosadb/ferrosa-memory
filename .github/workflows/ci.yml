@@ -231,12 +231,11 @@ jobs:
       - name: Install harness dependencies
         run: python -m pip install -r tests/requirements.txt
       - name: Verify traceability coverage
-        run: python scripts/coverage_gap.py specs/test-specification.md crates/ferrosa-memory-core/tests tests
+        run: python scripts/coverage_gap.py specs/test-specification.md crates/ferrosa-memory-core/src crates/ferrosa-memory-core/tests tests
       - name: Run repo-level pytest harness
         run: |
           pytest tests/integration -v
           pytest tests/system -v
-          pytest tests/property -v
           pytest tests/duration/test_duration_specs.py -v
 
   # Stage 7: Cluster-backed integration tests (--ignored, Docker)

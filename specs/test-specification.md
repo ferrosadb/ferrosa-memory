@@ -464,6 +464,11 @@ When the effective rule loader normalizes them
 Then the resulting evaluation set is deterministic and equivalent across input orderings.
 
 Traceability: `T-P-001`, sources `PLAN-8.1`, `F62`
+Implemented as a real Rust `proptest` against the actual loader:
+`datalog::tests::effective_loader_property::effective_loader_is_permutation_invariant`
+(`crates/ferrosa-memory-core/src/datalog.rs`) — registers approved registry rules
+in generated orders via `MockStorage`, calls `load_effective_rule_entries` twice,
+and asserts the merged builtin+registry effective set is identical.
 
 ### Approval and Claim Invariants
 
@@ -472,6 +477,12 @@ When the authoritative append-only log is replayed
 Then the reconstructed current state matches the table's latest effective view and never invents a reviewer identity.
 
 Traceability: `T-P-002`, sources `PLAN-8.3`, `PLAN-8.4`, `ES-S1`, `ES-R1`
+Implemented as a real Rust `proptest` against the actual functions:
+`expert_system::property_tests::reviewer_is_auth_derived_and_replay_invariant`
+(`crates/ferrosa-memory-core/src/expert_system.rs`) — generates arbitrary
+`session_origin` strings and decision sequences, asserts `reviewer_from_ctx` is a
+pure function of `ctx` and that every `record_approval` stamps the auth-derived
+reviewer regardless of decision-replay history.
 
 ### Alias Determinism
 
@@ -480,6 +491,13 @@ When exact lookup is repeated
 Then the same scope precedence result is returned every time.
 
 Traceability: `T-P-003`, sources `PLAN-8.5`, `F64`
+Implemented as real Rust tests against the actual functions:
+`expert_system::property_tests::alias_scope_rank_orders_session_over_workspace_over_global`
+asserts the `alias_scope_rank` ordering, and the `proptest`
+`expert_system::property_tests::resolve_alias_is_permutation_invariant_and_rank_respecting`
+(`crates/ferrosa-memory-core/src/expert_system.rs`) generates alias sets with
+arbitrary scopes/`updated_at`, resolves them in two store orders via `MockStorage`,
+and asserts `resolve_alias` returns the same rank-then-recency winner.
 
 ### Explanation Shape
 
@@ -488,6 +506,12 @@ When reconstruction succeeds
 Then support steps are ordered, deduplicated, and never exceed the configured maximum depth or support count.
 
 Traceability: `T-P-004`, sources `PLAN-8.6`, `ES-D1`
+Implemented as a real Rust `proptest` against the actual truncation logic:
+`dispatch::explanation_property_tests::explanation_bounds_and_order_are_invariant`
+(`crates/ferrosa-memory-core/src/dispatch.rs`) drives the extracted
+`bounded_explanation` helper (now also used by `handle_explain_derived`) with
+generated provenance depth and limit, asserting the chain is bounded to `limit`,
+`truncated == (depth > limit)`, `fanout` reports the full length, and order is stable.
 
 ## Layer 6: Performance Tests
 
@@ -605,10 +629,10 @@ Traceability: `T-D-003`, sources `PLAN-7.5`, `PLAN-8.9`, `F30`, `F60`
 | T-S-008 | System | Black | Semantic alias browse cannot alter execution | ES-T2, F64 | High | Stub |
 | T-S-009 | System | Black | Serving path boots under least privilege without graph-table MODIFY | PLAN-9.5, PLAN-9.6, F68, TC59 | Critical | Stub |
 | T-S-010 | System | White | Boundary harness finds no serving-path direct graph-table writes | PLAN-9.2, F66, TC57 | Critical | Stub |
-| T-P-001 | Property | White | Effective loader is permutation-invariant | PLAN-8.1, F62 | High | Stub |
-| T-P-002 | Property | White | Approval replay preserves auth-derived state | PLAN-8.3, PLAN-8.4, ES-S1, ES-R1 | High | Stub |
-| T-P-003 | Property | White | Alias scope resolution is deterministic | PLAN-8.5, F64 | Medium | Stub |
-| T-P-004 | Property | White | Explanation ordering and bounds are invariant | PLAN-8.6, ES-D1 | Medium | Stub |
+| T-P-001 | Property | White | Effective loader is permutation-invariant | PLAN-8.1, F62 | High | Implemented (Rust proptest: `datalog::tests::effective_loader_property::effective_loader_is_permutation_invariant`) |
+| T-P-002 | Property | White | Approval replay preserves auth-derived state | PLAN-8.3, PLAN-8.4, ES-S1, ES-R1 | High | Implemented (Rust proptest: `expert_system::property_tests::reviewer_is_auth_derived_and_replay_invariant`) |
+| T-P-003 | Property | White | Alias scope resolution is deterministic | PLAN-8.5, F64 | Medium | Implemented (Rust: `expert_system::property_tests::{alias_scope_rank_orders_session_over_workspace_over_global, resolve_alias_is_permutation_invariant_and_rank_respecting}`) |
+| T-P-004 | Property | White | Explanation ordering and bounds are invariant | PLAN-8.6, ES-D1 | Medium | Implemented (Rust proptest: `dispatch::explanation_property_tests::explanation_bounds_and_order_are_invariant`) |
 | T-PF-001 | Performance | Black | Shared auth/probe overhead stays within envelope | PLAN-7.1, PLAN-7.2, PLAN-7.3 | Medium | Stub |
 | T-PF-002 | Performance | Black | Workbench home loads without blocking on slow views | PLAN-8.9 | Medium | Stub |
 | T-PF-003 | Performance | Black | On-demand explanation stays under latency cap | PLAN-8.6, F65 | High | Stub |
