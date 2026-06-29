@@ -10,6 +10,8 @@
 //! row binds directly to a prepared INSERT (the "dynamic-length parameter list"
 //! limitation only applies to *variable* arity).
 
+#![allow(deprecated)] // legacy scylla deserialization API, as used across the crate
+
 use anyhow::{Context, Result};
 use scylla::frame::response::result::{CqlValue, Row};
 
@@ -78,6 +80,229 @@ pub fn rewrite_derived_cache_endpoints(
         move_col(row, col_map, "rule_id")?,
         move_col(row, col_map, "computed_at")?,
     ))
+}
+
+// ─── Production CQL implementations of the streaming-rewrite I/O traits ──────
+
+use std::collections::HashMap;
+use std::marker::PhantomData;
+use std::pin::Pin;
+
+use futures_util::{Stream, StreamExt};
+use scylla::serialize::row::SerializeRow;
+
+use crate::cql_storage::{CqlSession, build_col_map, cql_get};
+use crate::migration_backfill::{BackfillReport, Checkpoints, Cursor, RowSink, RowStream};
+
+/// Checkpoint store backed by a `migration_backfill_progress` table.
+pub struct CqlCheckpoints<'a> {
+    pub session: &'a CqlSession,
+    pub keyspace: &'a str,
+}
+
+impl Checkpoints for CqlCheckpoints<'_> {
+    async fn load(&self, job: &str) -> Result<Option<Cursor>> {
+        let q = format!(
+            "SELECT cursor FROM {}.migration_backfill_progress WHERE job = ?",
+            self.keyspace
+        );
+        let res = self.session.query_unpaged(q, (job,)).await?;
+        let col_map = build_col_map(res.col_specs());
+        let rows = res.rows_or_empty();
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let cursor: Vec<u8> = cql_get(row, &col_map, "cursor")?;
+        Ok(Some(cursor))
+    }
+
+    async fn save(&self, job: &str, cursor: &[u8]) -> Result<()> {
+        let q = format!(
+            "INSERT INTO {}.migration_backfill_progress (job, cursor, updated_at) VALUES (?, ?, ?)",
+            self.keyspace
+        );
+        self.session
+            .query_unpaged(q, (job, cursor, chrono::Utc::now()))
+            .await?;
+        Ok(())
+    }
+}
+
+/// Boxed row stream so we don't have to name scylla's iterator type. Errors are
+/// normalized to `anyhow` before boxing. Not `Send`: the backfill runs inline in
+/// the (single-threaded) migration path, never spawned.
+type BoxedRows<'a> = Pin<Box<dyn Stream<Item = Result<Row>> + 'a>>;
+
+/// Full-scan streaming SELECT. The driver pages internally — fmem holds one row
+/// at a time, never a page.
+///
+/// Resume is **count-based**: `execute_iter` returns rows in a stable
+/// storage/token order for a given table, so the cursor is simply the number of
+/// rows consumed; resuming re-opens the scan and skips that many. (Token-range
+/// resume — `WHERE token(pk) > ?` — would avoid the re-scan, but ferrosa's CQL
+/// parser does not yet accept `token(<composite pk>)`; see the upstream gap.
+/// Inserts are idempotent upserts, so the skipped re-read is harmless.)
+pub struct CqlRowStream<'a> {
+    session: &'a CqlSession,
+    /// `SELECT <cols> FROM <ks>.<table>` — a full scan, no bind parameters.
+    select_sql: String,
+    /// Rows to skip on (re)open to resume to the checkpointed position.
+    to_skip: u64,
+    /// Absolute rows consumed from the logical stream (incl. skipped) — the cursor.
+    consumed: u64,
+    opened: Option<BoxedRows<'a>>,
+}
+
+impl<'a> CqlRowStream<'a> {
+    pub fn new(session: &'a CqlSession, select_sql: String) -> Self {
+        Self {
+            session,
+            select_sql,
+            to_skip: 0,
+            consumed: 0,
+            opened: None,
+        }
+    }
+}
+
+impl RowStream for CqlRowStream<'_> {
+    type Row = Row;
+
+    async fn seek(&mut self, cursor: Cursor) -> Result<()> {
+        anyhow::ensure!(
+            cursor.len() == 8,
+            "backfill cursor must be an 8-byte row count, got {} bytes",
+            cursor.len()
+        );
+        self.to_skip = u64::from_be_bytes(cursor.as_slice().try_into().unwrap());
+        self.opened = None; // reopen and re-skip on next pull
+        Ok(())
+    }
+
+    async fn next_row(&mut self) -> Result<Option<Row>> {
+        if self.opened.is_none() {
+            let stmt = self.session.prepare(self.select_sql.as_str()).await?;
+            let iter = self.session.execute_iter(stmt, ()).await?;
+            let mut stream: BoxedRows<'_> = Box::pin(iter.map(|r| r.map_err(anyhow::Error::from)));
+            // Skip already-processed rows to resume to the checkpoint.
+            let mut skipped = 0u64;
+            while skipped < self.to_skip {
+                match stream.next().await {
+                    Some(row) => {
+                        row?; // surface a read error rather than silently stop
+                        self.consumed += 1;
+                        skipped += 1;
+                    }
+                    None => break, // source shorter than checkpoint (shrank) — stop
+                }
+            }
+            self.opened = Some(stream);
+        }
+        let stream = self.opened.as_mut().unwrap();
+        match stream.next().await {
+            Some(row) => {
+                let row = row?;
+                self.consumed += 1;
+                Ok(Some(row))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn cursor(&self) -> Option<Cursor> {
+        (self.consumed > 0 || self.to_skip > 0).then(|| self.consumed.to_be_bytes().to_vec())
+    }
+}
+
+/// Per-row INSERT sink. `D` is a fixed-arity tuple of `CqlValue` bound straight
+/// to the prepared INSERT (idempotent upsert — re-running a row is safe).
+pub struct CqlRowSink<'a, D> {
+    session: &'a CqlSession,
+    insert: scylla::prepared_statement::PreparedStatement,
+    _d: PhantomData<D>,
+}
+
+impl<'a, D> CqlRowSink<'a, D> {
+    pub fn new(
+        session: &'a CqlSession,
+        insert: scylla::prepared_statement::PreparedStatement,
+    ) -> Self {
+        Self {
+            session,
+            insert,
+            _d: PhantomData,
+        }
+    }
+}
+
+impl<D: SerializeRow> RowSink for CqlRowSink<'_, D> {
+    type Row = D;
+
+    async fn put(&mut self, row: D) -> Result<()> {
+        self.session.execute_unpaged(&self.insert, row).await?;
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        Ok(()) // nothing buffered; each row is written as it streams
+    }
+}
+
+/// The fixed projection (name → index) for the derived-cache backfill SELECT, so
+/// the tested name-based [`rewrite_derived_cache_endpoints`] transform threads
+/// through without consulting the live result metadata.
+fn derived_cache_projection() -> ColMap {
+    [
+        "tenant_id",
+        "cache_key",
+        "seq",
+        "src_id",
+        "pred",
+        "dst_id",
+        "confidence",
+        "rule_id",
+        "computed_at",
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, name)| (name.to_string(), i))
+    .collect::<HashMap<_, _>>()
+}
+
+/// Backfill `derived_cache_by_query` → `derived_cache_by_query_v2` (uuid → text
+/// endpoints) via the streaming-rewrite primitive. Caller must have created the
+/// v2 table + the `migration_backfill_progress` table and applied grants.
+pub async fn backfill_derived_cache_endpoints(
+    session: &CqlSession,
+    keyspace: &str,
+) -> Result<BackfillReport> {
+    let select_sql = format!(
+        "SELECT tenant_id, cache_key, seq, src_id, pred, dst_id, confidence, rule_id, \
+         computed_at \
+         FROM {keyspace}.derived_cache_by_query"
+    );
+    let insert = session
+        .prepare(format!(
+            "INSERT INTO {keyspace}.derived_cache_by_query_v2 \
+             (tenant_id, cache_key, seq, src_id, pred, dst_id, confidence, rule_id, computed_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ))
+        .await?;
+
+    let mut source = CqlRowStream::new(session, select_sql);
+    let mut sink: CqlRowSink<DerivedCacheV2Row> = CqlRowSink::new(session, insert);
+    let checkpoints = CqlCheckpoints { session, keyspace };
+    let projection = derived_cache_projection();
+
+    crate::migration_backfill::streaming_rewrite(
+        &mut source,
+        &mut sink,
+        &checkpoints,
+        "derived_cache_uuid_to_text",
+        500,
+        move |row| rewrite_derived_cache_endpoints(row, &projection),
+    )
+    .await
 }
 
 #[cfg(test)]
