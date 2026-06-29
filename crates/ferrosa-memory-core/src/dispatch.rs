@@ -202,6 +202,9 @@ pub struct SessionState {
     /// critical degradation) so the agent stops and investigates. The LLM can
     /// toggle this at runtime via the `config` tool.
     pub debug_stop: Arc<AtomicBool>,
+    /// Latest cluster-health snapshot published by the background `HealthMonitor`,
+    /// read by the serving-path `debug_stop` injection (a lock read, never I/O).
+    pub health: Arc<std::sync::Mutex<crate::debug_stop::HealthSnapshot>>,
     /// (tenant_id, session_id) pairs explicitly queued for background
     /// consolidation. The tenant is carried so the background worker runs under
     /// the same tenant that wrote the data (HTTP requests authenticate
@@ -266,6 +269,9 @@ impl Default for SessionState {
             last_activity: Arc::new(tokio::sync::Notify::new()),
             dirty: Arc::new(AtomicBool::new(false)),
             debug_stop: Arc::new(AtomicBool::new(false)),
+            health: Arc::new(std::sync::Mutex::new(
+                crate::debug_stop::HealthSnapshot::default(),
+            )),
             consolidation_queue: Arc::new(Mutex::new(VecDeque::new())),
             smart_ingest_created_since_consolidation: Arc::new(Mutex::new(HashMap::new())),
             last_consolidation_status: Arc::new(Mutex::new(HashMap::new())),
@@ -310,6 +316,12 @@ impl SessionState {
     /// `config` tool so the LLM can turn it on mid-session).
     pub fn set_debug_stop(&self, on: bool) {
         self.debug_stop.store(on, Ordering::Relaxed);
+    }
+
+    /// A copy of the latest cluster-health snapshot (Default until the monitor's
+    /// first probe; a poisoned lock degrades to Default rather than panicking).
+    pub fn health_snapshot(&self) -> crate::debug_stop::HealthSnapshot {
+        self.health.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
     fn set_runtime_session_id(&self, session_id: uuid::Uuid) -> Result<(), (i32, String)> {
@@ -820,6 +832,15 @@ async fn dispatch_tool<S: crate::storage::Storage>(
             );
         }
     }
+
+    // debug_stop (dev-only): when enabled, surface a degraded-cluster alert on
+    // the result (or fail the call on critical degradation) so the agent stops
+    // and investigates instead of building on a broken cluster.
+    let result = crate::debug_stop::apply_debug_stop(
+        result,
+        &session.health_snapshot(),
+        session.debug_stop(),
+    );
 
     // Wrap in MCP CallToolResult format: { content: [{type: "text", text: "..."}] }
     // MCP clients expect this structure; without it, tool output is invisible.
@@ -15358,6 +15379,65 @@ mod tests {
         );
         assert_eq!(off["debug_stop"], false);
         assert!(!session.debug_stop());
+    }
+
+    #[tokio::test]
+    async fn debug_stop_attaches_alert_to_response_when_degraded() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        session.set_debug_stop(true);
+        // 1 of 3 DB nodes unreachable, quorum holds → degraded (warn, still serves).
+        *session.health.lock().unwrap() = crate::debug_stop::HealthSnapshot {
+            db_nodes_up: 2,
+            db_nodes_total: 3,
+            ..Default::default()
+        };
+
+        let res = unwrap_tool_result(
+            dispatch(
+                "tools/call",
+                serde_json::json!({ "name": "config", "arguments": {} }),
+                &store,
+                &ctx,
+                &session,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(res["debug_stop_alert"]["severity"], "degraded");
+        assert!(
+            res["debug_stop_alert"]["degraded"][0]
+                .as_str()
+                .unwrap()
+                .contains("DB nodes unreachable")
+        );
+    }
+
+    #[tokio::test]
+    async fn debug_stop_fails_the_call_when_critical() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        session.set_debug_stop(true);
+        // quorum lost → critical: the call must fail so the agent halts.
+        *session.health.lock().unwrap() = crate::debug_stop::HealthSnapshot {
+            db_nodes_up: 1,
+            db_nodes_total: 3,
+            ..Default::default()
+        };
+
+        let err = dispatch(
+            "tools/call",
+            serde_json::json!({ "name": "config", "arguments": {} }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, crate::debug_stop::DEBUG_STOP_CRITICAL);
+        assert!(err.1.contains("quorum lost"), "{}", err.1);
     }
 
     #[tokio::test]
