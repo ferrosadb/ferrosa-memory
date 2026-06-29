@@ -9385,6 +9385,40 @@ async fn handle_manage_aliases<S: crate::storage::Storage>(
     }
 }
 
+/// Build the bounded explanation JSON for one derived fact.
+///
+/// The provenance chain is truncated to at most `limit` steps, preserving its
+/// original order. `fanout` always reports the full provenance length and
+/// `truncated` is set when the chain exceeded `limit`. Pure and order-stable so
+/// the bounding invariant (T-P-004) can be unit-tested directly.
+fn bounded_explanation(fact: &crate::types::DerivedFact, limit: usize) -> Value {
+    let truncated = fact.provenance.len() > limit;
+    let chain: Vec<Value> = fact
+        .provenance
+        .iter()
+        .take(limit)
+        .map(|step| {
+            serde_json::json!({
+                "parent_src": step.parent_src,
+                "parent_pred": step.parent_pred,
+                "parent_dst": step.parent_dst,
+                "parent_kind": step.parent_kind,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "predicate": fact.pred,
+        "src_id": fact.src_id,
+        "dst_id": fact.dst_id,
+        "rule_id": fact.rule_id,
+        "support_count": fact.support_count,
+        "support_chain": chain,
+        "approval_state": Value::Null,
+        "fanout": fact.provenance.len(),
+        "truncated": truncated,
+    })
+}
+
 async fn handle_explain_derived<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
@@ -9416,33 +9450,7 @@ async fn handle_explain_derived<S: crate::storage::Storage>(
         .iter()
         .filter(|fact| src_id.is_none_or(|src| fact.src_id == src))
         .filter(|fact| dst_id.is_none_or(|dst| fact.dst_id == dst))
-        .map(|fact| {
-            let truncated = fact.provenance.len() > limit;
-            let chain: Vec<Value> = fact
-                .provenance
-                .iter()
-                .take(limit)
-                .map(|step| {
-                    serde_json::json!({
-                        "parent_src": step.parent_src,
-                        "parent_pred": step.parent_pred,
-                        "parent_dst": step.parent_dst,
-                        "parent_kind": step.parent_kind,
-                    })
-                })
-                .collect();
-            serde_json::json!({
-                "predicate": fact.pred,
-                "src_id": fact.src_id,
-                "dst_id": fact.dst_id,
-                "rule_id": fact.rule_id,
-                "support_count": fact.support_count,
-                "support_chain": chain,
-                "approval_state": Value::Null,
-                "fanout": fact.provenance.len(),
-                "truncated": truncated,
-            })
-        })
+        .map(|fact| bounded_explanation(fact, limit))
         .collect();
     let elapsed_ms = start.elapsed().as_millis() as i64;
     let metric_predicate = format!("explain:{predicate}");
@@ -17383,5 +17391,68 @@ mod speculative_tests {
             "timeout should include an actionable readiness probe: {}",
             err.1
         );
+    }
+}
+
+// ─── Property tests (T-P-004) ─────────────────────────────────────
+//
+// Replaces the former `tests/property/test_expert_system_properties.py`
+// pseudo-property test (which only grepped this file's source text) with a
+// real proptest that drives the actual `bounded_explanation` truncation logic.
+#[cfg(test)]
+mod explanation_property_tests {
+    use super::*;
+    use crate::types::{DerivedFact, ProvenanceStep};
+    use proptest::prelude::*;
+
+    fn fact_with_provenance(depth: usize) -> DerivedFact {
+        let provenance = (0..depth)
+            .map(|i| ProvenanceStep {
+                parent_src: format!("src-{i}"),
+                parent_pred: format!("pred-{i}"),
+                parent_dst: format!("dst-{i}"),
+                parent_kind: format!("kind-{i}"),
+            })
+            .collect();
+        DerivedFact {
+            src_id: "root-src".to_string(),
+            pred: "related".to_string(),
+            dst_id: "root-dst".to_string(),
+            confidence: 1.0,
+            rule_id: "rule-1".to_string(),
+            support_count: depth as i32,
+            provenance,
+        }
+    }
+
+    proptest! {
+        /// T-P-004 "explanation ordering and bounds are invariant": for any
+        /// provenance depth and limit, `bounded_explanation` bounds the chain to
+        /// `limit`, sets `truncated` iff the chain exceeded `limit`, reports the
+        /// full fan-out, and preserves provenance order.
+        #[test]
+        fn explanation_bounds_and_order_are_invariant(
+            depth in 0usize..50,
+            limit in 1usize..64,
+        ) {
+            let fact = fact_with_provenance(depth);
+            let value = bounded_explanation(&fact, limit);
+
+            // fanout always reflects the full, untruncated provenance length.
+            prop_assert_eq!(value["fanout"].as_u64().unwrap() as usize, depth);
+            // truncated iff provenance exceeded the limit.
+            prop_assert_eq!(value["truncated"].as_bool().unwrap(), depth > limit);
+
+            // chain bounded to min(depth, limit).
+            let chain = value["support_chain"].as_array().unwrap();
+            let expected_len = depth.min(limit);
+            prop_assert_eq!(chain.len(), expected_len);
+
+            // ordering is stable: chain[i] is provenance[i].
+            for (i, step) in chain.iter().enumerate() {
+                prop_assert_eq!(step["parent_src"].as_str().unwrap(), format!("src-{i}"));
+                prop_assert_eq!(step["parent_pred"].as_str().unwrap(), format!("pred-{i}"));
+            }
+        }
     }
 }

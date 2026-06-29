@@ -2789,4 +2789,124 @@ mod tests {
         let any = derived.get("avoid_action").map(|v| v.len()).unwrap_or(0);
         assert_eq!(any, 1, "v1 single-atom aggregate must still fire");
     }
+
+    // ── Property test (T-P-001) ───────────────────────────────────
+    //
+    // Replaces the former `tests/property/test_expert_system_properties.py`
+    // pseudo-property test (which only grepped this file's source text) with a
+    // real proptest that drives the actual `load_effective_rule_entries` loader
+    // against MockStorage.
+    mod effective_loader_property {
+        use super::*;
+        use crate::storage::mock::MockStorage;
+        use crate::types::{ApprovalDecision, ApprovalEntry, ArtifactKind};
+        use proptest::prelude::*;
+
+        async fn register_approved_rule(store: &MockStorage, ctx: &TenantContext, rule_id: &str) {
+            let now = chrono::Utc::now();
+            store
+                .rule_put(
+                    ctx,
+                    &RuleEntry {
+                        tenant_id: ctx.tenant_id,
+                        rule_id: rule_id.to_string(),
+                        version: 1,
+                        name: rule_id.to_string(),
+                        family: "registry_fam".to_string(),
+                        state: RuleState::Active,
+                        rule_body: "registered(X) :- node(X).".to_string(),
+                        rule_weight: 1.0,
+                        incremental: false,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                )
+                .await
+                .unwrap();
+            // The loader only surfaces a registry rule once it is approved.
+            store
+                .approval_append(
+                    ctx,
+                    &ApprovalEntry {
+                        tenant_id: ctx.tenant_id,
+                        approval_id: Uuid::now_v7(),
+                        artifact_kind: ArtifactKind::Rule,
+                        artifact_ref: rule_id.to_string(),
+                        decision: ApprovalDecision::Approved,
+                        review_note: None,
+                        reviewer: "tester".to_string(),
+                        scope: "global".to_string(),
+                        workspace_scope: None,
+                        session_scope: None,
+                        mirror_entity_id: crate::expert_system::approval_mirror_entity_id(
+                            ArtifactKind::Rule,
+                            rule_id,
+                        ),
+                        created_at: now,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        /// Collect the effective rule set as an order-independent, comparable key:
+        /// (rule_id, is_registry) pairs, sorted.
+        fn effective_key(entries: &[EffectiveRuleEntry]) -> Vec<(String, bool)> {
+            let mut key: Vec<(String, bool)> = entries
+                .iter()
+                .map(|e| {
+                    (
+                        e.entry.rule_id.clone(),
+                        matches!(e.source, RuleSource::Registry),
+                    )
+                })
+                .collect();
+            key.sort();
+            key
+        }
+
+        proptest! {
+            /// T-P-001 "effective loader is permutation-invariant": registering the
+            /// same registry rules in two different orders yields an identical
+            /// merged (builtin + registry) effective rule set.
+            #[test]
+            fn effective_loader_is_permutation_invariant(ids in prop::collection::vec(0u32..32, 1..8)) {
+                // Distinct, stable rule ids regardless of generated duplicates.
+                let mut unique: Vec<u32> = ids.clone();
+                unique.sort_unstable();
+                unique.dedup();
+                let rule_ids: Vec<String> = unique.iter().map(|i| format!("reg-rule-{i}")).collect();
+
+                // Same tenant -> identical synthetic builtins across both runs.
+                let tenant_id = Uuid::new_v4();
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let (forward, reversed) = rt.block_on(async {
+                    let ctx = TenantContext {
+                        tenant_id,
+                        session_origin: "tester".into(),
+                    };
+
+                    let store_a = MockStorage::new();
+                    for id in rule_ids.iter() {
+                        register_approved_rule(&store_a, &ctx, id).await;
+                    }
+                    let forward = load_effective_rule_entries(&store_a, &ctx, None)
+                        .await
+                        .unwrap();
+
+                    let store_b = MockStorage::new();
+                    for id in rule_ids.iter().rev() {
+                        register_approved_rule(&store_b, &ctx, id).await;
+                    }
+                    let reversed = load_effective_rule_entries(&store_b, &ctx, None)
+                        .await
+                        .unwrap();
+
+                    (effective_key(&forward), effective_key(&reversed))
+                });
+
+                prop_assert_eq!(forward, reversed);
+            }
+        }
+    }
 }
