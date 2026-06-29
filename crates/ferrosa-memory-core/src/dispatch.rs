@@ -19085,6 +19085,35 @@ mod speculative_tests {
         assert_eq!(source, "derived_from_session_id");
     }
 
+    /// Characterization snapshot of the full tool catalog. Guards the
+    /// behavior-preserving `tool_definitions` decomposition: the serialized
+    /// catalog must stay byte-identical as the giant function is split into
+    /// per-family builders. Regenerate intentionally with `UPDATE_SNAPSHOTS=1`
+    /// (only when a tool schema is deliberately changed).
+    #[test]
+    fn tool_definitions_catalog_snapshot() {
+        let sample = [
+            "person".to_string(),
+            "place".to_string(),
+            "organization".to_string(),
+        ];
+        let actual = serde_json::to_string_pretty(&tool_definitions(&sample)).unwrap() + "\n";
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/snapshots/tool_definitions_catalog.json"
+        );
+        if std::env::var("UPDATE_SNAPSHOTS").is_ok() {
+            std::fs::create_dir_all(std::path::Path::new(path).parent().unwrap()).unwrap();
+            std::fs::write(path, &actual).unwrap();
+        }
+        let expected = std::fs::read_to_string(path).unwrap_or_default();
+        assert_eq!(
+            actual, expected,
+            "tool_definitions catalog changed — the refactor must be behavior-preserving. \
+             If a schema change is intentional, regenerate with UPDATE_SNAPSHOTS=1."
+        );
+    }
+
     #[test]
     fn resolve_session_id_passes_through_valid_uuid() {
         let default_sid = Uuid::new_v4();
