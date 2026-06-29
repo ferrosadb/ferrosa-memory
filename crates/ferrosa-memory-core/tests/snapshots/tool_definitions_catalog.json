@@ -1769,6 +1769,10 @@
           "maxLength": 2048,
           "type": "string"
         },
+        "debug_stop": {
+          "description": "Hidden dev toggle. When true, tool responses carry a degraded-cluster alert (and fail on critical degradation) so you STOP and investigate instead of building on a broken cluster. Leave unset in normal use.",
+          "type": "boolean"
+        },
         "default_limit": {
           "description": "Alias for retrieval_limit.",
           "maximum": 50,

@@ -12,10 +12,15 @@
 //! When `debug_stop` is unset, [`evaluate`] returns `None` and behavior is
 //! unchanged — this is a dev-only affordance, silent in production.
 //!
-//! This module is the pure severity policy; detection (counting reachable DB
-//! nodes, probing providers) and response injection live at the call sites.
+//! This module owns the pure severity policy ([`evaluate`]), the serving-path
+//! injection ([`apply_debug_stop`]), and a background TCP-reachability monitor
+//! ([`HealthMonitor`]) that publishes the snapshot the serving path reads.
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::Serialize;
+use serde_json::Value;
 
 /// Last-known health of a single monitored component.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,9 +131,154 @@ pub fn evaluate(snap: &HealthSnapshot, debug_stop: bool) -> Option<DebugStopAler
     })
 }
 
+/// JSON-RPC error code returned when `debug_stop` fails a call on critical
+/// degradation. Distinct from generic internal errors so clients can recognize it.
+pub const DEBUG_STOP_CRITICAL: i32 = -32010;
+
+/// Apply `debug_stop` to a tool result given the current `snapshot`.
+///
+/// - off / everything healthy → the result is returned unchanged.
+/// - **critical** (quorum lost / configured provider down) → the call **fails**
+///   (`Err`) so the agent halts, regardless of the tool's own outcome.
+/// - **degraded but serving** → a `debug_stop_alert` is attached to a successful
+///   object result (non-object results are wrapped under `result`); an already
+///   failing call is left as-is.
+pub fn apply_debug_stop(
+    result: Result<Value, (i32, String)>,
+    snapshot: &HealthSnapshot,
+    debug_stop: bool,
+) -> Result<Value, (i32, String)> {
+    let Some(alert) = evaluate(snapshot, debug_stop) else {
+        return result;
+    };
+    let summary = alert.degraded.join("; ");
+    if alert.is_critical() {
+        return Err((
+            DEBUG_STOP_CRITICAL,
+            format!(
+                "debug_stop: cluster critically degraded — {summary}. {}",
+                alert.action
+            ),
+        ));
+    }
+    result.map(|mut value| {
+        let alert_json = serde_json::to_value(&alert).unwrap_or(Value::Null);
+        match value.as_object_mut() {
+            Some(obj) => {
+                obj.insert("debug_stop_alert".to_string(), alert_json);
+            }
+            None => {
+                value = serde_json::json!({ "result": value, "debug_stop_alert": alert_json });
+            }
+        }
+        value
+    })
+}
+
+/// Background reachability monitor. Periodically TCP-probes the configured DB
+/// nodes and external providers and publishes a [`HealthSnapshot`] read by
+/// [`apply_debug_stop`] on the serving path — so the per-call cost is a lock
+/// read, never network I/O.
+///
+/// TCP-reachability is a deliberately coarse but **honest** signal: it confirms
+/// the port answers, not that the component is fully healthy. We never fabricate
+/// health — until the first probe completes the snapshot is `Default` (no nodes,
+/// no providers), which [`evaluate`] treats as "nothing monitored yet" rather
+/// than a false all-clear or a false alarm.
+pub struct HealthMonitor {
+    db_endpoints: Vec<String>,
+    embedding: Option<String>,
+    reranker: Option<String>,
+    snapshot: Arc<Mutex<HealthSnapshot>>,
+}
+
+impl HealthMonitor {
+    pub fn new(
+        db_endpoints: Vec<String>,
+        embedding: Option<String>,
+        reranker: Option<String>,
+        snapshot: Arc<Mutex<HealthSnapshot>>,
+    ) -> Self {
+        Self {
+            db_endpoints,
+            embedding,
+            reranker,
+            snapshot,
+        }
+    }
+
+    /// Probe every component once and publish the resulting snapshot.
+    pub async fn probe_once(&self) {
+        let mut up = 0usize;
+        for ep in &self.db_endpoints {
+            if tcp_reachable(ep).await {
+                up += 1;
+            }
+        }
+        let embedding = match &self.embedding {
+            Some(ep) => Some(health_of(ep).await),
+            None => None,
+        };
+        let reranker = match &self.reranker {
+            Some(ep) => Some(health_of(ep).await),
+            None => None,
+        };
+        let next = HealthSnapshot {
+            db_nodes_up: up,
+            db_nodes_total: self.db_endpoints.len(),
+            embedding,
+            reranker,
+        };
+        if let Ok(mut guard) = self.snapshot.lock() {
+            *guard = next;
+        }
+    }
+
+    /// Probe forever at `interval`; spawn on the runtime at startup.
+    pub async fn run(self, interval: Duration) {
+        loop {
+            self.probe_once().await;
+            tokio::time::sleep(interval).await;
+        }
+    }
+}
+
+async fn health_of(host_port: &str) -> Health {
+    if tcp_reachable(host_port).await {
+        Health::Up
+    } else {
+        Health::Down
+    }
+}
+
+async fn tcp_reachable(host_port: &str) -> bool {
+    matches!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::net::TcpStream::connect(host_port),
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
+/// Extract a `host:port` authority from a URL (or bare authority). Returns `None`
+/// when no explicit port is present — we don't guess a port across schemes, and
+/// an unprobable endpoint is left unmonitored rather than faked.
+pub fn endpoint_authority(url: &str) -> Option<String> {
+    let s = url.trim();
+    let s = s
+        .strip_prefix("http://")
+        .or_else(|| s.strip_prefix("https://"))
+        .unwrap_or(s);
+    let authority = s.split('/').next().unwrap_or(s);
+    authority.contains(':').then(|| authority.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn snap(up: usize, total: usize) -> HealthSnapshot {
         HealthSnapshot {
@@ -193,5 +343,90 @@ mod tests {
         assert_eq!(a.degraded.len(), 2);
         assert!(a.degraded.iter().any(|d| d.contains("quorum lost")));
         assert!(a.degraded.iter().any(|d| d.contains("reranker")));
+    }
+
+    #[test]
+    fn apply_is_passthrough_when_off_or_healthy() {
+        // off: returns the result untouched even with a dead cluster.
+        let mut dead = snap(0, 3);
+        dead.embedding = Some(Health::Down);
+        let r = apply_debug_stop(Ok(json!({"x": 1})), &dead, false).unwrap();
+        assert_eq!(r, json!({"x": 1}));
+        // on but healthy: also untouched.
+        let r = apply_debug_stop(Ok(json!({"x": 1})), &snap(3, 3), true).unwrap();
+        assert_eq!(r, json!({"x": 1}));
+    }
+
+    #[test]
+    fn apply_attaches_alert_on_degraded() {
+        let r = apply_debug_stop(Ok(json!({"x": 1})), &snap(2, 3), true).unwrap();
+        assert_eq!(r["x"], 1, "tool result preserved");
+        assert_eq!(r["debug_stop_alert"]["severity"], "degraded");
+        assert_eq!(r["debug_stop_alert"]["action"], "STOP and investigate");
+    }
+
+    #[test]
+    fn apply_wraps_non_object_result_on_degraded() {
+        let r = apply_debug_stop(Ok(json!([1, 2, 3])), &snap(2, 3), true).unwrap();
+        assert_eq!(r["result"], json!([1, 2, 3]));
+        assert_eq!(r["debug_stop_alert"]["severity"], "degraded");
+    }
+
+    #[test]
+    fn apply_fails_loud_on_critical() {
+        let (code, msg) = apply_debug_stop(Ok(json!({"x": 1})), &snap(1, 3), true).unwrap_err();
+        assert_eq!(code, DEBUG_STOP_CRITICAL);
+        assert!(msg.contains("quorum lost"), "{msg}");
+        assert!(msg.contains("STOP and investigate"), "{msg}");
+    }
+
+    #[test]
+    fn endpoint_authority_parses_url_and_requires_port() {
+        assert_eq!(
+            endpoint_authority("http://127.0.0.1:11434"),
+            Some("127.0.0.1:11434".to_string())
+        );
+        assert_eq!(
+            endpoint_authority("https://host:1234/v1/embeddings"),
+            Some("host:1234".to_string())
+        );
+        assert_eq!(
+            endpoint_authority("localhost:19042"),
+            Some("localhost:19042".to_string())
+        );
+        // no explicit port → unprobable → not monitored (never guessed).
+        assert_eq!(endpoint_authority("http://example.com"), None);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the live 3-node dev cluster on 19042-19044"]
+    async fn monitor_probes_live_cluster_reachability() {
+        let snapshot = Arc::new(Mutex::new(HealthSnapshot::default()));
+        let monitor = HealthMonitor::new(
+            vec![
+                "127.0.0.1:19042".to_string(),
+                "127.0.0.1:19043".to_string(),
+                "127.0.0.1:19044".to_string(),
+            ],
+            // a port that nothing listens on → must read as Down (honest, not faked)
+            Some("127.0.0.1:1".to_string()),
+            None,
+            Arc::clone(&snapshot),
+        );
+        monitor.probe_once().await;
+        let s = snapshot.lock().unwrap().clone();
+        assert_eq!(s.db_nodes_total, 3);
+        assert_eq!(s.db_nodes_up, 3, "all 3 dev nodes should be reachable");
+        assert!(s.quorum());
+        assert_eq!(
+            s.embedding,
+            Some(Health::Down),
+            "unbound port reads as Down"
+        );
+        // With a configured provider down, evaluate must be Critical.
+        assert_eq!(
+            evaluate(&s, true).map(|a| a.severity),
+            Some(Severity::Critical)
+        );
     }
 }
