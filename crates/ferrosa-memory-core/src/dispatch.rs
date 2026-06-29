@@ -2222,6 +2222,31 @@ fn recursive_exploration_tools() -> Vec<ToolDef> {
     ]
 }
 
+// --- Datalog query ---
+fn datalog_query_tools() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "query_derived".into(),
+            description: "Query Datalog-derived facts with provenance.\n\n\
+                CALL WHEN:\n\
+                - You need to explain why entity A relates to entity B\n\
+                - You want transitive closure (related, reachable, isa)\n\
+                - You need derived facts with explanation chains\n\n\
+                DO NOT CALL:\n\
+                - For raw entity retrieval (use retrieve_entities)\n\n\
+                Cost: Cache hit is free. Cache miss computes Datalog evaluation.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Session UUID" },
+                    "predicate": { "type": "string", "description": "Derived predicate to query (e.g., 'related', 'reachable', 'isa', 'cluster')" }
+                },
+                "required": ["predicate"]
+            }),
+        },
+    ]
+}
+
 pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
     let entity_type_enum: Value = serde_json::json!(entity_types);
     let mut tools: Vec<ToolDef> = Vec::new();
@@ -2248,27 +2273,8 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
     tools.extend(spreading_activation_tools());
     tools.extend(duplicate_detection_tools());
     tools.extend(recursive_exploration_tools());
+    tools.extend(datalog_query_tools());
     tools.extend(vec![
-        // --- Datalog query ---
-        ToolDef {
-            name: "query_derived".into(),
-            description: "Query Datalog-derived facts with provenance.\n\n\
-                CALL WHEN:\n\
-                - You need to explain why entity A relates to entity B\n\
-                - You want transitive closure (related, reachable, isa)\n\
-                - You need derived facts with explanation chains\n\n\
-                DO NOT CALL:\n\
-                - For raw entity retrieval (use retrieve_entities)\n\n\
-                Cost: Cache hit is free. Cache miss computes Datalog evaluation.".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "session_id": { "type": "string", "description": "Session UUID" },
-                    "predicate": { "type": "string", "description": "Derived predicate to query (e.g., 'related', 'reachable', 'isa', 'cluster')" }
-                },
-                "required": ["predicate"]
-            }),
-        },
         // --- Datalog rule management ---
         ToolDef {
             name: "manage_rules".into(),
