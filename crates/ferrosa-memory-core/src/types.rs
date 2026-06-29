@@ -991,6 +991,19 @@ pub struct DerivedFact {
     pub provenance: Vec<ProvenanceStep>,
 }
 
+impl DerivedFact {
+    /// True iff both endpoints parse as UUIDs.
+    ///
+    /// The Datalog engine legitimately derives taxonomy facts whose object is an
+    /// entity *type* string rather than an entity UUID — e.g.
+    /// `isa(<entity-uuid>, "conversation_turn")`. The `derived_cache_by_query`
+    /// table is UUID-keyed, so only UUID↔UUID facts can be cached there; callers
+    /// use this to skip the rest instead of failing the whole batch (issue #129).
+    pub fn has_uuid_endpoints(&self) -> bool {
+        Uuid::parse_str(&self.src_id).is_ok() && Uuid::parse_str(&self.dst_id).is_ok()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvenanceStep {
     pub parent_src: String,
