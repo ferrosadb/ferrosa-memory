@@ -2076,6 +2076,24 @@ fn memory_state_tools() -> Vec<ToolDef> {
     ]
 }
 
+// --- Importance scoring ---
+fn importance_scoring_tools() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "importance_score".into(),
+            description: "Computes a 4-channel importance score for a memory entity: novelty (how surprising), arousal (emotional intensity), reward (past retrieval success), attention (recency/frequency).\n\nCALL WHEN: Prioritizing which memories to surface, deciding whether to consolidate or prune, or ranking retrieval results by relevance.\nRETURNS: Per-channel scores (0-1) and a weighted composite score.\nCost: ~5ms.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "entity_id": { "type": "string", "format": "uuid" }
+                },
+                "required": ["entity_id"]
+            }),
+        },
+    ]
+}
+
 pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
     let entity_type_enum: Value = serde_json::json!(entity_types);
     let mut tools: Vec<ToolDef> = Vec::new();
@@ -2096,20 +2114,8 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
     tools.extend(enrichment_tools());
     tools.extend(stats_tools());
     tools.extend(memory_state_tools());
+    tools.extend(importance_scoring_tools());
     tools.extend(vec![
-        // --- Importance scoring ---
-        ToolDef {
-            name: "importance_score".into(),
-            description: "Computes a 4-channel importance score for a memory entity: novelty (how surprising), arousal (emotional intensity), reward (past retrieval success), attention (recency/frequency).\n\nCALL WHEN: Prioritizing which memories to surface, deciding whether to consolidate or prune, or ranking retrieval results by relevance.\nRETURNS: Per-channel scores (0-1) and a weighted composite score.\nCost: ~5ms.".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "session_id": { "type": "string" },
-                    "entity_id": { "type": "string", "format": "uuid" }
-                },
-                "required": ["entity_id"]
-            }),
-        },
         // --- Memory chains ---
         ToolDef {
             name: "find_memory_chain".into(),
