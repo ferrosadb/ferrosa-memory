@@ -136,19 +136,15 @@ async fn seed_minimal_fixture(tenant_id: Uuid, session_origin: &str) -> (Uuid, U
     (ctx.tenant_id, session_id, a, b)
 }
 
-#[tokio::test]
-#[ignore = "requires live Ferrosa cluster; run with --ignored and FERROSA_TEST_CONTAINERS=1"]
-async fn derived_cache_count_streams_past_one_hundred_thousand_live_rows() {
-    if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
-        eprintln!(
-            "set FERROSA_TEST_CONTAINERS=1 and run `podman compose up -d` in \
-             /Users/bkearns/src/ferrosa-suite/ferrosa-memory before this live test"
-        );
-        return;
-    }
-
+/// Seed `rows` rows for a fresh tenant (spread across many
+/// `derived_cache_by_query` partitions) and assert that `derived_cache_count`
+/// (the streaming `COUNT(*)`) returns every row — i.e. the tenant-wide scan
+/// streams *past* the `DEFAULT_RANGE_READ_LIMIT` (10_000) page/cap boundary
+/// without OOMing or silently truncating (regression for ferrosa #229/#230).
+/// Seeding >10k rows is inherently heavy, so this lives in the duration/nightly
+/// suite (FERROSA_HEAVY_TESTS=1), not the timeout-bound cluster-gated job.
+async fn assert_derived_cache_count_streams_past_cap(rows: usize) {
     init_test_tracing();
-    const BOUNDARY_ROWS: usize = 100_001;
 
     let cfg = local_cluster_config();
     let storage = CqlStorage::connect(&cfg)
@@ -168,17 +164,39 @@ async fn derived_cache_count_streams_past_one_hundred_thousand_live_rows() {
                   (tenant_id, cache_key, seq, src_id, pred, dst_id, confidence, rule_id, computed_at) \
                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
-    stream::iter(0..BOUNDARY_ROWS)
-        .for_each_concurrent(128, |seq| {
+    // Spread rows across many partitions (distinct cache_keys) so the seed is
+    // fast. Piling all rows onto ONE (tenant_id, cache_key) partition serializes
+    // every write through a single Raft leader on slow CI disk — it grinds for
+    // tens of minutes (and a batched write to it blows the 30s deadline:
+    // RequestTimeout / "Raft lane timeout"). `derived_cache_count` is
+    // tenant-scoped and the verification SELECT below filters only by
+    // `tenant_id`, so the count still spans every partition and the COUNT(*) scan
+    // still crosses the 10k read cap — the regression is unchanged, just seeded
+    // across partitions instead of one hot one.
+    const PARTITIONS: usize = 64;
+    let prepared = raw
+        .prepare(insert)
+        .await
+        .expect("prepare derived_cache insert");
+    let writes: Vec<(String, i32)> = (0..rows)
+        .map(|i| {
+            (
+                format!("{cache_key}:{}", i % PARTITIONS),
+                (i / PARTITIONS) as i32,
+            )
+        })
+        .collect();
+    stream::iter(writes)
+        .for_each_concurrent(128, |(partition_key, seq)| {
             let raw = Arc::clone(&raw);
-            let cache_key = cache_key.clone();
+            let prepared = prepared.clone();
             async move {
-                raw.query_unpaged(
-                    insert,
+                raw.execute_unpaged(
+                    &prepared,
                     (
                         tenant_id,
-                        cache_key,
-                        seq as i32,
+                        partition_key,
+                        seq,
                         src_id,
                         "boundary",
                         dst_id,
@@ -211,13 +229,30 @@ async fn derived_cache_count_streams_past_one_hundred_thousand_live_rows() {
     }
 
     assert!(
-        raw_count >= BOUNDARY_ROWS,
-        "live fixture must exercise the historical 100k page/cap boundary; raw_count={raw_count}"
+        raw_count >= rows,
+        "live fixture must seed every row past the read cap; rows={rows} raw_count={raw_count}"
     );
     assert_eq!(
         storage_count, raw_count,
         "derived_cache_count must stream every CQL page, not report a rounded cap"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires live Ferrosa cluster; run with --ignored and FERROSA_TEST_CONTAINERS=1"]
+async fn derived_cache_count_streams_past_one_hundred_thousand_live_rows() {
+    if std::env::var("FERROSA_TEST_CONTAINERS").ok().as_deref() != Some("1") {
+        eprintln!("set FERROSA_TEST_CONTAINERS=1 and bring up the cluster before this live test");
+        return;
+    }
+    // Heavy 100k-scale variant. Excluded from the timeout-bound cluster-gated CI
+    // job (it dominated the ~55-min budget); run it in the duration/nightly suite
+    // with FERROSA_HEAVY_TESTS=1.
+    if std::env::var("FERROSA_HEAVY_TESTS").ok().as_deref() != Some("1") {
+        eprintln!("skipping 100k heavy count-boundary test; set FERROSA_HEAVY_TESTS=1 to run it");
+        return;
+    }
+    assert_derived_cache_count_streams_past_cap(100_001).await;
 }
 
 #[tokio::test]
@@ -485,7 +520,9 @@ async fn viz_streaming_queries_return_live_nodes_and_edges() {
 
     // entity_stream_all and typed_edge_stream_all bind ctx.tenant_id, so
     // the fixture's rows MUST live under the same tenant the test reads.
-    let viz_tenant = Uuid::parse_str("9a5f8fbf-d842-4d30-8ea5-1aa931e618a8").unwrap();
+    // Arbitrary fixed test tenant — must NOT be a real local tenant ID (those
+    // are secrets kept only in gitignored local config, never in source).
+    let viz_tenant = Uuid::parse_str("aaaa0000-0000-4000-8000-0000000000a1").unwrap();
     let (_, _, seed_a, seed_b) = seed_minimal_fixture(viz_tenant, "viz-stream-live-test").await;
 
     let storage = Arc::new(
