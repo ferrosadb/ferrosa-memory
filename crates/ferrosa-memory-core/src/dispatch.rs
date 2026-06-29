@@ -1439,19 +1439,9 @@ fn cognitive_memory_tools(entity_type_enum: &Value) -> Vec<ToolDef> {
     ]
 }
 
-pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
-    let entity_type_enum: Value = serde_json::json!(entity_types);
-    let mut tools: Vec<ToolDef> = Vec::new();
-    tools.push(all_tools_def());
-    tools.extend(remote_memory_tools());
-    tools.extend(session_continuity_tools());
-    tools.extend(fold_tools());
-    tools.extend(entity_tools(&entity_type_enum));
-    tools.extend(feedback_tools());
-    tools.extend(session_lifecycle_tools());
-    tools.extend(cognitive_memory_tools(&entity_type_enum));
-    tools.extend(vec![
-        // --- Skills layer ---
+// --- Skills layer ---
+fn skills_tools() -> Vec<ToolDef> {
+    vec![
         ToolDef {
             name: "ingest_skill".into(),
             description: "Ingest a methodology into the global skill catalog. Skills are shared across all sessions and tenants' queries.\n\nCALL WHEN: You encounter or refine a reusable methodology — TDD, STRIDE threat modeling, debugging process, refactoring pattern, etc.\n\nThe server generates the version (YYYYMMDDNN) — do not pass it. Pass content_hash for idempotent re-ingest; re-running with an unchanged hash is a no-op.\n\nSkills are stored with entity_type='skill', scope='global'. Category and additional tags become tag entities + TAGGED_AS edges. Prerequisites become REQUIRES edges. If a prerequisite skill doesn't exist yet, its name is recorded in `missing_prerequisites` on the response — the skill itself still lands. Either ingest the missing prereqs and re-run this skill, or accept the partial graph.\n\nTAG NORMALIZATION: category and tags are normalized to lowercase, alphanumeric + dash only. Any other character (including underscore, space, slash) becomes `-`; consecutive dashes collapse and leading/trailing dashes are stripped. Example: 'Chaos Engineering' → 'chaos-engineering', 'unit_testing' → 'unit-testing', 'foo/bar/baz' → 'foo-bar-baz'. Use the same normalized form when calling retrieve_skills_for_context or ensure_parent_tag.\n\nLEARN AND REFINE: If you use a skill and discover a better step, a missing prerequisite, or a clearer description, call ingest_skill again to refine it. Your changes persist across all sessions.\nCost: ~20ms + one embed call for description.".into(),
@@ -1537,6 +1527,22 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                 "required": ["skill_name"]
             }),
         },
+    ]
+}
+
+pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
+    let entity_type_enum: Value = serde_json::json!(entity_types);
+    let mut tools: Vec<ToolDef> = Vec::new();
+    tools.push(all_tools_def());
+    tools.extend(remote_memory_tools());
+    tools.extend(session_continuity_tools());
+    tools.extend(fold_tools());
+    tools.extend(entity_tools(&entity_type_enum));
+    tools.extend(feedback_tools());
+    tools.extend(session_lifecycle_tools());
+    tools.extend(cognitive_memory_tools(&entity_type_enum));
+    tools.extend(skills_tools());
+    tools.extend(vec![
         // --- Intention tools (prospective memory, repo-scoped) ---
         ToolDef {
             name: "set_intention".into(),
