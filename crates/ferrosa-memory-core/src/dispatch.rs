@@ -2143,6 +2143,32 @@ fn speculative_retrieval_tools() -> Vec<ToolDef> {
     ]
 }
 
+// --- Spreading activation ---
+fn spreading_activation_tools() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "spread_activation".into(),
+            description: "Spreading activation search (Collins & Loftus). Propagates activation energy from seed entities through the knowledge graph, decaying at each hop. Returns the most activated non-seed entities.\n\nCALL WHEN: You have one or more known entities and want to discover related entities through graph structure — especially when semantic search alone misses structural relationships.\nPair with retrieve_entities for seeds, then spread to find indirect connections.\nCost: ~10-50ms depending on graph density and max_hops.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "seeds": {
+                        "type": "array",
+                        "items": { "type": "string", "format": "uuid" },
+                        "minItems": 1,
+                        "description": "Entity IDs to start activation from"
+                    },
+                    "max_hops": { "type": "integer", "minimum": 1, "maximum": 5, "description": "Maximum traversal depth (default: 2)" },
+                    "decay": { "type": "number", "minimum": 0.01, "maximum": 1.0, "description": "Activation decay per hop (default: 0.7)" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Max results to return (default: 10)" }
+                },
+                "required": ["seeds"]
+            }),
+        },
+    ]
+}
+
 pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
     let entity_type_enum: Value = serde_json::json!(entity_types);
     let mut tools: Vec<ToolDef> = Vec::new();
@@ -2166,28 +2192,8 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
     tools.extend(importance_scoring_tools());
     tools.extend(memory_chain_tools());
     tools.extend(speculative_retrieval_tools());
+    tools.extend(spreading_activation_tools());
     tools.extend(vec![
-        // --- Spreading activation ---
-        ToolDef {
-            name: "spread_activation".into(),
-            description: "Spreading activation search (Collins & Loftus). Propagates activation energy from seed entities through the knowledge graph, decaying at each hop. Returns the most activated non-seed entities.\n\nCALL WHEN: You have one or more known entities and want to discover related entities through graph structure — especially when semantic search alone misses structural relationships.\nPair with retrieve_entities for seeds, then spread to find indirect connections.\nCost: ~10-50ms depending on graph density and max_hops.".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "session_id": { "type": "string" },
-                    "seeds": {
-                        "type": "array",
-                        "items": { "type": "string", "format": "uuid" },
-                        "minItems": 1,
-                        "description": "Entity IDs to start activation from"
-                    },
-                    "max_hops": { "type": "integer", "minimum": 1, "maximum": 5, "description": "Maximum traversal depth (default: 2)" },
-                    "decay": { "type": "number", "minimum": 0.01, "maximum": 1.0, "description": "Activation decay per hop (default: 0.7)" },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Max results to return (default: 10)" }
-                },
-                "required": ["seeds"]
-            }),
-        },
         // --- Duplicate detection ---
         ToolDef {
             name: "find_duplicates".into(),
