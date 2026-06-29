@@ -1530,20 +1530,9 @@ fn skills_tools() -> Vec<ToolDef> {
     ]
 }
 
-pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
-    let entity_type_enum: Value = serde_json::json!(entity_types);
-    let mut tools: Vec<ToolDef> = Vec::new();
-    tools.push(all_tools_def());
-    tools.extend(remote_memory_tools());
-    tools.extend(session_continuity_tools());
-    tools.extend(fold_tools());
-    tools.extend(entity_tools(&entity_type_enum));
-    tools.extend(feedback_tools());
-    tools.extend(session_lifecycle_tools());
-    tools.extend(cognitive_memory_tools(&entity_type_enum));
-    tools.extend(skills_tools());
-    tools.extend(vec![
-        // --- Intention tools (prospective memory, repo-scoped) ---
+// --- Intention tools (prospective memory, repo-scoped) ---
+fn intention_tools() -> Vec<ToolDef> {
+    vec![
         ToolDef {
             name: "set_intention".into(),
             description: "Prospective memory — 'remember to do X when Y happens.' Sets a deferred action that auto-triggers on context match.\n\nCALL WHEN you notice something to do later:\n- 'When we touch auth, check the error handling'\n- 'Next time we open database.rs, add that index'\n- 'When user mentions deployment, remind about the TLS cert'\n- 'In 30 minutes, check if the build finished'\n\nTrigger types: Topic (keyword match), FilePattern (file glob), Duration (minutes), Context (flexible condition).\n\nIntentions are repo-scoped and persist across sessions. They trigger automatically when check_intentions runs. Set liberally — they cost nothing until triggered.\nCost: ~1ms.".into(),
@@ -1627,6 +1616,23 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                 "required": ["intention_id"]
             }),
         },
+    ]
+}
+
+pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
+    let entity_type_enum: Value = serde_json::json!(entity_types);
+    let mut tools: Vec<ToolDef> = Vec::new();
+    tools.push(all_tools_def());
+    tools.extend(remote_memory_tools());
+    tools.extend(session_continuity_tools());
+    tools.extend(fold_tools());
+    tools.extend(entity_tools(&entity_type_enum));
+    tools.extend(feedback_tools());
+    tools.extend(session_lifecycle_tools());
+    tools.extend(cognitive_memory_tools(&entity_type_enum));
+    tools.extend(skills_tools());
+    tools.extend(intention_tools());
+    tools.extend(vec![
         // --- Temporal fact tools ---
         ToolDef {
             name: "write_temporal_fact".into(),
