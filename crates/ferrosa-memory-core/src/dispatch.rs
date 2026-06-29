@@ -1400,17 +1400,9 @@ fn feedback_tools() -> Vec<ToolDef> {
     ]
 }
 
-pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
-    let entity_type_enum: Value = serde_json::json!(entity_types);
-    let mut tools: Vec<ToolDef> = Vec::new();
-    tools.push(all_tools_def());
-    tools.extend(remote_memory_tools());
-    tools.extend(session_continuity_tools());
-    tools.extend(fold_tools());
-    tools.extend(entity_tools(&entity_type_enum));
-    tools.extend(feedback_tools());
-    tools.extend(vec![
-        // --- Session lifecycle ---
+// --- Session lifecycle ---
+fn session_lifecycle_tools() -> Vec<ToolDef> {
+    vec![
         ToolDef {
             name: "delete_session".into(),
             description: "Deletes all memory objects for a session across all tables (right-to-deletion).\n\nCALL WHEN: User explicitly requests data deletion, or session cleanup is needed.\nDO NOT CALL: During normal operation. This is destructive and irreversible.".into(),
@@ -1422,6 +1414,20 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                 "required": ["session_id"]
             }),
         },
+    ]
+}
+
+pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
+    let entity_type_enum: Value = serde_json::json!(entity_types);
+    let mut tools: Vec<ToolDef> = Vec::new();
+    tools.push(all_tools_def());
+    tools.extend(remote_memory_tools());
+    tools.extend(session_continuity_tools());
+    tools.extend(fold_tools());
+    tools.extend(entity_tools(&entity_type_enum));
+    tools.extend(feedback_tools());
+    tools.extend(session_lifecycle_tools());
+    tools.extend(vec![
         // --- Cognitive memory tools ---
         ToolDef {
             name: "smart_ingest".into(),
