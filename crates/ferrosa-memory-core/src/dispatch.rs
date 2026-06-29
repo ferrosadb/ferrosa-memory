@@ -2383,37 +2383,9 @@ fn predicate_promotion_tools() -> Vec<ToolDef> {
     ]
 }
 
-pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
-    let entity_type_enum: Value = serde_json::json!(entity_types);
-    let mut tools: Vec<ToolDef> = Vec::new();
-    tools.push(all_tools_def());
-    tools.extend(remote_memory_tools());
-    tools.extend(session_continuity_tools());
-    tools.extend(fold_tools());
-    tools.extend(entity_tools(&entity_type_enum));
-    tools.extend(feedback_tools());
-    tools.extend(session_lifecycle_tools());
-    tools.extend(cognitive_memory_tools(&entity_type_enum));
-    tools.extend(skills_tools());
-    tools.extend(intention_tools());
-    tools.extend(temporal_fact_tools());
-    tools.extend(graph_traversal_tools());
-    tools.extend(hybrid_search_tools());
-    tools.extend(dream_consolidation_tools());
-    tools.extend(enrichment_tools());
-    tools.extend(stats_tools());
-    tools.extend(memory_state_tools());
-    tools.extend(importance_scoring_tools());
-    tools.extend(memory_chain_tools());
-    tools.extend(speculative_retrieval_tools());
-    tools.extend(spreading_activation_tools());
-    tools.extend(duplicate_detection_tools());
-    tools.extend(recursive_exploration_tools());
-    tools.extend(datalog_query_tools());
-    tools.extend(datalog_rule_tools());
-    tools.extend(predicate_promotion_tools());
-    tools.extend(vec![
-        // --- Typed edge tools ---
+// --- Typed edge tools ---
+fn typed_edge_tools() -> Vec<ToolDef> {
+    vec![
         ToolDef {
             name: "create_edge".into(),
             description: "Create a typed, labeled edge between two entities.\n\n\
@@ -2517,6 +2489,40 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                 "required": ["edges"]
             }),
         },
+    ]
+}
+
+pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
+    let entity_type_enum: Value = serde_json::json!(entity_types);
+    let mut tools: Vec<ToolDef> = Vec::new();
+    tools.push(all_tools_def());
+    tools.extend(remote_memory_tools());
+    tools.extend(session_continuity_tools());
+    tools.extend(fold_tools());
+    tools.extend(entity_tools(&entity_type_enum));
+    tools.extend(feedback_tools());
+    tools.extend(session_lifecycle_tools());
+    tools.extend(cognitive_memory_tools(&entity_type_enum));
+    tools.extend(skills_tools());
+    tools.extend(intention_tools());
+    tools.extend(temporal_fact_tools());
+    tools.extend(graph_traversal_tools());
+    tools.extend(hybrid_search_tools());
+    tools.extend(dream_consolidation_tools());
+    tools.extend(enrichment_tools());
+    tools.extend(stats_tools());
+    tools.extend(memory_state_tools());
+    tools.extend(importance_scoring_tools());
+    tools.extend(memory_chain_tools());
+    tools.extend(speculative_retrieval_tools());
+    tools.extend(spreading_activation_tools());
+    tools.extend(duplicate_detection_tools());
+    tools.extend(recursive_exploration_tools());
+    tools.extend(datalog_query_tools());
+    tools.extend(datalog_rule_tools());
+    tools.extend(predicate_promotion_tools());
+    tools.extend(typed_edge_tools());
+    tools.extend(vec![
         // --- Derived cache listing ---
         ToolDef {
             name: "list_derived_cache".into(),
