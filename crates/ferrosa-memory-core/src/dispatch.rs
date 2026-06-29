@@ -1651,22 +1651,9 @@ fn temporal_fact_tools() -> Vec<ToolDef> {
     ]
 }
 
-pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
-    let entity_type_enum: Value = serde_json::json!(entity_types);
-    let mut tools: Vec<ToolDef> = Vec::new();
-    tools.push(all_tools_def());
-    tools.extend(remote_memory_tools());
-    tools.extend(session_continuity_tools());
-    tools.extend(fold_tools());
-    tools.extend(entity_tools(&entity_type_enum));
-    tools.extend(feedback_tools());
-    tools.extend(session_lifecycle_tools());
-    tools.extend(cognitive_memory_tools(&entity_type_enum));
-    tools.extend(skills_tools());
-    tools.extend(intention_tools());
-    tools.extend(temporal_fact_tools());
-    tools.extend(vec![
-        // --- Graph traversal tool ---
+// --- Graph traversal tool ---
+fn graph_traversal_tools() -> Vec<ToolDef> {
+    vec![
         ToolDef {
             name: "explore_connections".into(),
             description: "Traverses the knowledge graph. Supports 4 traversal types:\n- fold_ancestors: walk the fold hierarchy upward from a fold\n- related_entities: find entities connected within N hops\n- entities_in_fold: list all entities mentioned in a fold\n- supersession_chain: follow temporal supersession links from a fact\n\nCALL WHEN: You need to understand relationships between entities or folds, or trace how facts evolved over time.\nRequires a graph connection to be configured.\nCost: ~10-50ms depending on traversal depth.".into(),
@@ -1687,6 +1674,25 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
                 "required": ["traversal"]
             }),
         },
+    ]
+}
+
+pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
+    let entity_type_enum: Value = serde_json::json!(entity_types);
+    let mut tools: Vec<ToolDef> = Vec::new();
+    tools.push(all_tools_def());
+    tools.extend(remote_memory_tools());
+    tools.extend(session_continuity_tools());
+    tools.extend(fold_tools());
+    tools.extend(entity_tools(&entity_type_enum));
+    tools.extend(feedback_tools());
+    tools.extend(session_lifecycle_tools());
+    tools.extend(cognitive_memory_tools(&entity_type_enum));
+    tools.extend(skills_tools());
+    tools.extend(intention_tools());
+    tools.extend(temporal_fact_tools());
+    tools.extend(graph_traversal_tools());
+    tools.extend(vec![
         // --- Hybrid search ---
         ToolDef {
             name: "hybrid_search".into(),
