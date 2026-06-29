@@ -1872,6 +1872,23 @@ fn hybrid_search_tools() -> Vec<ToolDef> {
     ]
 }
 
+// --- Dream consolidation ---
+fn dream_consolidation_tools() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "run_consolidation".into(),
+            description: "Dream consolidation — discovers hidden connections between memories. Groups entities by shared context, creates CO_OCCURS graph edges, identifies clusters.\n\nCALL WHEN:\n- At the end of a productive work session\n- When the user says 'wrap up' or 'that's it for now'\n- When you want to force background consolidation for the current session\n\nSmart ingest automatically queues consolidation after enough new entities; you do not need to count memories manually.\nCost: request path only queues work; the background worker does the consolidation.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" }
+                },
+                "required": []
+            }),
+        },
+    ]
+}
+
 pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
     let entity_type_enum: Value = serde_json::json!(entity_types);
     let mut tools: Vec<ToolDef> = Vec::new();
@@ -1888,19 +1905,8 @@ pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
     tools.extend(temporal_fact_tools());
     tools.extend(graph_traversal_tools());
     tools.extend(hybrid_search_tools());
+    tools.extend(dream_consolidation_tools());
     tools.extend(vec![
-        // --- Dream consolidation ---
-        ToolDef {
-            name: "run_consolidation".into(),
-            description: "Dream consolidation — discovers hidden connections between memories. Groups entities by shared context, creates CO_OCCURS graph edges, identifies clusters.\n\nCALL WHEN:\n- At the end of a productive work session\n- When the user says 'wrap up' or 'that's it for now'\n- When you want to force background consolidation for the current session\n\nSmart ingest automatically queues consolidation after enough new entities; you do not need to count memories manually.\nCost: request path only queues work; the background worker does the consolidation.".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "session_id": { "type": "string" }
-                },
-                "required": []
-            }),
-        },
         // --- Enrichment pipeline ---
         ToolDef {
             name: "enrich_entities".into(),
