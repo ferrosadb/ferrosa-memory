@@ -214,6 +214,11 @@ pub async fn smart_ingest(
             session_id,
             entity_name: resolved_name.clone(),
             entity_type: resolved_type.clone(),
+            // Issue 13: derive durability from the type. Without this the field
+            // falls through `..Default::default()` to `EntityScope::Session`, so
+            // every smart_ingest write is session-scoped and the documented
+            // cross-session/global promise never holds.
+            scope: crate::scope::default_scope_for(&resolved_type),
             source_fold_id,
             context_snippet: content.to_string(),
             entity_embedding: embedding.map(|e| e.to_vec()),
@@ -300,6 +305,11 @@ pub async fn smart_ingest(
             session_id,
             entity_name: resolved_name.clone(),
             entity_type: resolved_type.clone(),
+            // Issue 13: derive durability from the type. Without this the field
+            // falls through `..Default::default()` to `EntityScope::Session`, so
+            // every smart_ingest write is session-scoped and the documented
+            // cross-session/global promise never holds.
+            scope: crate::scope::default_scope_for(&resolved_type),
             source_fold_id,
             context_snippet: content.to_string(),
             entity_embedding: embedding.map(|e| e.to_vec()),
@@ -343,6 +353,11 @@ pub async fn smart_ingest(
         session_id,
         entity_name: resolved_name.clone(),
         entity_type: resolved_type.clone(),
+        // Issue 13: derive durability from the type. Without this the field
+        // falls through `..Default::default()` to `EntityScope::Session`, so
+        // every smart_ingest write is session-scoped and the documented
+        // cross-session/global promise never holds.
+        scope: crate::scope::default_scope_for(&resolved_type),
         source_fold_id,
         context_snippet: content.to_string(),
         entity_embedding: embedding.map(|e| e.to_vec()),
@@ -922,6 +937,50 @@ mod tests {
         .expect("a fuzzy dedup read timeout must not block creating a new memory");
 
         assert!(matches!(result, IngestDecision::Created { .. }));
+    }
+
+    #[tokio::test]
+    async fn smart_ingest_scopes_entities_by_type_not_session() {
+        // Issue 13 regression: smart_ingest must derive scope from the entity
+        // type via default_scope_for, not leave every write at the Session
+        // default. A global type (skill/concept/...) lands Global so the memory
+        // is durable across sessions; a session type (bug/...) stays Session.
+        // Passing a name keeps resolve_entity_name from re-classifying the type.
+        use crate::storage::mock::MockStorage;
+        use crate::types::EntityScope;
+
+        for (entity_type, expected) in [
+            ("skill", EntityScope::Global),
+            ("bug", EntityScope::Session),
+        ] {
+            let store = MockStorage::new();
+            let ctx = TenantContext {
+                tenant_id: Uuid::new_v4(),
+                session_origin: "test".into(),
+            };
+            let result = smart_ingest(
+                &store,
+                &ctx,
+                Uuid::new_v4(),
+                "novel content exercising the scope-wiring regression",
+                entity_type,
+                None,
+                None,
+                &IngestConfig::default(),
+                Some("scope wiring regression entity"),
+                None,
+            )
+            .await
+            .expect("ingest should create a new entity");
+            assert!(matches!(result, IngestDecision::Created { .. }));
+
+            let entities = store.entities.lock().await;
+            assert_eq!(entities.len(), 1);
+            assert_eq!(
+                entities[0].scope, expected,
+                "{entity_type} must ingest as {expected:?} via default_scope_for, not the Session default"
+            );
+        }
     }
 
     #[tokio::test]
