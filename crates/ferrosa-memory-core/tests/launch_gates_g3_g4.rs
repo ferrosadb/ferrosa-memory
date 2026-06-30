@@ -230,8 +230,11 @@ async fn g4_smart_ingest_still_creates_plain_entities_against_new_schema() {
     assert!(fetched.description.is_none());
     assert!(fetched.description_embedding.is_none());
     assert!(fetched.tags.is_empty());
-    // Scope defaults to Session for non-global types.
-    assert_eq!(fetched.scope, EntityScope::Session);
+    // "decision" is a durable, cross-session type, so smart_ingest must scope it
+    // Global via default_scope_for (Issue 13). This test previously asserted
+    // Session, which codified the bug where every ingest fell through to the
+    // Session default regardless of type.
+    assert_eq!(fetched.scope, EntityScope::Global);
     // Core fields populated normally.
     assert_eq!(fetched.entity_name, "rate-limit-policy");
     assert_eq!(fetched.entity_type, "decision");
