@@ -115,12 +115,23 @@ pub async fn smart_ingest(
     let (resolved_name, resolved_type) =
         resolve_entity_name(entity_name, content, entity_type, ner_config).await;
 
+    // Issue #148: derive the scope from the type and resolve the physical
+    // storage partition ONCE. A global-scope entity must live under the tenant
+    // global-sentinel partition (not the caller's session) so a later session
+    // can read it — setting the `scope` label alone leaves the row session-keyed
+    // and invisible cross-session. Every dedup lookup and write below uses
+    // `storage_session`; for session-scoped types it resolves back to the
+    // caller's own session, so session-scoped behavior is unchanged.
+    let scope = crate::scope::default_scope_for(&resolved_type);
+    let (storage_session, ingested_by) =
+        crate::scope::resolve_storage_session(session_id, scope, ctx.tenant_id);
+
     // Always check for an exact-name match first. This path preserves updates for
     // repeated entity names, but it is still a dedup optimization: a read-side
     // timeout here must not prevent the write path from creating a new memory.
     let mut existing = if !resolved_name.is_empty() {
         match storage
-            .entity_find_by_exact_name(ctx, session_id, &resolved_name, &resolved_type)
+            .entity_find_by_exact_name(ctx, storage_session, &resolved_name, &resolved_type)
             .await
         {
             Ok(Some(entry)) => vec![entry],
@@ -165,7 +176,10 @@ pub async fn smart_ingest(
     // is more important than fuzzy dedup when a quorum read times out.
     if existing.is_empty() {
         existing = if let Some(emb) = embedding {
-            match storage.entity_search_ann(ctx, session_id, emb, 3).await {
+            match storage
+                .entity_search_ann(ctx, storage_session, emb, 3)
+                .await
+            {
                 Ok(matches) => matches,
                 Err(err) => {
                     tracing::warn!(
@@ -186,7 +200,7 @@ pub async fn smart_ingest(
                     .join(" ")
             };
             match storage
-                .entity_find_phonetic(ctx, session_id, &name_hint)
+                .entity_find_phonetic(ctx, storage_session, &name_hint)
                 .await
             {
                 Ok(mut matches) => {
@@ -211,14 +225,14 @@ pub async fn smart_ingest(
         let entry = crate::types::EntityEntry {
             tenant_id: ctx.tenant_id,
             entity_id,
-            session_id,
+            session_id: storage_session,
             entity_name: resolved_name.clone(),
             entity_type: resolved_type.clone(),
-            // Issue 13: derive durability from the type. Without this the field
-            // falls through `..Default::default()` to `EntityScope::Session`, so
-            // every smart_ingest write is session-scoped and the documented
-            // cross-session/global promise never holds.
-            scope: crate::scope::default_scope_for(&resolved_type),
+            // Issue #148: store under the resolved partition (global sentinel for
+            // global types, caller's session otherwise) and record the caller as
+            // ingested_by for global entities so the audit/re-rank signal survives.
+            scope,
+            ingested_by_session: ingested_by,
             source_fold_id,
             context_snippet: content.to_string(),
             entity_embedding: embedding.map(|e| e.to_vec()),
@@ -302,14 +316,14 @@ pub async fn smart_ingest(
         let entry = crate::types::EntityEntry {
             tenant_id: ctx.tenant_id,
             entity_id: new_id,
-            session_id,
+            session_id: storage_session,
             entity_name: resolved_name.clone(),
             entity_type: resolved_type.clone(),
-            // Issue 13: derive durability from the type. Without this the field
-            // falls through `..Default::default()` to `EntityScope::Session`, so
-            // every smart_ingest write is session-scoped and the documented
-            // cross-session/global promise never holds.
-            scope: crate::scope::default_scope_for(&resolved_type),
+            // Issue #148: store under the resolved partition (global sentinel for
+            // global types, caller's session otherwise) and record the caller as
+            // ingested_by for global entities so the audit/re-rank signal survives.
+            scope,
+            ingested_by_session: ingested_by,
             source_fold_id,
             context_snippet: content.to_string(),
             entity_embedding: embedding.map(|e| e.to_vec()),
@@ -319,9 +333,13 @@ pub async fn smart_ingest(
             ..Default::default()
         };
         storage.entity_put(ctx, &entry).await?;
-        let removed_edges =
-            delete_typed_edges_referencing_entity(storage, ctx, session_id, best_match.entity_id)
-                .await?;
+        let removed_edges = delete_typed_edges_referencing_entity(
+            storage,
+            ctx,
+            storage_session,
+            best_match.entity_id,
+        )
+        .await?;
         // Create supersession edge
         let _ = crate::graph_write::create_supersedes_edge(
             storage,
@@ -350,14 +368,14 @@ pub async fn smart_ingest(
     let entry = crate::types::EntityEntry {
         tenant_id: ctx.tenant_id,
         entity_id,
-        session_id,
+        session_id: storage_session,
         entity_name: resolved_name.clone(),
         entity_type: resolved_type.clone(),
-        // Issue 13: derive durability from the type. Without this the field
-        // falls through `..Default::default()` to `EntityScope::Session`, so
-        // every smart_ingest write is session-scoped and the documented
-        // cross-session/global promise never holds.
-        scope: crate::scope::default_scope_for(&resolved_type),
+        // Issue #148: store under the resolved partition (global sentinel for
+        // global types, caller's session otherwise) and record the caller as
+        // ingested_by for global entities so the audit/re-rank signal survives.
+        scope,
+        ingested_by_session: ingested_by,
         source_fold_id,
         context_snippet: content.to_string(),
         entity_embedding: embedding.map(|e| e.to_vec()),
@@ -984,6 +1002,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn smart_ingest_global_entity_is_stored_in_the_global_partition() {
+        // Issue #148: setting scope=Global on the record is not enough. The CQL
+        // write must be rerouted to the tenant global-sentinel partition, or the
+        // entity lives in a session-keyed row no other session can read. Before
+        // the fix, `session_id` on the stored row is the caller's session.
+        use crate::scope::tenant_global_session_uuid;
+        use crate::storage::mock::MockStorage;
+        use crate::types::EntityScope;
+
+        let store = MockStorage::new();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "test".into(),
+        };
+        let caller = Uuid::new_v4();
+        let sentinel = tenant_global_session_uuid(ctx.tenant_id);
+
+        // "decision" is a global type per default_scope_for.
+        smart_ingest(
+            &store,
+            &ctx,
+            caller,
+            "route global entities to the sentinel partition",
+            "decision",
+            None,
+            None,
+            &IngestConfig::default(),
+            Some("global-partition routing decision"),
+            None,
+        )
+        .await
+        .expect("ingest should create a new entity");
+
+        let entities = store.entities.lock().await;
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].scope, EntityScope::Global);
+        assert_eq!(
+            entities[0].session_id, sentinel,
+            "a global entity must be stored under the tenant global-sentinel partition, not the caller's session (Issue #148)"
+        );
+        assert_ne!(
+            entities[0].session_id, caller,
+            "global entity must NOT live in the caller's session partition"
+        );
+        assert_eq!(
+            entities[0].ingested_by_session,
+            Some(caller),
+            "global entity must record the originating session for audit"
+        );
+    }
+
+    #[tokio::test]
+    async fn global_entity_ingested_in_one_session_is_visible_from_another() {
+        // Issue #148 headline ("context that survives sessions"): a global entity
+        // ingested in session A must be readable from the global partition by a
+        // brand-new session B. Asserted via a direct partition read (Storage),
+        // NOT hybrid_search — ANN scope leakage (#147) would give a false positive.
+        use crate::scope::tenant_global_session_uuid;
+        use crate::storage::Storage;
+        use crate::storage::mock::MockStorage;
+
+        let store = MockStorage::new();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "test".into(),
+        };
+        let session_a = Uuid::new_v4();
+        let session_b = Uuid::new_v4();
+        let canary = "xyzzy-canary-8842 global routing works";
+
+        smart_ingest(
+            &store,
+            &ctx,
+            session_a,
+            canary,
+            "decision",
+            None,
+            None,
+            &IngestConfig::default(),
+            Some("cross session canary"),
+            None,
+        )
+        .await
+        .expect("ingest should create a new entity");
+
+        // Session B reads the GLOBAL partition directly.
+        let global = store
+            .entity_list_session(&ctx, tenant_global_session_uuid(ctx.tenant_id))
+            .await
+            .unwrap();
+        assert!(
+            global.iter().any(|e| e.context_snippet.contains(canary)),
+            "a global entity ingested in session A must be readable from the global partition in session B (Issue #148)"
+        );
+
+        // ...and must not be stranded in the caller's session partition.
+        let in_a = store.entity_list_session(&ctx, session_a).await.unwrap();
+        assert!(
+            !in_a.iter().any(|e| e.context_snippet.contains(canary)),
+            "a global entity must not be stranded in the caller's session partition"
+        );
+        let _ = session_b;
+    }
+
+    #[tokio::test]
     async fn smart_ingest_updates_exact_name_match_from_another_session() {
         use crate::storage::Storage;
         use crate::storage::mock::MockStorage;
@@ -1063,6 +1186,11 @@ mod tests {
             session_origin: "test".into(),
         };
         let session_id = Uuid::new_v4();
+        // "concept" is a global type: global entities and their typed edges live
+        // in the tenant global-sentinel partition (Issue #148). Set the fixture up
+        // there and assert edge cleanup there, while the ingest is still driven
+        // from the caller's `session_id`.
+        let storage_session = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
         let old_entity_id = Uuid::new_v4();
         let other_entity_id = Uuid::new_v4();
         let unrelated_src_id = Uuid::new_v4();
@@ -1074,7 +1202,7 @@ mod tests {
                 &EntityEntry {
                     tenant_id: ctx.tenant_id,
                     entity_id: old_entity_id,
-                    session_id,
+                    session_id: storage_session,
                     entity_name: "Old Topic".into(),
                     entity_type: "concept".into(),
                     context_snippet: "alpha beta gamma".into(),
@@ -1095,7 +1223,7 @@ mod tests {
                     &ctx,
                     &TypedEdge {
                         tenant_id: ctx.tenant_id,
-                        session_id,
+                        session_id: storage_session,
                         src_id,
                         edge_type: edge_type.into(),
                         dst_id,
@@ -1125,7 +1253,7 @@ mod tests {
 
         assert!(matches!(result, IngestDecision::Superseded { .. }));
         let typed_edges = store
-            .typed_edge_list_session(&ctx, session_id)
+            .typed_edge_list_session(&ctx, storage_session)
             .await
             .unwrap();
         assert!(
