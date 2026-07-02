@@ -2611,69 +2611,207 @@ async fn send_viz_event(
     write.send(Message::Text(json.into())).await.is_ok()
 }
 
-/// Drain a temporal-edge producer into the viz snapshot edge stream, mirroring
-/// the typed-edge consume loop: each `TemporalEdge` becomes a `VizEdge` (temporal
-/// edges have no weight, so `strength` is `None`) and bounded chunks are flushed
-/// as `SnapshotStreamChunk`s. The producer is a paged cursor, so the full edge
-/// set is never materialized. Returns `false` if a websocket send failed (the
-/// caller should propagate by returning `false`).
-async fn drain_temporal_edges_into_snapshot(
-    write: &mut futures_util::stream::SplitSink<
+/// Transport for pushing viz events to one client. The production sink is
+/// the websocket writer; unit tests drive the snapshot builder and its drain
+/// loops with an in-memory collecting sink.
+trait VizSink {
+    /// Send one event. Returns `false` when the client is gone.
+    fn send_event(&mut self, event: &VizEvent) -> impl std::future::Future<Output = bool> + Send;
+}
+
+impl VizSink
+    for futures_util::stream::SplitSink<
         tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
         Message,
-    >,
-    producer: impl std::future::Future<Output = ()>,
-    rx: &mut tokio::sync::mpsc::Receiver<anyhow::Result<Vec<crate::context_segment::TemporalEdge>>>,
-    edge_chunk: &mut Vec<VizEdge>,
-    total_edges: &mut usize,
+    >
+{
+    async fn send_event(&mut self, event: &VizEvent) -> bool {
+        send_viz_event(self, event).await
+    }
+}
+
+/// One element produced by a paged snapshot stream.
+enum SnapshotElem {
+    Node(viz::VizNode),
+    Edge(VizEdge),
+}
+
+/// How one paged stream drain ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainStatus {
+    /// Producer finished normally and everything was flushed.
+    Completed,
+    /// Idle budget elapsed; partial data was served (fail-soft path for
+    /// backend lane contention).
+    IdleTimeout,
+    /// Storage reported an error mid-stream; partial data was served.
+    ProducerError,
+    /// The cursor-progress guard stopped a non-progressing server cursor —
+    /// a designed, loudly logged fallback for server-side paging bugs. The
+    /// deduplicated rows collected so far were emitted and the snapshot ends
+    /// with an error-bearing `SnapshotStreamEnd`.
+    GuardTripped,
+    /// A websocket send failed; the client is gone.
+    SendFailed,
+}
+
+/// Mutable state shared by every paged stream within one snapshot.
+struct SnapshotProgress {
+    total_nodes: usize,
+    total_edges: usize,
+    /// Edge buffer shared across edge streams so small tails coalesce.
+    edge_chunk: Vec<VizEdge>,
+    /// Guard-trip descriptions, surfaced on `SnapshotStreamEnd` as `error`.
+    truncations: Vec<String>,
+}
+
+impl SnapshotProgress {
+    fn new(chunk_size: usize) -> Self {
+        Self {
+            total_nodes: 0,
+            total_edges: 0,
+            edge_chunk: Vec::with_capacity(chunk_size),
+            truncations: Vec::new(),
+        }
+    }
+}
+
+/// Per-stream drain parameters.
+struct DrainSpec<'a> {
+    /// Human-readable stream label for logs and truncation errors.
+    label: &'a str,
     chunk_size: usize,
-    label: &str,
-) -> bool {
+    /// Cursor progress guard; fresh per stream because each stream is one
+    /// server-side cursor.
+    guard: viz::CursorProgressGuard,
+}
+
+impl<'a> DrainSpec<'a> {
+    fn new(label: &'a str, chunk_size: usize) -> Self {
+        Self {
+            label,
+            chunk_size,
+            guard: viz::CursorProgressGuard::new(),
+        }
+    }
+}
+
+/// Drain one paged storage stream into `SnapshotStreamChunk`s.
+///
+/// Every page is fed through the stream's [`viz::CursorProgressGuard`]: rows
+/// are deduplicated by `key_of` (bounded by the guard's seen-key cap) and a
+/// cursor that stops progressing — e.g. a server whose `paging_state` cycles
+/// and re-serves the same row window forever — is terminated instead of
+/// producing an infinite duplicate stream. Returning drops `producer`, which
+/// cancels the underlying paged query.
+///
+/// The idle budget is the existing fail-soft path: if the producer goes
+/// silent for `VIZ_STREAM_IDLE_BUDGET` the drain stops, serving partial
+/// snapshot data instead of hanging the browser.
+async fn drain_snapshot_stream<T, W: VizSink>(
+    write: &mut W,
+    producer: impl std::future::Future<Output = ()>,
+    rx: &mut tokio::sync::mpsc::Receiver<anyhow::Result<Vec<T>>>,
+    mut spec: DrainSpec<'_>,
+    key_of: impl Fn(&T) -> u64,
+    into_elem: impl Fn(T) -> SnapshotElem,
+    progress: &mut SnapshotProgress,
+) -> DrainStatus {
     tokio::pin!(producer);
     let idle_deadline = tokio::time::sleep(VIZ_STREAM_IDLE_BUDGET);
     tokio::pin!(idle_deadline);
     let mut producer_done = false;
-    loop {
+    let mut node_chunk: Vec<viz::VizNode> = Vec::new();
+    let mut status = DrainStatus::Completed;
+    'stream: loop {
         tokio::select! {
             _ = &mut producer, if !producer_done => producer_done = true,
             _ = &mut idle_deadline, if !producer_done => {
                 tracing::warn!(
-                    edge_context = label,
+                    stream = spec.label,
                     timeout_ms = VIZ_STREAM_IDLE_BUDGET.as_millis() as u64,
-                    "viz: temporal edge stream idle timeout; serving partial snapshot"
+                    "viz: snapshot stream idle timeout; serving partial snapshot"
                 );
-                break;
+                status = DrainStatus::IdleTimeout;
+                break 'stream;
             }
-            chunk = rx.recv() => {
-                match chunk {
-                    Some(Ok(temporal_edges)) => {
-                        idle_deadline.as_mut().reset(tokio::time::Instant::now() + VIZ_STREAM_IDLE_BUDGET);
-                        for temporal_edge in temporal_edges {
-                            edge_chunk.push(VizEdge {
-                                source: temporal_edge.src_id.to_string(),
-                                target: temporal_edge.dst_id.to_string(),
-                                edge_type: temporal_edge.edge_type,
-                                strength: None,
-                            });
-                            *total_edges += 1;
-                            if edge_chunk.len() >= chunk_size {
-                                let edges = std::mem::take(edge_chunk);
-                                if !send_viz_event(
-                                    write,
-                                    &VizEvent::SnapshotStreamChunk { nodes: Vec::new(), edges },
-                                )
-                                .await
-                                {
-                                    return false;
+            batch = rx.recv() => {
+                match batch {
+                    Some(Ok(rows)) => {
+                        idle_deadline.as_mut().reset(
+                            tokio::time::Instant::now() + VIZ_STREAM_IDLE_BUDGET,
+                        );
+                        spec.guard.begin_page();
+                        for row in rows {
+                            if !spec.guard.note_row(key_of(&row)) {
+                                continue; // duplicate row: already emitted
+                            }
+                            match into_elem(row) {
+                                SnapshotElem::Node(node) => {
+                                    progress.total_nodes += 1;
+                                    node_chunk.push(node);
+                                    if node_chunk.len() >= spec.chunk_size {
+                                        let nodes = std::mem::take(&mut node_chunk);
+                                        if !write
+                                            .send_event(&VizEvent::SnapshotStreamChunk {
+                                                nodes,
+                                                edges: Vec::new(),
+                                            })
+                                            .await
+                                        {
+                                            return DrainStatus::SendFailed;
+                                        }
+                                    }
+                                }
+                                SnapshotElem::Edge(edge) => {
+                                    progress.total_edges += 1;
+                                    progress.edge_chunk.push(edge);
+                                    if progress.edge_chunk.len() >= spec.chunk_size {
+                                        let edges = std::mem::take(&mut progress.edge_chunk);
+                                        if !write
+                                            .send_event(&VizEvent::SnapshotStreamChunk {
+                                                nodes: Vec::new(),
+                                                edges,
+                                            })
+                                            .await
+                                        {
+                                            return DrainStatus::SendFailed;
+                                        }
+                                    }
                                 }
                             }
                         }
+                        if let Some(stall) = spec.guard.end_page() {
+                            let stats = spec.guard.stats();
+                            tracing::error!(
+                                stream = spec.label,
+                                reason = %stall,
+                                pages = stats.pages,
+                                rows_delivered = stats.delivered,
+                                unique_rows = stats.unique,
+                                "viz: snapshot cursor is not progressing; truncating \
+                                 stream after emitting deduplicated rows (server-side \
+                                 paging bug?)"
+                            );
+                            progress.truncations.push(format!(
+                                "{}: server cursor not progressing ({stall}; pages={}, \
+                                 rows_delivered={}, unique_rows={})",
+                                spec.label, stats.pages, stats.delivered, stats.unique,
+                            ));
+                            status = DrainStatus::GuardTripped;
+                            break 'stream;
+                        }
                     }
                     Some(Err(e)) => {
-                        tracing::warn!(error = %e, edge_context = label, "viz: temporal edge stream failed");
-                        break;
+                        tracing::warn!(
+                            error = %e,
+                            stream = spec.label,
+                            "viz: snapshot stream failed; serving partial snapshot"
+                        );
+                        status = DrainStatus::ProducerError;
+                        break 'stream;
                     }
-                    None if producer_done => break,
+                    None if producer_done => break 'stream,
                     None => {}
                 }
             }
@@ -2682,14 +2820,91 @@ async fn drain_temporal_edges_into_snapshot(
             break;
         }
     }
-    true
+    if !node_chunk.is_empty()
+        && !write
+            .send_event(&VizEvent::SnapshotStreamChunk {
+                nodes: node_chunk,
+                edges: Vec::new(),
+            })
+            .await
+    {
+        return DrainStatus::SendFailed;
+    }
+    status
 }
 
-async fn send_streaming_viz_snapshot<S: Storage>(
-    write: &mut futures_util::stream::SplitSink<
-        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-        Message,
-    >,
+/// Row identity for a typed edge (progress/dedup key). Includes `session_id`
+/// so distinct rows that render as the same visual edge never look like a
+/// stalled cursor.
+fn typed_edge_row_key(edge: &crate::types::TypedEdge) -> u64 {
+    viz::row_key(&(
+        edge.session_id,
+        edge.src_id,
+        edge.edge_type.as_str(),
+        edge.dst_id,
+    ))
+}
+
+fn typed_edge_elem(edge: crate::types::TypedEdge) -> SnapshotElem {
+    SnapshotElem::Edge(VizEdge {
+        source: edge.src_id.to_string(),
+        target: edge.dst_id.to_string(),
+        edge_type: edge.edge_type,
+        strength: Some(edge.weight as f32),
+    })
+}
+
+/// Row identity for a temporal edge; includes `relation_time`/`ordinal`
+/// because turn chains legitimately repeat (src, type, dst) triples.
+fn temporal_edge_row_key(edge: &crate::context_segment::TemporalEdge) -> u64 {
+    viz::row_key(&(
+        edge.session_id,
+        edge.src_id,
+        edge.edge_type.as_str(),
+        edge.dst_id,
+        edge.relation_time,
+        edge.ordinal,
+    ))
+}
+
+/// Temporal edges have no weight, so `strength` is `None`.
+fn temporal_edge_elem(edge: crate::context_segment::TemporalEdge) -> SnapshotElem {
+    SnapshotElem::Edge(VizEdge {
+        source: edge.src_id.to_string(),
+        target: edge.dst_id.to_string(),
+        edge_type: edge.edge_type,
+        strength: None,
+    })
+}
+
+fn entity_row_key(entity: &crate::types::EntityEntry) -> u64 {
+    viz::row_key(&(entity.session_id, entity.entity_id))
+}
+
+fn entity_elem(entity: crate::types::EntityEntry) -> SnapshotElem {
+    SnapshotElem::Node(viz::entity_to_viz_node(&entity))
+}
+
+fn fold_row_key(fold: &crate::types::FoldEntry) -> u64 {
+    viz::row_key(&(fold.session_id, fold.fold_id))
+}
+
+fn fold_elem(fold: crate::types::FoldEntry) -> SnapshotElem {
+    SnapshotElem::Node(viz::fold_to_viz_node(&fold))
+}
+
+/// Error surfaced on `SnapshotStreamEnd` when any stream's cursor-progress
+/// guard tripped. `None` on a healthy snapshot.
+fn snapshot_truncation_error(truncations: &[String]) -> Option<String> {
+    if truncations.is_empty() {
+        None
+    } else {
+        Some(format!("snapshot truncated: {}", truncations.join("; ")))
+    }
+}
+
+async fn send_streaming_viz_snapshot<W: VizSink, S: Storage>(
+    write: &mut W,
     storage: &S,
     ctx: &TenantContext,
     session_id: Uuid,
@@ -2697,63 +2912,34 @@ async fn send_streaming_viz_snapshot<S: Storage>(
 ) -> bool {
     const VIZ_CHUNK_SIZE: usize = 500;
 
-    if !send_viz_event(
-        write,
-        &VizEvent::SnapshotStreamStart {
+    if !write
+        .send_event(&VizEvent::SnapshotStreamStart {
             level: None,
             parent: None,
-        },
-    )
-    .await
+        })
+        .await
     {
         return false;
     }
 
-    let mut total_nodes = 0usize;
-    let mut total_edges = 0usize;
+    let mut progress = SnapshotProgress::new(VIZ_CHUNK_SIZE);
 
     match scope {
         VizSnapshotScope::All => {
             let (tx, mut rx) = tokio::sync::mpsc::channel(4);
             let producer = storage.entity_stream_all(ctx.clone(), VIZ_CHUNK_SIZE, tx);
-            tokio::pin!(producer);
-            let idle_deadline = tokio::time::sleep(VIZ_STREAM_IDLE_BUDGET);
-            tokio::pin!(idle_deadline);
-            let mut producer_done = false;
-            loop {
-                tokio::select! {
-                    _ = &mut producer, if !producer_done => producer_done = true,
-                    _ = &mut idle_deadline, if !producer_done => {
-                        tracing::warn!(
-                            timeout_ms = VIZ_STREAM_IDLE_BUDGET.as_millis() as u64,
-                            "viz: entity stream idle timeout; serving partial snapshot"
-                        );
-                        break;
-                    }
-                    chunk = rx.recv() => {
-                        match chunk {
-                            Some(Ok(entities)) => {
-                                idle_deadline.as_mut().reset(tokio::time::Instant::now() + VIZ_STREAM_IDLE_BUDGET);
-                                let nodes: Vec<_> = entities.iter().map(viz::entity_to_viz_node).collect();
-                                total_nodes += nodes.len();
-                                if !nodes.is_empty()
-                                    && !send_viz_event(write, &VizEvent::SnapshotStreamChunk { nodes, edges: Vec::new() }).await
-                                {
-                                    return false;
-                                }
-                            }
-                            Some(Err(e)) => {
-                                tracing::warn!("viz: failed to stream entities for snapshot: {e}");
-                                break;
-                            }
-                            None if producer_done => break,
-                            None => {}
-                        }
-                    }
-                }
-                if producer_done && rx.is_empty() {
-                    break;
-                }
+            let status = drain_snapshot_stream(
+                write,
+                producer,
+                &mut rx,
+                DrainSpec::new("entities(all)", VIZ_CHUNK_SIZE),
+                entity_row_key,
+                entity_elem,
+                &mut progress,
+            )
+            .await;
+            if status == DrainStatus::SendFailed {
+                return false;
             }
         }
         VizSnapshotScope::SessionOnly | VizSnapshotScope::GlobalOnly => {
@@ -2773,103 +2959,39 @@ async fn send_streaming_viz_snapshot<S: Storage>(
             for sid in sessions {
                 let (tx, mut rx) = tokio::sync::mpsc::channel(4);
                 let producer = storage.entity_stream_session(ctx.clone(), sid, VIZ_CHUNK_SIZE, tx);
-                tokio::pin!(producer);
-                let idle_deadline = tokio::time::sleep(VIZ_STREAM_IDLE_BUDGET);
-                tokio::pin!(idle_deadline);
-                let mut producer_done = false;
-                loop {
-                    tokio::select! {
-                        _ = &mut producer, if !producer_done => producer_done = true,
-                        _ = &mut idle_deadline, if !producer_done => {
-                            tracing::warn!(
-                                session_id = %sid,
-                                timeout_ms = VIZ_STREAM_IDLE_BUDGET.as_millis() as u64,
-                                "viz: scoped entity stream idle timeout; serving partial snapshot"
-                            );
-                            break;
-                        }
-                        chunk = rx.recv() => {
-                            match chunk {
-                                Some(Ok(entities)) => {
-                                    idle_deadline.as_mut().reset(tokio::time::Instant::now() + VIZ_STREAM_IDLE_BUDGET);
-                                    let nodes: Vec<_> = entities.iter().map(viz::entity_to_viz_node).collect();
-                            total_nodes += nodes.len();
-                            if !nodes.is_empty()
-                                && !send_viz_event(
-                                    write,
-                                    &VizEvent::SnapshotStreamChunk {
-                                        nodes,
-                                        edges: Vec::new(),
-                                    },
-                                )
-                                .await
-                            {
-                                return false;
-                            }
-                                }
-                                Some(Err(e)) => {
-                                    tracing::warn!(session_id = %sid, "viz: failed to stream scoped entities for snapshot: {e}");
-                                    break;
-                                }
-                                None if producer_done => break,
-                                None => {}
-                            }
-                        }
-                    }
-                    if producer_done && rx.is_empty() {
-                        break;
-                    }
+                let label = format!("entities(session {sid})");
+                let status = drain_snapshot_stream(
+                    write,
+                    producer,
+                    &mut rx,
+                    DrainSpec::new(&label, VIZ_CHUNK_SIZE),
+                    entity_row_key,
+                    entity_elem,
+                    &mut progress,
+                )
+                .await;
+                if status == DrainStatus::SendFailed {
+                    return false;
                 }
             }
         }
     }
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-    let producer = storage.fold_stream_all(ctx.clone(), VIZ_CHUNK_SIZE, tx);
-    tokio::pin!(producer);
-    let idle_deadline = tokio::time::sleep(VIZ_STREAM_IDLE_BUDGET);
-    tokio::pin!(idle_deadline);
-    let mut producer_done = false;
-    loop {
-        tokio::select! {
-            _ = &mut producer, if !producer_done => producer_done = true,
-            _ = &mut idle_deadline, if !producer_done => {
-                tracing::warn!(
-                    timeout_ms = VIZ_STREAM_IDLE_BUDGET.as_millis() as u64,
-                    "viz: fold stream idle timeout; serving partial snapshot"
-                );
-                break;
-            }
-            chunk = rx.recv() => {
-                match chunk {
-                    Some(Ok(folds)) => {
-                        idle_deadline.as_mut().reset(tokio::time::Instant::now() + VIZ_STREAM_IDLE_BUDGET);
-                        let nodes: Vec<_> = folds.iter().map(viz::fold_to_viz_node).collect();
-                        total_nodes += nodes.len();
-                        if !nodes.is_empty()
-                            && !send_viz_event(
-                                write,
-                                &VizEvent::SnapshotStreamChunk {
-                                    nodes,
-                                    edges: Vec::new(),
-                                },
-                            )
-                            .await
-                        {
-                            return false;
-                        }
-                    }
-                    Some(Err(e)) => {
-                        tracing::warn!("viz: failed to stream folds for snapshot: {e}");
-                        break;
-                    }
-                    None if producer_done => break,
-                    None => {}
-                }
-            }
-        }
-        if producer_done && rx.is_empty() {
-            break;
+    {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let producer = storage.fold_stream_all(ctx.clone(), VIZ_CHUNK_SIZE, tx);
+        let status = drain_snapshot_stream(
+            write,
+            producer,
+            &mut rx,
+            DrainSpec::new("folds(all)", VIZ_CHUNK_SIZE),
+            fold_row_key,
+            fold_elem,
+            &mut progress,
+        )
+        .await;
+        if status == DrainStatus::SendFailed {
+            return false;
         }
     }
 
@@ -2877,7 +2999,6 @@ async fn send_streaming_viz_snapshot<S: Storage>(
         tenant_id: session_id,
         session_origin: ctx.session_origin.clone(),
     };
-    let mut edge_chunk = Vec::with_capacity(VIZ_CHUNK_SIZE);
 
     // Do not run tenant-wide legacy edge-table scans as part of the initial
     // browser stream. Those tables require ALLOW FILTERING and can saturate
@@ -2895,66 +3016,25 @@ async fn send_streaming_viz_snapshot<S: Storage>(
                 }
                 let (tx, mut rx) = tokio::sync::mpsc::channel(4);
                 let producer = storage.typed_edge_stream_all(edge_ctx, VIZ_CHUNK_SIZE, tx);
-                tokio::pin!(producer);
-                let idle_deadline = tokio::time::sleep(VIZ_STREAM_IDLE_BUDGET);
-                tokio::pin!(idle_deadline);
-                let mut producer_done = false;
-                loop {
-                    tokio::select! {
-                        _ = &mut producer, if !producer_done => producer_done = true,
-                        _ = &mut idle_deadline, if !producer_done => {
-                            tracing::warn!(
-                                edge_context = label,
-                                timeout_ms = VIZ_STREAM_IDLE_BUDGET.as_millis() as u64,
-                                "viz: all-scope typed edge stream idle timeout; serving partial snapshot"
-                            );
-                            break;
-                        }
-                        chunk = rx.recv() => {
-                            match chunk {
-                                Some(Ok(typed_edges)) => {
-                                    idle_deadline.as_mut().reset(tokio::time::Instant::now() + VIZ_STREAM_IDLE_BUDGET);
-                                    for typed_edge in typed_edges {
-                                        edge_chunk.push(VizEdge {
-                                            source: typed_edge.src_id.to_string(),
-                                            target: typed_edge.dst_id.to_string(),
-                                            edge_type: typed_edge.edge_type,
-                                            strength: Some(typed_edge.weight as f32),
-                                        });
-                                        total_edges += 1;
-                                        if edge_chunk.len() >= VIZ_CHUNK_SIZE {
-                                            let edges = std::mem::take(&mut edge_chunk);
-                                            if !send_viz_event(
-                                                write,
-                                                &VizEvent::SnapshotStreamChunk {
-                                                    nodes: Vec::new(),
-                                                    edges,
-                                                },
-                                            )
-                                            .await
-                                            {
-                                                return false;
-                                            }
-                                        }
-                                    }
-                                }
-                                Some(Err(e)) => {
-                                    tracing::warn!(error = %e, edge_context = label, "viz: failed to stream all-scope typed edges");
-                                    break;
-                                }
-                                None if producer_done => break,
-                                None => {}
-                            }
-                        }
-                    }
-                    if producer_done && rx.is_empty() {
-                        break;
-                    }
+                let drain_label = format!("typed-edges({label})");
+                let status = drain_snapshot_stream(
+                    write,
+                    producer,
+                    &mut rx,
+                    DrainSpec::new(&drain_label, VIZ_CHUNK_SIZE),
+                    typed_edge_row_key,
+                    typed_edge_elem,
+                    &mut progress,
+                )
+                .await;
+                if status == DrainStatus::SendFailed {
+                    return false;
                 }
             }
             // Stream temporal_edges (next_turn/previous_turn and *_context_segment)
             // tenant-wide so turn/segment chains render in the all-scope graph.
-            // Same paged-cursor + idle-budget contract as the typed-edge stream.
+            // Same paged-cursor + idle-budget + progress-guard contract as the
+            // typed-edge stream.
             for (edge_ctx, label) in [
                 (ctx.clone(), "current"),
                 (swapped_ctx.clone(), "legacy-swapped"),
@@ -2964,17 +3044,18 @@ async fn send_streaming_viz_snapshot<S: Storage>(
                 }
                 let (tx, mut rx) = tokio::sync::mpsc::channel(4);
                 let producer = storage.temporal_edge_stream_all(edge_ctx, VIZ_CHUNK_SIZE, tx);
-                if !drain_temporal_edges_into_snapshot(
+                let drain_label = format!("temporal-edges({label})");
+                let status = drain_snapshot_stream(
                     write,
                     producer,
                     &mut rx,
-                    &mut edge_chunk,
-                    &mut total_edges,
-                    VIZ_CHUNK_SIZE,
-                    label,
+                    DrainSpec::new(&drain_label, VIZ_CHUNK_SIZE),
+                    temporal_edge_row_key,
+                    temporal_edge_elem,
+                    &mut progress,
                 )
-                .await
-                {
+                .await;
+                if status == DrainStatus::SendFailed {
                     return false;
                 }
             }
@@ -3002,61 +3083,19 @@ async fn send_streaming_viz_snapshot<S: Storage>(
                         VIZ_CHUNK_SIZE,
                         tx,
                     );
-                    tokio::pin!(producer);
-                    let idle_deadline = tokio::time::sleep(VIZ_STREAM_IDLE_BUDGET);
-                    tokio::pin!(idle_deadline);
-                    let mut producer_done = false;
-                    loop {
-                        tokio::select! {
-                            _ = &mut producer, if !producer_done => producer_done = true,
-                            _ = &mut idle_deadline, if !producer_done => {
-                                tracing::warn!(
-                                    session_id = %sid,
-                                    timeout_ms = VIZ_STREAM_IDLE_BUDGET.as_millis() as u64,
-                                    "viz: session typed edge stream idle timeout; serving partial snapshot"
-                                );
-                                break;
-                            }
-                            chunk = rx.recv() => {
-                                match chunk {
-                                    Some(Ok(typed_edges)) => {
-                                        idle_deadline.as_mut().reset(tokio::time::Instant::now() + VIZ_STREAM_IDLE_BUDGET);
-                                        for typed_edge in typed_edges {
-                                            edge_chunk.push(VizEdge {
-                                                source: typed_edge.src_id.to_string(),
-                                                target: typed_edge.dst_id.to_string(),
-                                                edge_type: typed_edge.edge_type,
-                                                strength: Some(typed_edge.weight as f32),
-                                            });
-                                            total_edges += 1;
-                                            if edge_chunk.len() >= VIZ_CHUNK_SIZE {
-                                                let edges = std::mem::take(&mut edge_chunk);
-                                                if !send_viz_event(
-                                                    write,
-                                                    &VizEvent::SnapshotStreamChunk {
-                                                        nodes: Vec::new(),
-                                                        edges,
-                                                    },
-                                                )
-                                                .await
-                                                {
-                                                    return false;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Some(Err(e)) => {
-                                        tracing::warn!(error = %e, session_id = %sid, "viz: typed_edge_stream_session failed");
-                                        break;
-                                    }
-                                    None if producer_done => break,
-                                    None => {}
-                                }
-                            }
-                        }
-                        if producer_done && rx.is_empty() {
-                            break;
-                        }
+                    let label = format!("typed-edges(session {sid})");
+                    let status = drain_snapshot_stream(
+                        write,
+                        producer,
+                        &mut rx,
+                        DrainSpec::new(&label, VIZ_CHUNK_SIZE),
+                        typed_edge_row_key,
+                        typed_edge_elem,
+                        &mut progress,
+                    )
+                    .await;
+                    if status == DrainStatus::SendFailed {
+                        return false;
                     }
                 }
             }
@@ -3071,17 +3110,18 @@ async fn send_streaming_viz_snapshot<S: Storage>(
                         VIZ_CHUNK_SIZE,
                         tx,
                     );
-                    if !drain_temporal_edges_into_snapshot(
+                    let label = format!("temporal-edges(session {sid})");
+                    let status = drain_snapshot_stream(
                         write,
                         producer,
                         &mut rx,
-                        &mut edge_chunk,
-                        &mut total_edges,
-                        VIZ_CHUNK_SIZE,
-                        "session-temporal",
+                        DrainSpec::new(&label, VIZ_CHUNK_SIZE),
+                        temporal_edge_row_key,
+                        temporal_edge_elem,
+                        &mut progress,
                     )
-                    .await
-                    {
+                    .await;
+                    if status == DrainStatus::SendFailed {
                         return false;
                     }
                 }
@@ -3089,27 +3129,26 @@ async fn send_streaming_viz_snapshot<S: Storage>(
         }
     }
 
-    if !edge_chunk.is_empty()
-        && !send_viz_event(
-            write,
-            &VizEvent::SnapshotStreamChunk {
+    if !progress.edge_chunk.is_empty() {
+        let edges = std::mem::take(&mut progress.edge_chunk);
+        if !write
+            .send_event(&VizEvent::SnapshotStreamChunk {
                 nodes: Vec::new(),
-                edges: edge_chunk,
-            },
-        )
-        .await
-    {
-        return false;
+                edges,
+            })
+            .await
+        {
+            return false;
+        }
     }
 
-    send_viz_event(
-        write,
-        &VizEvent::SnapshotStreamEnd {
-            total_nodes,
-            total_edges,
-        },
-    )
-    .await
+    write
+        .send_event(&VizEvent::SnapshotStreamEnd {
+            total_nodes: progress.total_nodes,
+            total_edges: progress.total_edges,
+            error: snapshot_truncation_error(&progress.truncations),
+        })
+        .await
 }
 
 /// Handle a WebSocket connection for the viz dashboard.
@@ -4523,6 +4562,20 @@ mod tests {
     }
 
     #[test]
+    fn viz_html_renders_truncated_snapshot_end_loudly() {
+        let end_case = VIZ_HTML
+            .split("case 'SnapshotStreamEnd':")
+            .nth(1)
+            .and_then(|rest| rest.split("case 'EntityChanged':").next())
+            .expect("viz html must handle SnapshotStreamEnd events");
+        assert!(
+            end_case.contains("event.error") && end_case.contains("TRUNCATED"),
+            "SnapshotStreamEnd handler must surface the guard's truncation \
+             error instead of silently showing a partial graph; handler was: {end_case}"
+        );
+    }
+
+    #[test]
     fn viz_browser_paths_do_not_build_materialized_snapshots() {
         let source = include_str!("http.rs");
         let workbench_snapshot_route = source
@@ -4729,9 +4782,21 @@ mod tests {
             "all-scope streaming must preserve the old snapshot's legacy swapped-tenant typed edge fallback: {streaming_snapshot}"
         );
         assert!(
-            streaming_snapshot.contains("VIZ_STREAM_IDLE_BUDGET")
-                && streaming_snapshot.contains("serving partial snapshot"),
-            "viz snapshot streams must fail soft under backend lane contention instead of hanging the browser: {streaming_snapshot}"
+            streaming_snapshot.contains("drain_snapshot_stream"),
+            "viz snapshot streams must go through the guarded drain loop: {streaming_snapshot}"
+        );
+        let drain = source
+            .split("async fn drain_snapshot_stream")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn send_streaming_viz_snapshot").next())
+            .expect("drain_snapshot_stream body must be present");
+        assert!(
+            drain.contains("VIZ_STREAM_IDLE_BUDGET") && drain.contains("serving partial snapshot"),
+            "viz snapshot streams must fail soft under backend lane contention instead of hanging the browser: {drain}"
+        );
+        assert!(
+            drain.contains("guard.end_page()") && drain.contains("GuardTripped"),
+            "the drain loop must terminate non-progressing server cursors via the progress guard: {drain}"
         );
     }
 
@@ -4880,6 +4945,299 @@ mod tests {
             }),
             "viz snapshot must include typed edges stored under legacy swapped tenant_id; got {edges:?}"
         );
+    }
+
+    /// In-memory sink standing in for the websocket writer in drain tests.
+    #[derive(Default)]
+    struct CollectingSink {
+        events: Vec<VizEvent>,
+    }
+
+    impl VizSink for CollectingSink {
+        async fn send_event(&mut self, event: &VizEvent) -> bool {
+            self.events.push(event.clone());
+            true
+        }
+    }
+
+    impl CollectingSink {
+        fn chunk_edges(&self) -> Vec<VizEdge> {
+            self.events
+                .iter()
+                .filter_map(|e| match e {
+                    VizEvent::SnapshotStreamChunk { edges, .. } => Some(edges.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .collect()
+        }
+    }
+
+    fn make_typed_edges(count: usize) -> Vec<crate::types::TypedEdge> {
+        let now = chrono::Utc::now();
+        (0..count)
+            .map(|i| crate::types::TypedEdge {
+                tenant_id: Uuid::from_u128(1),
+                session_id: Uuid::from_u128(2),
+                src_id: Uuid::from_u128(1_000 + i as u128),
+                edge_type: "RELATES_TO".into(),
+                dst_id: Uuid::from_u128(1_000_000 + i as u128),
+                weight: 1.0,
+                metadata: None,
+                created_at: now,
+            })
+            .collect()
+    }
+
+    /// A producer that mimics the live ferrosa paging bug: `paging_state`
+    /// cycles, so the same window of pages is re-served forever and the
+    /// storage stream never ends.
+    async fn cycling_producer(
+        pages: Vec<Vec<crate::types::TypedEdge>>,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Vec<crate::types::TypedEdge>>>,
+    ) {
+        loop {
+            for page in &pages {
+                if tx.send(Ok(page.clone())).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn viz_snapshot_drain_without_guard_streams_cycling_cursor_forever() {
+        // RED baseline for the cursor-progress guard (fmem t_c081cbb7,
+        // ferrosa paging bug t_a0f922a3): with progress detection disabled,
+        // a cycling server cursor keeps the drain running unboundedly — a
+        // live probe saw 37,347 chunks / 18.6M edge items from a ~50k-edge
+        // table with no SnapshotStreamEnd. This test documents that failure
+        // mode; the guarded test below proves the fix.
+        let edges = make_typed_edges(1_000);
+        let pages: Vec<Vec<_>> = edges.chunks(500).map(<[_]>::to_vec).collect();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let producer = cycling_producer(pages, tx);
+        let mut sink = CollectingSink::default();
+        let mut progress = SnapshotProgress::new(500);
+        let disabled_guard = viz::CursorProgressGuard::with_config(viz::CursorGuardConfig {
+            max_page_repeats: u32::MAX,
+            duplication_factor: usize::MAX,
+            duplication_floor_rows: usize::MAX,
+            max_pages: usize::MAX,
+            seen_key_cap: usize::MAX,
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            drain_snapshot_stream(
+                &mut sink,
+                producer,
+                &mut rx,
+                DrainSpec {
+                    label: "cycling(no guard)",
+                    chunk_size: 500,
+                    guard: disabled_guard,
+                },
+                typed_edge_row_key,
+                typed_edge_elem,
+                &mut progress,
+            ),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "without the progress guard a cycling cursor must stream unboundedly \
+             (this documents the pre-fix failure mode)"
+        );
+    }
+
+    #[tokio::test]
+    async fn viz_snapshot_drain_guard_terminates_cycling_cursor_emitting_unique_edges_once() {
+        let edges = make_typed_edges(1_000);
+        let pages: Vec<Vec<_>> = edges.chunks(500).map(<[_]>::to_vec).collect();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let producer = cycling_producer(pages, tx);
+        let mut sink = CollectingSink::default();
+        let mut progress = SnapshotProgress::new(500);
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            drain_snapshot_stream(
+                &mut sink,
+                producer,
+                &mut rx,
+                DrainSpec::new("typed-edges(cycling)", 500),
+                typed_edge_row_key,
+                typed_edge_elem,
+                &mut progress,
+            ),
+        )
+        .await
+        .expect("the progress guard must terminate a cycling cursor promptly");
+
+        assert_eq!(status, DrainStatus::GuardTripped);
+        // Every unique edge is emitted exactly once (flushed chunks + residue).
+        let mut emitted = sink.chunk_edges();
+        emitted.extend(progress.edge_chunk.iter().cloned());
+        assert_eq!(emitted.len(), 1_000, "each unique edge exactly once");
+        let unique: std::collections::HashSet<(String, String)> = emitted
+            .iter()
+            .map(|e| (e.source.clone(), e.target.clone()))
+            .collect();
+        assert_eq!(unique.len(), 1_000, "no duplicate edges in the output");
+        assert_eq!(progress.total_edges, 1_000);
+        // The truncation is recorded for the error-bearing end event.
+        assert_eq!(progress.truncations.len(), 1);
+        assert!(
+            progress.truncations[0].contains("server cursor not progressing"),
+            "{}",
+            progress.truncations[0]
+        );
+        assert!(
+            snapshot_truncation_error(&progress.truncations)
+                .expect("guard trip must surface an end-event error")
+                .starts_with("snapshot truncated: ")
+        );
+    }
+
+    #[tokio::test]
+    async fn viz_snapshot_drain_completes_healthy_slow_stream_without_guard_trip() {
+        // Healthy-but-slow paging: 12,000 unique edges (above the duplication
+        // floor) where every page re-serves the previous page's last row —
+        // duplicate ROWS across page boundaries, but always progressing.
+        // The guard must never fire; duplicates are deduplicated on emission.
+        let edges = make_typed_edges(12_000);
+        let mut pages: Vec<Vec<crate::types::TypedEdge>> = Vec::new();
+        let mut idx = 0usize;
+        while idx < edges.len() {
+            let mut page = Vec::new();
+            if idx > 0 {
+                page.push(edges[idx - 1].clone()); // boundary duplicate
+            }
+            let end = (idx + 499).min(edges.len());
+            page.extend_from_slice(&edges[idx..end]);
+            idx = end;
+            pages.push(page);
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let producer = async move {
+            for page in pages {
+                if tx.send(Ok(page)).await.is_err() {
+                    return;
+                }
+            }
+        };
+        let mut sink = CollectingSink::default();
+        let mut progress = SnapshotProgress::new(500);
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            drain_snapshot_stream(
+                &mut sink,
+                producer,
+                &mut rx,
+                DrainSpec::new("typed-edges(healthy)", 500),
+                typed_edge_row_key,
+                typed_edge_elem,
+                &mut progress,
+            ),
+        )
+        .await
+        .expect("healthy stream must complete");
+
+        assert_eq!(
+            status,
+            DrainStatus::Completed,
+            "the guard must never trip on a slow-but-progressing stream"
+        );
+        assert!(progress.truncations.is_empty());
+        let mut emitted = sink.chunk_edges();
+        emitted.extend(progress.edge_chunk.iter().cloned());
+        assert_eq!(
+            emitted.len(),
+            12_000,
+            "boundary duplicates deduplicated; every unique edge exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn viz_streaming_snapshot_healthy_path_ends_without_error() {
+        // Full builder over MockStorage: unchanged protocol on healthy data —
+        // Start first, End last, End carries totals and NO error.
+        let storage = MockStorage::new();
+        let tenant_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let ctx = TenantContext {
+            tenant_id,
+            session_origin: "test".into(),
+        };
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        for (entity_id, name) in [(a, "alpha"), (b, "beta")] {
+            storage
+                .entity_put(
+                    &ctx,
+                    &crate::types::EntityEntry {
+                        tenant_id,
+                        session_id,
+                        entity_id,
+                        entity_name: name.into(),
+                        entity_type: "concept".into(),
+                        confidence: 1.0,
+                        created_at: now,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        storage
+            .typed_edge_put(
+                &ctx,
+                &crate::types::TypedEdge {
+                    tenant_id,
+                    session_id,
+                    src_id: a,
+                    edge_type: "TAGGED_AS".into(),
+                    dst_id: b,
+                    weight: 0.5,
+                    metadata: None,
+                    created_at: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut sink = CollectingSink::default();
+        let ok = send_streaming_viz_snapshot(
+            &mut sink,
+            &storage,
+            &ctx,
+            session_id,
+            VizSnapshotScope::All,
+        )
+        .await;
+        assert!(ok, "healthy snapshot must complete");
+        assert!(
+            matches!(
+                sink.events.first(),
+                Some(VizEvent::SnapshotStreamStart { .. })
+            ),
+            "stream must open with SnapshotStreamStart"
+        );
+        match sink.events.last() {
+            Some(VizEvent::SnapshotStreamEnd {
+                total_nodes,
+                total_edges,
+                error,
+            }) => {
+                assert_eq!(*total_nodes, 2);
+                assert_eq!(*total_edges, 1);
+                assert!(
+                    error.is_none(),
+                    "healthy snapshot must not carry a truncation error: {error:?}"
+                );
+            }
+            other => panic!("stream must close with SnapshotStreamEnd, got {other:?}"),
+        }
     }
 
     #[test]

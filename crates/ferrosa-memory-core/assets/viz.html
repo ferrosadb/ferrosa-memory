@@ -3183,7 +3183,14 @@ function handleEvent(event) {
         applySnapshotEvent(streamSnapshotEvent());
       }
       snapshotStream = null;
-      updateConnectionStatus('LIVE', true);
+      if (event.error) {
+        // Server truncated the snapshot (e.g. a non-progressing storage
+        // cursor). Render loudly instead of pretending the graph is complete.
+        console.error('viz snapshot truncated:', event.error);
+        updateConnectionStatus(`TRUNCATED — ${event.error}`, true);
+      } else {
+        updateConnectionStatus('LIVE', true);
+      }
       break;
 
     case 'EntityChanged':
