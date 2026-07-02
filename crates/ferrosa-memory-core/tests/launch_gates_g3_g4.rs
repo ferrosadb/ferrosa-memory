@@ -221,8 +221,14 @@ async fn g4_smart_ingest_still_creates_plain_entities_against_new_schema() {
         other => panic!("expected Created, got {other:?}"),
     };
 
+    // "decision" is a global type, so Issue #148 stores it under the tenant
+    // global-sentinel partition, not the caller's session. Read it back from there.
     let fetched = storage
-        .entity_get_by_id(&ctx, session_id, entity_id)
+        .entity_get_by_id(
+            &ctx,
+            ferrosa_memory_core::scope::tenant_global_session_uuid(ctx.tenant_id),
+            entity_id,
+        )
         .await
         .expect("fetch")
         .expect("exists");

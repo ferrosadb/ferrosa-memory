@@ -16255,8 +16255,14 @@ mod tests {
         assert_eq!(result["action"], "Created");
 
         let entity_id = Uuid::parse_str(result["entity_id"].as_str().unwrap()).unwrap();
+        // "concept" is a global type — Issue #148 stores it under the tenant
+        // global-sentinel partition, not the caller's session.
         let entity = store
-            .entity_get_by_id(&ctx, sid, entity_id)
+            .entity_get_by_id(
+                &ctx,
+                crate::scope::tenant_global_session_uuid(ctx.tenant_id),
+                entity_id,
+            )
             .await
             .unwrap()
             .expect("entity should be persisted");
