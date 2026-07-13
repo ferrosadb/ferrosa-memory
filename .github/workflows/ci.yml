@@ -421,10 +421,16 @@ jobs:
             node2:
               image: ferrosa-memory-node
               depends_on:
-                node1:
-                  condition: service_healthy
+                # Start all Ferrosa nodes after the shared object-store
+                # bootstrap. A TCP-open node1 is only a standalone/pair node,
+                # not proof that a three-node Raft cluster has formed. Waiting
+                # for it here serializes formation and can leave node2 as a
+                # pair-mode secondary when node3 joins.
+                rustfs-init:
+                  condition: service_completed_successfully
               ports:
                 - "19043:9042"
+                - "19091:9090"
               environment:
                 FERROSA_HOST_ID: "22222222-2222-2222-2222-222222222222"
                 FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
@@ -449,12 +455,13 @@ jobs:
             node3:
               image: ferrosa-memory-node
               depends_on:
-                node1:
-                  condition: service_healthy
-                node2:
-                  condition: service_healthy
+                # Match the upstream cluster topology: all three nodes begin
+                # discovery together after the shared dependency is ready.
+                rustfs-init:
+                  condition: service_completed_successfully
               ports:
                 - "19044:9042"
+                - "19092:9090"
               environment:
                 FERROSA_HOST_ID: "33333333-3333-3333-3333-333333333333"
                 FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
@@ -478,7 +485,7 @@ jobs:
                 start_period: 20s
           CEOF
           docker compose -f /tmp/docker-compose.memory-ci.yml up -d
-      - name: Wait for all 3 nodes on 19042-19044
+      - name: Wait for a formed 3-node cluster
         run: |
           for port in 19042 19043 19044; do
             echo "Waiting for CQL on port ${port}..."
@@ -495,6 +502,30 @@ jobs:
               sleep 2
             done
           done
+
+          # A listening CQL socket only proves that the process accepted TCP.
+          # In the progressive topology it may still be standalone, pair, or
+          # forming; scylla drivers then correctly reject a secondary during
+          # their mandatory REGISTER handshake. Gate migrations on the actual
+          # cluster state of every node instead.
+          for port in 19090 19091 19092; do
+            echo "Waiting for cluster mode on web port ${port}..."
+            for i in $(seq 1 60); do
+              status="$(curl --fail --silent --show-error \
+                "http://127.0.0.1:${port}/api/cluster/status" 2>&1 || true)"
+              if printf '%s' "$status" | grep -Eq '"mode"[[:space:]]*:[[:space:]]*"cluster"'; then
+                echo "  web port ${port} reports cluster mode after ${i}s"
+                break
+              fi
+              if [ "$i" -eq 60 ]; then
+                echo "::error::Node on web port ${port} did not reach cluster mode; last status: ${status}"
+                docker compose -f /tmp/docker-compose.memory-ci.yml logs 2>/dev/null | tail -200
+                exit 1
+              fi
+              sleep 2
+            done
+          done
+
           echo "Waiting for graph HTTP on port 17474..."
           for i in $(seq 1 60); do
             if bash -c "</dev/tcp/127.0.0.1/17474" 2>/dev/null; then
