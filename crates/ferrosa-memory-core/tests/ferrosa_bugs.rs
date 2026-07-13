@@ -14,7 +14,10 @@
 
 use ferrosa_memory_core::cql_storage::build_col_map;
 use ferrosa_memory_core::test_cluster::TestClusterConfig;
-use scylla::{LegacySession, SessionBuilder};
+use scylla::{
+    LegacySession, SessionBuilder,
+    statement::{Consistency, query::Query},
+};
 use uuid::Uuid;
 
 /// Returns the test cluster config or `None` when the harness env isn't
@@ -43,6 +46,19 @@ async fn connect_test_cluster_maybe_auth(cfg: &TestClusterConfig) -> LegacySessi
     }
     #[allow(deprecated)]
     builder.build_legacy().await.expect("session build failed")
+}
+
+fn local_quorum_query(cql: impl Into<String>) -> Query {
+    let mut query = Query::new(cql);
+    query.set_consistency(Consistency::LocalQuorum);
+    query
+}
+
+#[test]
+fn phonetic_regression_queries_use_local_quorum() {
+    let query = local_quorum_query("SELECT entity_name FROM entity_store");
+
+    assert_eq!(query.get_consistency(), Some(Consistency::LocalQuorum));
 }
 
 // ---- FIXED: Vector PREPARE + ANN ----
@@ -360,22 +376,22 @@ async fn open_secondary_index_paging() {
     );
 }
 
-// ---- OPEN: Phonetic index ----
+// ---- FIXED: Phonetic index ----
 
 #[tokio::test]
 #[ignore]
-async fn open_phonetic_match() {
+async fn fixed_phonetic_match() {
     let Some(cfg) = test_cluster() else { return };
-    let s = connect_test_cluster(&cfg).await;
+    let s = connect_test_cluster_maybe_auth(&cfg).await;
     let ks = &cfg.keyspace;
     #[allow(deprecated)]
     s.query_unpaged(
-        format!(
+        local_quorum_query(format!(
             "INSERT INTO {ks}.entity_store \
              (tenant_id, session_id, entity_id, entity_name, entity_type, context_snippet, confidence, created_at) \
              VALUES (550e8400-e29b-41d4-a716-446655440000, d855258d-c5b7-41be-bf28-e8cfa0fc6b9e, \
                      11111111-1111-1111-1111-111111111111, 'John Smith', 'person', 'test', 0.9, 1711036800000)"
-        ),
+        )),
         (),
     )
     .await
@@ -384,12 +400,12 @@ async fn open_phonetic_match() {
     #[allow(deprecated)]
     let result = s
         .query_unpaged(
-            format!(
+            local_quorum_query(format!(
                 "SELECT entity_name FROM {ks}.entity_store \
                  WHERE tenant_id = 550e8400-e29b-41d4-a716-446655440000 \
                  AND session_id = d855258d-c5b7-41be-bf28-e8cfa0fc6b9e \
                  AND entity_name = 'Jon Smyth'"
-            ),
+            )),
             (),
         )
         .await
