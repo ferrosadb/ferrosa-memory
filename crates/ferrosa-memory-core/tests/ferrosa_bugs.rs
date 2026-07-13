@@ -384,13 +384,20 @@ async fn fixed_phonetic_match() {
     let Some(cfg) = test_cluster() else { return };
     let s = connect_test_cluster_maybe_auth(&cfg).await;
     let ks = &cfg.keyspace;
+    // This test runs concurrently with the other live suites under nextest.
+    // Give every invocation a private partition so a previous run cannot make
+    // an absent fresh write look healthy (or leave a stale tombstone behind).
+    let tenant_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let entity_id = Uuid::new_v4();
+    let created_at = chrono::Utc::now().timestamp_millis();
     #[allow(deprecated)]
     s.query_unpaged(
         local_quorum_query(format!(
             "INSERT INTO {ks}.entity_store \
              (tenant_id, session_id, entity_id, entity_name, entity_type, context_snippet, confidence, created_at) \
-             VALUES (550e8400-e29b-41d4-a716-446655440000, d855258d-c5b7-41be-bf28-e8cfa0fc6b9e, \
-                     11111111-1111-1111-1111-111111111111, 'John Smith', 'person', 'test', 0.9, 1711036800000)"
+             VALUES ({tenant_id}, {session_id}, {entity_id}, \
+                     'John Smith', 'person', 'test', 0.9, {created_at})"
         )),
         (),
     )
@@ -398,12 +405,29 @@ async fn fixed_phonetic_match() {
     .expect("INSERT");
 
     #[allow(deprecated)]
+    let exact = s
+        .query_unpaged(
+            local_quorum_query(format!(
+                "SELECT entity_name FROM {ks}.entity_store \
+                 WHERE tenant_id = {tenant_id} AND session_id = {session_id} \
+                 AND entity_id = {entity_id}"
+            )),
+            (),
+        )
+        .await
+        .expect("exact read after INSERT");
+    assert!(
+        !exact.rows_or_empty().is_empty(),
+        "exact read must see the newly inserted phonetic fixture"
+    );
+
+    #[allow(deprecated)]
     let result = s
         .query_unpaged(
             local_quorum_query(format!(
                 "SELECT entity_name FROM {ks}.entity_store \
-                 WHERE tenant_id = 550e8400-e29b-41d4-a716-446655440000 \
-                 AND session_id = d855258d-c5b7-41be-bf28-e8cfa0fc6b9e \
+                 WHERE tenant_id = {tenant_id} \
+                 AND session_id = {session_id} \
                  AND entity_name = 'Jon Smyth'"
             )),
             (),
