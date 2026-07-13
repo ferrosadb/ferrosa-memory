@@ -12,6 +12,8 @@
 //!
 //! Requires `FERROSA_TEST_CONTAINERS=1`; panics with setup instructions when
 //! the env var is unset so failures are loud and diagnosable.
+//! Embedding-backed assertions are opt-in with
+//! `FERROSA_TEST_NOMIC_EMBEDDINGS=1` because CI does not provision Nomic.
 
 use ferrosa_memory_core::config::{EmbeddingConfig, FerrosaCqlConfig};
 use ferrosa_memory_core::cql_storage::CqlStorage;
@@ -57,6 +59,17 @@ async fn tenant() -> TenantContext {
     }
 }
 
+fn nomic_embeddings_enabled(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+#[test]
+fn nomic_embedding_live_test_is_explicitly_opt_in() {
+    assert!(nomic_embeddings_enabled(Some("1")));
+    assert!(!nomic_embeddings_enabled(None));
+    assert!(!nomic_embeddings_enabled(Some("0")));
+}
+
 #[tokio::test]
 #[ignore = "requires live Ferrosa cluster; run with --ignored and FERROSA_TEST_CONTAINERS=1"]
 async fn skill_round_trip_on_live_cluster() {
@@ -67,12 +80,36 @@ async fn skill_round_trip_on_live_cluster() {
              cluster on port 19042"
         );
     }
+    if !nomic_embeddings_enabled(
+        std::env::var("FERROSA_TEST_NOMIC_EMBEDDINGS")
+            .ok()
+            .as_deref(),
+    ) {
+        eprintln!(
+            "skipping skill round-trip: set FERROSA_TEST_NOMIC_EMBEDDINGS=1 \
+             when the Nomic embedding model is provisioned"
+        );
+        return;
+    }
     let Some(test_cfg) = TestClusterConfig::from_env_or_skip() else {
         panic!(
             "TestClusterConfig not found in environment — run \
              `scripts/start-test-cluster.sh` and export the env vars it prints"
         );
     };
+
+    // This round-trip exercises embedding-backed ranking. Treat a missing
+    // model as an unmet external test prerequisite before touching the cluster.
+    let embed_cfg = EmbeddingConfig::default();
+    let embed_client = EmbeddingClient::new(&embed_cfg);
+    if let Err(error) = embed_client.health_check().await {
+        eprintln!(
+            "skipping skill round-trip: required embedding model '{}' is unavailable: {error}",
+            embed_cfg.model,
+        );
+        return;
+    }
+
     let storage = CqlStorage::connect(&base_cfg(&test_cfg))
         .await
         .expect("connect");
@@ -85,18 +122,6 @@ async fn skill_round_trip_on_live_cluster() {
 
     let ctx = tenant().await;
     let caller_session = Uuid::new_v4();
-
-    // Embedding client wired to the configured provider so retrieve ranks
-    // on description similarity, not just name.
-    let embed_cfg = EmbeddingConfig::default();
-    let embed_client = EmbeddingClient::new(&embed_cfg);
-    if embed_client.health_check().await.is_err() {
-        eprintln!(
-            "WARNING: embedding provider not reachable — ranking falls back to \
-             name + keyword signals. Start Ollama + pull {}.",
-            embed_cfg.model
-        );
-    }
 
     // ingest_skill routes REQUIRES edge writes through the graph client
     // when one is supplied — CqlStorage::typed_edge_put rejects direct
