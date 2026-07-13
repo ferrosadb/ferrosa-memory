@@ -198,6 +198,14 @@ class VerifyWrapperHonestyTests(unittest.TestCase):
         result = self.module.verify_wrapper(cmd, "ingest-turn")
         self.assertEqual(result, f"{cmd}: ok")
 
+    def test_turn_entity_ingest_failure_is_reported_as_failure(self):
+        cmd = self._fake_wrapper(
+            "echo '[ferrosa-memory-hook] turn entity ingest failed: tenant mismatch' >&2\nexit 0"
+        )
+        result = self.module.verify_wrapper(cmd, "ingest-turn")
+        self.assertNotEqual(result, f"{cmd}: ok")
+        self.assertIn("turn entity ingest failed", result)
+
 
 class MainAuthFlagTests(unittest.TestCase):
     def test_auth_header_flag_lands_in_env_file(self):

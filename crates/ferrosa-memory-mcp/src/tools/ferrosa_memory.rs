@@ -118,8 +118,10 @@ fn print_help() {
 ///
 /// Reads the MCP config (and auth file if present), resolves the tenant
 /// (reusing an existing real one, else generating a fresh UUID), and writes it
-/// consistently into `[server].tenant_id`, `[viz].tenant_id`, and every auth
-/// principal. If the auth file is absent it generates one with random
+/// consistently into the HTTP auth principals and `[viz].tenant_id`; stdio
+/// configs also receive `[server].tenant_id`. HTTP mode deliberately removes
+/// that legacy fallback because the authenticated principal is authoritative.
+/// If the auth file is absent it generates one with random
 /// per-install credentials. Emits `KEY=VALUE` lines on stdout for the
 /// installer to thread into the hook env (the plaintext password is shown
 /// once here and is otherwise unrecoverable).
@@ -146,9 +148,16 @@ fn provision_tenant(cli: &Cli) -> anyhow::Result<()> {
 
     let tenant = tp::resolve_tenant(existing, Uuid::new_v4());
 
-    // Config: [server].tenant_id + [viz].tenant_id.
-    let mut new_config =
-        tp::set_in_section(&config_doc, "server", "tenant_id", &tenant.to_string());
+    // HTTP derives tenant identity only from the authenticated principal. An
+    // old release may have left the now-invalid server fallback behind; repair
+    // it during provisioning so setup is idempotent and self-healing.
+    let is_http = section_value(&config_doc, "server", "transport")
+        .is_some_and(|transport| transport.eq_ignore_ascii_case("http"));
+    let mut new_config = if is_http {
+        tp::remove_from_section(&config_doc, "server", "tenant_id")
+    } else {
+        tp::set_in_section(&config_doc, "server", "tenant_id", &tenant.to_string())
+    };
     new_config = tp::set_in_section(&new_config, "viz", "tenant_id", &tenant.to_string());
 
     // Auth file: update existing principals, or generate fresh credentials.
@@ -576,6 +585,50 @@ mod tests {
         assert_eq!(first_principal_tenant(auth).as_deref(), Some("t-1"));
         // Commented assignments are not read as values.
         assert_eq!(line_value("# tenant_id = \"x\"", "tenant_id"), None);
+    }
+
+    #[test]
+    fn provision_tenant_repairs_http_config_without_server_tenant_fallback() {
+        let directory = std::env::temp_dir().join(format!(
+            "ferrosa-memory-provision-tenant-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("ferrosa-memory.toml");
+        let auth_path = directory.join("http-auth.toml");
+        fs::write(
+            &config_path,
+            "[server]\ntransport = \"http\"\nauth_file = \"http-auth.toml\"\ntenant_id = \"00000000-0000-0000-0000-000000000001\"\n\n[viz]\nenabled = true\n",
+        )
+        .unwrap();
+        fs::write(
+            &auth_path,
+            "[[principal]]\nusername = \"ferrosa_user\"\npassword_sha256 = \"hash\"\ntenant_id = \"22222222-2222-2222-2222-222222222222\"\n",
+        )
+        .unwrap();
+        let cli = Cli {
+            command: Command::ProvisionTenant,
+            yes: false,
+            dry_run: false,
+            system: false,
+            delete_data: false,
+            config: Some(config_path.display().to_string()),
+            auth_file: Some(auth_path.display().to_string()),
+        };
+
+        provision_tenant(&cli).unwrap();
+
+        let config = fs::read_to_string(&config_path).unwrap();
+        let auth = fs::read_to_string(&auth_path).unwrap();
+        assert_eq!(section_value(&config, "server", "tenant_id"), None);
+        let tenant = first_principal_tenant(&auth).unwrap();
+        assert!(
+            !ferrosa_memory_core::tenant_provision::is_placeholder_tenant(
+                uuid::Uuid::parse_str(&tenant).unwrap()
+            )
+        );
+        assert_eq!(section_value(&config, "viz", "tenant_id"), Some(tenant));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

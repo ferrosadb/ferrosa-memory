@@ -713,9 +713,17 @@ def verify_wrapper(command: str, mode: str) -> str:
     if proc.returncode != 0:
         return f"{command}: exited {proc.returncode}: {proc.stderr.strip()[:300]}"
     combined = f"{proc.stdout}\n{proc.stderr}"
-    if "skipped:" in combined:
-        skip_line = next((line for line in combined.splitlines() if "skipped:" in line), "skipped")
-        return f"{command}: FAILED (hook degraded to skip): {skip_line.strip()[:300]}"
+    failure_markers = (
+        "skipped:",
+        "turn entity ingest failed:",
+        "context segment ingest failed:",
+    )
+    for marker in failure_markers:
+        if marker in combined:
+            failure_line = next(
+                (line for line in combined.splitlines() if marker in line), marker.rstrip(":"),
+            )
+            return f"{command}: FAILED (hook write unavailable): {failure_line.strip()[:300]}"
     return f"{command}: ok"
 
 
@@ -822,10 +830,19 @@ def main() -> int:
     for result in results:
         log(result)
     if args.verify:
+        verification_failed = False
         for harness, commands in wrappers.items():
-            log(f"{harness} session-start verification: {verify_wrapper(commands['session_start'], 'session-start')}")
-            log(f"{harness} recall verification: {verify_wrapper(commands['recall'], 'recall')}")
-            log(f"{harness} ingest verification: {verify_wrapper(commands['ingest_turn'], 'ingest-turn')}")
+            for mode, command in (
+                ("session-start", commands["session_start"]),
+                ("recall", commands["recall"]),
+                ("ingest", commands["ingest_turn"]),
+            ):
+                verification = verify_wrapper(command, mode)
+                log(f"{harness} {mode} verification: {verification}")
+                verification_failed |= "FAILED" in verification
+        if verification_failed:
+            log("hook verification failed; refusing to report a usable memory integration")
+            return 4
     log(f"wrote manifest: {manifest_path}")
     return 0
 
