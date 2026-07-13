@@ -484,6 +484,7 @@ jobs:
                 retries: 30
                 start_period: 20s
           CEOF
+          python scripts/validate-ci-cluster-topology.py /tmp/docker-compose.memory-ci.yml
           docker compose -f /tmp/docker-compose.memory-ci.yml up -d
       - name: Wait for a formed 3-node cluster
         run: |
