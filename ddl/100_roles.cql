@@ -102,4 +102,15 @@ GRANT MODIFY ON agent_memory.edge_types   TO ferrosa_user;
 -- graph-engine edge tables listed below.
 GRANT MODIFY ON agent_memory.temporal_edges TO ferrosa_user;
 
+-- Consolidation, profile, retrieval-learning, and foresight tables are all
+-- written by CqlStorage on the application serving path. Omitting these
+-- grants makes an auth-enabled deployment fail only after a session reaches
+-- the corresponding feature, rather than at migration time.
+GRANT MODIFY ON agent_memory.consolidation_requests TO ferrosa_user;
+GRANT MODIFY ON agent_memory.consolidation_runs     TO ferrosa_user;
+GRANT MODIFY ON agent_memory.mem_scenes             TO ferrosa_user;
+GRANT MODIFY ON agent_memory.mem_profiles           TO ferrosa_user;
+GRANT MODIFY ON agent_memory.retrieval_traces       TO ferrosa_user;
+GRANT MODIFY ON agent_memory.foresight_facts        TO ferrosa_user;
+
 -- graph-owned tables: NOT GRANTED to ferrosa_user on purpose.

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import unittest
 from argparse import Namespace
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -105,6 +107,26 @@ class RecallCompactionTests(unittest.TestCase):
 
     def test_empty_triggered_intentions_are_suppressed(self) -> None:
         self.assertEqual(self.module.compact_recall_block('{"triggered":[]}'), [])
+
+    def test_codex_session_start_uses_the_session_start_hook_envelope(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.module.emit_session_start(
+                "11111111-1111-1111-1111-111111111111",
+                "codex-json",
+            )
+
+        payload = json.loads(output.getvalue())
+        self.assertNotIn("session_id", payload)
+        self.assertEqual(
+            payload,
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": "Ferrosa Memory session is ready.",
+                }
+            },
+        )
 
     def test_hybrid_search_json_compacts_to_hints_and_content(self) -> None:
         payload = {
