@@ -198,20 +198,30 @@ async fn g4_smart_ingest_still_creates_plain_entities_against_new_schema() {
         .await
         .expect("migrate");
 
-    let ctx = test_ctx();
+    let ctx = TenantContext {
+        tenant_id: Uuid::new_v4(),
+        session_origin: "launch-g3-g4-smart-ingest".into(),
+    };
     let session_id = Uuid::new_v4();
+    // Decisions are global-scoped and smart_ingest deduplicates them by
+    // content/name. Keep this live fixture unique so a rerun proves the
+    // creation path instead of observing a prior test run's update path.
+    let suffix = Uuid::new_v4();
+    let entity_name = format!("rate-limit-policy-{suffix}");
+    let content =
+        format!("A minor API rate-limit policy {suffix}: 100 req/sec per tenant, burst 500.");
 
     let cfg = IngestConfig::default();
     let decision = smart_ingest(
         &storage,
         &ctx,
         session_id,
-        "A minor API rate-limit policy: 100 req/sec per tenant, burst 500.",
+        &content,
         "decision",
         None,
         None,
         &cfg,
-        Some("rate-limit-policy"),
+        Some(&entity_name),
         None,
     )
     .await
@@ -242,7 +252,7 @@ async fn g4_smart_ingest_still_creates_plain_entities_against_new_schema() {
     // Session default regardless of type.
     assert_eq!(fetched.scope, EntityScope::Global);
     // Core fields populated normally.
-    assert_eq!(fetched.entity_name, "rate-limit-policy");
+    assert_eq!(fetched.entity_name, entity_name);
     assert_eq!(fetched.entity_type, "decision");
 }
 
