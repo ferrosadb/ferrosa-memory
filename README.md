@@ -227,6 +227,13 @@ Shared HTTP startup is fail-closed. The binary refuses to bind the listener unle
 - `server.auth_file` is set
 - `server.tenant_id` is omitted
 
+For a source checkout, run `./setup.sh --config <path>` after building or
+upgrading. Setup reconciles the per-install tenant across the HTTP auth file,
+`[viz].tenant_id`, and agent-hook environment before restarting the service;
+it removes obsolete `server.tenant_id` fallbacks from HTTP configs. Hook
+verification sends a representative per-turn write and fails the setup rather
+than claiming success when that write is rejected.
+
 Probe semantics differ on purpose:
 
 - `GET /healthz/live` reports process liveness only

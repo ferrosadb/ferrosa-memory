@@ -255,6 +255,7 @@
 | F59 | TLS/auth secrets baked into container config or committed examples | Credential leakage and difficult rotation | 9 | 3 | 6 | **162** | Use mounted files or runtime env injection only. Keep examples redacted. Document rotation procedure. |
 | F60 | Viz exposed on shared deployment without equivalent auth boundary | Cross-tenant snapshot/event leakage and operator surface exposed to end users | 8 | 3 | 6 | **144** | Disable viz by default in shared deployments. If enabled, require same auth/TLS posture or internal-only exposure. |
 | F61 | Shared HTTP starts with fixed/default tenant fallback enabled | Multiple users silently share one tenant namespace | 9 | 3 | 7 | **189** | In HTTP mode, fail startup when auth mapping is absent and disallow random/fixed tenant fallback. |
+| F62 | Hook tenant differs from the authenticated HTTP principal | Per-turn memory writes are rejected while a wrapper exits successfully | 8 | 4 | 8 | **256** | `setup.sh` reconciles auth, config, and hook tenant idempotently; hook verification treats rejected turn/context writes as a setup failure. |
 
 ### Component: bulk_ingest / `ingest_entities`
 

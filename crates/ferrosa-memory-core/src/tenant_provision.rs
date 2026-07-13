@@ -120,6 +120,31 @@ pub fn set_in_section(doc: &str, section: &str, key: &str, value: &str) -> Strin
     finish(out, doc)
 }
 
+/// Remove every active assignment of `key` from a TOML table while preserving
+/// comments, unrelated fields, and the document's trailing-newline style.
+///
+/// HTTP deployments derive tenant identity exclusively from the authenticated
+/// principal, so this lets provisioning repair an obsolete `[server]`
+/// `tenant_id` fallback instead of leaving the configuration invalid.
+pub fn remove_from_section(doc: &str, section: &str, key: &str) -> String {
+    let header = format!("[{section}]");
+    let mut out = Vec::new();
+    let mut in_section = false;
+
+    for line in doc.lines() {
+        let trimmed = line.trim();
+        if is_header(trimmed) {
+            in_section = trimmed == header;
+        }
+        if in_section && is_assignment_of(trimmed, key) {
+            continue;
+        }
+        out.push(line.to_string());
+    }
+
+    finish(out, doc)
+}
+
 /// Set `tenant_id = "<tenant>"` inside every `[[principal]]` array-table of a
 /// TOML auth document, preserving all other lines. Inserts the key into a
 /// principal block that lacks it.
@@ -267,6 +292,16 @@ mod tests {
         // The comment is preserved and a real assignment is added.
         assert!(out.contains("# tenant_id = \"commented\""));
         assert!(out.contains("tenant_id = \"T\""));
+    }
+
+    #[test]
+    fn remove_from_section_removes_only_the_target_assignment() {
+        let doc = "[server]\ntransport = \"http\"\ntenant_id = \"OLD\"\n# tenant_id = \"commented\"\n\n[viz]\ntenant_id = \"OLD\"\n";
+        let out = remove_from_section(doc, "server", "tenant_id");
+        assert!(out.contains("[server]\ntransport = \"http\""));
+        assert!(out.contains("# tenant_id = \"commented\""));
+        assert!(out.contains("[viz]\ntenant_id = \"OLD\""));
+        assert!(!out.contains("[server]\ntransport = \"http\"\ntenant_id = \"OLD\""));
     }
 
     #[test]

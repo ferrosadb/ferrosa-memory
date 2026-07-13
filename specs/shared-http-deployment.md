@@ -17,6 +17,11 @@ The shared HTTP boundary is now implemented with explicit startup validation and
 - Readiness is distinct from liveness. `/healthz/live` reports that the process is up; `/healthz/ready` reports role-aware Ferrosa client health for MCP serving (auth + app-table CQL + public query endpoints required by enabled features).
 - Viz remains a separate surface. In HTTP mode it is unauthenticated, binds loopback only, and requires an explicit `[viz].tenant_id` if enabled.
 - The auth file can be reloaded with `SIGHUP` without restarting the process.
+- Source `setup.sh` reconciles the per-install tenant through
+  `ferrosa-memory provision-tenant`: it updates auth principals and
+  `[viz].tenant_id`, removes a legacy HTTP `server.tenant_id` fallback, and
+  writes the resulting tenant into agent-hook configuration. A representative
+  hook write is verified fail-loud during setup.
 
 The remaining rollout work is no longer operator query plumbing. CQL/SPARQL passthrough is now in place; the remaining correction is graph-table write cutover plus readiness/read-only gating under least-privilege `app_reader`.
 

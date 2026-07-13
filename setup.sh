@@ -147,6 +147,35 @@ else
     log "skipping build"
 fi
 
+# Reconcile the per-install tenant before starting the service or generating
+# hooks. This repairs releases that predate tenant provisioning: HTTP mode
+# derives identity solely from the auth principal, while the hooks must send
+# that same tenant on every per-turn ingest.
+tenant_id=""
+if [[ -f "$config_path" ]]; then
+    auth_file=$(awk '
+        /^\[server\]$/ { in_server=1; next }
+        /^\[/ { in_server=0 }
+        in_server && /^[[:space:]]*auth_file[[:space:]]*=/ {
+            value=$0
+            sub(/^[^=]*=[[:space:]]*/, "", value)
+            gsub(/^[[:space:]\"]+|[[:space:]\"]+$/, "", value)
+            print value
+            exit
+        }
+    ' "$config_path")
+    provision_args=(provision-tenant --config "$config_path")
+    if [[ -n "$auth_file" ]]; then
+        provision_args+=(--auth-file "$auth_file")
+    fi
+    log "reconciling per-install tenant and HTTP auth configuration"
+    provision_output=$(target/release/ferrosa-memory "${provision_args[@]}")
+    tenant_id=$(printf '%s\n' "$provision_output" | sed -n 's/^FERROSA_MEMORY_TENANT_ID=//p')
+    [[ -n "$tenant_id" ]] || die "tenant provisioning produced no tenant id"
+else
+    log "config not found at $config_path; tenant reconciliation deferred"
+fi
+
 # Track whether THIS run actually installed/started a native service. The
 # health-check loop below must only hard-fail when we installed one — otherwise
 # a Linux checkout (no auto-install path) would always fail setup even though
@@ -216,6 +245,9 @@ if [[ -n "$mcp_user" ]]; then
 fi
 if [[ -n "$mcp_password" ]]; then
     installer_args+=(--mcp-password "$mcp_password")
+fi
+if [[ -n "$tenant_id" ]]; then
+    installer_args+=(--tenant-id "$tenant_id")
 fi
 
 log "installing agent memory hooks"
