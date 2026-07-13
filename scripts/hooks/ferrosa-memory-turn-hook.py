@@ -976,6 +976,28 @@ def emit_context(context: str, output_format: str, event: str) -> None:
         print(context)
 
 
+def emit_session_start(session_id: str, output_format: str) -> None:
+    """Emit only the output shape accepted by the active harness.
+
+    The fmem session id is already persisted by ``configure``. Codex's
+    SessionStart protocol does not accept arbitrary top-level fields, so the
+    id must not be printed directly there.
+    """
+    if output_format == "hermes-json":
+        print(json.dumps({"session_id": session_id}))
+    elif output_format == "codex-json":
+        print(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "SessionStart",
+                        "additionalContext": "Ferrosa Memory session is ready.",
+                    }
+                }
+            )
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["session-start", "recall", "ingest-turn"], default="recall")
@@ -1035,10 +1057,7 @@ def main() -> int:
         client.initialize()
         if args.mode == "session-start":
             session_id = configure_session_start(client, payload, args)
-            if args.format == "hermes-json":
-                print(json.dumps({"session_id": session_id}))
-            elif args.format == "codex-json":
-                print(json.dumps({"session_id": session_id}))
+            emit_session_start(session_id, args.format)
         elif args.mode == "recall":
             context = recall_context(client, payload, args)
             emit_context(context, args.format, payload.get("hook_event_name") or args.event)
