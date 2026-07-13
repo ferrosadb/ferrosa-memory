@@ -227,7 +227,7 @@ def extract_prompt(payload: dict[str, Any]) -> str:
 
 
 def extract_response(payload: dict[str, Any]) -> str:
-    for key in ("assistant_response", "response", "final_response"):
+    for key in ("assistant_response", "response", "final_response", "last_assistant_message"):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
@@ -330,11 +330,29 @@ def transcript_tail(payload: dict[str, Any]) -> tuple[str, str, list[dict[str, s
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(obj, dict):
+                continue
             text = json.dumps(obj, ensure_ascii=False)
             role = obj.get("role") or obj.get("type") or obj.get("message", {}).get("role")
+            codex_payload = obj.get("payload")
+            if isinstance(codex_payload, dict):
+                codex_role = codex_payload.get("role")
+                codex_text = " ".join(content_texts(codex_payload.get("content"))).strip()
+                if codex_role == "user" and codex_text:
+                    user = codex_text[:4000]
+                elif codex_role == "assistant" and codex_text:
+                    assistant = codex_text[:4000]
+                elif codex_payload.get("type") == "user_message":
+                    message = codex_payload.get("message")
+                    if isinstance(message, str) and message.strip():
+                        user = message.strip()[:4000]
+                elif codex_payload.get("type") == "agent_message" and not assistant:
+                    message = codex_payload.get("message")
+                    if isinstance(message, str) and message.strip():
+                        assistant = message.strip()[:4000]
             if role == "user" and not user:
                 user = text[:4000]
-            elif role == "assistant":
+            elif role == "assistant" and not assistant:
                 assistant = text[:4000]
             role_text = str(role or "").lower()
             if (

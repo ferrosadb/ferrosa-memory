@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import os
+import tempfile
 import unittest
 from argparse import Namespace
 from contextlib import redirect_stdout
@@ -127,6 +128,55 @@ class RecallCompactionTests(unittest.TestCase):
                 }
             },
         )
+
+    def test_codex_stop_last_assistant_message_is_ingested(self) -> None:
+        args = Namespace(harness="codex", event="Stop")
+        client = FakeClient()
+
+        self.module.ingest_turn(
+            client,
+            {
+                "hook_event_name": "Stop",
+                "session_id": "codex-session",
+                "cwd": "/repo",
+                "last_assistant_message": "The root cause is fixed.",
+            },
+            args,
+        )
+
+        entity_call = [call for call in client.calls if call[0] == "ingest_entities"]
+        self.assertEqual(len(entity_call), 1)
+        self.assertIn("Assistant: The root cause is fixed.", entity_call[0][1]["entities"][0]["context"])
+
+    def test_transcript_tail_reads_codex_response_item_messages(self) -> None:
+        lines = [
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Please preserve memory nodes."}],
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "I will fix the hook."}],
+                },
+            },
+        ]
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl") as transcript:
+            for line in lines:
+                transcript.write(json.dumps(line) + "\n")
+            transcript.flush()
+            user, assistant, _artifacts = self.module.transcript_tail(
+                {"transcript_path": transcript.name}
+            )
+
+        self.assertEqual(user, "Please preserve memory nodes.")
+        self.assertEqual(assistant, "I will fix the hook.")
 
     def test_hybrid_search_json_compacts_to_hints_and_content(self) -> None:
         payload = {
