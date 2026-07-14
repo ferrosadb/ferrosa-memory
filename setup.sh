@@ -29,6 +29,14 @@ Options:
   --skip-service
       Do not install/restart the native service. On Linux (no auto-install
       path here) start the server yourself, then re-run with hooks.
+  --skip-forge
+      Do not fetch/build/install the Forge `frg` CLI.
+  --forge-repo URL
+      Forge git repository. Default: https://github.com/ferrosadb/forge.git.
+  --forge-dir PATH
+      Local Forge source checkout. Default: ~/.cache/ferrosa-memory/forge.
+  --forge-bin-dir PATH
+      Directory where `frg` is installed. Default: ~/.local/bin.
   --no-apply-config
       Write hook wrappers/snippets but do not patch harness config files.
   --dry-run
@@ -66,6 +74,10 @@ auth_header="${FERROSA_MEMORY_AUTH_HEADER:-}"
 config_path="${FERROSA_MEMORY_CONFIG_FILE:-${script_dir}/.runtime/ferrosa-memory-http-18765.toml}"
 skip_build=false
 skip_service=false
+skip_forge=false
+forge_repo="${FERROSA_FORGE_REPO:-https://github.com/ferrosadb/forge.git}"
+forge_dir="${FERROSA_FORGE_DIR:-${HOME}/.cache/ferrosa-memory/forge}"
+forge_bin_dir="${FERROSA_FORGE_BIN_DIR:-${HOME}/.local/bin}"
 apply_config=true
 dry_run=false
 verify=true
@@ -109,6 +121,25 @@ while [[ $# -gt 0 ]]; do
         --skip-service)
             skip_service=true
             shift
+            ;;
+        --skip-forge)
+            skip_forge=true
+            shift
+            ;;
+        --forge-repo)
+            forge_repo="${2:-}"
+            [[ -n "$forge_repo" ]] || die "--forge-repo requires a value"
+            shift 2
+            ;;
+        --forge-dir)
+            forge_dir="${2:-}"
+            [[ -n "$forge_dir" ]] || die "--forge-dir requires a value"
+            shift 2
+            ;;
+        --forge-bin-dir)
+            forge_bin_dir="${2:-}"
+            [[ -n "$forge_bin_dir" ]] || die "--forge-bin-dir requires a value"
+            shift 2
             ;;
         --no-apply-config)
             apply_config=false
@@ -176,11 +207,23 @@ else
     log "config not found at $config_path; tenant reconciliation deferred"
 fi
 
+# Install the Forge CLI (frg) for task/defer workflows, unless skipped.
+if [[ "$skip_forge" == false ]]; then
+    log "installing Forge CLI for task/defer workflows"
+    scripts/install-forge.sh --repo "$forge_repo" --dir "$forge_dir" --bin-dir "$forge_bin_dir"
+    if [[ ":$PATH:" != *":$forge_bin_dir:"* ]]; then
+        log "add $forge_bin_dir to PATH to use frg from new shells"
+    fi
+else
+    log "skipping Forge CLI install"
+fi
+
 # Track whether THIS run actually installed/started a native service. The
 # health-check loop below must only hard-fail when we installed one — otherwise
 # a Linux checkout (no auto-install path) would always fail setup even though
 # nothing was supposed to be listening yet.
 service_installed=false
+
 if [[ "$skip_service" == false ]]; then
     if [[ "$(uname -s)" == "Darwin" ]]; then
         [[ -f "$config_path" ]] || die "config file not found: $config_path"
