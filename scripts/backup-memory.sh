@@ -1,6 +1,8 @@
 #!/bin/bash
 # Backup fmem data to disk via CQL dump.
-# Run every 30 minutes via launchd (com.ferrosa-memory.backup.plist).
+# Intended for low-frequency launchd use (com.ferrosa-memory.backup.plist).
+# This is a full keyspace dump, so keep it off the interactive CQL node and
+# run it gently enough that MCP search stays responsive.
 #
 # Dumps every fmem table that exists and holds data to per-table JSON
 # files under a timestamped directory. Skips tables that don't exist
@@ -20,14 +22,15 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
 BACKUP_ROOT="${FMEM_BACKUP_DIR:-$HOME/data/ferrosa-memory/backups}"
 CQL_HOST="${FMEM_CQL_HOST:-localhost}"
-# Default to querying ANY of the three nodes — cassandra-driver will
-# pick the first one that responds. If node1 is in a bad state (raft
-# init failure or similar) the driver falls through to node2/node3.
-# Reads work even when Raft writes are blocked since SSTable reads are
-# a non-consensus path.
-CQL_PORTS="${FMEM_CQL_PORTS:-19042,19043,19044}"
+# Default to the non-interactive nodes first. MCP/forge clients normally use
+# node1 (:19042) as their first contact point; full backup scans on that node
+# make semantic recall and task-board reads timeout under normal agent work.
+CQL_PORTS="${FMEM_CQL_PORTS:-19044,19043,19042}"
 MAX_BACKUPS=10
 MIN_ENTITIES=100  # refuse to backup if fewer entities than this
+FETCH_SIZE="${FMEM_BACKUP_FETCH_SIZE:-500}"
+THROTTLE_ROWS="${FMEM_BACKUP_THROTTLE_ROWS:-5000}"
+THROTTLE_SECS="${FMEM_BACKUP_THROTTLE_SECS:-0.05}"
 
 mkdir -p "$BACKUP_ROOT"
 
@@ -88,6 +91,7 @@ import json, uuid, datetime, sys, os, base64, traceback, time
 
 from cassandra.cluster import Cluster
 from cassandra.policies import RoundRobinPolicy
+from cassandra.query import SimpleStatement
 
 host = '$CQL_HOST'
 port = int('$WORKING_PORT')
@@ -99,6 +103,9 @@ keyspace = 'agent_memory'
 # against a partially-broken cluster are worse than no backup.
 cluster = Cluster([host], port=port, load_balancing_policy=RoundRobinPolicy(), protocol_version=4)
 session = cluster.connect(keyspace)
+fetch_size = int('$FETCH_SIZE')
+throttle_rows = int('$THROTTLE_ROWS')
+throttle_secs = float('$THROTTLE_SECS')
 
 def json_default(obj):
     if isinstance(obj, uuid.UUID):
@@ -147,19 +154,29 @@ for table in tables:
         else:
             print(f'  dumping {table}...', file=sys.stderr, flush=True)
         try:
-            rows = list(session.execute(f'SELECT * FROM {keyspace}.{table}'))
-            data = []
-            for r in rows:
-                row_dict = {}
-                for c in r._fields:
-                    row_dict[c] = getattr(r, c)
-                data.append(row_dict)
             out_path = os.path.join(backup_dir, f'{table}.json')
+            rows = session.execute(
+                SimpleStatement(f'SELECT * FROM {keyspace}.{table}', fetch_size=fetch_size)
+            )
+            row_count = 0
             with open(out_path, 'w') as f:
-                json.dump(data, f, default=json_default)
-            print(f'    {table}: {len(data)} rows → {os.path.basename(out_path)}', file=sys.stderr)
-            manifest['tables'][table] = {'rows': len(data), 'file': f'{table}.json', 'attempts': attempt + 1}
-            grand_total += len(data)
+                f.write('[')
+                first = True
+                for r in rows:
+                    row_dict = {}
+                    for c in r._fields:
+                        row_dict[c] = getattr(r, c)
+                    if not first:
+                        f.write(',')
+                    json.dump(row_dict, f, default=json_default)
+                    first = False
+                    row_count += 1
+                    if throttle_rows > 0 and throttle_secs > 0 and row_count % throttle_rows == 0:
+                        time.sleep(throttle_secs)
+                f.write(']')
+            print(f'    {table}: {row_count} rows → {os.path.basename(out_path)}', file=sys.stderr)
+            manifest['tables'][table] = {'rows': row_count, 'file': f'{table}.json', 'attempts': attempt + 1}
+            grand_total += row_count
             success = True
             break
         except Exception as e:

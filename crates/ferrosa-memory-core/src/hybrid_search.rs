@@ -145,6 +145,14 @@ impl Default for FusionConfig {
 }
 
 impl FusionConfig {
+    pub fn requires_query_embedding(&self) -> bool {
+        source_enabled(self.ann_weight)
+            || source_enabled(self.fold_weight)
+            || source_enabled(self.context_ann_weight)
+            || source_enabled(self.document_ann_weight)
+            || source_enabled(self.scene_weight)
+    }
+
     pub fn profile(name: &str) -> Option<Self> {
         let mut config = Self::default();
         match name {
@@ -257,6 +265,10 @@ impl FusionConfig {
 
     fn zero_all(&mut self) {
         self.phonetic_weight = 0.0;
+        self.entity_content_fts_weight = 0.0;
+        self.scene_weight = 0.0;
+        self.profile_weight = 0.0;
+        self.foresight_weight = 0.0;
         self.ann_weight = 0.0;
         self.fold_weight = 0.0;
         self.context_bm25_weight = 0.0;
@@ -328,6 +340,10 @@ impl FusionConfig {
             _ => false,
         }
     }
+}
+
+fn source_enabled(weight: f64) -> bool {
+    weight > 0.0
 }
 
 /// Reciprocal Rank Fusion: merge ranked lists with per-signal weights.
@@ -1242,7 +1258,8 @@ pub async fn hybrid_search_with_diagnostics(
 
     for &sid in &sessions {
         // Strategy 1: Phonetic entity search (ranked by match quality)
-        if let Ok(entities) = storage.entity_find_phonetic(ctx, sid, query).await
+        if source_enabled(config.phonetic_weight)
+            && let Ok(entities) = storage.entity_find_phonetic(ctx, sid, query).await
             && !entities.is_empty()
         {
             lists.push(
@@ -1282,9 +1299,10 @@ pub async fn hybrid_search_with_diagnostics(
         // entity even with no ANN — the gap that entity_text_scan_bounded only
         // patched as a labeled last-resort scan. Needs idx_entity_context_snippet_fts
         // (ddl/043); no-op against clusters/older schema where the index is absent.
-        if let Ok(entities) = storage
-            .entity_find_content_fts(ctx, sid, query, source_limit)
-            .await
+        if source_enabled(config.entity_content_fts_weight)
+            && let Ok(entities) = storage
+                .entity_find_content_fts(ctx, sid, query, source_limit)
+                .await
             && !entities.is_empty()
         {
             lists.push(
@@ -1326,7 +1344,8 @@ pub async fn hybrid_search_with_diagnostics(
         // scene's member-centroid embedding, ddl/048) — so a scene whose wording
         // differs from the query still surfaces. `hint` carries member_ids so a
         // caller can expand a scene; a no-op until the session is consolidated.
-        if let Ok(scenes) = storage.scene_list_session(ctx, sid).await
+        if source_enabled(config.scene_weight)
+            && let Ok(scenes) = storage.scene_list_session(ctx, sid).await
             && !scenes.is_empty()
         {
             let q_tokens = crate::storage::lexical_query_tokens(query);
@@ -1429,7 +1448,8 @@ pub async fn hybrid_search_with_diagnostics(
         // entities, repo/branch/task context) built by consolidation, injected
         // as always-on context so the agent has the session's frame regardless
         // of the specific query. No-op until a profile has been consolidated.
-        if let Ok(Some(profile)) = storage.profile_get(ctx, sid).await
+        if source_enabled(config.profile_weight)
+            && let Ok(Some(profile)) = storage.profile_get(ctx, sid).await
             && !profile.summary.trim().is_empty()
         {
             lists.push(vec![SearchResult {
@@ -1457,7 +1477,8 @@ pub async fn hybrid_search_with_diagnostics(
         // the validity filter — a fact is surfaced only while valid at NOW, so
         // expired facts and not-yet-active plans never pollute context. Valid
         // facts are then scored lexically against the query.
-        if let Ok(facts) = storage.foresight_list_session(ctx, sid).await
+        if source_enabled(config.foresight_weight)
+            && let Ok(facts) = storage.foresight_list_session(ctx, sid).await
             && !facts.is_empty()
         {
             let now = chrono::Utc::now();
@@ -1499,7 +1520,8 @@ pub async fn hybrid_search_with_diagnostics(
         }
 
         // Strategy 2: ANN entity search
-        if let Some(emb) = embedding
+        if source_enabled(config.ann_weight)
+            && let Some(emb) = embedding
             && let Ok(entities) = storage.entity_search_ann(ctx, sid, emb, source_limit).await
             && !entities.is_empty()
         {
@@ -1530,7 +1552,8 @@ pub async fn hybrid_search_with_diagnostics(
         }
 
         // Strategy 3: ANN fold search
-        if let Some(emb) = embedding
+        if source_enabled(config.fold_weight)
+            && let Some(emb) = embedding
             && let Ok(folds) = storage
                 .fold_search(ctx, sid, emb, source_limit, false)
                 .await
@@ -1558,9 +1581,10 @@ pub async fn hybrid_search_with_diagnostics(
         }
 
         // Strategy 4: raw context lexical/BM25 search over semantic segments.
-        if let Ok(segments) = storage
-            .context_segment_search_bm25(ctx, sid, query, source_limit)
-            .await
+        if source_enabled(config.context_bm25_weight)
+            && let Ok(segments) = storage
+                .context_segment_search_bm25(ctx, sid, query, source_limit)
+                .await
             && !segments.is_empty()
         {
             lists.push(
@@ -1589,7 +1613,8 @@ pub async fn hybrid_search_with_diagnostics(
         }
 
         // Strategy 5: raw context ANN search over semantic segment embeddings.
-        if let Some(emb) = embedding
+        if source_enabled(config.context_ann_weight)
+            && let Some(emb) = embedding
             && let Ok(segments) = storage
                 .context_segment_search_ann(ctx, sid, emb, source_limit)
                 .await
@@ -1620,9 +1645,10 @@ pub async fn hybrid_search_with_diagnostics(
         }
 
         // Strategy 6: document lexical/BM25 search over semantic chunks.
-        if let Ok(chunks) = storage
-            .document_chunk_search_bm25(ctx, sid, query, source_limit)
-            .await
+        if source_enabled(config.document_bm25_weight)
+            && let Ok(chunks) = storage
+                .document_chunk_search_bm25(ctx, sid, query, source_limit)
+                .await
             && !chunks.is_empty()
         {
             lists.push(
@@ -1649,9 +1675,10 @@ pub async fn hybrid_search_with_diagnostics(
 
         // Strategy 7: document phonetic term search. This helps doc IDs,
         // titles, and spelling variants contribute candidates before RRF.
-        if let Ok(chunks) = storage
-            .document_chunk_search_phonetic(ctx, sid, query, source_limit)
-            .await
+        if source_enabled(config.document_phonetic_weight)
+            && let Ok(chunks) = storage
+                .document_chunk_search_phonetic(ctx, sid, query, source_limit)
+                .await
             && !chunks.is_empty()
         {
             lists.push(
@@ -1678,7 +1705,8 @@ pub async fn hybrid_search_with_diagnostics(
         }
 
         // Strategy 8: document ANN search over chunk embeddings.
-        if let Some(emb) = embedding
+        if source_enabled(config.document_ann_weight)
+            && let Some(emb) = embedding
             && let Ok(chunks) = storage
                 .document_chunk_search_ann(ctx, sid, emb, source_limit)
                 .await
@@ -1733,7 +1761,9 @@ pub async fn hybrid_search_with_diagnostics(
     }
 
     // Strategy 4: Warmth signal — rank existing candidates by warmth score
-    if let Some(warmth) = warmth_scores {
+    if source_enabled(config.warmth_weight)
+        && let Some(warmth) = warmth_scores
+    {
         let mut warmth_ranked: Vec<SearchResult> = lists
             .iter()
             .flatten()
@@ -1764,7 +1794,9 @@ pub async fn hybrid_search_with_diagnostics(
     }
 
     // Strategy 5: PageRank signal — same approach
-    if let Some(pagerank) = pagerank_scores {
+    if source_enabled(config.pagerank_weight)
+        && let Some(pagerank) = pagerank_scores
+    {
         let mut pr_ranked: Vec<SearchResult> = lists
             .iter()
             .flatten()
@@ -1797,7 +1829,9 @@ pub async fn hybrid_search_with_diagnostics(
     // Strategy 6: Reputation signal — boost trusted entities, demote penalized ones.
     // Reputation ranges [-1.0, 1.0]. We shift to [0.0, 2.0] for RRF ranking so
     // that negative reputation maps to low rank and positive to high rank.
-    if let Some(reputation) = reputation_scores {
+    if source_enabled(config.reputation_weight)
+        && let Some(reputation) = reputation_scores
+    {
         let mut rep_ranked: Vec<SearchResult> = lists
             .iter()
             .flatten()
@@ -1830,7 +1864,8 @@ pub async fn hybrid_search_with_diagnostics(
     // Strategy 7: Workspace affinity — if the caller supplies cwd/repo context,
     // rank candidates learned in that same tree higher. This is intentionally
     // a boost rather than a filter because cross-repo facts can still be useful.
-    if let Some(workspace_cwd) = filter.and_then(|f| f.workspace_cwd.as_deref())
+    if source_enabled(config.workspace_weight)
+        && let Some(workspace_cwd) = filter.and_then(|f| f.workspace_cwd.as_deref())
         && !workspace_cwd.trim().is_empty()
     {
         let mut workspace_ranked = Vec::new();
@@ -1881,11 +1916,13 @@ pub async fn hybrid_search_with_diagnostics(
     // skipped and an entity is lexically findable only by its NAME (its content
     // body is not fts-indexed), so a content-body query against a plain-ingested
     // entity returns nothing even though find/list can see it. When EVERY
-    // strategy came back empty, do a bounded, labeled scan of the same
-    // entity_store that find/list read, so search isn't silently empty. Gated on
-    // zero candidates so it never runs when normal retrieval works — no scan
-    // cost on a large, healthy store.
-    if lists.iter().all(|l| l.is_empty()) {
+    // strategy came back empty in the caller's own session, do a bounded,
+    // labeled scan of the same entity_store that find/list read, so search
+    // isn't silently empty. Do not run this for cross-session/global recall:
+    // on a mature memory store the fallback would become a broad scan over
+    // tens of thousands of global entities, making normal no-result searches
+    // look like timeouts.
+    if scope == SearchScope::SessionOnly && lists.iter().all(|l| l.is_empty()) {
         const FALLBACK_CAP: usize = 25;
         let mut fallback: Vec<SearchResult> = Vec::new();
         for &sid in &sessions {
@@ -2600,6 +2637,10 @@ mod tests {
         assert!(bm25.context_bm25_weight > 0.0);
         assert_eq!(bm25.document_ann_weight, 0.0);
         assert_eq!(bm25.document_phonetic_weight, 0.0);
+        assert!(
+            !bm25.requires_query_embedding(),
+            "bm25-only searches must not generate embeddings"
+        );
 
         let auto = FusionConfig::profile("auto").unwrap();
         assert!(auto.document_bm25_weight > 0.0);
@@ -2607,6 +2648,7 @@ mod tests {
         assert!(auto.document_ann_weight > 0.0);
         assert!(auto.context_ann_weight > 0.0);
         assert_eq!(auto.document_phonetic_weight, 0.0);
+        assert!(auto.requires_query_embedding());
 
         let workspace = FusionConfig::profile("bm25-semantic-workspace").unwrap();
         assert!(workspace.document_bm25_weight > 0.0);
@@ -2619,6 +2661,7 @@ mod tests {
         assert!(semantic.document_ann_weight > 0.0);
         assert_eq!(semantic.document_bm25_weight, 0.0);
         assert_eq!(semantic.document_phonetic_weight, 0.0);
+        assert!(semantic.requires_query_embedding());
 
         let combined = FusionConfig::profile("bm25-semantic-phonetic-workspace").unwrap();
         assert!(combined.document_bm25_weight > 0.0);
@@ -3136,6 +3179,73 @@ mod tests {
             none.is_empty(),
             "irrelevant query must not trigger a blind fallback dump, got {} results",
             none.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_zero_candidate_fallback_does_not_scan_cross_session_memory() {
+        use crate::storage::mock::MockStorage;
+        use crate::types::{EntityEntry, MemoryState, TenantContext};
+
+        let storage = MockStorage::new();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "test".into(),
+        };
+        let caller_session = Uuid::new_v4();
+        let global_session = crate::scope::tenant_global_session_uuid(ctx.tenant_id);
+        let global_id = Uuid::new_v4();
+
+        storage
+            .entity_put(
+                &ctx,
+                &EntityEntry {
+                    tenant_id: ctx.tenant_id,
+                    entity_id: global_id,
+                    session_id: global_session,
+                    entity_name: "Project Phoenix".into(),
+                    entity_type: "note".into(),
+                    source_fold_id: None,
+                    context_snippet: "the migration runbook for the billing service".into(),
+                    entity_embedding: None,
+                    confidence: 1.0,
+                    state: MemoryState::Active,
+                    created_at: chrono::Utc::now(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let filter = SearchFilter {
+            scope: SearchScope::Both,
+            ..Default::default()
+        };
+        let results = hybrid_search(
+            &storage,
+            &ctx,
+            caller_session,
+            "billing service runbook",
+            None,
+            10,
+            None,
+            None,
+            None,
+            &FusionConfig::default(),
+            Some(&filter),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            results
+                .iter()
+                .all(|result| result.source != "entity_store_fallback"),
+            "cross-session/global recall must not trigger entity_store_fallback scans"
+        );
+        assert!(
+            !results.iter().any(|result| result.id == global_id),
+            "global entity should not be surfaced through the scan fallback"
         );
     }
 

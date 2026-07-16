@@ -7365,6 +7365,25 @@ impl Storage for CqlStorage {
         let Some(fts_query) = native_fts_query_text(query) else {
             return Ok(Vec::new());
         };
+        let terms = tokenize_context_terms(query);
+        if !terms.is_empty() {
+            let term_exists_q = format!(
+                "SELECT chunk_id FROM {ks}.document_terms \
+                 WHERE tenant_id = ? AND session_id = ? AND term = ? \
+                 LIMIT 1",
+                ks = self.keyspace
+            );
+            for term in terms {
+                let (_col_map, rows) = query_paged_rows!(
+                    self.session,
+                    term_exists_q.clone(),
+                    (ctx.tenant_id, session_id, term)
+                )?;
+                if rows.is_empty() {
+                    return Ok(Vec::new());
+                }
+            }
+        }
         let q = native_fts_select_query(
             &self.keyspace,
             "document_chunks",
