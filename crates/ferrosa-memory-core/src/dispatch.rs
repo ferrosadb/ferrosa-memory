@@ -7360,23 +7360,6 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
         }
     }
 
-    // Auto-generate query embedding for ANN search if Ollama is configured.
-    let embedding_client = session_embedding_client(session);
-    if embedding.is_none()
-        && let Some(client) = embedding_client.as_ref()
-    {
-        match client.embed(query).await {
-            Ok(emb) => {
-                embedding = Some(emb);
-                base_embedding_status = "generated".into();
-            }
-            Err(e) => {
-                tracing::debug!("query embedding generation skipped: {e}");
-                base_embedding_status = "failed".into();
-            }
-        }
-    }
-
     let requested_fusion_profile = args
         .get("fusion_profile")
         .and_then(Value::as_str)
@@ -7413,6 +7396,26 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
             }
             if !fusion_config.set_weight(key, weight) {
                 return Err((INVALID_PARAMS, format!("unknown fusion weight key: {key}")));
+            }
+        }
+    }
+    // Auto-generate query embedding only when the selected fusion configuration
+    // can actually consume it. Profiles like `bm25-only` must stay
+    // embeddings-free; otherwise a no-result lexical lookup pays ANN setup cost
+    // and can look like a timeout even though all ANN weights are zero.
+    let embedding_client = session_embedding_client(session);
+    if embedding.is_none()
+        && fusion_config.requires_query_embedding()
+        && let Some(client) = embedding_client.as_ref()
+    {
+        match client.embed(query).await {
+            Ok(emb) => {
+                embedding = Some(emb);
+                base_embedding_status = "generated".into();
+            }
+            Err(e) => {
+                tracing::debug!("query embedding generation skipped: {e}");
+                base_embedding_status = "failed".into();
             }
         }
     }
