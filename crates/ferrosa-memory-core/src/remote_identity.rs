@@ -5,7 +5,8 @@
 //! Last changed: Added initial Ed25519 signing primitives for remote teaching packets.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use rand_core::OsRng;
+use rand::RngCore;
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -105,7 +106,9 @@ pub struct InstanceSigningIdentity {
 
 impl InstanceSigningIdentity {
     pub fn generate(instance_id: InstanceId) -> Self {
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let mut secret = [0u8; 32];
+        OsRng.fill_bytes(&mut secret);
+        let signing_key = SigningKey::from_bytes(&secret);
         Self {
             instance_id,
             signing_key,
