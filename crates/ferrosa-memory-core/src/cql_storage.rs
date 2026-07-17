@@ -850,6 +850,50 @@ fn is_context_stopword(term: &str) -> bool {
     )
 }
 
+/// Terms the document-term existence precheck may REQUIRE to exist.
+///
+/// `fts_match` runs the query through ferrosa's fulltext `StandardAnalyzer`,
+/// which strips its default English stop words before matching (implicit AND
+/// over the survivors). The precheck must therefore require only terms the
+/// analyzer keeps: requiring a stripped term (e.g. "were", an analyzer stop
+/// word that is NOT a context stop word) would turn a matching query into a
+/// silent empty result whenever that term is absent from the corpus.
+/// Precheck terms ⊆ fts-required terms, so an empty precheck hit is proof of
+/// an empty fts result — never the other way around.
+fn document_precheck_terms(query: &str) -> Vec<String> {
+    tokenize_context_terms(query)
+        .into_iter()
+        .filter(|term| !is_fts_analyzer_stopword(term))
+        .collect()
+}
+
+/// Ferrosa fulltext `StandardAnalyzer` default English stop words (terms of
+/// length >= 3 only — shorter ones never survive `tokenize_context_terms`).
+/// Keep in sync with `ferrosa-index/src/fulltext/analyzer.rs`.
+fn is_fts_analyzer_stopword(term: &str) -> bool {
+    matches!(
+        term,
+        "and"
+            | "are"
+            | "been"
+            | "but"
+            | "for"
+            | "from"
+            | "has"
+            | "its"
+            | "that"
+            | "the"
+            | "their"
+            | "there"
+            | "they"
+            | "this"
+            | "was"
+            | "were"
+            | "will"
+            | "with"
+    )
+}
+
 fn phonetic_index_code(term: &str) -> Option<String> {
     let mut chars = term
         .chars()
@@ -7365,7 +7409,7 @@ impl Storage for CqlStorage {
         let Some(fts_query) = native_fts_query_text(query) else {
             return Ok(Vec::new());
         };
-        let terms = tokenize_context_terms(query);
+        let terms = document_precheck_terms(query);
         if !terms.is_empty() {
             let term_exists_q = format!(
                 "SELECT chunk_id FROM {ks}.document_terms \
@@ -8461,6 +8505,30 @@ mod cql_storage_tests {
         assert!(
             query.contains("entity_name = fts_match('bob''s parser')"),
             "single quotes in FTS query text must be escaped as CQL string literals: {query}"
+        );
+    }
+
+    /// The document-term existence precheck must only require terms that
+    /// `fts_match` itself requires. Ferrosa's fulltext `StandardAnalyzer`
+    /// strips its own English stop words (e.g. "were") from the query before
+    /// matching; the context tokenizer keeps "were". Requiring an
+    /// analyzer-stripped term to exist in `document_terms` turns a matching
+    /// query into a silent empty result when that term is absent from the
+    /// corpus.
+    #[test]
+    fn document_precheck_terms_exclude_fts_analyzer_stopwords() {
+        let terms = document_precheck_terms("reports were emitted yesterday");
+        assert_eq!(
+            terms,
+            vec!["reports".to_string(), "emitted".into(), "yesterday".into()],
+            "'were' is an fts analyzer stop word — the precheck must not require it"
+        );
+
+        // A query whose every context term is analyzer-stripped yields no
+        // precheck terms: the precheck is skipped rather than false-empty.
+        assert!(
+            document_precheck_terms("there were").is_empty(),
+            "all-stopword queries must not produce required precheck terms"
         );
     }
 
