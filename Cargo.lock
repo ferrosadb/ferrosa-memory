@@ -992,7 +992,7 @@ dependencies = [
  "ordered-float",
  "prometheus",
  "proptest",
- "rand_core 0.6.4",
+ "rand 0.8.6",
  "rcgen 0.14.8",
  "reqwest",
  "rustls-pemfile",
