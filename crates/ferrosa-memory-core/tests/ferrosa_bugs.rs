@@ -417,6 +417,86 @@ async fn fixed_phonetic_match() {
     );
 }
 
+/// The document-term existence precheck must not require terms that
+/// `fts_match` itself strips. Ferrosa's fulltext analyzer removes its English
+/// stop words (e.g. "were") from the query before matching; the precheck must
+/// therefore not demand that such a term exist in `document_terms`, or a
+/// matching query silently returns no documents whenever the stop word is
+/// absent from the session's corpus.
+#[tokio::test]
+#[ignore = "requires live Ferrosa test cluster; run with --ignored and FERROSA_TEST_CQL_PORT set"]
+async fn fixed_document_search_survives_fts_stopword_absent_from_corpus() {
+    use ferrosa_memory_core::config::FerrosaCqlConfig;
+    use ferrosa_memory_core::cql_storage::CqlStorage;
+    use ferrosa_memory_core::storage::Storage;
+    use ferrosa_memory_core::types::{DocumentChunk, TenantContext};
+
+    let Some(cfg) = test_cluster() else { return };
+    let config = FerrosaCqlConfig {
+        contact_points: vec![cfg.contact_point()],
+        keyspace: cfg.keyspace.clone(),
+        replication_factor: 1,
+        consistency: "ONE".into(),
+        username: "ferrosa_user".into(),
+        password: "ferrosa_user".into(),
+        admin_username: None,
+        admin_password: None,
+    };
+    let storage = CqlStorage::connect(&config)
+        .await
+        .expect("CQL connection to live test cluster");
+
+    let tenant_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let ctx = TenantContext {
+        tenant_id,
+        session_origin: "stdio".to_string(),
+    };
+
+    // Corpus deliberately contains "reports" and "emitted" but NOT "were".
+    let now = chrono::Utc::now();
+    let chunk = DocumentChunk {
+        tenant_id,
+        session_id,
+        document_id: Uuid::new_v4(),
+        chunk_id: Uuid::new_v4(),
+        ordinal: 0,
+        source_doc_id: "doc-1".into(),
+        title: "latency report".into(),
+        section_path: "/".into(),
+        semantic_kind: "paragraph".into(),
+        content: "Quarterly latency reports emitted by the ingest pipeline.".into(),
+        bm25_text: "quarterly latency reports emitted by the ingest pipeline".into(),
+        chunk_embedding: None,
+        token_count: 8,
+        content_hash: "hash-1".into(),
+        prev_chunk_id: None,
+        next_chunk_id: None,
+        overlap_from_prev: false,
+        overlap_to_next: false,
+        metadata: serde_json::Value::Null,
+        created_at: now,
+        updated_at: now,
+    };
+    storage
+        .document_chunk_put(&ctx, &chunk)
+        .await
+        .expect("document_chunk_put");
+
+    // "were" is an fts-analyzer stop word: fts_match strips it and requires
+    // only "reports emitted", which the chunk contains. The precheck must not
+    // turn the absent-from-corpus "were" into an empty result.
+    let hits = storage
+        .document_chunk_search_bm25(&ctx, session_id, "reports were emitted", 5)
+        .await
+        .expect("document_chunk_search_bm25");
+    assert!(
+        !hits.is_empty(),
+        "document search must match on the analyzer-required terms; \
+         an fts-stopword absent from the corpus must not empty the result"
+    );
+}
+
 /// Ghost rows with NULL required fields must not crash row-scanning queries.
 ///
 /// The Python CQL loader can create rows where clustering columns (entity_id,
