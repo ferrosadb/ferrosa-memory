@@ -1090,6 +1090,15 @@ impl Storage for ReconnectingStorage {
         delegate!(self, session_task_list, ctx, session_id, status)
     }
 
+    async fn session_task_list_by_workspace(
+        &self,
+        ctx: &TenantContext,
+        workspace: &str,
+        status: SessionTaskStatus,
+    ) -> anyhow::Result<Vec<SessionTask>> {
+        delegate!(self, session_task_list_by_workspace, ctx, workspace, status)
+    }
+
     async fn session_task_alias_put(
         &self,
         ctx: &TenantContext,

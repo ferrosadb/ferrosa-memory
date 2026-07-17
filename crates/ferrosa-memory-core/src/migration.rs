@@ -210,6 +210,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "cross-replica consolidation lease queue and run log",
         ddl: include_str!("../../../ddl/049_consolidation_lease_queue.cql"),
     },
+    Migration {
+        version: 50,
+        description: "workspace index for cross-session task resources",
+        ddl: include_str!("../../../ddl/050_session_task_workspace_index.cql"),
+    },
 ];
 
 /// `ddl/011_warmth_field.cql` — the `entity_warmth` table + session index.

@@ -241,6 +241,14 @@ pub trait Storage: Send + Sync {
         status: Option<SessionTaskStatus>,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<SessionTask>>> + Send;
 
+    /// List durable session tasks for a workspace across all sessions by status.
+    fn session_task_list_by_workspace(
+        &self,
+        ctx: &TenantContext,
+        workspace: &str,
+        status: SessionTaskStatus,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<SessionTask>>> + Send;
+
     /// Upsert a scoped alias for a canonical task id.
     fn session_task_alias_put(
         &self,
@@ -2572,6 +2580,40 @@ pub mod mock {
                     .cmp(&b.focus_rank)
                     .then(a.priority.cmp(&b.priority))
                     .then(b.updated_at.cmp(&a.updated_at))
+                    .then(a.task_id.cmp(&b.task_id))
+            });
+            Ok(tasks)
+        }
+
+        async fn session_task_list_by_workspace(
+            &self,
+            _ctx: &TenantContext,
+            workspace: &str,
+            status: SessionTaskStatus,
+        ) -> anyhow::Result<Vec<SessionTask>> {
+            let workspace = workspace.trim();
+            if workspace.is_empty() {
+                return Ok(Vec::new());
+            }
+            let tasks = self.session_tasks.lock().await;
+            let mut tasks: Vec<_> = tasks
+                .iter()
+                .filter(|task| {
+                    task.status == status
+                        && task
+                            .client
+                            .workspace
+                            .as_deref()
+                            .is_some_and(|candidate| candidate.trim() == workspace)
+                })
+                .cloned()
+                .collect();
+            tasks.sort_by(|a, b| {
+                a.focus_rank
+                    .cmp(&b.focus_rank)
+                    .then(a.priority.cmp(&b.priority))
+                    .then(b.updated_at.cmp(&a.updated_at))
+                    .then(a.session_id.cmp(&b.session_id))
                     .then(a.task_id.cmp(&b.task_id))
             });
             Ok(tasks)

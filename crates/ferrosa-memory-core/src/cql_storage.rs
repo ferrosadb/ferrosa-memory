@@ -83,6 +83,15 @@ fn parse_session_task_status(status: &str) -> SessionTaskStatus {
     serde_json::from_str(&format!("\"{status}\"")).unwrap_or(SessionTaskStatus::Pending)
 }
 
+fn normalized_task_workspace(task: &SessionTask) -> Option<String> {
+    task.client
+        .workspace
+        .as_deref()
+        .map(str::trim)
+        .filter(|workspace| !workspace.is_empty())
+        .map(str::to_string)
+}
+
 fn consolidation_request_state_string(state: &ConsolidationRequestState) -> anyhow::Result<String> {
     Ok(serde_json::to_string(state)?.trim_matches('"').to_string())
 }
@@ -1343,6 +1352,9 @@ struct PreparedStatements {
     session_task_put_by_status: PreparedStatement,
     session_task_delete_by_status: PreparedStatement,
     session_task_list_by_status: PreparedStatement,
+    session_task_put_by_workspace: PreparedStatement,
+    session_task_delete_by_workspace: PreparedStatement,
+    session_task_list_by_workspace: PreparedStatement,
     session_task_alias_put: PreparedStatement,
     session_task_alias_get: PreparedStatement,
     session_task_focus_delete: PreparedStatement,
@@ -1553,6 +1565,25 @@ impl CqlStorage {
                 .prepare(format!(
                     "SELECT task_id FROM {ks}.session_tasks_by_status \
                      WHERE tenant_id = ? AND session_id = ? AND status = ?"
+                ))
+                .await?,
+            session_task_put_by_workspace: session
+                .prepare(format!(
+                    "INSERT INTO {ks}.session_tasks_by_workspace \
+                     (tenant_id, workspace, status, priority, updated_at, session_id, task_id, title, parent_task_id, focus_rank) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                ))
+                .await?,
+            session_task_delete_by_workspace: session
+                .prepare(format!(
+                    "DELETE FROM {ks}.session_tasks_by_workspace \
+                     WHERE tenant_id = ? AND workspace = ? AND status = ? AND priority = ? AND updated_at = ? AND session_id = ? AND task_id = ?"
+                ))
+                .await?,
+            session_task_list_by_workspace: session
+                .prepare(format!(
+                    "SELECT session_id, task_id FROM {ks}.session_tasks_by_workspace \
+                     WHERE tenant_id = ? AND workspace = ? AND status = ?"
                 ))
                 .await?,
             session_task_alias_put: session
@@ -2906,13 +2937,28 @@ impl Storage for CqlStorage {
                 (
                     ctx.tenant_id,
                     existing.session_id,
-                    old_status,
+                    old_status.clone(),
                     existing.priority,
                     existing.updated_at,
                     existing.task_id,
                 ),
             )
             .await?;
+            if let Some(workspace) = normalized_task_workspace(&existing) {
+                self.exec_prepared_rows(
+                    &self.stmts.session_task_delete_by_workspace,
+                    (
+                        ctx.tenant_id,
+                        workspace,
+                        old_status,
+                        existing.priority,
+                        existing.updated_at,
+                        existing.session_id,
+                        existing.task_id,
+                    ),
+                )
+                .await?;
+            }
         }
 
         let status = session_task_status_string(&task.status)?;
@@ -2943,7 +2989,7 @@ impl Storage for CqlStorage {
             (
                 ctx.tenant_id,
                 task.session_id,
-                status,
+                status.clone(),
                 task.priority,
                 task.updated_at,
                 task.task_id,
@@ -2953,6 +2999,24 @@ impl Storage for CqlStorage {
             ),
         )
         .await?;
+        if let Some(workspace) = normalized_task_workspace(task) {
+            self.exec_prepared_rows(
+                &self.stmts.session_task_put_by_workspace,
+                (
+                    ctx.tenant_id,
+                    workspace,
+                    status,
+                    task.priority,
+                    task.updated_at,
+                    task.session_id,
+                    task.task_id,
+                    task.title.clone(),
+                    task.parent_task_id,
+                    task.focus_rank,
+                ),
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -3011,6 +3075,49 @@ impl Storage for CqlStorage {
                 .cmp(&b.focus_rank)
                 .then(a.priority.cmp(&b.priority))
                 .then(b.updated_at.cmp(&a.updated_at))
+                .then(a.task_id.cmp(&b.task_id))
+        });
+        Ok(tasks)
+    }
+
+    async fn session_task_list_by_workspace(
+        &self,
+        ctx: &TenantContext,
+        workspace: &str,
+        status: SessionTaskStatus,
+    ) -> anyhow::Result<Vec<SessionTask>> {
+        let workspace = workspace.trim();
+        if workspace.is_empty() {
+            return Ok(Vec::new());
+        }
+        let status_string = session_task_status_string(&status)?;
+        let (col_map, rows) = self
+            .exec_prepared_rows(
+                &self.stmts.session_task_list_by_workspace,
+                (ctx.tenant_id, workspace.to_string(), status_string),
+            )
+            .await?;
+        let mut tasks = Vec::new();
+        for row in rows {
+            let session_id: Uuid = cql_get(&row, &col_map, "session_id")?;
+            let task_id: Uuid = cql_get(&row, &col_map, "task_id")?;
+            if let Some(task) = self.session_task_get(ctx, session_id, task_id).await?
+                && task.status == status
+                && task
+                    .client
+                    .workspace
+                    .as_deref()
+                    .is_some_and(|candidate| candidate.trim() == workspace)
+            {
+                tasks.push(task);
+            }
+        }
+        tasks.sort_by(|a, b| {
+            a.focus_rank
+                .cmp(&b.focus_rank)
+                .then(a.priority.cmp(&b.priority))
+                .then(b.updated_at.cmp(&a.updated_at))
+                .then(a.session_id.cmp(&b.session_id))
                 .then(a.task_id.cmp(&b.task_id))
         });
         Ok(tasks)

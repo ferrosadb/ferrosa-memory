@@ -6,8 +6,8 @@
 //! Correctness: task ids are generated here, normal lifecycle never hard
 //! deletes, and current-task recovery reads the explicit focus stack before
 //! falling back to non-terminal task ordering.
-//! Last revised: 2026-06-15
-//! Last changed: add v1 session task persistence and recovery helpers.
+//! Last revised: 2026-07-17
+//! Last changed: add workspace-scoped active task recovery across sessions.
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -200,6 +200,36 @@ pub async fn list_tasks<S: Storage>(
     status: Option<SessionTaskStatus>,
 ) -> anyhow::Result<Vec<SessionTask>> {
     storage.session_task_list(ctx, session_id, status).await
+}
+
+pub async fn active_workspace_tasks<S: Storage>(
+    storage: &S,
+    ctx: &TenantContext,
+    workspace: &str,
+) -> anyhow::Result<Vec<SessionTask>> {
+    let workspace = workspace.trim();
+    if workspace.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut tasks = Vec::new();
+    for status in active_task_statuses() {
+        tasks.extend(
+            storage
+                .session_task_list_by_workspace(ctx, workspace, status)
+                .await?,
+        );
+    }
+    tasks.retain(|task| {
+        !task.status.is_terminal()
+            && task
+                .client
+                .workspace
+                .as_deref()
+                .is_some_and(|candidate| candidate.trim() == workspace)
+    });
+    sort_session_tasks(&mut tasks);
+    Ok(tasks)
 }
 
 pub async fn current_tasks<S: Storage>(
@@ -565,11 +595,7 @@ async fn active_tasks<S: Storage>(
     session_id: Uuid,
 ) -> anyhow::Result<Vec<SessionTask>> {
     let mut tasks = Vec::new();
-    for status in [
-        SessionTaskStatus::InProgress,
-        SessionTaskStatus::Blocked,
-        SessionTaskStatus::Pending,
-    ] {
+    for status in active_task_statuses() {
         tasks.extend(
             storage
                 .session_task_list(ctx, session_id, Some(status))
@@ -577,6 +603,19 @@ async fn active_tasks<S: Storage>(
         );
     }
     tasks.retain(|task| !task.status.is_terminal());
+    sort_session_tasks(&mut tasks);
+    Ok(tasks)
+}
+
+fn active_task_statuses() -> [SessionTaskStatus; 3] {
+    [
+        SessionTaskStatus::InProgress,
+        SessionTaskStatus::Blocked,
+        SessionTaskStatus::Pending,
+    ]
+}
+
+fn sort_session_tasks(tasks: &mut [SessionTask]) {
     tasks.sort_by(|a, b| {
         a.focus_rank
             .cmp(&b.focus_rank)
@@ -584,7 +623,6 @@ async fn active_tasks<S: Storage>(
             .then(b.updated_at.cmp(&a.updated_at))
             .then(a.task_id.cmp(&b.task_id))
     });
-    Ok(tasks)
 }
 
 async fn record_event<S: Storage>(

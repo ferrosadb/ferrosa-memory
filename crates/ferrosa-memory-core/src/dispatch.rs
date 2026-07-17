@@ -4,7 +4,7 @@
 //! dispatch. Returns tool definitions for `tools/list`.
 //!
 //! Last revised: 2026-07-17
-//! Last changed: Added task-list resources for draft 2026-07-28 subscriptions.
+//! Last changed: Added cwd/workspace task resources spanning all sessions.
 //!
 //! ## MCP protocol methods handled
 //!
@@ -15,12 +15,13 @@
 //! - `tools/call` — dispatches to the named tool handler
 //! - `notifications/initialized` — client acknowledgment (no-op)
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use base64::Engine as _;
 use futures_util::{StreamExt, future::join_all, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -50,6 +51,7 @@ const MODERN_RESULT_TTL_MS: u64 = 300_000;
 const MODERN_CACHE_SCOPE: &str = "private";
 pub const TASK_RESOURCE_MIME_TYPE: &str = "application/vnd.ferrosa-memory.task+json";
 const TASK_RESOURCE_SCHEME_PREFIX: &str = "ferrosa-memory://tasks/";
+const TASK_WORKSPACE_RESOURCE_PREFIX: &str = "ferrosa-memory://tasks/workspaces/";
 // LLM rerank tunables were promoted to `[search]` config; see
 // `crate::config::SearchConfig` and `RerankTunables`. Defaults preserved there.
 /// Connection-establishment budget for the judge endpoint. Kept small so a
@@ -655,6 +657,33 @@ pub fn parse_task_resource_uri(uri: &str) -> Option<(uuid::Uuid, TaskResourceKin
     Some((session_id, kind))
 }
 
+pub fn task_workspace_resource_uri(workspace: &str) -> String {
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(workspace.trim());
+    format!("{TASK_WORKSPACE_RESOURCE_PREFIX}{encoded}/active")
+}
+
+pub fn parse_task_workspace_resource_uri(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix(TASK_WORKSPACE_RESOURCE_PREFIX)?;
+    let (encoded, kind) = rest.split_once('/')?;
+    if encoded.is_empty() || kind != "active" || kind.contains('/') {
+        return None;
+    }
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .ok()?;
+    let workspace = String::from_utf8(decoded).ok()?;
+    let workspace = workspace.trim();
+    if workspace.is_empty() {
+        None
+    } else {
+        Some(workspace.to_string())
+    }
+}
+
+pub fn is_task_resource_uri(uri: &str) -> bool {
+    parse_task_resource_uri(uri).is_some() || parse_task_workspace_resource_uri(uri).is_some()
+}
+
 fn task_resources_for_session(session_id: uuid::Uuid) -> Vec<Value> {
     vec![
         serde_json::json!({
@@ -682,12 +711,47 @@ fn task_resources_for_session(session_id: uuid::Uuid) -> Vec<Value> {
     ]
 }
 
-fn resources_list_result(session: &SessionState) -> Value {
+fn task_resources_for_workspace(workspace: &str) -> Vec<Value> {
+    vec![serde_json::json!({
+        "uri": task_workspace_resource_uri(workspace),
+        "name": "ferrosa-memory.workspace_tasks.active",
+        "title": "Workspace Active Tasks",
+        "description": "Active Ferrosa Memory tasks for this cwd across all sessions, suitable for discovering dependent work identified elsewhere.",
+        "mimeType": TASK_RESOURCE_MIME_TYPE,
+        "annotations": {
+            "audience": ["assistant"],
+            "priority": 0.95
+        }
+    })]
+}
+
+fn resources_workspace_from_params(params: &Value, session: &SessionState) -> Option<String> {
+    ["cwd", "workspace", "workspace_cwd"]
+        .into_iter()
+        .find_map(|key| {
+            params
+                .get(key)
+                .or_else(|| params.get("_meta").and_then(|meta| meta.get(key)))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| session.repo.get().cloned())
+        .map(|workspace| workspace.trim().to_string())
+        .filter(|workspace| !workspace.is_empty())
+}
+
+fn resources_list_result(params: &Value, session: &SessionState) -> Value {
     let session_id = session
         .effective_default_session_id()
         .unwrap_or(uuid::Uuid::nil());
+    let mut resources = task_resources_for_session(session_id);
+    if let Some(workspace) = resources_workspace_from_params(params, session) {
+        resources.extend(task_resources_for_workspace(&workspace));
+    }
     serde_json::json!({
-        "resources": task_resources_for_session(session_id),
+        "resources": resources,
         "ttlMs": MODERN_RESULT_TTL_MS,
         "cacheScope": MODERN_CACHE_SCOPE
     })
@@ -702,23 +766,33 @@ async fn resources_read_result<S: crate::storage::Storage>(
         .get("uri")
         .and_then(Value::as_str)
         .ok_or((INVALID_PARAMS, "missing resource uri".to_string()))?;
-    let Some((session_id, kind)) = parse_task_resource_uri(uri) else {
+    let payload = if let Some((session_id, kind)) = parse_task_resource_uri(uri) {
+        match kind {
+            TaskResourceKind::Current => {
+                let snapshot = crate::session_task::current_tasks(storage, ctx, session_id)
+                    .await
+                    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+                serde_json::to_value(snapshot).map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+            }
+            TaskResourceKind::List => {
+                let tasks = crate::session_task::list_tasks(storage, ctx, session_id, None)
+                    .await
+                    .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+                serde_json::json!({ "tasks": tasks })
+            }
+        }
+    } else if let Some(workspace) = parse_task_workspace_resource_uri(uri) {
+        let tasks = crate::session_task::active_workspace_tasks(storage, ctx, &workspace)
+            .await
+            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+        serde_json::json!({
+            "workspace": workspace,
+            "count": tasks.len(),
+            "tasks": tasks,
+            "coordination_hint": "tasks include source session_id and task_id; focus or adopt the task explicitly before mutating it from another session"
+        })
+    } else {
         return Err((INVALID_PARAMS, format!("resource not found: {uri}")));
-    };
-
-    let payload = match kind {
-        TaskResourceKind::Current => {
-            let snapshot = crate::session_task::current_tasks(storage, ctx, session_id)
-                .await
-                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
-            serde_json::to_value(snapshot).map_err(|e| (INTERNAL_ERROR, e.to_string()))?
-        }
-        TaskResourceKind::List => {
-            let tasks = crate::session_task::list_tasks(storage, ctx, session_id, None)
-                .await
-                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
-            serde_json::json!({ "tasks": tasks })
-        }
     };
     let text = serde_json::to_string(&payload).map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
     Ok(serde_json::json!({
@@ -863,7 +937,9 @@ pub async fn dispatch_modern<S: crate::storage::Storage>(
 
     match method {
         "server/discover" => Ok(discover_result()),
-        "resources/list" => Ok(modern_cacheable_result(resources_list_result(session))),
+        "resources/list" => Ok(modern_cacheable_result(resources_list_result(
+            &params, session,
+        ))),
         "resources/read" => {
             let result = resources_read_result(params, storage, ctx).await?;
             Ok(modern_cacheable_result(result))
@@ -909,6 +985,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         .get("session_id")
         .and_then(|v| v.as_str())
         .and_then(|s| uuid::Uuid::parse_str(s).ok());
+    let previous_task_workspace = prior_task_workspace(canonical_name, &args, storage, ctx).await;
     let input_bytes = serde_json::to_string(&args).map(|s| s.len()).unwrap_or(0) as i32;
     let start = std::time::Instant::now();
     tracing::info!(
@@ -929,7 +1006,7 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "write_plan_node" => Box::pin(handle_write_plan(args, storage, ctx)),
         "get_plan_context" => Box::pin(handle_get_plan(args, storage, ctx)),
         "update_plan_node" => Box::pin(handle_update_plan(args, storage, ctx)),
-        "session_task_put" => Box::pin(handle_session_task_put(args, storage, ctx)),
+        "session_task_put" => Box::pin(handle_session_task_put(args, storage, ctx, session)),
         "session_task_get" => Box::pin(handle_session_task_get(args, storage, ctx)),
         "session_task_current" => Box::pin(handle_session_task_current(args, storage, ctx)),
         "session_task_list" => Box::pin(handle_session_task_list(args, storage, ctx)),
@@ -1093,12 +1170,18 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         if let Some(action) = session_task_change_action(canonical_name) {
             let sid = resolved_session_id.unwrap_or_else(uuid::Uuid::nil);
             let task_id = result.as_ref().ok().and_then(result_task_id);
+            let workspaces = result
+                .as_ref()
+                .ok()
+                .map(|value| task_change_workspaces(previous_task_workspace.as_deref(), value))
+                .unwrap_or_default();
             session
                 .event_bus
                 .emit(crate::viz::VizEvent::SessionTaskChanged {
                     session_id: sid.to_string(),
                     task_id,
                     action: action.to_string(),
+                    workspaces,
                 });
         }
     }
@@ -1302,12 +1385,74 @@ fn session_task_change_action(name: &str) -> Option<&'static str> {
     }
 }
 
+async fn prior_task_workspace<S: crate::storage::Storage>(
+    name: &str,
+    args: &Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Option<String> {
+    let name = canonical_tool_name(name);
+    if !matches!(
+        name,
+        "session_task_put"
+            | "session_task_complete"
+            | "session_task_cancel"
+            | "session_task_focus"
+            | "session_task_observe"
+    ) {
+        return None;
+    }
+
+    let session_id = args
+        .get("session_id")
+        .and_then(Value::as_str)
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())?;
+    let task_id = args
+        .get("task_id")
+        .and_then(Value::as_str)
+        .or_else(|| args.pointer("/payload/task_id").and_then(Value::as_str))
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())?;
+    storage
+        .session_task_get(ctx, session_id, task_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|task| task.client.workspace)
+        .map(|workspace| workspace.trim().to_string())
+        .filter(|workspace| !workspace.is_empty())
+}
+
 fn result_task_id(result: &Value) -> Option<String> {
     result
         .get("task")
         .and_then(|task| task.get("task_id"))
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+fn task_change_workspaces(previous: Option<&str>, result: &Value) -> Vec<String> {
+    let mut workspaces = BTreeSet::new();
+    if let Some(previous) = previous {
+        insert_workspace(&mut workspaces, previous);
+    }
+    for pointer in [
+        "/task/client/workspace",
+        "/foreground/client/workspace",
+        "/resume_candidate/client/workspace",
+        "/snapshot/foreground/client/workspace",
+    ] {
+        if let Some(workspace) = result.pointer(pointer).and_then(Value::as_str) {
+            insert_workspace(&mut workspaces, workspace);
+        }
+    }
+    workspaces.into_iter().collect()
+}
+
+fn insert_workspace(workspaces: &mut BTreeSet<String>, workspace: &str) {
+    let workspace = workspace.trim();
+    if !workspace.is_empty() {
+        workspaces.insert(workspace.to_string());
+    }
 }
 
 async fn queue_session_for_consolidation(
@@ -1596,6 +1741,7 @@ async fn handle_session_task_put<S: crate::storage::Storage>(
     args: Value,
     storage: &S,
     ctx: &crate::types::TenantContext,
+    session: &SessionState,
 ) -> Result<Value, (i32, String)> {
     let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
     let title = require_str(&args, "title")?.to_string();
@@ -1603,6 +1749,19 @@ async fn handle_session_task_put<S: crate::storage::Storage>(
         Some(value) => Some(parse_session_task_status_param(value)?),
         None => None,
     };
+    let workspace = args
+        .get("workspace")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|workspace| !workspace.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            session
+                .repo
+                .get()
+                .map(|workspace| workspace.trim().to_string())
+                .filter(|workspace| !workspace.is_empty())
+        });
     let input = crate::session_task::SessionTaskUpsert {
         session_id,
         task_id: optional_uuid(&args, "task_id")?,
@@ -1623,10 +1782,7 @@ async fn handle_session_task_put<S: crate::storage::Storage>(
                 .get("client_agent")
                 .and_then(|value| value.as_str())
                 .map(str::to_string),
-            workspace: args
-                .get("workspace")
-                .and_then(|value| value.as_str())
-                .map(str::to_string),
+            workspace,
             thread_id: args
                 .get("thread_id")
                 .and_then(|value| value.as_str())
@@ -4754,6 +4910,16 @@ async fn handle_configure(args: Value, session: &SessionState) -> Result<Value, 
     // Hidden dev-only toggle: the LLM can turn debug_stop alerting on/off mid-session.
     if let Some(on) = args.get("debug_stop").and_then(|v| v.as_bool()) {
         session.set_debug_stop(on);
+        updated = true;
+    }
+
+    if session.repo.get().is_none()
+        && let Some(workspace) = nested_or_flat_str(&args, "workspace")
+            .or_else(|| nested_or_flat_str(&args, "cwd"))
+            .map(|workspace| workspace.trim().to_string())
+            .filter(|workspace| !workspace.is_empty())
+    {
+        let _ = session.repo.set(workspace);
         updated = true;
     }
 
@@ -12834,6 +13000,7 @@ mod tests {
         let store = MockStorage::new();
         let ctx = test_ctx();
         let session = SessionState::default();
+        let _ = session.repo.set("/repo/ferrosa-memory".to_string());
         let result = dispatch_modern("resources/list", Value::Null, &store, &ctx, &session)
             .await
             .unwrap();
@@ -12845,6 +13012,7 @@ mod tests {
             .collect();
         assert!(uris.contains(&task_resource_uri(Uuid::nil(), TaskResourceKind::Current)));
         assert!(uris.contains(&task_resource_uri(Uuid::nil(), TaskResourceKind::List)));
+        assert!(uris.contains(&task_workspace_resource_uri("/repo/ferrosa-memory")));
     }
 
     #[tokio::test]
@@ -12891,6 +13059,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn modern_workspace_resource_reads_active_tasks_across_sessions_for_cwd() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let workspace = "/repo/ferrosa-memory";
+        let first_session = Uuid::new_v4();
+        let second_session = Uuid::new_v4();
+        let unrelated_session = Uuid::new_v4();
+
+        for (session_id, title, workspace, status) in [
+            (
+                first_session,
+                "Implement workspace resource",
+                workspace,
+                "in_progress",
+            ),
+            (second_session, "Watch dependent task", workspace, "blocked"),
+            (
+                unrelated_session,
+                "Different repo task",
+                "/repo/other",
+                "in_progress",
+            ),
+            (
+                Uuid::new_v4(),
+                "Completed local task",
+                workspace,
+                "completed",
+            ),
+        ] {
+            dispatch(
+                "tools/call",
+                serde_json::json!({
+                    "name": "task_put",
+                    "arguments": {
+                        "session_id": session_id.to_string(),
+                        "title": title,
+                        "workspace": workspace,
+                        "status": status,
+                        "focus": false
+                    }
+                }),
+                &store,
+                &ctx,
+                &session,
+            )
+            .await
+            .unwrap();
+        }
+
+        let result = dispatch_modern(
+            "resources/read",
+            serde_json::json!({ "uri": task_workspace_resource_uri(workspace) }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let text = result["contents"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["workspace"], workspace);
+        assert_eq!(payload["count"], 2);
+        let titles: std::collections::HashSet<_> = payload["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| task["title"].as_str().unwrap())
+            .collect();
+        assert!(titles.contains("Implement workspace resource"));
+        assert!(titles.contains("Watch dependent task"));
+        assert_eq!(
+            payload["tasks"][0]["client"]["workspace"].as_str(),
+            Some(workspace)
+        );
+        assert!(payload["tasks"][0]["session_id"].as_str().is_some());
+        assert!(payload["tasks"][0]["task_id"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn task_put_defaults_workspace_from_session_repo_for_cwd_resources() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let _ = session.repo.set("/repo/ferrosa-memory".to_string());
+        let session_id = Uuid::new_v4();
+
+        dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "task_put",
+                "arguments": {
+                    "session_id": session_id.to_string(),
+                    "title": "Repo default workspace",
+                    "focus": false
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+
+        let tasks =
+            crate::session_task::active_workspace_tasks(&store, &ctx, "/repo/ferrosa-memory")
+                .await
+                .unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            tasks[0].client.workspace.as_deref(),
+            Some("/repo/ferrosa-memory")
+        );
+    }
+
+    #[tokio::test]
     async fn session_task_mutation_emits_task_resource_change_event() {
         let store = MockStorage::new();
         let ctx = test_ctx();
@@ -12905,6 +13189,7 @@ mod tests {
                 "arguments": {
                     "session_id": session_id.to_string(),
                     "title": "Notify monitor",
+                    "workspace": "/repo/ferrosa-memory",
                     "focus": false
                 }
             }),
@@ -12920,10 +13205,12 @@ mod tests {
             crate::viz::VizEvent::SessionTaskChanged {
                 session_id: event_session_id,
                 action,
+                workspaces,
                 ..
             } => {
                 assert_eq!(event_session_id, session_id.to_string());
                 assert_eq!(action, "task_put");
+                assert_eq!(workspaces, vec!["/repo/ferrosa-memory".to_string()]);
             }
             other => panic!("expected task event, got {other:?}"),
         }

@@ -4,7 +4,7 @@
 //! and streams responses. Supports HTTP Basic auth for tenant identification.
 //!
 //! Last revised: 2026-07-17
-//! Last changed: Added Streamable HTTP `subscriptions/listen` SSE streams for task resources.
+//! Last changed: Added Streamable HTTP task subscriptions for session and workspace resources.
 //!
 //! ## Endpoints
 //!
@@ -661,9 +661,7 @@ fn subscription_filter(params: &Value) -> SubscriptionFilter {
     let mut resource_subscriptions = HashSet::new();
     let mut acknowledged_resource_subscriptions = Vec::new();
     for uri in requested {
-        if dispatch::parse_task_resource_uri(uri).is_some()
-            && resource_subscriptions.insert(uri.to_string())
-        {
+        if dispatch::is_task_resource_uri(uri) && resource_subscriptions.insert(uri.to_string()) {
             acknowledged_resource_subscriptions.push(uri.to_string());
         }
     }
@@ -738,17 +736,28 @@ fn resource_updated_message(subscription_id: &Value, uri: String) -> Value {
 }
 
 fn subscribed_task_resource_updates(event: &VizEvent, filter: &SubscriptionFilter) -> Vec<String> {
-    let VizEvent::SessionTaskChanged { session_id, .. } = event else {
-        return Vec::new();
-    };
-    let Ok(session_id) = Uuid::parse_str(session_id) else {
+    let VizEvent::SessionTaskChanged {
+        session_id,
+        workspaces,
+        ..
+    } = event
+    else {
         return Vec::new();
     };
 
-    dispatch::task_resource_uris(session_id)
-        .into_iter()
-        .filter(|uri| filter.resource_subscriptions.contains(uri))
-        .collect()
+    let mut updates = Vec::new();
+    if let Ok(session_id) = Uuid::parse_str(session_id) {
+        updates.extend(
+            dispatch::task_resource_uris(session_id)
+                .into_iter()
+                .filter(|uri| filter.resource_subscriptions.contains(uri)),
+        );
+    }
+    updates.extend(workspaces.iter().filter_map(|workspace| {
+        let uri = dispatch::task_workspace_resource_uri(workspace);
+        filter.resource_subscriptions.contains(&uri).then_some(uri)
+    }));
+    updates
 }
 
 async fn write_sse_message<T: AsyncWriteExt + Unpin>(
@@ -6294,6 +6303,7 @@ mod tests {
             session_id: session_id.to_string(),
             task_id: None,
             action: "task_put".to_string(),
+            workspaces: Vec::new(),
         });
 
         let n = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf))
@@ -6310,6 +6320,109 @@ mod tests {
         assert_eq!(
             messages[0]["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
             21
+        );
+
+        drop(client);
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn modern_mcp_subscriptions_listen_streams_workspace_task_resource_updates() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let metrics = MemoryMetrics::new().unwrap();
+        let storage = MockStorage::new();
+        let session = Arc::new(dispatch::SessionState::default());
+        let (mut client, mut server) = tokio::io::duplex(16 * 1024);
+        let session_for_server = Arc::clone(&session);
+        let session_id = Uuid::new_v4();
+        let workspace = "/repo/ferrosa-memory";
+        let uri = dispatch::task_workspace_resource_uri(workspace);
+
+        let server_task = tokio::spawn(async move {
+            serve_one_connection_with_session(
+                &mut server,
+                &storage,
+                ConnectionContext {
+                    metrics: &metrics,
+                    credential_validator: &valid_credentials,
+                    readiness_checker: &|| true,
+                    shell_routes: &ShellRouteConfig::default(),
+                    session: session_for_server.as_ref(),
+                    request_budget: DEFAULT_REQUEST_BUDGET,
+                },
+            )
+            .await
+        });
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 22,
+            "method": "subscriptions/listen",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": dispatch::MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                },
+                "notifications": {
+                    "resourceSubscriptions": [uri]
+                }
+            }
+        })
+        .to_string();
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Authorization: Basic dXNlcjpwYXNz\r\n\
+             Content-Type: application/json\r\n\
+             Accept: application/json, text/event-stream\r\n\
+             MCP-Protocol-Version: {}\r\n\
+             Mcp-Method: subscriptions/listen\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            dispatch::MODERN_PROTOCOL_VERSION,
+            body.len()
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.flush().await.unwrap();
+
+        let mut buf = vec![0u8; 16 * 1024];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let first = String::from_utf8_lossy(&buf[..n]).to_string();
+        let messages = sse_data_messages(&first);
+        assert_eq!(
+            messages[0]["method"],
+            "notifications/subscriptions/acknowledged"
+        );
+        assert_eq!(
+            messages[0]["params"]["notifications"]["resourceSubscriptions"][0],
+            dispatch::task_workspace_resource_uri(workspace)
+        );
+
+        session.event_bus.emit(VizEvent::SessionTaskChanged {
+            session_id: session_id.to_string(),
+            task_id: None,
+            action: "task_put".to_string(),
+            workspaces: vec![workspace.to_string()],
+        });
+
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let second = String::from_utf8_lossy(&buf[..n]).to_string();
+        let messages = sse_data_messages(&second);
+        assert_eq!(messages[0]["method"], "notifications/resources/updated");
+        assert_eq!(
+            messages[0]["params"]["uri"],
+            dispatch::task_workspace_resource_uri(workspace)
+        );
+        assert_eq!(
+            messages[0]["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+            22
         );
 
         drop(client);

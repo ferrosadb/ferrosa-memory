@@ -181,6 +181,7 @@ pub enum VizEvent {
         session_id: String,
         task_id: Option<String>,
         action: String,
+        workspaces: Vec<String>,
     },
 }
 
