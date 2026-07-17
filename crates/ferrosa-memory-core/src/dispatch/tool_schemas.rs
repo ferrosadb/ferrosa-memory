@@ -5,17 +5,58 @@
 //! the serialized catalog is guarded by the `tool_definitions_catalog_snapshot`
 //! characterization test.
 
+use serde::ser::SerializeStruct;
 use serde_json::Value;
 
 use super::{MAX_RETRIEVAL_LIMIT, MIN_RETRIEVAL_LIMIT, short_tool_name};
 
 /// MCP tool definition for `tools/list`.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone)]
 pub struct ToolDef {
     pub name: String,
     pub description: String,
-    #[serde(rename = "inputSchema")]
     pub input_schema: Value,
+}
+
+impl serde::Serialize for ToolDef {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut tool = serializer.serialize_struct("ToolDef", 4)?;
+        tool.serialize_field("name", &self.name)?;
+        tool.serialize_field("description", &self.description)?;
+        tool.serialize_field("inputSchema", &self.input_schema)?;
+        tool.serialize_field("outputSchema", &tool_output_schema())?;
+        tool.end()
+    }
+}
+
+fn tool_output_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "tool": {
+                "type": "string",
+                "description": "Canonical tool name that handled the call."
+            },
+            "requested_tool": {
+                "type": "string",
+                "description": "Tool name requested by the client, after alias resolution."
+            },
+            "duration_ms": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Server-side tool execution duration in milliseconds."
+            },
+            "is_error": {
+                "type": "boolean",
+                "description": "False for successful tool results."
+            }
+        },
+        "required": ["tool", "requested_tool", "duration_ms", "is_error"],
+        "additionalProperties": true
+    })
 }
 
 /// The `all_tools` catalog-expansion tool definition.

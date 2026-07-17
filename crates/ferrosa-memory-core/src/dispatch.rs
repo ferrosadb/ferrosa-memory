@@ -1,10 +1,15 @@
-//! Tool dispatch — registry of MCP tools with schema validation.
+//! Tool dispatch - registry of MCP tools with schema validation.
 //!
 //! Maps MCP tool names to handler functions. Validates input schemas before
 //! dispatch. Returns tool definitions for `tools/list`.
 //!
+//! Last revised: 2026-07-17
+//! Last changed: Added dual-era MCP dispatch for the draft 2026-07-28 protocol
+//! while preserving the legacy 2024-11-05 initialize flow.
+//!
 //! ## MCP protocol methods handled
 //!
+//! - `server/discover` - modern server discovery
 //! - `initialize` — server capability handshake
 //! - `tools/list` — returns all tool schemas
 //! - `tools/call` — dispatches to the named tool handler
@@ -18,7 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use futures_util::{StreamExt, future::join_all, stream};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
@@ -37,6 +42,12 @@ const BATCH_MUTATION_CONCURRENCY: usize = 16;
 const MIN_RETRIEVAL_LIMIT: usize = 1;
 const MAX_RETRIEVAL_LIMIT: usize = 50;
 const DEFAULT_RETRIEVAL_LIMIT: usize = 10;
+pub const LEGACY_PROTOCOL_VERSION: &str = "2024-11-05";
+pub const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
+pub const HEADER_MISMATCH: i32 = -32020;
+pub const UNSUPPORTED_PROTOCOL_VERSION: i32 = -32022;
+const MODERN_RESULT_TTL_MS: u64 = 300_000;
+const MODERN_CACHE_SCOPE: &str = "private";
 // LLM rerank tunables were promoted to `[search]` config; see
 // `crate::config::SearchConfig` and `RerankTunables`. Defaults preserved there.
 /// Connection-establishment budget for the judge endpoint. Kept small so a
@@ -556,7 +567,7 @@ FEEDBACK: If you had to use grep, find, or read files to get context that SHOULD
 /// Server info returned during initialize.
 fn server_info() -> Value {
     serde_json::json!({
-        "protocolVersion": "2024-11-05",
+        "protocolVersion": LEGACY_PROTOCOL_VERSION,
         "capabilities": {
             "tools": {}
         },
@@ -566,6 +577,108 @@ fn server_info() -> Value {
         },
         "instructions": MEMORY_GUIDE
     })
+}
+
+fn server_identity() -> Value {
+    serde_json::json!({
+        "name": "ferrosa-memory-mcp",
+        "version": env!("CARGO_PKG_VERSION")
+    })
+}
+
+fn server_capabilities() -> Value {
+    serde_json::json!({
+        "tools": {}
+    })
+}
+
+fn discover_result() -> Value {
+    serde_json::json!({
+        "resultType": "complete",
+        "supportedVersions": [MODERN_PROTOCOL_VERSION],
+        "capabilities": server_capabilities(),
+        "_meta": {
+            "io.modelcontextprotocol/serverInfo": server_identity()
+        },
+        "instructions": MEMORY_GUIDE,
+        "ttlMs": MODERN_RESULT_TTL_MS,
+        "cacheScope": MODERN_CACHE_SCOPE
+    })
+}
+
+fn add_modern_server_meta(map: &mut Map<String, Value>) {
+    let meta = map
+        .entry("_meta".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+
+    if !meta.is_object() {
+        *meta = Value::Object(Map::new());
+    }
+
+    if let Some(meta_map) = meta.as_object_mut() {
+        meta_map.insert(
+            "io.modelcontextprotocol/serverInfo".to_string(),
+            server_identity(),
+        );
+    }
+}
+
+fn modern_complete_result(result: Value) -> Value {
+    match result {
+        Value::Object(mut map) => {
+            map.entry("resultType".to_string())
+                .or_insert_with(|| Value::String("complete".to_string()));
+            add_modern_server_meta(&mut map);
+            Value::Object(map)
+        }
+        value => {
+            let mut map = Map::new();
+            map.insert(
+                "resultType".to_string(),
+                Value::String("complete".to_string()),
+            );
+            map.insert("value".to_string(), value);
+            add_modern_server_meta(&mut map);
+            Value::Object(map)
+        }
+    }
+}
+
+fn modern_cacheable_result(result: Value) -> Value {
+    match modern_complete_result(result) {
+        Value::Object(mut map) => {
+            map.entry("ttlMs".to_string())
+                .or_insert_with(|| Value::from(MODERN_RESULT_TTL_MS));
+            map.entry("cacheScope".to_string())
+                .or_insert_with(|| Value::String(MODERN_CACHE_SCOPE.to_string()));
+            Value::Object(map)
+        }
+        value => value,
+    }
+}
+
+fn tools_list_result(params: &Value, session: &SessionState) -> Value {
+    let include_all = params
+        .get("include_all")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let all_tools = tool_definitions(&session.entity_types);
+    let tools: Vec<ToolDef> = if include_all {
+        all_tools
+    } else {
+        all_tools
+            .into_iter()
+            .filter(|t| is_tier1(&t.name))
+            .collect()
+    };
+    serde_json::json!({ "tools": tools })
+}
+
+fn request_protocol_version(params: &Value) -> Option<&str> {
+    params
+        .get("_meta")
+        .and_then(|meta| meta.get("io.modelcontextprotocol/protocolVersion"))
+        .and_then(Value::as_str)
 }
 
 /// Dispatch an MCP method call. Returns `Ok(result)` or `Err((code, message))`.
@@ -597,23 +710,38 @@ pub async fn dispatch<S: crate::storage::Storage>(
             Ok(server_info())
         }
         "notifications/initialized" => Ok(Value::Null),
-        "tools/list" => {
-            let include_all = params
-                .get("include_all")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let all_tools = tool_definitions(&session.entity_types);
-            let tools: Vec<ToolDef> = if include_all {
-                all_tools
-            } else {
-                all_tools
-                    .into_iter()
-                    .filter(|t| is_tier1(&t.name))
-                    .collect()
-            };
-            Ok(serde_json::json!({ "tools": tools }))
-        }
+        "tools/list" => Ok(tools_list_result(&params, session)),
         "tools/call" => dispatch_tool(params, storage, ctx, session).await,
+        _ => Err((METHOD_NOT_FOUND, format!("unknown method: {method}"))),
+    }
+}
+
+/// Dispatch a modern MCP request using the draft 2026-07-28 per-request model.
+pub async fn dispatch_modern<S: crate::storage::Storage>(
+    method: &str,
+    params: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    if let Some(version) = request_protocol_version(&params)
+        && version != MODERN_PROTOCOL_VERSION
+    {
+        return Err((
+            UNSUPPORTED_PROTOCOL_VERSION,
+            format!(
+                "Unsupported MCP protocol version: {version}; supported: {MODERN_PROTOCOL_VERSION}"
+            ),
+        ));
+    }
+
+    match method {
+        "server/discover" => Ok(discover_result()),
+        "tools/list" => Ok(modern_cacheable_result(tools_list_result(&params, session))),
+        "tools/call" => {
+            let result = dispatch_tool(params, storage, ctx, session).await?;
+            Ok(modern_complete_result(result))
+        }
         _ => Err((METHOD_NOT_FOUND, format!("unknown method: {method}"))),
     }
 }
@@ -12519,6 +12647,71 @@ mod tests {
             .unwrap();
         assert_eq!(result["serverInfo"]["name"], "ferrosa-memory-mcp");
         assert!(result["capabilities"]["tools"].is_object());
+    }
+
+    #[tokio::test]
+    async fn server_discover_returns_modern_capabilities() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let result = dispatch_modern("server/discover", Value::Null, &store, &ctx, &session)
+            .await
+            .unwrap();
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["supportedVersions"][0], MODERN_PROTOCOL_VERSION);
+        assert_eq!(
+            result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "ferrosa-memory-mcp"
+        );
+        assert!(result["capabilities"]["tools"].is_object());
+    }
+
+    #[tokio::test]
+    async fn modern_tools_list_includes_result_type_and_cache_metadata() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let result = dispatch_modern("tools/list", Value::Null, &store, &ctx, &session)
+            .await
+            .unwrap();
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["cacheScope"], "private");
+        assert_eq!(result["ttlMs"], MODERN_RESULT_TTL_MS);
+        assert!(result["tools"].as_array().unwrap().len() > 5);
+    }
+
+    #[tokio::test]
+    async fn modern_tool_call_includes_result_type() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let params = serde_json::json!({
+            "name": "all_tools",
+            "arguments": {}
+        });
+        let result = dispatch_modern("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        assert_eq!(result["resultType"], "complete");
+        assert!(result["content"].is_array());
+        assert!(result["_meta"]["io.modelcontextprotocol/serverInfo"].is_object());
+    }
+
+    #[tokio::test]
+    async fn modern_dispatch_rejects_unsupported_protocol_version() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2099-01-01"
+            }
+        });
+        let err = dispatch_modern("tools/list", params, &store, &ctx, &session)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, UNSUPPORTED_PROTOCOL_VERSION);
+        assert!(err.1.contains("2099-01-01"));
     }
 
     #[tokio::test]

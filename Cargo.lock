@@ -992,6 +992,7 @@ name = "ferrosa-memory-core"
 version = "0.23.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "dirs",
  "ed25519-dalek",
@@ -1003,7 +1004,7 @@ dependencies = [
  "ordered-float",
  "prometheus",
  "proptest",
- "rand 0.8.6",
+ "rand 0.8.7",
  "rcgen 0.14.8",
  "reqwest",
  "rustls-pemfile",
