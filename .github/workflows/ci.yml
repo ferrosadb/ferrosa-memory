@@ -175,6 +175,8 @@ jobs:
       - name: Run MCP draft conformance tests
         run: |
           cargo test -p ferrosa-memory-core --lib modern_
+          cargo test -p ferrosa-memory-core --lib modern_resources
+          cargo test -p ferrosa-memory-core --lib modern_mcp_subscriptions
           cargo test -p ferrosa-memory-core --lib rejects_non_loopback_origin_that_does_not_match_host
           cargo test -p ferrosa-memory-core --lib get_or_delete_mcp_returns_method_not_allowed
           cargo test -p ferrosa-memory-core --lib tool_definitions_catalog_snapshot

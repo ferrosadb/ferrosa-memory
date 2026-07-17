@@ -35,7 +35,7 @@ The near-term goal is a dual-era HTTP server by the July 28, 2026 final spec dat
 | Discovery | No `server/discover`. | Add mandatory `server/discover` with supported versions, capabilities, server info, instructions, `ttlMs`, and `cacheScope`. |
 | Result bodies | `tools/list` returns `{ "tools": [...] }`; tool calls return legacy MCP content. | Modern results include `resultType: "complete"` and cache fields on list/read responses. Tool calls include `resultType` and may later support `input_required`. Legacy results remain unchanged. |
 | Tool definitions | Tool definitions expose `name`, `description`, `inputSchema`, and a conservative common `outputSchema` matching the current `structuredContent` envelope. | Audit names and schemas against the draft Tools page: JSON Schema 2020-12 default, no sensitive `x-mcp-header`, optional precise per-tool `outputSchema` only where stable. |
-| Notifications | Historical HTTP notification behavior exists for `notifications/initialized`. | Streamable HTTP has no core client notifications; request-scoped SSE only when needed. Add `subscriptions/listen` only for advertised change streams. |
+| Notifications | Historical HTTP notification behavior exists for `notifications/initialized`; task mutations emit process-local events for the visualizer. | Streamable HTTP has no core client notifications. `subscriptions/listen` is implemented for task-list resource updates; broader CDC streams should be added as explicit resources before advertising them. |
 | Auth | Shared HTTP is TLS + Basic auth for private/internal deployments. OAuth authorization is not advertised as an implemented MCP capability. | For public co-marketing, add OAuth protected-resource metadata and a bearer-token path before claiming public OAuth support. |
 | Extensions | Ferrosa Memory has durable session task tools and operator HTML surfaces, but not MCP Tasks or MCP Apps extensions. | Treat Tasks and Apps as phase-two extension demos after core compatibility. |
 
@@ -105,7 +105,7 @@ The near-term goal is a dual-era HTTP server by the July 28, 2026 final spec dat
 |---|---|---|---|---|---|---|
 | 2.1 | Cacheable list results | Add `ttlMs` and `cacheScope` to modern `tools/list` and `server/discover`. Return tools in deterministic order. | Clients can cache tool discovery safely; no tenant-private data is marked public. | Snapshot tests and deterministic ordering test. | S | done |
 | 2.2 | Capability truthfulness | Advertise only implemented capabilities. Do not advertise resources/prompts/subscriptions unless real methods exist. | `server/discover` capabilities match dispatch methods. | Capability snapshot plus unknown-method tests. | S | done |
-| 2.3 | `subscriptions/listen` decision | Decide whether list-change/resource-change streaming is needed now. If not, document non-support and avoid advertising it. If yes, implement minimal `toolsListChanged` stream using existing event bus semantics. | No client sees a dangling advertised stream. | Dispatch/HTTP tests for chosen path. | M | done: subscriptions are not advertised |
+| 2.3 | `subscriptions/listen` task stream | Implement Streamable HTTP `subscriptions/listen` for task-list resources. Acknowledge first, filter to requested resource URIs, tag notifications with `io.modelcontextprotocol/subscriptionId`, and keep the stream open until cancellation. | Task monitor clients can subscribe to `ferrosa-memory://tasks/{session_id}/current` or `/list` and receive `notifications/resources/updated` after task mutations. | Dispatch resource tests and HTTP SSE subscription test. | M | done |
 | 2.4 | Origin validation | Enforce Streamable HTTP `Origin` validation with config for allowed origins. Keep local/dev defaults safe. | Invalid browser origins receive 403 before auth/dispatch. | HTTP tests for absent, loopback/same-host allowed, and denied Origin. | M | done |
 | 2.5 | Protected resource metadata | Add OAuth protected-resource metadata discovery for HTTP deployments and include `WWW-Authenticate` `resource_metadata` on 401 when configured. | OAuth-capable clients can discover authorization server metadata; Basic-only internal deployments remain supported. | HTTP tests for 401 challenge and well-known endpoint. | M | backlog: required only before advertising public OAuth support |
 | 2.6 | Tool output schemas | Add `outputSchema` only for stable, structured high-value tools. Preserve text content for compatibility and put JSON under `structuredContent` where useful. | Modern clients get better structured data without breaking existing text consumers. | Snapshot/schema tests for selected tools. | M | done: common envelope schema; precise per-tool schemas remain backlog B4 |
@@ -113,6 +113,8 @@ The near-term goal is a dual-era HTTP server by the July 28, 2026 final spec dat
 
 **Quality Gates:**
 - [x] Security negative tests for origin and header validation
+- [x] `cargo test -p ferrosa-memory-core --lib modern_resources`
+- [x] `cargo test -p ferrosa-memory-core --lib modern_mcp_subscriptions`
 - [x] Docs updated with public vs internal auth posture
 - [x] No capability is advertised without a working method
 

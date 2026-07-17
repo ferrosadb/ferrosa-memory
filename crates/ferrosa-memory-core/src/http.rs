@@ -4,11 +4,11 @@
 //! and streams responses. Supports HTTP Basic auth for tenant identification.
 //!
 //! Last revised: 2026-07-17
-//! Last changed: Tightened MCP draft 2026-07-28 Origin, metadata, and mirrored-header validation.
+//! Last changed: Added Streamable HTTP `subscriptions/listen` SSE streams for task resources.
 //!
 //! ## Endpoints
 //!
-//! - `POST /mcp` — JSON-RPC request/response
+//! - `POST /mcp` — JSON-RPC request/response and Streamable HTTP subscription streams
 //! - `GET /metrics` — Prometheus metrics scrape
 //! - `GET /healthz/live` — Liveness check
 //! - `GET /healthz/ready` — Readiness check
@@ -23,7 +23,7 @@
 //! - Connection limit per source IP (FMEA F30)
 //! - Idle connection timeout
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -546,29 +546,8 @@ where
     T: AsyncReadExt + AsyncWriteExt + Unpin,
 {
     loop {
-        let handler = handle_connection_rw(
-            stream,
-            storage,
-            connection.metrics,
-            connection.credential_validator,
-            connection.readiness_checker,
-            connection.shell_routes,
-            connection.session,
-        );
-        let keep_alive = match tokio::time::timeout(connection.request_budget, handler).await {
-            Ok(res) => res?,
-            Err(_) => {
-                let body = format!("request exceeded {:?}", connection.request_budget);
-                let resp = text_response("504 Gateway Timeout", &body);
-                // Best-effort notify the client; ignore write errors since
-                // the peer may already be gone.
-                let _ = stream.write_all(resp.as_bytes()).await;
-                return Err(anyhow::anyhow!(
-                    "request exceeded {:?}",
-                    connection.request_budget
-                ));
-            }
-        };
+        let handler = handle_connection_rw(stream, storage, &connection);
+        let keep_alive = handler.await?;
         if !keep_alive {
             break;
         }
@@ -590,23 +569,29 @@ async fn handle_connection_rw<
 >(
     stream: &mut T,
     storage: &S,
-    metrics: &MemoryMetrics,
-    credential_validator: &CredentialValidator,
-    readiness_checker: &(dyn Fn() -> bool + Send + Sync),
-    shell_routes: &ShellRouteConfig,
-    session: &dispatch::SessionState,
+    connection: &ConnectionContext<'_>,
 ) -> anyhow::Result<bool> {
-    let request = match read_http_request(stream, MAX_REQUEST_BYTES).await {
-        Ok(r) => r,
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("connection closed before request headers complete") {
+    let request_budget = connection.request_budget;
+    let request =
+        match tokio::time::timeout(request_budget, read_http_request(stream, MAX_REQUEST_BYTES))
+            .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                let msg = e.to_string();
+                if msg.contains("connection closed before request headers complete") {
+                    return Ok(false);
+                }
+                tracing::debug!(error = %e, "http: incomplete or malformed request");
                 return Ok(false);
             }
-            tracing::debug!(error = %e, "http: incomplete or malformed request");
-            return Ok(false);
-        }
-    };
+            Err(_) => {
+                let body = format!("request exceeded {request_budget:?}");
+                let resp = text_response("504 Gateway Timeout", &body);
+                let _ = stream.write_all(resp.as_bytes()).await;
+                return Err(anyhow::anyhow!("request exceeded {request_budget:?}"));
+            }
+        };
 
     // Parse HTTP request line and headers
     let (method, path, headers, body) = parse_http_request(&request)?;
@@ -614,22 +599,303 @@ async fn handle_connection_rw<
         .iter()
         .any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("close"));
 
-    let response = handle_http_request_with_session(
+    if let Some(keep_alive) = handle_mcp_subscription_stream_if_requested(
+        stream,
         method,
         path,
         &headers,
         body,
-        storage,
-        metrics,
-        credential_validator,
-        readiness_checker,
-        shell_routes,
-        session,
+        connection.credential_validator,
+        connection.session,
     )
-    .await?;
+    .await?
+    {
+        return Ok(keep_alive);
+    }
+
+    let response = match tokio::time::timeout(
+        request_budget,
+        handle_http_request_with_session(
+            method,
+            path,
+            &headers,
+            body,
+            storage,
+            connection.metrics,
+            connection.credential_validator,
+            connection.readiness_checker,
+            connection.shell_routes,
+            connection.session,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            let body = format!("request exceeded {request_budget:?}");
+            let resp = text_response("504 Gateway Timeout", &body);
+            let _ = stream.write_all(resp.as_bytes()).await;
+            return Err(anyhow::anyhow!("request exceeded {request_budget:?}"));
+        }
+    };
     stream.write_all(response.as_bytes()).await?;
 
     Ok(!close_requested)
+}
+
+#[derive(Debug)]
+struct SubscriptionFilter {
+    resource_subscriptions: HashSet<String>,
+    acknowledged_resource_subscriptions: Vec<String>,
+}
+
+fn subscription_filter(params: &Value) -> SubscriptionFilter {
+    let requested = params
+        .get("notifications")
+        .and_then(|notifications| notifications.get("resourceSubscriptions"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str);
+
+    let mut resource_subscriptions = HashSet::new();
+    let mut acknowledged_resource_subscriptions = Vec::new();
+    for uri in requested {
+        if dispatch::parse_task_resource_uri(uri).is_some()
+            && resource_subscriptions.insert(uri.to_string())
+        {
+            acknowledged_resource_subscriptions.push(uri.to_string());
+        }
+    }
+
+    SubscriptionFilter {
+        resource_subscriptions,
+        acknowledged_resource_subscriptions,
+    }
+}
+
+fn accepts_mime(headers: &[(String, String)], mime: &str) -> bool {
+    headers
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case("accept"))
+        .flat_map(|(_, value)| value.split(','))
+        .filter_map(|part| part.trim().split(';').next())
+        .any(|part| part.eq_ignore_ascii_case(mime) || part == "*/*")
+}
+
+fn subscription_meta(subscription_id: &Value) -> Value {
+    serde_json::json!({
+        "io.modelcontextprotocol/subscriptionId": subscription_id
+    })
+}
+
+fn subscription_ack_message(subscription_id: &Value, filter: &SubscriptionFilter) -> Value {
+    let mut notifications = serde_json::Map::new();
+    if !filter.acknowledged_resource_subscriptions.is_empty() {
+        notifications.insert(
+            "resourceSubscriptions".to_string(),
+            Value::Array(
+                filter
+                    .acknowledged_resource_subscriptions
+                    .iter()
+                    .cloned()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+    }
+
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/subscriptions/acknowledged",
+        "params": {
+            "_meta": subscription_meta(subscription_id),
+            "notifications": Value::Object(notifications)
+        }
+    })
+}
+
+fn subscription_complete_message(subscription_id: &Value) -> Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": subscription_id,
+        "result": {
+            "resultType": "complete",
+            "_meta": subscription_meta(subscription_id)
+        }
+    })
+}
+
+fn resource_updated_message(subscription_id: &Value, uri: String) -> Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/resources/updated",
+        "params": {
+            "_meta": subscription_meta(subscription_id),
+            "uri": uri
+        }
+    })
+}
+
+fn subscribed_task_resource_updates(event: &VizEvent, filter: &SubscriptionFilter) -> Vec<String> {
+    let VizEvent::SessionTaskChanged { session_id, .. } = event else {
+        return Vec::new();
+    };
+    let Ok(session_id) = Uuid::parse_str(session_id) else {
+        return Vec::new();
+    };
+
+    dispatch::task_resource_uris(session_id)
+        .into_iter()
+        .filter(|uri| filter.resource_subscriptions.contains(uri))
+        .collect()
+}
+
+async fn write_sse_message<T: AsyncWriteExt + Unpin>(
+    stream: &mut T,
+    message: &Value,
+) -> std::io::Result<()> {
+    let json = serde_json::to_string(message).map_err(std::io::Error::other)?;
+    stream.write_all(b"event: message\n").await?;
+    stream.write_all(b"data: ").await?;
+    stream.write_all(json.as_bytes()).await?;
+    stream.write_all(b"\n\n").await?;
+    stream.flush().await
+}
+
+async fn handle_mcp_subscription_stream_if_requested<T: AsyncWriteExt + Unpin>(
+    stream: &mut T,
+    method: &str,
+    path: &str,
+    headers: &[(String, String)],
+    body: &str,
+    credential_validator: &CredentialValidator,
+    session: &dispatch::SessionState,
+) -> anyhow::Result<Option<bool>> {
+    if method != "POST" || path != "/mcp" {
+        return Ok(None);
+    }
+
+    let Ok(rpc_request) = serde_json::from_str::<Value>(body) else {
+        return Ok(None);
+    };
+    let rpc_method = rpc_request
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if rpc_method != "subscriptions/listen" {
+        return Ok(None);
+    }
+
+    let params = rpc_request.get("params").cloned().unwrap_or(Value::Null);
+    let id = rpc_request.get("id").cloned();
+
+    if let Err(message) = validate_origin(headers) {
+        tracing::warn!(%message, "rejecting subscription request with invalid Origin header");
+        let response = json_rpc_error_response(
+            "403 Forbidden",
+            id,
+            crate::transport::INVALID_REQUEST,
+            message,
+            None,
+        );
+        stream.write_all(response.as_bytes()).await?;
+        return Ok(Some(false));
+    }
+
+    if authenticate_from_headers(headers, credential_validator).is_err() {
+        let response = unauthorized_response();
+        stream.write_all(response.as_bytes()).await?;
+        return Ok(Some(false));
+    }
+
+    if let Err(error) = validate_modern_mcp_http_request(headers, rpc_method, &params, id.as_ref())
+    {
+        let response =
+            json_rpc_error_response("400 Bad Request", id, error.code, error.message, error.data);
+        stream.write_all(response.as_bytes()).await?;
+        return Ok(Some(false));
+    }
+
+    let Some(id) = id else {
+        let response = json_rpc_error_response(
+            "400 Bad Request",
+            None,
+            crate::transport::INVALID_PARAMS,
+            "subscriptions/listen requires a JSON-RPC request id",
+            None,
+        );
+        stream.write_all(response.as_bytes()).await?;
+        return Ok(Some(false));
+    };
+    if !is_valid_json_rpc_id(&id) {
+        let response = json_rpc_error_response(
+            "400 Bad Request",
+            Some(id),
+            crate::transport::INVALID_PARAMS,
+            "JSON-RPC id must be a string or integer and must not be null",
+            None,
+        );
+        stream.write_all(response.as_bytes()).await?;
+        return Ok(Some(false));
+    }
+
+    if !accepts_mime(headers, "text/event-stream") {
+        let response = json_rpc_error_response(
+            "406 Not Acceptable",
+            Some(id),
+            crate::transport::INVALID_REQUEST,
+            "subscriptions/listen requires Accept: text/event-stream",
+            None,
+        );
+        stream.write_all(response.as_bytes()).await?;
+        return Ok(Some(false));
+    }
+
+    let filter = subscription_filter(&params);
+    let response_headers = "HTTP/1.1 200 OK\r\n\
+                            Content-Type: text/event-stream\r\n\
+                            Cache-Control: no-cache\r\n\
+                            Connection: keep-alive\r\n\
+                            X-Accel-Buffering: no\r\n\
+                            \r\n";
+    stream.write_all(response_headers.as_bytes()).await?;
+    write_sse_message(stream, &subscription_ack_message(&id, &filter)).await?;
+
+    let mut rx = session.event_bus.subscribe();
+    let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(15));
+    keepalive.tick().await;
+
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                match event {
+                    Ok(event) => {
+                        for uri in subscribed_task_resource_updates(&event, &filter) {
+                            if write_sse_message(stream, &resource_updated_message(&id, uri)).await.is_err() {
+                                return Ok(Some(false));
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("mcp subscription stream lagged by {n} task events");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        let _ = write_sse_message(stream, &subscription_complete_message(&id)).await;
+                        return Ok(Some(false));
+                    }
+                }
+            }
+            _ = keepalive.tick() => {
+                if stream.write_all(b":\n\n").await.is_err() {
+                    return Ok(Some(false));
+                }
+                if stream.flush().await.is_err() {
+                    return Ok(Some(false));
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4669,6 +4935,14 @@ mod tests {
         serde_json::from_str(body).expect("response body must be JSON")
     }
 
+    fn sse_data_messages(response: &str) -> Vec<Value> {
+        response
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|line| serde_json::from_str(line).expect("SSE data must be JSON"))
+            .collect()
+    }
+
     #[tokio::test]
     async fn run_with_budget_times_out_on_stalled_future() {
         // Regression guard: the HTTPS accept loop wedged in the field
@@ -5888,6 +6162,159 @@ mod tests {
             body["result"]["supportedVersions"][0],
             dispatch::MODERN_PROTOCOL_VERSION
         );
+    }
+
+    #[tokio::test]
+    async fn modern_mcp_resources_read_validates_name_header() {
+        let metrics = MemoryMetrics::new().unwrap();
+        let storage = MockStorage::new();
+        let uri = dispatch::task_resource_uri(Uuid::nil(), dispatch::TaskResourceKind::List);
+        let mut headers = valid_basic_auth_headers();
+        headers.extend([
+            (
+                "MCP-Protocol-Version".to_string(),
+                dispatch::MODERN_PROTOCOL_VERSION.to_string(),
+            ),
+            ("Mcp-Method".to_string(), "resources/read".to_string()),
+            ("Mcp-Name".to_string(), uri.clone()),
+        ]);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "resources/read",
+            "params": {
+                "uri": uri,
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": dispatch::MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        })
+        .to_string();
+        let response = handle_http_request(
+            "POST",
+            "/mcp",
+            &headers,
+            &body,
+            &storage,
+            &metrics,
+            &valid_credentials,
+            &|| true,
+            &ShellRouteConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        let body = response_json(&response);
+        assert_eq!(body["result"]["resultType"], "complete");
+        assert_eq!(
+            body["result"]["contents"][0]["mimeType"],
+            dispatch::TASK_RESOURCE_MIME_TYPE
+        );
+    }
+
+    #[tokio::test]
+    async fn modern_mcp_subscriptions_listen_streams_task_resource_updates() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let metrics = MemoryMetrics::new().unwrap();
+        let storage = MockStorage::new();
+        let session = Arc::new(dispatch::SessionState::default());
+        let (mut client, mut server) = tokio::io::duplex(16 * 1024);
+        let session_for_server = Arc::clone(&session);
+        let session_id = Uuid::new_v4();
+        let uri = dispatch::task_resource_uri(session_id, dispatch::TaskResourceKind::List);
+
+        let server_task = tokio::spawn(async move {
+            serve_one_connection_with_session(
+                &mut server,
+                &storage,
+                ConnectionContext {
+                    metrics: &metrics,
+                    credential_validator: &valid_credentials,
+                    readiness_checker: &|| true,
+                    shell_routes: &ShellRouteConfig::default(),
+                    session: session_for_server.as_ref(),
+                    request_budget: DEFAULT_REQUEST_BUDGET,
+                },
+            )
+            .await
+        });
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "subscriptions/listen",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": dispatch::MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                },
+                "notifications": {
+                    "resourceSubscriptions": [uri]
+                }
+            }
+        })
+        .to_string();
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Authorization: Basic dXNlcjpwYXNz\r\n\
+             Content-Type: application/json\r\n\
+             Accept: application/json, text/event-stream\r\n\
+             MCP-Protocol-Version: {}\r\n\
+             Mcp-Method: subscriptions/listen\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            dispatch::MODERN_PROTOCOL_VERSION,
+            body.len()
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.flush().await.unwrap();
+
+        let mut buf = vec![0u8; 16 * 1024];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let first = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(first.starts_with("HTTP/1.1 200 OK"), "got: {first}");
+        assert!(first.contains("Content-Type: text/event-stream"));
+        assert!(first.contains("X-Accel-Buffering: no"));
+        let messages = sse_data_messages(&first);
+        assert_eq!(
+            messages[0]["method"],
+            "notifications/subscriptions/acknowledged"
+        );
+        assert_eq!(
+            messages[0]["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+            21
+        );
+
+        session.event_bus.emit(VizEvent::SessionTaskChanged {
+            session_id: session_id.to_string(),
+            task_id: None,
+            action: "task_put".to_string(),
+        });
+
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let second = String::from_utf8_lossy(&buf[..n]).to_string();
+        let messages = sse_data_messages(&second);
+        assert_eq!(messages[0]["method"], "notifications/resources/updated");
+        assert_eq!(
+            messages[0]["params"]["uri"],
+            dispatch::task_resource_uri(session_id, dispatch::TaskResourceKind::List)
+        );
+        assert_eq!(
+            messages[0]["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+            21
+        );
+
+        drop(client);
+        server_task.abort();
+        let _ = server_task.await;
     }
 
     #[tokio::test]

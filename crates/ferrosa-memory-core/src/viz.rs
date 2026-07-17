@@ -176,6 +176,12 @@ pub enum VizEvent {
         session_stddev: f64,
         sigma_threshold: f64,
     },
+    /// Durable task state changed and task-list resources should be refreshed.
+    SessionTaskChanged {
+        session_id: String,
+        task_id: Option<String>,
+        action: String,
+    },
 }
 
 /// Broadcast channel for visualization events.
