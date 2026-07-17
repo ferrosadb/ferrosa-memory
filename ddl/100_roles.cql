@@ -82,6 +82,7 @@ GRANT MODIFY ON agent_memory.document_phonetic_terms TO ferrosa_user;
 -- via CqlStorage on the runtime session.
 GRANT MODIFY ON agent_memory.session_tasks_by_id      TO ferrosa_user;
 GRANT MODIFY ON agent_memory.session_tasks_by_status  TO ferrosa_user;
+GRANT MODIFY ON agent_memory.session_tasks_by_workspace TO ferrosa_user;
 GRANT MODIFY ON agent_memory.session_task_events      TO ferrosa_user;
 GRANT MODIFY ON agent_memory.session_task_focus_stack TO ferrosa_user;
 GRANT MODIFY ON agent_memory.session_task_policies    TO ferrosa_user;
