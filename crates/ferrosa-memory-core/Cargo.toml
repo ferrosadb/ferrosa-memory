@@ -37,6 +37,7 @@ ordered-float = { workspace = true }
 tempfile = { workspace = true }
 nom = "8"
 nom-supreme = "0.8"
+base64 = "0.22"
 
 # Integration tests under `tests/` compile against the public crate
 # surface, which means `mod mock` must be gated on a feature (not

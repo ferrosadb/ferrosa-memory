@@ -66,6 +66,7 @@ at startup.
 | [data-flow.md](data-flow.md) | Data flow diagrams — tool call paths, storage paths, retrieval paths |
 | [threat-model.md](threat-model.md) | STRIDE threat analysis with trust boundaries |
 | [project-plan.md](project-plan.md) | Timeboxed sprint plan prioritized by risk |
+| [plans/mcp-2026-07-28-release-support.md](plans/mcp-2026-07-28-release-support.md) | MCP 2026-07-28 stateless protocol support and co-marketing plan |
 | [shared-http-deployment.md](shared-http-deployment.md) | Production HTTP deployment blueprint: auth, TLS, probes, tenant policy, viz boundary |
 | [decisions/](decisions/) | Architecture Decision Records |
 
@@ -90,3 +91,4 @@ All specs derived from `ferrosa-memory-mcp-spec.md` (v0.1, 2026-03-21).
 - **2026-04-19 (update):** Expert-system knowledge plane review: effective-rule-set gap, core ownership of claims/approvals/aliases, operator console above viz, explanation API risks, and Sprint 8 planning
 - **2026-06-11 (update):** Graph edge reconciliation and turn-chain capture: serving-path graph writes route through the graph client, typed edges are visible through graph/CQL/MCP traversal APIs, hooks use `ingest_entities`, and captured turns link through `next_turn` / `previous_turn` temporal edges.
 - **2026-06-15 (blueprint):** Session task continuity Phase 0 decisions captured: fmem-owned canonical task IDs, scoped aliases, multiple active tasks, persisted focus stack, deterministic v1 task observation, recovery hints, and compact recall injection with temporal-link pointers.
+- **2026-07-17 (plan):** MCP 2026-07-28 release support plan added from the official draft spec: dual-era stateless core, Streamable HTTP header validation, `server/discover`, cacheable tool discovery, auth posture, extension showcase, and co-marketing runbook.

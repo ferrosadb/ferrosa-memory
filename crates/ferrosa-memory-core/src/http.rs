@@ -3,6 +3,9 @@
 //! Provides an HTTP server that accepts MCP JSON-RPC requests via POST
 //! and streams responses. Supports HTTP Basic auth for tenant identification.
 //!
+//! Last revised: 2026-07-17
+//! Last changed: Tightened MCP draft 2026-07-28 Origin, metadata, and mirrored-header validation.
+//!
 //! ## Endpoints
 //!
 //! - `POST /mcp` — JSON-RPC request/response
@@ -25,6 +28,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use base64::Engine as _;
 use futures_util::SinkExt;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -670,6 +674,17 @@ async fn handle_http_request_with_session<S: Storage + OperatorQuerySurface>(
     shell_routes: &ShellRouteConfig,
     session: &dispatch::SessionState,
 ) -> anyhow::Result<String> {
+    if let Err(message) = validate_origin(headers) {
+        tracing::warn!(%message, "rejecting request with invalid Origin header");
+        return Ok(json_rpc_error_response(
+            "403 Forbidden",
+            None,
+            crate::transport::INVALID_REQUEST,
+            message,
+            None,
+        ));
+    }
+
     if (method == "GET" || method == "HEAD") && path == "/viz" {
         let host = request_hostname(headers).unwrap_or("127.0.0.1");
         return Ok(redirect_response(&format!(
@@ -724,6 +739,9 @@ async fn handle_http_request_with_session<S: Storage + OperatorQuerySurface>(
                 body
             ))
         }
+        ("GET" | "DELETE", "/mcp") => {
+            Ok("HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n".into())
+        }
         ("POST", "/mcp") => {
             let ctx = match authenticate_from_headers(headers, credential_validator) {
                 Ok(ctx) => ctx,
@@ -739,6 +757,19 @@ async fn handle_http_request_with_session<S: Storage + OperatorQuerySurface>(
                 .unwrap_or("");
             let params = rpc_request.get("params").cloned().unwrap_or(Value::Null);
             let id = rpc_request.get("id").cloned();
+            let is_modern = is_modern_mcp_http_request(rpc_method, headers, &params);
+            if is_modern
+                && let Err(error) =
+                    validate_modern_mcp_http_request(headers, rpc_method, &params, id.as_ref())
+            {
+                return Ok(json_rpc_error_response(
+                    "400 Bad Request",
+                    id,
+                    error.code,
+                    error.message,
+                    error.data,
+                ));
+            }
             // Per MCP Streamable-HTTP (2025-03-26): a POST whose body
             // is a JSON-RPC notification (method present, `id` absent)
             // or a JSON-RPC response (no `method`) must return **HTTP
@@ -749,7 +780,11 @@ async fn handle_http_request_with_session<S: Storage + OperatorQuerySurface>(
             let is_client_response = rpc_request.get("method").is_none()
                 && (rpc_request.get("result").is_some() || rpc_request.get("error").is_some());
 
-            let result = dispatch::dispatch(rpc_method, params, storage, &ctx, session).await;
+            let result = if is_modern {
+                dispatch::dispatch_modern(rpc_method, params, storage, &ctx, session).await
+            } else {
+                dispatch::dispatch(rpc_method, params, storage, &ctx, session).await
+            };
 
             if is_notification || is_client_response {
                 // Dispatch still runs for its side effects (logging,
@@ -780,7 +815,18 @@ async fn handle_http_request_with_session<S: Storage + OperatorQuerySurface>(
             };
 
             let body_str = serde_json::to_string(&response_body)?;
-            Ok(json_response("200 OK", &body_str))
+            let status = if is_modern
+                && response_body
+                    .get("error")
+                    .and_then(|error| error.get("code"))
+                    .and_then(Value::as_i64)
+                    == Some(i64::from(crate::transport::METHOD_NOT_FOUND))
+            {
+                "404 Not Found"
+            } else {
+                "200 OK"
+            };
+            Ok(json_response(status, &body_str))
         }
         // Unauthenticated loopback introspection (same exposure tier as /health
         // and /metrics). Lets a local controller (the Ferrosa workbench) map a
@@ -846,6 +892,289 @@ fn json_response(status: &str, body: &str) -> String {
         body.len(),
         body
     )
+}
+
+fn json_rpc_error_response(
+    status: &str,
+    id: Option<Value>,
+    code: i32,
+    message: impl Into<String>,
+    data: Option<Value>,
+) -> String {
+    let mut error = serde_json::Map::new();
+    error.insert("code".to_string(), Value::from(code));
+    error.insert("message".to_string(), Value::String(message.into()));
+    if let Some(data) = data {
+        error.insert("data".to_string(), data);
+    }
+
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id.unwrap_or(Value::Null),
+        "error": Value::Object(error)
+    });
+    json_response(status, &body.to_string())
+}
+
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn body_protocol_version(params: &Value) -> Option<&str> {
+    params
+        .get("_meta")
+        .and_then(|meta| meta.get("io.modelcontextprotocol/protocolVersion"))
+        .and_then(Value::as_str)
+}
+
+fn is_modern_mcp_http_request(method: &str, headers: &[(String, String)], params: &Value) -> bool {
+    method == "server/discover"
+        || header_value(headers, "MCP-Protocol-Version").is_some()
+        || body_protocol_version(params).is_some()
+}
+
+struct ModernHttpValidationError {
+    code: i32,
+    message: String,
+    data: Option<Value>,
+}
+
+impl ModernHttpValidationError {
+    fn header_mismatch(message: impl Into<String>) -> Self {
+        Self {
+            code: dispatch::HEADER_MISMATCH,
+            message: message.into(),
+            data: None,
+        }
+    }
+
+    fn unsupported_version(requested: impl Into<String>) -> Self {
+        let requested = requested.into();
+        Self {
+            code: dispatch::UNSUPPORTED_PROTOCOL_VERSION,
+            message: format!("Unsupported MCP protocol version: {requested}"),
+            data: Some(serde_json::json!({
+                "requested": requested,
+                "supported": [dispatch::MODERN_PROTOCOL_VERSION]
+            })),
+        }
+    }
+
+    fn invalid_params(message: impl Into<String>) -> Self {
+        Self {
+            code: -32602,
+            message: message.into(),
+            data: None,
+        }
+    }
+}
+
+fn validate_origin(headers: &[(String, String)]) -> Result<(), String> {
+    let Some(origin) = header_value(headers, "Origin") else {
+        return Ok(());
+    };
+    if origin == "null" {
+        return Err("invalid Origin header: null origin is not allowed".to_string());
+    }
+    let Some(origin_host) = origin_host(origin) else {
+        return Err(format!("invalid Origin header: {origin}"));
+    };
+    if is_loopback_host(origin_host) {
+        return Ok(());
+    }
+    let Some(host_header) = header_value(headers, "Host") else {
+        return Err(
+            "invalid Origin header: Host header is required for non-loopback origins".to_string(),
+        );
+    };
+    let Some(request_host) = host_without_port(host_header) else {
+        return Err(format!("invalid Host header: {host_header}"));
+    };
+    if origin_host.eq_ignore_ascii_case(request_host) {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid Origin header: {origin_host} does not match Host {request_host}"
+        ))
+    }
+}
+
+fn origin_host(origin: &str) -> Option<&str> {
+    let (_, rest) = origin.split_once("://")?;
+    if rest.is_empty() || rest.contains('/') || rest.contains('?') || rest.contains('#') {
+        return None;
+    }
+    host_without_port(rest)
+}
+
+fn host_without_port(host_port: &str) -> Option<&str> {
+    if host_port.is_empty() {
+        return None;
+    }
+    if let Some(rest) = host_port.strip_prefix('[') {
+        let end = rest.find(']')?;
+        return Some(&host_port[..=end + 1]);
+    }
+    Some(host_port.split(':').next().unwrap_or(host_port))
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost") || matches!(host, "127.0.0.1" | "[::1]" | "::1")
+}
+
+fn params_name_for_mcp_header<'a>(method: &str, params: &'a Value) -> Option<&'a str> {
+    match method {
+        "tools/call" | "prompts/get" => params.get("name").and_then(Value::as_str),
+        "resources/read" => params.get("uri").and_then(Value::as_str),
+        _ => None,
+    }
+}
+
+fn validate_modern_mcp_http_request(
+    headers: &[(String, String)],
+    method: &str,
+    params: &Value,
+    id: Option<&Value>,
+) -> Result<(), ModernHttpValidationError> {
+    let header_version = header_value(headers, "MCP-Protocol-Version").ok_or_else(|| {
+        ModernHttpValidationError::header_mismatch("missing MCP-Protocol-Version header")
+    })?;
+    validate_plain_header_value(header_version).map_err(|message| {
+        ModernHttpValidationError::header_mismatch(format!(
+            "invalid MCP-Protocol-Version header: {message}"
+        ))
+    })?;
+    let body_version = body_protocol_version(params).ok_or_else(|| {
+        ModernHttpValidationError::invalid_params(
+            "missing params._meta.io.modelcontextprotocol/protocolVersion",
+        )
+    })?;
+    if header_version != body_version {
+        return Err(ModernHttpValidationError::header_mismatch(format!(
+            "MCP-Protocol-Version header ({header_version}) does not match request _meta protocolVersion ({body_version})"
+        )));
+    }
+    if header_version != dispatch::MODERN_PROTOCOL_VERSION {
+        return Err(ModernHttpValidationError::unsupported_version(
+            header_version.to_string(),
+        ));
+    }
+
+    let header_method = header_value(headers, "Mcp-Method")
+        .ok_or_else(|| ModernHttpValidationError::header_mismatch("missing Mcp-Method header"))?;
+    validate_plain_header_value(header_method).map_err(|message| {
+        ModernHttpValidationError::header_mismatch(format!("invalid Mcp-Method header: {message}"))
+    })?;
+    if header_method != method {
+        return Err(ModernHttpValidationError::header_mismatch(format!(
+            "Mcp-Method header ({header_method}) does not match JSON-RPC method ({method})"
+        )));
+    }
+
+    let meta = params
+        .get("_meta")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            ModernHttpValidationError::invalid_params("params._meta must be an object")
+        })?;
+    if !meta
+        .get("io.modelcontextprotocol/clientCapabilities")
+        .is_some_and(Value::is_object)
+    {
+        return Err(ModernHttpValidationError::invalid_params(
+            "missing params._meta.io.modelcontextprotocol/clientCapabilities",
+        ));
+    }
+    if let Some(client_info) = meta.get("io.modelcontextprotocol/clientInfo")
+        && !client_info.is_object()
+    {
+        return Err(ModernHttpValidationError::invalid_params(
+            "params._meta.io.modelcontextprotocol/clientInfo must be an object when present",
+        ));
+    }
+    if let Some(id) = id
+        && !is_valid_json_rpc_id(id)
+    {
+        return Err(ModernHttpValidationError::invalid_params(
+            "JSON-RPC id must be a string or integer and must not be null",
+        ));
+    }
+
+    if matches!(method, "tools/call" | "resources/read" | "prompts/get") {
+        let expected = params_name_for_mcp_header(method, params).ok_or_else(|| {
+            ModernHttpValidationError::header_mismatch(format!(
+                "missing request name for {method} Mcp-Name validation"
+            ))
+        })?;
+        let header_name = header_value(headers, "Mcp-Name")
+            .ok_or_else(|| ModernHttpValidationError::header_mismatch("missing Mcp-Name header"))?;
+        let decoded_header_name = decode_mcp_header_value(header_name).map_err(|message| {
+            ModernHttpValidationError::header_mismatch(format!(
+                "invalid Mcp-Name header: {message}"
+            ))
+        })?;
+        if decoded_header_name != expected {
+            return Err(ModernHttpValidationError::header_mismatch(format!(
+                "Mcp-Name header ({decoded_header_name}) does not match request name ({expected})"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_plain_header_value(value: &str) -> Result<(), &'static str> {
+    if value.is_empty() {
+        return Err("value is empty");
+    }
+    if value
+        .as_bytes()
+        .iter()
+        .any(|byte| !matches!(*byte, 0x21..=0x7e))
+    {
+        return Err("value contains characters that must be encoded");
+    }
+    Ok(())
+}
+
+fn decode_mcp_header_value(value: &str) -> Result<String, String> {
+    const PREFIX: &str = "=?base64?";
+    const SUFFIX: &str = "?=";
+    if let Some(encoded) = value
+        .strip_prefix(PREFIX)
+        .and_then(|rest| rest.strip_suffix(SUFFIX))
+    {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|error| format!("invalid base64 sentinel: {error}"))?;
+        return String::from_utf8(decoded)
+            .map_err(|error| format!("base64 sentinel did not decode to UTF-8: {error}"));
+    }
+    if value.starts_with("=?base64?") || value.ends_with("?=") {
+        return Err("malformed base64 sentinel".to_string());
+    }
+    if value.is_empty() || value.trim_matches([' ', '\t']) != value {
+        return Err("value must use base64 sentinel encoding".to_string());
+    }
+    if value
+        .as_bytes()
+        .iter()
+        .any(|byte| !matches!(*byte, 0x20..=0x7e))
+    {
+        return Err("value contains characters that must be encoded".to_string());
+    }
+    Ok(value.to_string())
+}
+
+fn is_valid_json_rpc_id(id: &Value) -> bool {
+    match id {
+        Value::String(_) => true,
+        Value::Number(number) => number.as_i64().is_some() || number.as_u64().is_some(),
+        _ => false,
+    }
 }
 
 fn parse_optional_positive_limit(path: &str) -> anyhow::Result<Option<usize>> {
@@ -4318,6 +4647,28 @@ mod tests {
     use crate::metrics::MemoryMetrics;
     use crate::storage::mock::MockStorage;
 
+    fn valid_basic_auth_headers() -> Vec<(String, String)> {
+        vec![(
+            "Authorization".to_string(),
+            "Basic dXNlcjpwYXNz".to_string(),
+        )]
+    }
+
+    fn valid_credentials(user: &str, password: &str) -> Option<Uuid> {
+        if user == "user" && password == "pass" {
+            Some(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap())
+        } else {
+            None
+        }
+    }
+
+    fn response_json(response: &str) -> Value {
+        let (_, body) = response
+            .split_once("\r\n\r\n")
+            .expect("HTTP response must contain body separator");
+        serde_json::from_str(body).expect("response body must be JSON")
+    }
+
     #[tokio::test]
     async fn run_with_budget_times_out_on_stalled_future() {
         // Regression guard: the HTTPS accept loop wedged in the field
@@ -5487,6 +5838,391 @@ mod tests {
         .unwrap();
         assert!(response.starts_with("HTTP/1.1 401 Unauthorized"));
         assert!(response.contains("WWW-Authenticate: Basic realm=\"Ferrosa Memory\""));
+    }
+
+    #[tokio::test]
+    async fn modern_mcp_server_discover_returns_modern_result() {
+        let metrics = MemoryMetrics::new().unwrap();
+        let storage = MockStorage::new();
+        let mut headers = valid_basic_auth_headers();
+        headers.extend([
+            (
+                "MCP-Protocol-Version".to_string(),
+                dispatch::MODERN_PROTOCOL_VERSION.to_string(),
+            ),
+            ("Mcp-Method".to_string(), "server/discover".to_string()),
+        ]);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "server/discover",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": dispatch::MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientInfo": {
+                        "name": "test-client",
+                        "version": "0.1.0"
+                    },
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        })
+        .to_string();
+        let response = handle_http_request(
+            "POST",
+            "/mcp",
+            &headers,
+            &body,
+            &storage,
+            &metrics,
+            &valid_credentials,
+            &|| true,
+            &ShellRouteConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        let body = response_json(&response);
+        assert_eq!(body["result"]["resultType"], "complete");
+        assert_eq!(
+            body["result"]["supportedVersions"][0],
+            dispatch::MODERN_PROTOCOL_VERSION
+        );
+    }
+
+    #[tokio::test]
+    async fn modern_mcp_request_rejects_missing_method_header() {
+        let metrics = MemoryMetrics::new().unwrap();
+        let storage = MockStorage::new();
+        let mut headers = valid_basic_auth_headers();
+        headers.push((
+            "MCP-Protocol-Version".to_string(),
+            dispatch::MODERN_PROTOCOL_VERSION.to_string(),
+        ));
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": dispatch::MODERN_PROTOCOL_VERSION
+                }
+            }
+        })
+        .to_string();
+        let response = handle_http_request(
+            "POST",
+            "/mcp",
+            &headers,
+            &body,
+            &storage,
+            &metrics,
+            &valid_credentials,
+            &|| true,
+            &ShellRouteConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+        assert_eq!(
+            response_json(&response)["error"]["code"],
+            dispatch::HEADER_MISMATCH
+        );
+    }
+
+    #[tokio::test]
+    async fn modern_mcp_tool_call_rejects_mismatched_name_header() {
+        let metrics = MemoryMetrics::new().unwrap();
+        let storage = MockStorage::new();
+        let mut headers = valid_basic_auth_headers();
+        headers.extend([
+            (
+                "MCP-Protocol-Version".to_string(),
+                dispatch::MODERN_PROTOCOL_VERSION.to_string(),
+            ),
+            ("Mcp-Method".to_string(), "tools/call".to_string()),
+            ("Mcp-Name".to_string(), "wrong_tool".to_string()),
+        ]);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "all_tools",
+                "arguments": {},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": dispatch::MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        })
+        .to_string();
+        let response = handle_http_request(
+            "POST",
+            "/mcp",
+            &headers,
+            &body,
+            &storage,
+            &metrics,
+            &valid_credentials,
+            &|| true,
+            &ShellRouteConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+        assert_eq!(
+            response_json(&response)["error"]["code"],
+            dispatch::HEADER_MISMATCH
+        );
+    }
+
+    #[tokio::test]
+    async fn modern_mcp_request_rejects_unsupported_protocol_version() {
+        let metrics = MemoryMetrics::new().unwrap();
+        let storage = MockStorage::new();
+        let requested = "2099-01-01";
+        let mut headers = valid_basic_auth_headers();
+        headers.extend([
+            ("MCP-Protocol-Version".to_string(), requested.to_string()),
+            ("Mcp-Method".to_string(), "tools/list".to_string()),
+        ]);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/list",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": requested
+                }
+            }
+        })
+        .to_string();
+        let response = handle_http_request(
+            "POST",
+            "/mcp",
+            &headers,
+            &body,
+            &storage,
+            &metrics,
+            &valid_credentials,
+            &|| true,
+            &ShellRouteConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+        let body = response_json(&response);
+        assert_eq!(
+            body["error"]["code"],
+            dispatch::UNSUPPORTED_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            body["error"]["data"]["supported"][0],
+            dispatch::MODERN_PROTOCOL_VERSION
+        );
+    }
+
+    #[tokio::test]
+    async fn modern_mcp_request_rejects_missing_client_capabilities_meta() {
+        let metrics = MemoryMetrics::new().unwrap();
+        let storage = MockStorage::new();
+        let mut headers = valid_basic_auth_headers();
+        headers.extend([
+            (
+                "MCP-Protocol-Version".to_string(),
+                dispatch::MODERN_PROTOCOL_VERSION.to_string(),
+            ),
+            ("Mcp-Method".to_string(), "tools/list".to_string()),
+        ]);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/list",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": dispatch::MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientInfo": {
+                        "name": "test-client",
+                        "version": "0.1.0"
+                    }
+                }
+            }
+        })
+        .to_string();
+        let response = handle_http_request(
+            "POST",
+            "/mcp",
+            &headers,
+            &body,
+            &storage,
+            &metrics,
+            &valid_credentials,
+            &|| true,
+            &ShellRouteConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+        assert_eq!(response_json(&response)["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn modern_mcp_tool_call_accepts_base64_encoded_name_header() {
+        let metrics = MemoryMetrics::new().unwrap();
+        let storage = MockStorage::new();
+        let mut headers = valid_basic_auth_headers();
+        headers.extend([
+            (
+                "MCP-Protocol-Version".to_string(),
+                dispatch::MODERN_PROTOCOL_VERSION.to_string(),
+            ),
+            ("Mcp-Method".to_string(), "tools/call".to_string()),
+            (
+                "Mcp-Name".to_string(),
+                "=?base64?YWxsX3Rvb2xz?=".to_string(),
+            ),
+        ]);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "all_tools",
+                "arguments": {},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": dispatch::MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        })
+        .to_string();
+        let response = handle_http_request(
+            "POST",
+            "/mcp",
+            &headers,
+            &body,
+            &storage,
+            &metrics,
+            &valid_credentials,
+            &|| true,
+            &ShellRouteConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(response_json(&response)["result"]["resultType"], "complete");
+    }
+
+    #[tokio::test]
+    async fn modern_mcp_request_rejects_null_json_rpc_id() {
+        let metrics = MemoryMetrics::new().unwrap();
+        let storage = MockStorage::new();
+        let mut headers = valid_basic_auth_headers();
+        headers.extend([
+            (
+                "MCP-Protocol-Version".to_string(),
+                dispatch::MODERN_PROTOCOL_VERSION.to_string(),
+            ),
+            ("Mcp-Method".to_string(), "tools/list".to_string()),
+        ]);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "method": "tools/list",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": dispatch::MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        })
+        .to_string();
+        let response = handle_http_request(
+            "POST",
+            "/mcp",
+            &headers,
+            &body,
+            &storage,
+            &metrics,
+            &valid_credentials,
+            &|| true,
+            &ShellRouteConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+        assert_eq!(response_json(&response)["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn rejects_non_loopback_origin_that_does_not_match_host() {
+        let metrics = MemoryMetrics::new().unwrap();
+        let storage = MockStorage::new();
+        let headers = vec![
+            ("Host".to_string(), "memory.example.com".to_string()),
+            ("Origin".to_string(), "https://evil.example.com".to_string()),
+        ];
+        let response = handle_http_request(
+            "GET",
+            "/health",
+            &headers,
+            "",
+            &storage,
+            &metrics,
+            &valid_credentials,
+            &|| true,
+            &ShellRouteConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+    }
+
+    #[tokio::test]
+    async fn get_or_delete_mcp_returns_method_not_allowed() {
+        let metrics = MemoryMetrics::new().unwrap();
+        let storage = MockStorage::new();
+        for method in ["GET", "DELETE"] {
+            let response = handle_http_request(
+                method,
+                "/mcp",
+                &[],
+                "",
+                &storage,
+                &metrics,
+                &valid_credentials,
+                &|| true,
+                &ShellRouteConfig::default(),
+            )
+            .await
+            .unwrap();
+            assert!(response.starts_with("HTTP/1.1 405 Method Not Allowed"));
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_mcp_tools_list_still_works_without_modern_headers() {
+        let metrics = MemoryMetrics::new().unwrap();
+        let storage = MockStorage::new();
+        let headers = valid_basic_auth_headers();
+        let response = handle_http_request(
+            "POST",
+            "/mcp",
+            &headers,
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/list","params":{}}"#,
+            &storage,
+            &metrics,
+            &valid_credentials,
+            &|| true,
+            &ShellRouteConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        let body = response_json(&response);
+        assert!(body["result"]["tools"].as_array().unwrap().len() > 5);
+        assert!(body["result"]["resultType"].is_null());
     }
 
     #[tokio::test]
