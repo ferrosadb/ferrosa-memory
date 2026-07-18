@@ -23,6 +23,7 @@ The near-term goal is a dual-era HTTP server by the July 28, 2026 final spec dat
 | https://modelcontextprotocol.io/specification/draft/basic/versioning | Per-request version negotiation and dual-era compatibility. |
 | https://modelcontextprotocol.io/specification/draft/basic/transports/streamable-http | Modern Streamable HTTP header, validation, SSE, and compatibility rules. |
 | https://modelcontextprotocol.io/specification/draft/server/discover | `server/discover` response shape and caching expectations. |
+| https://modelcontextprotocol.io/specification/draft/server/prompts | Prompt capability, list/get response shapes, and user-controlled workflow requirements. |
 
 ## Current Ferrosa Memory Posture
 
@@ -107,6 +108,7 @@ The near-term goal is a dual-era HTTP server by the July 28, 2026 final spec dat
 | 2.2 | Capability truthfulness | Advertise only implemented capabilities. Do not advertise resources/prompts/subscriptions unless real methods exist. | `server/discover` capabilities match dispatch methods. | Capability snapshot plus unknown-method tests. | S | done |
 | 2.3 | `subscriptions/listen` task stream | Implement Streamable HTTP `subscriptions/listen` for task-list resources. Acknowledge first, filter to requested resource URIs, tag notifications with `io.modelcontextprotocol/subscriptionId`, and keep the stream open until cancellation. | Task monitor clients can subscribe to `ferrosa-memory://tasks/{session_id}/current`, `/list`, or `ferrosa-memory://tasks/workspaces/{base64url(cwd)}/active` and receive `notifications/resources/updated` after matching task mutations. | Dispatch resource tests and HTTP SSE subscription test. | M | done: includes cwd/workspace subscriptions |
 | 2.8 | Cwd-spanning task resource index | Add a bounded workspace index for active tasks across all sessions, default new task writes to session repo/cwd when no explicit workspace is provided, and expose the resource through `resources/list`/`resources/read`. | A client can discover active tasks identified by another session in the same cwd without scanning all sessions; returned tasks include source `session_id` and `task_id` for explicit focus/adoption. | `modern_workspace_resource_reads_active_tasks_across_sessions_for_cwd`, `task_put_defaults_workspace_from_session_repo_for_cwd_resources`, migration drift grant coverage. | M | done |
+| 2.9 | Compact prompt workflows | Expose the user-controlled `forget`, `resume`, `recall`, and `remind` workflows through `prompts/list` and `prompts/get`. Keep the catalog static (`listChanged: false`) and reject malformed or unknown arguments. | Hosts can explicitly select short, safe workflow prompts; forget remains candidate-confirmed and prompt input cannot override workflow instructions. | `modern_mcp_prompts_*`, modern HTTP `prompts/get` header validation. | S | done |
 | 2.4 | Origin validation | Enforce Streamable HTTP `Origin` validation with config for allowed origins. Keep local/dev defaults safe. | Invalid browser origins receive 403 before auth/dispatch. | HTTP tests for absent, loopback/same-host allowed, and denied Origin. | M | done |
 | 2.5 | Protected resource metadata | Add OAuth protected-resource metadata discovery for HTTP deployments and include `WWW-Authenticate` `resource_metadata` on 401 when configured. | OAuth-capable clients can discover authorization server metadata; Basic-only internal deployments remain supported. | HTTP tests for 401 challenge and well-known endpoint. | M | backlog: required only before advertising public OAuth support |
 | 2.6 | Tool output schemas | Add `outputSchema` only for stable, structured high-value tools. Preserve text content for compatibility and put JSON under `structuredContent` where useful. | Modern clients get better structured data without breaking existing text consumers. | Snapshot/schema tests for selected tools. | M | done: common envelope schema; precise per-tool schemas remain backlog B4 |
@@ -117,6 +119,7 @@ The near-term goal is a dual-era HTTP server by the July 28, 2026 final spec dat
 - [x] `cargo test -p ferrosa-memory-core --lib modern_resources`
 - [x] `cargo test -p ferrosa-memory-core --lib modern_workspace_resource`
 - [x] `cargo test -p ferrosa-memory-core --lib modern_mcp_subscriptions`
+- [x] `cargo test -p ferrosa-memory-core --lib modern_mcp_prompts`
 - [x] Docs updated with public vs internal auth posture
 - [x] No capability is advertised without a working method
 

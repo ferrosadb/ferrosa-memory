@@ -6174,6 +6174,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn modern_mcp_prompts_get_validates_name_header_and_returns_workflow() {
+        let metrics = MemoryMetrics::new().unwrap();
+        let storage = MockStorage::new();
+        let mut headers = valid_basic_auth_headers();
+        headers.extend([
+            (
+                "MCP-Protocol-Version".to_string(),
+                dispatch::MODERN_PROTOCOL_VERSION.to_string(),
+            ),
+            ("Mcp-Method".to_string(), "prompts/get".to_string()),
+            ("Mcp-Name".to_string(), "recall".to_string()),
+        ]);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "prompts/get",
+            "params": {
+                "name": "recall",
+                "arguments": { "query": "MCP prompt support" },
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": dispatch::MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        })
+        .to_string();
+        let response = handle_http_request(
+            "POST",
+            "/mcp",
+            &headers,
+            &body,
+            &storage,
+            &metrics,
+            &valid_credentials,
+            &|| true,
+            &ShellRouteConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        let response = response_json(&response);
+        assert_eq!(response["result"]["resultType"], "complete");
+        assert!(
+            response["result"]["messages"][0]["content"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("hybrid_search")
+        );
+    }
+
+    #[tokio::test]
     async fn modern_mcp_resources_read_validates_name_header() {
         let metrics = MemoryMetrics::new().unwrap();
         let storage = MockStorage::new();
