@@ -818,7 +818,9 @@ async fn handle_mcp_subscription_stream_if_requested<T: AsyncWriteExt + Unpin>(
         return Ok(Some(false));
     }
 
-    if let Err(error) = validate_modern_mcp_http_request(headers, rpc_method, &params, id.as_ref())
+    if is_modern_mcp_http_request(rpc_method, headers, &params)
+        && let Err(error) =
+            validate_modern_mcp_http_request(headers, rpc_method, &params, id.as_ref())
     {
         let response =
             json_rpc_error_response("400 Bad Request", id, error.code, error.message, error.data);
@@ -1206,8 +1208,15 @@ fn body_protocol_version(params: &Value) -> Option<&str> {
 }
 
 fn is_modern_mcp_http_request(method: &str, headers: &[(String, String)], params: &Value) -> bool {
+    // A request is "modern" (2026-draft) only when the client has actually
+    // negotiated the draft protocol — the `MCP-Protocol-Version` header carries
+    // the DRAFT version, or the draft `_meta.protocolVersion` is present, or it
+    // is a draft-only method. The `MCP-Protocol-Version` header is also part of
+    // the STABLE spec (2025+), so keying "modern" off its mere presence forces
+    // every stable client (which does not send the draft `_meta` fields) through
+    // draft validation and rejects it — locking out the whole stable ecosystem.
     method == "server/discover"
-        || header_value(headers, "MCP-Protocol-Version").is_some()
+        || header_value(headers, "MCP-Protocol-Version") == Some(dispatch::MODERN_PROTOCOL_VERSION)
         || body_protocol_version(params).is_some()
 }
 
@@ -5129,6 +5138,51 @@ mod tests {
         // "user:pass" -> "dXNlcjpwYXNz"
         let decoded = base64_decode("dXNlcjpwYXNz").unwrap();
         assert_eq!(String::from_utf8(decoded).unwrap(), "user:pass");
+    }
+
+    #[test]
+    fn stable_protocol_header_is_not_modern_but_draft_version_is() {
+        // A stable-spec client (2025) legitimately sends the MCP-Protocol-Version
+        // header with a NON-draft version and none of the 2026-draft `_meta`
+        // fields. It MUST take the classic path — being forced into modern
+        // (draft) validation rejects it for a missing
+        // `params._meta.io.modelcontextprotocol/protocolVersion`, which locks out
+        // every stable client (e.g. Claude Code). Modern validation must key off
+        // the negotiated *version*, not the mere presence of the header.
+        let legacy_headers = vec![(
+            "MCP-Protocol-Version".to_string(),
+            dispatch::LEGACY_PROTOCOL_VERSION.to_string(),
+        )];
+        assert!(
+            !is_modern_mcp_http_request("tools/call", &legacy_headers, &Value::Null),
+            "a stable MCP-Protocol-Version must NOT trigger modern (draft) validation"
+        );
+
+        // The draft version in the header IS modern.
+        let modern_headers = vec![(
+            "MCP-Protocol-Version".to_string(),
+            dispatch::MODERN_PROTOCOL_VERSION.to_string(),
+        )];
+        assert!(
+            is_modern_mcp_http_request("tools/call", &modern_headers, &Value::Null),
+            "the draft MCP-Protocol-Version must trigger modern validation"
+        );
+
+        // The draft `_meta.protocolVersion` also marks a modern request.
+        let draft_params = serde_json::json!({
+            "_meta": { "io.modelcontextprotocol/protocolVersion": dispatch::MODERN_PROTOCOL_VERSION }
+        });
+        assert!(
+            is_modern_mcp_http_request("tools/call", &[], &draft_params),
+            "draft _meta.protocolVersion must trigger modern validation"
+        );
+
+        // `server/discover` is a draft-only method — always modern.
+        assert!(is_modern_mcp_http_request(
+            "server/discover",
+            &[],
+            &Value::Null
+        ));
     }
 
     #[test]
