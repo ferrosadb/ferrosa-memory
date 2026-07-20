@@ -712,6 +712,27 @@ pub fn is_task_resource_uri(uri: &str) -> bool {
     parse_task_resource_uri(uri).is_some() || parse_task_workspace_resource_uri(uri).is_some()
 }
 
+#[cfg(feature = "subscription-fixture")]
+pub fn emit_task_resource_update_fixture(session: &SessionState, uri: &str) -> Result<(), String> {
+    let (session_id, workspaces) = if let Some((session_id, _)) = parse_task_resource_uri(uri) {
+        (session_id, Vec::new())
+    } else if let Some(workspace) = parse_task_workspace_resource_uri(uri) {
+        (uuid::Uuid::nil(), vec![workspace])
+    } else {
+        return Err("uri must be a Ferrosa Memory task resource".to_string());
+    };
+
+    session
+        .event_bus
+        .emit(crate::viz::VizEvent::SessionTaskChanged {
+            session_id: session_id.to_string(),
+            task_id: None,
+            action: "subscription_fixture".to_string(),
+            workspaces,
+        });
+    Ok(())
+}
+
 fn task_resources_for_session(session_id: uuid::Uuid) -> Vec<Value> {
     vec![
         serde_json::json!({
@@ -11882,6 +11903,59 @@ mod tests {
     use crate::storage::mock::MockStorage;
     use crate::types::{TenantContext, TypedEdge};
     use uuid::Uuid;
+
+    #[cfg(feature = "subscription-fixture")]
+    #[test]
+    fn subscription_fixture_emits_session_task_resource_update() {
+        let session = SessionState::default();
+        let session_id = uuid::Uuid::new_v4();
+        let uri = task_resource_uri(session_id, TaskResourceKind::Current);
+        let mut events = session.event_bus.subscribe();
+
+        emit_task_resource_update_fixture(&session, &uri).unwrap();
+
+        let event = events.try_recv().unwrap();
+        assert!(matches!(
+            event,
+            crate::viz::VizEvent::SessionTaskChanged {
+                session_id: emitted_session_id,
+                action,
+                workspaces,
+                ..
+            } if emitted_session_id == session_id.to_string()
+                && action == "subscription_fixture"
+                && workspaces.is_empty()
+        ));
+    }
+
+    #[cfg(feature = "subscription-fixture")]
+    #[test]
+    fn subscription_fixture_emits_workspace_task_resource_update() {
+        let session = SessionState::default();
+        let workspace = "/repo/ferrosa-memory";
+        let uri = task_workspace_resource_uri(workspace);
+        let mut events = session.event_bus.subscribe();
+
+        emit_task_resource_update_fixture(&session, &uri).unwrap();
+
+        let event = events.try_recv().unwrap();
+        assert!(matches!(
+            event,
+            crate::viz::VizEvent::SessionTaskChanged {
+                action,
+                workspaces,
+                ..
+            } if action == "subscription_fixture" && workspaces == [workspace]
+        ));
+    }
+
+    #[cfg(feature = "subscription-fixture")]
+    #[test]
+    fn subscription_fixture_rejects_non_task_resource() {
+        let session = SessionState::default();
+        let error = emit_task_resource_update_fixture(&session, "file:///not-a-task").unwrap_err();
+        assert_eq!(error, "uri must be a Ferrosa Memory task resource");
+    }
 
     #[test]
     fn hybrid_search_scope_defaults_to_both_so_global_corpus_is_visible() {
