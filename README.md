@@ -47,6 +47,9 @@ aged out, superseded, or deleted.
   entities during recall.
 - **Retrieval feedback** — record traces, abstentions, judge results, and user
   feedback for offline tuning and regression detection.
+- **Modern MCP draft support** — shared HTTP clients can discover capabilities,
+  read task resources, and subscribe to workspace task updates with the
+  `2026-07-28` per-request protocol.
 - **Operational controls** — tenant isolation, audit trails, reversible
   forgetting, rule governance, and fail-loud health checks.
 
@@ -138,6 +141,12 @@ the tier-1 default `tools/list`; request it with `include_all`.)
 | Maintenance | `get_stats`, `migration_status`, `record_outcome`, `ensure_parent_tag` | Health stats, schema status, strategy feedback, and tag hierarchy |
 | Management | `describe` | Read-only, management-safe self-description (contract `ferrosa-memory.system.describe.v1`): identity, runtime/store health, redacted config, live ferrosa cluster info, summary statistics, schema drift, capabilities, and management actions |
 | Forgetting | `forget`, `restore_forgotten` | Candidate-confirmed forgetting: propose candidates (with blast radius) → confirm to retract (reversible, audited, restorable) or hard-delete; `restore_forgotten` reverses a retraction |
+
+## MCP draft support
+
+Shared HTTP deployments support the MCP draft per-request protocol version `2026-07-28` for modern clients. The supported surface includes `server/discover`, tools, prompts, task resources, and task-resource subscriptions over Server-Sent Events.
+
+Use this when a client wants to discover capabilities without a legacy `initialize` session, read active task resources directly, or subscribe to workspace task updates for multi-agent coordination. See [`docs/mcp-draft-support.md`](docs/mcp-draft-support.md) for request headers, examples, and subscription usage.
 
 ## Recall quality
 
@@ -311,6 +320,33 @@ Add to `~/.claude/settings.json`:
 ```
 
 Use [`examples/claude-code-settings.json`](examples/claude-code-settings.json) with [`examples/ferrosa-memory.toml`](examples/ferrosa-memory.toml) for that local fallback path.
+
+### Modern MCP draft clients
+
+Draft clients can use the per-request HTTP protocol by adding the modern protocol headers and `_meta` fields to each JSON-RPC request. Start with `server/discover`:
+
+```sh
+curl -sS -u ferrosa_user:ferrosa_user \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json' \
+  -H 'MCP-Protocol-Version: 2026-07-28' \
+  -H 'Mcp-Method: server/discover' \
+  --data '{
+    "jsonrpc":"2.0",
+    "id":1,
+    "method":"server/discover",
+    "params":{
+      "_meta":{
+        "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities":{},
+        "io.modelcontextprotocol/clientInfo":{"name":"example-client","version":"0.1.0"}
+      }
+    }
+  }' \
+  https://memory.example.com:8765/mcp
+```
+
+A successful discovery response advertises tools, prompts, resources, and `resources.subscribe`. See [`docs/mcp-draft-support.md`](docs/mcp-draft-support.md) for complete examples, including `tools/call`, `prompts/get`, `resources/read`, and `subscriptions/listen` for workspace task updates.
 
 ### Database Setup
 
