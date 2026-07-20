@@ -1019,6 +1019,23 @@ async fn handle_http_request_with_session<S: Storage + OperatorQuerySurface>(
         ("GET" | "DELETE", "/mcp") => {
             Ok("HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n".into())
         }
+        #[cfg(feature = "subscription-fixture")]
+        ("POST", "/_test/mcp/task-resource-update") => {
+            if authenticate_from_headers(headers, credential_validator).is_err() {
+                return Ok(unauthorized_response());
+            }
+            let payload: Value = serde_json::from_str(body)
+                .map_err(|error| anyhow::anyhow!("invalid subscription fixture JSON: {error}"))?;
+            let uri = payload.get("uri").and_then(Value::as_str).ok_or_else(|| {
+                anyhow::anyhow!("subscription fixture requires a task resource uri")
+            })?;
+            dispatch::emit_task_resource_update_fixture(session, uri)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            Ok(json_response(
+                "200 OK",
+                &serde_json::json!({ "emitted": uri }).to_string(),
+            ))
+        }
         ("POST", "/mcp") => {
             let ctx = match authenticate_from_headers(headers, credential_validator) {
                 Ok(ctx) => ctx,
@@ -6445,6 +6462,117 @@ mod tests {
             body["result"]["contents"][0]["mimeType"],
             dispatch::TASK_RESOURCE_MIME_TYPE
         );
+    }
+
+    #[cfg(feature = "subscription-fixture")]
+    #[tokio::test]
+    async fn subscription_fixture_endpoint_emits_a_subscribed_resource_update() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let metrics = MemoryMetrics::new().unwrap();
+        let storage = MockStorage::new();
+        let session = Arc::new(dispatch::SessionState::default());
+        let (mut client, mut server) = tokio::io::duplex(16 * 1024);
+        let session_for_server = Arc::clone(&session);
+        let session_id = Uuid::new_v4();
+        let uri = dispatch::task_resource_uri(session_id, dispatch::TaskResourceKind::List);
+
+        let server_task = tokio::spawn(async move {
+            serve_one_connection_with_session(
+                &mut server,
+                &storage,
+                ConnectionContext {
+                    metrics: &metrics,
+                    credential_validator: &valid_credentials,
+                    readiness_checker: &|| true,
+                    shell_routes: &ShellRouteConfig::default(),
+                    session: session_for_server.as_ref(),
+                    request_budget: DEFAULT_REQUEST_BUDGET,
+                },
+            )
+            .await
+        });
+
+        let subscription_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 31,
+            "method": "subscriptions/listen",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": dispatch::MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                },
+                "notifications": {
+                    "resourceSubscriptions": [uri]
+                }
+            }
+        })
+        .to_string();
+        let subscription_request = format!(
+            "POST /mcp HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Authorization: Basic dXNlcjpwYXNz\r\n\
+             Content-Type: application/json\r\n\
+             Accept: application/json, text/event-stream\r\n\
+             MCP-Protocol-Version: {}\r\n\
+             Mcp-Method: subscriptions/listen\r\n\
+             Content-Length: {}\r\n\r\n{subscription_body}",
+            dispatch::MODERN_PROTOCOL_VERSION,
+            subscription_body.len()
+        );
+        client
+            .write_all(subscription_request.as_bytes())
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        let mut buf = vec![0u8; 16 * 1024];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let acknowledgement = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert_eq!(
+            sse_data_messages(&acknowledgement)[0]["method"],
+            "notifications/subscriptions/acknowledged"
+        );
+
+        let fixture_body = serde_json::json!({ "uri": uri }).to_string();
+        let response = handle_http_request_with_session(
+            "POST",
+            "/_test/mcp/task-resource-update",
+            &[
+                (
+                    "Authorization".to_string(),
+                    "Basic dXNlcjpwYXNz".to_string(),
+                ),
+                ("Content-Type".to_string(), "application/json".to_string()),
+            ],
+            &fixture_body,
+            &MockStorage::new(),
+            &MemoryMetrics::new().unwrap(),
+            &valid_credentials,
+            &|| true,
+            &ShellRouteConfig::default(),
+            session.as_ref(),
+        )
+        .await
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("\"emitted\""));
+
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let update = String::from_utf8_lossy(&buf[..n]).to_string();
+        let messages = sse_data_messages(&update);
+        assert_eq!(messages[0]["method"], "notifications/resources/updated");
+        assert_eq!(messages[0]["params"]["uri"], uri);
+
+        drop(client);
+        server_task.abort();
+        let _ = server_task.await;
     }
 
     #[tokio::test]

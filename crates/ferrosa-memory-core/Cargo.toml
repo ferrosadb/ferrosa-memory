@@ -6,6 +6,7 @@ license.workspace = true
 
 [features]
 mock-storage = []
+subscription-fixture = []
 # p1-22: enable after cdrs-tokio → scylla migration to unlock T-01 and T-08
 # tests that call scylla::Session::query_unpaged directly.
 scylla-driver = []

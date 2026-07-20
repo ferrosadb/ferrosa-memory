@@ -20,6 +20,9 @@ path = "src/tools/ferrosa_memory.rs"
 name = "reconcile-dangling-edges"
 path = "src/tools/reconcile_dangling_edges.rs"
 
+[features]
+subscription-fixture = ["ferrosa-memory-core/subscription-fixture"]
+
 [dependencies]
 ferrosa-memory-core = { path = "../ferrosa-memory-core" }
 tokio = { workspace = true }
