@@ -606,13 +606,34 @@ fn server_capabilities() -> Value {
     })
 }
 
+fn supported_draft_profile() -> Value {
+    serde_json::json!({
+        "methods": [
+            "server/discover",
+            "tools/list",
+            "tools/call",
+            "prompts/list",
+            "prompts/get",
+            "resources/list",
+            "resources/read",
+            "subscriptions/listen"
+        ],
+        "resourceSubscriptions": {
+            "transport": "sse",
+            "acknowledgement": "notifications/subscriptions/acknowledged",
+            "updateNotification": "notifications/resources/updated"
+        }
+    })
+}
+
 fn discover_result() -> Value {
     serde_json::json!({
         "resultType": "complete",
         "supportedVersions": [MODERN_PROTOCOL_VERSION],
         "capabilities": server_capabilities(),
         "_meta": {
-            "io.modelcontextprotocol/serverInfo": server_identity()
+            "io.modelcontextprotocol/serverInfo": server_identity(),
+            "io.ferrosa-memory/supportedDraftProfile": supported_draft_profile()
         },
         "instructions": MEMORY_GUIDE,
         "ttlMs": MODERN_RESULT_TTL_MS,
@@ -13175,6 +13196,27 @@ mod tests {
         assert!(result["capabilities"]["tools"].is_object());
         assert_eq!(result["capabilities"]["prompts"]["listChanged"], false);
         assert_eq!(result["capabilities"]["resources"]["subscribe"], true);
+        assert_eq!(
+            result["_meta"]["io.ferrosa-memory/supportedDraftProfile"]["methods"],
+            serde_json::json!([
+                "server/discover",
+                "tools/list",
+                "tools/call",
+                "prompts/list",
+                "prompts/get",
+                "resources/list",
+                "resources/read",
+                "subscriptions/listen"
+            ])
+        );
+        assert_eq!(
+            result["_meta"]["io.ferrosa-memory/supportedDraftProfile"]["resourceSubscriptions"],
+            serde_json::json!({
+                "transport": "sse",
+                "acknowledgement": "notifications/subscriptions/acknowledged",
+                "updateNotification": "notifications/resources/updated"
+            })
+        );
     }
 
     #[tokio::test]
