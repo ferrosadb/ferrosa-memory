@@ -3297,6 +3297,11 @@ struct DrainSpec<'a> {
     /// Cursor progress guard; fresh per stream because each stream is one
     /// server-side cursor.
     guard: viz::CursorProgressGuard,
+    /// How long the producer may go silent before the drain gives up and
+    /// serves a partial (truncated) snapshot. Defaults to
+    /// [`VIZ_STREAM_IDLE_BUDGET`]; injectable so tests can trip the idle path
+    /// deterministically without a multi-second wait.
+    idle_budget: std::time::Duration,
 }
 
 impl<'a> DrainSpec<'a> {
@@ -3305,6 +3310,7 @@ impl<'a> DrainSpec<'a> {
             label,
             chunk_size,
             guard: viz::CursorProgressGuard::new(),
+            idle_budget: VIZ_STREAM_IDLE_BUDGET,
         }
     }
 }
@@ -3331,7 +3337,7 @@ async fn drain_snapshot_stream<T, W: VizSink>(
     progress: &mut SnapshotProgress,
 ) -> DrainStatus {
     tokio::pin!(producer);
-    let idle_deadline = tokio::time::sleep(VIZ_STREAM_IDLE_BUDGET);
+    let idle_deadline = tokio::time::sleep(spec.idle_budget);
     tokio::pin!(idle_deadline);
     let mut producer_done = false;
     let mut node_chunk: Vec<viz::VizNode> = Vec::new();
@@ -3340,11 +3346,19 @@ async fn drain_snapshot_stream<T, W: VizSink>(
         tokio::select! {
             _ = &mut producer, if !producer_done => producer_done = true,
             _ = &mut idle_deadline, if !producer_done => {
+                let idle_ms = spec.idle_budget.as_millis() as u64;
                 tracing::warn!(
                     stream = spec.label,
-                    timeout_ms = VIZ_STREAM_IDLE_BUDGET.as_millis() as u64,
+                    timeout_ms = idle_ms,
                     "viz: snapshot stream idle timeout; serving partial snapshot"
                 );
+                // Fail loud: an idle-timeout drain serves a PARTIAL snapshot, so
+                // record a truncation the end event surfaces as TRUNCATED rather
+                // than letting the browser render a subset as a complete graph.
+                progress.truncations.push(format!(
+                    "{}: idle timeout after {idle_ms}ms; served partial snapshot",
+                    spec.label,
+                ));
                 status = DrainStatus::IdleTimeout;
                 break 'stream;
             }
@@ -3352,7 +3366,7 @@ async fn drain_snapshot_stream<T, W: VizSink>(
                 match batch {
                     Some(Ok(rows)) => {
                         idle_deadline.as_mut().reset(
-                            tokio::time::Instant::now() + VIZ_STREAM_IDLE_BUDGET,
+                            tokio::time::Instant::now() + spec.idle_budget,
                         );
                         spec.guard.begin_page();
                         for row in rows {
@@ -3421,6 +3435,13 @@ async fn drain_snapshot_stream<T, W: VizSink>(
                             stream = spec.label,
                             "viz: snapshot stream failed; serving partial snapshot"
                         );
+                        // Fail loud: the stream errored mid-flight, so the
+                        // snapshot is partial. Record a truncation so the end
+                        // event is TRUNCATED (with the cause), not a silent LIVE.
+                        progress.truncations.push(format!(
+                            "{}: stream error: {e}; served partial snapshot",
+                            spec.label,
+                        ));
                         status = DrainStatus::ProducerError;
                         break 'stream;
                     }
@@ -5479,8 +5500,12 @@ mod tests {
             .and_then(|rest| rest.split("async fn send_streaming_viz_snapshot").next())
             .expect("drain_snapshot_stream body must be present");
         assert!(
-            drain.contains("VIZ_STREAM_IDLE_BUDGET") && drain.contains("serving partial snapshot"),
-            "viz snapshot streams must fail soft under backend lane contention instead of hanging the browser: {drain}"
+            drain.contains("spec.idle_budget") && drain.contains("serving partial snapshot"),
+            "viz snapshot streams must fail soft under backend lane contention (via the injectable idle budget) instead of hanging the browser: {drain}"
+        );
+        assert!(
+            drain.contains("progress.truncations.push"),
+            "every non-clean drain terminator (idle timeout / producer error / guard trip) must record a truncation so the end event is TRUNCATED, not a silent LIVE partial graph: {drain}"
         );
         assert!(
             drain.contains("guard.end_page()") && drain.contains("GuardTripped"),
@@ -5724,6 +5749,7 @@ mod tests {
                     label: "cycling(no guard)",
                     chunk_size: 500,
                     guard: disabled_guard,
+                    idle_budget: VIZ_STREAM_IDLE_BUDGET,
                 },
                 typed_edge_row_key,
                 typed_edge_elem,
@@ -5842,6 +5868,100 @@ mod tests {
             emitted.len(),
             12_000,
             "boundary duplicates deduplicated; every unique edge exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn viz_snapshot_drain_producer_error_populates_truncations() {
+        // A storage stream that errors mid-page serves a PARTIAL snapshot. That
+        // partial must be surfaced as TRUNCATED (error set on the end event),
+        // not silently ended as a complete LIVE graph. Regression for the
+        // fail-silent drain terminator (t_0a2071d6).
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let producer = async move {
+            let _ = tx.send(Ok(make_typed_edges(3))).await;
+            let _ = tx
+                .send(Err(anyhow::anyhow!("storage stream exploded")))
+                .await;
+        };
+        let mut sink = CollectingSink::default();
+        let mut progress = SnapshotProgress::new(500);
+        let status = drain_snapshot_stream(
+            &mut sink,
+            producer,
+            &mut rx,
+            DrainSpec::new("typed-edges(erroring)", 500),
+            typed_edge_row_key,
+            typed_edge_elem,
+            &mut progress,
+        )
+        .await;
+        assert_eq!(status, DrainStatus::ProducerError);
+        assert_eq!(
+            progress.truncations.len(),
+            1,
+            "producer error must record a truncation so the end event is TRUNCATED, not LIVE"
+        );
+        assert!(
+            progress.truncations[0].contains("typed-edges(erroring)")
+                && progress.truncations[0].contains("stream error"),
+            "truncation must name the stream and the cause; got: {}",
+            progress.truncations[0]
+        );
+        assert!(
+            snapshot_truncation_error(&progress.truncations).is_some(),
+            "a producer-error drain must surface an end-event error"
+        );
+    }
+
+    #[tokio::test]
+    async fn viz_snapshot_drain_idle_timeout_populates_truncations() {
+        // A producer that holds the channel open but goes silent must trip the
+        // idle budget and serve a PARTIAL snapshot flagged TRUNCATED. A tiny
+        // injected idle budget keeps the test fast + deterministic (no real
+        // 5s wait, no tokio time-pause feature). Regression for t_0a2071d6.
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<anyhow::Result<Vec<crate::types::TypedEdge>>>(4);
+        // Move `tx` into the producer so the channel stays OPEN (rx.recv()
+        // pends instead of returning None) while the producer never sends and
+        // never completes — the only way the idle deadline can fire.
+        let producer = async move {
+            let _hold = tx;
+            std::future::pending::<()>().await;
+        };
+        let mut sink = CollectingSink::default();
+        let mut progress = SnapshotProgress::new(500);
+        let mut spec = DrainSpec::new("typed-edges(idle)", 500);
+        spec.idle_budget = std::time::Duration::from_millis(30);
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            drain_snapshot_stream(
+                &mut sink,
+                producer,
+                &mut rx,
+                spec,
+                typed_edge_row_key,
+                typed_edge_elem,
+                &mut progress,
+            ),
+        )
+        .await
+        .expect("idle budget must terminate a silent stream promptly");
+        assert_eq!(status, DrainStatus::IdleTimeout);
+        assert_eq!(
+            progress.truncations.len(),
+            1,
+            "idle timeout must record a truncation so the end event is TRUNCATED, not LIVE"
+        );
+        assert!(
+            progress.truncations[0].contains("typed-edges(idle)")
+                && progress.truncations[0].contains("idle timeout"),
+            "truncation must name the stream and the cause; got: {}",
+            progress.truncations[0]
+        );
+        assert!(
+            snapshot_truncation_error(&progress.truncations).is_some(),
+            "an idle-timeout drain must surface an end-event error"
         );
     }
 
