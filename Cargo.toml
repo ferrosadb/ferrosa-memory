@@ -32,7 +32,7 @@ sha2 = "0.11"
 
 # Remote-memory signing (Ed25519 envelopes for teaching packets)
 ed25519-dalek = { version = "3", features = ["rand_core"] }
-rand_core = { version = "0.6", features = ["getrandom"] }
+rand_core = { version = "0.10", features = ["getrandom"] }
 
 # MaaS P2P transfer crypto (ferrosa-memory-sync). RustCrypto 0.10/0.12
 # generation — internally consistent AEAD + KDF stack (aead 0.5, digest 0.10).
