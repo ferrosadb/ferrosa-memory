@@ -613,6 +613,20 @@ async fn handle_connection_rw<
         return Ok(keep_alive);
     }
 
+    #[cfg(feature = "long-running-operation-fixture")]
+    if let Some(keep_alive) = handle_long_running_operation_fixture_stream_if_requested(
+        stream,
+        method,
+        path,
+        &headers,
+        body,
+        connection.credential_validator,
+    )
+    .await?
+    {
+        return Ok(keep_alive);
+    }
+
     let response = match tokio::time::timeout(
         request_budget,
         handle_http_request_with_session(
@@ -907,6 +921,149 @@ async fn handle_mcp_subscription_stream_if_requested<T: AsyncWriteExt + Unpin>(
             }
         }
     }
+}
+
+#[cfg(feature = "long-running-operation-fixture")]
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LongRunningOperationFixtureRequest {
+    operation_id: String,
+    #[serde(default = "default_fixture_total_steps")]
+    total_steps: u32,
+    #[serde(default)]
+    delay_ms: u64,
+    #[serde(default)]
+    cancel_at_step: Option<u32>,
+}
+
+#[cfg(feature = "long-running-operation-fixture")]
+fn default_fixture_total_steps() -> u32 {
+    3
+}
+
+#[cfg(feature = "long-running-operation-fixture")]
+fn fixture_progress_message(operation_id: &str, completed_steps: u32, total_steps: u32) -> Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/progress",
+        "params": {
+            "operationId": operation_id,
+            "completedSteps": completed_steps,
+            "totalSteps": total_steps
+        }
+    })
+}
+
+#[cfg(feature = "long-running-operation-fixture")]
+fn fixture_complete_message(operation_id: &str, completed_steps: u32, status: &str) -> Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": operation_id,
+        "result": {
+            "resultType": "complete",
+            "status": status,
+            "completedSteps": completed_steps
+        }
+    })
+}
+
+#[cfg(feature = "long-running-operation-fixture")]
+async fn handle_long_running_operation_fixture_stream_if_requested<T: AsyncWriteExt + Unpin>(
+    stream: &mut T,
+    method: &str,
+    path: &str,
+    headers: &[(String, String)],
+    body: &str,
+    credential_validator: &CredentialValidator,
+) -> anyhow::Result<Option<bool>> {
+    if method != "POST" || path != "/_test/mcp/long-running-operation" {
+        return Ok(None);
+    }
+
+    if authenticate_from_headers(headers, credential_validator).is_err() {
+        stream.write_all(unauthorized_response().as_bytes()).await?;
+        return Ok(Some(false));
+    }
+    if !accepts_mime(headers, "text/event-stream") {
+        let response = json_rpc_error_response(
+            "406 Not Acceptable",
+            None,
+            crate::transport::INVALID_REQUEST,
+            "long-running operation fixture requires Accept: text/event-stream",
+            None,
+        );
+        stream.write_all(response.as_bytes()).await?;
+        return Ok(Some(false));
+    }
+
+    let request: LongRunningOperationFixtureRequest = serde_json::from_str(body)
+        .map_err(|error| anyhow::anyhow!("invalid long-running operation fixture JSON: {error}"))?;
+    if request.operation_id.trim().is_empty() {
+        let response = json_rpc_error_response(
+            "400 Bad Request",
+            None,
+            crate::transport::INVALID_PARAMS,
+            "long-running operation fixture requires a non-empty operationId",
+            None,
+        );
+        stream.write_all(response.as_bytes()).await?;
+        return Ok(Some(false));
+    }
+    if request.total_steps == 0 {
+        let response = json_rpc_error_response(
+            "400 Bad Request",
+            None,
+            crate::transport::INVALID_PARAMS,
+            "totalSteps must be greater than zero",
+            None,
+        );
+        stream.write_all(response.as_bytes()).await?;
+        return Ok(Some(false));
+    }
+    if request
+        .cancel_at_step
+        .is_some_and(|step| step > request.total_steps)
+    {
+        let response = json_rpc_error_response(
+            "400 Bad Request",
+            None,
+            crate::transport::INVALID_PARAMS,
+            "cancelAtStep must not exceed totalSteps",
+            None,
+        );
+        stream.write_all(response.as_bytes()).await?;
+        return Ok(Some(false));
+    }
+
+    stream
+        .write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+        )
+        .await?;
+    for step in 1..=request.total_steps {
+        write_sse_message(
+            stream,
+            &fixture_progress_message(&request.operation_id, step, request.total_steps),
+        )
+        .await?;
+        if request.cancel_at_step == Some(step) {
+            write_sse_message(
+                stream,
+                &fixture_complete_message(&request.operation_id, step, "cancelled"),
+            )
+            .await?;
+            return Ok(Some(false));
+        }
+        if request.delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(request.delay_ms)).await;
+        }
+    }
+    write_sse_message(
+        stream,
+        &fixture_complete_message(&request.operation_id, request.total_steps, "completed"),
+    )
+    .await?;
+    Ok(Some(false))
 }
 
 #[cfg(test)]
@@ -6462,6 +6619,135 @@ mod tests {
             body["result"]["contents"][0]["mimeType"],
             dispatch::TASK_RESOURCE_MIME_TYPE
         );
+    }
+
+    #[cfg(feature = "long-running-operation-fixture")]
+    #[tokio::test]
+    async fn long_running_operation_fixture_streams_progress_then_cancellation() {
+        use tokio::io::AsyncReadExt;
+
+        let (mut client, mut server) = tokio::io::duplex(16 * 1024);
+        let body = serde_json::json!({
+            "operationId": "fixture-cancel",
+            "totalSteps": 3,
+            "delayMs": 0,
+            "cancelAtStep": 2
+        })
+        .to_string();
+        let headers = vec![
+            (
+                "Authorization".to_string(),
+                "Basic dXNlcjpwYXNz".to_string(),
+            ),
+            (
+                "Accept".to_string(),
+                "application/json, text/event-stream".to_string(),
+            ),
+        ];
+
+        let server_task = tokio::spawn(async move {
+            handle_long_running_operation_fixture_stream_if_requested(
+                &mut server,
+                "POST",
+                "/_test/mcp/long-running-operation",
+                &headers,
+                &body,
+                &valid_credentials,
+            )
+            .await
+        });
+
+        let mut buffer = vec![0; 16 * 1024];
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+        let response = String::from_utf8_lossy(&buffer[..read]);
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        let messages = sse_data_messages(&response);
+        assert_eq!(messages[0]["method"], "notifications/progress");
+        assert_eq!(messages[0]["params"]["operationId"], "fixture-cancel");
+        assert_eq!(messages[1]["method"], "notifications/progress");
+        assert_eq!(messages[2]["id"], "fixture-cancel");
+        assert_eq!(messages[2]["result"]["status"], "cancelled");
+        assert_eq!(messages[2]["result"]["completedSteps"], 2);
+
+        drop(client);
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[cfg(feature = "long-running-operation-fixture")]
+    #[tokio::test]
+    async fn long_running_operation_fixture_completes_after_all_steps() {
+        use tokio::io::AsyncReadExt;
+
+        let (mut client, mut server) = tokio::io::duplex(16 * 1024);
+        let body = serde_json::json!({
+            "operationId": "fixture-complete",
+            "totalSteps": 2,
+            "delayMs": 0
+        })
+        .to_string();
+        let headers = vec![
+            (
+                "Authorization".to_string(),
+                "Basic dXNlcjpwYXNz".to_string(),
+            ),
+            ("Accept".to_string(), "text/event-stream".to_string()),
+        ];
+
+        let server_task = tokio::spawn(async move {
+            handle_long_running_operation_fixture_stream_if_requested(
+                &mut server,
+                "POST",
+                "/_test/mcp/long-running-operation",
+                &headers,
+                &body,
+                &valid_credentials,
+            )
+            .await
+        });
+
+        let mut buffer = vec![0; 16 * 1024];
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+        let messages = sse_data_messages(&String::from_utf8_lossy(&buffer[..read]));
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[2]["result"]["status"], "completed");
+        assert_eq!(messages[2]["result"]["completedSteps"], 2);
+
+        drop(client);
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[cfg(feature = "long-running-operation-fixture")]
+    #[tokio::test]
+    async fn long_running_operation_fixture_rejects_unauthenticated_requests() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let body = serde_json::json!({ "operationId": "fixture-auth" }).to_string();
+        let headers = vec![("Accept".to_string(), "text/event-stream".to_string())];
+
+        let server_task = tokio::spawn(async move {
+            handle_long_running_operation_fixture_stream_if_requested(
+                &mut server,
+                "POST",
+                "/_test/mcp/long-running-operation",
+                &headers,
+                &body,
+                &valid_credentials,
+            )
+            .await
+        });
+
+        use tokio::io::AsyncReadExt;
+        let mut buffer = vec![0; 1024];
+        let read = client.read(&mut buffer).await.unwrap();
+        assert!(String::from_utf8_lossy(&buffer[..read]).starts_with("HTTP/1.1 401 Unauthorized"));
+        server_task.await.unwrap().unwrap();
     }
 
     #[cfg(feature = "subscription-fixture")]

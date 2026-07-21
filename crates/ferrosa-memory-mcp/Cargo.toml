@@ -21,6 +21,7 @@ name = "reconcile-dangling-edges"
 path = "src/tools/reconcile_dangling_edges.rs"
 
 [features]
+long-running-operation-fixture = ["ferrosa-memory-core/long-running-operation-fixture"]
 subscription-fixture = ["ferrosa-memory-core/subscription-fixture"]
 
 [dependencies]
