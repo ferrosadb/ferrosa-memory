@@ -327,6 +327,27 @@ This is useful for:
 - waking an agent UI when a dependency task becomes unblocked;
 - detecting that another session created follow-up work for the current workspace.
 
+## Test-only long-running operation fixture
+
+Client implementations for progress and cancellation can use an opt-in deterministic fixture. It is **not** part of Ferrosa Memory's production MCP surface and is absent unless both the core crate and MCP binary are built with:
+
+```bash
+cargo build -p ferrosa-memory-mcp --features long-running-operation-fixture
+```
+
+With that feature enabled, an authenticated request to `POST /_test/mcp/long-running-operation` must include `Accept: text/event-stream` and a JSON body such as:
+
+```json
+{
+  "operationId": "client-progress-test",
+  "totalSteps": 3,
+  "delayMs": 25,
+  "cancelAtStep": 2
+}
+```
+
+The fixture emits one `notifications/progress` SSE message per completed step. `cancelAtStep` emits a terminal JSON-RPC result with `status: "cancelled"`; omitting it emits `status: "completed"` after `totalSteps`. Invalid parameters, missing SSE acceptance, and missing authentication fail loudly. Use this endpoint only in local or controlled integration tests.
+
 ## Errors to expect
 
 Draft validation fails loud so clients do not accidentally mix protocol modes.
