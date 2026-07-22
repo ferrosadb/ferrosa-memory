@@ -23,6 +23,7 @@ tracing-subscriber.workspace = true
 sha2.workspace = true
 hex.workspace = true
 reqwest.workspace = true
+base64 = "0.22"
 regex = "1"
 clap = { version = "4", features = ["derive"] }
 dirs.workspace = true

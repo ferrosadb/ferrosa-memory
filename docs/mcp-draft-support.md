@@ -2,7 +2,7 @@
 
 Ferrosa Memory supports the MCP draft per-request HTTP model for shared HTTP deployments. Modern MCP clients can discover capabilities without a legacy `initialize` session, then call tools, prompts, resources, and task subscriptions with explicit protocol metadata on each request.
 
-This support is intentionally scoped to the draft features Ferrosa Memory exposes today. It is not a full conformance suite for every draft feature.
+This support is intentionally scoped to the draft features Ferrosa Memory exposes today. It is not a full conformance suite for every draft feature. See the [compatibility matrix](mcp-compatibility.md), [demo runbook](mcp-draft-demo.md), and [draft-profile release notes](releases/mcp-2026-07-28-draft-profile.md) for the tested claim boundary and release evidence.
 
 ## Supported draft surface
 
@@ -44,7 +44,7 @@ Requests whose method names a specific item also require `Mcp-Name`:
 When a `Mcp-Name` value contains characters that are unsafe for HTTP header values, encode it as:
 
 ```text
-=?base64?<URL_SAFE_NO_PAD_BASE64_VALUE>?=
+=?base64?<STANDARD_BASE64_VALUE>?=
 ```
 
 For example, `ferrosa-memory://tasks/<session>/current` should usually be sent as an encoded `Mcp-Name` header even though the JSON body still contains the plain URI.

@@ -146,7 +146,7 @@ the tier-1 default `tools/list`; request it with `include_all`.)
 
 Shared HTTP deployments support the MCP draft per-request protocol version `2026-07-28` for modern clients. The supported surface includes `server/discover`, tools, prompts, task resources, and task-resource subscriptions over Server-Sent Events.
 
-Use this when a client wants to discover capabilities without a legacy `initialize` session, read active task resources directly, or subscribe to workspace task updates for multi-agent coordination. See [`docs/mcp-draft-support.md`](docs/mcp-draft-support.md) for request headers, examples, and subscription usage.
+Use this when a client wants to discover capabilities without a legacy `initialize` session, read active task resources directly, or subscribe to workspace task updates for multi-agent coordination. See the [protocol guide](docs/mcp-draft-support.md), [compatibility matrix](docs/mcp-compatibility.md), and [demo runbook](docs/mcp-draft-demo.md) for the implemented claim boundary and reproducible evidence.
 
 ## Recall quality
 
@@ -346,7 +346,7 @@ curl -sS -u ferrosa_user:ferrosa_user \
   https://memory.example.com:8765/mcp
 ```
 
-A successful discovery response advertises tools, prompts, resources, and `resources.subscribe`. See [`docs/mcp-draft-support.md`](docs/mcp-draft-support.md) for complete examples, including `tools/call`, `prompts/get`, `resources/read`, and `subscriptions/listen` for workspace task updates.
+A successful discovery response advertises tools, prompts, resources, and `subscriptions/listen`. See [`docs/mcp-draft-support.md`](docs/mcp-draft-support.md) for complete examples, including `tools/call`, `prompts/get`, `resources/read`, and workspace task updates.
 
 ### Database Setup
 
