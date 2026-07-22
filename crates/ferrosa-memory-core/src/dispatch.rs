@@ -1198,6 +1198,19 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         requested_tool = name,
         "dispatching tool call"
     );
+    normalize_embedding_argument(
+        &mut args,
+        "embedding",
+        session.embed_dimensions,
+        canonical_name != "complete_fold",
+    )?;
+    normalize_embedding_argument(
+        &mut args,
+        "query_embedding",
+        session.embed_dimensions,
+        canonical_name != "retrieve_fold_context",
+    )?;
+    normalize_nested_embedding_arguments(&mut args, session.embed_dimensions)?;
     if canonical_name != "configure" {
         resolve_session_id(&mut args, session.effective_default_session_id())?;
     }
@@ -11082,6 +11095,70 @@ fn optional_f32_array(args: &Value, field: &str) -> Result<Option<Vec<f32>>, (i3
     }
 }
 
+/// Normalize caller-supplied vectors once, before any tool handler can route
+/// them to ANN or persistence. Optional empty arrays mean "not supplied";
+/// required vectors remain errors. Non-empty vectors must match the configured
+/// model dimension so CQL ANN never sees a malformed literal.
+fn normalize_embedding_argument(
+    args: &mut Value,
+    field: &str,
+    expected_dimensions: u32,
+    empty_is_none: bool,
+) -> Result<(), (i32, String)> {
+    let Some(value) = args.get(field) else {
+        return Ok(());
+    };
+    let Some(values) = value.as_array() else {
+        return Err((INVALID_PARAMS, format!("{field} must be an array")));
+    };
+    if values.is_empty() && empty_is_none {
+        args.as_object_mut()
+            .ok_or((INVALID_PARAMS, "arguments must be an object".to_string()))?
+            .remove(field);
+        return Ok(());
+    }
+    if expected_dimensions == 0 {
+        return Err((
+            INVALID_PARAMS,
+            format!(
+                "cannot validate {field}: configured embedding dimensions must be greater than zero"
+            ),
+        ));
+    }
+    if values.len() != expected_dimensions as usize {
+        return Err((
+            INVALID_PARAMS,
+            format!(
+                "{field} must have {expected_dimensions} dimensions for ANN search; got {}",
+                values.len()
+            ),
+        ));
+    }
+    for (idx, value) in values.iter().enumerate() {
+        if !value.as_f64().is_some_and(f64::is_finite) {
+            return Err((
+                INVALID_PARAMS,
+                format!("{field}[{idx}] must be a finite number"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_nested_embedding_arguments(
+    args: &mut Value,
+    expected_dimensions: u32,
+) -> Result<(), (i32, String)> {
+    let Some(items) = args.get_mut("entities").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for (idx, item) in items.iter_mut().enumerate() {
+        normalize_embedding_argument(item, "embedding", expected_dimensions, true)
+            .map_err(|(code, message)| (code, format!("entities[{idx}].{message}")))?;
+    }
+    Ok(())
+}
+
 fn optional_string_array(args: &Value, field: &str) -> Result<Vec<String>, (i32, String)> {
     let Some(value) = args.get(field) else {
         return Ok(Vec::new());
@@ -14190,7 +14267,10 @@ mod tests {
     async fn batch_update_entities_updates_rows_and_reports_counts() {
         let store = MockStorage::new();
         let ctx = test_ctx();
-        let session = SessionState::default();
+        let session = SessionState {
+            embed_dimensions: 3,
+            ..SessionState::default()
+        };
         let sid = Uuid::new_v4();
         let update_id = Uuid::new_v4();
         let unchanged_id = Uuid::new_v4();
@@ -15448,11 +15528,179 @@ mod tests {
         assert_eq!(results[0]["result_type"], "entity");
     }
 
+    #[test]
+    fn optional_ann_embedding_normalizes_empty_array_to_none() {
+        let mut args = serde_json::json!({"embedding": []});
+
+        normalize_embedding_argument(&mut args, "embedding", 3, true).unwrap();
+
+        assert!(optional_f32_array(&args, "embedding").unwrap().is_none());
+    }
+
+    #[test]
+    fn required_embedding_rejects_empty_array() {
+        let mut args = serde_json::json!({"embedding": []});
+
+        let error = normalize_embedding_argument(&mut args, "embedding", 3, false).unwrap_err();
+
+        assert_eq!(error.0, INVALID_PARAMS);
+        assert!(error.1.contains("must have 3 dimensions"));
+        assert!(error.1.contains("got 0"));
+    }
+
+    #[test]
+    fn nested_empty_embedding_normalizes_to_absent() {
+        let mut args = serde_json::json!({"entities": [{"embedding": []}]});
+
+        normalize_nested_embedding_arguments(&mut args, 3).unwrap();
+
+        assert!(args["entities"][0].get("embedding").is_none());
+    }
+
+    #[test]
+    fn nested_wrong_dimension_reports_entity_index() {
+        let mut args = serde_json::json!({"entities": [{"embedding": [0.1, 0.2]}]});
+
+        let error = normalize_nested_embedding_arguments(&mut args, 3).unwrap_err();
+
+        assert_eq!(error.0, INVALID_PARAMS);
+        assert!(error.1.contains("entities[0].embedding"));
+        assert!(error.1.contains("must have 3 dimensions"));
+    }
+
+    #[test]
+    fn optional_ann_embedding_rejects_wrong_dimension() {
+        let mut args = serde_json::json!({"embedding": [0.1, 0.2]});
+
+        let error = normalize_embedding_argument(&mut args, "embedding", 3, true).unwrap_err();
+
+        assert_eq!(error.0, INVALID_PARAMS);
+        assert!(error.1.contains("must have 3 dimensions"));
+        assert!(error.1.contains("got 2"));
+    }
+
+    #[tokio::test]
+    async fn retrieve_entities_empty_embedding_skips_ann() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            embed_provider: "disabled".to_string(),
+            embed_dimensions: 3,
+            ..SessionState::default()
+        };
+        let sid = Uuid::new_v4();
+        store.entities.lock().await.push(crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: sid,
+            entity_name: "Only reachable through ANN".into(),
+            entity_type: "concept".into(),
+            context_snippet: "unrelated content".into(),
+            state: crate::types::MemoryState::Active,
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        });
+
+        let result = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "retrieve_entities",
+                "arguments": {
+                    "session_id": sid,
+                    "query": "no phonetic match",
+                    "embedding": [],
+                    "strategy": "both",
+                    "k": 10
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let result = unwrap_tool_result(result);
+
+        assert_eq!(result, serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_empty_embedding_uses_configured_generator_instead_of_ann_empty_vector() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            embed_provider: "synthetic".to_string(),
+            ollama_base_url: String::new(),
+            embed_dimensions: 3,
+            ..SessionState::default()
+        };
+        let sid = Uuid::new_v4();
+
+        let result = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "hybrid_search",
+                "arguments": {
+                    "session_id": sid,
+                    "query": "empty embedding regression",
+                    "embedding": [],
+                    "fusion_profile": "semantic-only"
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let result = unwrap_tool_result(result);
+
+        assert_eq!(
+            result["query_decomposition"]["queries"][0]["embedding_status"],
+            "generated"
+        );
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_rejects_wrong_dimension_before_ann() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            embed_dimensions: 3,
+            ..SessionState::default()
+        };
+        let sid = Uuid::new_v4();
+
+        let error = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "hybrid_search",
+                "arguments": {
+                    "session_id": sid,
+                    "query": "wrong dimension regression",
+                    "embedding": [0.1, 0.2]
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.0, INVALID_PARAMS);
+        assert!(error.1.contains("must have 3 dimensions"));
+        assert!(error.1.contains("got 2"));
+    }
+
     #[tokio::test]
     async fn hybrid_search_with_embedding() {
         let store = MockStorage::new();
         let ctx = test_ctx();
-        let session = SessionState::default();
+        let session = SessionState {
+            embed_dimensions: 3,
+            ..SessionState::default()
+        };
         let sid = Uuid::new_v4();
 
         // Seed an entity
