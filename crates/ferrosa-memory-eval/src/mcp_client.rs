@@ -9,6 +9,7 @@
 //! JSON-RPC 2.0 over stdio, newline-delimited. See `ferrosa-memory-core::transport`
 //! for request/response types.
 
+use base64::Engine as _;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -47,6 +48,10 @@ pub enum McpClientError {
     /// Timed out waiting for a response.
     #[error("timeout after {0:?}")]
     Timeout(Duration),
+
+    /// The client could not construct a valid protocol request.
+    #[error("invalid MCP request: {0}")]
+    InvalidRequest(String),
 
     /// HTTP transport error.
     #[error("http error: {0}")]
@@ -90,12 +95,41 @@ pub fn compute_binary_hash(path: &Path) -> Result<String, McpClientError> {
 // T-037: HTTP Transport
 // ---------------------------------------------------------------------------
 
+const MODERN_MCP_PROTOCOL_VERSION: &str = "2026-07-28";
+
+/// Protocol mode used for JSON-RPC over HTTP.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HttpMcpProtocolMode {
+    /// Session-oriented MCP used by existing clients.
+    #[default]
+    Legacy,
+    /// Stateless MCP draft with per-request metadata and mirrored HTTP headers.
+    Modern,
+}
+
+#[derive(Debug)]
+struct PreparedHttpRequest {
+    body: Value,
+    headers: Vec<(String, String)>,
+}
+
+impl PreparedHttpRequest {
+    #[cfg(test)]
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
 /// HTTP-based MCP client using JSON-RPC over HTTP POST.
 pub struct HttpMcpClient {
     client: reqwest::Client,
     url: String,
     next_id: u64,
     basic_auth: Option<(String, String)>,
+    protocol_mode: HttpMcpProtocolMode,
 }
 
 impl std::fmt::Debug for HttpMcpClient {
@@ -107,6 +141,7 @@ impl std::fmt::Debug for HttpMcpClient {
                 "basic_auth",
                 &self.basic_auth.as_ref().map(|(user, _)| user),
             )
+            .field("protocol_mode", &self.protocol_mode)
             .finish()
     }
 }
@@ -119,7 +154,14 @@ impl HttpMcpClient {
             url: url.to_string(),
             next_id: 1,
             basic_auth: None,
+            protocol_mode: HttpMcpProtocolMode::Legacy,
         }
+    }
+
+    /// Use the stateless 2026-07-28 draft protocol for each request.
+    pub fn with_modern_protocol(mut self) -> Self {
+        self.protocol_mode = HttpMcpProtocolMode::Modern;
+        self
     }
 
     /// Configure HTTP Basic auth credentials for protected MCP endpoints.
@@ -142,17 +184,28 @@ impl HttpMcpClient {
         self.next_id
     }
 
-    /// Send the MCP `initialize` request over HTTP.
+    /// Negotiate the configured HTTP protocol mode.
+    ///
+    /// Legacy mode sends `initialize`; modern mode uses the stateless
+    /// `server/discover` request instead.
     pub async fn initialize(&mut self) -> Result<ToolCallResult, McpClientError> {
-        let params = serde_json::json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {
-                "name": "ferrosa-memory-eval",
-                "version": env!("CARGO_PKG_VERSION")
+        match self.protocol_mode {
+            HttpMcpProtocolMode::Legacy => {
+                let params = serde_json::json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "ferrosa-memory-eval",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                });
+                self.send_request("initialize", params).await
             }
-        });
-        self.send_request("initialize", params).await
+            HttpMcpProtocolMode::Modern => {
+                self.send_request("server/discover", serde_json::json!({}))
+                    .await
+            }
+        }
     }
 
     /// Send a `tools/call` request over HTTP.
@@ -174,6 +227,63 @@ impl HttpMcpClient {
             .await
     }
 
+    fn prepare_request(
+        &self,
+        id: u64,
+        method: &str,
+        mut params: Value,
+    ) -> Result<PreparedHttpRequest, McpClientError> {
+        let mut headers = Vec::new();
+        if self.protocol_mode == HttpMcpProtocolMode::Modern {
+            let params = params.as_object_mut().ok_or_else(|| {
+                McpClientError::InvalidRequest(format!(
+                    "HTTP MCP params for {method} must be a JSON object"
+                ))
+            })?;
+            let meta = params
+                .entry("_meta")
+                .or_insert_with(|| Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .ok_or_else(|| {
+                    McpClientError::InvalidRequest(format!(
+                        "HTTP MCP params._meta for {method} must be an object"
+                    ))
+                })?;
+            meta.insert(
+                "io.modelcontextprotocol/protocolVersion".to_string(),
+                Value::String(MODERN_MCP_PROTOCOL_VERSION.to_string()),
+            );
+            meta.entry("io.modelcontextprotocol/clientCapabilities")
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            meta.entry("io.modelcontextprotocol/clientInfo")
+                .or_insert_with(|| {
+                    serde_json::json!({
+                        "name": "ferrosa-memory-eval",
+                        "version": env!("CARGO_PKG_VERSION")
+                    })
+                });
+
+            headers.push((
+                "MCP-Protocol-Version".to_string(),
+                MODERN_MCP_PROTOCOL_VERSION.to_string(),
+            ));
+            headers.push(("Mcp-Method".to_string(), method.to_string()));
+            if let Some(name) = mcp_request_name(method, &Value::Object(params.clone())) {
+                headers.push(("Mcp-Name".to_string(), encode_mcp_header_value(name)));
+            }
+        }
+
+        Ok(PreparedHttpRequest {
+            body: serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params
+            }),
+            headers,
+        })
+    }
+
     /// Send a raw JSON-RPC request over HTTP POST.
     pub async fn send_request(
         &mut self,
@@ -182,17 +292,14 @@ impl HttpMcpClient {
     ) -> Result<ToolCallResult, McpClientError> {
         let id = self.next_id;
         self.next_id += 1;
-
-        let request = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params
-        });
+        let prepared = self.prepare_request(id, method, params)?;
 
         let start = Instant::now();
 
-        let mut http_request = self.client.post(&self.url).json(&request);
+        let mut http_request = self.client.post(&self.url).json(&prepared.body);
+        for (name, value) in prepared.headers {
+            http_request = http_request.header(name, value);
+        }
         if let Some((username, password)) = &self.basic_auth {
             http_request = http_request.basic_auth(username, Some(password));
         }
@@ -237,6 +344,31 @@ impl HttpMcpClient {
             latency,
             request_id: id,
         })
+    }
+}
+
+fn mcp_request_name<'a>(method: &str, params: &'a Value) -> Option<&'a str> {
+    match method {
+        "tools/call" | "prompts/get" => params.get("name").and_then(Value::as_str),
+        "resources/read" => params.get("uri").and_then(Value::as_str),
+        _ => None,
+    }
+}
+
+fn encode_mcp_header_value(value: &str) -> String {
+    let plain = !value.is_empty()
+        && value.trim_matches([' ', '\t']) == value
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| matches!(*byte, 0x20..=0x7e));
+    if plain {
+        value.to_string()
+    } else {
+        format!(
+            "=?base64?{}?=",
+            base64::engine::general_purpose::STANDARD.encode(value)
+        )
     }
 }
 
@@ -913,6 +1045,74 @@ for line in sys.stdin:
         let client = HttpMcpClient::new("http://localhost:8080");
         assert_eq!(client.url(), "http://localhost:8080");
         assert_eq!(client.next_id(), 1);
+    }
+
+    #[test]
+    fn modern_http_client_adds_per_request_metadata_and_headers() {
+        let client = HttpMcpClient::new("http://localhost:8080").with_modern_protocol();
+        let params = serde_json::json!({
+            "name": "get_stats",
+            "arguments": {}
+        });
+
+        let prepared = client.prepare_request(7, "tools/call", params).unwrap();
+
+        assert_eq!(
+            prepared.body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+            "2026-07-28"
+        );
+        assert!(
+            prepared.body["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]
+                .is_object()
+        );
+        assert_eq!(prepared.header("MCP-Protocol-Version"), Some("2026-07-28"));
+        assert_eq!(prepared.header("Mcp-Method"), Some("tools/call"));
+        assert_eq!(prepared.header("Mcp-Name"), Some("get_stats"));
+    }
+
+    #[test]
+    fn legacy_http_client_preserves_initialize_request_without_draft_metadata() {
+        let client = HttpMcpClient::new("http://localhost:8080");
+        let params = serde_json::json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {}
+        });
+
+        let prepared = client
+            .prepare_request(3, "initialize", params.clone())
+            .unwrap();
+
+        assert_eq!(prepared.body["params"], params);
+        assert!(prepared.headers.is_empty());
+    }
+
+    #[test]
+    fn modern_http_client_encodes_non_ascii_mcp_names() {
+        let client = HttpMcpClient::new("http://localhost:8080").with_modern_protocol();
+        let prepared = client
+            .prepare_request(
+                9,
+                "resources/read",
+                serde_json::json!({"uri": "ferrosa-memory://tasks/😀/current"}),
+            )
+            .unwrap();
+
+        assert_eq!(
+            prepared.header("Mcp-Name"),
+            Some("=?base64?ZmVycm9zYS1tZW1vcnk6Ly90YXNrcy/wn5iAL2N1cnJlbnQ=?=")
+        );
+    }
+
+    #[test]
+    fn modern_http_client_rejects_non_object_params_without_panicking() {
+        let client = HttpMcpClient::new("http://localhost:8080").with_modern_protocol();
+
+        let error = client
+            .prepare_request(10, "tools/list", Value::Null)
+            .unwrap_err();
+
+        assert!(matches!(error, McpClientError::InvalidRequest(_)));
+        assert!(error.to_string().contains("params for tools/list"));
     }
 
     #[test]

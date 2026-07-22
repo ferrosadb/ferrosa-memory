@@ -1031,6 +1031,7 @@ version = "0.23.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "chrono",
  "clap",
  "dirs",

@@ -6861,6 +6861,210 @@ mod tests {
         let _ = server_task.await;
     }
 
+    #[cfg(all(
+        feature = "subscription-fixture",
+        feature = "long-running-operation-fixture"
+    ))]
+    #[tokio::test]
+    async fn draft_profile_end_to_end_smoke() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let metrics = MemoryMetrics::new().unwrap();
+        let storage = MockStorage::new();
+        let session = Arc::new(dispatch::SessionState::default());
+        let session_id = Uuid::new_v4();
+        let uri = dispatch::task_resource_uri(session_id, dispatch::TaskResourceKind::List);
+
+        for (id, method, mut params) in [
+            (1, "server/discover", serde_json::json!({})),
+            (2, "tools/list", serde_json::json!({})),
+            (
+                3,
+                "tools/call",
+                serde_json::json!({"name": "get_stats", "arguments": {}}),
+            ),
+        ] {
+            params["_meta"] = serde_json::json!({
+                "io.modelcontextprotocol/protocolVersion": dispatch::MODERN_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "io.modelcontextprotocol/clientInfo": {
+                    "name": "ferrosa-memory-conformance-smoke",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            });
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params
+            })
+            .to_string();
+            let mut headers = valid_basic_auth_headers();
+            headers.extend([
+                (
+                    "MCP-Protocol-Version".to_string(),
+                    dispatch::MODERN_PROTOCOL_VERSION.to_string(),
+                ),
+                ("Mcp-Method".to_string(), method.to_string()),
+            ]);
+            if method == "tools/call" {
+                headers.push(("Mcp-Name".to_string(), "get_stats".to_string()));
+            }
+            let response = handle_http_request_with_session(
+                "POST",
+                "/mcp",
+                &headers,
+                &body,
+                &storage,
+                &metrics,
+                &valid_credentials,
+                &|| true,
+                &ShellRouteConfig::default(),
+                session.as_ref(),
+            )
+            .await
+            .unwrap();
+            assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+            let response = response_json(&response);
+            assert_eq!(response["result"]["resultType"], "complete", "{method}");
+            if method == "server/discover" {
+                assert_eq!(
+                    response["result"]["supportedVersions"][0],
+                    dispatch::MODERN_PROTOCOL_VERSION
+                );
+            }
+            if method == "tools/list" {
+                assert!(
+                    response["result"]["tools"]
+                        .as_array()
+                        .is_some_and(|v| !v.is_empty())
+                );
+            }
+        }
+
+        let (mut subscription_client, mut subscription_server) = tokio::io::duplex(16 * 1024);
+        let session_for_server = Arc::clone(&session);
+        let subscription_server_task = tokio::spawn(async move {
+            serve_one_connection_with_session(
+                &mut subscription_server,
+                &MockStorage::new(),
+                ConnectionContext {
+                    metrics: &MemoryMetrics::new().unwrap(),
+                    credential_validator: &valid_credentials,
+                    readiness_checker: &|| true,
+                    shell_routes: &ShellRouteConfig::default(),
+                    session: session_for_server.as_ref(),
+                    request_budget: DEFAULT_REQUEST_BUDGET,
+                },
+            )
+            .await
+        });
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "subscriptions/listen",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": dispatch::MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                },
+                "notifications": {"resourceSubscriptions": [uri]}
+            }
+        })
+        .to_string();
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic dXNlcjpwYXNz\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nMCP-Protocol-Version: {}\r\nMcp-Method: subscriptions/listen\r\nContent-Length: {}\r\n\r\n{body}",
+            dispatch::MODERN_PROTOCOL_VERSION,
+            body.len()
+        );
+        subscription_client
+            .write_all(request.as_bytes())
+            .await
+            .unwrap();
+        subscription_client.flush().await.unwrap();
+        let mut buffer = vec![0u8; 16 * 1024];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            subscription_client.read(&mut buffer),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            sse_data_messages(&String::from_utf8_lossy(&buffer[..n]))[0]["method"],
+            "notifications/subscriptions/acknowledged"
+        );
+
+        let fixture_body = serde_json::json!({"uri": uri}).to_string();
+        let response = handle_http_request_with_session(
+            "POST",
+            "/_test/mcp/task-resource-update",
+            &valid_basic_auth_headers(),
+            &fixture_body,
+            &storage,
+            &metrics,
+            &valid_credentials,
+            &|| true,
+            &ShellRouteConfig::default(),
+            session.as_ref(),
+        )
+        .await
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            subscription_client.read(&mut buffer),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            sse_data_messages(&String::from_utf8_lossy(&buffer[..n]))[0]["method"],
+            "notifications/resources/updated"
+        );
+        drop(subscription_client);
+        subscription_server_task.abort();
+        let _ = subscription_server_task.await;
+
+        for (operation_id, cancel_at_step, expected_status, expected_steps) in [
+            ("complete-smoke", None, "completed", 3),
+            ("cancel-smoke", Some(2), "cancelled", 2),
+        ] {
+            let (mut fixture_client, mut fixture_server) = tokio::io::duplex(16 * 1024);
+            let body = serde_json::json!({
+                "operationId": operation_id,
+                "totalSteps": 3,
+                "delayMs": 0,
+                "cancelAtStep": cancel_at_step
+            })
+            .to_string();
+            let server_task = tokio::spawn(async move {
+                handle_long_running_operation_fixture_stream_if_requested(
+                    &mut fixture_server,
+                    "POST",
+                    "/_test/mcp/long-running-operation",
+                    &[
+                        (
+                            "Authorization".to_string(),
+                            "Basic dXNlcjpwYXNz".to_string(),
+                        ),
+                        ("Accept".to_string(), "text/event-stream".to_string()),
+                    ],
+                    &body,
+                    &valid_credentials,
+                )
+                .await
+            });
+            let mut response = String::new();
+            fixture_client.read_to_string(&mut response).await.unwrap();
+            assert!(server_task.await.unwrap().unwrap().is_some());
+            let messages = sse_data_messages(&response);
+            let terminal = messages.last().unwrap();
+            assert_eq!(terminal["result"]["status"], expected_status);
+            assert_eq!(terminal["result"]["completedSteps"], expected_steps);
+        }
+    }
+
     #[tokio::test]
     async fn modern_mcp_subscriptions_listen_streams_task_resource_updates() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

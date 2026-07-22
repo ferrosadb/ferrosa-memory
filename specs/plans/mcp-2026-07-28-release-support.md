@@ -1,14 +1,16 @@
 # Project Plan: MCP 2026-07-28 Release Support
 
-> Last updated: 2026-07-17
-> Status: implementation in progress
+> Last updated: 2026-07-22
+> Status: draft-profile release evidence complete; final-spec adjustment pending upstream
 > Source: MCP draft spec, local PDF `~/Desktop/Model Context Protocol Release.pdf`, /project-management
 
 ## Executive Summary
 
 Ferrosa Memory is operationally close to the 2026-07-28 MCP direction because its shared HTTP service already exposes a single authenticated `POST /mcp` endpoint and does not depend on an MCP session store. The base modern HTTP path is now implemented: `server/discover`, per-request version/header validation, required `_meta` validation, Base64-safe mirrored header decoding, Origin validation, modern result envelopes, cache metadata, and conservative tool `outputSchema` contracts. Legacy clients remain supported through the legacy dispatch path.
 
-The near-term goal is a dual-era HTTP server by the July 28, 2026 final spec date: legacy clients keep working, modern clients can call statelessly, and we have credible conformance evidence plus a co-marketing demo around "stateless durable memory for MCP agents." Ferrosa Memory does not need a modern stdio path because it is operated as a long-running service. Tasks and MCP Apps are valuable follow-on showcases, but they should not block the base protocol compatibility milestone.
+The dual-era draft-profile milestone is implemented: legacy clients keep working, modern clients can call statelessly, and CI carries focused plus deterministic end-to-end evidence. The compatibility matrix, demo runbook, and draft-profile release notes define the claim boundary. Ferrosa Memory does not need a modern stdio path because it is operated as a long-running service. Tasks, MCP Apps, public OAuth, and final-spec certification remain follow-on work and do not block this milestone.
+
+This plan records support for the current draft, not certification against a final standard. The final schema and official conformance suite are upstream dependencies expected July 28, 2026; their publication triggers a comparison and adjustment pass.
 
 ## Source Evidence
 
@@ -33,7 +35,7 @@ The near-term goal is a dual-era HTTP server by the July 28, 2026 final spec dat
 | Protocol version | `dispatch::server_info()` advertises `2024-11-05`. | Advertise `2026-07-28` through `server/discover`; support legacy only in dual-era path. |
 | Handshake | `initialize` and `notifications/initialized` are accepted. `initialize` reads `roots`. | Modern path has no handshake. Legacy path remains behind dual-era compatibility. |
 | Request metadata | Modern HTTP handler validates version, method, name, required `_meta`, JSON-RPC id shape, and Base64 sentinel decoding for mirrored headers. | Keep this covered by conformance tests and update if the draft changes. |
-| Discovery | No `server/discover`. | Add mandatory `server/discover` with supported versions, capabilities, server info, instructions, `ttlMs`, and `cacheScope`. |
+| Discovery | `server/discover` returns supported versions, capabilities, server info, instructions, cache metadata, and the implemented draft profile. | Reconcile the response against the final schema after publication. |
 | Result bodies | `tools/list` returns `{ "tools": [...] }`; tool calls return legacy MCP content. | Modern results include `resultType: "complete"` and cache fields on list/read responses. Tool calls include `resultType` and may later support `input_required`. Legacy results remain unchanged. |
 | Tool definitions | Tool definitions expose `name`, `description`, `inputSchema`, and a conservative common `outputSchema` matching the current `structuredContent` envelope. | Audit names and schemas against the draft Tools page: JSON Schema 2020-12 default, no sensitive `x-mcp-header`, optional precise per-tool `outputSchema` only where stable. |
 | Notifications | Historical HTTP notification behavior exists for `notifications/initialized`; task mutations emit process-local events for the visualizer. | Streamable HTTP has no core client notifications. `subscriptions/listen` is implemented for session task-list resources and cwd/workspace active-task resources; broader CDC streams should be added as explicit resources before advertising them. |
@@ -55,9 +57,9 @@ The near-term goal is a dual-era HTTP server by the July 28, 2026 final spec dat
 | # | Dependency | Owner | Due Date | Status |
 |---|---|---|---|---|
 | D1 | Final MCP 2026-07-28 schema/types or conformance cases. | MCP WG | 2026-07-28 | pending |
-| D2 | Decide public auth posture: Basic-auth internal only vs OAuth bearer for public demo. | Ferrosa tech lead | 2026-07-19 | pending |
-| D3 | Pick co-marketing demo host/client: Codex, Claude Desktop/Code, or a lightweight reference client. | Product/engineering | 2026-07-19 | pending |
-| D4 | Confirm whether Tasks/App extension support is launch-blocking or follow-on. | Product/engineering | 2026-07-19 | pending |
+| D2 | Decide public auth posture: Basic-auth internal only vs OAuth bearer for public demo. | Ferrosa tech lead | 2026-07-19 | resolved: internal/shared-service Basic auth; public OAuth remains follow-on |
+| D3 | Pick co-marketing demo host/client: Codex, Claude Desktop/Code, or a lightweight reference client. | Product/engineering | 2026-07-19 | resolved for reproducibility: checked-in reference curl runbook plus eval client |
+| D4 | Confirm whether Tasks/App extension support is launch-blocking or follow-on. | Product/engineering | 2026-07-19 | resolved: follow-on; excluded from draft-profile claim |
 
 ## Risk Register
 
@@ -86,14 +88,14 @@ The near-term goal is a dual-era HTTP server by the July 28, 2026 final spec dat
 | 1.4 | Unsupported protocol errors | Add `UnsupportedProtocolVersionError` `-32022` with supported/requested versions. Ensure modern clients can distinguish this from legacy failures. | Unknown versions return the spec-shaped error and supported versions list. | Unit and HTTP tests. | S | done |
 | 1.5 | Modern result envelope | For modern requests, include `resultType: "complete"` on ordinary results and `_meta.io.modelcontextprotocol/serverInfo` where appropriate. Keep legacy response bodies unchanged. | `tools/list`, `tools/call`, and `server/discover` modern and legacy snapshots differ only by intentional modern fields. | Snapshot tests for `tools/list`, representative `tools/call`, and `server/discover`. | M | done |
 | 1.6 | Tool schema audit | Validate all advertised tool names and `inputSchema` objects against the draft Tools page. Prefer `{ "type": "object", "additionalProperties": false }` for no-parameter tools where practical. Do not add `x-mcp-header` to sensitive fields. | Modern `tools/list` contains only spec-valid tool definitions; no custom `x-mcp-header` annotations are advertised. | Snapshot/schema validation test over the full tool catalog. | M | done: common `outputSchema` snapshot added; no custom `x-mcp-header` annotations |
-| 1.7 | Client/eval updates | Add a modern mode to `crates/ferrosa-memory-eval/src/mcp_client.rs` that sends per-request `_meta` plus required HTTP headers. Keep legacy tests. | Eval client can test both eras. | Existing eval tests plus new modern HTTP smoke. | M | todo |
+| 1.7 | Client/eval updates | Add a modern mode to `crates/ferrosa-memory-eval/src/mcp_client.rs` that sends per-request `_meta` plus required HTTP headers. Keep legacy tests. | Eval client can test both eras. | Existing eval tests plus new modern HTTP smoke. | M | done |
 
 **Quality Gates:**
 - [x] `cargo test -p ferrosa-memory-core modern_`
 - [x] `cargo test -p ferrosa-memory-core modern_mcp_`
 - [x] `cargo test -p ferrosa-memory-core get_or_delete_mcp_returns_method_not_allowed`
 - [x] `cargo test -p ferrosa-memory-core tool_definitions_catalog_snapshot`
-- [ ] `cargo test -p ferrosa-memory-eval mcp_client`
+- [x] `cargo test -p ferrosa-memory-eval --lib http_client`
 - [x] Legacy HTTP `tools/list` still works without modern headers
 
 ### Sprint 2: Cacheability, Change Streams, and Auth Posture (Priority: High)
@@ -149,17 +151,18 @@ The near-term goal is a dual-era HTTP server by the July 28, 2026 final spec dat
 
 | # | Task | Description | Success Criteria | Tests | Estimate | Status |
 |---|---|---|---|---|---|---|
-| 4.1 | Conformance harness | Add MCP 2026-07-28 scenario tests for discovery, version errors, header validation, modern tools/list, and a representative tools/call. | CI has a named modern-MCP lane. | `cargo test` lane plus any official conformance suite once available. | M | todo |
-| 4.2 | Compatibility matrix | Document supported clients and transports: legacy stdio, legacy HTTP, modern Streamable HTTP, auth modes, extensions. | Sales/support can answer "does it work with X?" without guessing. | Docs review. | S | todo |
-| 4.3 | Demo script | Build a short demo: stateless request to `hybrid_search`, any-instance routing story, cacheable `tools/list`, and durable memory recall. | Demo can be run locally and recorded. | Manual runbook with expected outputs. | M | todo |
-| 4.4 | Co-marketing messaging | Prepare copy: "Ferrosa Memory is a durable, stateless MCP-native memory layer for agents." Include honest caveats for extension and auth status. | Messaging is accurate against the compatibility matrix. | Product/engineering review. | S | todo |
-| 4.5 | Release notes | Publish internal/external release notes tied to the July 28 final spec. | Notes link spec sources, version support, migration notes, and upgrade steps. | Docs review. | S | todo |
+| 4.1 | Conformance harness | Add MCP 2026-07-28 scenario tests for discovery, version errors, header validation, modern tools/list, and a representative tools/call. | CI has a named modern-MCP lane. | Focused tests plus deterministic discovery/list/call/subscription/progress smoke; official suite after publication. | M | done for draft profile; official suite pending upstream |
+| 4.2 | Compatibility matrix | Document supported clients and transports: legacy stdio, legacy HTTP, modern Streamable HTTP, auth modes, extensions. | Sales/support can answer "does it work with X?" without guessing. | Docs review. | S | done: `docs/mcp-compatibility.md` |
+| 4.3 | Demo script | Build a short demo: stateless request to `hybrid_search`, any-instance routing story, cacheable `tools/list`, and durable memory recall. | Demo can be run locally and recorded. | Manual runbook with expected outputs. | M | done: `docs/mcp-draft-demo.md` |
+| 4.4 | Co-marketing messaging | Prepare copy: "Ferrosa Memory is a durable, stateless MCP-native memory layer for agents." Include honest caveats for extension and auth status. | Messaging is accurate against the compatibility matrix. | Product/engineering review. | S | done for draft-profile claim; product review remains external |
+| 4.5 | Release notes | Publish internal/external release notes tied to the July 28 final spec. | Notes link spec sources, version support, migration notes, and upgrade steps. | Docs review. | S | done for draft profile; final-spec update pending upstream |
 
 **Quality Gates:**
-- [ ] Modern MCP smoke runs green
-- [ ] Legacy clients still have a tested path
-- [ ] Release note claims match conformance evidence
-- [ ] Co-marketing demo has a deterministic runbook
+- [x] Modern MCP draft-profile smoke runs green
+- [x] Legacy clients still have a tested path
+- [x] Draft-profile release note claims match conformance evidence
+- [x] Co-marketing demo has a deterministic runbook
+- [ ] Final schema comparison and official conformance suite pass after upstream publication
 
 ## Co-Marketing Angle
 
