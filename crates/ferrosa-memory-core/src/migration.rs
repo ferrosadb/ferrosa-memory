@@ -472,7 +472,7 @@ pub async fn run_migrations(session: &CqlSession, keyspace: &str) -> Result<usiz
         .filter(|m| applied.contains(&m.version))
         .collect();
     for m in applied_migrations {
-        let satisfied = migration_postcondition_satisfied(session, keyspace, m.version)
+        let satisfied = migration_postcondition_satisfied(session, keyspace, m)
             .await
             .map_err(|e| MigrationError::Setup { source: e })?;
         if !satisfied {
@@ -606,7 +606,7 @@ pub async fn run_migrations(session: &CqlSession, keyspace: &str) -> Result<usiz
                 source: e.into(),
             });
         }
-        let satisfied = migration_postcondition_satisfied(session, keyspace, m.version)
+        let satisfied = migration_postcondition_satisfied(session, keyspace, m)
             .await
             .map_err(|source| MigrationError::Statement {
                 version: m.version,
@@ -1693,12 +1693,44 @@ async fn apply_feedback_outcomes_query_id_uuid_migration(
     Ok(())
 }
 
+/// Extract the table names a migration's own DDL creates, by scanning its
+/// `CREATE TABLE IF NOT EXISTS` statements. Handles both keyspace-qualified
+/// (`agent_memory.foo`) and bare (`foo`, relying on a stripped `USE`) forms —
+/// DDL files use both styles. Statements that aren't `CREATE TABLE` (e.g.
+/// `ALTER TABLE`, `CREATE CUSTOM INDEX`) are not represented here; a migration
+/// whose DDL contains none yields an empty list.
+fn tables_created_by_ddl(ddl: &str, keyspace: &str) -> Vec<String> {
+    const MARKER: &str = "CREATE TABLE IF NOT EXISTS";
+    let prefix = format!("{keyspace}.");
+    let mut tables = Vec::new();
+    for stmt in split_cql(ddl) {
+        let upper = stmt.to_ascii_uppercase();
+        let Some(pos) = upper.find(MARKER) else {
+            continue;
+        };
+        let after = stmt[pos + MARKER.len()..].trim_start();
+        let end = after
+            .find(|c: char| c == '(' || c.is_whitespace())
+            .unwrap_or(after.len());
+        let mut name = after[..end].trim().to_string();
+        if let Some(stripped) = name.strip_prefix(&prefix) {
+            name = stripped.to_string();
+        } else if let Some(idx) = name.find('.') {
+            name = name[idx + 1..].to_string();
+        }
+        if !name.is_empty() {
+            tables.push(name);
+        }
+    }
+    tables
+}
+
 async fn migration_postcondition_satisfied(
     session: &CqlSession,
     keyspace: &str,
-    version: u32,
+    m: &Migration,
 ) -> anyhow::Result<bool> {
-    match version {
+    match m.version {
         42 => table_exists(session, keyspace, "typed_edges").await,
         41 => {
             for table in [
@@ -1739,7 +1771,19 @@ async fn migration_postcondition_satisfied(
             }
             Ok(true)
         }
-        _ => Ok(true),
+        // No hand-written case for this version: fall back to checking every
+        // table this migration's own DDL creates. Covers any CREATE-TABLE-only
+        // migration automatically, present or future, without a maintained
+        // per-version list (see tables_created_by_ddl doc comment for the
+        // ALTER/INDEX-only migrations this does NOT cover).
+        _ => {
+            for table in tables_created_by_ddl(m.ddl, keyspace) {
+                if !table_exists(session, keyspace, &table).await? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
     }
 }
 
@@ -1896,6 +1940,51 @@ pub fn split_cql(ddl: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
+
+    // --- generic postcondition fallback: tables_created_by_ddl ---
+
+    #[test]
+    fn tables_created_by_ddl_handles_keyspace_qualified_names() {
+        let ddl = "CREATE TABLE IF NOT EXISTS agent_memory.session_tasks_by_id (\
+            tenant_id uuid, task_id uuid, PRIMARY KEY (tenant_id, task_id));\n\
+            CREATE TABLE IF NOT EXISTS agent_memory.session_tasks_by_status (\
+            tenant_id uuid, status text, PRIMARY KEY (tenant_id, status));";
+        let tables = tables_created_by_ddl(ddl, "agent_memory");
+        assert_eq!(
+            tables,
+            vec!["session_tasks_by_id", "session_tasks_by_status"]
+        );
+    }
+
+    #[test]
+    fn tables_created_by_ddl_handles_bare_names_relying_on_use() {
+        // Some DDL files omit the keyspace prefix and rely on `USE agent_memory;`
+        // instead (e.g. ddl/046_retrieval_traces.cql) — this is the exact style
+        // that made retrieval_traces invisible to a naive keyspace-qualified-only
+        // scan.
+        let ddl = "USE agent_memory;\n\
+            CREATE TABLE IF NOT EXISTS retrieval_traces (\
+            tenant_id uuid, trace_id uuid, PRIMARY KEY (tenant_id, trace_id));";
+        let tables = tables_created_by_ddl(ddl, "agent_memory");
+        assert_eq!(tables, vec!["retrieval_traces"]);
+    }
+
+    #[test]
+    fn tables_created_by_ddl_ignores_alter_and_index_statements() {
+        let ddl = "ALTER TABLE agent_memory.entity_warmth ADD reputation double;\n\
+            CREATE CUSTOM INDEX idx_foo ON agent_memory.entity_store (entity_name) \
+            USING 'org.apache.cassandra.index.sasi.SASIIndex';";
+        assert!(tables_created_by_ddl(ddl, "agent_memory").is_empty());
+    }
+
+    #[test]
+    fn tables_created_by_ddl_handles_mixed_qualification_in_one_migration() {
+        let ddl = "USE agent_memory;\n\
+            CREATE TABLE IF NOT EXISTS agent_memory.foo (id uuid PRIMARY KEY);\n\
+            CREATE TABLE IF NOT EXISTS bar (id uuid PRIMARY KEY);";
+        let tables = tables_created_by_ddl(ddl, "agent_memory");
+        assert_eq!(tables, vec!["foo", "bar"]);
+    }
 
     // --- t_5beeb5da: runtime-grant verification (silent-data-loss guard) ---
 
