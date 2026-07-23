@@ -88,6 +88,39 @@ fn t01_registry_monotonic_and_above_baseline() {
     );
 }
 
+/// Every versioned DDL checked into a release must be present in the runtime
+/// registry. Otherwise CI can build and ship a file that startup never applies.
+#[test]
+fn t01b_every_versioned_ddl_is_registered() {
+    let ddl_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ddl");
+    let registered: std::collections::BTreeSet<u32> = MIGRATIONS
+        .iter()
+        .map(|migration| migration.version)
+        .collect();
+
+    let mut missing = Vec::new();
+    for entry in std::fs::read_dir(&ddl_dir).expect("ddl directory must be readable in CI") {
+        let path = entry.expect("ddl directory entry").path();
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some((prefix, _)) = file_name.split_once('_') else {
+            continue;
+        };
+        let Ok(version) = prefix.parse::<u32>() else {
+            continue;
+        };
+        if (PRE_VERSIONING_BASELINE < version && version < 100) && !registered.contains(&version) {
+            missing.push(file_name.to_string());
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "versioned DDL files are not registered and therefore cannot be applied at startup: {missing:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // T-02: Migration 31 DDL is additive (ALTER TABLE ADD) and non-destructive
 // ---------------------------------------------------------------------------
@@ -527,7 +560,65 @@ async fn t11_baseline_gap_backfills_missing_typed_edges() {
 }
 
 // ---------------------------------------------------------------------------
-// T-12: Exhaustive grant coverage — every created app table is granted or exempt
+// T-12: Ledger/schema postcondition recovery
+// ---------------------------------------------------------------------------
+
+/// The incident shape: a previous deployment recorded v39 even though one of
+/// its tables never reached the cluster.  A ledger-only runner declares this
+/// healthy forever.  The runner must invalidate that row, replay the
+/// idempotent migration, and restore the missing table without an operator
+/// editing `schema_version` by hand.
+#[tokio::test]
+#[ignore = "requires live test cluster; run with --ignored"]
+async fn t12_recorded_migration_repairs_missing_schema_postcondition() {
+    let _serial = live_migration_test_lock().lock().await;
+    let test = TestClusterConfig::from_env()
+        .expect("FERROSA_TEST_CQL_PORT must be set; start a test cluster first");
+    let cfg = test_cfg(&test);
+    let session = connect_session(&cfg, &cfg.username, &cfg.password)
+        .await
+        .expect("connect_session must succeed against test cluster");
+
+    run_migrations(&session, &cfg.keyspace)
+        .await
+        .expect("initial migration must succeed");
+    assert!(
+        live_version_recorded(&session, &cfg.keyspace, 39).await,
+        "initial migration must record v39"
+    );
+
+    // Intentionally retain the ledger row: this reproduces the false-success
+    // condition from the deploy failure rather than the easy missing-row path.
+    session
+        .query_unpaged(
+            format!(
+                "DROP TABLE IF EXISTS {}.session_task_focus_stack",
+                cfg.keyspace
+            ),
+            (),
+        )
+        .await
+        .expect("drop one v39 table while retaining its schema_version row");
+
+    let applied = run_migrations(&session, &cfg.keyspace)
+        .await
+        .expect("recorded migration with missing table must repair itself");
+    assert!(
+        applied >= 1,
+        "v39 must be reapplied after postcondition drift"
+    );
+    assert!(
+        live_table_exists(&session, &cfg.keyspace, "session_task_focus_stack").await,
+        "v39 postcondition must be restored"
+    );
+    assert!(
+        live_version_recorded(&session, &cfg.keyspace, 39).await,
+        "the repaired migration must be recorded again"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T-13: Exhaustive grant coverage — every created app table is granted or exempt
 // ---------------------------------------------------------------------------
 
 /// Extract `CREATE TABLE [IF NOT EXISTS] [keyspace.]<name>` table names from a
