@@ -50,6 +50,13 @@ fn test_cfg(test: &TestClusterConfig) -> FerrosaCqlConfig {
     }
 }
 
+/// Ferrosa accepts CQL keyspace names up to 48 characters. Keep the per-run
+/// keyspace unique without generating a name that the cluster rejects before
+/// migration 0 can start.
+fn fresh_migration_keyspace() -> String {
+    format!("migration_{}", Uuid::new_v4().simple())
+}
+
 /// Serializes the live migration tests. They share one `agent_memory_test`
 /// keyspace and DROP/CREATE tables + rewrite `schema_version` to simulate
 /// partial-migration recovery, so running concurrently lets one test's schema
@@ -67,6 +74,21 @@ fn live_migration_test_lock() -> &'static tokio::sync::Mutex<()> {
 // ---------------------------------------------------------------------------
 // T-01: Registry invariants — monotonic versions, no gaps, append-only
 // ---------------------------------------------------------------------------
+
+#[test]
+fn fresh_migration_keyspace_is_within_cql_identifier_limit() {
+    let keyspace = fresh_migration_keyspace();
+    assert!(
+        keyspace.len() <= 48,
+        "generated keyspace exceeds Ferrosa's 48-character limit: {keyspace}"
+    );
+    assert!(
+        keyspace
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_'),
+        "generated keyspace contains an invalid CQL identifier character: {keyspace}"
+    );
+}
 
 /// T-01: MIGRATIONS array is monotonically increasing and every version
 /// is strictly greater than the pre-versioning baseline.
@@ -421,7 +443,7 @@ async fn t10_fresh_keyspace_applies_every_registered_migration() {
     )
     .await
     .expect("connect to test cluster for fresh-keyspace migration gate");
-    let keyspace = format!("migration_release_{}", Uuid::new_v4().simple());
+    let keyspace = fresh_migration_keyspace();
 
     let test_result: anyhow::Result<()> = async {
         let applied = run_migrations(&admin, &keyspace)
