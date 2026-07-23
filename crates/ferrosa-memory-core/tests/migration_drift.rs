@@ -14,9 +14,11 @@
 use ferrosa_memory_core::config::FerrosaCqlConfig;
 use ferrosa_memory_core::cql_storage::connect_session;
 use ferrosa_memory_core::migration::{
-    BOOTSTRAP_DDLS, MIGRATIONS, Migration, PRE_VERSIONING_BASELINE, ROLES_DDL, run_migrations,
+    BOOTSTRAP_DDLS, MIGRATIONS, Migration, PRE_VERSIONING_BASELINE, ROLES_DDL, migration_status,
+    run_migrations,
 };
 use ferrosa_memory_core::test_cluster::TestClusterConfig;
+use uuid::Uuid;
 
 fn trajectory_folds_ddl_columns_are_uuid_compatible(ddl: &str) -> bool {
     let ddl_lower = ddl.to_lowercase();
@@ -397,7 +399,94 @@ fn t09_roles_ddl_grants_modify_on_core_write_path_tables() {
 }
 
 // ---------------------------------------------------------------------------
-// T-10/T-11: Live partial-migration recovery (entity_warmth + typed_edges)
+// T-10: Fresh-keyspace release gate — execute and verify the full registry
+// ---------------------------------------------------------------------------
+
+/// Creates a unique empty keyspace and runs the same application-owned runner
+/// used at server startup. This is the merge-blocking release gate: a checked-in
+/// migration is not enough; every registered migration must execute, record
+/// its ledger row, and leave its derived postconditions present on a real CQL
+/// cluster. The unique keyspace keeps this proof independent of the shared
+/// `agent_memory_test` fixture and makes cleanup safe after failure.
+#[tokio::test]
+#[ignore = "requires live test cluster; run with --ignored"]
+async fn t10_fresh_keyspace_applies_every_registered_migration() {
+    let test = TestClusterConfig::from_env()
+        .expect("FERROSA_TEST_CQL_PORT must be set; start a test cluster first");
+    let bootstrap_cfg = test_cfg(&test);
+    let admin = connect_session(
+        &bootstrap_cfg,
+        &bootstrap_cfg.username,
+        &bootstrap_cfg.password,
+    )
+    .await
+    .expect("connect to test cluster for fresh-keyspace migration gate");
+    let keyspace = format!("migration_release_{}", Uuid::new_v4().simple());
+
+    let test_result: anyhow::Result<()> = async {
+        let applied = run_migrations(&admin, &keyspace)
+            .await
+            .map_err(|error| anyhow::anyhow!("fresh migration registry failed: {error}"))?;
+        if applied != MIGRATIONS.len() {
+            anyhow::bail!(
+                "fresh-keyspace migration run applied {applied} migrations; expected {}",
+                MIGRATIONS.len()
+            );
+        }
+
+        let status = migration_status(&admin, &keyspace)
+            .await
+            .map_err(|error| anyhow::anyhow!("fresh schema status query failed: {error}"))?;
+        let expected = MIGRATIONS
+            .last()
+            .expect("migration registry must not be empty")
+            .version;
+        if status.db_version != expected {
+            anyhow::bail!(
+                "schema ledger reached v{}, expected release registry v{expected}",
+                status.db_version
+            );
+        }
+        if !status.pending.is_empty() {
+            anyhow::bail!(
+                "fresh keyspace has recorded versions but missing schema postconditions: {:?}",
+                status.pending
+            );
+        }
+
+        for migration in MIGRATIONS {
+            if !live_version_recorded(&admin, &keyspace, migration.version).await {
+                anyhow::bail!(
+                    "migration {} ({}) has no schema_version ledger row",
+                    migration.version,
+                    migration.description
+                );
+            }
+        }
+
+        // Re-running must be an idempotent no-op after all postconditions are
+        // confirmed, preventing a false pass that only works once.
+        let reapplied = run_migrations(&admin, &keyspace)
+            .await
+            .map_err(|error| anyhow::anyhow!("idempotent migration rerun failed: {error}"))?;
+        if reapplied != 0 {
+            anyhow::bail!("an already-complete fresh keyspace reapplied {reapplied} migrations");
+        }
+        Ok(())
+    }
+    .await;
+
+    let cleanup = admin
+        .query_unpaged(format!("DROP KEYSPACE IF EXISTS {keyspace}"), ())
+        .await;
+    if let Err(error) = cleanup {
+        panic!("fresh-keyspace migration gate cleanup failed for {keyspace}: {error}");
+    }
+    test_result.unwrap_or_else(|error| panic!("fresh-keyspace migration gate failed: {error}"));
+}
+
+// ---------------------------------------------------------------------------
+// T-11/T-12: Live partial-migration recovery (entity_warmth + typed_edges)
 // ---------------------------------------------------------------------------
 
 /// True if `keyspace.table.column` exists in system_schema.

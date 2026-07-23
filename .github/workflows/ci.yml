@@ -731,7 +731,26 @@ jobs:
         # come from the archive; this MCP *bin* is a runtime spawn target, not a
         # cargo test dependency, so it must be built explicitly here.
         run: cargo build -p ferrosa-memory-mcp
-      - name: Run ignored (cluster-gated) Rust tests
+      - name: Require a clean fresh-keyspace migration run
+        # Release gate: creates a unique keyspace and executes the exact
+        # application startup runner through every registered migration. It
+        # asserts every ledger row and derived schema postcondition, then an
+        # idempotent second pass. Keep this explicit rather than relying on the
+        # broad ignored suite, so the guarantee stays visible and merge-blocking.
+        env:
+          FERROSA_TEST_CONTAINERS: "1"
+          FERROSA_TEST_CQL_HOST: "127.0.0.1"
+          FERROSA_TEST_CQL_PORT: "19542"
+          FERROSA_TEST_GRAPH_URL: "http://127.0.0.1:17974"
+          FERROSA_TEST_KEYSPACE: "agent_memory_test"
+          FERROSA_TEST_S3_ENDPOINT: "http://127.0.0.1:19500"
+        run: |
+          cargo nextest run \
+            --archive-file nextest-archive.tar.zst \
+            --workspace-remap . \
+            --run-ignored ignored-only \
+            --filterset 'package(ferrosa-memory-core) and binary(migration_drift) and test(t10_fresh_keyspace_applies_every_registered_migration)'
+      - name: Run remaining ignored (cluster-gated) Rust tests
         env:
           FERROSA_TEST_CONTAINERS: "1"
           # Migration-drift tests run keyspace-recreate cycles against
@@ -753,18 +772,18 @@ jobs:
         # job exercises the full concurrent load against the fixed engine so a
         # regression would surface here rather than being masked by serializing.
         #
-        # 12-factor build-once: run the test binaries compiled in the `build`
-        # job from the downloaded nextest archive — NO workspace recompile here
-        # (this step used to spend ~14 min rebuilding the workspace). `--run-
-        # ignored ignored-only` reproduces the prior `cargo test -- --ignored`
-        # selection (only #[ignore] cluster-gated tests). `--workspace-remap .`
-        # points the archived binaries at this checkout for any path-relative
-        # fixtures.
+        # 12-factor build-once: run the remaining test binaries compiled in
+        # the `build` job from the downloaded nextest archive — NO workspace
+        # recompile here. The dedicated fresh-keyspace migration release gate
+        # above has already run; excluding it avoids duplicate expensive DDL.
+        # `--workspace-remap .` points archived binaries at this checkout for
+        # path-relative fixtures.
         run: |
           cargo nextest run \
             --archive-file nextest-archive.tar.zst \
             --workspace-remap . \
             --run-ignored ignored-only \
+            --filterset 'not (package(ferrosa-memory-core) and binary(migration_drift) and test(t10_fresh_keyspace_applies_every_registered_migration))' \
             --no-fail-fast
       - name: Run system pytest suite against live cluster
         env:
