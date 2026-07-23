@@ -670,11 +670,18 @@ pub async fn migration_status(
         .map(|m| m.version)
         .max()
         .unwrap_or(PRE_VERSIONING_BASELINE);
-    let pending = MIGRATIONS
-        .iter()
-        .filter(|m| !applied.contains(&m.version))
-        .map(|m| m.version)
-        .collect();
+    // A ledger row alone is not a schema-health signal: a partial restore or
+    // historical runner bug can leave the version recorded after its DDL
+    // disappeared. Status therefore reports a migration as pending until both
+    // its ledger row and its derived schema postcondition are present.
+    let mut pending = Vec::new();
+    for migration in MIGRATIONS {
+        if !applied.contains(&migration.version)
+            || !migration_postcondition_satisfied(session, keyspace, migration).await?
+        {
+            pending.push(migration.version);
+        }
+    }
     let last_applied = last_applied_at(session, keyspace).await?;
 
     Ok(MigrationStatus {
@@ -1693,36 +1700,134 @@ async fn apply_feedback_outcomes_query_id_uuid_migration(
     Ok(())
 }
 
-/// Extract the table names a migration's own DDL creates, by scanning its
-/// `CREATE TABLE IF NOT EXISTS` statements. Handles both keyspace-qualified
-/// (`agent_memory.foo`) and bare (`foo`, relying on a stripped `USE`) forms —
-/// DDL files use both styles. Statements that aren't `CREATE TABLE` (e.g.
-/// `ALTER TABLE`, `CREATE CUSTOM INDEX`) are not represented here; a migration
-/// whose DDL contains none yields an empty list.
-fn tables_created_by_ddl(ddl: &str, keyspace: &str) -> Vec<String> {
-    const MARKER: &str = "CREATE TABLE IF NOT EXISTS";
-    let prefix = format!("{keyspace}.");
-    let mut tables = Vec::new();
+/// A schema object that a migration must have created before its ledger row
+/// may be trusted.  This deliberately derives the contract from the immutable
+/// migration DDL so a new migration cannot silently acquire an unverified
+/// postcondition merely because nobody updated a per-version match statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DdlPostcondition {
+    Table(String),
+    Column { table: String, column: String },
+    Index { table: String, name: String },
+}
+
+fn unqualified_identifier(identifier: &str) -> String {
+    identifier
+        .trim_matches('"')
+        .rsplit('.')
+        .next()
+        .unwrap_or(identifier)
+        .trim_matches('"')
+        .to_ascii_lowercase()
+}
+
+/// Extract every observable postcondition induced by the supported additive
+/// DDL forms.  This is intentionally fail-closed: adding a new DDL shape must
+/// also add a parser and a verifier rather than silently returning `true`.
+fn ddl_postconditions(ddl: &str) -> anyhow::Result<Vec<DdlPostcondition>> {
+    let mut required = Vec::new();
     for stmt in split_cql(ddl) {
         let upper = stmt.to_ascii_uppercase();
-        let Some(pos) = upper.find(MARKER) else {
-            continue;
-        };
-        let after = stmt[pos + MARKER.len()..].trim_start();
-        let end = after
-            .find(|c: char| c == '(' || c.is_whitespace())
-            .unwrap_or(after.len());
-        let mut name = after[..end].trim().to_string();
-        if let Some(stripped) = name.strip_prefix(&prefix) {
-            name = stripped.to_string();
-        } else if let Some(idx) = name.find('.') {
-            name = name[idx + 1..].to_string();
-        }
-        if !name.is_empty() {
-            tables.push(name);
+        let words: Vec<&str> = stmt.split_whitespace().collect();
+        if upper.starts_with("CREATE TABLE") {
+            let after = stmt["CREATE TABLE".len()..].trim_start();
+            let after = after
+                .strip_prefix("IF NOT EXISTS")
+                .or_else(|| after.strip_prefix("if not exists"))
+                .unwrap_or(after)
+                .trim_start();
+            let table = after
+                .split(|c: char| c == '(' || c.is_whitespace())
+                .next()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("cannot parse CREATE TABLE postcondition: {stmt}")
+                })?;
+            required.push(DdlPostcondition::Table(unqualified_identifier(table)));
+        } else if upper.starts_with("ALTER TABLE") && upper.contains(" ADD ") {
+            let table = words
+                .get(2)
+                .ok_or_else(|| anyhow::anyhow!("cannot parse ALTER TABLE postcondition: {stmt}"))?;
+            let add = upper.find(" ADD ").ok_or_else(|| {
+                anyhow::anyhow!("cannot parse ALTER TABLE ADD postcondition: {stmt}")
+            })?;
+            let column = stmt[add + " ADD ".len()..]
+                .split_whitespace()
+                .next()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("cannot parse ALTER TABLE ADD column: {stmt}"))?;
+            required.push(DdlPostcondition::Column {
+                table: unqualified_identifier(table),
+                column: unqualified_identifier(column),
+            });
+        } else if upper.starts_with("CREATE INDEX") {
+            let after = stmt["CREATE INDEX".len()..].trim_start();
+            let after = after
+                .strip_prefix("IF NOT EXISTS")
+                .or_else(|| after.strip_prefix("if not exists"))
+                .unwrap_or(after)
+                .trim_start();
+            let name = after
+                .split_whitespace()
+                .next()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("cannot parse CREATE INDEX name: {stmt}"))?;
+            let on = find_on_keyword(&stmt, 0)
+                .ok_or_else(|| anyhow::anyhow!("cannot parse CREATE INDEX target: {stmt}"))?;
+            let table = stmt[on..]
+                .trim_start()
+                .split(|c: char| c == '(' || c.is_whitespace())
+                .next()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("cannot parse CREATE INDEX table: {stmt}"))?;
+            required.push(DdlPostcondition::Index {
+                table: unqualified_identifier(table),
+                name: unqualified_identifier(name),
+            });
+        } else if upper.starts_with("ALTER TABLE") || upper.starts_with("DROP ") {
+            // Rebuild/copy/swap migrations have dedicated semantic probes
+            // below. `ALTER ... WITH extensions` has no portable system-schema
+            // representation in the supported Ferrosa versions, so table
+            // existence remains its observable postcondition.
+        } else if !upper.is_empty() {
+            anyhow::bail!(
+                "unsupported migration DDL statement requires an explicit postcondition: {stmt}"
+            );
         }
     }
-    tables
+    Ok(required)
+}
+
+async fn index_exists(
+    session: &CqlSession,
+    keyspace: &str,
+    table: &str,
+    index: &str,
+) -> anyhow::Result<bool> {
+    #[allow(deprecated)]
+    let result = session
+        .query_unpaged(
+            "SELECT keyspace_name, table_name, index_name FROM system_schema.indexes",
+            (),
+        )
+        .await?;
+    let col_map = build_col_map(result.col_specs());
+    for row in result.rows_or_empty() {
+        let (Ok(ks), Ok(actual_table), Ok(actual_index)) = (
+            cql_get::<String>(&row, &col_map, "keyspace_name"),
+            cql_get::<String>(&row, &col_map, "table_name"),
+            cql_get::<String>(&row, &col_map, "index_name"),
+        ) else {
+            continue;
+        };
+        if ks.eq_ignore_ascii_case(keyspace)
+            && actual_table.eq_ignore_ascii_case(table)
+            && actual_index.eq_ignore_ascii_case(index)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn migration_postcondition_satisfied(
@@ -1730,61 +1835,31 @@ async fn migration_postcondition_satisfied(
     keyspace: &str,
     m: &Migration,
 ) -> anyhow::Result<bool> {
-    match m.version {
-        42 => table_exists(session, keyspace, "typed_edges").await,
-        41 => {
-            for table in [
-                "memory_remotes",
-                "remote_policy_facts",
-                "teaching_packets",
-                "teaching_items",
-                "remote_stubs",
-                "memory_provenance",
-                "memory_conflicts",
-                "memory_feedback",
-                "import_batches",
-            ] {
-                if !table_exists(session, keyspace, table).await? {
-                    return Ok(false);
-                }
+    // Data-preserving table-recreation migrations need a stronger probe than
+    // static DDL can express. All other schema objects are derived generically.
+    if m.version == 36
+        && !feedback_outcomes_uuid_write_probe(session, keyspace, "feedback_outcomes").await?
+    {
+        return Ok(false);
+    }
+
+    for condition in ddl_postconditions(m.ddl)? {
+        let satisfied = match condition {
+            DdlPostcondition::Table(table) => table_exists(session, keyspace, &table).await?,
+            DdlPostcondition::Column { table, column } => {
+                column_type(session, keyspace, &table, &column)
+                    .await?
+                    .is_some()
             }
-            Ok(true)
-        }
-        38 => table_exists(session, keyspace, "retraction").await,
-        37 => table_exists(session, keyspace, "forget_journal").await,
-        // 25 backfills `entity_warmth.reputation`; the version-25 special case
-        // in `run_migrations` also (re)creates the table if a ≤19 baseline
-        // never did. Verified by the column's presence.
-        25 => column_type(session, keyspace, "entity_warmth", "reputation")
-            .await
-            .map(|t| t.is_some()),
-        36 => feedback_outcomes_uuid_write_probe(session, keyspace, "feedback_outcomes").await,
-        35 => {
-            for table in [
-                "document_chunks",
-                "document_terms",
-                "document_phonetic_terms",
-            ] {
-                if !table_exists(session, keyspace, table).await? {
-                    return Ok(false);
-                }
+            DdlPostcondition::Index { table, name } => {
+                index_exists(session, keyspace, &table, &name).await?
             }
-            Ok(true)
-        }
-        // No hand-written case for this version: fall back to checking every
-        // table this migration's own DDL creates. Covers any CREATE-TABLE-only
-        // migration automatically, present or future, without a maintained
-        // per-version list (see tables_created_by_ddl doc comment for the
-        // ALTER/INDEX-only migrations this does NOT cover).
-        _ => {
-            for table in tables_created_by_ddl(m.ddl, keyspace) {
-                if !table_exists(session, keyspace, &table).await? {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
+        };
+        if !satisfied {
+            return Ok(false);
         }
     }
+    Ok(true)
 }
 
 pub async fn ensure_schema_version_table(
@@ -1941,49 +2016,63 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
 
-    // --- generic postcondition fallback: tables_created_by_ddl ---
+    // --- generic migration postconditions derived from immutable DDL ---
 
     #[test]
-    fn tables_created_by_ddl_handles_keyspace_qualified_names() {
-        let ddl = "CREATE TABLE IF NOT EXISTS agent_memory.session_tasks_by_id (\
-            tenant_id uuid, task_id uuid, PRIMARY KEY (tenant_id, task_id));\n\
-            CREATE TABLE IF NOT EXISTS agent_memory.session_tasks_by_status (\
-            tenant_id uuid, status text, PRIMARY KEY (tenant_id, status));";
-        let tables = tables_created_by_ddl(ddl, "agent_memory");
+    fn ddl_postconditions_cover_tables_columns_and_indexes() {
+        let ddl = "USE agent_memory;\n\
+            CREATE TABLE IF NOT EXISTS agent_memory.foo (id uuid PRIMARY KEY);\n\
+            ALTER TABLE foo ADD summary text;\n\
+            CREATE INDEX IF NOT EXISTS foo_summary_idx ON foo (summary);";
         assert_eq!(
-            tables,
-            vec!["session_tasks_by_id", "session_tasks_by_status"]
+            ddl_postconditions(ddl).unwrap(),
+            vec![
+                DdlPostcondition::Table("foo".into()),
+                DdlPostcondition::Column {
+                    table: "foo".into(),
+                    column: "summary".into(),
+                },
+                DdlPostcondition::Index {
+                    table: "foo".into(),
+                    name: "foo_summary_idx".into(),
+                },
+            ]
         );
     }
 
     #[test]
-    fn tables_created_by_ddl_handles_bare_names_relying_on_use() {
-        // Some DDL files omit the keyspace prefix and rely on `USE agent_memory;`
-        // instead (e.g. ddl/046_retrieval_traces.cql) — this is the exact style
-        // that made retrieval_traces invisible to a naive keyspace-qualified-only
-        // scan.
+    fn ddl_postconditions_handle_bare_names_relying_on_use() {
         let ddl = "USE agent_memory;\n\
             CREATE TABLE IF NOT EXISTS retrieval_traces (\
             tenant_id uuid, trace_id uuid, PRIMARY KEY (tenant_id, trace_id));";
-        let tables = tables_created_by_ddl(ddl, "agent_memory");
-        assert_eq!(tables, vec!["retrieval_traces"]);
+        assert_eq!(
+            ddl_postconditions(ddl).unwrap(),
+            vec![DdlPostcondition::Table("retrieval_traces".into())]
+        );
     }
 
     #[test]
-    fn tables_created_by_ddl_ignores_alter_and_index_statements() {
-        let ddl = "ALTER TABLE agent_memory.entity_warmth ADD reputation double;\n\
-            CREATE CUSTOM INDEX idx_foo ON agent_memory.entity_store (entity_name) \
-            USING 'org.apache.cassandra.index.sasi.SASIIndex';";
-        assert!(tables_created_by_ddl(ddl, "agent_memory").is_empty());
+    fn ddl_postconditions_reject_unverifiable_ddl() {
+        let error =
+            ddl_postconditions("CREATE CUSTOM INDEX idx_foo ON entity_store (entity_name);")
+                .expect_err("unsupported DDL must not silently have no postcondition");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported migration DDL statement")
+        );
     }
 
     #[test]
-    fn tables_created_by_ddl_handles_mixed_qualification_in_one_migration() {
-        let ddl = "USE agent_memory;\n\
-            CREATE TABLE IF NOT EXISTS agent_memory.foo (id uuid PRIMARY KEY);\n\
-            CREATE TABLE IF NOT EXISTS bar (id uuid PRIMARY KEY);";
-        let tables = tables_created_by_ddl(ddl, "agent_memory");
-        assert_eq!(tables, vec!["foo", "bar"]);
+    fn every_registered_migration_has_derivable_or_explicit_postconditions() {
+        for migration in MIGRATIONS {
+            assert!(
+                ddl_postconditions(migration.ddl).is_ok(),
+                "migration {} ({}) has DDL that lacks a verified postcondition",
+                migration.version,
+                migration.description
+            );
+        }
     }
 
     // --- t_5beeb5da: runtime-grant verification (silent-data-loss guard) ---
