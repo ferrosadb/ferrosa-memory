@@ -10,6 +10,7 @@
 #   NOTICE
 #   README.md
 #   config/ferrosa-memory.example.toml   (if present)
+#   examples/<template>                  (HTTP/auth templates for binary installs)
 #   launchd/com.ferrosa-memory.mcp.plist (if present)
 #   systemd/ferrosa-memory.service       (if present)
 #   skills/<skill>/SKILL.md              (portable agent skills, if present)
@@ -60,6 +61,16 @@ for entry in \
     echo "WARN: $entry not found, skipping" >&2
   fi
 done
+
+# Binary installs must retain the published HTTP/auth templates. Requiring this
+# directory makes an incomplete release fail during staging rather than leaving
+# quick-start users to discover the missing documentation after installation.
+if [[ ! -d examples ]]; then
+  echo "ERROR: examples/ not found; cannot stage binary-install templates" >&2
+  exit 1
+fi
+mkdir -p "${STAGE}/examples"
+cp -R examples/. "${STAGE}/examples/"
 
 # Bundle the portable agent skills (a directory tree) so the installer can place
 # them in the user's agent skill directory.
