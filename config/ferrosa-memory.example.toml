@@ -21,9 +21,9 @@
 #     --auth-file ~/.ferrosa/config/http-auth.toml
 # This preserves existing data, updates the auth principal mapping, and removes
 # server.tenant_id because HTTP derives tenant identity from authentication.
-# Source-checkout examples are separate: http-auth.toml matches this template's
-# tenant, while http-auth-multi-tenant.toml requires data to be seeded or
-# migrated for each principal.
+# Source-checkout examples are separate: http-auth-single-tenant.toml matches
+# this template's tenant, while http-auth.toml and http-auth-multi-tenant.toml
+# require data to be seeded or migrated for each principal.
 
 [server]
 transport = "stdio"          # "stdio" for Claude Code/Desktop, "http" for remote
