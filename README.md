@@ -242,14 +242,15 @@ For a binary install, do not replace the generated
 provisions that file and the installed config with one matching per-install
 tenant. The HTTP-auth comments in
 `~/.ferrosa/config/ferrosa-memory.toml` contain the exact reconciliation
-command to run after changing transport or auth settings.
+command to run after changing transport or auth settings. The published
+templates are available without a source checkout at
+`~/.ferrosa/share/ferrosa-memory/examples/`.
 
 For a shared deployment with separate tenant data, start from
 [`examples/http-auth.toml`](examples/http-auth.toml) or
 [`examples/http-auth-multi-tenant.toml`](examples/http-auth-multi-tenant.toml).
 Seed or migrate data into each listed tenant before clients connect; principal
 credentials select that tenant and cannot see the local single-user tenant.
-
 Shared HTTP startup is fail-closed. The binary refuses to bind the listener unless all of the following are true:
 
 - `server.require_tls = true`
