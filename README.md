@@ -9,6 +9,11 @@ It runs as an [MCP](https://modelcontextprotocol.io/) server backed by Ferrosa D
 Agents call normal MCP tools; Ferrosa Memory handles storage, retrieval,
 consolidation, and governance behind those tools.
 
+## Community and support
+
+Join the [Ferrosa Discord](https://discord.gg/BTpKMp9HRM) to discuss deployments,
+ask questions, and report issues with the community and maintainers.
+
 ## Why it exists
 
 Most agent workflows still behave like disposable chat windows. When the process
