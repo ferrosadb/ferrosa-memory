@@ -65,6 +65,14 @@ def validate_compose(compose: dict[str, Any]) -> list[str]:
             errors.append(f"{node} must expose CQL 9042 on host port {cql_port}")
         if not exposes_port(service.get("ports"), web_port, "9090"):
             errors.append(f"{node} must expose web 9090 on host port {web_port}")
+
+    # The CI graph probe runs from the host through node1's published Graph
+    # HTTP port. Ferrosa deliberately defaults this listener to loopback, so
+    # the Docker topology must opt in explicitly.
+    node1 = services.get("node1")
+    node1_environment = node1.get("environment") if isinstance(node1, dict) else None
+    if not isinstance(node1_environment, dict) or node1_environment.get("FERROSA_GRAPH_BIND") != "0.0.0.0:7474":
+        errors.append("node1 must bind Graph HTTP on 0.0.0.0:7474 for the published CI probe")
     return errors
 
 

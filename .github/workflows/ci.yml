@@ -429,6 +429,7 @@ jobs:
                 FERROSA_INTERNODE_BROADCAST: "node1:7000"
                 FERROSA_CQL_BIND: "0.0.0.0:9042"
                 FERROSA_WEB_BIND: "0.0.0.0:9090"
+                FERROSA_GRAPH_BIND: "0.0.0.0:7474"
                 FERROSA_GRAPH_ENABLED: "true"
                 FERROSA_CLUSTER_NAME: "ferrosa-memory-ci"
                 FERROSA_DATA_DIR: "/var/lib/ferrosa"
