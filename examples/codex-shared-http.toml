@@ -2,8 +2,8 @@
 # Replace the host, credentials, and port for your deployment.
 # The endpoint must include /mcp and use credentials that exist in
 # examples/http-auth.toml (or your mounted auth file).
-# The single-user example's principal is ferrosa_user / ferrosa_user.
-# The separate http-auth-multi-tenant.toml example uses team_alpha/team_beta;
+# The shared example's principal is ferrosa_user / ferrosa_user. Use
+# http-auth-single-tenant.toml only when converting a local source checkout;
 # replace this URL with the principal for the tenant whose data you need.
 
 [mcp_servers.ferrosa-memory]

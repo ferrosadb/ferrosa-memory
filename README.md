@@ -224,7 +224,7 @@ cargo run --bin ferrosa-memory-mcp
 
 ```sh
 cp examples/ferrosa-memory-http.toml ./ferrosa-memory-http.toml
-cp examples/http-auth.toml ./http-auth.toml
+cp examples/http-auth-single-tenant.toml ./http-auth.toml
 # Update TLS paths, contact points, graph URL, and the single auth principal.
 # This example maps ferrosa_user to the default stdio tenant, preserving data
 # already written with config/ferrosa-memory.example.toml.
@@ -245,6 +245,7 @@ tenant. The HTTP-auth comments in
 command to run after changing transport or auth settings.
 
 For a shared deployment with separate tenant data, start from
+[`examples/http-auth.toml`](examples/http-auth.toml) or
 [`examples/http-auth-multi-tenant.toml`](examples/http-auth-multi-tenant.toml).
 Seed or migrate data into each listed tenant before clients connect; principal
 credentials select that tenant and cannot see the local single-user tenant.
@@ -446,8 +447,9 @@ Full-corpus BRIGHT-Pro currently contains hundreds of thousands of support docum
 For shared deployments, use:
 
 - [`examples/ferrosa-memory-http.toml`](examples/ferrosa-memory-http.toml) for the HTTP server
-- [`examples/http-auth.toml`](examples/http-auth.toml) for a single principal aligned with the source default tenant
-- [`examples/http-auth-multi-tenant.toml`](examples/http-auth-multi-tenant.toml) for separate tenant principals after each tenant is seeded or migrated
+- [`examples/http-auth.toml`](examples/http-auth.toml) for the shared multi-tenant principal mapping
+- [`examples/http-auth-single-tenant.toml`](examples/http-auth-single-tenant.toml) to preserve source-checkout data when changing one local tenant from stdio to HTTP
+- [`examples/http-auth-multi-tenant.toml`](examples/http-auth-multi-tenant.toml) for an alternate shared tenant mapping after each tenant is seeded or migrated
 
 Shared HTTP mode requires:
 
