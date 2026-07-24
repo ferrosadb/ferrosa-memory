@@ -30,7 +30,8 @@ Options:
       Do not install/restart the native service. On Linux (no auto-install
       path here) start the server yourself, then re-run with hooks.
   --skip-forge
-      Do not fetch/build/install the Forge `frg` CLI.
+      Do not fetch/build/install the required Forge `frg` CLI. Use only in
+      controlled environments where Forge is installed and validated separately.
   --forge-repo URL
       Forge git repository. Default: https://github.com/ferrosadb/forge.git.
   --forge-dir PATH
@@ -207,15 +208,17 @@ else
     log "config not found at $config_path; tenant reconciliation deferred"
 fi
 
-# Install the Forge CLI (frg) for task/defer workflows, unless skipped.
+# Forge is part of the memory profile: its research and ingestion tools are
+# used by user-facing agent workflows. --skip-forge is only for controlled
+# environments that provision it separately.
 if [[ "$skip_forge" == false ]]; then
-    log "installing Forge CLI for task/defer workflows"
+    log "installing and validating Forge CLI for research and ingestion workflows"
     scripts/install-forge.sh --repo "$forge_repo" --dir "$forge_dir" --bin-dir "$forge_bin_dir"
     if [[ ":$PATH:" != *":$forge_bin_dir:"* ]]; then
         log "add $forge_bin_dir to PATH to use frg from new shells"
     fi
 else
-    log "skipping Forge CLI install"
+    log "skipping required Forge CLI install by explicit request"
 fi
 
 # Track whether THIS run actually installed/started a native service. The

@@ -1372,6 +1372,8 @@ struct PreparedStatements {
     entity_put: PreparedStatement,
     entity_count: PreparedStatement,
     entity_count_all: PreparedStatement,
+    entity_type_state_count_session: PreparedStatement,
+    entity_type_state_count_all: PreparedStatement,
     entity_list_session: PreparedStatement,
     entity_list_all: PreparedStatement,
     entity_update_state: PreparedStatement,
@@ -1681,6 +1683,18 @@ impl CqlStorage {
                 ))
                 .await?,
             entity_count_all: session.prepare(entity_count_all_query(ks)).await?,
+            entity_type_state_count_session: session
+                .prepare(format!(
+                    "SELECT entity_type, state FROM {ks}.entity_store \
+                     WHERE tenant_id = ? AND session_id = ?"
+                ))
+                .await?,
+            entity_type_state_count_all: session
+                .prepare(format!(
+                    "SELECT entity_type, state FROM {ks}.entity_store \
+                     WHERE tenant_id = ? ALLOW FILTERING"
+                ))
+                .await?,
             entity_list_session: session
                 .prepare(format!(
                     "SELECT entity_id, session_id, entity_name, entity_type, source_fold_id, \
@@ -2229,6 +2243,24 @@ impl CqlStorage {
             }
         }
         Ok(count)
+    }
+
+    async fn count_entity_type_state_rows_from_paged_iter(
+        &self,
+        stmt: PreparedStatement,
+        values: impl scylla::serialize::row::SerializeRow,
+        counts: &mut std::collections::BTreeMap<(String, String), usize>,
+    ) -> anyhow::Result<()> {
+        let mut iter = self.session.execute_iter(stmt, values).await?;
+        let col_map = build_col_map(iter.get_column_specs());
+        while let Some(row) = iter.next().await {
+            let row = row?;
+            let entity_type = cql_get::<String>(&row, &col_map, "entity_type").unwrap_or_default();
+            let state = cql_get::<String>(&row, &col_map, "state")
+                .unwrap_or_else(|_| MemoryState::default().to_string());
+            *counts.entry((entity_type, state)).or_insert(0) += 1;
+        }
+        Ok(())
     }
 
     async fn collect_legacy_edges_from_paged_iter(
@@ -4524,20 +4556,28 @@ impl Storage for CqlStorage {
     async fn entity_counts_by_type_and_state(
         &self,
         ctx: &TenantContext,
-        session_id: Uuid,
+        query: EntityListQuery,
     ) -> anyhow::Result<Vec<EntityTypeStateCount>> {
-        let query = format!(
-            "SELECT entity_type, state FROM {}.entity_store WHERE tenant_id = ? AND session_id = ?",
-            self.keyspace
-        );
-        let (col_map, rows) = query_paged_rows!(self.session, query, (ctx.tenant_id, session_id))?;
         let mut counts: std::collections::BTreeMap<(String, String), usize> =
             std::collections::BTreeMap::new();
-        for row in rows {
-            let entity_type = cql_get::<String>(&row, &col_map, "entity_type").unwrap_or_default();
-            let state = cql_get::<String>(&row, &col_map, "state")
-                .unwrap_or_else(|_| MemoryState::default().to_string());
-            *counts.entry((entity_type, state)).or_insert(0) += 1;
+        if let Some(sessions) =
+            crate::storage::entity_list_sessions(ctx.tenant_id, query.session_id, query.scope)
+        {
+            for session_id in sessions {
+                self.count_entity_type_state_rows_from_paged_iter(
+                    self.stmts.entity_type_state_count_session.clone(),
+                    (ctx.tenant_id, session_id),
+                    &mut counts,
+                )
+                .await?;
+            }
+        } else {
+            self.count_entity_type_state_rows_from_paged_iter(
+                self.stmts.entity_type_state_count_all.clone(),
+                (ctx.tenant_id,),
+                &mut counts,
+            )
+            .await?;
         }
         Ok(counts
             .into_iter()
@@ -8785,6 +8825,25 @@ mod cql_storage_tests {
             "entity_count_matching must not materialize all count rows before counting"
         );
 
+        let type_count_start = source
+            .find("async fn entity_counts_by_type_and_state")
+            .expect("entity_counts_by_type_and_state must exist");
+        let type_count_tail = &source[type_count_start..];
+        let type_count_end = type_count_tail.find("async fn entity_list_all").unwrap();
+        let type_count_source = &type_count_tail[..type_count_end];
+        assert!(
+            type_count_source.contains("count_entity_type_state_rows_from_paged_iter"),
+            "type counts must aggregate through the streaming helper"
+        );
+        assert!(
+            type_count_source.contains("entity_type_state_count_all"),
+            "default type counts must use the tenant-wide CQL projection"
+        );
+        assert!(
+            !type_count_source.contains("query_paged_rows!"),
+            "type counts must not materialize tenant-wide rows before aggregation"
+        );
+
         let helper_start = source
             .find("async fn count_entity_matches_from_paged_iter")
             .expect("count_entity_matches_from_paged_iter must exist");
@@ -8800,6 +8859,23 @@ mod cql_storage_tests {
         assert!(
             !helper_source.contains("Vec<"),
             "count_entity_matches_from_paged_iter must not allocate a result Vec"
+        );
+
+        let type_count_helper_start = source
+            .find("async fn count_entity_type_state_rows_from_paged_iter")
+            .expect("type-count streaming helper must exist");
+        let type_count_helper_tail = &source[type_count_helper_start..];
+        let type_count_helper_end = type_count_helper_tail
+            .find("async fn collect_legacy_edges_from_paged_iter")
+            .unwrap();
+        let type_count_helper_source = &type_count_helper_tail[..type_count_helper_end];
+        assert!(
+            type_count_helper_source.contains("execute_iter"),
+            "type-count streaming helper must consume driver pages"
+        );
+        assert!(
+            !type_count_helper_source.contains("Vec<"),
+            "type-count streaming helper must not allocate entity rows"
         );
 
         let derived_start = source

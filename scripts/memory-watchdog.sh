@@ -22,11 +22,11 @@ EVENT_LOG=/tmp/ferrosa-memory-watchdog.log
 STATE_DIR=/tmp/ferrosa-memory-watchdog
 mkdir -p "$STATE_DIR"
 
+# NOTE: ferrosa nodes now run natively (com.ferrosa.node* launchd jobs);
+# only minio remains in podman. podman-compose names use underscores —
+# the old dash-style names here silently matched nothing.
 CONTAINERS=(
-    ferrosa-memory-node1-1
-    ferrosa-memory-node2-1
-    ferrosa-memory-node3-1
-    ferrosa-memory-minio-1
+    ferrosa-memory_minio_1
 )
 
 TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")

@@ -2852,7 +2852,7 @@
           "type": "object"
         },
         "include_cross_session": {
-          "description": "Compatibility flag. true is equivalent to scope=all; false is equivalent to scope=session when scope is omitted.",
+          "description": "Compatibility flag. true is equivalent to scope=all; false is equivalent to scope=session when scope is omitted and requires session_id.",
           "type": "boolean"
         },
         "limit": {
@@ -2862,7 +2862,7 @@
           "type": "integer"
         },
         "scope": {
-          "description": "session=current session; global=tenant global plus legacy nil session; both=session+global; all=tenant-wide scan. Default all.",
+          "description": "session=the supplied session_id; global=tenant global plus legacy nil session; both=session+global; all=tenant-wide scan. Default all; session_id alone never changes scope.",
           "enum": [
             "session",
             "global",
@@ -2872,6 +2872,7 @@
           "type": "string"
         },
         "session_id": {
+          "description": "Session UUID to target only with scope=session. Supplying it alone does not change the tenant-wide default.",
           "type": "string"
         }
       },
@@ -3282,6 +3283,7 @@
           "type": "string"
         },
         "session_id": {
+          "description": "Caller session UUID retained as ingest provenance. It does not move an existing entity or override its type-defined storage scope.",
           "type": "string"
         },
         "source_fold_id": {
@@ -4627,11 +4629,19 @@
   },
   {
     "name": "stats",
-    "description": "Returns memory system statistics. By default, entity/node counts and edge counts are tenant-wide; pass session_id to scope both counts to one session.\n\nCALL WHEN: For health monitoring, debugging, or when the user asks about memory usage.\nCost: ~5ms (runs count queries).",
+    "description": "Returns memory system statistics. Entity/node and edge counts are tenant-wide by default. Use scope=session with session_id to scope both counts to one session.\n\nCALL WHEN: For health monitoring, debugging, or when the user asks about memory usage.\nCost: ~5ms (runs count queries).",
     "inputSchema": {
       "properties": {
+        "scope": {
+          "description": "tenant is the default; session scopes all counts to the supplied session_id.",
+          "enum": [
+            "tenant",
+            "session"
+          ],
+          "type": "string"
+        },
         "session_id": {
-          "description": "Optional session UUID. Omit for tenant-wide stats; pass to scope entity/node and edge counts to this session.",
+          "description": "Session UUID required when scope=session. Supplying it alone does not change the tenant-wide default.",
           "type": "string"
         }
       },
@@ -4961,10 +4971,19 @@
   },
   {
     "name": "type_counts",
-    "description": "Return a per-session entity histogram broken down by entity_type, by state, and by the joint (type,state) buckets.\n\nCALL WHEN: You need status/diagnostic counts like 'how many bugs are active in this session?' without coupling the client to entity_store columns.\nCost: ~5-10ms.",
+    "description": "Return an entity histogram broken down by entity_type, by state, and by the joint (type,state) buckets. Counts are tenant-wide by default. Use scope=session with session_id to scope the histogram to one session.\n\nCALL WHEN: You need status/diagnostic counts like 'how many bugs are active in this session?' without coupling the client to entity_store columns.\nCost: ~5-10ms.",
     "inputSchema": {
       "properties": {
+        "scope": {
+          "description": "tenant is the default; session scopes the histogram to the supplied session_id.",
+          "enum": [
+            "tenant",
+            "session"
+          ],
+          "type": "string"
+        },
         "session_id": {
+          "description": "Session UUID required when scope=session. Supplying it alone does not change the tenant-wide default.",
           "type": "string"
         }
       },

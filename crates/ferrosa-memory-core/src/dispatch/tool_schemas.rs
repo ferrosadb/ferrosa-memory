@@ -820,7 +820,7 @@ fn entity_tools(entity_type_enum: &Value) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string" },
+                    "session_id": { "type": "string", "description": "Session UUID to target only with scope=session. Supplying it alone does not change the tenant-wide default." },
                     "entity_type": { "type": "string", "description": "Optional entity_type filter, e.g. task" },
                     "filters": {
                         "type": "object",
@@ -829,11 +829,11 @@ fn entity_tools(entity_type_enum: &Value) -> Vec<ToolDef> {
                     "scope": {
                         "type": "string",
                         "enum": ["session", "global", "both", "all"],
-                        "description": "session=current session; global=tenant global plus legacy nil session; both=session+global; all=tenant-wide scan. Default all."
+                        "description": "session=the supplied session_id; global=tenant global plus legacy nil session; both=session+global; all=tenant-wide scan. Default all; session_id alone never changes scope."
                     },
                     "include_cross_session": {
                         "type": "boolean",
-                        "description": "Compatibility flag. true is equivalent to scope=all; false is equivalent to scope=session when scope is omitted."
+                        "description": "Compatibility flag. true is equivalent to scope=all; false is equivalent to scope=session when scope is omitted and requires session_id."
                     },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Max results to return (default 50)" }
                 },
@@ -977,7 +977,7 @@ fn cognitive_memory_tools(entity_type_enum: &Value) -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string" },
+                    "session_id": { "type": "string", "description": "Caller session UUID retained as ingest provenance. It does not move an existing entity or override its type-defined storage scope." },
                     "content": { "type": "string", "maxLength": 8192, "description": "The content to ingest" },
                     "entity_type": { "type": "string", "enum": entity_type_enum },
                     "entity_name": { "type": "string", "maxLength": 256, "description": "Clean entity name (e.g. 'Ben Kearns', 'Ferrosa'). If omitted, extracted automatically from content via LLM or heuristic." },
@@ -1486,11 +1486,12 @@ fn stats_tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "get_stats".into(),
-            description: "Returns memory system statistics. By default, entity/node counts and edge counts are tenant-wide; pass session_id to scope both counts to one session.\n\nCALL WHEN: For health monitoring, debugging, or when the user asks about memory usage.\nCost: ~5ms (runs count queries).".into(),
+            description: "Returns memory system statistics. Entity/node and edge counts are tenant-wide by default. Use scope=session with session_id to scope both counts to one session.\n\nCALL WHEN: For health monitoring, debugging, or when the user asks about memory usage.\nCost: ~5ms (runs count queries).".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "description": "Optional session UUID. Omit for tenant-wide stats; pass to scope entity/node and edge counts to this session." }
+                    "session_id": { "type": "string", "description": "Session UUID required when scope=session. Supplying it alone does not change the tenant-wide default." },
+                    "scope": { "type": "string", "enum": ["tenant", "session"], "description": "tenant is the default; session scopes all counts to the supplied session_id." }
                 },
                 "required": []
             }),
@@ -1585,11 +1586,12 @@ fn stats_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "count_entities_by_type".into(),
-            description: "Return a per-session entity histogram broken down by entity_type, by state, and by the joint (type,state) buckets.\n\nCALL WHEN: You need status/diagnostic counts like 'how many bugs are active in this session?' without coupling the client to entity_store columns.\nCost: ~5-10ms.".into(),
+            description: "Return an entity histogram broken down by entity_type, by state, and by the joint (type,state) buckets. Counts are tenant-wide by default. Use scope=session with session_id to scope the histogram to one session.\n\nCALL WHEN: You need status/diagnostic counts like 'how many bugs are active in this session?' without coupling the client to entity_store columns.\nCost: ~5-10ms.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string" }
+                    "session_id": { "type": "string", "description": "Session UUID required when scope=session. Supplying it alone does not change the tenant-wide default." },
+                    "scope": { "type": "string", "enum": ["tenant", "session"], "description": "tenant is the default; session scopes the histogram to the supplied session_id." }
                 },
                 "required": []
             }),

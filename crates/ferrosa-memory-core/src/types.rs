@@ -483,8 +483,10 @@ pub struct EntityEntry {
     /// Session vs global storage partition.
     #[serde(default)]
     pub scope: EntityScope,
-    /// For global-scope entities, the session that originally ingested them
-    /// (audit + session-affinity re-rank signal).
+    /// The session that most recently ingested or refreshed this entity.
+    /// Global entities need this because their physical `session_id` is a
+    /// tenant-global sentinel; session-scoped entities retain their original
+    /// provenance in `session_id` and may record a later refresh here.
     #[serde(default)]
     pub ingested_by_session: Option<Uuid>,
 }

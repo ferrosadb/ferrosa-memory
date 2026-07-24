@@ -613,11 +613,14 @@ pub trait Storage: Send + Sync {
         }
     }
 
-    /// Return a flat histogram over entity_type and state for one session.
+    /// Return a flat histogram over entity type and state in the query scope.
+    ///
+    /// Implementations must aggregate while scanning and avoid materializing
+    /// tenant-wide entity rows solely to compute the histogram.
     fn entity_counts_by_type_and_state(
         &self,
         ctx: &TenantContext,
-        session_id: Uuid,
+        query: EntityListQuery,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<EntityTypeStateCount>>> + Send;
 
     // --- Document chunk retrieval plane ---
@@ -3115,15 +3118,20 @@ pub mod mock {
         async fn entity_counts_by_type_and_state(
             &self,
             ctx: &TenantContext,
-            session_id: Uuid,
+            query: EntityListQuery,
         ) -> anyhow::Result<Vec<EntityTypeStateCount>> {
             let entities = self.entities.lock().await;
             let mut counts: std::collections::BTreeMap<(String, String), usize> =
                 std::collections::BTreeMap::new();
-            for entity in entities
-                .iter()
-                .filter(|e| e.tenant_id == ctx.tenant_id && e.session_id == session_id)
-            {
+            let scoped_sessions =
+                entity_list_sessions(ctx.tenant_id, query.session_id, query.scope);
+            for entity in entities.iter().filter(|entity| {
+                entity.tenant_id == ctx.tenant_id
+                    && match &scoped_sessions {
+                        Some(sessions) => sessions.contains(&entity.session_id),
+                        None => true,
+                    }
+            }) {
                 *counts
                     .entry((entity.entity_type.clone(), entity.state.to_string()))
                     .or_insert(0) += 1;

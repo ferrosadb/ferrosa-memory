@@ -31,8 +31,8 @@ if ! "$PODMAN" machine list --format '{{.Running}}' | grep -q true; then
     "$PODMAN" machine start
 fi
 
-echo "$(date): podman ready after ${WAITED}s, starting stack"
+echo "$(date): podman ready after ${WAITED}s, starting minio only (ferrosa nodes run natively via com.ferrosa.node* launchd jobs)"
 cd "$REPO_ROOT"
-"$PODMAN" compose up -d
+"$PODMAN" compose up -d minio minio-init
 
-echo "$(date): podman compose up -d exited with $?"
+echo "$(date): podman compose up -d minio minio-init exited with $?"

@@ -14,7 +14,7 @@ repos:
     rev: v2.4.1
     hooks:
       - id: codespell
-        args: ['--skip=Cargo.lock,target', '--ignore-words-list=wit,allEdges,crate']
+        args: ['--skip=Cargo.lock,target', '--ignore-words-list=wit,allEdges,crate,ser']
 
   - repo: https://github.com/compilerla/conventional-pre-commit
     rev: v4.0.0

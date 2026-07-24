@@ -1578,9 +1578,9 @@ impl Storage for ReconnectingStorage {
     async fn entity_counts_by_type_and_state(
         &self,
         ctx: &TenantContext,
-        session_id: uuid::Uuid,
+        query: EntityListQuery,
     ) -> anyhow::Result<Vec<EntityTypeStateCount>> {
-        delegate!(self, entity_counts_by_type_and_state, ctx, session_id)
+        delegate!(self, entity_counts_by_type_and_state, ctx, query)
     }
 
     async fn document_chunk_put(
