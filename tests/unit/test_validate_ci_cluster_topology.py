@@ -30,6 +30,7 @@ def valid_compose() -> dict:
             },
             "ports": [f"{cql_port}:9042", f"{web_port}:9090"],
         }
+    services["node1"]["environment"] = {"FERROSA_GRAPH_BIND": "0.0.0.0:7474"}
     return {"services": services}
 
 
@@ -55,6 +56,14 @@ class ClusterTopologyValidationTests(unittest.TestCase):
         errors = self.module.validate_compose(compose)
 
         self.assertTrue(any("node2" in error and "rustfs-init" in error for error in errors))
+
+    def test_rejects_loopback_graph_bind_for_published_probe(self) -> None:
+        compose = valid_compose()
+        compose["services"]["node1"]["environment"]["FERROSA_GRAPH_BIND"] = "127.0.0.1:7474"
+
+        errors = self.module.validate_compose(compose)
+
+        self.assertTrue(any("Graph HTTP" in error for error in errors))
 
 
 if __name__ == "__main__":
