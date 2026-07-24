@@ -147,6 +147,12 @@ the tier-1 default `tools/list`; request it with `include_all`.)
 Shared HTTP deployments support the MCP draft per-request protocol version `2026-07-28` for modern clients. The supported surface includes `server/discover`, tools, prompts, task resources, and task-resource subscriptions over Server-Sent Events.
 
 Use this when a client wants to discover capabilities without a legacy `initialize` session, read active task resources directly, or subscribe to workspace task updates for multi-agent coordination. See the [protocol guide](docs/mcp-draft-support.md), [compatibility matrix](docs/mcp-compatibility.md), and [demo runbook](docs/mcp-draft-demo.md) for the implemented claim boundary and reproducible evidence.
+### Entity Scope Defaults
+
+`list_entities`, `get_stats` (and its `stats` alias), and
+`count_entities_by_type` are tenant-wide by default. Supply both
+`scope: "session"` and `session_id` to scope a read to one session.
+Passing `session_id` alone does not change the read scope.
 
 ## Recall quality
 
@@ -219,7 +225,9 @@ cargo run --bin ferrosa-memory-mcp
 ```sh
 cp examples/ferrosa-memory-http.toml ./ferrosa-memory-http.toml
 cp examples/http-auth.toml ./http-auth.toml
-# Update TLS paths, contact points, graph URL, and auth principals
+# Update TLS paths, contact points, graph URL, and the single auth principal.
+# This example maps ferrosa_user to the default stdio tenant, preserving data
+# already written with config/ferrosa-memory.example.toml.
 
 FERROSA_MEMORY_CONFIG=./ferrosa-memory-http.toml cargo run --bin ferrosa-memory-mcp
 # Listens on port 8765 by default and exposes:
@@ -228,6 +236,18 @@ FERROSA_MEMORY_CONFIG=./ferrosa-memory-http.toml cargo run --bin ferrosa-memory-
 #   GET /healthz/ready
 #   POST /mcp
 ```
+
+For a binary install, do not replace the generated
+`~/.ferrosa/config/http-auth.toml` with the repository example. The installer
+provisions that file and the installed config with one matching per-install
+tenant. The HTTP-auth comments in
+`~/.ferrosa/config/ferrosa-memory.toml` contain the exact reconciliation
+command to run after changing transport or auth settings.
+
+For a shared deployment with separate tenant data, start from
+[`examples/http-auth-multi-tenant.toml`](examples/http-auth-multi-tenant.toml).
+Seed or migrate data into each listed tenant before clients connect; principal
+credentials select that tenant and cannot see the local single-user tenant.
 
 Shared HTTP startup is fail-closed. The binary refuses to bind the listener unless all of the following are true:
 
@@ -426,7 +446,8 @@ Full-corpus BRIGHT-Pro currently contains hundreds of thousands of support docum
 For shared deployments, use:
 
 - [`examples/ferrosa-memory-http.toml`](examples/ferrosa-memory-http.toml) for the HTTP server
-- [`examples/http-auth.toml`](examples/http-auth.toml) for principal-to-tenant auth mapping
+- [`examples/http-auth.toml`](examples/http-auth.toml) for a single principal aligned with the source default tenant
+- [`examples/http-auth-multi-tenant.toml`](examples/http-auth-multi-tenant.toml) for separate tenant principals after each tenant is seeded or migrated
 
 Shared HTTP mode requires:
 

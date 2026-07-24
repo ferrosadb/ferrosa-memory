@@ -11,8 +11,10 @@ The installer is intentionally conservative:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -24,6 +26,8 @@ from pathlib import Path
 
 DEFAULT_MCP_URL = "http://127.0.0.1:18765/mcp"
 DEFAULT_INSTALL_DIR = Path.home() / ".config" / "ferrosa-memory" / "hooks"
+KNOWN_HARNESSES = ("codex", "claude", "goose", "hermes", "pi")
+GOOSE_EXTENSION_NAME = "ferrosa-memory"
 
 
 def log(message: str) -> None:
@@ -113,13 +117,21 @@ def command_exists(name: str) -> bool:
     return shutil.which(name) is not None
 
 
-def detect_harnesses() -> list[str]:
+def detect_harnesses(home: Path | None = None) -> list[str]:
+    """Detect harnesses from their commands or user configuration directories.
+
+    ``home`` keeps repair runs and tests hermetic. Production callers use the
+    current user's home directory, while tests can supply an empty temporary
+    directory without accidentally inspecting or updating a real installation.
+    """
     found: list[str] = []
-    home = Path.home()
+    home = (home or Path.home()).expanduser()
     if command_exists("codex") or (home / ".codex").exists():
         found.append("codex")
     if command_exists("claude") or (home / ".claude").exists():
         found.append("claude")
+    if command_exists("goose") or (home / ".config" / "goose").exists():
+        found.append("goose")
     if command_exists("hermes") or (home / ".hermes").exists():
         found.append("hermes")
     if command_exists("pi") or (home / ".pi").exists():
@@ -127,12 +139,12 @@ def detect_harnesses() -> list[str]:
     return found
 
 
-def selected_harnesses(value: str) -> list[str]:
+def selected_harnesses(value: str, home: Path | None = None) -> list[str]:
     if value == "auto":
-        detected = detect_harnesses()
+        detected = detect_harnesses(home)
         return detected if detected else ["generic"]
     if value == "all":
-        return ["codex", "claude", "hermes", "pi"]
+        return list(KNOWN_HARNESSES)
     return [value]
 
 
@@ -214,8 +226,9 @@ def wrapper_format(harness: str) -> str:
         return "hermes-json"
     if harness == "claude":
         return "codex-json"
-    # pi + generic: plain text (the Pi extension feeds {prompt,response} JSON on
-    # stdin and the turn hook treats `pi` as a generic harness).
+    # Goose, Pi, and generic wrappers use plain text. Goose has no lifecycle
+    # hook configuration surface, but a wrapper remains available for a manual
+    # integration if Goose adds one in the future.
     return "plain"
 
 
@@ -351,23 +364,152 @@ def ensure_hook_with_entry(
     return True
 
 
-def patch_claude(settings_path: Path, wrappers: dict[str, str], dry_run: bool) -> str:
-    if not settings_path.exists():
-        return f"Claude settings not found at {settings_path}; snippet written only."
-    settings = json.loads(settings_path.read_text())
+def registration_result(
+    status: str,
+    detail: str,
+    *,
+    error: str | None = None,
+) -> dict[str, str | None]:
+    """Build the registration shape persisted for a single harness surface."""
+    return {"status": status, "detail": detail, "error": error}
+
+
+def mcp_auth_headers(
+    auth_header: str | None,
+    mcp_user: str | None,
+    mcp_password: str | None,
+) -> dict[str, str]:
+    """Return MCP headers only when this invocation supplied usable credentials."""
+    if auth_header:
+        return {"Authorization": auth_header}
+    if mcp_user and mcp_password:
+        credentials = base64.b64encode(f"{mcp_user}:{mcp_password}".encode()).decode()
+        return {"Authorization": f"Basic {credentials}"}
+    return {}
+
+
+def ensure_mcp_server(settings: dict[str, object], name: str, desired: dict[str, object]) -> bool:
+    """Create or update one named MCP server without disturbing other servers."""
+    servers = settings.setdefault("mcpServers", {})
+    if not isinstance(servers, dict):
+        raise ValueError("settings.mcpServers exists but is not an object")
+    existing = servers.get(name)
+    if existing is None:
+        servers[name] = desired
+        return True
+    if not isinstance(existing, dict):
+        raise ValueError(f"settings.mcpServers.{name} exists but is not an object")
+
     changed = False
-    changed |= ensure_hook(settings, "SessionStart", wrappers["session_start"])
-    changed |= ensure_hook(settings, "UserPromptSubmit", wrappers["recall"])
-    changed |= ensure_hook(settings, "Stop", wrappers["ingest_turn"])
-    changed |= ensure_hook(settings, "SubagentStop", wrappers["ingest_turn"])
-    changed |= ensure_hook(settings, "PreCompact", wrappers["ingest_turn"])
-    if not changed:
-        return f"Claude settings already include Ferrosa Memory hooks: {settings_path}"
+    for key, value in desired.items():
+        if existing.get(key) != value:
+            existing[key] = value
+            changed = True
+    return changed
+
+
+def configure_claude(
+    settings_path: Path,
+    wrappers: dict[str, str],
+    mcp_url: str | None,
+    dry_run: bool,
+    auth_header: str | None = None,
+    mcp_user: str | None = None,
+    mcp_password: str | None = None,
+) -> tuple[dict[str, str | None], dict[str, str | None]]:
+    """Register Claude lifecycle hooks and the Ferrosa Memory HTTP MCP server.
+
+    Claude Code accepts both settings under ``~/.claude/settings.json``. Missing
+    settings are created as an empty JSON object, then patched atomically so a
+    late Claude installation can be repaired on the next automatic run.
+    """
+    existed = settings_path.exists()
+    if existed:
+        settings = json.loads(settings_path.read_text())
+        if not isinstance(settings, dict):
+            raise ValueError(f"{settings_path} exists but is not a JSON object")
+    else:
+        settings: dict[str, object] = {}
+
+    hooks_changed = False
+    hooks_changed |= ensure_hook(settings, "SessionStart", wrappers["session_start"])
+    hooks_changed |= ensure_hook(settings, "UserPromptSubmit", wrappers["recall"])
+    hooks_changed |= ensure_hook(settings, "Stop", wrappers["ingest_turn"])
+    hooks_changed |= ensure_hook(settings, "SubagentStop", wrappers["ingest_turn"])
+    hooks_changed |= ensure_hook(settings, "PreCompact", wrappers["ingest_turn"])
+
+    mcp_changed = False
+    mcp_result = registration_result("not_applicable", "Claude MCP registration was not requested")
+    if mcp_url is not None:
+        mcp_server: dict[str, object] = {"type": "http", "url": mcp_url}
+        headers = mcp_auth_headers(auth_header, mcp_user, mcp_password)
+        if headers:
+            mcp_server["headers"] = headers
+        mcp_changed = ensure_mcp_server(settings, GOOSE_EXTENSION_NAME, mcp_server)
+
+    if not hooks_changed and not mcp_changed:
+        return (
+            registration_result("already_registered", f"Claude hooks already registered in {settings_path}"),
+            mcp_result
+            if mcp_url is None
+            else registration_result("already_registered", f"Claude MCP already registered in {settings_path}"),
+        )
+
     if dry_run:
-        return f"Dry run: would patch Claude settings at {settings_path}"
-    backup_path = backup(settings_path)
+        return (
+            registration_result(
+                "dry_run" if hooks_changed else "already_registered",
+                f"Dry run: would update Claude hooks in {settings_path}"
+                if hooks_changed
+                else f"Claude hooks already registered in {settings_path}",
+            ),
+            mcp_result
+            if mcp_url is None
+            else registration_result(
+                "dry_run" if mcp_changed else "already_registered",
+                f"Dry run: would update Claude MCP registration in {settings_path}"
+                if mcp_changed
+                else f"Claude MCP already registered in {settings_path}",
+            ),
+        )
+
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    backup_path = backup(settings_path) if existed else None
     settings_path.write_text(json.dumps(settings, indent=2) + "\n")
-    return f"Patched Claude settings at {settings_path} (backup: {backup_path})"
+    action = "Created" if not existed else "Patched"
+    backup_detail = f" (backup: {backup_path})" if backup_path else ""
+    return (
+        registration_result(
+            "created" if not existed else "updated" if hooks_changed else "already_registered",
+            f"{action} Claude settings hooks at {settings_path}{backup_detail}"
+            if hooks_changed
+            else f"Claude hooks already registered in {settings_path}",
+        ),
+        mcp_result
+        if mcp_url is None
+        else registration_result(
+            "created" if not existed else "updated" if mcp_changed else "already_registered",
+            f"{action} Claude MCP registration at {settings_path}{backup_detail}"
+            if mcp_changed
+            else f"Claude MCP already registered in {settings_path}",
+        ),
+    )
+
+
+def patch_claude(settings_path: Path, wrappers: dict[str, str], dry_run: bool) -> str:
+    """Backward-compatible hook-only Claude patch entry point.
+
+    ``main`` calls ``configure_claude`` to register both surfaces together. This
+    helper retains the older string return used by callers that only need hook
+    setup while inheriting safe creation of a missing settings file.
+    """
+    hook_result, _ = configure_claude(
+        settings_path,
+        wrappers,
+        None,
+        dry_run,
+    )
+    return hook_result["detail"] or ""
 
 
 def patch_codex(hooks_path: Path, wrappers: dict[str, str], dry_run: bool) -> str:
@@ -458,6 +600,224 @@ def patch_hermes(config_path: Path, wrappers: dict[str, str], dry_run: bool) -> 
     backup_path = backup(config_path)
     config_path.write_text(text.replace("hooks: {}", block.rstrip(), 1))
     return f"Patched Hermes config at {config_path} (backup: {backup_path})"
+
+
+def goose_extension_block(mcp_url: str, headers: dict[str, str]) -> str:
+    """Render Goose's streamable HTTP MCP extension configuration."""
+    lines = [
+        f"  {GOOSE_EXTENSION_NAME}:",
+        "    type: streamable_http",
+        f"    uri: {json.dumps(mcp_url)}",
+    ]
+    if headers:
+        lines.append("    headers:")
+        lines.extend(f"      {name}: {json.dumps(value)}" for name, value in headers.items())
+    lines.extend(
+        [
+            "    envs: {}",
+            "    enabled: true",
+            "    timeout: 300",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def goose_extensions_span(lines: list[str]) -> tuple[int, int] | None:
+    """Find the root ``extensions`` mapping and its indented child span.
+
+    This is intentionally narrow rather than a general YAML parser: we only
+    edit Goose's documented root mapping and otherwise fail with a repair action
+    instead of risking comments, anchors, or an inline mapping we cannot merge.
+    """
+    for index, line in enumerate(lines):
+        value = line.rstrip("\r\n")
+        if re.fullmatch(r"extensions:\s*(?:#.*)?", value):
+            end = index + 1
+            while end < len(lines):
+                candidate = lines[end]
+                stripped = candidate.strip()
+                if not stripped or candidate.lstrip().startswith("#") or candidate[0].isspace():
+                    end += 1
+                    continue
+                break
+            return index, end
+        if re.fullmatch(r"extensions:\s*\{\}\s*(?:#.*)?", value):
+            return index, index + 1
+        if value.strip().startswith("extensions:"):
+            raise ValueError(
+                "Goose config has an inline or non-mapping extensions value; "
+                "add the Ferrosa Memory extension manually instead of rewriting it"
+            )
+    return None
+
+
+def goose_extension_span(lines: list[str], start: int, end: int) -> tuple[int, int] | None:
+    entry = re.compile(rf"^  {re.escape(GOOSE_EXTENSION_NAME)}:\s*(?:#.*)?$")
+    entry_start = next(
+        (index for index in range(start + 1, end) if entry.fullmatch(lines[index].rstrip("\r\n"))),
+        None,
+    )
+    if entry_start is None:
+        return None
+    entry_end = entry_start + 1
+    while entry_end < end:
+        candidate = lines[entry_end]
+        if candidate.startswith("  ") and not candidate.startswith("    ") and candidate.strip():
+            break
+        entry_end += 1
+    return entry_start, entry_end
+
+
+def goose_field_spans(lines: list[str]) -> dict[str, tuple[int, int]]:
+    """Return field spans for one indented Goose extension mapping."""
+    fields: dict[str, tuple[int, int]] = {}
+    index = 1
+    field = re.compile(r"^    (?P<name>[A-Za-z][A-Za-z0-9_-]*):")
+    while index < len(lines):
+        match = field.match(lines[index])
+        if not match:
+            index += 1
+            continue
+        end = index + 1
+        while end < len(lines) and not field.match(lines[end]):
+            end += 1
+        fields[match.group("name")] = (index, end)
+        index = end
+    return fields
+
+
+def merged_goose_headers(existing: list[str], headers: dict[str, str]) -> list[str]:
+    """Merge the supplied headers into an existing block without losing others."""
+    if not headers:
+        return existing
+    first = existing[0].rstrip("\r\n")
+    if re.fullmatch(r"    headers:\s*\{\}\s*(?:#.*)?", first):
+        return ["    headers:\n"] + [
+            f"      {name}: {json.dumps(value)}\n" for name, value in headers.items()
+        ]
+    if not re.fullmatch(r"    headers:\s*(?:#.*)?", first):
+        raise ValueError("Goose extension has inline headers that cannot be safely merged")
+
+    header_names = set(headers)
+    merged = [existing[0]]
+    for line in existing[1:]:
+        match = re.match(r"^      (?P<name>[^:#]+):", line)
+        if match and match.group("name") in header_names:
+            continue
+        merged.append(line)
+    merged.extend(f"      {name}: {json.dumps(value)}\n" for name, value in headers.items())
+    return merged
+
+
+def merge_goose_extension(
+    existing: list[str],
+    mcp_url: str,
+    headers: dict[str, str],
+) -> list[str]:
+    """Update Ferrosa-owned transport fields while retaining user extension fields."""
+    fields = goose_field_spans(existing)
+    merged = [existing[0]]
+    index = 1
+    seen: set[str] = set()
+    while index < len(existing):
+        field = next((name for name, span in fields.items() if span[0] == index), None)
+        if field is None:
+            merged.append(existing[index])
+            index += 1
+            continue
+        _, end = fields[field]
+        seen.add(field)
+        if field == "type":
+            merged.append("    type: streamable_http\n")
+        elif field == "uri":
+            merged.append(f"    uri: {json.dumps(mcp_url)}\n")
+        elif field in {"cmd", "args"}:
+            pass
+        elif field == "headers":
+            merged.extend(merged_goose_headers(existing[index:end], headers))
+        elif field == "enabled":
+            merged.append("    enabled: true\n")
+        else:
+            merged.extend(existing[index:end])
+        index = end
+
+    if "type" not in seen:
+        merged.append("    type: streamable_http\n")
+    if "uri" not in seen:
+        merged.append(f"    uri: {json.dumps(mcp_url)}\n")
+    if "headers" not in seen and headers:
+        merged.extend(["    headers:\n"] + [f"      {name}: {json.dumps(value)}\n" for name, value in headers.items()])
+    if "envs" not in seen:
+        merged.append("    envs: {}\n")
+    if "enabled" not in seen:
+        merged.append("    enabled: true\n")
+    if "timeout" not in seen:
+        merged.append("    timeout: 300\n")
+    return merged
+
+
+def updated_goose_config(text: str, mcp_url: str, headers: dict[str, str] | None = None) -> tuple[str, bool]:
+    """Add or repair the named Goose extension without disturbing other entries."""
+    headers = headers or {}
+    block = goose_extension_block(mcp_url, headers)
+    lines = text.splitlines(keepends=True)
+    span = goose_extensions_span(lines)
+    if span is None:
+        prefix = text.rstrip()
+        if prefix:
+            prefix += "\n"
+        return prefix + "extensions:\n" + block, True
+
+    start, end = span
+    empty_mapping = re.fullmatch(
+        r"extensions:\s*\{\}\s*(?P<comment>#.*)?", lines[start].rstrip("\r\n")
+    )
+    if empty_mapping:
+        comment = empty_mapping.group("comment")
+        lines[start] = f"extensions:{f' {comment}' if comment else ''}\n"
+    entry_span = goose_extension_span(lines, start, end)
+    if entry_span is None:
+        updated = "".join(lines[:end] + block.splitlines(keepends=True) + lines[end:])
+        return updated, True
+
+    entry_start, entry_end = entry_span
+    merged = merge_goose_extension(lines[entry_start:entry_end], mcp_url, headers)
+    updated = "".join(lines[:entry_start] + merged + lines[entry_end:])
+    return updated, updated != text
+
+
+def patch_goose(
+    config_path: Path,
+    mcp_url: str,
+    dry_run: bool,
+    auth_header: str | None = None,
+    mcp_user: str | None = None,
+    mcp_password: str | None = None,
+) -> dict[str, str | None]:
+    """Idempotently register Ferrosa Memory as a Goose HTTP MCP extension."""
+    existed = config_path.exists()
+    text = config_path.read_text() if existed else ""
+    updated, changed = updated_goose_config(
+        text,
+        mcp_url,
+        mcp_auth_headers(auth_header, mcp_user, mcp_password),
+    )
+    if not changed:
+        return registration_result(
+            "already_registered",
+            f"Goose MCP already registered in {config_path}",
+        )
+    if dry_run:
+        return registration_result("dry_run", f"Dry run: would update Goose MCP config at {config_path}")
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    backup_path = backup(config_path) if existed else None
+    config_path.write_text(updated)
+    detail = f"Created Goose MCP config at {config_path}"
+    if existed:
+        detail = f"Patched Goose MCP config at {config_path} (backup: {backup_path})"
+    return registration_result("created" if not existed else "updated", detail)
 
 
 def write_snippets(install_dir: Path, wrappers: dict[str, dict[str, str]]) -> None:
@@ -727,14 +1087,43 @@ def verify_wrapper(command: str, mode: str) -> str:
     return f"{command}: ok"
 
 
-def main() -> int:
+def legacy_registration(detail: str) -> dict[str, str | None]:
+    """Translate existing harness patch messages into the manifest result shape."""
+    normalized = detail.lower()
+    if normalized.startswith("dry run:"):
+        return registration_result("dry_run", detail)
+    if "already include" in normalized or "already registered" in normalized:
+        return registration_result("already_registered", detail)
+    if "snippet written only" in normalized:
+        return registration_result("requires_manual_action", detail)
+    if normalized.startswith("created") or normalized.startswith("wrote"):
+        return registration_result("created", detail)
+    return registration_result("updated", detail)
+
+
+def harness_outcome(detected: bool, selection: str) -> dict[str, object]:
+    return {
+        "detection": {"detected": detected, "selection": selection},
+        "hook_registration": registration_result("pending", "Not attempted"),
+        "mcp_registration": registration_result("pending", "Not attempted"),
+        "required_action": None,
+        "error": None,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--harness",
-        choices=["auto", "all", "codex", "claude", "hermes", "pi", "generic"],
+        choices=["auto", "all", "codex", "claude", "goose", "hermes", "pi", "generic"],
         default="auto",
     )
-    parser.add_argument("--install-dir", type=Path, default=DEFAULT_INSTALL_DIR)
+    parser.add_argument(
+        "--home",
+        type=Path,
+        help="Override the harness home directory. Intended for hermetic repair and test runs.",
+    )
+    parser.add_argument("--install-dir", type=Path)
     parser.add_argument("--mcp-url", default=os.environ.get("FERROSA_MEMORY_MCP_URL", DEFAULT_MCP_URL))
     parser.add_argument(
         "--auth-header",
@@ -749,9 +1138,10 @@ def main() -> int:
         help="Per-install tenant UUID (from `ferrosa-memory provision-tenant`) written to the hook env "
         "as FERROSA_MEMORY_TENANT_ID. Must match the authenticated principal's tenant or ingests are dropped.",
     )
-    parser.add_argument("--claude-settings", type=Path, default=Path.home() / ".claude" / "settings.json")
-    parser.add_argument("--hermes-config", type=Path, default=Path.home() / ".hermes" / "config.yaml")
-    parser.add_argument("--codex-hooks", type=Path, default=Path.home() / ".codex" / "hooks.json")
+    parser.add_argument("--claude-settings", type=Path)
+    parser.add_argument("--goose-config", type=Path)
+    parser.add_argument("--hermes-config", type=Path)
+    parser.add_argument("--codex-hooks", type=Path)
     parser.add_argument("--no-apply-config", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verify", action="store_true")
@@ -760,7 +1150,15 @@ def main() -> int:
         action="store_true",
         help="Skip the MCP auth-consistency preflight (probe endpoint + match against configured creds).",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    home = (args.home or Path.home()).expanduser()
+    install_dir = (args.install_dir or home / ".config" / "ferrosa-memory" / "hooks").expanduser()
+    claude_settings = (args.claude_settings or home / ".claude" / "settings.json").expanduser()
+    goose_config = (args.goose_config or home / ".config" / "goose" / "config.yaml").expanduser()
+    hermes_config = (args.hermes_config or home / ".hermes" / "config.yaml").expanduser()
+    codex_hooks = (args.codex_hooks or home / ".codex" / "hooks.json").expanduser()
+    pi_extensions = home / ".pi" / "agent" / "extensions"
 
     root = repo_root()
     hook_path = root / "scripts" / "hooks" / "ferrosa-memory-turn-hook.py"
@@ -789,10 +1187,11 @@ def main() -> int:
             configured = "yes" if has_usable_auth(args.auth_header, args.mcp_user, args.mcp_password) else "no"
             log(f"auth consistency OK: server_requires_auth={required}, credentials_configured={configured}")
 
-    harnesses = selected_harnesses(args.harness)
+    detected_harnesses = detect_harnesses(home)
+    harnesses = selected_harnesses(args.harness, home)
     log(f"harnesses: {', '.join(harnesses)}")
     wrappers = create_wrappers(
-        args.install_dir,
+        install_dir,
         hook_path,
         args.mcp_url,
         harnesses,
@@ -801,34 +1200,114 @@ def main() -> int:
         mcp_password=args.mcp_password,
         tenant_id=args.tenant_id,
     )
-    write_snippets(args.install_dir, wrappers)
+    write_snippets(install_dir, wrappers)
 
-    results: list[str] = []
-    if not args.no_apply_config:
-        if "claude" in wrappers:
-            results.append(patch_claude(args.claude_settings.expanduser(), wrappers["claude"], args.dry_run))
-        if "codex" in wrappers:
-            results.append(patch_codex(args.codex_hooks.expanduser(), wrappers["codex"], args.dry_run))
-        if "hermes" in wrappers:
-            results.append(patch_hermes(args.hermes_config.expanduser(), wrappers["hermes"], args.dry_run))
-        if "pi" in wrappers:
-            results.append(install_pi_extension(wrappers["pi"], args.dry_run))
+    outcomes: dict[str, dict[str, object]] = {}
+    for harness in harnesses:
+        selection = "auto" if args.harness == "auto" else "explicit"
+        outcomes[harness] = harness_outcome(harness in detected_harnesses, selection)
+
+    if args.no_apply_config:
+        for outcome in outcomes.values():
+            outcome["hook_registration"] = registration_result(
+                "skipped", "Skipped because --no-apply-config was set"
+            )
+            outcome["mcp_registration"] = registration_result(
+                "skipped", "Skipped because --no-apply-config was set"
+            )
+            outcome["required_action"] = "Re-run without --no-apply-config to register harness configuration."
     else:
-        results.append("Skipped harness config patching because --no-apply-config was set.")
+        for harness, outcome in outcomes.items():
+            try:
+                if harness == "claude":
+                    hooks, mcp = configure_claude(
+                        claude_settings,
+                        wrappers[harness],
+                        args.mcp_url,
+                        args.dry_run,
+                        auth_header=args.auth_header,
+                        mcp_user=args.mcp_user,
+                        mcp_password=args.mcp_password,
+                    )
+                    outcome["hook_registration"] = hooks
+                    outcome["mcp_registration"] = mcp
+                elif harness == "goose":
+                    outcome["hook_registration"] = registration_result(
+                        "unsupported",
+                        "Goose exposes MCP extensions but no lifecycle hook configuration surface.",
+                    )
+                    outcome["mcp_registration"] = patch_goose(
+                        goose_config,
+                        args.mcp_url,
+                        args.dry_run,
+                        auth_header=args.auth_header,
+                        mcp_user=args.mcp_user,
+                        mcp_password=args.mcp_password,
+                    )
+                    outcome["required_action"] = (
+                        "Goose lifecycle hooks are not configurable; use the registered MCP extension."
+                    )
+                elif harness == "codex":
+                    outcome["hook_registration"] = legacy_registration(
+                        patch_codex(codex_hooks, wrappers[harness], args.dry_run)
+                    )
+                    outcome["mcp_registration"] = registration_result(
+                        "not_configured",
+                        "This installer does not manage Codex MCP registration.",
+                    )
+                    outcome["required_action"] = "Register the Ferrosa Memory MCP server with Codex separately."
+                elif harness == "hermes":
+                    outcome["hook_registration"] = legacy_registration(
+                        patch_hermes(hermes_config, wrappers[harness], args.dry_run)
+                    )
+                    outcome["mcp_registration"] = registration_result(
+                        "not_configured",
+                        "This installer does not manage Hermes MCP registration.",
+                    )
+                    outcome["required_action"] = "Register the Ferrosa Memory MCP server with Hermes separately."
+                elif harness == "pi":
+                    outcome["hook_registration"] = legacy_registration(
+                        install_pi_extension(wrappers[harness], args.dry_run, extensions_dir=pi_extensions)
+                    )
+                    outcome["mcp_registration"] = registration_result(
+                        "not_configured",
+                        "This installer does not manage Pi MCP registration.",
+                    )
+                    outcome["required_action"] = "Register the Ferrosa Memory MCP server with Pi separately."
+                else:
+                    outcome["hook_registration"] = registration_result(
+                        "not_applicable", "Generic wrappers were created without a harness config target."
+                    )
+                    outcome["mcp_registration"] = registration_result(
+                        "not_applicable", "Generic mode has no MCP configuration target."
+                    )
+                    outcome["required_action"] = "Install a supported harness and rerun with --harness auto."
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                message = f"{harness} configuration failed: {exc}"
+                outcome["hook_registration"] = registration_result("error", message, error=str(exc))
+                outcome["mcp_registration"] = registration_result("error", message, error=str(exc))
+                outcome["required_action"] = "Repair the harness configuration file, then rerun the installer."
+                outcome["error"] = str(exc)
 
     manifest = {
-        "install_dir": str(args.install_dir),
+        "install_dir": str(install_dir),
         "mcp_url": args.mcp_url,
-        "detected_harnesses": detect_harnesses(),
+        "detected_harnesses": detected_harnesses,
         "installed_harnesses": harnesses,
         "wrappers": wrappers,
-        "config_results": results,
+        "harness_outcomes": outcomes,
     }
-    manifest_path = args.install_dir / "manifest.json"
+    manifest_path = install_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 
-    for result in results:
-        log(result)
+    for harness, outcome in outcomes.items():
+        hooks = outcome["hook_registration"]
+        mcp = outcome["mcp_registration"]
+        assert isinstance(hooks, dict)
+        assert isinstance(mcp, dict)
+        log(f"{harness}: hooks={hooks['status']}; mcp={mcp['status']}")
+        if outcome["required_action"]:
+            log(f"{harness}: required action: {outcome['required_action']}")
     if args.verify:
         verification_failed = False
         for harness, commands in wrappers.items():

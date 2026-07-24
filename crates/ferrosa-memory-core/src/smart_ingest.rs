@@ -269,6 +269,9 @@ pub async fn smart_ingest(
             context_snippet: content.to_string(),
             entity_embedding: embedding.map(|e| e.to_vec()),
             created_at: chrono::Utc::now(),
+            // Preserve the physical session partition, but retain the caller
+            // that most recently refreshed this entity as provenance.
+            ingested_by_session: Some(session_id),
             ..best_match.clone()
         };
         storage.entity_put(ctx, &updated).await?;
@@ -1168,6 +1171,7 @@ mod tests {
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].entity_id, entity_id);
         assert_eq!(entities[0].session_id, original_session_id);
+        assert_eq!(entities[0].ingested_by_session, Some(ingest_session_id));
         assert_eq!(
             entities[0].context_snippet,
             "BRIGHT-Pro adds aspect-aware retrieval metrics for agentic search"

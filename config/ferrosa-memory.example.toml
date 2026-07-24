@@ -13,8 +13,17 @@
 # Rotate via `ferrosa-ctl auth set-password` on your Ferrosa node, then update
 # the matching entries here.
 #
-# For a multi-tenant HTTP deployment, see examples/ferrosa-memory-http.toml
-# and examples/http-auth.toml.
+# HTTP auth for a binary install is self-contained: the installer creates
+# ~/.ferrosa/config/http-auth.toml with the same per-install tenant it writes
+# below. When switching this config to HTTP, keep that auth file and run:
+#   ~/.ferrosa/bin/ferrosa-memory provision-tenant \
+#     --config ~/.ferrosa/config/ferrosa-memory.toml \
+#     --auth-file ~/.ferrosa/config/http-auth.toml
+# This preserves existing data, updates the auth principal mapping, and removes
+# server.tenant_id because HTTP derives tenant identity from authentication.
+# Source-checkout examples are separate: http-auth.toml matches this template's
+# tenant, while http-auth-multi-tenant.toml requires data to be seeded or
+# migrated for each principal.
 
 [server]
 transport = "stdio"          # "stdio" for Claude Code/Desktop, "http" for remote
@@ -73,7 +82,8 @@ http_url = "http://localhost:7474"   # HTTP health/transaction endpoint
 
 [sparql]
 enabled = true
-http_url = "http://localhost:9090"
+# Omit http_url to use the built-in Ferrosa SPARQL listener default.
+# Set it only when the Ferrosa listener bind is overridden.
 
 [security]
 # audit_log_enabled = true

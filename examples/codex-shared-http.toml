@@ -2,14 +2,12 @@
 # Replace the host, credentials, and port for your deployment.
 # The endpoint must include /mcp and use credentials that exist in
 # examples/http-auth.toml (or your mounted auth file).
-# Seeded principals are:
-# - ferrosa_user / ferrosa_user
-# - ferrosa_admin / ferrosa_admin
+# The single-user example's principal is ferrosa_user / ferrosa_user.
+# The separate http-auth-multi-tenant.toml example uses team_alpha/team_beta;
+# replace this URL with the principal for the tenant whose data you need.
 
 [mcp_servers.ferrosa-memory]
 url = "https://ferrosa_user:ferrosa_user@memory.example.com:8765/mcp"
 
 # Local TLS smoke-test variant:
 # url = "https://ferrosa_user:ferrosa_user@localhost:8765/mcp"
-# Admin variant for bootstrap/readiness checks:
-# url = "https://ferrosa_admin:ferrosa_admin@memory.example.com:8765/mcp"

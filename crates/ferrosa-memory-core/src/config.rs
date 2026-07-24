@@ -131,6 +131,12 @@ impl Default for GraphDbConfig {
     }
 }
 
+/// Public Ferrosa SPARQL listener used by the operator passthrough.
+///
+/// This must track Ferrosa's default sparql bind; deployments that change
+/// that listener set sparql.http_url explicitly in their Memory config.
+pub const DEFAULT_FERROSA_SPARQL_HTTP_URL: &str = "http://localhost:8080";
+
 /// Public SPARQL endpoint configuration.
 #[derive(Debug, Deserialize, Clone)]
 pub struct SparqlConfig {
@@ -825,7 +831,7 @@ fn default_http_graph_url() -> String {
     "http://localhost:7474".into()
 }
 fn default_sparql_url() -> String {
-    "http://localhost:8080".into()
+    DEFAULT_FERROSA_SPARQL_HTTP_URL.into()
 }
 /// P0-11/W-02: default CQL username for local-dev / non-DBaaS installs.
 /// In production (FERROSA_DBAAS_MODE=true) `apply_dbaas_env_overrides`
@@ -1552,6 +1558,43 @@ contact_points = ["localhost:9042"]
             Some("/etc/ssl/cert.pem")
         );
         assert_eq!(config.server.key_path.as_deref(), Some("/etc/ssl/key.pem"));
+    }
+
+    #[test]
+    fn release_sparql_config_uses_the_named_default_and_preserves_overrides() {
+        let release_toml = include_str!("../../../config/ferrosa-memory.example.toml");
+        let raw: toml::Value =
+            toml::from_str(release_toml).expect("release config must be valid TOML");
+        let release_sparql = raw
+            .get("sparql")
+            .and_then(toml::Value::as_table)
+            .expect("release config must include [sparql]");
+        assert!(
+            !release_sparql.contains_key("http_url"),
+            "release config must not duplicate the SPARQL default"
+        );
+
+        let release_config = parse_config(release_toml).expect("release config must parse");
+        assert!(release_config.sparql.enabled);
+        assert_eq!(
+            release_config.sparql.http_url,
+            DEFAULT_FERROSA_SPARQL_HTTP_URL
+        );
+
+        let override_config = parse_config(
+            r#"
+[ferrosa]
+contact_points = ["localhost:9042"]
+
+[sparql]
+http_url = "http://ferrosa.internal:18080"
+"#,
+        )
+        .expect("explicit SPARQL URL override must parse");
+        assert_eq!(
+            override_config.sparql.http_url,
+            "http://ferrosa.internal:18080"
+        );
     }
 
     #[test]

@@ -4384,8 +4384,20 @@ fn parse_entity_list_scope(args: &Value) -> Result<crate::types::EntityListScope
     }
 
     match args.get("include_cross_session").and_then(|v| v.as_bool()) {
-        Some(true) | None => Ok(crate::types::EntityListScope::All),
+        Some(true) => Ok(crate::types::EntityListScope::All),
         Some(false) => Ok(crate::types::EntityListScope::Session),
+        None => Ok(crate::types::EntityListScope::All),
+    }
+}
+
+fn parse_tenant_or_session_scope(args: &Value) -> Result<bool, (i32, String)> {
+    match args.get("scope").and_then(|value| value.as_str()) {
+        None | Some("tenant") | Some("all") => Ok(false),
+        Some("session") | Some("session_only") => Ok(true),
+        Some(other) => Err((
+            INVALID_PARAMS,
+            format!("invalid scope: expected tenant|session, got {other}"),
+        )),
     }
 }
 
@@ -4413,7 +4425,8 @@ async fn handle_list_entities<S: crate::storage::Storage>(
     storage: &S,
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+    let explicit_session_id = optional_uuid(&args, "session_id")?;
+    let session_id = explicit_session_id.unwrap_or(uuid::Uuid::nil());
     let limit = args
         .get("limit")
         .and_then(|v| v.as_u64())
@@ -4439,6 +4452,10 @@ async fn handle_list_entities<S: crate::storage::Storage>(
         scope: parse_entity_list_scope(&args)?,
         limit,
     };
+
+    if query.scope == crate::types::EntityListScope::Session && explicit_session_id.is_none() {
+        return Err((INVALID_PARAMS, "scope=session requires session_id".into()));
+    }
 
     let scope = query.scope;
     let entities = storage
@@ -8616,18 +8633,21 @@ async fn handle_get_stats<S: crate::storage::Storage>(
     session: &SessionState,
 ) -> Result<Value, (i32, String)> {
     // Default stats are tenant-wide so node/entity counts and edge counts use
-    // the same scope. Passing `session_id` opts into session-scoped stats for
-    // both counts; this keeps the numbers comparable and avoids the previous
-    // misleading mix of session entity_count with tenant edge_count.
+    // the same scope. A supplied session ID does not select a read scope
+    // unless scope=session is explicit; this prevents silent filtering.
     let explicit_session_id = optional_uuid(&args, "session_id")?;
-    let session_id = explicit_session_id
-        .or_else(|| session.effective_default_session_id())
-        .unwrap_or(uuid::Uuid::nil());
-    let scope = if explicit_session_id.is_some() {
-        "session"
+    let session_scoped = parse_tenant_or_session_scope(&args)?;
+    let session_id = if session_scoped {
+        explicit_session_id.ok_or_else(|| {
+            (
+                INVALID_PARAMS,
+                "scope=session requires session_id".to_string(),
+            )
+        })?
     } else {
-        "tenant"
+        uuid::Uuid::nil()
     };
+    let scope = if session_scoped { "session" } else { "tenant" };
 
     let memo_count = storage.memo_count(ctx).await.unwrap_or(0);
     let memo_total_hits = storage.memo_total_hits(ctx).await.unwrap_or(0);
@@ -8637,7 +8657,7 @@ async fn handle_get_stats<S: crate::storage::Storage>(
         0.0
     };
 
-    let entity_count = if explicit_session_id.is_some() {
+    let entity_count = if session_scoped {
         storage.entity_count(ctx, session_id).await.unwrap_or(0)
     } else {
         storage
@@ -8669,7 +8689,7 @@ async fn handle_get_stats<S: crate::storage::Storage>(
         .unwrap_or(0);
 
     let temporal_fact_count = storage.temporal_count(ctx).await.unwrap_or(0);
-    let edge_count = if explicit_session_id.is_some() {
+    let edge_count = if session_scoped {
         let legacy_edges = storage
             .edge_list_session(ctx, session_id)
             .await
@@ -8712,7 +8732,7 @@ async fn handle_get_stats<S: crate::storage::Storage>(
 
     let mut response = serde_json::json!({
         "scope": scope,
-        "session_id": if explicit_session_id.is_some() { Some(session_id.to_string()) } else { None },
+        "session_id": if session_scoped { Some(session_id.to_string()) } else { None },
         "memo_count": memo_count,
         "memo_total_hits": memo_total_hits,
         "memo_hit_rate": memo_hit_rate,
@@ -9087,9 +9107,33 @@ async fn handle_count_entities_by_type<S: crate::storage::Storage>(
     ctx: &crate::types::TenantContext,
 ) -> Result<Value, (i32, String)> {
     let start = std::time::Instant::now();
-    let session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
+    let explicit_session_id = optional_uuid(&args, "session_id")?;
+    let session_scoped = parse_tenant_or_session_scope(&args)?;
+    let session_id = if session_scoped {
+        explicit_session_id.ok_or_else(|| {
+            (
+                INVALID_PARAMS,
+                "scope=session requires session_id".to_string(),
+            )
+        })?
+    } else {
+        uuid::Uuid::nil()
+    };
+    let scope = if session_scoped {
+        crate::types::EntityListScope::Session
+    } else {
+        crate::types::EntityListScope::All
+    };
     let rows = storage
-        .entity_counts_by_type_and_state(ctx, session_id)
+        .entity_counts_by_type_and_state(
+            ctx,
+            crate::types::EntityListQuery {
+                session_id,
+                scope,
+                limit: 0,
+                ..Default::default()
+            },
+        )
         .await
         .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
@@ -9153,6 +9197,8 @@ async fn handle_count_entities_by_type<S: crate::storage::Storage>(
     debug_assert_eq!(total, sum_joint);
 
     Ok(serde_json::json!({
+        "scope": if session_scoped { "session" } else { "tenant" },
+        "session_id": if session_scoped { Some(session_id.to_string()) } else { None },
         "total": total,
         "by_entity_type": by_entity_type,
         "by_state": by_state,
@@ -12166,7 +12212,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stats_defaults_to_tenant_scope_and_session_id_scopes_both_counts() {
+    async fn stats_requires_explicit_scope_for_session_counts() {
         let store = MockStorage::new();
         let ctx = test_ctx();
         let session = SessionState::default();
@@ -12218,10 +12264,25 @@ mod tests {
         assert_eq!(tenant["node_count"], 3);
         assert_eq!(tenant["edge_count"], 2);
 
-        let scoped = unwrap_tool_result(
+        let unscoped_with_session_id = unwrap_tool_result(
             dispatch(
                 "tools/call",
                 serde_json::json!({"name": "stats", "arguments": {"session_id": session_a.to_string()}}),
+                &store,
+                &ctx,
+                &session,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(unscoped_with_session_id["scope"], "tenant");
+        assert_eq!(unscoped_with_session_id["entity_count"], 3);
+        assert_eq!(unscoped_with_session_id["edge_count"], 2);
+
+        let scoped = unwrap_tool_result(
+            dispatch(
+                "tools/call",
+                serde_json::json!({"name": "stats", "arguments": {"session_id": session_a.to_string(), "scope": "session"}}),
                 &store,
                 &ctx,
                 &session,
@@ -13190,7 +13251,6 @@ mod tests {
         let params = serde_json::json!({
             "name": "list_entities",
             "arguments": {
-                "session_id": live_session.to_string(),
                 "entity_type": "task",
                 "filters": { "status": "ready", "assignee": "claude" },
                 "limit": 50
@@ -13655,6 +13715,73 @@ mod tests {
             tasks[0].client.workspace.as_deref(),
             Some("/repo/ferrosa-memory")
         );
+    }
+
+    #[tokio::test]
+    async fn list_entities_session_id_requires_explicit_scope() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let live_session = Uuid::new_v4();
+        let session = SessionState::default();
+
+        store
+            .entity_put(
+                &ctx,
+                &test_entity(
+                    &ctx,
+                    Uuid::nil(),
+                    "nil ready task",
+                    "task",
+                    serde_json::json!({"status": "ready"}),
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .entity_put(
+                &ctx,
+                &test_entity(
+                    &ctx,
+                    live_session,
+                    "live ready task",
+                    "task",
+                    serde_json::json!({"status": "ready"}),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let params = serde_json::json!({
+            "name": "list_entities",
+            "arguments": {
+                "session_id": live_session.to_string(),
+                "entity_type": "task",
+                "filters": { "status": "ready" }
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["count"], 2);
+        assert_eq!(result["scope"], "all");
+
+        let params = serde_json::json!({
+            "name": "list_entities",
+            "arguments": {
+                "session_id": live_session.to_string(),
+                "entity_type": "task",
+                "filters": { "status": "ready" },
+                "scope": "session"
+            }
+        });
+        let result = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["count"], 1);
+        assert_eq!(result["entities"][0]["entity_name"], "live ready task");
+        assert_eq!(result["scope"], "session");
     }
 
     #[tokio::test]
@@ -15195,6 +15322,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ingest_alias_records_latest_session_as_provenance_on_update() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState::default();
+        let original_session = Uuid::new_v4();
+        let refresh_session = Uuid::new_v4();
+
+        let created = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "ingest",
+                "arguments": {
+                    "session_id": original_session.to_string(),
+                    "content": "Session provenance is retained for durable memory.",
+                    "entity_type": "concept",
+                    "entity_name": "Session Provenance"
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        assert_eq!(unwrap_tool_result(created)["action"], "Created");
+
+        let updated = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "ingest",
+                "arguments": {
+                    "session_id": refresh_session.to_string(),
+                    "content": "Session provenance is retained when durable memory is refreshed.",
+                    "entity_type": "concept",
+                    "entity_name": "Session Provenance"
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        assert_eq!(unwrap_tool_result(updated)["action"], "Updated");
+
+        let entities = store.entities.lock().await;
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].ingested_by_session, Some(refresh_session));
+        assert_eq!(
+            entities[0].session_id,
+            crate::scope::tenant_global_session_uuid(ctx.tenant_id),
+            "provenance updates must not move a global entity out of its storage scope"
+        );
+    }
+
+    #[tokio::test]
     async fn set_intention_and_check() {
         let store = MockStorage::new();
         let ctx = test_ctx();
@@ -15779,7 +15962,8 @@ mod tests {
         let params = serde_json::json!({
             "name": "get_stats",
             "arguments": {
-                "session_id": sid.to_string()
+                "session_id": sid.to_string(),
+                "scope": "session"
             }
         });
         let result = dispatch("tools/call", params, &store, &ctx, &session)
@@ -15814,7 +15998,8 @@ mod tests {
             serde_json::json!({
                 "name": "get_stats",
                 "arguments": {
-                    "session_id": sid.to_string()
+                    "session_id": sid.to_string(),
+                    "scope": "session"
                 }
             }),
             &store,
@@ -15863,12 +16048,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_stats_without_session_id_counts_default_session_entities() {
-        // Regression: get_stats previously returned entity_count=0 hardcoded
-        // when session_id was omitted, instead of querying the server-owned
-        // runtime/default session that ordinary tools use when session_id is
-        // omitted from their arguments. The tools must agree on the
-        // implicit session — otherwise ingested entities look like phantoms.
+    async fn get_stats_defaults_to_tenant_scope_even_with_a_default_session() {
         let store = MockStorage::new();
         let ctx = test_ctx();
         let sid = Uuid::new_v4();
@@ -15894,6 +16074,17 @@ mod tests {
             };
             store.entities.lock().await.push(entity);
         }
+        store.entities.lock().await.push(crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            entity_name: "OtherSessionEntity".into(),
+            entity_type: "concept".into(),
+            context_snippet: "another session entity".into(),
+            confidence: 0.9,
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        });
 
         let params = serde_json::json!({
             "name": "get_stats",
@@ -15904,8 +16095,8 @@ mod tests {
             .unwrap();
         let result = unwrap_tool_result(result);
         assert_eq!(
-            result["entity_count"], 2,
-            "get_stats with no session_id should count default-session entities, not return 0"
+            result["entity_count"], 3,
+            "get_stats without scope=session must report tenant-wide entities"
         );
     }
 
@@ -16126,7 +16317,8 @@ mod tests {
         let params = serde_json::json!({
             "name": "count_entities_by_type",
             "arguments": {
-                "session_id": sid.to_string()
+                "session_id": sid.to_string(),
+                "scope": "session"
             }
         });
         let result = dispatch("tools/call", params, &store, &ctx, &session)
@@ -16220,12 +16412,25 @@ mod tests {
             created_at: chrono::Utc::now(),
             ..Default::default()
         });
+        entities.push(crate::types::EntityEntry {
+            tenant_id: ctx.tenant_id,
+            entity_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            entity_name: "Other Session Entity".into(),
+            entity_type: "concept".into(),
+            context_snippet: "other".into(),
+            confidence: 0.9,
+            state: crate::types::MemoryState::Active,
+            created_at: chrono::Utc::now(),
+            ..Default::default()
+        });
         drop(entities);
 
         let params = serde_json::json!({
             "name": "count_entities_by_type",
             "arguments": {
-                "session_id": sid.to_string()
+                "session_id": sid.to_string(),
+                "scope": "session"
             }
         });
         let result = dispatch("tools/call", params, &store, &ctx, &session)
@@ -16245,6 +16450,22 @@ mod tests {
         assert_eq!(result["by_type_and_state"]["document"]["active"], 1);
         assert_eq!(result["by_type_and_state"]["function"]["active"], 2);
         assert_eq!(result["by_type_and_state"]["function"]["silent"], 1);
+
+        let unscoped = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "count_entities_by_type",
+                "arguments": { "session_id": sid.to_string() }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let unscoped = unwrap_tool_result(unscoped);
+        assert_eq!(unscoped["scope"], "tenant");
+        assert_eq!(unscoped["total"], 7);
     }
 
     #[tokio::test]
@@ -16276,7 +16497,8 @@ mod tests {
         let params = serde_json::json!({
             "name": "count_entities_by_type",
             "arguments": {
-                "session_id": sid.to_string()
+                "session_id": sid.to_string(),
+                "scope": "session"
             }
         });
         let result = dispatch("tools/call", params, &store, &ctx, &session)
@@ -16288,34 +16510,137 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn count_entities_by_type_defaults_to_nil_session_without_dirtying_session() {
+    async fn default_entity_scopes_keep_list_stats_and_type_counts_in_agreement() {
         let store = MockStorage::new();
         let ctx = test_ctx();
         let session = SessionState::default();
+        let ingest_session = Uuid::new_v4();
+        let other_session = Uuid::new_v4();
 
-        store.entities.lock().await.push(crate::types::EntityEntry {
-            tenant_id: ctx.tenant_id,
-            entity_id: Uuid::new_v4(),
-            session_id: Uuid::nil(),
-            entity_name: "Nil Session Bug".into(),
-            entity_type: "bug".into(),
-            context_snippet: "nil".into(),
-            confidence: 0.9,
-            state: crate::types::MemoryState::Active,
-            created_at: chrono::Utc::now(),
-            ..Default::default()
-        });
+        // These entities are visible to the default tenant-wide list but were
+        // previously counted as zero because type counts targeted only the nil
+        // session when session_id was omitted.
+        for entity in [
+            test_entity(
+                &ctx,
+                ingest_session,
+                "ingested bug",
+                "bug",
+                serde_json::json!({}),
+            ),
+            test_entity(
+                &ctx,
+                ingest_session,
+                "ingested decision",
+                "decision",
+                serde_json::json!({}),
+            ),
+            test_entity(
+                &ctx,
+                other_session,
+                "other session concept",
+                "concept",
+                serde_json::json!({}),
+            ),
+        ] {
+            store.entity_put(&ctx, &entity).await.unwrap();
+        }
 
-        let params = serde_json::json!({
-            "name": "count_entities_by_type",
-            "arguments": {}
-        });
-        let result = dispatch("tools/call", params, &store, &ctx, &session)
+        let listed = unwrap_tool_result(
+            dispatch(
+                "tools/call",
+                serde_json::json!({"name": "list_entities", "arguments": {}}),
+                &store,
+                &ctx,
+                &session,
+            )
             .await
-            .unwrap();
-        let result = unwrap_tool_result(result);
-        assert_eq!(result["total"], 1);
-        assert_eq!(result["by_entity_type"]["bug"], 1);
+            .unwrap(),
+        );
+        let stats = unwrap_tool_result(
+            dispatch(
+                "tools/call",
+                serde_json::json!({"name": "get_stats", "arguments": {}}),
+                &store,
+                &ctx,
+                &session,
+            )
+            .await
+            .unwrap(),
+        );
+        let type_counts = unwrap_tool_result(
+            dispatch(
+                "tools/call",
+                serde_json::json!({"name": "count_entities_by_type", "arguments": {}}),
+                &store,
+                &ctx,
+                &session,
+            )
+            .await
+            .unwrap(),
+        );
+
+        assert_eq!(listed["scope"], "all");
+        assert_eq!(listed["count"], 3);
+        assert_eq!(stats["scope"], "tenant");
+        assert_eq!(stats["entity_count"], 3);
+        assert_eq!(type_counts["scope"], "tenant");
+        assert!(type_counts["session_id"].is_null());
+        assert_eq!(type_counts["total"], 3);
+        assert_eq!(type_counts["by_entity_type"]["bug"], 1);
+        assert_eq!(type_counts["by_entity_type"]["decision"], 1);
+        assert_eq!(type_counts["by_entity_type"]["concept"], 1);
+
+        let listed = unwrap_tool_result(
+            dispatch(
+                "tools/call",
+                serde_json::json!({
+                    "name": "list_entities",
+                    "arguments": { "session_id": ingest_session.to_string(), "scope": "session" }
+                }),
+                &store,
+                &ctx,
+                &session,
+            )
+            .await
+            .unwrap(),
+        );
+        let stats = unwrap_tool_result(
+            dispatch(
+                "tools/call",
+                serde_json::json!({
+                    "name": "stats",
+                    "arguments": { "session_id": ingest_session.to_string(), "scope": "session" }
+                }),
+                &store,
+                &ctx,
+                &session,
+            )
+            .await
+            .unwrap(),
+        );
+        let type_counts = unwrap_tool_result(
+            dispatch(
+                "tools/call",
+                serde_json::json!({
+                    "name": "count_entities_by_type",
+                    "arguments": { "session_id": ingest_session.to_string(), "scope": "session" }
+                }),
+                &store,
+                &ctx,
+                &session,
+            )
+            .await
+            .unwrap(),
+        );
+
+        assert_eq!(listed["scope"], "session");
+        assert_eq!(listed["count"], 2);
+        assert_eq!(stats["scope"], "session");
+        assert_eq!(stats["entity_count"], 2);
+        assert_eq!(type_counts["scope"], "session");
+        assert_eq!(type_counts["session_id"], ingest_session.to_string());
+        assert_eq!(type_counts["total"], 2);
         assert!(!session.dirty.load(Ordering::Relaxed));
     }
 
@@ -17449,7 +17774,7 @@ mod tests {
 
         let params = serde_json::json!({
             "name": "get_stats",
-            "arguments": { "session_id": sid.to_string() }
+            "arguments": { "session_id": sid.to_string(), "scope": "session" }
         });
         let result = dispatch("tools/call", params, &store, &ctx, &session)
             .await

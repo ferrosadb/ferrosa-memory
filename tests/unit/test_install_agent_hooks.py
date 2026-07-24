@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import stat
 import sys
 import tempfile
@@ -331,6 +332,159 @@ class PiHarnessTests(unittest.TestCase):
         msg = self.module.install_pi_extension(pi_wrappers, dry_run=True, extensions_dir=ext_dir)
         self.assertIn("Dry run", msg)
         self.assertFalse((ext_dir / "ferrosa-memory.ts").exists())
+
+
+class LateHarnessRepairTests(unittest.TestCase):
+    """Automatic repair must rescan a controlled home on every invocation."""
+
+    def setUp(self):
+        self.module = load_installer()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name) / "home"
+        self.install_dir = Path(self.tmp.name) / "hooks"
+        self.home.mkdir()
+        # Command discovery is environment-dependent. The test exercises the
+        # config-directory detection path without consulting the real machine.
+        self.module.command_exists = lambda _name: False
+
+    def _run_auto(self, *extra_args):
+        return self.module.main(
+            [
+                "--harness",
+                "auto",
+                "--home",
+                str(self.home),
+                "--install-dir",
+                str(self.install_dir),
+                "--skip-auth-check",
+            ]
+            + list(extra_args)
+        )
+
+    def _manifest(self):
+        return json.loads((self.install_dir / "manifest.json").read_text())
+
+    def test_auto_repair_detects_late_claude_and_goose_without_real_home(self):
+        self.assertEqual(self._run_auto(), 0)
+        first = self._manifest()
+        self.assertEqual(first["detected_harnesses"], [])
+        self.assertEqual(first["installed_harnesses"], ["generic"])
+        self.assertNotIn("config_results", first)
+        generic = first["harness_outcomes"]["generic"]
+        self.assertFalse(generic["detection"]["detected"])
+        self.assertEqual(generic["hook_registration"]["status"], "not_applicable")
+        self.assertEqual(generic["mcp_registration"]["status"], "not_applicable")
+
+        # Simulate installing Claude Code and Goose after the first Ferrosa run.
+        (self.home / ".claude").mkdir()
+        (self.home / ".config" / "goose").mkdir(parents=True)
+        (self.home / ".config" / "goose" / "config.yaml").write_text("default_provider: test\n")
+        mcp_url = "http://127.0.0.1:18767/mcp"
+
+        self.assertEqual(
+            self._run_auto(
+                "--mcp-url",
+                mcp_url,
+                "--mcp-user",
+                "goose_user",
+                "--mcp-password",
+                "goose_password",
+            ),
+            0,
+        )
+        repaired = self._manifest()
+        self.assertEqual(repaired["detected_harnesses"], ["claude", "goose"])
+        self.assertEqual(repaired["installed_harnesses"], ["claude", "goose"])
+
+        claude = repaired["harness_outcomes"]["claude"]
+        self.assertTrue(claude["detection"]["detected"])
+        self.assertEqual(claude["hook_registration"]["status"], "created")
+        self.assertEqual(claude["mcp_registration"]["status"], "created")
+        self.assertIsNone(claude["required_action"])
+
+        settings_path = self.home / ".claude" / "settings.json"
+        settings = json.loads(settings_path.read_text())
+        self.assertIn("hooks", settings)
+        self.assertEqual(
+            settings["mcpServers"]["ferrosa-memory"],
+            {
+                "type": "http",
+                "url": mcp_url,
+                "headers": {"Authorization": "Basic Z29vc2VfdXNlcjpnb29zZV9wYXNzd29yZA=="},
+            },
+        )
+
+        goose = repaired["harness_outcomes"]["goose"]
+        self.assertTrue(goose["detection"]["detected"])
+        self.assertEqual(goose["hook_registration"]["status"], "unsupported")
+        self.assertEqual(goose["mcp_registration"]["status"], "updated")
+        self.assertIn("not configurable", goose["required_action"])
+
+        goose_path = self.home / ".config" / "goose" / "config.yaml"
+        goose_config = goose_path.read_text()
+        self.assertIn("default_provider: test", goose_config)
+        self.assertIn("extensions:\n  ferrosa-memory:", goose_config)
+        self.assertIn("type: streamable_http", goose_config)
+        self.assertIn(f'uri: "{mcp_url}"', goose_config)
+        self.assertIn("headers:\n      Authorization: \"Basic Z29vc2VfdXNlcjpnb29zZV9wYXNzd29yZA==\"", goose_config)
+        self.assertIn("envs: {}", goose_config)
+        self.assertNotIn("cmd:", goose_config)
+
+        self.assertEqual(self._run_auto("--mcp-url", mcp_url), 0)
+        rerun = self._manifest()
+        self.assertEqual(
+            rerun["harness_outcomes"]["claude"]["hook_registration"]["status"],
+            "already_registered",
+        )
+        self.assertEqual(
+            rerun["harness_outcomes"]["claude"]["mcp_registration"]["status"],
+            "already_registered",
+        )
+        self.assertEqual(
+            rerun["harness_outcomes"]["goose"]["mcp_registration"]["status"],
+            "already_registered",
+        )
+        self.assertEqual(goose_path.read_text().count("  ferrosa-memory:\n"), 1)
+        self.assertTrue(settings_path.is_relative_to(self.home))
+        self.assertTrue(goose_path.is_relative_to(self.home))
+
+    def test_goose_empty_extensions_mapping_is_upgraded_idempotently(self):
+        config, changed = self.module.updated_goose_config(
+            "extensions: {}\n", "http://127.0.0.1:18767/mcp"
+        )
+        self.assertTrue(changed)
+        self.assertIn("extensions:\n  ferrosa-memory:", config)
+        self.assertIn("type: streamable_http", config)
+
+        rerun, changed = self.module.updated_goose_config(config, "http://127.0.0.1:18767/mcp")
+        self.assertFalse(changed)
+        self.assertEqual(rerun, config)
+
+    def test_goose_streamable_http_merge_preserves_existing_extension_fields(self):
+        original = """\
+extensions:
+  ferrosa-memory:
+    name: Custom Ferrosa Memory
+    cmd: ferrosa-memory
+    headers:
+      X-Trace: \"keep\"
+    description: Keep this description
+"""
+        updated, changed = self.module.updated_goose_config(
+            original,
+            "http://127.0.0.1:18767/mcp",
+            {"Authorization": "Bearer token"},
+        )
+        self.assertTrue(changed)
+        self.assertIn("name: Custom Ferrosa Memory", updated)
+        self.assertIn("description: Keep this description", updated)
+        self.assertIn('X-Trace: "keep"', updated)
+        self.assertIn('Authorization: "Bearer token"', updated)
+        self.assertIn("type: streamable_http", updated)
+        self.assertIn('uri: "http://127.0.0.1:18767/mcp"', updated)
+        self.assertIn("envs: {}", updated)
+        self.assertNotIn("cmd:", updated)
 
 
 if __name__ == "__main__":

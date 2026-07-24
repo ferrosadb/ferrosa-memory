@@ -337,7 +337,7 @@ If MCP is run as a standalone host-network container instead of compose, preserv
 
 ## Phase 7 — Configure optional Nomic embeddings
 
-Ferrosa Memory can still operate without an embedding model, but semantic/vector search quality will be degraded. Lexical, phonetic, direct ID lookup, and graph traversal remain useful; ANN-style semantic ranking and context-segment embedding search need embeddings.
+Ferrosa Memory can still operate without an embedding model. Lexical content search, phonetic matching, direct ID lookup, and graph traversal remain available; semantic ANN ranking and context-segment semantic search are unavailable until an embedding provider can generate vectors.
 
 Recommended local option:
 
@@ -351,7 +351,7 @@ Then configure Ferrosa Memory's embedding provider according to the repository c
 If the user declines embeddings, record this clearly in the onboarding summary:
 
 ```text
-Nomic embeddings disabled; semantic search degraded. Use lexical/phonetic examples for initial verification.
+Nomic embeddings disabled; lexical content retrieval verified; semantic ANN ranking unavailable. Use lexical/phonetic examples for initial verification.
 ```
 
 ---
@@ -620,7 +620,7 @@ Once the stack and MCP client work, run these examples.
   "arguments": {
     "entity_name": "Ferrosa Memory onboarding",
     "entity_type": "concept",
-    "content": "Ferrosa Memory is configured as a local MCP memory service for this agent harness."
+    "content": "Ferrosa Memory is configured as a local MCP memory service for this agent harness. Content verification token: c7lexicalsentinel."
   }
 }
 ```
@@ -631,10 +631,17 @@ Once the stack and MCP client work, run these examples.
 {
   "tool": "hybrid_search",
   "arguments": {
-    "query": "Ferrosa Memory onboarding"
+    "query": "c7lexicalsentinel"
   }
 }
 ```
+
+`c7lexicalsentinel` appears only in the entity content, not its name. A result
+therefore proves content retrieval rather than entity-name matching. On an
+install without an embedding provider, expect
+`query_decomposition.queries[0].embedding_status` to be `unavailable`; an
+enabled but unreachable provider reports `failed`. Both statuses mean lexical
+retrieval is available but semantic ANN ranking is unavailable.
 
 Retrieval tools use `[retrieval] default_limit` when `limit`/`k` is omitted.
 To reduce token usage at runtime, call:
@@ -838,7 +845,9 @@ Onboarding is complete when:
 - `/healthz/live`, `/healthz/ready`, and `/viz` work.
 - At least one selected harness can list Ferrosa Memory MCP tools.
 - `get_stats` succeeds.
-- A small ingest + retrieval example succeeds.
+- A small ingest + content-only retrieval example succeeds. Without embeddings,
+  its query diagnostics report `embedding_status` as `unavailable` or `failed`
+  and semantic ANN ranking is treated as unavailable.
 - The user knows where data is persisted and how to stop/start without deleting volumes.
 
 Safe stop/start commands:

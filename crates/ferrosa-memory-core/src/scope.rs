@@ -74,11 +74,11 @@ pub fn default_scope_for(entity_type: &str) -> EntityScope {
 /// caller's session. Returns `(storage_session, ingested_by_session)`.
 ///
 /// - For `Session` scope: storage session is the caller's, and
-///   `ingested_by_session` is `None` (legacy semantics — the session_id
-///   itself is the audit).
+///   `ingested_by_session` is `None` because `session_id` itself retains the
+///   original provenance.
 /// - For `Global` scope: storage session is the tenant's global sentinel,
-///   and `ingested_by_session` records the caller's session for audit and
-///   the re-rank session-affinity signal.
+///   and `ingested_by_session` records the caller's session for provenance
+///   and the re-rank session-affinity signal.
 pub fn resolve_storage_session(
     caller_session: Uuid,
     scope: EntityScope,
