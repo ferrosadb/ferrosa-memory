@@ -48,7 +48,7 @@ base64 = "0.23"
 [dev-dependencies]
 ferrosa-memory-core = { path = ".", features = ["mock-storage", "scylla-driver"] }
 tracing-subscriber = { workspace = true }
-serial_test = "3.5"
+serial_test = "4.0"
 # Property/fuzz testing of config parsing + validation (config-robustness
 # initiative). Matches the version used in ferrosa-memory-sync.
 proptest = "1"
