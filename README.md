@@ -1,5 +1,7 @@
 # Ferrosa Memory
 
+[![MCP Toplist](https://mcptoplist.com/badge/pulsemcp%2Fferrosa-memory.svg)](https://mcptoplist.com/server/pulsemcp%2Fferrosa-memory)
+
 Ferrosa Memory is durable working memory for AI agents. It turns one-off agent
 sessions into a long-running, searchable knowledge system: plans survive restarts,
 important facts keep their history, documents become retrievable by meaning, and
