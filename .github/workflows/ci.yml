@@ -41,6 +41,11 @@ jobs:
         run: cargo fmt --check
       - name: Clippy (warnings as errors)
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # MAAS-T-36: the P2P transport is feature-gated, so the default matrix
+      # never compiles it — a broken locked dep (e.g. the webrtc 0.17.2 /
+      # webrtc-sctp mismatch) would land silently. Keep the feature honest.
+      - name: Clippy (webrtc-transport feature)
+        run: cargo clippy -p ferrosa-memory-sync --features webrtc-transport --all-targets -- -D warnings
       # P0-11/W-01: no hardcoded loopback CQL addresses in non-test source.
       # Uses an awk-based scanner that strips #[cfg(test)] modules so the
       # tests that VERIFY the W-01 validator (which must literally use
