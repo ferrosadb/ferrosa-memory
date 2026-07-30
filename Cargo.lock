@@ -1090,6 +1090,7 @@ dependencies = [
  "prometheus",
  "proptest",
  "rand 0.8.7",
+ "reqwest",
  "rustls",
  "scylla",
  "serde",
@@ -1101,6 +1102,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "webrtc",
+ "x25519-dalek",
  "zeroize",
 ]
 

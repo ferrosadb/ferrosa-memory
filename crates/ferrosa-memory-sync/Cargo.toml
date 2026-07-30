@@ -33,11 +33,14 @@ rand = { workspace = true }
 # RTCDataChannel binding needs it; the transport core is dependency-free.
 webrtc = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
+# MAAS-T-36 peer session: broker signaling client + signed-ephemeral DH IKM.
+reqwest = { workspace = true, optional = true }
+x25519-dalek = { workspace = true, optional = true }
 
 [features]
 # Pulls the webrtc-rs ICE/DTLS/SCTP/SRTP stack and enables the concrete
 # `peer_transport::webrtc` channel. Off by default to keep non-P2P builds light.
-webrtc-transport = ["dep:webrtc", "dep:bytes"]
+webrtc-transport = ["dep:webrtc", "dep:bytes", "dep:reqwest", "dep:x25519-dalek"]
 
 [lib]
 name = "ferrosa_memory_sync"
