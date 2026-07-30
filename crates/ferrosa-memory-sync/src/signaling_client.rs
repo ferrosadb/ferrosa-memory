@@ -13,11 +13,7 @@
 // on known-good fixtures and are exempt.
 #![cfg_attr(
     not(test),
-    deny(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::indexing_slicing
-    )
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
 )]
 
 use serde::{Deserialize, Serialize};
