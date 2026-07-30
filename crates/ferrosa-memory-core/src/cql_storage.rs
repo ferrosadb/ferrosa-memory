@@ -366,10 +366,13 @@ fn entity_list_all_query(ks: &str) -> String {
 }
 
 fn entity_count_all_query(ks: &str) -> String {
-    format!(
-        "SELECT entity_id, session_id, entity_name, entity_type \
-         FROM {ks}.entity_store WHERE tenant_id = ? ALLOW FILTERING"
-    )
+    // Server-side aggregate. The previous form selected four columns per row
+    // and counted them client-side, which pulled the tenant's ENTIRE
+    // entity_store over the wire for a single integer — on a 77k-row tenant
+    // that hung memory_metrics indefinitely and the connection was shut down
+    // mid-stream. Measured on a live 3-node cluster: this aggregate answers in
+    // ~2s where the row stream never completed.
+    format!("SELECT count(*) FROM {ks}.entity_store WHERE tenant_id = ? ALLOW FILTERING")
 }
 
 fn edge_list_all_query(ks: &str, table: &str, src_col: &str, tgt_col: &str) -> String {
@@ -1679,7 +1682,8 @@ impl CqlStorage {
                 .await?,
             entity_count: session
                 .prepare(format!(
-                    "SELECT entity_id FROM {ks}.entity_store WHERE tenant_id = ? AND session_id = ?"
+                    "SELECT count(*) FROM {ks}.entity_store \
+                     WHERE tenant_id = ? AND session_id = ?"
                 ))
                 .await?,
             entity_count_all: session.prepare(entity_count_all_query(ks)).await?,
@@ -2224,25 +2228,29 @@ impl CqlStorage {
         Ok(count)
     }
 
-    async fn count_entities_from_minimal_paged_iter(
+    /// Read a `count(*)` aggregate for an entity-count statement.
+    ///
+    /// Replaces the former row-streaming counter: sizing a set must never
+    /// transfer the set. Tolerates every `count` column spelling ferrosa has
+    /// emitted via [`cql_get_i64_from_single_aggregate`].
+    async fn count_entities_via_aggregate(
         &self,
         stmt: PreparedStatement,
         values: impl scylla::serialize::row::SerializeRow,
     ) -> anyhow::Result<usize> {
-        let mut iter = self.session.execute_iter(stmt, values).await?;
-        let col_map = build_col_map(iter.get_column_specs());
-        let mut count = 0usize;
-        while let Some(row) = iter.next().await {
-            let row = row?;
-            if cql_get::<Uuid>(&row, &col_map, "entity_id").is_ok()
-                && cql_get::<Uuid>(&row, &col_map, "session_id").is_ok()
-                && cql_get::<String>(&row, &col_map, "entity_name").is_ok()
-                && cql_get::<String>(&row, &col_map, "entity_type").is_ok()
-            {
-                count += 1;
-            }
-        }
-        Ok(count)
+        #[allow(deprecated)]
+        let result = self.session.execute_unpaged(&stmt, values).await?;
+        let col_map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
+        let Some(row) = rows.first() else {
+            return Ok(0);
+        };
+        let count = cql_get_i64_from_single_aggregate(
+            row,
+            &col_map,
+            &["system.count", "count", "count(*)"],
+        )?;
+        Ok(count.max(0) as usize)
     }
 
     async fn count_entity_type_state_rows_from_paged_iter(
@@ -4149,19 +4157,16 @@ impl Storage for CqlStorage {
     }
 
     async fn entity_count(&self, ctx: &TenantContext, session_id: Uuid) -> anyhow::Result<usize> {
-        // Client-side count: SELECT entity_id returns rows, count them as the
-        // driver yields pages. Ferrosa's COUNT(*) column naming has varied, so
-        // this keeps exact counts without materializing the result set.
-        let mut iter = self
-            .session
-            .execute_iter(self.stmts.entity_count.clone(), (ctx.tenant_id, session_id))
-            .await?;
-        let mut count = 0usize;
-        while let Some(row) = iter.next().await {
-            row?;
-            count += 1;
-        }
-        Ok(count)
+        // Server-side aggregate. Counting client-side meant streaming every
+        // entity row just to size the set; the COUNT(*) column-naming variance
+        // that motivated that is already handled by
+        // `cql_get_i64_from_single_aggregate`, which accepts every spelling
+        // ferrosa has used.
+        self.count_entities_via_aggregate(
+            self.stmts.entity_count.clone(),
+            (ctx.tenant_id, session_id),
+        )
+        .await
     }
 
     async fn entity_count_matching(
@@ -4180,10 +4185,7 @@ impl Storage for CqlStorage {
                 return Ok(count);
             }
             return self
-                .count_entities_from_minimal_paged_iter(
-                    self.stmts.entity_count_all.clone(),
-                    (ctx.tenant_id,),
-                )
+                .count_entities_via_aggregate(self.stmts.entity_count_all.clone(), (ctx.tenant_id,))
                 .await;
         }
 
@@ -8792,9 +8794,19 @@ mod cql_storage_tests {
         let method_end = tail.find("async fn entity_count_matching").unwrap();
         let method_source = &tail[..method_end];
 
+        // The invariant is "never transfer N rows to learn N", not "use
+        // execute_iter". A server-side count(*) returns exactly ONE row, which
+        // satisfies that invariant strictly better than paging every row:
+        // measured on a 77k-row tenant, the aggregate answers in ~2s where the
+        // row stream never completed and the connection was shut down
+        // mid-scan. Assert the aggregate, and assert we are NOT selecting rows.
         assert!(
-            method_source.contains("execute_iter"),
-            "{method} must consume driver pages instead of unpaged rows"
+            method_source.contains("count_entities_via_aggregate"),
+            "{method} must read a server-side count(*) aggregate"
+        );
+        assert!(
+            !method_source.contains("execute_iter"),
+            "{method} must not page rows to count them — use the aggregate"
         );
         assert!(
             !method_source.contains("exec_prepared_rows"),
@@ -8816,7 +8828,7 @@ mod cql_storage_tests {
             "entity_count_matching must delegate to the streaming count helper"
         );
         assert!(
-            matching_source.contains("count_entities_from_minimal_paged_iter")
+            matching_source.contains("count_entities_via_aggregate")
                 && matching_source.contains("entity_count_all"),
             "unfiltered entity_count_matching must use a minimal projection instead of full entity rows"
         );
