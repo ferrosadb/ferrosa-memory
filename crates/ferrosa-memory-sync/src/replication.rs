@@ -69,7 +69,7 @@ use crate::pack_crypto::{CipherFloor, PackCryptoError, Secret, seal_pack};
 /// The builder copies these and **only** these — it never expands the graph to
 /// pull in neighbours (MR-P2P-07). Edges and temporal events that reference an
 /// entity outside [`TeacherSelection::entities`] are dropped during the build.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct TeacherSelection {
     /// Exactly the entities the teacher selected. Defines the closure set.
     pub entities: Vec<EntityEntry>,

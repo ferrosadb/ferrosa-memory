@@ -54,6 +54,59 @@ enum Command {
         #[arg(long)]
         source: std::path::PathBuf,
     },
+    /// Generate a P2P device identity key file (MAAS-T-36). Prints the public
+    /// key hex to register at the gateway (POST /v1/devices) + its fingerprint.
+    #[cfg(feature = "webrtc-transport")]
+    P2pKeygen {
+        /// Where to write the key file (created 0600).
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
+    /// Offer + stream a sealed pack to a mutual contact through the MaaS
+    /// broker (teacher side).
+    #[cfg(feature = "webrtc-transport")]
+    P2pShare {
+        /// Gateway base URL (e.g. https://gw.example).
+        #[arg(long)]
+        gateway: String,
+        /// API key; falls back to $FERROSA_MAAS_API_KEY.
+        #[arg(long, env = "FERROSA_MAAS_API_KEY")]
+        api_key: String,
+        /// Device key file (from p2p-keygen; its key must be registered).
+        #[arg(long)]
+        identity: std::path::PathBuf,
+        /// The learner's account id (must be a mutual contact).
+        #[arg(long)]
+        learner_account: Uuid,
+        /// JSON file holding the TeacherSelection to pack.
+        #[arg(long)]
+        selection: std::path::PathBuf,
+        /// Namespace label carried in pack provenance.
+        #[arg(long, default_value = "default")]
+        namespace: String,
+    },
+    /// Accept a pending offer and receive the pack into a landing directory
+    /// (learner side).
+    #[cfg(feature = "webrtc-transport")]
+    P2pReceive {
+        /// Gateway base URL.
+        #[arg(long)]
+        gateway: String,
+        /// API key; falls back to $FERROSA_MAAS_API_KEY.
+        #[arg(long, env = "FERROSA_MAAS_API_KEY")]
+        api_key: String,
+        /// Device key file (from p2p-keygen; its key must be registered).
+        #[arg(long)]
+        identity: std::path::PathBuf,
+        /// Landing directory for applied packs (durable JSON; the
+        /// storage-backed apply store is a separate packet).
+        #[arg(long)]
+        out_dir: std::path::PathBuf,
+        /// Accept a specific session; defaults to the only pending offer
+        /// (errors if there are zero or several — never guesses).
+        #[arg(long)]
+        session: Option<Uuid>,
+    },
 }
 
 #[derive(Default)]
@@ -86,7 +139,173 @@ async fn main() -> anyhow::Result<()> {
             tenant_id,
             dry_run,
         } => cmd_sync(&source, &dest, tenant_id, dry_run).await,
+        #[cfg(feature = "webrtc-transport")]
+        Command::P2pKeygen { out } => cmd_p2p_keygen(&out),
+        #[cfg(feature = "webrtc-transport")]
+        Command::P2pShare {
+            gateway,
+            api_key,
+            identity,
+            learner_account,
+            selection,
+            namespace,
+        } => {
+            cmd_p2p_share(
+                &gateway,
+                &api_key,
+                &identity,
+                learner_account,
+                &selection,
+                &namespace,
+            )
+            .await
+        }
+        #[cfg(feature = "webrtc-transport")]
+        Command::P2pReceive {
+            gateway,
+            api_key,
+            identity,
+            out_dir,
+            session,
+        } => cmd_p2p_receive(&gateway, &api_key, &identity, &out_dir, session).await,
     }
+}
+
+#[cfg(feature = "webrtc-transport")]
+fn cmd_p2p_keygen(out: &std::path::Path) -> anyhow::Result<()> {
+    use ferrosa_memory_sync::peer_cli;
+    let identity = peer_cli::keygen(out)?;
+    let public = identity.public_identity();
+    let public_hex: String = public
+        .public_key
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    println!("device key written: {}", out.display());
+    println!("instance_id:        {}", public.instance_id.0);
+    println!("public_key (register this at POST /v1/devices): {public_hex}");
+    println!("fingerprint:        {}", public.public_key_fingerprint.0);
+    Ok(())
+}
+
+#[cfg(feature = "webrtc-transport")]
+async fn cmd_p2p_share(
+    gateway: &str,
+    api_key: &str,
+    identity_path: &std::path::Path,
+    learner_account: Uuid,
+    selection_path: &std::path::Path,
+    namespace: &str,
+) -> anyhow::Result<()> {
+    use chrono::Utc;
+    use ferrosa_memory_sync::pack::{CipherSuite, PackProvenanceEnvelope};
+    use ferrosa_memory_sync::peer_cli;
+    use ferrosa_memory_sync::peer_session::{PeerSessionConfig, run_teacher_session};
+    use ferrosa_memory_sync::replication::{PackBuildParams, TeacherSelection};
+    use ferrosa_memory_sync::signaling_client::{HttpSignalingClient, SignalingApi};
+
+    let identity = peer_cli::load_identity(identity_path)?;
+    let selection: TeacherSelection = serde_json::from_slice(&std::fs::read(selection_path)?)?;
+    let api = HttpSignalingClient::new(gateway, api_key);
+    let public = identity.public_identity();
+
+    let pack_id = Uuid::new_v4();
+    let session_id = api
+        .offer(learner_account, pack_id, &public.public_key_fingerprint.0)
+        .await?;
+    println!("offer created: session {session_id} pack {pack_id}");
+    println!("waiting for the learner to accept…");
+
+    let created = Utc::now();
+    let mut params = PackBuildParams {
+        pack_id,
+        pack_version: 1,
+        cipher_suite: CipherSuite::Aes256Gcm,
+        engine_version: env!("CARGO_PKG_VERSION").to_string(),
+        embedding_model: String::new(),
+        embedding_dim: 0,
+        summary_first: false,
+        created_at: created,
+        ttl_expires_at: None,
+        provenance: PackProvenanceEnvelope {
+            teacher_instance_id: public.instance_id,
+            // Overwritten with the broker-vouched pair inside the driver.
+            teacher_fingerprint: public.public_key_fingerprint.clone(),
+            learner_fingerprint: public.public_key_fingerprint.clone(),
+            request_id: None,
+            source_namespace: namespace.to_string(),
+        },
+    };
+    let report = run_teacher_session(
+        &api,
+        &identity,
+        session_id,
+        &selection,
+        &mut params,
+        &PeerSessionConfig::default(),
+    )
+    .await?;
+    println!(
+        "pack {pack_id} delivered and applied (dropped_edges={}, dropped_temporal={})",
+        report.dropped_edges, report.dropped_temporal
+    );
+    Ok(())
+}
+
+#[cfg(feature = "webrtc-transport")]
+async fn cmd_p2p_receive(
+    gateway: &str,
+    api_key: &str,
+    identity_path: &std::path::Path,
+    out_dir: &std::path::Path,
+    session: Option<Uuid>,
+) -> anyhow::Result<()> {
+    use ferrosa_memory_sync::peer_cli::{self, DirPackApplyStore};
+    use ferrosa_memory_sync::peer_session::{PeerSessionConfig, run_learner_session};
+    use ferrosa_memory_sync::signaling_client::{HttpSignalingClient, SignalingApi};
+
+    let identity = peer_cli::load_identity(identity_path)?;
+    let api = HttpSignalingClient::new(gateway, api_key);
+
+    let session_id = match session {
+        Some(s) => s,
+        None => {
+            let pending = api.pending_offers().await?;
+            match pending.as_slice() {
+                [only] => {
+                    println!(
+                        "accepting the pending offer {} from {} (pack {})",
+                        only.session_id, only.teacher_account, only.pack_id
+                    );
+                    only.session_id
+                }
+                [] => anyhow::bail!("no pending offers"),
+                many => anyhow::bail!(
+                    "{} pending offers — pass --session to pick one: {:?}",
+                    many.len(),
+                    many.iter().map(|o| o.session_id).collect::<Vec<_>>()
+                ),
+            }
+        }
+    };
+
+    let store = DirPackApplyStore::open(out_dir)?;
+    let health = run_learner_session(
+        &api,
+        &identity,
+        session_id,
+        store,
+        session_id,
+        &PeerSessionConfig::default(),
+    )
+    .await?;
+    println!(
+        "pack applied into {} (frames={}, applied={})",
+        out_dir.display(),
+        health.frames_received,
+        health.packs_applied
+    );
+    Ok(())
 }
 
 async fn cmd_sync(
