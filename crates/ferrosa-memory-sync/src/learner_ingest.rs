@@ -172,7 +172,7 @@ pub trait PackApplyStore {
 /// the same unit (MR-P2P-13).
 ///
 /// No `PartialEq`: core payload component types do not implement it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StagedPack {
     pub pack_id: Uuid,
     pub pack_version: u64,

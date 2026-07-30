@@ -115,6 +115,22 @@ impl InstanceSigningIdentity {
         }
     }
 
+    /// Rebuild an identity from its 32-byte Ed25519 secret (MAAS-T-36 device
+    /// key files). The caller owns secret-material hygiene; this type still
+    /// never serializes the secret itself.
+    pub fn from_secret_bytes(instance_id: InstanceId, secret: [u8; 32]) -> Self {
+        Self {
+            instance_id,
+            signing_key: SigningKey::from_bytes(&secret),
+        }
+    }
+
+    /// Export the 32-byte Ed25519 secret (for writing a device key file at
+    /// keygen time ONLY — never log or transmit this).
+    pub fn secret_bytes(&self) -> [u8; 32] {
+        self.signing_key.to_bytes()
+    }
+
     pub fn public_identity(&self) -> InstancePublicIdentity {
         let verifying_key = self.signing_key.verifying_key();
         InstancePublicIdentity {
