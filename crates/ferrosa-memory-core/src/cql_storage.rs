@@ -1375,6 +1375,8 @@ struct PreparedStatements {
     entity_put: PreparedStatement,
     entity_count: PreparedStatement,
     entity_count_all: PreparedStatement,
+    entity_count_by_type_all: PreparedStatement,
+    entity_count_by_type_session: PreparedStatement,
     entity_type_state_count_session: PreparedStatement,
     entity_type_state_count_all: PreparedStatement,
     entity_list_session: PreparedStatement,
@@ -1687,6 +1689,18 @@ impl CqlStorage {
                 ))
                 .await?,
             entity_count_all: session.prepare(entity_count_all_query(ks)).await?,
+            entity_count_by_type_all: session
+                .prepare(format!(
+                    "SELECT count(*) FROM {ks}.entity_store \
+                     WHERE tenant_id = ? AND entity_type = ? ALLOW FILTERING"
+                ))
+                .await?,
+            entity_count_by_type_session: session
+                .prepare(format!(
+                    "SELECT count(*) FROM {ks}.entity_store \
+                     WHERE tenant_id = ? AND session_id = ? AND entity_type = ? ALLOW FILTERING"
+                ))
+                .await?,
             entity_type_state_count_session: session
                 .prepare(format!(
                     "SELECT entity_type, state FROM {ks}.entity_store \
@@ -4187,6 +4201,46 @@ impl Storage for CqlStorage {
             return self
                 .count_entities_via_aggregate(self.stmts.entity_count_all.clone(), (ctx.tenant_id,))
                 .await;
+        }
+
+        // Predicate pushdown: `entity_type` is a real column, so when it is the
+        // ONLY narrowing predicate the whole count runs server-side as an
+        // aggregate — measured ~0.0s versus streaming every candidate row.
+        //
+        // `filters` is an arbitrary `serde_json::Map` evaluated per row in
+        // Rust; those predicates have no CQL equivalent, so that case must
+        // still stream. It streams with a minimal projection and O(1) memory,
+        // and it is deliberately NOT bounded: truncating a count returns a
+        // WRONG NUMBER, which is worse than a slow one. Bound work, not results.
+        if let Some(entity_type) = query.entity_type.as_deref()
+            && query.filters.is_empty()
+            && query.limit == 0
+        {
+            {
+                let mut count = 0usize;
+                if let Some(sessions) = crate::storage::entity_list_sessions(
+                    ctx.tenant_id,
+                    query.session_id,
+                    query.scope,
+                ) {
+                    for session_id in sessions {
+                        count += self
+                            .count_entities_via_aggregate(
+                                self.stmts.entity_count_by_type_session.clone(),
+                                (ctx.tenant_id, session_id, entity_type),
+                            )
+                            .await?;
+                    }
+                } else {
+                    count = self
+                        .count_entities_via_aggregate(
+                            self.stmts.entity_count_by_type_all.clone(),
+                            (ctx.tenant_id, entity_type),
+                        )
+                        .await?;
+                }
+                return Ok(count);
+            }
         }
 
         let mut count = 0usize;
