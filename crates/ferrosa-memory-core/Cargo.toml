@@ -31,6 +31,7 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 dirs = { workspace = true }
 scylla = { workspace = true }
+openssl = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 tokio-tungstenite = { workspace = true }
