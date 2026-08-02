@@ -457,6 +457,8 @@ async fn fixed_document_search_survives_fts_stopword_absent_from_corpus() {
 
     let Some(cfg) = test_cluster() else { return };
     let config = FerrosaCqlConfig {
+        tls_ca_path: None,
+        tls_skip_hostname_verify: false,
         contact_points: vec![cfg.contact_point()],
         keyspace: cfg.keyspace.clone(),
         replication_factor: 1,
@@ -540,6 +542,8 @@ async fn ghost_rows_do_not_crash_queries() {
 
     let Some(cfg) = test_cluster() else { return };
     let config = FerrosaCqlConfig {
+        tls_ca_path: None,
+        tls_skip_hostname_verify: false,
         contact_points: vec![cfg.contact_point()],
         keyspace: cfg.keyspace.clone(),
         replication_factor: 1,

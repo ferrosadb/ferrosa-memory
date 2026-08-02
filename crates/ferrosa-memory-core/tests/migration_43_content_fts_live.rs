@@ -25,6 +25,8 @@ async fn migration_43_finds_entity_content_without_an_embedding() {
     let username = std::env::var("FERROSA_TEST_USERNAME").unwrap_or_else(|_| "ferrosa_user".into());
     let password = std::env::var("FERROSA_TEST_PASSWORD").unwrap_or_else(|_| "ferrosa_user".into());
     let config = FerrosaCqlConfig {
+        tls_ca_path: None,
+        tls_skip_hostname_verify: false,
         contact_points: vec![test.contact_point()],
         keyspace: test.keyspace,
         replication_factor: 1,

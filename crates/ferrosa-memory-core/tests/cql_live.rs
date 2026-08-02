@@ -35,6 +35,8 @@ async fn connect_plain(contact_point: &str) -> LegacySession {
 
 fn local_cluster_config() -> FerrosaCqlConfig {
     FerrosaCqlConfig {
+        tls_ca_path: None,
+        tls_skip_hostname_verify: false,
         contact_points: vec![
             "127.0.0.1:19042".into(),
             "127.0.0.1:19043".into(),
@@ -362,6 +364,8 @@ async fn auth_enabled_multipoint_cql_storage_connect_matches_fmem_runtime_path()
     }
 
     let cfg = FerrosaCqlConfig {
+        tls_ca_path: None,
+        tls_skip_hostname_verify: false,
         contact_points: vec![
             "127.0.0.1:19042".into(),
             "127.0.0.1:19043".into(),
@@ -504,6 +508,8 @@ async fn viz_streaming_queries_return_live_nodes_and_edges() {
     }
 
     let cfg = FerrosaCqlConfig {
+        tls_ca_path: None,
+        tls_skip_hostname_verify: false,
         contact_points: vec![
             "127.0.0.1:19042".into(),
             "127.0.0.1:19043".into(),

@@ -827,6 +827,19 @@ for line in sys.stdin:
         let child_stdin = child.stdin.take().unwrap();
         let child_stdout = child.stdout.take().unwrap();
 
+        // Wait for the child to actually exit rather than guessing with a
+        // fixed sleep. A 100ms sleep here was enough when this test ran alone
+        // but not when it ran alongside the rest of the suite: spawn+exit had
+        // not completed, so initialize() reported a different error variant
+        // and the strict ServerCrashed assertion below failed. try_wait()
+        // caches the status, so the client's own crash detection still sees it.
+        loop {
+            if child.try_wait().expect("try_wait on test child").is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
         let mut client = McpClient {
             child,
             stdin: BufWriter::new(child_stdin),
@@ -834,9 +847,6 @@ for line in sys.stdin:
             next_id: 1,
             binary_path: "python3".to_string(),
         };
-
-        // Give the process a moment to exit
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let err = client.initialize().await.unwrap_err();
         match err {
@@ -1398,6 +1408,8 @@ for line in sys.stdin:
             .expect("second smart_ingest call should succeed");
 
         let storage_config = FerrosaCqlConfig {
+            tls_ca_path: None,
+            tls_skip_hostname_verify: false,
             contact_points: vec![format!("{cql_host}:{cql_port}")],
             keyspace: "agent_memory_test".to_string(),
             replication_factor: 1,

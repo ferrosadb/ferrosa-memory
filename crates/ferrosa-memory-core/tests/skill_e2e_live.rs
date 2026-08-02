@@ -41,6 +41,8 @@ async fn graph_client(test: &TestClusterConfig) -> GraphClient {
 
 fn base_cfg(test: &TestClusterConfig) -> FerrosaCqlConfig {
     FerrosaCqlConfig {
+        tls_ca_path: None,
+        tls_skip_hostname_verify: false,
         contact_points: vec![test.contact_point()],
         keyspace: test.keyspace.clone(),
         replication_factor: 1,

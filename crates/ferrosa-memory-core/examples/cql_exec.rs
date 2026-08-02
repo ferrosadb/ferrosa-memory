@@ -47,9 +47,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if stmt.is_empty() || stmt.starts_with("--") {
             continue;
         }
-        session.query_unpaged(stmt, &[]).await.map_err(|e| {
-            format!("statement failed: {stmt}\n  {e}")
-        })?;
+        session
+            .query_unpaged(stmt, &[])
+            .await
+            .map_err(|e| format!("statement failed: {stmt}\n  {e}"))?;
         applied += 1;
         println!("ok: {stmt}");
     }
