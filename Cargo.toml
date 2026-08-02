@@ -76,7 +76,9 @@ dirs = "6"
 # Replaces an earlier cdrs-tokio fork on the feature/vector-type branch.
 # The fork existed only for VECTOR type support; scylla 0.15 supports bytes/blob
 # round-trips which we use for vector embedding storage (encode_vector/decode_vector).
-scylla = { version = "0.15", features = ["chrono-04"] }
+scylla = { version = "0.15", features = ["chrono-04", "ssl"] }
+# TLS for the CQL client; must track scylla's `ssl` feature (openssl 0.10).
+openssl = "0.10"
 
 # TLS
 tokio-rustls = "0.26"

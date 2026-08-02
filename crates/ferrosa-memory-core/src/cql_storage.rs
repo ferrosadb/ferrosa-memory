@@ -1310,18 +1310,64 @@ pub async fn connect_session(
         anyhow::bail!("no contact points configured");
     }
 
-    let session = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        SessionBuilder::new()
-            .known_nodes(&config.contact_points)
-            .user(username, password)
-            .connection_timeout(std::time::Duration::from_secs(10))
-            .build_legacy(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("CQL session build timed out (10s) — is Ferrosa running?"))??;
+    let mut builder = SessionBuilder::new()
+        .known_nodes(&config.contact_points)
+        .user(username, password)
+        .connection_timeout(std::time::Duration::from_secs(10));
+    if let Some(ctx) = build_cql_ssl_context(config)? {
+        builder = builder.ssl_context(Some(ctx));
+    }
+
+    let session = tokio::time::timeout(std::time::Duration::from_secs(10), builder.build_legacy())
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "CQL session build timed out (10s) — is Ferrosa running{}?",
+                if config.tls_ca_path.is_some() {
+                    ""
+                } else {
+                    ", and does it require TLS (ferrosa.tls_ca_path is unset)"
+                }
+            )
+        })??;
 
     Ok(Arc::new(session))
+}
+
+/// Build the OpenSSL context for CQL, or `None` when TLS is not configured.
+///
+/// Verification is always `PEER`. Encrypting to an unverified server defeats a
+/// passive listener but not an active MITM, and the CQL link carries every
+/// memory the engine stores. Only the hostname check is optional, and only for
+/// port-forward access.
+fn build_cql_ssl_context(
+    config: &FerrosaCqlConfig,
+) -> anyhow::Result<Option<openssl::ssl::SslContext>> {
+    use openssl::ssl::{SslContextBuilder, SslMethod, SslVerifyMode};
+
+    let Some(ca_path) = config.tls_ca_path.as_deref() else {
+        return Ok(None);
+    };
+
+    let mut builder = SslContextBuilder::new(SslMethod::tls_client())
+        .map_err(|e| anyhow::anyhow!("could not create CQL TLS context: {e}"))?;
+    builder
+        .set_ca_file(ca_path)
+        .map_err(|e| anyhow::anyhow!("could not load CQL CA bundle {ca_path}: {e}"))?;
+    builder.set_verify(SslVerifyMode::PEER);
+
+    if config.tls_skip_hostname_verify {
+        tracing::warn!(
+            ca = ca_path,
+            "CQL TLS hostname verification disabled — expected only via a local port forward"
+        );
+        builder
+            .verify_param_mut()
+            .set_hostflags(openssl::x509::verify::X509CheckFlags::NEVER_CHECK_SUBJECT);
+    }
+
+    tracing::info!(ca = ca_path, "CQL TLS enabled");
+    Ok(Some(builder.build()))
 }
 
 /// Build a short-lived session for schema migrations. Uses
@@ -9203,6 +9249,100 @@ mod cql_storage_tests {
                 "fallback entity type registry must include {expected}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod cql_tls_tests {
+    use super::*;
+
+    fn cfg(ca: Option<&str>, skip_hostname: bool) -> FerrosaCqlConfig {
+        FerrosaCqlConfig {
+            contact_points: vec!["127.0.0.1:9042".to_string()],
+            keyspace: "agent_memory".to_string(),
+            replication_factor: 1,
+            consistency: "QUORUM".to_string(),
+            username: "u".to_string(),
+            password: "p".to_string(),
+            admin_username: None,
+            admin_password: None,
+            tls_ca_path: ca.map(str::to_string),
+            tls_skip_hostname_verify: skip_hostname,
+        }
+    }
+
+    /// Absent CA means plaintext, not an error — local dev clusters run
+    /// without TLS.
+    #[test]
+    fn no_ca_path_yields_no_context() {
+        assert!(
+            build_cql_ssl_context(&cfg(None, false))
+                .expect("absent CA must not be an error")
+                .is_none(),
+            "expected plaintext when no CA is configured"
+        );
+    }
+
+    /// A missing CA file must fail immediately and name the path. Against a
+    /// require_tls cluster the alternative is a 10s connect timeout that says
+    /// nothing about the certificate.
+    #[test]
+    fn missing_ca_file_fails_and_names_the_path() {
+        let err = build_cql_ssl_context(&cfg(Some("/nonexistent/ca-cert.pem"), false))
+            .expect_err("a missing CA bundle must fail loudly");
+        assert!(
+            err.to_string().contains("/nonexistent/ca-cert.pem"),
+            "error should name the offending path, got: {err}"
+        );
+    }
+
+    /// A file that exists but is not PEM must be rejected up front, rather
+    /// than yielding a context that trusts nothing and fails at handshake.
+    #[test]
+    fn malformed_ca_file_is_rejected() {
+        let dir = std::env::temp_dir().join("fmem-cql-tls-test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("not-a-cert.pem");
+        std::fs::write(&path, b"definitely not a certificate\n").expect("write");
+        let res = build_cql_ssl_context(&cfg(Some(path.to_str().unwrap()), false));
+        assert!(res.is_err(), "a malformed CA bundle must be rejected");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A real CA builds a context in both hostname-verification modes.
+    #[test]
+    fn valid_ca_builds_context_in_both_hostname_modes() {
+        let dir = std::env::temp_dir().join("fmem-cql-tls-test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("ca-cert.pem");
+
+        let rsa = openssl::rsa::Rsa::generate(2048).expect("rsa");
+        let pkey = openssl::pkey::PKey::from_rsa(rsa).expect("pkey");
+        let mut nb = openssl::x509::X509NameBuilder::new().expect("name");
+        nb.append_entry_by_text("CN", "test-ca").expect("cn");
+        let name = nb.build();
+        let mut b = openssl::x509::X509::builder().expect("builder");
+        b.set_version(2).expect("version");
+        b.set_subject_name(&name).expect("subject");
+        b.set_issuer_name(&name).expect("issuer");
+        b.set_pubkey(&pkey).expect("pubkey");
+        b.set_not_before(&openssl::asn1::Asn1Time::days_from_now(0).unwrap())
+            .expect("nb");
+        b.set_not_after(&openssl::asn1::Asn1Time::days_from_now(1).unwrap())
+            .expect("na");
+        b.sign(&pkey, openssl::hash::MessageDigest::sha256())
+            .expect("sign");
+        std::fs::write(&path, b.build().to_pem().expect("pem")).expect("write ca");
+
+        for skip in [false, true] {
+            assert!(
+                build_cql_ssl_context(&cfg(Some(path.to_str().unwrap()), skip))
+                    .unwrap_or_else(|e| panic!("valid CA must build (skip={skip}): {e}"))
+                    .is_some(),
+                "expected a TLS context when a CA is configured (skip={skip})"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }
 

@@ -17,7 +17,7 @@ build-podman:
 		-w /work \
 		-e CARGO_TARGET_DIR=/work/target-podman-linux \
 		$(PODMAN_BUILD_IMAGE) \
-		bash -lc '. /usr/local/cargo/env && export DEBIAN_FRONTEND=noninteractive && apt-get update -qq && apt-get install -y --no-install-recommends cmake >/dev/null && cargo build --release -p ferrosa-memory-mcp'
+		bash -lc '. /usr/local/cargo/env && export DEBIAN_FRONTEND=noninteractive && apt-get update -qq && apt-get install -y --no-install-recommends cmake pkg-config libssl-dev >/dev/null && cargo build --release -p ferrosa-memory-mcp'
 
 test-unit:
 	cargo test --workspace --lib

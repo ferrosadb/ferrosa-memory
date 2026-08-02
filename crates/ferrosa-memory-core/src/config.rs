@@ -622,6 +622,21 @@ pub struct FerrosaCqlConfig {
     pub admin_username: Option<String>,
     #[serde(default)]
     pub admin_password: Option<String>,
+    /// Path to the PEM CA bundle signing the Ferrosa cluster's CQL
+    /// certificate. `Some` enables TLS and verifies the server against this
+    /// CA; `None` connects in plaintext.
+    ///
+    /// A cluster started with `FERROSA_MODE=production` refuses to boot unless
+    /// `cql_require_tls` is set, so this is required to reach one. Without it
+    /// the TCP connection is accepted and the handshake then stalls until the
+    /// connect timeout, with no error from either end explaining why.
+    #[serde(default)]
+    pub tls_ca_path: Option<String>,
+    /// Skip server hostname verification while still requiring a CA-signed
+    /// certificate. Only for reaching a cluster through a local port forward,
+    /// where the dialled address is absent from the certificate's SAN list.
+    #[serde(default)]
+    pub tls_skip_hostname_verify: bool,
 }
 
 #[derive(Debug, Deserialize)]
