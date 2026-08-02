@@ -1,0 +1,37 @@
+# Multi-stage build for the MaaS retrieval engine, compiled on Fly's builder.
+#
+# Why not `make build-podman`: podman on Apple Silicon builds
+# aarch64-unknown-linux-gnu by default, and Fly only accepts amd64 images.
+# Forcing --platform linux/amd64 locally means qemu emulation, which is
+# punishing for a workspace this size. `fly deploy --remote-only` runs this
+# on a native amd64 builder instead.
+#
+# rust-toolchain.toml pins the compiler, so rustup fetches that exact version
+# here — the image's default stable is deliberately not what gets used.
+FROM docker.io/library/rust:1 AS builder
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+# Single crate: the workspace also holds test-only members we do not ship.
+RUN cargo build --release -p ferrosa-memory-mcp
+
+FROM docker.io/library/debian:trixie-slim
+
+# libssl3 backs the openssl crate used for CQL TLS. curl and ca-certificates
+# would pull it in anyway; naming it makes the dependency explicit rather than
+# incidental to another package.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=builder /src/target/release/ferrosa-memory-mcp /usr/local/bin/ferrosa-memory-mcp
+
+ENV FERROSA_MEMORY_CONFIG=/etc/ferrosa-memory/config.toml
+EXPOSE 8080
+CMD ["ferrosa-memory-mcp"]

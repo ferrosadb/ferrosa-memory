@@ -33,3 +33,6 @@ venv/
 node_modules/
 *.log
 **/tmp/
+
+# Sibling git worktrees (.wt-*) are full checkouts; never part of the context.
+.wt-*/
