@@ -3926,6 +3926,8 @@ enabled = false
     #[tokio::test]
     async fn reconnecting_storage_reports_readiness() {
         let cfg = FerrosaCqlConfig {
+            tls_ca_path: None,
+            tls_skip_hostname_verify: false,
             contact_points: vec!["localhost:19042".into()],
             keyspace: "agent_memory".into(),
             replication_factor: 3,

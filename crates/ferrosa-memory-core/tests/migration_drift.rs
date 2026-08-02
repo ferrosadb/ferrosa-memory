@@ -39,6 +39,8 @@ fn feedback_outcomes_ddl_query_id_is_uuid(ddl: &str) -> bool {
 
 fn test_cfg(test: &TestClusterConfig) -> FerrosaCqlConfig {
     FerrosaCqlConfig {
+        tls_ca_path: None,
+        tls_skip_hostname_verify: false,
         contact_points: vec![test.contact_point()],
         keyspace: test.keyspace.clone(),
         replication_factor: 1,

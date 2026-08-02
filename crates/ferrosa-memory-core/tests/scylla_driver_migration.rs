@@ -90,6 +90,8 @@ fn test_config() -> FerrosaCqlConfig {
         std::env::var("FERROSA_TEST_KEYSPACE").unwrap_or_else(|_| "agent_memory_test".to_string());
 
     FerrosaCqlConfig {
+        tls_ca_path: None,
+        tls_skip_hostname_verify: false,
         contact_points: vec![format!("{host}:{port}")],
         keyspace,
         replication_factor: 1,
