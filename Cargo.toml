@@ -35,7 +35,7 @@ ed25519-dalek = { version = "3", features = ["rand_core"] }
 # MAAS-T-36 peer session: signed-ephemeral X25519 DH derives the per-session
 # pack IKM; static_secrets lets us feed locally generated random bytes without
 # rand_core version coupling.
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 rand_core = { version = "0.10", features = ["getrandom"] }
 
 # MaaS P2P transfer crypto (ferrosa-memory-sync). RustCrypto 0.10/0.12
