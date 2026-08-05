@@ -78,7 +78,11 @@ dirs = "6"
 # round-trips which we use for vector embedding storage (encode_vector/decode_vector).
 scylla = { version = "0.15", features = ["chrono-04", "ssl"] }
 # TLS for the CQL client; must track scylla's `ssl` feature (openssl 0.10).
-openssl = "0.10"
+# `vendored` makes openssl-sys compile its own OpenSSL from source, removing
+# the system-library dependency that broke musl cross-compile in CI (the musl
+# build targets don't have libssl-dev / a musl-compatible openssl.pc available).
+# This works identically for x86_64-musl, aarch64-musl (cross), and macOS.
+openssl = { version = "0.10", features = ["vendored"] }
 
 # TLS
 tokio-rustls = "0.26"
