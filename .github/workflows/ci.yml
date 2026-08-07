@@ -572,6 +572,26 @@ jobs:
             fi
             sleep 2
           done
+      - name: Pre-build the migrate binary (keep the compile out of the DDL timeout)
+        # Both `timeout 180s cargo run --bin migrate` calls below were timing
+        # the COMPILE, not the DDL apply. This job does not share the earlier
+        # `cargo build --workspace` step (different job), so `cargo run` built
+        # migrate from scratch inside the timeout.
+        #
+        # Observed on run 31162617800 (and identically on main since
+        # 2026-08-05, so this blocks every PR in the repo, not one branch):
+        #   08:49:52  step starts, timeout 180s begins
+        #   08:50:07  still compiling dependencies
+        #   08:52:29  first DDL applied — 157s of the 180s already spent
+        #   08:52:52  killed, exit 124, 36 of 53 DDL files applied
+        # It was making steady progress when killed: not a hang, and not slow
+        # DDL. The budget was simply consumed before the work started.
+        #
+        # Building here leaves the timeout bounding only the DDL apply, which
+        # is what it was meant to bound. The `cargo run` calls stay as-is and
+        # become near-instant freshness checks.
+        run: cargo build --bin migrate
+
       - name: Apply DDL + wait for schema propagation across all 3 nodes
         # p1-37 (ferrosa) lifted the scylla 0.15 driver-compat block, so
         # the migrate binary can now apply DDL against ferrosa via raw
