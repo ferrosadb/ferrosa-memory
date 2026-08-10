@@ -53,7 +53,7 @@ rand = "0.8"
 # MaaS P2P WebRTC transport (ferrosa-memory-sync, behind the `webrtc-transport`
 # feature so non-P2P builds don't pull the ICE/DTLS/SCTP/SRTP tree). Provides
 # the concrete RTCDataChannel that backs peer_transport::DataChannel (MAAS-T-25b).
-webrtc = "0.17"
+webrtc = "0.20"
 bytes = "1"
 # digest 0.11 changed finalize() output to hybrid_array::Array, which doesn't
 # implement LowerHex — encode digests via hex::encode instead of "{:x}".
