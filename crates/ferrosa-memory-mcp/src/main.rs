@@ -3204,8 +3204,44 @@ where
     })
 }
 
+/// The text `--version` / `--help` should print, or `None` to start the server.
+///
+/// Pure so it can be tested without spawning a process.
+///
+/// This exists because `ferrosa-memory-mcp --version` previously printed no
+/// version at all: the flag fell through and the SERVER STARTED. Anything
+/// probing the binary for its version — an installer, an update check — quietly
+/// launched a memory daemon instead.
+fn cli_meta_output(args: impl IntoIterator<Item = String>) -> Option<String> {
+    let version = format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+    for arg in args {
+        match arg.as_str() {
+            "--version" | "-V" => return Some(version),
+            "--help" | "-h" => {
+                return Some(format!(
+                    "{version}\n\n\
+The Ferrosa Memory MCP server. Configuration comes from the TOML file named by\n\
+FERROSA_MEMORY_CONFIG (or ferrosa-memory.toml in the working directory).\n\n\
+  --debug          verbose logging\n\
+  -V, --version    print the version and exit\n\
+  -h, --help       print this help and exit"
+                ));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Before tracing init and before any config/storage work, so the output is
+    // a single clean line a caller can parse rather than log-interleaved.
+    if let Some(output) = cli_meta_output(std::env::args().skip(1)) {
+        println!("{output}");
+        return Ok(());
+    }
+
     let debug = std::env::args().any(|a| a == "--debug");
 
     let default_filter = if debug {
@@ -3716,6 +3752,46 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn cli_args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    /// `--version` previously printed nothing and STARTED THE SERVER: the flag
+    /// fell through to normal startup. Anything probing this binary for its
+    /// version quietly launched a memory daemon.
+    #[test]
+    fn version_flag_prints_a_single_parseable_line() {
+        for flag in ["--version", "-V"] {
+            let output = cli_meta_output(cli_args(&[flag]))
+                .unwrap_or_else(|| panic!("{flag} must not fall through to starting the server"));
+            assert_eq!(output.lines().count(), 1, "{flag} output: {output}");
+            assert_eq!(
+                output,
+                format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+            );
+            let (name, version) = output.split_once(' ').expect("name and version");
+            assert_eq!(name, "ferrosa-memory-mcp");
+            assert_eq!(version.split('.').count(), 3, "semver: {version}");
+        }
+    }
+
+    #[test]
+    fn help_flag_reports_the_version_and_exits() {
+        for flag in ["--help", "-h"] {
+            let output = cli_meta_output(cli_args(&[flag])).expect("help must be handled");
+            assert!(output.starts_with("ferrosa-memory-mcp "), "{output}");
+            assert!(output.contains("FERROSA_MEMORY_CONFIG"), "{output}");
+        }
+    }
+
+    /// --debug and unknown arguments must still start the server.
+    #[test]
+    fn other_arguments_still_start_the_server() {
+        assert!(cli_meta_output(cli_args(&[])).is_none());
+        assert!(cli_meta_output(cli_args(&["--debug"])).is_none());
+        assert!(cli_meta_output(cli_args(&["--config", "x.toml"])).is_none());
+    }
 
     // --- is_connection_error tests ---
 
