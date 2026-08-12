@@ -41,6 +41,52 @@ struct OllamaEmbedResponse {
     embeddings: Vec<Vec<f64>>,
 }
 
+/// OpenAI-compatible embedding request body.
+///
+/// llama.cpp (`llama-server`), vLLM, LM Studio and OpenAI itself all accept
+/// this; only Ollama differs.
+#[derive(Serialize)]
+struct OpenAiEmbedRequest<'a> {
+    model: &'a str,
+    input: &'a str,
+}
+
+/// OpenAI-compatible embedding response body.
+#[derive(Deserialize)]
+struct OpenAiEmbedResponse {
+    data: Vec<OpenAiEmbedDatum>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiEmbedDatum {
+    embedding: Vec<f64>,
+}
+
+/// Which wire protocol a provider speaks.
+///
+/// Runtimes are grouped by PROTOCOL rather than listed individually, so adding
+/// another OpenAI-compatible server is a one-line alias and not a new code path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbeddingApi {
+    Ollama,
+    OpenAiCompatible,
+    Synthetic,
+}
+
+impl EmbeddingApi {
+    fn from_provider(provider: &str) -> Option<Self> {
+        match provider.trim().to_ascii_lowercase().as_str() {
+            "ollama" | "ollama.com" => Some(Self::Ollama),
+            "openai" | "openai_compatible" | "openai-compatible" | "lmstudio" | "lm-studio"
+            | "llamacpp" | "llama.cpp" | "llama-cpp" | "vllm" | "vllm-metal" => {
+                Some(Self::OpenAiCompatible)
+            }
+            "synthetic" => Some(Self::Synthetic),
+            _ => None,
+        }
+    }
+}
+
 /// HTTP client for generating text embeddings.
 pub struct EmbeddingClient {
     http: reqwest::Client,
@@ -65,7 +111,14 @@ impl EmbeddingClient {
         Self {
             http,
             provider: config.provider.clone(),
-            base_url: config.ollama_base_url.clone(),
+            // `base_url` is the general setting; `ollama_base_url` is kept as a
+            // fallback so configs written before multi-runtime support keep
+            // working without edits.
+            base_url: if config.base_url.trim().is_empty() {
+                config.ollama_base_url.clone()
+            } else {
+                config.base_url.clone()
+            },
             model: config.model.clone(),
             dimensions: config.dimensions,
             max_input_chars: config.max_input_chars,
@@ -79,7 +132,17 @@ impl EmbeddingClient {
     /// - [`EmbeddingError::Unavailable`] if the endpoint can't be reached
     /// - [`EmbeddingError::DimensionMismatch`] if the response has wrong dimensions
     pub async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
-        if self.provider.eq_ignore_ascii_case("synthetic") {
+        // Resolve the protocol BEFORE doing any work: an unknown provider must
+        // fail by name rather than quietly behaving like Ollama and producing
+        // baffling 404s from someone else's server.
+        let api = EmbeddingApi::from_provider(&self.provider).ok_or_else(|| {
+            EmbeddingError::RequestFailed(format!(
+                "unsupported embedding provider '{}'; expected one of: ollama, openai, \
+openai_compatible, lmstudio, llamacpp, vllm, synthetic",
+                self.provider
+            ))
+        })?;
+        if api == EmbeddingApi::Synthetic {
             return Ok(synthetic_embedding(text, self.dimensions));
         }
 
@@ -88,7 +151,7 @@ impl EmbeddingClient {
         let mut count = 0usize;
 
         for chunk in chunks {
-            let embedding = self.embed_one(&chunk).await?;
+            let embedding = self.embed_one(api, &chunk).await?;
             if let Some(ref mut sum) = accum {
                 for (slot, value) in sum.iter_mut().zip(embedding) {
                     *slot += value;
@@ -110,11 +173,31 @@ impl EmbeddingClient {
         Ok(averaged.into_iter().map(|v| v as f32).collect())
     }
 
-    async fn embed_one(&self, text: &str) -> Result<Vec<f64>, EmbeddingError> {
-        let url = format!("{}/api/embed", self.base_url);
-        let body = OllamaEmbedRequest {
-            model: &self.model,
-            input: text,
+    async fn embed_one(&self, api: EmbeddingApi, text: &str) -> Result<Vec<f64>, EmbeddingError> {
+        let base_url = self.base_url.trim_end_matches('/');
+        let (url, body) = match api {
+            EmbeddingApi::Ollama => (
+                format!("{base_url}/api/embed"),
+                serde_json::to_value(OllamaEmbedRequest {
+                    model: &self.model,
+                    input: text,
+                })
+                .map_err(|e| EmbeddingError::BadResponse(e.to_string()))?,
+            ),
+            EmbeddingApi::OpenAiCompatible => (
+                format!("{base_url}/v1/embeddings"),
+                serde_json::to_value(OpenAiEmbedRequest {
+                    model: &self.model,
+                    input: text,
+                })
+                .map_err(|e| EmbeddingError::BadResponse(e.to_string()))?,
+            ),
+            EmbeddingApi::Synthetic => {
+                return Ok(synthetic_embedding(text, self.dimensions)
+                    .into_iter()
+                    .map(f64::from)
+                    .collect());
+            }
         };
 
         let resp = self
@@ -132,16 +215,31 @@ impl EmbeddingClient {
             )));
         }
 
-        let parsed: OllamaEmbedResponse = resp
-            .json()
-            .await
-            .map_err(|e| EmbeddingError::BadResponse(e.to_string()))?;
-
-        let embedding = parsed
-            .embeddings
-            .into_iter()
-            .next()
-            .ok_or_else(|| EmbeddingError::BadResponse("empty embeddings array".into()))?;
+        let embedding =
+            match api {
+                EmbeddingApi::Ollama => {
+                    let parsed: OllamaEmbedResponse = resp
+                        .json()
+                        .await
+                        .map_err(|e| EmbeddingError::BadResponse(e.to_string()))?;
+                    parsed.embeddings.into_iter().next().ok_or_else(|| {
+                        EmbeddingError::BadResponse("empty embeddings array".into())
+                    })?
+                }
+                EmbeddingApi::OpenAiCompatible => {
+                    let parsed: OpenAiEmbedResponse = resp
+                        .json()
+                        .await
+                        .map_err(|e| EmbeddingError::BadResponse(e.to_string()))?;
+                    parsed
+                        .data
+                        .into_iter()
+                        .next()
+                        .map(|datum| datum.embedding)
+                        .ok_or_else(|| EmbeddingError::BadResponse("empty data array".into()))?
+                }
+                EmbeddingApi::Synthetic => unreachable!("handled above"),
+            };
 
         if embedding.len() != self.dimensions as usize {
             return Err(EmbeddingError::DimensionMismatch {
@@ -160,11 +258,27 @@ impl EmbeddingClient {
     /// `Err(RequestFailed)` with a clear message if the configured model is
     /// not in the loaded model list.
     pub async fn health_check(&self) -> Result<(), EmbeddingError> {
-        if self.provider.eq_ignore_ascii_case("synthetic") {
+        let api = EmbeddingApi::from_provider(&self.provider).ok_or_else(|| {
+            EmbeddingError::RequestFailed(format!(
+                "unsupported embedding provider '{}'; expected one of: ollama, openai, \
+openai_compatible, lmstudio, llamacpp, vllm, synthetic",
+                self.provider
+            ))
+        })?;
+        if api == EmbeddingApi::Synthetic {
             return Ok(());
         }
 
-        let url = format!("{}/api/tags", self.base_url);
+        let base_url = self.base_url.trim_end_matches('/');
+        let url = match api {
+            EmbeddingApi::Ollama => format!("{base_url}/api/tags"),
+            // OpenAI-compatible servers have no /api/tags; /v1/models is the
+            // equivalent. Without this a healthy llama.cpp reported itself
+            // unavailable.
+            EmbeddingApi::OpenAiCompatible => format!("{base_url}/v1/models"),
+            EmbeddingApi::Synthetic => unreachable!("handled above"),
+        };
+
         let resp = self
             .http
             .get(&url)
@@ -179,21 +293,36 @@ impl EmbeddingClient {
             )));
         }
 
-        let body: OllamaTagsResponse = resp
-            .json()
-            .await
-            .map_err(|e| EmbeddingError::BadResponse(e.to_string()))?;
-
-        if !is_model_loaded(&body.models, &self.model) {
-            return Err(EmbeddingError::RequestFailed(format!(
-                "model '{}' not loaded; loaded models: {}",
-                self.model,
-                body.models
-                    .iter()
-                    .map(|m| m.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
+        match api {
+            EmbeddingApi::Ollama => {
+                let body: OllamaTagsResponse = resp
+                    .json()
+                    .await
+                    .map_err(|e| EmbeddingError::BadResponse(e.to_string()))?;
+                if !is_model_loaded(&body.models, &self.model) {
+                    return Err(EmbeddingError::RequestFailed(format!(
+                        "model '{}' not loaded; loaded models: {}",
+                        self.model,
+                        body.models
+                            .iter()
+                            .map(|m| m.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+            }
+            EmbeddingApi::OpenAiCompatible => {
+                // A successful status is the whole check, deliberately. The body
+                // shape is NOT portable: OpenAI returns {"data":[...]} while
+                // llama.cpp returns {"models":[...]}, so parsing it would make
+                // this fail against a healthy server for no benefit.
+                //
+                // Nor is the model name checked: single-model servers report the
+                // gguf filename or --alias, not the configured model name. A
+                // genuinely wrong model still fails loudly on the first embed
+                // with DimensionMismatch.
+            }
+            EmbeddingApi::Synthetic => unreachable!("handled above"),
         }
 
         Ok(())
@@ -362,6 +491,152 @@ mod tests {
         assert!(
             matches!(err, EmbeddingError::BadResponse(_)),
             "HTTP 200 with an Ollama error payload must fail hard, got {err:?}"
+        );
+        handle.join().unwrap();
+    }
+
+    /// llama.cpp, vLLM, LM Studio and OpenAI all speak the same embeddings
+    /// shape; Ollama does not. The client was hardcoded to Ollama's
+    /// `/api/embed` + `{"embeddings":[[..]]}`, so none of the others could be
+    /// used as a runtime at all.
+    #[tokio::test]
+    async fn openai_compatible_provider_uses_the_v1_embeddings_contract() {
+        let (base_url, requests, handle) =
+            spawn_embedding_server(vec!["{\"data\":[{\"embedding\":[1.0,2.0],\"index\":0}]}"]);
+        let config = EmbeddingConfig {
+            provider: "openai_compatible".into(),
+            base_url: base_url.clone(),
+            model: "nomic-embed-text-v2-moe".into(),
+            dimensions: 2,
+            ..EmbeddingConfig::default()
+        };
+
+        let embedding = EmbeddingClient::new(&config).embed("hello").await.unwrap();
+
+        assert_eq!(embedding, vec![1.0, 2.0]);
+        let body = requests.lock().unwrap()[0].clone();
+        assert!(
+            body.starts_with("POST /v1/embeddings "),
+            "must POST the OpenAI route, got: {}",
+            body.lines().next().unwrap_or_default()
+        );
+        assert!(
+            body.contains("\"model\":\"nomic-embed-text-v2-moe\""),
+            "{body}"
+        );
+        assert!(body.contains("\"input\":"), "{body}");
+        handle.join().unwrap();
+    }
+
+    /// Existing Ollama installs must keep working byte for byte: same route,
+    /// same request shape, same response shape.
+    #[tokio::test]
+    async fn ollama_provider_is_unchanged() {
+        let (base_url, requests, handle) =
+            spawn_embedding_server(vec!["{\"embeddings\":[[4.0,5.0]]}"]);
+        let config = EmbeddingConfig {
+            provider: "ollama".into(),
+            ollama_base_url: base_url,
+            dimensions: 2,
+            ..EmbeddingConfig::default()
+        };
+
+        let embedding = EmbeddingClient::new(&config).embed("hello").await.unwrap();
+
+        assert_eq!(embedding, vec![4.0, 5.0]);
+        let body = requests.lock().unwrap()[0].clone();
+        assert!(
+            body.starts_with("POST /api/embed "),
+            "Ollama must keep its own route, got: {}",
+            body.lines().next().unwrap_or_default()
+        );
+        handle.join().unwrap();
+    }
+
+    /// LM Studio was already named in the config docs as an OpenAI-compatible
+    /// server; it must route there rather than silently falling back to Ollama.
+    #[tokio::test]
+    async fn lmstudio_and_llamacpp_aliases_route_to_the_openai_contract() {
+        for provider in ["lmstudio", "llamacpp", "llama.cpp", "openai", "vllm"] {
+            let (base_url, requests, handle) =
+                spawn_embedding_server(vec!["{\"data\":[{\"embedding\":[7.0]}]}"]);
+            let config = EmbeddingConfig {
+                provider: provider.into(),
+                base_url: base_url.clone(),
+                dimensions: 1,
+                ..EmbeddingConfig::default()
+            };
+
+            EmbeddingClient::new(&config).embed("x").await.unwrap();
+
+            let body = requests.lock().unwrap()[0].clone();
+            assert!(
+                body.starts_with("POST /v1/embeddings "),
+                "{provider} must use the OpenAI route"
+            );
+            handle.join().unwrap();
+        }
+    }
+
+    /// Config written before this change has no `base_url`, only
+    /// `ollama_base_url`. Those files must keep working untouched.
+    #[tokio::test]
+    async fn base_url_falls_back_to_ollama_base_url_for_existing_configs() {
+        let (base_url, requests, handle) =
+            spawn_embedding_server(vec!["{\"data\":[{\"embedding\":[9.0]}]}"]);
+        let config = EmbeddingConfig {
+            provider: "openai_compatible".into(),
+            ollama_base_url: base_url,
+            dimensions: 1,
+            ..EmbeddingConfig::default()
+        };
+
+        EmbeddingClient::new(&config).embed("x").await.unwrap();
+        assert!(requests.lock().unwrap()[0].starts_with("POST /v1/embeddings "));
+        handle.join().unwrap();
+    }
+
+    /// An unknown provider must fail loudly rather than quietly behaving like
+    /// Ollama and producing confusing 404s from someone else's server.
+    #[tokio::test]
+    async fn unknown_provider_fails_with_a_named_error() {
+        let config = EmbeddingConfig {
+            provider: "definitely-not-a-runtime".into(),
+            base_url: "http://127.0.0.1:9".into(),
+            dimensions: 2,
+            ..EmbeddingConfig::default()
+        };
+
+        let err = EmbeddingClient::new(&config).embed("x").await.unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("definitely-not-a-runtime"),
+            "the error must name the unsupported provider: {message}"
+        );
+    }
+
+    /// The health check was Ollama-only (`/api/tags` + loaded-model list). An
+    /// OpenAI-compatible server has no such route, so a perfectly healthy
+    /// llama.cpp would report itself unavailable.
+    #[tokio::test]
+    async fn health_check_uses_the_right_route_per_protocol() {
+        let (base_url, requests, handle) =
+            spawn_embedding_server(vec!["{\"object\":\"list\",\"data\":[{\"id\":\"nomic\"}]}"]);
+        let config = EmbeddingConfig {
+            provider: "llamacpp".into(),
+            base_url: base_url.clone(),
+            model: "nomic".into(),
+            dimensions: 2,
+            ..EmbeddingConfig::default()
+        };
+
+        EmbeddingClient::new(&config).health_check().await.unwrap();
+
+        let request = requests.lock().unwrap()[0].clone();
+        assert!(
+            request.starts_with("GET /v1/models "),
+            "OpenAI-compatible health must query /v1/models, got: {}",
+            request.lines().next().unwrap_or_default()
         );
         handle.join().unwrap();
     }

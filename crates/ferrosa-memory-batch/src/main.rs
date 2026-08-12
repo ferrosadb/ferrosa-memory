@@ -182,7 +182,7 @@ async fn retype_entities(config: &ferrosa_memory_core::config::Config) -> anyhow
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
-    let ollama_url = &config.embeddings.ollama_base_url;
+    let ollama_url = config.embeddings.resolved_base_url();
     let llm_model = "qwen3.5:27b";
 
     let mut retyped_heuristic = 0;
@@ -265,7 +265,7 @@ async fn rename_entities(config: &ferrosa_memory_core::config::Config) -> anyhow
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
-    let ollama_url = &config.embeddings.ollama_base_url;
+    let ollama_url = config.embeddings.resolved_base_url();
     let ner_model = &config.embeddings.ner_model;
 
     let mut renamed = 0;

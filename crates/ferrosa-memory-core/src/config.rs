@@ -673,8 +673,20 @@ impl Default for MemoryConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct EmbeddingConfig {
+    /// Which runtime serves embeddings.
+    ///
+    /// `ollama` speaks Ollama's own `/api/embed`. Everything else in the
+    /// OpenAI-compatible family — `openai`, `openai_compatible`, `lmstudio`,
+    /// `llamacpp`, `vllm` — speaks `/v1/embeddings`. `synthetic` is for tests.
     #[serde(default = "default_provider")]
     pub provider: String,
+    /// Base URL of the embedding server, for any provider.
+    ///
+    /// Preferred over `ollama_base_url`, which is kept so configs written
+    /// before multi-runtime support keep working unchanged. When this is empty
+    /// the client falls back to `ollama_base_url`.
+    #[serde(default)]
+    pub base_url: String,
     #[serde(default = "default_ollama_url")]
     pub ollama_base_url: String,
     #[serde(default = "default_embed_model")]
@@ -691,10 +703,28 @@ pub struct EmbeddingConfig {
     pub ner_model: String,
 }
 
+impl EmbeddingConfig {
+    /// The embedding endpoint to call, whichever setting supplied it.
+    ///
+    /// `base_url` is the general setting; `ollama_base_url` predates
+    /// multi-runtime support and is still honoured so existing config files
+    /// keep working. EVERY consumer must go through here — reading
+    /// `ollama_base_url` directly means a config that only sets `base_url`
+    /// silently gets an empty endpoint.
+    pub fn resolved_base_url(&self) -> &str {
+        if self.base_url.trim().is_empty() {
+            &self.ollama_base_url
+        } else {
+            &self.base_url
+        }
+    }
+}
+
 impl Default for EmbeddingConfig {
     fn default() -> Self {
         Self {
             provider: default_provider(),
+            base_url: String::new(),
             ollama_base_url: default_ollama_url(),
             model: default_embed_model(),
             dimensions: default_dimensions(),

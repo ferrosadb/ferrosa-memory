@@ -2991,6 +2991,7 @@ fn build_ingest_embedding_client(
     Some(crate::embedding::EmbeddingClient::new(
         &crate::config::EmbeddingConfig {
             provider: session.embed_provider.clone(),
+            base_url: String::new(),
             ollama_base_url: session.ollama_base_url.clone(),
             model,
             dimensions: session.embed_dimensions,

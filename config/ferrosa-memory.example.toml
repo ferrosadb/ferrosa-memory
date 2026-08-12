@@ -60,10 +60,26 @@ admin_password = "ferrosa_admin"
 default_limit = 10
 
 [embeddings]
+# provider selects the WIRE PROTOCOL, not a vendor:
+#   ollama                          -> POST {base_url}/api/embed        (Ollama only)
+#   openai | openai_compatible |
+#   lmstudio | llamacpp | vllm      -> POST {base_url}/v1/embeddings    (everyone else)
+#   synthetic                       -> deterministic vectors, for tests
 provider = "ollama"
+# base_url is the endpoint for ANY provider. ollama_base_url is still read when
+# base_url is unset, so configs written before multi-runtime support keep working.
+base_url = "http://127.0.0.1:11434"
 ollama_base_url = "http://127.0.0.1:11434"
 model = "nomic-embed-text-v2-moe"
 dimensions = 768
+
+# Example: llama.cpp serving the same model, no Ollama required.
+#   llama-server -m nomic-embed-text-v2-moe.Q4_K_M.gguf --embeddings --port 11435
+# [embeddings]
+# provider = "llamacpp"
+# base_url = "http://127.0.0.1:11435"
+# model = "nomic-embed-text-v2-moe"
+# dimensions = 768
 
 # Graph / typed-edge backend (create_edge, explore_connections, etc.).
 #
