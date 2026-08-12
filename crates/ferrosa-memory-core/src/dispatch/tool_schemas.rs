@@ -4,6 +4,9 @@
 //! Extracted verbatim from `dispatch.rs` as a behavior-preserving split;
 //! the serialized catalog is guarded by the `tool_definitions_catalog_snapshot`
 //! characterization test.
+//! Correctness: Correct when lazy and collected traversals serialize identically.
+//! Last revised: 2026-08-12
+//! Last changed: Added a family-lazy iterator for bounded catalog discovery.
 
 use serde::ser::SerializeStruct;
 use serde_json::Value;
@@ -63,10 +66,16 @@ fn tool_output_schema() -> Value {
 fn all_tools_def() -> ToolDef {
     ToolDef {
         name: "all_tools".into(),
-        description: "Return the full Ferrosa Memory tool catalog when the compact default tools are not enough.\n\nCALL WHEN: You need deeper memory operations, batching, folds, derived facts, governance, or diagnostics not exposed in the compact default tool set.".into(),
+        description: "Search and page through the Ferrosa Memory tool catalog when the compact default tools are not enough. Use compact discovery first, then request schema detail by exact name.".into(),
         input_schema: serde_json::json!({
             "type": "object",
-            "properties": {},
+            "properties": {
+                "detail": { "type": "string", "enum": ["compact", "schema"], "default": "compact" },
+                "query": { "type": "string", "minLength": 1, "maxLength": 256 },
+                "categories": { "type": "array", "items": { "type": "string", "minLength": 1 }, "maxItems": 16, "uniqueItems": true },
+                "names": { "type": "array", "items": { "type": "string", "minLength": 1 }, "maxItems": 20, "uniqueItems": true },
+                "cursor": { "type": "string", "minLength": 1, "maxLength": 2048 }
+            },
             "required": []
         }),
     }
@@ -2061,43 +2070,95 @@ fn derived_cache_tools() -> Vec<ToolDef> {
     }]
 }
 
-/// Build all tool definitions for the memory server.
-/// Entity types are loaded dynamically from the type registry.
-pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
-    let entity_type_enum: Value = serde_json::json!(entity_types);
-    let mut tools: Vec<ToolDef> = Vec::new();
-    tools.push(all_tools_def());
-    tools.extend(remote_memory_tools());
-    tools.extend(session_continuity_tools());
-    tools.extend(fold_tools());
-    tools.extend(entity_tools(&entity_type_enum));
-    tools.extend(feedback_tools());
-    tools.extend(session_lifecycle_tools());
-    tools.extend(cognitive_memory_tools(&entity_type_enum));
-    tools.extend(skills_tools());
-    tools.extend(intention_tools());
-    tools.extend(temporal_fact_tools());
-    tools.extend(graph_traversal_tools());
-    tools.extend(hybrid_search_tools());
-    tools.extend(dream_consolidation_tools());
-    tools.extend(enrichment_tools());
-    tools.extend(stats_tools());
-    tools.extend(memory_state_tools());
-    tools.extend(importance_scoring_tools());
-    tools.extend(memory_chain_tools());
-    tools.extend(speculative_retrieval_tools());
-    tools.extend(spreading_activation_tools());
-    tools.extend(duplicate_detection_tools());
-    tools.extend(recursive_exploration_tools());
-    tools.extend(datalog_query_tools());
-    tools.extend(datalog_rule_tools());
-    tools.extend(predicate_promotion_tools());
-    tools.extend(typed_edge_tools());
-    tools.extend(derived_cache_tools());
-    for tool in &mut tools {
-        if let Some(short) = short_tool_name(&tool.name) {
-            tool.name = short.to_string();
+/// One lazily-produced tool definition with stable discovery metadata.
+pub(super) struct ToolRecord {
+    pub(super) tool: ToolDef,
+    pub(super) category: &'static str,
+}
+
+/// Iterator that retains at most one bounded tool family at a time.
+pub(super) struct ToolDefinitionIter {
+    entity_type_enum: Value,
+    family: usize,
+    current: std::vec::IntoIter<ToolRecord>,
+}
+
+impl ToolDefinitionIter {
+    fn family_records(&self, family: usize) -> Vec<ToolRecord> {
+        let (category, tools) = match family {
+            0 => ("discovery", vec![all_tools_def()]),
+            1 => ("remotes", remote_memory_tools()),
+            2 => ("sessions", session_continuity_tools()),
+            3 => ("folds", fold_tools()),
+            4 => ("entities", entity_tools(&self.entity_type_enum)),
+            5 => ("feedback", feedback_tools()),
+            6 => ("sessions", session_lifecycle_tools()),
+            7 => ("cognitive", cognitive_memory_tools(&self.entity_type_enum)),
+            8 => ("skills", skills_tools()),
+            9 => ("intentions", intention_tools()),
+            10 => ("temporal", temporal_fact_tools()),
+            11 => ("graph", graph_traversal_tools()),
+            12 => ("search", hybrid_search_tools()),
+            13 => ("consolidation", dream_consolidation_tools()),
+            14 => ("enrichment", enrichment_tools()),
+            15 => ("operations", stats_tools()),
+            16 => ("lifecycle", memory_state_tools()),
+            17 => ("scoring", importance_scoring_tools()),
+            18 => ("graph", memory_chain_tools()),
+            19 => ("retrieval", speculative_retrieval_tools()),
+            20 => ("retrieval", spreading_activation_tools()),
+            21 => ("entities", duplicate_detection_tools()),
+            22 => ("retrieval", recursive_exploration_tools()),
+            23 => ("reasoning", datalog_query_tools()),
+            24 => ("governance", datalog_rule_tools()),
+            25 => ("reasoning", predicate_promotion_tools()),
+            26 => ("graph", typed_edge_tools()),
+            27 => ("reasoning", derived_cache_tools()),
+            _ => return Vec::new(),
+        };
+        tools
+            .into_iter()
+            .map(|mut tool| {
+                if let Some(short) = short_tool_name(&tool.name) {
+                    tool.name = short.to_string();
+                }
+                ToolRecord { tool, category }
+            })
+            .collect()
+    }
+}
+
+impl Iterator for ToolDefinitionIter {
+    type Item = ToolRecord;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(record) = self.current.next() {
+                return Some(record);
+            }
+            let records = self.family_records(self.family);
+            self.family += 1;
+            if records.is_empty() {
+                return None;
+            }
+            self.current = records.into_iter();
         }
     }
-    tools
+}
+
+/// Traverse definitions without materializing the complete catalog.
+pub(super) fn tool_definition_records(entity_types: &[String]) -> ToolDefinitionIter {
+    ToolDefinitionIter {
+        entity_type_enum: serde_json::json!(entity_types),
+        family: 0,
+        current: Vec::new().into_iter(),
+    }
+}
+
+/// Build all definitions for compatibility tests and explicit collectors.
+/// Production catalog discovery uses [`tool_definition_records`] directly.
+pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
+    tool_definition_records(entity_types)
+        .map(|record| record.tool)
+        .collect()
 }

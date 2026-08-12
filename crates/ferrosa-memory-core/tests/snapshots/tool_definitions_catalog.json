@@ -1,9 +1,46 @@
 [
   {
     "name": "all_tools",
-    "description": "Return the full Ferrosa Memory tool catalog when the compact default tools are not enough.\n\nCALL WHEN: You need deeper memory operations, batching, folds, derived facts, governance, or diagnostics not exposed in the compact default tool set.",
+    "description": "Search and page through the Ferrosa Memory tool catalog when the compact default tools are not enough. Use compact discovery first, then request schema detail by exact name.",
     "inputSchema": {
-      "properties": {},
+      "properties": {
+        "categories": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "cursor": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "type": "string"
+        },
+        "detail": {
+          "default": "compact",
+          "enum": [
+            "compact",
+            "schema"
+          ],
+          "type": "string"
+        },
+        "names": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 20,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "query": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
       "required": [],
       "type": "object"
     },

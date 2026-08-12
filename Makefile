@@ -23,7 +23,7 @@ test-unit:
 	cargo test --workspace --lib
 
 test-contracts:
-	cargo test --workspace --test shared_http_deployment_spec --test expert_system_rules_spec --test expert_system_governance_spec
+	cargo test --workspace --test shared_http_deployment_spec --test expert_system_rules_spec --test expert_system_governance_spec --test tool_catalog_contract
 
 test-live:
 	./scripts/start-test-cluster.sh

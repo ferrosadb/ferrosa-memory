@@ -1298,6 +1298,7 @@
             <textarea id="toolRawArgs" class="input mono" rows="10" style="display:none;" spellcheck="false" placeholder="{}"></textarea>
             <div class="toolbar-row">
               <button class="btn" type="submit">Run Tool</button>
+              <button class="btn secondary" id="toolLoadMore" type="button" style="display:none;">Load More</button>
               <button class="btn secondary" id="toolReload" type="button">Reload Tools</button>
             </div>
             <div class="status" id="toolStatus">Ready.</div>
@@ -2570,6 +2571,9 @@
     const runner = {
       tools: [],
       toolsLoaded: false,
+      toolsCursor: null,
+      toolPages: 0,
+      seenToolCursors: new Set(),
       forgetToken: null,
       forgetCandidates: [],
       forgetSelected: new Set(),
@@ -2608,25 +2612,71 @@
     const loadTools = async () => {
       renderStatus(el('toolStatus'), 'Loading tools…', 'ok');
       try {
-        const payload = await request('/tools/list');
+        const payload = await request('/tools/list?detail=compact');
         const tools = Array.isArray(payload.tools) ? payload.tools.slice() : [];
+        if (!tools.some((tool) => tool.name === 'search')) {
+          const primaryPayload = await request('/tools/list?detail=schema&names=search');
+          const primary = Array.isArray(primaryPayload.tools) ? primaryPayload.tools[0] : null;
+          if (primary) tools.push(primary);
+        }
         // Surface the most-used tools first; `search` is the primary entry point.
         const PRIMARY = ['search', 'find', 'ingest', 'stats', 'check', 'turn_chain', 'chunk_ctx', 'forget', 'edge', 'list', 'config'];
         const rank = (n) => { const i = PRIMARY.indexOf(n); return i === -1 ? 999 : i; };
         tools.sort((a, b) => (rank(a.name) - rank(b.name)) || a.name.localeCompare(b.name));
         runner.tools = tools;
         runner.toolsLoaded = true;
+        runner.toolsCursor = payload.next_cursor || null;
+        runner.toolPages = 1;
+        runner.seenToolCursors = new Set(runner.toolsCursor ? [runner.toolsCursor] : []);
+        el('toolLoadMore').style.display = runner.toolsCursor ? '' : 'none';
         el('toolSelect').innerHTML =
           tools.map((t) => `<option value="${escapeAttr(t.name)}">${escapeHtml(t.name)}</option>`).join('');
         el('toolsCountBadge').textContent = `${tools.length} tools`;
         // Default to the primary tool so the main argument (e.g. query) is front-and-center.
         const def = tools.find((t) => t.name === 'search') || tools[0];
-        if (def) { el('toolSelect').value = def.name; renderToolForm(); }
+        if (def) { el('toolSelect').value = def.name; await loadSelectedToolSchema(); }
         renderStatus(el('toolStatus'), 'Ready — edit arguments and run.', 'ok');
       } catch (e) {
         el('toolsCountBadge').textContent = 'error';
         renderStatus(el('toolStatus'), `Failed to load tools: ${e.message}`, 'bad');
       }
+    };
+    const loadMoreTools = async () => {
+      if (!runner.toolsCursor) return;
+      if (runner.toolPages >= 256) throw new Error('Tool catalog exceeded 256 pages');
+      const payload = await request(`/tools/list?detail=compact&cursor=${encodeURIComponent(runner.toolsCursor)}`);
+      const known = new Set(runner.tools.map((tool) => tool.name));
+      const additions = Array.isArray(payload.tools)
+        ? payload.tools.filter((tool) => !known.has(tool.name))
+        : [];
+      runner.tools.push(...additions);
+      runner.toolsCursor = payload.next_cursor || null;
+      runner.toolPages += 1;
+      if (runner.toolsCursor && runner.seenToolCursors.has(runner.toolsCursor)) {
+        runner.toolsCursor = null;
+        throw new Error('Tool catalog repeated a continuation cursor');
+      }
+      if (runner.toolsCursor) runner.seenToolCursors.add(runner.toolsCursor);
+      el('toolLoadMore').style.display = runner.toolsCursor ? '' : 'none';
+      for (const tool of additions) {
+        const option = document.createElement('option');
+        option.value = tool.name;
+        option.textContent = tool.name;
+        el('toolSelect').appendChild(option);
+      }
+      el('toolsCountBadge').textContent = `${runner.tools.length} loaded`;
+    };
+    const loadSelectedToolSchema = async () => {
+      const selected = currentTool();
+      if (!selected || selected.inputSchema) { renderToolForm(); return; }
+      renderStatus(el('toolStatus'), `Loading ${selected.name} schema…`, 'ok');
+      const payload = await request(`/tools/list?detail=schema&names=${encodeURIComponent(selected.name)}`);
+      const schema = Array.isArray(payload.tools) ? payload.tools[0] : null;
+      if (!schema) throw new Error(`Schema not found for ${selected.name}`);
+      const index = runner.tools.findIndex((tool) => tool.name === selected.name);
+      runner.tools[index] = schema;
+      renderToolForm();
+      renderStatus(el('toolStatus'), 'Ready — edit arguments and run.', 'ok');
     };
     const currentTool = () => runner.tools.find((t) => t.name === el('toolSelect').value) || null;
     const toolFieldHtml = (key, spec, isRequired) => {
@@ -2947,14 +2997,25 @@
     };
 
     // ---- wiring for the new panels ----
-    el('toolSelect').addEventListener('change', () => {
+    el('toolSelect').addEventListener('change', async () => {
       el('toolRawToggle').checked = false;
       onRawToggle();
-      renderToolForm();
+      try {
+        await loadSelectedToolSchema();
+      } catch (e) {
+        renderStatus(el('toolStatus'), `Failed to load schema: ${e.message}`, 'bad');
+      }
     });
     el('toolRawToggle').addEventListener('change', onRawToggle);
     el('toolRunForm').addEventListener('submit', runTool);
     el('toolReload').addEventListener('click', () => { runner.toolsLoaded = false; loadTools(); });
+    el('toolLoadMore').addEventListener('click', async () => {
+      try {
+        await loadMoreTools();
+      } catch (e) {
+        renderStatus(el('toolStatus'), `Failed to load next page: ${e.message}`, 'bad');
+      }
+    });
     el('configForm').addEventListener('submit', saveConfig);
     el('configReload').addEventListener('click', loadConfigEditor);
     el('forgetProposeForm').addEventListener('submit', proposeForget);

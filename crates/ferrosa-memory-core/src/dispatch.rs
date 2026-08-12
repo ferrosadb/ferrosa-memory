@@ -3,8 +3,8 @@
 //! Maps MCP tool names to handler functions. Validates input schemas before
 //! dispatch. Returns tool definitions for `tools/list`.
 //!
-//! Last revised: 2026-07-17
-//! Last changed: Added compact, user-invoked MCP prompt workflows.
+//! Last revised: 2026-08-12
+//! Last changed: Routed tool discovery through bounded, versioned pagination.
 //!
 //! ## MCP protocol methods handled
 //!
@@ -35,6 +35,7 @@ use crate::context_segment::{
 };
 use crate::transport::{INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND};
 
+pub mod tool_catalog;
 mod tool_schemas;
 pub use tool_schemas::{ToolDef, tool_definitions};
 
@@ -906,21 +907,31 @@ fn modern_cacheable_result(result: Value) -> Value {
     }
 }
 
-fn tools_list_result(params: &Value, session: &SessionState) -> Value {
+fn catalog_dispatch_error(error: tool_catalog::CatalogError) -> (i32, String) {
+    let data = error.data();
+    (
+        INVALID_PARAMS,
+        serde_json::to_string(&data).unwrap_or_else(|_| error.to_string()),
+    )
+}
+
+fn tools_list_result(
+    params: &Value,
+    session: &SessionState,
+    surface: tool_catalog::CatalogSurface,
+) -> Result<Value, (i32, String)> {
     let include_all = params
         .get("include_all")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let all_tools = tool_definitions(&session.entity_types);
-    let tools: Vec<ToolDef> = if include_all {
-        all_tools
+    let visibility = if include_all {
+        tool_catalog::CatalogVisibility::Full
     } else {
-        all_tools
-            .into_iter()
-            .filter(|t| is_tier1(&t.name))
-            .collect()
+        tool_catalog::CatalogVisibility::Tier1
     };
-    serde_json::json!({ "tools": tools })
+    let query = tool_catalog::CatalogQuery::for_surface(surface, visibility, params.clone())
+        .map_err(catalog_dispatch_error)?;
+    tool_catalog::build_catalog_page(&session.entity_types, &query).map_err(catalog_dispatch_error)
 }
 
 /// Static MCP prompt catalog. The catalog has no connection- or tenant-specific
@@ -1130,7 +1141,11 @@ pub async fn dispatch<S: crate::storage::Storage>(
         "notifications/initialized" => Ok(Value::Null),
         "prompts/list" => Ok(prompts_list_result()),
         "prompts/get" => prompts_get_result(&params),
-        "tools/list" => Ok(tools_list_result(&params, session)),
+        "tools/list" => tools_list_result(
+            &params,
+            session,
+            tool_catalog::CatalogSurface::LegacyToolsList,
+        ),
         "tools/call" => dispatch_tool(params, storage, ctx, session).await,
         _ => Err((METHOD_NOT_FOUND, format!("unknown method: {method}"))),
     }
@@ -1166,7 +1181,11 @@ pub async fn dispatch_modern<S: crate::storage::Storage>(
             let result = resources_read_result(params, storage, ctx).await?;
             Ok(modern_cacheable_result(result))
         }
-        "tools/list" => Ok(modern_cacheable_result(tools_list_result(&params, session))),
+        "tools/list" => Ok(modern_cacheable_result(tools_list_result(
+            &params,
+            session,
+            tool_catalog::CatalogSurface::ModernToolsList,
+        )?)),
         "tools/call" => {
             let result = dispatch_tool(params, storage, ctx, session).await?;
             Ok(modern_complete_result(result))
@@ -1232,10 +1251,14 @@ async fn dispatch_tool<S: crate::storage::Storage>(
     let handler: ToolDispatchFuture<'_> = match canonical_name {
         "check_memo_cache" => Box::pin(handle_check_memo(args, storage, ctx)),
         "all_tools" => Box::pin(async move {
-            Ok(serde_json::json!({
-                "tools": tool_definitions(&session.entity_types),
-                "hint": "Use these short tool names directly. Keep using compact defaults unless you need a specific deeper operation."
-            }))
+            let query = tool_catalog::CatalogQuery::for_surface(
+                tool_catalog::CatalogSurface::AllTools,
+                tool_catalog::CatalogVisibility::Full,
+                args,
+            )
+            .map_err(catalog_dispatch_error)?;
+            tool_catalog::build_catalog_page(&session.entity_types, &query)
+                .map_err(catalog_dispatch_error)
         }),
         "store_memo_result" => Box::pin(handle_store_memo(args, storage, ctx)),
         "write_plan_node" => Box::pin(handle_write_plan(args, storage, ctx)),
@@ -1424,11 +1447,18 @@ async fn dispatch_tool<S: crate::storage::Storage>(
     // debug_stop (dev-only): when enabled, surface a degraded-cluster alert on
     // the result (or fail the call on critical degradation) so the agent stops
     // and investigates instead of building on a broken cluster.
-    let result = crate::debug_stop::apply_debug_stop(
-        result,
-        &session.health_snapshot(),
-        session.debug_stop(),
-    );
+    let result = if canonical_name == "all_tools" {
+        // Catalog admission already accounts for the exact CallToolResult
+        // envelope. Injecting an unrelated health payload afterward would
+        // violate the hard 16 KiB discovery contract.
+        result
+    } else {
+        crate::debug_stop::apply_debug_stop(
+            result,
+            &session.health_snapshot(),
+            session.debug_stop(),
+        )
+    };
 
     // Wrap in MCP CallToolResult format: { content: [{type: "text", text: "..."}] }
     // MCP clients expect this structure; without it, tool output is invisible.
@@ -1476,6 +1506,12 @@ fn wrap_tool_result(
     value: &serde_json::Value,
     duration_ms: u64,
 ) -> serde_json::Value {
+    if canonical_name == "all_tools"
+        && value.get("catalog_version").is_some()
+        && let Ok(result) = tool_catalog::wrap_all_tools_page(value, requested_name, duration_ms)
+    {
+        return result;
+    }
     let text = if let Some(s) = value.as_str() {
         s.to_string()
     } else {
@@ -8819,9 +8855,8 @@ async fn handle_system_describe<S: crate::storage::Storage>(
     let sections = crate::system_describe::SectionSet::from_include(include.as_deref());
 
     let tool_names = if sections.capabilities {
-        tool_definitions(&session.entity_types)
-            .into_iter()
-            .map(|t| t.name)
+        tool_schemas::tool_definition_records(&session.entity_types)
+            .map(|record| record.tool.name)
             .collect()
     } else {
         Vec::new()
@@ -12578,21 +12613,28 @@ mod tests {
         let store = MockStorage::new();
         let ctx = test_ctx();
         let session = SessionState::default();
-        let tools = dispatch(
-            "tools/list",
-            serde_json::json!({"include_all": true}),
-            &store,
-            &ctx,
-            &session,
-        )
-        .await
-        .unwrap();
-        let tool_names: Vec<&str> = tools["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|tool| tool["name"].as_str().unwrap())
-            .collect();
+        let mut cursor: Option<String> = None;
+        let mut tool_names = Vec::new();
+        loop {
+            let mut params = serde_json::json!({"include_all": true});
+            if let Some(cursor) = &cursor {
+                params["cursor"] = Value::String(cursor.clone());
+            }
+            let tools = dispatch("tools/list", params, &store, &ctx, &session)
+                .await
+                .unwrap();
+            tool_names.extend(
+                tools["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|tool| tool["name"].as_str().unwrap().to_string()),
+            );
+            cursor = tools["nextCursor"].as_str().map(str::to_string);
+            if cursor.is_none() {
+                break;
+            }
+        }
 
         for name in [
             "remote_add",
@@ -12604,7 +12646,7 @@ mod tests {
             "pull_commit",
         ] {
             assert!(
-                tool_names.contains(&name),
+                tool_names.iter().any(|tool_name| tool_name == name),
                 "missing remote smoke tool: {name}"
             );
         }
@@ -13838,7 +13880,8 @@ mod tests {
         assert_eq!(result["resultType"], "complete");
         assert_eq!(result["cacheScope"], "private");
         assert_eq!(result["ttlMs"], MODERN_RESULT_TTL_MS);
-        assert!(result["tools"].as_array().unwrap().len() > 5);
+        assert!(!result["tools"].as_array().unwrap().is_empty());
+        assert!(serde_json::to_vec(&result).unwrap().len() <= 16_384);
     }
 
     #[tokio::test]
@@ -13958,10 +14001,20 @@ mod tests {
         let store = MockStorage::new();
         let ctx = test_ctx();
         let session = SessionState::default();
-        let result = dispatch("tools/list", Value::Null, &store, &ctx, &session)
-            .await
-            .unwrap();
-        let tools = result["tools"].as_array().unwrap();
+        let mut params = Value::Null;
+        let mut collected = Vec::new();
+        loop {
+            let result = dispatch("tools/list", params, &store, &ctx, &session)
+                .await
+                .unwrap();
+            assert!(serde_json::to_vec(&result).unwrap().len() <= 16_384);
+            collected.extend(result["tools"].as_array().unwrap().iter().cloned());
+            let Some(cursor) = result["nextCursor"].as_str() else {
+                break;
+            };
+            params = serde_json::json!({"cursor": cursor});
+        }
+        let tools = &collected;
         let expected_tier1 = tool_definitions(&session.entity_types)
             .iter()
             .filter(|tool| is_tier1(&tool.name))
@@ -14335,11 +14388,20 @@ mod tests {
         let store = MockStorage::new();
         let ctx = test_ctx();
         let session = SessionState::default();
-        let params = serde_json::json!({ "include_all": true });
-        let result = dispatch("tools/list", params, &store, &ctx, &session)
-            .await
-            .unwrap();
-        let tools = result["tools"].as_array().unwrap();
+        let mut params = serde_json::json!({ "include_all": true });
+        let mut collected = Vec::new();
+        loop {
+            let result = dispatch("tools/list", params, &store, &ctx, &session)
+                .await
+                .unwrap();
+            assert!(serde_json::to_vec(&result).unwrap().len() <= 16_384);
+            collected.extend(result["tools"].as_array().unwrap().iter().cloned());
+            let Some(cursor) = result["nextCursor"].as_str() else {
+                break;
+            };
+            params = serde_json::json!({"include_all": true, "cursor": cursor});
+        }
+        let tools = &collected;
         assert_eq!(
             tools.len(),
             tool_definitions(&session.entity_types).len(),

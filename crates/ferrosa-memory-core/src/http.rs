@@ -1258,11 +1258,9 @@ async fn handle_http_request_with_session<S: Storage + OperatorQuerySurface>(
                     "id": id,
                     "result": val
                 }),
-                Err((code, msg)) => serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": { "code": code, "message": msg }
-                }),
+                Err((code, msg)) => serde_json::to_value(
+                    crate::transport::JsonRpcResponse::dispatch_error(id, code, msg),
+                )?,
             };
 
             let body_str = serde_json::to_string(&response_body)?;
@@ -2019,22 +2017,37 @@ async fn call_tool_http<S: Storage>(
     serde_json::from_str(text).map_err(|e| anyhow::anyhow!("invalid tool response JSON: {e}"))
 }
 
-/// Operator tool runner: list every registered tool (tier-1 and tier-2) with its
-/// inputSchema so the workbench can render a form per tool.
-async fn handle_tools_list<S: Storage>(
-    storage: &S,
-    ctx: &TenantContext,
-    session: &dispatch::SessionState,
-) -> anyhow::Result<String> {
-    let result = dispatch::dispatch(
-        "tools/list",
-        serde_json::json!({ "include_all": true }),
-        storage,
-        ctx,
-        session,
+/// Return one bounded operator catalog page. The workbench starts compact and
+/// requests a full schema only for the selected public name.
+async fn handle_tools_list(session: &dispatch::SessionState, path: &str) -> anyhow::Result<String> {
+    let mut params = serde_json::json!({ "detail": "compact" });
+    if let Some(query) = path.split_once('?').map(|(_, query)| query) {
+        for pair in query.split('&') {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            let value = decode_query_component(value)?;
+            match key {
+                "cursor" | "detail" | "query" => params[key] = Value::String(value),
+                "names" | "categories" => {
+                    params[key] = Value::Array(
+                        value
+                            .split(',')
+                            .filter(|item| !item.is_empty())
+                            .map(|item| Value::String(item.to_string()))
+                            .collect(),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    let query = dispatch::tool_catalog::CatalogQuery::for_surface(
+        dispatch::tool_catalog::CatalogSurface::Operator,
+        dispatch::tool_catalog::CatalogVisibility::Operator,
+        params,
     )
-    .await
-    .map_err(|(_, message)| anyhow::anyhow!(message))?;
+    .map_err(|error| anyhow::anyhow!(error.data().to_string()))?;
+    let result = dispatch::tool_catalog::build_catalog_page(&session.entity_types, &query)
+        .map_err(|error| anyhow::anyhow!(error.data().to_string()))?;
     Ok(json_response("200 OK", &result.to_string()))
 }
 
@@ -2538,7 +2551,12 @@ async fn handle_operator_request<S: Storage + OperatorQuerySurface>(
         ("GET", models_path) if models_path.starts_with("/workbench/api/judge/models?") => {
             handle_judge_models_get(session, models_path).await
         }
-        ("GET", "/workbench/api/tools/list") => handle_tools_list(storage, ctx, session).await,
+        ("GET", tools_path)
+            if tools_path == "/workbench/api/tools/list"
+                || tools_path.starts_with("/workbench/api/tools/list?") =>
+        {
+            handle_tools_list(session, tools_path).await
+        }
         ("POST", "/workbench/api/tools/call") => {
             handle_tool_call(storage, ctx, session, body).await
         }
@@ -6255,6 +6273,9 @@ mod tests {
         assert!(WORKBENCH_HTML.contains(r#"data-section="forget""#));
         // Endpoints the panels call (request() prefixes /workbench/api)
         assert!(WORKBENCH_HTML.contains("/tools/list"));
+        assert!(WORKBENCH_HTML.contains("detail=compact"));
+        assert!(WORKBENCH_HTML.contains("detail=schema&names="));
+        assert!(WORKBENCH_HTML.contains("payload.next_cursor"));
         assert!(WORKBENCH_HTML.contains("/tools/call"));
         assert!(WORKBENCH_HTML.contains("/config/tunables"));
         // Memory branding swap (no terracotta accent, Fm mark)
@@ -7606,6 +7627,79 @@ mod tests {
         let body = response_json(&response);
         assert!(body["result"]["tools"].as_array().unwrap().len() > 5);
         assert!(body["result"]["resultType"].is_null());
+    }
+
+    #[tokio::test]
+    async fn workbench_tool_catalog_pages_compact_then_fetches_named_schema() {
+        let metrics = MemoryMetrics::new().unwrap();
+        let storage = MockStorage::new();
+        let headers = valid_basic_auth_headers();
+        let first = handle_http_request(
+            "GET",
+            "/workbench/api/tools/list?detail=compact",
+            &headers,
+            "",
+            &storage,
+            &metrics,
+            &valid_credentials,
+            &|| true,
+            &ShellRouteConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert!(first.starts_with("HTTP/1.1 200 OK"));
+        let first_body = response_json(&first);
+        assert!(first_body["hint"].is_object());
+        let first_names: std::collections::HashSet<_> = first_body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_string())
+            .collect();
+        for tool in first_body["tools"].as_array().unwrap() {
+            assert!(tool["schema_digest"].is_string());
+            assert!(tool["inputSchema"].is_null());
+        }
+        let cursor = first_body["next_cursor"].as_str().unwrap();
+        let second = handle_http_request(
+            "GET",
+            &format!("/workbench/api/tools/list?detail=compact&cursor={cursor}"),
+            &headers,
+            "",
+            &storage,
+            &metrics,
+            &valid_credentials,
+            &|| true,
+            &ShellRouteConfig::default(),
+        )
+        .await
+        .unwrap();
+        let second_body = response_json(&second);
+        assert!(
+            second_body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|tool| { !first_names.contains(tool["name"].as_str().unwrap()) })
+        );
+
+        let schema = handle_http_request(
+            "GET",
+            "/workbench/api/tools/list?detail=schema&names=search",
+            &headers,
+            "",
+            &storage,
+            &metrics,
+            &valid_credentials,
+            &|| true,
+            &ShellRouteConfig::default(),
+        )
+        .await
+        .unwrap();
+        let schema_body = response_json(&schema);
+        assert_eq!(schema_body["tools"][0]["name"], "search");
+        assert!(schema_body["tools"][0]["inputSchema"].is_object());
+        assert!(schema_body.to_string().len() <= 16_384);
     }
 
     #[tokio::test]

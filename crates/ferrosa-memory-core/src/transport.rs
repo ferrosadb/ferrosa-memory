@@ -75,6 +75,32 @@ impl JsonRpcResponse {
             }),
         }
     }
+
+    /// Build a JSON-RPC error and preserve machine-readable data emitted by a
+    /// typed dispatch boundary. Ordinary string errors remain unchanged.
+    pub fn dispatch_error(id: Option<Value>, code: i32, message: String) -> Self {
+        let Ok(data) = serde_json::from_str::<Value>(&message) else {
+            return Self::error(id, code, message);
+        };
+        let Some(error_code) = data.get("code").and_then(Value::as_str) else {
+            return Self::error(id, code, message);
+        };
+        let human_message = data
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or(error_code)
+            .to_string();
+        Self {
+            jsonrpc: "2.0".into(),
+            id,
+            result: None,
+            error: Some(JsonRpcError {
+                code,
+                message: human_message,
+                data: Some(data),
+            }),
+        }
+    }
 }
 
 /// Handler function type — takes a method and params, returns a result or error.
@@ -225,7 +251,7 @@ pub async fn serve_stdio(handler: Handler) -> anyhow::Result<()> {
                 let id = req.id.clone();
                 let result = match (handler)(&req.method, req.params).await {
                     Ok(result) => JsonRpcResponse::success(id.clone(), result),
-                    Err((code, msg)) => JsonRpcResponse::error(id.clone(), code, msg),
+                    Err((code, msg)) => JsonRpcResponse::dispatch_error(id.clone(), code, msg),
                 };
                 // JSON-RPC notifications omit `id` and must not receive a response.
                 id.map(|_| result)
@@ -322,5 +348,24 @@ mod tests {
         assert!(s.contains("\"error\""));
         assert!(s.contains("-32601"));
         assert!(!s.contains("\"result\""));
+    }
+
+    #[test]
+    fn typed_dispatch_error_preserves_restart_data() {
+        let message = serde_json::json!({
+            "code": "STALE_CURSOR",
+            "catalog_version": "sha256:new",
+            "restart_arguments": {"detail": "compact"},
+            "hint": "Restart without the stale cursor."
+        })
+        .to_string();
+        let response =
+            JsonRpcResponse::dispatch_error(Some(Value::Number(7.into())), INVALID_PARAMS, message);
+        let error = response.error.unwrap();
+        assert_eq!(error.message, "STALE_CURSOR");
+        assert_eq!(
+            error.data.unwrap()["restart_arguments"]["detail"],
+            "compact"
+        );
     }
 }

@@ -47,9 +47,14 @@ graph backing rows explicitly, but that path is not part of normal MCP serving.
 See [overview.md](overview.md), [components.md](components.md), and
 [dsm-analysis.md](dsm-analysis.md).
 
-**68 MCP tools** are exposed through the full tool catalog in
-`crates/ferrosa-memory-core/src/dispatch.rs`; the compact default list remains
-smaller for agent token economy.
+The current snapshot contains **95 MCP tool definitions** in
+`crates/ferrosa-memory-core/src/dispatch/tool_schemas.rs`; the default
+`tools/list` tier remains smaller for agent token economy. `all_tools`, legacy
+and modern `tools/list`, and the operator catalog now share bounded semantic
+pagination with a 16 KiB final-result cap, catalog-versioned cursors, compact
+search, category filters, and named schema lookup. The architecture and rollout
+contracts are documented in the
+[bounded tool catalog bundle](tool-catalog-pagination/README.md).
 The registry covers context segments, memoization, plan state, trajectory folds,
 entity graph, bulk ingest, temporal chains, captured-turn chains,
 feedback/routing, skills, intentions, cognitive memory, governance, derived
@@ -67,6 +72,7 @@ at startup.
 | [threat-model.md](threat-model.md) | STRIDE threat analysis with trust boundaries |
 | [project-plan.md](project-plan.md) | Timeboxed sprint plan prioritized by risk |
 | [plans/mcp-2026-07-28-release-support.md](plans/mcp-2026-07-28-release-support.md) | MCP 2026-07-28 stateless protocol support and co-marketing plan |
+| [tool-catalog-pagination/](tool-catalog-pagination/) | Accepted bounded, searchable, source-paginated `all_tools` architecture and compiled execution plan |
 | [shared-http-deployment.md](shared-http-deployment.md) | Production HTTP deployment blueprint: auth, TLS, probes, tenant policy, viz boundary |
 | [decisions/](decisions/) | Architecture Decision Records |
 
@@ -92,3 +98,5 @@ All specs derived from `ferrosa-memory-mcp-spec.md` (v0.1, 2026-03-21).
 - **2026-06-11 (update):** Graph edge reconciliation and turn-chain capture: serving-path graph writes route through the graph client, typed edges are visible through graph/CQL/MCP traversal APIs, hooks use `ingest_entities`, and captured turns link through `next_turn` / `previous_turn` temporal edges.
 - **2026-06-15 (blueprint):** Session task continuity Phase 0 decisions captured: fmem-owned canonical task IDs, scoped aliases, multiple active tasks, persisted focus stack, deterministic v1 task observation, recovery hints, and compact recall injection with temporal-link pointers.
 - **2026-07-17 (plan):** MCP 2026-07-28 release support plan added from the official draft spec: dual-era stateless core, Streamable HTTP header validation, `server/discover`, cacheable tool discovery, auth posture, extension showcase, and co-marketing runbook.
+- **2026-08-12 (blueprint):** Bounded tool catalog design accepted: compact searchable `all_tools`, exact 16 KiB final-result pages, versioned restartable cursors, source-level pagination, seven-layer tests, and a schema-v3 Forge plan.
+- **2026-08-12 (implementation):** Bounded catalog pagination implemented across `all_tools`, MCP `tools/list`, operator/workbench discovery, setup validation, and eval clients; contract tests enforce final-envelope size, traversal, named schema, and cursor recovery.
