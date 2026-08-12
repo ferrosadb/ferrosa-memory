@@ -128,10 +128,19 @@ a private backing-table workaround.
 
 ## Tools
 
-65 MCP tools are defined in `crates/ferrosa-memory-core/src/dispatch.rs` and
-returned by `tools/list`. Keep this section aligned with the dispatch registry
-when adding or removing tools. (`describe` is a management tool excluded from
-the tier-1 default `tools/list`; request it with `include_all`.)
+The current snapshot contains 95 MCP tool definitions. The default
+`tools/list` remains a smaller tier for agent token economy. Catalog discovery
+is paginated at complete tool boundaries and every caller-visible result is
+capped at 16,384 UTF-8 bytes. `include_all: true` remains a paginated
+compatibility mode.
+
+`all_tools` keeps its public name and defaults to compact entries. Search in
+place with `{"query":"graph"}`, filter with `{"categories":["graph"]}`, or
+fetch a full schema with `{"names":["search"]}`. When `has_more` is true, send
+the returned `hint.next_arguments` unchanged; it includes the opaque,
+catalog-versioned cursor. Final pages include a named-schema lookup hint, and a
+stale cursor returns current version plus safe restart arguments. See the
+[tool catalog architecture](specs/tool-catalog-pagination/README.md).
 
 | Group | Tools | Purpose |
 |-------|-------|---------|

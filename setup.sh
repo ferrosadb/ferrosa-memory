@@ -354,7 +354,23 @@ def request(method, params=None, ident=1):
     return parsed.get("result")
 
 request("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "ferrosa-memory-setup", "version": "0.1"}})
-tools = request("tools/list", {}, 2).get("tools", [])
+tools = []
+cursor = None
+seen_cursors = set()
+request_id = 2
+for _ in range(256):
+    params = {"cursor": cursor} if cursor else {}
+    page = request("tools/list", params, request_id)
+    tools.extend(page.get("tools", []))
+    cursor = page.get("nextCursor")
+    if not cursor:
+        break
+    if cursor in seen_cursors:
+        raise SystemExit("tools/list repeated a continuation cursor")
+    seen_cursors.add(cursor)
+    request_id += 1
+else:
+    raise SystemExit("tools/list exceeded 256 pages")
 names = [tool.get("name") for tool in tools]
 if "ingest" not in names:
     raise SystemExit(f"default tool list missing ingest: {names}")

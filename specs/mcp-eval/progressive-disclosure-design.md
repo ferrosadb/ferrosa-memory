@@ -1,5 +1,12 @@
 # Progressive Disclosure Design
 
+> **Historical design note:** The tool counts and one-shot discovery assumptions
+> below predate the current 95-definition catalog. The implemented discovery
+> contract is [bounded tool catalog pagination](../tool-catalog-pagination/README.md):
+> `all_tools` remains public, adds deterministic search and named schema lookup,
+> and returns source-paginated results under an exact 16 KiB final-result cap.
+> This document remains useful for response-triggered recommendation behavior.
+
 ## Concept
 
 Instead of exposing all 50 tools, expose ~15 "primary" tools. When a primary tool's response meets certain conditions, it includes a `hint` field suggesting a more specialized tool. The LLM learns about advanced tools exactly when they're relevant.

@@ -12,6 +12,7 @@
 use base64::Engine as _;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -96,6 +97,7 @@ pub fn compute_binary_hash(path: &Path) -> Result<String, McpClientError> {
 // ---------------------------------------------------------------------------
 
 const MODERN_MCP_PROTOCOL_VERSION: &str = "2026-07-28";
+const MAX_TOOL_LIST_PAGES: usize = 256;
 
 /// Protocol mode used for JSON-RPC over HTTP.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -223,8 +225,32 @@ impl HttpMcpClient {
 
     /// Send a `tools/list` request over HTTP.
     pub async fn list_tools(&mut self) -> Result<ToolCallResult, McpClientError> {
-        self.send_request("tools/list", Value::Object(serde_json::Map::new()))
-            .await
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+        let mut tools = Vec::new();
+        for _ in 0..MAX_TOOL_LIST_PAGES {
+            let params = cursor
+                .as_ref()
+                .map(|cursor| serde_json::json!({"cursor": cursor}))
+                .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+            let mut page = self.send_request("tools/list", params).await?;
+            tools.extend(page.response["tools"].as_array().cloned().ok_or_else(|| {
+                McpClientError::InvalidRequest("tools/list result omitted tools array".into())
+            })?);
+            cursor = page.response["nextCursor"].as_str().map(str::to_string);
+            if cursor.is_none() {
+                page.response["tools"] = Value::Array(tools);
+                return Ok(page);
+            }
+            if !seen_cursors.insert(cursor.clone().unwrap_or_default()) {
+                return Err(McpClientError::InvalidRequest(
+                    "tools/list repeated a continuation cursor".into(),
+                ));
+            }
+        }
+        Err(McpClientError::InvalidRequest(format!(
+            "tools/list exceeded {MAX_TOOL_LIST_PAGES} pages"
+        )))
     }
 
     fn prepare_request(
@@ -501,8 +527,32 @@ impl McpClient {
 
     /// Send a `tools/list` request and return the tool definitions.
     pub async fn list_tools(&mut self) -> Result<ToolCallResult, McpClientError> {
-        self.send_request("tools/list", Value::Object(serde_json::Map::new()))
-            .await
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+        let mut tools = Vec::new();
+        for _ in 0..MAX_TOOL_LIST_PAGES {
+            let params = cursor
+                .as_ref()
+                .map(|cursor| serde_json::json!({"cursor": cursor}))
+                .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+            let mut page = self.send_request("tools/list", params).await?;
+            tools.extend(page.response["tools"].as_array().cloned().ok_or_else(|| {
+                McpClientError::InvalidRequest("tools/list result omitted tools array".into())
+            })?);
+            cursor = page.response["nextCursor"].as_str().map(str::to_string);
+            if cursor.is_none() {
+                page.response["tools"] = Value::Array(tools);
+                return Ok(page);
+            }
+            if !seen_cursors.insert(cursor.clone().unwrap_or_default()) {
+                return Err(McpClientError::InvalidRequest(
+                    "tools/list repeated a continuation cursor".into(),
+                ));
+            }
+        }
+        Err(McpClientError::InvalidRequest(format!(
+            "tools/list exceeded {MAX_TOOL_LIST_PAGES} pages"
+        )))
     }
 
     /// Send a raw JSON-RPC request and wait for the response.
@@ -715,6 +765,46 @@ for line in sys.stdin:
         }
     }
 
+    async fn spawn_paged_tool_server(repeat_cursor: bool) -> McpClient {
+        let repeat = if repeat_cursor { "True" } else { "False" };
+        let script = format!(
+            r#"
+import sys, json
+repeat = {repeat}
+for line in sys.stdin:
+    req = json.loads(line)
+    rid = req.get("id")
+    if rid is None:
+        continue
+    cursor = req.get("params", {{}}).get("cursor")
+    if cursor is None:
+        result = {{"tools":[{{"name":"first"}}],"nextCursor":"page-2"}}
+    elif repeat:
+        result = {{"tools":[{{"name":"again"}}],"nextCursor":"page-2"}}
+    else:
+        result = {{"tools":[{{"name":"second"}}]}}
+    print(json.dumps({{"jsonrpc":"2.0","id":rid,"result":result}}), flush=True)
+"#
+        );
+        let mut child = Command::new("python3")
+            .arg("-c")
+            .arg(script)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("python3 must be available for tests");
+        let stdin = BufWriter::new(child.stdin.take().unwrap());
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        McpClient {
+            child,
+            stdin,
+            stdout,
+            next_id: 1,
+            binary_path: "python3".to_string(),
+        }
+    }
+
     #[tokio::test]
     async fn initialize_returns_server_info() {
         let mut client = spawn_echo_server().await;
@@ -763,6 +853,27 @@ for line in sys.stdin:
         assert_eq!(tools[0]["name"], "get_stats");
 
         client.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_tools_follows_pages_and_rejects_cursor_cycles() {
+        let mut client = spawn_paged_tool_server(false).await;
+        let result = client.list_tools().await.unwrap();
+        let names: Vec<_> = result.response["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert_eq!(names, ["first", "second"]);
+        client.shutdown().await.unwrap();
+
+        let mut cycling = spawn_paged_tool_server(true).await;
+        let error = cycling.list_tools().await.unwrap_err();
+        assert!(
+            matches!(error, McpClientError::InvalidRequest(message) if message.contains("repeated"))
+        );
+        cycling.shutdown().await.unwrap();
     }
 
     #[tokio::test]
