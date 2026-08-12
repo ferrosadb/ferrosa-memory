@@ -643,6 +643,7 @@ pub async fn run_enrichment(
             Some(crate::embedding::EmbeddingClient::new(
                 &crate::config::EmbeddingConfig {
                     provider: config.embed_provider.clone(),
+                    base_url: String::new(),
                     ollama_base_url: config.ollama_base_url.clone(),
                     model: config.embed_model.clone(),
                     dimensions: config.embed_dimensions,

@@ -517,7 +517,7 @@ fn effective_config(config: &Config) -> serde_json::Value {
         "embeddings.provider": config.embeddings.provider,
         "embeddings.model": config.embeddings.model,
         "embeddings.dimensions": config.embeddings.dimensions,
-        "embeddings.baseUrl": config.embeddings.ollama_base_url,
+        "embeddings.baseUrl": config.embeddings.resolved_base_url(),
         "graph.boltUri": config.graph.bolt_uri,
         "graph.httpUrl": config.graph.http_url,
         "viz.enabled": config.viz.enabled,

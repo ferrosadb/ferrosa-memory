@@ -55,12 +55,13 @@ fn random_forget_token_key() -> Vec<u8> {
 /// the probes are a few cheap TCP connects and the alert only fires when enabled.
 fn spawn_debug_stop_monitor(config: &Config, session: &std::sync::Arc<dispatch::SessionState>) {
     let db_endpoints = config.ferrosa.contact_points.clone();
-    let embedding =
-        if config.embeddings.provider != "synthetic" && config.embeddings.provider != "disabled" {
-            ferrosa_memory_core::debug_stop::endpoint_authority(&config.embeddings.ollama_base_url)
-        } else {
-            None
-        };
+    let embedding = if config.embeddings.provider != "synthetic"
+        && config.embeddings.provider != "disabled"
+    {
+        ferrosa_memory_core::debug_stop::endpoint_authority(config.embeddings.resolved_base_url())
+    } else {
+        None
+    };
     let reranker = ferrosa_memory_core::debug_stop::endpoint_authority(&config.enrich.llm_base_url);
     let monitor = ferrosa_memory_core::debug_stop::HealthMonitor::new(
         db_endpoints,
@@ -3411,13 +3412,13 @@ async fn main() -> anyhow::Result<()> {
         match embed_health.health_check().await {
             Ok(()) => tracing::info!(
                 provider = %embeddings_config.provider,
-                url = %embeddings_config.ollama_base_url,
+                url = %embeddings_config.resolved_base_url(),
                 model = %embeddings_config.model,
                 "embedding provider reachable and model loaded"
             ),
             Err(e) => tracing::warn!(
                 provider = %embeddings_config.provider,
-                url = %embeddings_config.ollama_base_url,
+                url = %embeddings_config.resolved_base_url(),
                 model = %embeddings_config.model,
                 error = %e,
                 "embedding provider check failed — tools that require embeddings \
@@ -3533,7 +3534,7 @@ async fn main() -> anyhow::Result<()> {
                 default_session_id: Some(default_session_id),
                 repo: repo_lock,
                 embed_provider: config.embeddings.provider.clone(),
-                ollama_base_url: config.embeddings.ollama_base_url.clone(),
+                ollama_base_url: config.embeddings.resolved_base_url().to_owned(),
                 ner_model: config.embeddings.ner_model.clone(),
                 embed_model: config.embeddings.model.clone(),
                 embed_dimensions: config.embeddings.dimensions,
@@ -3659,7 +3660,7 @@ async fn main() -> anyhow::Result<()> {
                 default_session_id: Some(default_session_id),
                 repo: repo_lock,
                 embed_provider: config.embeddings.provider.clone(),
-                ollama_base_url: config.embeddings.ollama_base_url.clone(),
+                ollama_base_url: config.embeddings.resolved_base_url().to_owned(),
                 ner_model: config.embeddings.ner_model.clone(),
                 embed_model: config.embeddings.model.clone(),
                 embed_dimensions: config.embeddings.dimensions,
