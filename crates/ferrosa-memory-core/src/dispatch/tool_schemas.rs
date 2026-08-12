@@ -2156,7 +2156,7 @@ pub(super) fn tool_definition_records(entity_types: &[String]) -> ToolDefinition
 }
 
 /// Build all definitions for compatibility tests and explicit collectors.
-/// Production catalog discovery uses [`tool_definition_records`] directly.
+/// Production catalog discovery uses `tool_definition_records` directly.
 pub fn tool_definitions(entity_types: &[String]) -> Vec<ToolDef> {
     tool_definition_records(entity_types)
         .map(|record| record.tool)
