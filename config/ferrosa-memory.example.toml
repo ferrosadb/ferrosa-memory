@@ -30,6 +30,21 @@ transport = "stdio"          # "stdio" for Claude Code/Desktop, "http" for remot
 # http_port = 8765           # only used in http mode
 # request_timeout_seconds = 30 # increase for cold local judge/embedding model loads
 # log_level = "info"
+
+# Connections allowed per minute from ONE client IP before HTTP 429. Unset
+# derives from bind_addr: a loopback bind is UNLIMITED, a network-exposed bind
+# gets 50. Loopback is unlimited because every local client -- the workbench,
+# forge, Claude Code, Codex -- arrives as 127.0.0.1 and would otherwise divide
+# a single budget among cooperating processes rather than police an attacker.
+# 0 also means unlimited; there is no useful "allow zero connections" setting.
+# rate_limit_per_minute = 600
+
+# Per-IP tiers for a hosted server, overriding the value above. 0 = unlimited.
+# An entry keyed by anything that is not an IP address is a startup ERROR, not
+# a silently ignored tier.
+# [server.rate_limit_overrides]
+# "203.0.113.7" = 0            # premium, uncapped
+# "198.51.100.4" = 100         # basic
 tenant_id = "00000000-0000-0000-0000-000000000001"
 
 [ferrosa]

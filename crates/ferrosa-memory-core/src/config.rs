@@ -543,6 +543,32 @@ pub struct ServerConfig {
     /// Per-request HTTP timeout. Long enough to allow first-call local model loads.
     #[serde(default = "default_request_timeout_seconds")]
     pub request_timeout_seconds: u64,
+    /// Connections allowed per minute from one client IP before HTTP 429.
+    /// `0` means UNLIMITED (allowing 0 connections is never a useful config --
+    /// that is what not running the server is for).
+    ///
+    /// Unset derives from the bind address, because the two deployments have
+    /// opposite needs. On loopback EVERY local client shares one IP: the
+    /// workbench, forge, Claude Code and Codex all arrive as 127.0.0.1 and
+    /// contend for a single budget, so ANY limit throttles legitimate local
+    /// use rather than an attacker -- loopback therefore defaults to
+    /// unlimited. A network-exposed bind keeps the conservative figure.
+    #[serde(default)]
+    pub rate_limit_per_minute: Option<usize>,
+    /// Per-IP connection budgets overriding `rate_limit_per_minute`, keyed by
+    /// address. This is how a hosted server offers TIERS: the limiter has
+    /// always been per-IP, but every IP got the same number, so a paying
+    /// client and an anonymous one were rationed identically.
+    ///
+    /// `0` means unlimited here too, so a top tier can be uncapped.
+    ///
+    /// ```toml
+    /// [server.rate_limit_overrides]
+    /// "203.0.113.7" = 0       # premium, uncapped
+    /// "198.51.100.4" = 100    # basic
+    /// ```
+    #[serde(default)]
+    pub rate_limit_overrides: std::collections::HashMap<String, usize>,
     /// Fixed tenant UUID for sharing data across sessions.
     /// If not set, a random UUID is generated per session.
     pub tenant_id: Option<String>,
@@ -584,6 +610,8 @@ impl Default for ServerConfig {
             key_path: None,
             auth_file: None,
             request_timeout_seconds: default_request_timeout_seconds(),
+            rate_limit_per_minute: None,
+            rate_limit_overrides: std::collections::HashMap::new(),
             tenant_id: None,
             session_id: None,
             idle_consolidation_enabled: true,
@@ -1096,26 +1124,35 @@ pub fn validate_shared_http_config(config: &Config) -> anyhow::Result<()> {
     // instead of restarting once per field. Previously each check bailed on the
     // first failure, which took ~5 restart/error cycles to bring a stdio config
     // up in HTTP mode (auth_file, bind_addr, tenant fallback, TLS secrets, viz).
-    let mut problems: Vec<&'static str> = Vec::new();
+    let mut problems: Vec<String> = Vec::new();
     if !config.server.require_tls && !is_loopback_bind_addr(&config.server.bind_addr) {
-        problems.push("HTTP transport requires TLS unless server.bind_addr is loopback-only");
+        problems.push(
+            "HTTP transport requires TLS unless server.bind_addr is loopback-only".to_owned(),
+        );
     }
     if config.server.require_tls
         && (config.server.cert_path.is_none() || config.server.key_path.is_none())
     {
-        problems.push("HTTP transport requires cert_path and key_path when require_tls is true");
+        problems.push(
+            "HTTP transport requires cert_path and key_path when require_tls is true".to_owned(),
+        );
     }
     if config.server.auth_file.is_none() {
-        problems.push("HTTP transport requires server.auth_file");
+        problems.push("HTTP transport requires server.auth_file".to_owned());
+    }
+    // The tier map is PARSED here so a bad address is a config error naming the
+    // key, not a tier that quietly does not apply.
+    if let Err(error) = config.server.resolved_rate_limit_overrides() {
+        problems.push(error.to_string());
     }
     if config.server.tenant_id.is_some() {
-        problems.push("HTTP transport must not use server.tenant_id fallback");
+        problems.push("HTTP transport must not use server.tenant_id fallback".to_owned());
     }
     // Viz is unauthenticated (loopback-only), so under HTTP it cannot inherit a
     // request principal's tenant — it needs an explicit one. Surface it here so
     // it isn't yet another separate restart at viz-spawn time.
     if config.viz.enabled && config.viz.tenant_id.is_none() {
-        problems.push("viz.tenant_id is required when viz.enabled is true in HTTP mode");
+        problems.push("viz.tenant_id is required when viz.enabled is true in HTTP mode".to_owned());
     }
 
     if !problems.is_empty() {
@@ -1207,6 +1244,50 @@ pub fn validate_tenant_connection_path(config: &Config) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Per-IP connection budget for a network-exposed bind, where distinct clients
+/// have distinct addresses and an abusive one should be cut off early.
+///
+/// There is no loopback equivalent: loopback is UNLIMITED by default. A limit
+/// there polices nothing -- the traffic is already local, and every local
+/// client (workbench, forge, Claude Code, Codex) shares the single address
+/// 127.0.0.1, so any budget is divided among cooperating processes rather than
+/// applied to an attacker.
+pub const EXPOSED_RATE_LIMIT_PER_MINUTE: usize = 50;
+
+impl ServerConfig {
+    /// Per-IP budget overrides, parsed into addresses.
+    ///
+    /// An unparseable address or a zero budget is an ERROR, not a skipped
+    /// entry: a tier that silently disappears rations a client at the wrong
+    /// rate, and the operator sees a working server doing the wrong thing.
+    pub fn resolved_rate_limit_overrides(
+        &self,
+    ) -> anyhow::Result<std::collections::HashMap<std::net::IpAddr, Option<usize>>> {
+        self.rate_limit_overrides
+            .iter()
+            .map(|(address, limit)| {
+                let ip: std::net::IpAddr = address.trim().parse().map_err(|_| {
+                    anyhow::anyhow!(
+                        "server.rate_limit_overrides key {address:?} is not an IP address"
+                    )
+                })?;
+                Ok((ip, (*limit != 0).then_some(*limit)))
+            })
+            .collect()
+    }
+
+    /// The connection budget this server should enforce; `None` is unlimited.
+    pub fn resolved_rate_limit_per_minute(&self) -> Option<usize> {
+        match self.rate_limit_per_minute {
+            Some(0) => None,
+            Some(explicit) => Some(explicit),
+            // Loopback is unlimited: see EXPOSED_RATE_LIMIT_PER_MINUTE.
+            None if is_loopback_bind_addr(&self.bind_addr) => None,
+            None => Some(EXPOSED_RATE_LIMIT_PER_MINUTE),
+        }
+    }
 }
 
 fn is_loopback_bind_addr(bind_addr: &str) -> bool {
@@ -1717,6 +1798,74 @@ contact_points = "not_an_array"
     fn server_config_default_http_port() {
         let cfg = ServerConfig::default();
         assert_eq!(cfg.http_port, 8765);
+    }
+
+    #[test]
+    fn loopback_bind_is_unlimited_by_default() {
+        // Every local client -- workbench, forge, Claude Code, Codex -- arrives
+        // as 127.0.0.1 and would otherwise share one budget.
+        for bind in ["127.0.0.1", "::1", "localhost"] {
+            let cfg = ServerConfig {
+                bind_addr: bind.into(),
+                ..Default::default()
+            };
+            assert_eq!(cfg.resolved_rate_limit_per_minute(), None, "{bind}");
+        }
+    }
+
+    #[test]
+    fn exposed_bind_keeps_a_conservative_default() {
+        let cfg = ServerConfig {
+            bind_addr: "0.0.0.0".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.resolved_rate_limit_per_minute(),
+            Some(EXPOSED_RATE_LIMIT_PER_MINUTE)
+        );
+    }
+
+    #[test]
+    fn an_explicit_zero_means_unlimited_not_reject_everything() {
+        let mut cfg = ServerConfig {
+            bind_addr: "0.0.0.0".into(),
+            rate_limit_per_minute: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolved_rate_limit_per_minute(), None);
+        cfg.rate_limit_per_minute = Some(120);
+        assert_eq!(cfg.resolved_rate_limit_per_minute(), Some(120));
+    }
+
+    #[test]
+    fn rate_limit_tiers_parse_per_ip_with_zero_as_unlimited() {
+        let cfg = ServerConfig {
+            rate_limit_overrides: std::collections::HashMap::from([
+                ("203.0.113.7".to_owned(), 0usize),
+                ("198.51.100.4".to_owned(), 100usize),
+            ]),
+            ..Default::default()
+        };
+        let resolved = cfg.resolved_rate_limit_overrides().expect("valid tiers");
+        assert_eq!(resolved[&"203.0.113.7".parse().unwrap()], None);
+        assert_eq!(resolved[&"198.51.100.4".parse().unwrap()], Some(100));
+    }
+
+    #[test]
+    fn a_tier_keyed_by_a_non_address_is_an_error_not_a_dropped_entry() {
+        // Silently skipping it would ration a paying client at the anonymous
+        // rate while the server looks healthy.
+        let cfg = ServerConfig {
+            rate_limit_overrides: std::collections::HashMap::from([(
+                "premium-customer".to_owned(),
+                5000usize,
+            )]),
+            ..Default::default()
+        };
+        let error = cfg
+            .resolved_rate_limit_overrides()
+            .expect_err("a hostname is not an IP address");
+        assert!(error.to_string().contains("premium-customer"), "{error}");
     }
 
     #[test]
