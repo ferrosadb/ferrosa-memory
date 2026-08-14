@@ -3375,6 +3375,27 @@ async fn handle_viz_connection<S: crate::storage::Storage + 'static>(
             handle_anomaly_sse(stream, event_bus).await?;
         }
         ("GET", "/viz/ws") => {
+            // Reject cross-origin upgrades BEFORE anything else.
+            //
+            // A WebSocket handshake is not subject to CORS: the browser will
+            // open it and hand the response to the calling page. Loopback is no
+            // defence, because the connection originates from the user's own
+            // browser -- so any page they visit could open ws://127.0.0.1:<viz>
+            // /viz/ws and read the entire graph. Confirmed against a running
+            // daemon: `Origin: https://evil.example` returned 101 and streamed
+            // SnapshotStreamChunk frames.
+            //
+            // validate_origin already guards the MCP surface (subscriptions and
+            // requests). It was never applied here, which is the whole bug: a
+            // non-loopback Origin is now rejected, and a same-origin or
+            // header-less client (curl, the Rust workbench) still connects.
+            if let Err(message) = validate_origin(&headers) {
+                tracing::warn!(%message, "rejecting viz WebSocket upgrade with invalid Origin");
+                let response = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
+                stream.write_all(response.as_bytes()).await?;
+                return Ok(());
+            }
+
             // Validate WebSocket upgrade headers
             let has_upgrade = headers.iter().any(|(k, v)| {
                 k.eq_ignore_ascii_case("upgrade") && v.eq_ignore_ascii_case("websocket")
@@ -5181,6 +5202,56 @@ fn parse_http_request(raw: &str) -> anyhow::Result<ParsedRequest<'_>> {
 
 #[cfg(test)]
 mod tests {
+    // --- viz WebSocket origin guard -------------------------------------
+    //
+    // A WebSocket handshake is not subject to CORS. The browser opens it and
+    // hands the response to the calling page, so loopback is no defence: the
+    // connection comes from the user's own browser. Before this guard,
+    // `Origin: https://evil.example` against a running daemon returned 101 and
+    // streamed SnapshotStreamChunk frames carrying the graph.
+
+    fn upgrade_headers(origin: Option<&str>) -> Vec<(String, String)> {
+        let mut headers = vec![
+            ("Host".to_owned(), "127.0.0.1:8766".to_owned()),
+            ("Connection".to_owned(), "Upgrade".to_owned()),
+            ("Upgrade".to_owned(), "websocket".to_owned()),
+            ("Sec-WebSocket-Version".to_owned(), "13".to_owned()),
+            (
+                "Sec-WebSocket-Key".to_owned(),
+                "x3JJHMbDL1EzLkh9GBhXDw==".to_owned(),
+            ),
+        ];
+        if let Some(origin) = origin {
+            headers.push(("Origin".to_owned(), origin.to_owned()));
+        }
+        headers
+    }
+
+    #[test]
+    fn viz_upgrade_refuses_a_foreign_origin() {
+        // The exact header set that streamed the graph in the wild.
+        for origin in ["https://evil.example", "http://attacker.test", "null"] {
+            let result = validate_origin(&upgrade_headers(Some(origin)));
+            assert!(
+                result.is_err(),
+                "a {origin} upgrade must be refused, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn viz_upgrade_allows_the_dashboard_and_local_clients() {
+        // The viz dashboard itself is served from loopback, and non-browser
+        // clients (curl, the Rust workbench) send no Origin at all. Both must
+        // still connect, or the guard breaks the feature it protects.
+        for origin in ["http://127.0.0.1:8766", "http://localhost:8766"] {
+            validate_origin(&upgrade_headers(Some(origin)))
+                .expect("the dashboard's own origin must be allowed");
+        }
+        validate_origin(&upgrade_headers(None))
+            .expect("a client sending no Origin must still connect");
+    }
+
     use super::*;
     use crate::metrics::MemoryMetrics;
     use crate::storage::mock::MockStorage;
