@@ -3122,6 +3122,12 @@ fn accepted_no_body_response() -> String {
 ///
 /// On WebSocket connect, sends a `VizEvent::Snapshot` with current graph
 /// state so new clients don't start with a blank canvas.
+// Already sat at clippy's seven-argument threshold before auth existed; adding
+// VizAuth tips it to eight. The three auth values are already bundled, and
+// grouping the remaining unrelated parameters (bind, port, bus, storage, ctx,
+// session, routes) purely to satisfy a counter would obscure them rather than
+// clarify anything.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_viz<S: Storage + 'static>(
     bind_addr: &str,
     port: u16,
@@ -3130,6 +3136,7 @@ pub async fn serve_viz<S: Storage + 'static>(
     ctx: Arc<TenantContext>,
     session_id: Uuid,
     shell_routes: ShellRouteConfig,
+    auth: VizAuth,
 ) -> anyhow::Result<()> {
     let addr = format!("{bind_addr}:{port}");
     let listener = TcpListener::bind(&addr).await?;
@@ -3141,9 +3148,18 @@ pub async fn serve_viz<S: Storage + 'static>(
         let storage = Arc::clone(&storage);
         let ctx = Arc::clone(&ctx);
         let shell_routes = shell_routes.clone();
+        let conn_auth = auth.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_viz_connection(stream, bus, storage, ctx, session_id, &shell_routes).await
+            if let Err(e) = handle_viz_connection(
+                stream,
+                bus,
+                storage,
+                ctx,
+                session_id,
+                &shell_routes,
+                &conn_auth,
+            )
+            .await
             {
                 tracing::debug!("viz connection from {peer} closed: {e}");
             }
@@ -3310,6 +3326,49 @@ async fn handle_enrich_models(
     Ok(())
 }
 
+/// Everything viz needs to authenticate a caller.
+///
+/// Bundled because the three always travel together and are meaningless apart:
+/// the validator says whether credentials are good, the sessions turn a good
+/// credential into a browser cookie, and `tls_enabled` decides whether that
+/// cookie may carry `Secure` (setting it over plain HTTP makes the browser drop
+/// the cookie entirely).
+#[derive(Clone)]
+pub struct VizAuth {
+    pub sessions: Arc<crate::viz_session::VizSessions>,
+    pub credential_validator: Arc<CredentialValidator>,
+    pub tls_enabled: bool,
+}
+
+/// Authorize a viz request, returning a `Set-Cookie` value when a new session
+/// was just established.
+///
+/// Two accepted credentials, both checked against the SAME validator the other
+/// ports use, so this is not a parallel auth scheme:
+///   - a live session cookie (browsers, which cannot set headers on a
+///     WebSocket handshake);
+///   - `Authorization`, for everything that is not a browser (curl, the Rust
+///     workbench). Presenting it also mints a session, so a browser that was
+///     prompted for Basic auth on `/viz` carries a cookie afterwards and never
+///     needs to send credentials on the upgrade.
+fn viz_authorize(
+    headers: &[(String, String)],
+    validator: &CredentialValidator,
+    sessions: &crate::viz_session::VizSessions,
+) -> Option<Option<String>> {
+    if let Some(token) = crate::viz_session::session_token_from_headers(headers)
+        && sessions.validate(&token)
+    {
+        return Some(None);
+    }
+
+    if authenticate_from_headers(headers, validator).is_ok() {
+        return Some(Some(sessions.issue()));
+    }
+
+    None
+}
+
 /// Handle a single viz HTTP connection.
 ///
 /// Runs entirely in a spawned task — the accept loop does nothing
@@ -3323,6 +3382,7 @@ async fn handle_viz_connection<S: crate::storage::Storage + 'static>(
     ctx: Arc<crate::types::TenantContext>,
     default_session_id: Uuid,
     shell_routes: &ShellRouteConfig,
+    auth: &VizAuth,
 ) -> anyhow::Result<()> {
     let request = match read_http_request(&mut stream, MAX_REQUEST_BYTES).await {
         Ok(r) => r,
@@ -3335,6 +3395,35 @@ async fn handle_viz_connection<S: crate::storage::Storage + 'static>(
     let route = route_path(path);
     let effective_session = session_override(path).unwrap_or(default_session_id);
     let initial_viz_scope = viz_scope_override(path).unwrap_or(VizSnapshotScope::All);
+
+    // Authorize BEFORE routing, so a route added later is protected by default.
+    //
+    // This is deliberate: the cross-origin hole existed because validate_origin
+    // was a per-route control and /viz/ws was the one route that forgot it. A
+    // gate in front of the match cannot be forgotten by a new arm.
+    let issued_cookie = match viz_authorize(&headers, &*auth.credential_validator, &auth.sessions) {
+        Some(issued) => issued,
+        None => {
+            let body = "viz requires authentication";
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\n\
+                 WWW-Authenticate: Basic realm=\"Ferrosa Memory viz\"\r\n\
+                 Content-Type: text/plain\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await?;
+            return Ok(());
+        }
+    };
+    let set_cookie = issued_cookie
+        .map(|token| {
+            format!(
+                "Set-Cookie: {}\r\n",
+                crate::viz_session::set_cookie_header(&token, auth.tls_enabled)
+            )
+        })
+        .unwrap_or_default();
 
     match (method, route) {
         ("POST", p) if p.starts_with("/consolidate") => {
@@ -3352,6 +3441,7 @@ async fn handle_viz_connection<S: crate::storage::Storage + 'static>(
                  Cache-Control: no-cache, no-store, must-revalidate\r\n\
                  Pragma: no-cache\r\n\
                  Expires: 0\r\n\
+                 {set_cookie}\
                  Content-Length: {}\r\n\r\n{}",
                 viz_html.len(),
                 viz_html
@@ -5202,6 +5292,54 @@ fn parse_http_request(raw: &str) -> anyhow::Result<ParsedRequest<'_>> {
 
 #[cfg(test)]
 mod tests {
+    /// An unauthenticated viz request is refused by the gate in FRONT of the
+    /// router, so the protection does not depend on each route remembering it.
+    /// The cross-origin hole existed precisely because a per-route control was
+    /// forgotten by one route.
+    #[tokio::test]
+    async fn viz_refuses_a_request_with_no_credentials() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_viz_connection(
+                stream,
+                Arc::new(EventBus::new()),
+                Arc::new(MockStorage::new()),
+                Arc::new(crate::auth::authenticate_stdio(uuid::Uuid::nil())),
+                uuid::Uuid::nil(),
+                &ShellRouteConfig::default(),
+                &VizAuth {
+                    sessions: Arc::new(crate::viz_session::VizSessions::new()),
+                    credential_validator: Arc::new(|user: &str, pass: &str| {
+                        (user == "viz" && pass == "secret").then(uuid::Uuid::nil)
+                    }),
+                    tls_enabled: false,
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET /viz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        server.await.unwrap();
+
+        assert!(
+            response.starts_with("HTTP/1.1 401 Unauthorized"),
+            "viz must refuse an unauthenticated request: {response}"
+        );
+        assert!(
+            response.contains("WWW-Authenticate: Basic"),
+            "the browser needs a challenge to prompt with: {response}"
+        );
+    }
+
     // --- viz WebSocket origin guard -------------------------------------
     //
     // A WebSocket handshake is not subject to CORS. The browser opens it and
@@ -5685,6 +5823,13 @@ mod tests {
                 server_ctx,
                 session_id,
                 &ShellRouteConfig::default(),
+                &VizAuth {
+                    sessions: Arc::new(crate::viz_session::VizSessions::new()),
+                    credential_validator: Arc::new(|user: &str, pass: &str| {
+                        (user == "viz" && pass == "secret").then(uuid::Uuid::nil)
+                    }),
+                    tls_enabled: false,
+                },
             )
             .await
             .unwrap();
@@ -5694,6 +5839,7 @@ mod tests {
         let request = format!(
             "GET /viz/api/derived_facts?session_id={session_id}&limit=2 HTTP/1.1\r\n\
              Host: 127.0.0.1\r\n\
+             Authorization: Basic dml6OnNlY3JldA==\r\n\
              Connection: close\r\n\r\n"
         );
         client.write_all(request.as_bytes()).await.unwrap();

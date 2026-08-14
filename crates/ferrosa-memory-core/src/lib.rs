@@ -84,4 +84,5 @@ pub mod turn_chain;
 pub mod types;
 pub mod vector;
 pub mod viz;
+pub mod viz_session;
 pub mod warmth;

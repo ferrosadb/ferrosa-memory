@@ -3500,31 +3500,73 @@ async fn main() -> anyhow::Result<()> {
             viz_scheme: "http".into(),
             viz_port: config.viz.public_port.unwrap_or(viz_port),
         };
+        // viz authenticates with the SAME credentials as the HTTP surface --
+        // one auth story, not a parallel one. Browsers get a session cookie
+        // (they cannot set headers on a WebSocket handshake); everything else
+        // presents Authorization.
+        let viz_sessions = Arc::new(ferrosa_memory_core::viz_session::VizSessions::new());
+        let config_require_tls = config.server.require_tls;
+
+        // No auth_file means no credentials to check against, so viz would be
+        // an unauthenticated network surface. Under stdio that is the ONLY
+        // network surface the daemon has -- stdio itself is stdin/stdout -- so
+        // an unauthenticated viz is the entire attack surface.
+        //
+        // Refuse to open it. Loud, and NOT fatal: memory keeps serving over
+        // stdio, only the insecure port stays shut.
+        let viz_validator: Option<Arc<http::CredentialValidator>> =
+            match config.server.auth_file.as_deref() {
+                Some(auth_file) => {
+                    let file_validator = Arc::new(auth::FileAuthValidator::from_path(auth_file)?);
+                    Some(Arc::new(move |user: &str, pass: &str| {
+                        file_validator.validate(user, pass)
+                    }))
+                }
+                None => None,
+            };
+        let viz_credentials = viz_validator;
         let viz_bind_for_log = viz_bind.clone();
-        tokio::spawn(async move {
-            if let Err(e) = http::serve_viz(
-                &viz_bind,
-                viz_port,
-                viz_bus,
-                viz_storage,
-                viz_ctx,
-                viz_session_id,
-                shell_routes,
-            )
-            .await
-            {
-                tracing::warn!("viz server error: {e}");
-            }
-        });
-        tracing::info!(
-            "viz dashboard at http://{}:{}/viz",
-            if viz_bind_for_log == "0.0.0.0" {
-                "localhost".to_string()
-            } else {
-                viz_bind_for_log
-            },
-            config.viz.port
-        );
+        // Skip viz only -- returning from here would exit main and take the
+        // whole daemon down, turning a hardening change into an outage for
+        // every stdio user on the default config.
+        if let Some(viz_validator) = viz_credentials {
+            tokio::spawn(async move {
+                if let Err(e) = http::serve_viz(
+                    &viz_bind,
+                    viz_port,
+                    viz_bus,
+                    viz_storage,
+                    viz_ctx,
+                    viz_session_id,
+                    shell_routes,
+                    http::VizAuth {
+                        sessions: viz_sessions,
+                        credential_validator: viz_validator,
+                        tls_enabled: config_require_tls,
+                    },
+                )
+                .await
+                {
+                    tracing::warn!("viz server error: {e}");
+                }
+            });
+            tracing::info!(
+                "viz dashboard at http://{}:{}/viz",
+                if viz_bind_for_log == "0.0.0.0" {
+                    "localhost".to_string()
+                } else {
+                    viz_bind_for_log
+                },
+                config.viz.port
+            );
+        } else {
+            tracing::error!(
+                "viz.enabled = true but server.auth_file is not configured, so viz has no \
+                 credentials to check and will NOT start. viz serves the whole graph over \
+                 the network. Set server.auth_file, or set viz.enabled = false to silence \
+                 this."
+            );
+        }
     }
 
     match config.server.transport.as_str() {
