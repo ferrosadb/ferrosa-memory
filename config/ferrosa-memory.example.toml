@@ -30,7 +30,24 @@ transport = "stdio"          # "stdio" for Claude Code/Desktop, "http" for remot
 # http_port = 8765           # only used in http mode
 # request_timeout_seconds = 30 # increase for cold local judge/embedding model loads
 # log_level = "info"
-tenant_id = "00000000-0000-0000-0000-000000000001"
+
+# Connections allowed per minute from ONE client IP before HTTP 429.
+#   -1  unlimited
+#    0  blocked (refuse every connection from that address)
+#   >0  that many connections per minute
+# Unset derives from bind_addr: a loopback bind is unlimited, a network-exposed
+# bind gets 50. Loopback defaults to unlimited because every process on the
+# host shares the address 127.0.0.1, so a per-IP budget is divided among
+# co-operating local clients rather than applied to a remote caller.
+# rate_limit_per_minute = 600
+
+# Per-IP budgets overriding the value above: rate tiers, and blocking single
+# addresses. Same encoding. A key that is not an IP address is a startup error,
+# not a silently ignored entry.
+# [server.rate_limit_overrides]
+# "203.0.113.7" = -1           # uncapped
+# "198.51.100.4" = 100         # 100 per minute
+# "198.51.100.9" = 0           # blocked
 
 [ferrosa]
 contact_points = ["localhost:9042"]

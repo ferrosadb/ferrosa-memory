@@ -3719,6 +3719,14 @@ async fn main() -> anyhow::Result<()> {
                     require_tls: config.server.require_tls,
                     cert_path: config.server.cert_path.clone(),
                     key_path: config.server.key_path.clone(),
+                    rate_limit_per_minute: config
+                        .server
+                        .resolved_rate_limit_per_minute()
+                        .expect("validated at startup by validate_shared_http_config"),
+                    rate_limit_overrides: config
+                        .server
+                        .resolved_rate_limit_overrides()
+                        .expect("validated at startup by validate_shared_http_config"),
                     readiness_checker: Arc::new(move || readiness_storage.is_ready()),
                     shell_routes: http::ShellRouteConfig {
                         workbench_scheme: if config.server.require_tls {

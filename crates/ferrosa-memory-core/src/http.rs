@@ -106,29 +106,61 @@ struct ConnectionContext<'a> {
 /// Per-IP connection rate limiter.
 ///
 /// Tracks connection counts per source IP within a rolling one-minute window.
-/// When an IP exceeds `max_per_minute` connections, subsequent connections
-/// are rejected until the window resets.
+/// When an IP exceeds its budget, subsequent connections are rejected until the
+/// window resets.
+///
+/// A budget of `None` means unlimited, and is handled before any bookkeeping:
+/// an unlimited IP never gets an entry in the map, so the default loopback
+/// configuration accumulates no state for a client it is not policing.
+///
+/// A budget of `Some(0)` blocks the address outright. That is how an operator
+/// bans a caller: give it a zero override and every connection is refused
+/// while other addresses are unaffected.
 pub struct RateLimiter {
     limits: Mutex<HashMap<IpAddr, (usize, Instant)>>,
-    max_per_minute: usize,
+    max_per_minute: Option<usize>,
+    /// Per-IP budgets that override the default, so one server can serve
+    /// several rate tiers and block individual addresses.
+    overrides: HashMap<IpAddr, Option<usize>>,
 }
 
 impl RateLimiter {
-    /// Create a rate limiter allowing `max_per_minute` connections per IP.
-    pub fn new(max_per_minute: usize) -> Self {
-        assert!(max_per_minute > 0, "max_per_minute must be positive");
+    /// Create a rate limiter allowing `max_per_minute` connections per IP:
+    /// `None` is unlimited, `Some(0)` blocks every connection.
+    pub fn new(max_per_minute: Option<usize>) -> Self {
+        Self::with_overrides(max_per_minute, HashMap::new())
+    }
+
+    /// Create a rate limiter with per-IP overrides on top of a default.
+    pub fn with_overrides(
+        max_per_minute: Option<usize>,
+        overrides: HashMap<IpAddr, Option<usize>>,
+    ) -> Self {
         Self {
             limits: Mutex::new(HashMap::new()),
             max_per_minute,
+            overrides,
         }
+    }
+
+    /// The budget applying to `ip`: its own tier, else the default.
+    fn limit_for(&self, ip: IpAddr) -> Option<usize> {
+        self.overrides
+            .get(&ip)
+            .copied()
+            .unwrap_or(self.max_per_minute)
     }
 
     /// Check whether a connection from `ip` should be allowed.
     ///
     /// Returns `true` if the connection is within the rate limit, `false` if
-    /// the IP has exceeded the limit. Automatically resets the counter when
-    /// the one-minute window expires.
+    /// the IP has exceeded it. Automatically resets the counter when the
+    /// one-minute window expires.
     pub fn check(&self, ip: IpAddr) -> bool {
+        let Some(limit) = self.limit_for(ip) else {
+            return true;
+        };
+
         let mut limits = self.limits.lock().expect("rate limiter lock poisoned");
         let now = Instant::now();
         let entry = limits.entry(ip).or_insert((0, now));
@@ -140,7 +172,7 @@ impl RateLimiter {
         }
 
         entry.0 += 1;
-        entry.0 <= self.max_per_minute
+        entry.0 <= limit
     }
 }
 
@@ -280,6 +312,12 @@ pub struct HttpConfig {
     pub readiness_checker: Arc<dyn Fn() -> bool + Send + Sync>,
     pub shell_routes: ShellRouteConfig,
     pub session: Arc<dispatch::SessionState>,
+    /// Connections allowed per minute per client IP before HTTP 429. `None`
+    /// is unlimited (the default for a loopback bind); `Some(0)` blocks.
+    pub rate_limit_per_minute: Option<usize>,
+    /// Per-IP budgets overriding `rate_limit_per_minute`, for rate tiers and
+    /// for blocking individual addresses.
+    pub rate_limit_overrides: HashMap<IpAddr, Option<usize>>,
 }
 
 /// Public query surfaces available to the authenticated operator workbench.
@@ -334,7 +372,10 @@ pub async fn serve_http<S: Storage + OperatorQuerySurface + 'static>(
         None
     };
 
-    let rate_limiter = Arc::new(RateLimiter::new(50));
+    let rate_limiter = Arc::new(RateLimiter::with_overrides(
+        config.rate_limit_per_minute,
+        config.rate_limit_overrides.clone(),
+    ));
     let readiness = config.readiness_checker.clone();
     let shell_routes = config.shell_routes.clone();
     let session = Arc::clone(&config.session);
@@ -6308,7 +6349,7 @@ mod tests {
 
     #[test]
     fn rate_limiter_allows_within_limit() {
-        let limiter = RateLimiter::new(5);
+        let limiter = RateLimiter::new(Some(5));
         let ip: IpAddr = "192.168.1.1".parse().unwrap();
 
         for i in 1..=5 {
@@ -6318,7 +6359,7 @@ mod tests {
 
     #[test]
     fn rate_limiter_rejects_over_limit() {
-        let limiter = RateLimiter::new(3);
+        let limiter = RateLimiter::new(Some(3));
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
         assert!(limiter.check(ip), "connection 1 should be allowed");
@@ -6329,8 +6370,72 @@ mod tests {
     }
 
     #[test]
+    fn rate_limiter_unlimited_never_rejects_and_keeps_no_state() {
+        // The loopback default. Tracking an unlimited IP would grow the map
+        // for a client that is never policed.
+        let limiter = RateLimiter::new(None);
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        for _ in 0..10_000 {
+            assert!(limiter.check(ip));
+        }
+        assert!(
+            limiter.limits.lock().unwrap().is_empty(),
+            "an unlimited IP must not accumulate rate-limiter state"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_override_gives_one_ip_a_different_tier() {
+        let premium: IpAddr = "203.0.113.7".parse().unwrap();
+        let basic: IpAddr = "198.51.100.4".parse().unwrap();
+        let limiter = RateLimiter::with_overrides(
+            Some(2),
+            HashMap::from([(premium, Some(5)), (basic, Some(1))]),
+        );
+
+        for _ in 0..5 {
+            assert!(limiter.check(premium), "premium tier is 5");
+        }
+        assert!(!limiter.check(premium), "premium tier stops at 5");
+
+        assert!(limiter.check(basic), "basic tier is 1");
+        assert!(!limiter.check(basic), "basic tier stops at 1");
+
+        let default: IpAddr = "192.0.2.9".parse().unwrap();
+        assert!(limiter.check(default));
+        assert!(limiter.check(default));
+        assert!(!limiter.check(default), "unlisted IPs get the default of 2");
+    }
+
+    #[test]
+    fn rate_limiter_zero_budget_blocks_one_address_and_leaves_others_alone() {
+        let banned: IpAddr = "203.0.113.7".parse().unwrap();
+        let allowed: IpAddr = "192.0.2.9".parse().unwrap();
+        let limiter = RateLimiter::with_overrides(Some(10), HashMap::from([(banned, Some(0))]));
+
+        assert!(
+            !limiter.check(banned),
+            "a 0 budget refuses the first connection"
+        );
+        assert!(!limiter.check(banned));
+        assert!(limiter.check(allowed), "other addresses are unaffected");
+    }
+
+    #[test]
+    fn rate_limiter_override_can_be_unlimited_while_the_default_is_not() {
+        let uncapped: IpAddr = "203.0.113.7".parse().unwrap();
+        let limiter = RateLimiter::with_overrides(Some(1), HashMap::from([(uncapped, None)]));
+        for _ in 0..1_000 {
+            assert!(limiter.check(uncapped));
+        }
+        let other: IpAddr = "192.0.2.9".parse().unwrap();
+        assert!(limiter.check(other));
+        assert!(!limiter.check(other));
+    }
+
+    #[test]
     fn rate_limiter_independent_per_ip() {
-        let limiter = RateLimiter::new(2);
+        let limiter = RateLimiter::new(Some(2));
         let ip_a: IpAddr = "10.0.0.1".parse().unwrap();
         let ip_b: IpAddr = "10.0.0.2".parse().unwrap();
 
@@ -6401,6 +6506,8 @@ mod tests {
             require_tls: false,
             cert_path: None,
             key_path: None,
+            rate_limit_per_minute: Some(50),
+            rate_limit_overrides: std::collections::HashMap::new(),
             readiness_checker: Arc::new(|| true),
             shell_routes: ShellRouteConfig::default(),
             session: Arc::new(dispatch::SessionState::default()),
@@ -6416,6 +6523,8 @@ mod tests {
             require_tls: true,
             cert_path: Some("/etc/ssl/cert.pem".into()),
             key_path: Some("/etc/ssl/key.pem".into()),
+            rate_limit_per_minute: Some(50),
+            rate_limit_overrides: std::collections::HashMap::new(),
             readiness_checker: Arc::new(|| true),
             shell_routes: ShellRouteConfig::default(),
             session: Arc::new(dispatch::SessionState::default()),
