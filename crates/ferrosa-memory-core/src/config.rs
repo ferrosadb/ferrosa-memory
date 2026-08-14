@@ -543,6 +543,32 @@ pub struct ServerConfig {
     /// Per-request HTTP timeout. Long enough to allow first-call local model loads.
     #[serde(default = "default_request_timeout_seconds")]
     pub request_timeout_seconds: u64,
+    /// Connections allowed per minute from one client IP before HTTP 429.
+    ///
+    /// `-1` is unlimited, `0` blocks the address entirely, and any positive
+    /// value is that many connections per minute.
+    ///
+    /// Unset derives from the bind address. A loopback bind defaults to
+    /// unlimited: every process on the host shares the single address
+    /// 127.0.0.1, so a per-IP budget is divided among co-operating local
+    /// clients rather than applied to a remote caller. A network-exposed bind
+    /// defaults to `EXPOSED_RATE_LIMIT_PER_MINUTE`.
+    #[serde(default)]
+    pub rate_limit_per_minute: Option<i64>,
+    /// Per-IP connection budgets overriding `rate_limit_per_minute`, keyed by
+    /// address, so one server can serve several rate tiers.
+    ///
+    /// Same encoding as `rate_limit_per_minute`: `-1` unlimited, `0` blocked,
+    /// positive is a per-minute budget.
+    ///
+    /// ```toml
+    /// [server.rate_limit_overrides]
+    /// "203.0.113.7" = -1      # uncapped
+    /// "198.51.100.4" = 100    # 100 per minute
+    /// "198.51.100.9" = 0      # blocked
+    /// ```
+    #[serde(default)]
+    pub rate_limit_overrides: std::collections::HashMap<String, i64>,
     /// Fixed tenant UUID for sharing data across sessions.
     /// If not set, a random UUID is generated per session.
     pub tenant_id: Option<String>,
@@ -584,6 +610,8 @@ impl Default for ServerConfig {
             key_path: None,
             auth_file: None,
             request_timeout_seconds: default_request_timeout_seconds(),
+            rate_limit_per_minute: None,
+            rate_limit_overrides: std::collections::HashMap::new(),
             tenant_id: None,
             session_id: None,
             idle_consolidation_enabled: true,
@@ -1096,26 +1124,38 @@ pub fn validate_shared_http_config(config: &Config) -> anyhow::Result<()> {
     // instead of restarting once per field. Previously each check bailed on the
     // first failure, which took ~5 restart/error cycles to bring a stdio config
     // up in HTTP mode (auth_file, bind_addr, tenant fallback, TLS secrets, viz).
-    let mut problems: Vec<&'static str> = Vec::new();
+    let mut problems: Vec<String> = Vec::new();
     if !config.server.require_tls && !is_loopback_bind_addr(&config.server.bind_addr) {
-        problems.push("HTTP transport requires TLS unless server.bind_addr is loopback-only");
+        problems.push(
+            "HTTP transport requires TLS unless server.bind_addr is loopback-only".to_owned(),
+        );
     }
     if config.server.require_tls
         && (config.server.cert_path.is_none() || config.server.key_path.is_none())
     {
-        problems.push("HTTP transport requires cert_path and key_path when require_tls is true");
+        problems.push(
+            "HTTP transport requires cert_path and key_path when require_tls is true".to_owned(),
+        );
     }
     if config.server.auth_file.is_none() {
-        problems.push("HTTP transport requires server.auth_file");
+        problems.push("HTTP transport requires server.auth_file".to_owned());
+    }
+    // Both rate-limit fields are DECODED here so an invalid value is a startup
+    // error naming the field, not a policy quietly guessed at request time.
+    if let Err(error) = config.server.resolved_rate_limit_per_minute() {
+        problems.push(error.to_string());
+    }
+    if let Err(error) = config.server.resolved_rate_limit_overrides() {
+        problems.push(error.to_string());
     }
     if config.server.tenant_id.is_some() {
-        problems.push("HTTP transport must not use server.tenant_id fallback");
+        problems.push("HTTP transport must not use server.tenant_id fallback".to_owned());
     }
     // Viz is unauthenticated (loopback-only), so under HTTP it cannot inherit a
     // request principal's tenant — it needs an explicit one. Surface it here so
     // it isn't yet another separate restart at viz-spawn time.
     if config.viz.enabled && config.viz.tenant_id.is_none() {
-        problems.push("viz.tenant_id is required when viz.enabled is true in HTTP mode");
+        problems.push("viz.tenant_id is required when viz.enabled is true in HTTP mode".to_owned());
     }
 
     if !problems.is_empty() {
@@ -1207,6 +1247,76 @@ pub fn validate_tenant_connection_path(config: &Config) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Per-IP connection budget for a network-exposed bind, where distinct clients
+/// have distinct addresses.
+///
+/// There is no loopback equivalent: a loopback bind is unlimited by default,
+/// because every process on the host shares the address 127.0.0.1 and a budget
+/// there is divided among co-operating local clients.
+pub const EXPOSED_RATE_LIMIT_PER_MINUTE: usize = 50;
+
+/// The configured value meaning "no limit".
+pub const RATE_LIMIT_UNLIMITED: i64 = -1;
+
+impl ServerConfig {
+    /// Per-IP budget overrides, parsed into addresses.
+    ///
+    /// An unparseable address or a zero budget is an ERROR, not a skipped
+    /// entry: a tier that silently disappears rations a client at the wrong
+    /// rate, and the operator sees a working server doing the wrong thing.
+    pub fn resolved_rate_limit_overrides(
+        &self,
+    ) -> anyhow::Result<std::collections::HashMap<std::net::IpAddr, Option<usize>>> {
+        self.rate_limit_overrides
+            .iter()
+            .map(|(address, limit)| {
+                let ip: std::net::IpAddr = address.trim().parse().map_err(|_| {
+                    anyhow::anyhow!(
+                        "server.rate_limit_overrides key {address:?} is not an IP address"
+                    )
+                })?;
+                let budget = decode_rate_limit(*limit).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "server.rate_limit_overrides[{address:?}] is {limit}; \
+                         use -1 for unlimited, 0 to block, or a positive budget"
+                    )
+                })?;
+                Ok((ip, budget))
+            })
+            .collect()
+    }
+
+    /// The connection budget this server should enforce.
+    ///
+    /// `Ok(None)` is unlimited; `Ok(Some(0))` blocks every connection.
+    pub fn resolved_rate_limit_per_minute(&self) -> anyhow::Result<Option<usize>> {
+        match self.rate_limit_per_minute {
+            Some(configured) => decode_rate_limit(configured).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "server.rate_limit_per_minute is {configured}; \
+                     use -1 for unlimited, 0 to block, or a positive budget"
+                )
+            }),
+            None if is_loopback_bind_addr(&self.bind_addr) => Ok(None),
+            None => Ok(Some(EXPOSED_RATE_LIMIT_PER_MINUTE)),
+        }
+    }
+}
+
+/// Decode a configured rate limit into a budget.
+///
+/// `-1` is unlimited (`None`), `0` blocks (`Some(0)`), positive values are the
+/// budget itself. Any other negative number is rejected rather than clamped:
+/// silently reading `-5` as unlimited or as blocked would apply a policy the
+/// operator did not write, in opposite directions depending on the guess.
+fn decode_rate_limit(configured: i64) -> Option<Option<usize>> {
+    match configured {
+        RATE_LIMIT_UNLIMITED => Some(None),
+        budget if budget >= 0 => Some(Some(budget as usize)),
+        _ => None,
+    }
 }
 
 fn is_loopback_bind_addr(bind_addr: &str) -> bool {
@@ -1717,6 +1827,104 @@ contact_points = "not_an_array"
     fn server_config_default_http_port() {
         let cfg = ServerConfig::default();
         assert_eq!(cfg.http_port, 8765);
+    }
+
+    #[test]
+    fn loopback_bind_is_unlimited_by_default() {
+        // Every process on the host arrives as 127.0.0.1 and would otherwise
+        // share a single budget.
+        for bind in ["127.0.0.1", "::1", "localhost"] {
+            let cfg = ServerConfig {
+                bind_addr: bind.into(),
+                ..Default::default()
+            };
+            assert_eq!(
+                cfg.resolved_rate_limit_per_minute().unwrap(),
+                None,
+                "{bind}"
+            );
+        }
+    }
+
+    #[test]
+    fn exposed_bind_keeps_a_conservative_default() {
+        let cfg = ServerConfig {
+            bind_addr: "0.0.0.0".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.resolved_rate_limit_per_minute().unwrap(),
+            Some(EXPOSED_RATE_LIMIT_PER_MINUTE)
+        );
+    }
+
+    #[test]
+    fn minus_one_is_unlimited_zero_blocks_and_positive_is_a_budget() {
+        let mut cfg = ServerConfig {
+            bind_addr: "0.0.0.0".into(),
+            rate_limit_per_minute: Some(RATE_LIMIT_UNLIMITED),
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolved_rate_limit_per_minute().unwrap(), None);
+
+        // Blocking an address is the point of 0, not a misconfiguration.
+        cfg.rate_limit_per_minute = Some(0);
+        assert_eq!(cfg.resolved_rate_limit_per_minute().unwrap(), Some(0));
+
+        cfg.rate_limit_per_minute = Some(120);
+        assert_eq!(cfg.resolved_rate_limit_per_minute().unwrap(), Some(120));
+    }
+
+    #[test]
+    fn a_negative_other_than_minus_one_is_rejected_not_guessed() {
+        // Clamping -5 to unlimited or to blocked would apply a policy the
+        // operator did not write, in opposite directions depending on the guess.
+        let cfg = ServerConfig {
+            bind_addr: "0.0.0.0".into(),
+            rate_limit_per_minute: Some(-5),
+            ..Default::default()
+        };
+        let error = cfg
+            .resolved_rate_limit_per_minute()
+            .expect_err("-5 is not a valid budget");
+        assert!(error.to_string().contains("-5"), "{error}");
+    }
+
+    #[test]
+    fn rate_limit_tiers_parse_per_ip_including_blocked_and_unlimited() {
+        let cfg = ServerConfig {
+            rate_limit_overrides: std::collections::HashMap::from([
+                ("203.0.113.7".to_owned(), RATE_LIMIT_UNLIMITED),
+                ("198.51.100.4".to_owned(), 100i64),
+                ("198.51.100.9".to_owned(), 0i64),
+            ]),
+            ..Default::default()
+        };
+        let resolved = cfg.resolved_rate_limit_overrides().expect("valid tiers");
+        assert_eq!(resolved[&"203.0.113.7".parse().unwrap()], None);
+        assert_eq!(resolved[&"198.51.100.4".parse().unwrap()], Some(100));
+        assert_eq!(
+            resolved[&"198.51.100.9".parse().unwrap()],
+            Some(0),
+            "0 blocks the address"
+        );
+    }
+
+    #[test]
+    fn a_tier_keyed_by_a_non_address_is_an_error_not_a_dropped_entry() {
+        // Silently skipping it would ration a paying client at the anonymous
+        // rate while the server looks healthy.
+        let cfg = ServerConfig {
+            rate_limit_overrides: std::collections::HashMap::from([(
+                "premium-customer".to_owned(),
+                5000i64,
+            )]),
+            ..Default::default()
+        };
+        let error = cfg
+            .resolved_rate_limit_overrides()
+            .expect_err("a hostname is not an IP address");
+        assert!(error.to_string().contains("premium-customer"), "{error}");
     }
 
     #[test]
