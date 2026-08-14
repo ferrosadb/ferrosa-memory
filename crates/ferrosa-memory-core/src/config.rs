@@ -169,15 +169,21 @@ pub struct VizConfig {
     pub public_port: Option<u16>,
     /// Tenant UUID viz should read under when running in HTTP transport mode.
     ///
-    /// Viz is unauthenticated (loopback-only), so the tenant cannot come from
-    /// a request principal. In stdio mode this is unused — viz inherits the
-    /// stdio tenant. In HTTP mode this is required if `enabled = true`.
+    /// Viz is unauthenticated, so the tenant cannot come from a request
+    /// principal. In stdio mode this is unused — viz inherits the stdio tenant.
+    /// In HTTP mode this is required if `enabled = true`.
+    ///
+    /// "loopback-only" used to be asserted here and was not true: the stdio and
+    /// fallback arms bound 0.0.0.0. It is true now, enforced by
+    /// `resolve_viz_bind` rather than by comment.
     #[serde(default)]
     pub tenant_id: Option<String>,
-    /// Explicit bind address for the viz listener. When unset the runtime picks
-    /// a safe default (0.0.0.0 under stdio, 127.0.0.1 under HTTP). Override to
-    /// 0.0.0.0 only when the container/host port mapping already constrains
-    /// exposure (e.g. podman forwarding host 127.0.0.1:X → container 0.0.0.0:Y).
+    /// Explicit bind address for the viz listener. Unset means loopback,
+    /// whatever the transport.
+    ///
+    /// A non-loopback value is REFUSED while viz cannot authenticate callers —
+    /// it serves the whole graph. For a container, map the host side to
+    /// 127.0.0.1 rather than binding the listener wide.
     #[serde(default)]
     pub bind_addr: Option<String>,
 }
@@ -1151,7 +1157,7 @@ pub fn validate_shared_http_config(config: &Config) -> anyhow::Result<()> {
     if config.server.tenant_id.is_some() {
         problems.push("HTTP transport must not use server.tenant_id fallback".to_owned());
     }
-    // Viz is unauthenticated (loopback-only), so under HTTP it cannot inherit a
+    // Viz is unauthenticated and now loopback-bound, so under HTTP it cannot inherit a
     // request principal's tenant — it needs an explicit one. Surface it here so
     // it isn't yet another separate restart at viz-spawn time.
     if config.viz.enabled && config.viz.tenant_id.is_none() {
@@ -1318,6 +1324,53 @@ fn decode_rate_limit(configured: i64) -> Option<Option<usize>> {
         _ => None,
     }
 }
+
+/// Where the viz listener should bind, and whether that is allowed.
+///
+/// Viz started as a debug dashboard and kept a debug posture. It serves the
+/// whole graph -- `/viz`, `/viz/ws`, `/viz/snapshot`, `/viz/api/*` -- and it
+/// authenticates nobody. The binding rule it grew was:
+///
+///     "stdio" => 0.0.0.0        // the DEFAULT transport
+///     "http"  => 127.0.0.1
+///     _       => 0.0.0.0        // and any typo, too
+///
+/// with `viz.enabled` defaulting to true. So a default install published the
+/// user's knowledge graph on every interface, and an unrecognised transport
+/// string failed OPEN.
+///
+/// This resolves the bind instead: loopback unless the operator says otherwise
+/// IN WRITING, and an explicit non-loopback bind is refused while viz cannot
+/// authenticate. Fails closed in every arm, including the fallback.
+pub fn resolve_viz_bind(
+    configured: Option<&str>,
+    viz_can_authenticate: bool,
+) -> Result<String, String> {
+    let Some(requested) = configured.map(str::trim).filter(|value| !value.is_empty()) else {
+        // No transport arm gets a non-loopback default any more. The old
+        // stdio/fallback arms are the exposure.
+        return Ok(LOOPBACK_BIND.to_owned());
+    };
+
+    if is_loopback_bind_addr(requested) {
+        return Ok(requested.to_owned());
+    }
+
+    if viz_can_authenticate {
+        return Ok(requested.to_owned());
+    }
+
+    Err(format!(
+        "viz.bind_addr = {requested:?} would publish the graph on a non-loopback \
+         interface, and viz cannot authenticate callers. Bind loopback, or set \
+         viz.enabled = false. If a container port mapping already constrains \
+         exposure, map the host side to 127.0.0.1 rather than binding the \
+         listener wide."
+    ))
+}
+
+/// The address viz binds when nothing else is configured.
+pub const LOOPBACK_BIND: &str = "127.0.0.1";
 
 fn is_loopback_bind_addr(bind_addr: &str) -> bool {
     matches!(
@@ -1827,6 +1880,44 @@ contact_points = "not_an_array"
     fn server_config_default_http_port() {
         let cfg = ServerConfig::default();
         assert_eq!(cfg.http_port, 8765);
+    }
+
+    #[test]
+    fn viz_binds_loopback_when_nothing_is_configured() {
+        // The old rule gave stdio -- the DEFAULT transport -- 0.0.0.0, so a
+        // default install published the graph on every interface.
+        assert_eq!(resolve_viz_bind(None, false).unwrap(), "127.0.0.1");
+        assert_eq!(resolve_viz_bind(Some(""), false).unwrap(), "127.0.0.1");
+        assert_eq!(resolve_viz_bind(Some("   "), false).unwrap(), "127.0.0.1");
+    }
+
+    #[test]
+    fn viz_refuses_a_wide_bind_while_it_cannot_authenticate() {
+        // Fail LOUD and closed. Silently narrowing to loopback would leave an
+        // operator believing a remote dashboard works when it does not.
+        for wide in ["0.0.0.0", "::", "192.168.1.10"] {
+            let error = resolve_viz_bind(Some(wide), false)
+                .expect_err("a wide bind without auth must be refused");
+            assert!(
+                error.contains(wide),
+                "the error must name the address: {error}"
+            );
+            assert!(error.contains("cannot authenticate"), "{error}");
+        }
+    }
+
+    #[test]
+    fn viz_allows_an_explicit_loopback_bind() {
+        for local in ["127.0.0.1", "localhost", "::1"] {
+            assert_eq!(resolve_viz_bind(Some(local), false).unwrap(), local);
+        }
+    }
+
+    #[test]
+    fn viz_allows_a_wide_bind_once_it_can_authenticate() {
+        // The refusal is about the missing auth, not about the address. When
+        // viz authenticates, a deliberate wide bind is the operator's call.
+        assert_eq!(resolve_viz_bind(Some("0.0.0.0"), true).unwrap(), "0.0.0.0");
     }
 
     #[test]
