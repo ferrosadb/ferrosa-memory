@@ -11651,6 +11651,14 @@ async fn handle_pull_commit<S: crate::storage::Storage>(
 #[serde(deny_unknown_fields)]
 struct RemoteListRequest {
     limit: Option<usize>,
+    /// Accepted and ignored. `resolve_session_id` injects `session_id` into the
+    /// arguments of EVERY tool call when a default session is configured, and
+    /// these handlers are session-independent -- a remote is tenant-scoped, not
+    /// session-scoped. Without this field `deny_unknown_fields` rejected every
+    /// call, so the whole remotes surface was unreachable over MCP: callers got
+    /// "unknown field `session_id`" no matter what they sent.
+    #[serde(default, rename = "session_id")]
+    _session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -11663,6 +11671,14 @@ struct RemoteAddRequest {
     endpoint: String,
     trust_class: crate::remotes::types::RemoteTrustClass,
     public_key_fingerprint: String,
+    /// Accepted and ignored. `resolve_session_id` injects `session_id` into the
+    /// arguments of EVERY tool call when a default session is configured, and
+    /// these handlers are session-independent -- a remote is tenant-scoped, not
+    /// session-scoped. Without this field `deny_unknown_fields` rejected every
+    /// call, so the whole remotes surface was unreachable over MCP: callers got
+    /// "unknown field `session_id`" no matter what they sent.
+    #[serde(default, rename = "session_id")]
+    _session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -11680,6 +11696,14 @@ struct RemoteUpdatePolicyRequest {
     tenant_id: uuid::Uuid,
     remote_id: uuid::Uuid,
     facts: Vec<RemotePolicyInputFact>,
+    /// Accepted and ignored. `resolve_session_id` injects `session_id` into the
+    /// arguments of EVERY tool call when a default session is configured, and
+    /// these handlers are session-independent -- a remote is tenant-scoped, not
+    /// session-scoped. Without this field `deny_unknown_fields` rejected every
+    /// call, so the whole remotes surface was unreachable over MCP: callers got
+    /// "unknown field `session_id`" no matter what they sent.
+    #[serde(default, rename = "session_id")]
+    _session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -11687,6 +11711,14 @@ struct RemoteUpdatePolicyRequest {
 struct RemoteIdRequest {
     tenant_id: Option<uuid::Uuid>,
     remote_id: uuid::Uuid,
+    /// Accepted and ignored. `resolve_session_id` injects `session_id` into the
+    /// arguments of EVERY tool call when a default session is configured, and
+    /// these handlers are session-independent -- a remote is tenant-scoped, not
+    /// session-scoped. Without this field `deny_unknown_fields` rejected every
+    /// call, so the whole remotes surface was unreachable over MCP: callers got
+    /// "unknown field `session_id`" no matter what they sent.
+    #[serde(default, rename = "session_id")]
+    _session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -11695,6 +11727,14 @@ struct RemoteExplainPolicyRequest {
     remote_id: uuid::Uuid,
     action: String,
     namespace: String,
+    /// Accepted and ignored. `resolve_session_id` injects `session_id` into the
+    /// arguments of EVERY tool call when a default session is configured, and
+    /// these handlers are session-independent -- a remote is tenant-scoped, not
+    /// session-scoped. Without this field `deny_unknown_fields` rejected every
+    /// call, so the whole remotes surface was unreachable over MCP: callers got
+    /// "unknown field `session_id`" no matter what they sent.
+    #[serde(default, rename = "session_id")]
+    _session_id: Option<String>,
 }
 
 async fn handle_remote_list<S: crate::storage::Storage>(
@@ -19074,6 +19114,53 @@ mod speculative_tests {
     // The dispatcher injects the configured default_session_id when the caller
     // passes a placeholder (missing, null, empty, literal "default") or an
     // invalid UUID. Callers should never silently get Uuid::nil() scope.
+
+    #[test]
+    fn remote_request_types_accept_the_injected_session_id() {
+        // resolve_session_id injects session_id into EVERY tool call's
+        // arguments. These request types use deny_unknown_fields, so before
+        // they carried the field the entire remotes surface was unreachable
+        // over MCP -- every call came back "unknown field `session_id`",
+        // whatever the caller actually sent. The handlers exist and the
+        // feature works; only the argument shape refused it.
+        let mut args = serde_json::json!({ "limit": 10 });
+        resolve_session_id(&mut args, Some(uuid::Uuid::nil())).expect("injects");
+        assert!(
+            args.get("session_id").is_some(),
+            "precondition: dispatch injects session_id"
+        );
+
+        serde_json::from_value::<RemoteListRequest>(args)
+            .expect("remote_list must accept the session_id dispatch injects");
+
+        let tenant = uuid::Uuid::nil();
+        let remote = uuid::Uuid::nil();
+
+        let mut id_args = serde_json::json!({ "remote_id": remote, "session_id": "abc" });
+        serde_json::from_value::<RemoteIdRequest>(id_args.take())
+            .expect("remote_health/remote_remove must accept it");
+
+        let mut explain = serde_json::json!({
+            "remote_id": remote, "action": "import", "namespace": "ns",
+            "session_id": "abc"
+        });
+        serde_json::from_value::<RemoteExplainPolicyRequest>(explain.take())
+            .expect("remote_explain_policy must accept it");
+
+        let mut policy = serde_json::json!({
+            "tenant_id": tenant, "remote_id": remote, "facts": [],
+            "session_id": "abc"
+        });
+        serde_json::from_value::<RemoteUpdatePolicyRequest>(policy.take())
+            .expect("remote_update_policy must accept it");
+
+        let mut add = serde_json::json!({
+            "tenant_id": tenant, "instance_id": tenant, "name": "t",
+            "endpoint": "https://example.invalid", "trust_class": "personal",
+            "public_key_fingerprint": "aa:bb", "session_id": "abc"
+        });
+        serde_json::from_value::<RemoteAddRequest>(add.take()).expect("remote_add must accept it");
+    }
 
     #[test]
     fn resolve_session_id_injects_default_when_absent() {
