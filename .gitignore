@@ -26,3 +26,7 @@ __pycache__/
 # Coverage artifacts
 lcov.info
 coverage/
+
+# Local worktrees and scratch state (never part of a release)
+.wt-*/
+specs/.grill-state
