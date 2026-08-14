@@ -3435,14 +3435,20 @@ async fn main() -> anyhow::Result<()> {
 
     // Start visualization server if enabled.
     //
-    // Viz is unauthenticated. Under stdio transport we bind 0.0.0.0 (local trust
-    // model). Under HTTP transport we force loopback (127.0.0.1) and require an
-    // explicit `[viz] tenant_id` — the spec bans tenant fallback in HTTP mode.
+    // Viz still authenticates nobody, so it binds LOOPBACK in every arm and an
+    // explicit non-loopback bind is refused (resolve_viz_bind). Previously the
+    // arm for stdio -- the DEFAULT transport -- bound 0.0.0.0, as did the
+    // fallback arm for any unrecognised transport string, while viz.enabled
+    // defaults to true. A default install therefore published the whole graph
+    // (/viz, /viz/ws, /viz/snapshot, /viz/api/*) on every interface.
+    //
+    // Under HTTP transport we additionally require an explicit `[viz] tenant_id`
+    // — the spec bans tenant fallback in HTTP mode.
     let shared_event_bus = Arc::new(ferrosa_memory_core::viz::EventBus::new());
     if config.viz.enabled {
         let transport = config.server.transport.as_str();
-        let (default_bind, viz_tenant_id) = match transport {
-            "stdio" => ("0.0.0.0", tenant_id),
+        let (_legacy_default_bind, viz_tenant_id) = match transport {
+            "stdio" => ("127.0.0.1", tenant_id),
             "http" => {
                 let raw = config.viz.tenant_id.as_deref().ok_or_else(|| {
                     anyhow::anyhow!(
@@ -3453,13 +3459,16 @@ async fn main() -> anyhow::Result<()> {
                     .map_err(|e| anyhow::anyhow!("[viz] tenant_id is not a valid UUID: {e}"))?;
                 ("127.0.0.1", parsed)
             }
-            _ => ("0.0.0.0", tenant_id),
+            // Fail CLOSED on an unrecognised transport. This arm used to hand
+            // back 0.0.0.0, so a typo in `transport` published the graph.
+            _ => ("127.0.0.1", tenant_id),
         };
-        let viz_bind: String = config
-            .viz
-            .bind_addr
-            .clone()
-            .unwrap_or_else(|| default_bind.to_string());
+        // viz cannot authenticate a caller yet, so a non-loopback bind is
+        // refused rather than quietly narrowed -- an operator who asked for a
+        // remote dashboard must be told it will not happen.
+        let viz_bind: String =
+            ferrosa_memory_core::config::resolve_viz_bind(config.viz.bind_addr.as_deref(), false)
+                .map_err(|message| anyhow::anyhow!(message))?;
         let viz_bus = Arc::clone(&shared_event_bus);
         let viz_port = config.viz.port;
         let viz_storage = Arc::new(ReconnectingStorage::disconnected_secondary_reader(
