@@ -426,6 +426,67 @@ fn t09_roles_ddl_grants_modify_on_core_write_path_tables() {
 // T-10: Fresh-keyspace release gate — execute and verify the full registry
 // ---------------------------------------------------------------------------
 
+/// A fully migrated keyspace must STAY migrated across a database restart.
+///
+/// Reproduces the clean-install failure seen on the Tahoe QA VM: after the
+/// installer hands the daemons to launchd — which restarts ferrosa —
+/// ferrosa-memory finds the schema ledger back at v34 and fails migration 35's
+/// postcondition forever, while every object migration 35 creates is present in
+/// the node's own persisted schema.json (document_chunks, document_terms,
+/// document_phonetic_terms and all three indexes). The objects exist on disk,
+/// and `system_schema`, queried over CQL, disagrees.
+///
+/// This is why the fresh-keyspace gate below passes while the install still
+/// breaks: that gate never restarts the database. Everything before the restart
+/// is identical.
+///
+/// TWO-PHASE, run by hand around a restart:
+///
+///   export FERROSA_TEST_CQL_PORT=... FERROSA_TEST_KEYSPACE=restart_repro
+///   cargo test -p ferrosa-memory-core --test migration_drift \
+///     migrations_survive_a_database_restart -- --ignored --nocapture
+///   # restart the ferrosa node, wait for /readyz 200
+///   # run the same command again — the second run is the assertion
+///
+/// Phase one migrates and must apply the full registry. Phase two must be a
+/// no-op with the ledger still at the newest version. A postcondition failure
+/// or a regressed `db_version` on the second run IS the bug.
+#[tokio::test]
+#[ignore = "requires live cluster AND a manual restart between runs; see doc comment"]
+async fn migrations_survive_a_database_restart() {
+    let test = TestClusterConfig::from_env()
+        .expect("FERROSA_TEST_CQL_PORT must be set; start a cluster first");
+    let cfg = test_cfg(&test);
+    let admin = connect_session(&cfg, &cfg.username, &cfg.password)
+        .await
+        .expect("connect to cluster");
+    let keyspace = test.keyspace.clone();
+
+    let applied = run_migrations(&admin, &keyspace)
+        .await
+        .unwrap_or_else(|error| panic!("migrations failed against {keyspace}: {error}"));
+
+    let status = migration_status(&admin, &keyspace)
+        .await
+        .expect("schema status query");
+    let newest = MIGRATIONS
+        .last()
+        .expect("migration registry must not be empty")
+        .version;
+
+    eprintln!(
+        "keyspace={keyspace} applied={applied} db_version={} newest={newest}",
+        status.db_version
+    );
+
+    assert_eq!(
+        status.db_version, newest,
+        "the ledger must be at the newest migration after a run. Seeing an OLDER \
+         version here on the second (post-restart) run is the bug: the schema \
+         regressed across a database restart"
+    );
+}
+
 /// Creates a unique empty keyspace and runs the same application-owned runner
 /// used at server startup. This is the merge-blocking release gate: a checked-in
 /// migration is not enough; every registered migration must execute, record
