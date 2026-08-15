@@ -6,14 +6,19 @@
 //! records each success. On failure it fails loud — startup aborts and the
 //! operator's backup is the rollback path.
 //!
-//! ## Adoption for pre-versioning installs
+//! ## Bootstrap and adoption
 //!
-//! DDLs 001-019 were applied manually before this module existed. When
-//! `run_migrations` runs for the first time against an existing keyspace,
-//! it auto-seeds `schema_version` to the pre-versioning baseline (version
-//! 19) so only migration 20 and later execute. Fresh keyspaces start at
-//! version 0 and apply every migration in the registry (though the
-//! pre-versioning DDLs are expected to have been applied as bootstrap).
+//! DDLs 001-019 were applied manually before this module existed. A keyspace
+//! that genuinely predates versioning is auto-seeded to the pre-versioning
+//! baseline (version 19) so only migration 20 and later execute.
+//!
+//! "Genuinely predates versioning" is decided from the schema, not from the
+//! keyspace merely existing — see [`ensure_bootstrap_complete`]. The keyspace
+//! existing proves only that `ddl/001_keyspace.cql` ran; a first run killed
+//! partway through leaves a half-created keyspace that must be *resumed*, not
+//! adopted. Adoption is only legitimate when every table in
+//! [`pre_versioning_tables`] is present, and the seed write refuses otherwise.
+//! Fresh keyspaces run the full bootstrap and then every registered migration.
 //!
 //! ## Rollback
 //!
@@ -285,6 +290,146 @@ pub const BOOTSTRAP_DDLS: &[&str] = &[
     include_str!("../../../ddl/029_domain_schema_bundles.cql"),
 ];
 
+/// How many leading [`BOOTSTRAP_DDLS`] entries make up the pre-versioning
+/// baseline (`ddl/001` … `ddl/019`).
+///
+/// The entries after this point (`ddl/020` …) are *also* registered in
+/// [`MIGRATIONS`], so a genuine pre-versioning install is not expected to have
+/// their tables — requiring them would misclassify it as half-built. Verified
+/// against the file contents by
+/// `pre_versioning_ddl_count_splits_at_the_019_020_boundary`.
+pub const PRE_VERSIONING_DDL_COUNT: usize = 21;
+
+/// Case-insensitive `str::strip_prefix`. DDL keywords are ASCII.
+fn strip_prefix_ignore_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &s[prefix.len()..])
+}
+
+/// Extract every `CREATE TABLE [IF NOT EXISTS] [keyspace.]name` target from a
+/// DDL blob, unqualified and lowercased. Pure and testable.
+pub fn created_table_names(ddl: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for stmt in split_cql(ddl) {
+        let Some(after) = strip_prefix_ignore_case(&stmt, "CREATE TABLE") else {
+            continue;
+        };
+        let after = after.trim_start();
+        let after = strip_prefix_ignore_case(after, "IF NOT EXISTS")
+            .unwrap_or(after)
+            .trim_start();
+        let token: String = after
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != '(')
+            .collect();
+        let name = unqualified_identifier(&token);
+        if !name.is_empty() {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// Every table the pre-versioning DDLs (`ddl/001` … `ddl/019`) create.
+///
+/// Derived from the DDL text rather than hand-listed, so it cannot drift from
+/// the files. This is the *contract* a keyspace must satisfy before it may be
+/// called a completed pre-versioning install.
+pub fn pre_versioning_tables() -> Vec<String> {
+    let mut tables: Vec<String> = BOOTSTRAP_DDLS
+        .iter()
+        .take(PRE_VERSIONING_DDL_COUNT)
+        .flat_map(|ddl| created_table_names(ddl))
+        .collect();
+    tables.sort();
+    tables.dedup();
+    tables
+}
+
+/// What a keyspace's observable schema says about the first-run bootstrap.
+///
+/// The historic signal — "does the keyspace exist?" — proves only that
+/// `ddl/001_keyspace.cql` ran. A first run killed at any point after that (the
+/// app quitting, a crash, the machine sleeping, an installer cancelled) left a
+/// half-created keyspace that the next start skipped the bootstrap for,
+/// recorded as a pre-versioning install at v19, and never repaired. See
+/// t_34ef406d.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootstrapState {
+    /// No keyspace at all: nothing has ever run.
+    Greenfield,
+    /// The keyspace exists but at least one pre-versioning table does not.
+    /// The bootstrap started and never finished; resume it.
+    Interrupted { missing_tables: Vec<String> },
+    /// Every pre-versioning table is present. Either a genuine pre-versioning
+    /// install or an already-bootstrapped one. No DDL is owed.
+    Complete,
+}
+
+/// Classify the keyspace from two observations: whether it appears in
+/// `system_schema.keyspaces`, and which [`pre_versioning_tables`] are absent
+/// from `system_schema.tables`. Pure and testable.
+pub fn classify_bootstrap_state(
+    keyspace_present: bool,
+    missing_tables: &[String],
+) -> BootstrapState {
+    if !keyspace_present {
+        return BootstrapState::Greenfield;
+    }
+    if missing_tables.is_empty() {
+        BootstrapState::Complete
+    } else {
+        BootstrapState::Interrupted {
+            missing_tables: missing_tables.to_vec(),
+        }
+    }
+}
+
+/// Whether seeding [`PRE_VERSIONING_BASELINE`] is honest.
+///
+/// The seed row asserts "migrations 1-19 already ran". That is only provable
+/// when every pre-versioning table is present. Writing it over a half-built
+/// keyspace is precisely what bricked the install: nothing then re-runs the
+/// unreached DDLs, so their tables are never created by anything.
+pub fn adoption_baseline_is_provable(missing_tables: &[String]) -> bool {
+    missing_tables.is_empty()
+}
+
+/// Whether a single bootstrap statement may execute during a *resume*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeAction {
+    /// Additive (or harmless) — run it.
+    Apply,
+    /// The statement would delete data that already exists. A resume exists to
+    /// create what is missing, never to delete. Skipped, loudly.
+    SkipDestructive { kind: &'static str, target: String },
+}
+
+/// Decide what a resume does with one statement, given whether its target
+/// already holds rows. Pure and testable; the caller supplies the liveness
+/// answer via [`table_nonempty`].
+///
+/// `ddl/008_intentions_repo_scope.cql` opens with `DROP TABLE IF EXISTS
+/// intentions`. On the case this path exists for — a first run killed partway
+/// — the table is empty and that drop/recreate *must* still run, or
+/// `intentions` keeps `ddl/007`'s pre-repo-scope primary key. On an install
+/// that holds real intentions it must never fire.
+pub fn resume_action(stmt: &str, target_is_populated: bool) -> ResumeAction {
+    match destructive_head(stmt) {
+        Some(d) if d.always_unsafe || target_is_populated => ResumeAction::SkipDestructive {
+            kind: d.kind,
+            target: d.target,
+        },
+        _ => ResumeAction::Apply,
+    }
+}
+
+/// The destructive operation a single statement would perform, if any.
+fn destructive_head(stmt: &str) -> Option<DestructiveStmt> {
+    destructive_statements(stmt).into_iter().next()
+}
+
 /// Role-auth seed DDL — creates `ferrosa_admin` (superuser) and
 /// `ferrosa_user` (LOGIN), plus the keyspace/table-level grants that
 /// give `ferrosa_user` SELECT on everything in `agent_memory` and
@@ -382,6 +527,91 @@ pub async fn assert_keyspace_exists_dbaas(
     Ok(())
 }
 
+/// Bring the pre-versioning schema (`ddl/001` … `ddl/019`) to completion
+/// before any version bookkeeping happens, and fail loud if it cannot.
+///
+/// The historic greenfield signal was `!keyspace_exists`, which proves only
+/// that `ddl/001_keyspace.cql` ran. A first run killed at any point after that
+/// left a half-created keyspace that the next start skipped the bootstrap for
+/// and then recorded as a pre-versioning install at v19 — asserting that DDLs
+/// 1-19 had run when they had not. Every unreached table was then created by
+/// nothing, forever, and the daemon never became ready (t_34ef406d).
+///
+/// The signal here is the schema itself: the bootstrap is finished when every
+/// table it creates exists.
+async fn ensure_bootstrap_complete(
+    session: &CqlSession,
+    keyspace: &str,
+) -> Result<(), MigrationError> {
+    let setup = |e: anyhow::Error| MigrationError::Setup { source: e };
+    let bootstrap_failed = |source: anyhow::Error| MigrationError::Statement {
+        version: 0,
+        stmt_index: 0,
+        last_good: 0,
+        source,
+    };
+
+    let keyspace_present = keyspace_exists(session, keyspace).await.map_err(setup)?;
+    let missing_before = if keyspace_present {
+        missing_pre_versioning_tables(session, keyspace)
+            .await
+            .map_err(setup)?
+    } else {
+        Vec::new()
+    };
+
+    let state = classify_bootstrap_state(keyspace_present, &missing_before);
+    match &state {
+        BootstrapState::Complete => return Ok(()),
+        BootstrapState::Greenfield => {
+            tracing::info!(
+                keyspace,
+                bootstrap_count = BOOTSTRAP_DDLS.len(),
+                "keyspace absent; running greenfield bootstrap"
+            );
+            apply_bootstrap(session, keyspace)
+                .await
+                .map_err(bootstrap_failed)?;
+        }
+        BootstrapState::Interrupted { missing_tables } => {
+            tracing::warn!(
+                keyspace,
+                missing_count = missing_tables.len(),
+                missing_tables = ?missing_tables,
+                "keyspace exists but the pre-versioning bootstrap never completed \
+                 (interrupted first run); resuming it instead of adopting the \
+                 pre-versioning baseline over a half-built keyspace"
+            );
+            resume_bootstrap(session, keyspace)
+                .await
+                .map_err(bootstrap_failed)?;
+        }
+    }
+
+    // Never proceed over a schema that is still short of the contract: each
+    // table below is one that no later migration would ever create.
+    let still_missing = missing_pre_versioning_tables(session, keyspace)
+        .await
+        .map_err(setup)?;
+    if !still_missing.is_empty() {
+        return Err(bootstrap_failed(anyhow::anyhow!(
+            "bootstrap finished but {} pre-versioning table(s) are still absent from \
+             {keyspace}: {still_missing:?}. The schema is incomplete and no later \
+             migration creates these tables — restore from backup or re-create the \
+             keyspace.",
+            still_missing.len()
+        )));
+    }
+    if let BootstrapState::Interrupted { missing_tables } = &state {
+        tracing::info!(
+            keyspace,
+            repaired = missing_tables.len(),
+            "interrupted bootstrap resumed to completion"
+        );
+    }
+    Ok(())
+}
+
 /// Apply every migration whose version is strictly greater than the
 /// keyspace's current version. Returns the number of migrations applied.
 ///
@@ -391,27 +621,7 @@ pub async fn assert_keyspace_exists_dbaas(
 /// In DBaaS mode, use `assert_keyspace_exists_dbaas` instead — this function
 /// must not be called when `FERROSA_DBAAS_MODE=true`.
 pub async fn run_migrations(session: &CqlSession, keyspace: &str) -> Result<usize, MigrationError> {
-    // If the keyspace doesn't exist yet, this is a greenfield install.
-    // Apply the historic DDLs (001-019) first so pre-versioning state
-    // is in place before modern migrations (20+) run.
-    let greenfield = !keyspace_exists(session, keyspace)
-        .await
-        .map_err(|e| MigrationError::Setup { source: e })?;
-    if greenfield {
-        tracing::info!(
-            keyspace,
-            bootstrap_count = BOOTSTRAP_DDLS.len(),
-            "keyspace absent; running greenfield bootstrap"
-        );
-        apply_bootstrap(session, keyspace)
-            .await
-            .map_err(|source| MigrationError::Statement {
-                version: 0,
-                stmt_index: 0,
-                last_good: 0,
-                source,
-            })?;
-    }
+    ensure_bootstrap_complete(session, keyspace).await?;
 
     ensure_schema_version_table(session, keyspace)
         .await
@@ -427,6 +637,26 @@ pub async fn run_migrations(session: &CqlSession, keyspace: &str) -> Result<usiz
             // schema_version is empty. Seed the adoption baseline so the
             // keyspace is marked as "pre-versioning — up to v19" before
             // modern migrations run.
+            //
+            // This row asserts that DDLs 1-19 already ran, so it may only be
+            // written once that is provable from the schema. Re-read rather
+            // than trust the earlier check: this is the write that bricks the
+            // install when it is wrong, and it runs once per keyspace lifetime.
+            let missing_pre_versioning = missing_pre_versioning_tables(session, keyspace)
+                .await
+                .map_err(|e| MigrationError::Setup { source: e })?;
+            if !adoption_baseline_is_provable(&missing_pre_versioning) {
+                return Err(MigrationError::Setup {
+                    source: anyhow::anyhow!(
+                        "refusing to seed the pre-versioning adoption baseline \
+                         (v{PRE_VERSIONING_BASELINE}) for {keyspace}: {} table(s) from \
+                         ddl/001-019 are missing: {missing_pre_versioning:?}. Recording \
+                         the baseline here would claim migrations 1-19 ran when they did \
+                         not, and nothing would ever create these tables.",
+                        missing_pre_versioning.len()
+                    ),
+                });
+            }
             tracing::info!(
                 baseline = PRE_VERSIONING_BASELINE,
                 "schema_version empty; seeding pre-versioning adoption baseline"
@@ -708,10 +938,50 @@ pub async fn migration_status(
 ///    unqualified `CREATE TABLE`, `CREATE INDEX ... ON <table>`, and
 ///    `ALTER TABLE <table>` with the keyspace.
 async fn apply_bootstrap(session: &CqlSession, keyspace: &str) -> anyhow::Result<()> {
+    apply_bootstrap_files(session, keyspace, BOOTSTRAP_DDLS, false).await
+}
+
+/// Re-run the pre-versioning bootstrap against a keyspace whose first run was
+/// interrupted, so the tables it never reached get created.
+///
+/// Two differences from [`apply_bootstrap`]:
+///
+/// 1. It stops at the pre-versioning boundary. `ddl/020`+ are registered in
+///    [`MIGRATIONS`], so [`run_migrations`]'s pending loop applies them.
+/// 2. It will not execute a destructive statement against a table that already
+///    holds rows — see [`resume_action`]. The greenfield path has nothing to
+///    lose; a resume runs against a keyspace that may hold live data.
+///
+/// Known and accepted side effect: `ddl/019_type_registry.cql` seeds the
+/// canonical `entity_types` / `edge_types` rows with plain INSERTs, so a resume
+/// re-asserts those rows to their canonical values (and refreshes their
+/// `created_at`). That is deliberate — an interruption inside `ddl/019` leaves
+/// the registry half-seeded, and skipping the remaining seeds to protect an
+/// edited description would ship an incomplete type registry. Only rows the
+/// bootstrap itself owns are touched; nothing else is rewritten.
+async fn resume_bootstrap(session: &CqlSession, keyspace: &str) -> anyhow::Result<()> {
+    let files = &BOOTSTRAP_DDLS[..PRE_VERSIONING_DDL_COUNT];
+    apply_bootstrap_files(session, keyspace, files, true).await
+}
+
+/// Apply `files` (bootstrap DDL blobs) in order against `keyspace`.
+///
+/// Handles the DDL rewriting described on [`apply_bootstrap`]. When `resume`
+/// is set, each statement is first passed through [`resume_action`] so a
+/// historic drop/recreate cannot delete rows that a live install owns.
+async fn apply_bootstrap_files(
+    session: &CqlSession,
+    keyspace: &str,
+    files: &[&str],
+    resume: bool,
+) -> anyhow::Result<()> {
     let applied_at = chrono::Utc::now();
-    for (file_idx, ddl) in BOOTSTRAP_DDLS.iter().enumerate() {
+    for (file_idx, ddl) in files.iter().enumerate() {
         let rewritten = qualify_ddl(ddl, keyspace);
         for (i, stmt) in split_cql(&rewritten).iter().enumerate() {
+            if resume && skip_destructive_on_resume(session, keyspace, file_idx, i, stmt).await {
+                continue;
+            }
             let prepared = prepare_bootstrap_statement(stmt, applied_at);
             #[allow(deprecated)]
             if let Err(e) = session.query_unpaged(prepared.as_str(), ()).await {
@@ -741,6 +1011,82 @@ async fn apply_bootstrap(session: &CqlSession, keyspace: &str) -> anyhow::Result
     }
 
     Ok(())
+}
+
+/// True when a resume must not run `stmt`. Logs the skip loudly — a silently
+/// skipped schema statement is how the original brick stayed invisible.
+async fn skip_destructive_on_resume(
+    session: &CqlSession,
+    keyspace: &str,
+    file_idx: usize,
+    stmt_index: usize,
+    stmt: &str,
+) -> bool {
+    let Some(d) = destructive_head(stmt) else {
+        return false;
+    };
+    let populated = table_nonempty(session, keyspace, &d.target).await;
+    match resume_action(stmt, populated) {
+        ResumeAction::Apply => false,
+        ResumeAction::SkipDestructive { kind, target } => {
+            tracing::warn!(
+                file_idx,
+                stmt_index,
+                kind,
+                target,
+                "bootstrap resume skipped a destructive statement: the target holds data \
+                 and a resume may only create what is missing, never delete. The table \
+                 keeps its current shape; if this install genuinely needs the historic \
+                 rebuild, back up and run it by hand."
+            );
+            true
+        }
+    }
+}
+
+/// Table names present in `keyspace` per `system_schema.tables`, lowercased.
+///
+/// Filters client-side for the same reason [`keyspace_exists`] does: some
+/// Ferrosa builds do not honour a `WHERE keyspace_name = '...'` restriction on
+/// the schema tables.
+async fn live_table_names(
+    session: &CqlSession,
+    keyspace: &str,
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    #[allow(deprecated)]
+    let result = session
+        .query_unpaged(
+            "SELECT keyspace_name, table_name FROM system_schema.tables",
+            (),
+        )
+        .await?;
+    let col_map = build_col_map(result.col_specs());
+    let mut present = std::collections::HashSet::new();
+    for row in result.rows_or_empty() {
+        let (Ok(ks), Ok(name)) = (
+            cql_get::<String>(&row, &col_map, "keyspace_name"),
+            cql_get::<String>(&row, &col_map, "table_name"),
+        ) else {
+            continue;
+        };
+        if ks.eq_ignore_ascii_case(keyspace) {
+            present.insert(name.to_ascii_lowercase());
+        }
+    }
+    Ok(present)
+}
+
+/// Which [`pre_versioning_tables`] are absent from `keyspace`. An empty result
+/// is the proof that the pre-versioning bootstrap actually completed.
+async fn missing_pre_versioning_tables(
+    session: &CqlSession,
+    keyspace: &str,
+) -> anyhow::Result<Vec<String>> {
+    let present = live_table_names(session, keyspace).await?;
+    Ok(pre_versioning_tables()
+        .into_iter()
+        .filter(|table| !present.contains(table))
+        .collect())
 }
 
 /// Apply a DDL blob (qualified to `keyspace`) statement-by-statement,
@@ -2011,6 +2357,80 @@ pub fn split_cql(ddl: &str) -> Vec<String> {
         .collect()
 }
 
+/// Marker Ferrosa's driver emits when a PREPARE resolved no column specs at
+/// all — i.e. the statement's table is not in the schema this node can see.
+const PREPARE_RESOLVED_NOTHING: &str = "resolved only 0";
+
+/// Turn a CQL connect/reconnect failure into an accurate operator-facing
+/// diagnosis when it is really a missing table, or `None` when it is not.
+///
+/// Ferrosa's driver reports a PREPARE whose bind markers resolve to nothing as
+/// "may not yet be visible on this node (schema replication lag). Retry in a
+/// moment." On a single-node install with the table genuinely absent, that
+/// wording is wrong and actively misleading — it sent the t_34ef406d
+/// investigation into the wrong repository. Ferrosa Memory knows which tables
+/// its own schema is supposed to create, so it can say what actually happened.
+///
+/// Returns `None` for anything that is not a resolved-nothing PREPARE, so
+/// genuinely transient failures keep their own message.
+pub fn diagnose_cql_connect_failure(error: &str) -> Option<String> {
+    if !error.contains(PREPARE_RESOLVED_NOTHING) {
+        return None;
+    }
+    let table = missing_table_from_prepare_error(error)?;
+    let provenance = table_provenance(&table);
+    Some(format!(
+        "table '{table}' is absent from the schema, not merely unreplicated: a PREPARE \
+         against it resolved no columns. {provenance} On a single-node install this is \
+         never replication lag — it means the schema bootstrap did not complete. Restart \
+         the daemon and let it run uninterrupted: startup resumes an unfinished bootstrap \
+         and logs 'interrupted bootstrap resumed to completion'. Check the startup log for \
+         a bootstrap that was cut short."
+    ))
+}
+
+/// Where in this build's schema a table is supposed to come from.
+fn table_provenance(table: &str) -> String {
+    if pre_versioning_tables().iter().any(|t| t == table) {
+        return "It is created by the first-run bootstrap (ddl/001-019).".to_string();
+    }
+    if let Some(m) = MIGRATIONS
+        .iter()
+        .find(|m| created_table_names(m.ddl).iter().any(|t| t == table))
+    {
+        return format!(
+            "It is created by migration v{} ({}).",
+            m.version, m.description
+        );
+    }
+    "It is not created by this build's bootstrap (ddl/001-019) or migration registry.".to_string()
+}
+
+/// Pull the table name out of a Ferrosa PREPARE failure. Handles both the
+/// driver's `Table 'ks.name'` hint and the echoed statement's `INSERT INTO
+/// ks.name` / `FROM ks.name`.
+fn missing_table_from_prepare_error(error: &str) -> Option<String> {
+    if let Some(rest) = error.split("Table '").nth(1)
+        && let Some(name) = rest.split('\'').next()
+        && !name.is_empty()
+    {
+        return Some(unqualified_identifier(name));
+    }
+    for keyword in ["INSERT INTO ", "UPDATE ", "DELETE FROM ", "FROM "] {
+        if let Some(rest) = error.split(keyword).nth(1) {
+            let token: String = rest
+                .chars()
+                .take_while(|c| !c.is_whitespace() && *c != '(')
+                .collect();
+            let name = unqualified_identifier(&token);
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2653,6 +3073,185 @@ mod tests {
         assert!(
             !should_apply_roles_ddl(),
             "In test environment (no FERROSA_AUTH_ENABLED), roles DDL must not apply"
+        );
+    }
+
+    // ── t_34ef406d: interrupted first-run bootstrap ──────────────────────────
+
+    /// The `PRE_VERSIONING_DDL_COUNT` split point must actually land between
+    /// `ddl/019` and `ddl/020`, or every table-completeness check below is
+    /// measuring the wrong set.
+    #[test]
+    fn pre_versioning_ddl_count_splits_at_the_019_020_boundary() {
+        assert_eq!(
+            BOOTSTRAP_DDLS[PRE_VERSIONING_DDL_COUNT - 1],
+            include_str!("../../../ddl/019_type_registry.cql"),
+            "the last pre-versioning bootstrap entry must be ddl/019"
+        );
+        assert_eq!(
+            BOOTSTRAP_DDLS[PRE_VERSIONING_DDL_COUNT],
+            include_str!("../../../ddl/020_rich_entity_schema.cql"),
+            "the first post-baseline bootstrap entry must be ddl/020"
+        );
+    }
+
+    #[test]
+    fn pre_versioning_tables_are_derived_from_the_001_to_019_ddls() {
+        let tables = pre_versioning_tables();
+        // The incident table: ddl/012 creates it, and the daemon's PREPARE
+        // loop fails forever when it is absent.
+        assert!(
+            tables.iter().any(|t| t == "rules_by_id"),
+            "rules_by_id (ddl/012) must be part of the pre-versioning contract: {tables:?}"
+        );
+        for expected in ["entity_store", "intentions", "entity_warmth", "typed_edges"] {
+            assert!(
+                tables.iter().any(|t| t == expected),
+                "{expected} must be part of the pre-versioning contract: {tables:?}"
+            );
+        }
+        // Tables introduced by registered migrations (20+) are NOT part of the
+        // baseline — a genuine pre-versioning install does not have them, and
+        // requiring them would misclassify it as incomplete.
+        for later in ["context_segments", "document_chunks", "mem_scenes"] {
+            assert!(
+                !tables.iter().any(|t| t == later),
+                "{later} comes from a registered migration, not the pre-19 baseline"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_keyspace_is_greenfield() {
+        assert_eq!(
+            classify_bootstrap_state(false, &[]),
+            BootstrapState::Greenfield
+        );
+    }
+
+    /// The bug: the keyspace existing proves only that `ddl/001_keyspace.cql`
+    /// ran, never that the bootstrap finished. A keyspace missing a pre-19
+    /// table must be resumed, never adopted at the baseline.
+    #[test]
+    fn keyspace_missing_a_pre_versioning_table_is_interrupted_not_complete() {
+        let state = classify_bootstrap_state(true, &["rules_by_id".to_string()]);
+        assert_eq!(
+            state,
+            BootstrapState::Interrupted {
+                missing_tables: vec!["rules_by_id".to_string()],
+            },
+            "a half-built keyspace must be resumed, not adopted at v{PRE_VERSIONING_BASELINE}"
+        );
+    }
+
+    #[test]
+    fn keyspace_with_every_pre_versioning_table_is_complete() {
+        assert_eq!(
+            classify_bootstrap_state(true, &[]),
+            BootstrapState::Complete
+        );
+    }
+
+    /// The adoption seed is only legitimate when the pre-19 schema is provably
+    /// present. Seeding v19 over a half-built keyspace is the brick.
+    #[test]
+    fn adoption_baseline_is_refused_while_pre_versioning_tables_are_missing() {
+        assert!(adoption_baseline_is_provable(&[]));
+        assert!(!adoption_baseline_is_provable(&["rules_by_id".to_string()]));
+    }
+
+    /// `ddl/008_intentions_repo_scope.cql` opens with `DROP TABLE IF EXISTS
+    /// intentions`. Replaying the bootstrap over an install that holds
+    /// intentions would delete them, which AGENTS.md forbids outright.
+    #[test]
+    fn resume_never_drops_a_populated_table() {
+        let stmt = "DROP TABLE IF EXISTS agent_memory.intentions";
+        assert_eq!(
+            resume_action(stmt, true),
+            ResumeAction::SkipDestructive {
+                kind: "DROP TABLE",
+                target: "intentions".to_string(),
+            }
+        );
+    }
+
+    /// On the case this fix exists for — a first run killed partway — the
+    /// table is empty, so the historic drop/recreate must still run or
+    /// `intentions` keeps ddl/007's pre-repo-scope primary key.
+    #[test]
+    fn resume_still_replays_a_drop_against_an_empty_table() {
+        let stmt = "DROP TABLE IF EXISTS agent_memory.intentions";
+        assert_eq!(resume_action(stmt, false), ResumeAction::Apply);
+    }
+
+    #[test]
+    fn resume_applies_additive_ddl_unconditionally() {
+        for stmt in [
+            "CREATE TABLE IF NOT EXISTS agent_memory.rules_by_id (id text PRIMARY KEY)",
+            "ALTER TABLE agent_memory.entity_warmth ADD reputation double",
+            "CREATE INDEX IF NOT EXISTS idx_a ON agent_memory.entity_store (tenant_id)",
+            "INSERT INTO agent_memory.entity_types (type_name) VALUES ('person')",
+        ] {
+            assert_eq!(
+                resume_action(stmt, true),
+                ResumeAction::Apply,
+                "stmt: {stmt}"
+            );
+        }
+    }
+
+    #[test]
+    fn created_table_names_extracts_unqualified_lowercase_targets() {
+        let ddl = "USE agent_memory;\n\
+                   CREATE TABLE IF NOT EXISTS agent_memory.Rules_By_Id (id text PRIMARY KEY);\n\
+                   CREATE TABLE memo_cache (\n  id text PRIMARY KEY\n);\n\
+                   CREATE INDEX idx ON memo_cache (id);";
+        assert_eq!(created_table_names(ddl), vec!["rules_by_id", "memo_cache"]);
+    }
+
+    /// The incident's investigation went to the wrong repo because the driver
+    /// blamed "schema replication lag". ferrosa-memory must name the real
+    /// cause when a table it requires is absent from the schema.
+    #[test]
+    fn missing_table_prepare_failure_is_diagnosed_as_incomplete_schema() {
+        let err = "PREPARE failed for 'INSERT INTO agent_memory.rules_by_id (rule_id, tenant_id) \
+                   VALUES (?, ?)': expected 11 bind-marker column spec(s) but resolved only 0. \
+                   Table 'agent_memory.rules_by_id' may not yet be visible on this node \
+                   (schema replication lag). Retry in a moment.";
+        let hint = diagnose_cql_connect_failure(err)
+            .expect("a resolved-only-0 PREPARE failure must be diagnosed");
+        assert!(
+            hint.contains("rules_by_id"),
+            "the diagnosis must name the missing table: {hint}"
+        );
+        assert!(
+            hint.contains("ddl/001-019"),
+            "the diagnosis must name where the table should have come from: {hint}"
+        );
+        assert!(
+            hint.contains("bootstrap"),
+            "the diagnosis must point at the incomplete bootstrap: {hint}"
+        );
+        assert!(
+            hint.contains("never replication lag"),
+            "the diagnosis must contradict the driver's replication-lag guess outright, \
+             not leave it standing: {hint}"
+        );
+        assert!(
+            !hint.to_lowercase().contains("retry in a moment"),
+            "the diagnosis must not tell the operator to wait — nothing will change: {hint}"
+        );
+    }
+
+    #[test]
+    fn transient_connect_failures_are_not_diagnosed_as_schema_gaps() {
+        assert!(diagnose_cql_connect_failure("Connection refused (os error 61)").is_none());
+        assert!(
+            diagnose_cql_connect_failure(
+                "PREPARE failed for 'SELECT * FROM agent_memory.entity_store': timed out"
+            )
+            .is_none(),
+            "a PREPARE that failed for some other reason is not a missing-table diagnosis"
         );
     }
 

@@ -823,3 +823,348 @@ fn t12_every_created_table_is_granted_or_explicitly_exempt() {
          entry to the exempt lists: {unexpected:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// T-14/T-15/T-16 (t_34ef406d): interrupted first-run bootstrap
+// ---------------------------------------------------------------------------
+
+/// Index of the first bootstrap DDL file that creates `table`.
+fn bootstrap_file_creating(table: &str) -> usize {
+    BOOTSTRAP_DDLS
+        .iter()
+        .position(|ddl| created_table_names(ddl).iter().any(|t| t == table))
+        .unwrap_or_else(|| panic!("no bootstrap DDL file creates {table}"))
+}
+
+/// Replay the first `files` bootstrap DDL files into `keyspace`, exactly as
+/// `apply_bootstrap` would. Simulates a first run that was killed partway
+/// through: the keyspace exists, some tables exist, and `schema_version` was
+/// never created.
+async fn replay_bootstrap_prefix(
+    session: &ferrosa_memory_core::cql_storage::CqlSession,
+    keyspace: &str,
+    files: usize,
+) {
+    let applied_at = chrono::Utc::now();
+    for ddl in BOOTSTRAP_DDLS.iter().take(files) {
+        let rewritten = ferrosa_memory_core::migration::qualify_ddl(ddl, keyspace);
+        for stmt in ferrosa_memory_core::migration::split_cql(&rewritten) {
+            let prepared =
+                ferrosa_memory_core::migration::prepare_bootstrap_statement(&stmt, applied_at);
+            session
+                .query_unpaged(prepared.as_str(), ())
+                .await
+                .unwrap_or_else(|e| panic!("partial bootstrap statement failed: {e}\n{prepared}"));
+            session
+                .await_schema_agreement()
+                .await
+                .expect("schema agreement during partial bootstrap");
+        }
+    }
+}
+
+/// Every table the pre-versioning DDL files (001-019) create. Computed here
+/// from the DDL text rather than from the production helper so this test does
+/// not inherit a bug in the code under test.
+fn expected_pre_versioning_tables() -> Vec<String> {
+    let cut = BOOTSTRAP_DDLS
+        .iter()
+        .position(|ddl| *ddl == include_str!("../../../ddl/020_rich_entity_schema.cql"))
+        .expect("ddl/020 must be present in BOOTSTRAP_DDLS");
+    let mut tables: Vec<String> = BOOTSTRAP_DDLS
+        .iter()
+        .take(cut)
+        .flat_map(|ddl| created_table_names(ddl))
+        .collect();
+    tables.sort();
+    tables.dedup();
+    tables
+}
+
+async fn missing_tables(
+    session: &ferrosa_memory_core::cql_storage::CqlSession,
+    keyspace: &str,
+    expected: &[String],
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    for table in expected {
+        if !live_table_exists(session, keyspace, table).await {
+            missing.push(table.clone());
+        }
+    }
+    missing
+}
+
+/// T-14 (t_34ef406d): a first run killed partway through the bootstrap must be
+/// **resumed**, not mistaken for a pre-versioning install.
+///
+/// The reported failure: `keyspace_exists` is the greenfield signal, so once
+/// `ddl/001_keyspace.cql` has run the next start skips the whole bootstrap,
+/// finds `schema_version` empty, and seeds the adoption baseline at 19 —
+/// asserting that DDLs 1-19 ran when they did not. Every table from the
+/// unreached files (here `rules_by_id`, from `ddl/012`) is then never created
+/// by anything, the CQL prepare loop fails forever, and `/healthz/ready`
+/// never returns 200.
+#[tokio::test]
+#[ignore = "requires live test cluster; run with --ignored"]
+async fn t14_interrupted_bootstrap_is_resumed_not_adopted_at_baseline() {
+    // Own keyspace, but still serialized: concurrent CREATE/DROP KEYSPACE on
+    // the shared cluster contends for schema agreement with its siblings.
+    let _serial = live_migration_test_lock().lock().await;
+    let test = TestClusterConfig::from_env()
+        .expect("FERROSA_TEST_CQL_PORT must be set; start a test cluster first");
+    let cfg = test_cfg(&test);
+    let session = connect_session(&cfg, &cfg.username, &cfg.password)
+        .await
+        .expect("connect_session must succeed against test cluster");
+    let keyspace = fresh_migration_keyspace();
+
+    let outcome: anyhow::Result<()> = async {
+        // Kill the first run just before ddl/012 creates rules_by_id — the
+        // table named in the incident's PREPARE failure.
+        let cut = bootstrap_file_creating("rules_by_id");
+        replay_bootstrap_prefix(&session, &keyspace, cut).await;
+
+        // Preconditions: half-built keyspace, no version ledger.
+        if !live_table_exists(&session, &keyspace, "entity_store").await {
+            anyhow::bail!("partial bootstrap did not create entity_store");
+        }
+        if live_table_exists(&session, &keyspace, "rules_by_id").await {
+            anyhow::bail!("partial bootstrap should have stopped before rules_by_id");
+        }
+        if live_table_exists(&session, &keyspace, "schema_version").await {
+            anyhow::bail!("partial bootstrap must leave schema_version absent");
+        }
+
+        // The next daemon start.
+        let run = run_migrations(&session, &keyspace).await;
+
+        // Whatever the runner returns, the install must not be left with a
+        // pre-19 table that nothing will ever create.
+        let expected = expected_pre_versioning_tables();
+        let missing = missing_tables(&session, &keyspace, &expected).await;
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "resumed bootstrap left {} pre-versioning table(s) missing: {missing:?} \
+                 (run_migrations returned {:?})",
+                missing.len(),
+                run.as_ref().map_err(|e| e.to_string())
+            );
+        }
+        run.map_err(|e| anyhow::anyhow!("run_migrations must recover the interrupted run: {e}"))?;
+
+        let status = migration_status(&session, &keyspace)
+            .await
+            .map_err(|e| anyhow::anyhow!("migration_status: {e}"))?;
+        if !status.pending.is_empty() {
+            anyhow::bail!(
+                "resumed install still has pending migrations: {:?}",
+                status.pending
+            );
+        }
+        let expected_version = MIGRATIONS.last().expect("registry not empty").version;
+        if status.db_version != expected_version {
+            anyhow::bail!(
+                "resumed install reached v{}, expected v{expected_version}",
+                status.db_version
+            );
+        }
+        Ok(())
+    }
+    .await;
+
+    let cleanup = session
+        .query_unpaged(format!("DROP KEYSPACE IF EXISTS {keyspace}"), ())
+        .await;
+    if let Err(error) = cleanup {
+        panic!("t14 cleanup failed for {keyspace}: {error}");
+    }
+    outcome.unwrap_or_else(|error| panic!("interrupted-bootstrap recovery failed: {error}"));
+}
+
+/// T-15 (t_34ef406d regression guard): a **genuine** pre-versioning install —
+/// one that really did run DDLs 001-019 by hand and holds live data — must
+/// still be adopted at the baseline, and its data must not be touched.
+///
+/// This is the risk the fix introduces: making an incomplete keyspace re-run
+/// the bootstrap must not make a complete one re-run it, because
+/// `ddl/008_intentions_repo_scope.cql` opens with `DROP TABLE IF EXISTS
+/// intentions`.
+#[tokio::test]
+#[ignore = "requires live test cluster; run with --ignored"]
+async fn t15_genuine_pre_versioning_install_adopts_baseline_and_keeps_its_data() {
+    let _serial = live_migration_test_lock().lock().await;
+    let test = TestClusterConfig::from_env()
+        .expect("FERROSA_TEST_CQL_PORT must be set; start a test cluster first");
+    let cfg = test_cfg(&test);
+    let session = connect_session(&cfg, &cfg.username, &cfg.password)
+        .await
+        .expect("connect_session must succeed against test cluster");
+    let keyspace = fresh_migration_keyspace();
+
+    let outcome: anyhow::Result<()> = async {
+        // Build the full pre-versioning schema the way a hand-run install had it.
+        let cut = BOOTSTRAP_DDLS
+            .iter()
+            .position(|ddl| *ddl == include_str!("../../../ddl/020_rich_entity_schema.cql"))
+            .expect("ddl/020 present");
+        replay_bootstrap_prefix(&session, &keyspace, cut).await;
+
+        // Legacy rows the adoption path must preserve.
+        let tenant = Uuid::new_v4();
+        let intention = Uuid::new_v4();
+        session
+            .query_unpaged(
+                format!(
+                    "INSERT INTO {keyspace}.intentions \
+                     (tenant_id, repo, intention_id, description, status) \
+                     VALUES ({tenant}, 'legacy-repo', {intention}, 'legacy intention', 'pending')"
+                ),
+                (),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("seed legacy intention: {e}"))?;
+        session
+            .query_unpaged(
+                format!(
+                    "INSERT INTO {keyspace}.entity_types (type_name, description) \
+                     VALUES ('operator_custom_type', 'hand-edited by the operator')"
+                ),
+                (),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("seed operator entity type: {e}"))?;
+
+        run_migrations(&session, &keyspace)
+            .await
+            .map_err(|e| anyhow::anyhow!("adoption run must succeed: {e}"))?;
+
+        if !live_version_recorded(&session, &keyspace, PRE_VERSIONING_BASELINE).await {
+            anyhow::bail!(
+                "a genuine pre-versioning install must still be seeded at baseline v{PRE_VERSIONING_BASELINE}"
+            );
+        }
+
+        let kept = session
+            .query_unpaged(
+                format!(
+                    "SELECT description FROM {keyspace}.intentions \
+                     WHERE tenant_id = {tenant} AND repo = 'legacy-repo' \
+                     AND intention_id = {intention}"
+                ),
+                (),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("read back legacy intention: {e}"))?;
+        if kept.rows_or_empty().is_empty() {
+            anyhow::bail!(
+                "adoption destroyed the legacy intentions row — the bootstrap's \
+                 `DROP TABLE IF EXISTS intentions` must never run against a complete keyspace"
+            );
+        }
+
+        let custom = session
+            .query_unpaged(
+                format!(
+                    "SELECT type_name FROM {keyspace}.entity_types \
+                     WHERE type_name = 'operator_custom_type'"
+                ),
+                (),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("read back operator entity type: {e}"))?;
+        if custom.rows_or_empty().is_empty() {
+            anyhow::bail!("adoption dropped the operator's custom entity_types row");
+        }
+        Ok(())
+    }
+    .await;
+
+    let cleanup = session
+        .query_unpaged(format!("DROP KEYSPACE IF EXISTS {keyspace}"), ())
+        .await;
+    if let Err(error) = cleanup {
+        panic!("t15 cleanup failed for {keyspace}: {error}");
+    }
+    outcome.unwrap_or_else(|error| panic!("pre-versioning adoption regressed: {error}"));
+}
+
+/// T-16 (t_34ef406d): the awkward middle case — an install adopted so early
+/// that its ≤19 baseline never created some pre-19 tables (the gap that
+/// migrations 25 and 42 were added to paper over), but which holds real data.
+/// The resumed bootstrap must create the missing table and must NOT execute
+/// the historic `DROP TABLE IF EXISTS intentions` against populated data.
+#[tokio::test]
+#[ignore = "requires live test cluster; run with --ignored"]
+async fn t16_incomplete_legacy_install_is_repaired_without_dropping_populated_tables() {
+    let _serial = live_migration_test_lock().lock().await;
+    let test = TestClusterConfig::from_env()
+        .expect("FERROSA_TEST_CQL_PORT must be set; start a test cluster first");
+    let cfg = test_cfg(&test);
+    let session = connect_session(&cfg, &cfg.username, &cfg.password)
+        .await
+        .expect("connect_session must succeed against test cluster");
+    let keyspace = fresh_migration_keyspace();
+
+    let outcome: anyhow::Result<()> = async {
+        let cut = BOOTSTRAP_DDLS
+            .iter()
+            .position(|ddl| *ddl == include_str!("../../../ddl/020_rich_entity_schema.cql"))
+            .expect("ddl/020 present");
+        replay_bootstrap_prefix(&session, &keyspace, cut).await;
+
+        let tenant = Uuid::new_v4();
+        let intention = Uuid::new_v4();
+        session
+            .query_unpaged(
+                format!(
+                    "INSERT INTO {keyspace}.intentions \
+                     (tenant_id, repo, intention_id, description, status) \
+                     VALUES ({tenant}, 'legacy-repo', {intention}, 'legacy intention', 'pending')"
+                ),
+                (),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("seed legacy intention: {e}"))?;
+
+        // The early-adoption gap: this install never got ddl/011's table.
+        session
+            .query_unpaged(format!("DROP TABLE IF EXISTS {keyspace}.entity_warmth"), ())
+            .await
+            .map_err(|e| anyhow::anyhow!("simulate missing entity_warmth: {e}"))?;
+
+        run_migrations(&session, &keyspace)
+            .await
+            .map_err(|e| anyhow::anyhow!("repair run must succeed: {e}"))?;
+
+        if !live_table_exists(&session, &keyspace, "entity_warmth").await {
+            anyhow::bail!("the repair must create the missing pre-19 table entity_warmth");
+        }
+        let kept = session
+            .query_unpaged(
+                format!(
+                    "SELECT description FROM {keyspace}.intentions \
+                     WHERE tenant_id = {tenant} AND repo = 'legacy-repo' \
+                     AND intention_id = {intention}"
+                ),
+                (),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("read back legacy intention: {e}"))?;
+        if kept.rows_or_empty().is_empty() {
+            anyhow::bail!(
+                "repairing a missing pre-19 table destroyed the populated intentions table"
+            );
+        }
+        Ok(())
+    }
+    .await;
+
+    let cleanup = session
+        .query_unpaged(format!("DROP KEYSPACE IF EXISTS {keyspace}"), ())
+        .await;
+    if let Err(error) = cleanup {
+        panic!("t16 cleanup failed for {keyspace}: {error}");
+    }
+    outcome.unwrap_or_else(|error| panic!("incomplete legacy repair failed: {error}"));
+}

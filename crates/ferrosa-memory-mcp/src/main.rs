@@ -2878,7 +2878,17 @@ async fn cql_reconnect_watcher(storage: Arc<ReconnectingStorage>) {
                 }
                 Err(e) => {
                     attempt = attempt.saturating_add(1);
-                    tracing::warn!(attempt, "CQL reconnection failed: {e}");
+                    let error = e.to_string();
+                    // Ferrosa's driver blames "schema replication lag" for any
+                    // PREPARE that resolves no columns. When the table is one
+                    // our own schema owns and it simply is not there, say so —
+                    // retrying forever is not the remedy (t_34ef406d).
+                    match ferrosa_memory_core::migration::diagnose_cql_connect_failure(&error) {
+                        Some(diagnosis) => {
+                            tracing::error!(attempt, %diagnosis, "CQL reconnection failed: {error}")
+                        }
+                        None => tracing::warn!(attempt, "CQL reconnection failed: {error}"),
+                    }
                 }
             }
         }
@@ -4423,6 +4433,24 @@ enabled = false
         assert!(
             watcher_source.contains("run_schema_migrations_if_enabled(&storage.cql_config).await"),
             "primary reconnect watcher must still run migrations before CQL connect"
+        );
+    }
+
+    /// t_34ef406d: the reconnect loop must translate a missing-table PREPARE
+    /// failure instead of relaying the driver's "schema replication lag" guess,
+    /// which is wrong on a single-node install and sent the original
+    /// investigation to the wrong repository.
+    #[test]
+    fn reconnect_watcher_diagnoses_missing_table_failures() {
+        let source = include_str!("main.rs");
+        let watcher_start = source
+            .find("async fn cql_reconnect_watcher")
+            .expect("reconnect watcher must exist");
+        let watcher_source = &source[watcher_start..];
+        assert!(
+            watcher_source
+                .contains("ferrosa_memory_core::migration::diagnose_cql_connect_failure(&error)"),
+            "reconnect failures must be run through the missing-table diagnosis"
         );
     }
 
