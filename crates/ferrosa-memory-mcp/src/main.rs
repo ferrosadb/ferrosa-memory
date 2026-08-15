@@ -89,11 +89,37 @@ fn spawn_debug_stop_monitor(config: &Config, session: &std::sync::Arc<dispatch::
 /// nulls the session when the generation matches the one captured before
 /// the failed query. `notify_one` is called while the write lock is still
 /// held so the signal cannot be lost to cancellation.
+/// Held for the duration of one schema migration run.
+///
+/// Releases on drop, including while unwinding from a panic, so a single failed
+/// run cannot block migrations for the life of the process.
+struct MigrationRunGuard {
+    storage: std::sync::Arc<ReconnectingStorage>,
+}
+
+impl Drop for MigrationRunGuard {
+    fn drop(&mut self) {
+        self.storage
+            .migration_in_flight
+            .store(false, Ordering::Release);
+    }
+}
+
 struct ReconnectingStorage {
     inner: RwLock<Option<Arc<CqlStorage>>>,
     /// Last bounded CQL probe result. `inner.is_some()` means a session exists;
     /// this flag means the session has answered a cheap read recently.
     cql_probe_ready: AtomicBool,
+    /// Is a schema migration run in flight right now?
+    ///
+    /// The reconnect watcher runs migrations on every reconnect attempt, and
+    /// without this a second run starts while the first is still going. On a
+    /// clean install that happened 30 seconds in: the second run read a stale
+    /// `current=34` while the first was applying 36, re-attempted 35 against
+    /// objects the first was creating, and the collision left migration 35's
+    /// ledger row unwritten. Every later run then retried 35 forever and the
+    /// daemon never became ready.
+    migration_in_flight: AtomicBool,
     /// Have schema migrations finished successfully?
     ///
     /// A CQL session comes up BEFORE migrations run, and a failed migration
@@ -389,6 +415,7 @@ impl ReconnectingStorage {
             cql_probe_ready: AtomicBool::new(false),
             // False until a migration run reports success. Starting true would
             // reopen the exact window this closes.
+            migration_in_flight: AtomicBool::new(false),
             migrations_complete: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             reconnect_signal: tokio::sync::Notify::new(),
@@ -440,6 +467,20 @@ impl ReconnectingStorage {
 
     fn set_cql_probe_ready(&self, ready: bool) {
         self.cql_probe_ready.store(ready, Ordering::Release);
+    }
+
+    /// Claim the right to run migrations, or `None` if another run holds it.
+    ///
+    /// Declines rather than queues: the run already in flight will bring the
+    /// schema up to date, and a queued duplicate would only re-run everything
+    /// against a moving target — which is the collision this prevents.
+    fn begin_migration_run(self: &std::sync::Arc<Self>) -> Option<MigrationRunGuard> {
+        self.migration_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| MigrationRunGuard {
+                storage: self.clone(),
+            })
     }
 
     fn migrations_complete(&self) -> bool {
@@ -2910,8 +2951,20 @@ async fn cql_reconnect_watcher(storage: Arc<ReconnectingStorage>) {
             tokio::time::sleep(delay).await;
 
             if storage.run_migrations_on_connect {
-                let migrated = run_schema_migrations_if_enabled(&storage.cql_config).await;
-                storage.set_migrations_complete(migrated);
+                // One run at a time. A reconnect that lands mid-migration must
+                // NOT start a second one: the two read each other's half-written
+                // ledger and collide, which is how a clean install ended up
+                // retrying migration 35 forever.
+                match storage.begin_migration_run() {
+                    Some(_guard) => {
+                        let migrated = run_schema_migrations_if_enabled(&storage.cql_config).await;
+                        storage.set_migrations_complete(migrated);
+                    }
+                    None => tracing::info!(
+                        "schema migrations already running; this reconnect will not start a \
+                         second run"
+                    ),
+                }
             } else {
                 // A secondary reader does not own the schema, so it has nothing
                 // to verify and must not hold itself un-ready over it.
@@ -4130,6 +4183,98 @@ enabled = false
         assert!(
             !storage.is_ready(),
             "readiness still requires a connected CQL handle"
+        );
+    }
+
+    /// Only ONE schema migration run at a time, ever.
+    ///
+    /// The reconnect watcher calls the migration runner on every reconnect
+    /// attempt, and nothing stopped a second run starting while the first was
+    /// still going. On a clean install that is exactly what happened:
+    ///
+    ///   03:41:37  applying schema migrations current=19 pending_count=31
+    ///   03:41:49  applying migration version=35          <- succeeds
+    ///   03:42:07  applying schema migrations current=34  <- SECOND RUN
+    ///   03:42:08  migration 35 failed ... postcondition
+    ///
+    /// The second run read a stale `current=34` while the first was still
+    /// applying 36 and 37, re-attempted 35 against objects the first run was
+    /// creating, and the two collided. Migration 35's ledger row never landed,
+    /// so every later run retried it — 28 runs in that log, and the daemon
+    /// never became ready again. The install was permanently broken by two
+    /// copies of the same work racing.
+    ///
+    /// A run that finds another in flight must decline, not queue: the one
+    /// already running will bring the schema up to date, and a queued duplicate
+    /// would just re-run everything against a moving target.
+    #[tokio::test]
+    async fn only_one_migration_run_happens_at_a_time() {
+        let cfg = FerrosaCqlConfig {
+            tls_ca_path: None,
+            tls_skip_hostname_verify: false,
+            contact_points: vec!["localhost:19042".into()],
+            keyspace: "agent_memory".into(),
+            replication_factor: 3,
+            consistency: "LOCAL_QUORUM".into(),
+            username: "ferrosa_user".into(),
+            password: "ferrosa_user".into(),
+            admin_username: None,
+            admin_password: None,
+        };
+        let storage = std::sync::Arc::new(ReconnectingStorage::disconnected(cfg, None, None));
+
+        let first = storage
+            .begin_migration_run()
+            .expect("the first run must be admitted");
+
+        assert!(
+            storage.begin_migration_run().is_none(),
+            "a second run must be refused while one is in flight — this is the \
+             race that bricked a clean install"
+        );
+
+        drop(first);
+        assert!(
+            storage.begin_migration_run().is_some(),
+            "once the run finishes the next reconnect must be able to migrate \
+             again, or a failed run could never be retried"
+        );
+    }
+
+    /// The guard must release even if the run panics, or one crash would block
+    /// migrations for the life of the process.
+    #[tokio::test]
+    async fn a_panicking_migration_run_still_releases_the_guard() {
+        let cfg = FerrosaCqlConfig {
+            tls_ca_path: None,
+            tls_skip_hostname_verify: false,
+            contact_points: vec!["localhost:19042".into()],
+            keyspace: "agent_memory".into(),
+            replication_factor: 1,
+            consistency: "ONE".into(),
+            username: "ferrosa_user".into(),
+            password: "ferrosa_user".into(),
+            admin_username: None,
+            admin_password: None,
+        };
+        let storage = std::sync::Arc::new(ReconnectingStorage::disconnected(cfg, None, None));
+
+        // AssertUnwindSafe: the guard's release is a Drop impl on an atomic, which
+        // runs correctly while unwinding. Nothing here observes a
+        // partially-mutated value after the panic — that is precisely what is
+        // being asserted.
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let storage = storage.clone();
+            move || {
+                let _guard = storage.begin_migration_run().expect("first run admitted");
+                panic!("migration blew up");
+            }
+        }));
+        assert!(caught.is_err(), "the panic must actually happen");
+
+        assert!(
+            storage.begin_migration_run().is_some(),
+            "the guard must be released by unwinding, not held forever"
         );
     }
 
