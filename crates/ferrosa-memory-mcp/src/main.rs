@@ -94,6 +94,14 @@ struct ReconnectingStorage {
     /// Last bounded CQL probe result. `inner.is_some()` means a session exists;
     /// this flag means the session has answered a cheap read recently.
     cql_probe_ready: AtomicBool,
+    /// Have schema migrations finished successfully?
+    ///
+    /// A CQL session comes up BEFORE migrations run, and a failed migration
+    /// logs and lets the daemon keep serving. Without this, `/healthz/ready`
+    /// answered 200 over an incomplete or half-applied schema, and anything
+    /// gating on that endpoint — the workbench installer does — treated a
+    /// broken install as a finished one.
+    migrations_complete: AtomicBool,
     /// Monotonically increasing generation — bumped on every `set_connected`.
     /// Prevents stale errors from disconnecting a fresh session.
     generation: AtomicU64,
@@ -379,6 +387,9 @@ impl ReconnectingStorage {
         Self {
             inner: RwLock::new(None),
             cql_probe_ready: AtomicBool::new(false),
+            // False until a migration run reports success. Starting true would
+            // reopen the exact window this closes.
+            migrations_complete: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             reconnect_signal: tokio::sync::Notify::new(),
             cql_config: config,
@@ -416,6 +427,11 @@ impl ReconnectingStorage {
         if !self.cql_probe_ready.load(Ordering::Acquire) {
             return false;
         }
+        // A session that cannot serve the schema is not ready, however
+        // healthy the socket looks.
+        if !self.migrations_complete() {
+            return false;
+        }
         self.inner
             .try_read()
             .map(|guard| guard.is_some())
@@ -424,6 +440,17 @@ impl ReconnectingStorage {
 
     fn set_cql_probe_ready(&self, ready: bool) {
         self.cql_probe_ready.store(ready, Ordering::Release);
+    }
+
+    fn migrations_complete(&self) -> bool {
+        self.migrations_complete.load(Ordering::Acquire)
+    }
+
+    /// Record the outcome of a migration run. `false` on failure, so a daemon
+    /// serving a half-applied schema keeps reporting not-ready instead of
+    /// letting a caller mistake a live socket for a usable database.
+    fn set_migrations_complete(&self, complete: bool) {
+        self.migrations_complete.store(complete, Ordering::Release);
     }
 
     async fn probe_cql_readiness(&self, budget: Duration) -> bool {
@@ -2744,30 +2771,46 @@ async fn ensure_required_indexes(
     Ok(attempted)
 }
 
-async fn run_schema_migrations_if_enabled(config: &FerrosaCqlConfig) {
+/// Returns whether the schema is safe to serve.
+///
+/// `true` also for the disabled case: an externally managed keyspace (DBaaS)
+/// is not this process's to vouch for, and reporting it permanently not-ready
+/// would be a different lie.
+async fn run_schema_migrations_if_enabled(config: &FerrosaCqlConfig) -> bool {
     if !migrations_enabled() {
         tracing::info!(
             "FERROSA_MIGRATIONS_ENABLED is disabled; skipping schema migrations. \
              Ensure the keyspace schema is managed externally (DBaaS mode) or manually applied."
         );
-        return;
+        return true;
     }
 
     match ferrosa_memory_core::cql_storage::connect_admin_session(config).await {
         Ok(admin_session) => {
-            match ferrosa_memory_core::migration::run_migrations(&admin_session, &config.keyspace)
-                .await
+            let migrated = match ferrosa_memory_core::migration::run_migrations(
+                &admin_session,
+                &config.keyspace,
+            )
+            .await
             {
-                Ok(0) => tracing::debug!("schema up to date"),
-                Ok(n) => tracing::info!(applied = n, "schema migrations applied"),
+                Ok(0) => {
+                    tracing::debug!("schema up to date");
+                    true
+                }
+                Ok(n) => {
+                    tracing::info!(applied = n, "schema migrations applied");
+                    true
+                }
                 Err(e) => {
                     tracing::error!(
                         "schema migration failed: {e}. The keyspace may be out of sync with this binary. \
-                         Investigate the failing DDL and restart. CqlStorage will attempt to connect, \
-                         but runtime queries may fail if the schema is incomplete."
+                             Investigate the failing DDL and restart. This daemon will report NOT READY on \
+                             /healthz/ready until migrations succeed, so installers and orchestrators do not \
+                             mistake a live socket for a usable schema."
                     );
+                    false
                 }
-            }
+            };
             match ferrosa_memory_core::migration::migration_status(&admin_session, &config.keyspace)
                 .await
             {
@@ -2811,11 +2854,15 @@ async fn run_schema_migrations_if_enabled(config: &FerrosaCqlConfig) {
                      lexical search may be degraded if FTS is unavailable."
                 ),
             }
+            migrated
         }
         Err(e) => {
             tracing::warn!(
                 "admin CQL session unavailable ({e}), skipping migrations for this reconnect attempt"
             );
+            // Unknown, so not vouched for. The next reconnect attempt runs
+            // migrations again and can promote it.
+            false
         }
     }
 }
@@ -2863,11 +2910,15 @@ async fn cql_reconnect_watcher(storage: Arc<ReconnectingStorage>) {
             tokio::time::sleep(delay).await;
 
             if storage.run_migrations_on_connect {
-                run_schema_migrations_if_enabled(&storage.cql_config).await;
+                let migrated = run_schema_migrations_if_enabled(&storage.cql_config).await;
+                storage.set_migrations_complete(migrated);
             } else {
+                // A secondary reader does not own the schema, so it has nothing
+                // to verify and must not hold itself un-ready over it.
                 tracing::debug!(
                     "secondary CQL reader reconnect skips migrations; primary watcher owns schema"
                 );
+                storage.set_migrations_complete(true);
             }
 
             match CqlStorage::connect(&storage.cql_config).await {
@@ -4079,6 +4130,57 @@ enabled = false
         assert!(
             !storage.is_ready(),
             "readiness still requires a connected CQL handle"
+        );
+    }
+
+    /// Readiness must mean "can serve", not "has a socket".
+    ///
+    /// `is_ready` was a CQL probe plus a live handle, and said nothing about
+    /// schema migrations — which run AFTER the session is established and are
+    /// allowed to fail without stopping the daemon. So `/healthz/ready` returned
+    /// 200 over an incomplete or failed schema.
+    ///
+    /// That is not theoretical. On a QA VM the workbench installer waits for
+    /// this endpoint, took the 200 as "install finished", recorded full setup
+    /// evidence, and handed the daemon to launchd — which restarted it
+    /// mid-migration. The restarted daemon then failed migration 35's
+    /// postcondition 112 times and never became ready again. The installer had
+    /// already reported success.
+    ///
+    /// A daemon whose migrations have not completed is not ready, and must say
+    /// so while anyone can still act on it.
+    #[tokio::test]
+    async fn readiness_requires_migrations_to_have_completed() {
+        let cfg = FerrosaCqlConfig {
+            tls_ca_path: None,
+            tls_skip_hostname_verify: false,
+            contact_points: vec!["localhost:19042".into()],
+            keyspace: "agent_memory".into(),
+            replication_factor: 3,
+            consistency: "LOCAL_QUORUM".into(),
+            username: "ferrosa_user".into(),
+            password: "ferrosa_user".into(),
+            admin_username: None,
+            admin_password: None,
+        };
+        let storage = ReconnectingStorage::disconnected(cfg, None, None);
+
+        storage.set_cql_probe_ready(true);
+        assert!(
+            !storage.migrations_complete(),
+            "migrations start out incomplete"
+        );
+
+        storage.set_migrations_complete(false);
+        assert!(
+            !storage.is_ready(),
+            "a daemon whose migrations failed must not report ready"
+        );
+
+        storage.set_migrations_complete(true);
+        assert!(
+            storage.migrations_complete(),
+            "a completed migration run must be recorded"
         );
     }
 
