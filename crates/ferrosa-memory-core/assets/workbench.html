@@ -4,41 +4,239 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Ferrosa Memory Operator Workbench</title>
-  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='fg' x1='0%25' y1='0%25' x2='100%25' y2='100%25'%3E%3Cstop offset='0%25' stop-color='%237ee7ff'/%3E%3Cstop offset='100%25' stop-color='%23348cff'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='7' fill='%2305070c'/%3E%3Crect x='3' y='3' width='26' height='26' rx='5.5' fill='none' stroke='url(%23fg)' stroke-width='1.5'/%3E%3Ctext x='16' y='21.5' text-anchor='middle' font-family='Georgia,serif' font-size='14' font-weight='700' fill='url(%23fg)'%3EFm%3C/text%3E%3Ctext x='6' y='10.5' font-family='sans-serif' font-size='5' font-weight='600' fill='%237d9fca'%3E100%3C/text%3E%3C/svg%3E">
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='fg' x1='0%25' y1='0%25' x2='100%25' y2='100%25'%3E%3Cstop offset='0%25' stop-color='%237ee7ff'/%3E%3Cstop offset='55%25' stop-color='%23348cff'/%3E%3Cstop offset='100%25' stop-color='%23516d92'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='7' fill='%2305070c'/%3E%3Crect x='3' y='3' width='26' height='26' rx='5.5' fill='none' stroke='url(%23fg)' stroke-width='1.5'/%3E%3Ctext x='16' y='21.5' text-anchor='middle' font-family='Georgia,serif' font-size='14' font-weight='700' fill='url(%23fg)'%3EFe%3C/text%3E%3Ctext x='6' y='10.5' font-family='sans-serif' font-size='5' font-weight='600' fill='%23516d92'%3E26%3C/text%3E%3C/svg%3E">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <style>
+    /* Tokens mirror the site (ferrosa-docs docs/site.css) and viz.html, so the
+       product surfaces and the marketing site read as one system. Light values
+       are DARKENED counterparts, never the dark values reused. */
     :root {
-      --bg-primary: #05070c;
-      --bg-secondary: #09111f;
-      --bg-card: #0e1726;
-      --bg-card-hover: #16243a;
-      --text-primary: #e8f4ff;
-      --text-secondary: #9bb3cf;
-      --text-muted: #6b8199;
-      --accent: #348cff;
-      --accent-warm: #7ee7ff;
-      --accent-green: #6bc9a0;
-      --accent-cool: #5aa6ff;
-      --accent-purple: #8a9bff;
-      --warn: #f4a261;
+      --bg: #05070c;
+      --surface: #0e1726;
+      --surface-2: #16243a;
+      --surface-inset: #09111f;
+
+      --text: #e8f4ff;
+      --muted: #9bb3cf;
+      --subtle: #6d829a;
+
+      --primary: #348cff;
+      --accent: #7ee7ff;
+      --steel: #516d92;
+      --border: #3d659c;
+      --divider: #17273d;
+      --hairline: #1c3454;
+
+      --success: #6bc9a0;
+      --warning: #f4a261;
       --danger: #e25b5b;
-      --border: #17263b;
+      --info: #d7fbff;
+      --on-primary: #04101f;
+
+      --focus-ring: #7ee7ff;
+      --film: rgba(255, 255, 255, 0.045);
+      --chrome-bg: linear-gradient(180deg, #09111f, #070c16);
+      --chrome-glow: radial-gradient(circle at top left, rgba(52, 140, 255, 0.18), transparent 38%);
+      --tile-bg: linear-gradient(150deg, #11162a, #0c1120);
+      --menu-bg: rgba(9, 17, 31, 0.96);
+      --input-bg: rgba(5, 7, 12, 0.95);
+      --primary-soft: rgba(52, 140, 255, 0.16);
+      --accent-soft: rgba(126, 231, 255, 0.08);
+      --shadow-1: 0 4px 12px rgba(5, 7, 12, 0.45);
+      --shadow-2: 0 8px 24px rgba(5, 7, 12, 0.5);
+      --shadow-3: 0 12px 28px rgba(5, 7, 12, 0.4);
+      --node-glow: rgba(126, 231, 255, 0.15);
+      --page-bg: linear-gradient(180deg, #081120 0%, #05070c 42%, #04060a 100%);
+
+      --e-concept: #7ee7ff;
+      --e-document: #4fd0e8;
+      --e-section: #2fb2d4;
+      --e-person: #348cff;
+      --e-org: #5a7fe0;
+      --e-app: #7b76d4;
+      --e-preference: #9a86c9;
+      --e-place: #6f8fb8;
+      --e-module: #8aa6c4;
+      --e-crate: #a9c4dd;
+      --e-fold: #516d92;
+      --e-decision: #f4a261;
+      --e-event: #6bc9a0;
+      --e-pattern: #d7fbff;
+      --e-bug: #e25b5b;
+
+      --r-CO_OCCURS: #6f8fb8;
+      --r-MENTIONED_IN: #4a7fc4;
+      --r-FOLDED_INTO: #7b76d4;
+      --r-SUPERSEDES: #e25b5b;
+      --r-depends_on: #348cff;
+      --r-contains: #5f93a8;
+      --r-part_of: #4fd0e8;
+      --r-calls: #8aa6c4;
+      --r-implements: #9a86c9;
+      --r-uses: #57b0c4;
+      --r-subclass_of: #a9c4dd;
+      --r-related_to: #516d92;
+      --r-references: #7ee7ff;
       --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
       --font-serif: 'Georgia', 'Times New Roman', serif;
       --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
-      --bg: var(--bg-primary);
-      --bg-soft: var(--bg-secondary);
-      --panel: var(--bg-card);
-      --panel-2: var(--bg-card-hover);
-      --text: var(--text-primary);
-      --subtle: var(--text-secondary);
-      --muted: var(--text-muted);
-      --line: var(--border);
-      --accent-2: var(--accent-warm);
-      --success: var(--accent-green);
-      --focus: var(--accent-cool);
+
+      --radius-xs: 4px;
+      --radius-sm: 8px;
+      --radius-md: 12px;
+      --radius-lg: 16px;
+      --radius-pill: 999px;
+      /* Names this file already uses in its rules, pointed at the shared tokens
+         rather than holding values of their own. */
+      --panel-2: var(--surface-2);
+      --line: var(--divider);
+      --accent-2: var(--accent);
+      --focus: var(--focus-ring);
       --mono: var(--font-mono);
+      --line-hover: var(--border);
+    }
+
+    :root[data-theme="light"] {
+      --bg: #f4f8fd;
+      --surface: #ffffff;
+      --surface-2: #e7eef7;
+      --surface-inset: #eef4fb;
+
+      --text: #0c1a2b;
+      --muted: #44586f;
+      --subtle: #61738a;
+
+      --primary: #2270d8;
+      --accent: #0e7ea3;
+      --steel: #55708f;
+      --border: #6a93bf;
+      --divider: #d7e2ee;
+      --hairline: #e2eaf4;
+
+      --success: #1d805c;
+      --warning: #a15c14;
+      --danger: #c23b3b;
+      --info: #1c6b80;
+      --on-primary: #ffffff;
+
+      --focus-ring: #0e7ea3;
+      --film: rgba(12, 26, 43, 0.035);
+      --chrome-bg: linear-gradient(180deg, #ffffff, #eef4fb);
+      --chrome-glow: radial-gradient(circle at top left, rgba(34, 112, 216, 0.10), transparent 38%);
+      --tile-bg: linear-gradient(150deg, #ffffff, #e7eef7);
+      --menu-bg: rgba(255, 255, 255, 0.97);
+      --input-bg: rgba(255, 255, 255, 0.95);
+      --primary-soft: rgba(34, 112, 216, 0.10);
+      --accent-soft: rgba(14, 126, 163, 0.10);
+      --shadow-1: 0 4px 12px rgba(12, 26, 43, 0.10);
+      --shadow-2: 0 8px 24px rgba(12, 26, 43, 0.12);
+      --shadow-3: 0 12px 28px rgba(12, 26, 43, 0.10);
+      --node-glow: rgba(14, 126, 163, 0.18);
+      --page-bg: linear-gradient(180deg, #ffffff 0%, #f4f8fd 42%, #eef4fb 100%);
+
+      --e-concept: #0e7ea3;
+      --e-document: #1183a8;
+      --e-section: #146d8c;
+      --e-person: #2270d8;
+      --e-org: #3f5fb8;
+      --e-app: #5a54ab;
+      --e-preference: #74609f;
+      --e-place: #4a6b91;
+      --e-module: #4f6d8c;
+      --e-crate: #5b7a97;
+      --e-fold: #55708f;
+      --e-decision: #a15c14;
+      --e-event: #1d805c;
+      --e-pattern: #1c6b80;
+      --e-bug: #c23b3b;
+
+      --r-CO_OCCURS: #4a6b91;
+      --r-MENTIONED_IN: #2f63ad;
+      --r-FOLDED_INTO: #5a54ab;
+      --r-SUPERSEDES: #c23b3b;
+      --r-depends_on: #2270d8;
+      --r-contains: #3d6f82;
+      --r-part_of: #1183a8;
+      --r-calls: #4f6d8c;
+      --r-implements: #74609f;
+      --r-uses: #20748c;
+      --r-subclass_of: #5b7a97;
+      --r-related_to: #55708f;
+      --r-references: #0e7ea3;
+    }
+
+    /* Same tokens as the explicit choice above, for hosts that asked for
+       light without the user picking. Kept in sync by check-viz-theme.py. */
+    @media (prefers-color-scheme: light) {
+      :root:not([data-theme="dark"]) {
+        --bg: #f4f8fd;
+        --surface: #ffffff;
+        --surface-2: #e7eef7;
+        --surface-inset: #eef4fb;
+
+        --text: #0c1a2b;
+        --muted: #44586f;
+        --subtle: #61738a;
+
+        --primary: #2270d8;
+        --accent: #0e7ea3;
+        --steel: #55708f;
+        --border: #6a93bf;
+        --divider: #d7e2ee;
+        --hairline: #e2eaf4;
+
+        --success: #1d805c;
+        --warning: #a15c14;
+        --danger: #c23b3b;
+        --info: #1c6b80;
+        --on-primary: #ffffff;
+
+        --focus-ring: #0e7ea3;
+        --film: rgba(12, 26, 43, 0.035);
+        --chrome-bg: linear-gradient(180deg, #ffffff, #eef4fb);
+        --chrome-glow: radial-gradient(circle at top left, rgba(34, 112, 216, 0.10), transparent 38%);
+        --tile-bg: linear-gradient(150deg, #ffffff, #e7eef7);
+        --menu-bg: rgba(255, 255, 255, 0.97);
+        --input-bg: rgba(255, 255, 255, 0.95);
+        --primary-soft: rgba(34, 112, 216, 0.10);
+        --accent-soft: rgba(14, 126, 163, 0.10);
+        --shadow-1: 0 4px 12px rgba(12, 26, 43, 0.10);
+        --shadow-2: 0 8px 24px rgba(12, 26, 43, 0.12);
+        --shadow-3: 0 12px 28px rgba(12, 26, 43, 0.10);
+        --node-glow: rgba(14, 126, 163, 0.18);
+        --page-bg: linear-gradient(180deg, #ffffff 0%, #f4f8fd 42%, #eef4fb 100%);
+
+        --e-concept: #0e7ea3;
+        --e-document: #1183a8;
+        --e-section: #146d8c;
+        --e-person: #2270d8;
+        --e-org: #3f5fb8;
+        --e-app: #5a54ab;
+        --e-preference: #74609f;
+        --e-place: #4a6b91;
+        --e-module: #4f6d8c;
+        --e-crate: #5b7a97;
+        --e-fold: #55708f;
+        --e-decision: #a15c14;
+        --e-event: #1d805c;
+        --e-pattern: #1c6b80;
+        --e-bug: #c23b3b;
+
+        --r-CO_OCCURS: #4a6b91;
+        --r-MENTIONED_IN: #2f63ad;
+        --r-FOLDED_INTO: #5a54ab;
+        --r-SUPERSEDES: #c23b3b;
+        --r-depends_on: #2270d8;
+        --r-contains: #3d6f82;
+        --r-part_of: #1183a8;
+        --r-calls: #4f6d8c;
+        --r-implements: #74609f;
+        --r-uses: #20748c;
+        --r-subclass_of: #5b7a97;
+        --r-related_to: #55708f;
+        --r-references: #0e7ea3;
+      }
     }
 
     * {
@@ -50,9 +248,8 @@
       margin: 0;
       min-height: 100%;
       background:
-        radial-gradient(circle at top left, rgba(52, 140, 255, 0.18), transparent 32%),
-        radial-gradient(circle at top right, rgba(126, 231, 255, 0.10), transparent 26%),
-        linear-gradient(180deg, #081120 0%, var(--bg) 42%, #04060a 100%);
+        var(--chrome-glow),
+        var(--page-bg);
       color: var(--text);
       font-family: var(--font-sans);
       -webkit-font-smoothing: antialiased;
@@ -75,8 +272,8 @@
       z-index: 12;
       backdrop-filter: blur(14px);
       background:
-        radial-gradient(circle at top left, rgba(52, 140, 255, 0.20), transparent 38%),
-        linear-gradient(180deg, #0a1424, #060b14);
+        var(--chrome-glow),
+        var(--chrome-bg);
       border-bottom: 1px solid var(--line);
     }
 
@@ -103,12 +300,12 @@
     .brand-mark {
       width: 40px;
       height: 40px;
-      border-radius: 10px;
+      border-radius: var(--radius-md);
       border: 1px solid var(--line);
       display: grid;
       place-items: center;
-      background: linear-gradient(150deg, #11162a, #0c1120);
-      color: var(--accent);
+      background: var(--tile-bg);
+      color: var(--primary);
       font-family: var(--font-serif);
       font-size: 18px;
       font-weight: 700;
@@ -148,7 +345,7 @@
     .top-nav a,
     .nav a {
       padding: 8px 12px;
-      border-radius: 999px;
+      border-radius: var(--radius-pill);
       border: 1px solid transparent;
       color: var(--muted);
       text-decoration: none;
@@ -162,14 +359,14 @@
     .nav a:hover {
       color: var(--text);
       border-color: var(--line);
-      background: rgba(255, 255, 255, 0.05);
+      background: var(--film);
     }
 
     .top-nav a.active,
     .nav a.active {
       color: var(--accent-2);
-      background: linear-gradient(110deg, rgba(52, 140, 255, 0.18), rgba(126, 231, 255, 0.15));
-      border-color: rgba(126, 231, 255, 0.4);
+      background: linear-gradient(110deg, var(--primary-soft), var(--accent-soft));
+      border-color: var(--accent);
     }
 
     .topbar-meta,
@@ -184,9 +381,9 @@
     .topbar-chip,
     .chip {
       padding: 7px 12px;
-      border-radius: 999px;
+      border-radius: var(--radius-pill);
       border: 1px solid var(--line);
-      background: rgba(255, 255, 255, 0.03);
+      background: var(--film);
       color: var(--subtle);
       font-size: 0.78rem;
       white-space: nowrap;
@@ -198,10 +395,10 @@
 
     .btn {
       border: 1px solid var(--line);
-      background: linear-gradient(180deg, rgba(36, 39, 58, 0.96), rgba(22, 24, 36, 0.98));
+      background: var(--menu-bg);
       color: var(--text);
       padding: 7px 13px;
-      border-radius: 999px;
+      border-radius: var(--radius-pill);
       font-size: 0.82rem;
       font-weight: 700;
       letter-spacing: 0.04em;
@@ -212,7 +409,7 @@
 
     .btn:hover {
       transform: translateY(-1px);
-      border-color: rgba(126, 231, 255, 0.6);
+      border-color: var(--accent);
     }
 
     .btn:disabled {
@@ -222,7 +419,7 @@
     }
 
     .btn.secondary {
-      background: rgba(255, 255, 255, 0.03);
+      background: var(--film);
     }
 
     main {
@@ -237,9 +434,9 @@
 
     .panel {
       border: 1px solid var(--line);
-      border-radius: 18px;
-      background: linear-gradient(180deg, rgba(22, 22, 31, 0.98), rgba(13, 13, 20, 0.98));
-      box-shadow: 0 18px 40px rgba(0, 0, 0, 0.28);
+      border-radius: var(--radius-lg);
+      background: var(--menu-bg);
+      box-shadow: var(--shadow-3);
       overflow: hidden;
       display: none;
       opacity: 0;
@@ -261,8 +458,8 @@
       padding: 16px 18px;
       border-bottom: 1px solid var(--line);
       background:
-        radial-gradient(circle at top right, rgba(124, 156, 245, 0.08), transparent 28%),
-        linear-gradient(180deg, rgba(18, 18, 28, 0.96), rgba(15, 15, 23, 0.84));
+        var(--chrome-glow),
+        var(--chrome-bg);
     }
 
     .panel-head h2 {
@@ -292,10 +489,10 @@
 
     .card {
       border: 1px solid var(--line);
-      border-radius: 16px;
+      border-radius: var(--radius-lg);
       padding: 14px;
-      background: linear-gradient(180deg, rgba(22, 22, 31, 0.98), rgba(17, 17, 24, 0.94));
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02);
+      background: var(--menu-bg);
+      box-shadow: inset 0 1px 0 var(--film);
     }
 
     .card h3 {
@@ -328,9 +525,9 @@
     textarea,
     select {
       width: 100%;
-      border-radius: 10px;
+      border-radius: var(--radius-md);
       border: 1px solid var(--line);
-      background: rgba(11, 11, 17, 0.92);
+      background: var(--menu-bg);
       color: var(--text);
       padding: 10px 11px;
       font: inherit;
@@ -382,14 +579,14 @@
     .checkbox-row input {
       width: 16px;
       height: 16px;
-      accent-color: var(--accent);
+      accent-color: var(--primary);
     }
 
     .field input[type="number"] {
       width: 96px;
-      border-radius: 8px;
+      border-radius: var(--radius-sm);
       border: 1px solid var(--line);
-      background: rgba(11, 11, 17, 0.92);
+      background: var(--menu-bg);
       color: var(--text);
       padding: 7px;
       font: inherit;
@@ -398,12 +595,12 @@
     .output-box {
       margin-top: 10px;
       border: 1px dashed var(--line);
-      border-radius: 10px;
-      background: rgba(9, 9, 14, 0.96);
+      border-radius: var(--radius-md);
+      background: var(--input-bg);
       min-height: 140px;
       padding: 12px;
       font-size: 0.84rem;
-      color: #cfe7ff;
+      color: var(--text);
       overflow-x: auto;
       overflow-wrap: anywhere;
       white-space: pre-wrap;
@@ -421,7 +618,7 @@
     }
 
     .status.warn {
-      color: var(--warn);
+      color: var(--warning);
     }
 
     .status.err {
@@ -454,7 +651,7 @@
       color: var(--accent-2);
       position: sticky;
       top: 0;
-      background: rgba(12, 12, 18, 0.98);
+      background: var(--input-bg);
       z-index: 1;
     }
 
@@ -462,39 +659,39 @@
       max-height: 420px;
       overflow: auto;
       border: 1px solid var(--line);
-      border-radius: 12px;
-      background: rgba(11, 11, 17, 0.92);
+      border-radius: var(--radius-md);
+      background: var(--menu-bg);
     }
 
     .badge {
       font-size: 0.75rem;
-      border-radius: 999px;
+      border-radius: var(--radius-pill);
       padding: 3px 8px;
       display: inline-flex;
       align-items: center;
       justify-content: center;
       border: 1px solid var(--line);
-      background: rgba(255, 255, 255, 0.03);
+      background: var(--film);
       white-space: nowrap;
       line-height: 1.2;
     }
 
     .badge.good {
       color: var(--success);
-      border-color: rgba(124, 207, 159, 0.4);
-      background: rgba(124, 207, 159, 0.08);
+      border-color: var(--success);
+      background: var(--film);
     }
 
     .badge.warn {
-      color: var(--warn);
-      border-color: rgba(244, 162, 97, 0.45);
-      background: rgba(244, 162, 97, 0.08);
+      color: var(--warning);
+      border-color: var(--warning);
+      background: var(--film);
     }
 
     .badge.bad {
       color: var(--danger);
-      border-color: rgba(230, 95, 106, 0.45);
-      background: rgba(230, 95, 106, 0.08);
+      border-color: var(--danger);
+      background: var(--film);
     }
 
     .row-actions {
@@ -505,9 +702,9 @@
 
     .action {
       border: 1px solid var(--line);
-      border-radius: 8px;
+      border-radius: var(--radius-sm);
       padding: 4px 8px;
-      background: rgba(22, 22, 31, 0.96);
+      background: var(--menu-bg);
       color: var(--subtle);
       cursor: pointer;
       font-size: 0.76rem;
@@ -517,11 +714,11 @@
 
     .action:hover {
       color: var(--text);
-      border-color: var(--line-hover, var(--accent));
+      border-color: var(--line-hover, var(--primary));
     }
 
     .action.warn {
-      color: var(--warn);
+      color: var(--warning);
     }
 
     .hero-kpi {
@@ -531,17 +728,17 @@
     }
 
     .hero-kpi .kpi {
-      background: linear-gradient(180deg, rgba(22, 22, 31, 0.98), rgba(16, 16, 24, 0.94));
+      background: var(--menu-bg);
       border: 1px solid var(--line);
-      border-radius: 14px;
+      border-radius: var(--radius-lg);
       padding: 12px 14px;
-      box-shadow: 0 10px 24px rgba(0, 0, 0, 0.2);
+      box-shadow: var(--shadow-2);
     }
 
     .hero-kpi .kpi b {
       display: block;
       margin-bottom: 6px;
-      color: var(--accent);
+      color: var(--primary);
       font-size: 0.72rem;
       letter-spacing: 0.1em;
       text-transform: uppercase;
@@ -585,9 +782,9 @@
 
     .pill {
       border: 1px solid var(--line);
-      border-radius: 999px;
+      border-radius: var(--radius-pill);
       padding: 5px 10px;
-      background: rgba(255, 255, 255, 0.03);
+      background: var(--film);
       color: var(--subtle);
       font-size: 0.75rem;
       font-weight: 700;
@@ -633,7 +830,7 @@
     }
 
     tr.is-selected td {
-      background: rgba(111, 137, 248, 0.08);
+      background: var(--primary-soft);
     }
 
     .table-summary {
@@ -738,7 +935,7 @@
     /* Forget — candidate review cards */
     .forget-candidate {
       border: 1px solid var(--line);
-      border-radius: 12px;
+      border-radius: var(--radius-md);
       padding: 12px 14px;
       margin-bottom: 10px;
       background: var(--panel-2);
@@ -746,22 +943,22 @@
       gap: 12px;
       align-items: flex-start;
     }
-    .forget-candidate.selected { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
-    .forget-candidate.high-impact { border-left: 3px solid var(--warn); }
+    .forget-candidate.selected { border-color: var(--primary); box-shadow: inset 0 0 0 1px var(--primary); }
+    .forget-candidate.high-impact { border-left: 3px solid var(--warning); }
     .forget-candidate input[type="checkbox"] { margin-top: 4px; flex: 0 0 auto; }
     .forget-candidate .cand-body { flex: 1; min-width: 0; }
     .forget-candidate .cand-name { font-weight: 600; word-break: break-word; }
     .forget-candidate .cand-snippet { color: var(--subtle); font-size: 0.85rem; margin: 4px 0; word-break: break-word; }
     .forget-candidate .cand-meta { color: var(--muted); font-size: 0.72rem; font-family: var(--mono); }
     .blast { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
-    .blast .badge.warn { color: var(--warn); border-color: var(--warn); }
+    .blast .badge.warn { color: var(--warning); border-color: var(--warning); }
   </style>
 </head>
 <body>
   <header class="topbar">
     <div class="topbar-inner">
       <div class="shell-brand">
-        <div class="shell-brand-mark"><svg width="30" height="30" viewBox="0 0 100 100" aria-label="Ferrosa Memory"><defs><linearGradient id="fmIg" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#7ee7ff"/><stop offset="55%" stop-color="#348cff"/><stop offset="100%" stop-color="#516d92"/></linearGradient><linearGradient id="fmRg" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#7ee7ff" stop-opacity="0.32"/><stop offset="100%" stop-color="#348cff" stop-opacity="0.08"/></linearGradient><linearGradient id="fmNg" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#f4feff"/><stop offset="45%" stop-color="#7ee7ff"/><stop offset="100%" stop-color="#2f7cff"/></linearGradient></defs><ellipse cx="50" cy="50" rx="47" ry="47" fill="none" stroke="url(#fmRg)" stroke-width="1.5" stroke-dasharray="216 80" transform="rotate(-20, 50, 50)"/><g opacity="0.55" stroke="url(#fmRg)" stroke-width="2" stroke-linecap="round" fill="none"><path d="M22 72 C36 60 46 60 58 64"/><path d="M24 32 C38 42 50 42 62 36"/></g><g fill="url(#fmNg)" opacity="0.85"><circle cx="22" cy="72" r="3"/><circle cx="24" cy="32" r="2.5"/><circle cx="72" cy="40" r="3"/></g><rect x="14" y="14" width="72" height="72" rx="15" ry="15" fill="none" stroke="url(#fmIg)" stroke-width="2.5"/><text x="50" y="61" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-size="36" font-weight="700" fill="url(#fmIg)" letter-spacing="-1">Fm</text><text x="24" y="30" font-family="Inter, sans-serif" font-size="9" font-weight="600" fill="#7d9fca">100</text></svg></div>
+        <div class="shell-brand-mark"><svg width="30" height="30" viewBox="0 0 100 100" role="img" aria-label="Ferrosa AI"><defs><linearGradient id="feIcon" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#7ee7ff"/><stop offset="55%" stop-color="#348cff"/><stop offset="100%" stop-color="#516d92"/></linearGradient><linearGradient id="feRing" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#7ee7ff" stop-opacity="0.32"/><stop offset="100%" stop-color="#348cff" stop-opacity="0.08"/></linearGradient></defs><ellipse cx="50" cy="50" rx="47" ry="47" fill="none" stroke="url(#feRing)" stroke-width="1.5" stroke-dasharray="216 80" stroke-linecap="round" transform="rotate(-20 50 50)"/><rect x="14" y="14" width="72" height="72" rx="15" fill="none" stroke="url(#feIcon)" stroke-width="2.5"/><text x="50" y="61" font-family="Georgia, 'Times New Roman', Times, serif" font-size="40" font-weight="700" letter-spacing="-1" fill="url(#feIcon)" text-anchor="middle">Fe</text><text x="26" y="30" font-family="Inter, sans-serif" font-size="10" font-weight="600" fill="url(#feIcon)" text-anchor="middle">26</text></svg></div>
         <div class="shell-brand-copy">
           <b>Ferrosa Memory</b>
           <span>Knowledge Graph Console</span>

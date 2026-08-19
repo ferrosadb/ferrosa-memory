@@ -19,8 +19,16 @@ build-podman:
 		$(PODMAN_BUILD_IMAGE) \
 		bash -lc '. /usr/local/cargo/env && export DEBIAN_FRONTEND=noninteractive && apt-get update -qq && apt-get install -y --no-install-recommends cmake >/dev/null && cargo build --release -p ferrosa-memory-mcp'
 
-test-unit:
+test-unit: check-viz-theme
 	cargo test --workspace --lib
+
+# The two light-theme token blocks in the web assets are duplicated because CSS
+# cannot alias one from the other, and duplicated blocks drift. They already did
+# once, silently — a token added to the explicit block never reached the
+# prefers-color-scheme copy, which only shows up on a light-preference host with
+# no saved choice.
+check-viz-theme:
+	python3 scripts/check-viz-theme.py
 
 test-contracts:
 	cargo test --workspace --test shared_http_deployment_spec --test expert_system_rules_spec --test expert_system_governance_spec --test tool_catalog_contract
