@@ -6536,12 +6536,29 @@ mod tests {
         assert!(WORKBENCH_HTML.contains("payload.next_cursor"));
         assert!(WORKBENCH_HTML.contains("/tools/call"));
         assert!(WORKBENCH_HTML.contains("/config/tunables"));
-        // Memory branding swap (no terracotta accent, Fm mark)
-        assert!(WORKBENCH_HTML.contains("--accent: #348cff;"));
+        // Brand tokens carry the published names: Core Blue is --primary and
+        // Electric Cyan is --accent, matching the site's site.css. This used to
+        // assert `--accent: #348cff`, which named Core Blue as the accent.
+        assert!(WORKBENCH_HTML.contains("--primary: #348cff;"));
+        assert!(WORKBENCH_HTML.contains("--accent: #7ee7ff;"));
         assert!(!WORKBENCH_HTML.contains("#e2725b"));
         // Topbar mark uses the brand logo-icon SVG art, not a text placeholder.
         assert!(WORKBENCH_HTML.contains(r#"class="shell-brand-mark"><svg"#));
-        assert!(WORKBENCH_HTML.contains(r#"aria-label="Ferrosa Memory""#));
+        // The monogram is the COMPANY mark. Brand rules lock it to Fe/26:
+        // "products do not get element tiles of their own", and "don't swap
+        // element symbol or atomic number for products". This asset shipped an
+        // invented "Fm" tile with atomic number 100 (Fermium) until that was
+        // caught, so the absence is asserted, not just the presence.
+        assert!(WORKBENCH_HTML.contains(r#"aria-label="Ferrosa AI""#));
+        assert!(WORKBENCH_HTML.contains(">Fe</text>"));
+        assert!(
+            !WORKBENCH_HTML.contains(">Fm<"),
+            "the Fe monogram is company-only"
+        );
+        assert!(
+            !WORKBENCH_HTML.contains(">100</text>"),
+            "atomic number is 26, not a per-product one"
+        );
     }
 
     #[test]
