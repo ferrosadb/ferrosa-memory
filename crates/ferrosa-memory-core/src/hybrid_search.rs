@@ -82,8 +82,25 @@ pub struct SearchOutput {
     pub diagnostics: SearchDiagnostics,
 }
 
-/// Configuration for 6-signal RRF fusion weights.
-/// Default weight 1.0 for all signals. Set to 0.0 to disable a signal.
+/// Weights for the RRF fusion, one per candidate source.
+///
+/// There are 17 weighted channels, in six families:
+///
+/// | family                 | channels                                          |
+/// |------------------------|---------------------------------------------------|
+/// | vector / ANN           | `ann`, `context_ann`, `document_ann`              |
+/// | lexical BM25 / FTS     | `entity_content_fts`, `context_bm25`, `document_bm25` |
+/// | phonetic               | `phonetic`, `document_phonetic`                   |
+/// | graph                  | `pagerank`, `datalog_frontier`, `reputation`      |
+/// | workspace / recency    | `workspace`, `warmth`                             |
+/// | memory-type structural | `scene`, `profile`, `foresight`, `fold`           |
+///
+/// Defaults are NOT uniform: they span 0.5 (`reputation`) to 4.0
+/// (`datalog_frontier`), so a derived-fact hit outranks a reputation hit by 8x
+/// at equal rank. Treat the defaults as a tuned ranking, not a neutral one.
+///
+/// Set a weight to 0.0 to disable that source: `source_enabled` skips the query
+/// and `rrf_merge` drops the list, so a disabled channel costs nothing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FusionConfig {
     pub phonetic_weight: f64,
