@@ -380,12 +380,8 @@ impl CqlControlStore {
     /// verifies the current mobile-control migration plus every required table.
     /// This is intentionally opt-in for degraded clusters and DBaaS deployments.
     pub async fn connect_existing(config: &FerrosaCqlConfig) -> anyhow::Result<Self> {
-        let session = connect_session_to_configured_nodes(
-            config,
-            &config.username,
-            &config.password,
-        )
-        .await?;
+        let session =
+            connect_session_to_configured_nodes(config, &config.username, &config.password).await?;
         verify_existing_control_schema(&session, &config.keyspace).await?;
         Ok(Self {
             session,
@@ -436,14 +432,15 @@ impl CqlControlStore {
     }
 }
 
-async fn verify_existing_control_schema(session: &CqlSession, keyspace: &str) -> anyhow::Result<()> {
+async fn verify_existing_control_schema(
+    session: &CqlSession,
+    keyspace: &str,
+) -> anyhow::Result<()> {
     let expected = MIGRATIONS
         .last()
         .map(|migration| migration.version)
         .ok_or_else(|| anyhow::anyhow!("migration registry is empty"))?;
-    let version_query = format!(
-        "SELECT version FROM {keyspace}.schema_version WHERE version = ?"
-    );
+    let version_query = format!("SELECT version FROM {keyspace}.schema_version WHERE version = ?");
     #[allow(deprecated)]
     let result = session
         .query_unpaged(version_query, (i32::try_from(expected)?,))
@@ -459,9 +456,7 @@ async fn verify_existing_control_schema(session: &CqlSession, keyspace: &str) ->
         format!(
             "SELECT next_cursor, reservation_token FROM {keyspace}.mobile_control_cursor_state LIMIT 1"
         ),
-        format!(
-            "SELECT cursor, event_type, payload FROM {keyspace}.mobile_control_events LIMIT 1"
-        ),
+        format!("SELECT cursor, event_type, payload FROM {keyspace}.mobile_control_events LIMIT 1"),
         format!(
             "SELECT command_id, command_type, state, payload FROM {keyspace}.mobile_control_commands LIMIT 1"
         ),
