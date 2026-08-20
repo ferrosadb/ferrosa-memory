@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use anyhow::Context;
 use futures_util::StreamExt;
 use scylla::frame::response::cql_to_rust::FromCqlVal;
 use scylla::frame::response::result::{CqlValue, Row};
@@ -1306,6 +1307,28 @@ pub async fn connect_session(
     username: &str,
     password: &str,
 ) -> anyhow::Result<Arc<CqlSession>> {
+    connect_session_inner(config, username, password, false).await
+}
+
+/// Connect only to the explicitly configured contact points.
+///
+/// This is useful for a degraded cluster where topology discovery still
+/// advertises a half-started node. Normal memory traffic should use
+/// [`connect_session`] so it retains topology-aware failover.
+pub async fn connect_session_to_configured_nodes(
+    config: &FerrosaCqlConfig,
+    username: &str,
+    password: &str,
+) -> anyhow::Result<Arc<CqlSession>> {
+    connect_session_inner(config, username, password, true).await
+}
+
+async fn connect_session_inner(
+    config: &FerrosaCqlConfig,
+    username: &str,
+    password: &str,
+    configured_nodes_only: bool,
+) -> anyhow::Result<Arc<CqlSession>> {
     if config.contact_points.is_empty() {
         anyhow::bail!("no contact points configured");
     }
@@ -1314,6 +1337,13 @@ pub async fn connect_session(
         .known_nodes(&config.contact_points)
         .user(username, password)
         .connection_timeout(std::time::Duration::from_secs(10));
+    if configured_nodes_only {
+        let filter = scylla::transport::host_filter::AllowListHostFilter::new(
+            &config.contact_points,
+        )
+        .context("resolving configured CQL contact points for host allow-list")?;
+        builder = builder.host_filter(Arc::new(filter));
+    }
     if let Some(ctx) = build_cql_ssl_context(config)? {
         builder = builder.ssl_context(Some(ctx));
     }

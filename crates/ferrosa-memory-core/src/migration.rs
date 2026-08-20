@@ -215,6 +215,16 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "workspace index for cross-session task resources",
         ddl: include_str!("../../../ddl/050_session_task_workspace_index.cql"),
     },
+    Migration {
+        version: 51,
+        description: "durable mobile control cursor, event log, and idempotent command store",
+        ddl: include_str!("../../../ddl/051_mobile_control_store.cql"),
+    },
+    Migration {
+        version: 52,
+        description: "verifiable ownership token for mobile control cursor reservations",
+        ddl: include_str!("../../../ddl/052_mobile_control_cursor_reservation_token.cql"),
+    },
 ];
 
 /// `ddl/011_warmth_field.cql` — the `entity_warmth` table + session index.

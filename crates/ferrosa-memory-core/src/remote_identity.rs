@@ -62,7 +62,11 @@ impl fmt::Display for ContentHash {
     }
 }
 
-/// Short stable fingerprint for a teacher/learner public signing key.
+/// Stable lowercase SHA-256 fingerprint for a device public signing key.
+///
+/// The full 64-character digest deliberately matches the gateway device-key
+/// registry. Truncating it would make a locally generated identity impossible
+/// to vouch through the live signaling service.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PublicKeyFingerprint(pub String);
@@ -70,7 +74,7 @@ pub struct PublicKeyFingerprint(pub String);
 impl PublicKeyFingerprint {
     pub fn from_verifying_key(key: &VerifyingKey) -> Self {
         let digest = ContentHash::sha256_bytes(key.as_bytes());
-        Self(digest.0[..16].to_string())
+        Self(digest.0)
     }
 }
 
@@ -156,6 +160,14 @@ impl InstanceSigningIdentity {
             public_key_fingerprint: public_identity.public_key_fingerprint,
             signature: SignatureBytes(signature.to_bytes().to_vec()),
         })
+    }
+
+    /// Sign an externally specified byte contract without serializing it.
+    ///
+    /// Enrollment approval uses a gateway-owned, versioned UTF-8 message
+    /// rather than the canonical-JSON envelope used by memory payloads.
+    pub fn sign_bytes(&self, payload: &[u8]) -> SignatureBytes {
+        SignatureBytes(self.signing_key.sign(payload).to_bytes().to_vec())
     }
 }
 
@@ -283,6 +295,24 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn raw_byte_signature_verifies_against_public_identity() {
+        let identity = InstanceSigningIdentity::generate(InstanceId::new());
+        let message = b"maas-device-approval:v1:account:fingerprint";
+        let signature = identity.sign_bytes(message);
+        let public = identity.public_identity();
+        let verifying_key = VerifyingKey::from_bytes(
+            public
+                .public_key
+                .as_slice()
+                .try_into()
+                .expect("32-byte key"),
+        )
+        .expect("valid key");
+        let signature = Signature::from_slice(&signature.0).expect("64-byte signature");
+        assert!(verifying_key.verify(message, &signature).is_ok());
+    }
+
+    #[test]
     fn instance_id_serializes_and_deserializes() {
         let id = InstanceId::new();
         let encoded = serde_json::to_string(&id).unwrap();
@@ -299,6 +329,16 @@ mod tests {
             ContentHash::sha256_json(&left).unwrap(),
             ContentHash::sha256_json(&right).unwrap()
         );
+    }
+
+    #[test]
+    fn device_fingerprint_matches_gateway_registry_shape() {
+        let signer = InstanceSigningIdentity::generate(InstanceId::new());
+        let public = signer.public_identity();
+        let expected = ContentHash::sha256_bytes(&public.public_key);
+
+        assert_eq!(public.public_key_fingerprint.0.len(), 64);
+        assert_eq!(public.public_key_fingerprint.0, expected.0);
     }
 
     #[test]

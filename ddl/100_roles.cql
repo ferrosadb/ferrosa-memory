@@ -114,4 +114,11 @@ GRANT MODIFY ON agent_memory.mem_profiles           TO ferrosa_user;
 GRANT MODIFY ON agent_memory.retrieval_traces       TO ferrosa_user;
 GRANT MODIFY ON agent_memory.foresight_facts        TO ferrosa_user;
 
+-- Direct mobile control (migrations 051-052): server-owned cursor allocation,
+-- replay log, and idempotent typed-command results. The gateway never reads
+-- these tables; only the local Ferrosa Memory runtime does.
+GRANT MODIFY ON agent_memory.mobile_control_cursor_state TO ferrosa_user;
+GRANT MODIFY ON agent_memory.mobile_control_events       TO ferrosa_user;
+GRANT MODIFY ON agent_memory.mobile_control_commands     TO ferrosa_user;
+
 -- graph-owned tables: NOT GRANTED to ferrosa_user on purpose.
