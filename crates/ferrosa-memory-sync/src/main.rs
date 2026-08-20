@@ -62,6 +62,22 @@ enum Command {
         #[arg(long)]
         out: std::path::PathBuf,
     },
+    /// Approve one pending device using an already-approved device identity.
+    #[cfg(feature = "webrtc-transport")]
+    DeviceApprove {
+        /// Gateway base URL.
+        #[arg(long)]
+        gateway: String,
+        /// API key; falls back to $FERROSA_MAAS_API_KEY.
+        #[arg(long, env = "FERROSA_MAAS_API_KEY")]
+        api_key: String,
+        /// Already-approved device key file (from p2p-keygen).
+        #[arg(long)]
+        identity: std::path::PathBuf,
+        /// Exact pending device id to approve.
+        #[arg(long)]
+        device_id: Uuid,
+    },
     /// Offer + stream a sealed pack to a mutual contact through the MaaS
     /// broker (teacher side).
     #[cfg(feature = "webrtc-transport")]
@@ -107,6 +123,29 @@ enum Command {
         #[arg(long)]
         session: Option<Uuid>,
     },
+    /// Poll for mobile control offers addressed to this registered device,
+    /// bind one direct signed WebRTC channel, and serve it until disconnect.
+    #[cfg(feature = "webrtc-transport")]
+    ControlListen {
+        /// Gateway base URL.
+        #[arg(long)]
+        gateway: String,
+        /// API key; falls back to $FERROSA_MAAS_API_KEY.
+        #[arg(long, env = "FERROSA_MAAS_API_KEY")]
+        api_key: String,
+        /// Registered device key file (from p2p-keygen).
+        #[arg(long)]
+        identity: std::path::PathBuf,
+        /// One absolute project directory available to the managed Codex CLI.
+        #[arg(long)]
+        workspace: std::path::PathBuf,
+        /// Restrict durable control traffic to these CQL nodes. Repeatable.
+        #[arg(long = "contact-point")]
+        contact_points: Vec<String>,
+        /// Use an already-current schema without issuing startup DDL.
+        #[arg(long)]
+        existing_schema: bool,
+    },
 }
 
 #[derive(Default)]
@@ -142,6 +181,13 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "webrtc-transport")]
         Command::P2pKeygen { out } => cmd_p2p_keygen(&out),
         #[cfg(feature = "webrtc-transport")]
+        Command::DeviceApprove {
+            gateway,
+            api_key,
+            identity,
+            device_id,
+        } => cmd_device_approve(&gateway, &api_key, &identity, device_id).await,
+        #[cfg(feature = "webrtc-transport")]
         Command::P2pShare {
             gateway,
             api_key,
@@ -168,6 +214,25 @@ async fn main() -> anyhow::Result<()> {
             out_dir,
             session,
         } => cmd_p2p_receive(&gateway, &api_key, &identity, &out_dir, session).await,
+        #[cfg(feature = "webrtc-transport")]
+        Command::ControlListen {
+            gateway,
+            api_key,
+            identity,
+            workspace,
+            contact_points,
+            existing_schema,
+        } => {
+            cmd_control_listen(
+                &gateway,
+                &api_key,
+                &identity,
+                &workspace,
+                &contact_points,
+                existing_schema,
+            )
+            .await
+        }
     }
 }
 
@@ -185,6 +250,49 @@ fn cmd_p2p_keygen(out: &std::path::Path) -> anyhow::Result<()> {
     println!("instance_id:        {}", public.instance_id.0);
     println!("public_key (register this at POST /v1/devices): {public_hex}");
     println!("fingerprint:        {}", public.public_key_fingerprint.0);
+    Ok(())
+}
+
+#[cfg(feature = "webrtc-transport")]
+async fn cmd_device_approve(
+    gateway: &str,
+    api_key: &str,
+    identity_path: &std::path::Path,
+    target_device_id: Uuid,
+) -> anyhow::Result<()> {
+    use ferrosa_memory_sync::peer_cli;
+    use ferrosa_memory_sync::signaling_client::HttpSignalingClient;
+
+    let identity = peer_cli::load_identity(identity_path)?;
+    let fingerprint = identity.public_identity().public_key_fingerprint.0;
+    let api = HttpSignalingClient::new(gateway, api_key);
+    let account = api.whoami().await?;
+    let devices = api.devices().await?;
+    let approver = devices
+        .iter()
+        .find(|device| device.fingerprint == fingerprint && device.revoked_at.is_none())
+        .context("the supplied identity is not a live registered device")?;
+    let pending = api.pending_devices().await?;
+    let target = pending
+        .iter()
+        .find(|device| device.device_id == target_device_id)
+        .context("the exact target device is not pending")?;
+    let message = format!(
+        "maas-device-approval:v1:{}:{}",
+        account.account_id, target.fingerprint
+    );
+    let signature = identity.sign_bytes(message.as_bytes());
+    let signature_hex: String = signature
+        .0
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    api.approve_device(target.device_id, approver.device_id, &signature_hex)
+        .await?;
+    println!(
+        "approved device {} ({}) with enrolled device {}",
+        target.device_id, target.label, approver.device_id
+    );
     Ok(())
 }
 
@@ -308,6 +416,147 @@ async fn cmd_p2p_receive(
     Ok(())
 }
 
+#[cfg(feature = "webrtc-transport")]
+async fn cmd_control_listen(
+    gateway: &str,
+    api_key: &str,
+    identity_path: &std::path::Path,
+    workspace: &std::path::Path,
+    contact_points: &[String],
+    existing_schema: bool,
+) -> anyhow::Result<()> {
+    use std::{sync::Arc, time::Duration};
+
+    use ferrosa_memory_core::config::load_config_with_dbaas;
+    use ferrosa_memory_core::control_store::{ControlEventDraft, ControlStore, CqlControlStore};
+    use ferrosa_memory_core::types::TenantContext;
+    use ferrosa_memory_sync::codex_runtime::{CodexTmuxConfig, CodexTmuxRuntime};
+    use ferrosa_memory_sync::control_session::{
+        ControlRuntimeDispatcher, ControlSessionConfig, run_control_server_session,
+    };
+    use ferrosa_memory_sync::peer_cli;
+    use ferrosa_memory_sync::signaling_client::{ControlSignalingApi, HttpSignalingClient};
+
+    let identity = peer_cli::load_identity(identity_path)?;
+    let public = identity.public_identity();
+    let fingerprint = public.public_key_fingerprint.0;
+    let api = HttpSignalingClient::new(gateway, api_key);
+    let config = ControlSessionConfig::default();
+    let mut memory_config = load_config_with_dbaas()
+        .context("loading Ferrosa Memory config for durable mobile control")?;
+    if !contact_points.is_empty() {
+        memory_config.ferrosa.contact_points = contact_points.to_vec();
+    }
+    let store = if existing_schema {
+        CqlControlStore::connect_existing(&memory_config.ferrosa).await
+    } else {
+        CqlControlStore::connect(&memory_config.ferrosa).await
+    }
+    .context("connecting durable mobile control store")?;
+    let control_store = Arc::new(store);
+    let runtime = CodexTmuxRuntime::new(CodexTmuxConfig::new(workspace, fingerprint.clone()))
+        .context("configuring Codex tmux-light runtime")?;
+    let dispatcher = ControlRuntimeDispatcher::new(Arc::clone(&control_store), runtime);
+    println!("control listener device fingerprint: {fingerprint}");
+    println!("managed Codex workspace: {}", workspace.display());
+    println!("polling {gateway} for device-targeted control offers");
+
+    loop {
+        let pending = api.control_pending_offers(&fingerprint).await?;
+        if pending.is_empty() {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        }
+        for offer in pending {
+            println!(
+                "accepting control session {} from controller device {}",
+                offer.session_id, offer.controller_device_id
+            );
+            let mut channel = match run_control_server_session(
+                &api,
+                &identity,
+                offer.session_id,
+                &config,
+            )
+            .await
+            {
+                Ok(channel) => channel,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %offer.session_id,
+                        error = %error,
+                        "control session bind failed"
+                    );
+                    continue;
+                }
+            };
+            println!("control session {} bound directly", offer.session_id);
+            let tenant = TenantContext {
+                tenant_id: offer.account_id,
+                session_origin: format!("mobile-control:{}", offer.session_id),
+            };
+            let cursor = control_store
+                .reserve_cursor_block(&tenant, &fingerprint, 64)
+                .await
+                .context("reserving durable mobile control cursor block")?
+                .start;
+            control_store
+                .append_event(
+                    &tenant,
+                    &fingerprint,
+                    ControlEventDraft {
+                        cursor,
+                        event_id: Uuid::now_v7(),
+                        command_id: None,
+                        kind: "heartbeat".to_owned(),
+                        payload: serde_json::json!({
+                            "session_id": offer.session_id,
+                            "controller_device_id": offer.controller_device_id,
+                        }),
+                        created_at: chrono::Utc::now(),
+                    },
+                )
+                .await
+                .context("persisting control-session heartbeat")?;
+            loop {
+                let frame = match channel.recv_text().await {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        tracing::info!(
+                            session_id = %offer.session_id,
+                            error = %error,
+                            "control session disconnected"
+                        );
+                        break;
+                    }
+                };
+                match dispatcher.reply(&tenant, &fingerprint, &frame).await {
+                    Ok(Some(reply)) => {
+                        if let Err(error) = channel.send_text(&reply).await {
+                            tracing::info!(
+                                session_id = %offer.session_id,
+                                error = %error,
+                                "control pong send failed"
+                            );
+                            break;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            session_id = %offer.session_id,
+                            error = %error,
+                            "invalid control application frame"
+                        );
+                        let _ = channel.close().await;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn cmd_sync(
     source: &std::path::Path,
     dest: &std::path::Path,
@@ -371,6 +620,39 @@ async fn cmd_sync(
         tracing::warn!(count = stats.errors, "some records failed to sync");
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "webrtc-transport"))]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn control_listen_cli_contract() {
+        let args = Args::try_parse_from([
+            "memory-sync",
+            "control-listen",
+            "--gateway",
+            "https://gateway.example",
+            "--api-key",
+            "secret",
+            "--identity",
+            "/tmp/device.json",
+            "--workspace",
+            "/tmp/project",
+            "--contact-point",
+            "127.0.0.1:19044",
+            "--existing-schema",
+        ])
+        .expect("parse control-listen");
+
+        assert!(matches!(
+            args.command,
+            Command::ControlListen { workspace, contact_points, existing_schema, .. }
+                if workspace == std::path::Path::new("/tmp/project")
+                    && contact_points == vec!["127.0.0.1:19044"]
+                    && existing_schema
+        ));
+    }
 }
 
 /// Discover tenant IDs present on a cluster.

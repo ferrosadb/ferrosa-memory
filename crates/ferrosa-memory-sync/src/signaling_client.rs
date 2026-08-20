@@ -46,6 +46,49 @@ impl BrokerSessionView {
     }
 }
 
+/// Device-targeted control signaling session returned by `/v1/control`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlBrokerSessionView {
+    /// Ephemeral offer/session token.
+    pub session_id: Uuid,
+    /// `offered` | `accepted` | `closed`.
+    pub phase: String,
+    /// Account owning the controller and server devices.
+    pub account_id: Uuid,
+    /// Mobile controller device fixed at offer time.
+    pub controller_device_id: Uuid,
+    /// Controller's gateway-vouched fingerprint.
+    pub controller_fingerprint: String,
+    /// Exact Ferrosa Memory server device fixed at offer time.
+    pub server_device_id: Uuid,
+    /// Server's gateway-vouched fingerprint, present after acceptance.
+    pub server_fingerprint: Option<String>,
+}
+
+/// Registered gateway device view used by the operator enrollment command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayDeviceView {
+    pub device_id: Uuid,
+    pub public_key: String,
+    pub fingerprint: String,
+    pub label: String,
+    pub revoked_at: Option<String>,
+}
+
+/// Authenticated account identity returned by `/v1/whoami`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayIdentityView {
+    pub account_id: Uuid,
+    pub key_id: Uuid,
+}
+
+impl ControlBrokerSessionView {
+    /// Whether the exact target server accepted the session.
+    pub fn is_accepted(&self) -> bool {
+        self.phase == "accepted"
+    }
+}
+
 /// One relayed signal (wire mirror of the gateway's `Signal`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "payload")]
@@ -115,6 +158,54 @@ pub trait SignalingApi: Send + Sync {
     fn take_signals(
         &self,
         session_id: Uuid,
+    ) -> impl std::future::Future<Output = Result<Vec<BrokerSignal>, SignalingClientError>> + Send;
+}
+
+/// Device-targeted signaling contract for the separate mobile control data
+/// channel. Application commands and events do not transit this API.
+pub trait ControlSignalingApi: Send + Sync {
+    /// Controller offers a session to one exact Ferrosa Memory server device.
+    fn control_offer(
+        &self,
+        server_device_id: Uuid,
+        controller_fingerprint: &str,
+    ) -> impl std::future::Future<Output = Result<Uuid, SignalingClientError>> + Send;
+
+    /// Server lists offers addressed to its own vouched device fingerprint.
+    fn control_pending_offers(
+        &self,
+        fingerprint: &str,
+    ) -> impl std::future::Future<
+        Output = Result<Vec<ControlBrokerSessionView>, SignalingClientError>,
+    > + Send;
+
+    /// Exact target server accepts once with its own vouched fingerprint.
+    fn control_accept(
+        &self,
+        session_id: Uuid,
+        fingerprint: &str,
+    ) -> impl std::future::Future<Output = Result<ControlBrokerSessionView, SignalingClientError>> + Send;
+
+    /// Exact participant reads the current session view.
+    fn control_session(
+        &self,
+        session_id: Uuid,
+        fingerprint: &str,
+    ) -> impl std::future::Future<Output = Result<ControlBrokerSessionView, SignalingClientError>> + Send;
+
+    /// Exact participant posts one SDP/ICE signal to the peer.
+    fn control_post_signal(
+        &self,
+        session_id: Uuid,
+        fingerprint: &str,
+        signal: &BrokerSignal,
+    ) -> impl std::future::Future<Output = Result<(), SignalingClientError>> + Send;
+
+    /// Exact participant drains SDP/ICE signals posted by the peer.
+    fn control_take_signals(
+        &self,
+        session_id: Uuid,
+        fingerprint: &str,
     ) -> impl std::future::Future<Output = Result<Vec<BrokerSignal>, SignalingClientError>> + Send;
 }
 
@@ -204,6 +295,38 @@ impl HttpSignalingClient {
             .map_err(|e| SignalingClientError::Transport(e.to_string()))?;
         Self::check(resp).await.map(|_| ())
     }
+
+    /// Return the authenticated account identity used in approval signatures.
+    pub async fn whoami(&self) -> Result<GatewayIdentityView, SignalingClientError> {
+        self.get_json("/v1/whoami").await
+    }
+
+    /// List all registered devices for the authenticated account.
+    pub async fn devices(&self) -> Result<Vec<GatewayDeviceView>, SignalingClientError> {
+        self.get_json("/v1/devices").await
+    }
+
+    /// List devices still awaiting an enrolled-device signature.
+    pub async fn pending_devices(&self) -> Result<Vec<GatewayDeviceView>, SignalingClientError> {
+        self.get_json("/v1/devices/pending").await
+    }
+
+    /// Approve one exact device with an already-enrolled device signature.
+    pub async fn approve_device(
+        &self,
+        target_device_id: Uuid,
+        approved_by_device_id: Uuid,
+        signature: &str,
+    ) -> Result<(), SignalingClientError> {
+        self.post_json_no_body(
+            &format!("/v1/devices/{target_device_id}/approve"),
+            &serde_json::json!({
+                "approved_by_device_id": approved_by_device_id,
+                "signature": signature,
+            }),
+        )
+        .await
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -270,6 +393,83 @@ impl SignalingApi for HttpSignalingClient {
     }
 }
 
+impl ControlSignalingApi for HttpSignalingClient {
+    async fn control_offer(
+        &self,
+        server_device_id: Uuid,
+        controller_fingerprint: &str,
+    ) -> Result<Uuid, SignalingClientError> {
+        let created: OfferCreated = self
+            .post_json(
+                "/v1/control/offers",
+                &serde_json::json!({
+                    "server_device_id": server_device_id,
+                    "controller_fingerprint": controller_fingerprint,
+                }),
+            )
+            .await?;
+        Ok(created.session_id)
+    }
+
+    async fn control_pending_offers(
+        &self,
+        fingerprint: &str,
+    ) -> Result<Vec<ControlBrokerSessionView>, SignalingClientError> {
+        self.get_json(&format!("/v1/control/offers?fingerprint={fingerprint}"))
+            .await
+    }
+
+    async fn control_accept(
+        &self,
+        session_id: Uuid,
+        fingerprint: &str,
+    ) -> Result<ControlBrokerSessionView, SignalingClientError> {
+        self.post_json(
+            &format!("/v1/control/offers/{session_id}/accept"),
+            &serde_json::json!({"fingerprint": fingerprint}),
+        )
+        .await
+    }
+
+    async fn control_session(
+        &self,
+        session_id: Uuid,
+        fingerprint: &str,
+    ) -> Result<ControlBrokerSessionView, SignalingClientError> {
+        self.get_json(&format!(
+            "/v1/control/sessions/{session_id}?fingerprint={fingerprint}"
+        ))
+        .await
+    }
+
+    async fn control_post_signal(
+        &self,
+        session_id: Uuid,
+        fingerprint: &str,
+        signal: &BrokerSignal,
+    ) -> Result<(), SignalingClientError> {
+        self.post_json_no_body(
+            &format!("/v1/control/sessions/{session_id}/signals"),
+            &serde_json::json!({
+                "fingerprint": fingerprint,
+                "signal": signal,
+            }),
+        )
+        .await
+    }
+
+    async fn control_take_signals(
+        &self,
+        session_id: Uuid,
+        fingerprint: &str,
+    ) -> Result<Vec<BrokerSignal>, SignalingClientError> {
+        self.get_json(&format!(
+            "/v1/control/sessions/{session_id}/signals?fingerprint={fingerprint}"
+        ))
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,5 +504,26 @@ mod tests {
         let view: BrokerSessionView = serde_json::from_value(json).expect("decode");
         assert!(view.is_accepted());
         assert!(view.learner_fingerprint.is_none());
+    }
+
+    #[test]
+    fn control_session_view_decodes_gateway_shape() {
+        let controller_device_id = Uuid::new_v4();
+        let server_device_id = Uuid::new_v4();
+        let json = serde_json::json!({
+            "session_id": Uuid::new_v4(),
+            "phase": "accepted",
+            "account_id": Uuid::new_v4(),
+            "controller_device_id": controller_device_id,
+            "controller_fingerprint": "ab".repeat(32),
+            "server_device_id": server_device_id,
+            "server_fingerprint": "cd".repeat(32),
+        });
+
+        let view: ControlBrokerSessionView = serde_json::from_value(json).expect("decode");
+
+        assert!(view.is_accepted());
+        assert_eq!(view.controller_device_id, controller_device_id);
+        assert_eq!(view.server_device_id, server_device_id);
     }
 }

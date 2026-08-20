@@ -29,6 +29,7 @@ pub mod confidence;
 pub mod config;
 pub mod context_segment;
 pub mod contradiction;
+pub mod control_store;
 pub mod cql_storage;
 pub mod datalog;
 pub mod datalog_filter_expr;
