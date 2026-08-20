@@ -1338,10 +1338,9 @@ async fn connect_session_inner(
         .user(username, password)
         .connection_timeout(std::time::Duration::from_secs(10));
     if configured_nodes_only {
-        let filter = scylla::transport::host_filter::AllowListHostFilter::new(
-            &config.contact_points,
-        )
-        .context("resolving configured CQL contact points for host allow-list")?;
+        let filter =
+            scylla::transport::host_filter::AllowListHostFilter::new(&config.contact_points)
+                .context("resolving configured CQL contact points for host allow-list")?;
         builder = builder.host_filter(Arc::new(filter));
     }
     if let Some(ctx) = build_cql_ssl_context(config)? {
