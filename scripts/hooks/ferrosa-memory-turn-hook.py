@@ -8,9 +8,10 @@ agent turn continues. Use `recall` for pre-turn context injection and
 Correctness: Correct when lifecycle events keep agent turns running, recall
 context is compact and human-usable, and ingestion preserves enough turn
 evidence for later search.
-Last revised: 2026-06-15
-Last changed: Emit recall context only when a result has a positive reranker
-judgment, keeping unjudged or low-confidence searches silent.
+Last revised: 2026-08-20
+Last changed: Recall uses focused query + heuristic decomposition instead of
+full prompt; ingest creates a project entity and learned_in edge so the
+knowledge graph has workspace structure for fusion workspace_weight to boost.
 """
 
 from __future__ import annotations
@@ -156,6 +157,26 @@ def env_csv(name: str, default: set[str]) -> set[str]:
 def parse_csv_set(value: str, default: set[str]) -> set[str]:
     parsed = {item.strip().lower() for item in value.split(",") if item.strip()}
     return parsed or set(default)
+
+
+def extract_focus_query(prompt: str, max_chars: int = 200) -> str:
+    """Extract a focused retrieval query from a full user prompt.
+
+    Instead of passing the entire prompt (often 500+ chars of task context)
+    as the search query, extract the most signal-dense portion: the first
+    sentence or clause, truncated. This matches entity names better because
+    entities are typically short descriptive strings like "Cancel Safety
+    Design Spec" or "RRD materialization streaming boundary", not long
+    multi-clause paragraphs.
+    """
+    if not prompt:
+        return ""
+    # Take the first sentence/clause boundary
+    for separator in (". ", "\n", "; ", ", "):
+        idx = prompt.find(separator)
+        if 0 < idx < max_chars:
+            return prompt[:idx].strip()[:max_chars]
+    return prompt[:max_chars].strip()
 
 
 def query_terms(text: str) -> set[str]:
@@ -594,7 +615,7 @@ def label_memory_piece(kind: str, text: str) -> str:
 
 def result_score(result: dict[str, Any]) -> float | None:
     score = result.get("score")
-    if isinstance(score, int | float):
+    if isinstance(score, (int, float)):
         return float(score)
     if isinstance(score, str):
         try:
@@ -605,7 +626,7 @@ def result_score(result: dict[str, Any]) -> float | None:
 
 
 def judge_score(value: Any) -> float | None:
-    if isinstance(value, int | float):
+    if isinstance(value, (int, float)):
         return float(value)
     if isinstance(value, str):
         try:
@@ -625,7 +646,7 @@ def reranker_judgments(parsed: dict[str, Any], min_judge_score: float) -> dict[s
         return {}
 
     judgments: dict[str, bool] = {}
-    for result_id, score_value in zip(judged_ids, judge_scores, strict=False):
+    for result_id, score_value in zip(judged_ids, judge_scores):
         if not isinstance(result_id, str):
             continue
         score = judge_score(score_value)
@@ -763,7 +784,8 @@ def recall_context(client: McpClient, payload: dict[str, Any], args: argparse.Na
             return []
         search_args = {
             "session_id": session_id,
-            "query": prompt[:4000],
+            "query": extract_focus_query(prompt),
+            "query_decomposition": "heuristic",
             "limit": args.limit,
             "scope": scope,
             "cwd": cwd,
@@ -891,11 +913,30 @@ def ingest_turn(client: McpClient, payload: dict[str, Any], args: argparse.Names
         )
         tenant_id = DEFAULT_TENANT_ID
     try:
+        # Create a project entity for the cwd so the knowledge graph has
+        # workspace structure. This lets workspace_weight in fusion actually
+        # boost entities from the same repo. The project entity is idempotent
+        # (deterministic UUID from the cwd path), so repeated ingests from the
+        # same repo update the same entity.
+        project_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"ferrosa-memory-hook:project:{cwd}"))
+        project_name = os.path.basename(cwd.rstrip("/")) or cwd
         client.call_tool(
             "ingest_entities",
             {
                 "tenant_id": tenant_id,
                 "entities": [
+                    {
+                        "id": project_id,
+                        "name": project_name,
+                        "entity_type": "project",
+                        "context": f"Project workspace at {cwd}",
+                        "confidence": 0.9,
+                        "attrs": {
+                            "cwd": cwd,
+                            "workspace": cwd,
+                            "project_path": cwd,
+                        },
+                    },
                     {
                         "id": entity_id,
                         "name": f"{args.harness} turn {turn_id}",
@@ -903,9 +944,20 @@ def ingest_turn(client: McpClient, payload: dict[str, Any], args: argparse.Names
                         "context": text[:16000],
                         "confidence": 0.7,
                         "attrs": common_attrs,
-                    }
+                    },
                 ],
-                "edges": [],
+                "edges": [
+                    {
+                        "src_id": entity_id,
+                        "dst_id": project_id,
+                        "edge_type": "learned_in",
+                        "weight": 0.9,
+                        "metadata": {
+                            "source": "ferrosa-memory-hook",
+                            "harness": args.harness,
+                        },
+                    },
+                ],
                 "options": {
                     "embed_missing": False,
                     "on_conflict": "skip",
