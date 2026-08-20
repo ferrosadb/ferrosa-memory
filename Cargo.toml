@@ -3,7 +3,7 @@ members = ["crates/ferrosa-memory-core", "crates/ferrosa-memory-mcp", "crates/fe
 resolver = "2"
 
 [workspace.package]
-version = "0.23.0"
+version = "0.28.0-nightly"
 edition = "2024"
 license = "Apache-2.0"
 
