@@ -146,6 +146,34 @@ enum Command {
         #[arg(long)]
         existing_schema: bool,
     },
+    /// Offer a control session to one Ferrosa Memory server device, bind the
+    /// signed WebRTC channel, and exchange typed control text over it.
+    ///
+    /// This is the controller half of `control-listen`. It exists so the
+    /// transport can be exercised machine-to-machine, through the real
+    /// gateway, before a mobile shell is the first client — debugging the
+    /// transport and a UniFFI/Swift binding at the same time is a bad trade.
+    /// It also serves as the executable reference for what the mobile
+    /// controller must do.
+    #[cfg(feature = "webrtc-transport")]
+    ControlConnect {
+        /// Gateway base URL.
+        #[arg(long)]
+        gateway: String,
+        /// API key; falls back to $FERROSA_MAAS_API_KEY.
+        #[arg(long, env = "FERROSA_MAAS_API_KEY")]
+        api_key: String,
+        /// This controller's registered device key file (from p2p-keygen).
+        #[arg(long)]
+        identity: std::path::PathBuf,
+        /// Device id of the Ferrosa Memory server to control.
+        #[arg(long)]
+        server_device: Uuid,
+        /// Send one line, print the reply, and exit. Without this the session
+        /// stays open and relays stdin lines until EOF.
+        #[arg(long)]
+        send: Option<String>,
+    },
 }
 
 #[derive(Default)]
@@ -232,6 +260,16 @@ async fn main() -> anyhow::Result<()> {
                 existing_schema,
             )
             .await
+        }
+        #[cfg(feature = "webrtc-transport")]
+        Command::ControlConnect {
+            gateway,
+            api_key,
+            identity,
+            server_device,
+            send,
+        } => {
+            cmd_control_connect(&gateway, &api_key, &identity, server_device, send.as_deref()).await
         }
     }
 }
@@ -417,6 +455,73 @@ async fn cmd_p2p_receive(
 }
 
 #[cfg(feature = "webrtc-transport")]
+/// Controller half of `control-listen`: offer a session to one server device,
+/// bind the signed channel, and relay text over it.
+///
+/// Deliberately has no Ferrosa store and no Codex runtime. The controller is a
+/// thin client — every durable effect belongs to the server side — so this
+/// stays a faithful model of what the mobile shell will do, and a failure here
+/// implicates the transport rather than local storage.
+#[cfg(feature = "webrtc-transport")]
+async fn cmd_control_connect(
+    gateway: &str,
+    api_key: &str,
+    identity_path: &std::path::Path,
+    server_device: Uuid,
+    send: Option<&str>,
+) -> anyhow::Result<()> {
+    use ferrosa_memory_sync::control_session::{
+        ControlSessionConfig, run_control_controller_session,
+    };
+    use ferrosa_memory_sync::peer_cli;
+    use ferrosa_memory_sync::signaling_client::{ControlSignalingApi, HttpSignalingClient};
+
+    let identity = peer_cli::load_identity(identity_path)?;
+    let fingerprint = identity.public_identity().public_key_fingerprint.0;
+    let api = HttpSignalingClient::new(gateway, api_key);
+    let config = ControlSessionConfig::default();
+
+    println!("controller device fingerprint: {fingerprint}");
+    println!("offering control session to server device {server_device} via {gateway}");
+
+    let session_id = api
+        .control_offer(server_device, &fingerprint)
+        .await
+        .context("offering the control session to the gateway")?;
+    println!("session {session_id} offered; waiting for the server to accept and bind");
+
+    // Binds the signed WebRTC channel. The identity is checked against the
+    // gateway-vouched fingerprint pair inside, so a mis-vouched session fails
+    // here rather than after data flows.
+    let mut channel = run_control_controller_session(&api, &identity, session_id, &config)
+        .await
+        .context("binding the direct control channel")?;
+    println!("session {session_id} bound directly");
+
+    match send {
+        Some(line) => {
+            channel.send_text(line).await.context("sending control text")?;
+            let reply = channel.recv_text().await.context("awaiting control reply")?;
+            println!("{reply}");
+        }
+        None => {
+            use tokio::io::AsyncBufReadExt;
+
+            println!("relaying stdin; EOF to close");
+            let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+            while let Some(line) = lines.next_line().await.context("reading stdin")? {
+                channel.send_text(&line).await.context("sending control text")?;
+                let reply = channel.recv_text().await.context("awaiting control reply")?;
+                println!("{reply}");
+            }
+        }
+    }
+
+    channel.close().await.context("closing the control channel")?;
+    println!("session {session_id} closed");
+    Ok(())
+}
+
 async fn cmd_control_listen(
     gateway: &str,
     api_key: &str,
