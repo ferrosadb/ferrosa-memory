@@ -11,7 +11,7 @@
 #   README.md
 #   config/ferrosa-memory.example.toml   (if present)
 #   examples/<template>                  (HTTP/auth templates for binary installs)
-#   launchd/com.ferrosa-memory.mcp.plist (if present)
+#   launchd/com.ferrosa-memory.mcp.plist.in (if present)
 #   systemd/ferrosa-memory.service       (if present)
 #   skills/<skill>/SKILL.md              (portable agent skills, if present)
 
@@ -52,7 +52,7 @@ done
 
 for entry in \
     "config/ferrosa-memory.example.toml" \
-    "launchd/com.ferrosa-memory.mcp.plist" \
+    "launchd/com.ferrosa-memory.mcp.plist.in" \
     "systemd/ferrosa-memory.service"; do
   if [[ -f "$entry" ]]; then
     mkdir -p "${STAGE}/$(dirname "$entry")"
