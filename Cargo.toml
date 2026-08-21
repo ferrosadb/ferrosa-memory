@@ -53,6 +53,11 @@ rand = "0.8"
 # MaaS P2P WebRTC transport (ferrosa-memory-sync, behind the `webrtc-transport`
 # feature so non-P2P builds don't pull the ICE/DTLS/SCTP/SRTP tree). Provides
 # the concrete RTCDataChannel that backs peer_transport::DataChannel (MAAS-T-25b).
+# Held at 0.17 deliberately. 0.20 restructured the crate into a thin async
+# layer over a Sans-I/O `rtc` core: webrtc::api, webrtc::interceptor and
+# webrtc::ice_transport are gone, APIBuilder became PeerConnectionBuilder, and
+# every on_*() callback became a PeerConnectionEventHandler method. That is a
+# port of the P2P event model, not an upgrade. See .github/dependabot.yml.
 webrtc = "0.17"
 bytes = "1"
 # digest 0.11 changed finalize() output to hybrid_array::Array, which doesn't
