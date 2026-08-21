@@ -462,7 +462,7 @@ impl Default for SearchConfig {
 /// and other signals without recompiling.
 ///
 /// Weights must be in `[0.0, 10.0]`. Set to `0.0` to disable a signal.
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Default)]
 pub struct FusionTuningConfig {
     /// Override workspace affinity weight. Boosts entities learned in or near
     /// the caller's working directory. Default `None` (profile decides).
@@ -518,30 +518,6 @@ pub struct FusionTuningConfig {
     /// Override reputation weight. Default `None`.
     #[serde(default)]
     pub reputation_weight: Option<f64>,
-}
-
-impl Default for FusionTuningConfig {
-    fn default() -> Self {
-        Self {
-            workspace_weight: None,
-            datalog_frontier_weight: None,
-            ann_weight: None,
-            fold_weight: None,
-            context_bm25_weight: None,
-            context_ann_weight: None,
-            document_bm25_weight: None,
-            document_ann_weight: None,
-            phonetic_weight: None,
-            document_phonetic_weight: None,
-            entity_content_fts_weight: None,
-            scene_weight: None,
-            profile_weight: None,
-            foresight_weight: None,
-            warmth_weight: None,
-            pagerank_weight: None,
-            reputation_weight: None,
-        }
-    }
 }
 
 impl FusionTuningConfig {

@@ -12309,8 +12309,7 @@ mod tests {
         };
         let selected = select_auto_fusion_profile("project-b app roster events RSVP", &filter);
         assert_eq!(
-            selected.profile,
-            "bm25-semantic-workspace",
+            selected.profile, "bm25-semantic-workspace",
             "default query with workspace cwd must use workspace profile, got {}",
             selected.profile
         );
@@ -12334,10 +12333,10 @@ mod tests {
             workspace_cwd: Some("/repo/project-c".into()),
             ..Default::default()
         };
-        let selected = select_auto_fusion_profile("explain the architecture of the storage engine", &filter);
+        let selected =
+            select_auto_fusion_profile("explain the architecture of the storage engine", &filter);
         assert_eq!(
-            selected.profile,
-            "bm25-semantic-workspace",
+            selected.profile, "bm25-semantic-workspace",
             "broad semantic with workspace must use workspace profile"
         );
         assert_eq!(selected.intent, "broad_semantic_workspace");
@@ -12355,14 +12354,20 @@ mod tests {
         // Verify that FusionTuningConfig.apply_overrides can set workspace_weight
         // even when the selected profile zeros it (like "auto" does).
         let mut config = crate::hybrid_search::FusionConfig::profile("auto").unwrap();
-        assert_eq!(config.workspace_weight, 0.0, "auto profile must zero workspace_weight");
+        assert_eq!(
+            config.workspace_weight, 0.0,
+            "auto profile must zero workspace_weight"
+        );
 
         let tuning = crate::config::FusionTuningConfig {
             workspace_weight: Some(2.0),
             ..Default::default()
         };
         tuning.apply_overrides(&mut config);
-        assert_eq!(config.workspace_weight, 2.0, "override must set workspace_weight to 2.0");
+        assert_eq!(
+            config.workspace_weight, 2.0,
+            "override must set workspace_weight to 2.0"
+        );
     }
 
     /// Extract the inner tool result from MCP CallToolResult wrapper.
