@@ -16,10 +16,11 @@ pub fn encode_vector(values: &[f32]) -> Vec<u8> {
 
 /// Deserialize CQL VECTOR wire format to `Vec<f32>`.
 pub fn decode_vector(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect()
+    // `as_chunks` yields `&[u8; 4]` directly, so `from_be_bytes` takes the
+    // array without rebuilding it index by index. A trailing partial chunk is
+    // dropped, matching the previous `chunks_exact` behaviour.
+    let (quads, _remainder) = bytes.as_chunks::<4>();
+    quads.iter().copied().map(f32::from_be_bytes).collect()
 }
 
 #[cfg(test)]
