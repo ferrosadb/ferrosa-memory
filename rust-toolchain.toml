@@ -12,6 +12,6 @@
 # default stable can't silently diverge. Bump this in lockstep with the CI
 # toolchain (.github/workflows/ci.yml, dtolnay/rust-toolchain).
 [toolchain]
-channel = "1.96.0"
+channel = "1.98.0"
 components = ["rustfmt", "clippy", "llvm-tools-preview"]
 profile = "minimal"
