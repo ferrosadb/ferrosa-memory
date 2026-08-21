@@ -115,7 +115,10 @@ fn parse_hex32(hex: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut out = [0u8; 32];
-    for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+    // The length check above guarantees 32 whole pairs and an empty remainder;
+    // `as_chunks` yields `&[u8; 2]`, so the pair length is known at compile time.
+    let (pairs, _remainder) = hex.as_bytes().as_chunks::<2>();
+    for (i, chunk) in pairs.iter().enumerate() {
         let hi = hex_digit(*chunk.first()?)?;
         let lo = hex_digit(*chunk.get(1)?)?;
         *out.get_mut(i)? = (hi << 4) | lo;
@@ -217,6 +220,28 @@ impl PackApplyStore for DirPackApplyStore {
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    /// `parse_hex32` decodes every byte value, and rejects malformed input.
+    ///
+    /// Cover for the `as_chunks::<2>()` rewrite: the decoder indexes into
+    /// fixed-size pairs now, so a mistake here would silently mis-decode key
+    /// material rather than fail to compile.
+    #[test]
+    fn parse_hex32_roundtrips_every_byte_value_and_rejects_garbage() {
+        let mut key = [0u8; 32];
+        for (i, slot) in key.iter_mut().enumerate() {
+            // 0, 8, 16 ... 248 — spans the low and high nibble ranges.
+            *slot = (i as u8).wrapping_mul(8);
+        }
+        let encoded = hex_encode(&key);
+        assert_eq!(encoded.len(), 64);
+        assert_eq!(parse_hex32(&encoded), Some(key));
+
+        assert_eq!(parse_hex32(""), None, "empty input");
+        assert_eq!(parse_hex32(&encoded[..62]), None, "too short");
+        assert_eq!(parse_hex32(&format!("{encoded}00")), None, "too long");
+        assert_eq!(parse_hex32(&"zz".repeat(32)), None, "non-hex digits");
+    }
 
     #[test]
     fn keygen_roundtrips_through_the_key_file() {

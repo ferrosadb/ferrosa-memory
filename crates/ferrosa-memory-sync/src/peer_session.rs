@@ -198,7 +198,10 @@ fn parse_hex32(hex: &str) -> Result<[u8; 32], PeerSessionError> {
         ));
     }
     let mut out = [0u8; 32];
-    for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+    // The length check above guarantees 32 whole pairs and an empty remainder;
+    // `as_chunks` yields `&[u8; 2]`, so the pair length is known at compile time.
+    let (pairs, _remainder) = hex.as_bytes().as_chunks::<2>();
+    for (i, chunk) in pairs.iter().enumerate() {
         let hi = hex_val(chunk.first().copied())
             .ok_or_else(|| PeerSessionError::Attestation("ephemeral key must be hex".into()))?;
         let lo = hex_val(chunk.get(1).copied())

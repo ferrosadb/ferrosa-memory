@@ -280,7 +280,10 @@ fn parse_hex_32(value: &str) -> Result<[u8; 32], ControlSessionError> {
         ));
     }
     let mut output = [0_u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    // The length check above guarantees 32 whole pairs and an empty remainder;
+    // `as_chunks` yields `&[u8; 2]`, so the pair length is known at compile time.
+    let (pairs, _remainder) = value.as_bytes().as_chunks::<2>();
+    for (index, pair) in pairs.iter().enumerate() {
         let high = hex_value(pair.first().copied()).ok_or_else(|| {
             ControlSessionError::Attestation("ephemeral key must be hexadecimal".to_owned())
         })?;
@@ -1327,6 +1330,28 @@ mod tests {
 
     fn identity() -> InstanceSigningIdentity {
         InstanceSigningIdentity::generate(InstanceId::new())
+    }
+
+    /// `parse_hex_32` decodes every byte value, and rejects malformed input.
+    ///
+    /// Cover for the `as_chunks::<2>()` rewrite: the decoder walks fixed-size
+    /// pairs now, so a mistake here would silently mis-decode an ephemeral key
+    /// rather than fail to compile.
+    #[test]
+    fn parse_hex_32_roundtrips_every_byte_value_and_rejects_garbage() {
+        let mut key = [0_u8; 32];
+        for (i, slot) in key.iter_mut().enumerate() {
+            // 0, 8, 16 ... 248 — spans the low and high nibble ranges.
+            *slot = (i as u8).wrapping_mul(8);
+        }
+        let encoded = hex_32(&key);
+        assert_eq!(encoded.len(), 64);
+        assert_eq!(parse_hex_32(&encoded).expect("valid hex decodes"), key);
+
+        assert!(parse_hex_32("").is_err(), "empty input");
+        assert!(parse_hex_32(&encoded[..62]).is_err(), "too short");
+        assert!(parse_hex_32(&format!("{encoded}00")).is_err(), "too long");
+        assert!(parse_hex_32(&"zz".repeat(32)).is_err(), "non-hex digits");
     }
 
     #[test]
