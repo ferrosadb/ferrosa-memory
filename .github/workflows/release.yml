@@ -43,18 +43,22 @@ jobs:
         run: |
           cargo build --release --target x86_64-unknown-linux-musl -p ferrosa-memory-mcp
           cargo build --release --target x86_64-unknown-linux-musl -p fmem-cli
-          # memory-sync is NOT built for musl here, deliberately.
+          # A hosted memory on linux is the case where remote control matters
+          # most, so the listener ships here too.
           #
-          # webrtc-transport pulls the webrtc-rs ICE/DTLS/SCTP stack and a
-          # rustls ring provider. Whether that links against musl has not been
-          # verified, and an unverified addition to the release path fails the
-          # RELEASE, not a feature branch -- every future release would be
-          # blocked by it. A hosted memory on linux is the case where remote
-          # control matters most, so this is worth doing; it is worth doing
-          # after someone has built it once.
+          # The C dependencies this adds are NOT new: ferrosa-memory-mcp, which
+          # this job already builds for musl today, pulls the same
+          # ring 0.17.14 and aws-lc-sys 0.40.0, and openssl-sys arrives through
+          # ferrosa-memory-core and scylla for both. So the musl C toolchain
+          # this needs is the one already in use. What webrtc-transport adds on
+          # top is the pure-Rust webrtc-rs ICE/DTLS/SCTP stack, and
+          # control_session.rs carries no platform gates at all.
+          cargo build --release --target x86_64-unknown-linux-musl -p ferrosa-memory-sync \
+            --features webrtc-transport
           strip target/x86_64-unknown-linux-musl/release/ferrosa-memory
           strip target/x86_64-unknown-linux-musl/release/ferrosa-memory-mcp
           strip target/x86_64-unknown-linux-musl/release/fmem
+          strip target/x86_64-unknown-linux-musl/release/memory-sync
           file target/x86_64-unknown-linux-musl/release/ferrosa-memory
           file target/x86_64-unknown-linux-musl/release/ferrosa-memory-mcp
 
@@ -143,13 +147,15 @@ jobs:
         run: |
           cross build --release --target aarch64-unknown-linux-musl -p ferrosa-memory-mcp
           cross build --release --target aarch64-unknown-linux-musl -p fmem-cli
-          # memory-sync is not built here either; see the x86_64 job for why.
+          cross build --release --target aarch64-unknown-linux-musl -p ferrosa-memory-sync \
+            --features webrtc-transport
           if ! command -v aarch64-linux-gnu-strip >/dev/null 2>&1; then
             sudo apt-get update && sudo apt-get install -y binutils-aarch64-linux-gnu
           fi
           aarch64-linux-gnu-strip target/aarch64-unknown-linux-musl/release/ferrosa-memory
           aarch64-linux-gnu-strip target/aarch64-unknown-linux-musl/release/ferrosa-memory-mcp
           aarch64-linux-gnu-strip target/aarch64-unknown-linux-musl/release/fmem
+          aarch64-linux-gnu-strip target/aarch64-unknown-linux-musl/release/memory-sync
 
       - name: Stage tarball
         run: |
