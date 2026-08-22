@@ -9,7 +9,7 @@
 //! The code travels terminal → human → browser. The secret ([`Grant::device_code`])
 //! stays in this process; the thing printed on screen is useless without it. A
 //! design where the browser shows a code to paste back here would make the
-//! screen the enrolment authority, which is what this direction avoids.
+//! screen the enrollment authority, which is what this direction avoids.
 //!
 //! Correctness: Correct when the CLI never claims success it was not told, and
 //! when a terminal server response ends the loop instead of spinning.
@@ -40,7 +40,7 @@ pub struct Grant {
 
 /// What the device became, once a human approved it.
 #[derive(Debug, Clone, Deserialize)]
-pub struct Enrolment {
+pub struct Enrollment {
     /// Device id the gateway assigned.
     pub device_id: String,
     /// Server-derived fingerprint.
@@ -141,7 +141,7 @@ pub async fn wait_for_approval<F>(
     base_url: &str,
     grant: &Grant,
     mut on_wait: F,
-) -> Result<Enrolment, AuthError>
+) -> Result<Enrollment, AuthError>
 where
     F: FnMut(Duration),
 {
@@ -239,24 +239,24 @@ mod tests {
 
     /// The exact body the deployed server returns on success.
     #[test]
-    fn an_enrolment_parses_from_the_servers_shape() {
+    fn an_enrollment_parses_from_the_servers_shape() {
         let body = r#"{
             "status":"approved",
             "device_id":"11111111-1111-4111-8111-111111111111",
             "fingerprint":"a8b5d7b0",
             "email":"ben@example.com"
         }"#;
-        let done: Enrolment = serde_json::from_str(body).expect("parses");
+        let done: Enrollment = serde_json::from_str(body).expect("parses");
         assert_eq!(done.email.as_deref(), Some("ben@example.com"));
         assert_eq!(done.fingerprint, "a8b5d7b0");
     }
 
-    /// An enrolment with no email must still parse — the field is optional and
+    /// An enrollment with no email must still parse — the field is optional and
     /// a provider that does not release it must not break the flow.
     #[test]
-    fn an_enrolment_without_an_email_still_parses() {
+    fn an_enrollment_without_an_email_still_parses() {
         let body = r#"{"device_id":"d","fingerprint":"f","email":null}"#;
-        let done: Enrolment = serde_json::from_str(body).expect("parses");
+        let done: Enrollment = serde_json::from_str(body).expect("parses");
         assert!(done.email.is_none());
     }
 

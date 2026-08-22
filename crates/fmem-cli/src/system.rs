@@ -68,20 +68,33 @@ impl MemorySystem {
             .join(format!("{}.json", self.port))
     }
 
-    /// Where this system's enrolment record lives.
+    /// Where this system's enrollment record lives.
     ///
     /// Beside the key rather than inside it: the key file keeps the shape
     /// `memory-sync p2p-keygen` writes and `load_identity` reads, so the same
     /// file still works for `control-listen` and friends. Widening that struct
     /// would fork the format for no gain.
     #[must_use]
-    pub fn enrolment_path(&self, root: &Path) -> PathBuf {
-        root.join("config")
+    ///
+    /// Falls back to the pre-rename `<port>.enrolment.json` when only that
+    /// exists, for the same reason the legacy contract is accepted: a record on
+    /// disk describes a live device, and ignoring it would enroll it twice.
+    pub fn enrollment_path(&self, root: &Path) -> PathBuf {
+        let current = root
+            .join("config")
             .join("devices")
-            .join(format!("{}.enrolment.json", self.port))
+            .join(format!("{}.enrollment.json", self.port));
+        if current.exists() {
+            return current;
+        }
+        let legacy = root
+            .join("config")
+            .join("devices")
+            .join(format!("{}.enrolment.json", self.port));
+        if legacy.exists() { legacy } else { current }
     }
 
-    /// The label this system enrols under when the operator does not choose.
+    /// The label this system enrolls under when the operator does not choose.
     ///
     /// Host AND port, because several memory systems on one machine would
     /// otherwise arrive in the device list with identical names, and the list
@@ -196,7 +209,7 @@ mod tests {
     }
 
     /// The rule that matters. Guessing binds an IMMUTABLE kind to the wrong
-    /// keypair, and the only fix is revoke-and-re-enrol.
+    /// keypair, and the only fix is revoke-and-re-enroll.
     #[test]
     fn several_systems_refuse_rather_than_guess() {
         let tmp = tempfile::tempdir().expect("tmp");
@@ -309,7 +322,7 @@ mod tests {
         };
 
         assert_ne!(a.key_path(root), b.key_path(root));
-        assert_ne!(a.key_path(root), a.enrolment_path(root));
+        assert_ne!(a.key_path(root), a.enrollment_path(root));
         assert_eq!(a.key_path(root), root.join("config/devices/43971.json"));
         assert_ne!(a.key_path(root), root.join("config/device.json"));
     }
