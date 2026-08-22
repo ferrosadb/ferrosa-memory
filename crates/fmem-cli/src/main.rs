@@ -312,8 +312,12 @@ async fn devices(cli: &Cli, root: &Path) -> Result<()> {
         } else {
             ""
         };
+        // The device id is printed because it is what the gateway and every
+        // listener log line refer to. Without it, correlating "controller
+        // device 2320ee44" against a row in this list means asking the server
+        // again by hand.
         println!(
-            "{:<8} {:<28} {}{}{}",
+            "{:<8} {:<24} {:<38} {}{}{}",
             // Absent kind is shown as such rather than as "control": the
             // gateway defaults it, but a blank here means this gateway did not
             // report one, which is a different fact.
@@ -322,6 +326,10 @@ async fn devices(cli: &Cli, root: &Path) -> Result<()> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("(none)"),
             device.get("label").and_then(|v| v.as_str()).unwrap_or(""),
+            device
+                .get("device_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no id)"),
             group(fingerprint),
             marker,
             revoked
