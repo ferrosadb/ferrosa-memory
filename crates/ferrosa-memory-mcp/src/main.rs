@@ -727,6 +727,29 @@ fn startup_default_session_id(config: &Config, repo: &str) -> anyhow::Result<uui
     Ok(uuid::Uuid::new_v4())
 }
 
+/// Tenants the HTTP consolidation worker should poll.
+///
+/// Reads them from the auth file, because in HTTP mode that is the only place
+/// a tenant is declared — `server.tenant_id` is rejected outright. Returns an
+/// empty vec rather than a fallback: a background worker with an invented
+/// tenant is indistinguishable from one that is working and finds nothing to
+/// do, which is exactly how this went unnoticed for two months.
+fn http_consolidation_tenants(config: &Config) -> Vec<uuid::Uuid> {
+    let Some(auth_file) = config.server.auth_file.as_deref() else {
+        return Vec::new();
+    };
+    match auth::FileAuthValidator::from_path(auth_file) {
+        Ok(v) => v.tenants(),
+        Err(e) => {
+            tracing::error!(
+                auth_file,
+                "cannot read auth file for consolidation tenants: {e}"
+            );
+            Vec::new()
+        }
+    }
+}
+
 #[cfg(test)]
 fn build_http_validator(config: &Config) -> anyhow::Result<Arc<http::CredentialValidator>> {
     validate_shared_http_config(config)?;
@@ -3839,29 +3862,61 @@ async fn main() -> anyhow::Result<()> {
             spawn_debug_stop_monitor(&config, &session);
 
             // Spawn the cross-replica consolidation worker for HTTP too.
+            //
+            // One worker PER CONFIGURED TENANT, taken from the auth file.
+            //
+            // This used to pass `authenticate_stdio(stdio_tenant_id(&config))`,
+            // and that could never work in HTTP mode. `stdio_tenant_id` falls
+            // back to `Uuid::new_v4()` when `server.tenant_id` is unset, and
+            // `validate_shared_http_config` REFUSES to start an HTTP server
+            // that sets it ("HTTP transport must not use server.tenant_id
+            // fallback"). So the key is guaranteed absent, the fallback always
+            // fires, and the worker polled a freshly-invented tenant that owned
+            // nothing — every tick, forever.
+            //
+            // Observed 2026-08-22 on the live cluster: 275 consolidation
+            // requests spanning 2026-06-28 to that day, 270 with
+            // attempt_count = 0, zero rows in consolidation_runs, and five
+            // leases stranded since 2026-06-30. Consolidation had never run.
+            // The same fallback also left 63 orphan tenants in entity_store,
+            // one per server boot.
+            //
+            // In HTTP mode the auth principals ARE the tenant list; there is no
+            // other source of truth. If it is empty the worker is not started
+            // and says so, rather than inventing an identity to poll with.
             if config.consolidation.enabled {
-                let lease_owner = format!("{}@{}", Uuid::new_v4(), std::process::id());
-                let consolidation_session = Arc::clone(&session);
-                let consolidation_storage = Arc::clone(&storage);
-                let consolidation_ctx = Arc::new(auth::authenticate_stdio(tenant_id));
-                spawn_critical(
-                    "consolidation_worker_loop",
-                    consolidation_worker_loop(
-                        consolidation_session,
-                        consolidation_storage,
-                        consolidation_ctx,
-                        lease_owner,
-                        config.consolidation.clone(),
-                        Arc::clone(&metrics),
-                    ),
-                );
-                tracing::info!(
-                    poll_seconds = config.consolidation.poll_seconds,
-                    lease_seconds = config.consolidation.lease_seconds,
-                    decay_factor = config.consolidation.edge_decay_factor,
-                    prune_days = config.consolidation.stale_edge_max_days,
-                    "consolidation worker enabled (http transport)"
-                );
+                let tenants = http_consolidation_tenants(&config);
+                if tenants.is_empty() {
+                    tracing::error!(
+                        auth_file = ?config.server.auth_file,
+                        "consolidation is enabled but no tenant could be resolved from the \
+                         auth file; NOT starting the worker. Pending consolidation requests \
+                         will accumulate unprocessed until a principal is configured."
+                    );
+                } else {
+                    for tenant in &tenants {
+                        let lease_owner = format!("{}@{}", Uuid::new_v4(), std::process::id());
+                        spawn_critical(
+                            "consolidation_worker_loop",
+                            consolidation_worker_loop(
+                                Arc::clone(&session),
+                                Arc::clone(&storage),
+                                Arc::new(auth::authenticate_stdio(*tenant)),
+                                lease_owner,
+                                config.consolidation.clone(),
+                                Arc::clone(&metrics),
+                            ),
+                        );
+                    }
+                    tracing::info!(
+                        tenants = tenants.len(),
+                        poll_seconds = config.consolidation.poll_seconds,
+                        lease_seconds = config.consolidation.lease_seconds,
+                        decay_factor = config.consolidation.edge_decay_factor,
+                        prune_days = config.consolidation.stale_edge_max_days,
+                        "consolidation worker enabled (http transport)"
+                    );
+                }
             }
 
             http::serve_http(
