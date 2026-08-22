@@ -68,9 +68,6 @@ enum Command {
         /// Gateway base URL.
         #[arg(long)]
         gateway: String,
-        /// API key; falls back to $FERROSA_MAAS_API_KEY.
-        #[arg(long, env = "FERROSA_MAAS_API_KEY")]
-        api_key: String,
         /// Already-approved device key file (from p2p-keygen).
         #[arg(long)]
         identity: std::path::PathBuf,
@@ -85,10 +82,8 @@ enum Command {
         /// Gateway base URL (e.g. https://gw.example).
         #[arg(long)]
         gateway: String,
-        /// API key; falls back to $FERROSA_MAAS_API_KEY.
-        #[arg(long, env = "FERROSA_MAAS_API_KEY")]
-        api_key: String,
-        /// Device key file (from p2p-keygen; its key must be registered).
+        /// Enrolled device key file. The ONLY credential — it signs every
+        /// request, so no bearer key sits on this machine.
         #[arg(long)]
         identity: std::path::PathBuf,
         /// The learner's account id (must be a mutual contact).
@@ -108,10 +103,8 @@ enum Command {
         /// Gateway base URL.
         #[arg(long)]
         gateway: String,
-        /// API key; falls back to $FERROSA_MAAS_API_KEY.
-        #[arg(long, env = "FERROSA_MAAS_API_KEY")]
-        api_key: String,
-        /// Device key file (from p2p-keygen; its key must be registered).
+        /// Enrolled device key file. The ONLY credential — it signs every
+        /// request, so no bearer key sits on this machine.
         #[arg(long)]
         identity: std::path::PathBuf,
         /// Landing directory for applied packs (durable JSON; the
@@ -130,10 +123,11 @@ enum Command {
         /// Gateway base URL.
         #[arg(long)]
         gateway: String,
-        /// API key; falls back to $FERROSA_MAAS_API_KEY.
-        #[arg(long, env = "FERROSA_MAAS_API_KEY")]
-        api_key: String,
-        /// Registered device key file (from p2p-keygen).
+        /// Enrolled device key file (from `fmem login` or `p2p-keygen`).
+        ///
+        /// The ONLY credential. This path no longer takes an API key: the
+        /// identity signs every request, so there is no bearer secret sitting
+        /// on the machine for an attacker to lift.
         #[arg(long)]
         identity: std::path::PathBuf,
         /// One absolute project directory available to the managed Codex CLI.
@@ -183,41 +177,27 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "webrtc-transport")]
         Command::DeviceApprove {
             gateway,
-            api_key,
             identity,
             device_id,
-        } => cmd_device_approve(&gateway, &api_key, &identity, device_id).await,
+        } => cmd_device_approve(&gateway, &identity, device_id).await,
         #[cfg(feature = "webrtc-transport")]
         Command::P2pShare {
             gateway,
-            api_key,
             identity,
             learner_account,
             selection,
             namespace,
-        } => {
-            cmd_p2p_share(
-                &gateway,
-                &api_key,
-                &identity,
-                learner_account,
-                &selection,
-                &namespace,
-            )
-            .await
-        }
+        } => cmd_p2p_share(&gateway, &identity, learner_account, &selection, &namespace).await,
         #[cfg(feature = "webrtc-transport")]
         Command::P2pReceive {
             gateway,
-            api_key,
             identity,
             out_dir,
             session,
-        } => cmd_p2p_receive(&gateway, &api_key, &identity, &out_dir, session).await,
+        } => cmd_p2p_receive(&gateway, &identity, &out_dir, session).await,
         #[cfg(feature = "webrtc-transport")]
         Command::ControlListen {
             gateway,
-            api_key,
             identity,
             workspace,
             contact_points,
@@ -225,7 +205,6 @@ async fn main() -> anyhow::Result<()> {
         } => {
             cmd_control_listen(
                 &gateway,
-                &api_key,
                 &identity,
                 &workspace,
                 &contact_points,
@@ -256,16 +235,21 @@ fn cmd_p2p_keygen(out: &std::path::Path) -> anyhow::Result<()> {
 #[cfg(feature = "webrtc-transport")]
 async fn cmd_device_approve(
     gateway: &str,
-    api_key: &str,
     identity_path: &std::path::Path,
     target_device_id: Uuid,
 ) -> anyhow::Result<()> {
     use ferrosa_memory_sync::peer_cli;
     use ferrosa_memory_sync::signaling_client::HttpSignalingClient;
 
-    let identity = peer_cli::load_identity(identity_path)?;
+    let identity = std::sync::Arc::new(peer_cli::load_identity(identity_path)?);
     let fingerprint = identity.public_identity().public_key_fingerprint.0;
-    let api = HttpSignalingClient::new(gateway, api_key);
+    // The approving device signs for itself. It already had to prove possession
+    // of an enrolled key to be allowed to vouch at all, so an API key here was
+    // a second, weaker credential doing no additional work.
+    let api = HttpSignalingClient::with_credential(
+        gateway,
+        ferrosa_memory_sync::signaling_client::Credential::device(std::sync::Arc::clone(&identity)),
+    );
     let account = api.whoami().await?;
     let devices = api.devices().await?;
     let approver = devices
@@ -299,7 +283,6 @@ async fn cmd_device_approve(
 #[cfg(feature = "webrtc-transport")]
 async fn cmd_p2p_share(
     gateway: &str,
-    api_key: &str,
     identity_path: &std::path::Path,
     learner_account: Uuid,
     selection_path: &std::path::Path,
@@ -310,11 +293,14 @@ async fn cmd_p2p_share(
     use ferrosa_memory_sync::peer_cli;
     use ferrosa_memory_sync::peer_session::{PeerSessionConfig, run_teacher_session};
     use ferrosa_memory_sync::replication::{PackBuildParams, TeacherSelection};
-    use ferrosa_memory_sync::signaling_client::{HttpSignalingClient, SignalingApi};
+    use ferrosa_memory_sync::signaling_client::{Credential, HttpSignalingClient, SignalingApi};
 
-    let identity = peer_cli::load_identity(identity_path)?;
+    let identity = std::sync::Arc::new(peer_cli::load_identity(identity_path)?);
     let selection: TeacherSelection = serde_json::from_slice(&std::fs::read(selection_path)?)?;
-    let api = HttpSignalingClient::new(gateway, api_key);
+    let api = HttpSignalingClient::with_credential(
+        gateway,
+        Credential::device(std::sync::Arc::clone(&identity)),
+    );
     let public = identity.public_identity();
 
     let pack_id = Uuid::new_v4();
@@ -363,17 +349,19 @@ async fn cmd_p2p_share(
 #[cfg(feature = "webrtc-transport")]
 async fn cmd_p2p_receive(
     gateway: &str,
-    api_key: &str,
     identity_path: &std::path::Path,
     out_dir: &std::path::Path,
     session: Option<Uuid>,
 ) -> anyhow::Result<()> {
     use ferrosa_memory_sync::peer_cli::{self, DirPackApplyStore};
     use ferrosa_memory_sync::peer_session::{PeerSessionConfig, run_learner_session};
-    use ferrosa_memory_sync::signaling_client::{HttpSignalingClient, SignalingApi};
+    use ferrosa_memory_sync::signaling_client::{Credential, HttpSignalingClient, SignalingApi};
 
-    let identity = peer_cli::load_identity(identity_path)?;
-    let api = HttpSignalingClient::new(gateway, api_key);
+    let identity = std::sync::Arc::new(peer_cli::load_identity(identity_path)?);
+    let api = HttpSignalingClient::with_credential(
+        gateway,
+        Credential::device(std::sync::Arc::clone(&identity)),
+    );
 
     let session_id = match session {
         Some(s) => s,
@@ -419,7 +407,6 @@ async fn cmd_p2p_receive(
 #[cfg(feature = "webrtc-transport")]
 async fn cmd_control_listen(
     gateway: &str,
-    api_key: &str,
     identity_path: &std::path::Path,
     workspace: &std::path::Path,
     contact_points: &[String],
@@ -435,12 +422,18 @@ async fn cmd_control_listen(
         ControlRuntimeDispatcher, ControlSessionConfig, run_control_server_session,
     };
     use ferrosa_memory_sync::peer_cli;
-    use ferrosa_memory_sync::signaling_client::{ControlSignalingApi, HttpSignalingClient};
+    use ferrosa_memory_sync::signaling_client::{
+        ControlSignalingApi, Credential, HttpSignalingClient,
+    };
 
-    let identity = peer_cli::load_identity(identity_path)?;
+    let identity = Arc::new(peer_cli::load_identity(identity_path)?);
     let public = identity.public_identity();
     let fingerprint = public.public_key_fingerprint.0;
-    let api = HttpSignalingClient::new(gateway, api_key);
+    // Device-signed, not API-key. The gateway resolves the account from the
+    // signature, so the listener carries nothing that would still be useful to
+    // someone who copied it off this disk.
+    let api =
+        HttpSignalingClient::with_credential(gateway, Credential::device(Arc::clone(&identity)));
     let config = ControlSessionConfig::default();
     let mut memory_config = load_config_with_dbaas()
         .context("loading Ferrosa Memory config for durable mobile control")?;
