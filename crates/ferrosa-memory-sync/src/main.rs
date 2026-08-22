@@ -414,6 +414,7 @@ async fn cmd_p2p_receive(
 /// slots free rather than being refused.
 const MAX_CONCURRENT_CONTROL_SESSIONS: usize = 8;
 
+#[cfg(feature = "webrtc-transport")]
 async fn cmd_control_listen(
     gateway: &str,
     identity_path: &std::path::Path,
@@ -525,6 +526,7 @@ async fn cmd_control_listen(
     }
 }
 
+#[cfg(feature = "webrtc-transport")]
 /// Bind one accepted session and serve it until the peer goes away.
 ///
 /// Returns rather than propagating: this runs in its own task, and one
