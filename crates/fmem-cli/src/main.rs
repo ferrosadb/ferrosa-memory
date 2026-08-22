@@ -69,6 +69,12 @@ enum Command {
     },
     /// Show what this host's memory systems are, and whether they are enrolled.
     Status,
+    /// List the account's devices, as the gateway sees them.
+    ///
+    /// Authenticated by SIGNING with this system's device key — there is no API
+    /// key on this path. Doubles as the check that the enrolment actually works
+    /// against the gateway, not merely that a record was written locally.
+    Devices,
     /// Forget this system's enrolment record LOCALLY.
     ///
     /// Does not revoke anything. A device cannot un-enrol itself server-side by
@@ -84,6 +90,7 @@ async fn main() -> Result<()> {
     match &cli.command {
         Command::Login { label } => login(&cli, &root, label.as_deref()).await,
         Command::Status => status(&cli, &root),
+        Command::Devices => devices(&cli, &root).await,
         Command::Logout => logout(&cli, &root),
     }
 }
@@ -233,6 +240,121 @@ fn status(cli: &Cli, root: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+/// List the account's devices, signing the request with this system's key.
+async fn devices(cli: &Cli, root: &Path) -> Result<()> {
+    let system = system::resolve(root, cli.system)?;
+    let key_path = system.key_path(root);
+    if !key_path.exists() {
+        anyhow::bail!(
+            "MCP port {} has no device key. Run `fmem login --system {}` first.",
+            system.port,
+            system.port
+        );
+    }
+    let identity = peer_cli::load_identity(&key_path)
+        .with_context(|| format!("reading {}", key_path.display()))?;
+    let mine = identity.public_identity().public_key_fingerprint.0;
+
+    // The gateway is the memory gateway, not the console: /v1/devices is served
+    // there. The console origin fronts pairing and the device grant only.
+    let gateway = gateway_url(root, cli.console.as_deref());
+    let path = "/v1/devices";
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let signed = ferrosa_memory_sync::device_request::sign_request(
+        &identity, "GET", path, b"", timestamp, &nonce,
+    );
+
+    let client = reqwest::Client::builder()
+        .build()
+        .context("building the HTTP client")?;
+    let request = signed.pairs().into_iter().fold(
+        client.get(format!("{gateway}{path}")),
+        |r, (name, value)| r.header(name, value),
+    );
+
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("GET {gateway}{path}"))?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!(
+            "the gateway refused this device ({status}): {}",
+            body.trim()
+        );
+    }
+
+    let listed: Vec<serde_json::Value> = serde_json::from_str(&body)
+        .context("the gateway returned something that is not a device list")?;
+    if listed.is_empty() {
+        println!("No devices on this account.");
+        return Ok(());
+    }
+    for device in listed {
+        let fingerprint = device
+            .get("fingerprint")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        // Marked, because several systems on one host carry similar labels and
+        // the operator needs to know which row is the machine they are on.
+        let marker = if fingerprint.eq_ignore_ascii_case(&mine) {
+            " <- this system"
+        } else {
+            ""
+        };
+        let revoked = if device.get("revoked_at").is_some_and(|v| !v.is_null()) {
+            "  REVOKED"
+        } else {
+            ""
+        };
+        println!(
+            "{:<8} {:<28} {}{}{}",
+            // Absent kind is shown as such rather than as "control": the
+            // gateway defaults it, but a blank here means this gateway did not
+            // report one, which is a different fact.
+            device
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(none)"),
+            device.get("label").and_then(|v| v.as_str()).unwrap_or(""),
+            group(fingerprint),
+            marker,
+            revoked
+        );
+    }
+    Ok(())
+}
+
+/// The memory gateway origin.
+///
+/// Derived from the recorded enrolment where possible so `devices` talks to the
+/// same control plane the system enrolled against, rather than to whatever the
+/// default happens to be today.
+fn gateway_url(root: &Path, flag: Option<&str>) -> String {
+    let _ = root;
+    flag.map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map_or_else(
+            || {
+                std::env::var("FMEM_GATEWAY_URL")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| DEFAULT_GATEWAY_URL.to_string())
+            },
+            str::to_string,
+        )
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Memory gateway used when nothing says otherwise.
+const DEFAULT_GATEWAY_URL: &str = "https://maas-dev-v2-gateway.fly.dev";
 
 /// Forget the local record. Server-side enrolment is untouched.
 fn logout(cli: &Cli, root: &Path) -> Result<()> {

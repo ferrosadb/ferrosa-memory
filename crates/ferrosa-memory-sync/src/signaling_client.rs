@@ -255,8 +255,13 @@ impl Credential {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs() as i64);
                 let nonce = Uuid::new_v4().to_string();
-                crate::device_request::sign_request(identity, method, path, body, timestamp, &nonce)
-                    .apply(req)
+                let signed = crate::device_request::sign_request(
+                    identity, method, path, body, timestamp, &nonce,
+                );
+                signed
+                    .pairs()
+                    .into_iter()
+                    .fold(req, |r, (name, value)| r.header(name, value))
             }
         }
     }
