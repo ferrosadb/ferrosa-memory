@@ -2,8 +2,8 @@
 //!
 //! Config comes from the environment first, then a file, then a built-in
 //! default — and the resolved value is always REPORTED, with its source. A URL
-//! that silently differs from what the operator expects points enrolment at the
-//! wrong control plane, and enrolment is not undoable.
+//! that silently differs from what the operator expects points enrollment at the
+//! wrong control plane, and enrollment is not undoable.
 //!
 //! Correctness: Correct when the effective console URL and where it came from
 //! are both visible before anything is sent to it.

@@ -1,4 +1,4 @@
-//! `fmem` — enrol and inspect this host's memory systems.
+//! `fmem` — enroll and inspect this host's memory systems.
 //!
 //! One host can run several memory systems, each with its own keypair (trust
 //! D15), so every command here is scoped to ONE system, named by its MCP port.
@@ -26,7 +26,7 @@
 )]
 
 mod device_auth;
-mod enrolment;
+mod enrollment;
 mod settings;
 mod system;
 
@@ -40,7 +40,7 @@ use ferrosa_memory_sync::peer_cli;
 #[derive(Debug, Parser)]
 #[command(
     name = "fmem",
-    about = "Enrol and inspect this host's Ferrosa Memory systems",
+    about = "Enroll and inspect this host's Ferrosa Memory systems",
     version
 )]
 struct Cli {
@@ -61,7 +61,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Enrol this memory system against an account.
+    /// Enroll this memory system against an account.
     Login {
         /// Label for the device list. Defaults to `<hostname>:<port>`.
         #[arg(long)]
@@ -72,12 +72,12 @@ enum Command {
     /// List the account's devices, as the gateway sees them.
     ///
     /// Authenticated by SIGNING with this system's device key — there is no API
-    /// key on this path. Doubles as the check that the enrolment actually works
+    /// key on this path. Doubles as the check that the enrollment actually works
     /// against the gateway, not merely that a record was written locally.
     Devices,
-    /// Forget this system's enrolment record LOCALLY.
+    /// Forget this system's enrollment record LOCALLY.
     ///
-    /// Does not revoke anything. A device cannot un-enrol itself server-side by
+    /// Does not revoke anything. A device cannot un-enroll itself server-side by
     /// design — that would let a compromised machine erase its own audit trail.
     Logout,
 }
@@ -95,14 +95,14 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Enrol one memory system.
+/// Enroll one memory system.
 async fn login(cli: &Cli, root: &Path, label: Option<&str>) -> Result<()> {
     let system = system::resolve(root, cli.system)?;
     let console = settings::console_url(root, cli.console.as_deref());
 
     // Reported before anything is sent. An operator who is pointed at the wrong
     // control plane has to be able to see it BEFORE enrolling, because
-    // enrolment is not undoable.
+    // enrollment is not undoable.
     println!(
         "console:  {} ({})",
         console.value,
@@ -116,17 +116,17 @@ async fn login(cli: &Cli, root: &Path, label: Option<&str>) -> Result<()> {
     let fingerprint = public.public_key_fingerprint.0.clone();
     let public_hex = hex(&public.public_key);
 
-    // An existing enrolment is reported rather than silently redone. Enrolling
+    // An existing enrollment is reported rather than silently redone. Enrolling
     // twice creates a second device row for one system, and the operator ends
     // up with two near-identical entries and no way to tell which is live.
-    let enrolment_path = system.enrolment_path(root);
-    if let Some(existing) = enrolment::load(&enrolment_path, &fingerprint)? {
+    let enrollment_path = system.enrollment_path(root);
+    if let Some(existing) = enrollment::load(&enrollment_path, &fingerprint)? {
         println!();
         println!("Already enrolled.");
-        print_enrolment(&existing);
+        print_enrollment(&existing);
         println!();
-        println!("To enrol again, revoke the device first, then delete");
-        println!("  {}", enrolment_path.display());
+        println!("To enroll again, revoke the device first, then delete");
+        println!("  {}", enrollment_path.display());
         return Ok(());
     }
 
@@ -179,8 +179,8 @@ async fn login(cli: &Cli, root: &Path, label: Option<&str>) -> Result<()> {
         );
     }
 
-    let record = enrolment::Enrolment {
-        contract: enrolment::CONTRACT.to_string(),
+    let record = enrollment::Enrollment {
+        contract: enrollment::CONTRACT.to_string(),
         system_port: system.port,
         device_id: enrolled.device_id.clone(),
         fingerprint: enrolled.fingerprint.clone(),
@@ -189,11 +189,11 @@ async fn login(cli: &Cli, root: &Path, label: Option<&str>) -> Result<()> {
         email: enrolled.email.clone(),
         console_url: console.value.clone(),
     };
-    enrolment::save(&enrolment_path, &record)?;
+    enrollment::save(&enrollment_path, &record)?;
 
     println!();
     println!("Enrolled.");
-    print_enrolment(&record);
+    print_enrollment(&record);
     Ok(())
 }
 
@@ -228,8 +228,8 @@ fn status(cli: &Cli, root: &Path) -> Result<()> {
         let fingerprint = identity.public_identity().public_key_fingerprint.0;
         println!("  identity  {}", group(&fingerprint));
 
-        match enrolment::load(&system.enrolment_path(root), &fingerprint) {
-            Ok(Some(record)) => print_enrolment(&record),
+        match enrollment::load(&system.enrollment_path(root), &fingerprint) {
+            Ok(Some(record)) => print_enrollment(&record),
             Ok(None) => println!("  not enrolled — run `fmem login --system {}`", system.port),
             // Surfaced, not swallowed: a divergent record is exactly the state
             // an operator needs to know about, and it reads as "enrolled" from
@@ -340,7 +340,7 @@ async fn devices(cli: &Cli, root: &Path) -> Result<()> {
 
 /// The memory gateway origin.
 ///
-/// Derived from the recorded enrolment where possible so `devices` talks to the
+/// Derived from the recorded enrollment where possible so `devices` talks to the
 /// same control plane the system enrolled against, rather than to whatever the
 /// default happens to be today.
 fn gateway_url(root: &Path, flag: Option<&str>) -> String {
@@ -364,31 +364,31 @@ fn gateway_url(root: &Path, flag: Option<&str>) -> String {
 /// Memory gateway used when nothing says otherwise.
 const DEFAULT_GATEWAY_URL: &str = "https://maas-dev-v2-gateway.fly.dev";
 
-/// Forget the local record. Server-side enrolment is untouched.
+/// Forget the local record. Server-side enrollment is untouched.
 fn logout(cli: &Cli, root: &Path) -> Result<()> {
     let system = system::resolve(root, cli.system)?;
-    let path = system.enrolment_path(root);
+    let path = system.enrollment_path(root);
     match std::fs::remove_file(&path) {
         Ok(()) => {
             println!(
-                "Forgot the local enrolment record for MCP port {}.",
+                "Forgot the local enrollment record for MCP port {}.",
                 system.port
             );
             println!();
             // Said plainly, because the opposite is the reasonable assumption.
             println!("The device is STILL enrolled at the gateway. A device cannot");
-            println!("un-enrol itself — revoke it from another device to do that.");
+            println!("un-enroll itself — revoke it from another device to do that.");
             Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!("No local enrolment record for MCP port {}.", system.port);
+            println!("No local enrollment record for MCP port {}.", system.port);
             Ok(())
         }
         Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
     }
 }
 
-fn print_enrolment(record: &enrolment::Enrolment) {
+fn print_enrollment(record: &enrollment::Enrollment) {
     println!("  device    {}", record.device_id);
     println!("  kind      {}", record.kind);
     println!("  label     {}", record.label);
@@ -423,7 +423,7 @@ fn load_or_create_identity(
 ///
 /// Best effort by design, and its failure is never fatal: the code and URL are
 /// already on screen, so a machine with no browser is not a machine that cannot
-/// enrol. Returns whether a launcher was found and exited cleanly.
+/// enroll. Returns whether a launcher was found and exited cleanly.
 fn open_browser(url: &str) -> std::io::Result<bool> {
     let launcher = if cfg!(target_os = "macos") {
         "open"
@@ -506,7 +506,7 @@ mod tests {
     }
 
     /// A hostname is always produced, even where the command is unavailable —
-    /// an empty label would enrol a device with no name at all.
+    /// an empty label would enroll a device with no name at all.
     #[test]
     fn a_hostname_is_never_empty() {
         assert!(!hostname().is_empty());

@@ -7,18 +7,18 @@
 //!
 //! This file holds no secret. The key next to it does.
 //!
-//! Correctness: Correct when a recorded enrolment matches the key it sits
+//! Correctness: Correct when a recorded enrollment matches the key it sits
 //! beside, and a mismatch is refused rather than reported as enrolled.
 //! Last revised: 2026-08-22
-//! Last changed: Initial enrolment record.
+//! Last changed: Initial enrollment record.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// The non-secret record of an enrolment.
+/// The non-secret record of an enrollment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Enrolment {
+pub struct Enrollment {
     /// Schema marker, so a future format change is detectable rather than
     /// silently misread.
     pub contract: String,
@@ -40,20 +40,29 @@ pub struct Enrolment {
 }
 
 /// The current schema marker.
-pub const CONTRACT: &str = "ferrosa-memory.enrolment.v1";
+pub const CONTRACT: &str = "ferrosa-memory.enrollment.v1";
+
+/// The marker written before the spelling was normalised to `enrollment`.
+///
+/// Accepted on read, never written. Records with it exist on real machines —
+/// the first memory system was enrolled under it — and refusing them would
+/// report an enrolled system as unenrolled, which makes the next `fmem login`
+/// mint a SECOND device row for one system. Rejecting a readable record is
+/// worse than the inconsistent spelling it was written with.
+const LEGACY_CONTRACT: &str = "ferrosa-memory.enrolment.v1";
 
 #[derive(Debug, thiserror::Error)]
-pub enum EnrolmentError {
+pub enum EnrollmentError {
     #[error("writing {path}: {source}")]
     Io {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("{path} is not a readable enrolment record: {reason}")]
+    #[error("{path} is not a readable enrollment record: {reason}")]
     Malformed { path: PathBuf, reason: String },
     #[error(
         "{path} records fingerprint {recorded} but the key beside it is {actual}. \
-         The record and the key have diverged; delete the record and enrol again."
+         The record and the key have diverged; delete the record and enroll again."
     )]
     Mismatch {
         path: PathBuf,
@@ -66,24 +75,24 @@ pub enum EnrolmentError {
 ///
 /// Write-then-rename for the same reason the key file uses it: a crash
 /// mid-write must not leave a half-parsed record that reads as a corrupt
-/// enrolment for a device that is actually fine.
-pub fn save(path: &Path, record: &Enrolment) -> Result<(), EnrolmentError> {
+/// enrollment for a device that is actually fine.
+pub fn save(path: &Path, record: &Enrollment) -> Result<(), EnrollmentError> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| EnrolmentError::Io {
+        std::fs::create_dir_all(parent).map_err(|source| EnrollmentError::Io {
             path: parent.to_path_buf(),
             source,
         })?;
     }
-    let json = serde_json::to_vec_pretty(record).map_err(|e| EnrolmentError::Malformed {
+    let json = serde_json::to_vec_pretty(record).map_err(|e| EnrollmentError::Malformed {
         path: path.to_path_buf(),
         reason: e.to_string(),
     })?;
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &json).map_err(|source| EnrolmentError::Io {
+    std::fs::write(&tmp, &json).map_err(|source| EnrollmentError::Io {
         path: tmp.clone(),
         source,
     })?;
-    std::fs::rename(&tmp, path).map_err(|source| EnrolmentError::Io {
+    std::fs::rename(&tmp, path).map_err(|source| EnrollmentError::Io {
         path: path.to_path_buf(),
         source,
     })
@@ -96,24 +105,24 @@ pub fn save(path: &Path, record: &Enrolment) -> Result<(), EnrolmentError> {
 /// which would otherwise report a system as enrolled under an identity it can
 /// no longer sign for — the failure would surface much later as a gateway
 /// refusing every request.
-pub fn load(path: &Path, actual_fingerprint: &str) -> Result<Option<Enrolment>, EnrolmentError> {
+pub fn load(path: &Path, actual_fingerprint: &str) -> Result<Option<Enrollment>, EnrollmentError> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(source) => {
-            return Err(EnrolmentError::Io {
+            return Err(EnrollmentError::Io {
                 path: path.to_path_buf(),
                 source,
             });
         }
     };
-    let record: Enrolment =
-        serde_json::from_slice(&bytes).map_err(|e| EnrolmentError::Malformed {
+    let record: Enrollment =
+        serde_json::from_slice(&bytes).map_err(|e| EnrollmentError::Malformed {
             path: path.to_path_buf(),
             reason: e.to_string(),
         })?;
-    if record.contract != CONTRACT {
-        return Err(EnrolmentError::Malformed {
+    if record.contract != CONTRACT && record.contract != LEGACY_CONTRACT {
+        return Err(EnrollmentError::Malformed {
             path: path.to_path_buf(),
             reason: format!(
                 "unknown contract {:?}, expected {CONTRACT}",
@@ -122,7 +131,7 @@ pub fn load(path: &Path, actual_fingerprint: &str) -> Result<Option<Enrolment>, 
         });
     }
     if !record.fingerprint.eq_ignore_ascii_case(actual_fingerprint) {
-        return Err(EnrolmentError::Mismatch {
+        return Err(EnrollmentError::Mismatch {
             path: path.to_path_buf(),
             recorded: record.fingerprint,
             actual: actual_fingerprint.to_string(),
@@ -135,8 +144,8 @@ pub fn load(path: &Path, actual_fingerprint: &str) -> Result<Option<Enrolment>, 
 mod tests {
     use super::*;
 
-    fn record(fingerprint: &str) -> Enrolment {
-        Enrolment {
+    fn record(fingerprint: &str) -> Enrollment {
+        Enrollment {
             contract: CONTRACT.to_string(),
             system_port: 43971,
             device_id: "11111111-1111-4111-8111-111111111111".to_string(),
@@ -151,7 +160,7 @@ mod tests {
     #[test]
     fn a_record_round_trips() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let path = tmp.path().join("devices").join("43971.enrolment.json");
+        let path = tmp.path().join("devices").join("43971.enrollment.json");
         let written = record("aa");
 
         save(&path, &written).expect("save");
@@ -175,11 +184,11 @@ mod tests {
     #[test]
     fn a_record_that_does_not_match_its_key_is_refused() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let path = tmp.path().join("43971.enrolment.json");
+        let path = tmp.path().join("43971.enrollment.json");
         save(&path, &record("aa")).expect("save");
 
         match load(&path, "bb") {
-            Err(EnrolmentError::Mismatch {
+            Err(EnrollmentError::Mismatch {
                 recorded, actual, ..
             }) => {
                 assert_eq!(recorded, "aa");
@@ -193,10 +202,27 @@ mod tests {
     #[test]
     fn the_fingerprint_check_ignores_case() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let path = tmp.path().join("43971.enrolment.json");
+        let path = tmp.path().join("43971.enrollment.json");
         save(&path, &record("abcdef")).expect("save");
 
         assert!(load(&path, "ABCDEF").expect("load").is_some());
+    }
+
+    /// The pre-rename spelling is still readable.
+    ///
+    /// A record written before `enrolment` became `enrollment` describes a live
+    /// device. Refusing it would report that system as unenrolled and send the
+    /// next login to enroll it a second time.
+    #[test]
+    fn the_legacy_contract_spelling_is_still_accepted() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("43971.enrollment.json");
+        let mut legacy = record("aa");
+        legacy.contract = LEGACY_CONTRACT.to_string();
+        save(&path, &legacy).expect("save");
+
+        let read = load(&path, "aa").expect("load").expect("present");
+        assert_eq!(read.contract, LEGACY_CONTRACT);
     }
 
     /// An unknown contract is refused, not best-effort parsed. A future format
@@ -204,13 +230,13 @@ mod tests {
     #[test]
     fn an_unknown_contract_is_refused() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let path = tmp.path().join("43971.enrolment.json");
+        let path = tmp.path().join("43971.enrollment.json");
         let mut future = record("aa");
-        future.contract = "ferrosa-memory.enrolment.v99".to_string();
+        future.contract = "ferrosa-memory.enrollment.v99".to_string();
         save(&path, &future).expect("save");
 
         match load(&path, "aa") {
-            Err(EnrolmentError::Malformed { reason, .. }) => {
+            Err(EnrollmentError::Malformed { reason, .. }) => {
                 assert!(reason.contains("v99"), "{reason}");
             }
             other => panic!("expected malformed, got {other:?}"),
@@ -221,25 +247,25 @@ mod tests {
     /// (delete the record) is not guessable.
     #[test]
     fn the_mismatch_error_says_how_to_recover() {
-        let err = EnrolmentError::Mismatch {
-            path: PathBuf::from("/x/43971.enrolment.json"),
+        let err = EnrollmentError::Mismatch {
+            path: PathBuf::from("/x/43971.enrollment.json"),
             recorded: "aa".into(),
             actual: "bb".into(),
         };
         let message = err.to_string();
         assert!(message.contains("delete the record"), "{message}");
-        assert!(message.contains("enrol again"), "{message}");
+        assert!(message.contains("enroll again"), "{message}");
     }
 
     /// Garbage on disk is named as such, with its path.
     #[test]
     fn a_corrupt_record_names_the_file() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let path = tmp.path().join("43971.enrolment.json");
+        let path = tmp.path().join("43971.enrollment.json");
         std::fs::write(&path, b"{not json").expect("write");
 
         match load(&path, "aa") {
-            Err(EnrolmentError::Malformed { path: p, .. }) => assert_eq!(p, path),
+            Err(EnrollmentError::Malformed { path: p, .. }) => assert_eq!(p, path),
             other => panic!("expected malformed, got {other:?}"),
         }
     }
