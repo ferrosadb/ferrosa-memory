@@ -405,6 +405,15 @@ async fn cmd_p2p_receive(
 }
 
 #[cfg(feature = "webrtc-transport")]
+/// How many control sessions one memory system serves at once.
+///
+/// A bound, not a target. Each session is a peer connection plus a durable
+/// cursor block, so an unbounded fan-out would let anyone holding an account
+/// key exhaust the host by opening offers. Eight covers a person's own devices
+/// several times over; sessions past it stay pending on the broker and start as
+/// slots free rather than being refused.
+const MAX_CONCURRENT_CONTROL_SESSIONS: usize = 8;
+
 async fn cmd_control_listen(
     gateway: &str,
     identity_path: &std::path::Path,
@@ -415,12 +424,9 @@ async fn cmd_control_listen(
     use std::{sync::Arc, time::Duration};
 
     use ferrosa_memory_core::config::load_config_with_dbaas;
-    use ferrosa_memory_core::control_store::{ControlEventDraft, ControlStore, CqlControlStore};
-    use ferrosa_memory_core::types::TenantContext;
+    use ferrosa_memory_core::control_store::CqlControlStore;
     use ferrosa_memory_sync::codex_runtime::{CodexTmuxConfig, CodexTmuxRuntime};
-    use ferrosa_memory_sync::control_session::{
-        ControlRuntimeDispatcher, ControlSessionConfig, run_control_server_session,
-    };
+    use ferrosa_memory_sync::control_session::{ControlRuntimeDispatcher, ControlSessionConfig};
     use ferrosa_memory_sync::peer_cli;
     use ferrosa_memory_sync::signaling_client::{
         ControlSignalingApi, Credential, HttpSignalingClient,
@@ -432,9 +438,11 @@ async fn cmd_control_listen(
     // Device-signed, not API-key. The gateway resolves the account from the
     // signature, so the listener carries nothing that would still be useful to
     // someone who copied it off this disk.
-    let api =
-        HttpSignalingClient::with_credential(gateway, Credential::device(Arc::clone(&identity)));
-    let config = ControlSessionConfig::default();
+    let api = Arc::new(HttpSignalingClient::with_credential(
+        gateway,
+        Credential::device(Arc::clone(&identity)),
+    ));
+    let config = Arc::new(ControlSessionConfig::default());
     let mut memory_config = load_config_with_dbaas()
         .context("loading Ferrosa Memory config for durable mobile control")?;
     if !contact_points.is_empty() {
@@ -449,7 +457,24 @@ async fn cmd_control_listen(
     let control_store = Arc::new(store);
     let runtime = CodexTmuxRuntime::new(CodexTmuxConfig::new(workspace, fingerprint.clone()))
         .context("configuring Codex tmux-light runtime")?;
-    let dispatcher = ControlRuntimeDispatcher::new(Arc::clone(&control_store), runtime);
+    let dispatcher = Arc::new(ControlRuntimeDispatcher::new(
+        Arc::clone(&control_store),
+        runtime,
+    ));
+
+    // Sessions run CONCURRENTLY, one task each.
+    //
+    // They used to run in the poll loop itself, so the listener served exactly
+    // one controller at a time: a phone that was accepted and then went away
+    // pinned it for the whole bind timeout, and a phone that connected pinned
+    // it for the entire session. Every other device queued behind and failed
+    // with a client-side timeout that said nothing about why. With a phone, a
+    // tablet and an iPad on one account that is the normal case, not an edge.
+    let in_flight: Arc<tokio::sync::Mutex<std::collections::HashSet<Uuid>>> =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+    // Bounded so a flood of offers cannot exhaust the host. Sessions beyond the
+    // cap stay pending on the broker and are picked up as slots free.
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONTROL_SESSIONS));
     println!("control listener device fingerprint: {fingerprint}");
     println!("managed Codex workspace: {}", workspace.display());
     println!("polling {gateway} for device-targeted control offers");
@@ -461,90 +486,163 @@ async fn cmd_control_listen(
             continue;
         }
         for offer in pending {
-            println!(
-                "accepting control session {} from controller device {}",
-                offer.session_id, offer.controller_device_id
+            // The broker keeps listing an offer until it is accepted, and the
+            // accept happens inside the spawned task — so without this the
+            // 500ms poll would spawn the same session again and again.
+            if !in_flight.lock().await.insert(offer.session_id) {
+                continue;
+            }
+            let permit = match Arc::clone(&slots).acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => break,
+            };
+            let api = Arc::clone(&api);
+            let identity = Arc::clone(&identity);
+            let config = Arc::clone(&config);
+            let dispatcher = Arc::clone(&dispatcher);
+            let control_store = Arc::clone(&control_store);
+            let in_flight = Arc::clone(&in_flight);
+            let fingerprint = fingerprint.clone();
+            // Kept because `offer` moves into the call below, and the id is
+            // needed afterwards to release the in-flight slot.
+            let session_id = offer.session_id;
+            tokio::spawn(async move {
+                // Held for the life of the session, then dropped with it.
+                let _permit = permit;
+                serve_control_session(
+                    api.as_ref(),
+                    identity.as_ref(),
+                    config.as_ref(),
+                    dispatcher.as_ref(),
+                    control_store.as_ref(),
+                    &fingerprint,
+                    offer,
+                )
+                .await;
+                in_flight.lock().await.remove(&session_id);
+            });
+        }
+    }
+}
+
+/// Bind one accepted session and serve it until the peer goes away.
+///
+/// Returns rather than propagating: this runs in its own task, and one
+/// controller's failure must not take down the listener for every other
+/// device. Every exit path logs why.
+#[allow(clippy::too_many_arguments)]
+async fn serve_control_session<S, R, T>(
+    api: &S,
+    identity: &ferrosa_memory_core::remote_identity::InstanceSigningIdentity,
+    config: &ferrosa_memory_sync::control_session::ControlSessionConfig,
+    dispatcher: &ferrosa_memory_sync::control_session::ControlRuntimeDispatcher<T, R>,
+    control_store: &T,
+    fingerprint: &str,
+    offer: ferrosa_memory_sync::signaling_client::ControlBrokerSessionView,
+) where
+    S: ferrosa_memory_sync::signaling_client::ControlSignalingApi,
+    R: ferrosa_memory_sync::control_session::AgentRuntime,
+    T: ferrosa_memory_core::control_store::ControlStore + 'static,
+{
+    use ferrosa_memory_core::control_store::ControlEventDraft;
+    use ferrosa_memory_core::types::TenantContext;
+    use ferrosa_memory_sync::control_session::run_control_server_session;
+
+    println!(
+        "accepting control session {} from controller device {}",
+        offer.session_id, offer.controller_device_id
+    );
+    let mut channel =
+        match run_control_server_session(api, identity, offer.session_id, config).await {
+            Ok(channel) => channel,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %offer.session_id,
+                    error = %error,
+                    "control session bind failed"
+                );
+                return;
+            }
+        };
+    println!("control session {} bound directly", offer.session_id);
+    let tenant = TenantContext {
+        tenant_id: offer.account_id,
+        session_origin: format!("mobile-control:{}", offer.session_id),
+    };
+    let cursor = match control_store
+        .reserve_cursor_block(&tenant, fingerprint, 64)
+        .await
+    {
+        Ok(block) => block.start,
+        Err(error) => {
+            // Ends THIS session, not the listener. A cursor failure used to
+            // propagate out of the poll loop and stop the process, taking every
+            // other device's session with it.
+            tracing::warn!(
+                session_id = %offer.session_id,
+                error = %error,
+                "reserving durable mobile control cursor block failed"
             );
-            let mut channel = match run_control_server_session(
-                &api,
-                &identity,
-                offer.session_id,
-                &config,
-            )
-            .await
-            {
-                Ok(channel) => channel,
-                Err(error) => {
-                    tracing::warn!(
+            return;
+        }
+    };
+    if let Err(error) = control_store
+        .append_event(
+            &tenant,
+            fingerprint,
+            ControlEventDraft {
+                cursor,
+                event_id: Uuid::now_v7(),
+                command_id: None,
+                kind: "heartbeat".to_owned(),
+                payload: serde_json::json!({
+                    "session_id": offer.session_id,
+                    "controller_device_id": offer.controller_device_id,
+                }),
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await
+    {
+        tracing::warn!(
+            session_id = %offer.session_id,
+            error = %error,
+            "persisting control-session heartbeat failed"
+        );
+        return;
+    }
+    loop {
+        let frame = match channel.recv_text().await {
+            Ok(frame) => frame,
+            Err(error) => {
+                tracing::info!(
+                    session_id = %offer.session_id,
+                    error = %error,
+                    "control session disconnected"
+                );
+                break;
+            }
+        };
+        match dispatcher.reply(&tenant, fingerprint, &frame).await {
+            Ok(Some(reply)) => {
+                if let Err(error) = channel.send_text(&reply).await {
+                    tracing::info!(
                         session_id = %offer.session_id,
                         error = %error,
-                        "control session bind failed"
+                        "control pong send failed"
                     );
-                    continue;
+                    break;
                 }
-            };
-            println!("control session {} bound directly", offer.session_id);
-            let tenant = TenantContext {
-                tenant_id: offer.account_id,
-                session_origin: format!("mobile-control:{}", offer.session_id),
-            };
-            let cursor = control_store
-                .reserve_cursor_block(&tenant, &fingerprint, 64)
-                .await
-                .context("reserving durable mobile control cursor block")?
-                .start;
-            control_store
-                .append_event(
-                    &tenant,
-                    &fingerprint,
-                    ControlEventDraft {
-                        cursor,
-                        event_id: Uuid::now_v7(),
-                        command_id: None,
-                        kind: "heartbeat".to_owned(),
-                        payload: serde_json::json!({
-                            "session_id": offer.session_id,
-                            "controller_device_id": offer.controller_device_id,
-                        }),
-                        created_at: chrono::Utc::now(),
-                    },
-                )
-                .await
-                .context("persisting control-session heartbeat")?;
-            loop {
-                let frame = match channel.recv_text().await {
-                    Ok(frame) => frame,
-                    Err(error) => {
-                        tracing::info!(
-                            session_id = %offer.session_id,
-                            error = %error,
-                            "control session disconnected"
-                        );
-                        break;
-                    }
-                };
-                match dispatcher.reply(&tenant, &fingerprint, &frame).await {
-                    Ok(Some(reply)) => {
-                        if let Err(error) = channel.send_text(&reply).await {
-                            tracing::info!(
-                                session_id = %offer.session_id,
-                                error = %error,
-                                "control pong send failed"
-                            );
-                            break;
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        tracing::warn!(
-                            session_id = %offer.session_id,
-                            error = %error,
-                            "invalid control application frame"
-                        );
-                        let _ = channel.close().await;
-                        break;
-                    }
-                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %offer.session_id,
+                    error = %error,
+                    "invalid control application frame"
+                );
+                let _ = channel.close().await;
+                break;
             }
         }
     }
