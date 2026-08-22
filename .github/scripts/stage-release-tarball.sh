@@ -6,6 +6,8 @@
 # Top-level layout inside the tarball (no wrapper directory):
 #   ferrosa-memory
 #   ferrosa-memory-mcp
+#   fmem                                 (enrolment CLI)
+#   memory-sync                          (control listener; darwin only)
 #   LICENSE
 #   NOTICE
 #   README.md
@@ -37,14 +39,56 @@ if [[ ! -x "${BIN_DIR}/ferrosa-memory" ]]; then
   echo "ERROR: missing ferrosa-memory management binary at ${BIN_DIR}/ferrosa-memory" >&2
   exit 1
 fi
+# fmem writes the per-system device key that everything else authenticates with,
+# so it is required on every target. Hard error, like the two above: a release
+# that quietly ships fewer binaries than the last one is how a missing tool is
+# discovered by a user instead of by CI.
+if [[ ! -x "${BIN_DIR}/fmem" ]]; then
+  echo "ERROR: missing fmem enrolment CLI at ${BIN_DIR}/fmem" >&2
+  exit 1
+fi
+
+# memory-sync answers the live control sessions a phone opens. Darwin only for
+# now -- webrtc-transport against musl is unverified, and the linux jobs
+# deliberately do not build it (see .github/workflows/release.yml).
+#
+# Checked by TARGET rather than by "copy it if it happens to be there": an
+# optional copy would let a darwin build that silently failed to produce it ship
+# a tarball that looks complete. On darwin its absence is an error; elsewhere
+# its absence is expected.
+WANT_MEMORY_SYNC=0
+case "$TARGET" in
+  *-apple-darwin) WANT_MEMORY_SYNC=1 ;;
+esac
+if [[ "$WANT_MEMORY_SYNC" == "1" && ! -x "${BIN_DIR}/memory-sync" ]]; then
+  echo "ERROR: missing memory-sync control listener at ${BIN_DIR}/memory-sync" >&2
+  echo "       Built with: cargo build -p ferrosa-memory-sync --features webrtc-transport" >&2
+  exit 1
+fi
 
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 
 cp "${BIN_DIR}/ferrosa-memory" "${STAGE}/ferrosa-memory"
 cp "${BIN_DIR}/ferrosa-memory-mcp" "${STAGE}/ferrosa-memory-mcp"
+cp "${BIN_DIR}/fmem" "${STAGE}/fmem"
 chmod 755 "${STAGE}/ferrosa-memory"
 chmod 755 "${STAGE}/ferrosa-memory-mcp"
+chmod 755 "${STAGE}/fmem"
+
+if [[ "$WANT_MEMORY_SYNC" == "1" ]]; then
+  cp "${BIN_DIR}/memory-sync" "${STAGE}/memory-sync"
+  chmod 755 "${STAGE}/memory-sync"
+  # Prove the feature flag was on. A memory-sync built without
+  # webrtc-transport is the right name and the wrong binary, and the failure it
+  # causes is a phone timing out after thirty seconds with nothing naming the
+  # listener. Cheap to check here; expensive to discover there.
+  if ! "${STAGE}/memory-sync" control-listen --help >/dev/null 2>&1; then
+    echo "ERROR: staged memory-sync has no control-listen subcommand" >&2
+    echo "       It was built without --features webrtc-transport" >&2
+    exit 1
+  fi
+fi
 
 for f in LICENSE NOTICE README.md; do
   [[ -f "$f" ]] && cp "$f" "${STAGE}/$f" || echo "WARN: $f missing" >&2
