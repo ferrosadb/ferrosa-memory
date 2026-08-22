@@ -65,6 +65,23 @@ struct PrincipalRecord {
 }
 
 impl FileAuthValidator {
+    /// Every distinct tenant this server is configured to serve, sorted.
+    ///
+    /// In HTTP mode the tenants ARE the auth principals' tenants — there is no
+    /// other source of truth, because `server.tenant_id` is rejected for HTTP
+    /// (`validate_shared_http_config`). Background work that needs a tenant has
+    /// to ask here rather than invent one.
+    pub fn tenants(&self) -> Vec<Uuid> {
+        let guard = self
+            .principals
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut out: Vec<Uuid> = guard.values().map(|p| p.tenant_id).collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
     pub fn from_path(path: &str) -> Result<Self, AuthError> {
         let principals = Self::load_principals(path)?;
         if principals.is_empty() {
@@ -200,6 +217,60 @@ pub fn validate_origin(origin: &str) -> Result<(), AuthError> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The tenant list must come from the principals, and never be invented.
+    ///
+    /// This is what the HTTP consolidation worker polls with. It used to call
+    /// `stdio_tenant_id(&config)`, whose fallback is `Uuid::new_v4()` -- and
+    /// `validate_shared_http_config` refuses to start an HTTP server that sets
+    /// `server.tenant_id`, so the fallback was guaranteed to fire. The worker
+    /// therefore polled a brand-new tenant that owned nothing, on every boot.
+    ///
+    /// Live evidence, 2026-08-22: 275 consolidation requests going back to
+    /// 2026-06-28, 270 with `attempt_count = 0`, `consolidation_runs` empty,
+    /// and 63 orphan tenants in `entity_store` -- one per boot.
+    #[test]
+    fn tenants_come_from_the_principals_and_are_deduped() {
+        let shared = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let path = std::env::temp_dir().join(format!("fmem-auth-{}.toml", Uuid::new_v4()));
+        let body = format!(
+            "[[principal]]\nusername = \"a\"\npassword_sha256 = \"x\"\ntenant_id = \"{shared}\"\n\n\
+[[principal]]\nusername = \"b\"\npassword_sha256 = \"y\"\ntenant_id = \"{shared}\"\n\n\
+[[principal]]\nusername = \"c\"\npassword_sha256 = \"z\"\ntenant_id = \"{other}\"\n"
+        );
+        std::fs::write(&path, body).unwrap();
+
+        let v = FileAuthValidator::from_path(path.to_str().unwrap()).unwrap();
+        let mut expected = vec![shared, other];
+        expected.sort();
+
+        assert_eq!(
+            v.tenants(),
+            expected,
+            "two principals sharing a tenant must yield it once, and a distinct \
+             tenant must not be dropped"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// No principals means no tenant -- not a fabricated one.
+    ///
+    /// The caller must be able to tell "nothing to serve" from "serving
+    /// something", because a worker polling an invented tenant looks exactly
+    /// like a worker that is healthy and idle. That resemblance is why this
+    /// went unnoticed for two months.
+    #[test]
+    fn no_principals_yields_no_tenants() {
+        let path = std::env::temp_dir().join(format!("fmem-auth-{}.toml", Uuid::new_v4()));
+        std::fs::write(&path, "").unwrap();
+        let v = FileAuthValidator::from_path(path.to_str().unwrap()).unwrap();
+        assert!(
+            v.tenants().is_empty(),
+            "an empty auth file must yield no tenants rather than a random one"
+        );
+        std::fs::remove_file(&path).ok();
+    }
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
