@@ -80,12 +80,20 @@ pub struct SignedHeaders {
 }
 
 impl SignedHeaders {
-    /// Apply to a request builder.
-    pub fn apply(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        req.header(HDR_FINGERPRINT, &self.fingerprint)
-            .header(HDR_TIMESTAMP, &self.timestamp)
-            .header(HDR_NONCE, &self.nonce)
-            .header(HDR_SIGNATURE, &self.signature)
+    /// The four header name/value pairs, in a fixed order.
+    ///
+    /// Returned as data rather than applied to a request builder so this module
+    /// needs no HTTP client at all. `reqwest` is an OPTIONAL dependency of this
+    /// crate, and a signer that dragged it in would be unusable from anything
+    /// that does not already pull the whole WebRTC stack — including `fmem`.
+    #[must_use]
+    pub fn pairs(&self) -> [(&'static str, &str); 4] {
+        [
+            (HDR_FINGERPRINT, self.fingerprint.as_str()),
+            (HDR_TIMESTAMP, self.timestamp.as_str()),
+            (HDR_NONCE, self.nonce.as_str()),
+            (HDR_SIGNATURE, self.signature.as_str()),
+        ]
     }
 }
 
@@ -213,6 +221,27 @@ mod tests {
         );
         assert_eq!(headers.fingerprint.len(), 64);
         assert!(headers.fingerprint.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// All four headers are emitted, named exactly as the gateway reads them.
+    #[test]
+    fn every_required_header_is_present_and_named_correctly() {
+        let headers = sign_request(&identity(), "GET", "/x", b"", 1, "n");
+        let names: Vec<&str> = headers.pairs().iter().map(|(n, _)| *n).collect();
+
+        assert_eq!(
+            names,
+            [
+                "X-Device-Fingerprint",
+                "X-Device-Timestamp",
+                "X-Device-Nonce",
+                "X-Device-Signature"
+            ]
+        );
+        assert!(
+            headers.pairs().iter().all(|(_, v)| !v.is_empty()),
+            "an empty header value would authenticate nothing"
+        );
     }
 
     /// Signatures are lowercase hex of the raw 64 bytes.

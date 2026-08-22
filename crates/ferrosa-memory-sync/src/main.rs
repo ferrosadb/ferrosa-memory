@@ -626,8 +626,6 @@ mod cli_tests {
             "control-listen",
             "--gateway",
             "https://gateway.example",
-            "--api-key",
-            "secret",
             "--identity",
             "/tmp/device.json",
             "--workspace",
@@ -645,6 +643,36 @@ mod cli_tests {
                     && contact_points == vec!["127.0.0.1:19044"]
                     && existing_schema
         ));
+    }
+
+    /// `--api-key` is GONE from every command that carries an identity.
+    ///
+    /// Asserted rather than assumed: a re-added flag would fail no other test.
+    /// It would simply reintroduce a bearer secret on machines that no longer
+    /// need one, and nothing would notice until someone read the help text.
+    #[test]
+    fn identity_commands_refuse_an_api_key() {
+        for command in [
+            "control-listen",
+            "device-approve",
+            "p2p-share",
+            "p2p-receive",
+        ] {
+            let parsed = Args::try_parse_from([
+                "memory-sync",
+                command,
+                "--gateway",
+                "https://gateway.example",
+                "--identity",
+                "/tmp/device.json",
+                "--api-key",
+                "secret",
+            ]);
+            assert!(
+                parsed.is_err(),
+                "{command} still accepts --api-key; device identities do not use one"
+            );
+        }
     }
 }
 
