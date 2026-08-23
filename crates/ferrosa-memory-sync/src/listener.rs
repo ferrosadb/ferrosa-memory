@@ -16,6 +16,8 @@
 
 #![cfg(feature = "webrtc-transport")]
 
+use std::time::Duration;
+
 use anyhow::Context as _;
 use uuid::Uuid;
 
@@ -27,6 +29,13 @@ use uuid::Uuid;
 /// several times over; sessions past it stay pending on the broker and start as
 /// slots free rather than being refused.
 const MAX_CONCURRENT_CONTROL_SESSIONS: usize = 8;
+
+/// Wait added per consecutive failed poll.
+const POLL_BACKOFF_BASE: Duration = Duration::from_millis(500);
+
+/// Ceiling on the backoff multiplier, so a long outage retries every 5s rather
+/// than drifting toward never.
+const POLL_BACKOFF_MAX_STEPS: u32 = 10;
 
 /// A caller's hook for an attested session.
 ///
@@ -181,8 +190,37 @@ pub async fn run_control_listener(
     }
     println!("polling {gateway} for device-targeted control offers");
 
+    let mut poll_failures: u32 = 0;
     loop {
-        let pending = api.control_pending_offers(&fingerprint).await?;
+        // A failed poll is not a reason to stop listening.
+        //
+        // This propagated with `?`, so one transient broker error ended the
+        // process — taking every live session with it, including sessions that
+        // were working perfectly. Observed killing a listener mid-stream on a
+        // single request failure.
+        //
+        // Backs off on repeated failures rather than hammering a broker that is
+        // already struggling, and says so each time: a listener that has been
+        // unable to reach the gateway for a minute is not the same as a quiet
+        // one, and silence would make those identical.
+        let pending = match api.control_pending_offers(&fingerprint).await {
+            Ok(pending) => {
+                poll_failures = 0;
+                pending
+            }
+            Err(error) => {
+                poll_failures = poll_failures.saturating_add(1);
+                let backoff = POLL_BACKOFF_BASE * poll_failures.min(POLL_BACKOFF_MAX_STEPS);
+                tracing::warn!(
+                    %error,
+                    consecutive = poll_failures,
+                    retry_in_ms = backoff.as_millis() as u64,
+                    "polling the broker for offers failed; still listening"
+                );
+                tokio::time::sleep(backoff).await;
+                continue;
+            }
+        };
         if pending.is_empty() {
             tokio::time::sleep(Duration::from_millis(500)).await;
             continue;
