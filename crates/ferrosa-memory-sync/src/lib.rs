@@ -41,5 +41,7 @@ pub mod peer_cli;
 pub mod peer_session;
 pub mod peer_transport;
 pub mod replication;
+/// Named session configurations, owned by the machine.
+pub mod session_config;
 #[cfg(feature = "webrtc-transport")]
 pub mod signaling_client;
