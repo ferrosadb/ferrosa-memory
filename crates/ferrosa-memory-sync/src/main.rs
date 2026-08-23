@@ -211,9 +211,9 @@ async fn main() -> anyhow::Result<()> {
                     contact_points,
                     existing_schema,
                 },
-                // The public binary streams nothing. A private one passes real
-                // plugins here and changes nothing else.
-                ferrosa_memory_sync::listener::VisualPlugins::null(),
+                // A plain control session. Another binary attaches extensions
+                // here and changes nothing else.
+                ferrosa_memory_sync::listener::SessionExtensions::none(),
             )
             .await
         }

@@ -43,9 +43,3 @@ pub mod peer_transport;
 pub mod replication;
 #[cfg(feature = "webrtc-transport")]
 pub mod signaling_client;
-/// The public seam for visual-streaming plugins.
-///
-/// Deliberately NOT behind `webrtc-transport`: the traits and the null
-/// implementation must compile and be testable in the default build, or the
-/// contract is one nobody exercises.
-pub mod visual;
