@@ -203,6 +203,19 @@ impl BoundControlChannel {
         self.session_key.len()
     }
 
+    /// The underlying peer connection.
+    ///
+    /// Exposed so a caller can attach things this crate does not model — a
+    /// media track, for one. Deliberately returns the connection rather than
+    /// growing an `add_video_track` method here: the moment this crate has a
+    /// method with "video" in the name, media has become a capability of a
+    /// repository that is not supposed to have one.
+    ///
+    /// A caller that adds a track owns the renegotiation that follows.
+    pub fn peer_connection(&self) -> Arc<RTCPeerConnection> {
+        Arc::clone(&self.peer_connection)
+    }
+
     /// Close the direct peer connection.
     pub async fn close(&self) -> Result<(), ControlSessionError> {
         self.peer_connection
@@ -426,6 +439,25 @@ pub async fn run_control_server_session<S: ControlSignalingApi>(
     session_id: Uuid,
     config: &ControlSessionConfig,
 ) -> Result<BoundControlChannel, ControlSessionError> {
+    run_control_server_session_with_rtc(api, identity, session_id, config, None).await
+}
+
+/// As [`run_control_server_session`], with a caller-supplied WebRTC API.
+///
+/// The API is built by the CALLER and used here without inspection. That is the
+/// whole point: a caller that needs media registers its own codecs and hands
+/// the result in, and this crate never names a codec, a track or a media
+/// engine. Media is not a capability of this repository.
+///
+/// `None` builds the data-channel-only API this crate has always used, so a
+/// caller that does not care negotiates exactly what it did before.
+pub async fn run_control_server_session_with_rtc<S: ControlSignalingApi>(
+    api: &S,
+    identity: &InstanceSigningIdentity,
+    session_id: Uuid,
+    config: &ControlSessionConfig,
+    rtc: Option<Arc<webrtc::api::API>>,
+) -> Result<BoundControlChannel, ControlSessionError> {
     validate_config(config)?;
     let own_fingerprint = identity.public_identity().public_key_fingerprint.0;
     let view = api.control_accept(session_id, &own_fingerprint).await?;
@@ -436,7 +468,12 @@ pub async fn run_control_server_session<S: ControlSignalingApi>(
     }
     let controller_fingerprint = view.controller_fingerprint;
 
-    let rtc_api = build_rtc_api(config)?;
+    // Caller-supplied when the caller needs something this crate does not
+    // provide; otherwise the data-channel-only default.
+    let rtc_api = match rtc {
+        Some(rtc) => rtc,
+        None => Arc::new(build_rtc_api(config)?),
+    };
     let peer_connection = Arc::new(
         rtc_api
             .new_peer_connection(rtc_config(config))
