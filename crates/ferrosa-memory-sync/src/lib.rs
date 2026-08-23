@@ -31,6 +31,9 @@ pub mod codex_runtime;
 pub mod control_session;
 pub mod device_request;
 pub mod learner_ingest;
+/// The control-listener runtime, so every binary hosting one shares it.
+#[cfg(feature = "webrtc-transport")]
+pub mod listener;
 pub mod pack;
 pub mod pack_crypto;
 pub mod peer_cli;
