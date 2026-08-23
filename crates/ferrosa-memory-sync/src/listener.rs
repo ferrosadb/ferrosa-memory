@@ -276,7 +276,7 @@ async fn serve_control_session<S, R, T>(
     R: crate::control_session::AgentRuntime,
     T: ferrosa_memory_core::control_store::ControlStore + 'static,
 {
-    use crate::control_session::run_control_server_session_with_rtc;
+    use crate::control_session::run_control_server_session;
     use ferrosa_memory_core::control_store::ControlEventDraft;
     use ferrosa_memory_core::types::TenantContext;
 
@@ -285,9 +285,7 @@ async fn serve_control_session<S, R, T>(
         offer.session_id, offer.controller_device_id
     );
     let mut channel =
-        match run_control_server_session_with_rtc(api, identity, offer.session_id, config, rtc)
-            .await
-        {
+        match run_control_server_session(api, identity, offer.session_id, config, rtc).await {
             Ok(channel) => channel,
             Err(error) => {
                 tracing::warn!(
