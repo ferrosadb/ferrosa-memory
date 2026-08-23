@@ -9,6 +9,10 @@ ferrosa-memory-core = { path = "../ferrosa-memory-core" }
 # For the SessionExtension seam: a dyn-compatible async trait. Already in the
 # tree via webrtc; this makes the dependency an explicit one.
 async-trait = "0.1"
+# A PTY, not piped stdio. Programs line-buffer and emit progress only when they
+# believe they are on a terminal; piped output arrives in 8 KiB lumps minutes
+# apart, which in an interactive session is indistinguishable from a hang.
+portable-pty = "0.9"
 scylla = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
