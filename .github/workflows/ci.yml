@@ -52,6 +52,26 @@ jobs:
       # "localhost:19042" as a fixture) don't trip the rule.
       - name: No loopback CQL addresses in production source (p0-11)
         run: ./.github/scripts/check-no-prod-loopback.sh
+      # The workspace version must agree with the latest released tag, and the
+      # commits since it must imply a bump somebody can see.
+      #
+      # promote-release syncs main to the tag it just cut, but only via a PR it
+      # opens with continue-on-error and calls "cosmetic". On 2026-08-17 that
+      # PR was never created -- the branch was pushed, `gh pr create` did not
+      # produce one, the failure was swallowed, and main sat at 0.23.0 behind
+      # tag v0.27.0 for five days and twenty-one commits with nothing noticing.
+      #
+      # Binaries self-report the Cargo version, so that drift ships binaries
+      # announcing one version under a tag that says another, and every
+      # downstream update check compares the two.
+      #
+      # fetch-depth 0 on this step's own fetch: the default checkout has no
+      # tags, and a tag-less checkout would make this check pass by finding
+      # nothing to disagree with.
+      - name: Fetch tags for the version check
+        run: git fetch --tags --quiet
+      - name: Workspace version is in step with the latest release tag
+        run: ./.github/scripts/check-version-sync.sh
 
   # Stage 1b: Dependency advisories
   advisories:
@@ -89,7 +109,7 @@ jobs:
       # The `--all-targets` build above already compiled these test binaries, so
       # `nextest archive` is cache-warm and just packages them.
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
         with:
           tool: nextest
       - name: Archive test binaries (built once, run in integration)
@@ -122,7 +142,7 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
         with:
           tool: cargo-llvm-cov
       - name: Run tests with coverage
@@ -309,7 +329,7 @@ jobs:
           shared-key: ws-noinstrument
           cache-on-failure: false
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
         with:
           tool: nextest
       - name: Download prebuilt test-binary archive (from the build job)

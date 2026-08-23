@@ -68,9 +68,6 @@ enum Command {
         /// Gateway base URL.
         #[arg(long)]
         gateway: String,
-        /// API key; falls back to $FERROSA_MAAS_API_KEY.
-        #[arg(long, env = "FERROSA_MAAS_API_KEY")]
-        api_key: String,
         /// Already-approved device key file (from p2p-keygen).
         #[arg(long)]
         identity: std::path::PathBuf,
@@ -85,10 +82,8 @@ enum Command {
         /// Gateway base URL (e.g. https://gw.example).
         #[arg(long)]
         gateway: String,
-        /// API key; falls back to $FERROSA_MAAS_API_KEY.
-        #[arg(long, env = "FERROSA_MAAS_API_KEY")]
-        api_key: String,
-        /// Device key file (from p2p-keygen; its key must be registered).
+        /// Enrolled device key file. The ONLY credential — it signs every
+        /// request, so no bearer key sits on this machine.
         #[arg(long)]
         identity: std::path::PathBuf,
         /// The learner's account id (must be a mutual contact).
@@ -108,10 +103,8 @@ enum Command {
         /// Gateway base URL.
         #[arg(long)]
         gateway: String,
-        /// API key; falls back to $FERROSA_MAAS_API_KEY.
-        #[arg(long, env = "FERROSA_MAAS_API_KEY")]
-        api_key: String,
-        /// Device key file (from p2p-keygen; its key must be registered).
+        /// Enrolled device key file. The ONLY credential — it signs every
+        /// request, so no bearer key sits on this machine.
         #[arg(long)]
         identity: std::path::PathBuf,
         /// Landing directory for applied packs (durable JSON; the
@@ -130,10 +123,11 @@ enum Command {
         /// Gateway base URL.
         #[arg(long)]
         gateway: String,
-        /// API key; falls back to $FERROSA_MAAS_API_KEY.
-        #[arg(long, env = "FERROSA_MAAS_API_KEY")]
-        api_key: String,
-        /// Registered device key file (from p2p-keygen).
+        /// Enrolled device key file (from `fmem login` or `p2p-keygen`).
+        ///
+        /// The ONLY credential. This path no longer takes an API key: the
+        /// identity signs every request, so there is no bearer secret sitting
+        /// on the machine for an attacker to lift.
         #[arg(long)]
         identity: std::path::PathBuf,
         /// One absolute project directory available to the managed Codex CLI.
@@ -183,41 +177,27 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "webrtc-transport")]
         Command::DeviceApprove {
             gateway,
-            api_key,
             identity,
             device_id,
-        } => cmd_device_approve(&gateway, &api_key, &identity, device_id).await,
+        } => cmd_device_approve(&gateway, &identity, device_id).await,
         #[cfg(feature = "webrtc-transport")]
         Command::P2pShare {
             gateway,
-            api_key,
             identity,
             learner_account,
             selection,
             namespace,
-        } => {
-            cmd_p2p_share(
-                &gateway,
-                &api_key,
-                &identity,
-                learner_account,
-                &selection,
-                &namespace,
-            )
-            .await
-        }
+        } => cmd_p2p_share(&gateway, &identity, learner_account, &selection, &namespace).await,
         #[cfg(feature = "webrtc-transport")]
         Command::P2pReceive {
             gateway,
-            api_key,
             identity,
             out_dir,
             session,
-        } => cmd_p2p_receive(&gateway, &api_key, &identity, &out_dir, session).await,
+        } => cmd_p2p_receive(&gateway, &identity, &out_dir, session).await,
         #[cfg(feature = "webrtc-transport")]
         Command::ControlListen {
             gateway,
-            api_key,
             identity,
             workspace,
             contact_points,
@@ -225,7 +205,6 @@ async fn main() -> anyhow::Result<()> {
         } => {
             cmd_control_listen(
                 &gateway,
-                &api_key,
                 &identity,
                 &workspace,
                 &contact_points,
@@ -256,16 +235,21 @@ fn cmd_p2p_keygen(out: &std::path::Path) -> anyhow::Result<()> {
 #[cfg(feature = "webrtc-transport")]
 async fn cmd_device_approve(
     gateway: &str,
-    api_key: &str,
     identity_path: &std::path::Path,
     target_device_id: Uuid,
 ) -> anyhow::Result<()> {
     use ferrosa_memory_sync::peer_cli;
     use ferrosa_memory_sync::signaling_client::HttpSignalingClient;
 
-    let identity = peer_cli::load_identity(identity_path)?;
+    let identity = std::sync::Arc::new(peer_cli::load_identity(identity_path)?);
     let fingerprint = identity.public_identity().public_key_fingerprint.0;
-    let api = HttpSignalingClient::new(gateway, api_key);
+    // The approving device signs for itself. It already had to prove possession
+    // of an enrolled key to be allowed to vouch at all, so an API key here was
+    // a second, weaker credential doing no additional work.
+    let api = HttpSignalingClient::with_credential(
+        gateway,
+        ferrosa_memory_sync::signaling_client::Credential::device(std::sync::Arc::clone(&identity)),
+    );
     let account = api.whoami().await?;
     let devices = api.devices().await?;
     let approver = devices
@@ -299,7 +283,6 @@ async fn cmd_device_approve(
 #[cfg(feature = "webrtc-transport")]
 async fn cmd_p2p_share(
     gateway: &str,
-    api_key: &str,
     identity_path: &std::path::Path,
     learner_account: Uuid,
     selection_path: &std::path::Path,
@@ -310,11 +293,14 @@ async fn cmd_p2p_share(
     use ferrosa_memory_sync::peer_cli;
     use ferrosa_memory_sync::peer_session::{PeerSessionConfig, run_teacher_session};
     use ferrosa_memory_sync::replication::{PackBuildParams, TeacherSelection};
-    use ferrosa_memory_sync::signaling_client::{HttpSignalingClient, SignalingApi};
+    use ferrosa_memory_sync::signaling_client::{Credential, HttpSignalingClient, SignalingApi};
 
-    let identity = peer_cli::load_identity(identity_path)?;
+    let identity = std::sync::Arc::new(peer_cli::load_identity(identity_path)?);
     let selection: TeacherSelection = serde_json::from_slice(&std::fs::read(selection_path)?)?;
-    let api = HttpSignalingClient::new(gateway, api_key);
+    let api = HttpSignalingClient::with_credential(
+        gateway,
+        Credential::device(std::sync::Arc::clone(&identity)),
+    );
     let public = identity.public_identity();
 
     let pack_id = Uuid::new_v4();
@@ -363,17 +349,19 @@ async fn cmd_p2p_share(
 #[cfg(feature = "webrtc-transport")]
 async fn cmd_p2p_receive(
     gateway: &str,
-    api_key: &str,
     identity_path: &std::path::Path,
     out_dir: &std::path::Path,
     session: Option<Uuid>,
 ) -> anyhow::Result<()> {
     use ferrosa_memory_sync::peer_cli::{self, DirPackApplyStore};
     use ferrosa_memory_sync::peer_session::{PeerSessionConfig, run_learner_session};
-    use ferrosa_memory_sync::signaling_client::{HttpSignalingClient, SignalingApi};
+    use ferrosa_memory_sync::signaling_client::{Credential, HttpSignalingClient, SignalingApi};
 
-    let identity = peer_cli::load_identity(identity_path)?;
-    let api = HttpSignalingClient::new(gateway, api_key);
+    let identity = std::sync::Arc::new(peer_cli::load_identity(identity_path)?);
+    let api = HttpSignalingClient::with_credential(
+        gateway,
+        Credential::device(std::sync::Arc::clone(&identity)),
+    );
 
     let session_id = match session {
         Some(s) => s,
@@ -417,9 +405,18 @@ async fn cmd_p2p_receive(
 }
 
 #[cfg(feature = "webrtc-transport")]
+/// How many control sessions one memory system serves at once.
+///
+/// A bound, not a target. Each session is a peer connection plus a durable
+/// cursor block, so an unbounded fan-out would let anyone holding an account
+/// key exhaust the host by opening offers. Eight covers a person's own devices
+/// several times over; sessions past it stay pending on the broker and start as
+/// slots free rather than being refused.
+const MAX_CONCURRENT_CONTROL_SESSIONS: usize = 8;
+
+#[cfg(feature = "webrtc-transport")]
 async fn cmd_control_listen(
     gateway: &str,
-    api_key: &str,
     identity_path: &std::path::Path,
     workspace: &std::path::Path,
     contact_points: &[String],
@@ -428,20 +425,25 @@ async fn cmd_control_listen(
     use std::{sync::Arc, time::Duration};
 
     use ferrosa_memory_core::config::load_config_with_dbaas;
-    use ferrosa_memory_core::control_store::{ControlEventDraft, ControlStore, CqlControlStore};
-    use ferrosa_memory_core::types::TenantContext;
+    use ferrosa_memory_core::control_store::CqlControlStore;
     use ferrosa_memory_sync::codex_runtime::{CodexTmuxConfig, CodexTmuxRuntime};
-    use ferrosa_memory_sync::control_session::{
-        ControlRuntimeDispatcher, ControlSessionConfig, run_control_server_session,
-    };
+    use ferrosa_memory_sync::control_session::{ControlRuntimeDispatcher, ControlSessionConfig};
     use ferrosa_memory_sync::peer_cli;
-    use ferrosa_memory_sync::signaling_client::{ControlSignalingApi, HttpSignalingClient};
+    use ferrosa_memory_sync::signaling_client::{
+        ControlSignalingApi, Credential, HttpSignalingClient,
+    };
 
-    let identity = peer_cli::load_identity(identity_path)?;
+    let identity = Arc::new(peer_cli::load_identity(identity_path)?);
     let public = identity.public_identity();
     let fingerprint = public.public_key_fingerprint.0;
-    let api = HttpSignalingClient::new(gateway, api_key);
-    let config = ControlSessionConfig::default();
+    // Device-signed, not API-key. The gateway resolves the account from the
+    // signature, so the listener carries nothing that would still be useful to
+    // someone who copied it off this disk.
+    let api = Arc::new(HttpSignalingClient::with_credential(
+        gateway,
+        Credential::device(Arc::clone(&identity)),
+    ));
+    let config = Arc::new(ControlSessionConfig::default());
     let mut memory_config = load_config_with_dbaas()
         .context("loading Ferrosa Memory config for durable mobile control")?;
     if !contact_points.is_empty() {
@@ -456,7 +458,24 @@ async fn cmd_control_listen(
     let control_store = Arc::new(store);
     let runtime = CodexTmuxRuntime::new(CodexTmuxConfig::new(workspace, fingerprint.clone()))
         .context("configuring Codex tmux-light runtime")?;
-    let dispatcher = ControlRuntimeDispatcher::new(Arc::clone(&control_store), runtime);
+    let dispatcher = Arc::new(ControlRuntimeDispatcher::new(
+        Arc::clone(&control_store),
+        runtime,
+    ));
+
+    // Sessions run CONCURRENTLY, one task each.
+    //
+    // They used to run in the poll loop itself, so the listener served exactly
+    // one controller at a time: a phone that was accepted and then went away
+    // pinned it for the whole bind timeout, and a phone that connected pinned
+    // it for the entire session. Every other device queued behind and failed
+    // with a client-side timeout that said nothing about why. With a phone, a
+    // tablet and an iPad on one account that is the normal case, not an edge.
+    let in_flight: Arc<tokio::sync::Mutex<std::collections::HashSet<Uuid>>> =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+    // Bounded so a flood of offers cannot exhaust the host. Sessions beyond the
+    // cap stay pending on the broker and are picked up as slots free.
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONTROL_SESSIONS));
     println!("control listener device fingerprint: {fingerprint}");
     println!("managed Codex workspace: {}", workspace.display());
     println!("polling {gateway} for device-targeted control offers");
@@ -468,90 +487,164 @@ async fn cmd_control_listen(
             continue;
         }
         for offer in pending {
-            println!(
-                "accepting control session {} from controller device {}",
-                offer.session_id, offer.controller_device_id
+            // The broker keeps listing an offer until it is accepted, and the
+            // accept happens inside the spawned task — so without this the
+            // 500ms poll would spawn the same session again and again.
+            if !in_flight.lock().await.insert(offer.session_id) {
+                continue;
+            }
+            let permit = match Arc::clone(&slots).acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => break,
+            };
+            let api = Arc::clone(&api);
+            let identity = Arc::clone(&identity);
+            let config = Arc::clone(&config);
+            let dispatcher = Arc::clone(&dispatcher);
+            let control_store = Arc::clone(&control_store);
+            let in_flight = Arc::clone(&in_flight);
+            let fingerprint = fingerprint.clone();
+            // Kept because `offer` moves into the call below, and the id is
+            // needed afterwards to release the in-flight slot.
+            let session_id = offer.session_id;
+            tokio::spawn(async move {
+                // Held for the life of the session, then dropped with it.
+                let _permit = permit;
+                serve_control_session(
+                    api.as_ref(),
+                    identity.as_ref(),
+                    config.as_ref(),
+                    dispatcher.as_ref(),
+                    control_store.as_ref(),
+                    &fingerprint,
+                    offer,
+                )
+                .await;
+                in_flight.lock().await.remove(&session_id);
+            });
+        }
+    }
+}
+
+#[cfg(feature = "webrtc-transport")]
+/// Bind one accepted session and serve it until the peer goes away.
+///
+/// Returns rather than propagating: this runs in its own task, and one
+/// controller's failure must not take down the listener for every other
+/// device. Every exit path logs why.
+#[allow(clippy::too_many_arguments)]
+async fn serve_control_session<S, R, T>(
+    api: &S,
+    identity: &ferrosa_memory_core::remote_identity::InstanceSigningIdentity,
+    config: &ferrosa_memory_sync::control_session::ControlSessionConfig,
+    dispatcher: &ferrosa_memory_sync::control_session::ControlRuntimeDispatcher<T, R>,
+    control_store: &T,
+    fingerprint: &str,
+    offer: ferrosa_memory_sync::signaling_client::ControlBrokerSessionView,
+) where
+    S: ferrosa_memory_sync::signaling_client::ControlSignalingApi,
+    R: ferrosa_memory_sync::control_session::AgentRuntime,
+    T: ferrosa_memory_core::control_store::ControlStore + 'static,
+{
+    use ferrosa_memory_core::control_store::ControlEventDraft;
+    use ferrosa_memory_core::types::TenantContext;
+    use ferrosa_memory_sync::control_session::run_control_server_session;
+
+    println!(
+        "accepting control session {} from controller device {}",
+        offer.session_id, offer.controller_device_id
+    );
+    let mut channel =
+        match run_control_server_session(api, identity, offer.session_id, config).await {
+            Ok(channel) => channel,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %offer.session_id,
+                    error = %error,
+                    "control session bind failed"
+                );
+                return;
+            }
+        };
+    println!("control session {} bound directly", offer.session_id);
+    let tenant = TenantContext {
+        tenant_id: offer.account_id,
+        session_origin: format!("mobile-control:{}", offer.session_id),
+    };
+    let cursor = match control_store
+        .reserve_cursor_block(&tenant, fingerprint, 64)
+        .await
+    {
+        Ok(block) => block.start,
+        Err(error) => {
+            // Ends THIS session, not the listener. A cursor failure used to
+            // propagate out of the poll loop and stop the process, taking every
+            // other device's session with it.
+            tracing::warn!(
+                session_id = %offer.session_id,
+                error = %error,
+                "reserving durable mobile control cursor block failed"
             );
-            let mut channel = match run_control_server_session(
-                &api,
-                &identity,
-                offer.session_id,
-                &config,
-            )
-            .await
-            {
-                Ok(channel) => channel,
-                Err(error) => {
-                    tracing::warn!(
+            return;
+        }
+    };
+    if let Err(error) = control_store
+        .append_event(
+            &tenant,
+            fingerprint,
+            ControlEventDraft {
+                cursor,
+                event_id: Uuid::now_v7(),
+                command_id: None,
+                kind: "heartbeat".to_owned(),
+                payload: serde_json::json!({
+                    "session_id": offer.session_id,
+                    "controller_device_id": offer.controller_device_id,
+                }),
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await
+    {
+        tracing::warn!(
+            session_id = %offer.session_id,
+            error = %error,
+            "persisting control-session heartbeat failed"
+        );
+        return;
+    }
+    loop {
+        let frame = match channel.recv_text().await {
+            Ok(frame) => frame,
+            Err(error) => {
+                tracing::info!(
+                    session_id = %offer.session_id,
+                    error = %error,
+                    "control session disconnected"
+                );
+                break;
+            }
+        };
+        match dispatcher.reply(&tenant, fingerprint, &frame).await {
+            Ok(Some(reply)) => {
+                if let Err(error) = channel.send_text(&reply).await {
+                    tracing::info!(
                         session_id = %offer.session_id,
                         error = %error,
-                        "control session bind failed"
+                        "control pong send failed"
                     );
-                    continue;
+                    break;
                 }
-            };
-            println!("control session {} bound directly", offer.session_id);
-            let tenant = TenantContext {
-                tenant_id: offer.account_id,
-                session_origin: format!("mobile-control:{}", offer.session_id),
-            };
-            let cursor = control_store
-                .reserve_cursor_block(&tenant, &fingerprint, 64)
-                .await
-                .context("reserving durable mobile control cursor block")?
-                .start;
-            control_store
-                .append_event(
-                    &tenant,
-                    &fingerprint,
-                    ControlEventDraft {
-                        cursor,
-                        event_id: Uuid::now_v7(),
-                        command_id: None,
-                        kind: "heartbeat".to_owned(),
-                        payload: serde_json::json!({
-                            "session_id": offer.session_id,
-                            "controller_device_id": offer.controller_device_id,
-                        }),
-                        created_at: chrono::Utc::now(),
-                    },
-                )
-                .await
-                .context("persisting control-session heartbeat")?;
-            loop {
-                let frame = match channel.recv_text().await {
-                    Ok(frame) => frame,
-                    Err(error) => {
-                        tracing::info!(
-                            session_id = %offer.session_id,
-                            error = %error,
-                            "control session disconnected"
-                        );
-                        break;
-                    }
-                };
-                match dispatcher.reply(&tenant, &fingerprint, &frame).await {
-                    Ok(Some(reply)) => {
-                        if let Err(error) = channel.send_text(&reply).await {
-                            tracing::info!(
-                                session_id = %offer.session_id,
-                                error = %error,
-                                "control pong send failed"
-                            );
-                            break;
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        tracing::warn!(
-                            session_id = %offer.session_id,
-                            error = %error,
-                            "invalid control application frame"
-                        );
-                        let _ = channel.close().await;
-                        break;
-                    }
-                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %offer.session_id,
+                    error = %error,
+                    "invalid control application frame"
+                );
+                let _ = channel.close().await;
+                break;
             }
         }
     }
@@ -633,8 +726,6 @@ mod cli_tests {
             "control-listen",
             "--gateway",
             "https://gateway.example",
-            "--api-key",
-            "secret",
             "--identity",
             "/tmp/device.json",
             "--workspace",
@@ -652,6 +743,36 @@ mod cli_tests {
                     && contact_points == vec!["127.0.0.1:19044"]
                     && existing_schema
         ));
+    }
+
+    /// `--api-key` is GONE from every command that carries an identity.
+    ///
+    /// Asserted rather than assumed: a re-added flag would fail no other test.
+    /// It would simply reintroduce a bearer secret on machines that no longer
+    /// need one, and nothing would notice until someone read the help text.
+    #[test]
+    fn identity_commands_refuse_an_api_key() {
+        for command in [
+            "control-listen",
+            "device-approve",
+            "p2p-share",
+            "p2p-receive",
+        ] {
+            let parsed = Args::try_parse_from([
+                "memory-sync",
+                command,
+                "--gateway",
+                "https://gateway.example",
+                "--identity",
+                "/tmp/device.json",
+                "--api-key",
+                "secret",
+            ]);
+            assert!(
+                parsed.is_err(),
+                "{command} still accepts --api-key; device identities do not use one"
+            );
+        }
     }
 }
 
