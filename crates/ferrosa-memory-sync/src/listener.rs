@@ -63,19 +63,39 @@ impl Default for VisualPlugins {
 }
 
 #[cfg(feature = "webrtc-transport")]
+/// Everything a control listener needs, independent of which binary hosts it.
+///
+/// Shared so a downstream binary does not restate the argument list. Those
+/// arguments were duplicated field-for-field between the two binaries, which is
+/// the same divergence risk as duplicating the runtime, just quieter — a new
+/// option added to one and not the other produces two tools that look alike and
+/// behave differently.
+#[derive(Debug, Clone)]
+pub struct ListenerConfig {
+    pub gateway: String,
+    pub identity: std::path::PathBuf,
+    pub workspace: std::path::PathBuf,
+    pub contact_points: Vec<String>,
+    pub existing_schema: bool,
+}
+
 /// Run a control listener until the process ends.
 ///
 /// `visual` is the ONLY thing that differs between the public binary and one
 /// linking real capture. If a second parameter ever has to be added to make a
 /// downstream binary work, the seam has sprouted a second seam beside it.
 pub async fn run_control_listener(
-    gateway: &str,
-    identity_path: &std::path::Path,
-    workspace: &std::path::Path,
-    contact_points: &[String],
-    existing_schema: bool,
+    config: &ListenerConfig,
     visual: VisualPlugins,
 ) -> anyhow::Result<()> {
+    let ListenerConfig {
+        gateway,
+        identity: identity_path,
+        workspace,
+        contact_points,
+        existing_schema,
+    } = config;
+    let existing_schema = *existing_schema;
     use std::{sync::Arc, time::Duration};
 
     use crate::codex_runtime::{CodexTmuxConfig, CodexTmuxRuntime};
