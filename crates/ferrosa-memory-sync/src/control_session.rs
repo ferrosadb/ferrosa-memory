@@ -433,25 +433,16 @@ pub async fn run_control_controller_session<S: ControlSignalingApi>(
 
 /// Accept and establish the exact-target Ferrosa Memory server half, returning
 /// only after the controller's first signed hello verifies.
-pub async fn run_control_server_session<S: ControlSignalingApi>(
-    api: &S,
-    identity: &InstanceSigningIdentity,
-    session_id: Uuid,
-    config: &ControlSessionConfig,
-) -> Result<BoundControlChannel, ControlSessionError> {
-    run_control_server_session_with_rtc(api, identity, session_id, config, None).await
-}
-
-/// As [`run_control_server_session`], with a caller-supplied WebRTC API.
+/// Run the server half of one control session.
 ///
-/// The API is built by the CALLER and used here without inspection. That is the
-/// whole point: a caller that needs media registers its own codecs and hands
-/// the result in, and this crate never names a codec, a track or a media
-/// engine. Media is not a capability of this repository.
+/// `rtc` is built by the CALLER and used here without inspection. That is the
+/// point: a caller that needs media registers its own codecs and hands the
+/// result in, and this crate never names a codec, a track or a media engine.
+/// Media is not a capability of this repository.
 ///
 /// `None` builds the data-channel-only API this crate has always used, so a
 /// caller that does not care negotiates exactly what it did before.
-pub async fn run_control_server_session_with_rtc<S: ControlSignalingApi>(
+pub async fn run_control_server_session<S: ControlSignalingApi>(
     api: &S,
     identity: &InstanceSigningIdentity,
     session_id: Uuid,
