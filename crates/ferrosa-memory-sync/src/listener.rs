@@ -157,6 +157,7 @@ pub async fn run_control_listener(
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONTROL_SESSIONS));
     println!("control listener device fingerprint: {fingerprint}");
     println!("managed Codex workspace: {}", workspace.display());
+    let rtc_api = visual.rtc_api.clone();
     let caps = visual.provider.capabilities();
     if caps.any() {
         println!(
@@ -196,6 +197,7 @@ pub async fn run_control_listener(
             let control_store = Arc::clone(&control_store);
             let in_flight = Arc::clone(&in_flight);
             let fingerprint = fingerprint.clone();
+            let rtc = rtc_api.clone();
             // Kept because `offer` moves into the call below, and the id is
             // needed afterwards to release the in-flight slot.
             let session_id = offer.session_id;
@@ -210,6 +212,7 @@ pub async fn run_control_listener(
                     control_store.as_ref(),
                     &fingerprint,
                     offer,
+                    rtc,
                 )
                 .await;
                 in_flight.lock().await.remove(&session_id);
@@ -233,12 +236,13 @@ async fn serve_control_session<S, R, T>(
     control_store: &T,
     fingerprint: &str,
     offer: crate::signaling_client::ControlBrokerSessionView,
+    rtc: Option<std::sync::Arc<webrtc::api::API>>,
 ) where
     S: crate::signaling_client::ControlSignalingApi,
     R: crate::control_session::AgentRuntime,
     T: ferrosa_memory_core::control_store::ControlStore + 'static,
 {
-    use crate::control_session::run_control_server_session;
+    use crate::control_session::run_control_server_session_with_rtc;
     use ferrosa_memory_core::control_store::ControlEventDraft;
     use ferrosa_memory_core::types::TenantContext;
 
@@ -247,7 +251,9 @@ async fn serve_control_session<S, R, T>(
         offer.session_id, offer.controller_device_id
     );
     let mut channel =
-        match run_control_server_session(api, identity, offer.session_id, config).await {
+        match run_control_server_session_with_rtc(api, identity, offer.session_id, config, rtc)
+            .await
+        {
             Ok(channel) => channel,
             Err(error) => {
                 tracing::warn!(
