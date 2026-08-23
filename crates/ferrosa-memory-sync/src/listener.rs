@@ -30,6 +30,25 @@ use crate::visual::{SurfaceProvider, VisualCapture};
 /// slots free rather than being refused.
 const MAX_CONCURRENT_CONTROL_SESSIONS: usize = 8;
 
+/// A caller's hook for an attested session.
+///
+/// A trait rather than a boxed closure so an implementation can hold state
+/// across sessions — an encoder pool, a session registry — without smuggling it
+/// through captured variables.
+pub trait SessionBound: Send + Sync {
+    /// Attach to a session whose hello has been verified.
+    ///
+    /// Errors are logged and the session continues WITHOUT whatever the caller
+    /// was attaching. A failure to start video must not tear down a working
+    /// control channel: the operator keeps the session they asked for and loses
+    /// only the part that broke.
+    fn on_bound(
+        &self,
+        peer: std::sync::Arc<webrtc::peer_connection::RTCPeerConnection>,
+        session_id: uuid::Uuid,
+    ) -> Result<(), String>;
+}
+
 /// The visual-streaming plugins a listener runs with.
 ///
 /// Passed in rather than constructed, because choosing them is the ONLY
@@ -43,6 +62,16 @@ pub struct VisualPlugins {
     /// `None` uses the data-channel-only default, which is what a host with no
     /// capture plugin should negotiate. This crate never inspects it.
     pub rtc_api: Option<std::sync::Arc<webrtc::api::API>>,
+    /// Called once a session's signed hello has been attested.
+    ///
+    /// The moment — and the only moment — at which a caller may attach things
+    /// this crate does not model. It runs AFTER attestation deliberately:
+    /// attaching earlier would start sending to a peer whose identity has not
+    /// been proven.
+    ///
+    /// Takes the peer connection, not a media type. This crate does not know
+    /// what the caller does with it, and must not.
+    pub on_session_bound: Option<std::sync::Arc<dyn SessionBound>>,
     pub provider: Box<dyn SurfaceProvider>,
     /// Builds a capture per session. A factory rather than an instance because
     /// sessions are concurrent and each needs its own.
@@ -57,6 +86,7 @@ impl VisualPlugins {
     pub fn null() -> Self {
         Self {
             rtc_api: None,
+            on_session_bound: None,
             provider: Box::new(crate::visual::NullSurfaceProvider),
             capture: Box::new(|| Box::new(crate::visual::NullCapture::new())),
         }
@@ -158,6 +188,7 @@ pub async fn run_control_listener(
     println!("control listener device fingerprint: {fingerprint}");
     println!("managed Codex workspace: {}", workspace.display());
     let rtc_api = visual.rtc_api.clone();
+    let bound_hook = visual.on_session_bound.clone();
     let caps = visual.provider.capabilities();
     if caps.any() {
         println!(
@@ -198,6 +229,7 @@ pub async fn run_control_listener(
             let in_flight = Arc::clone(&in_flight);
             let fingerprint = fingerprint.clone();
             let rtc = rtc_api.clone();
+            let on_bound = bound_hook.clone();
             // Kept because `offer` moves into the call below, and the id is
             // needed afterwards to release the in-flight slot.
             let session_id = offer.session_id;
@@ -213,6 +245,7 @@ pub async fn run_control_listener(
                     &fingerprint,
                     offer,
                     rtc,
+                    on_bound,
                 )
                 .await;
                 in_flight.lock().await.remove(&session_id);
@@ -237,6 +270,7 @@ async fn serve_control_session<S, R, T>(
     fingerprint: &str,
     offer: crate::signaling_client::ControlBrokerSessionView,
     rtc: Option<std::sync::Arc<webrtc::api::API>>,
+    on_bound: Option<std::sync::Arc<dyn SessionBound>>,
 ) where
     S: crate::signaling_client::ControlSignalingApi,
     R: crate::control_session::AgentRuntime,
@@ -265,6 +299,14 @@ async fn serve_control_session<S, R, T>(
             }
         };
     println!("control session {} bound directly", offer.session_id);
+    if let Some(hook) = on_bound
+        && let Err(error) = hook.on_bound(channel.peer_connection(), offer.session_id)
+    {
+        // Logged, not fatal. Whatever the caller was attaching failed; the
+        // control channel underneath it still works, and taking the whole
+        // session down would lose the part that was fine.
+        tracing::warn!(session_id = %offer.session_id, %error, "session-bound hook failed");
+    }
     let tenant = TenantContext {
         tenant_id: offer.account_id,
         session_origin: format!("mobile-control:{}", offer.session_id),
