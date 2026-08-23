@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# Terminal output is raw bytes — escape sequences, and whatever encoding the
+# program chose. JSON strings cannot carry that, and lossy UTF-8 conversion
+# would corrupt exactly the control sequences the emulator needs.
+base64 = "0.23"
 ferrosa-memory-core = { path = "../ferrosa-memory-core" }
 # For the SessionExtension seam: a dyn-compatible async trait. Already in the
 # tree via webrtc; this makes the dependency an explicit one.
