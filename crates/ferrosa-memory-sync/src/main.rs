@@ -204,11 +204,13 @@ async fn main() -> anyhow::Result<()> {
             existing_schema,
         } => {
             ferrosa_memory_sync::listener::run_control_listener(
-                &gateway,
-                &identity,
-                &workspace,
-                &contact_points,
-                existing_schema,
+                &ferrosa_memory_sync::listener::ListenerConfig {
+                    gateway,
+                    identity,
+                    workspace,
+                    contact_points,
+                    existing_schema,
+                },
                 // The public binary streams nothing. A private one passes real
                 // plugins here and changes nothing else.
                 ferrosa_memory_sync::listener::VisualPlugins::null(),
