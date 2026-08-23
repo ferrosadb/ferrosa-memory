@@ -19,8 +19,6 @@
 use anyhow::Context as _;
 use uuid::Uuid;
 
-use crate::visual::{SurfaceProvider, VisualCapture};
-
 /// How many control sessions one memory system serves at once.
 ///
 /// A bound, not a target. Each session is a peer connection plus a durable
@@ -33,15 +31,15 @@ const MAX_CONCURRENT_CONTROL_SESSIONS: usize = 8;
 /// A caller's hook for an attested session.
 ///
 /// A trait rather than a boxed closure so an implementation can hold state
-/// across sessions — an encoder pool, a session registry — without smuggling it
-/// through captured variables.
+/// across sessions — a pool, a registry — without smuggling it through captured
+/// variables.
 pub trait SessionBound: Send + Sync {
     /// Attach to a session whose hello has been verified.
     ///
     /// Errors are logged and the session continues WITHOUT whatever the caller
-    /// was attaching. A failure to start video must not tear down a working
-    /// control channel: the operator keeps the session they asked for and loses
-    /// only the part that broke.
+    /// was attaching. A failure to start an extension must not tear down a
+    /// working control channel: the operator keeps the session they asked for
+    /// and loses only the part that broke.
     fn on_bound(
         &self,
         peer: std::sync::Arc<webrtc::peer_connection::RTCPeerConnection>,
@@ -49,57 +47,37 @@ pub trait SessionBound: Send + Sync {
     ) -> Result<(), String>;
 }
 
-/// The visual-streaming plugins a listener runs with.
+/// What a caller attaches to the control sessions this listener serves.
 ///
-/// Passed in rather than constructed, because choosing them is the ONLY
-/// difference between the public binary and a private one that links real
-/// capture. Anything else a binary needs to customize belongs here too, or the
-/// seam will grow a second one beside it.
-pub struct VisualPlugins {
-    /// A WebRTC API built by the plugin, when it needs one this crate would not
-    /// build — codecs for a media track, for instance.
-    ///
-    /// `None` uses the data-channel-only default, which is what a host with no
-    /// capture plugin should negotiate. This crate never inspects it.
+/// Deliberately says nothing about what is attached. An earlier version was
+/// called `VisualPlugins` and carried a capture factory and a surface provider
+/// — media types, in a repository that does not have media as a capability, and
+/// a factory the listener never once called.
+///
+/// Extensions are a `Vec` because video is not the only thing that will want
+/// this. Audio, a metrics channel, file transfer: each is a `SessionBound`, and
+/// none of them needs this crate to know its name.
+#[derive(Default, Clone)]
+pub struct SessionExtensions {
+    /// A WebRTC API built by the caller, when it needs one this crate would not
+    /// build. `None` uses the data-channel-only default. Never inspected here.
     pub rtc_api: Option<std::sync::Arc<webrtc::api::API>>,
-    /// Called once a session's signed hello has been attested.
-    ///
-    /// The moment — and the only moment — at which a caller may attach things
-    /// this crate does not model. It runs AFTER attestation deliberately:
-    /// attaching earlier would start sending to a peer whose identity has not
-    /// been proven.
-    ///
-    /// Takes the peer connection, not a media type. This crate does not know
-    /// what the caller does with it, and must not.
-    pub on_session_bound: Option<std::sync::Arc<dyn SessionBound>>,
-    pub provider: Box<dyn SurfaceProvider>,
-    /// Builds a capture per session. A factory rather than an instance because
-    /// sessions are concurrent and each needs its own.
-    pub capture: Box<dyn Fn() -> Box<dyn VisualCapture> + Send + Sync>,
+    /// Run in order once a session's hello is attested.
+    pub on_bound: Vec<std::sync::Arc<dyn SessionBound>>,
 }
 
-impl VisualPlugins {
-    /// The default: a host that cannot stream.
-    ///
-    /// Reports no capability, so a client hides the control rather than
-    /// offering a session that cannot start.
-    pub fn null() -> Self {
-        Self {
-            rtc_api: None,
-            on_session_bound: None,
-            provider: Box::new(crate::visual::NullSurfaceProvider),
-            capture: Box::new(|| Box::new(crate::visual::NullCapture::new())),
-        }
+impl SessionExtensions {
+    /// No extensions: a plain control session.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Whether anything is attached. Drives what the listener reports at start.
+    pub fn any(&self) -> bool {
+        self.rtc_api.is_some() || !self.on_bound.is_empty()
     }
 }
 
-impl Default for VisualPlugins {
-    fn default() -> Self {
-        Self::null()
-    }
-}
-
-#[cfg(feature = "webrtc-transport")]
 /// Everything a control listener needs, independent of which binary hosts it.
 ///
 /// Shared so a downstream binary does not restate the argument list. Those
@@ -123,7 +101,7 @@ pub struct ListenerConfig {
 /// downstream binary work, the seam has sprouted a second seam beside it.
 pub async fn run_control_listener(
     config: &ListenerConfig,
-    visual: VisualPlugins,
+    extensions: SessionExtensions,
 ) -> anyhow::Result<()> {
     let ListenerConfig {
         gateway,
@@ -187,21 +165,20 @@ pub async fn run_control_listener(
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONTROL_SESSIONS));
     println!("control listener device fingerprint: {fingerprint}");
     println!("managed Codex workspace: {}", workspace.display());
-    let rtc_api = visual.rtc_api.clone();
-    let bound_hook = visual.on_session_bound.clone();
-    let caps = visual.provider.capabilities();
-    if caps.any() {
+    let rtc_api = extensions.rtc_api.clone();
+    let hooks = extensions.on_bound.clone();
+
+    if extensions.any() {
         println!(
-            "visual streaming available: browser={} desktop={} up to {}x{}@{}",
-            caps.browser, caps.desktop, caps.max_width, caps.max_height, caps.max_fps
+            "{} session extension(s) attached",
+            extensions.on_bound.len()
         );
     } else {
-        // Said out loud. A host with no capture is the normal case for the
-        // public binary, and silence here would leave an operator wondering
-        // whether streaming failed or was never present.
-        println!("visual streaming not available on this host (no capture plugin)");
+        // Said out loud. A plain control session is the normal case for the
+        // public binary, and silence would leave an operator unable to tell
+        // "nothing is attached" from "something failed to attach".
+        println!("no session extensions attached");
     }
-    let _visual = visual;
     println!("polling {gateway} for device-targeted control offers");
 
     loop {
@@ -229,7 +206,7 @@ pub async fn run_control_listener(
             let in_flight = Arc::clone(&in_flight);
             let fingerprint = fingerprint.clone();
             let rtc = rtc_api.clone();
-            let on_bound = bound_hook.clone();
+            let on_bound = hooks.clone();
             // Kept because `offer` moves into the call below, and the id is
             // needed afterwards to release the in-flight slot.
             let session_id = offer.session_id;
@@ -270,7 +247,7 @@ async fn serve_control_session<S, R, T>(
     fingerprint: &str,
     offer: crate::signaling_client::ControlBrokerSessionView,
     rtc: Option<std::sync::Arc<webrtc::api::API>>,
-    on_bound: Option<std::sync::Arc<dyn SessionBound>>,
+    on_bound: Vec<std::sync::Arc<dyn SessionBound>>,
 ) where
     S: crate::signaling_client::ControlSignalingApi,
     R: crate::control_session::AgentRuntime,
@@ -297,13 +274,13 @@ async fn serve_control_session<S, R, T>(
             }
         };
     println!("control session {} bound directly", offer.session_id);
-    if let Some(hook) = on_bound
-        && let Err(error) = hook.on_bound(channel.peer_connection(), offer.session_id)
-    {
-        // Logged, not fatal. Whatever the caller was attaching failed; the
-        // control channel underneath it still works, and taking the whole
-        // session down would lose the part that was fine.
-        tracing::warn!(session_id = %offer.session_id, %error, "session-bound hook failed");
+    for hook in &on_bound {
+        // Logged, not fatal, and the next hook still runs. One extension
+        // failing must not cost the operator the others, nor the control
+        // channel underneath them.
+        if let Err(error) = hook.on_bound(channel.peer_connection(), offer.session_id) {
+            tracing::warn!(session_id = %offer.session_id, %error, "session extension failed");
+        }
     }
     let tenant = TenantContext {
         tenant_id: offer.account_id,
