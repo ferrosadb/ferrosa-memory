@@ -37,6 +37,12 @@ const MAX_CONCURRENT_CONTROL_SESSIONS: usize = 8;
 /// capture. Anything else a binary needs to customize belongs here too, or the
 /// seam will grow a second one beside it.
 pub struct VisualPlugins {
+    /// A WebRTC API built by the plugin, when it needs one this crate would not
+    /// build — codecs for a media track, for instance.
+    ///
+    /// `None` uses the data-channel-only default, which is what a host with no
+    /// capture plugin should negotiate. This crate never inspects it.
+    pub rtc_api: Option<std::sync::Arc<webrtc::api::API>>,
     pub provider: Box<dyn SurfaceProvider>,
     /// Builds a capture per session. A factory rather than an instance because
     /// sessions are concurrent and each needs its own.
@@ -50,6 +56,7 @@ impl VisualPlugins {
     /// offering a session that cannot start.
     pub fn null() -> Self {
         Self {
+            rtc_api: None,
             provider: Box::new(crate::visual::NullSurfaceProvider),
             capture: Box::new(|| Box::new(crate::visual::NullCapture::new())),
         }
