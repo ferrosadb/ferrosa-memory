@@ -401,7 +401,7 @@ impl CqlControlStore {
         &self,
         ctx: &TenantContext,
         server_fingerprint: &str,
-    ) -> anyhow::Result<(u64, Option<Uuid>)> {
+    ) -> anyhow::Result<Option<(u64, Option<Uuid>)>> {
         let query = format!(
             "SELECT next_cursor, reservation_token FROM {}.mobile_control_cursor_state \
              WHERE tenant_id = ? AND server_fingerprint = ?",
@@ -413,12 +413,20 @@ impl CqlControlStore {
             .query_unpaged(query, (ctx.tenant_id, server_fingerprint))
             .await?;
         let columns = build_col_map(result.col_specs());
+        // `None` means NO ROW, which is not the same as a row holding a low
+        // cursor. Collapsing the two is what wedged this allocator: the caller
+        // used `high_water == 0` to decide between INSERT and UPDATE, so an
+        // existing row whose `next_cursor` was 0 or 1 sent it down the
+        // `INSERT ... IF NOT EXISTS` path against a row that already existed.
+        // That never applies, and the loop reported 32 rounds of it as
+        // contention — a permanent, deterministic failure wearing the costume
+        // of a transient one.
         let Some(row) = result.rows_or_empty().into_iter().next() else {
-            return Ok((0, None));
+            return Ok(None);
         };
         let next: i64 = cql_get(&row, &columns, "next_cursor")?;
         let token = cql_get::<Uuid>(&row, &columns, "reservation_token").ok();
-        Ok((u64::try_from(next)?.saturating_sub(1), token))
+        Ok(Some((u64::try_from(next)?.saturating_sub(1), token)))
     }
 
     async fn high_water(
@@ -428,7 +436,7 @@ impl CqlControlStore {
     ) -> anyhow::Result<u64> {
         self.cursor_state(ctx, server_fingerprint)
             .await
-            .map(|(high_water, _)| high_water)
+            .map(|state| state.map_or(0, |(high_water, _)| high_water))
     }
 }
 
@@ -481,7 +489,8 @@ impl ControlStore for CqlControlStore {
         validate_stream(server_fingerprint)?;
         validate_block_size(size)?;
         for _ in 0..32 {
-            let high_water = self.high_water(ctx, server_fingerprint).await?;
+            let existing = self.cursor_state(ctx, server_fingerprint).await?;
+            let high_water = existing.map_or(0, |(high_water, _)| high_water);
             let start = high_water.saturating_add(1).max(1);
             let end = start
                 .checked_add(size - 1)
@@ -490,7 +499,7 @@ impl ControlStore for CqlControlStore {
             let next = i64::try_from(end + 1)?;
             let now = Utc::now();
             let reservation_token = Uuid::now_v7();
-            let query = if high_water == 0 {
+            let query = if existing.is_none() {
                 format!(
                     "INSERT INTO {}.mobile_control_cursor_state \
                      (tenant_id, server_fingerprint, next_cursor, updated_at, reservation_token) \
@@ -506,7 +515,7 @@ impl ControlStore for CqlControlStore {
                 )
             };
             #[allow(deprecated)]
-            let result = if high_water == 0 {
+            let result = if existing.is_none() {
                 self.session
                     .query_unpaged(
                         query,
@@ -539,8 +548,10 @@ impl ControlStore for CqlControlStore {
                 Some(true) => return Ok(CursorBlock { start, end }),
                 Some(false) => continue,
                 None => {
-                    let (observed_high_water, observed_token) =
-                        self.cursor_state(ctx, server_fingerprint).await?;
+                    let (observed_high_water, observed_token) = self
+                        .cursor_state(ctx, server_fingerprint)
+                        .await?
+                        .unwrap_or((0, None));
                     if observed_high_water == end && observed_token == Some(reservation_token) {
                         return Ok(CursorBlock { start, end });
                     }
@@ -550,7 +561,19 @@ impl ControlStore for CqlControlStore {
                 }
             }
         }
-        anyhow::bail!("mobile control cursor allocation remained contended after 32 attempts")
+        // Report the state, not just the count. "Contended after 32 attempts"
+        // described a race; when the cause was actually a stuck row, it sent
+        // the reader looking for a competing writer that did not exist.
+        let observed = self.cursor_state(ctx, server_fingerprint).await?;
+        anyhow::bail!(
+            "mobile control cursor allocation failed after 32 attempts for {server_fingerprint}; \
+             row {}",
+            match observed {
+                Some((high_water, token)) =>
+                    format!("high_water={high_water} reservation_token={token:?}"),
+                None => "absent".to_owned(),
+            }
+        )
     }
 
     async fn append_event(

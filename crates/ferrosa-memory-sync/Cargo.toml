@@ -6,6 +6,9 @@ license.workspace = true
 
 [dependencies]
 ferrosa-memory-core = { path = "../ferrosa-memory-core" }
+# For the SessionExtension seam: a dyn-compatible async trait. Already in the
+# tree via webrtc; this makes the dependency an explicit one.
+async-trait = "0.1"
 scylla = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -55,3 +58,7 @@ path = "src/main.rs"
 
 [dev-dependencies]
 proptest = "1"
+# `test-util` gives the paused clock. The peer-loss tests turn on a ten-second
+# grace period; without it they would take ten real seconds each and would be
+# timing-dependent, which is the wrong way to test a timeout.
+tokio = { workspace = true, features = ["test-util"] }

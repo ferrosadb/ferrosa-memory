@@ -37,23 +37,119 @@ const POLL_BACKOFF_BASE: Duration = Duration::from_millis(500);
 /// than drifting toward never.
 const POLL_BACKOFF_MAX_STEPS: u32 = 10;
 
-/// A caller's hook for an attested session.
+/// How long a peer may stay `Disconnected` before the session is given up on.
+///
+/// `Disconnected` is recoverable by design — a phone changing Wi-Fi bands, a
+/// moment of packet loss — and WebRTC will return to `Connected` on its own if
+/// the path comes back. So it cannot be treated as death outright. But it also
+/// must not be ignored: `Disconnected` does not close the data channel, so a
+/// session loop blocked on a read never wakes, and anything the session holds
+/// runs on. That is not hypothetical — a screen capture was measured still
+/// encoding at 21% CPU seven minutes after the viewer's connection dropped,
+/// because nothing was watching this state.
+///
+/// Ten seconds: long enough to ride out a hiccup, short enough that nobody
+/// pays for a stream nobody is receiving. ICE's own failure detection is
+/// slower, so this is what actually ends the session in practice.
+const PEER_DISCONNECT_GRACE: Duration = Duration::from_secs(10);
+
+/// A caller's extension to a control session.
 ///
 /// A trait rather than a boxed closure so an implementation can hold state
 /// across sessions — a pool, a registry — without smuggling it through captured
 /// variables.
-pub trait SessionBound: Send + Sync {
+///
+/// Four points, because an extension has a life and not just a birth. The
+/// earlier version had `on_bound` alone, and the consequence was that anything
+/// attached started at bind and ran until the process died: no way to ask for
+/// it, no way to stop it, and no notification when the peer went away. An
+/// extension that captures a screen would therefore capture every screen of
+/// every session forever.
+#[async_trait::async_trait]
+pub trait SessionExtension: Send + Sync {
+    /// Frame kinds this extension answers.
+    ///
+    /// A frame whose `body.type` appears here is routed to [`Self::on_request`]
+    /// INSTEAD of the built-in dispatcher, which would otherwise reject it as
+    /// an unknown kind and close the session. Kinds must not collide with the
+    /// protocol's own (`command`, `ping`, `pong`, `subscribe`); a collision
+    /// silently shadows a real frame, so keep extension kinds prefixed.
+    fn kinds(&self) -> &'static [&'static str];
+
     /// Attach to a session whose hello has been verified.
+    ///
+    /// Register state here. Do NOT start work: nobody has asked for anything
+    /// yet, and a session exists to carry control frames whether or not this
+    /// extension is ever used.
     ///
     /// Errors are logged and the session continues WITHOUT whatever the caller
     /// was attaching. A failure to start an extension must not tear down a
     /// working control channel: the operator keeps the session they asked for
     /// and loses only the part that broke.
-    fn on_bound(
+    async fn on_bound(&self, session: &SessionHandle) -> Result<(), String>;
+
+    /// A frame of one of [`Self::kinds`] arrived.
+    ///
+    /// Errors are logged and the session survives, on the same reasoning as
+    /// `on_bound`: a refused request is not a reason to drop a control channel.
+    async fn on_request(
         &self,
-        peer: std::sync::Arc<webrtc::peer_connection::RTCPeerConnection>,
-        session_id: uuid::Uuid,
+        session: &SessionHandle,
+        kind: &str,
+        frame: &serde_json::Value,
     ) -> Result<(), String>;
+
+    /// The session ended — for any reason, including one this extension never
+    /// heard about.
+    ///
+    /// MUST be idempotent and MUST release everything held for the session. It
+    /// runs on every exit path: an explicit stop, a peer that disconnected, a
+    /// peer that went silent, and a protocol error. That is the whole point of
+    /// having it — a peer that vanishes without saying goodbye is the normal
+    /// case for a phone, not the exceptional one.
+    async fn on_closed(&self, session_id: uuid::Uuid);
+}
+
+/// What an extension is given, and everything it is allowed to do.
+///
+/// Carries the peer connection and a way to write frames, which together are
+/// enough to add a track and renegotiate for it over the channel that is
+/// already up. Notably it does NOT carry the broker: renegotiation belongs on
+/// the established, authenticated data channel, not on the signaling path used
+/// to create it. See the note on [`SessionHandle::send`].
+#[derive(Clone)]
+pub struct SessionHandle {
+    session_id: uuid::Uuid,
+    peer: std::sync::Arc<webrtc::peer_connection::RTCPeerConnection>,
+    sink: crate::control_session::ControlFrameSink,
+}
+
+impl SessionHandle {
+    /// Which session this is.
+    pub fn session_id(&self) -> uuid::Uuid {
+        self.session_id
+    }
+
+    /// The peer connection, for attaching what this crate does not model.
+    ///
+    /// A caller that adds a track owns the renegotiation that follows, and
+    /// [`Self::send`] is how it does that.
+    pub fn peer(&self) -> std::sync::Arc<webrtc::peer_connection::RTCPeerConnection> {
+        std::sync::Arc::clone(&self.peer)
+    }
+
+    /// Write one frame on the control channel.
+    ///
+    /// This is the renegotiation path. Re-offering through the broker would
+    /// mean a second pass through a phase machine built for one handshake, at
+    /// the broker's poll interval, with the offer and answer visible to the
+    /// gateway. The data channel is already open, already authenticated, and
+    /// already end-to-end — an offer sent on it reaches the peer in one round
+    /// trip and is nobody else's business. Signaling servers exist to introduce
+    /// peers that cannot yet talk; these two can.
+    pub async fn send(&self, frame: &str) -> Result<(), String> {
+        self.sink.send_text(frame).await.map_err(|e| e.to_string())
+    }
 }
 
 /// What a caller attaches to the control sessions this listener serves.
@@ -64,15 +160,16 @@ pub trait SessionBound: Send + Sync {
 /// a factory the listener never once called.
 ///
 /// Extensions are a `Vec` because video is not the only thing that will want
-/// this. Audio, a metrics channel, file transfer: each is a `SessionBound`, and
-/// none of them needs this crate to know its name.
+/// this. Audio, a metrics channel, file transfer: each is a `SessionExtension`,
+/// and none of them needs this crate to know its name.
 #[derive(Default, Clone)]
 pub struct SessionExtensions {
     /// A WebRTC API built by the caller, when it needs one this crate would not
     /// build. `None` uses the data-channel-only default. Never inspected here.
     pub rtc_api: Option<std::sync::Arc<webrtc::api::API>>,
-    /// Run in order once a session's hello is attested.
-    pub on_bound: Vec<std::sync::Arc<dyn SessionBound>>,
+    /// Attached in order once a session's hello is attested, and driven for
+    /// the life of the session.
+    pub attach: Vec<std::sync::Arc<dyn SessionExtension>>,
 }
 
 impl SessionExtensions {
@@ -83,7 +180,7 @@ impl SessionExtensions {
 
     /// Whether anything is attached. Drives what the listener reports at start.
     pub fn any(&self) -> bool {
-        self.rtc_api.is_some() || !self.on_bound.is_empty()
+        self.rtc_api.is_some() || !self.attach.is_empty()
     }
 }
 
@@ -175,13 +272,10 @@ pub async fn run_control_listener(
     println!("control listener device fingerprint: {fingerprint}");
     println!("managed Codex workspace: {}", workspace.display());
     let rtc_api = extensions.rtc_api.clone();
-    let hooks = extensions.on_bound.clone();
+    let hooks = extensions.attach.clone();
 
     if extensions.any() {
-        println!(
-            "{} session extension(s) attached",
-            extensions.on_bound.len()
-        );
+        println!("{} session extension(s) attached", extensions.attach.len());
     } else {
         // Said out loud. A plain control session is the normal case for the
         // public binary, and silence would leave an operator unable to tell
@@ -244,7 +338,7 @@ pub async fn run_control_listener(
             let in_flight = Arc::clone(&in_flight);
             let fingerprint = fingerprint.clone();
             let rtc = rtc_api.clone();
-            let on_bound = hooks.clone();
+            let attach = hooks.clone();
             // Kept because `offer` moves into the call below, and the id is
             // needed afterwards to release the in-flight slot.
             let session_id = offer.session_id;
@@ -260,7 +354,7 @@ pub async fn run_control_listener(
                     &fingerprint,
                     offer,
                     rtc,
-                    on_bound,
+                    attach,
                 )
                 .await;
                 in_flight.lock().await.remove(&session_id);
@@ -285,16 +379,13 @@ async fn serve_control_session<S, R, T>(
     fingerprint: &str,
     offer: crate::signaling_client::ControlBrokerSessionView,
     rtc: Option<std::sync::Arc<webrtc::api::API>>,
-    on_bound: Vec<std::sync::Arc<dyn SessionBound>>,
+    attach: Vec<std::sync::Arc<dyn SessionExtension>>,
 ) where
     S: crate::signaling_client::ControlSignalingApi,
     R: crate::control_session::AgentRuntime,
     T: ferrosa_memory_core::control_store::ControlStore + 'static,
 {
     use crate::control_session::run_control_server_session;
-    use ferrosa_memory_core::control_store::ControlEventDraft;
-    use ferrosa_memory_core::types::TenantContext;
-
     println!(
         "accepting control session {} from controller device {}",
         offer.session_id, offer.controller_device_id
@@ -312,14 +403,65 @@ async fn serve_control_session<S, R, T>(
             }
         };
     println!("control session {} bound directly", offer.session_id);
-    for hook in &on_bound {
-        // Logged, not fatal, and the next hook still runs. One extension
-        // failing must not cost the operator the others, nor the control
-        // channel underneath them.
-        if let Err(error) = hook.on_bound(channel.peer_connection(), offer.session_id) {
+    let peer_state = watch_peer_state(&channel.peer_connection());
+    let handle = SessionHandle {
+        session_id: offer.session_id,
+        peer: channel.peer_connection(),
+        sink: channel.frame_sink(),
+    };
+    for extension in &attach {
+        // Logged, not fatal, and the next extension still runs. One failing
+        // must not cost the operator the others, nor the control channel
+        // underneath them.
+        if let Err(error) = extension.on_bound(&handle).await {
             tracing::warn!(session_id = %offer.session_id, %error, "session extension failed");
         }
     }
+    // Every path out of the work below — clean disconnect, cursor failure,
+    // protocol error, peer that simply stopped answering — has to reach the
+    // teardown. Hence the inner future and the unconditional close after it,
+    // rather than a `return` at each failure: an extension holding a screen
+    // capture must not keep it because a cursor reservation failed.
+    session_work(
+        &mut channel,
+        dispatcher,
+        control_store,
+        fingerprint,
+        &offer,
+        &handle,
+        &attach,
+        peer_state,
+    )
+    .await;
+    for extension in &attach {
+        extension.on_closed(offer.session_id).await;
+    }
+    tracing::info!(session_id = %offer.session_id, "control session closed");
+}
+
+/// The body of a bound session.
+///
+/// Split out so that [`serve_control_session`] has exactly one exit path and
+/// can always run the extension teardown. Returns nothing: every failure in
+/// here ends this session and only this session, and is logged where it occurs.
+#[allow(clippy::too_many_arguments)]
+async fn session_work<R, T>(
+    channel: &mut crate::control_session::BoundControlChannel,
+    dispatcher: &crate::control_session::ControlRuntimeDispatcher<T, R>,
+    control_store: &T,
+    fingerprint: &str,
+    offer: &crate::signaling_client::ControlBrokerSessionView,
+    handle: &SessionHandle,
+    attach: &[std::sync::Arc<dyn SessionExtension>],
+    peer_state: tokio::sync::watch::Receiver<
+        webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState,
+    >,
+) where
+    R: crate::control_session::AgentRuntime,
+    T: ferrosa_memory_core::control_store::ControlStore + 'static,
+{
+    use ferrosa_memory_core::control_store::ControlEventDraft;
+    use ferrosa_memory_core::types::TenantContext;
     let tenant = TenantContext {
         tenant_id: offer.account_id,
         session_origin: format!("mobile-control:{}", offer.session_id),
@@ -366,18 +508,56 @@ async fn serve_control_session<S, R, T>(
         );
         return;
     }
+    // Read a frame, OR notice the peer has gone. Reading alone was not enough:
+    // a peer that stops answering without closing leaves this await pending
+    // forever, and the session — with everything attached to it — never ends.
+    //
+    // `recv_text` is cancel-safe (it awaits `mpsc::Receiver::recv`), so losing
+    // the race drops no frame.
+    let mut lost = std::pin::pin!(peer_lost(peer_state, PEER_DISCONNECT_GRACE));
     loop {
-        let frame = match channel.recv_text().await {
-            Ok(frame) => frame,
-            Err(error) => {
+        let frame = tokio::select! {
+            received = channel.recv_text() => match received {
+                Ok(frame) => frame,
+                Err(error) => {
+                    tracing::info!(
+                        session_id = %offer.session_id,
+                        error = %error,
+                        "control session disconnected"
+                    );
+                    break;
+                }
+            },
+            state = &mut lost => {
                 tracing::info!(
                     session_id = %offer.session_id,
-                    error = %error,
-                    "control session disconnected"
+                    ?state,
+                    "peer went away; ending the session"
                 );
                 break;
             }
         };
+        // Extensions get first refusal. Without this the dispatcher rejects
+        // any kind it does not know and CLOSES the session, so an extension
+        // frame would not merely go unanswered — it would drop the channel it
+        // arrived on.
+        if let Some((extension, kind)) = claim(attach, &frame) {
+            if let Err(error) = extension
+                .on_request(handle, &kind, &frame_json(&frame))
+                .await
+            {
+                // The request failed; the session did not. A screen that could
+                // not be captured is a screen that could not be captured, not a
+                // reason to disconnect a working control channel.
+                tracing::warn!(
+                    session_id = %offer.session_id,
+                    %kind,
+                    %error,
+                    "session extension refused a request"
+                );
+            }
+            continue;
+        }
         match dispatcher.reply(&tenant, fingerprint, &frame).await {
             Ok(Some(reply)) => {
                 if let Err(error) = channel.send_text(&reply).await {
@@ -400,5 +580,247 @@ async fn serve_control_session<S, R, T>(
                 break;
             }
         }
+    }
+}
+
+/// Which extension, if any, claims this frame.
+///
+/// Reads `body.type` only. A frame that does not parse, or carries no body
+/// type, is left for the dispatcher to reject with its own error — this is a
+/// routing question, not a validation one, and two places rejecting the same
+/// malformed frame differently is how error messages start lying.
+fn claim(
+    attach: &[std::sync::Arc<dyn SessionExtension>],
+    frame: &str,
+) -> Option<(std::sync::Arc<dyn SessionExtension>, String)> {
+    let value: serde_json::Value = serde_json::from_str(frame).ok()?;
+    let kind = value.pointer("/body/type")?.as_str()?.to_owned();
+    let extension = attach
+        .iter()
+        .find(|extension| extension.kinds().contains(&kind.as_str()))?;
+    Some((std::sync::Arc::clone(extension), kind))
+}
+
+/// Reparse for the extension.
+///
+/// [`claim`] parses to find the kind and discards the result; parsing twice
+/// costs one pass over a frame bounded by `max_frame_bytes`, and is what keeps
+/// `claim` a pure predicate rather than a function that returns a routing
+/// decision AND a payload. Revisit if frames ever get large enough to notice.
+fn frame_json(frame: &str) -> serde_json::Value {
+    serde_json::from_str(frame).unwrap_or(serde_json::Value::Null)
+}
+
+/// Publish the peer connection's state to anyone waiting on it.
+fn watch_peer_state(
+    peer: &std::sync::Arc<webrtc::peer_connection::RTCPeerConnection>,
+) -> tokio::sync::watch::Receiver<
+    webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState,
+> {
+    use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+    let (sender, receiver) = tokio::sync::watch::channel(RTCPeerConnectionState::New);
+    peer.on_peer_connection_state_change(Box::new(move |state| {
+        let sender = sender.clone();
+        Box::pin(async move {
+            // `send_replace`, not `send`: a state change matters even when
+            // nobody is currently listening, and `send` fails with no
+            // receivers.
+            sender.send_replace(state);
+        })
+    }));
+    receiver
+}
+
+/// Resolve once the peer should be considered gone.
+///
+/// `Failed` and `Closed` are terminal and reported at once. `Disconnected` is
+/// given [`PEER_DISCONNECT_GRACE`] to recover, and if the state changes in that
+/// window the wait restarts against the new state — so a connection that
+/// flickers Disconnected → Connected keeps its session.
+async fn peer_lost(
+    mut states: tokio::sync::watch::Receiver<
+        webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState,
+    >,
+    grace: Duration,
+) -> webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState {
+    use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState as State;
+    loop {
+        let current = *states.borrow_and_update();
+        match current {
+            State::Failed | State::Closed => return current,
+            State::Disconnected => {
+                match tokio::time::timeout(grace, states.changed()).await {
+                    // Still disconnected when the grace ran out.
+                    Err(_) => return State::Disconnected,
+                    // Changed — loop and judge the new state.
+                    Ok(Ok(())) => {}
+                    // The sender is gone, which means the connection is too.
+                    Ok(Err(_)) => return State::Closed,
+                }
+            }
+            _ => {
+                if states.changed().await.is_err() {
+                    return State::Closed;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Claims(&'static [&'static str]);
+
+    #[async_trait::async_trait]
+    impl SessionExtension for Claims {
+        fn kinds(&self) -> &'static [&'static str] {
+            self.0
+        }
+        async fn on_bound(&self, _: &SessionHandle) -> Result<(), String> {
+            Ok(())
+        }
+        async fn on_request(
+            &self,
+            _: &SessionHandle,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn on_closed(&self, _: uuid::Uuid) {}
+    }
+
+    fn attach(kinds: &'static [&'static str]) -> Vec<std::sync::Arc<dyn SessionExtension>> {
+        vec![std::sync::Arc::new(Claims(kinds))]
+    }
+
+    fn frame(kind: &str) -> String {
+        format!(r#"{{"version":1,"frame_id":"f1","body":{{"type":"{kind}"}}}}"#)
+    }
+
+    #[test]
+    fn a_declared_kind_is_claimed() {
+        let claimed = claim(&attach(&["visual_start"]), &frame("visual_start"));
+        assert_eq!(
+            claimed.map(|(_, kind)| kind).as_deref(),
+            Some("visual_start")
+        );
+    }
+
+    /// The reason routing exists at all. `command` reaching an extension
+    /// instead of the dispatcher would silently break every command the app
+    /// sends.
+    #[test]
+    fn an_undeclared_kind_is_left_for_the_dispatcher() {
+        assert!(claim(&attach(&["visual_start"]), &frame("command")).is_none());
+    }
+
+    /// With nothing attached — the public binary — routing must be inert.
+    #[test]
+    fn nothing_is_claimed_when_nothing_is_attached() {
+        assert!(claim(&[], &frame("visual_start")).is_none());
+    }
+
+    /// A malformed frame belongs to the dispatcher, which already has an error
+    /// for it. Claiming it here would report the wrong reason for the failure.
+    #[test]
+    fn a_frame_that_does_not_parse_is_not_claimed() {
+        assert!(claim(&attach(&["visual_start"]), "{not json").is_none());
+        assert!(claim(&attach(&["visual_start"]), r#"{"body":{}}"#).is_none());
+    }
+
+    // --- peer_lost ---
+    //
+    // These pin the behaviour that was missing entirely: nothing watched the
+    // peer state, so a viewer whose connection dropped left the session — and
+    // its screen capture — running indefinitely.
+
+    use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState as State;
+
+    const GRACE: Duration = Duration::from_secs(10);
+
+    /// Terminal states end the session with no waiting.
+    #[tokio::test]
+    async fn a_failed_peer_is_lost_at_once() {
+        let (tx, rx) = tokio::sync::watch::channel(State::Failed);
+        assert_eq!(peer_lost(rx, GRACE).await, State::Failed);
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn a_closed_peer_is_lost_at_once() {
+        let (tx, rx) = tokio::sync::watch::channel(State::Closed);
+        assert_eq!(peer_lost(rx, GRACE).await, State::Closed);
+        drop(tx);
+    }
+
+    /// A healthy connection must never resolve. Without this the session would
+    /// be torn down while it was working.
+    #[tokio::test(start_paused = true)]
+    async fn a_connected_peer_is_not_lost() {
+        let (_tx, rx) = tokio::sync::watch::channel(State::Connected);
+        assert!(
+            tokio::time::timeout(GRACE * 10, peer_lost(rx, GRACE))
+                .await
+                .is_err(),
+            "a connected peer must not be reported lost"
+        );
+    }
+
+    /// The measured bug: Disconnected persisted and nothing noticed.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_stays_disconnected_is_lost_after_the_grace() {
+        let (_tx, rx) = tokio::sync::watch::channel(State::Disconnected);
+        assert_eq!(peer_lost(rx, GRACE).await, State::Disconnected);
+    }
+
+    /// And the reason the grace exists: a flicker must not kill the session.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_recovers_within_the_grace_is_kept() {
+        let (tx, rx) = tokio::sync::watch::channel(State::Disconnected);
+        tokio::spawn(async move {
+            tokio::time::sleep(GRACE / 2).await;
+            tx.send_replace(State::Connected);
+            // Held so the channel does not close, which would itself count as
+            // loss and pass the test for the wrong reason.
+            tokio::time::sleep(GRACE * 20).await;
+            drop(tx);
+        });
+        assert!(
+            tokio::time::timeout(GRACE * 5, peer_lost(rx, GRACE))
+                .await
+                .is_err(),
+            "a peer that came back must not be reported lost"
+        );
+    }
+
+    /// A drop-out that recovers and then drops again is lost on the second one
+    /// — the grace restarts, it is not a one-time allowance.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_disconnect_after_recovery_is_still_lost() {
+        let (tx, rx) = tokio::sync::watch::channel(State::Disconnected);
+        tokio::spawn(async move {
+            tokio::time::sleep(GRACE / 2).await;
+            tx.send_replace(State::Connected);
+            tokio::time::sleep(GRACE / 2).await;
+            tx.send_replace(State::Disconnected);
+            tokio::time::sleep(GRACE * 20).await;
+            drop(tx);
+        });
+        assert_eq!(peer_lost(rx, GRACE).await, State::Disconnected);
+    }
+
+    /// First match wins, deterministically by attachment order — so a collision
+    /// is a stable bug rather than an intermittent one.
+    #[test]
+    fn the_first_extension_declaring_a_kind_wins() {
+        let both: Vec<std::sync::Arc<dyn SessionExtension>> = vec![
+            std::sync::Arc::new(Claims(&["shared"])),
+            std::sync::Arc::new(Claims(&["shared"])),
+        ];
+        let (winner, _) = claim(&both, &frame("shared")).expect("claimed");
+        assert!(std::sync::Arc::ptr_eq(&winner, &both[0]));
     }
 }

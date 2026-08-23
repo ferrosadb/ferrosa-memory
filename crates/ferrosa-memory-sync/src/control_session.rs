@@ -162,6 +162,36 @@ enum BindingFrame {
     Hello { hello: Box<ControlHelloFrame> },
 }
 
+/// A send-only handle on a bound control channel.
+///
+/// Exists because receiving needs `&mut` and sending does not, so an extension
+/// that only ever writes should not have to contend for the loop that reads.
+/// Cloneable and cheap: the alternative was handing extensions the whole
+/// channel behind a lock, where a slow writer would stall the reader that
+/// detects the peer going away.
+#[derive(Clone)]
+pub struct ControlFrameSink {
+    data_channel: Arc<RTCDataChannel>,
+    max_frame_bytes: usize,
+}
+
+impl ControlFrameSink {
+    /// Send one complete UTF-8 application frame with an explicit size bound.
+    pub async fn send_text(&self, text: &str) -> Result<(), ControlSessionError> {
+        if text.len() > self.max_frame_bytes {
+            return Err(ControlSessionError::FrameTooLarge {
+                actual: text.len(),
+                limit: self.max_frame_bytes,
+            });
+        }
+        self.data_channel
+            .send_text(text.to_owned())
+            .await
+            .map(|_| ())
+            .map_err(|error| ControlSessionError::Rtc(format!("send text: {error}")))
+    }
+}
+
 /// Successfully signed and bound direct control data channel.
 pub struct BoundControlChannel {
     peer_connection: Arc<RTCPeerConnection>,
@@ -214,6 +244,15 @@ impl BoundControlChannel {
     /// A caller that adds a track owns the renegotiation that follows.
     pub fn peer_connection(&self) -> Arc<RTCPeerConnection> {
         Arc::clone(&self.peer_connection)
+    }
+
+    /// A send-only handle, for a caller that writes frames but does not read
+    /// them.
+    pub fn frame_sink(&self) -> ControlFrameSink {
+        ControlFrameSink {
+            data_channel: Arc::clone(&self.data_channel),
+            max_frame_bytes: self.max_frame_bytes,
+        }
     }
 
     /// Close the direct peer connection.
