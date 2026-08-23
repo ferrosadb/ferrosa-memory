@@ -476,47 +476,60 @@ async fn session_work<R, T>(
         tenant_id: offer.account_id,
         session_origin: format!("mobile-control:{}", offer.session_id),
     };
-    let cursor = match control_store
+    // An AUDIT record that a session began. Nothing below reads the cursor and
+    // nothing about serving the operator depends on this row existing.
+    //
+    // It used to `return` on failure, which ended a perfectly good session
+    // because a bookkeeping write did not land. Observed 2026-08-23: two
+    // sessions in quick succession collided on the same cursor
+    // ("event cursor 4289 is already occupied") and the second was destroyed
+    // moments after connecting — the operator saw a machine that connected and
+    // then had no agents, because the session was gone before the list could
+    // reach them.
+    //
+    // Losing the record is a real loss and is logged at ERROR so it cannot pass
+    // unnoticed. Losing the SESSION over it is a worse one, and is the operator's
+    // problem rather than the log's.
+    match control_store
         .reserve_cursor_block(&tenant, fingerprint, 64)
         .await
     {
-        Ok(block) => block.start,
         Err(error) => {
-            // Ends THIS session, not the listener. A cursor failure used to
-            // propagate out of the poll loop and stop the process, taking every
-            // other device's session with it.
-            tracing::warn!(
+            tracing::error!(
                 session_id = %offer.session_id,
                 error = %error,
-                "reserving durable mobile control cursor block failed"
+                "reserving a control cursor block failed; this session is NOT \
+                 recorded in the durable event log, but continues to serve"
             );
-            return;
         }
-    };
-    if let Err(error) = control_store
-        .append_event(
-            &tenant,
-            fingerprint,
-            ControlEventDraft {
-                cursor,
-                event_id: Uuid::now_v7(),
-                command_id: None,
-                kind: "heartbeat".to_owned(),
-                payload: serde_json::json!({
-                    "session_id": offer.session_id,
-                    "controller_device_id": offer.controller_device_id,
-                }),
-                created_at: chrono::Utc::now(),
-            },
-        )
-        .await
-    {
-        tracing::warn!(
-            session_id = %offer.session_id,
-            error = %error,
-            "persisting control-session heartbeat failed"
-        );
-        return;
+        Ok(block) => {
+            if let Err(error) = control_store
+                .append_event(
+                    &tenant,
+                    fingerprint,
+                    ControlEventDraft {
+                        cursor: block.start,
+                        event_id: Uuid::now_v7(),
+                        command_id: None,
+                        kind: "heartbeat".to_owned(),
+                        payload: serde_json::json!({
+                            "session_id": offer.session_id,
+                            "controller_device_id": offer.controller_device_id,
+                        }),
+                        created_at: chrono::Utc::now(),
+                    },
+                )
+                .await
+            {
+                tracing::error!(
+                    session_id = %offer.session_id,
+                    cursor = block.start,
+                    error = %error,
+                    "persisting the control-session heartbeat failed; this session \
+                     is NOT in the durable event log, but continues to serve"
+                );
+            }
+        }
     }
     // Read a frame, OR notice the peer has gone. Reading alone was not enough:
     // a peer that stops answering without closing leaves this await pending

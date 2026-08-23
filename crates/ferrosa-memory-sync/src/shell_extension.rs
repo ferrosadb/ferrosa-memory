@@ -104,28 +104,63 @@ impl ShellExtension {
     }
 
     async fn add_config(&self, body: &serde_json::Value) -> Result<(), String> {
-        let name = body
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        let kind = body
-            .get("kind")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        let command: Vec<String> = body
-            .get("command")
-            .and_then(serde_json::Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default();
         let config =
-            SessionConfig::create(name, kind, command).map_err(|error| error.to_string())?;
+            SessionConfig::create(text(body, "name"), text(body, "kind"), command_list(body))
+                .map_err(|error| error.to_string())?;
         let mut configs = self.configs.lock().await;
         configs.push(config);
+        save_configs(&self.store_path, &configs);
+        Ok(())
+    }
+
+    /// Change an existing config.
+    ///
+    /// A tmux session already running keeps running the OLD command — it was
+    /// started with it, and nothing here can retroactively change what a
+    /// process was launched as. Reported so the operator knows the edit takes
+    /// effect next time, rather than believing a running build picked up their
+    /// change.
+    async fn update_config(&self, body: &serde_json::Value) -> Result<bool, String> {
+        let id = config_id(body)?;
+        let name = text(body, "name");
+        let kind = text(body, "kind");
+        let command = command_list(body);
+
+        let mut configs = self.configs.lock().await;
+        let position = configs
+            .iter()
+            .position(|config| config.id == id)
+            .ok_or_else(|| "no config with that id".to_owned())?;
+        let updated = configs[position]
+            .edited(name, kind, command)
+            .map_err(|error| error.to_string())?;
+        let was_running = self.runtime.is_running(&configs[position]).await;
+        configs[position] = updated;
+        save_configs(&self.store_path, &configs);
+        Ok(was_running)
+    }
+
+    /// Remove a config.
+    ///
+    /// Refused while its tmux session is running. Deleting would leave a
+    /// process alive that nothing can name, attribute or stop — an orphan the
+    /// operator would find later in `tmux ls` with no idea what started it.
+    /// Killing it silently is worse: "delete this config" is not "stop my
+    /// build".
+    async fn delete_config(&self, body: &serde_json::Value) -> Result<(), String> {
+        let id = config_id(body)?;
+        let mut configs = self.configs.lock().await;
+        let position = configs
+            .iter()
+            .position(|config| config.id == id)
+            .ok_or_else(|| "no config with that id".to_owned())?;
+        if self.runtime.is_running(&configs[position]).await {
+            return Err(
+                "this config's session is still running — detach and stop it before deleting"
+                    .to_owned(),
+            );
+        }
+        configs.remove(position);
         save_configs(&self.store_path, &configs);
         Ok(())
     }
@@ -191,20 +226,57 @@ impl ShellExtension {
 }
 
 /// Forward a session's output to the device until it ends.
+/// The most raw terminal bytes one `shell_output` frame may carry.
+///
+/// Deliberately small. A data channel is SCTP over DTLS over UDP, and SCTP
+/// fragments a large message to the path MTU it believes in. On a path where
+/// MTU discovery does not work — mobile carriers routinely drop the ICMP that
+/// makes it work — those fragments are silently lost, so a big message never
+/// arrives while small ones do.
+///
+/// That is the shape of the bug this bounds: video kept working (RTP packetises
+/// to about 1200 bytes of its own accord) and small control frames kept
+/// working, while terminal output alone vanished off WiFi. 512 bytes of raw
+/// input becomes roughly 700 of base64 plus the envelope, which stays inside a
+/// conservative MTU with room to spare.
+///
+/// The channel is reliable and ORDERED, so splitting changes nothing the
+/// emulator sees: it receives the same bytes in the same sequence, in more
+/// pieces.
+const MAX_OUTPUT_BYTES_PER_FRAME: usize = 512;
+
+/// One `shell_output` frame carrying raw terminal bytes.
+///
+/// Base64, not a string. This is a raw terminal stream — escape sequences,
+/// cursor moves, whatever encoding the program chose. A lossy UTF-8 conversion
+/// would replace exactly the bytes the emulator needs to position anything.
+async fn send_output(
+    session: &SessionHandle,
+    config_id: uuid::Uuid,
+    bytes: &[u8],
+) -> Result<(), ()> {
+    use base64::Engine as _;
+
+    let frame = serde_json::json!({
+        "version": 1,
+        "frame_id": uuid::Uuid::now_v7().to_string(),
+        "body": {
+            "type": "shell_output",
+            "config_id": config_id.to_string(),
+            "bytes": base64::engine::general_purpose::STANDARD.encode(bytes),
+        },
+    });
+    session.send(&frame.to_string()).await.map_err(|_| ())
+}
+
 async fn pump_output(running: Arc<RunningSession>, session: SessionHandle, config_id: uuid::Uuid) {
-    while let Some(text) = running.next_output().await {
-        let frame = serde_json::json!({
-            "version": 1,
-            "frame_id": uuid::Uuid::now_v7().to_string(),
-            "body": {
-                "type": "shell_output",
-                "config_id": config_id.to_string(),
-                "text": text,
-            },
-        });
-        if session.send(&frame.to_string()).await.is_err() {
-            // The channel has gone; so has the reason to keep reading.
-            return;
+    while let Some(bytes) = running.next_output().await {
+        // Split rather than sent whole. See MAX_OUTPUT_BYTES_PER_FRAME.
+        for piece in bytes.chunks(MAX_OUTPUT_BYTES_PER_FRAME) {
+            if send_output(&session, config_id, piece).await.is_err() {
+                // The channel has gone; so has the reason to keep reading.
+                return;
+            }
         }
     }
     // Ended. Said explicitly, because a transcript that simply stops is
@@ -234,8 +306,12 @@ impl SessionExtension for ShellExtension {
             "shell_stop",
             "shell_list",
             "shell_add_config",
+            "shell_update_config",
+            "shell_delete_config",
             "shell_open",
             "shell_close",
+            "shell_delete_session",
+            "shell_resize",
             "shell_input",
         ]
     }
@@ -292,6 +368,28 @@ impl SessionExtension for ShellExtension {
                 // to change the list, so what it needs back is the list.
                 session.send(&envelope(self.configs_frame().await)).await
             }
+            "shell_update_config" => {
+                let was_running = self.update_config(body).await?;
+                session.send(&envelope(self.configs_frame().await)).await?;
+                if was_running {
+                    // Said plainly. A running process cannot retroactively
+                    // become the command it was just edited to be, and an
+                    // operator who believes otherwise will trust output from a
+                    // build they think they changed.
+                    session
+                        .send(&envelope(serde_json::json!({
+                            "type": "shell_notice",
+                            "text": "The running session still uses the previous command. \
+                                     The change applies next time it starts.",
+                        })))
+                        .await?;
+                }
+                Ok(())
+            }
+            "shell_delete_config" => {
+                self.delete_config(body).await?;
+                session.send(&envelope(self.configs_frame().await)).await
+            }
             "shell_open" => {
                 let config_id = body
                     .get("config_id")
@@ -303,11 +401,21 @@ impl SessionExtension for ShellExtension {
                 self.close(session_id).await;
                 Ok(())
             }
-            "shell_input" => {
-                let text = body
-                    .get("text")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| "input needs text".to_owned())?;
+            "shell_resize" => {
+                // A TUI lays out to the size it is told, so a wrong one wraps
+                // or truncates every frame it draws. The device is the only
+                // thing that knows how big its terminal is.
+                let rows = body.get("rows").and_then(serde_json::Value::as_u64);
+                let cols = body.get("cols").and_then(serde_json::Value::as_u64);
+                let (Some(rows), Some(cols)) = (rows, cols) else {
+                    return Err("resize needs rows and cols".to_owned());
+                };
+                // Refused rather than clamped. A zero here means the device
+                // measured nothing, and telling the program it has a
+                // zero-column terminal makes it draw nothing at all.
+                if rows == 0 || cols == 0 {
+                    return Err("a terminal cannot be zero rows or columns".to_owned());
+                }
                 let open = self
                     .sessions
                     .lock()
@@ -315,7 +423,79 @@ impl SessionExtension for ShellExtension {
                     .get(&session_id)
                     .and_then(|state| state.open.clone())
                     .ok_or_else(|| "no session is open".to_owned())?;
-                open.send(text).map_err(|error| error.to_string())
+                open.resize(
+                    u16::try_from(rows.min(u64::from(u16::MAX))).unwrap_or(u16::MAX),
+                    u16::try_from(cols.min(u64::from(u16::MAX))).unwrap_or(u16::MAX),
+                )
+                .map_err(|error| error.to_string())
+            }
+            "shell_delete_session" => {
+                // Deliberately distinct from shell_close. Closing a persistent
+                // session detaches and leaves it running, which is the whole
+                // reason to choose that kind; this is the operator saying the
+                // work is finished and the session should stop existing.
+                let open = self
+                    .sessions
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .and_then(|state| state.open.clone())
+                    .ok_or_else(|| "no session is open".to_owned())?;
+                open.destroy().map_err(|error| error.to_string())?;
+                self.close(session_id).await;
+                // The list changes — the agent stops being "in use" — so send
+                // it rather than leaving the device to guess.
+                session.send(&envelope(self.configs_frame().await)).await
+            }
+            "shell_input" => {
+                let open = self
+                    .sessions
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .and_then(|state| state.open.clone())
+                    .ok_or_else(|| "no session is open".to_owned())?;
+
+                // Text and keys are separate fields, and a frame may carry
+                // either or both. A bare Return — no text at all — is how a
+                // CLI waiting for confirmation is answered, so "empty means
+                // nothing to do" would make the app unable to say yes.
+                if let Some(text) = body.get("text").and_then(serde_json::Value::as_str)
+                    && !text.is_empty()
+                {
+                    open.send(text).map_err(|error| error.to_string())?;
+                }
+
+                // Raw bytes from a client-side emulator. This is the normal
+                // path now that the device runs a real terminal; `text` and
+                // `keys` remain for the on-screen key bar and for any client
+                // without an emulator.
+                let raw = body.get("bytes").and_then(serde_json::Value::as_str);
+                if let Some(encoded) = raw {
+                    use base64::Engine as _;
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .map_err(|error| format!("input bytes are not base64: {error}"))?;
+                    open.send_bytes(&bytes).map_err(|error| error.to_string())?;
+                }
+
+                let keys = body.get("keys").and_then(serde_json::Value::as_array);
+                if let Some(keys) = keys {
+                    for name in keys.iter().filter_map(serde_json::Value::as_str) {
+                        // Refused, not guessed. `send-keys` reads its argument
+                        // as tmux's command language, so forwarding an unknown
+                        // name would hand the device remote tmux control rather
+                        // than a keypress.
+                        let key = crate::session_runtime::NamedKey::from_wire(name)
+                            .ok_or_else(|| format!("{name} is not a key this machine sends"))?;
+                        open.send_key(key).map_err(|error| error.to_string())?;
+                    }
+                }
+
+                if body.get("text").is_none() && keys.is_none() && raw.is_none() {
+                    return Err("input needs bytes, text or keys".to_owned());
+                }
+                Ok(())
             }
             other => Err(format!("claimed {other} and cannot serve it")),
         }
@@ -327,6 +507,31 @@ impl SessionExtension for ShellExtension {
         // dropping it; a tmux one keeps running, which is why it was chosen.
         self.sessions.lock().await.remove(&session_id);
     }
+}
+
+fn config_id(body: &serde_json::Value) -> Result<uuid::Uuid, String> {
+    body.get("config_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|id| id.parse().ok())
+        .ok_or_else(|| "that is not a config id".to_owned())
+}
+
+fn text<'a>(body: &'a serde_json::Value, key: &str) -> &'a str {
+    body.get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+}
+
+fn command_list(body: &serde_json::Value) -> Vec<String> {
+    body.get("command")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn envelope(body: serde_json::Value) -> String {
@@ -456,5 +661,73 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].name, "keep");
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod output_framing_tests {
+    use super::*;
+    use base64::Engine as _;
+
+    /// A conservative floor for path MTU.
+    ///
+    /// IPv6 guarantees 1280, and DTLS, UDP, IP and SCTP headers all come out of
+    /// that. Staying under this means SCTP never has to fragment an output
+    /// frame, which is the thing that was failing on a path where MTU discovery
+    /// does not work.
+    const SAFE_DATAGRAM_BYTES: usize = 1100;
+
+    fn frame_len(payload: &[u8]) -> usize {
+        serde_json::json!({
+            "version": 1,
+            "frame_id": uuid::Uuid::now_v7().to_string(),
+            "body": {
+                "type": "shell_output",
+                "config_id": uuid::Uuid::now_v7().to_string(),
+                "bytes": base64::engine::general_purpose::STANDARD.encode(payload),
+            },
+        })
+        .to_string()
+        .len()
+    }
+
+    /// The invariant that matters is the SERIALIZED frame, not the chunk size.
+    ///
+    /// Base64 inflates by a third and the envelope carries two UUIDs, so a
+    /// chunk limit chosen without measuring the whole frame is a guess. This
+    /// fails if anyone raises the chunk size or adds a field to the envelope
+    /// without rechecking.
+    #[test]
+    fn a_full_output_frame_fits_in_one_datagram() {
+        let payload = vec![0xffu8; MAX_OUTPUT_BYTES_PER_FRAME];
+        let length = frame_len(&payload);
+        assert!(
+            length <= SAFE_DATAGRAM_BYTES,
+            "a full output frame is {length} bytes, over the {SAFE_DATAGRAM_BYTES} \
+             budget — SCTP will fragment it and it will vanish on a path with a \
+             small MTU, which is the bug this bounds"
+        );
+    }
+
+    /// Splitting must not lose or reorder anything: the channel is reliable and
+    /// ordered, so reassembling the pieces has to give back the original.
+    #[test]
+    fn splitting_preserves_the_byte_stream() {
+        let original: Vec<u8> = (0..5000u32).map(|byte| (byte % 256) as u8).collect();
+        let rejoined: Vec<u8> = original
+            .chunks(MAX_OUTPUT_BYTES_PER_FRAME)
+            .flat_map(<[u8]>::to_vec)
+            .collect();
+        assert_eq!(rejoined, original);
+    }
+
+    /// Every piece is within budget, including the last short one.
+    #[test]
+    fn no_piece_exceeds_the_limit() {
+        let original = vec![0u8; 5000];
+        for piece in original.chunks(MAX_OUTPUT_BYTES_PER_FRAME) {
+            assert!(piece.len() <= MAX_OUTPUT_BYTES_PER_FRAME);
+            assert!(frame_len(piece) <= SAFE_DATAGRAM_BYTES);
+        }
     }
 }

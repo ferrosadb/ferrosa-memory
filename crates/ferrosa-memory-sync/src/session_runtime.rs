@@ -35,7 +35,7 @@ use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc};
 
-use crate::session_config::{SessionConfig, SessionKind, clean_terminal_output};
+use crate::session_config::{SessionConfig, SessionKind};
 
 /// How much output to hold for a reader that has fallen behind.
 ///
@@ -64,10 +64,108 @@ pub enum SessionError {
 /// A running session, whichever kind it is.
 pub struct RunningSession {
     config: SessionConfig,
-    output: Mutex<mpsc::Receiver<String>>,
+    output: Mutex<mpsc::Receiver<Vec<u8>>>,
     input: Box<dyn SessionInput>,
     /// Chunks dropped because the reader was behind.
     dropped: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// What pressing Return actually puts on the wire.
+///
+/// A terminal sends carriage return (0x0d) for the Return key, not line feed
+/// (0x0a). A cooked shell accepts either, because the line discipline turns CR
+/// into NL — which is why sending "\n" LOOKED correct against bash. A program
+/// in raw mode does not get that translation: crossterm and friends read 0x0d
+/// as Return and 0x0a as Ctrl-J, so a TUI sent "\n" shows the typed text and
+/// then does nothing — indistinguishable from input not being wired at all.
+const RETURN: &str = "\r";
+
+/// Runs the operator's command, reports how it ended, and keeps the pane.
+///
+/// `"$@"` is the operator's argv, passed to `sh` as arguments rather than
+/// pasted into this string — so nothing they type is ever parsed as shell
+/// syntax. The trailing wait is what makes a session outlive the thing it ran:
+/// the pane, and therefore its scrollback, stays readable until the session is
+/// deleted.
+///
+/// The exit line is deliberately printed rather than only recorded. It is the
+/// first thing an operator debugging "why did this not start" needs, and it
+/// belongs in the transcript they are already reading.
+const KEEPER_SCRIPT: &str = r#"
+"$@"
+status=$?
+if [ "$status" -eq 0 ]; then
+  printf '\n[%s exited normally]\n' "$1"
+else
+  printf '\n[%s exited with status %s]\n' "$1" "$status"
+fi
+printf '[the session is still here — delete it when you are done]\n'
+while :; do sleep 3600; done
+"#;
+
+/// A key that is not a character.
+///
+/// The set is deliberately small and explicit rather than "any string the
+/// device sends". These names cross the wire from a phone, and `send-keys`
+/// without `-l` interprets its argument as a tmux command language — an
+/// unvalidated name there is arbitrary tmux control, not a keypress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamedKey {
+    Enter,
+    Escape,
+    Tab,
+    Backspace,
+    Up,
+    Down,
+    Left,
+    Right,
+    /// Interrupt. The single most important one for a harness that is stuck.
+    CtrlC,
+    /// End of input.
+    CtrlD,
+    /// Suspend.
+    CtrlZ,
+}
+
+impl NamedKey {
+    /// Parse a name the device sent. Unknown names are refused, not guessed.
+    pub fn from_wire(name: &str) -> Option<Self> {
+        Some(match name {
+            "enter" | "return" => Self::Enter,
+            "escape" | "esc" => Self::Escape,
+            "tab" => Self::Tab,
+            "backspace" => Self::Backspace,
+            "up" => Self::Up,
+            "down" => Self::Down,
+            "left" => Self::Left,
+            "right" => Self::Right,
+            "ctrl-c" => Self::CtrlC,
+            "ctrl-d" => Self::CtrlD,
+            "ctrl-z" => Self::CtrlZ,
+            _ => return None,
+        })
+    }
+
+    /// The bytes a terminal actually sends for it.
+    ///
+    /// Used for the PTY path, which has no key names — only bytes. The arrows
+    /// are the standard CSI sequences; a program in raw mode recognises
+    /// nothing else as an arrow.
+    fn bytes(self) -> &'static [u8] {
+        match self {
+            Self::Enter => b"\r",
+            Self::Escape => b"\x1b",
+            Self::Tab => b"\t",
+            Self::Backspace => b"\x7f",
+            Self::Up => b"\x1b[A",
+            Self::Down => b"\x1b[B",
+            Self::Right => b"\x1b[C",
+            Self::Left => b"\x1b[D",
+            Self::CtrlC => b"\x03",
+            Self::CtrlD => b"\x04",
+            Self::CtrlZ => b"\x1a",
+        }
+    }
 }
 
 /// Where a session's input goes.
@@ -76,14 +174,51 @@ pub struct RunningSession {
 /// master versus `tmux send-keys` — and pretending otherwise would mean a
 /// branch at every call site.
 trait SessionInput: Send + Sync {
-    /// Send a line to the session. The newline is the caller's business:
-    /// a shell needs one to act, and a program reading raw input may not.
+    /// Send text to the session.
+    ///
+    /// A `\n` in `text` means "the operator pressed Return here", and each
+    /// implementation is responsible for delivering that as a real Return —
+    /// see [`RETURN`] for why a literal line feed is not one.
     fn send(&self, text: &str) -> Result<(), SessionError>;
+
+    /// Write raw bytes straight to the terminal.
+    ///
+    /// What a client-side emulator produces: already exactly what a terminal
+    /// would put on the wire, including the escape sequences for arrows and
+    /// the control bytes for Ctrl-C. Passing these through `send` would
+    /// newline-translate them and corrupt any sequence containing 0x0a.
+    fn send_bytes(&self, bytes: &[u8]) -> Result<(), SessionError>;
+
+    /// Press a key that is not a character.
+    ///
+    /// Separate from [`Self::send`] because there is no text encoding that
+    /// means "Ctrl-C" — a byte that happens to be 0x03 inside a string would
+    /// arrive as data on one transport and as an interrupt on the other.
+    fn send_key(&self, key: NamedKey) -> Result<(), SessionError>;
+
+    /// Tell the program how big the operator's terminal is.
+    ///
+    /// Not cosmetic: a TUI lays out to the size it is told, so a wrong one
+    /// wraps or truncates every frame it draws. Resizing the master is also
+    /// what sends SIGWINCH, which is the only way a running program learns the
+    /// size changed.
+    fn resize(&self, rows: u16, cols: u16) -> Result<(), SessionError>;
 
     /// Stop the session if it belongs to this connection.
     ///
     /// A no-op for tmux, which is the whole reason to choose tmux.
     fn shutdown(&self);
+
+    /// End the session permanently, whatever kind it is.
+    ///
+    /// The counterpart to [`Self::shutdown`]: that one asks "does this session
+    /// belong to the connection going away", this one is the operator saying
+    /// they are done. For tmux the difference is everything — detaching leaves
+    /// a build running, this does not.
+    ///
+    /// Synchronous, like the rest of this trait, because it is boxed: a trait
+    /// with an `async fn` cannot be used behind `dyn`.
+    fn destroy(&self) -> Result<(), SessionError>;
 }
 
 impl RunningSession {
@@ -96,12 +231,36 @@ impl RunningSession {
     /// `None` once the session has ended and everything it produced has been
     /// read — so a caller draining after a command exits still gets the last
     /// output rather than losing it to the teardown.
-    pub async fn next_output(&self) -> Option<String> {
+    pub async fn next_output(&self) -> Option<Vec<u8>> {
         self.output.lock().await.recv().await
     }
 
     pub fn send(&self, text: &str) -> Result<(), SessionError> {
         self.input.send(text)
+    }
+
+    /// Press a named key — Return on its own, Ctrl-C, an arrow.
+    pub fn send_key(&self, key: NamedKey) -> Result<(), SessionError> {
+        self.input.send_key(key)
+    }
+
+    /// Write raw bytes from a client-side terminal emulator.
+    pub fn send_bytes(&self, bytes: &[u8]) -> Result<(), SessionError> {
+        self.input.send_bytes(bytes)
+    }
+
+    /// Tell the program the size of the terminal showing it.
+    pub fn resize(&self, rows: u16, cols: u16) -> Result<(), SessionError> {
+        self.input.resize(rows, cols)
+    }
+
+    /// End this session for good.
+    ///
+    /// Distinct from dropping the handle, which for a persistent session only
+    /// detaches. This is the operator saying they are finished with it: the
+    /// tmux session and its scrollback go away, and nothing is left to resume.
+    pub fn destroy(&self) -> Result<(), SessionError> {
+        self.input.destroy()
     }
 
     /// Chunks dropped because the reader could not keep up.
@@ -165,14 +324,32 @@ impl SessionRuntime {
     }
 
     fn open_pty(&self, config: &SessionConfig) -> Result<RunningSession, SessionError> {
+        let mut command = std::process::Command::new(&config.command[0]);
+        command.args(&config.command[1..]);
+        self.spawn_pty(command, config, PtyKind::Ephemeral)
+    }
+
+    /// Run something in a PTY and stream its raw bytes.
+    ///
+    /// Shared by both kinds, because after attaching to tmux they ARE the same
+    /// thing: a pseudo-terminal with a program on the far end. The only
+    /// difference left is what closing it means, which is what [`PtyKind`]
+    /// carries.
+    fn spawn_pty(
+        &self,
+        command: std::process::Command,
+        config: &SessionConfig,
+        kind: PtyKind,
+    ) -> Result<RunningSession, SessionError> {
         use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
         let pty = native_pty_system();
         let pair = pty
             .openpty(PtySize {
-                // A width a phone can read without wrapping mid-word. Programs
-                // ask the terminal how wide it is and format to fit, so this
-                // is not cosmetic — it decides where `cargo` breaks its lines.
+                // The device resizes this as soon as it knows its own terminal
+                // size. These are only what the program sees for the first few
+                // milliseconds, and a program that measures once at startup —
+                // which most TUIs do — would otherwise be stuck with them.
                 rows: 40,
                 cols: 100,
                 pixel_width: 0,
@@ -183,11 +360,16 @@ impl SessionRuntime {
                 message: error.to_string(),
             })?;
 
-        let mut builder = CommandBuilder::new(&config.command[0]);
-        for argument in &config.command[1..] {
+        let mut builder = CommandBuilder::new(command.get_program());
+        for argument in command.get_args() {
             builder.arg(argument);
         }
         builder.cwd(&self.workspace);
+        // Declared, because a program asks $TERM what it may draw with. Without
+        // it a TUI assumes a dumb terminal and either refuses to run or falls
+        // back to output no emulator can lay out. This is the value the client
+        // emulator implements.
+        builder.env("TERM", "xterm-256color");
 
         let child = pair
             .slave
@@ -227,15 +409,16 @@ impl SessionRuntime {
                 let mut buffer = [0u8; READ_CHUNK];
                 loop {
                     match reader.read(&mut buffer) {
-                        // EOF: the command has finished and the writer is gone.
+                        // EOF: the program has finished and the writer is gone.
                         Ok(0) | Err(_) => break,
                         Ok(read) => {
-                            let text = String::from_utf8_lossy(&buffer[..read]);
-                            let cleaned = clean_terminal_output(&text);
-                            if cleaned.is_empty() {
-                                continue;
-                            }
-                            if sender.try_send(cleaned).is_err() {
+                            // RAW. Nothing is stripped or interpreted here —
+                            // the device runs a terminal emulator, and an
+                            // escape sequence removed on the way past is one it
+                            // can never act on. Cleaning these bytes is what
+                            // made a redrawing CLI "jump around".
+                            let chunk = buffer[..read].to_vec();
+                            if sender.try_send(chunk).is_err() {
                                 counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
@@ -253,6 +436,9 @@ impl SessionRuntime {
             input: Box::new(PtyInput {
                 writer: std::sync::Mutex::new(writer),
                 child: std::sync::Mutex::new(child),
+                master: std::sync::Mutex::new(pair.master),
+                kind,
+                tmux: self.tmux_binary.clone(),
             }),
             dropped,
         })
@@ -264,207 +450,274 @@ impl SessionRuntime {
             let workspace = self.workspace.to_string_lossy().into_owned();
             let mut command = Command::new(&self.tmux_binary);
             command.args(["new-session", "-d", "-s", &name, "-c", &workspace, "--"]);
+            // Run under a keeper, not directly.
+            //
+            // A command that exits takes its pane and its session with it, so a
+            // harness that fails on startup is GONE before anything can read
+            // what it printed — which looks exactly like a session that never
+            // started. The keeper runs the command, prints its exit status into
+            // the pane, and then holds the pane open so the output stays
+            // readable until the operator deletes the session.
+            //
+            // The user's argv is passed as ARGUMENTS to `sh`, never
+            // interpolated into the script. `"$@"` expands to exactly the words
+            // the operator entered, so a command containing quotes, semicolons
+            // or backticks runs as one command with those characters in it
+            // rather than becoming several.
+            command.args(["/bin/sh", "-c", KEEPER_SCRIPT, "ferrosa-session"]);
             command.args(&config.command);
-            let status = command
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
+            let output = command
+                .stdout(Stdio::piped())
+                // KEPT, not discarded. This was `Stdio::null()`, so a failure
+                // reported "tmux exited with exit status: 1" and nothing else —
+                // the one line that says whether the command does not exist,
+                // the directory is missing, or tmux itself is unhappy.
+                .stderr(Stdio::piped())
+                .output()
                 .await
                 .map_err(|error| SessionError::Tmux {
                     operation: "new-session",
                     message: error.to_string(),
                 })?;
-            if !status.success() {
+            if !output.status.success() {
+                let complaint = String::from_utf8_lossy(&output.stderr);
+                let complaint = complaint.trim();
                 return Err(SessionError::Tmux {
                     operation: "new-session",
-                    message: format!("tmux exited with {status}"),
+                    message: if complaint.is_empty() {
+                        format!("tmux exited with {} and said nothing", output.status)
+                    } else {
+                        complaint.to_owned()
+                    },
                 });
+            }
+
+            // Per session, never globally — this process does not get to
+            // reconfigure the operator's own tmux.
+            for option in [
+                // No status bar. It costs a row on a phone and describes tmux
+                // rather than the work.
+                ["status", "off"],
+                // Mouse reporting ON, which is what makes the real scrollback
+                // reachable. The emulator on the device only holds what it has
+                // received since attaching; the session's HISTORY lives in
+                // tmux. With this, a drag becomes a scroll event tmux acts on,
+                // entering copy-mode and walking its own history — so the
+                // operator can reach output from before they connected.
+                //
+                // A program that asks for mouse events still gets them: tmux
+                // forwards to an application that has requested them and only
+                // handles the scroll itself when none has.
+                ["mouse", "on"],
+                // A history worth scrolling. The default is 2000 lines, which
+                // a build log passes in seconds.
+                ["history-limit", "50000"],
+            ] {
+                let _ = Command::new(&self.tmux_binary)
+                    .args(["set-option", "-t", &name, option[0], option[1]])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .await;
             }
         }
 
-        let (sender, output) = mpsc::channel(OUTPUT_QUEUE);
-        let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        // Polled with `capture-pane` rather than attached. Attaching would need
-        // a PTY of its own and would make this connection the session's
-        // controlling terminal — which is exactly what must NOT happen, because
-        // the session has to outlive it.
-        let poller = TmuxPoller {
-            tmux: self.tmux_binary.clone(),
-            session: name.clone(),
-            sender,
-            dropped: Arc::clone(&dropped),
-        };
-        tokio::spawn(poller.run());
-
-        Ok(RunningSession {
-            config: config.clone(),
-            output: Mutex::new(output),
-            input: Box::new(TmuxInput {
-                tmux: self.tmux_binary.clone(),
-                session: name,
-            }),
-            dropped,
-        })
+        // ATTACHED through a PTY, not scraped with `capture-pane`.
+        //
+        // Scraping produced cleaned text with the escape sequences stripped,
+        // which is fine for a command that emits lines and useless for anything
+        // that redraws — a TUI arrived as its repainted screens concatenated in
+        // emission order. Attaching gives the real byte stream in both
+        // directions, so the device can run an actual terminal emulator.
+        //
+        // Attaching does NOT endanger the session. tmux is a server; this
+        // creates a client, and when the PTY goes away the client detaches and
+        // the session keeps running. That is exactly what detaching means.
+        let mut attach = std::process::Command::new(&self.tmux_binary);
+        attach.args(["attach-session", "-t", &name]);
+        self.spawn_pty(attach, config, PtyKind::Tmux { session: name })
     }
+}
+/// What closing a PTY means for the thing on the far end.
+enum PtyKind {
+    /// Killing the child ends the work. There is nothing to outlive us.
+    Ephemeral,
+    /// The PTY holds a tmux CLIENT. Dropping it detaches; the session and its
+    /// scrollback keep going until someone deletes them.
+    Tmux { session: String },
 }
 
 struct PtyInput {
     writer: std::sync::Mutex<Box<dyn std::io::Write + Send>>,
     child: std::sync::Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
+    /// Kept so the terminal can be resized after it is running. A program that
+    /// asked the terminal its size at startup only learns about a change from
+    /// SIGWINCH, which is what resizing the master sends.
+    master: std::sync::Mutex<Box<dyn portable_pty::MasterPty + Send>>,
+    kind: PtyKind,
+    tmux: PathBuf,
 }
 
 impl SessionInput for PtyInput {
     fn send(&self, text: &str) -> Result<(), SessionError> {
-        let mut writer = self.writer.lock().map_err(|_| SessionError::Ended)?;
-        writer
-            .write_all(text.as_bytes())
-            .and_then(|()| writer.flush())
-            .map_err(|_| SessionError::Ended)
+        // Translated on the way in, because a terminal sends CR when Return is
+        // pressed. A cooked shell gets NL anyway (the line discipline's ICRNL
+        // does it), and a raw-mode program gets the Return it is waiting for
+        // instead of a Ctrl-J it will ignore.
+        let keyed = text.replace('\n', RETURN);
+        self.write(keyed.as_bytes())
+    }
+
+    fn send_key(&self, key: NamedKey) -> Result<(), SessionError> {
+        self.write(key.bytes())
+    }
+
+    fn send_bytes(&self, bytes: &[u8]) -> Result<(), SessionError> {
+        // Untouched. These already ARE terminal bytes; translating anything
+        // here would corrupt a multi-byte escape sequence that happens to
+        // contain the byte being translated.
+        self.write(bytes)
+    }
+
+    fn resize(&self, rows: u16, cols: u16) -> Result<(), SessionError> {
+        let master = self.master.lock().map_err(|_| SessionError::Ended)?;
+        master
+            .resize(portable_pty::PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|error| SessionError::Start {
+                kind: "pty resize",
+                message: error.to_string(),
+            })
+    }
+
+    fn destroy(&self) -> Result<(), SessionError> {
+        match &self.kind {
+            // These are the same act for an ephemeral session. It dies with the
+            // connection anyway; asking for it early changes only the timing.
+            PtyKind::Ephemeral => {
+                self.shutdown();
+                Ok(())
+            }
+            // The one place a persistent session is actually killed. Everything
+            // else — closing the transcript, losing the connection, quitting
+            // the app — only detaches, which is the point of choosing tmux.
+            PtyKind::Tmux { session } => {
+                let result = std::process::Command::new(&self.tmux)
+                    .args(["kill-session", "-t", session])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .map_err(|error| SessionError::Tmux {
+                        operation: "kill-session",
+                        message: error.to_string(),
+                    })?;
+                if !result.status.success() {
+                    let complaint = String::from_utf8_lossy(&result.stderr);
+                    let complaint = complaint.trim();
+                    // A session already gone is the outcome the operator asked
+                    // for, so it is not an error to report at them.
+                    if complaint.contains("can't find session") {
+                        return Ok(());
+                    }
+                    return Err(SessionError::Tmux {
+                        operation: "kill-session",
+                        message: complaint.to_owned(),
+                    });
+                }
+                // The attached client goes too, so the reader sees EOF.
+                self.shutdown();
+                Ok(())
+            }
+        }
     }
 
     fn shutdown(&self) {
+        // Kills whatever is on the far end of THIS pty. For tmux that is the
+        // attached client, not the session — detaching, which is exactly what
+        // losing a connection should do.
         if let Ok(mut child) = self.child.lock() {
             let _ = child.kill();
         }
     }
 }
 
-struct TmuxInput {
-    tmux: PathBuf,
-    session: String,
-}
-
-impl SessionInput for TmuxInput {
-    fn send(&self, text: &str) -> Result<(), SessionError> {
-        // `-l` sends the text literally, so a message containing something
-        // tmux would read as a key name — "Enter", "C-c" — arrives as those
-        // characters rather than as that key.
-        let status = std::process::Command::new(&self.tmux)
-            .args(["send-keys", "-t", &self.session, "-l", text])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|error| SessionError::Tmux {
-                operation: "send-keys",
-                message: error.to_string(),
-            })?;
-        if !status.success() {
-            return Err(SessionError::Ended);
-        }
-        Ok(())
+impl PtyInput {
+    fn write(&self, bytes: &[u8]) -> Result<(), SessionError> {
+        let mut writer = self.writer.lock().map_err(|_| SessionError::Ended)?;
+        writer
+            .write_all(bytes)
+            .and_then(|()| writer.flush())
+            .map_err(|_| SessionError::Ended)
     }
-
-    fn shutdown(&self) {
-        // Deliberately nothing. Outliving this connection is the entire reason
-        // to choose tmux, and killing it here would make the two kinds
-        // identical.
-    }
-}
-
-/// Reads a detached tmux session by polling its pane.
-struct TmuxPoller {
-    tmux: PathBuf,
-    session: String,
-    sender: mpsc::Sender<String>,
-    dropped: Arc<std::sync::atomic::AtomicU64>,
-}
-
-impl TmuxPoller {
-    /// How often to look. Fast enough to feel live, slow enough that a
-    /// long-running session is not a busy loop spawning processes.
-    const INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
-
-    async fn run(self) {
-        let mut seen = String::new();
-        loop {
-            tokio::time::sleep(Self::INTERVAL).await;
-            if self.sender.is_closed() {
-                return;
-            }
-            let Ok(output) = Command::new(&self.tmux)
-                .args(["capture-pane", "-p", "-t", &self.session])
-                .output()
-                .await
-            else {
-                return;
-            };
-            if !output.status.success() {
-                // The session has gone — killed, or the machine restarted.
-                // Ending the poller closes the channel, which the reader sees
-                // as the session finishing.
-                return;
-            }
-            let text = clean_terminal_output(&String::from_utf8_lossy(&output.stdout));
-            // `capture-pane` returns the WHOLE visible pane every time, so
-            // sending it raw would repeat everything on each poll. Only what
-            // is new since the last look is forwarded.
-            if let Some(fresh) = added_since(&seen, &text)
-                && self.sender.try_send(fresh).is_err()
-            {
-                self.dropped
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            seen = text;
-        }
-    }
-}
-
-/// What is new in `current` compared with `previous`.
-///
-/// `capture-pane` shows a window onto the pane, so between polls the content
-/// may have grown, or scrolled, or been cleared. Prefix matching handles growth
-/// — the common case — and anything else is treated as a fresh screen rather
-/// than trying to diff it, because a wrong diff silently drops output.
-fn added_since(previous: &str, current: &str) -> Option<String> {
-    if current == previous {
-        return None;
-    }
-    if let Some(rest) = current.strip_prefix(previous) {
-        let rest = rest.trim_start_matches('\n');
-        return (!rest.is_empty()).then(|| rest.to_owned());
-    }
-    // Scrolled or cleared. Send the whole visible pane rather than guessing:
-    // a duplicated screen is readable, a dropped one is invisible.
-    (!current.is_empty()).then(|| current.to_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The discovery that cost a debugging round, kept as a test even though
+    /// the code that first encoded it is gone.
+    ///
+    /// A terminal sends carriage return (0x0d) for Return, not line feed
+    /// (0x0a). bash accepts either because the line discipline translates CR
+    /// to NL for it — which is why sending "\n" LOOKED correct. A program in
+    /// raw mode gets no translation: crossterm reads 0x0d as Return and 0x0a
+    /// as Ctrl-J, so a TUI sent "\n" shows the typed text and then does
+    /// nothing.
     #[test]
-    fn nothing_new_yields_nothing() {
-        assert_eq!(added_since("hello", "hello"), None);
+    fn a_newline_is_written_as_a_carriage_return() {
+        assert_eq!("echo hi\n".replace('\n', RETURN), "echo hi\r");
     }
 
-    /// The common case: the pane grew. Only the new part is forwarded, or the
-    /// transcript repeats the entire screen every 400ms.
+    /// A paste keeps one Return per line, not one at the end.
     #[test]
-    fn only_the_growth_is_forwarded() {
-        assert_eq!(
-            added_since("line one", "line one\nline two"),
-            Some("line two".to_owned())
-        );
+    fn every_line_of_a_paste_keeps_its_return() {
+        assert_eq!("one\ntwo\n".replace('\n', RETURN), "one\rtwo\r");
     }
 
-    /// Scrolled: the old text is no longer a prefix. Resending the visible
-    /// pane duplicates some lines, which is readable — guessing at a diff
-    /// would drop lines, which is invisible.
+    /// Return on its own is a real thing to send: it is how a CLI waiting for
+    /// confirmation is answered.
     #[test]
-    fn a_scrolled_pane_resends_rather_than_guessing() {
-        let before = "line one\nline two";
-        let after = "line two\nline three";
-        assert_eq!(added_since(before, after), Some(after.to_owned()));
+    fn return_is_a_single_carriage_return() {
+        assert_eq!(NamedKey::Enter.bytes(), b"\r");
     }
 
+    /// The interrupt byte, which is the only way out of a stuck harness from a
+    /// phone.
     #[test]
-    fn a_cleared_pane_yields_nothing_rather_than_an_empty_message() {
-        assert_eq!(added_since("something", ""), None);
+    fn ctrl_c_is_the_interrupt_byte() {
+        assert_eq!(NamedKey::CtrlC.bytes(), b"\x03");
     }
 
-    /// A pane starting from empty must forward its first content.
+    /// Arrows are CSI sequences. A program in raw mode recognises nothing else
+    /// as an arrow, so the exact bytes matter.
     #[test]
-    fn the_first_content_is_forwarded() {
-        assert_eq!(added_since("", "first line"), Some("first line".to_owned()));
+    fn the_arrows_are_csi_sequences() {
+        assert_eq!(NamedKey::Up.bytes(), b"\x1b[A");
+        assert_eq!(NamedKey::Down.bytes(), b"\x1b[B");
+        assert_eq!(NamedKey::Right.bytes(), b"\x1b[C");
+        assert_eq!(NamedKey::Left.bytes(), b"\x1b[D");
+    }
+
+    /// Names come off the wire from a phone, so anything unrecognised is
+    /// refused rather than passed along.
+    #[test]
+    fn an_unknown_key_name_is_refused() {
+        assert!(NamedKey::from_wire("enter").is_some());
+        assert!(NamedKey::from_wire("ctrl-c").is_some());
+        assert!(NamedKey::from_wire("kill-server").is_none());
+        assert!(NamedKey::from_wire("").is_none());
+    }
+
+    /// Both spellings of the same key, because the two shells disagree about
+    /// what to call it and neither should have to know about the other.
+    #[test]
+    fn return_and_enter_are_the_same_key() {
+        assert_eq!(NamedKey::from_wire("return"), NamedKey::from_wire("enter"));
+        assert_eq!(NamedKey::from_wire("esc"), NamedKey::from_wire("escape"));
     }
 }

@@ -133,6 +133,25 @@ impl SessionConfig {
         })
     }
 
+    /// Apply an edit, keeping the id so a running session stays attributable.
+    ///
+    /// Validated the same way a new config is, so an edit cannot produce
+    /// something `create` would have refused.
+    pub fn edited(
+        &self,
+        name: &str,
+        kind: &str,
+        command: Vec<String>,
+    ) -> Result<Self, ConfigError> {
+        let mut updated = SessionConfig::create(name, kind, command)?;
+        // The id is IDENTITY, not a version. Keeping it is what lets a tmux
+        // session started by this config still be recognised as its own after
+        // an edit — a new id would orphan it, leaving a session running that
+        // the machine could no longer attribute or stop.
+        updated.id = self.id;
+        Ok(updated)
+    }
+
     /// The tmux session name for this config on this machine.
     ///
     /// Derived from the config id rather than the name, so renaming a config
@@ -302,6 +321,35 @@ mod tests {
         let before = config.tmux_session_name();
         config.name = "renamed".to_owned();
         assert_eq!(config.tmux_session_name(), before);
+    }
+
+    /// An edit keeps the id, so a running session stays attributable. A new
+    /// id would orphan it — still running, no longer recognised.
+    #[test]
+    fn editing_keeps_the_id_and_so_the_running_session() {
+        let original = SessionConfig::create("build", "tmux", vec!["cargo".into(), "build".into()])
+            .expect("valid");
+        let edited = original
+            .edited("build", "tmux", vec!["cargo".into(), "test".into()])
+            .expect("valid");
+        assert_eq!(edited.id, original.id);
+        assert_eq!(edited.tmux_session_name(), original.tmux_session_name());
+        assert_eq!(edited.command, vec!["cargo", "test"]);
+    }
+
+    /// An edit is validated like a creation, so it cannot produce something
+    /// `create` would have refused.
+    #[test]
+    fn an_edit_to_nothing_is_refused() {
+        let original = SessionConfig::create("build", "tmux", vec!["ls".into()]).expect("valid");
+        assert_eq!(
+            original.edited("", "tmux", vec!["ls".into()]),
+            Err(ConfigError::NoName)
+        );
+        assert_eq!(
+            original.edited("build", "tmux", vec![]),
+            Err(ConfigError::NoCommand)
+        );
     }
 
     /// Two configs must never share a tmux session, or selecting one attaches
