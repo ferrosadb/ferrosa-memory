@@ -272,7 +272,17 @@ pub async fn run_control_listener(
     println!("control listener device fingerprint: {fingerprint}");
     println!("managed Codex workspace: {}", workspace.display());
     let rtc_api = extensions.rtc_api.clone();
-    let hooks = extensions.attach.clone();
+    // Configured sessions are attached by the LISTENER, not supplied by the
+    // binary. Running a command is not media and needs nothing the caller has
+    // to provide — and every binary that hosts a listener wants it, so making
+    // each one remember to attach it is a way for one of them to forget.
+    let mut hooks = extensions.attach.clone();
+    hooks.push(std::sync::Arc::new(
+        crate::shell_extension::ShellExtension::new(
+            workspace.clone(),
+            session_config_store(workspace),
+        ),
+    ));
 
     if extensions.any() {
         println!("{} session extension(s) attached", extensions.attach.len());
@@ -609,6 +619,15 @@ fn claim(
 /// decision AND a payload. Revisit if frames ever get large enough to notice.
 fn frame_json(frame: &str) -> serde_json::Value {
     serde_json::from_str(frame).unwrap_or(serde_json::Value::Null)
+}
+
+/// Where a machine keeps its session configs.
+///
+/// Beside the workspace rather than in a global config directory: the configs
+/// are commands to run in THIS workspace, and a machine serving two workspaces
+/// should not offer one's build command while sitting in the other.
+fn session_config_store(workspace: &std::path::Path) -> std::path::PathBuf {
+    workspace.join(".ferrosa").join("sessions.json")
 }
 
 /// Publish the peer connection's state to anyone waiting on it.

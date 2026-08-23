@@ -41,9 +41,12 @@ pub mod peer_cli;
 pub mod peer_session;
 pub mod peer_transport;
 pub mod replication;
-/// Named session configurations, owned by the machine.
 pub mod session_config;
 /// Runs a configured session and carries its text both ways.
 pub mod session_runtime;
+/// Named session configurations, owned by the machine.
+#[cfg(feature = "webrtc-transport")]
+/// The wire surface for configured sessions.
+pub mod shell_extension;
 #[cfg(feature = "webrtc-transport")]
 pub mod signaling_client;
