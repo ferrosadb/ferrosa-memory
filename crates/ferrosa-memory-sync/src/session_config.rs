@@ -4,7 +4,7 @@
 //! reconnect, and when text from a terminal renders as the operator would read
 //! it rather than as escape codes.
 //! Last revised: 2026-08-23
-//! Last changed: Initial config model and terminal output cleaning.
+//! Last changed: An agent carries the directory it starts in, validated when the config is written rather than when a session fails to start.
 //!
 //! # Why the machine owns these
 //!
@@ -75,6 +75,32 @@ pub struct SessionConfig {
     /// between one argument and two, and on this path that difference is
     /// arbitrary code.
     pub command: Vec<String>,
+    /// Where the agent starts.
+    ///
+    /// `None` means the machine's own workspace, which is what every config
+    /// did before this field existed — so an older `sessions.json` keeps
+    /// working and keeps behaving the same way.
+    ///
+    /// This does not widen what an agent can do. The harness is already an
+    /// arbitrary command with the machine's own reach; pointing it at a
+    /// directory chooses where that happens, and a config author already holds
+    /// the more powerful half.
+    pub working_dir: Option<String>,
+}
+
+/// Expand a leading `~` so an operator can type a path the way they say it.
+///
+/// Only the leading one, and only when it is the whole first segment — `~foo`
+/// is a username in shell convention and this does not implement that, so it
+/// is left alone rather than mangled into something that half works.
+fn expand_home(path: &str) -> String {
+    let Some(rest) = path.strip_prefix("~/") else {
+        return path.to_owned();
+    };
+    match std::env::var("HOME") {
+        Ok(home) => format!("{}/{rest}", home.trim_end_matches('/')),
+        Err(_) => path.to_owned(),
+    }
 }
 
 /// Why a proposed config was refused.
@@ -82,6 +108,10 @@ pub struct SessionConfig {
 pub enum ConfigError {
     #[error("a config needs a name")]
     NoName,
+    #[error("that working directory does not exist: {0}")]
+    NoSuchDirectory(String),
+    #[error("the working directory must be a path, not {0}")]
+    NotADirectory(String),
     #[error("a name may be at most {MAX_NAME_CHARS} characters")]
     NameTooLong,
     #[error("a config needs a command to run")]
@@ -101,7 +131,12 @@ impl SessionConfig {
     /// Validated HERE rather than at use, so a bad config is refused while
     /// someone is looking at the dialog that made it — not later, when a
     /// session mysteriously fails to open.
-    pub fn create(name: &str, kind: &str, command: Vec<String>) -> Result<Self, ConfigError> {
+    pub fn create(
+        name: &str,
+        kind: &str,
+        command: Vec<String>,
+        working_dir: Option<&str>,
+    ) -> Result<Self, ConfigError> {
         let name = name.trim();
         if name.is_empty() {
             return Err(ConfigError::NoName);
@@ -124,10 +159,30 @@ impl SessionConfig {
         if command.len() > MAX_ARGS {
             return Err(ConfigError::TooManyArgs);
         }
+
+        // Checked HERE, at authoring time, rather than at first run. A config
+        // pointing somewhere that does not exist fails silently at start
+        // otherwise — the agent runs in the wrong place, or dies with a message
+        // nobody sees. FMEA F12.
+        let working_dir = working_dir
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(|path| {
+                let expanded = expand_home(path);
+                let meta = std::fs::metadata(&expanded)
+                    .map_err(|_| ConfigError::NoSuchDirectory(path.to_owned()))?;
+                if !meta.is_dir() {
+                    return Err(ConfigError::NotADirectory(path.to_owned()));
+                }
+                Ok(expanded)
+            })
+            .transpose()?;
+
         Ok(Self {
             // v7 so the list has a natural creation order without storing one.
             id: uuid::Uuid::now_v7(),
             name: name.to_owned(),
+            working_dir,
             kind,
             command,
         })
@@ -142,8 +197,9 @@ impl SessionConfig {
         name: &str,
         kind: &str,
         command: Vec<String>,
+        working_dir: Option<&str>,
     ) -> Result<Self, ConfigError> {
-        let mut updated = SessionConfig::create(name, kind, command)?;
+        let mut updated = SessionConfig::create(name, kind, command, working_dir)?;
         // The id is IDENTITY, not a version. Keeping it is what lets a tmux
         // session started by this config still be recognised as its own after
         // an edit — a new id would orphan it, leaving a session running that
@@ -274,8 +330,9 @@ mod tests {
 
     #[test]
     fn a_valid_config_is_accepted() {
-        let config = SessionConfig::create("build", "tmux", vec!["cargo".into(), "test".into()])
-            .expect("valid");
+        let config =
+            SessionConfig::create("build", "tmux", vec!["cargo".into(), "test".into()], None)
+                .expect("valid");
         assert_eq!(config.name, "build");
         assert_eq!(config.kind, SessionKind::Tmux);
         assert_eq!(config.command, vec!["cargo", "test"]);
@@ -286,11 +343,11 @@ mod tests {
     #[test]
     fn a_config_with_no_command_is_refused() {
         assert_eq!(
-            SessionConfig::create("empty", "bash", vec![]),
+            SessionConfig::create("empty", "bash", vec![], None),
             Err(ConfigError::NoCommand)
         );
         assert_eq!(
-            SessionConfig::create("blank", "bash", vec!["  ".into(), "".into()]),
+            SessionConfig::create("blank", "bash", vec!["  ".into(), "".into()], None),
             Err(ConfigError::NoCommand)
         );
     }
@@ -298,7 +355,7 @@ mod tests {
     #[test]
     fn a_config_with_no_name_is_refused() {
         assert_eq!(
-            SessionConfig::create("   ", "bash", vec!["ls".into()]),
+            SessionConfig::create("   ", "bash", vec!["ls".into()], None),
             Err(ConfigError::NoName)
         );
     }
@@ -306,7 +363,7 @@ mod tests {
     #[test]
     fn an_unknown_kind_is_refused() {
         assert_eq!(
-            SessionConfig::create("odd", "powershell", vec!["ls".into()]),
+            SessionConfig::create("odd", "powershell", vec!["ls".into()], None),
             Err(ConfigError::UnknownKind)
         );
     }
@@ -317,7 +374,7 @@ mod tests {
     #[test]
     fn renaming_a_config_does_not_change_its_tmux_session() {
         let mut config =
-            SessionConfig::create("first", "tmux", vec!["htop".into()]).expect("valid");
+            SessionConfig::create("first", "tmux", vec!["htop".into()], None).expect("valid");
         let before = config.tmux_session_name();
         config.name = "renamed".to_owned();
         assert_eq!(config.tmux_session_name(), before);
@@ -327,10 +384,11 @@ mod tests {
     /// id would orphan it — still running, no longer recognised.
     #[test]
     fn editing_keeps_the_id_and_so_the_running_session() {
-        let original = SessionConfig::create("build", "tmux", vec!["cargo".into(), "build".into()])
-            .expect("valid");
+        let original =
+            SessionConfig::create("build", "tmux", vec!["cargo".into(), "build".into()], None)
+                .expect("valid");
         let edited = original
-            .edited("build", "tmux", vec!["cargo".into(), "test".into()])
+            .edited("build", "tmux", vec!["cargo".into(), "test".into()], None)
             .expect("valid");
         assert_eq!(edited.id, original.id);
         assert_eq!(edited.tmux_session_name(), original.tmux_session_name());
@@ -341,13 +399,14 @@ mod tests {
     /// `create` would have refused.
     #[test]
     fn an_edit_to_nothing_is_refused() {
-        let original = SessionConfig::create("build", "tmux", vec!["ls".into()]).expect("valid");
+        let original =
+            SessionConfig::create("build", "tmux", vec!["ls".into()], None).expect("valid");
         assert_eq!(
-            original.edited("", "tmux", vec!["ls".into()]),
+            original.edited("", "tmux", vec!["ls".into()], None),
             Err(ConfigError::NoName)
         );
         assert_eq!(
-            original.edited("build", "tmux", vec![]),
+            original.edited("build", "tmux", vec![], None),
             Err(ConfigError::NoCommand)
         );
     }
@@ -356,8 +415,8 @@ mod tests {
     /// to the other's process.
     #[test]
     fn two_configs_get_distinct_tmux_sessions() {
-        let one = SessionConfig::create("a", "tmux", vec!["ls".into()]).expect("valid");
-        let two = SessionConfig::create("b", "tmux", vec!["ls".into()]).expect("valid");
+        let one = SessionConfig::create("a", "tmux", vec!["ls".into()], None).expect("valid");
+        let two = SessionConfig::create("b", "tmux", vec!["ls".into()], None).expect("valid");
         assert_ne!(one.tmux_session_name(), two.tmux_session_name());
     }
 
