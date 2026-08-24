@@ -11,7 +11,7 @@ The [`install-memory.sh`](../docs/install-memory.sh) installer copies these into
 agent skill directory (`~/.claude/skills/` by default) automatically:
 
 ```sh
-curl -fsSL https://ferrosadb.com/install-memory.sh | bash
+curl -fsSL https://www.ferrosa.ai/install-memory.sh | bash
 ```
 
 Skip skill installation with `--no-skills`, or point it elsewhere with
