@@ -529,6 +529,17 @@ impl SessionRuntime {
     /// rather than from a record in memory is deliberate: the machine may have
     /// restarted since, and a remembered session that no longer exists is worse
     /// than no memory at all.
+    /// Whether a session is running ON THE MACHINE, independently of anyone
+    /// being connected.
+    ///
+    /// Only ever true for tmux, and that is the honest answer: an ephemeral
+    /// session exists only as a process this listener holds, so nothing on the
+    /// machine outlives the connection to be asked about.
+    ///
+    /// Which means this is NOT the same question as "is this job running", and
+    /// callers that want that must also ask whether they are holding one. The
+    /// status pump did not, so an ephemeral session was reported off-shift for
+    /// its whole life — invisible on a home screen that hides off-shift jobs.
     pub async fn is_running(&self, config: &SessionConfig) -> bool {
         if config.kind != SessionKind::Tmux {
             return false;

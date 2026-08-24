@@ -1017,3 +1017,80 @@ async fn a_scroll_survives_the_terminal_answering_queries() {
     );
     assert_eq!(after_typing, "0", "typing did not return the pane to live");
 }
+
+/// An ephemeral session runs, and the machine can only know it by holding it.
+///
+/// `is_running` asks tmux, and tmux has never heard of an ephemeral session —
+/// it is a process this listener holds and nothing more. So it answered false
+/// for the session's whole life, the roster showed it off-shift, and a home
+/// screen that hides off-shift jobs hid it completely: "ephemeral sessions
+/// don't seem to show up anywhere".
+///
+/// The fix is not to make `is_running` lie. It is for the caller to also ask
+/// whether it is holding one, and this pins both halves.
+#[tokio::test]
+#[ignore = "needs a real tmux"]
+async fn an_ephemeral_session_runs_without_tmux_knowing() {
+    let config = SessionConfig::create(
+        "ephemeral-visible",
+        "bash",
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "echo EPHEMERAL-ALIVE; sleep 30".into(),
+        ],
+        None,
+    )
+    .expect("valid config");
+
+    let runtime = SessionRuntime::new(std::env::temp_dir());
+    let running = runtime.open(&config).await.expect("opens");
+
+    // It IS running: it said so.
+    let seen = wait_for(&running, "EPHEMERAL-ALIVE", Duration::from_secs(6)).await;
+    assert!(
+        seen.contains("EPHEMERAL-ALIVE"),
+        "the ephemeral session produced nothing, so this test cannot judge \
+         whether it is visible"
+    );
+
+    // And tmux still says no, which is the honest answer to the question tmux
+    // was asked — nothing on the machine outlives this connection.
+    assert!(
+        !runtime.is_running(&config).await,
+        "is_running claims an ephemeral session survives on the machine; \
+         nothing there does"
+    );
+
+    // So the holder is the only witness.
+    assert_eq!(running.config().id, config.id);
+}
+
+/// And a tmux session is running whether or not anyone holds it — the
+/// distinction the two answers exist to keep.
+#[tokio::test]
+#[ignore = "needs a real tmux"]
+async fn a_tmux_session_runs_whether_or_not_it_is_held() {
+    let config = SessionConfig::create(
+        "persistent-visible",
+        "tmux",
+        vec!["sh".into(), "-c".into(), "sleep 30".into()],
+        None,
+    )
+    .expect("valid config");
+
+    let runtime = SessionRuntime::new(std::env::temp_dir());
+    let held = runtime.open(&config).await.expect("opens");
+    assert!(runtime.is_running(&config).await);
+
+    // Let go. It keeps running, which is the whole point of the kind.
+    drop(held);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let still = runtime.is_running(&config).await;
+
+    let _ = std::process::Command::new("tmux")
+        .args(["kill-session", "-t", &config.tmux_session_name()])
+        .status();
+
+    assert!(still, "a tmux session stopped when the holder let go");
+}
