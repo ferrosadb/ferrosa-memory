@@ -76,6 +76,14 @@ pub struct RunningSession {
     input: Box<dyn SessionInput>,
     /// Chunks dropped because the reader was behind.
     dropped: Arc<std::sync::atomic::AtomicU64>,
+    /// Whether a scroll from here left the pane in tmux's copy mode.
+    ///
+    /// It matters because copy mode swallows typing: keys go to copy-mode
+    /// bindings rather than to the program, so after scrolling the session
+    /// appears to stop accepting input. Tracked rather than asked, because
+    /// asking tmux costs a process spawn and this would be on the path of
+    /// every keystroke.
+    in_copy_mode: std::sync::atomic::AtomicBool,
 }
 
 /// What pressing Return actually puts on the wire.
@@ -273,17 +281,59 @@ impl RunningSession {
     }
 
     pub fn send(&self, text: &str) -> Result<(), SessionError> {
+        self.leave_copy_mode();
         self.input.send(text)
     }
 
     /// Press a named key — Return on its own, Ctrl-C, an arrow.
     pub fn send_key(&self, key: NamedKey) -> Result<(), SessionError> {
+        self.leave_copy_mode();
         self.input.send_key(key)
     }
 
     /// Write raw bytes from a client-side terminal emulator.
     pub fn send_bytes(&self, bytes: &[u8]) -> Result<(), SessionError> {
+        self.leave_copy_mode();
         self.input.send_bytes(bytes)
+    }
+
+    /// Whether the pane is showing history rather than the live output.
+    ///
+    /// Read by the caller so the device's LIVE control can show which state it
+    /// is in. A button that sets a mode but never reflects it leaves the
+    /// operator guessing whether they are looking at now.
+    pub fn is_scrolled(&self) -> bool {
+        self.in_copy_mode.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Come back to the live pane before delivering input.
+    ///
+    /// Scrolling puts tmux into copy mode, and copy mode routes keys to its own
+    /// bindings instead of to the program — so after scrolling, a session looks
+    /// like it has stopped accepting typing. It has not; the keys are going
+    /// somewhere else.
+    ///
+    /// Typing means "I am done reading", which is how every other terminal
+    /// behaves: type and the view snaps to the bottom. Doing it here rather
+    /// than on the device means it holds for every client and for the key bar
+    /// as well as the keyboard.
+    ///
+    /// Costs a tmux call only on the FIRST input after a scroll, because the
+    /// flag is cleared by leaving.
+    fn leave_copy_mode(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.in_copy_mode.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        let _ = std::process::Command::new("tmux")
+            .args([
+                "send-keys",
+                "-X",
+                "-t",
+                &self.config.tmux_session_name(),
+                "cancel",
+            ])
+            .status();
     }
 
     /// Tell the program the size of the terminal showing it.
@@ -355,7 +405,14 @@ impl RunningSession {
                 .status(),
         };
         match status {
-            Ok(status) if status.success() => Ok(()),
+            Ok(status) if status.success() => {
+                use std::sync::atomic::Ordering;
+                // `Bottom` IS leaving copy mode; everything else enters or
+                // stays in it.
+                self.in_copy_mode
+                    .store(motion != ScrollMotion::Bottom, Ordering::Relaxed);
+                Ok(())
+            }
             // A non-zero exit is usually "not in copy mode" for a motion that
             // needs it. Reported rather than swallowed: a scroll that silently
             // does nothing reads as a dead button.
@@ -637,6 +694,8 @@ impl SessionRuntime {
                 tmux: self.tmux_binary.clone(),
             }),
             dropped,
+            // A fresh session is live, not scrolled.
+            in_copy_mode: std::sync::atomic::AtomicBool::new(false),
         })
     }
 

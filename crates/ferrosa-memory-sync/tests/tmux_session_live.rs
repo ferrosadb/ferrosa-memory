@@ -884,3 +884,64 @@ async fn mouse_reporting_is_off_after_a_rejoin() {
          typed into the pane as escape sequences"
     );
 }
+
+/// Typing works after scrolling.
+///
+/// Scrolling puts tmux into copy mode, and copy mode routes keys to its own
+/// bindings rather than to the program — so the session looked like it had
+/// stopped accepting input. It had not; the keys were going somewhere else.
+///
+/// Asserted at the PANE: the text has to appear where the program can see it,
+/// not merely be accepted by the input path.
+#[tokio::test]
+#[ignore = "needs a real tmux"]
+async fn typing_after_a_scroll_reaches_the_program() {
+    let config = SessionConfig::create(
+        "type-after-scroll",
+        "tmux",
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "for i in $(seq 1 300); do printf 'LINE-%04d\\n' $i; done; cat".into(),
+        ],
+        None,
+    )
+    .expect("valid config");
+
+    let running = SessionRuntime::new(std::env::temp_dir())
+        .open(&config)
+        .await
+        .expect("opens");
+    let _ = wait_for(&running, "LINE-0300", Duration::from_secs(10)).await;
+
+    running.scroll(ScrollMotion::Top).expect("scrolls");
+    assert!(running.is_scrolled(), "the scroll was not recorded");
+    assert_eq!(
+        tmux_var(&config, "#{pane_in_mode}"),
+        "1",
+        "tmux is not in copy mode, so this test is not testing anything"
+    );
+
+    // The thing that was broken.
+    running.send("TYPED-AFTER-SCROLL").expect("sends");
+    let seen = wait_for(&running, "TYPED-AFTER-SCROLL", Duration::from_secs(6)).await;
+    let still_in_mode = tmux_var(&config, "#{pane_in_mode}");
+
+    let _ = std::process::Command::new("tmux")
+        .args(["kill-session", "-t", &config.tmux_session_name()])
+        .status();
+
+    assert!(
+        seen.contains("TYPED-AFTER-SCROLL"),
+        "typing after a scroll never reached the pane"
+    );
+    assert_eq!(
+        still_in_mode, "0",
+        "the pane is still in copy mode after typing"
+    );
+    assert!(
+        !running.is_scrolled(),
+        "the machine still believes the pane is scrolled, so the device's LIVE \
+         control will keep claiming it"
+    );
+}
