@@ -212,3 +212,37 @@ async fn report_what_links_to_a_task() {
         println!("    {kind}: {} {}", task.id, task.title);
     }
 }
+
+/// Diagnostic: what a search returns, and what the first page of work holds.
+#[tokio::test]
+#[ignore = "needs the live task board"]
+async fn report_search_and_first_page() {
+    let board = TaskBoard::connect(&contact_points())
+        .await
+        .expect("connects to the board");
+
+    for query in ["t_393bc64e", "T_393BC64E", "393bc64e", "t_393bc"] {
+        let hits = board.find_by_id(query, 10).await.expect("searches");
+        println!("REPORT search {query:>12} -> {} hit(s)", hits.len());
+    }
+
+    let dirs = vec![
+        "/Users/bkearns/src/hippo".to_owned(),
+        "/Users/bkearns/src/ferrosa-suite".to_owned(),
+    ];
+    let all = board.open_work(&dirs).await.expect("reads");
+    let hippo = all.iter().filter(|t| t.repo.contains("hippo")).count();
+    println!(
+        "REPORT {} open across both repos, {hippo} of them hippo",
+        all.len()
+    );
+    let in_page = all
+        .iter()
+        .take(10)
+        .filter(|t| t.repo.contains("hippo"))
+        .count();
+    println!("REPORT hippo tasks in the first page of 10: {in_page}");
+    for task in all.iter().take(10) {
+        println!("        p{} {} {}", task.priority, task.repo, task.id);
+    }
+}

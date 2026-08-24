@@ -335,7 +335,12 @@ impl ShellExtension {
     /// So: a bounded number of tasks, ranked, split into datagram-sized pages,
     /// with the TRUE total on the first page so the device can say what it is
     /// not showing.
-    async fn tasks_frames(&self, offset: usize, limit: usize) -> Vec<serde_json::Value> {
+    async fn tasks_frames(
+        &self,
+        repo: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<serde_json::Value> {
         let dirs: Vec<String> = {
             let configs = self.configs.lock().await;
             let mut dirs: Vec<String> = configs
@@ -348,12 +353,13 @@ impl ShellExtension {
         };
         if dirs.is_empty() {
             // Not an error, and not an empty board either. No agent has said
-            // where it works, so there is nothing to look up — said plainly so
-            // the screen can explain itself rather than showing a blank list.
+            // where it works, so there is nothing to look up.
             return vec![serde_json::json!({
                 "type": "shell_tasks",
                 "first": true,
-                "total": 0,
+                "repo": "",
+                "repo_total": 0,
+                "offset": 0,
                 "tasks": [],
                 "unavailable": "No agent has a working directory yet, so there is no repository to look up.",
             })];
@@ -362,7 +368,9 @@ impl ShellExtension {
             return vec![serde_json::json!({
                 "type": "shell_tasks",
                 "first": true,
-                "total": 0,
+                "repo": "",
+                "repo_total": 0,
+                "offset": 0,
                 "tasks": [],
                 "unavailable": "The task board could not be reached from this machine.",
             })];
@@ -373,57 +381,89 @@ impl ShellExtension {
                 return vec![serde_json::json!({
                     "type": "shell_tasks",
                     "first": true,
-                    "total": 0,
+                    "repo": "",
+                    "repo_total": 0,
+                    "offset": 0,
                     "tasks": [],
                     "unavailable": format!("The task board refused the read: {error}"),
                 })];
             }
         };
 
-        let total = tasks.len();
-        let listed: Vec<serde_json::Value> = tasks
-            .iter()
-            .skip(offset)
-            .take(limit.min(MAX_TASKS_SENT))
-            .map(|task| {
-                serde_json::json!({
-                    "id": task.id,
-                    "title": task.title,
-                    "status": task.status,
-                    "priority": task.priority,
-                    "block_reason": task.block_reason,
-                    "needs_a_person": task.waits_on_a_person(),
-                    "repo": task.repo,
-                })
-            })
-            .collect();
-
-        if listed.is_empty() {
-            // Still carries the total and the offset: "no more" and "none at
-            // all" are different answers, and a device that cannot tell them
-            // apart either hides a MORE button that works or shows one that
-            // does nothing.
-            return vec![serde_json::json!({
-                "type": "shell_tasks",
-                "first": offset == 0,
-                "offset": offset,
-                "total": total,
-                "tasks": [],
-            })];
+        // Per REPOSITORY, not globally. A page off a globally ranked list is a
+        // page of whichever repository has the most work — 905 open tasks, 11
+        // of them hippo, none in the first ten, so hippo vanished from a screen
+        // that groups by repository. Each repository now has its own first ten
+        // and its own next ten, which is also the only paging model that makes
+        // sense on a screen where each repository is a section.
+        let mut by_repo: std::collections::BTreeMap<String, Vec<&crate::task_board::BoardTask>> =
+            std::collections::BTreeMap::new();
+        let mut order: Vec<String> = Vec::new();
+        for task in &tasks {
+            if task.repo.is_empty() {
+                continue;
+            }
+            if !by_repo.contains_key(&task.repo) {
+                order.push(task.repo.clone());
+            }
+            by_repo.entry(task.repo.clone()).or_default().push(task);
         }
+
+        // One repository when asked for one, every repository otherwise.
+        let wanted: Vec<String> = match repo {
+            Some(repo) => order.iter().filter(|name| *name == repo).cloned().collect(),
+            None => order,
+        };
+
         let mut frames = Vec::new();
-        for (index, page) in listed.chunks(TASKS_PER_FRAME).enumerate() {
-            frames.push(serde_json::json!({
-                "type": "shell_tasks",
-                // Only the first frame of the first PAGE replaces what the
-                // device holds. Without this, every frame would wipe the one
-                // before it and the device would show the last three tasks of
-                // the board.
-                "first": offset == 0 && index == 0,
-                "offset": offset,
-                "total": total,
-                "tasks": page,
-            }));
+        for name in wanted {
+            let all = by_repo.get(&name).map(Vec::as_slice).unwrap_or_default();
+            let listed: Vec<serde_json::Value> = all
+                .iter()
+                .skip(offset)
+                .take(limit.min(MAX_TASKS_SENT))
+                .map(|task| {
+                    serde_json::json!({
+                        "id": task.id,
+                        "title": task.title,
+                        "status": task.status,
+                        "priority": task.priority,
+                        "block_reason": task.block_reason,
+                        "needs_a_person": task.waits_on_a_person(),
+                        "repo": task.repo,
+                    })
+                })
+                .collect();
+
+            if listed.is_empty() {
+                // Still carries the total and the offset: "no more" and "none
+                // at all" are different answers, and a device that cannot tell
+                // them apart either hides a working MORE button or shows one
+                // that does nothing.
+                frames.push(serde_json::json!({
+                    "type": "shell_tasks",
+                    "first": offset == 0,
+                    "repo": name,
+                    "repo_total": all.len(),
+                    "offset": offset,
+                    "tasks": [],
+                }));
+                continue;
+            }
+            for (index, page) in listed.chunks(TASKS_PER_FRAME).enumerate() {
+                frames.push(serde_json::json!({
+                    "type": "shell_tasks",
+                    // Only the first frame of a repository's first page
+                    // replaces that repository's list. Without this every frame
+                    // would wipe the one before it and the section would show
+                    // its last three tasks.
+                    "first": offset == 0 && index == 0,
+                    "repo": name,
+                    "repo_total": all.len(),
+                    "offset": offset,
+                    "tasks": page,
+                }));
+            }
         }
         frames
     }
@@ -688,11 +728,11 @@ const MAX_OUTPUT_BYTES_PER_FRAME: usize = 512;
 /// row; typical rows are what made the single-frame version look fine.
 const TASKS_PER_FRAME: usize = 3;
 
-/// How many tasks a request returns when it does not say.
+/// How many tasks a request returns per REPOSITORY when it does not say.
 ///
-/// Ten. The device asks for the next ten when the operator wants them, so the
-/// common case — open the app, glance at what is waiting — costs four frames
-/// rather than fifty.
+/// Ten each. Ten overall was the wrong unit: on a screen grouped by repository,
+/// a global page is a page of the largest repository and the others are simply
+/// absent.
 const DEFAULT_TASK_PAGE: usize = 10;
 
 /// How many agents a task detail offers to dispatch.
@@ -1111,7 +1151,10 @@ impl SessionExtension for ShellExtension {
                     .and_then(serde_json::Value::as_u64)
                     .map(|value| value as usize)
                     .unwrap_or(DEFAULT_TASK_PAGE);
-                for frame in self.tasks_frames(offset, limit).await {
+                // Absent means every repository's first page; present means the
+                // next page of one of them.
+                let repo = body.get("repo").and_then(serde_json::Value::as_str);
+                for frame in self.tasks_frames(repo, offset, limit).await {
                     session.send(&envelope(frame)).await?;
                 }
                 Ok(())
