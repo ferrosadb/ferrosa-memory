@@ -1176,6 +1176,9 @@ impl SessionExtension for ShellExtension {
                     .and_then(|state| state.open.clone())
                     .ok_or_else(|| "no session is open".to_owned())?;
 
+                // Read BEFORE the input, which is what clears it.
+                let was_scrolled = open.is_scrolled();
+
                 // Text and keys are separate fields, and a frame may carry
                 // either or both. A bare Return — no text at all — is how a
                 // CLI waiting for confirmation is answered, so "empty means
@@ -1215,6 +1218,17 @@ impl SessionExtension for ShellExtension {
                 if body.get("text").is_none() && keys.is_none() && raw.is_none() {
                     return Err("input needs bytes, text or keys".to_owned());
                 }
+                // Typing leaves copy mode, so the device's LIVE control has to
+                // stop claiming the pane is scrolled. Sent only on the CHANGE:
+                // a frame per keystroke is a frame per keystroke.
+                if was_scrolled && !open.is_scrolled() {
+                    session
+                        .send(&envelope(serde_json::json!({
+                            "type": "shell_scrolled",
+                            "scrolled": false,
+                        })))
+                        .await?;
+                }
                 Ok(())
             }
             "shell_scroll" => {
@@ -1234,7 +1248,13 @@ impl SessionExtension for ShellExtension {
                 // command line, and an unvalidated one is remote tmux control.
                 let motion = crate::session_runtime::ScrollMotion::from_wire(name)
                     .ok_or_else(|| format!("{name} is not a scroll this machine makes"))?;
-                open.scroll(motion).map_err(|error| error.to_string())
+                open.scroll(motion).map_err(|error| error.to_string())?;
+                session
+                    .send(&envelope(serde_json::json!({
+                        "type": "shell_scrolled",
+                        "scrolled": open.is_scrolled(),
+                    })))
+                    .await
             }
             "shell_tasks" => {
                 let offset = body
@@ -1626,6 +1646,7 @@ mod output_framing_tests {
         ("shell_task_text", Sizing::Paged),
         ("shell_task_search", Sizing::Paged),
         ("shell_task_related", Sizing::Paged),
+        ("shell_scrolled", Sizing::Bounded),
     ];
 
     /// A new frame kind cannot be emitted without a decision about its size.
