@@ -237,6 +237,29 @@ pub async fn seed_tier_rules(
         report.rules_written += 1;
     }
 
+    // An identity alias for every builtin root, FIRST.
+    //
+    // A root rule with no alias that can produce it is a rule that can never
+    // fire: the resolver only ever returns a canonical root some alias named,
+    // so `session-capture -> data` sat there while 2,791 real paths beginning
+    // `session-capture/` resolved to no root and counted as unclassified. The
+    // rule looked correct in every listing of the rules. Every rule must be
+    // reachable by at least one alias, which the test below holds.
+    for (root, _) in TierRules::builtin().entries() {
+        store
+            .put_alias(
+                ctx,
+                RootAlias {
+                    alias_prefix: root.clone(),
+                    canonical_root: root,
+                    created_by: actor.to_owned(),
+                    created_at: now,
+                },
+            )
+            .await?;
+        report.aliases_written += 1;
+    }
+
     let trimmed = research_root.trim_end_matches('/');
     // Each canonical root gets the concrete path it lives at here. The short
     // spelling is registered too, because a path that arrives from another
@@ -1597,6 +1620,60 @@ mod tests {
             .await
             .expect("record");
         assert_eq!(record.source_root.as_deref(), Some("research/rules"));
+    }
+
+    /// Every rule the seed writes must be REACHABLE.
+    ///
+    /// A root rule whose canonical root no alias produces can never fire. That
+    /// shipped: `session-capture -> data` was written and looked correct in
+    /// every listing of the rules, while 2,791 real paths beginning
+    /// `session-capture/` resolved to no root at all and counted as
+    /// unclassified.
+    #[tokio::test]
+    async fn every_seeded_rule_is_reachable_by_an_alias() {
+        let store = InMemoryTierStore::default();
+        let ctx = tenant();
+        seed_tier_rules(&store, &ctx, "/Users/bkearns/src/research", "ben")
+            .await
+            .expect("seed");
+        let (resolver, rules) = load_rules(&store, &ctx).await.expect("rules");
+
+        for (root, _) in TierRules::builtin().entries() {
+            let probe = format!("{root}/something.md");
+            assert_eq!(
+                resolver.root_of(&probe).as_deref(),
+                Some(root.as_str()),
+                "no alias can produce the root {root:?}, so its rule can never fire",
+            );
+            assert!(
+                rules.tier_of_root(&root).is_some(),
+                "rule for {root:?} missing"
+            );
+        }
+    }
+
+    /// The shape session capture actually takes on a real store.
+    #[tokio::test]
+    async fn a_session_capture_path_tiers_as_data() {
+        let store = InMemoryTierStore::default();
+        let ctx = tenant();
+        seed_tier_rules(&store, &ctx, "/Users/bkearns/src/research", "ben")
+            .await
+            .expect("seed");
+
+        let id = Uuid::new_v4();
+        let record = store
+            .record_source(
+                &ctx,
+                draft(id, "session-capture/Users/bkearns/src/ferrosa-suite"),
+            )
+            .await
+            .expect("record");
+        assert_eq!(record.source_root.as_deref(), Some("session-capture"));
+        assert_eq!(
+            tier_of(&store, &ctx, id).await.expect("tier").tier,
+            Tier::Data
+        );
     }
 
     #[tokio::test]
