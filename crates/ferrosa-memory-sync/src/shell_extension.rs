@@ -3,7 +3,8 @@
 //! when a config survives a restart of the machine, and when output reaches
 //! the device as it is produced rather than when the command finishes.
 //! Last revised: 2026-08-23
-//! Last changed: working_dir carried on add/update/list and persisted, so an agent's directory survives a restart.
+//! Last changed: shell_scroll moves through tmux's scrollback, which keys sent
+//! into the pane cannot reach.
 //!
 //! # Three capabilities wearing one grant, for now
 //!
@@ -427,6 +428,7 @@ impl SessionExtension for ShellExtension {
             "shell_delete_session",
             "shell_resize",
             "shell_input",
+            "shell_scroll",
         ]
     }
 
@@ -621,6 +623,25 @@ impl SessionExtension for ShellExtension {
                     return Err("input needs bytes, text or keys".to_owned());
                 }
                 Ok(())
+            }
+            "shell_scroll" => {
+                let open = self
+                    .sessions
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .and_then(|state| state.open.clone())
+                    .ok_or_else(|| "no session is open".to_owned())?;
+
+                let name = body
+                    .get("motion")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "scroll needs a motion".to_owned())?;
+                // Closed set, same reason as keys: the value reaches a tmux
+                // command line, and an unvalidated one is remote tmux control.
+                let motion = crate::session_runtime::ScrollMotion::from_wire(name)
+                    .ok_or_else(|| format!("{name} is not a scroll this machine makes"))?;
+                open.scroll(motion).map_err(|error| error.to_string())
             }
             other => Err(format!("claimed {other} and cannot serve it")),
         }

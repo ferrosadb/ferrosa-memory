@@ -16,7 +16,7 @@
 use std::time::Duration;
 
 use ferrosa_memory_sync::session_config::SessionConfig;
-use ferrosa_memory_sync::session_runtime::SessionRuntime;
+use ferrosa_memory_sync::session_runtime::{ScrollMotion, SessionRuntime};
 
 /// Read from the session until `needle` shows up, or give up.
 ///
@@ -536,4 +536,119 @@ fn a_missing_working_directory_is_refused_at_authoring() {
         result.is_err(),
         "a file was accepted as a working directory"
     );
+}
+
+/// Scrolling reaches tmux's real scrollback, and the device sees it.
+///
+/// Asserted on the OUTPUT STREAM, which is what actually reaches the phone —
+/// not on `capture-pane`, which reads the LIVE pane buffer and reports the
+/// bottom of the history no matter where copy mode is looking. The first
+/// version of this test used capture-pane and failed against a scroll that was
+/// working correctly (tmux reported pane_in_mode=1, scroll_position=377).
+///
+/// Sending Page Up as KEY BYTES cannot pass this: those keys go to the program
+/// in the pane and never reach tmux's history.
+#[tokio::test]
+#[ignore = "needs a real tmux"]
+async fn scrolling_up_reaches_output_that_left_the_screen() {
+    let config = SessionConfig::create(
+        "scrollback",
+        "tmux",
+        // Numbered so a specific line can be looked for, and far more than a
+        // pane holds so the early ones are definitely off-screen.
+        vec![
+            "sh".into(),
+            "-c".into(),
+            // Zero-padded, so "LINE-0001" cannot match LINE-100 and friends.
+            // tmux redraws with cursor positioning rather than padding, so a
+            // trailing space is NOT a reliable delimiter — the first version of
+            // this test looked for "LINE-1 " and never found it.
+            "for i in $(seq 1 400); do printf 'LINE-%04d\\n' $i; done; sleep 60".into(),
+        ],
+        None,
+    )
+    .expect("valid config");
+
+    let running = SessionRuntime::new(std::env::temp_dir())
+        .open(&config)
+        .await
+        .expect("opens");
+
+    // Let it finish printing before scrolling, or the pane is still moving.
+    let _ = wait_for(&running, "LINE-0400", Duration::from_secs(10)).await;
+
+    running
+        .scroll(ScrollMotion::Top)
+        .expect("scrolling to the top is accepted");
+    // The redraw tmux sends its attached client is the evidence: the first line
+    // ever printed is only drawn if the history really moved.
+    let at_top = wait_for(&running, "LINE-0001", Duration::from_secs(8)).await;
+    let scrolled_position = tmux_var(&config, "#{scroll_position}");
+
+    running
+        .scroll(ScrollMotion::Bottom)
+        .expect("returns to live");
+    let back_live = wait_for(&running, "LINE-0400", Duration::from_secs(8)).await;
+    let in_mode = tmux_var(&config, "#{pane_in_mode}");
+
+    let _ = std::process::Command::new("tmux")
+        .args(["kill-session", "-t", &config.tmux_session_name()])
+        .status();
+
+    assert_ne!(
+        scrolled_position, "0",
+        "tmux did not move through the history at all"
+    );
+    assert!(
+        at_top.contains("LINE-0001"),
+        "the top of the history never reached the device"
+    );
+    assert!(
+        back_live.contains("LINE-0400"),
+        "leaving copy mode did not redraw the live pane"
+    );
+    assert_eq!(in_mode, "0", "the pane was left in copy mode, not live");
+}
+
+/// An ephemeral session says so rather than failing silently.
+///
+/// Its scrollback lives in the client's own emulator, and there is no tmux to
+/// ask. A scroll that quietly did nothing would read as a dead button.
+#[tokio::test]
+#[ignore = "needs a real tmux"]
+async fn scrolling_an_ephemeral_session_is_refused_with_a_reason() {
+    let config = SessionConfig::create(
+        "ephemeral",
+        "bash",
+        vec!["sh".into(), "-c".into(), "sleep 5".into()],
+        None,
+    )
+    .expect("valid config");
+
+    let running = SessionRuntime::new(std::env::temp_dir())
+        .open(&config)
+        .await
+        .expect("opens");
+
+    let refused = running.scroll(ScrollMotion::PageUp);
+    let message = refused.expect_err("must be refused").to_string();
+    assert!(
+        message.contains("scrollback"),
+        "the refusal should say why, not just fail; got: {message}"
+    );
+}
+
+/// Ask tmux directly, for the assertions the output stream cannot make.
+fn tmux_var(config: &SessionConfig, format: &str) -> String {
+    let output = std::process::Command::new("tmux")
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            &config.tmux_session_name(),
+            format,
+        ])
+        .output()
+        .expect("display-message runs");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
