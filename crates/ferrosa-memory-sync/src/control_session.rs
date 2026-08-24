@@ -162,6 +162,36 @@ enum BindingFrame {
     Hello { hello: Box<ControlHelloFrame> },
 }
 
+/// A send-only handle on a bound control channel.
+///
+/// Exists because receiving needs `&mut` and sending does not, so an extension
+/// that only ever writes should not have to contend for the loop that reads.
+/// Cloneable and cheap: the alternative was handing extensions the whole
+/// channel behind a lock, where a slow writer would stall the reader that
+/// detects the peer going away.
+#[derive(Clone)]
+pub struct ControlFrameSink {
+    data_channel: Arc<RTCDataChannel>,
+    max_frame_bytes: usize,
+}
+
+impl ControlFrameSink {
+    /// Send one complete UTF-8 application frame with an explicit size bound.
+    pub async fn send_text(&self, text: &str) -> Result<(), ControlSessionError> {
+        if text.len() > self.max_frame_bytes {
+            return Err(ControlSessionError::FrameTooLarge {
+                actual: text.len(),
+                limit: self.max_frame_bytes,
+            });
+        }
+        self.data_channel
+            .send_text(text.to_owned())
+            .await
+            .map(|_| ())
+            .map_err(|error| ControlSessionError::Rtc(format!("send text: {error}")))
+    }
+}
+
 /// Successfully signed and bound direct control data channel.
 pub struct BoundControlChannel {
     peer_connection: Arc<RTCPeerConnection>,
@@ -201,6 +231,28 @@ impl BoundControlChannel {
     /// Length of the signed ephemeral shared key without exposing it.
     pub fn session_key_len(&self) -> usize {
         self.session_key.len()
+    }
+
+    /// The underlying peer connection.
+    ///
+    /// Exposed so a caller can attach things this crate does not model — a
+    /// media track, for one. Deliberately returns the connection rather than
+    /// growing an `add_video_track` method here: the moment this crate has a
+    /// method with "video" in the name, media has become a capability of a
+    /// repository that is not supposed to have one.
+    ///
+    /// A caller that adds a track owns the renegotiation that follows.
+    pub fn peer_connection(&self) -> Arc<RTCPeerConnection> {
+        Arc::clone(&self.peer_connection)
+    }
+
+    /// A send-only handle, for a caller that writes frames but does not read
+    /// them.
+    pub fn frame_sink(&self) -> ControlFrameSink {
+        ControlFrameSink {
+            data_channel: Arc::clone(&self.data_channel),
+            max_frame_bytes: self.max_frame_bytes,
+        }
     }
 
     /// Close the direct peer connection.
@@ -420,11 +472,21 @@ pub async fn run_control_controller_session<S: ControlSignalingApi>(
 
 /// Accept and establish the exact-target Ferrosa Memory server half, returning
 /// only after the controller's first signed hello verifies.
+/// Run the server half of one control session.
+///
+/// `rtc` is built by the CALLER and used here without inspection. That is the
+/// point: a caller that needs media registers its own codecs and hands the
+/// result in, and this crate never names a codec, a track or a media engine.
+/// Media is not a capability of this repository.
+///
+/// `None` builds the data-channel-only API this crate has always used, so a
+/// caller that does not care negotiates exactly what it did before.
 pub async fn run_control_server_session<S: ControlSignalingApi>(
     api: &S,
     identity: &InstanceSigningIdentity,
     session_id: Uuid,
     config: &ControlSessionConfig,
+    rtc: Option<Arc<webrtc::api::API>>,
 ) -> Result<BoundControlChannel, ControlSessionError> {
     validate_config(config)?;
     let own_fingerprint = identity.public_identity().public_key_fingerprint.0;
@@ -436,7 +498,12 @@ pub async fn run_control_server_session<S: ControlSignalingApi>(
     }
     let controller_fingerprint = view.controller_fingerprint;
 
-    let rtc_api = build_rtc_api(config)?;
+    // Caller-supplied when the caller needs something this crate does not
+    // provide; otherwise the data-channel-only default.
+    let rtc_api = match rtc {
+        Some(rtc) => rtc,
+        None => Arc::new(build_rtc_api(config)?),
+    };
     let peer_connection = Arc::new(
         rtc_api
             .new_peer_connection(rtc_config(config))

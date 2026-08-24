@@ -30,7 +30,11 @@ pub mod codex_runtime;
 #[cfg(feature = "webrtc-transport")]
 pub mod control_session;
 pub mod device_request;
+/// The control-listener runtime, so every binary hosting one shares it.
+#[cfg(feature = "webrtc-transport")]
+pub mod harness_state;
 pub mod learner_ingest;
+pub mod listener;
 pub mod pack;
 pub mod pack_crypto;
 pub mod peer_cli;
@@ -38,5 +42,13 @@ pub mod peer_cli;
 pub mod peer_session;
 pub mod peer_transport;
 pub mod replication;
+pub mod session_config;
+/// Runs a configured session and carries its text both ways.
+pub mod session_runtime;
+/// Named session configurations, owned by the machine.
+#[cfg(feature = "webrtc-transport")]
+/// The wire surface for configured sessions.
+pub mod shell_extension;
 #[cfg(feature = "webrtc-transport")]
 pub mod signaling_client;
+pub mod task_board;
