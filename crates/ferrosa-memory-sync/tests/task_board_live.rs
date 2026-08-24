@@ -69,3 +69,56 @@ async fn an_unrelated_directory_gets_nothing() {
         none.len()
     );
 }
+
+/// A task can be read in full, with its body.
+///
+/// The list carries titles; the detail screen needs the prose, and the prose is
+/// the whole reason to open one. Read against the real board because the column
+/// set is forge's, in another repository.
+#[tokio::test]
+#[ignore = "needs the live task board"]
+async fn one_task_can_be_read_in_full() {
+    let board = TaskBoard::connect(&contact_points())
+        .await
+        .expect("connects to the board");
+
+    let listed = board
+        .open_work(&["/Users/bkearns/src/ferrosa-suite/ferrosa-mobile".to_owned()])
+        .await
+        .expect("reads the board");
+    let first = listed.first().expect("the board has open work");
+
+    let detail = board
+        .detail(&first.id)
+        .await
+        .expect("reads one task")
+        .expect("the task listed a moment ago is still there");
+
+    println!("{} — {}", detail.task.id, detail.task.title);
+    println!(
+        "body is {} chars, {} comment(s)",
+        detail.body.len(),
+        detail.comments.len()
+    );
+
+    assert_eq!(detail.task.id, first.id);
+    assert!(
+        !detail.body.is_empty(),
+        "the body is the reason to open a task; an empty one means the column \
+         is not being read"
+    );
+}
+
+/// An id that was never on the board is absent, not an error.
+#[tokio::test]
+#[ignore = "needs the live task board"]
+async fn an_unknown_task_is_absent_rather_than_an_error() {
+    let board = TaskBoard::connect(&contact_points())
+        .await
+        .expect("connects to the board");
+    let missing = board
+        .detail("t_definitely_not_real")
+        .await
+        .expect("a missing task is not a failure");
+    assert!(missing.is_none());
+}
