@@ -132,6 +132,16 @@ impl RootResolver {
     /// came from somewhere unclassified" are different states and only the
     /// first should be silent.
     pub fn root_of(&self, path: &str) -> Option<String> {
+        self.match_of(path).map(|matched| matched.root)
+    }
+
+    /// The same lookup, but keeping the alias that fired.
+    ///
+    /// Storage records the alias alongside the root it produced: when an item
+    /// lands in the wrong tier, the question is always *which rule put it
+    /// there*, and a bare root cannot answer that once two aliases point at
+    /// the same place.
+    pub fn match_of(&self, path: &str) -> Option<RootMatch> {
         let path = normalise_separators(path);
         self.aliases.iter().find_map(|(prefix, root)| {
             // A prefix must end at a separator. Without this, `research/corp`
@@ -140,9 +150,19 @@ impl RootResolver {
                 || path
                     .strip_prefix(prefix)
                     .is_some_and(|rest| rest.starts_with('/'));
-            matches.then(|| root.clone())
+            matches.then(|| RootMatch {
+                alias_prefix: prefix.clone(),
+                root: root.clone(),
+            })
         })
     }
+}
+
+/// Which alias matched, and what it resolved to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootMatch {
+    pub alias_prefix: String,
+    pub root: String,
 }
 
 /// Trim and collapse a path so two spellings of one location compare equal.

@@ -225,6 +225,13 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "verifiable ownership token for mobile control cursor reservations",
         ddl: include_str!("../../../ddl/052_mobile_control_cursor_reservation_token.cql"),
     },
+    // 53 is session archives, on its own branch. `pending` is set-based
+    // (see the gap detection above), so 53 still applies after 54 lands.
+    Migration {
+        version: 54,
+        description: "knowledge tiers: source provenance, root aliases, tier rules, promotions",
+        ddl: include_str!("../../../ddl/054_knowledge_tiers.cql"),
+    },
 ];
 
 /// `ddl/011_warmth_field.cql` — the `entity_warmth` table + session index.

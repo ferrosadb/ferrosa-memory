@@ -81,6 +81,7 @@ pub mod system_describe;
 pub mod temporal;
 pub mod tenant_provision;
 pub mod test_cluster;
+pub mod tier_store;
 pub mod tiers;
 pub mod transport;
 pub mod turn_chain;
