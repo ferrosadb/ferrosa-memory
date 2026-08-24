@@ -141,7 +141,39 @@ impl ShellExtension {
                     "repo": detail.task.repo,
                     "assignee": detail.assignee,
                     "summary": detail.summary,
+                    // Which of this machine's agents could take it. Decided
+                    // HERE because deciding it needs git — an agent working in
+                    // a worktree is working on the repository, and only the
+                    // machine can resolve that. Bounded, and the worst case is
+                    // asserted with the other Bounded frames.
+                    "agents": self.agents_for_repo(&detail.task.repo).await,
                 })];
+                // Related work, discovered while the detail is being read
+                // rather than on a second request: the operator has already
+                // asked "what is this", and "what else is about this" is the
+                // same question one step out.
+                if let Some(board) = self.board().await {
+                    let related = board
+                        .related_to(task_id, MAX_RELATED)
+                        .await
+                        .unwrap_or_default();
+                    for page in related.chunks(TASKS_PER_FRAME) {
+                        frames.push(serde_json::json!({
+                            "type": "shell_task_related",
+                            "task_id": task_id,
+                            "related": page
+                                .iter()
+                                .map(|item| serde_json::json!({
+                                    "reason": item.reason,
+                                    "id": item.task.id,
+                                    "title": item.task.title,
+                                    "status": item.task.status,
+                                    "needs_a_person": item.task.waits_on_a_person(),
+                                }))
+                                .collect::<Vec<_>>(),
+                        }));
+                    }
+                }
                 frames.extend(text_pages(task_id, "body", None, &detail.body));
                 if let Some(result) = &detail.result {
                     frames.extend(text_pages(task_id, "result", None, result));
@@ -162,6 +194,127 @@ impl ShellExtension {
                 "unavailable": format!("The task board refused the read: {error}"),
             })],
         }
+    }
+
+    /// Agents whose working directory is in the task's repository.
+    ///
+    /// Capped, because this rides on a Bounded frame. A machine with more than
+    /// a handful of agents for one repository is not a case that exists yet,
+    /// and if it starts to, the frame-size test is what will say so.
+    async fn agents_for_repo(&self, repo: &str) -> Vec<serde_json::Value> {
+        if repo.is_empty() {
+            return Vec::new();
+        }
+        let configs = self.configs.lock().await;
+        let dirs: Vec<String> = configs
+            .iter()
+            .filter_map(|config| config.working_dir.clone())
+            .collect();
+        let mut matcher = crate::task_board::RepoMatcher::new(&dirs);
+        // Asked once for the TASK's repository, then compared against each
+        // agent — rather than a matcher per agent, which would re-run git for
+        // every row.
+        let in_repo = matcher.matches(repo);
+        configs
+            .iter()
+            .filter(|config| {
+                let Some(dir) = &config.working_dir else {
+                    return false;
+                };
+                in_repo && crate::task_board::belongs_to(repo, dir)
+            })
+            .take(MAX_AGENTS_OFFERED)
+            .map(|config| {
+                serde_json::json!({
+                    "id": config.id.to_string(),
+                    "name": config.name,
+                })
+            })
+            .collect()
+    }
+
+    /// Send an agent to work on a task.
+    ///
+    /// Opens the agent's session and types an instruction naming the task. The
+    /// instruction is SHORT and names the id rather than pasting the body: the
+    /// agent can read the board itself, and a few kilobytes of prose typed into
+    /// a CLI is a way to corrupt a prompt, not a way to brief someone.
+    ///
+    /// The board is updated too — in_progress, assigned to the agent — because
+    /// a dispatch nobody recorded is a dispatch that happens twice.
+    async fn dispatch(
+        &self,
+        session: &SessionHandle,
+        task_id: &str,
+        config_id: uuid::Uuid,
+    ) -> Result<(), String> {
+        let config = {
+            let configs = self.configs.lock().await;
+            configs
+                .iter()
+                .find(|config| config.id == config_id)
+                .cloned()
+                .ok_or_else(|| "no agent with that id".to_owned())?
+        };
+
+        // The title, for an instruction a person reading the pane can follow.
+        let title = match self.board().await {
+            Some(board) => board
+                .detail(task_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|detail| detail.task.title),
+            None => None,
+        };
+
+        // Through the ordinary open path, so a dispatch to a running tmux
+        // agent resumes it rather than starting a second one beside it.
+        self.open(session, &config.id.to_string()).await?;
+        let running = self
+            .sessions
+            .lock()
+            .await
+            .get(&session.session_id())
+            .and_then(|state| state.open.clone())
+            .ok_or_else(|| "the session did not open".to_owned())?;
+
+        let instruction = match &title {
+            Some(title) => format!(
+                "Please pick up forge task {task_id} — \"{title}\". \
+                 Read it from the task board first, follow its acceptance criteria, \
+                 and comment on the task with what you did."
+            ),
+            None => format!(
+                "Please pick up forge task {task_id}. Read it from the task board first, \
+                 follow its acceptance criteria, and comment on the task with what you did."
+            ),
+        };
+        running
+            .send(&instruction)
+            .map_err(|error| error.to_string())?;
+        // NOT submitted. The operator sees the instruction in the pane and
+        // presses Return themselves — sending an agent to work is worth one
+        // deliberate keystroke, and a harness that was mid-prompt would
+        // otherwise have this run as an answer to something else.
+
+        if let Some(board) = self.board().await
+            && let Err(error) = board.assign(task_id, &config.name).await
+        {
+            // The agent HAS been briefed; only the record failed. Said out
+            // loud rather than reported as a failed dispatch, which would
+            // invite the operator to do it a second time.
+            session
+                .send(&envelope(serde_json::json!({
+                    "type": "shell_notice",
+                    "text": format!(
+                        "{} was briefed, but the board was not updated: {error}",
+                        config.name
+                    ),
+                })))
+                .await?;
+        }
+        Ok(())
     }
 
     /// Outstanding work for the repositories this machine's agents work in.
@@ -542,6 +695,19 @@ const TASKS_PER_FRAME: usize = 3;
 /// rather than fifty.
 const DEFAULT_TASK_PAGE: usize = 10;
 
+/// How many agents a task detail offers to dispatch.
+///
+/// Four. The frame that carries them is Bounded, and this is the number the
+/// size test is asserted against.
+const MAX_AGENTS_OFFERED: usize = 4;
+
+/// How many related tasks a detail carries.
+///
+/// Twelve. One blocked task on the live board has ten others talking about the
+/// same identifier; a bound below that would hide the duplicate cluster, which
+/// is the most useful thing the list has to say.
+const MAX_RELATED: usize = 12;
+
 /// The most a single request will return, however large a limit it asks for.
 ///
 /// A cap on WORK, not on truth: the real total travels with every page, so a
@@ -719,6 +885,8 @@ impl SessionExtension for ShellExtension {
             "shell_tasks",
             "shell_task",
             "shell_task_search",
+            "shell_dispatch",
+            "shell_task_complete",
         ]
     }
 
@@ -944,6 +1112,39 @@ impl SessionExtension for ShellExtension {
                     .map(|value| value as usize)
                     .unwrap_or(DEFAULT_TASK_PAGE);
                 for frame in self.tasks_frames(offset, limit).await {
+                    session.send(&envelope(frame)).await?;
+                }
+                Ok(())
+            }
+            "shell_dispatch" => {
+                let task_id = body
+                    .get("task_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "dispatch needs a task_id".to_owned())?;
+                let config_id = config_id(body)?;
+                self.dispatch(session, task_id, config_id).await?;
+                for frame in self.task_detail_frames(task_id).await {
+                    session.send(&envelope(frame)).await?;
+                }
+                Ok(())
+            }
+            "shell_task_complete" => {
+                let task_id = body
+                    .get("task_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "completing needs a task_id".to_owned())?;
+                let note = body.get("note").and_then(serde_json::Value::as_str);
+                let board = self
+                    .board()
+                    .await
+                    .ok_or_else(|| "the task board could not be reached".to_owned())?;
+                board
+                    .complete(task_id, note)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                // The task back, so the screen shows what the board now says
+                // rather than what the app assumed it would say.
+                for frame in self.task_detail_frames(task_id).await {
                     session.send(&envelope(frame)).await?;
                 }
                 Ok(())
@@ -1286,6 +1487,7 @@ mod output_framing_tests {
         ("shell_task_detail", Sizing::Bounded),
         ("shell_task_text", Sizing::Paged),
         ("shell_task_search", Sizing::Paged),
+        ("shell_task_related", Sizing::Paged),
     ];
 
     /// A new frame kind cannot be emitted without a decision about its size.
@@ -1370,6 +1572,10 @@ mod output_framing_tests {
                     "repo": path,
                     "assignee": "ben",
                     "summary": long,
+                    "agents": (0..MAX_AGENTS_OFFERED).map(|_| serde_json::json!({
+                        "id": uuid::Uuid::now_v7().to_string(),
+                        "name": "ferrosa-suite claude",
+                    })).collect::<Vec<_>>(),
                 }),
                 _ => serde_json::json!({
                     "type": kind,
@@ -1404,6 +1610,30 @@ mod output_framing_tests {
                 frame.len()
             );
         }
+    }
+
+    /// A page of related tasks fits too. Its rows carry a reason as well as a
+    /// title, so it is fatter than a task row and needs its own assertion.
+    #[test]
+    fn a_page_of_related_tasks_fits_a_datagram() {
+        let item = serde_json::json!({
+            "reason": "mentions MAAS-T-35",
+            "id": "t_393bc64e",
+            "title": "Decide QA-0009: fix the entity_type example or the tool",
+            "status": "blocked",
+            "needs_a_person": true,
+        });
+        let page: Vec<serde_json::Value> = (0..TASKS_PER_FRAME).map(|_| item.clone()).collect();
+        let frame = envelope(serde_json::json!({
+            "type": "shell_task_related",
+            "task_id": "t_393bc64e",
+            "related": page,
+        }));
+        assert!(
+            frame.len() <= SAFE_DATAGRAM_BYTES,
+            "a related page is {} bytes",
+            frame.len()
+        );
     }
 
     /// A page of tasks must fit a datagram, like a page of output.
