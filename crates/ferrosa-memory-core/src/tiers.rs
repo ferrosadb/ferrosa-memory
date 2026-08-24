@@ -252,6 +252,14 @@ impl TierRules {
             ("consolidation".to_owned(), Tier::Knowledge),
             ("agent-artifacts".to_owned(), Tier::Knowledge),
             ("session-capture".to_owned(), Tier::Data),
+            // Benchmark fixtures. Externally curated and trustworthy as text,
+            // but it is TEST data: it is not this person's knowledge, and it
+            // outnumbers everything else in the store by an order of
+            // magnitude. Leaving it unclassified would let 63,000 evaluation
+            // documents sit in the same tier as material nobody placed, and
+            // promoting it to Information would drown the curated corpus it
+            // has nothing to do with.
+            ("brightpro-test".to_owned(), Tier::Data),
         ])
     }
 }

@@ -5471,6 +5471,10 @@ async fn handle_ingest_skill<S: crate::storage::Storage>(
         "output_artifacts",
         "completion_criteria",
         "content_hash",
+        // Where the SKILL.md lives, so the skill can be tiered. Skills are the
+        // Wisdom tier's whole population; without this they arrive with no
+        // origin and sit at Data alongside session exhaust.
+        "source_path",
     ];
     if let Some(obj) = args.as_object() {
         let unknown: Vec<&str> = obj
@@ -5491,6 +5495,8 @@ async fn handle_ingest_skill<S: crate::storage::Storage>(
     }
 
     let name = require_str(&args, "name")?.to_string();
+    // Kept for the source record, which is written after `params` takes it.
+    let skill_name = name.clone();
     let category = require_str(&args, "category")?.to_string();
     let description = require_str(&args, "description")?.to_string();
     let caller_session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
@@ -5576,8 +5582,41 @@ async fn handle_ingest_skill<S: crate::storage::Storage>(
     .await
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
+    // Record where it came from, if the caller said. Best-effort and loud, on
+    // the same terms as ingest_entities: the skill lands either way, but a
+    // skill with no origin cannot be told from session exhaust by the tier
+    // rules, and that must look like a failure rather than a quiet Data row.
+    let mut source_recorded = false;
+    if let Some(path) = args
+        .get("source_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        match storage
+            .entity_source_record(
+                ctx,
+                crate::tier_store::SourceDraft {
+                    entity_id: action.entity_id(),
+                    session_id: caller_session_id,
+                    title: skill_name,
+                    source_path: path.to_owned(),
+                },
+            )
+            .await
+        {
+            Ok(_) => source_recorded = true,
+            Err(error) => tracing::warn!(
+                entity_id = %action.entity_id(),
+                %error,
+                "could not record where this skill came from"
+            ),
+        }
+    }
+
     let mut result = serde_json::to_value(&action).map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
     if let Some(obj) = result.as_object_mut() {
+        obj.insert("source_recorded".into(), Value::Bool(source_recorded));
         obj.insert(
             "_hint".into(),
             Value::String(

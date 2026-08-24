@@ -332,6 +332,18 @@ pub fn origin_of(entity_type: &str, text: &str, properties: &serde_json::Value) 
     if let Some(stated) = stated_origin(text) {
         return Some(stated);
     }
+    // Benchmark fixtures state their dataset and their document id. Both are
+    // written by the loader, so this is stated provenance, not a guess about
+    // what the text contains.
+    if let Some(benchmark) = properties.get("benchmark").and_then(|v| v.as_str())
+        && benchmark == "bright-pro"
+    {
+        let doc = properties
+            .get("doc_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        return Some(format!("brightpro-test/{doc}"));
+    }
     if matches!(entity_type, "turn" | "project") {
         // The directory is real and stated; the root says what wrote it. Kept
         // as one path so a rule can match the root and a reader can still see
