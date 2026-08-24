@@ -1983,12 +1983,29 @@ pub trait Storage: Send + Sync {
         session_id: Uuid,
     ) -> impl std::future::Future<Output = anyhow::Result<Option<ConsolidationRequest>>> + Send;
 
-    /// List sessions with pending consolidation requests, oldest first.
-    fn consolidation_request_list_pending(
+    /// Stream every session with consolidation work outstanding.
+    ///
+    /// Deliberately takes no limit. A limit would force a decision about WHICH
+    /// items to return, which forces an ordering, which forces buffering the
+    /// candidates to sort them — the bound on the RESULT is what creates the
+    /// materialisation it appears to prevent. Delivering the whole set means
+    /// there is no selection, so no ordering requirement, and nothing to hold.
+    ///
+    /// The work is bounded instead by the channel: `tx` is expected to be
+    /// bounded, so a consumer that claims and processes slowly throttles the
+    /// producer rather than letting it accumulate. A consumer that has had
+    /// enough drops the receiver and the producer stops.
+    ///
+    /// Ordering is NOT guaranteed. Nothing selects a subset, so every
+    /// outstanding item is delivered in the same pass and order affects only
+    /// the sequence work is picked up in, never whether it is. If ordering is
+    /// ever required it must come from the schema (a clustering key), not from
+    /// sorting on the client.
+    fn consolidation_request_stream_pending(
         &self,
-        ctx: &TenantContext,
-        limit: usize,
-    ) -> impl std::future::Future<Output = anyhow::Result<Vec<Uuid>>> + Send;
+        ctx: TenantContext,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Uuid>>,
+    ) -> impl std::future::Future<Output = ()> + Send;
 
     /// Append a consolidation run audit record.
     fn consolidation_run_insert(
@@ -4811,13 +4828,13 @@ pub mod mock {
                 .cloned())
         }
 
-        async fn consolidation_request_list_pending(
+        async fn consolidation_request_stream_pending(
             &self,
-            ctx: &TenantContext,
-            limit: usize,
-        ) -> anyhow::Result<Vec<Uuid>> {
+            ctx: TenantContext,
+            tx: tokio::sync::mpsc::Sender<anyhow::Result<Uuid>>,
+        ) {
             let now = chrono::Utc::now();
-            let mut requests: Vec<ConsolidationRequest> = self
+            let outstanding: Vec<Uuid> = self
                 .consolidation_requests
                 .lock()
                 .await
@@ -4829,14 +4846,19 @@ pub mod mock {
                                 && r.lease_expires_at
                                     .is_some_and(|expires_at| expires_at <= now)))
                 })
-                .cloned()
-                .collect();
-            requests.sort_by_key(|r| r.requested_at);
-            Ok(requests
-                .into_iter()
-                .take(limit)
                 .map(|r| r.session_id)
-                .collect())
+                .collect();
+
+            // The mock's rows already live in memory behind a lock, so the
+            // copy here is of the in-memory set, not of a query result — and
+            // the lock is released before sending so a slow consumer cannot
+            // block writers. The CQL implementation streams from the driver
+            // and holds nothing.
+            for session_id in outstanding {
+                if tx.send(Ok(session_id)).await.is_err() {
+                    return; // consumer went away
+                }
+            }
         }
 
         async fn consolidation_run_insert(
@@ -5116,14 +5138,172 @@ pub mod mock {
                 .await
                 .unwrap();
 
-            let pending = storage
-                .consolidation_request_list_pending(&ctx, 10)
-                .await
-                .unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let produce = storage.consolidation_request_stream_pending(ctx.clone(), tx);
+            let consume = async {
+                let mut seen = std::collections::HashSet::new();
+                while let Some(item) = rx.recv().await {
+                    seen.insert(item.unwrap());
+                }
+                seen
+            };
+            let (_, pending) = tokio::join!(produce, consume);
             assert!(pending.contains(&stale_session));
             assert!(pending.contains(&pending_session));
             assert!(!pending.contains(&fresh_session));
             assert_eq!(pending.len(), 2);
+        }
+
+        /// Every outstanding session is delivered — there is no limit to take
+        /// a slice with.
+        ///
+        /// The previous `consolidation_request_list_pending(ctx, limit)` asked
+        /// for N items, which forced a decision about WHICH N, which forced an
+        /// ordering, which forced buffering the candidates to sort them. The
+        /// limit manufactured the materialisation. With the whole set streamed
+        /// there is no selection, so no ordering requirement, so nothing to
+        /// buffer: rows flow from the driver page straight to the consumer.
+        #[tokio::test]
+        async fn consolidation_stream_delivers_every_outstanding_session() {
+            let storage = MockStorage::default();
+            let ctx = test_ctx();
+
+            // Far more than any batch size the old code used (it took 64).
+            let mut expected = std::collections::HashSet::new();
+            let mut n = 0;
+            while n < 200 {
+                let session = Uuid::new_v4();
+                storage
+                    .consolidation_request_upsert(&ctx, session)
+                    .await
+                    .unwrap();
+                expected.insert(session);
+                n += 1;
+            }
+
+            // A small channel relative to the number of rows, so the producer
+            // cannot finish without the consumer keeping up — backpressure,
+            // not buffering.
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let produce = storage.consolidation_request_stream_pending(ctx.clone(), tx);
+            let consume = async {
+                let mut seen = std::collections::HashSet::new();
+                while let Some(item) = rx.recv().await {
+                    seen.insert(item.unwrap());
+                }
+                seen
+            };
+            let (_, seen) = tokio::join!(produce, consume);
+
+            assert_eq!(
+                seen, expected,
+                "every outstanding session must be delivered, not a slice"
+            );
+        }
+
+        /// A lease that has NOT expired is still owned by another replica and
+        /// must not be handed out again; an expired one must be reclaimable.
+        #[tokio::test]
+        async fn consolidation_stream_yields_expired_leases_but_not_live_ones() {
+            let storage = MockStorage::default();
+            let ctx = test_ctx();
+
+            let pending_session = Uuid::new_v4();
+            let stale_session = Uuid::new_v4();
+            let fresh_session = Uuid::new_v4();
+
+            storage
+                .consolidation_request_upsert(&ctx, pending_session)
+                .await
+                .unwrap();
+
+            storage
+                .consolidation_request_upsert(&ctx, stale_session)
+                .await
+                .unwrap();
+            storage
+                .consolidation_request_claim(
+                    &ctx,
+                    stale_session,
+                    "replica-a",
+                    chrono::Utc::now() - chrono::Duration::minutes(5),
+                )
+                .await
+                .unwrap();
+
+            storage
+                .consolidation_request_upsert(&ctx, fresh_session)
+                .await
+                .unwrap();
+            storage
+                .consolidation_request_claim(
+                    &ctx,
+                    fresh_session,
+                    "replica-a",
+                    chrono::Utc::now() + chrono::Duration::minutes(5),
+                )
+                .await
+                .unwrap();
+
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let produce = storage.consolidation_request_stream_pending(ctx.clone(), tx);
+            let consume = async {
+                let mut seen = std::collections::HashSet::new();
+                while let Some(item) = rx.recv().await {
+                    seen.insert(item.unwrap());
+                }
+                seen
+            };
+            let (_, seen) = tokio::join!(produce, consume);
+
+            assert!(seen.contains(&pending_session), "pending must be delivered");
+            assert!(
+                seen.contains(&stale_session),
+                "an expired lease must be reclaimable"
+            );
+            assert!(
+                !seen.contains(&fresh_session),
+                "a live lease belongs to another replica"
+            );
+            assert_eq!(seen.len(), 2);
+        }
+
+        /// The consumer decides when it has had enough — that is what replaces
+        /// the limit. Dropping the receiver must stop the producer rather than
+        /// leave it blocked forever trying to send into a closed channel.
+        #[tokio::test]
+        async fn consolidation_stream_stops_when_the_consumer_goes_away() {
+            let storage = MockStorage::default();
+            let ctx = test_ctx();
+
+            let mut n = 0;
+            while n < 50 {
+                storage
+                    .consolidation_request_upsert(&ctx, Uuid::new_v4())
+                    .await
+                    .unwrap();
+                n += 1;
+            }
+
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            let produce = storage.consolidation_request_stream_pending(ctx.clone(), tx);
+            let consume = async move {
+                // Take one, then walk away.
+                //
+                // The drop must be EXPLICIT: `tokio::join!` holds both futures
+                // until both finish, so `rx` would otherwise stay alive until
+                // the producer completed — and the producer is precisely what
+                // is waiting on it. Dropping here mid-poll is what releases it.
+                let _first = rx.recv().await.expect("at least one item").unwrap();
+                drop(rx);
+            };
+
+            // Must terminate promptly rather than block forever on send.
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(produce, consume)
+            })
+            .await
+            .expect("producer must stop once the receiver is dropped");
         }
 
         #[tokio::test]

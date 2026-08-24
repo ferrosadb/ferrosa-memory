@@ -8355,73 +8355,83 @@ impl Storage for CqlStorage {
             .transpose()
     }
 
-    async fn consolidation_request_list_pending(
+    async fn consolidation_request_stream_pending(
         &self,
-        ctx: &TenantContext,
-        limit: usize,
-    ) -> anyhow::Result<Vec<Uuid>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        // Both candidate sets stream through one bounded selector.
+        ctx: TenantContext,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Uuid>>,
+    ) {
+        // Rows go from the driver page straight to the consumer. Nothing is
+        // accumulated: no Vec of candidates, no sort, no limit.
         //
-        // This used to `query_unpaged` each set, push EVERY matching row into
-        // a Vec, sort it, and only then `truncate(limit)` — so asking for a
-        // handful of work items cost a full materialisation of
-        // `consolidation_requests`, on every poll tick, forever. Streaming
-        // with `query_iter` and folding through `PendingSelector` keeps peak
-        // memory at `O(limit)` regardless of table size.
+        // The two queries match DISJOINT states, and the table is
+        // `PRIMARY KEY ((tenant_id, session_id))` so a session has exactly one
+        // row — there is no duplicate to dedup. The one narrow exception is a
+        // row transitioning between the two queries, and the claim LWT is the
+        // authority there: a second claim on the same session simply returns
+        // `applied = false` and the worker moves on.
         //
-        // The table is keyed `PRIMARY KEY ((tenant_id, session_id))`, so both
-        // columns are in the PARTITION key and "pending for this tenant" can
-        // only be a ring scan (hence ALLOW FILTERING). Streaming does not make
-        // the scan cheap on the server — that needs the schema change tracked
-        // in t_a553df97 / the CDC work in t_25c736b8 — but it does stop the
-        // CLIENT from holding the whole result, and it lets us stop reading
-        // early.
+        // This does NOT make the scan cheap. Both columns are in the partition
+        // key, so "outstanding for this tenant" can only be a ring scan and
+        // ALLOW FILTERING is the only way to express it. Streaming stops the
+        // CLIENT holding the result and lets a slow consumer throttle the
+        // producer; making the server-side lookup cheap needs the schema
+        // change (t_a553df97) or the CDC work (t_25c736b8).
         let pending_query = format!(
-            "SELECT session_id, requested_at FROM {}.consolidation_requests \
+            "SELECT session_id FROM {}.consolidation_requests \
              WHERE tenant_id = ? AND state = 'pending' ALLOW FILTERING",
             self.keyspace
         );
         let stale_query = format!(
-            "SELECT session_id, requested_at FROM {}.consolidation_requests \
+            "SELECT session_id FROM {}.consolidation_requests \
              WHERE tenant_id = ? AND state = 'leased' AND lease_expires_at <= ? ALLOW FILTERING",
             self.keyspace
         );
         let now = chrono::Utc::now();
 
-        let mut selector = PendingSelector::new(limit);
-
-        let mut pending_iter = self
+        let mut pending_iter = match self
             .session
             .query_iter(pending_query, (ctx.tenant_id,))
-            .await?;
+            .await
+        {
+            Ok(iter) => iter,
+            Err(e) => {
+                let _ = tx.send(Err(anyhow::Error::new(e))).await;
+                return;
+            }
+        };
         let pending_cols = build_col_map(pending_iter.get_column_specs());
         while let Some(row) = pending_iter.next().await {
-            let row = row?;
-            let requested_at: chrono::DateTime<chrono::Utc> =
-                cql_get(&row, &pending_cols, "requested_at")?;
-            let session_id: Uuid = cql_get(&row, &pending_cols, "session_id")?;
-            selector.offer(requested_at, session_id);
+            let item = row
+                .map_err(anyhow::Error::new)
+                .and_then(|row| cql_get::<Uuid>(&row, &pending_cols, "session_id"));
+            let failed = item.is_err();
+            if tx.send(item).await.is_err() || failed {
+                return;
+            }
         }
         drop(pending_iter);
 
-        let mut stale_iter = self
+        let mut stale_iter = match self
             .session
             .query_iter(stale_query, (ctx.tenant_id, now))
-            .await?;
+            .await
+        {
+            Ok(iter) => iter,
+            Err(e) => {
+                let _ = tx.send(Err(anyhow::Error::new(e))).await;
+                return;
+            }
+        };
         let stale_cols = build_col_map(stale_iter.get_column_specs());
         while let Some(row) = stale_iter.next().await {
-            let row = row?;
-            let requested_at: chrono::DateTime<chrono::Utc> =
-                cql_get(&row, &stale_cols, "requested_at")?;
-            let session_id: Uuid = cql_get(&row, &stale_cols, "session_id")?;
-            selector.offer(requested_at, session_id);
+            let item = row
+                .map_err(anyhow::Error::new)
+                .and_then(|row| cql_get::<Uuid>(&row, &stale_cols, "session_id"));
+            let failed = item.is_err();
+            if tx.send(item).await.is_err() || failed {
+                return;
+            }
         }
-        drop(stale_iter);
-
-        Ok(selector.finish())
     }
 
     async fn consolidation_run_insert(
@@ -9436,240 +9446,5 @@ mod remotes_cql_tests {
                 "intentional JSON blob column missing: {col}"
             );
         }
-    }
-}
-
-/// Selects the `limit` oldest pending sessions from a stream of candidate
-/// rows, holding at most `limit` of them at a time.
-///
-/// The previous implementation read EVERY matching row into a `Vec`, sorted
-/// it, and only then called `truncate(limit)` — so the cost of asking for 8
-/// items scaled with the total size of `consolidation_requests`, and the
-/// worker paid it on every tick. Feeding rows through this selector instead
-/// keeps memory at `O(limit)` no matter how many rows the query returns.
-///
-/// It also fixes the dedup. The old code did
-/// `sort_by_key(requested_at)` followed by `dedup_by_key(session_id)`, but
-/// `Vec::dedup_by_key` only removes CONSECUTIVE duplicates — on a vec ordered
-/// by a different key that is a no-op, so one session could be handed to the
-/// worker several times in a single pass. Here a session is keyed once and
-/// keeps its EARLIEST request, so a re-request cannot push a long-waiting
-/// session back down the queue.
-#[derive(Debug)]
-pub(crate) struct PendingSelector {
-    limit: usize,
-    /// Retained candidates ordered by (requested_at, session_id), oldest
-    /// first. Never larger than `limit`.
-    ordered: std::collections::BTreeMap<(chrono::DateTime<chrono::Utc>, Uuid), ()>,
-    /// The timestamp currently retained for each session, so a duplicate can
-    /// be recognised and the earlier of the two kept.
-    by_session: HashMap<Uuid, chrono::DateTime<chrono::Utc>>,
-}
-
-impl PendingSelector {
-    pub(crate) fn new(limit: usize) -> Self {
-        Self {
-            limit,
-            ordered: std::collections::BTreeMap::new(),
-            by_session: HashMap::new(),
-        }
-    }
-
-    /// Number of candidates currently held. Bounded by `limit`.
-    pub(crate) fn retained(&self) -> usize {
-        self.ordered.len()
-    }
-
-    /// True when the selector is full AND `requested_at` is newer than every
-    /// retained candidate, so this row — and, on an ordered stream, every row
-    /// after it — cannot change the outcome.
-    ///
-    /// Callers use this to stop reading early rather than draining the rest of
-    /// the result set.
-    pub(crate) fn is_saturated_beyond(&self, requested_at: chrono::DateTime<chrono::Utc>) -> bool {
-        if self.ordered.len() < self.limit {
-            return false;
-        }
-        match self.ordered.keys().next_back() {
-            Some((newest, _)) => requested_at >= *newest,
-            None => true, // limit == 0: nothing can ever be retained
-        }
-    }
-
-    /// Offer one candidate row. Keeps it only if it belongs in the `limit`
-    /// oldest; evicts the newest retained candidate when that pushes us over.
-    pub(crate) fn offer(&mut self, requested_at: chrono::DateTime<chrono::Utc>, session_id: Uuid) {
-        if self.limit == 0 {
-            return;
-        }
-
-        // Same session seen twice: keep the earlier request, drop the later.
-        if let Some(existing) = self.by_session.get(&session_id).copied() {
-            if existing <= requested_at {
-                return;
-            }
-            self.ordered.remove(&(existing, session_id));
-        }
-
-        self.by_session.insert(session_id, requested_at);
-        self.ordered.insert((requested_at, session_id), ());
-
-        // One over at most, since we insert one at a time.
-        if self.ordered.len() > self.limit {
-            if let Some((newest, sid)) = self.ordered.keys().next_back().copied() {
-                self.ordered.remove(&(newest, sid));
-                // Only forget the session if the evicted entry is the one we
-                // are tracking for it.
-                if self.by_session.get(&sid) == Some(&newest) {
-                    self.by_session.remove(&sid);
-                }
-            }
-        }
-    }
-
-    /// The retained sessions, oldest request first.
-    pub(crate) fn finish(self) -> Vec<Uuid> {
-        self.ordered
-            .into_keys()
-            .map(|(_, session_id)| session_id)
-            .collect()
-    }
-}
-
-#[cfg(test)]
-mod pending_selector_tests {
-    use super::PendingSelector;
-    use chrono::{TimeZone, Utc};
-    use uuid::Uuid;
-
-    fn ts(secs: i64) -> chrono::DateTime<Utc> {
-        Utc.timestamp_opt(1_700_000_000 + secs, 0).unwrap()
-    }
-
-    /// Duplicate sessions must be collapsed even when they are NOT adjacent.
-    ///
-    /// The original code did `sort_by_key(requested_at)` then
-    /// `dedup_by_key(session_id)`. `Vec::dedup_by_key` only removes
-    /// CONSECUTIVE duplicates, so on a vec ordered by a DIFFERENT key it is a
-    /// no-op — the same session could be handed to the worker more than once
-    /// per pass.
-    #[test]
-    fn collapses_duplicate_sessions_that_are_not_adjacent() {
-        let a = Uuid::from_u128(1);
-        let b = Uuid::from_u128(2);
-
-        let mut sel = PendingSelector::new(10);
-        // Interleaved so the two `a` entries are never neighbours once sorted.
-        sel.offer(ts(10), a);
-        sel.offer(ts(20), b);
-        sel.offer(ts(30), a);
-
-        let out = sel.finish();
-        assert_eq!(out, vec![a, b], "each session must appear exactly once");
-    }
-
-    /// When a session appears twice, the EARLIEST request wins — the queue is
-    /// oldest-first, so keeping the later timestamp would let a long-waiting
-    /// session be starved by its own re-request.
-    #[test]
-    fn keeps_the_earliest_request_for_a_duplicated_session() {
-        let a = Uuid::from_u128(1);
-        let b = Uuid::from_u128(2);
-
-        let mut sel = PendingSelector::new(10);
-        sel.offer(ts(30), a); // later first
-        sel.offer(ts(20), b);
-        sel.offer(ts(10), a); // earlier arrives after
-
-        assert_eq!(
-            sel.finish(),
-            vec![a, b],
-            "a must sort by its EARLIEST timestamp (10), ahead of b (20)"
-        );
-    }
-
-    /// Oldest request first, regardless of arrival order.
-    #[test]
-    fn returns_oldest_request_first() {
-        let a = Uuid::from_u128(1);
-        let b = Uuid::from_u128(2);
-        let c = Uuid::from_u128(3);
-
-        let mut sel = PendingSelector::new(10);
-        sel.offer(ts(30), c);
-        sel.offer(ts(10), a);
-        sel.offer(ts(20), b);
-
-        assert_eq!(sel.finish(), vec![a, b, c]);
-    }
-
-    /// Keeps the `limit` OLDEST, not the first `limit` seen.
-    #[test]
-    fn keeps_the_oldest_when_more_than_limit_are_offered() {
-        let newest = Uuid::from_u128(99);
-        let old_a = Uuid::from_u128(1);
-        let old_b = Uuid::from_u128(2);
-
-        let mut sel = PendingSelector::new(2);
-        sel.offer(ts(900), newest); // arrives first but is newest
-        sel.offer(ts(10), old_a);
-        sel.offer(ts(20), old_b);
-
-        assert_eq!(
-            sel.finish(),
-            vec![old_a, old_b],
-            "the newest entry must be evicted, not the late-arriving old ones"
-        );
-    }
-
-    /// THE POINT OF THE FIX: memory is bounded by `limit`, not by the number
-    /// of rows offered.
-    ///
-    /// The original path materialised EVERY matching row into a Vec and only
-    /// then called `truncate(limit)`, so cost scaled with total table size.
-    /// Offering far more rows than the limit must not grow the selector.
-    #[test]
-    fn retains_only_limit_entries_however_many_are_offered() {
-        let mut sel = PendingSelector::new(3);
-        let mut i: u128 = 0;
-        while i < 10_000 {
-            sel.offer(ts(i as i64), Uuid::from_u128(i + 1));
-            i += 1;
-        }
-        assert!(
-            sel.retained() <= 3,
-            "selector must hold at most `limit` entries, held {}",
-            sel.retained()
-        );
-        assert_eq!(sel.finish().len(), 3);
-    }
-
-    /// A zero limit asks for no work and must not retain anything.
-    #[test]
-    fn limit_zero_yields_nothing() {
-        let mut sel = PendingSelector::new(0);
-        sel.offer(ts(10), Uuid::from_u128(1));
-        assert_eq!(sel.retained(), 0);
-        assert!(sel.finish().is_empty());
-    }
-
-    /// Enough is enough: once `limit` entries are held and an offered row is
-    /// newer than every one of them, the caller can stop reading. This is what
-    /// lets the query stream terminate early instead of draining the table.
-    #[test]
-    fn reports_when_a_newer_row_cannot_displace_the_retained_set() {
-        let mut sel = PendingSelector::new(2);
-        assert!(!sel.is_saturated_beyond(ts(5)), "not yet full");
-        sel.offer(ts(10), Uuid::from_u128(1));
-        sel.offer(ts(20), Uuid::from_u128(2));
-
-        assert!(
-            sel.is_saturated_beyond(ts(30)),
-            "a row newer than the retained set cannot displace anything"
-        );
-        assert!(
-            !sel.is_saturated_beyond(ts(15)),
-            "a row older than the newest retained entry still matters"
-        );
     }
 }
