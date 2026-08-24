@@ -690,35 +690,45 @@ impl SessionRuntime {
                     },
                 });
             }
+        }
 
-            // Per session, never globally — this process does not get to
-            // reconfigure the operator's own tmux.
-            for option in [
-                // No status bar. It costs a row on a phone and describes tmux
-                // rather than the work.
-                ["status", "off"],
-                // Mouse reporting ON, which is what makes the real scrollback
-                // reachable. The emulator on the device only holds what it has
-                // received since attaching; the session's HISTORY lives in
-                // tmux. With this, a drag becomes a scroll event tmux acts on,
-                // entering copy-mode and walking its own history — so the
-                // operator can reach output from before they connected.
-                //
-                // A program that asks for mouse events still gets them: tmux
-                // forwards to an application that has requested them and only
-                // handles the scroll itself when none has.
-                ["mouse", "on"],
-                // A history worth scrolling. The default is 2000 lines, which
-                // a build log passes in seconds.
-                ["history-limit", "50000"],
-            ] {
-                let _ = Command::new(&self.tmux_binary)
-                    .args(["set-option", "-t", &name, option[0], option[1]])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .await;
-            }
+        // Applied on EVERY open, not only on creation.
+        //
+        // A session created before these settings changed keeps whatever it was
+        // made with, for as long as it runs — and these sessions run for days.
+        // Setting them on rejoin is what repairs one, and setting an option to
+        // the value it already has costs nothing.
+        //
+        // Per session, never globally: this process does not get to
+        // reconfigure the operator's own tmux.
+        for option in [
+            // No status bar. It costs a row on a phone and describes tmux
+            // rather than the work.
+            ["status", "off"],
+            // Mouse reporting OFF, and this matters more than it sounds.
+            //
+            // It was ON, to make a drag scroll tmux's history. That is not how
+            // scrolling works here any more — `shell_scroll` drives copy mode
+            // directly — and leaving it on did real damage. With mouse
+            // reporting active, SwiftTerm turns every TAP into a mouse escape
+            // sequence and sends it as INPUT: the "weird ascii characters that
+            // had to be deleted before I could type a command". Worse, a tap
+            // that becomes a mouse report is a tap that no longer focuses the
+            // terminal, so typing stopped working altogether.
+            //
+            // A program that genuinely wants mouse events can still request
+            // them itself; this only stops tmux asking on its behalf.
+            ["mouse", "off"],
+            // A history worth scrolling. The default is 2000 lines, which a
+            // build log passes in seconds.
+            ["history-limit", "50000"],
+        ] {
+            let _ = Command::new(&self.tmux_binary)
+                .args(["set-option", "-t", &name, option[0], option[1]])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
         }
 
         // ATTACHED through a PTY, not scraped with `capture-pane`.
