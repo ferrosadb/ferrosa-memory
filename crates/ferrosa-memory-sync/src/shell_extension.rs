@@ -49,7 +49,9 @@ pub struct ShellExtension {
     /// lasted as long as the session would have to be unpicked when real
     /// capability grants land, because an owner revoking access mid-command
     /// must stop it.
-    sessions: Mutex<HashMap<uuid::Uuid, ShellState>>,
+    /// Shared, because the status pump needs to know what this control
+    /// session is holding open — an ephemeral session exists nowhere else.
+    sessions: Arc<Mutex<HashMap<uuid::Uuid, ShellState>>>,
     /// Where the deferred-work board lives.
     ///
     /// Connected on FIRST USE rather than at startup: the board is a
@@ -82,7 +84,7 @@ impl ShellExtension {
             configs: Arc::new(Mutex::new(load_configs(&store_path))),
             store_path,
             runtime: Arc::new(SessionRuntime::new(workspace)),
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
             board_contact_points,
             board: tokio::sync::OnceCell::new(),
         }
@@ -787,8 +789,10 @@ const STATUS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 async fn pump_status(
     configs: Arc<Mutex<Vec<SessionConfig>>>,
     runtime: Arc<SessionRuntime>,
+    sessions: Arc<Mutex<HashMap<uuid::Uuid, ShellState>>>,
     session: SessionHandle,
 ) {
+    let session_id = session.session_id();
     // One watcher per job. It holds the previous pane AND how often each row
     // changes, which is how a spinner is told apart from something said.
     let mut watchers: HashMap<uuid::Uuid, crate::session_runtime::PaneWatcher> = HashMap::new();
@@ -796,6 +800,8 @@ async fn pump_status(
     let mut last_moved: HashMap<uuid::Uuid, u64> = HashMap::new();
     // Jobs already reported as waiting, so it is said once and not every tick.
     let mut announced: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
+    // Jobs last seen running, so a state change is reported once.
+    let mut was_running: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
     let mut first = true;
     // Which pids belong to which job. Resolved once per job and kept, because
     // walking a process tree is several spawns and a pane's harness does not
@@ -813,11 +819,23 @@ async fn pump_status(
             .unwrap_or(0);
 
         let snapshot: Vec<SessionConfig> = configs.lock().await.clone();
+        // What this control session is holding open. An EPHEMERAL session is a
+        // process held by this listener and nothing else — tmux has never heard
+        // of it — so without this it reports off-shift for its whole life, and
+        // a home screen that hides off-shift jobs hides it completely.
+        let held_by_this_session: Option<uuid::Uuid> = sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .and_then(|state| state.open.as_ref())
+            .map(|open| open.config().id);
+
         let mut jobs = Vec::new();
         for config in &snapshot {
-            let running = runtime.is_running(config).await;
+            let running =
+                runtime.is_running(config).await || held_by_this_session == Some(config.id);
             if !running {
-                if watchers.remove(&config.id).is_some() {
+                if watchers.remove(&config.id).is_some() || was_running.contains(&config.id) {
                     // It was running and is not. That IS news.
                     jobs.push(serde_json::json!({
                         "id": config.id.to_string(),
@@ -828,6 +846,7 @@ async fn pump_status(
                 last_moved.remove(&config.id);
                 announced.remove(&config.id);
                 pids.remove(&config.id);
+                was_running.remove(&config.id);
                 continue;
             }
 
@@ -847,8 +866,21 @@ async fn pump_status(
             let says = owned.iter().find_map(|pid| reported.get(pid).copied());
 
             let Some(pane) = runtime.pane_text(config).await else {
+                // No pane to read: an ephemeral session's output goes straight
+                // to the device and tmux holds nothing to scrape. Say it is
+                // up — skipping here is what left it off the roster even once
+                // it was known to be running.
+                if first || !was_running.contains(&config.id) {
+                    jobs.push(serde_json::json!({
+                        "id": config.id.to_string(),
+                        "running": true,
+                        "changed_at": at,
+                    }));
+                }
+                was_running.insert(config.id);
                 continue;
             };
+            was_running.insert(config.id);
             let moved = watchers.entry(config.id).or_default().observe(&pane);
 
             // A harness that reports itself waiting is waiting, now — no quiet
@@ -1058,6 +1090,9 @@ impl SessionExtension for ShellExtension {
                 state.status_pump = Some(tokio::spawn(pump_status(
                     Arc::clone(&self.configs),
                     Arc::clone(&self.runtime),
+                    // Cloning the handle needs no lock; the pump waits for the
+                    // one held here, which is released a few lines below.
+                    Arc::clone(&self.sessions),
                     session.clone(),
                 )));
             }
