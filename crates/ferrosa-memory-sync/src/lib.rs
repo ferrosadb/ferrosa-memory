@@ -50,3 +50,4 @@ pub mod session_runtime;
 pub mod shell_extension;
 #[cfg(feature = "webrtc-transport")]
 pub mod signaling_client;
+pub mod task_board;

@@ -281,6 +281,11 @@ pub async fn run_control_listener(
         crate::shell_extension::ShellExtension::new(
             workspace.clone(),
             session_config_store(workspace),
+            // The same cluster this listener already uses. The deferred-work
+            // board is a table on it, so the machine can answer "what is
+            // outstanding for the repository this agent works in" without the
+            // phone needing a route to the database or a credential for it.
+            memory_config.ferrosa.contact_points.clone(),
         ),
     ));
 

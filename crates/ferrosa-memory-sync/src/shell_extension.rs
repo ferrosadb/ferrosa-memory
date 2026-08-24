@@ -50,6 +50,14 @@ pub struct ShellExtension {
     /// capability grants land, because an owner revoking access mid-command
     /// must stop it.
     sessions: Mutex<HashMap<uuid::Uuid, ShellState>>,
+    /// Where the deferred-work board lives.
+    ///
+    /// Connected on FIRST USE rather than at startup: the board is a
+    /// convenience, and a cluster that is down must not stop an operator
+    /// reaching their agents. The failure then lands on the one screen that
+    /// asked for it, with a reason.
+    board_contact_points: Vec<String>,
+    board: tokio::sync::OnceCell<Option<Arc<crate::task_board::TaskBoard>>>,
 }
 
 #[derive(Default)]
@@ -63,7 +71,11 @@ struct ShellState {
 }
 
 impl ShellExtension {
-    pub fn new(workspace: impl Into<PathBuf>, store_path: impl Into<PathBuf>) -> Self {
+    pub fn new(
+        workspace: impl Into<PathBuf>,
+        store_path: impl Into<PathBuf>,
+        board_contact_points: Vec<String>,
+    ) -> Self {
         let store_path = store_path.into();
         let workspace = workspace.into();
         Self {
@@ -71,6 +83,84 @@ impl ShellExtension {
             store_path,
             runtime: Arc::new(SessionRuntime::new(workspace)),
             sessions: Mutex::new(HashMap::new()),
+            board_contact_points,
+            board: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// The board, connected once. `None` if it could not be reached.
+    async fn board(&self) -> Option<Arc<crate::task_board::TaskBoard>> {
+        self.board
+            .get_or_init(|| async {
+                match crate::task_board::TaskBoard::connect(&self.board_contact_points).await {
+                    Ok(board) => Some(Arc::new(board)),
+                    Err(error) => {
+                        // Loud, and not fatal. Agents keep working without it.
+                        eprintln!("task board unavailable: {error:#}");
+                        None
+                    }
+                }
+            })
+            .await
+            .clone()
+    }
+
+    /// Outstanding work for the repositories this machine's agents work in.
+    ///
+    /// Derived from the agents' working directories, which is what makes this
+    /// possible at all: before an agent could say where it starts, the machine
+    /// had no idea which repositories it was being used for.
+    async fn tasks_frame(&self) -> serde_json::Value {
+        let dirs: Vec<String> = {
+            let configs = self.configs.lock().await;
+            let mut dirs: Vec<String> = configs
+                .iter()
+                .filter_map(|config| config.working_dir.clone())
+                .collect();
+            dirs.sort();
+            dirs.dedup();
+            dirs
+        };
+        if dirs.is_empty() {
+            // Not an error, and not an empty board either. No agent has said
+            // where it works, so there is nothing to look up — said plainly so
+            // the screen can explain itself rather than showing a blank list.
+            return serde_json::json!({
+                "type": "shell_tasks",
+                "tasks": [],
+                "unavailable": "No agent has a working directory yet, so there is no repository to look up.",
+            });
+        }
+        let Some(board) = self.board().await else {
+            return serde_json::json!({
+                "type": "shell_tasks",
+                "tasks": [],
+                "unavailable": "The task board could not be reached from this machine.",
+            });
+        };
+        match board.open_work(&dirs).await {
+            Ok(tasks) => {
+                let listed: Vec<serde_json::Value> = tasks
+                    .iter()
+                    .map(|task| {
+                        serde_json::json!({
+                            "id": task.id,
+                            "title": task.title,
+                            "status": task.status,
+                            "priority": task.priority,
+                            "block_reason": task.block_reason,
+                            "needs_a_person": task.waits_on_a_person(),
+                            "repo": task.repo,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({ "type": "shell_tasks", "tasks": listed })
+            }
+            Err(error) => serde_json::json!({
+                "type": "shell_tasks",
+                "tasks": [],
+                "unavailable": format!("The task board refused the read: {error}"),
+            }),
         }
     }
 
@@ -429,6 +519,7 @@ impl SessionExtension for ShellExtension {
             "shell_resize",
             "shell_input",
             "shell_scroll",
+            "shell_tasks",
         ]
     }
 
@@ -642,6 +733,10 @@ impl SessionExtension for ShellExtension {
                 let motion = crate::session_runtime::ScrollMotion::from_wire(name)
                     .ok_or_else(|| format!("{name} is not a scroll this machine makes"))?;
                 open.scroll(motion).map_err(|error| error.to_string())
+            }
+            "shell_tasks" => {
+                let frame = self.tasks_frame().await;
+                session.send(&envelope(frame)).await
             }
             other => Err(format!("claimed {other} and cannot serve it")),
         }
