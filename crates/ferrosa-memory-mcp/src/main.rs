@@ -1652,6 +1652,14 @@ impl Storage for ReconnectingStorage {
         delegate!(self, entity_counts_by_type_and_state, ctx, query)
     }
 
+    async fn entity_source_record(
+        &self,
+        ctx: &TenantContext,
+        draft: ferrosa_memory_core::tier_store::SourceDraft,
+    ) -> anyhow::Result<ferrosa_memory_core::tier_store::EntitySource> {
+        delegate!(self, entity_source_record, ctx, draft)
+    }
+
     async fn document_chunk_put(
         &self,
         ctx: &TenantContext,

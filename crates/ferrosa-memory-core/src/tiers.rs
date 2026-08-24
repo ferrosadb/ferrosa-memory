@@ -235,6 +235,15 @@ impl TierRules {
     /// Ben's own layout, which is the only one that exists today. Roots are
     /// canonical names rather than paths — the alias table maps the many ways
     /// a path can be spelled onto these.
+    /// The mapping, as pairs. Lets a caller write it somewhere without
+    /// reaching into the private map or restating the list.
+    pub fn entries(&self) -> Vec<(String, Tier)> {
+        self.by_root
+            .iter()
+            .map(|(root, tier)| (root.clone(), *tier))
+            .collect()
+    }
+
     pub fn builtin() -> Self {
         Self::new([
             ("research/corpus".to_owned(), Tier::Information),

@@ -623,6 +623,25 @@ pub trait Storage: Send + Sync {
         query: EntityListQuery,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<EntityTypeStateCount>>> + Send;
 
+    // --- Knowledge tiers ---
+
+    /// Record where an entity came from, so it can be tiered.
+    ///
+    /// The PATH is what the caller knows; the canonical root and the alias
+    /// that produced it are worked out by the implementation against the
+    /// tenant's alias set. A caller cannot record a resolution that disagrees
+    /// with the rules, because it never supplies one.
+    ///
+    /// Best-effort at the call site: an entity is still ingested if this
+    /// fails. It is logged rather than swallowed — a store where nothing has
+    /// a source is a store where every tier reads zero, and that has to be
+    /// visible as a failure rather than as an empty library.
+    fn entity_source_record(
+        &self,
+        ctx: &TenantContext,
+        draft: crate::tier_store::SourceDraft,
+    ) -> impl std::future::Future<Output = anyhow::Result<crate::tier_store::EntitySource>> + Send;
+
     // --- Document chunk retrieval plane ---
 
     /// Store one semantic document chunk plus its retrieval indexes.
@@ -2179,6 +2198,25 @@ pub mod mock {
     }
 
     impl Storage for MockStorage {
+        /// Resolves against an empty alias set, so a test entity has a path
+        /// and no root. Tests that care about tiering use InMemoryTierStore,
+        /// which has the rules.
+        async fn entity_source_record(
+            &self,
+            _ctx: &TenantContext,
+            draft: crate::tier_store::SourceDraft,
+        ) -> anyhow::Result<crate::tier_store::EntitySource> {
+            Ok(crate::tier_store::EntitySource {
+                entity_id: draft.entity_id,
+                session_id: draft.session_id,
+                title: draft.title,
+                source_path: draft.source_path,
+                source_root: None,
+                matched_alias: None,
+                recorded_at: chrono::Utc::now(),
+            })
+        }
+
         // --- Remote teacher/learner storage operations ---
 
         async fn remote_put(

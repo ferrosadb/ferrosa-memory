@@ -2528,6 +2528,24 @@ impl CqlStorage {
 }
 
 impl Storage for CqlStorage {
+    /// Resolve the path against this tenant's alias set and write the row.
+    ///
+    /// Delegates to [`crate::tier_store::CqlTierStore`] rather than restating
+    /// the SQL: the
+    /// resolution rule, the columns and the audit of which alias fired all
+    /// live there with their tests, and a second copy here is how the two
+    /// start disagreeing about what a root is.
+    async fn entity_source_record(
+        &self,
+        ctx: &TenantContext,
+        draft: crate::tier_store::SourceDraft,
+    ) -> anyhow::Result<crate::tier_store::EntitySource> {
+        use crate::tier_store::TierStore as _;
+        crate::tier_store::CqlTierStore::new(self.session.clone(), self.keyspace.clone())
+            .record_source(ctx, draft)
+            .await
+    }
+
     async fn migration_status(&self) -> anyhow::Result<crate::migration::MigrationStatus> {
         crate::migration::migration_status(&self.session, &self.keyspace).await
     }

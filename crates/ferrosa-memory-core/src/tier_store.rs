@@ -187,6 +187,86 @@ pub trait TierStore: Send + Sync {
     ) -> impl std::future::Future<Output = anyhow::Result<RestateReport>> + Send;
 }
 
+/// What a seed actually wrote, so a caller can report it rather than assume.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeedReport {
+    pub rules_written: usize,
+    pub aliases_written: usize,
+}
+
+/// Write the builtin root rules, and aliases for one checkout of a repository.
+///
+/// Two halves, and only one of them is universal. The root -> tier MAPPING is
+/// a decision about what kind of thing lives where, and travels with the
+/// build. The ALIASES are filesystem paths, which are specific to a machine
+/// and a person, so they are supplied rather than guessed.
+///
+/// Idempotent: both tables are keyed by their own primary key, so re-seeding
+/// overwrites rather than duplicating. That matters because the obvious way
+/// to fix a wrong alias is to run this again.
+///
+/// # Why `research_root` and not a scan
+///
+/// Walking the filesystem to find candidate roots would tie tiering to what
+/// happens to be on this disk today, and a machine with a different layout
+/// would silently tier the same content differently. A path stated once is a
+/// decision; a path discovered is an accident.
+pub async fn seed_tier_rules(
+    store: &impl TierStore,
+    ctx: &TenantContext,
+    // Absolute path of the research checkout, e.g. /Users/you/src/research.
+    research_root: &str,
+    actor: &str,
+) -> anyhow::Result<SeedReport> {
+    let now = Utc::now();
+    let mut report = SeedReport::default();
+
+    for (root, tier) in TierRules::builtin().entries() {
+        store
+            .put_root_rule(
+                ctx,
+                RootRule {
+                    root: root.clone(),
+                    tier,
+                    created_by: actor.to_owned(),
+                    note: "builtin: ships with the build".to_owned(),
+                    created_at: now,
+                },
+            )
+            .await?;
+        report.rules_written += 1;
+    }
+
+    let trimmed = research_root.trim_end_matches('/');
+    // Each canonical root gets the concrete path it lives at here. The short
+    // spelling is registered too, because a path that arrives from another
+    // machine -- an imported packet, a hand-typed rule -- will not carry this
+    // machine's home directory.
+    let pairs = [
+        ("research/corpus", format!("{trimmed}/corpus")),
+        ("research/corpus", "research/corpus".to_owned()),
+        ("research/skills", format!("{trimmed}/skills")),
+        ("research/skills", "research/skills".to_owned()),
+        ("research/rules", format!("{trimmed}/skills/rules")),
+        ("research/rules", "research/rules".to_owned()),
+    ];
+    for (canonical, prefix) in pairs {
+        store
+            .put_alias(
+                ctx,
+                RootAlias {
+                    alias_prefix: prefix,
+                    canonical_root: canonical.to_owned(),
+                    created_by: actor.to_owned(),
+                    created_at: now,
+                },
+            )
+            .await?;
+        report.aliases_written += 1;
+    }
+    Ok(report)
+}
+
 /// Load the alias set and root rules as the resolver pair the tier logic wants.
 ///
 /// One read of each, so a caller tiering many entities pays for the rules once.
@@ -1420,6 +1500,103 @@ mod tests {
         };
         assert_eq!(count(Tier::Wisdom), 1);
         assert_eq!(count(Tier::Information), 0, "counted in both places");
+    }
+
+    /// Seeding makes a real path resolve. Before this, the rules existed in
+    /// the build and nowhere a query could see them.
+    #[tokio::test]
+    async fn seeding_makes_a_real_path_tier() {
+        let store = InMemoryTierStore::default();
+        let ctx = tenant();
+        let report = seed_tier_rules(&store, &ctx, "/Users/bkearns/src/research", "ben")
+            .await
+            .expect("seed");
+        assert!(report.rules_written >= 4);
+        assert!(report.aliases_written >= 4);
+
+        let skill = Uuid::new_v4();
+        store
+            .record_source(
+                &ctx,
+                draft(skill, "/Users/bkearns/src/research/skills/rust.md"),
+            )
+            .await
+            .expect("record");
+        assert_eq!(
+            tier_of(&store, &ctx, skill).await.expect("tier").tier,
+            Tier::Wisdom
+        );
+
+        let corpus = Uuid::new_v4();
+        store
+            .record_source(
+                &ctx,
+                draft(corpus, "/Users/bkearns/src/research/corpus/rust/x.md"),
+            )
+            .await
+            .expect("record");
+        assert_eq!(
+            tier_of(&store, &ctx, corpus).await.expect("tier").tier,
+            Tier::Information,
+        );
+    }
+
+    /// A path from ANOTHER machine still tiers. An imported packet or a rule
+    /// typed by hand will not carry this machine's home directory.
+    #[tokio::test]
+    async fn the_short_spelling_of_a_root_also_resolves() {
+        let store = InMemoryTierStore::default();
+        let ctx = tenant();
+        seed_tier_rules(&store, &ctx, "/Users/bkearns/src/research", "ben")
+            .await
+            .expect("seed");
+
+        let id = Uuid::new_v4();
+        store
+            .record_source(&ctx, draft(id, "research/skills/elixir.md"))
+            .await
+            .expect("record");
+        assert_eq!(
+            tier_of(&store, &ctx, id).await.expect("tier").tier,
+            Tier::Wisdom
+        );
+    }
+
+    /// The obvious way to fix a wrong alias is to run the seed again, so
+    /// running it twice must not double anything.
+    #[tokio::test]
+    async fn seeding_twice_is_the_same_as_seeding_once() {
+        let store = InMemoryTierStore::default();
+        let ctx = tenant();
+        seed_tier_rules(&store, &ctx, "/Users/bkearns/src/research", "ben")
+            .await
+            .expect("a");
+        let after_one = store.aliases(&ctx).await.expect("read").len();
+        seed_tier_rules(&store, &ctx, "/Users/bkearns/src/research", "ben")
+            .await
+            .expect("b");
+        assert_eq!(after_one, store.aliases(&ctx).await.expect("read").len());
+    }
+
+    /// The deeper root must win over the shallower one it sits inside, or
+    /// every rule file tiers as a skill.
+    #[tokio::test]
+    async fn the_rules_directory_beats_the_skills_directory_it_sits_in() {
+        let store = InMemoryTierStore::default();
+        let ctx = tenant();
+        seed_tier_rules(&store, &ctx, "/Users/bkearns/src/research", "ben")
+            .await
+            .expect("seed");
+
+        let id = Uuid::new_v4();
+        let record = store
+            .record_source(
+                &ctx,
+                draft(id, "/Users/bkearns/src/research/skills/rules/safety.md"),
+            )
+            .await
+            .expect("record");
+        assert_eq!(record.source_root.as_deref(), Some("research/rules"));
     }
 
     #[tokio::test]
