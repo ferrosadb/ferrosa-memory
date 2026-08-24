@@ -4,7 +4,7 @@
 //! behind, and when output reaches the reader as it is produced rather than
 //! when the command finishes.
 //! Last revised: 2026-08-23
-//! Last changed: Initial session runtime.
+//! Last changed: Sessions start in their config's working directory, falling back to the machine's workspace when none is set.
 //!
 //! # The two kinds are genuinely different, not a flag
 //!
@@ -47,6 +47,9 @@ const OUTPUT_QUEUE: usize = 256;
 
 /// Largest single chunk read from a session.
 const READ_CHUNK: usize = 8192;
+
+/// How much of a status line the roster shows. A glance, not a transcript.
+const STATUS_LINE_CHARS: usize = 120;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -323,6 +326,48 @@ impl SessionRuntime {
             .unwrap_or(false)
     }
 
+    /// The last thing this session printed, for the roster.
+    ///
+    /// Read with `capture-pane` rather than from the attached stream, because
+    /// the roster needs a line for EVERY job and only one is attached at a
+    /// time. Scraping for a one-line status is cheap; scraping to reconstruct
+    /// output is what the PTY attach replaced, and this does not reintroduce
+    /// it — nothing here is fed to a terminal.
+    ///
+    /// Returns `None` when the session is gone or has printed nothing, which
+    /// the caller must render as "no output yet" rather than as silence.
+    pub async fn last_line(&self, config: &SessionConfig) -> Option<String> {
+        if config.kind != SessionKind::Tmux {
+            return None;
+        }
+        let output = Command::new(&self.tmux_binary)
+            .args(["capture-pane", "-p", "-t", &config.tmux_session_name()])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        // Trailing blanks are most of a pane. The last line with anything on it
+        // is the one that says what is happening.
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .rev()
+            .map(str::trim_end)
+            .find(|line| !line.trim().is_empty())
+            .map(|line| {
+                // Bounded: a status line is glanced at, and a pane can hold a
+                // very long one. Truncating here keeps the frame small too.
+                let mut text = line.trim().to_owned();
+                if text.chars().count() > STATUS_LINE_CHARS {
+                    text = text.chars().take(STATUS_LINE_CHARS).collect::<String>() + "…";
+                }
+                text
+            })
+    }
+
     fn open_pty(&self, config: &SessionConfig) -> Result<RunningSession, SessionError> {
         let mut command = std::process::Command::new(&config.command[0]);
         command.args(&config.command[1..]);
@@ -364,7 +409,12 @@ impl SessionRuntime {
         for argument in command.get_args() {
             builder.arg(argument);
         }
-        builder.cwd(&self.workspace);
+        // The config's directory if it named one, else the machine's own
+        // workspace — which is what every config did before the field existed.
+        builder.cwd(config.working_dir.as_deref().map_or_else(
+            || self.workspace.to_string_lossy().into_owned(),
+            str::to_owned,
+        ));
         // Declared, because a program asks $TERM what it may draw with. Without
         // it a TUI assumes a dumb terminal and either refuses to run or falls
         // back to output no emulator can lay out. This is the value the client
@@ -447,7 +497,10 @@ impl SessionRuntime {
     async fn open_tmux(&self, config: &SessionConfig) -> Result<RunningSession, SessionError> {
         let name = config.tmux_session_name();
         if !self.is_running(config).await {
-            let workspace = self.workspace.to_string_lossy().into_owned();
+            let workspace = config
+                .working_dir
+                .clone()
+                .unwrap_or_else(|| self.workspace.to_string_lossy().into_owned());
             let mut command = Command::new(&self.tmux_binary);
             command.args(["new-session", "-d", "-s", &name, "-c", &workspace, "--"]);
             // Run under a keeper, not directly.

@@ -3,7 +3,7 @@
 //! when a config survives a restart of the machine, and when output reaches
 //! the device as it is produced rather than when the command finishes.
 //! Last revised: 2026-08-23
-//! Last changed: Initial shell extension.
+//! Last changed: working_dir carried on add/update/list and persisted, so an agent's directory survives a restart.
 //!
 //! # Three capabilities wearing one grant, for now
 //!
@@ -37,10 +37,10 @@ pub struct ShellExtension {
     /// The machine's configs. Shared by every device, which is the point:
     /// the tablet and the phone see one list, and a resumed tmux session can
     /// be attributed to the config that made it.
-    configs: Mutex<Vec<SessionConfig>>,
+    configs: Arc<Mutex<Vec<SessionConfig>>>,
     /// Where configs are written, so they survive a restart.
     store_path: PathBuf,
-    runtime: SessionRuntime,
+    runtime: Arc<SessionRuntime>,
     /// Per session: whether input is granted, and what is open.
     ///
     /// The grant lives HERE rather than being implied by an open session, so
@@ -57,6 +57,8 @@ struct ShellState {
     open: Option<Arc<RunningSession>>,
     /// Pumps output to the device until the session ends.
     pump: Option<tokio::task::JoinHandle<()>>,
+    /// Ticks the roster's status frames while the control session lives.
+    status_pump: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ShellExtension {
@@ -64,9 +66,9 @@ impl ShellExtension {
         let store_path = store_path.into();
         let workspace = workspace.into();
         Self {
-            configs: Mutex::new(load_configs(&store_path)),
+            configs: Arc::new(Mutex::new(load_configs(&store_path))),
             store_path,
-            runtime: SessionRuntime::new(workspace),
+            runtime: Arc::new(SessionRuntime::new(workspace)),
             sessions: Mutex::new(HashMap::new()),
         }
     }
@@ -94,6 +96,7 @@ impl ShellExtension {
                 "name": config.name,
                 "kind": config.kind.as_wire(),
                 "command": config.command,
+                "working_dir": config.working_dir,
                 // Whether a tmux session is already up, so the shell can say
                 // "resume" rather than "run" and the operator knows a second
                 // one is not about to start.
@@ -104,9 +107,13 @@ impl ShellExtension {
     }
 
     async fn add_config(&self, body: &serde_json::Value) -> Result<(), String> {
-        let config =
-            SessionConfig::create(text(body, "name"), text(body, "kind"), command_list(body))
-                .map_err(|error| error.to_string())?;
+        let config = SessionConfig::create(
+            text(body, "name"),
+            text(body, "kind"),
+            command_list(body),
+            body.get("working_dir").and_then(serde_json::Value::as_str),
+        )
+        .map_err(|error| error.to_string())?;
         let mut configs = self.configs.lock().await;
         configs.push(config);
         save_configs(&self.store_path, &configs);
@@ -132,7 +139,12 @@ impl ShellExtension {
             .position(|config| config.id == id)
             .ok_or_else(|| "no config with that id".to_owned())?;
         let updated = configs[position]
-            .edited(name, kind, command)
+            .edited(
+                name,
+                kind,
+                command,
+                body.get("working_dir").and_then(serde_json::Value::as_str),
+            )
             .map_err(|error| error.to_string())?;
         let was_running = self.runtime.is_running(&configs[position]).await;
         configs[position] = updated;
@@ -245,6 +257,105 @@ impl ShellExtension {
 /// pieces.
 const MAX_OUTPUT_BYTES_PER_FRAME: usize = 512;
 
+/// How often the roster's status is refreshed.
+///
+/// Each tick runs one `capture-pane` per tmux job. Slow enough that a handful
+/// of jobs costs nothing, fast enough that a glance at the roster is current.
+const STATUS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Tell the device what every job is doing, until the control session ends.
+/// What a job looked like on the last tick, so the next can send only changes.
+type JobSnapshot = std::collections::HashMap<uuid::Uuid, (bool, Option<String>)>;
+
+/// Read every job's current state.
+async fn read_status(configs: &Mutex<Vec<SessionConfig>>, runtime: &SessionRuntime) -> JobSnapshot {
+    let snapshot = configs.lock().await.clone();
+    let mut out = JobSnapshot::with_capacity(snapshot.len());
+    for config in &snapshot {
+        let running = runtime.is_running(config).await;
+        // Absent rather than empty when there is nothing yet: the device says
+        // "no output yet" instead of rendering silence as a blank line.
+        let line = if running {
+            runtime.last_line(config).await
+        } else {
+            None
+        };
+        out.insert(config.id, (running, line));
+    }
+    out
+}
+
+/// Tell the device what changed, and when.
+///
+/// A DELTA, not a snapshot. Two reasons, and the second is the important one:
+///
+/// - Frames stay small. A full snapshot of every job's status on every tick
+///   would grow past the datagram budget the output path had to be split to
+///   respect, and would do it silently as jobs are added.
+/// - A change is an EVENT. Sending only what moved, with the time it moved,
+///   gives the device a stream it can interleave into a feed across jobs —
+///   which a repeated snapshot cannot, because it cannot tell a line that just
+///   appeared from one that has been there for an hour.
+///
+/// The first tick sends everything, because a device that just connected has
+/// no prior state to diff against.
+async fn pump_status(
+    configs: Arc<Mutex<Vec<SessionConfig>>>,
+    runtime: Arc<SessionRuntime>,
+    session: SessionHandle,
+) {
+    let mut previous: Option<JobSnapshot> = None;
+
+    loop {
+        let current = read_status(&configs, &runtime).await;
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs())
+            .unwrap_or(0);
+
+        let changed: Vec<_> = current
+            .iter()
+            .filter(|(id, now)| {
+                previous
+                    .as_ref()
+                    .is_none_or(|was| was.get(*id) != Some(now))
+            })
+            .map(|(id, (running, line))| {
+                serde_json::json!({
+                    "id": id.to_string(),
+                    "running": running,
+                    "last_line": line,
+                    "changed_at": at,
+                })
+            })
+            .collect();
+
+        // Nothing moved. Say nothing — a tick that sends an empty list every
+        // three seconds is a heartbeat pretending to be news.
+        if !changed.is_empty() {
+            let frame = serde_json::json!({
+                "version": 1,
+                "frame_id": uuid::Uuid::now_v7().to_string(),
+                "body": {
+                    "type": "shell_status",
+                    // The device clears its state on a full send; on a delta it
+                    // merges. Without this a reconnect would leave stale jobs
+                    // in the roster forever.
+                    "full": previous.is_none(),
+                    "jobs": changed,
+                },
+            });
+            if session.send(&frame.to_string()).await.is_err() {
+                // The channel has gone; so has the reason to keep scraping.
+                return;
+            }
+        }
+
+        previous = Some(current);
+        tokio::time::sleep(STATUS_INTERVAL).await;
+    }
+}
+
 /// One `shell_output` frame carrying raw terminal bytes.
 ///
 /// Base64, not a string. This is a raw terminal stream — escape sequences,
@@ -340,7 +451,18 @@ impl SessionExtension for ShellExtension {
         // Granting is the one thing that does not require a grant.
         if kind == "shell_start" {
             let mut sessions = self.sessions.lock().await;
-            sessions.entry(session_id).or_default().granted = true;
+            let state = sessions.entry(session_id).or_default();
+            state.granted = true;
+            // One pump per control session. Re-granting must not stack a second
+            // one — two pumps means two status frames per tick and a roster
+            // that flickers between them.
+            if state.status_pump.is_none() {
+                state.status_pump = Some(tokio::spawn(pump_status(
+                    Arc::clone(&self.configs),
+                    Arc::clone(&self.runtime),
+                    session.clone(),
+                )));
+            }
             drop(sessions);
             tracing::info!(%session_id, "shell granted");
             return session.send(&envelope(self.configs_frame().await)).await;
@@ -502,6 +624,14 @@ impl SessionExtension for ShellExtension {
     }
 
     async fn on_closed(&self, session_id: uuid::Uuid) {
+        // The status pump outlives an open session but not the control session.
+        // Leaving it running would scrape tmux forever for a device that has
+        // gone, which is invisible and never stops.
+        if let Some(state) = self.sessions.lock().await.get_mut(&session_id)
+            && let Some(pump) = state.status_pump.take()
+        {
+            pump.abort();
+        }
         self.close(session_id).await;
         // The grant goes with the session. An ephemeral session is killed by
         // dropping it; a tmux one keeps running, which is why it was chosen.
@@ -568,6 +698,12 @@ fn config_from_json(value: &serde_json::Value) -> Option<SessionConfig> {
         id: value.get("id")?.as_str()?.parse().ok()?,
         name: value.get("name")?.as_str()?.to_owned(),
         kind: SessionKind::from_wire(value.get("kind")?.as_str()?)?,
+        // Absent in a file written before the field existed, which correctly
+        // means "the machine's workspace" — the behaviour those configs had.
+        working_dir: value
+            .get("working_dir")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
         command: value
             .get("command")?
             .as_array()?
@@ -590,6 +726,7 @@ fn save_configs(path: &PathBuf, configs: &[SessionConfig]) {
                 "name": config.name,
                 "kind": config.kind.as_wire(),
                 "command": config.command,
+                "working_dir": config.working_dir,
             })
         })
         .collect();
@@ -636,9 +773,9 @@ mod tests {
     fn configs_survive_a_round_trip_through_the_store() {
         let path = store();
         let original = vec![
-            SessionConfig::create("build", "tmux", vec!["cargo".into(), "test".into()])
+            SessionConfig::create("build", "tmux", vec!["cargo".into(), "test".into()], None)
                 .expect("valid"),
-            SessionConfig::create("shell", "bash", vec!["bash".into(), "-l".into()])
+            SessionConfig::create("shell", "bash", vec!["bash".into(), "-l".into()], None)
                 .expect("valid"),
         ];
         save_configs(&path, &original);
@@ -651,7 +788,7 @@ mod tests {
     #[test]
     fn one_malformed_entry_does_not_lose_the_others() {
         let path = store();
-        let good = SessionConfig::create("keep", "bash", vec!["ls".into()]).expect("valid");
+        let good = SessionConfig::create("keep", "bash", vec!["ls".into()], None).expect("valid");
         let text = format!(
             r#"[{{"id":"{}","name":"keep","kind":"bash","command":["ls"]}},{{"name":"broken"}}]"#,
             good.id

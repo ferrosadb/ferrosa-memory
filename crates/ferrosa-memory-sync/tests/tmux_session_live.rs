@@ -63,6 +63,7 @@ async fn input_sent_to_a_tmux_session_runs_in_the_pane() {
         "input-probe",
         "tmux",
         vec!["bash".into(), "--noprofile".into(), "--norc".into()],
+        None,
     )
     .expect("valid config");
 
@@ -139,6 +140,7 @@ finally:
         "raw-probe",
         "tmux",
         vec!["python3".into(), reader.to_string_lossy().into_owned()],
+        None,
     )
     .expect("valid config");
 
@@ -187,6 +189,7 @@ async fn a_command_that_fails_leaves_its_output_and_its_session_behind() {
             "-c".into(),
             "echo BOOM_BEFORE_EXIT >&2; exit 3".into(),
         ],
+        None,
     )
     .expect("valid config");
 
@@ -217,7 +220,6 @@ async fn a_command_that_fails_leaves_its_output_and_its_session_behind() {
         "the session vanished with the command — it must stay until deleted"
     );
 }
-
 
 /// Named keys reach a raw-mode program as the right bytes.
 ///
@@ -262,6 +264,7 @@ finally:
         "keys-probe",
         "tmux",
         vec!["python3".into(), reader.to_string_lossy().into_owned()],
+        None,
     )
     .expect("valid config");
 
@@ -325,6 +328,7 @@ async fn escape_sequences_reach_the_device_intact() {
             "-c".into(),
             "printf '\\033[2J\\033[H\\033[31mREDTEXT\\033[0m\\n'; sleep 30".into(),
         ],
+        None,
     )
     .expect("valid config");
 
@@ -335,7 +339,10 @@ async fn escape_sequences_reach_the_device_intact() {
         .args(["kill-session", "-t", &config.tmux_session_name()])
         .status();
 
-    assert!(seen.contains("REDTEXT"), "the text never arrived; saw:\n{seen:?}");
+    assert!(
+        seen.contains("REDTEXT"),
+        "the text never arrived; saw:\n{seen:?}"
+    );
     assert!(
         seen.contains('\u{1b}'),
         "no escape byte in the stream — it is being stripped somewhere, and an \
@@ -362,6 +369,7 @@ async fn a_resize_reaches_the_program() {
              while :; do sleep 1; done"
                 .into(),
         ],
+        None,
     )
     .expect("valid config");
 
@@ -427,6 +435,7 @@ finally:
         "rawinput-probe",
         "tmux",
         vec!["python3".into(), reader.to_string_lossy().into_owned()],
+        None,
     )
     .expect("valid config");
 
@@ -453,5 +462,78 @@ finally:
         "68 0d 03 1b 5b 41 0a",
         "bytes were altered in transit; a 0a arriving as 0d means this path is \
          newline-translating and will corrupt escape sequences"
+    );
+}
+
+/// An agent starts where its config says, not where the machine happens to be.
+///
+/// Asserted by asking the shell itself, because "it started somewhere" is the
+/// kind of thing that silently does not happen — the wrong directory produces a
+/// working agent doing the wrong work, with no error anywhere.
+#[tokio::test]
+#[ignore = "needs a real tmux"]
+async fn a_config_starts_in_its_own_working_directory() {
+    let machine_workspace = std::env::temp_dir().join("ferrosa-cwd-machine");
+    let agent_dir = std::env::temp_dir().join("ferrosa-cwd-agent");
+    std::fs::create_dir_all(&machine_workspace).expect("machine workspace");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+
+    let config = SessionConfig::create(
+        "cwd-probe",
+        "tmux",
+        vec!["sh".into(), "-c".into(), "pwd; sleep 30".into()],
+        Some(&agent_dir.to_string_lossy()),
+    )
+    .expect("valid config");
+
+    // The runtime is given the MACHINE's workspace, which is deliberately not
+    // the agent's — so a pass cannot be the fallback quietly working.
+    let running = SessionRuntime::new(machine_workspace.clone())
+        .open(&config)
+        .await
+        .expect("opens");
+
+    let seen = wait_for(&running, "ferrosa-cwd", Duration::from_secs(6)).await;
+
+    let _ = std::process::Command::new("tmux")
+        .args(["kill-session", "-t", &config.tmux_session_name()])
+        .status();
+
+    assert!(
+        seen.contains("ferrosa-cwd-agent"),
+        "started in the wrong directory; saw:\n{seen}"
+    );
+    assert!(
+        !seen.contains("ferrosa-cwd-machine"),
+        "fell back to the machine workspace despite the config naming one:\n{seen}"
+    );
+}
+
+/// A directory that does not exist is refused when the config is WRITTEN.
+///
+/// Catching it at first run means an agent that dies with a message nobody
+/// reads, or worse starts somewhere unintended. FMEA F12.
+#[test]
+fn a_missing_working_directory_is_refused_at_authoring() {
+    let result = SessionConfig::create(
+        "bad-cwd",
+        "tmux",
+        vec!["ls".into()],
+        Some("/definitely/not/a/real/path"),
+    );
+    assert!(result.is_err(), "a nonexistent directory was accepted");
+
+    // A file is not a directory, and the message should say which is wrong.
+    let file = std::env::temp_dir().join("ferrosa-cwd-not-a-dir");
+    std::fs::write(&file, b"x").expect("fixture");
+    let result = SessionConfig::create(
+        "file-cwd",
+        "tmux",
+        vec!["ls".into()],
+        Some(&file.to_string_lossy()),
+    );
+    assert!(
+        result.is_err(),
+        "a file was accepted as a working directory"
     );
 }
