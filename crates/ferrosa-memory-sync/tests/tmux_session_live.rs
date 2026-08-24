@@ -825,3 +825,62 @@ async fn a_line_a_program_prints_reaches_the_watcher() {
         "the watcher reported the spinner: {said:?}"
     );
 }
+
+/// A session comes back from a REJOIN with mouse reporting off.
+///
+/// It was on, and that turned every tap on the phone into a mouse escape
+/// sequence typed into the pane — garbage that had to be deleted before a
+/// command could be entered, and a tap that no longer focused the terminal, so
+/// typing stopped working at all.
+///
+/// Asserted after a rejoin rather than after creation: the options used to be
+/// applied only when a session was made, so one already running kept whatever
+/// it was created with for as long as it lived. These run for days.
+#[tokio::test]
+#[ignore = "needs a real tmux"]
+async fn mouse_reporting_is_off_after_a_rejoin() {
+    let config = SessionConfig::create(
+        "mouse-check",
+        "tmux",
+        vec!["sh".into(), "-c".into(), "sleep 30".into()],
+        None,
+    )
+    .expect("valid config");
+    let runtime = SessionRuntime::new(std::env::temp_dir());
+
+    let first = runtime.open(&config).await.expect("opens");
+    // Forced back to the bad setting, standing in for a session started before
+    // the fix.
+    let _ = std::process::Command::new("tmux")
+        .args([
+            "set-option",
+            "-t",
+            &config.tmux_session_name(),
+            "mouse",
+            "on",
+        ])
+        .status();
+    // tmux formats a flag as 1/0, not on/off — the SETTING takes on/off and
+    // the FORMAT reports a digit. Comparing against "off" would fail against a
+    // session that was correctly configured.
+    assert_eq!(
+        tmux_var(&config, "#{mouse}"),
+        "1",
+        "the fixture did not take"
+    );
+    drop(first);
+
+    // Rejoined. This is the moment that has to repair it.
+    let _second = runtime.open(&config).await.expect("rejoins");
+    let mouse = tmux_var(&config, "#{mouse}");
+
+    let _ = std::process::Command::new("tmux")
+        .args(["kill-session", "-t", &config.tmux_session_name()])
+        .status();
+
+    assert_eq!(
+        mouse, "0",
+        "a rejoined session still has mouse mode on ({mouse}); taps will be \
+         typed into the pane as escape sequences"
+    );
+}
