@@ -415,6 +415,69 @@ impl TaskBoard {
         }))
     }
 
+    /// Tasks whose id matches, exactly or by prefix.
+    ///
+    /// Two queries rather than one scan: an exact id is a primary-key lookup
+    /// and answers instantly, which is the case that matters when someone
+    /// pastes a full id. The prefix pass is a scan of the tenant partition,
+    /// bounded by `limit`, and only runs when the exact lookup misses.
+    ///
+    /// Open work only. A completed task still answers by exact id — you looked
+    /// it up on purpose — but a prefix should not fill with archived work.
+    pub async fn find_by_id(&self, query: &str, limit: usize) -> Result<Vec<BoardTask>> {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(found) = self.detail(&query).await? {
+            return Ok(vec![found.task]);
+        }
+
+        #[allow(deprecated)]
+        let result = self
+            .session
+            .query_unpaged(
+                format!(
+                    "SELECT task_id, title, status, priority, block_reason, workspace_path, \
+                     body, updated_at FROM agent_memory.tasks WHERE tenant_id={TENANT_ID}"
+                ),
+                (),
+            )
+            .await
+            .context("searching the task board")?;
+        let columns = column_index(&result);
+        let mut found = Vec::new();
+        for row in result.rows_or_empty() {
+            let text = |name: &str| text_at(&row, &columns, name);
+            let (Some(id), Some(status)) = (text("task_id"), text("status")) else {
+                continue;
+            };
+            if !id.to_lowercase().contains(&query) {
+                continue;
+            }
+            if !OPEN_STATUSES.contains(&status.as_str()) {
+                continue;
+            }
+            found.push(BoardTask {
+                repo: repo_of(text("workspace_path").as_deref(), text("body").as_deref())
+                    .unwrap_or_default(),
+                id,
+                title: text("title").unwrap_or_default(),
+                status,
+                priority: number_at(&row, &columns, "priority")
+                    .and_then(|value| i32::try_from(value).ok())
+                    .unwrap_or(0),
+                block_reason: text("block_reason").filter(|reason| !reason.is_empty()),
+                updated_at: number_at(&row, &columns, "updated_at").unwrap_or(0),
+            });
+        }
+        // Ranked like everything else, then cut. Cutting first would drop a
+        // blocked task in favour of an arbitrary one.
+        let mut ranked = ranked(found);
+        ranked.truncate(limit);
+        Ok(ranked)
+    }
+
     /// A task's comments, oldest first.
     ///
     /// Failure here does NOT fail the detail: the body is most of the value,

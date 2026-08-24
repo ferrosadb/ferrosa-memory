@@ -652,3 +652,73 @@ fn tmux_var(config: &SessionConfig, format: &str) -> String {
         .expect("display-message runs");
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
+
+/// An archived session keeps its colour and its whole history.
+///
+/// Both halves matter and both have a failure mode that looks fine: without
+/// `-e` the capture is plain text and the archive renders grey, and without
+/// `-S -` it is the last screenful presented as a day's work.
+#[tokio::test]
+#[ignore = "needs a real tmux"]
+async fn a_capture_keeps_the_colour_and_the_whole_history() {
+    let config = SessionConfig::create(
+        "archive-me",
+        "tmux",
+        vec![
+            "sh".into(),
+            "-c".into(),
+            // Numbered far past one screen, and one line in red so the escape
+            // sequences have something to preserve.
+            "for i in $(seq 1 300); do printf 'LINE-%04d\\n' $i; done; \
+             printf '\\033[31mREDLINE\\033[0m\\n'; sleep 60"
+                .into(),
+        ],
+        None,
+    )
+    .expect("valid config");
+
+    let running = SessionRuntime::new(std::env::temp_dir())
+        .open(&config)
+        .await
+        .expect("opens");
+    let _ = wait_for(&running, "REDLINE", Duration::from_secs(10)).await;
+
+    let (bytes, truncated) = running.capture_scrollback().expect("captures");
+
+    let _ = std::process::Command::new("tmux")
+        .args(["kill-session", "-t", &config.tmux_session_name()])
+        .status();
+
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains("LINE-0001"),
+        "the capture starts at the last screen, not the beginning of history"
+    );
+    assert!(
+        text.contains("LINE-0300"),
+        "the capture is missing recent output"
+    );
+    assert!(
+        bytes.windows(5).any(|window| window == b"\x1b[31m"),
+        "the capture has no escape sequences — it will render grey"
+    );
+    assert!(!truncated, "300 lines is well under the 50000-line limit");
+}
+
+/// An ephemeral session has no machine-side buffer to archive, and says so.
+#[tokio::test]
+#[ignore = "needs a real tmux"]
+async fn an_ephemeral_session_cannot_be_captured() {
+    let config = SessionConfig::create(
+        "no-archive",
+        "bash",
+        vec!["sh".into(), "-c".into(), "sleep 5".into()],
+        None,
+    )
+    .expect("valid config");
+    let running = SessionRuntime::new(std::env::temp_dir())
+        .open(&config)
+        .await
+        .expect("opens");
+    assert!(running.capture_scrollback().is_err());
+}

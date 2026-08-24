@@ -110,50 +110,57 @@ impl ShellExtension {
     /// Fetched on demand rather than carried with the list: the list is over a
     /// hundred titles, and shipping every body with them would put the board's
     /// whole prose through the data channel to render six rows.
-    async fn task_detail_frame(&self, task_id: &str) -> serde_json::Value {
+    async fn task_detail_frames(&self, task_id: &str) -> Vec<serde_json::Value> {
         let Some(board) = self.board().await else {
-            return serde_json::json!({
+            return vec![serde_json::json!({
                 "type": "shell_task_detail",
                 "task_id": task_id,
                 "unavailable": "The task board could not be reached from this machine.",
-            });
+            })];
         };
         match board.detail(task_id).await {
             // Gone between the list and the tap. A normal race, said plainly:
             // an empty detail screen would read as a task with no content.
-            Ok(None) => serde_json::json!({
+            Ok(None) => vec![serde_json::json!({
                 "type": "shell_task_detail",
                 "task_id": task_id,
                 "unavailable": "That task is no longer on the board.",
-            }),
-            Ok(Some(detail)) => serde_json::json!({
-                "type": "shell_task_detail",
-                "task_id": task_id,
-                "title": detail.task.title,
-                "status": detail.task.status,
-                "priority": detail.task.priority,
-                "block_reason": detail.task.block_reason,
-                "needs_a_person": detail.task.waits_on_a_person(),
-                "repo": detail.task.repo,
-                "body": detail.body,
-                "assignee": detail.assignee,
-                "result": detail.result,
-                "summary": detail.summary,
-                "comments": detail
-                    .comments
-                    .iter()
-                    .map(|comment| serde_json::json!({
-                        "author": comment.author,
-                        "body": comment.body,
-                        "at": comment.created_at,
-                    }))
-                    .collect::<Vec<_>>(),
-            }),
-            Err(error) => serde_json::json!({
+            })],
+            Ok(Some(detail)) => {
+                // The HEADER only. A task body is prose of no fixed length —
+                // several kilobytes is normal — so it travels as text pages
+                // like terminal output does, for exactly the same reason.
+                let mut frames = vec![serde_json::json!({
+                    "type": "shell_task_detail",
+                    "task_id": task_id,
+                    "title": detail.task.title,
+                    "status": detail.task.status,
+                    "priority": detail.task.priority,
+                    "block_reason": detail.task.block_reason,
+                    "needs_a_person": detail.task.waits_on_a_person(),
+                    "repo": detail.task.repo,
+                    "assignee": detail.assignee,
+                    "summary": detail.summary,
+                })];
+                frames.extend(text_pages(task_id, "body", None, &detail.body));
+                if let Some(result) = &detail.result {
+                    frames.extend(text_pages(task_id, "result", None, result));
+                }
+                for comment in &detail.comments {
+                    frames.extend(text_pages(
+                        task_id,
+                        "comment",
+                        Some(&comment.author),
+                        &comment.body,
+                    ));
+                }
+                return frames;
+            }
+            Err(error) => vec![serde_json::json!({
                 "type": "shell_task_detail",
                 "task_id": task_id,
                 "unavailable": format!("The task board refused the read: {error}"),
-            }),
+            })],
         }
     }
 
@@ -162,7 +169,20 @@ impl ShellExtension {
     /// Derived from the agents' working directories, which is what makes this
     /// possible at all: before an agent could say where it starts, the machine
     /// had no idea which repositories it was being used for.
-    async fn tasks_frame(&self) -> serde_json::Value {
+    ///
+    /// # Why this is several frames
+    ///
+    /// One repository on this machine has 895 open tasks. As a single frame
+    /// that is 194 KiB, on a channel where terminal output is chunked under
+    /// 1100 bytes precisely because SCTP fragmentation fails on paths whose MTU
+    /// discovery is broken. The list worked for an 11-task repository and then
+    /// stopped the moment a large one was added — the frame went out and
+    /// nothing arrived.
+    ///
+    /// So: a bounded number of tasks, ranked, split into datagram-sized pages,
+    /// with the TRUE total on the first page so the device can say what it is
+    /// not showing.
+    async fn tasks_frames(&self, offset: usize, limit: usize) -> Vec<serde_json::Value> {
         let dirs: Vec<String> = {
             let configs = self.configs.lock().await;
             let mut dirs: Vec<String> = configs
@@ -177,43 +197,147 @@ impl ShellExtension {
             // Not an error, and not an empty board either. No agent has said
             // where it works, so there is nothing to look up — said plainly so
             // the screen can explain itself rather than showing a blank list.
-            return serde_json::json!({
+            return vec![serde_json::json!({
                 "type": "shell_tasks",
+                "first": true,
+                "total": 0,
                 "tasks": [],
                 "unavailable": "No agent has a working directory yet, so there is no repository to look up.",
-            });
+            })];
         }
         let Some(board) = self.board().await else {
-            return serde_json::json!({
+            return vec![serde_json::json!({
                 "type": "shell_tasks",
+                "first": true,
+                "total": 0,
                 "tasks": [],
                 "unavailable": "The task board could not be reached from this machine.",
-            });
+            })];
         };
-        match board.open_work(&dirs).await {
-            Ok(tasks) => {
-                let listed: Vec<serde_json::Value> = tasks
-                    .iter()
-                    .map(|task| {
-                        serde_json::json!({
-                            "id": task.id,
-                            "title": task.title,
-                            "status": task.status,
-                            "priority": task.priority,
-                            "block_reason": task.block_reason,
-                            "needs_a_person": task.waits_on_a_person(),
-                            "repo": task.repo,
-                        })
-                    })
-                    .collect();
-                serde_json::json!({ "type": "shell_tasks", "tasks": listed })
+        let tasks = match board.open_work(&dirs).await {
+            Ok(tasks) => tasks,
+            Err(error) => {
+                return vec![serde_json::json!({
+                    "type": "shell_tasks",
+                    "first": true,
+                    "total": 0,
+                    "tasks": [],
+                    "unavailable": format!("The task board refused the read: {error}"),
+                })];
             }
-            Err(error) => serde_json::json!({
+        };
+
+        let total = tasks.len();
+        let listed: Vec<serde_json::Value> = tasks
+            .iter()
+            .skip(offset)
+            .take(limit.min(MAX_TASKS_SENT))
+            .map(|task| {
+                serde_json::json!({
+                    "id": task.id,
+                    "title": task.title,
+                    "status": task.status,
+                    "priority": task.priority,
+                    "block_reason": task.block_reason,
+                    "needs_a_person": task.waits_on_a_person(),
+                    "repo": task.repo,
+                })
+            })
+            .collect();
+
+        if listed.is_empty() {
+            // Still carries the total and the offset: "no more" and "none at
+            // all" are different answers, and a device that cannot tell them
+            // apart either hides a MORE button that works or shows one that
+            // does nothing.
+            return vec![serde_json::json!({
                 "type": "shell_tasks",
+                "first": offset == 0,
+                "offset": offset,
+                "total": total,
                 "tasks": [],
-                "unavailable": format!("The task board refused the read: {error}"),
-            }),
+            })];
         }
+        let mut frames = Vec::new();
+        for (index, page) in listed.chunks(TASKS_PER_FRAME).enumerate() {
+            frames.push(serde_json::json!({
+                "type": "shell_tasks",
+                // Only the first frame of the first PAGE replaces what the
+                // device holds. Without this, every frame would wipe the one
+                // before it and the device would show the last three tasks of
+                // the board.
+                "first": offset == 0 && index == 0,
+                "offset": offset,
+                "total": total,
+                "tasks": page,
+            }));
+        }
+        frames
+    }
+
+    /// Find tasks by id, across the whole board.
+    ///
+    /// By ID rather than by text: an id is what one agent hands another, what a
+    /// commit message quotes, and what a person reads off a screen and wants to
+    /// look up. Full-text search over bodies is a different feature with
+    /// different costs.
+    ///
+    /// Prefix as well as exact, because ids are long enough that nobody types
+    /// all of one. Not scoped to the agents' repositories: the point of looking
+    /// an id up is that you do not know where it lives.
+    async fn task_search_frames(&self, query: &str) -> Vec<serde_json::Value> {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() {
+            return vec![serde_json::json!({
+                "type": "shell_task_search", "query": query, "tasks": [],
+            })];
+        }
+        let Some(board) = self.board().await else {
+            return vec![serde_json::json!({
+                "type": "shell_task_search",
+                "query": query,
+                "tasks": [],
+                "unavailable": "The task board could not be reached from this machine.",
+            })];
+        };
+        let found = board.find_by_id(&query, DEFAULT_TASK_PAGE).await;
+        let listed: Vec<serde_json::Value> = match &found {
+            Ok(tasks) => tasks
+                .iter()
+                .map(|task| {
+                    serde_json::json!({
+                        "id": task.id,
+                        "title": task.title,
+                        "status": task.status,
+                        "priority": task.priority,
+                        "block_reason": task.block_reason,
+                        "needs_a_person": task.waits_on_a_person(),
+                        "repo": task.repo,
+                    })
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        if listed.is_empty() {
+            return vec![serde_json::json!({
+                "type": "shell_task_search",
+                "query": query,
+                "tasks": [],
+                "unavailable": found.err().map(|error| format!("Search failed: {error}")),
+            })];
+        }
+        listed
+            .chunks(TASKS_PER_FRAME)
+            .enumerate()
+            .map(|(index, page)| {
+                serde_json::json!({
+                    "type": "shell_task_search",
+                    "query": query,
+                    "first": index == 0,
+                    "tasks": page,
+                })
+            })
+            .collect()
     }
 
     /// Whether this session may use configured sessions at all.
@@ -403,6 +527,27 @@ impl ShellExtension {
 /// pieces.
 const MAX_OUTPUT_BYTES_PER_FRAME: usize = 512;
 
+/// How many tasks travel in one frame.
+///
+/// Three. A fat task row — long title, long path, a block reason — runs about
+/// 300 bytes of JSON, and four of them came to 1284 against a 1100-byte safe
+/// datagram. The number came from the test, not from arithmetic on a typical
+/// row; typical rows are what made the single-frame version look fine.
+const TASKS_PER_FRAME: usize = 3;
+
+/// How many tasks a request returns when it does not say.
+///
+/// Ten. The device asks for the next ten when the operator wants them, so the
+/// common case — open the app, glance at what is waiting — costs four frames
+/// rather than fifty.
+const DEFAULT_TASK_PAGE: usize = 10;
+
+/// The most a single request will return, however large a limit it asks for.
+///
+/// A cap on WORK, not on truth: the real total travels with every page, so a
+/// device showing 10 of 906 can say so.
+const MAX_TASKS_SENT: usize = 200;
+
 /// How often the roster's status is refreshed.
 ///
 /// Each tick runs one `capture-pane` per tmux job. Slow enough that a handful
@@ -573,6 +718,7 @@ impl SessionExtension for ShellExtension {
             "shell_scroll",
             "shell_tasks",
             "shell_task",
+            "shell_task_search",
         ]
     }
 
@@ -788,16 +934,39 @@ impl SessionExtension for ShellExtension {
                 open.scroll(motion).map_err(|error| error.to_string())
             }
             "shell_tasks" => {
-                let frame = self.tasks_frame().await;
-                session.send(&envelope(frame)).await
+                let offset = body
+                    .get("offset")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let limit = body
+                    .get("limit")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|value| value as usize)
+                    .unwrap_or(DEFAULT_TASK_PAGE);
+                for frame in self.tasks_frames(offset, limit).await {
+                    session.send(&envelope(frame)).await?;
+                }
+                Ok(())
+            }
+            "shell_task_search" => {
+                let query = body
+                    .get("query")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                for frame in self.task_search_frames(query).await {
+                    session.send(&envelope(frame)).await?;
+                }
+                Ok(())
             }
             "shell_task" => {
                 let id = body
                     .get("task_id")
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| "task needs a task_id".to_owned())?;
-                let frame = self.task_detail_frame(id).await;
-                session.send(&envelope(frame)).await
+                for frame in self.task_detail_frames(id).await {
+                    session.send(&envelope(frame)).await?;
+                }
+                Ok(())
             }
             other => Err(format!("claimed {other} and cannot serve it")),
         }
@@ -842,6 +1011,44 @@ fn command_list(body: &serde_json::Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Prose of any length, as datagram-sized pages.
+///
+/// Base64 over raw byte chunks, exactly as terminal output travels — the same
+/// bound, and covered by the same proof. Chunking the STRING instead would need
+/// a char-boundary rule and a guess at how much JSON escaping expands it; a
+/// byte chunk of a known size has neither problem.
+fn text_pages(
+    task_id: &str,
+    part: &str,
+    author: Option<&str>,
+    text: &str,
+) -> Vec<serde_json::Value> {
+    use base64::Engine as _;
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let bytes = text.as_bytes();
+    let pages = bytes.len().div_ceil(MAX_OUTPUT_BYTES_PER_FRAME);
+    bytes
+        .chunks(MAX_OUTPUT_BYTES_PER_FRAME)
+        .enumerate()
+        .map(|(index, chunk)| {
+            serde_json::json!({
+                "type": "shell_task_text",
+                "task_id": task_id,
+                "part": part,
+                "author": author,
+                // Index and count so the reader can tell a missing page from a
+                // short one. A body that silently loses its middle reads as a
+                // task somebody wrote badly.
+                "index": index,
+                "pages": pages,
+                "bytes": base64::engine::general_purpose::STANDARD.encode(chunk),
+            })
+        })
+        .collect()
 }
 
 fn envelope(body: serde_json::Value) -> String {
@@ -1043,6 +1250,208 @@ mod tests {
 mod output_framing_tests {
     use super::*;
     use base64::Engine as _;
+
+    /// How a frame kind is kept inside a datagram.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Sizing {
+        /// Content bounded by construction — a status word, an id, a count. A
+        /// worst-case sample is asserted below.
+        Bounded,
+        /// Content of no fixed length, so it travels as pages. The PAGE size is
+        /// asserted; the number of pages is not bounded and need not be.
+        Paged,
+    }
+
+    /// EVERY frame kind this module emits, and how each stays inside a datagram.
+    ///
+    /// This exists because the same bug has now happened twice: a frame whose
+    /// content is bounded in the common case and unbounded in the real one.
+    /// First terminal output, fine until a command printed a lot; then the task
+    /// list, fine for an 11-task repository and 194 KiB for an 895-task one. In
+    /// both cases the frame was sent and nothing arrived — no error, no log,
+    /// just a screen that never filled.
+    ///
+    /// `every_emitted_frame_kind_is_declared` fails if a new kind is emitted
+    /// without being added here, so the next one is not discovered by someone
+    /// staring at a blank screen.
+    const EMITTED: &[(&str, Sizing)] = &[
+        ("shell_configs", Sizing::Bounded),
+        ("shell_status", Sizing::Bounded),
+        ("shell_notice", Sizing::Bounded),
+        ("shell_opened", Sizing::Bounded),
+        ("shell_ended", Sizing::Bounded),
+        ("shell_error", Sizing::Bounded),
+        ("shell_output", Sizing::Paged),
+        ("shell_tasks", Sizing::Paged),
+        ("shell_task_detail", Sizing::Bounded),
+        ("shell_task_text", Sizing::Paged),
+        ("shell_task_search", Sizing::Paged),
+    ];
+
+    /// A new frame kind cannot be emitted without a decision about its size.
+    ///
+    /// Reads the module's own source, because that is where the truth is. A
+    /// list maintained by hand beside the code goes stale — which is how
+    /// `shell_notice` and `shell_status` both fell out of the client's frame
+    /// allowlist in one day.
+    #[test]
+    fn every_emitted_frame_kind_is_declared() {
+        let source = include_str!("shell_extension.rs");
+        let declared: std::collections::HashSet<&str> =
+            EMITTED.iter().map(|(kind, _)| *kind).collect();
+
+        let prefix = "\"type\": \"";
+        let mut found = std::collections::BTreeSet::new();
+        for (index, _) in source.match_indices(prefix) {
+            let rest = &source[index + prefix.len()..];
+            let Some(end) = rest.find('"') else { continue };
+            let kind = &rest[..end];
+            if kind.starts_with("shell_") {
+                found.insert(kind);
+            }
+        }
+        assert!(
+            !found.is_empty(),
+            "the source scan found no emitted frames — it has stopped working, and a \
+             guard that cannot fail is not a guard"
+        );
+
+        let undeclared: Vec<&&str> = found.iter().filter(|k| !declared.contains(**k)).collect();
+        assert!(
+            undeclared.is_empty(),
+            "emitted but not declared in EMITTED: {undeclared:?}. Decide whether each is \
+             Bounded (assert a worst case) or Paged (chunk it). The last two frames that \
+             skipped this step were sent and silently never arrived."
+        );
+    }
+
+    /// Every BOUNDED frame kind, at its worst case, fits a datagram.
+    #[test]
+    fn every_bounded_frame_fits_a_datagram() {
+        let long = "a".repeat(120);
+        let path = "/Users/bkearns/src/ferrosa-suite/ferrosa-memory/crates/ferrosa-memory-sync";
+        for (kind, sizing) in EMITTED {
+            if *sizing != Sizing::Bounded {
+                continue;
+            }
+            let body = match *kind {
+                // The one genuinely variable Bounded frame: it carries configs,
+                // of which a machine has a handful. If that stops being true,
+                // this assertion is what says so.
+                "shell_configs" => serde_json::json!({
+                    "type": kind,
+                    "configs": [{
+                        "id": uuid::Uuid::now_v7().to_string(),
+                        "name": long,
+                        "kind": "tmux",
+                        "command": ["codex", "--yolo"],
+                        "working_dir": path,
+                        "running": true,
+                    }],
+                }),
+                "shell_status" => serde_json::json!({
+                    "type": kind,
+                    "full": true,
+                    "jobs": [{
+                        "id": uuid::Uuid::now_v7().to_string(),
+                        "running": true,
+                        "last_line": long,
+                        "changed_at": 1_787_538_000.0,
+                    }],
+                }),
+                "shell_task_detail" => serde_json::json!({
+                    "type": kind,
+                    "task_id": "t_0d313bb0",
+                    "title": long,
+                    "status": "blocked",
+                    "priority": 95,
+                    "block_reason": long,
+                    "needs_a_person": true,
+                    "repo": path,
+                    "assignee": "ben",
+                    "summary": long,
+                }),
+                _ => serde_json::json!({
+                    "type": kind,
+                    "text": long,
+                    "reason": long,
+                    "dropped": 12,
+                    "resumable": true,
+                }),
+            };
+            let frame = envelope(body);
+            assert!(
+                frame.len() <= SAFE_DATAGRAM_BYTES,
+                "{kind} at its worst case is {} bytes, over the {} safe datagram — make \
+                 it Paged",
+                frame.len(),
+                SAFE_DATAGRAM_BYTES
+            );
+        }
+    }
+
+    /// A page of task text fits, using the same bound as output.
+    #[test]
+    fn a_page_of_task_text_fits_a_datagram() {
+        let text = "x".repeat(MAX_OUTPUT_BYTES_PER_FRAME * 3);
+        let pages = text_pages("t_0d313bb0", "comment", Some("ben"), &text);
+        assert_eq!(pages.len(), 3);
+        for page in pages {
+            let frame = envelope(page);
+            assert!(
+                frame.len() <= SAFE_DATAGRAM_BYTES,
+                "a task text page is {} bytes",
+                frame.len()
+            );
+        }
+    }
+
+    /// A page of tasks must fit a datagram, like a page of output.
+    ///
+    /// The bug this pins: the task list was one frame. For a repository with
+    /// 895 open tasks that is 194 KiB, and nothing arrived — the list worked
+    /// for an 11-task repository and stopped the moment a large one was added.
+    /// Asserted on the SERIALIZED frame, not on the task count, because the
+    /// count is not what travels.
+    #[test]
+    fn a_page_of_tasks_fits_a_datagram() {
+        // A deliberately fat row: a long title, a long path, a block reason.
+        let task = serde_json::json!({
+            "id": "t_0d313bb0",
+            "title": "Review specs/decisions.md to confirm the 10 decision records match intent",
+            "status": "blocked",
+            "priority": 95,
+            "block_reason": "waiting on a decision about where archived buffers live",
+            "needs_a_person": true,
+            "repo": "/Users/bkearns/src/ferrosa-suite/ferrosa-memory",
+        });
+        let page: Vec<serde_json::Value> = (0..TASKS_PER_FRAME).map(|_| task.clone()).collect();
+        let frame = envelope(serde_json::json!({
+            "type": "shell_tasks",
+            "first": true,
+            "total": 906,
+            "tasks": page,
+        }));
+        assert!(
+            frame.len() <= SAFE_DATAGRAM_BYTES,
+            "a {}-task page serializes to {} bytes, over the {} safe datagram",
+            TASKS_PER_FRAME,
+            frame.len(),
+            SAFE_DATAGRAM_BYTES
+        );
+    }
+
+    /// The cap bounds work, not truth. A device must be able to say what it is
+    /// not showing, which needs the real total even when the list is cut.
+    #[test]
+    fn the_task_cap_is_bounded() {
+        assert!(MAX_TASKS_SENT > 0);
+        assert!(
+            MAX_TASKS_SENT <= 500,
+            "a cap this high stops being a cap: it is {} frames",
+            MAX_TASKS_SENT.div_ceil(TASKS_PER_FRAME)
+        );
+    }
 
     /// A conservative floor for path MTU.
     ///
