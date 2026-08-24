@@ -109,6 +109,45 @@ pub fn ranked(mut tasks: Vec<BoardTask>) -> Vec<BoardTask> {
     tasks
 }
 
+/// Round-robin the ranked list across repositories.
+///
+/// A page taken off a globally ranked list is a page of whichever repository
+/// has the most work. The live board holds 905 open tasks for one machine, 11
+/// of them for hippo, and ZERO of those in the first ten — so a screen grouped
+/// by repository lost hippo entirely, which reads as the agent's working
+/// directory never having registered.
+///
+/// Rank order is preserved WITHIN each repository, so the first thing shown for
+/// a repository is still its most urgent. What changes is that every repository
+/// with work reaches the first page instead of the largest one taking it.
+pub fn interleave_by_repo(tasks: Vec<BoardTask>) -> Vec<BoardTask> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_repo: BTreeMap<String, std::collections::VecDeque<BoardTask>> = BTreeMap::new();
+    for task in tasks {
+        let repo = task.repo.clone();
+        if !by_repo.contains_key(&repo) {
+            // First-seen order, which is rank order — the repository holding
+            // the single most urgent task is still served first.
+            order.push(repo.clone());
+        }
+        by_repo.entry(repo).or_default().push_back(task);
+    }
+    let mut out = Vec::new();
+    let mut draining = true;
+    while draining {
+        draining = false;
+        for repo in &order {
+            if let Some(queue) = by_repo.get_mut(repo)
+                && let Some(task) = queue.pop_front()
+            {
+                out.push(task);
+                draining = true;
+            }
+        }
+    }
+    out
+}
+
 /// The repository a task belongs to, from whichever field carries it.
 ///
 /// `workspace_path` when the task was created through the API, and a leading
@@ -974,6 +1013,75 @@ mod tests {
         let again: Vec<String> = ranked(tasks).into_iter().map(|t| t.id).collect();
         assert_eq!(first, again);
         assert_eq!(first, vec!["a", "b", "c"]);
+    }
+
+    /// Every repository with work reaches the first page.
+    ///
+    /// The observed failure: 905 tasks, 11 of them hippo, none in the first
+    /// ten. A screen grouped by repository then showed no hippo at all.
+    #[test]
+    fn a_small_repository_survives_the_first_page() {
+        let mut tasks: Vec<BoardTask> = (0..100)
+            .map(|index| {
+                let mut big = task(&format!("big{index}"), "triage", 95, None);
+                big.repo = "/big".to_owned();
+                big
+            })
+            .collect();
+        for index in 0..3 {
+            let mut small = task(&format!("small{index}"), "triage", 10, None);
+            small.repo = "/small".to_owned();
+            tasks.push(small);
+        }
+        let page: Vec<String> = interleave_by_repo(ranked(tasks))
+            .into_iter()
+            .take(10)
+            .map(|task| task.repo)
+            .collect();
+        assert!(
+            page.iter().any(|repo| repo == "/small"),
+            "the small repository is missing from the first page: {page:?}"
+        );
+    }
+
+    /// Rank order still holds INSIDE a repository. Interleaving must not
+    /// promote a repository's routine work above its own blocked work.
+    #[test]
+    fn interleaving_preserves_rank_within_a_repository() {
+        let mut urgent = task("urgent", "blocked", 10, Some("waiting on a decision"));
+        urgent.repo = "/one".to_owned();
+        let mut routine = task("routine", "triage", 99, None);
+        routine.repo = "/one".to_owned();
+        let mut other = task("other", "triage", 50, None);
+        other.repo = "/two".to_owned();
+
+        let out = interleave_by_repo(ranked(vec![routine, urgent, other]));
+        let one: Vec<&str> = out
+            .iter()
+            .filter(|task| task.repo == "/one")
+            .map(|task| task.id.as_str())
+            .collect();
+        assert_eq!(one, vec!["urgent", "routine"]);
+    }
+
+    /// Nothing is lost or duplicated by the shuffle.
+    #[test]
+    fn interleaving_keeps_every_task_exactly_once() {
+        let mut tasks = Vec::new();
+        for (repo, count) in [("/a", 5), ("/b", 2), ("/c", 9)] {
+            for index in 0..count {
+                let mut one = task(&format!("{repo}-{index}"), "triage", 50, None);
+                one.repo = repo.to_owned();
+                tasks.push(one);
+            }
+        }
+        let before: std::collections::BTreeSet<String> =
+            tasks.iter().map(|task| task.id.clone()).collect();
+        let after: std::collections::BTreeSet<String> = interleave_by_repo(tasks)
+            .into_iter()
+            .map(|task| task.id)
+            .collect();
+        assert_eq!(before, after);
     }
 
     /// Priority orders the rest, highest first.
