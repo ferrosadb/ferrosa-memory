@@ -62,6 +62,11 @@ pub enum SessionError {
         operation: &'static str,
         message: String,
     },
+    /// An ephemeral session has no scrollback on the machine to move through.
+    #[error("this session has no scrollback on the machine — scroll it in the terminal instead")]
+    NotScrollable,
+    #[error("scrolling: {0}")]
+    ScrollRefused(String),
 }
 
 /// A running session, whichever kind it is.
@@ -224,6 +229,35 @@ trait SessionInput: Send + Sync {
     fn destroy(&self) -> Result<(), SessionError>;
 }
 
+/// How far to move through the scrollback, in the operator's terms.
+///
+/// A closed set for the same reason `NamedKey` is one: the wire value ends up
+/// in a tmux command, and an unvalidated string there is remote tmux control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollMotion {
+    PageUp,
+    PageDown,
+    LineUp,
+    LineDown,
+    Top,
+    /// Back to the live pane, leaving copy mode.
+    Bottom,
+}
+
+impl ScrollMotion {
+    pub fn from_wire(name: &str) -> Option<Self> {
+        match name {
+            "page-up" => Some(Self::PageUp),
+            "page-down" => Some(Self::PageDown),
+            "line-up" => Some(Self::LineUp),
+            "line-down" => Some(Self::LineDown),
+            "top" => Some(Self::Top),
+            "bottom" => Some(Self::Bottom),
+            _ => None,
+        }
+    }
+}
+
 impl RunningSession {
     pub fn config(&self) -> &SessionConfig {
         &self.config
@@ -255,6 +289,81 @@ impl RunningSession {
     /// Tell the program the size of the terminal showing it.
     pub fn resize(&self, rows: u16, cols: u16) -> Result<(), SessionError> {
         self.input.resize(rows, cols)
+    }
+
+    /// Move through the pane's scrollback.
+    ///
+    /// NOT key bytes. Scrollback belongs to tmux, not to the program in the
+    /// pane, and keys sent into the pane go to that program — Page Up in a TUI
+    /// scrolls the TUI, or does nothing, and never reaches tmux's history. So
+    /// this drives tmux directly, which also means it works while a full-screen
+    /// program is running and grabbing every key.
+    ///
+    /// Refused for an ephemeral session: there is no tmux to ask, and its
+    /// scrollback lives in the client's own emulator where the client can
+    /// scroll it without involving the machine at all.
+    pub fn scroll(&self, motion: ScrollMotion) -> Result<(), SessionError> {
+        if self.config.kind != SessionKind::Tmux {
+            return Err(SessionError::NotScrollable);
+        }
+        let target = self.config.tmux_session_name();
+        let status = match motion {
+            // `-u` both ENTERS copy mode and scrolls a page up, so the first
+            // press and every press after it are the same command. Entering
+            // first and then scrolling would swallow the first press.
+            ScrollMotion::PageUp => std::process::Command::new("tmux")
+                .args(["copy-mode", "-u", "-t", &target])
+                .status(),
+            ScrollMotion::PageDown => std::process::Command::new("tmux")
+                .args(["send-keys", "-X", "-t", &target, "page-down"])
+                .status(),
+            ScrollMotion::LineUp => std::process::Command::new("tmux")
+                .args([
+                    "copy-mode",
+                    "-t",
+                    &target,
+                    ";",
+                    "send-keys",
+                    "-X",
+                    "-t",
+                    &target,
+                    "scroll-up",
+                ])
+                .status(),
+            ScrollMotion::LineDown => std::process::Command::new("tmux")
+                .args(["send-keys", "-X", "-t", &target, "scroll-down"])
+                .status(),
+            ScrollMotion::Top => std::process::Command::new("tmux")
+                .args([
+                    "copy-mode",
+                    "-t",
+                    &target,
+                    ";",
+                    "send-keys",
+                    "-X",
+                    "-t",
+                    &target,
+                    "history-top",
+                ])
+                .status(),
+            // Leaving copy mode IS returning to the bottom: tmux jumps back to
+            // the live pane. Two words for one action would let the operator
+            // sit in copy mode believing they were live, watching output that
+            // had stopped updating.
+            ScrollMotion::Bottom => std::process::Command::new("tmux")
+                .args(["send-keys", "-X", "-t", &target, "cancel"])
+                .status(),
+        };
+        match status {
+            Ok(status) if status.success() => Ok(()),
+            // A non-zero exit is usually "not in copy mode" for a motion that
+            // needs it. Reported rather than swallowed: a scroll that silently
+            // does nothing reads as a dead button.
+            Ok(status) => Err(SessionError::ScrollRefused(format!(
+                "tmux exited with {status}"
+            ))),
+            Err(error) => Err(SessionError::ScrollRefused(error.to_string())),
+        }
     }
 
     /// End this session for good.
