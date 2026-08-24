@@ -4,7 +4,8 @@
 //! waiting on nobody, and when an unreachable board says so instead of looking
 //! like an empty board.
 //! Last revised: 2026-08-23
-//! Last changed: New.
+//! Last changed: One task can be read in full — body and comments — because a
+//! title is not enough to decide anything by.
 //!
 //! # Why the machine reads it and not the phone
 //!
@@ -248,6 +249,28 @@ impl RepoMatcher {
     }
 }
 
+/// One task read in full, for the screen that shows a single one.
+///
+/// Separate from [`BoardTask`] and fetched on demand. The list carries titles
+/// for a hundred-odd tasks; carrying every body with them would put the whole
+/// board's prose through the data channel to render six rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoardTaskDetail {
+    pub task: BoardTask,
+    pub body: String,
+    pub assignee: Option<String>,
+    pub result: Option<String>,
+    pub summary: Option<String>,
+    pub comments: Vec<BoardComment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoardComment {
+    pub author: String,
+    pub body: String,
+    pub created_at: i64,
+}
+
 /// Reads the board over CQL.
 pub struct TaskBoard {
     session: LegacySession,
@@ -294,30 +317,12 @@ impl TaskBoard {
             .query_unpaged(query, ())
             .await
             .context("reading the task board")?;
-        let columns: BTreeMap<String, usize> = result
-            .col_specs()
-            .iter()
-            .enumerate()
-            .map(|(index, spec)| (spec.name().to_owned(), index))
-            .collect();
+        let columns = column_index(&result);
 
         let mut matcher = RepoMatcher::new(working_dirs);
         let mut found: BTreeMap<String, BoardTask> = BTreeMap::new();
         for row in result.rows_or_empty() {
-            let text = |name: &str| -> Option<String> {
-                match row.columns.get(*columns.get(name)?)? {
-                    Some(CqlValue::Text(value)) => Some(value.clone()),
-                    Some(CqlValue::Ascii(value)) => Some(value.clone()),
-                    _ => None,
-                }
-            };
-            let number = |name: &str| -> Option<i64> {
-                match row.columns.get(*columns.get(name)?)? {
-                    Some(CqlValue::Int(value)) => Some(i64::from(*value)),
-                    Some(CqlValue::BigInt(value)) => Some(*value),
-                    _ => None,
-                }
-            };
+            let text = |name: &str| text_at(&row, &columns, name);
             let (id, status, title, block_reason, workspace_path, body) = (
                 text("task_id"),
                 text("status"),
@@ -326,8 +331,9 @@ impl TaskBoard {
                 text("workspace_path"),
                 text("body"),
             );
-            let priority = number("priority").and_then(|value| i32::try_from(value).ok());
-            let updated_at = number("updated_at");
+            let priority =
+                number_at(&row, &columns, "priority").and_then(|value| i32::try_from(value).ok());
+            let updated_at = number_at(&row, &columns, "updated_at");
             let (Some(id), Some(status)) = (id, status) else {
                 continue;
             };
@@ -354,6 +360,122 @@ impl TaskBoard {
             );
         }
         Ok(ranked(found.into_values().collect()))
+    }
+}
+
+impl TaskBoard {
+    /// Everything about one task, for the detail screen.
+    ///
+    /// `None` when the id is not on the board — a task completed or archived
+    /// between the list and the tap. Reported as absent rather than as an
+    /// error, because it is a normal race and not a fault.
+    pub async fn detail(&self, task_id: &str) -> Result<Option<BoardTaskDetail>> {
+        // Parameterised, unlike the list query: this value comes from a device.
+        // Interpolating it would be CQL injection through the control channel.
+        #[allow(deprecated)]
+        let result = self
+            .session
+            .query_unpaged(
+                format!(
+                    "SELECT task_id, title, status, priority, block_reason, workspace_path, \
+                     body, updated_at, assignee, result, summary FROM agent_memory.tasks \
+                     WHERE tenant_id={TENANT_ID} AND task_id = ?"
+                ),
+                (task_id,),
+            )
+            .await
+            .context("reading one task")?;
+        let columns = column_index(&result);
+        let Some(row) = result.rows_or_empty().into_iter().next() else {
+            return Ok(None);
+        };
+        let text = |name: &str| text_at(&row, &columns, name);
+        let Some(id) = text("task_id") else {
+            return Ok(None);
+        };
+        let task = BoardTask {
+            id,
+            title: text("title").unwrap_or_default(),
+            status: text("status").unwrap_or_else(|| "triage".to_owned()),
+            priority: number_at(&row, &columns, "priority")
+                .and_then(|value| i32::try_from(value).ok())
+                .unwrap_or(0),
+            block_reason: text("block_reason").filter(|reason| !reason.is_empty()),
+            repo: repo_of(text("workspace_path").as_deref(), text("body").as_deref())
+                .unwrap_or_default(),
+            updated_at: number_at(&row, &columns, "updated_at").unwrap_or(0),
+        };
+        Ok(Some(BoardTaskDetail {
+            body: text("body").unwrap_or_default(),
+            assignee: text("assignee").filter(|value| !value.is_empty()),
+            result: text("result").filter(|value| !value.is_empty()),
+            summary: text("summary").filter(|value| !value.is_empty()),
+            comments: self.comments(task_id).await.unwrap_or_default(),
+            task,
+        }))
+    }
+
+    /// A task's comments, oldest first.
+    ///
+    /// Failure here does NOT fail the detail: the body is most of the value,
+    /// and losing the whole screen because the discussion could not be read
+    /// would be a worse trade than showing it without them.
+    async fn comments(&self, task_id: &str) -> Result<Vec<BoardComment>> {
+        #[allow(deprecated)]
+        let result = self
+            .session
+            .query_unpaged(
+                format!(
+                    "SELECT author, body, created_at FROM agent_memory.task_comments \
+                     WHERE tenant_id={TENANT_ID} AND task_id = ?"
+                ),
+                (task_id,),
+            )
+            .await
+            .context("reading task comments")?;
+        let columns = column_index(&result);
+        Ok(result
+            .rows_or_empty()
+            .into_iter()
+            .map(|row| BoardComment {
+                author: text_at(&row, &columns, "author").unwrap_or_else(|| "unknown".to_owned()),
+                body: text_at(&row, &columns, "body").unwrap_or_default(),
+                created_at: number_at(&row, &columns, "created_at").unwrap_or(0),
+            })
+            .collect())
+    }
+}
+
+/// Column name to position, so rows can be read by name.
+fn column_index(result: &scylla::LegacyQueryResult) -> BTreeMap<String, usize> {
+    result
+        .col_specs()
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| (spec.name().to_owned(), index))
+        .collect()
+}
+
+fn text_at(
+    row: &scylla::frame::response::result::Row,
+    columns: &BTreeMap<String, usize>,
+    name: &str,
+) -> Option<String> {
+    match row.columns.get(*columns.get(name)?)? {
+        Some(CqlValue::Text(value)) | Some(CqlValue::Ascii(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn number_at(
+    row: &scylla::frame::response::result::Row,
+    columns: &BTreeMap<String, usize>,
+    name: &str,
+) -> Option<i64> {
+    match row.columns.get(*columns.get(name)?)? {
+        Some(CqlValue::Int(value)) => Some(i64::from(*value)),
+        Some(CqlValue::BigInt(value)) => Some(*value),
+        _ => None,
     }
 }
 

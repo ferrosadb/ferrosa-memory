@@ -105,6 +105,58 @@ impl ShellExtension {
             .clone()
     }
 
+    /// One task in full, for the screen that shows a single one.
+    ///
+    /// Fetched on demand rather than carried with the list: the list is over a
+    /// hundred titles, and shipping every body with them would put the board's
+    /// whole prose through the data channel to render six rows.
+    async fn task_detail_frame(&self, task_id: &str) -> serde_json::Value {
+        let Some(board) = self.board().await else {
+            return serde_json::json!({
+                "type": "shell_task_detail",
+                "task_id": task_id,
+                "unavailable": "The task board could not be reached from this machine.",
+            });
+        };
+        match board.detail(task_id).await {
+            // Gone between the list and the tap. A normal race, said plainly:
+            // an empty detail screen would read as a task with no content.
+            Ok(None) => serde_json::json!({
+                "type": "shell_task_detail",
+                "task_id": task_id,
+                "unavailable": "That task is no longer on the board.",
+            }),
+            Ok(Some(detail)) => serde_json::json!({
+                "type": "shell_task_detail",
+                "task_id": task_id,
+                "title": detail.task.title,
+                "status": detail.task.status,
+                "priority": detail.task.priority,
+                "block_reason": detail.task.block_reason,
+                "needs_a_person": detail.task.waits_on_a_person(),
+                "repo": detail.task.repo,
+                "body": detail.body,
+                "assignee": detail.assignee,
+                "result": detail.result,
+                "summary": detail.summary,
+                "comments": detail
+                    .comments
+                    .iter()
+                    .map(|comment| serde_json::json!({
+                        "author": comment.author,
+                        "body": comment.body,
+                        "at": comment.created_at,
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+            Err(error) => serde_json::json!({
+                "type": "shell_task_detail",
+                "task_id": task_id,
+                "unavailable": format!("The task board refused the read: {error}"),
+            }),
+        }
+    }
+
     /// Outstanding work for the repositories this machine's agents work in.
     ///
     /// Derived from the agents' working directories, which is what makes this
@@ -520,6 +572,7 @@ impl SessionExtension for ShellExtension {
             "shell_input",
             "shell_scroll",
             "shell_tasks",
+            "shell_task",
         ]
     }
 
@@ -736,6 +789,14 @@ impl SessionExtension for ShellExtension {
             }
             "shell_tasks" => {
                 let frame = self.tasks_frame().await;
+                session.send(&envelope(frame)).await
+            }
+            "shell_task" => {
+                let id = body
+                    .get("task_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "task needs a task_id".to_owned())?;
+                let frame = self.task_detail_frame(id).await;
                 session.send(&envelope(frame)).await
             }
             other => Err(format!("claimed {other} and cannot serve it")),
