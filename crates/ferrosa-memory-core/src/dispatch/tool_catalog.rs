@@ -461,10 +461,41 @@ fn project(record: &ToolRecord, detail: CatalogDetail) -> Result<Value, CatalogE
             "category": record.category,
             "summary": summary(&record.tool.description),
             "schema_digest": digest_serialized(&record.tool)?,
+            // The one part of the schema a caller cannot do without.
+            //
+            // A compact entry carries no inputSchema on purpose -- the whole
+            // point is to describe 100+ tools inside a token budget, and the
+            // digest plus a `detail=schema` follow-up is how a client gets the
+            // rest. But that left the compact catalog saying nothing about
+            // which arguments are mandatory, and "absent" is read by clients as
+            // "none": a caller who trusted the listing called `ingest` without
+            // `content` and got -32602 "missing required string: content", an
+            // error the listing said could not happen. Worse, the call fails at
+            // STORE time, so every retrieval test after it returns zero for the
+            // wrong reason (QA-0068).
+            //
+            // Required names only -- no types, no descriptions, no properties.
+            // That is a handful of tokens per tool and it is the difference
+            // between a listing a client can call from and one it cannot.
+            "required": required_fields(&record.tool.input_schema),
         })),
         CatalogDetail::Schema => serde_json::to_value(&record.tool)
             .map_err(|error| CatalogError::Serialization(error.to_string())),
     }
+}
+
+/// The `required` array from a tool's input schema, as an array (empty if none).
+///
+/// Always an array, never null. A missing key and an empty list mean different
+/// things to a caller -- "I was not told" versus "nothing is mandatory" -- and
+/// this projection is the one place that distinction is decided. Emitting the
+/// empty array says the second, truthfully, for the tools where it is true.
+fn required_fields(input_schema: &Value) -> Value {
+    input_schema
+        .get("required")
+        .filter(|value| value.is_array())
+        .cloned()
+        .unwrap_or_else(|| Value::Array(Vec::new()))
 }
 
 fn summary(description: &str) -> String {
@@ -732,6 +763,76 @@ mod tests {
         assert_eq!(page["tools"].as_array().unwrap().len(), 1);
         assert_eq!(page["tools"][0]["name"], "stats");
         assert!(page["tools"][0]["inputSchema"].is_object());
+    }
+
+    /// A compact listing must say which arguments are mandatory.
+    ///
+    /// The compact projection carries no inputSchema -- that is the whole point
+    /// of it -- but it also said nothing about required fields, and clients read
+    /// "absent" as "none". A caller that trusted the listing called `ingest`
+    /// without `content` and got -32602 "missing required string: content", an
+    /// error the listing said could not happen. Worse, the call fails at STORE
+    /// time, so every retrieval check after it returns zero for the wrong
+    /// reason (QA-0068).
+    #[test]
+    fn a_compact_listing_names_the_arguments_a_caller_must_supply() {
+        let query = CatalogQuery::for_surface(
+            CatalogSurface::AllTools,
+            CatalogVisibility::Full,
+            json!({"detail": "compact", "query": "ingest"}),
+        )
+        .unwrap();
+        let page = build_catalog_page(&[], &query).unwrap();
+        let tools = page["tools"].as_array().expect("tools array");
+
+        let ingest = tools
+            .iter()
+            .find(|tool| tool["name"] == "ingest")
+            .expect("the compact catalog must list `ingest`");
+
+        // Still no schema: the digest plus a detail=schema follow-up is how a
+        // client gets the rest, and that stays true.
+        assert!(
+            ingest.get("inputSchema").is_none(),
+            "compact entries must not carry a full schema: {ingest:?}"
+        );
+        assert!(ingest["schema_digest"].is_string());
+
+        let required: Vec<&str> = ingest["required"]
+            .as_array()
+            .expect("a compact entry must carry a `required` array, even when empty")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+        assert!(
+            required.contains(&"content"),
+            "`content` is rejected when omitted, so the listing must say it is required: {required:?}"
+        );
+    }
+
+    /// Always an array, never a missing key.
+    ///
+    /// "I was not told" and "nothing is mandatory" are different answers, and a
+    /// caller cannot tell them apart from an absent field. Every compact entry
+    /// answers the question, including the tools whose answer is "none".
+    #[test]
+    fn every_compact_entry_answers_the_required_question() {
+        let query = CatalogQuery::for_surface(
+            CatalogSurface::AllTools,
+            CatalogVisibility::Full,
+            json!({"detail": "compact"}),
+        )
+        .unwrap();
+        let page = build_catalog_page(&[], &query).unwrap();
+        let tools = page["tools"].as_array().expect("tools array");
+        assert!(!tools.is_empty(), "an empty page would pass this vacuously");
+        for tool in tools {
+            assert!(
+                tool["required"].is_array(),
+                "{} has no `required` array",
+                tool["name"]
+            );
+        }
     }
 
     #[test]
