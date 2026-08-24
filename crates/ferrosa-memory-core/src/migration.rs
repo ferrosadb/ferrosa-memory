@@ -225,6 +225,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "verifiable ownership token for mobile control cursor reservations",
         ddl: include_str!("../../../ddl/052_mobile_control_cursor_reservation_token.cql"),
     },
+    Migration {
+        version: 53,
+        description: "archived agent sessions with their raw tmux buffers",
+        ddl: include_str!("../../../ddl/053_session_archives.cql"),
+    },
 ];
 
 /// `ddl/011_warmth_field.cql` — the `entity_warmth` table + session index.

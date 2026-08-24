@@ -366,6 +366,45 @@ impl RunningSession {
         }
     }
 
+    /// The whole scrollback, as bytes, with its colour.
+    ///
+    /// `-e` keeps the escape sequences, so a reader can feed this to a terminal
+    /// emulator and see what the operator would have seen. Plain text renders
+    /// more cheaply and is not what was on screen. `-S -` takes the history
+    /// from its beginning; without it capture-pane returns the visible pane
+    /// only, which for an archive would be the last screenful of a day's work.
+    ///
+    /// `-J` is deliberately NOT used: it rejoins wrapped lines, which changes
+    /// the bytes from what the terminal actually received.
+    ///
+    /// Returns the bytes and whether tmux hit its history limit — a capture cut
+    /// short must be able to say so rather than pass as the whole thing.
+    pub fn capture_scrollback(&self) -> Result<(Vec<u8>, bool), SessionError> {
+        if self.config.kind != SessionKind::Tmux {
+            return Err(SessionError::NotScrollable);
+        }
+        let target = self.config.tmux_session_name();
+        let output = std::process::Command::new("tmux")
+            .args(["capture-pane", "-p", "-e", "-S", "-", "-t", &target])
+            .output()
+            .map_err(|error| SessionError::Tmux {
+                operation: "capture-pane",
+                message: error.to_string(),
+            })?;
+        if !output.status.success() {
+            return Err(SessionError::Tmux {
+                operation: "capture-pane",
+                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        // At the limit means older output has already been discarded by tmux,
+        // so this capture cannot be the whole history however it looks.
+        let truncated = tmux_number(&target, "#{history_size}")
+            .zip(tmux_number(&target, "#{history_limit}"))
+            .is_some_and(|(size, limit)| size >= limit);
+        Ok((output.stdout, truncated))
+    }
+
     /// End this session for good.
     ///
     /// Distinct from dropping the handle, which for a persistent session only
@@ -882,4 +921,16 @@ mod tests {
         assert_eq!(NamedKey::from_wire("return"), NamedKey::from_wire("enter"));
         assert_eq!(NamedKey::from_wire("esc"), NamedKey::from_wire("escape"));
     }
+}
+
+/// One numeric tmux format value for a session, or `None` if it cannot be read.
+fn tmux_number(target: &str, format: &str) -> Option<u64> {
+    let output = std::process::Command::new("tmux")
+        .args(["display-message", "-p", "-t", target, format])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }

@@ -122,3 +122,69 @@ async fn an_unknown_task_is_absent_rather_than_an_error() {
         .expect("a missing task is not a failure");
     assert!(missing.is_none());
 }
+
+/// What the machine would answer RIGHT NOW for its configured agents.
+///
+/// A diagnostic rather than a rule: it prints, so a disagreement between what
+/// the phone shows and what the board holds can be read rather than guessed at.
+#[tokio::test]
+#[ignore = "needs the live task board"]
+async fn report_work_for_the_machines_configured_agents() {
+    let dirs = vec![
+        "/Users/bkearns/src/hippo".to_owned(),
+        "/Users/bkearns/src/ferrosa-suite".to_owned(),
+    ];
+    let board = TaskBoard::connect(&contact_points())
+        .await
+        .expect("connects to the board");
+    for dir in &dirs {
+        let found = board.open_work(&[dir.clone()]).await.expect("reads");
+        println!("REPORT {dir}: {} open", found.len());
+        for task in found.iter().take(3) {
+            println!("    [{}] {} {}", task.status, task.id, task.title);
+        }
+    }
+    let together = board.open_work(&dirs).await.expect("reads");
+    println!("REPORT both together: {} open", together.len());
+}
+
+/// A full id finds its task; a prefix finds it too.
+#[tokio::test]
+#[ignore = "needs the live task board"]
+async fn a_task_is_findable_by_id_and_by_prefix() {
+    let board = TaskBoard::connect(&contact_points())
+        .await
+        .expect("connects to the board");
+    let listed = board
+        .open_work(&["/Users/bkearns/src/hippo".to_owned()])
+        .await
+        .expect("reads the board");
+    let known = listed.first().expect("hippo has open work");
+
+    let exact = board.find_by_id(&known.id, 10).await.expect("searches");
+    assert_eq!(exact.first().map(|t| t.id.clone()), Some(known.id.clone()));
+
+    // Long enough to be meaningful, short enough that nobody typed it all.
+    let prefix = &known.id[..6];
+    let partial = board.find_by_id(prefix, 10).await.expect("searches");
+    assert!(
+        partial.iter().any(|task| task.id == known.id),
+        "the prefix {prefix} did not find {}",
+        known.id
+    );
+    assert!(partial.len() <= 10, "the limit was not applied");
+}
+
+/// An id that matches nothing comes back empty rather than erroring.
+#[tokio::test]
+#[ignore = "needs the live task board"]
+async fn an_id_matching_nothing_finds_nothing() {
+    let board = TaskBoard::connect(&contact_points())
+        .await
+        .expect("connects to the board");
+    let none = board
+        .find_by_id("zzzz-not-an-id", 10)
+        .await
+        .expect("searches");
+    assert!(none.is_empty());
+}
