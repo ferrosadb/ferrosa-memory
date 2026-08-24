@@ -11,7 +11,7 @@
 //! |---|---|
 //! | Data | Raw capture — the exhaust of LLM sessions |
 //! | Information | Human-curated raw material, mostly trusted |
-//! | Knowledge | CLAIMS: derived structure and agent-authored artifacts |
+//! | Knowledge | derived structure and agent-authored artifacts |
 //! | Wisdom | Hand-curated, adjudicated |
 //!
 //! Knowledge is a queue as much as a shelf. What unites consolidation output
@@ -48,7 +48,9 @@ pub enum Tier {
     Information,
     /// A claim: asserted by a machine, not yet adjudicated.
     Knowledge,
-    /// Hand-curated and adjudicated.
+    /// Hand-curated by a person. NOT adjudicated: one person's curation is an
+    /// endorsement, and a Wisdom floor on a share means "someone vouched for
+    /// this", never "this was verified". See specs/knowledge-tiers D13.
     Wisdom,
 }
 

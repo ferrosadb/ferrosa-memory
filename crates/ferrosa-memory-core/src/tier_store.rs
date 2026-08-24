@@ -16,7 +16,7 @@
 //! re-resolves and reports how many rows moved — and a test holds the line
 //! that an alias edit alone does NOT silently fix them.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
@@ -31,6 +31,11 @@ use crate::types::{FactSet, TenantContext, Term};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntitySource {
     pub entity_id: Uuid,
+    /// Which partition of `entity_store` holds it. An entity id alone cannot
+    /// be read back, so without this nothing here can reach the entity.
+    pub session_id: Uuid,
+    /// Display cache, refreshed by `restate_sources`. Stale after a rename.
+    pub title: String,
     /// As supplied by the caller. This is the truth; the rest is derived.
     pub source_path: String,
     /// The canonical root, or `None` when no alias covered the path.
@@ -38,6 +43,16 @@ pub struct EntitySource {
     /// Which alias produced `source_root`. `None` when nothing matched.
     pub matched_alias: Option<String>,
     pub recorded_at: DateTime<Utc>,
+}
+
+/// What ingest supplies. The root, alias and timestamp are worked out here,
+/// so a caller cannot record a resolution that disagrees with the alias set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceDraft {
+    pub entity_id: Uuid,
+    pub session_id: Uuid,
+    pub title: String,
+    pub source_path: String,
 }
 
 /// Two spellings of one location.
@@ -96,8 +111,7 @@ pub trait TierStore: Send + Sync {
     fn record_source(
         &self,
         ctx: &TenantContext,
-        entity_id: Uuid,
-        source_path: &str,
+        draft: SourceDraft,
     ) -> impl std::future::Future<Output = anyhow::Result<EntitySource>> + Send;
 
     fn source_of(
@@ -279,6 +293,93 @@ pub async fn load_tier_facts(
     })
 }
 
+/// One row of the DIKW map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TierCount {
+    pub tier: Tier,
+    pub count: usize,
+    /// Which roots feed this tier, so the map can say where a number came from.
+    pub roots: Vec<String>,
+}
+
+/// What the tier plane knows, counted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TierSummary {
+    /// Always four rows, in DIKW order, including tiers with nothing in them.
+    /// A tier that vanishes when empty reads as a tier that does not exist.
+    pub tiers: Vec<TierCount>,
+    /// Sourced entities whose root matches no rule. The hole in the rule set.
+    pub unclassified: usize,
+    /// Rows in `entity_source`. Zero means nothing records a source yet, which
+    /// is a different statement from "the store is empty" and the map must be
+    /// able to say which one it is looking at.
+    pub sourced: usize,
+    pub truncated: bool,
+}
+
+/// Count what sits in each tier.
+///
+/// Counted here rather than by the database because the tier is derived: there
+/// is no column to group by, and materialising one would be the second truth
+/// that [`TierRules`] exists to avoid.
+pub async fn summarise(
+    store: &impl TierStore,
+    ctx: &TenantContext,
+    limit: usize,
+) -> anyhow::Result<TierSummary> {
+    let (_, rules) = load_rules(store, ctx).await?;
+    let promoted: HashMap<Uuid, Tier> = store
+        .promotions(ctx, limit)
+        .await?
+        .into_iter()
+        .map(|promotion| (promotion.entity_id, promotion.tier))
+        .collect();
+
+    let page = store.sources(ctx, limit).await?;
+    let mut counts: BTreeMap<Tier, usize> = BTreeMap::new();
+    let mut roots: BTreeMap<Tier, BTreeSet<String>> = BTreeMap::new();
+    let mut unclassified = 0;
+    let sourced = page.sources.len();
+
+    for source in page.sources {
+        // A promotion decides on its own, exactly as in `resolve`.
+        if let Some(tier) = promoted.get(&source.entity_id) {
+            *counts.entry(*tier).or_default() += 1;
+            continue;
+        }
+        match source
+            .source_root
+            .as_deref()
+            .and_then(|root| rules.tier_of_root(root).map(|tier| (root, tier)))
+        {
+            Some((root, tier)) => {
+                *counts.entry(tier).or_default() += 1;
+                roots.entry(tier).or_default().insert(root.to_owned());
+            }
+            // No root, or a root no rule covers. Both are Data by the floor in
+            // `resolve`, and both are counted as the hole they are.
+            None => {
+                *counts.entry(Tier::Data).or_default() += 1;
+                unclassified += 1;
+            }
+        }
+    }
+
+    Ok(TierSummary {
+        tiers: [Tier::Data, Tier::Information, Tier::Knowledge, Tier::Wisdom]
+            .into_iter()
+            .map(|tier| TierCount {
+                tier,
+                count: counts.get(&tier).copied().unwrap_or(0),
+                roots: roots.get(&tier).into_iter().flatten().cloned().collect(),
+            })
+            .collect(),
+        unclassified,
+        sourced,
+        truncated: page.truncated,
+    })
+}
+
 /// Resolve a path against an alias set into the pair stored on the row.
 fn resolved_pair(resolver: &RootResolver, path: &str) -> (Option<String>, Option<String>) {
     resolver
@@ -320,20 +421,21 @@ impl TierStore for InMemoryTierStore {
     async fn record_source(
         &self,
         ctx: &TenantContext,
-        entity_id: Uuid,
-        source_path: &str,
+        draft: SourceDraft,
     ) -> anyhow::Result<EntitySource> {
         Ok(self.with(ctx, |tenant| {
             let resolver = Self::resolver_of(tenant);
-            let (source_root, matched_alias) = resolved_pair(&resolver, source_path);
+            let (source_root, matched_alias) = resolved_pair(&resolver, &draft.source_path);
             let record = EntitySource {
-                entity_id,
-                source_path: source_path.to_owned(),
+                entity_id: draft.entity_id,
+                session_id: draft.session_id,
+                title: draft.title,
+                source_path: draft.source_path,
                 source_root,
                 matched_alias,
                 recorded_at: Utc::now(),
             };
-            tenant.sources.insert(entity_id, record.clone());
+            tenant.sources.insert(record.entity_id, record.clone());
             record
         }))
     }
@@ -494,8 +596,9 @@ impl CqlTierStore {
     async fn write_source(&self, ctx: &TenantContext, record: &EntitySource) -> anyhow::Result<()> {
         let query = format!(
             "INSERT INTO {}.entity_source \
-             (tenant_id, entity_id, source_path, source_root, matched_alias, recorded_at) \
-             VALUES (?, ?, ?, ?, ?, ?)",
+             (tenant_id, entity_id, session_id, title, source_path, source_root, \
+              matched_alias, recorded_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             self.keyspace
         );
         #[allow(deprecated)]
@@ -505,6 +608,8 @@ impl CqlTierStore {
                 (
                     ctx.tenant_id,
                     record.entity_id,
+                    record.session_id,
+                    record.title.as_str(),
                     record.source_path.as_str(),
                     record.source_root.as_deref(),
                     record.matched_alias.as_deref(),
@@ -525,6 +630,8 @@ fn source_from_row(
 ) -> anyhow::Result<EntitySource> {
     Ok(EntitySource {
         entity_id: cql_get(row, columns, "entity_id")?,
+        session_id: cql_get(row, columns, "session_id")?,
+        title: cql_get::<String>(row, columns, "title").unwrap_or_default(),
         source_path: cql_get(row, columns, "source_path")?,
         source_root: cql_get::<String>(row, columns, "source_root").ok(),
         matched_alias: cql_get::<String>(row, columns, "matched_alias").ok(),
@@ -546,14 +653,15 @@ impl TierStore for CqlTierStore {
     async fn record_source(
         &self,
         ctx: &TenantContext,
-        entity_id: Uuid,
-        source_path: &str,
+        draft: SourceDraft,
     ) -> anyhow::Result<EntitySource> {
         let resolver = self.load_resolver(ctx).await?;
-        let (source_root, matched_alias) = resolved_pair(&resolver, source_path);
+        let (source_root, matched_alias) = resolved_pair(&resolver, &draft.source_path);
         let record = EntitySource {
-            entity_id,
-            source_path: source_path.to_owned(),
+            entity_id: draft.entity_id,
+            session_id: draft.session_id,
+            title: draft.title,
+            source_path: draft.source_path,
             source_root,
             matched_alias,
             recorded_at: Utc::now(),
@@ -568,7 +676,8 @@ impl TierStore for CqlTierStore {
         entity_id: Uuid,
     ) -> anyhow::Result<Option<EntitySource>> {
         let query = format!(
-            "SELECT entity_id, source_path, source_root, matched_alias, recorded_at \
+            "SELECT entity_id, session_id, title, source_path, source_root, matched_alias, \
+             recorded_at \
              FROM {}.entity_source WHERE tenant_id = ? AND entity_id = ?",
             self.keyspace
         );
@@ -594,7 +703,8 @@ impl TierStore for CqlTierStore {
         limit: usize,
     ) -> anyhow::Result<Vec<EntitySource>> {
         let query = format!(
-            "SELECT entity_id, source_path, source_root, matched_alias, recorded_at \
+            "SELECT entity_id, session_id, title, source_path, source_root, matched_alias, \
+             recorded_at \
              FROM {}.entity_source WHERE tenant_id = ? AND source_root = ? LIMIT ?",
             self.keyspace
         );
@@ -776,7 +886,8 @@ impl TierStore for CqlTierStore {
         // One over the limit, so a full page is distinguishable from a page
         // that happened to end exactly at the bound.
         let query = format!(
-            "SELECT entity_id, source_path, source_root, matched_alias, recorded_at \
+            "SELECT entity_id, session_id, title, source_path, source_root, matched_alias, \
+             recorded_at \
              FROM {}.entity_source WHERE tenant_id = ? LIMIT ?",
             self.keyspace
         );
@@ -890,6 +1001,17 @@ mod tests {
         }
     }
 
+    /// A draft whose title is derived from the path, so a failing assertion
+    /// names something recognisable.
+    fn draft(entity_id: Uuid, path: &str) -> SourceDraft {
+        SourceDraft {
+            entity_id,
+            session_id: Uuid::new_v4(),
+            title: path.rsplit('/').next().unwrap_or(path).to_owned(),
+            source_path: path.to_owned(),
+        }
+    }
+
     /// The store with the aliases and rules Ben described: two spellings of the
     /// research tree, corpus as Information, skills as Wisdom.
     async fn curated() -> (InMemoryTierStore, TenantContext) {
@@ -917,11 +1039,14 @@ mod tests {
         let long = Uuid::new_v4();
         let short = Uuid::new_v4();
         store
-            .record_source(&ctx, long, "/Users/bkearns/src/research/corpus/rust/x.md")
+            .record_source(
+                &ctx,
+                draft(long, "/Users/bkearns/src/research/corpus/rust/x.md"),
+            )
             .await
             .expect("record");
         store
-            .record_source(&ctx, short, "bkearns/research/corpus/rust/x.md")
+            .record_source(&ctx, draft(short, "bkearns/research/corpus/rust/x.md"))
             .await
             .expect("record");
 
@@ -940,7 +1065,7 @@ mod tests {
         let (store, ctx) = curated().await;
         let id = Uuid::new_v4();
         let record = store
-            .record_source(&ctx, id, "bkearns/research/corpus/rust/x.md")
+            .record_source(&ctx, draft(id, "bkearns/research/corpus/rust/x.md"))
             .await
             .expect("record");
         // Without this, a mis-tier under two aliases pointing at one root is
@@ -957,7 +1082,7 @@ mod tests {
         let (store, ctx) = curated().await;
         let id = Uuid::new_v4();
         let record = store
-            .record_source(&ctx, id, "/tmp/scratch/notes.md")
+            .record_source(&ctx, draft(id, "/tmp/scratch/notes.md"))
             .await
             .expect("record");
         assert_eq!(record.source_root, None, "invented a root");
@@ -973,7 +1098,10 @@ mod tests {
         let (store, ctx) = curated().await;
         let id = Uuid::new_v4();
         store
-            .record_source(&ctx, id, "/Users/bkearns/src/research/corpus/rust/x.md")
+            .record_source(
+                &ctx,
+                draft(id, "/Users/bkearns/src/research/corpus/rust/x.md"),
+            )
             .await
             .expect("record");
         store
@@ -1008,7 +1136,10 @@ mod tests {
         let (store, ctx) = curated().await;
         let id = Uuid::new_v4();
         store
-            .record_source(&ctx, id, "/Users/bkearns/src/research/corpus/rust/x.md")
+            .record_source(
+                &ctx,
+                draft(id, "/Users/bkearns/src/research/corpus/rust/x.md"),
+            )
             .await
             .expect("record");
         assert_eq!(
@@ -1034,7 +1165,10 @@ mod tests {
         let (store, ctx) = curated().await;
         let id = Uuid::new_v4();
         store
-            .record_source(&ctx, id, "/Users/bkearns/src/research/corpus/rust/x.md")
+            .record_source(
+                &ctx,
+                draft(id, "/Users/bkearns/src/research/corpus/rust/x.md"),
+            )
             .await
             .expect("record");
 
@@ -1078,15 +1212,14 @@ mod tests {
         let (store, ctx) = curated().await;
         for path in ["/tmp/a.md", "/tmp/b.md"] {
             store
-                .record_source(&ctx, Uuid::new_v4(), path)
+                .record_source(&ctx, draft(Uuid::new_v4(), path))
                 .await
                 .expect("record");
         }
         store
             .record_source(
                 &ctx,
-                Uuid::new_v4(),
-                "/Users/bkearns/src/research/skills/rust.md",
+                draft(Uuid::new_v4(), "/Users/bkearns/src/research/skills/rust.md"),
             )
             .await
             .expect("record");
@@ -1102,7 +1235,7 @@ mod tests {
         let (store, ctx) = curated().await;
         for _ in 0..5 {
             store
-                .record_source(&ctx, Uuid::new_v4(), "/tmp/x.md")
+                .record_source(&ctx, draft(Uuid::new_v4(), "/tmp/x.md"))
                 .await
                 .expect("record");
         }
@@ -1117,7 +1250,10 @@ mod tests {
         let other = tenant();
         let id = Uuid::new_v4();
         store
-            .record_source(&ctx, id, "/Users/bkearns/src/research/skills/rust.md")
+            .record_source(
+                &ctx,
+                draft(id, "/Users/bkearns/src/research/skills/rust.md"),
+            )
             .await
             .expect("record");
 
@@ -1146,7 +1282,10 @@ mod tests {
         let demoted = Uuid::new_v4();
         for id in [kept, demoted] {
             store
-                .record_source(&ctx, id, "/Users/bkearns/src/research/skills/rust.md")
+                .record_source(
+                    &ctx,
+                    draft(id, "/Users/bkearns/src/research/skills/rust.md"),
+                )
                 .await
                 .expect("record");
         }
@@ -1199,6 +1338,88 @@ mod tests {
             .map(|rule| crate::datalog::parse_rule(rule).expect("registry rule must parse"))
             .collect();
         crate::datalog::evaluate(&rules, &loaded.facts, 64, 10_000).0
+    }
+
+    #[tokio::test]
+    async fn the_map_counts_every_tier_including_the_empty_ones() {
+        let (store, ctx) = curated().await;
+        for path in [
+            "/Users/bkearns/src/research/skills/rust.md",
+            "/Users/bkearns/src/research/skills/elixir.md",
+            "/Users/bkearns/src/research/corpus/rust/x.md",
+            "/tmp/exhaust.md",
+        ] {
+            store
+                .record_source(&ctx, draft(Uuid::new_v4(), path))
+                .await
+                .expect("record");
+        }
+
+        let map = summarise(&store, &ctx, 1_000).await.expect("summary");
+        let by_tier = |want: Tier| {
+            map.tiers
+                .iter()
+                .find(|row| row.tier == want)
+                .unwrap_or_else(|| panic!("{want:?} missing from the map"))
+        };
+        assert_eq!(by_tier(Tier::Wisdom).count, 2);
+        assert_eq!(by_tier(Tier::Information).count, 1);
+        assert_eq!(by_tier(Tier::Data).count, 1, "the uncovered path");
+        // Present with zero rather than absent: a tier that vanishes when
+        // empty reads as a tier that does not exist.
+        assert_eq!(by_tier(Tier::Knowledge).count, 0);
+        assert_eq!(map.tiers.len(), 4);
+
+        assert_eq!(map.unclassified, 1, "the hole in the rule set went unseen");
+        assert_eq!(map.sourced, 4);
+        assert!(!map.truncated);
+        assert_eq!(by_tier(Tier::Wisdom).roots, vec!["research/skills"]);
+    }
+
+    /// Zero sourced entities and an empty store are different statements, and
+    /// the map has to be able to tell them apart -- the first means nothing
+    /// records a source yet, which is a build step, not an empty library.
+    #[tokio::test]
+    async fn an_unwired_ingest_reads_as_zero_sourced_not_as_an_empty_store() {
+        let (store, ctx) = curated().await;
+        let map = summarise(&store, &ctx, 1_000).await.expect("summary");
+        assert_eq!(map.sourced, 0);
+        assert_eq!(map.unclassified, 0);
+        assert_eq!(map.tiers.len(), 4, "the map still has its shape");
+        assert!(map.tiers.iter().all(|row| row.count == 0));
+    }
+
+    #[tokio::test]
+    async fn a_promotion_moves_the_count_it_belongs_to() {
+        let (store, ctx) = curated().await;
+        let id = Uuid::new_v4();
+        store
+            .record_source(&ctx, draft(id, "/Users/bkearns/src/research/corpus/x.md"))
+            .await
+            .expect("record");
+        store
+            .promote(
+                &ctx,
+                TierPromotion {
+                    entity_id: id,
+                    tier: Tier::Wisdom,
+                    actor: "ben".to_owned(),
+                    reason: "curated".to_owned(),
+                    created_at: Utc::now(),
+                },
+            )
+            .await
+            .expect("promote");
+
+        let map = summarise(&store, &ctx, 1_000).await.expect("summary");
+        let count = |want: Tier| {
+            map.tiers
+                .iter()
+                .find(|row| row.tier == want)
+                .map_or(0, |row| row.count)
+        };
+        assert_eq!(count(Tier::Wisdom), 1);
+        assert_eq!(count(Tier::Information), 0, "counted in both places");
     }
 
     #[tokio::test]

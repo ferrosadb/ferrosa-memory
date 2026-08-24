@@ -35,6 +35,7 @@ pub mod device_request;
 pub mod harness_state;
 pub mod learner_ingest;
 pub mod listener;
+pub mod memory_view;
 pub mod pack;
 pub mod pack_crypto;
 pub mod peer_cli;

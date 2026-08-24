@@ -15,9 +15,19 @@
 -- The rules are also emitted as Datalog (see tiers.rs) so a sharing grant can
 -- reason about tiers on the graph rather than in Rust only.
 
+-- session_id is here because entity_store is partitioned by
+-- ((tenant_id, session_id)): an entity id ALONE cannot be read back, so
+-- without it nothing here can reach the entity it describes.
+--
+-- title is a display cache, on the same terms as source_root: the browse list
+-- is titles, and fetching twenty of them from twenty partitions to draw one
+-- page is a read amplification the list cannot afford. It goes stale on
+-- rename, and restate_sources is what refreshes it.
 CREATE TABLE IF NOT EXISTS agent_memory.entity_source (
     tenant_id     uuid,
     entity_id     uuid,
+    session_id    uuid,
+    title         text,
     source_path   text,     -- as supplied by the ingest caller
     source_root   text,     -- canonical root after alias resolution
     matched_alias text,     -- which alias rule fired, or null for a literal
