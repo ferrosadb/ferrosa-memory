@@ -271,6 +271,48 @@ pub struct BoardComment {
     pub created_at: i64,
 }
 
+/// One related task, and why it is related.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Related {
+    /// In the operator's terms: "parent", "mentions QA-0009", "refers to this".
+    pub reason: String,
+    pub task: BoardTask,
+}
+
+/// Identifier-shaped tokens in a piece of text.
+///
+/// Two shapes, both of which are how work actually cross-references here:
+/// `t_393bc64e` (a board id) and `QA-0009`, `MAAS-T-35`, `FG-003` (a ticket in
+/// some other scheme, written into the prose because there is nowhere else to
+/// put it).
+///
+/// Deliberately NOT a general word index. A "related" list built from shared
+/// words is a list of everything, and the reason these tokens are worth
+/// following is that a person chose to write one down.
+pub fn identifiers_in(text: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for raw in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-')) {
+        let token = raw.trim_matches(|c: char| c == '-' || c == '_');
+        if token.len() < 4 || token.len() > 40 {
+            continue;
+        }
+        let board_id = token.starts_with("t_")
+            && token.len() >= 8
+            && token[2..].chars().all(|c| c.is_ascii_hexdigit());
+        // LETTERS-DIGITS, with any number of dashed parts: QA-0009, MAAS-T-35.
+        let ticket = token.contains('-')
+            && token.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+            && token.chars().last().is_some_and(|c| c.is_ascii_digit())
+            && token
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '-');
+        if (board_id || ticket) && !found.iter().any(|seen| seen == token) {
+            found.push(token.to_owned());
+        }
+    }
+    found
+}
+
 /// Reads the board over CQL.
 pub struct TaskBoard {
     session: LegacySession,
@@ -476,6 +518,251 @@ impl TaskBoard {
         let mut ranked = ranked(found);
         ranked.truncate(limit);
         Ok(ranked)
+    }
+
+    /// Mark a task finished.
+    ///
+    /// Parameterised throughout: the id comes from a device, and the note is
+    /// free text a person typed. Interpolating either into CQL would be
+    /// injection through the control channel.
+    ///
+    /// Writes `status` and `result` and nothing else. Not a general edit: this
+    /// is one operator saying one thing about one task, and the narrower the
+    /// write the less there is to get wrong from a phone.
+    pub async fn complete(&self, task_id: &str, note: Option<&str>) -> Result<()> {
+        let now = now_millis();
+        #[allow(deprecated)]
+        self.session
+            .query_unpaged(
+                format!(
+                    "UPDATE agent_memory.tasks SET status = ?, result = ?, updated_at = ? \
+                     WHERE tenant_id={TENANT_ID} AND task_id = ?"
+                ),
+                (
+                    "complete",
+                    note.unwrap_or("Marked complete from the control room."),
+                    now,
+                    task_id,
+                ),
+            )
+            .await
+            .context("marking the task complete")?;
+        Ok(())
+    }
+
+    /// Record that an agent has been sent to work on a task.
+    ///
+    /// Status and assignee together, because either alone is a half-truth: an
+    /// assignee on a `triage` task does not read as "being worked on", and
+    /// `in_progress` with nobody named does not say who to ask.
+    pub async fn assign(&self, task_id: &str, assignee: &str) -> Result<()> {
+        let now = now_millis();
+        #[allow(deprecated)]
+        self.session
+            .query_unpaged(
+                format!(
+                    "UPDATE agent_memory.tasks SET status = ?, assignee = ?, updated_at = ? \
+                     WHERE tenant_id={TENANT_ID} AND task_id = ?"
+                ),
+                ("in_progress", assignee, now, task_id),
+            )
+            .await
+            .context("assigning the task")?;
+        Ok(())
+    }
+
+    /// Other tasks that mention a token in their title, body or block reason.
+    ///
+    /// The board has explicit links, and it also has the way people actually
+    /// cross-reference: writing the id in the prose. Both are real
+    /// relationships and only one of them is in `task_links`, so a "related"
+    /// list built from links alone would miss most of what relates.
+    ///
+    /// Case-insensitive, because ids get typed in whatever case is remembered.
+    pub async fn mentions_of(&self, token: &str, limit: usize) -> Result<Vec<BoardTask>> {
+        let needle = token.trim().to_lowercase();
+        if needle.len() < 4 {
+            // A short token matches everything and means nothing. Refusing
+            // beats a page of noise that looks like an answer.
+            return Ok(Vec::new());
+        }
+        #[allow(deprecated)]
+        let result = self
+            .session
+            .query_unpaged(
+                format!(
+                    "SELECT task_id, title, status, priority, block_reason, workspace_path, \
+                     body, updated_at FROM agent_memory.tasks WHERE tenant_id={TENANT_ID}"
+                ),
+                (),
+            )
+            .await
+            .context("scanning the board for mentions")?;
+        let columns = column_index(&result);
+        let mut found = Vec::new();
+        for row in result.rows_or_empty() {
+            let text = |name: &str| text_at(&row, &columns, name);
+            let Some(id) = text("task_id") else { continue };
+            // Not the task itself.
+            if id.to_lowercase() == needle {
+                continue;
+            }
+            let haystack = format!(
+                "{} {} {}",
+                text("title").unwrap_or_default(),
+                text("body").unwrap_or_default(),
+                text("block_reason").unwrap_or_default()
+            )
+            .to_lowercase();
+            if !haystack.contains(&needle) {
+                continue;
+            }
+            found.push(BoardTask {
+                repo: repo_of(text("workspace_path").as_deref(), text("body").as_deref())
+                    .unwrap_or_default(),
+                id,
+                title: text("title").unwrap_or_default(),
+                status: text("status").unwrap_or_else(|| "triage".to_owned()),
+                priority: number_at(&row, &columns, "priority")
+                    .and_then(|value| i32::try_from(value).ok())
+                    .unwrap_or(0),
+                block_reason: text("block_reason").filter(|reason| !reason.is_empty()),
+                updated_at: number_at(&row, &columns, "updated_at").unwrap_or(0),
+            });
+        }
+        let mut ranked = ranked(found);
+        ranked.truncate(limit);
+        Ok(ranked)
+    }
+
+    /// Explicitly linked tasks, in both directions.
+    ///
+    /// Both, because from a task on screen the operator wants "what is this
+    /// attached to", not "what did this attach itself to". A parent knows its
+    /// children; a child only knows its parents if you ask the other way.
+    pub async fn links_of(&self, task_id: &str) -> Result<Vec<(String, BoardTask)>> {
+        let mut related: Vec<(String, String)> = Vec::new();
+
+        #[allow(deprecated)]
+        let outgoing = self
+            .session
+            .query_unpaged(
+                format!(
+                    "SELECT link_type, dst_task_id FROM agent_memory.task_links \
+                     WHERE tenant_id={TENANT_ID} AND src_task_id = ?"
+                ),
+                (task_id,),
+            )
+            .await
+            .context("reading task links")?;
+        let columns = column_index(&outgoing);
+        for row in outgoing.rows_or_empty() {
+            if let (Some(kind), Some(dst)) = (
+                text_at(&row, &columns, "link_type"),
+                text_at(&row, &columns, "dst_task_id"),
+            ) {
+                related.push((kind, dst));
+            }
+        }
+
+        // The reverse needs a scan: `task_links` is keyed by source, so "what
+        // points at me" is not a lookup. Bounded by the board, which is small.
+        #[allow(deprecated)]
+        let incoming = self
+            .session
+            .query_unpaged(
+                format!(
+                    "SELECT src_task_id, link_type, dst_task_id FROM agent_memory.task_links \
+                     WHERE tenant_id={TENANT_ID}"
+                ),
+                (),
+            )
+            .await
+            .context("reading reverse task links")?;
+        let columns = column_index(&incoming);
+        for row in incoming.rows_or_empty() {
+            let (Some(src), Some(kind), Some(dst)) = (
+                text_at(&row, &columns, "src_task_id"),
+                text_at(&row, &columns, "link_type"),
+                text_at(&row, &columns, "dst_task_id"),
+            ) else {
+                continue;
+            };
+            if dst == task_id {
+                related.push((format!("{kind} of"), src));
+            }
+        }
+
+        let mut resolved = Vec::new();
+        for (kind, id) in related {
+            if let Ok(Some(detail)) = self.detail(&id).await {
+                resolved.push((kind, detail.task));
+            }
+        }
+        Ok(resolved)
+    }
+
+    /// Everything related to a task: what links to it, and what talks about it.
+    ///
+    /// Explicit links first, because someone stated them. Then tasks that
+    /// mention this task's id, then tasks that mention the same identifiers it
+    /// does — which is how the cross-referencing here is actually done. On the
+    /// live board the first two are frequently empty and the third is not: one
+    /// blocked task named QA-0009 in its title and ten other tasks turned out
+    /// to be about the same thing, several of them duplicates of each other.
+    ///
+    /// Bounded, and deduplicated by task, so a task related three ways appears
+    /// once with the strongest reason.
+    pub async fn related_to(&self, task_id: &str, limit: usize) -> Result<Vec<Related>> {
+        let Some(detail) = self.detail(task_id).await? else {
+            return Ok(Vec::new());
+        };
+
+        let mut out: Vec<Related> = Vec::new();
+        let mut seen: std::collections::HashSet<String> =
+            std::collections::HashSet::from([task_id.to_owned()]);
+
+        for (kind, task) in self.links_of(task_id).await.unwrap_or_default() {
+            if seen.insert(task.id.clone()) {
+                out.push(Related { reason: kind, task });
+            }
+        }
+
+        for task in self.mentions_of(task_id, limit).await.unwrap_or_default() {
+            if seen.insert(task.id.clone()) {
+                out.push(Related {
+                    reason: "refers to this".to_owned(),
+                    task,
+                });
+            }
+        }
+
+        // Identifiers this task names, from its title and its block reason —
+        // not its whole body. A body quotes ids in passing; a title and a
+        // blocking reason name the thing the task is ABOUT.
+        let named = identifiers_in(&format!(
+            "{} {}",
+            detail.task.title,
+            detail.task.block_reason.clone().unwrap_or_default()
+        ));
+        for token in named {
+            if out.len() >= limit {
+                break;
+            }
+            for task in self.mentions_of(&token, limit).await.unwrap_or_default() {
+                if out.len() >= limit {
+                    break;
+                }
+                if seen.insert(task.id.clone()) {
+                    out.push(Related {
+                        reason: format!("mentions {token}"),
+                        task,
+                    });
+                }
+            }
+        }
+        out.truncate(limit);
+        Ok(out)
     }
 
     /// A task's comments, oldest first.
@@ -700,5 +987,66 @@ mod tests {
             order.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
             vec!["high", "low"]
         );
+    }
+}
+
+/// Milliseconds since the epoch, as the board stores timestamps.
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod identifier_tests {
+    use super::identifiers_in;
+
+    /// The two shapes work actually cross-references by.
+    #[test]
+    fn board_ids_and_ticket_ids_are_found() {
+        let found = identifiers_in("Decide QA-0009 before t_393bc64e, see MAAS-T-35");
+        assert!(found.contains(&"QA-0009".to_owned()));
+        assert!(found.contains(&"t_393bc64e".to_owned()));
+        assert!(found.contains(&"MAAS-T-35".to_owned()));
+    }
+
+    /// Ordinary prose is not an identifier. A related list built from words is
+    /// a list of everything.
+    #[test]
+    fn prose_is_not_an_identifier() {
+        let found = identifiers_in(
+            "Fix the entity_type example in the onboarding docs, it is wrong and \
+             blocks the release",
+        );
+        assert!(found.is_empty(), "matched prose: {found:?}");
+    }
+
+    /// A hyphenated lowercase word is not a ticket. `well-known` and `QA-0009`
+    /// differ by case and by ending in a digit, and both tests matter.
+    #[test]
+    fn hyphenated_words_are_not_tickets() {
+        assert!(identifiers_in("a well-known follow-up").is_empty());
+        assert!(identifiers_in("ferrosa-memory").is_empty());
+    }
+
+    /// A version number is not a ticket either.
+    #[test]
+    fn versions_are_not_tickets() {
+        assert!(identifiers_in("upgrade to 1-2-3").is_empty());
+    }
+
+    /// Each identifier once, however often it is written.
+    #[test]
+    fn repeats_collapse() {
+        let found = identifiers_in("QA-0009 and QA-0009 again, QA-0009");
+        assert_eq!(found, vec!["QA-0009".to_owned()]);
+    }
+
+    /// A truncated id is not followed. Four characters of hex matches half the
+    /// board.
+    #[test]
+    fn a_short_token_is_not_an_id() {
+        assert!(identifiers_in("t_39").is_empty());
     }
 }

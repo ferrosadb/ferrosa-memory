@@ -188,3 +188,27 @@ async fn an_id_matching_nothing_finds_nothing() {
         .expect("searches");
     assert!(none.is_empty());
 }
+
+/// Diagnostic: what does the board know about QA-0009 and t_393bc64e?
+#[tokio::test]
+#[ignore = "needs the live task board"]
+async fn report_what_links_to_a_task() {
+    let board = TaskBoard::connect(&contact_points())
+        .await
+        .expect("connects to the board");
+    let mentions = board.mentions_of("QA-0009", 10).await.expect("searches");
+    println!("REPORT QA-0009 is mentioned by {} task(s)", mentions.len());
+    for task in &mentions {
+        println!("    {} [{}] {}", task.id, task.status, task.title);
+    }
+    let back = board.mentions_of("t_393bc64e", 10).await.expect("searches");
+    println!("REPORT t_393bc64e is mentioned by {} task(s)", back.len());
+    for task in &back {
+        println!("    {} [{}] {}", task.id, task.status, task.title);
+    }
+    let links = board.links_of("t_393bc64e").await.expect("links");
+    println!("REPORT t_393bc64e has {} explicit link(s)", links.len());
+    for (kind, task) in &links {
+        println!("    {kind}: {} {}", task.id, task.title);
+    }
+}
