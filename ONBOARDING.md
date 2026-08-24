@@ -65,14 +65,14 @@ Choose one setup path. Do not mix the hosted bootstrap command with a source che
 Use the hosted bootstrap for the fastest single-user setup on a machine without an existing checkout. The script is published from `ferrosadb.com`; it is **not** a file that should already exist in this repository checkout. It installs the prebuilt binaries, downloads this onboarding file, **installs the LLM-harness hooks** (session-start / recall / turn-finalization), optionally clones or updates the public repos, offers to pull the Nomic embedding model, and then hands the user to the selected LLM harness for the `onboard me` flow:
 
 ```bash
-curl -fsSL https://ferrosadb.com/setup-memory.sh | bash
+curl -fsSL https://www.ferrosa.ai/setup-memory.sh | bash
 ```
 
 The hosted `setup-memory.sh` uses this `ONBOARDING.md` as its source of truth for skills, hints, hooks, prompts, runtime choices, credentials, and ports. It does **not** require cloning either repo: hook installation works without a checkout by fetching the self-contained hook installer pinned to the release tag. Useful flags: `--no-clone` (skip the source checkout), `--harness auto|all|codex|claude|hermes|pi|generic`, `--mcp-url <url>`, `--no-hooks` (skip hook install), `--no-nomic`, `--no-hermes`.
 
 Supported harnesses: **Codex**, **Claude** (Desktop/Code), **Hermes**, and **Pi** ([pi.dev](https://pi.dev)). `--harness auto` detects which are installed and wires each. Codex/Claude/Hermes integrate by patching their hook config files; **Pi** has no hook-config file — instead the installer drops a self-loading TypeScript extension at `~/.pi/agent/extensions/ferrosa-memory.ts` that calls the same recall/ingest hooks on Pi's `before_agent_start` and `agent_end` lifecycle events. Remove it (or run `--no-hooks`) to disable.
 
-> Note: there are **two** scripts named `setup.sh`. The hosted `https://ferrosadb.com/setup.sh` installs only the **Ferrosa database** binary. The repo-local `./setup.sh` (below) is the **contributor** harness installer and exists only inside a source checkout. The hosted `setup-memory.sh` is what end users run; it does not depend on the repo-local `./setup.sh`.
+> Note: there are **two** scripts named `setup.sh`. The hosted `https://www.ferrosa.ai/setup.sh` installs only the **Ferrosa database** binary. The repo-local `./setup.sh` (below) is the **contributor** harness installer and exists only inside a source checkout. The hosted `setup-memory.sh` is what end users run; it does not depend on the repo-local `./setup.sh`.
 
 ### Source checkout setup
 
@@ -179,8 +179,8 @@ script installs the binary **and** the harness hooks without a checkout
 (`--no-clone` skips only the optional source clone, not the hooks):
 
 ```bash
-curl -fsSL https://ferrosadb.com/setup.sh | bash -s -- --no-service --no-password
-curl -fsSL https://ferrosadb.com/setup-memory.sh | bash -s -- --no-clone --no-nomic --no-hermes
+curl -fsSL https://www.ferrosa.ai/setup.sh | bash -s -- --no-service --no-password
+curl -fsSL https://www.ferrosa.ai/setup-memory.sh | bash -s -- --no-clone --no-nomic --no-hermes
 ```
 
 To (re)install the harness hooks by themselves — e.g. after switching harnesses
@@ -190,7 +190,7 @@ reference the turn hook by path, so it must live somewhere stable) pinned to
 your installed version `$VER`:
 
 ```bash
-VER=$(curl -fsSL https://ferrosadb.com/LATEST | tr -d '[:space:]')
+VER=$(curl -fsSL https://www.ferrosa.ai/LATEST | tr -d '[:space:]')
 RAW="https://raw.githubusercontent.com/ferrosadb/ferrosa-memory/${VER}"
 DEST="$HOME/.ferrosa/share/ferrosa-memory"
 mkdir -p "$DEST/scripts/hooks"

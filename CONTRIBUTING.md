@@ -19,7 +19,7 @@ Participation is conditioned on adherence to its terms.
 - Rust stable (current: see `rust-toolchain.toml` if present)
 - A POSIX-ish environment (Linux, macOS)
 - Optional: a running Ferrosa instance for integration tests
-  (`curl -fsSL https://ferrosadb.com/install.sh | bash` to get one locally)
+  (`curl -fsSL https://www.ferrosa.ai/install.sh | bash` to get one locally)
 
 ### Building
 
