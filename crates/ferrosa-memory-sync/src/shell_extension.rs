@@ -138,13 +138,16 @@ impl ShellExtension {
             .iter()
             .position(|config| config.id == id)
             .ok_or_else(|| "no config with that id".to_owned())?;
+        // An ABSENT working_dir means "leave it alone"; an EMPTY one means "use
+        // the machine's workspace". A client too old to know about the field
+        // sends neither, and treating that as a clear would silently move an
+        // agent to a different directory the next time anyone renamed it.
+        let working_dir = match body.get("working_dir").and_then(serde_json::Value::as_str) {
+            Some(dir) => dir,
+            None => configs[position].working_dir.as_deref().unwrap_or(""),
+        };
         let updated = configs[position]
-            .edited(
-                name,
-                kind,
-                command,
-                body.get("working_dir").and_then(serde_json::Value::as_str),
-            )
+            .edited(name, kind, command, Some(working_dir))
             .map_err(|error| error.to_string())?;
         let was_running = self.runtime.is_running(&configs[position]).await;
         configs[position] = updated;
@@ -751,6 +754,64 @@ mod tests {
 
     fn store() -> PathBuf {
         std::env::temp_dir().join(format!("ferrosa-configs-{}.json", uuid::Uuid::now_v7()))
+    }
+
+    /// Editing an agent from a client too old to know about working
+    /// directories must not move that agent somewhere else.
+    ///
+    /// The old client sends no `working_dir` at all. Reading that as "clear it"
+    /// would relocate the agent to the machine's workspace the next time anyone
+    /// renamed it, with nothing in the frame saying so.
+    #[test]
+    fn an_absent_working_dir_on_edit_leaves_the_directory_alone() {
+        let dir = std::env::temp_dir();
+        let original = SessionConfig::create(
+            "agent",
+            "tmux",
+            vec!["codex".into()],
+            Some(&dir.to_string_lossy()),
+        )
+        .expect("valid");
+        assert!(
+            original.working_dir.is_some(),
+            "fixture must set a directory"
+        );
+
+        // What an old client sends: everything except working_dir.
+        let body = serde_json::json!({
+            "config_id": original.id.to_string(),
+            "name": "renamed",
+            "kind": "tmux",
+            "command": ["codex"],
+        });
+        let carried = match body.get("working_dir").and_then(serde_json::Value::as_str) {
+            Some(dir) => dir,
+            None => original.working_dir.as_deref().unwrap_or(""),
+        };
+        let edited = original
+            .edited("renamed", "tmux", vec!["codex".into()], Some(carried))
+            .expect("valid");
+
+        assert_eq!(edited.working_dir, original.working_dir);
+        assert_eq!(edited.name, "renamed", "the rename must still apply");
+    }
+
+    /// An EMPTY working_dir is a deliberate "use the machine's workspace",
+    /// which absent is not. The two must stay distinguishable.
+    #[test]
+    fn an_empty_working_dir_on_edit_clears_it() {
+        let dir = std::env::temp_dir();
+        let original = SessionConfig::create(
+            "agent",
+            "tmux",
+            vec!["codex".into()],
+            Some(&dir.to_string_lossy()),
+        )
+        .expect("valid");
+        let edited = original
+            .edited("agent", "tmux", vec!["codex".into()], Some(""))
+            .expect("valid");
+        assert_eq!(edited.working_dir, None);
     }
 
     /// A first run has no store, and must start rather than refuse.
