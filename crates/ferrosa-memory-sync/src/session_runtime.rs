@@ -446,6 +446,12 @@ impl SessionRuntime {
         }
     }
 
+    /// Which tmux this runtime drives, for callers that need to ask it
+    /// something this type does not wrap.
+    pub fn tmux_binary(&self) -> &std::path::Path {
+        &self.tmux_binary
+    }
+
     /// Open a session for this config, rejoining a tmux one if it is running.
     pub async fn open(&self, config: &SessionConfig) -> Result<RunningSession, SessionError> {
         match config.kind {
@@ -484,7 +490,14 @@ impl SessionRuntime {
     ///
     /// Returns `None` when the session is gone or has printed nothing, which
     /// the caller must render as "no output yet" rather than as silence.
-    pub async fn last_line(&self, config: &SessionConfig) -> Option<String> {
+    /// The pane as it currently reads, whole.
+    ///
+    /// The caller diffs it. "The last non-empty line" was the previous answer
+    /// and it is wrong for exactly the programs this is for: a full-screen TUI
+    /// redraws in place and ends with a STATIC footer — codex sits on
+    /// `gpt-5.6-sol high · /` forever — so the last line never changed, no
+    /// delta was ever sent, and a session doing real work looked asleep.
+    pub async fn pane_text(&self, config: &SessionConfig) -> Option<String> {
         if config.kind != SessionKind::Tmux {
             return None;
         }
@@ -498,22 +511,7 @@ impl SessionRuntime {
         if !output.status.success() {
             return None;
         }
-        // Trailing blanks are most of a pane. The last line with anything on it
-        // is the one that says what is happening.
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .rev()
-            .map(str::trim_end)
-            .find(|line| !line.trim().is_empty())
-            .map(|line| {
-                // Bounded: a status line is glanced at, and a pane can hold a
-                // very long one. Truncating here keeps the frame small too.
-                let mut text = line.trim().to_owned();
-                if text.chars().count() > STATUS_LINE_CHARS {
-                    text = text.chars().take(STATUS_LINE_CHARS).collect::<String>() + "…";
-                }
-                text
-            })
+        Some(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     fn open_pty(&self, config: &SessionConfig) -> Result<RunningSession, SessionError> {
@@ -933,4 +931,248 @@ fn tmux_number(target: &str, format: &str) -> Option<u64> {
         return None;
     }
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+/// Watches one pane and reports what it SAID, not what it redrew.
+///
+/// # Three rules, and the first two were wrong against real panes
+///
+/// "The last non-empty line": a full-screen TUI ends every frame with a static
+/// footer — codex sits on `gpt-5.6-sol high · /` forever — so the answer never
+/// changed, no delta was sent, and a session doing real work looked asleep.
+///
+/// "The last line that CHANGED": better for codex, wrong for Claude, whose
+/// status line carries a spinner, a token count and an elapsed timer. It
+/// changes every tick and sits at the bottom, so it won every time.
+///
+/// "The last CHANGED row that does not change too often": measured churn per
+/// row index. Watching the live panes killed it — a transcript that scrolls
+/// moves the spinner between row indices, so no index accumulates the churn
+/// that would mark it as chrome, and the reported line was
+/// `✽ Canoodling… (4m 34s · ↓ 19.3k tokens)`.
+///
+/// # What actually separates speech from chrome
+///
+/// Speech STAYS. A model writes a line and it remains on screen; a spinner
+/// writes a line that is gone next tick, because the glyph or the elapsed time
+/// has moved on. So a line is reported when it is present now, was present on
+/// the previous reading, and was absent on the one before that — new, and
+/// still there.
+///
+/// Content-based rather than position-based, so scrolling does not confuse it.
+/// It costs one tick of delay, which at a three-second pump nobody can see.
+pub struct PaneWatcher {
+    /// Non-empty lines from the previous reading, and the one before it.
+    previous: Option<std::collections::HashSet<String>>,
+    before: Option<std::collections::HashSet<String>>,
+    /// The last thing reported, so the same line is not reported twice as it
+    /// scrolls up the pane.
+    said: Option<String>,
+}
+
+impl Default for PaneWatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PaneWatcher {
+    pub fn new() -> Self {
+        Self {
+            previous: None,
+            before: None,
+            said: None,
+        }
+    }
+
+    /// Take a reading. `None` when nothing worth saying appeared.
+    pub fn observe(&mut self, pane: &str) -> Option<String> {
+        let lines: Vec<String> = pane
+            .lines()
+            .map(|line| line.trim().to_owned())
+            .filter(|line| !line.is_empty())
+            .collect();
+        let now: std::collections::HashSet<String> = lines.iter().cloned().collect();
+
+        let chosen = match (&self.previous, &self.before) {
+            // The first reading only PRIMES. It has nothing to compare
+            // against, so "the last non-empty line" is the only answer
+            // available — and that is the footer, which is the very thing this
+            // exists to stop reporting. One tick later there is a real answer.
+            (None, _) => None,
+            // The second reading primes too. "Anything that survived the
+            // first reading" sounds like it excludes spinners, and it does —
+            // but the footer and the input box survive as well, so it reports
+            // exactly the chrome this exists to suppress. Two readings of
+            // history are needed to say "new AND stayed", so two readings is
+            // what it waits for.
+            (Some(_), None) => None,
+            (Some(previous), Some(before)) => lines
+                .iter()
+                .rev()
+                // Present now AND on the last reading: it stayed, so it is not
+                // a spinner frame.
+                .filter(|line| previous.contains(*line))
+                // Absent two readings ago: it is new, so it is not the static
+                // footer or the input box.
+                .find(|line| !before.contains(*line))
+                .cloned(),
+        };
+
+        self.before = self.previous.take();
+        self.previous = Some(now);
+
+        // Not the same thing twice. A line scrolling up the pane is still the
+        // line already reported.
+        match chosen {
+            Some(line) if self.said.as_ref() != Some(&line) => {
+                let mut text = line;
+                if text.chars().count() > STATUS_LINE_CHARS {
+                    text = text.chars().take(STATUS_LINE_CHARS).collect::<String>() + "…";
+                }
+                self.said = Some(text.clone());
+                Some(text)
+            }
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::PaneWatcher;
+
+    /// Feed a watcher several readings and collect what it reported.
+    fn watch(panes: &[&str]) -> Vec<String> {
+        let mut watcher = PaneWatcher::new();
+        panes
+            .iter()
+            .filter_map(|pane| watcher.observe(pane))
+            .collect()
+    }
+
+    /// Failure one: a TUI whose last line is a static footer.
+    ///
+    /// codex ends every frame with the same model line, so "the last non-empty
+    /// line" returned that forever and the roster showed nothing happening.
+    #[test]
+    fn a_static_footer_does_not_hide_the_work_above_it() {
+        let said = watch(&[
+            "reading files\ngpt-5.6-sol high · /",
+            "reading files\ngpt-5.6-sol high · /",
+            "writing the patch\ngpt-5.6-sol high · /",
+            "writing the patch\ngpt-5.6-sol high · /",
+        ]);
+        assert!(
+            said.contains(&"writing the patch".to_owned()),
+            "never reported the work: {said:?}"
+        );
+        assert!(
+            !said.iter().any(|line| line.contains("gpt-5.6-sol")),
+            "reported the footer: {said:?}"
+        );
+    }
+
+    /// Failure two and three, from the live panes: Claude's status line
+    /// changes every tick AND moves between rows as the transcript scrolls, so
+    /// neither "last changed row" nor per-row churn suppressed it. The reported
+    /// line was `✽ Canoodling… (4m 34s · ↓ 19.3k tokens)`.
+    #[test]
+    fn a_ticking_spinner_is_never_reported() {
+        let said = watch(&[
+            "the model is thinking\n✻ Canoodling… (4m 31s · ↓ 19.0k tokens)\n⏵⏵ bypass permissions on",
+            "the model is thinking\n· Canoodling… (4m 33s · ↓ 19.0k tokens)\n⏵⏵ bypass permissions on",
+            "the model is thinking\n✽ Canoodling… (4m 34s · ↓ 19.3k tokens)\n⏵⏵ bypass permissions on",
+            "the model is thinking\n✻ Canoodling… (4m 36s · ↓ 19.6k tokens)\n⏵⏵ bypass permissions on",
+        ]);
+        assert!(
+            !said.iter().any(|line| line.contains("Canoodling")),
+            "reported the spinner: {said:?}"
+        );
+    }
+
+    /// And what the model actually says IS reported, from among the same
+    /// churning chrome.
+    #[test]
+    fn what_the_model_says_is_reported_despite_the_spinner() {
+        let said = watch(&[
+            "thinking\n✻ Canoodling… (1s)\n⏵⏵ bypass permissions on",
+            "thinking\n· Canoodling… (2s)\n⏵⏵ bypass permissions on",
+            "thinking\nhere is the plan for the schema\n✽ Canoodling… (3s)\n⏵⏵ bypass permissions on",
+            "thinking\nhere is the plan for the schema\n✻ Canoodling… (4s)\n⏵⏵ bypass permissions on",
+        ]);
+        assert!(
+            said.contains(&"here is the plan for the schema".to_owned()),
+            "did not report what the model said: {said:?}"
+        );
+    }
+
+    /// A static input box is not news either, however permanent it looks.
+    #[test]
+    fn a_static_prompt_is_not_reported_twice() {
+        let pane = "Ask Codex to do anything\ngpt-5.6-sol high · /";
+        let said = watch(&[pane, pane, pane, pane]);
+        assert!(said.len() <= 1, "repeated a static pane: {said:?}");
+    }
+
+    /// The first reading only primes; the second speaks.
+    ///
+    /// The first has nothing to compare against, so its only possible answer is
+    /// the last non-empty line — which is the footer, the thing this exists to
+    /// stop reporting. One tick of the pump later there is a real answer, and a
+    /// roster row reading "started — no output yet" for three seconds is true
+    /// rather than wrong.
+    #[test]
+    fn the_first_two_readings_prime_and_the_third_speaks() {
+        let pane = "starting up\ncompiling";
+        assert!(
+            watch(&[pane]).is_empty(),
+            "the first reading must not guess"
+        );
+        assert!(
+            watch(&[pane, pane]).is_empty(),
+            "the second cannot tell a footer from a fact either"
+        );
+        // A third reading with something NEW in it. A pane that has not moved
+        // in three readings has nothing to say, and the waiting flag is what
+        // covers that case.
+        assert_eq!(
+            watch(&[
+                pane,
+                pane,
+                "starting up\ncompiling\nlinking",
+                "starting up\ncompiling\nlinking"
+            ]),
+            vec!["linking".to_owned()]
+        );
+    }
+
+    /// The same line is not reported again as it scrolls up the pane.
+    #[test]
+    fn a_line_scrolling_upward_is_reported_once() {
+        let said = watch(&[
+            "a\nb",
+            "a\nb\nDONE",
+            "a\nb\nDONE",
+            "b\nDONE\nc",
+            "DONE\nc\nd",
+        ]);
+        assert_eq!(
+            said.iter().filter(|line| *line == "DONE").count(),
+            1,
+            "reported the same line more than once: {said:?}"
+        );
+    }
+
+    /// Long lines are cut, because the roster shows one row.
+    #[test]
+    fn a_very_long_line_is_truncated() {
+        let long = "x".repeat(500);
+        let filler = "priming";
+        let combined = format!("{filler}\n{long}");
+        let said = watch(&[filler, filler, &combined, &combined]);
+        let reported = said.first().expect("a line");
+        assert!(reported.chars().count() <= super::STATUS_LINE_CHARS + 1);
+        assert!(reported.ends_with('…'));
+    }
 }

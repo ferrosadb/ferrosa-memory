@@ -722,3 +722,106 @@ async fn an_ephemeral_session_cannot_be_captured() {
         .expect("opens");
     assert!(running.capture_scrollback().is_err());
 }
+
+/// Diagnostic: what the watcher reports for the machine's REAL sessions.
+///
+/// The two rules before this looked right in isolation and were wrong against
+/// live panes — a static footer for codex, a ticking status line for Claude.
+/// This watches the actual sessions for twelve seconds each.
+#[tokio::test]
+#[ignore = "needs the operator's live tmux sessions"]
+async fn report_what_the_watcher_says() {
+    use ferrosa_memory_sync::session_runtime::PaneWatcher;
+
+    let listed = std::process::Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+        .expect("tmux ls");
+    let names: Vec<String> = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .filter(|name| name.starts_with("ferrosa-session-"))
+        .map(str::to_owned)
+        .collect();
+
+    for name in names.iter().take(4) {
+        let mut watcher = PaneWatcher::new();
+        let mut said = Vec::new();
+        for _ in 0..10 {
+            let pane = std::process::Command::new("tmux")
+                .args(["capture-pane", "-p", "-t", name])
+                .output()
+                .expect("capture");
+            let text = String::from_utf8_lossy(&pane.stdout).into_owned();
+            if let Some(line) = watcher.observe(&text) {
+                said.push(line);
+            }
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+        }
+        println!("REPORT {name}");
+        if said.is_empty() {
+            println!("        (nothing said in 12s)");
+        }
+        for line in said.iter().rev().take(4) {
+            println!("        {line}");
+        }
+    }
+}
+
+/// The positive control for the pane watcher.
+///
+/// The diagnostic against the operator's real sessions reports "nothing said"
+/// when they are idle, which is correct and proves nothing. This drives a pane
+/// that DOES print, alongside a spinner that changes every tick, and requires
+/// the printed line and not the spinner.
+#[tokio::test]
+#[ignore = "needs a real tmux"]
+async fn a_line_a_program_prints_reaches_the_watcher() {
+    use ferrosa_memory_sync::session_runtime::PaneWatcher;
+
+    let config = SessionConfig::create(
+        "watcher-control",
+        "tmux",
+        vec![
+            "sh".into(),
+            "-c".into(),
+            // A spinner that redraws every 0.2s, and one real line printed
+            // after two seconds — the shape of every harness this watches.
+            "i=0; while :; do \
+               i=$((i+1)); \
+               printf '\\r* thinking (%ss)' \"$i\"; \
+               if [ $i -eq 10 ]; then printf '\\nHERE-IS-THE-ANSWER\\n'; fi; \
+               sleep 0.2; \
+             done"
+                .into(),
+        ],
+        None,
+    )
+    .expect("valid config");
+
+    let runtime = SessionRuntime::new(std::env::temp_dir());
+    let _running = runtime.open(&config).await.expect("opens");
+
+    let mut watcher = PaneWatcher::new();
+    let mut said: Vec<String> = Vec::new();
+    for _ in 0..14 {
+        if let Some(pane) = runtime.pane_text(&config).await
+            && let Some(line) = watcher.observe(&pane)
+        {
+            said.push(line);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let _ = std::process::Command::new("tmux")
+        .args(["kill-session", "-t", &config.tmux_session_name()])
+        .status();
+
+    assert!(
+        said.iter().any(|line| line.contains("HERE-IS-THE-ANSWER")),
+        "the watcher never reported the printed line; it said: {said:?}"
+    );
+    assert!(
+        !said.iter().any(|line| line.contains("thinking")),
+        "the watcher reported the spinner: {said:?}"
+    );
+}

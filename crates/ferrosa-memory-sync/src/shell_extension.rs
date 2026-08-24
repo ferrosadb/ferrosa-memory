@@ -720,6 +720,14 @@ impl ShellExtension {
 /// pieces.
 const MAX_OUTPUT_BYTES_PER_FRAME: usize = 512;
 
+/// How long a running job must be still before it counts as waiting.
+///
+/// Forty-five seconds. Long enough that a compile or a long think is not
+/// mistaken for a question, short enough that an agent stuck on a prompt is
+/// noticed while the operator still remembers asking. An agent that is genuinely
+/// working prints something well inside this.
+const QUIET_SECONDS: u64 = 45;
+
 /// How many tasks travel in one frame.
 ///
 /// Three. A fat task row — long title, long path, a block reason — runs about
@@ -761,27 +769,7 @@ const MAX_TASKS_SENT: usize = 200;
 const STATUS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Tell the device what every job is doing, until the control session ends.
-/// What a job looked like on the last tick, so the next can send only changes.
-type JobSnapshot = std::collections::HashMap<uuid::Uuid, (bool, Option<String>)>;
-
-/// Read every job's current state.
-async fn read_status(configs: &Mutex<Vec<SessionConfig>>, runtime: &SessionRuntime) -> JobSnapshot {
-    let snapshot = configs.lock().await.clone();
-    let mut out = JobSnapshot::with_capacity(snapshot.len());
-    for config in &snapshot {
-        let running = runtime.is_running(config).await;
-        // Absent rather than empty when there is nothing yet: the device says
-        // "no output yet" instead of rendering silence as a blank line.
-        let line = if running {
-            runtime.last_line(config).await
-        } else {
-            None
-        };
-        out.insert(config.id, (running, line));
-    }
-    out
-}
-
+///
 /// Tell the device what changed, and when.
 ///
 /// A DELTA, not a snapshot. Two reasons, and the second is the important one:
@@ -801,35 +789,142 @@ async fn pump_status(
     runtime: Arc<SessionRuntime>,
     session: SessionHandle,
 ) {
-    let mut previous: Option<JobSnapshot> = None;
+    // One watcher per job. It holds the previous pane AND how often each row
+    // changes, which is how a spinner is told apart from something said.
+    let mut watchers: HashMap<uuid::Uuid, crate::session_runtime::PaneWatcher> = HashMap::new();
+    // When each job last moved, so one that has gone quiet can be noticed.
+    let mut last_moved: HashMap<uuid::Uuid, u64> = HashMap::new();
+    // Jobs already reported as waiting, so it is said once and not every tick.
+    let mut announced: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
+    let mut first = true;
+    // Which pids belong to which job. Resolved once per job and kept, because
+    // walking a process tree is several spawns and a pane's harness does not
+    // change pid while it runs.
+    let mut pids: HashMap<uuid::Uuid, Vec<u32>> = HashMap::new();
 
     loop {
-        let current = read_status(&configs, &runtime).await;
+        // One call for every job, not one per job. A harness that reports its
+        // own state is believed over anything read off the screen — see
+        // `harness_state`.
+        let reported = crate::harness_state::claude_agents().await;
         let at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|since| since.as_secs())
             .unwrap_or(0);
 
-        let changed: Vec<_> = current
-            .iter()
-            .filter(|(id, now)| {
-                previous
-                    .as_ref()
-                    .is_none_or(|was| was.get(*id) != Some(now))
-            })
-            .map(|(id, (running, line))| {
-                serde_json::json!({
-                    "id": id.to_string(),
-                    "running": running,
+        let snapshot: Vec<SessionConfig> = configs.lock().await.clone();
+        let mut jobs = Vec::new();
+        for config in &snapshot {
+            let running = runtime.is_running(config).await;
+            if !running {
+                if watchers.remove(&config.id).is_some() {
+                    // It was running and is not. That IS news.
+                    jobs.push(serde_json::json!({
+                        "id": config.id.to_string(),
+                        "running": false,
+                        "changed_at": at,
+                    }));
+                }
+                last_moved.remove(&config.id);
+                announced.remove(&config.id);
+                pids.remove(&config.id);
+                continue;
+            }
+
+            // What the harness says about ITSELF, if it says anything.
+            let owned = match pids.get(&config.id) {
+                Some(known) => known.clone(),
+                None => {
+                    let found = crate::harness_state::pane_process_tree(
+                        runtime.tmux_binary(),
+                        &config.tmux_session_name(),
+                    )
+                    .await;
+                    pids.insert(config.id, found.clone());
+                    found
+                }
+            };
+            let says = owned.iter().find_map(|pid| reported.get(pid).copied());
+
+            let Some(pane) = runtime.pane_text(config).await else {
+                continue;
+            };
+            let moved = watchers.entry(config.id).or_default().observe(&pane);
+
+            // A harness that reports itself waiting is waiting, now — no quiet
+            // timer, no guessing. This is the case the whole pane-watching
+            // exercise could not reach: a pane waiting for input looks exactly
+            // like a pane thinking.
+            if says == Some(crate::harness_state::HarnessState::Waiting) {
+                if announced.insert(config.id) {
+                    jobs.push(serde_json::json!({
+                        "id": config.id.to_string(),
+                        "running": true,
+                        "waiting": true,
+                        "said_so": true,
+                        "changed_at": at,
+                    }));
+                }
+                if let Some(line) = moved {
+                    last_moved.insert(config.id, at);
+                    jobs.push(serde_json::json!({
+                        "id": config.id.to_string(),
+                        "running": true,
+                        "last_line": line,
+                        "changed_at": at,
+                    }));
+                }
+                continue;
+            }
+            if says == Some(crate::harness_state::HarnessState::Busy) {
+                // Working, whatever the screen looks like. Clearing the
+                // announcement here is what lets a second wait be reported
+                // after the operator answers the first.
+                announced.remove(&config.id);
+                last_moved.insert(config.id, at);
+            }
+
+            if let Some(line) = moved {
+                last_moved.insert(config.id, at);
+                announced.remove(&config.id);
+                jobs.push(serde_json::json!({
+                    "id": config.id.to_string(),
+                    "running": true,
                     "last_line": line,
                     "changed_at": at,
-                })
-            })
-            .collect();
+                }));
+            } else if first {
+                // Nothing has moved yet and this is the first look. Say it is
+                // up, so a job started before the app connected is not missing
+                // from the roster until it happens to print something.
+                jobs.push(serde_json::json!({
+                    "id": config.id.to_string(),
+                    "running": true,
+                    "changed_at": at,
+                }));
+            } else if says.is_none()
+                && let Some(since) = last_moved.get(&config.id)
+                && at.saturating_sub(*since) >= QUIET_SECONDS
+                && announced.insert(config.id)
+            {
+                // Only for a harness that does NOT report itself — codex has no
+                // equivalent of `claude agents`. Moved, then stopped, is a
+                // guess; it is a decent one for an interactive harness, and it
+                // is marked as a guess so the screen can word it differently.
+                jobs.push(serde_json::json!({
+                    "id": config.id.to_string(),
+                    "running": true,
+                    "waiting": true,
+                    "said_so": false,
+                    "quiet_for": at.saturating_sub(*since),
+                    "changed_at": at,
+                }));
+            }
+        }
 
         // Nothing moved. Say nothing — a tick that sends an empty list every
         // three seconds is a heartbeat pretending to be news.
-        if !changed.is_empty() {
+        if !jobs.is_empty() {
             let frame = serde_json::json!({
                 "version": 1,
                 "frame_id": uuid::Uuid::now_v7().to_string(),
@@ -838,8 +933,8 @@ async fn pump_status(
                     // The device clears its state on a full send; on a delta it
                     // merges. Without this a reconnect would leave stale jobs
                     // in the roster forever.
-                    "full": previous.is_none(),
-                    "jobs": changed,
+                    "full": first,
+                    "jobs": jobs,
                 },
             });
             if session.send(&frame.to_string()).await.is_err() {
@@ -848,7 +943,7 @@ async fn pump_status(
             }
         }
 
-        previous = Some(current);
+        first = false;
         tokio::time::sleep(STATUS_INTERVAL).await;
     }
 }
