@@ -281,19 +281,25 @@ impl RunningSession {
     }
 
     pub fn send(&self, text: &str) -> Result<(), SessionError> {
-        self.leave_copy_mode();
+        if is_typing(text.as_bytes()) {
+            self.leave_copy_mode();
+        }
         self.input.send(text)
     }
 
     /// Press a named key — Return on its own, Ctrl-C, an arrow.
     pub fn send_key(&self, key: NamedKey) -> Result<(), SessionError> {
-        self.leave_copy_mode();
+        if is_typing(key.bytes()) {
+            self.leave_copy_mode();
+        }
         self.input.send_key(key)
     }
 
     /// Write raw bytes from a client-side terminal emulator.
     pub fn send_bytes(&self, bytes: &[u8]) -> Result<(), SessionError> {
-        self.leave_copy_mode();
+        if is_typing(bytes) {
+            self.leave_copy_mode();
+        }
         self.input.send_bytes(bytes)
     }
 
@@ -1002,6 +1008,76 @@ fn tmux_number(target: &str, format: &str) -> Option<u64> {
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
+/// Whether these bytes are a person typing, as opposed to the terminal talking.
+///
+/// # Why this has to be told apart
+///
+/// Typing leaves tmux's copy mode, so that scrolling and then typing does what
+/// it does in every other terminal. But a terminal emulator sends input on its
+/// own account: it answers Device Attributes and cursor-position queries, and
+/// it reports focus changes. Entering copy mode makes tmux REDRAW, the redraw
+/// contains queries, and the emulator's replies arrived here as input — so copy
+/// mode was cancelled a few milliseconds after it started and scrolling
+/// appeared to jump straight back to live.
+///
+/// The distinction is not "did bytes arrive" but "did a person cause them".
+/// Escape sequences are skipped whole; what is left is what was typed. An
+/// unterminated sequence is treated as a sequence rather than as its characters
+/// — a truncated reply is still not typing.
+///
+/// Cursor keys are deliberately NOT typing. In copy mode they scroll, which is
+/// what an operator pressing them while reading history means.
+pub fn is_typing(bytes: &[u8]) -> bool {
+    const ESC: u8 = 0x1b;
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != ESC {
+            let byte = bytes[index];
+            // Anything a key produces: printable ASCII, UTF-8 text, Return,
+            // Tab, Backspace, and control bytes like Ctrl-C — all of which are
+            // deliberate presses. Only NUL is ignored, as padding.
+            if byte != 0 {
+                return true;
+            }
+            index += 1;
+            continue;
+        }
+        index += 1;
+        let Some(&next) = bytes.get(index) else {
+            // A lone ESC at the end. That IS a keypress — Escape is how a TUI
+            // is dismissed — and it is not a query reply, which always carries
+            // a body.
+            return true;
+        };
+        index += 1;
+        match next {
+            // CSI: parameters, then a final byte in @..~.
+            b'[' => {
+                while index < bytes.len() && !(0x40..=0x7e).contains(&bytes[index]) {
+                    index += 1;
+                }
+                index += 1;
+            }
+            // OSC and friends: run to BEL or ST.
+            b']' | b'P' | b'X' | b'^' | b'_' => {
+                while index < bytes.len() && bytes[index] != 0x07 {
+                    if bytes[index] == ESC && bytes.get(index + 1) == Some(&b'\\') {
+                        index += 1;
+                        break;
+                    }
+                    index += 1;
+                }
+                index += 1;
+            }
+            // Two-byte sequences: ESC O A for a cursor key in application
+            // mode, ESC = , ESC > and the rest.
+            b'O' => index += 1,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Watches one pane and reports what it SAID, not what it redrew.
 ///
 /// # Three rules, and the first two were wrong against real panes
@@ -1104,6 +1180,91 @@ impl PaneWatcher {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod typing_tests {
+    use super::is_typing;
+
+    /// The bug: entering copy mode makes tmux redraw, the redraw asks the
+    /// emulator questions, and the emulator's ANSWERS arrived as input. Treated
+    /// as typing, they cancelled copy mode milliseconds after a scroll — so
+    /// scrolling "jumped back to live".
+    #[test]
+    fn a_device_attributes_reply_is_not_typing() {
+        assert!(!is_typing(b"\x1b[?62;1;6;9;15;22c"));
+        assert!(!is_typing(b"\x1b[?1;2c"));
+    }
+
+    /// A cursor-position report is the same kind of thing.
+    #[test]
+    fn a_cursor_position_report_is_not_typing() {
+        assert!(!is_typing(b"\x1b[24;80R"));
+    }
+
+    /// So are focus events, which arrive whenever the app comes forward.
+    #[test]
+    fn focus_events_are_not_typing() {
+        assert!(!is_typing(b"\x1b[I"));
+        assert!(!is_typing(b"\x1b[O"));
+    }
+
+    /// And what a person types IS typing.
+    #[test]
+    fn characters_are_typing() {
+        assert!(is_typing(b"hello"));
+        assert!(is_typing(b"y"));
+        assert!(is_typing(" ".as_bytes()));
+        assert!(is_typing("é".as_bytes()), "UTF-8 text is typing");
+    }
+
+    /// Return is the one that matters most: it is how a waiting CLI is
+    /// answered, and it must return the pane to live.
+    #[test]
+    fn return_is_typing() {
+        assert!(is_typing(b"\r"));
+        assert!(is_typing(b"\n"));
+    }
+
+    /// Deliberate control keys count.
+    #[test]
+    fn control_keys_are_typing() {
+        assert!(is_typing(b"\x03"), "Ctrl-C");
+        assert!(is_typing(b"\x04"), "Ctrl-D");
+        assert!(is_typing(b"\t"), "Tab");
+        assert!(is_typing(b"\x7f"), "Backspace");
+        assert!(is_typing(b"\x1b"), "a lone Escape is a keypress");
+    }
+
+    /// Cursor keys are NOT, on purpose: in copy mode they scroll, which is what
+    /// pressing them while reading history means.
+    #[test]
+    fn cursor_keys_do_not_leave_copy_mode() {
+        assert!(!is_typing(b"\x1b[A"));
+        assert!(!is_typing(b"\x1b[B"));
+        assert!(!is_typing(b"\x1bOA"), "application-mode cursor key");
+    }
+
+    /// A reply arriving in the same write as a keystroke still counts as
+    /// typing — the person did type.
+    #[test]
+    fn a_keystroke_mixed_with_a_reply_is_typing() {
+        assert!(is_typing(b"\x1b[?62ca"));
+    }
+
+    /// A truncated escape sequence is still not typing. A reply split across
+    /// two writes must not be read as its characters.
+    #[test]
+    fn a_truncated_sequence_is_not_typing() {
+        assert!(!is_typing(b"\x1b[?62"));
+        assert!(!is_typing(b"\x1b]0;some title"));
+    }
+
+    #[test]
+    fn nothing_is_not_typing() {
+        assert!(!is_typing(b""));
+        assert!(!is_typing(b"\0"));
     }
 }
 

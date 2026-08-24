@@ -945,3 +945,75 @@ async fn typing_after_a_scroll_reaches_the_program() {
          control will keep claiming it"
     );
 }
+
+/// A scroll STAYS while the terminal talks back.
+///
+/// Entering copy mode makes tmux redraw, the redraw asks the emulator
+/// questions, and the emulator answers. Those answers arrive on the same input
+/// path as typing, and treating them as typing cancelled copy mode a few
+/// milliseconds after every scroll — "it jumps back to live".
+///
+/// Driven with the exact replies a terminal sends, then checked at tmux.
+#[tokio::test]
+#[ignore = "needs a real tmux"]
+async fn a_scroll_survives_the_terminal_answering_queries() {
+    let config = SessionConfig::create(
+        "scroll-stays",
+        "tmux",
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "for i in $(seq 1 300); do printf 'LINE-%04d\\n' $i; done; cat".into(),
+        ],
+        None,
+    )
+    .expect("valid config");
+
+    let running = SessionRuntime::new(std::env::temp_dir())
+        .open(&config)
+        .await
+        .expect("opens");
+    let _ = wait_for(&running, "LINE-0300", Duration::from_secs(10)).await;
+
+    running.scroll(ScrollMotion::Top).expect("scrolls");
+    assert_eq!(
+        tmux_var(&config, "#{pane_in_mode}"),
+        "1",
+        "tmux did not enter copy mode, so this test proves nothing"
+    );
+
+    // Exactly what an emulator sends unprompted: a Device Attributes reply, a
+    // cursor position report, and a focus-in.
+    for reply in [
+        &b"\x1b[?62;1;6;9;15;22c"[..],
+        &b"\x1b[24;80R"[..],
+        &b"\x1b[I"[..],
+    ] {
+        running.send_bytes(reply).expect("sends");
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let still_scrolled = tmux_var(&config, "#{pane_in_mode}");
+    let machine_thinks = running.is_scrolled();
+
+    // And a real keystroke still returns to live.
+    running.send("x").expect("types");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let after_typing = tmux_var(&config, "#{pane_in_mode}");
+
+    let _ = std::process::Command::new("tmux")
+        .args(["kill-session", "-t", &config.tmux_session_name()])
+        .status();
+
+    assert_eq!(
+        still_scrolled, "1",
+        "the terminal answering a query cancelled copy mode; scrolling will \
+         jump back to live"
+    );
+    assert!(
+        machine_thinks,
+        "the machine stopped believing the pane was scrolled, so the device's \
+         LIVE control would go quiet while the pane was still in history"
+    );
+    assert_eq!(after_typing, "0", "typing did not return the pane to live");
+}
