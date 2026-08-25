@@ -22,7 +22,7 @@ A team is a graph the user draws: agents as nodes, and edges saying when one
 agent involves another. The first team is a writing team — researcher, writer,
 reviewer — producing an agent team knowledge claim for human review.
 
-The shape of the problem forces eleven decisions before any code, because each one
+The shape of the problem forces twelve decisions before any code, because each one
 changes the schema or the trust boundary rather than the interface.
 
 ## Decision 1: The runtime lives in Ferrosa Memory
@@ -315,6 +315,40 @@ it merely stopped, that work would be sitting in the queue.
 Because kill removes something no other control removes, it confirms first and
 names what is about to be lost. Not a generic warning: the count of drafts and
 the run it belongs to.
+
+## Decision 12: Sandbox suspend is a capability, and halt inherits it
+
+A managed sandbox can often be suspended and resumed — frozen mid-execution and
+continued where it stopped. Most backends can; not all can.
+
+So suspend is **declared per backend**, exactly like the node capabilities in
+Decision 3, and for the same reason: the system must never present a guarantee
+its substrate does not provide.
+
+Halt behaves differently depending on what is underneath it:
+
+| Backend | What halt does | What resume gets |
+|---|---|---|
+| suspend-capable | freezes execution in place | the turn continues from where it stopped |
+| not suspend-capable | the turn in flight is abandoned | the turn restarts from its last durable point |
+
+The run states which it will get, before someone reaches for the control. "Halt
+will freeze this and continue" and "halt will discard the turn in progress" are
+different enough decisions that guessing is not acceptable.
+
+Two consequences worth stating:
+
+**"Halt stops the bill" is only fully true with suspend.** A suspended sandbox
+stops consuming. An abandoned turn has already spent what it spent, and
+restarting it spends again. On a backend without suspend, halt bounds future
+cost rather than eliminating it.
+
+**Resume must tolerate a world that moved on.** A sandbox frozen for an hour
+wakes with connections that have timed out, credentials that may have expired
+and a memory server that may have restarted. Resume is not "continue as though
+no time passed" — it re-establishes what it depends on and fails loudly if it
+cannot, rather than continuing against a stale handle. This is the same class of
+fault as the streamer holding peer addresses frozen at startup.
 
 ## Consequences
 

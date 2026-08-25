@@ -265,6 +265,29 @@ itself and one that looks broken.
 names one run, because a control that destroys work should never accept a
 wildcard.
 
+#### What halt can actually do depends on the sandbox
+
+A managed sandbox can often be suspended and resumed — frozen mid-execution,
+continued where it stopped. Most backends can; not all. Suspend is declared per
+backend, like every other capability, and the run says which behaviour it will
+get *before* someone reaches for the control:
+
+| Backend | Halt | Resume |
+|---|---|---|
+| suspend-capable | freezes execution in place | the turn continues from where it stopped |
+| not suspend-capable | abandons the turn in flight | the turn restarts from its last durable point |
+
+This is why "halt stops the bill" needs a qualifier. A suspended sandbox stops
+consuming; an abandoned turn has already spent what it spent, and restarting it
+spends again. Without suspend, halt bounds future cost rather than eliminating
+it.
+
+**Resume re-establishes rather than assumes.** A sandbox frozen for an hour
+wakes to timed-out connections, possibly expired credentials, and a memory
+server that may have restarted. Resume reconnects and fails loudly if it cannot,
+rather than continuing against a stale handle — the same class of fault as
+holding a peer address frozen at startup.
+
 | | Halt | Kill | Stop |
 |---|---|---|---|
 | running agents | stopped, resumable | terminated | finish, then end |
@@ -373,6 +396,8 @@ Seven tables. Names are indicative; the shapes are the commitment.
     team_control      pause, resume, stop, kill: who, when, why -- written
                       BEFORE the effect, so a restart cannot resume what a
                       person halted, and a kill leaves a record of itself
+    sandbox_backend   per backend: declared capabilities, including whether it
+                      can suspend and resume
     halt_hold         one row per active hold: scope (team/user/org), the
                       subject it covers, who set it, when, why. Execution needs
                       zero rows covering a run; release deletes one row and
@@ -412,6 +437,8 @@ Focused on what this feature introduces, not a full STRIDE pass.
 | Pause mistaken for a spend brake | Bill keeps growing while the operator believes it stopped | — | the control names what it does; `halt all` is the global brake, `stop` and interrupt the narrower ones |
 | Halt released by a restart | Everything resumes after someone halted it on purpose | — | halt is written before it acts, and release is explicit |
 | A narrow release undoes a broad hold | A user resumes work an org halted | — | holds stack and release requires authority at the hold's scope |
+| Halt assumed to freeze on a backend that cannot | Turn discarded when the operator expected it preserved | — | the run states which behaviour it will get before the control is used |
+| Resume continues against a stale handle | Silent failure against a connection that died while frozen | — | resume re-establishes dependencies and fails loudly |
 | Halted team shows no reason | Person retries a release that will refuse them | — | the hold, its scope and who set it are shown |
 | Kill leaves no trace | A killed run is indistinguishable from one that never ran | — | the record survives what kill destroys |
 | A slow node reported dead | Person restarts healthy work | — | dead is established by the runtime, never inferred from a gap in traffic |
