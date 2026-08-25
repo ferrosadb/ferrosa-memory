@@ -59,6 +59,10 @@ pub struct ShellExtension {
     /// reaching their agents. The failure then lands on the one screen that
     /// asked for it, with a reason.
     board_contact_points: Vec<String>,
+    /// Which tenant's memory to read. `None` means nobody said, and the
+    /// memory frames say so rather than reading someone else's tenant and
+    /// reporting its emptiness as this one's.
+    memory_tenant: Option<uuid::Uuid>,
     board: tokio::sync::OnceCell<Option<Arc<crate::task_board::TaskBoard>>>,
     /// The memory tiers, on the same terms as the board: connected on first
     /// use, and a cluster that is down costs one screen rather than the
@@ -81,6 +85,7 @@ impl ShellExtension {
         workspace: impl Into<PathBuf>,
         store_path: impl Into<PathBuf>,
         board_contact_points: Vec<String>,
+        memory_tenant: Option<uuid::Uuid>,
     ) -> Self {
         let store_path = store_path.into();
         let workspace = workspace.into();
@@ -90,6 +95,7 @@ impl ShellExtension {
             runtime: Arc::new(SessionRuntime::new(workspace)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             board_contact_points,
+            memory_tenant,
             board: tokio::sync::OnceCell::new(),
             memory: tokio::sync::OnceCell::new(),
         }
@@ -116,7 +122,18 @@ impl ShellExtension {
     async fn memory(&self) -> Option<Arc<crate::memory_view::MemoryView>> {
         self.memory
             .get_or_init(|| async {
-                match crate::memory_view::MemoryView::connect(&self.board_contact_points).await {
+                let Some(tenant) = self.memory_tenant else {
+                    eprintln!(
+                        "memory tiers unavailable: no tenant configured. Set \
+                         server.tenant_id in the memory config, or \
+                         FERROSA_MEMORY_TENANT_ID, to the tenant this \
+                         machine's memory is stored under."
+                    );
+                    return None;
+                };
+                match crate::memory_view::MemoryView::connect(&self.board_contact_points, tenant)
+                    .await
+                {
                     Ok(view) => Some(Arc::new(view)),
                     Err(error) => {
                         eprintln!("memory tiers unavailable: {error:#}");
@@ -133,10 +150,19 @@ impl ShellExtension {
     /// Bounded — four counts and a handful of root names — so it is one frame.
     async fn memory_tiers_frame(&self) -> serde_json::Value {
         let Some(view) = self.memory().await else {
+            // Two different failures. "Unreachable" sends an operator to the
+            // cluster; an unset tenant is a configuration answer nobody gave,
+            // and saying the wrong one costs a round of looking at a database
+            // that was fine all along.
+            let reason = if self.memory_tenant.is_none() {
+                "no memory tenant is configured on this machine"
+            } else {
+                "the memory store could not be reached"
+            };
             return serde_json::json!({
                 "type": "shell_memory_tiers",
                 "reachable": false,
-                "reason": "the memory store could not be reached",
+                "reason": reason,
                 "tiers": [],
             });
         };

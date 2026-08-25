@@ -21,6 +21,40 @@ use std::time::Duration;
 use anyhow::Context as _;
 use uuid::Uuid;
 
+/// Which tenant's memory this machine serves to a controller.
+///
+/// `server.tenant_id` first, then `FERROSA_MEMORY_TENANT_ID`, then nothing.
+///
+/// There is deliberately no fallback. The obvious one is the task board's
+/// tenant, because the board is a table on this same cluster and the listener
+/// already holds its contact points — and that is exactly what this used to
+/// do. The board's tenant is not the memory's: on the machine where this was
+/// found the board held 118 entities and no source rows, while the memory held
+/// 79,284 under a tenant derived from the authenticated principal. The tier
+/// map came back reachable, with four tiers at zero, and looked precisely like
+/// a machine nobody had seeded yet.
+///
+/// `viz.tenant_id` is NOT consulted. It is a real tenant in the config and it
+/// is a plausible-looking answer, which makes it worse than no answer: viz is
+/// the unauthenticated loopback view and on that same machine its tenant is
+/// also empty. A wrong tenant reports zeros; an absent one reports that it
+/// does not know.
+fn memory_tenant(configured: Option<&str>) -> Option<Uuid> {
+    let configured = configured
+        .map(str::to_owned)
+        .or_else(|| std::env::var("FERROSA_MEMORY_TENANT_ID").ok())?;
+    match Uuid::parse_str(configured.trim()) {
+        Ok(tenant) => Some(tenant),
+        Err(error) => {
+            // Loud, and then None. A malformed tenant is a typo in a config
+            // file, and silently continuing without one would leave the phone
+            // saying "no tenant configured" while the file plainly has one.
+            eprintln!("memory tenant {configured:?} is not a UUID: {error}");
+            None
+        }
+    }
+}
+
 /// How many control sessions one memory system serves at once.
 ///
 /// A bound, not a target. Each session is a peer connection plus a durable
@@ -286,6 +320,7 @@ pub async fn run_control_listener(
             // outstanding for the repository this agent works in" without the
             // phone needing a route to the database or a credential for it.
             memory_config.ferrosa.contact_points.clone(),
+            memory_tenant(memory_config.server.tenant_id.as_deref()),
         ),
     ));
 
@@ -859,5 +894,37 @@ mod tests {
         ];
         let (winner, _) = claim(&both, &frame("shared")).expect("claimed");
         assert!(std::sync::Arc::ptr_eq(&winner, &both[0]));
+    }
+
+    /// The regression this function exists for.
+    ///
+    /// A config with no tenant must resolve to None, NOT to the task board's
+    /// tenant. Asserting the absence is the whole point: the bug it replaces
+    /// returned a perfectly valid UUID that simply pointed somewhere else.
+    #[test]
+    fn an_unset_memory_tenant_resolves_to_nothing() {
+        // The resolver reads this variable, so a value left by the environment
+        // would decide the assertion instead of the config.
+        unsafe { std::env::remove_var("FERROSA_MEMORY_TENANT_ID") };
+        assert_eq!(memory_tenant(None), None);
+        assert_ne!(
+            memory_tenant(None),
+            Some(Uuid::from_u128(1)),
+            "the board's tenant is not a default for the memory's"
+        );
+    }
+
+    #[test]
+    fn a_configured_memory_tenant_is_used_verbatim() {
+        assert_eq!(
+            memory_tenant(Some("9a5f8fbf-d842-4d30-8ea5-1aa931e618a8")),
+            Some(Uuid::parse_str("9a5f8fbf-d842-4d30-8ea5-1aa931e618a8").unwrap())
+        );
+    }
+
+    /// A typo must not read as "nobody configured one".
+    #[test]
+    fn a_malformed_memory_tenant_is_refused_rather_than_guessed() {
+        assert_eq!(memory_tenant(Some("not-a-uuid")), None);
     }
 }

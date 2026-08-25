@@ -30,8 +30,19 @@ use ferrosa_memory_core::types::TenantContext;
 use scylla::SessionBuilder;
 use uuid::Uuid;
 
-/// The single-user tenant, matching `task_board::TENANT_ID`.
-const TENANT_ID: Uuid = Uuid::from_u128(1);
+// The tenant is a PARAMETER, not a constant.
+//
+// This read the task board's tenant (`Uuid::from_u128(1)`), because the board
+// and the memory both live on this cluster and it looked like one thing. They
+// are not one thing. On this machine the board's tenant holds 118 entities and
+// no source rows at all, while the memory holds 79,284 entities and 69,683
+// source rows under a tenant derived from the authenticated principal.
+//
+// Nothing failed. `summarise` counted the rows it was asked for, found none,
+// and the phone would have shown a reachable memory plane with four tiers at
+// zero — indistinguishable from a machine that has not been seeded. That is
+// the same mistake `seed-tiers` made when it defaulted its tenant, and the
+// same answer applies: a tenant is not something to guess.
 
 /// How many source rows one answer will read.
 ///
@@ -77,7 +88,7 @@ pub struct ItemPage {
 }
 
 impl MemoryView {
-    pub async fn connect(contact_points: &[String]) -> Result<Self> {
+    pub async fn connect(contact_points: &[String], tenant_id: Uuid) -> Result<Self> {
         if contact_points.is_empty() {
             anyhow::bail!("no contact points for the memory store");
         }
@@ -98,7 +109,7 @@ impl MemoryView {
         Ok(Self {
             store: CqlTierStore::new(Arc::new(session), "agent_memory"),
             ctx: TenantContext {
-                tenant_id: TENANT_ID,
+                tenant_id,
                 session_origin: "mobile-control".to_owned(),
             },
         })
