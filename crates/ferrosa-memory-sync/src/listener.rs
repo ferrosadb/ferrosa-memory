@@ -550,8 +550,7 @@ async fn session_work<R, T>(
     // request can build one of its own to race against.
     let request_peer_state = peer_state.clone();
     // Bounds how much database work one device can have running at once.
-    let durable_slots =
-        std::sync::Arc::new(tokio::sync::Semaphore::new(max_durable_in_flight()));
+    let durable_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(max_durable_in_flight()));
     let mut lost = std::pin::pin!(peer_lost(peer_state, PEER_DISCONNECT_GRACE));
     loop {
         let frame = tokio::select! {
