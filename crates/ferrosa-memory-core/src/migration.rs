@@ -235,6 +235,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "knowledge tiers: source provenance, root aliases, tier rules, promotions",
         ddl: include_str!("../../../ddl/054_knowledge_tiers.cql"),
     },
+    Migration {
+        version: 55,
+        description: "recency-ordered provenance by root, so a browse page is a seek",
+        ddl: include_str!("../../../ddl/055_entity_source_by_root.cql"),
+    },
 ];
 
 /// `ddl/011_warmth_field.cql` — the `entity_warmth` table + session index.

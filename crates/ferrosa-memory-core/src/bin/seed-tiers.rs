@@ -99,6 +99,7 @@ async fn main() -> Result<()> {
     let dry_run = args.iter().any(|a| a == "--dry-run");
     let backfill = args.iter().any(|a| a == "--backfill");
     let sample = args.iter().any(|a| a == "--sample");
+    let backfill_by_root = args.iter().any(|a| a == "--backfill-by-root");
 
     let Some(tenant) = tenant else {
         eprintln!("{}", tenant_help());
@@ -111,7 +112,11 @@ async fn main() -> Result<()> {
              --research-root is the absolute path of your research checkout, e.g.\n\
              /Users/you/src/research. It is required rather than guessed: a path\n\
              discovered by scanning would tier the same content differently on a\n\
-             machine with a different layout."
+             machine with a different layout.\n\
+             \n\
+             --backfill-by-root copies existing entity_source rows into the\n\
+             recency-ordered entity_source_by_root view that migration 055\n\
+             creates empty. Run it once after 055; it is idempotent."
         );
         std::process::exit(2);
     };
@@ -168,6 +173,28 @@ async fn main() -> Result<()> {
                 tier.tier.as_str(),
                 tier.reason
             );
+        }
+    }
+
+    if backfill_by_root {
+        if dry_run {
+            println!("\ndry run: not copying rows into entity_source_by_root");
+        } else {
+            println!("\ncopying entity_source into entity_source_by_root...");
+            // The bound is above the 69,683 rows this was written against, so
+            // a truncated report means the corpus outgrew it rather than that
+            // the copy is complete.
+            let report = store.backfill_by_root(&ctx, 250_000).await?;
+            println!(
+                "  examined {}, wrote {}, skipped {} with no root",
+                report.examined, report.written, report.skipped_without_root
+            );
+            if report.truncated {
+                println!(
+                    "  WARNING: the read hit its limit, so this is a PREFIX of the\n\
+                     table. Raise the bound and run it again."
+                );
+            }
         }
     }
 

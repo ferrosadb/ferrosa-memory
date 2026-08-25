@@ -107,6 +107,40 @@ pub struct SourcePage {
     pub truncated: bool,
 }
 
+/// One page of a root's sources, newest first, and where to resume.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RootPage {
+    pub sources: Vec<EntitySource>,
+    /// The cursor for the NEXT page, or `None` at the end of the root.
+    ///
+    /// Opaque to the caller by intent: it is a `page_key`, and a device that
+    /// treats it as one could construct a cursor the store never issued.
+    pub next_cursor: Option<String>,
+}
+
+/// The clustering key of `entity_source_by_root`: `{millis:013}-{entity_id}`.
+///
+/// Unique by construction, and lexicographically ordered by time because the
+/// milliseconds are zero-padded to a fixed width. Uniqueness is the point --
+/// `recorded_at` alone repeats within a single ingest, and a cursor over tied
+/// rows either repeats them or steps over them, the second of which loses rows
+/// from a list that still looks complete.
+///
+/// Timestamps before 1970 produce a negative millisecond count, which does not
+/// zero-pad into a sortable fixed width. That cannot arise from an ingest --
+/// `recorded_at` is stamped at write time -- so it is a corrupt row rather
+/// than a case to handle, and this says so instead of emitting a key that
+/// silently sorts in the wrong place.
+pub fn page_key(recorded_at: DateTime<Utc>, entity_id: Uuid) -> anyhow::Result<String> {
+    let millis = recorded_at.timestamp_millis();
+    anyhow::ensure!(
+        millis >= 0,
+        "source recorded_at {recorded_at} is before 1970; it cannot be ordered \
+         in entity_source_by_root"
+    );
+    Ok(format!("{millis:013}-{entity_id}"))
+}
+
 pub trait TierStore: Send + Sync {
     fn record_source(
         &self,
@@ -721,8 +755,170 @@ impl CqlTierStore {
             )
             .await
             .context("writing entity source")?;
+
+        self.write_source_by_root(ctx, record).await
+    }
+
+    /// The same fact, in the order the browse list reads it.
+    ///
+    /// Written after entity_source, not before: entity_source is the
+    /// authority, and a crash between the two leaves this view missing a row
+    /// that a rebuild can restore. The other order would leave a row here with
+    /// no authority behind it.
+    ///
+    /// A source with no root is skipped. The partition key IS the root, so
+    /// there is nowhere to put one -- and a sentinel partition would invent a
+    /// root that the tier rules never assigned. Those rows stay reachable
+    /// through entity_source, which is what `summarise` counts as
+    /// unclassified.
+    async fn write_source_by_root(
+        &self,
+        ctx: &TenantContext,
+        record: &EntitySource,
+    ) -> anyhow::Result<()> {
+        let Some(root) = record.source_root.as_deref() else {
+            return Ok(());
+        };
+        let query = format!(
+            "INSERT INTO {}.entity_source_by_root \
+             (tenant_id, source_root, page_key, entity_id, session_id, title, \
+              source_path, matched_alias, recorded_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        self.session
+            .query_unpaged(
+                query,
+                (
+                    ctx.tenant_id,
+                    root,
+                    page_key(record.recorded_at, record.entity_id)?,
+                    record.entity_id,
+                    record.session_id,
+                    record.title.as_str(),
+                    record.source_path.as_str(),
+                    record.matched_alias.as_deref(),
+                    record.recorded_at,
+                ),
+            )
+            .await
+            .context("writing entity source by root")?;
         Ok(())
     }
+
+    /// One page of a root, newest first, resumable by cursor.
+    ///
+    /// `ORDER BY page_key DESC` is explicit because this engine accepts
+    /// `CLUSTERING ORDER BY ... DESC` in the DDL and then ignores it (see
+    /// ddl/055 and ../ferrosa/specs/bug-clustering-order-desc-ignored.md).
+    /// Without the clause here the newest page would be the oldest rows, and
+    /// nothing would report it.
+    pub async fn sources_page(
+        &self,
+        ctx: &TenantContext,
+        root: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<RootPage> {
+        anyhow::ensure!(limit > 0, "sources_page: limit must be > 0");
+        // One more than asked for, to learn whether a next page exists without
+        // a second query and without reporting a cursor that leads nowhere.
+        let probe = limit.saturating_add(1);
+        let base = format!(
+            "SELECT entity_id, session_id, title, source_path, source_root, \
+             matched_alias, recorded_at, page_key FROM {}.entity_source_by_root \
+             WHERE tenant_id = ? AND source_root = ?",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        let result = match cursor {
+            Some(cursor) => {
+                let query = format!("{base} AND page_key < ? ORDER BY page_key DESC LIMIT {probe}");
+                self.session
+                    .query_unpaged(query, (ctx.tenant_id, root, cursor))
+                    .await
+            }
+            None => {
+                let query = format!("{base} ORDER BY page_key DESC LIMIT {probe}");
+                self.session
+                    .query_unpaged(query, (ctx.tenant_id, root))
+                    .await
+            }
+        }
+        .context("reading a page of entity sources by root")?;
+
+        let columns = build_col_map(result.col_specs());
+        let mut sources = Vec::with_capacity(limit);
+        let mut keys = Vec::with_capacity(limit);
+        for row in result.rows_or_empty() {
+            // The cursor is read from the row rather than recomputed from its
+            // timestamp and id. Recomputing would agree until the day the key
+            // format changes, and then hand out cursors that match nothing.
+            keys.push(cql_get::<String>(&row, &columns, "page_key")?);
+            sources.push(source_from_row(&row, &columns)?);
+        }
+
+        // The probe row is evidence of a next page, not part of this one.
+        let has_more = sources.len() > limit;
+        sources.truncate(limit);
+        keys.truncate(limit);
+        let next_cursor = if has_more { keys.last().cloned() } else { None };
+        Ok(RootPage {
+            sources,
+            next_cursor,
+        })
+    }
+
+    /// Populate `entity_source_by_root` from `entity_source`.
+    ///
+    /// Migration 055 creates an empty table; every row written before it
+    /// existed lives only in `entity_source`. Without this the Memory tab
+    /// would show four tiers of nothing on a cluster holding 69,683 rows --
+    /// the same "reachable and empty" failure the wrong tenant produced, from
+    /// a different cause.
+    ///
+    /// Idempotent: the destination key is derived from the row, so re-running
+    /// rewrites each row onto itself. That makes it safe to re-run after a
+    /// partial failure, which matters because this reads the whole table and a
+    /// 69,683-row scan is a thing that gets interrupted.
+    ///
+    /// Rows with no `source_root` are counted, not written -- there is no
+    /// partition for them -- so `skipped` is the honest difference between
+    /// what was read and what the browse list can reach.
+    pub async fn backfill_by_root(
+        &self,
+        ctx: &TenantContext,
+        limit: usize,
+    ) -> anyhow::Result<BackfillByRootReport> {
+        let page = self.sources(ctx, limit).await?;
+        let mut report = BackfillByRootReport {
+            truncated: page.truncated,
+            ..BackfillByRootReport::default()
+        };
+        for source in &page.sources {
+            report.examined += 1;
+            if source.source_root.is_none() {
+                report.skipped_without_root += 1;
+                continue;
+            }
+            self.write_source_by_root(ctx, source).await?;
+            report.written += 1;
+        }
+        Ok(report)
+    }
+}
+
+/// What a by-root backfill actually did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackfillByRootReport {
+    pub examined: usize,
+    pub written: usize,
+    /// Read, but unreachable from the browse list: no root, so no partition.
+    pub skipped_without_root: usize,
+    /// The read hit its limit, so this is a prefix of the table and rerunning
+    /// with a higher limit will find more.
+    pub truncated: bool,
 }
 
 /// Read one `entity_source` row. Shared by the point read, the root query, and
@@ -1686,5 +1882,88 @@ mod tests {
             err.to_string().contains("gnosis"),
             "the error must name the value: {err}"
         );
+    }
+
+    /// The property the whole design rests on: a cursor over a page_key never
+    /// repeats a row and never steps over one, INCLUDING when many rows share
+    /// a millisecond. `recorded_at` alone cannot do this, which is why the key
+    /// is synthetic.
+    #[test]
+    fn paging_a_tied_millisecond_loses_nothing() {
+        let tied = DateTime::from_timestamp_millis(1_767_225_600_000).expect("epoch millis");
+        // Ten rows in one millisecond, then three in later ones -- the shape
+        // an ingest of a directory actually produces.
+        let mut keys: Vec<String> = (0..10)
+            .map(|i| page_key(tied, Uuid::from_u128(i + 1)).expect("key"))
+            .chain((1..=3).map(|i| {
+                let later =
+                    DateTime::from_timestamp_millis(1_767_225_600_000 + i).expect("epoch millis");
+                page_key(later, Uuid::from_u128(100 + i as u128)).expect("key")
+            }))
+            .collect();
+        assert_eq!(
+            keys.iter().collect::<std::collections::HashSet<_>>().len(),
+            13,
+            "a tied millisecond must still produce distinct keys"
+        );
+
+        // Newest first, as the query orders them.
+        keys.sort();
+        keys.reverse();
+
+        // Walk it in pages of five the way sources_page does: take a page,
+        // then ask for everything strictly less than its last key.
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..10 {
+            let page: Vec<String> = keys
+                .iter()
+                .filter(|key| match &cursor {
+                    None => true,
+                    Some(cursor) => *key < cursor,
+                })
+                .take(5)
+                .cloned()
+                .collect();
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().cloned();
+            seen.extend(page);
+        }
+
+        assert_eq!(seen, keys, "paging must reproduce the order exactly");
+        assert_eq!(
+            seen.iter().collect::<std::collections::HashSet<_>>().len(),
+            13,
+            "no row may be served twice"
+        );
+    }
+
+    /// Zero-padding is what makes a lexicographic compare a chronological one.
+    /// Without it "9999" sorts above "10000" and the list silently reorders
+    /// around a digit boundary.
+    #[test]
+    fn page_keys_sort_chronologically_across_a_digit_boundary() {
+        let id = Uuid::from_u128(1);
+        let early = page_key(
+            DateTime::from_timestamp_millis(999_999_999_999).expect("epoch millis"),
+            id,
+        )
+        .expect("key");
+        let late = page_key(
+            DateTime::from_timestamp_millis(1_000_000_000_000).expect("epoch millis"),
+            id,
+        )
+        .expect("key");
+        assert!(early < late, "{early} should sort below {late}");
+    }
+
+    /// A timestamp that cannot be ordered is a corrupt row, and saying so
+    /// beats emitting a key that sorts in the wrong place forever.
+    #[test]
+    fn a_pre_epoch_timestamp_is_refused_rather_than_mis_sorted() {
+        let before = DateTime::from_timestamp_millis(-1).expect("epoch millis");
+        assert!(page_key(before, Uuid::from_u128(1)).is_err());
     }
 }

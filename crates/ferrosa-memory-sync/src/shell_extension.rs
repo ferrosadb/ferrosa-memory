@@ -209,8 +209,7 @@ impl ShellExtension {
         &self,
         tier: &str,
         query: Option<&str>,
-        sort: &str,
-        offset: usize,
+        cursor: Option<&str>,
         limit: usize,
     ) -> Vec<serde_json::Value> {
         let Some(parsed) = ferrosa_memory_core::tiers::Tier::parse(tier) else {
@@ -232,7 +231,26 @@ impl ShellExtension {
             })];
         };
         let limit = limit.clamp(1, MEMORY_PAGE_MAX);
-        match view.items(parsed, query, sort, offset, limit).await {
+        // A cursor the device sent back. Refused rather than ignored: falling
+        // back to the first page would silently restart a list the operator
+        // was halfway down, which reads as the list looping.
+        let decoded = match cursor
+            .map(crate::memory_view::TierCursor::decode)
+            .transpose()
+        {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                return vec![serde_json::json!({
+                    "type": "shell_memory_items",
+                    "tier": tier,
+                    "reachable": false,
+                    "reason": format!("{error:#}"),
+                    "items": [],
+                })];
+            }
+        };
+        let first_page = decoded.is_none();
+        match view.items(parsed, query, decoded.as_ref(), limit).await {
             Ok(page) => {
                 let rows: Vec<serde_json::Value> = page
                     .items
@@ -257,12 +275,13 @@ impl ShellExtension {
                 if rows.is_empty() {
                     return vec![serde_json::json!({
                         "type": "shell_memory_items",
-                        "tier": tier, "reachable": true, "first": true,
-                        "query": query, "sort": sort, "offset": offset,
-                        "matched": page.matched, "truncated": page.truncated,
+                        "tier": tier, "reachable": true, "first": first_page,
+                        "query": query,
+                        "next_cursor": page.next_cursor.as_ref().map(|c| c.encode()),
                         "items": [],
                     })];
                 }
+                let frame_count = rows.len().div_ceil(MEMORY_ITEMS_PER_FRAME);
                 rows.chunks(MEMORY_ITEMS_PER_FRAME)
                     .enumerate()
                     .map(|(index, chunk)| {
@@ -274,12 +293,15 @@ impl ShellExtension {
                             // list; the rest append. Without this every frame
                             // wipes the one before it and the tier shows its
                             // last three items.
-                            "first": offset == 0 && index == 0,
+                            "first": first_page && index == 0,
                             "query": query,
-                            "sort": sort,
-                            "offset": offset,
-                            "matched": page.matched,
-                            "truncated": page.truncated,
+                            // Only the LAST frame of a page carries the
+                            // cursor. On any earlier frame it would invite a
+                            // device to request the next page while this one
+                            // is still arriving, and skip the rest of it.
+                            "next_cursor": (index + 1 == frame_count)
+                                .then(|| page.next_cursor.as_ref().map(|c| c.encode()))
+                                .flatten(),
                             "items": chunk,
                         })
                     })
@@ -1612,23 +1634,20 @@ impl SessionExtension for ShellExtension {
                     .and_then(serde_json::Value::as_str)
                     .map(str::trim)
                     .filter(|value| !value.is_empty());
-                let sort = body
-                    .get("sort")
+                // A cursor from the previous page's last frame. Absent means
+                // the first page; `offset` is gone, because an offset into a
+                // list this size is a scan and a cursor is a seek.
+                let cursor = body
+                    .get("cursor")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or("recent");
-                let offset = body
-                    .get("offset")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0) as usize;
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
                 let limit = body
                     .get("limit")
                     .and_then(serde_json::Value::as_u64)
                     .map(|value| value as usize)
                     .unwrap_or(MEMORY_PAGE_DEFAULT);
-                for frame in self
-                    .memory_items_frames(tier, query, sort, offset, limit)
-                    .await
-                {
+                for frame in self.memory_items_frames(tier, query, cursor, limit).await {
                     session.send(&envelope(frame)).await?;
                 }
                 Ok(())

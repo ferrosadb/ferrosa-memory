@@ -22,6 +22,7 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
+use ferrosa_memory_core::tier_store::page_key;
 use ferrosa_memory_core::tier_store::{
     CqlTierStore, EntitySource, TierStore, TierSummary, load_rules, summarise,
 };
@@ -58,7 +59,18 @@ const SCAN_LIMIT: usize = 50_000;
 /// offering them would be a control that silently does nothing.
 ///
 /// [D10]: ../../../specs/knowledge-tiers/decisions.md
-pub const AVAILABLE_SORTS: &[&str] = &["recent", "title"];
+/// The orders a paged tier can actually be served in.
+///
+/// One. `title` was here and is gone: sorting by title means ordering the
+/// whole tier before the first page can be drawn, which is the 15-second scan
+/// that migration 055 exists to remove. The rows are stored in recency order
+/// and a page is a seek along it; any other order is a different table, not a
+/// different query.
+///
+/// It stays a list because a device reads it to decide which controls to
+/// offer, and a device that is told there is one order will not draw a
+/// chooser for orders that do not exist.
+pub const AVAILABLE_SORTS: &[&str] = &["recent"];
 
 pub struct MemoryView {
     store: CqlTierStore,
@@ -77,14 +89,75 @@ pub struct MemoryItem {
     pub recorded_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// A page of a tier, and how much of the tier it is.
+/// A page of a tier, and where to resume.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ItemPage {
     pub items: Vec<MemoryItem>,
-    /// How many matched, before paging. The page is a window on this.
-    pub matched: usize,
-    /// The scan hit [`SCAN_LIMIT`], so `matched` is a floor and not a total.
-    pub truncated: bool,
+    /// Where the next page starts, or `None` at the end of the tier.
+    ///
+    /// There is deliberately no `matched` total. Counting the matches in a
+    /// tier means reading the tier, which is the 15-second scan this page
+    /// exists to avoid, and a count that costs more than the page it labels is
+    /// not worth its price. The map already reports each tier's size.
+    pub next_cursor: Option<TierCursor>,
+}
+
+/// Where a tier's next page resumes: one cursor per root, because a tier is
+/// the union of its roots and each is paged independently.
+///
+/// Opaque by intent. A device that understood the encoding could ask for a
+/// cursor the store never issued, and a `page_key` is not a capability -- it
+/// is a position in a partition the caller has already been shown.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TierCursor {
+    per_root: std::collections::BTreeMap<String, String>,
+}
+
+impl TierCursor {
+    pub fn get(&self, root: &str) -> Option<&str> {
+        self.per_root.get(root).map(String::as_str)
+    }
+
+    pub fn set(&mut self, root: String, page_key: String) {
+        self.per_root.insert(root, page_key);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.per_root.is_empty()
+    }
+
+    /// Wire form: `root\u{1}key` pairs joined by `\u{2}`.
+    ///
+    /// Control characters rather than a punctuation separator because a root
+    /// is a path and a path may contain almost anything else. Roots and
+    /// page_keys cannot contain these, so the encoding has no escape rules to
+    /// get wrong.
+    pub fn encode(&self) -> String {
+        self.per_root
+            .iter()
+            .map(|(root, key)| format!("{root}\u{1}{key}"))
+            .collect::<Vec<_>>()
+            .join("\u{2}")
+    }
+
+    /// Parse a cursor a device sent back. A malformed cursor is refused rather
+    /// than treated as "start from the beginning": silently restarting a list
+    /// the operator was halfway down looks like the list looping.
+    pub fn decode(raw: &str) -> Result<Self> {
+        let mut per_root = std::collections::BTreeMap::new();
+        for pair in raw.split('\u{2}') {
+            if pair.is_empty() {
+                continue;
+            }
+            let (root, key) = pair
+                .split_once('\u{1}')
+                .ok_or_else(|| anyhow::anyhow!("malformed memory cursor: no root/key separator"))?;
+            anyhow::ensure!(!root.is_empty(), "malformed memory cursor: empty root");
+            anyhow::ensure!(!key.is_empty(), "malformed memory cursor: empty page key");
+            per_root.insert(root.to_owned(), key.to_owned());
+        }
+        Ok(Self { per_root })
+    }
 }
 
 impl MemoryView {
@@ -120,59 +193,122 @@ impl MemoryView {
         summarise(&self.store, &self.ctx, SCAN_LIMIT).await
     }
 
-    /// One tier's contents, optionally filtered by a search term.
+    /// One page of a tier, newest first, resumable by cursor.
     ///
-    /// Search is a case-insensitive substring of the title or the source path.
-    /// Deliberately not the semantic search the memory system has: this list is
-    /// how someone finds a thing they already know the name of, and a ranked
-    /// semantic answer would reorder the list under them while they select.
+    /// This used to read the whole tenant partition, derive every row's tier,
+    /// sort, and keep a window of twenty. Measured on 69,683 rows that was
+    /// 15.0 s per page, paid again for every page, plus a second scan the same
+    /// size for promotions -- and sustained scans of one partition were
+    /// starving control-session writes on the same keyspace. Migration 055
+    /// stores the same facts partitioned by root and ordered by recency, so a
+    /// page is a seek: measured 375 ms for the largest tier and 1 ms for the
+    /// smallest.
+    ///
+    /// A tier is the union of its roots, so this pages each root and merges
+    /// them. `page_key` embeds the timestamp, so comparing keys across roots
+    /// IS comparing recency, and the merge needs no second sort key.
+    ///
+    /// Search is a case-insensitive substring of the title or the source path,
+    /// applied to the rows on the page. It is deliberately not the semantic
+    /// search the memory system has: that is a ranked top-50 window, which is
+    /// the right shape for "find the thing about X" and the wrong shape for
+    /// paging a list of 63,163.
     pub async fn items(
         &self,
         tier: Tier,
         query: Option<&str>,
-        sort: &str,
-        offset: usize,
+        cursor: Option<&TierCursor>,
         limit: usize,
     ) -> Result<ItemPage> {
+        anyhow::ensure!(limit > 0, "a page of no items is not a page");
         let (_, rules) = load_rules(&self.store, &self.ctx).await?;
         let promoted = self.promoted_tiers().await?;
-        let page = self.store.sources(&self.ctx, SCAN_LIMIT).await?;
+
+        // The roots this tier is made of. A tier with none has no rows to
+        // page, which is a real answer and not an error.
+        let roots: Vec<String> = rules
+            .entries()
+            .into_iter()
+            .filter(|(_, root_tier)| *root_tier == tier)
+            .map(|(root, _)| root)
+            .collect();
+        if roots.is_empty() {
+            return Ok(ItemPage::default());
+        }
+
+        // Ask each root for a whole page. Any single root could supply the
+        // entire merged page, so asking for less would under-fill it.
+        let mut candidates: Vec<(String, MemoryItem)> = Vec::new();
+        for root in &roots {
+            let from = cursor.and_then(|cursor| cursor.get(root));
+            let page = self
+                .store
+                .sources_page(&self.ctx, root, from, limit)
+                .await?;
+            for source in page.sources {
+                let key = page_key(source.recorded_at, source.entity_id)?;
+                candidates.push((key, self.item_of(source, &promoted, &rules)));
+            }
+        }
+
+        // Newest first across roots.
+        candidates.sort_by(|left, right| right.0.cmp(&left.0));
 
         let needle = query.map(str::to_lowercase);
-        let mut matched: Vec<MemoryItem> = page
-            .sources
-            .into_iter()
-            .map(|source| {
-                let item_tier = tier_of_source(&source, &promoted, &rules);
-                (source, item_tier)
-            })
-            .filter(|(_, item_tier)| *item_tier == tier)
-            .map(|(source, item_tier)| MemoryItem {
-                entity_id: source.entity_id,
-                session_id: source.session_id,
-                title: source.title,
-                tier: item_tier,
-                source_path: source.source_path,
-                source_root: source.source_root,
-                recorded_at: source.recorded_at,
-            })
-            .filter(|item| match &needle {
+        let mut next = TierCursor::default();
+        let mut items = Vec::with_capacity(limit);
+        let mut consumed = 0usize;
+        for (key, item) in candidates {
+            if consumed == limit {
+                break;
+            }
+            consumed += 1;
+            // The cursor advances over every row READ, matched or not.
+            // Advancing only over matches would re-read the filtered rows on
+            // the next page and never make progress through a tier where
+            // nothing matches.
+            if let Some(root) = item.source_root.clone() {
+                next.set(root, key);
+            }
+            let keep = match &needle {
                 None => true,
                 Some(needle) => {
                     item.title.to_lowercase().contains(needle)
                         || item.source_path.to_lowercase().contains(needle)
                 }
-            })
-            .collect();
+            };
+            if keep {
+                items.push(item);
+            }
+        }
 
-        sort_items(&mut matched, sort);
-        let total = matched.len();
-        let items = matched.into_iter().skip(offset).take(limit).collect();
         Ok(ItemPage {
             items,
-            matched: total,
-            truncated: page.truncated,
+            // A full page read means there is more behind it. This is the
+            // truthful signal available without counting the tier, which is
+            // the scan this change exists to remove.
+            next_cursor: (consumed == limit).then_some(next),
         })
+    }
+
+    /// One source row as a list item, with promotion applied exactly as
+    /// `summarise` applies it.
+    fn item_of(
+        &self,
+        source: EntitySource,
+        promoted: &std::collections::HashMap<Uuid, Tier>,
+        rules: &TierRules,
+    ) -> MemoryItem {
+        let tier = tier_of_source(&source, promoted, rules);
+        MemoryItem {
+            entity_id: source.entity_id,
+            session_id: source.session_id,
+            title: source.title,
+            tier,
+            source_path: source.source_path,
+            source_root: source.source_root,
+            recorded_at: source.recorded_at,
+        }
     }
 
     async fn promoted_tiers(&self) -> Result<std::collections::HashMap<Uuid, Tier>> {
@@ -203,16 +339,49 @@ fn tier_of_source(
         .unwrap_or(Tier::Data)
 }
 
-/// Order a tier's contents.
-///
-/// An unrecognised sort falls back to `recent` rather than erroring, because
-/// the caller is a phone whose build may be older than this one — but the
-/// frame states which sorts exist, so a UI has no reason to send another.
-fn sort_items(items: &mut [MemoryItem], sort: &str) {
-    match sort {
-        "title" => items.sort_by_key(|item| item.title.to_lowercase()),
-        // Newest first, by the timestamp on the row. Reversing the scan order
-        // would have been reverse-id order wearing the word "recent".
-        _ => items.sort_by_key(|item| std::cmp::Reverse(item.recorded_at)),
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A root is a path, and a path can contain almost any punctuation. The
+    /// separators are control characters precisely so this round-trips without
+    /// escape rules -- including the roots that look like they would break it.
+    #[test]
+    fn a_cursor_round_trips_through_awkward_roots() {
+        let mut cursor = TierCursor::default();
+        cursor.set(
+            "/Users/bkearns/src/research/skills".to_owned(),
+            "1767225600000-00000000-0000-0000-0000-000000000001".to_owned(),
+        );
+        cursor.set(
+            "a root, with a comma: and a colon".to_owned(),
+            "1767225600001-00000000-0000-0000-0000-000000000002".to_owned(),
+        );
+        let decoded = TierCursor::decode(&cursor.encode()).expect("decodes");
+        assert_eq!(decoded, cursor);
+    }
+
+    /// The empty cursor is the first page, not an error.
+    #[test]
+    fn an_empty_cursor_decodes_to_nothing() {
+        let decoded = TierCursor::decode("").expect("decodes");
+        assert!(decoded.is_empty());
+    }
+
+    /// Refused, NOT silently treated as the first page. Restarting a list the
+    /// operator is halfway down looks like the list looping, and looping is a
+    /// far harder thing to report than an error is.
+    #[test]
+    fn a_malformed_cursor_is_refused_rather_than_restarted() {
+        assert!(TierCursor::decode("no-separator-here").is_err());
+        assert!(TierCursor::decode("\u{1}key-with-no-root").is_err());
+        assert!(TierCursor::decode("root-with-no-key\u{1}").is_err());
+    }
+
+    /// The frame advertises what the store can serve. A device offering a
+    /// `title` order would be offering a scan.
+    #[test]
+    fn only_the_orders_a_seek_can_serve_are_advertised() {
+        assert_eq!(AVAILABLE_SORTS, &["recent"]);
     }
 }
