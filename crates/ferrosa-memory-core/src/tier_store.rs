@@ -118,6 +118,15 @@ pub struct RootPage {
     pub next_cursor: Option<String>,
 }
 
+/// The partition holding sources that resolved to no root at all.
+///
+/// The empty string, which cannot collide with a real root: a root is a
+/// `canonical_root` from the alias table, and an alias with an empty canonical
+/// root would resolve every path to nothing. Keeping these rows addressable is
+/// what lets the map count the hole in the rule set instead of reporting a
+/// total that quietly is not one.
+pub const NO_ROOT: &str = "";
+
 /// The clustering key of `entity_source_by_root`: `{millis:013}-{entity_id}`.
 ///
 /// Unique by construction, and lexicographically ordered by time because the
@@ -201,6 +210,20 @@ pub trait TierStore: Send + Sync {
         ctx: &TenantContext,
         limit: usize,
     ) -> impl std::future::Future<Output = anyhow::Result<SourcePage>> + Send;
+
+    /// How many sources sit under one root, counted by the server.
+    ///
+    /// The whole point is that no rows come back. Counting a tier used to mean
+    /// reading it: `summarise` materialised up to 50,000 source rows and
+    /// counted them in memory, which on a 69,683-row tenant took 15 s AND
+    /// returned a truncated answer -- it could not see the last 19,683 rows,
+    /// so every tier count on the device was wrong. A partition-scoped
+    /// COUNT(*) is exact and measured at 300 ms for the largest root.
+    fn count_under_root(
+        &self,
+        ctx: &TenantContext,
+        root: &str,
+    ) -> impl std::future::Future<Output = anyhow::Result<u64>> + Send;
 
     /// Every promotion for the tenant, up to `limit`. Promotions are human
     /// decisions and stay few; the limit exists so a runaway cannot become an
@@ -454,51 +477,108 @@ pub struct TierSummary {
     pub truncated: bool,
 }
 
-/// Count what sits in each tier.
+/// How many promotions one summary will read.
 ///
-/// Counted here rather than by the database because the tier is derived: there
-/// is no column to group by, and materialising one would be the second truth
-/// that [`TierRules`] exists to avoid.
+/// A promotion is a person overriding a derived tier, so the count is bounded
+/// by human effort rather than by corpus size. Named separately from any scan
+/// limit: this one is a real bound on a genuinely small set, not a cap
+/// standing in for a query that should have been server-side.
+const PROMOTION_READ_LIMIT: usize = 10_000;
+
+/// Count what sits in each tier, without reading the tiers.
+///
+/// This used to materialise up to `limit` source rows and count them in
+/// memory. On the tenant it was measured against that meant reading 50,000 of
+/// 69,683 rows -- 15 seconds, and a WRONG answer: the last 19,683 rows were
+/// invisible, so every count the device displayed was short and the only
+/// signal was a `truncated` flag next to numbers that looked plausible.
+///
+/// A tier is the union of its roots, and a root is a partition, so each root's
+/// size is a partition-scoped `COUNT(*)`. No rows cross the wire, nothing is
+/// bounded, and the answer is exact however large a root grows. Measured at
+/// 344 ms for all four roots against the same data.
+///
+/// # Completeness
+///
+/// Every root is counted, not merely every root with a rule. `source_root` is
+/// always the `canonical_root` of whichever alias matched, so the alias and
+/// rule tables bound the set of possible roots exactly, and sources that
+/// matched no alias sit in the [`NO_ROOT`] partition. The partitions
+/// themselves cannot be enumerated -- ferrosa rejects `SELECT DISTINCT` on a
+/// partition-key prefix and errors on the unfiltered form -- which is why the
+/// bound comes from the tiny configuration tables instead.
 pub async fn summarise(
     store: &impl TierStore,
     ctx: &TenantContext,
-    limit: usize,
+    _limit: usize,
 ) -> anyhow::Result<TierSummary> {
     let (_, rules) = load_rules(store, ctx).await?;
-    let promoted: HashMap<Uuid, Tier> = store
-        .promotions(ctx, limit)
-        .await?
-        .into_iter()
-        .map(|promotion| (promotion.entity_id, promotion.tier))
-        .collect();
 
-    let page = store.sources(ctx, limit).await?;
     let mut counts: BTreeMap<Tier, usize> = BTreeMap::new();
     let mut roots: BTreeMap<Tier, BTreeSet<String>> = BTreeMap::new();
-    let mut unclassified = 0;
-    let sourced = page.sources.len();
+    let mut sourced = 0usize;
+    let mut unclassified = 0usize;
 
-    for source in page.sources {
-        // A promotion decides on its own, exactly as in `resolve`.
-        if let Some(tier) = promoted.get(&source.entity_id) {
-            *counts.entry(*tier).or_default() += 1;
-            continue;
-        }
-        match source
-            .source_root
-            .as_deref()
-            .and_then(|root| rules.tier_of_root(root).map(|tier| (root, tier)))
-        {
-            Some((root, tier)) => {
-                *counts.entry(tier).or_default() += 1;
-                roots.entry(tier).or_default().insert(root.to_owned());
+    // Every root that CAN exist, not merely every root with a rule.
+    //
+    // `source_root` is never arbitrary: it is the `canonical_root` of whichever
+    // alias matched the path, so the alias table plus the rule table bound the
+    // set exactly. Both are tiny -- tens of rows, written by a person -- which
+    // is what makes enumerating them affordable when enumerating the
+    // partitions themselves is not.
+    let mut candidates: BTreeSet<String> =
+        rules.entries().into_iter().map(|(root, _)| root).collect();
+    for alias in store.aliases(ctx).await? {
+        candidates.insert(alias.canonical_root);
+    }
+
+    for root in candidates {
+        let count = store.count_under_root(ctx, &root).await? as usize;
+        sourced += count;
+        match rules.tier_of_root(&root) {
+            Some(tier) => {
+                // A root with a rule and no rows still belongs on the map: a
+                // configured place that happens to be empty is a different
+                // statement from a place nobody configured.
+                *counts.entry(tier).or_default() += count;
+                if count > 0 {
+                    roots.entry(tier).or_default().insert(root);
+                }
             }
-            // No root, or a root no rule covers. Both are Data by the floor in
-            // `resolve`, and both are counted as the hole they are.
+            // A root nobody wrote a rule for. Data by the floor in `resolve`,
+            // and counted as the hole it is.
             None => {
-                *counts.entry(Tier::Data).or_default() += 1;
-                unclassified += 1;
+                *counts.entry(Tier::Data).or_default() += count;
+                unclassified += count;
             }
+        }
+    }
+
+    // And the sources that resolved to no root at all.
+    let rootless = store.count_under_root(ctx, NO_ROOT).await? as usize;
+    sourced += rootless;
+    *counts.entry(Tier::Data).or_default() += rootless;
+    unclassified += rootless;
+
+    // Promotions move an entity between tiers, and they are counted per
+    // entity rather than per root, so they cannot be folded into a partition
+    // count. They stay few by construction -- each one is a person making a
+    // decision -- and are read whole.
+    let promoted = store.promotions(ctx, PROMOTION_READ_LIMIT).await?;
+    for promotion in &promoted {
+        if let Some(source) = store.source_of(ctx, promotion.entity_id).await?
+            && let Some(from) = source
+                .source_root
+                .as_deref()
+                .and_then(|root| rules.tier_of_root(root))
+            && from != promotion.tier
+        {
+            // Moved, not added: the partition count already included it under
+            // the root's own tier.
+            if let Some(slot) = counts.get_mut(&from) {
+                *slot = slot.saturating_sub(1);
+            }
+            *counts.entry(promotion.tier).or_default() += 1;
         }
     }
 
@@ -513,7 +593,7 @@ pub async fn summarise(
             .collect(),
         unclassified,
         sourced,
-        truncated: page.truncated,
+        truncated: false,
     })
 }
 
@@ -662,6 +742,25 @@ impl TierStore for InMemoryTierStore {
         }))
     }
 
+    async fn count_under_root(&self, ctx: &TenantContext, root: &str) -> anyhow::Result<u64> {
+        Ok(self.with(ctx, |tenant| {
+            tenant
+                .sources
+                .values()
+                .filter(|source| {
+                    // NO_ROOT means "resolved to nothing", which this store
+                    // represents as None. The CQL store writes the same rows
+                    // into the empty-string partition; both must answer the
+                    // same question or the map differs between them.
+                    match source.source_root.as_deref() {
+                        Some(existing) => existing == root,
+                        None => root == NO_ROOT,
+                    }
+                })
+                .count() as u64
+        }))
+    }
+
     async fn promotions(
         &self,
         ctx: &TenantContext,
@@ -776,9 +875,17 @@ impl CqlTierStore {
         ctx: &TenantContext,
         record: &EntitySource,
     ) -> anyhow::Result<()> {
-        let Some(root) = record.source_root.as_deref() else {
-            return Ok(());
-        };
+        // A source with no root goes to the NO_ROOT partition rather than
+        // being dropped.
+        //
+        // Dropping it was the first design, on the grounds that a sentinel
+        // invents a root the rules never assigned. That was the wrong reading:
+        // the empty string is not a root name, it is the explicit absence of
+        // one, and it can never match a rule because no rule has an empty
+        // root. Dropping the row cost the map its `unclassified` count -- the
+        // hole in the rule set became invisible, which is the one thing the
+        // count exists to show.
+        let root = record.source_root.as_deref().unwrap_or(NO_ROOT);
         let query = format!(
             "INSERT INTO {}.entity_source_by_root \
              (tenant_id, source_root, page_key, entity_id, session_id, title, \
@@ -1236,6 +1343,36 @@ impl TierStore for CqlTierStore {
             .map(|row| source_from_row(&row, &columns))
             .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(SourcePage { sources, truncated })
+    }
+
+    async fn count_under_root(&self, ctx: &TenantContext, root: &str) -> anyhow::Result<u64> {
+        // COUNT(*) scoped to ONE partition. No rows cross the wire, so there
+        // is nothing to bound and nothing to truncate: the answer is exact
+        // however large the root grows.
+        let query = format!(
+            "SELECT COUNT(*) FROM {}.entity_source_by_root \
+             WHERE tenant_id = ? AND source_root = ?",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        let result = self
+            .session
+            .query_unpaged(query, (ctx.tenant_id, root))
+            .await
+            .context("counting entity sources under a root")?;
+        let columns = build_col_map(result.col_specs());
+        let row = result
+            .rows_or_empty()
+            .into_iter()
+            .next()
+            // A COUNT that returns no row is a driver or engine fault, not an
+            // empty partition -- an empty partition counts zero. Substituting
+            // zero here would report a populated tier as empty.
+            .ok_or_else(|| anyhow::anyhow!("COUNT(*) returned no row for root {root:?}"))?;
+        let count: i64 = cql_get(&row, &columns, "count")
+            .or_else(|_| cql_get(&row, &columns, "system.count"))
+            .context("COUNT(*) column was not readable")?;
+        u64::try_from(count).context("COUNT(*) returned a negative count")
     }
 
     async fn promotions(

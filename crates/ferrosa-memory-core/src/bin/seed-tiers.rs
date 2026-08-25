@@ -100,6 +100,7 @@ async fn main() -> Result<()> {
     let backfill = args.iter().any(|a| a == "--backfill");
     let sample = args.iter().any(|a| a == "--sample");
     let backfill_by_root = args.iter().any(|a| a == "--backfill-by-root");
+    let show_map = args.iter().any(|a| a == "--map");
 
     let Some(tenant) = tenant else {
         eprintln!("{}", tenant_help());
@@ -173,6 +174,25 @@ async fn main() -> Result<()> {
                 tier.tier.as_str(),
                 tier.reason
             );
+        }
+    }
+
+    if show_map {
+        let started = std::time::Instant::now();
+        let map = ferrosa_memory_core::tier_store::summarise(&store, &ctx, 0).await?;
+        println!("\nDIKW map ({} ms):", started.elapsed().as_millis());
+        for row in &map.tiers {
+            println!(
+                "  {:<12} {:>7}  {}",
+                row.tier.as_str(),
+                row.count,
+                row.roots.join(", ")
+            );
+        }
+        println!("  {:<12} {:>7}", "sourced", map.sourced);
+        println!("  {:<12} {:>7}", "unclassified", map.unclassified);
+        if map.truncated {
+            println!("  WARNING: truncated");
         }
     }
 
