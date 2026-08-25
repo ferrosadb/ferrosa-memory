@@ -109,7 +109,7 @@ impl ShellExtension {
                     Ok(board) => Some(Arc::new(board)),
                     Err(error) => {
                         // Loud, and not fatal. Agents keep working without it.
-                        eprintln!("task board unavailable: {error:#}");
+                        tracing::warn!(%error, "task board unavailable");
                         None
                     }
                 }
@@ -123,10 +123,10 @@ impl ShellExtension {
         self.memory
             .get_or_init(|| async {
                 let Some(tenant) = self.memory_tenant else {
-                    eprintln!(
-                        "memory tiers unavailable: no tenant configured. Set \
-                         server.tenant_id in the memory config, or \
-                         FERROSA_MEMORY_TENANT_ID, to the tenant this \
+                    tracing::warn!(
+                        "memory tiers unavailable: no tenant configured. Pass \
+                         --memory-tenant, or set server.tenant_id in the memory \
+                         config, or FERROSA_MEMORY_TENANT_ID, to the tenant this \
                          machine's memory is stored under."
                     );
                     return None;
@@ -134,9 +134,17 @@ impl ShellExtension {
                 match crate::memory_view::MemoryView::connect(&self.board_contact_points, tenant)
                     .await
                 {
-                    Ok(view) => Some(Arc::new(view)),
+                    Ok(view) => {
+                        // Says which tenant, on the way in. An empty tier map
+                        // has two explanations -- nothing seeded, or the wrong
+                        // tenant -- and they are indistinguishable from the
+                        // counts alone. This is the line that tells them apart
+                        // without anyone having to query the cluster.
+                        tracing::info!(%tenant, "memory tiers connected");
+                        Some(Arc::new(view))
+                    }
                     Err(error) => {
-                        eprintln!("memory tiers unavailable: {error:#}");
+                        tracing::warn!(%error, %tenant, "memory tiers unavailable");
                         None
                     }
                 }

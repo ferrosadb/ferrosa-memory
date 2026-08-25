@@ -49,7 +49,7 @@ fn memory_tenant(configured: Option<&str>) -> Option<Uuid> {
             // Loud, and then None. A malformed tenant is a typo in a config
             // file, and silently continuing without one would leave the phone
             // saying "no tenant configured" while the file plainly has one.
-            eprintln!("memory tenant {configured:?} is not a UUID: {error}");
+            tracing::warn!(%error, tenant = ?configured, "memory tenant is not a UUID");
             None
         }
     }
