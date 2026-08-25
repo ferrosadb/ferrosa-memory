@@ -154,7 +154,7 @@ all.
 | pause | the run | inter-agent delivery is deferred; agents keep working | yes |
 | stop | the run | the run ends | no |
 | interrupt | one agent | halts that agent, via the harness, from inside its session | yes |
-| halt all | everything | stops EXECUTION in every run of every team | yes, by explicit release |
+| halt | team, user or org | stops EXECUTION within that scope | yes, by explicit release at that scope |
 | kill | one run | terminates it and discards its work | no |
 
 `halt all` and `kill` are break glass and behave unlike the rest — see "Break
@@ -238,13 +238,34 @@ Two rules keep the record honest:
 
 Two global controls for when something is wrong rather than merely unwanted.
 
-**Halt all** stops execution everywhere. Not delivery — execution. This is the
-control `pause` is repeatedly mistaken for, and the one that actually stops the
-bill.
+**Halt** stops execution. Not delivery — execution. This is the control `pause`
+is repeatedly mistaken for, and the one that actually stops the bill.
 
-**Kill** ends a run and discards its work.
+It is scoped at three levels: one **team**, every team a **user** manages, or an
+entire **organisation**. Org scope arrives with human teams collaborating with
+agent teams; it is not built first, but the scope field exists from the start,
+because retrofitting a scope onto a boolean means revisiting every read of it.
 
-| | Halt all | Kill | Stop |
+Halt is therefore not a switch but a **hold**, and holds stack:
+
+- a team may be held at team, user and org level simultaneously,
+- execution requires **zero** holds covering it,
+- so releasing one hold resumes nothing while another still applies.
+
+**Release authority must match or exceed the hold's scope.** A user cannot
+release an org halt. Without that rule the org control is advisory, and an
+advisory break-glass control is not one.
+
+**A halted team names the hold that stops it and who set it.** "Halted" alone
+sends a person to a button that will refuse them; "halted by your organisation"
+sends them to a person. That is the difference between a control that explains
+itself and one that looks broken.
+
+**Kill** ends a run and discards its work. Unlike halt it takes no scope — it
+names one run, because a control that destroys work should never accept a
+wildcard.
+
+| | Halt | Kill | Stop |
 |---|---|---|---|
 | running agents | stopped, resumable | terminated | finish, then end |
 | held and in-flight messages | preserved | discarded | preserved |
@@ -349,9 +370,13 @@ Seven tables. Names are indicative; the shapes are the commitment.
                       be attributed after a swap
     team_node_state   working / waiting / dead, per node, established by the
                       runtime rather than inferred from silence
-    team_control      pause, resume, stop, halt-all, kill: who, when, why --
-                      written BEFORE the effect, so a restart cannot resume what
-                      a person halted, and a kill leaves a record of itself
+    team_control      pause, resume, stop, kill: who, when, why -- written
+                      BEFORE the effect, so a restart cannot resume what a
+                      person halted, and a kill leaves a record of itself
+    halt_hold         one row per active hold: scope (team/user/org), the
+                      subject it covers, who set it, when, why. Execution needs
+                      zero rows covering a run; release deletes one row and
+                      requires authority at that scope
     team_session      the per-teammate session a human can enter
     team_budget       spend and counters, per run
 
@@ -386,6 +411,8 @@ Focused on what this feature introduces, not a full STRIDE pass.
 | Claim without provenance | Unauditable knowledge | schema requires links | refuse to publish a claim with none |
 | Pause mistaken for a spend brake | Bill keeps growing while the operator believes it stopped | — | the control names what it does; `halt all` is the global brake, `stop` and interrupt the narrower ones |
 | Halt released by a restart | Everything resumes after someone halted it on purpose | — | halt is written before it acts, and release is explicit |
+| A narrow release undoes a broad hold | A user resumes work an org halted | — | holds stack and release requires authority at the hold's scope |
+| Halted team shows no reason | Person retries a release that will refuse them | — | the hold, its scope and who set it are shown |
 | Kill leaves no trace | A killed run is indistinguishable from one that never ran | — | the record survives what kill destroys |
 | A slow node reported dead | Person restarts healthy work | — | dead is established by the runtime, never inferred from a gap in traffic |
 | Resume delivers a backlog at once | Sudden load spike on resume | — | expected; bounds still apply, and held messages are visible while paused |
@@ -456,7 +483,9 @@ model, a cluster or a browser.
 A claim without provenance is refused. A team with no terminal state cannot be
 saved. A claim with no responsible human cannot be enqueued. A swap against an
 active occupant is refused. A stopped run's drafts reach the queue; a killed run's do not, and its record
-still does. Halt-all survives a runtime restart and releases only explicitly. Node state
+still does. A halt survives a runtime restart and releases only explicitly. Holds stack:
+with a team hold and an org hold present, releasing the team hold leaves the run
+halted. A release attempted below the hold's scope is refused. Node state
 is written by the runtime and never derived from silence.
 
 **Integration.** A two-node delegation against a real store. A run resumed after
@@ -480,5 +509,6 @@ needs them:
   control and interrupt is the per-agent one — but should entering one *offer*
   the interrupt prominently? A person opening a session usually wants the agent
   to stop talking first.
-- **Slice 1:** does `halt all` need a scope narrower than everything — per
-  tenant, per team — or is one global switch the point of a break-glass control?
+- **Slice 1:** org-scope halt implies an organisation model — accounts, roles,
+  and who counts as an org authority. None of that exists yet. The scope field
+  and the stacking rule can be built now; the org *level* waits on it.
