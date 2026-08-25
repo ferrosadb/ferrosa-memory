@@ -419,7 +419,7 @@ fn default_retrieval_limit() -> usize {
 /// Promoted from former dispatch-layer constants so operators can tune them at
 /// runtime via the workbench and persist them to the config file. Defaults
 /// preserve the original hardcoded behaviour exactly.
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct SearchConfig {
     /// Minimum number of candidates required before the LLM judge reranks.
     #[serde(default = "default_rerank_min_candidates")]
@@ -433,6 +433,12 @@ pub struct SearchConfig {
     /// Batch size for chunked judge reranking of large candidate sets.
     #[serde(default = "default_rerank_batch_size")]
     pub rerank_batch_size: usize,
+    /// Fusion weight overrides applied after profile selection. Any weight set
+    /// here overrides the corresponding weight from the selected fusion profile.
+    /// All default to `None` (no override — use the profile's value).
+    /// See `[search.fusion]` in the example config for the full key list.
+    #[serde(default)]
+    pub fusion: FusionTuningConfig,
 }
 
 impl Default for SearchConfig {
@@ -442,6 +448,132 @@ impl Default for SearchConfig {
             rerank_max_candidates: default_rerank_max_candidates(),
             rerank_min_score_coverage: default_rerank_min_score_coverage(),
             rerank_batch_size: default_rerank_batch_size(),
+            fusion: FusionTuningConfig::default(),
+        }
+    }
+}
+
+/// Fusion weight overrides (`[search.fusion]` section).
+///
+/// Each field is `Option<f64>`: when `Some`, the value overrides the
+/// corresponding weight from the selected fusion profile (after `auto` routing
+/// and per-call `fusion_weights` merging). When `None`, the profile's value
+/// is preserved. This lets operators tune workspace affinity, datalog frontier,
+/// and other signals without recompiling.
+///
+/// Weights must be in `[0.0, 10.0]`. Set to `0.0` to disable a signal.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Default)]
+pub struct FusionTuningConfig {
+    /// Override workspace affinity weight. Boosts entities learned in or near
+    /// the caller's working directory. Default `None` (profile decides).
+    /// Recommended override: `2.0` to ensure workspace scoping is always active.
+    #[serde(default)]
+    pub workspace_weight: Option<f64>,
+    /// Override datalog graph-frontier expansion weight. Default `None`.
+    /// Recommended override: `2.0` to enable graph traversal recall.
+    #[serde(default)]
+    pub datalog_frontier_weight: Option<f64>,
+    /// Override entity ANN (vector similarity) weight. Default `None`.
+    #[serde(default)]
+    pub ann_weight: Option<f64>,
+    /// Override fold (consolidated cluster) weight. Default `None`.
+    #[serde(default)]
+    pub fold_weight: Option<f64>,
+    /// Override context BM25 (lexical) weight. Default `None`.
+    #[serde(default)]
+    pub context_bm25_weight: Option<f64>,
+    /// Override context ANN (vector) weight. Default `None`.
+    #[serde(default)]
+    pub context_ann_weight: Option<f64>,
+    /// Override document BM25 weight. Default `None`.
+    #[serde(default)]
+    pub document_bm25_weight: Option<f64>,
+    /// Override document ANN weight. Default `None`.
+    #[serde(default)]
+    pub document_ann_weight: Option<f64>,
+    /// Override phonetic (fuzzy name) weight. Default `None`.
+    #[serde(default)]
+    pub phonetic_weight: Option<f64>,
+    /// Override document phonetic weight. Default `None`.
+    #[serde(default)]
+    pub document_phonetic_weight: Option<f64>,
+    /// Override entity content FTS weight. Default `None`.
+    #[serde(default)]
+    pub entity_content_fts_weight: Option<f64>,
+    /// Override scene (consolidation cluster) weight. Default `None`.
+    #[serde(default)]
+    pub scene_weight: Option<f64>,
+    /// Override profile (session gist) weight. Default `None`.
+    #[serde(default)]
+    pub profile_weight: Option<f64>,
+    /// Override foresight (temporal fact) weight. Default `None`.
+    #[serde(default)]
+    pub foresight_weight: Option<f64>,
+    /// Override warmth (recency) weight. Default `None`.
+    #[serde(default)]
+    pub warmth_weight: Option<f64>,
+    /// Override pagerank weight. Default `None`.
+    #[serde(default)]
+    pub pagerank_weight: Option<f64>,
+    /// Override reputation weight. Default `None`.
+    #[serde(default)]
+    pub reputation_weight: Option<f64>,
+}
+
+impl FusionTuningConfig {
+    /// Apply all `Some` overrides from this config to the given `FusionConfig`.
+    /// Called after profile selection and before per-call `fusion_weights` merging.
+    pub fn apply_overrides(&self, config: &mut crate::hybrid_search::FusionConfig) {
+        if let Some(w) = self.workspace_weight {
+            config.workspace_weight = w;
+        }
+        if let Some(w) = self.datalog_frontier_weight {
+            config.datalog_frontier_weight = w;
+        }
+        if let Some(w) = self.ann_weight {
+            config.ann_weight = w;
+        }
+        if let Some(w) = self.fold_weight {
+            config.fold_weight = w;
+        }
+        if let Some(w) = self.context_bm25_weight {
+            config.context_bm25_weight = w;
+        }
+        if let Some(w) = self.context_ann_weight {
+            config.context_ann_weight = w;
+        }
+        if let Some(w) = self.document_bm25_weight {
+            config.document_bm25_weight = w;
+        }
+        if let Some(w) = self.document_ann_weight {
+            config.document_ann_weight = w;
+        }
+        if let Some(w) = self.phonetic_weight {
+            config.phonetic_weight = w;
+        }
+        if let Some(w) = self.document_phonetic_weight {
+            config.document_phonetic_weight = w;
+        }
+        if let Some(w) = self.entity_content_fts_weight {
+            config.entity_content_fts_weight = w;
+        }
+        if let Some(w) = self.scene_weight {
+            config.scene_weight = w;
+        }
+        if let Some(w) = self.profile_weight {
+            config.profile_weight = w;
+        }
+        if let Some(w) = self.foresight_weight {
+            config.foresight_weight = w;
+        }
+        if let Some(w) = self.warmth_weight {
+            config.warmth_weight = w;
+        }
+        if let Some(w) = self.pagerank_weight {
+            config.pagerank_weight = w;
+        }
+        if let Some(w) = self.reputation_weight {
+            config.reputation_weight = w;
         }
     }
 }
