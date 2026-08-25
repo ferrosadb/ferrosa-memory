@@ -324,11 +324,23 @@ responsible for the machines they can reach.
 
     Ferrosa Memory        state, authorisation, transcripts, artifacts, holds
         |
-        +-- host coordinator          sandboxes and VMs on that host
+        |   ..... WebRTC control channel (the streamer's) .....
         |
-        +-- delegate coordinator      in the cloud; itself a coordinator
+        +-- host coordinator          container runtime on that host
+        |
+        +-- delegate coordinator      cloud credentials; itself a coordinator
                 |
                 +-- cloud VMs
+
+Coordinators speak to the database and to agents over the **same WebRTC control
+channel the streamer uses**. They are peers on that plane, so a coordinator does
+not need to sit beside a database node.
+
+What it does need is direct control of whatever runs sandboxes — **cloud
+credentials, or host access to the container runtime**. The adjacency
+requirement is therefore inverted from the obvious one: *near the runtime, far
+from the database is fine; the reverse is useless.* A coordinator with a perfect
+database connection and no way to start a container coordinates nothing.
 
 Coordinators **nest**. A delegate takes direction from above and coordinates the
 machines below it, so "the coordinator" is a role rather than a singleton.
@@ -359,6 +371,48 @@ failure mode where losing contact means losing control.
 The cost, stated rather than discovered: a database outage stops agent work.
 For a system that spends money and touches the internet, that is the correct
 direction to fail.
+
+Renewal travels over WebRTC, which puts the lease behind a transport whose
+failure modes are known here and have been observed on this system: ICE failing
+mid-session with throughput at zero and no packets reported lost; inbound UDP
+dropped by a host firewall, which fails only on the local network; a TLS
+expectation mismatch that hangs rather than refusing.
+
+Each expires a lease and stops a coordinator — correct, and it makes the lease
+duration a real decision:
+
+- **too short**, an ordinary reconnect stops agent work
+- **too long**, a coordinator that has been cut off keeps spending
+
+Pick it deliberately and **render an expiry as an expiry**. In this system that
+class of failure has previously surfaced as "the display is blank" and "the
+stream stalled", and a coordinator that stopped because it lost its lease should
+say exactly that.
+
+### A coordinator is as privileged as what it can provision
+
+The sharpest security consequence in this design, and nothing else here
+mitigates it.
+
+`send_to` authorisation lives in Memory and is audited, but it governs which
+agent may ask which other agent for work. It says nothing about what a
+*coordinator* may do, because the coordinator is downstream of that decision —
+it executes what was already authorised.
+
+| Coordinator holds | Effective privilege |
+|---|---|
+| a container socket | run anything on that host |
+| cloud credentials | create machines, execute code on them, spend money |
+
+Compromise one and the graph's authorisation is irrelevant. Three controls:
+
+1. **Credentials scoped to provisioning** — create and destroy this
+   coordinator's sandboxes, nothing else. Not a general-purpose cloud identity.
+2. **Privilege declared and visible**, like the node capabilities, and for the
+   same reason. "This coordinator can start containers on your laptop" is
+   something an operator should be told once, plainly.
+3. **Actions recorded where the coordinator cannot edit them** — in Memory, on
+   the run, like every other control.
 
 ### What survives what
 
@@ -462,7 +516,8 @@ Seven tables. Names are indicative; the shapes are the commitment.
                       BEFORE the effect, so a restart cannot resume what a
                       person halted, and a kill leaves a record of itself
     coordinator       one row per coordinator: parent, scope, declared sandbox
-                      backends, and its lease expiry
+                      backends, declared privilege (container socket / cloud
+                      credentials), and its lease expiry
     sandbox_backend   per backend: declared capabilities, including whether it
                       can suspend and resume
     halt_hold         one row per active hold: scope (team/user/org), the
@@ -488,6 +543,8 @@ Focused on what this feature introduces, not a full STRIDE pass.
 | T4 | **Forged provenance.** A claim links to items it did not use, or omits ones it did. | Links are recorded by the runtime from actual message traffic, not asserted by the writer. |
 | T5 | **Spend exhaustion.** A cyclic graph burns budget until something else breaks. | Per-run token and message bounds, enforced by the runtime. Unlike forge's pacing, the default here is **not** unlimited. |
 | T6a | **Human work published as agent-team output.** A person writes a paragraph in a teammate's session; the claim ships it unattributed. | Human turns are marked in the transcript and in draft authorship. Same failure as T6, pointing the other way. |
+| T7 | **Compromised coordinator.** It holds a container socket or cloud credentials; graph authorisation does not constrain it. | Provisioning-scoped credentials, declared and visible privilege, and an action record it cannot edit. Not fully mitigated — a coordinator is trusted with what it can provision. |
+| T8 | **Lease starvation as denial of service.** Disrupting the control channel stops all agent work. | Accepted: failing closed is the intended direction. Lease duration is tuned so an ordinary reconnect does not trigger it. |
 | T6c | **Sent-on draft carries borrowed authority.** A stopped draft handed to another team arrives with provenance its new authors did not gather. | Provenance travels but is attributed by origin: inherited evidence renders as inherited, naming the team and run that gathered it. A claim cannot present another team's work as its own. |
 | T6b | **A stopped run resumes.** Pause or stop held in memory is lost to a restart. | Control state is written; the runtime reads it rather than remembering it. |
 | T6 | **Claim laundering.** Agent agreement is read as human approval. | Structural, not procedural: there is no transition from any agent-produced state to approved. Both terminal states await a named responsible human, and the green check is only ever awarded by one. |
@@ -504,6 +561,8 @@ Focused on what this feature introduces, not a full STRIDE pass.
 | Pause mistaken for a spend brake | Bill keeps growing while the operator believes it stopped | — | the control names what it does; `halt all` is the global brake, `stop` and interrupt the narrower ones |
 | Halt released by a restart | Everything resumes after someone halted it on purpose | — | halt is written before it acts, and release is explicit |
 | A narrow release undoes a broad hold | A user resumes work an org halted | — | holds stack and release requires authority at the hold's scope |
+| Lease expires on a transient reconnect | Agent work stops during ordinary network noise | expiry is rendered as expiry | lease duration tuned above reconnect time |
+| Coordinator far from its runtime | Coordinates nothing despite a healthy database link | — | adjacency is to the runtime, and is a placement requirement not a preference |
 | Coordinator keeps running after a halt it never saw | Break glass has a hole where nobody can look | lease not renewed | the coordinator stops itself; enforcement is by absence, not delivery |
 | Database outage stops all agent work | Teams idle during an incident | lease expiry | intended, and documented rather than discovered |
 | Delegate outlives its parent | Orphaned cloud VMs spending money | lease not renewed | same lease rule applies at every level of the tree |
