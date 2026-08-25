@@ -807,6 +807,37 @@ impl CqlTierStore {
         Ok(())
     }
 
+    /// Remove a row from a root's partition in the by-root view.
+    ///
+    /// Used when a row changes root. `entity_source` is keyed by entity_id and
+    /// updates in place; this view is keyed by root and does not, so the old
+    /// copy has to be taken out by hand or the entity is listed under both.
+    async fn delete_source_by_root(
+        &self,
+        ctx: &TenantContext,
+        root: &str,
+        record: &EntitySource,
+    ) -> anyhow::Result<()> {
+        let query = format!(
+            "DELETE FROM {}.entity_source_by_root \
+             WHERE tenant_id = ? AND source_root = ? AND page_key = ?",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        self.session
+            .query_unpaged(
+                query,
+                (
+                    ctx.tenant_id,
+                    root,
+                    page_key(record.recorded_at, record.entity_id)?,
+                ),
+            )
+            .await
+            .context("removing an entity source from its old root")?;
+        Ok(())
+    }
+
     /// One page of a root, newest first, resumable by cursor.
     ///
     /// `ORDER BY page_key DESC` is explicit because this engine accepts
@@ -1259,8 +1290,21 @@ impl TierStore for CqlTierStore {
                 report.unresolved += 1;
             }
             if source.source_root != root {
+                // The by-root view is PARTITIONED by root, so a re-rooted row
+                // does not move when it is rewritten -- it is inserted into
+                // the new partition while the old one keeps its copy, and the
+                // entity then appears in two tiers at once. entity_source
+                // updates in place and hides this completely.
+                //
+                // Deleted before the write, and by the same page_key the
+                // insert will use: recorded_at and entity_id do not change
+                // here, so the old row's address is known exactly.
+                let previous = source.source_root.clone();
                 source.source_root = root;
                 source.matched_alias = alias;
+                if let Some(previous) = previous.as_deref() {
+                    self.delete_source_by_root(ctx, previous, &source).await?;
+                }
                 self.write_source(ctx, &source).await?;
                 report.rewritten += 1;
             }
