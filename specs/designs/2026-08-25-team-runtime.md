@@ -7,7 +7,8 @@ executive_summary: >
   knowledge claim with links to every item it used. Because forwarder nodes make
   cycles structural, termination comes only from explicit bounds; because
   sandboxes do not exist yet, capability isolation is declared and shown as
-  unenforced rather than assumed.
+  unenforced rather than assumed. Both endings reach a named responsible human,
+  and no artifact is approved without one.
 ---
 
 # Team Runtime
@@ -86,6 +87,27 @@ carrying the draft, the objection, and the provenance links. A human answers and
 the run resumes. This is the same surface used to grill the user mid-run, which
 is why the Team tab and the home page both show it.
 
+The draft does not wait inside the parked run. It enters the queue immediately,
+`blocked on human`, so that work in dispute is visible rather than buried in a
+run nobody has opened.
+
+## Terminal states
+
+Both endings reach the same place. They differ in the state they arrive in and
+what they carry:
+
+| Run ended | Queue state | Carries | Next |
+|---|---|---|---|
+| writer and reviewer agreed | proposed | draft, provenance | responsible human reviews |
+| bounds exhausted, disagreeing | blocked on human | draft, provenance, objection | responsible human breaks the tie |
+
+There is no third path. **No artifact receives a green check without a person
+acting** — agent agreement buys a better starting state, never the outcome.
+
+Every claim names a **responsible human**. This is an assignment, not a pool: a
+claim nobody owns is a claim nobody reviews, and it would sit in the queue
+looking like progress.
+
 ## Capability model
 
 Each node declares what it holds — internet, browser, filesystem, shell.
@@ -144,7 +166,8 @@ Seven tables. Names are indicative; the shapes are the commitment.
     team_edge         from, to, condition prompt, message template
     team_run          team version, starting prompt, bounds, state
     team_message      the transcript: from, to, body, timestamp, refused flag
-    team_artifact     drafts and the final claim, with provenance links
+    team_artifact     drafts and the final claim, with provenance links,
+                      queue state, and the responsible human
     team_budget       spend and counters, per run
 
 `team_message` records refusals as well as sends. An authorisation refusal that
@@ -162,7 +185,7 @@ Focused on what this feature introduces, not a full STRIDE pass.
 | T3 | **Prompt injection from researched content.** The researcher fetches open-web text; it lands in the writer's context. | Researcher output is stored and passed as *data*, clearly delimited, never as instructions. This is the highest-likelihood threat here and the least mitigated by capability isolation. |
 | T4 | **Forged provenance.** A claim links to items it did not use, or omits ones it did. | Links are recorded by the runtime from actual message traffic, not asserted by the writer. |
 | T5 | **Spend exhaustion.** A cyclic graph burns budget until something else breaks. | Per-run token and message bounds, enforced by the runtime. Unlike forge's pacing, the default here is **not** unlimited. |
-| T6 | **Claim laundering.** Agent agreement is read as human approval. | The claim enters the existing proposed queue in a proposed state. It is never published without a human acting. |
+| T6 | **Claim laundering.** Agent agreement is read as human approval. | Structural, not procedural: there is no transition from any agent-produced state to approved. Both terminal states await a named responsible human, and the green check is only ever awarded by one. |
 
 ## Failure modes
 
@@ -173,6 +196,7 @@ Focused on what this feature introduces, not a full STRIDE pass.
 | Runtime restarts mid-run | Run lost, if state was in memory | — | state is in the database; a run is resumable by construction |
 | Deadlock undetected | Run parks, nobody notices | message surface on Team tab and home | the surface is the mitigation, which is why it is in scope |
 | Claim without provenance | Unauditable knowledge | schema requires links | refuse to publish a claim with none |
+| Claim with no responsible human | Sits in the queue unreviewed, indistinguishable from work in progress | assignment is required on entry | refuse to enqueue a claim that cannot name an owner |
 | Capability shown as enforced when it is not | Unfounded trust in isolation | — | unenforced state rendered on every run without a sandbox |
 
 ## Plan
@@ -199,8 +223,9 @@ slice 2 are exercised for real.
 **Slice 5 — storage and tiering of returns.** Researcher output stored as Data
 and Information, with provenance recorded from message traffic.
 
-**Slice 6 — the claim.** Artifact assembly, provenance links, and submission to
-the existing proposed-knowledge queue in a proposed state.
+**Slice 6 — the claim.** Artifact assembly, provenance links, responsible-human
+assignment, and submission to the existing proposed-knowledge queue in the right
+state — `proposed` when the team agreed, `blocked on human` when it did not.
 
 **Slice 7 — the surfaces.** Team tab, graph editor, run view, and the message
 section on the tab and the home page.
@@ -235,8 +260,6 @@ needs them:
 - **Slice 5:** who authors a stored summary — the researcher's own words, or the
   runtime recording what it returned? Provenance integrity (T4) argues for the
   runtime.
-- **Slice 6:** does a parked run's draft enter the queue when the human breaks
-  the tie, or does the run resume and re-derive it?
 - **Slice 7:** does the graph editor allow a graph with no terminal state, given
   cycles are legal? Refusing needs a definition of "terminal"; permitting needs
   the bounds to be visible in the editor.
