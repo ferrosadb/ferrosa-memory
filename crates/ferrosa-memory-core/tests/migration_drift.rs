@@ -92,6 +92,83 @@ fn fresh_migration_keyspace_is_within_cql_identifier_limit() {
     );
 }
 
+/// Every test binary that runs migrations against the SHARED test keyspace
+/// must be serialized by the same nextest test-group.
+///
+/// The in-process `live_migration_test_lock` cannot serialize across
+/// processes, and nextest runs one process PER TEST — so the only thing
+/// keeping these apart under nextest is the `migration-drift` test-group in
+/// `.config/nextest.toml`. That group was scoped to `binary(migration_drift)`
+/// alone, while `launch_gates_g3_g4` and `skill_e2e_live` also call
+/// `run_migrations` against `test.keyspace` (the shared `agent_memory_test`).
+/// Nothing serialized them against migration_drift, so they ran concurrently.
+///
+/// That is a real race, not a flaky test. t03 deletes the v31 `schema_version`
+/// row and asserts its own `run_migrations` re-applies exactly one migration.
+/// A concurrent `run_migrations` from another binary re-applies v31 first, so
+/// t03's call finds nothing pending and returns 0:
+///
+///     migration_drift.rs:317
+///     assertion `left == right` failed:
+///       exactly one migration (v31) should apply after rewind
+///       left: 0   right: 1
+///
+/// Observed on CI run 32606574972 (PR #227), which was a one-line version
+/// bump and could not itself have caused it.
+///
+/// This test fails the moment a new test binary starts running migrations
+/// without being added to the group, which is how the gap appeared.
+#[test]
+fn every_migration_running_binary_is_serialized_by_the_nextest_group() {
+    let tests_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut migration_runners: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&tests_dir).expect("tests dir must be readable") {
+        let path = entry.expect("readable dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let body = std::fs::read_to_string(&path).expect("test source must be readable");
+        // A call site, not a mention in prose.
+        if body.contains("run_migrations(") {
+            migration_runners.push(
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .expect("test file stem")
+                    .to_string(),
+            );
+        }
+    }
+    migration_runners.sort();
+    assert!(
+        !migration_runners.is_empty(),
+        "scan found no migration-running test binaries — the detector is broken, \
+         not the config"
+    );
+
+    let config_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.config/nextest.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
+        panic!(
+            "nextest config must be readable at {}: {e}",
+            config_path.display()
+        )
+    });
+
+    let missing: Vec<&String> = migration_runners
+        .iter()
+        .filter(|binary| !config.contains(&format!("binary({binary})")))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "these test binaries call run_migrations against the shared keyspace but \
+         are NOT in the migration-drift nextest test-group, so nextest runs them \
+         concurrently with migration_drift and they corrupt each other's \
+         schema_version state: {missing:?}\n\
+         Add them to the test-group filter in .config/nextest.toml."
+    );
+}
+
 /// T-01: MIGRATIONS array is monotonically increasing and every version
 /// is strictly greater than the pre-versioning baseline.
 #[test]
