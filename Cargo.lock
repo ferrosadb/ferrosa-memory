@@ -977,7 +977,7 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "ferrosa-memory-batch"
-version = "0.27.0"
+version = "0.28.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -995,7 +995,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-memory-core"
-version = "0.27.0"
+version = "0.28.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1034,7 +1034,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-memory-eval"
-version = "0.27.0"
+version = "0.28.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1062,7 +1062,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-memory-mcp"
-version = "0.27.0"
+version = "0.28.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1082,7 +1082,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-memory-sync"
-version = "0.27.0"
+version = "0.28.0"
 dependencies = [
  "aead",
  "aes-gcm",
@@ -1143,7 +1143,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "fmem-cli"
-version = "0.27.0"
+version = "0.28.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3747,9 +3747,9 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uuid"
-version = "1.24.0"
+version = "1.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf3923a6f5c4c6382e0b653c4117f48d631ea17f38ed86e2a828e6f7412f5239"
+checksum = "f053576934f05a761a402421fbbe3d425d9366f75f978806a037b3ca481abecc"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
