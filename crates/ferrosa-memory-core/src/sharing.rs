@@ -371,3 +371,313 @@ mod tests {
         );
     }
 }
+
+/// One item that would be shared, as the sender needs to read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedItem {
+    pub entity_id: Uuid,
+    pub title: String,
+    pub tier: Tier,
+    /// How far from a seed it was reached. 0 is a seed itself.
+    pub hops: usize,
+}
+
+/// What a grant resolves to right now.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SharePreview {
+    pub items: Vec<SharedItem>,
+    /// Seeds the sender named that do not clear the floor, so are not shared.
+    ///
+    /// Named rather than silently dropped: a seed that vanishes without
+    /// explanation is the single most confusing thing this screen can do, and
+    /// "why is that not in the list" is the question it must never provoke.
+    pub excluded_seeds: Vec<SharedItem>,
+    /// The scan bound bit, so the list is a floor rather than the answer.
+    pub truncated: bool,
+}
+
+/// Resolve a grant against a tenant's whole graph.
+///
+/// Loads tier facts and edges, runs the grant's Datalog, and returns the
+/// items with the titles the sender will actually read. Titles come from the
+/// tier plane's own records, which is why a share can only ever contain
+/// things that have a recorded source -- an entity nobody placed cannot be
+/// deliberately shared, which is the intended behaviour and not a gap.
+pub async fn preview_share(
+    store: &impl crate::tier_store::TierStore,
+    ctx: &crate::types::TenantContext,
+    edges: &[(Uuid, Uuid)],
+    grant: &ShareGrant,
+    scan_limit: usize,
+) -> anyhow::Result<SharePreview> {
+    let loaded = crate::tier_store::load_tier_facts(store, ctx, scan_limit).await?;
+    let mut facts = loaded.facts;
+    for (src, dst) in edges {
+        facts.insert(
+            "edge",
+            vec![
+                Term::Const(*src),
+                Term::ConstStr("relates".to_owned()),
+                Term::Const(*dst),
+            ],
+        );
+    }
+    // Derive tiers first: the grant's rules read `tier`, which the root rules
+    // produce from `source_root`.
+    let rules: Vec<_> = loaded
+        .rules
+        .iter()
+        .map(|rule| parse_rule(rule))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("registry rule did not parse: {e}"))?;
+    let (derived, _) = evaluate(&rules, &facts, 64, scan_limit);
+
+    let reached = grant
+        .resolve(&derived, scan_limit)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let page = store.sources(ctx, scan_limit).await?;
+    let titles: std::collections::HashMap<Uuid, String> = page
+        .sources
+        .iter()
+        .map(|source| (source.entity_id, source.title.clone()))
+        .collect();
+    let tiers = tiers_from(&derived);
+
+    let items = reached
+        .iter()
+        .map(|id| SharedItem {
+            entity_id: *id,
+            title: titles.get(id).cloned().unwrap_or_else(|| id.to_string()),
+            tier: tiers.get(id).copied().unwrap_or(Tier::Data),
+            hops: 0,
+        })
+        .collect();
+
+    // A seed that did not survive its own floor. The sender chose it, so its
+    // absence has to be stated.
+    let excluded_seeds = grant
+        .seeds
+        .iter()
+        .filter(|seed| !reached.contains(seed))
+        .map(|seed| SharedItem {
+            entity_id: *seed,
+            title: titles
+                .get(seed)
+                .cloned()
+                .unwrap_or_else(|| seed.to_string()),
+            tier: tiers.get(seed).copied().unwrap_or(Tier::Data),
+            hops: 0,
+        })
+        .collect();
+
+    Ok(SharePreview {
+        items,
+        excluded_seeds,
+        truncated: loaded.truncated || page.truncated,
+    })
+}
+
+/// Read the tier each entity ended up with, from the derived facts.
+fn tiers_from(facts: &FactSet) -> std::collections::HashMap<Uuid, Tier> {
+    let mut out = std::collections::HashMap::new();
+    for row in facts.facts.get("tier").into_iter().flatten() {
+        if let (Some(Term::Const(id)), Some(Term::ConstStr(tier))) = (row.first(), row.get(1))
+            && let Some(tier) = Tier::parse(tier)
+        {
+            out.insert(*id, tier);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    use crate::tier_store::{InMemoryTierStore, SourceDraft, TierStore, seed_tier_rules};
+    use crate::types::TenantContext;
+    use chrono::Utc;
+
+    fn tenant() -> TenantContext {
+        TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "preview-test".to_owned(),
+        }
+    }
+
+    async fn store_with(paths: &[(&str, &str)]) -> (InMemoryTierStore, TenantContext, Vec<Uuid>) {
+        let store = InMemoryTierStore::default();
+        let ctx = tenant();
+        seed_tier_rules(&store, &ctx, "/r", "test")
+            .await
+            .expect("seed");
+        let mut ids = Vec::new();
+        for (title, path) in paths {
+            let id = Uuid::new_v4();
+            store
+                .record_source(
+                    &ctx,
+                    SourceDraft {
+                        entity_id: id,
+                        session_id: Uuid::nil(),
+                        title: (*title).to_owned(),
+                        source_path: (*path).to_owned(),
+                    },
+                )
+                .await
+                .expect("record");
+            ids.push(id);
+        }
+        (store, ctx, ids)
+    }
+
+    /// The screen shows TITLES. An id is not something a sender can recognise,
+    /// and recognising what leaves is the whole job this serves.
+    #[tokio::test]
+    async fn a_preview_carries_the_titles_a_sender_reads() {
+        let (store, ctx, ids) = store_with(&[("Rust ownership", "/r/skills/rust.md")]).await;
+        let grant = ShareGrant::new([ids[0]], 0, Tier::Wisdom);
+        let preview = preview_share(&store, &ctx, &[], &grant, 10_000)
+            .await
+            .expect("preview");
+        assert_eq!(preview.items.len(), 1);
+        assert_eq!(preview.items[0].title, "Rust ownership");
+        assert_eq!(preview.items[0].tier, Tier::Wisdom);
+    }
+
+    /// A seed the floor rejects is NAMED, not silently dropped. The sender
+    /// chose it; its absence is the one thing this screen must explain.
+    #[tokio::test]
+    async fn a_seed_below_the_floor_is_named_rather_than_vanishing() {
+        let (store, ctx, ids) = store_with(&[
+            ("Corpus doc", "/r/corpus/x.md"),
+            ("Skill", "/r/skills/s.md"),
+        ])
+        .await;
+        let grant = ShareGrant::new([ids[0], ids[1]], 0, Tier::Wisdom);
+        let preview = preview_share(&store, &ctx, &[], &grant, 10_000)
+            .await
+            .expect("preview");
+
+        assert_eq!(preview.items.len(), 1, "the corpus seed was shared");
+        assert_eq!(preview.items[0].title, "Skill");
+        assert_eq!(
+            preview.excluded_seeds.len(),
+            1,
+            "the rejected seed vanished"
+        );
+        assert_eq!(preview.excluded_seeds[0].title, "Corpus doc");
+        assert_eq!(preview.excluded_seeds[0].tier, Tier::Information);
+    }
+
+    /// Hops walk the graph, and the floor still applies at every step.
+    #[tokio::test]
+    async fn hops_reach_neighbours_that_clear_the_floor() {
+        let (store, ctx, ids) = store_with(&[
+            ("Seed skill", "/r/skills/seed.md"),
+            ("Neighbour skill", "/r/skills/near.md"),
+            ("Corpus neighbour", "/r/corpus/near.md"),
+        ])
+        .await;
+        let edges = vec![(ids[0], ids[1]), (ids[0], ids[2])];
+
+        let one = ShareGrant::new([ids[0]], 1, Tier::Wisdom);
+        let preview = preview_share(&store, &ctx, &edges, &one, 10_000)
+            .await
+            .expect("preview");
+        let titles: Vec<&str> = preview.items.iter().map(|i| i.title.as_str()).collect();
+        assert!(titles.contains(&"Seed skill"));
+        assert!(
+            titles.contains(&"Neighbour skill"),
+            "one hop did not reach: {titles:?}"
+        );
+        assert!(
+            !titles.contains(&"Corpus neighbour"),
+            "a below-floor neighbour was shared: {titles:?}",
+        );
+    }
+
+    /// Zero hops is the seeds alone, whatever the graph says.
+    #[tokio::test]
+    async fn zero_hops_shares_only_the_seeds() {
+        let (store, ctx, ids) =
+            store_with(&[("Seed", "/r/skills/a.md"), ("Neighbour", "/r/skills/b.md")]).await;
+        let grant = ShareGrant::new([ids[0]], 0, Tier::Wisdom);
+        let preview = preview_share(&store, &ctx, &[(ids[0], ids[1])], &grant, 10_000)
+            .await
+            .expect("preview");
+        assert_eq!(preview.items.len(), 1);
+        assert_eq!(preview.items[0].title, "Seed");
+    }
+
+    /// Lowering the floor opens the path, which proves the tests above measure
+    /// the floor rather than an accident of the fixture.
+    #[tokio::test]
+    async fn lowering_the_floor_admits_the_corpus_neighbour() {
+        let (store, ctx, ids) = store_with(&[
+            ("Seed skill", "/r/skills/seed.md"),
+            ("Corpus neighbour", "/r/corpus/near.md"),
+        ])
+        .await;
+        let grant = ShareGrant::new([ids[0]], 1, Tier::Information);
+        let preview = preview_share(&store, &ctx, &[(ids[0], ids[1])], &grant, 10_000)
+            .await
+            .expect("preview");
+        let titles: Vec<&str> = preview.items.iter().map(|i| i.title.as_str()).collect();
+        assert!(titles.contains(&"Corpus neighbour"), "{titles:?}");
+    }
+
+    /// A truncated scan makes the list a floor, and the preview says so.
+    #[tokio::test]
+    async fn a_bounded_scan_is_reported_rather_than_looking_complete() {
+        let (store, ctx, ids) = store_with(&[
+            ("A", "/r/skills/a.md"),
+            ("B", "/r/skills/b.md"),
+            ("C", "/r/skills/c.md"),
+        ])
+        .await;
+        let grant = ShareGrant::new([ids[0]], 0, Tier::Wisdom);
+        let preview = preview_share(&store, &ctx, &[], &grant, 2)
+            .await
+            .expect("preview");
+        assert!(preview.truncated, "a partial scan reported as complete");
+    }
+
+    /// A promotion moves what a share contains: the floor reads the DERIVED
+    /// tier, and a promotion outranks the root it came from.
+    #[tokio::test]
+    async fn promoting_a_corpus_item_lets_a_wisdom_floor_share_it() {
+        let (store, ctx, ids) = store_with(&[("Corpus doc", "/r/corpus/x.md")]).await;
+        let grant = ShareGrant::new([ids[0]], 0, Tier::Wisdom);
+        assert!(
+            preview_share(&store, &ctx, &[], &grant, 10_000)
+                .await
+                .expect("before")
+                .items
+                .is_empty(),
+        );
+
+        store
+            .promote(
+                &ctx,
+                crate::tier_store::TierPromotion {
+                    entity_id: ids[0],
+                    tier: Tier::Wisdom,
+                    actor: "ben".to_owned(),
+                    reason: "curated".to_owned(),
+                    created_at: Utc::now(),
+                },
+            )
+            .await
+            .expect("promote");
+
+        let after = preview_share(&store, &ctx, &[], &grant, 10_000)
+            .await
+            .expect("after");
+        assert_eq!(
+            after.items.len(),
+            1,
+            "the promotion did not reach the share"
+        );
+    }
+}
