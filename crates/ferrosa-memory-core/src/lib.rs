@@ -27,6 +27,7 @@ pub mod chains;
 pub mod compression;
 pub mod confidence;
 pub mod config;
+pub mod content_address;
 pub mod context_segment;
 pub mod contradiction;
 pub mod control_store;
