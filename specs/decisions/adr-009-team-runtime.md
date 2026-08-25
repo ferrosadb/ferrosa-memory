@@ -3,8 +3,10 @@ executive_summary: >
   Agent teams are user-defined graphs whose state, authorisation and record live
   in Ferrosa Memory while execution runs in installed coordinator processes that
   nest -- a host coordinator, and delegate coordinators in the cloud that
-  coordinate in turn. Coordinators execute on renewable leases, so a halt is
-  enforced by absence rather than by delivery. Agents delegate through a single send_to(agent, request) endpoint
+  coordinate in turn. Coordinators reach the database over the same
+  WebRTC control channel the streamer uses, so they sit next to the runtime they
+  drive rather than next to a database node, and they execute on renewable
+  leases so a halt is enforced by absence rather than by delivery. Agents delegate through a single send_to(agent, request) endpoint
   whose target the engine authorises against the graph's edges; because a node
   may act purely as a forwarder the graph has cycles by design, so termination
   is never structural and every run carries explicit bounds. Node capabilities
@@ -24,7 +26,7 @@ A team is a graph the user draws: agents as nodes, and edges saying when one
 agent involves another. The first team is a writing team — researcher, writer,
 reviewer — producing an agent team knowledge claim for human review.
 
-The shape of the problem forces thirteen decisions before any code, because each one
+The shape of the problem forces fourteen decisions before any code, because each one
 changes the schema or the trust boundary rather than the interface.
 
 ## Decision 1: The runtime lives in Ferrosa Memory
@@ -427,6 +429,75 @@ inherits a set of problems already solved once:
 - re-signed when replaced in place, or it is killed on the next start,
 - allowlisted for inbound traffic where it needs it, and told plainly when it is
   not, rather than failing in a way that only shows up on one network.
+
+## Decision 14: A coordinator sits next to the runtime, not next to the database
+
+Coordinators reach the database and the agents over the **WebRTC control
+channel the streamer already uses**. They are peers on the same control plane,
+so they do not need to be co-located with a database node.
+
+What they *do* need is direct control of the thing that runs sandboxes, and that
+comes in exactly two forms:
+
+| Form | What it means | What it grants |
+|---|---|---|
+| cloud credentials | can create and destroy cloud machines; may itself run in a sandbox | spend, and code execution on machines it creates |
+| host access | on the host, talking to the container runtime | effectively root on that host |
+
+So the adjacency requirement is inverted from the obvious one: **near the
+runtime, far from the database is fine; the reverse is not.** A coordinator with
+a perfect database connection and no way to start a container coordinates
+nothing.
+
+### The lease now depends on the control channel
+
+Decision 13 makes a coordinator stop when its lease cannot renew. Renewal now
+travels over WebRTC, which puts the lease behind a transport with known and
+observed failure modes:
+
+- ICE failing mid-session, with throughput collapsing to zero while no packets
+  are reported lost — observed on this system,
+- inbound UDP dropped by a host firewall, which fails *only* on the local
+  network and looks like a timeout,
+- a TLS expectation mismatch that hangs rather than refusing.
+
+Each of those expires a lease and stops a coordinator. That is the correct
+direction to fail, and it makes the lease duration a real tuning decision:
+
+- **too short** and an ordinary reconnect stops agent work,
+- **too long** and a runaway coordinator keeps spending after it has been cut
+  off.
+
+Pick it deliberately, state the number, and make an expiry visible as an expiry
+rather than as agents mysteriously going quiet. A coordinator that stopped
+because it lost its lease should say so — in this system that class of failure
+has previously read as "the display is blank" and "the stream stalled".
+
+### A coordinator is as privileged as what it can provision
+
+This is the sharpest security consequence of the whole design, and it is not
+mitigated by anything else in this document.
+
+`send_to` authorisation lives in Memory and is audited. That governs which agent
+may ask which other agent for work. It says nothing about what a *coordinator*
+can do, because the coordinator is downstream of that decision — it executes
+what was already authorised.
+
+A coordinator holding a container socket can run anything on that host. A
+coordinator holding cloud credentials can create machines and spend money.
+Compromise one and the graph's authorisation is irrelevant.
+
+Three controls follow:
+
+1. **Credentials are scoped to provisioning** — create and destroy the sandboxes
+   this coordinator runs, and nothing else. Not a general-purpose cloud
+   identity.
+2. **A coordinator's own privilege is declared and visible**, alongside the node
+   capabilities of Decision 3 and for the same reason. "This coordinator can
+   start containers on your laptop" is a thing an operator should be told once,
+   plainly.
+3. **Its actions are recorded where it cannot edit them** — in Memory, on the
+   run, like every other control.
 
 ## Consequences
 
