@@ -17,7 +17,7 @@ Decisions: `specs/knowledge-tiers/decisions.md` D16–D49.
 - [x] tests: transitions, D46 demotion routing, band edges, page_key ties (15)
 - [x] register the module in `lib.rs`
 - [x] `KnowledgeStore` trait + `InMemoryKnowledgeStore` (22 tests)
-- [ ] `CqlKnowledgeStore` — create claim, approve, reject, send back
+- [x] `CqlKnowledgeStore` — 4 live conformance tests pass against the cluster
 - [x] state change is a MOVE (D43) — verified by removing unindex, 2 tests go red
 - [x] expiry sweep reads today's bucket
 

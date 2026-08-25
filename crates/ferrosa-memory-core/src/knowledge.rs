@@ -13,10 +13,14 @@
 //! The distinction the whole tier rests on: a **claim** is what a model
 //! asserts, and **knowledge** is what a person ratified.
 
+use std::sync::Arc;
+
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::cql_storage::{build_col_map, cql_get};
 use crate::tiers::Tier;
 
 /// Where a deliverable is in its life.
@@ -38,6 +42,7 @@ pub enum KnowledgeState {
 }
 
 impl KnowledgeState {
+    /// The wire and storage spelling.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Proposed => "proposed",
@@ -49,6 +54,9 @@ impl KnowledgeState {
         }
     }
 
+    /// Read a stored state back. `None` for anything this build does not know,
+    /// which is a row written by a different version rather than a value to
+    /// guess at.
     pub fn parse(raw: &str) -> Option<Self> {
         match raw {
             "proposed" => Some(Self::Proposed),
@@ -105,6 +113,8 @@ impl Demotion {
         }
     }
 
+    /// The stored spelling, kept distinct so the three reasons stay legible
+    /// once they are all sitting in Information.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::WasTrueThen => "was_true_then",
@@ -304,6 +314,16 @@ pub trait KnowledgeStore: Send + Sync {
     ) -> impl std::future::Future<Output = anyhow::Result<Option<KnowledgeItem>>> + Send;
 
     /// Its version chain, oldest first.
+    ///
+    /// Deliberately unlimited. The chain grows one entry per review cycle, so
+    /// it is bounded by human effort rather than by corpus size — measured at
+    /// 0.9 ms to read five hundred versions of one item, against 0.2 ms for
+    /// the two point reads the hot path actually uses via `current_version`.
+    ///
+    /// A LIMIT here would be a bound on a RESULT, which in this codebase means
+    /// the caller silently sees a partial history. If a chain ever does grow
+    /// past what a person could have produced, that is a runaway writer worth
+    /// hearing about, not a page size worth tuning.
     fn versions(
         &self,
         ctx: &crate::types::TenantContext,
@@ -574,6 +594,493 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
                 .unwrap_or_default()
         }))
     }
+}
+
+/// The CQL implementation, mirroring [`InMemoryKnowledgeStore`].
+///
+/// Columns are read BY NAME through `build_col_map`/`cql_get`, never by
+/// position. A positional reader is one added column away from silently
+/// shifting every field after it — a fault that cost real debugging in the
+/// task board on the same day this was written.
+pub struct CqlKnowledgeStore {
+    session: Arc<crate::cql_storage::CqlSession>,
+    keyspace: String,
+}
+
+impl CqlKnowledgeStore {
+    pub fn new(session: Arc<crate::cql_storage::CqlSession>, keyspace: impl Into<String>) -> Self {
+        Self {
+            session,
+            keyspace: keyspace.into(),
+        }
+    }
+
+    /// Put the item into the queues its current state belongs to.
+    async fn index(
+        &self,
+        ctx: &crate::types::TenantContext,
+        item: &KnowledgeItem,
+    ) -> anyhow::Result<()> {
+        let key = page_key(item.created_at, item.knowledge_id)?;
+        let band = priority_band(item.priority);
+        let query = format!(
+            "INSERT INTO {}.knowledge_by_state \
+             (tenant_id, state, priority_band, page_key, knowledge_id, title, kind, \
+              priority, repo, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        self.session
+            .query_unpaged(
+                query,
+                (
+                    ctx.tenant_id,
+                    item.state.as_str(),
+                    band,
+                    key.as_str(),
+                    item.knowledge_id,
+                    item.title.as_str(),
+                    item.kind.as_str(),
+                    item.priority,
+                    item.repo.as_deref(),
+                    item.expires_at,
+                ),
+            )
+            .await
+            .context("indexing knowledge by state")?;
+
+        if let Some(expires) = item.expires_at {
+            // Ordered by EXPIRY, not creation, so walking day buckets forward
+            // is already the Claims tab's default sort (D45).
+            let expiry_key = page_key(expires, item.knowledge_id)?;
+            let query = format!(
+                "INSERT INTO {}.knowledge_by_expiry \
+                 (tenant_id, state, expiry_day, page_key, knowledge_id, title, kind, \
+                  priority, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                self.keyspace
+            );
+            #[allow(deprecated)]
+            self.session
+                .query_unpaged(
+                    query,
+                    (
+                        ctx.tenant_id,
+                        item.state.as_str(),
+                        expiry_day(expires),
+                        expiry_key.as_str(),
+                        item.knowledge_id,
+                        item.title.as_str(),
+                        item.kind.as_str(),
+                        item.priority,
+                        expires,
+                    ),
+                )
+                .await
+                .context("indexing knowledge by expiry")?;
+        }
+        Ok(())
+    }
+
+    /// Take the item OUT of the queues its old state put it in.
+    ///
+    /// Both queues are partitioned by state, so a state change is a MOVE. An
+    /// insert without this leaves the item in two queues at once — the fault
+    /// already fixed once in `entity_source_by_root`, and demonstrated against
+    /// these very tables before they were written to (D43).
+    async fn unindex(
+        &self,
+        ctx: &crate::types::TenantContext,
+        item: &KnowledgeItem,
+    ) -> anyhow::Result<()> {
+        let key = page_key(item.created_at, item.knowledge_id)?;
+        let query = format!(
+            "DELETE FROM {}.knowledge_by_state \
+             WHERE tenant_id = ? AND state = ? AND priority_band = ? AND page_key = ?",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        self.session
+            .query_unpaged(
+                query,
+                (
+                    ctx.tenant_id,
+                    item.state.as_str(),
+                    priority_band(item.priority),
+                    key.as_str(),
+                ),
+            )
+            .await
+            .context("removing knowledge from its old state queue")?;
+
+        if let Some(expires) = item.expires_at {
+            let expiry_key = page_key(expires, item.knowledge_id)?;
+            let query = format!(
+                "DELETE FROM {}.knowledge_by_expiry \
+                 WHERE tenant_id = ? AND state = ? AND expiry_day = ? AND page_key = ?",
+                self.keyspace
+            );
+            #[allow(deprecated)]
+            self.session
+                .query_unpaged(
+                    query,
+                    (
+                        ctx.tenant_id,
+                        item.state.as_str(),
+                        expiry_day(expires),
+                        expiry_key.as_str(),
+                    ),
+                )
+                .await
+                .context("removing knowledge from its old expiry bucket")?;
+        }
+        Ok(())
+    }
+
+    async fn write_item(
+        &self,
+        ctx: &crate::types::TenantContext,
+        item: &KnowledgeItem,
+    ) -> anyhow::Result<()> {
+        let query = format!(
+            "INSERT INTO {}.knowledge_item \
+             (tenant_id, knowledge_id, title, kind, state, current_version, expires_at, \
+              author_agent, author_session, task_id, priority, repo, created_at, \
+              updated_at, reviewed_by, reviewed_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        self.session
+            .query_unpaged(
+                query,
+                (
+                    ctx.tenant_id,
+                    item.knowledge_id,
+                    item.title.as_str(),
+                    item.kind.as_str(),
+                    item.state.as_str(),
+                    item.current_version,
+                    item.expires_at,
+                    item.author_agent.as_deref(),
+                    item.author_session,
+                    item.task_id.as_deref(),
+                    item.priority,
+                    item.repo.as_deref(),
+                    item.created_at,
+                    item.updated_at,
+                    item.reviewed_by.as_deref(),
+                    item.reviewed_at,
+                ),
+            )
+            .await
+            .context("writing a knowledge item")?;
+        Ok(())
+    }
+}
+
+impl KnowledgeStore for CqlKnowledgeStore {
+    async fn propose(
+        &self,
+        ctx: &crate::types::TenantContext,
+        draft: ClaimDraft,
+    ) -> anyhow::Result<KnowledgeItem> {
+        let now = Utc::now();
+        let knowledge_id = Uuid::now_v7();
+        let item = KnowledgeItem {
+            knowledge_id,
+            title: draft.title,
+            kind: draft.kind,
+            state: KnowledgeState::Proposed,
+            current_version: Some(1),
+            // A claim expires too (D44).
+            expires_at: Some(now + chrono::Duration::days(draft.expires_in_days)),
+            author_agent: draft.author_agent,
+            author_session: draft.author_session,
+            task_id: draft.task_id,
+            priority: draft.priority,
+            repo: draft.repo,
+            created_at: now,
+            updated_at: now,
+            reviewed_by: None,
+            reviewed_at: None,
+        };
+        self.write_item(ctx, &item).await?;
+
+        let query = format!(
+            "INSERT INTO {}.knowledge_version \
+             (tenant_id, knowledge_id, version, body_url, artifact_id, summary, \
+              version_state, feedback, created_by, created_at, approved_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        self.session
+            .query_unpaged(
+                query,
+                (
+                    ctx.tenant_id,
+                    knowledge_id,
+                    1i32,
+                    draft.body_url.as_deref(),
+                    None::<Uuid>,
+                    draft.summary.as_deref(),
+                    "pending",
+                    None::<&str>,
+                    item.author_agent.as_deref(),
+                    now,
+                    None::<DateTime<Utc>>,
+                ),
+            )
+            .await
+            .context("writing the first knowledge version")?;
+
+        self.index(ctx, &item).await?;
+        Ok(item)
+    }
+
+    async fn decide(
+        &self,
+        ctx: &crate::types::TenantContext,
+        knowledge_id: Uuid,
+        to: KnowledgeState,
+        reviewer: Option<&str>,
+        feedback: Option<&str>,
+    ) -> anyhow::Result<KnowledgeItem> {
+        let item = self
+            .item(ctx, knowledge_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no knowledge item {knowledge_id}"))?;
+        // Refused before anything is written: the states carry meaning a
+        // person relies on.
+        transition(item.state, to).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // OUT of the old partitions before INTO the new ones. Both queues are
+        // keyed by state, so this is a move (D43).
+        self.unindex(ctx, &item).await?;
+
+        let now = Utc::now();
+        let mut moved = item;
+        moved.state = to;
+        moved.updated_at = now;
+        if matches!(
+            to,
+            KnowledgeState::Approved | KnowledgeState::Rejected | KnowledgeState::Revisit
+        ) {
+            moved.reviewed_by = reviewer.map(str::to_owned);
+            moved.reviewed_at = Some(now);
+        }
+        if to == KnowledgeState::Approved {
+            // RESETS rather than grants: the claim already had one.
+            moved.expires_at = Some(now + chrono::Duration::days(DEFAULT_EXPIRY_DAYS));
+        }
+        self.write_item(ctx, &moved).await?;
+        self.index(ctx, &moved).await?;
+
+        if let Some(feedback) = feedback
+            && let Some(version) = moved.current_version
+        {
+            let query = format!(
+                "UPDATE {}.knowledge_version SET feedback = ? \
+                 WHERE tenant_id = ? AND knowledge_id = ? AND version = ?",
+                self.keyspace
+            );
+            #[allow(deprecated)]
+            self.session
+                .query_unpaged(query, (feedback, ctx.tenant_id, knowledge_id, version))
+                .await
+                .context("recording review feedback")?;
+        }
+        Ok(moved)
+    }
+
+    async fn item(
+        &self,
+        ctx: &crate::types::TenantContext,
+        knowledge_id: Uuid,
+    ) -> anyhow::Result<Option<KnowledgeItem>> {
+        let query = format!(
+            "SELECT knowledge_id, title, kind, state, current_version, expires_at, \
+             author_agent, author_session, task_id, priority, repo, created_at, \
+             updated_at, reviewed_by, reviewed_at FROM {}.knowledge_item \
+             WHERE tenant_id = ? AND knowledge_id = ?",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        let result = self
+            .session
+            .query_unpaged(query, (ctx.tenant_id, knowledge_id))
+            .await
+            .context("reading a knowledge item")?;
+        let columns = build_col_map(result.col_specs());
+        result
+            .rows_or_empty()
+            .into_iter()
+            .next()
+            .map(|row| item_from_row(&row, &columns))
+            .transpose()
+    }
+
+    async fn versions(
+        &self,
+        ctx: &crate::types::TenantContext,
+        knowledge_id: Uuid,
+    ) -> anyhow::Result<Vec<KnowledgeVersion>> {
+        let query = format!(
+            "SELECT version, body_url, artifact_id, summary, version_state, feedback, \
+             created_by, created_at, approved_at FROM {}.knowledge_version \
+             WHERE tenant_id = ? AND knowledge_id = ? ORDER BY version ASC",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        let result = self
+            .session
+            .query_unpaged(query, (ctx.tenant_id, knowledge_id))
+            .await
+            .context("reading a knowledge version chain")?;
+        let columns = build_col_map(result.col_specs());
+        result
+            .rows_or_empty()
+            .into_iter()
+            .map(|row| {
+                Ok(KnowledgeVersion {
+                    version: cql_get(&row, &columns, "version")?,
+                    body_url: cql_get::<String>(&row, &columns, "body_url").ok(),
+                    artifact_id: cql_get(&row, &columns, "artifact_id").ok(),
+                    summary: cql_get::<String>(&row, &columns, "summary").ok(),
+                    version_state: cql_get::<String>(&row, &columns, "version_state")
+                        .unwrap_or_else(|_| "pending".to_owned()),
+                    feedback: cql_get::<String>(&row, &columns, "feedback").ok(),
+                    created_by: cql_get::<String>(&row, &columns, "created_by").ok(),
+                    created_at: cql_get(&row, &columns, "created_at")?,
+                    approved_at: cql_get(&row, &columns, "approved_at").ok(),
+                })
+            })
+            .collect()
+    }
+
+    async fn page(
+        &self,
+        ctx: &crate::types::TenantContext,
+        state: KnowledgeState,
+        band: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<KnowledgePage> {
+        anyhow::ensure!(limit > 0, "a page of no items is not a page");
+        // One more than asked, to learn whether a next page exists without a
+        // second query and without handing out a cursor that leads nowhere.
+        let probe = limit.saturating_add(1);
+        let base = format!(
+            "SELECT knowledge_id, page_key FROM {}.knowledge_by_state \
+             WHERE tenant_id = ? AND state = ? AND priority_band = ?",
+            self.keyspace
+        );
+        // ORDER BY explicitly: this engine accepts CLUSTERING ORDER BY DESC in
+        // DDL and then ignores it, so the newest page would silently be the
+        // oldest rows.
+        #[allow(deprecated)]
+        let result = match cursor {
+            Some(cursor) => {
+                let query = format!("{base} AND page_key < ? ORDER BY page_key DESC LIMIT {probe}");
+                self.session
+                    .query_unpaged(query, (ctx.tenant_id, state.as_str(), band, cursor))
+                    .await
+            }
+            None => {
+                let query = format!("{base} ORDER BY page_key DESC LIMIT {probe}");
+                self.session
+                    .query_unpaged(query, (ctx.tenant_id, state.as_str(), band))
+                    .await
+            }
+        }
+        .context("reading a page of knowledge")?;
+
+        let columns = build_col_map(result.col_specs());
+        let mut ids = Vec::with_capacity(limit);
+        let mut keys = Vec::with_capacity(limit);
+        for row in result.rows_or_empty() {
+            ids.push(cql_get::<Uuid>(&row, &columns, "knowledge_id")?);
+            keys.push(cql_get::<String>(&row, &columns, "page_key")?);
+        }
+        let has_more = ids.len() > limit;
+        ids.truncate(limit);
+        keys.truncate(limit);
+
+        let mut items = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(item) = self.item(ctx, id).await? {
+                items.push(item);
+            }
+        }
+        Ok(KnowledgePage {
+            items,
+            next_cursor: has_more.then(|| keys.last().cloned()).flatten(),
+        })
+    }
+
+    async fn expiring_on(
+        &self,
+        ctx: &crate::types::TenantContext,
+        state: KnowledgeState,
+        day: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<KnowledgeItem>> {
+        anyhow::ensure!(limit > 0, "a sweep of nothing is not a sweep");
+        let query = format!(
+            "SELECT knowledge_id FROM {}.knowledge_by_expiry \
+             WHERE tenant_id = ? AND state = ? AND expiry_day = ? \
+             ORDER BY page_key ASC LIMIT {limit}",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        let result = self
+            .session
+            .query_unpaged(query, (ctx.tenant_id, state.as_str(), day))
+            .await
+            .context("reading a day of expiring knowledge")?;
+        let columns = build_col_map(result.col_specs());
+        let ids: Vec<Uuid> = result
+            .rows_or_empty()
+            .into_iter()
+            .map(|row| cql_get::<Uuid>(&row, &columns, "knowledge_id"))
+            .collect::<anyhow::Result<_>>()?;
+        let mut items = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(item) = self.item(ctx, id).await? {
+                items.push(item);
+            }
+        }
+        Ok(items)
+    }
+}
+
+/// Read one `knowledge_item` row. Shared by every reader so they agree.
+fn item_from_row(
+    row: &scylla::frame::response::result::Row,
+    columns: &crate::cql_storage::ColMap,
+) -> anyhow::Result<KnowledgeItem> {
+    let raw_state: String = cql_get(row, columns, "state")?;
+    Ok(KnowledgeItem {
+        knowledge_id: cql_get(row, columns, "knowledge_id")?,
+        title: cql_get::<String>(row, columns, "title").unwrap_or_default(),
+        kind: cql_get::<String>(row, columns, "kind").unwrap_or_default(),
+        // A state this build does not know is a row written by another
+        // version. Substituting Proposed would put someone else's approved
+        // work back in the review queue.
+        state: KnowledgeState::parse(&raw_state)
+            .ok_or_else(|| anyhow::anyhow!("unknown knowledge state {raw_state:?}"))?,
+        current_version: cql_get::<i32>(row, columns, "current_version").ok(),
+        expires_at: cql_get(row, columns, "expires_at").ok(),
+        author_agent: cql_get::<String>(row, columns, "author_agent").ok(),
+        author_session: cql_get(row, columns, "author_session").ok(),
+        task_id: cql_get::<String>(row, columns, "task_id").ok(),
+        priority: cql_get::<i32>(row, columns, "priority").unwrap_or(50),
+        repo: cql_get::<String>(row, columns, "repo").ok(),
+        created_at: cql_get(row, columns, "created_at")?,
+        updated_at: cql_get(row, columns, "updated_at")?,
+        reviewed_by: cql_get::<String>(row, columns, "reviewed_by").ok(),
+        reviewed_at: cql_get(row, columns, "reviewed_at").ok(),
+    })
 }
 
 #[cfg(test)]
