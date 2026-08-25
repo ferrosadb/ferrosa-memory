@@ -523,84 +523,22 @@ async fn session_work<R, T>(
     R: crate::control_session::AgentRuntime,
     T: ferrosa_memory_core::control_store::ControlStore + 'static,
 {
-    use ferrosa_memory_core::control_store::ControlEventDraft;
     use ferrosa_memory_core::types::TenantContext;
     let tenant = TenantContext {
         tenant_id: offer.account_id,
         session_origin: format!("mobile-control:{}", offer.session_id),
     };
-    // An AUDIT record that a session began, written OFF the hot path.
-    //
-    // Nothing below reads the cursor and nothing about serving the operator
-    // depends on this row existing. It already did not `return` on failure --
-    // that was fixed on 2026-08-23, after a cursor collision destroyed a
-    // healthy session. What it still did was `await`, and that turned out to
-    // be the same bug wearing a different shape.
-    //
-    // With the cluster hot, `reserve_cursor_block` takes its full 30 s to time
-    // out, and for those 30 s this function has not reached `recv_text` yet.
-    // The session is bound, the peer is connected, and every frame the phone
-    // sends -- shell_open, the tmux list, keystrokes -- sits unread in the
-    // queue. Observed 2026-08-24: `visual available` at T+0, the cursor error
-    // at T+30.0, `shell granted` in the same millisecond, closed at T+60.
-    // From the operator's side the terminal simply was not there.
-    //
-    // So it is spawned. An audit heartbeat is best effort by definition, and
-    // best effort means the effort does not hold anything up. Bounded without
-    // extra machinery: one task per session, and sessions are already capped
-    // by MAX_CONCURRENT_CONTROL_SESSIONS.
-    // Detached deliberately. The handle is dropped, which in tokio leaves the
-    // task running: the record is still worth writing after the operator has
-    // gone, and aborting it at session end would throw away the write this
-    // whole block exists to make. It cannot run away -- the store's own
-    // timeout bounds it.
-    drop({
-        let store = std::sync::Arc::clone(control_store);
-        let tenant = tenant.clone();
-        let fingerprint = fingerprint.to_owned();
-        let session_id = offer.session_id;
-        let controller_device_id = offer.controller_device_id;
-        tokio::spawn(async move {
-            match store.reserve_cursor_block(&tenant, &fingerprint, 64).await {
-                Err(error) => {
-                    tracing::error!(
-                        %session_id,
-                        error = %error,
-                        "reserving a control cursor block failed; this session is NOT \
-                         recorded in the durable event log, but continues to serve"
-                    );
-                }
-                Ok(block) => {
-                    if let Err(error) = store
-                        .append_event(
-                            &tenant,
-                            &fingerprint,
-                            ControlEventDraft {
-                                cursor: block.start,
-                                event_id: Uuid::now_v7(),
-                                command_id: None,
-                                kind: "heartbeat".to_owned(),
-                                payload: serde_json::json!({
-                                    "session_id": session_id,
-                                    "controller_device_id": controller_device_id,
-                                }),
-                                created_at: chrono::Utc::now(),
-                            },
-                        )
-                        .await
-                    {
-                        tracing::error!(
-                            %session_id,
-                            cursor = block.start,
-                            error = %error,
-                            "persisting the control-session heartbeat failed; this \
-                             session is NOT in the durable event log, but continues to serve"
-                        );
-                    }
-                }
-            }
-        })
-    });
+    // An AUDIT record that a session began, written OFF the hot path. The
+    // handle is dropped, which in tokio leaves the task running: the record is
+    // still worth writing after the operator has gone, and aborting it at
+    // session end would throw away the write this exists to make.
+    drop(spawn_session_audit(
+        control_store,
+        &tenant,
+        fingerprint,
+        offer.session_id,
+        offer.controller_device_id,
+    ));
 
     // Read a frame, OR notice the peer has gone. Reading alone was not enough:
     // a peer that stops answering without closing leaves this await pending
@@ -652,8 +590,8 @@ async fn session_work<R, T>(
             }
             continue;
         }
-        match dispatcher.reply(&tenant, fingerprint, &frame).await {
-            Ok(Some(reply)) => {
+        match frame_outcome(dispatcher.reply(&tenant, fingerprint, &frame).await, &frame) {
+            FrameOutcome::Reply(reply) => {
                 if let Err(error) = channel.send_text(&reply).await {
                     tracing::info!(
                         session_id = %offer.session_id,
@@ -663,29 +601,19 @@ async fn session_work<R, T>(
                     break;
                 }
             }
-            Ok(None) => {}
+            FrameOutcome::Nothing => {}
             // A capability is down; the session is not. WebRTC,
             // authentication and the tmux surface need no database, so a
-            // durable-store failure must cost the operator that ONE feature
-            // and nothing else.
-            //
-            // This arm exists because there was no such arm: every store
-            // failure arrived as a protocol violation and fell into the close
-            // below. When the cluster was hot the control channel was torn
-            // down and the terminal the operator was watching disappeared,
-            // which reads as a network fault and is not one.
-            Err(crate::control_session::ControlSessionError::CapabilityUnavailable(reason)) => {
+            // durable-store failure costs the operator that ONE feature.
+            FrameOutcome::Degrade { reply, reason } => {
                 tracing::warn!(
                     session_id = %offer.session_id,
                     %reason,
                     "a durable capability is unavailable; the session continues"
                 );
-                // Answered rather than ignored. A request that gets no reply
+                // Answered rather than ignored: a request that gets no reply
                 // leaves the device waiting on a capability that is not
                 // coming, which looks the same as a hung session.
-                let reply = frame_id_of(&frame).and_then(|frame_id| {
-                    crate::control_session::capability_unavailable_reply(&frame_id, &reason)
-                });
                 if let Some(reply) = reply
                     && let Err(error) = channel.send_text(&reply).await
                 {
@@ -697,16 +625,138 @@ async fn session_work<R, T>(
                     break;
                 }
             }
-            Err(error) => {
+            FrameOutcome::Close { reason } => {
                 tracing::warn!(
                     session_id = %offer.session_id,
-                    error = %error,
+                    %reason,
                     "invalid control application frame"
                 );
                 let _ = channel.close().await;
                 break;
             }
         }
+    }
+}
+
+/// Record that a session began, without making anyone wait for it.
+///
+/// Nothing reads this cursor and nothing about serving the operator depends on
+/// the row existing. It is an audit trail, and an audit trail that holds up the
+/// thing it is auditing has stopped being best effort.
+///
+/// It used to be `await`ed here. An earlier fix had already stopped it
+/// `return`ing on failure -- a cursor collision had destroyed a healthy session
+/// -- but the await was the same bug in a different shape: with the cluster hot
+/// `reserve_cursor_block` takes its full 30 s deadline, and for those 30 s the
+/// caller had not yet reached `recv_text`. The session was bound and the peer
+/// connected while shell_open, the tmux list and every keystroke sat unread.
+///
+/// Returning the handle rather than spawning invisibly is what makes the
+/// ordering testable: a caller can be shown to be free while the store still
+/// hangs. Production drops the handle and lets the task finish on its own.
+///
+/// Bounded without extra machinery: one task per session, and sessions are
+/// already capped by MAX_CONCURRENT_CONTROL_SESSIONS.
+fn spawn_session_audit<T>(
+    store: &std::sync::Arc<T>,
+    tenant: &ferrosa_memory_core::types::TenantContext,
+    fingerprint: &str,
+    session_id: Uuid,
+    controller_device_id: Uuid,
+) -> tokio::task::JoinHandle<()>
+where
+    T: ferrosa_memory_core::control_store::ControlStore + 'static,
+{
+    use ferrosa_memory_core::control_store::ControlEventDraft;
+    let store = std::sync::Arc::clone(store);
+    let tenant = tenant.clone();
+    let fingerprint = fingerprint.to_owned();
+    tokio::spawn(async move {
+        match store.reserve_cursor_block(&tenant, &fingerprint, 64).await {
+            Err(error) => {
+                tracing::error!(
+                    %session_id,
+                    error = %error,
+                    "reserving a control cursor block failed; this session is NOT \
+                     recorded in the durable event log, but continues to serve"
+                );
+            }
+            Ok(block) => {
+                if let Err(error) = store
+                    .append_event(
+                        &tenant,
+                        &fingerprint,
+                        ControlEventDraft {
+                            cursor: block.start,
+                            event_id: Uuid::now_v7(),
+                            command_id: None,
+                            kind: "heartbeat".to_owned(),
+                            payload: serde_json::json!({
+                                "session_id": session_id,
+                                "controller_device_id": controller_device_id,
+                            }),
+                            created_at: chrono::Utc::now(),
+                        },
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        %session_id,
+                        cursor = block.start,
+                        error = %error,
+                        "persisting the control-session heartbeat failed; this \
+                         session is NOT in the durable event log, but continues to serve"
+                    );
+                }
+            }
+        }
+    })
+}
+
+/// What the frame loop should do about one dispatcher result.
+///
+/// A value rather than four arms inline, because the distinction it encodes --
+/// which failures end a session and which do not -- is the whole database
+/// boundary, and inline it could only be checked by standing up a WebRTC
+/// channel. As a value it is a unit test.
+#[derive(Debug)]
+enum FrameOutcome {
+    /// Send this reply and continue.
+    Reply(String),
+    /// Nothing to send; continue.
+    Nothing,
+    /// A capability could not be served. Send the reply if one could be
+    /// correlated, and CONTINUE: the peer did nothing wrong.
+    Degrade {
+        reply: Option<String>,
+        reason: String,
+    },
+    /// The peer violated the protocol. Close the channel.
+    Close { reason: String },
+}
+
+/// Classify one dispatcher result.
+///
+/// The arm that matters is `Degrade`. Every durable-store failure used to
+/// arrive as a protocol violation and fall into `Close`, so an overloaded
+/// database tore down the control channel and the operator's terminal went
+/// with it.
+fn frame_outcome(
+    result: Result<Option<String>, crate::control_session::ControlSessionError>,
+    frame: &str,
+) -> FrameOutcome {
+    match result {
+        Ok(Some(reply)) => FrameOutcome::Reply(reply),
+        Ok(None) => FrameOutcome::Nothing,
+        Err(crate::control_session::ControlSessionError::CapabilityUnavailable(reason)) => {
+            let reply = frame_id_of(frame).and_then(|frame_id| {
+                crate::control_session::capability_unavailable_reply(&frame_id, &reason)
+            });
+            FrameOutcome::Degrade { reply, reason }
+        }
+        Err(error) => FrameOutcome::Close {
+            reason: error.to_string(),
+        },
     }
 }
 
@@ -1005,5 +1055,207 @@ mod tests {
     #[test]
     fn a_malformed_memory_tenant_is_refused_rather_than_guessed() {
         assert_eq!(memory_tenant(Some("not-a-uuid")), None);
+    }
+
+    // ---- the control session's database boundary -------------------------
+    //
+    // Ben's statement of it, 2026-08-24: WebRTC, authentication and the tmux
+    // surface are database-independent; the audit heartbeat is asynchronous
+    // best effort; the command feed, task board and memory views are optional
+    // database-backed capabilities; and a database failure produces a degraded
+    // response, never a protocol violation and never a teardown.
+    //
+    // These pin the two halves the frame loop is responsible for. The
+    // classification half is pinned next to the error type in control_session.
+
+    use crate::control_session::ControlSessionError;
+
+    fn command_frame(frame_id: &str) -> String {
+        serde_json::json!({
+            "version": 1,
+            "frame_id": frame_id,
+            "body": {"type": "command"},
+        })
+        .to_string()
+    }
+
+    /// The regression that made the operator's terminal disappear: a hot
+    /// database must cost the capability and nothing else.
+    #[test]
+    fn a_capability_failure_degrades_and_keeps_the_session() {
+        let outcome = frame_outcome(
+            Err(ControlSessionError::CapabilityUnavailable(
+                "durable control store: Request timeout".to_owned(),
+            )),
+            &command_frame("command-1"),
+        );
+        match outcome {
+            FrameOutcome::Degrade { reply, reason } => {
+                assert!(reason.contains("Request timeout"));
+                let reply: serde_json::Value =
+                    serde_json::from_str(&reply.expect("a correlated reply")).expect("json");
+                assert_eq!(reply["frame_id"], "command-1");
+                assert_eq!(reply["body"]["type"], "capability_unavailable");
+            }
+            other => panic!("a store failure must not end the session; got {other:?}"),
+        }
+    }
+
+    /// The other half. Reclassifying everything would satisfy the test above
+    /// and leave a peer that genuinely speaks wrongly able to hold a session
+    /// open forever.
+    #[test]
+    fn a_protocol_violation_still_closes_the_session() {
+        let outcome = frame_outcome(
+            Err(ControlSessionError::Protocol("frame JSON: eof".to_owned())),
+            "{not json",
+        );
+        assert!(
+            matches!(outcome, FrameOutcome::Close { .. }),
+            "got {outcome:?}"
+        );
+    }
+
+    /// A frame the dispatcher answered normally is still answered normally.
+    #[test]
+    fn a_normal_reply_is_sent() {
+        let outcome = frame_outcome(Ok(Some("{\"pong\":true}".to_owned())), &command_frame("f1"));
+        match outcome {
+            FrameOutcome::Reply(reply) => assert_eq!(reply, "{\"pong\":true}"),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// Degenerate case: no frame_id, so no reply can be correlated. The answer
+    /// is lost; the SESSION is not. Getting this wrong the other way would
+    /// reintroduce the teardown through the back door.
+    #[test]
+    fn a_capability_failure_without_a_frame_id_still_keeps_the_session() {
+        let outcome = frame_outcome(
+            Err(ControlSessionError::CapabilityUnavailable("hot".to_owned())),
+            "{}",
+        );
+        match outcome {
+            FrameOutcome::Degrade { reply, .. } => {
+                assert!(reply.is_none(), "nothing to correlate a reply to");
+            }
+            other => panic!("a missing frame id must not end the session; got {other:?}"),
+        }
+    }
+
+    use std::sync::Arc;
+
+    /// A store that never answers, the way an overloaded cluster does not
+    /// answer: the caller waits for its deadline rather than being refused.
+    struct HangingControlStore {
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    impl ferrosa_memory_core::control_store::ControlStore for HangingControlStore {
+        async fn reserve_cursor_block(
+            &self,
+            _ctx: &ferrosa_memory_core::types::TenantContext,
+            _server_fingerprint: &str,
+            _size: u64,
+        ) -> anyhow::Result<ferrosa_memory_core::control_store::CursorBlock> {
+            // Says it began, then never finishes. The test needs to know the
+            // work actually started, or "the caller was not blocked" could be
+            // satisfied by a task that had not run at all.
+            self.started.notify_one();
+            std::future::pending::<()>().await;
+            unreachable!("a pending future does not resolve")
+        }
+
+        async fn append_event(
+            &self,
+            _ctx: &ferrosa_memory_core::types::TenantContext,
+            _server_fingerprint: &str,
+            _draft: ferrosa_memory_core::control_store::ControlEventDraft,
+        ) -> anyhow::Result<ferrosa_memory_core::control_store::ControlEvent> {
+            std::future::pending().await
+        }
+
+        async fn events_after(
+            &self,
+            _ctx: &ferrosa_memory_core::types::TenantContext,
+            _server_fingerprint: &str,
+            _after_cursor: Option<u64>,
+            _limit: usize,
+        ) -> anyhow::Result<ferrosa_memory_core::control_store::ControlReplayPage> {
+            std::future::pending().await
+        }
+
+        async fn put_command_if_absent(
+            &self,
+            _ctx: &ferrosa_memory_core::types::TenantContext,
+            _server_fingerprint: &str,
+            _command: &ferrosa_memory_core::control_store::ControlCommand,
+        ) -> anyhow::Result<ferrosa_memory_core::control_store::CommandInsert> {
+            std::future::pending().await
+        }
+
+        async fn get_command(
+            &self,
+            _ctx: &ferrosa_memory_core::types::TenantContext,
+            _server_fingerprint: &str,
+            _command_id: Uuid,
+        ) -> anyhow::Result<Option<ferrosa_memory_core::control_store::ControlCommand>> {
+            std::future::pending().await
+        }
+
+        async fn update_command(
+            &self,
+            _ctx: &ferrosa_memory_core::types::TenantContext,
+            _server_fingerprint: &str,
+            _command_id: Uuid,
+            _update: ferrosa_memory_core::control_store::ControlCommandUpdate,
+        ) -> anyhow::Result<ferrosa_memory_core::control_store::ControlCommand> {
+            std::future::pending().await
+        }
+    }
+
+    /// The incident, as a contract.
+    ///
+    /// The audit heartbeat had already been changed from `return`-on-failure
+    /// to log-on-failure. It still `await`ed, and that was the same bug in a
+    /// different shape: with the cluster hot, session_work spent 30 s inside
+    /// the heartbeat before its first `recv_text`, so a bound session with a
+    /// connected peer read nothing -- shell_open, the tmux list and every
+    /// keystroke sat in the queue. Five consecutive sessions, T+0 bound,
+    /// T+30.0 cursor error, T+60 closed.
+    ///
+    /// A comment cannot keep this true. This can: start the audit against a
+    /// store that never answers, and require the caller to be free anyway.
+    #[tokio::test]
+    async fn the_audit_heartbeat_does_not_block_its_caller() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let store = Arc::new(HangingControlStore {
+            started: Arc::clone(&started),
+        });
+        let tenant = ferrosa_memory_core::types::TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "audit-ordering-test".to_owned(),
+        };
+
+        let handle = spawn_session_audit(
+            &store,
+            &tenant,
+            "fingerprint",
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        );
+
+        // The caller is free while the store is still hanging. Generous
+        // enough that a slow machine does not fail it, and far below the 30 s
+        // deadline that a blocking implementation would wait out.
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+            .await
+            .expect("the audit should have begun");
+        assert!(
+            !handle.is_finished(),
+            "the audit is still hanging, which is the point: the caller \
+             reached this line anyway"
+        );
+        handle.abort();
     }
 }
