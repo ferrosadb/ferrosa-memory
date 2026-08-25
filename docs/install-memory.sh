@@ -259,7 +259,12 @@ register_macos() {
   sed -e "s|__BINARY_PATH__|$BIN_DIR/ferrosa-memory-mcp|g" \
       -e "s|__REPO_ROOT__|$INSTALL_ROOT|g" \
       -e "s|__CONFIG_PATH__|$CONFIG_DIR/ferrosa-memory.toml|g" \
-      "$TMP/launchd/com.ferrosa-memory.mcp.plist" > "$plist"
+      "$TMP/launchd/com.ferrosa-memory.mcp.plist.in" > "$plist"
+  # A plist that still carries a placeholder is not installable: launchd would
+  # try to exec a literal __BINARY_PATH__ and the job would silently never run.
+  if grep -q "__[A-Z_]*__" "$plist"; then
+    die "generated $plist still contains a placeholder; the shipped template and this installer disagree"
+  fi
   launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null || true
   launchctl bootstrap "gui/$(id -u)" "$plist"
   say "launchd: com.ferrosa-memory.mcp loaded; will start on every login"

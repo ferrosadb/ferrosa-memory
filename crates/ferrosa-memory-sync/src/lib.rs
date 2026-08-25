@@ -29,10 +29,10 @@
 pub mod codex_runtime;
 #[cfg(feature = "webrtc-transport")]
 pub mod control_session;
+pub mod device_request;
 pub mod learner_ingest;
 pub mod pack;
 pub mod pack_crypto;
-#[cfg(feature = "webrtc-transport")]
 pub mod peer_cli;
 #[cfg(feature = "webrtc-transport")]
 pub mod peer_session;

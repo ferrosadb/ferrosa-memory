@@ -8,7 +8,10 @@ use ferrosa_memory_core::cql_storage::{CqlStorage, build_col_map, cql_get};
 use ferrosa_memory_core::storage::Storage;
 use ferrosa_memory_core::types::{EntityEntry, TenantContext, TypedEdge};
 use futures_util::{StreamExt, stream};
-use scylla::{LegacySession, SessionBuilder};
+use scylla::{
+    LegacySession, SessionBuilder,
+    statement::{Consistency, query::Query},
+};
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -469,9 +472,29 @@ async fn confidence_scores_prepares_on_each_live_node() {
         }
 
         for table in ["confidence_scores", "typed_edges", "co_occurs_with"] {
+            // Read at LOCAL_QUORUM, not the driver default.
+            //
+            // `seed_minimal_fixture` writes through `local_cluster_config()`,
+            // which is LOCAL_QUORUM: on RF=3 that acknowledges after two of
+            // three replicas and the third is updated asynchronously. This
+            // loop talks to each node DIRECTLY, so a default-consistency
+            // (LOCAL_ONE) read against the replica that was not in the write
+            // quorum can correctly return zero rows — and the assertion below
+            // would fire on a perfectly healthy cluster.
+            //
+            // Observed 2026-08-22 (run 32582070204): typed_edges counted 1 on
+            // 19042 and 19043 but 0 on 19044. Nothing was wrong with the
+            // database; the test asserted a guarantee it never requested.
+            //
+            // What these assertions are actually for is that the restore
+            // populated the tables, not that every replica holds them
+            // locally, so a quorum read is the right contract. Same fix
+            // already applied in ferrosa_bugs.rs::local_quorum_query.
+            let mut count_query = Query::new(format!("SELECT COUNT(*) FROM agent_memory.{table}"));
+            count_query.set_consistency(Consistency::LocalQuorum);
             #[allow(deprecated)]
             let result = session
-                .query_unpaged(format!("SELECT COUNT(*) FROM agent_memory.{table}"), ())
+                .query_unpaged(count_query, ())
                 .await
                 .unwrap_or_else(|e| panic!("{table} count query failed for {contact_point}: {e}"));
             let col_map = build_col_map(result.col_specs());

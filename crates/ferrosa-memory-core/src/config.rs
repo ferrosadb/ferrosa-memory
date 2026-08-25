@@ -1463,9 +1463,11 @@ fn decode_rate_limit(configured: i64) -> Option<Option<usize>> {
 /// whole graph -- `/viz`, `/viz/ws`, `/viz/snapshot`, `/viz/api/*` -- and it
 /// authenticates nobody. The binding rule it grew was:
 ///
-///     "stdio" => 0.0.0.0        // the DEFAULT transport
-///     "http"  => 127.0.0.1
-///     _       => 0.0.0.0        // and any typo, too
+/// ```text
+/// "stdio" => 0.0.0.0        // the DEFAULT transport
+/// "http"  => 127.0.0.1
+/// _       => 0.0.0.0        // and any typo, too
+/// ```
 ///
 /// with `viz.enabled` defaulting to true. So a default install published the
 /// user's knowledge graph on every interface, and an unrecognised transport
