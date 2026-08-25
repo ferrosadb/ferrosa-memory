@@ -372,6 +372,81 @@ mod tests {
     }
 }
 
+/// What the walk needs from a graph: who is next to this node.
+///
+/// A seam rather than a direct `Storage` call, because the bounds are the
+/// interesting part -- the hop limit, the cycle guard, the edge cap -- and
+/// testing them through a 194-method storage trait tests the mock instead.
+pub trait Neighbours {
+    fn neighbours(
+        &self,
+        node: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<Uuid>>> + Send;
+}
+
+/// The live graph, read one node at a time.
+pub struct StorageNeighbours<'a, S> {
+    pub storage: &'a S,
+    pub ctx: &'a crate::types::TenantContext,
+}
+
+impl<S: crate::storage::Storage + Sync> Neighbours for StorageNeighbours<'_, S> {
+    async fn neighbours(&self, node: Uuid) -> anyhow::Result<Vec<Uuid>> {
+        Ok(self
+            .storage
+            .edge_list_for_entity(self.ctx, node)
+            .await?
+            .into_iter()
+            .map(|(neighbour, _kind)| neighbour)
+            .collect())
+    }
+}
+
+/// Collect only the edges a grant could possibly walk.
+///
+/// A breadth-first expansion from the seeds, `hops` deep. The alternative is
+/// loading every edge the tenant has -- 34,631 on the live store -- on each
+/// change of a hop selector, to answer a question that can never reach past
+/// its own limit. This reads the neighbourhood the grant is allowed to see and
+/// nothing else.
+///
+/// Bounded twice over: by the hop count, which is already capped at
+/// [`MAX_HOPS`], and by `max_edges`, because one popular node can have a
+/// degree in the thousands and a preview must not become a scan.
+pub async fn neighbourhood_edges<N: Neighbours>(
+    graph: &N,
+    seeds: &[Uuid],
+    hops: usize,
+    max_edges: usize,
+) -> anyhow::Result<(Vec<(Uuid, Uuid)>, bool)> {
+    let mut edges: Vec<(Uuid, Uuid)> = Vec::new();
+    let mut seen: std::collections::HashSet<Uuid> = seeds.iter().copied().collect();
+    let mut frontier: Vec<Uuid> = seeds.to_vec();
+    let mut truncated = false;
+
+    for _ in 0..hops.min(MAX_HOPS) {
+        let mut next = Vec::new();
+        for node in frontier.drain(..) {
+            if edges.len() >= max_edges {
+                // Say so rather than returning a short answer that looks whole.
+                truncated = true;
+                break;
+            }
+            for neighbour in graph.neighbours(node).await? {
+                edges.push((node, neighbour));
+                if seen.insert(neighbour) {
+                    next.push(neighbour);
+                }
+            }
+        }
+        if truncated || next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    Ok((edges, truncated))
+}
+
 /// One item that would be shared, as the sender needs to read it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedItem {
@@ -679,5 +754,95 @@ mod preview_tests {
             1,
             "the promotion did not reach the share"
         );
+    }
+}
+
+#[cfg(test)]
+mod walk_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// A graph in a map. Enough to exercise every bound the walk has.
+    struct Fake(HashMap<Uuid, Vec<Uuid>>);
+
+    impl Neighbours for Fake {
+        async fn neighbours(&self, node: Uuid) -> anyhow::Result<Vec<Uuid>> {
+            Ok(self.0.get(&node).cloned().unwrap_or_default())
+        }
+    }
+
+    fn chain(n: usize) -> (Fake, Vec<Uuid>) {
+        let ids: Vec<Uuid> = (0..n).map(|_| Uuid::new_v4()).collect();
+        let mut map = HashMap::new();
+        for pair in ids.windows(2) {
+            map.insert(pair[0], vec![pair[1]]);
+        }
+        (Fake(map), ids)
+    }
+
+    /// The walk stops at the hop limit. Reading further pulls in a
+    /// neighbourhood the grant can never reach, which on a real store is the
+    /// difference between a preview and a scan.
+    #[tokio::test]
+    async fn the_walk_stops_at_the_hop_limit() {
+        let (graph, ids) = chain(4);
+        let (edges, truncated) = neighbourhood_edges(&graph, &ids[..1], 1, 1_000)
+            .await
+            .expect("walk");
+        assert!(!truncated);
+        assert_eq!(edges, vec![(ids[0], ids[1])], "walked past one hop");
+    }
+
+    #[tokio::test]
+    async fn two_hops_reach_two_steps_out() {
+        let (graph, ids) = chain(4);
+        let (edges, _) = neighbourhood_edges(&graph, &ids[..1], 2, 1_000)
+            .await
+            .expect("walk");
+        assert!(edges.contains(&(ids[0], ids[1])));
+        assert!(edges.contains(&(ids[1], ids[2])));
+        assert!(
+            !edges.contains(&(ids[2], ids[3])),
+            "reached three hops at depth two"
+        );
+    }
+
+    /// Zero hops reads nothing. A grant sharing only its seeds has no use for
+    /// the graph, and touching it is work for an answer already known.
+    #[tokio::test]
+    async fn zero_hops_reads_no_edges() {
+        let (graph, ids) = chain(3);
+        let (edges, _) = neighbourhood_edges(&graph, &ids[..1], 0, 1_000)
+            .await
+            .expect("walk");
+        assert!(edges.is_empty());
+    }
+
+    /// A cycle must not spin. Following an edge back to somewhere already seen
+    /// is fine; queueing it again is not.
+    #[tokio::test]
+    async fn a_cycle_terminates() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let graph = Fake(HashMap::from([(a, vec![b]), (b, vec![a])]));
+        let (edges, _) = neighbourhood_edges(&graph, &[a], 3, 1_000)
+            .await
+            .expect("walk");
+        assert!(edges.len() <= 4, "a cycle kept expanding: {}", edges.len());
+    }
+
+    /// One popular node can have a degree in the thousands. The cap keeps a
+    /// preview a preview, and SAYS it stopped rather than returning a short
+    /// answer that looks whole.
+    #[tokio::test]
+    async fn the_edge_cap_is_reported_not_silent() {
+        let hub = Uuid::new_v4();
+        let spokes: Vec<Uuid> = (0..10).map(|_| Uuid::new_v4()).collect();
+        let graph = Fake(HashMap::from([(hub, spokes)]));
+        let (edges, truncated) = neighbourhood_edges(&graph, &[hub], 2, 3)
+            .await
+            .expect("walk");
+        assert!(truncated, "a capped walk reported as complete");
+        assert!(!edges.is_empty());
     }
 }
