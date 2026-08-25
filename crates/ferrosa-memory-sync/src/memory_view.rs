@@ -10,7 +10,7 @@
 //! A tier is derived from a source root through the rule table, so there is no
 //! column to `GROUP BY`. Materialising one would be the second truth that
 //! `TierRules` exists to avoid. The rows are read and counted in process,
-//! bounded by [`SCAN_LIMIT`], and every answer says whether the bound bit.
+//! never scanned: a page is a seek and a count is a server-side COUNT(*).
 
 // This module reads rows through scylla 0.15's LegacySession API, the same
 // choice cql_storage.rs made and for the same reason: the legacy API is
@@ -44,13 +44,6 @@ use uuid::Uuid;
 // zero — indistinguishable from a machine that has not been seeded. That is
 // the same mistake `seed-tiers` made when it defaulted its tenant, and the
 // same answer applies: a tenant is not something to guess.
-
-/// How many source rows one answer will read.
-///
-/// Not a page size — the page is much smaller. This is the bound on the scan
-/// that produces a count, and a summary that hit it says so rather than
-/// reporting a number that looks complete.
-const SCAN_LIMIT: usize = 50_000;
 
 /// Sorts this machine can actually perform.
 ///
@@ -190,7 +183,10 @@ impl MemoryView {
 
     /// The DIKW map.
     pub async fn map(&self) -> Result<TierSummary> {
-        summarise(&self.store, &self.ctx, SCAN_LIMIT).await
+        // The limit is vestigial: summarise counts per root and reads no
+        // source rows at all. Passing a scan size here would suggest it still
+        // scans.
+        summarise(&self.store, &self.ctx, 0).await
     }
 
     /// One page of a tier, newest first, resumable by cursor.
@@ -314,7 +310,10 @@ impl MemoryView {
     async fn promoted_tiers(&self) -> Result<std::collections::HashMap<Uuid, Tier>> {
         Ok(self
             .store
-            .promotions(&self.ctx, SCAN_LIMIT)
+            .promotions(
+                &self.ctx,
+                ferrosa_memory_core::tier_store::PROMOTION_READ_LIMIT,
+            )
             .await?
             .into_iter()
             .map(|promotion| (promotion.entity_id, promotion.tier))

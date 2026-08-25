@@ -15,6 +15,27 @@
 //! roots stale. Rather than hide that, [`TierStore::restate_sources`]
 //! re-resolves and reports how many rows moved — and a test holds the line
 //! that an alias edit alone does NOT silently fix them.
+//!
+//! ## Reads are seeks and counts, never scans
+//!
+//! Browsing a tier pages `entity_source_by_root` by `page_key`, and counting a
+//! tier is a partition-scoped `COUNT(*)` per root. Neither reads rows it does
+//! not return. The shape this replaced read up to 50,000 source rows per
+//! request and counted them in memory, which on a 69,683-row tenant was 15
+//! seconds AND a short answer.
+//!
+//! Where a bound is needed it bounds WORK — `MAX_ROOTS_COUNTED` caps the
+//! number of queries a map issues — never a result. A cap on a result is how
+//! the old map came to report 50,000 of 69,683 with nothing but a flag beside
+//! it.
+//!
+//! Correctness: correct when a page loses no row across a tied millisecond,
+//! when the map's counts match the partitions they came from, and when both
+//! store implementations answer identically.
+//! Last revised: 2026-08-25
+//! Last changed: Counting moved from a materialised scan to per-root COUNT(*),
+//! and rootless sources gained an explicit NO_ROOT partition so the map can
+//! still see the hole in the rule set.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -150,6 +171,14 @@ pub fn page_key(recorded_at: DateTime<Utc>, entity_id: Uuid) -> anyhow::Result<S
     Ok(format!("{millis:013}-{entity_id}"))
 }
 
+/// Everything the tier plane stores, behind one contract.
+///
+/// Two implementations, and they must agree: [`InMemoryTierStore`] backs the
+/// unit tests and [`CqlTierStore`] backs production. Where their
+/// representations differ -- the CQL store writes rootless sources into the
+/// [`NO_ROOT`] partition where the in-memory store holds `None` -- the
+/// difference is absorbed here so that a caller, and the map it produces,
+/// cannot depend on which one it is talking to.
 pub trait TierStore: Send + Sync {
     fn record_source(
         &self,
@@ -477,13 +506,25 @@ pub struct TierSummary {
     pub truncated: bool,
 }
 
+/// How many distinct roots a single map will count.
+///
+/// A bound on the number of QUERIES, which is the thing that actually grows
+/// here: one round trip per root. Deliberately not a bound on any result --
+/// each COUNT returns a single number, and capping the roots counted would
+/// produce a map that is quietly missing tiers.
+///
+/// 512 is far above the eight roots this tenant has and far below a number
+/// that would make a map slow. Crossing it is a configuration problem worth
+/// hearing about, not a size to absorb silently.
+const MAX_ROOTS_COUNTED: usize = 512;
+
 /// How many promotions one summary will read.
 ///
 /// A promotion is a person overriding a derived tier, so the count is bounded
 /// by human effort rather than by corpus size. Named separately from any scan
 /// limit: this one is a real bound on a genuinely small set, not a cap
 /// standing in for a query that should have been server-side.
-const PROMOTION_READ_LIMIT: usize = 10_000;
+pub const PROMOTION_READ_LIMIT: usize = 10_000;
 
 /// Count what sits in each tier, without reading the tiers.
 ///
@@ -531,6 +572,22 @@ pub async fn summarise(
     for alias in store.aliases(ctx).await? {
         candidates.insert(alias.canonical_root);
     }
+
+    // A bound on WORK, not on the answer.
+    //
+    // Each root is one round trip, so the alias table's size decides how many
+    // queries a map costs. Ten thousand aliases would be ten thousand
+    // sequential COUNTs and a map nobody waits for. This refuses rather than
+    // returning a partial map: a truncated count that looks whole is exactly
+    // what the old scan-based summarise did, and the point of this rewrite was
+    // to stop producing one.
+    anyhow::ensure!(
+        candidates.len() <= MAX_ROOTS_COUNTED,
+        "this tenant has {} distinct roots, above the {MAX_ROOTS_COUNTED} a map \
+         will count in one pass. The map would take one query per root. Prune \
+         the alias table, or give the counts their own aggregate.",
+        candidates.len()
+    );
 
     for root in candidates {
         let count = store.count_under_root(ctx, &root).await? as usize;
