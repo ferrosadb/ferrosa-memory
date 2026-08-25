@@ -2,9 +2,8 @@
 //! Correctness: Correct when a device cannot run anything without a grant,
 //! when a config survives a restart of the machine, and when output reaches
 //! the device as it is produced rather than when the command finishes.
-//! Last revised: 2026-08-23
-//! Last changed: shell_scroll moves through tmux's scrollback, which keys sent
-//! into the pane cannot reach.
+//! Last revised: 2026-08-24
+//! Last changed: Made task-cap invariants compile-time checks.
 //!
 //! # Three capabilities wearing one grant, for now
 //!
@@ -188,7 +187,7 @@ impl ShellExtension {
                         &comment.body,
                     ));
                 }
-                return frames;
+                frames
             }
             Err(error) => vec![serde_json::json!({
                 "type": "shell_task_detail",
@@ -1869,12 +1868,10 @@ mod output_framing_tests {
     /// not showing, which needs the real total even when the list is cut.
     #[test]
     fn the_task_cap_is_bounded() {
-        assert!(MAX_TASKS_SENT > 0);
-        assert!(
-            MAX_TASKS_SENT <= 500,
-            "a cap this high stops being a cap: it is {} frames",
-            MAX_TASKS_SENT.div_ceil(TASKS_PER_FRAME)
-        );
+        const {
+            assert!(MAX_TASKS_SENT > 0);
+            assert!(MAX_TASKS_SENT <= 500);
+        }
     }
 
     /// A conservative floor for path MTU.

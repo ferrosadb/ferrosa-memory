@@ -3,9 +3,8 @@
 //! whichever field carries it, when work waiting on a person sorts above work
 //! waiting on nobody, and when an unreachable board says so instead of looking
 //! like an empty board.
-//! Last revised: 2026-08-23
-//! Last changed: One task can be read in full — body and comments — because a
-//! title is not enough to decide anything by.
+//! Last revised: 2026-08-24
+//! Last changed: Scoped the legacy Scylla row API to the task-board CQL boundary.
 //!
 //! # Why the machine reads it and not the phone
 //!
@@ -26,6 +25,9 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context as _, Result};
 use scylla::frame::response::result::CqlValue;
+// Keep this boundary aligned with ferrosa-memory-core's `CqlSession` until the
+// shared dynamic, column-name-based row decoder is migrated as one unit.
+#[allow(deprecated)]
 use scylla::{LegacySession, SessionBuilder};
 
 /// The single-user tenant forge writes under.
@@ -353,11 +355,13 @@ pub fn identifiers_in(text: &str) -> Vec<String> {
 }
 
 /// Reads the board over CQL.
+#[allow(deprecated)]
 pub struct TaskBoard {
     session: LegacySession,
 }
 
 impl TaskBoard {
+    #[allow(deprecated)]
     pub async fn connect(contact_points: &[String]) -> Result<Self> {
         if contact_points.is_empty() {
             anyhow::bail!("no contact points for the task board");
@@ -836,6 +840,7 @@ impl TaskBoard {
 }
 
 /// Column name to position, so rows can be read by name.
+#[allow(deprecated)]
 fn column_index(result: &scylla::LegacyQueryResult) -> BTreeMap<String, usize> {
     result
         .col_specs()
