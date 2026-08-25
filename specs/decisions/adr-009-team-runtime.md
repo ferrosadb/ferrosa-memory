@@ -22,7 +22,7 @@ A team is a graph the user draws: agents as nodes, and edges saying when one
 agent involves another. The first team is a writing team — researcher, writer,
 reviewer — producing an agent team knowledge claim for human review.
 
-The shape of the problem forces five decisions before any code, because each one
+The shape of the problem forces nine decisions before any code, because each one
 changes the schema or the trust boundary rather than the interface.
 
 ## Decision 1: The runtime lives in Ferrosa Memory
@@ -128,6 +128,81 @@ a better starting state, never the outcome.
 A claim therefore has an owner, not a pool. "The responsible human" is an
 assignment, and a claim that cannot name one is a claim nobody is going to
 review.
+
+## Decision 6: A graph that cannot terminate is not a valid graph
+
+Every team must have a terminal state, and there are exactly three ways to have
+one:
+
+- **exhausted attempts** — a bound on cycles or messages,
+- **elapsed time** — a wall-clock deadline,
+- **completion** — an exit the graph can actually reach.
+
+This moves termination from a runtime concern to a **validity** concern. The
+editor refuses to save a team with no terminal state, rather than accepting it
+and discovering at run time that nothing ends. Because cycles are legal
+(Decision 2), a reachable exit is not implied by the shape of the graph and has
+to be checked.
+
+The check is a pure function of the graph and its bounds, so it is cheap and it
+is testable without running anything.
+
+## Decision 7: The definition is locked at creation; occupancy is not
+
+A team definition — its nodes, edges, prompts and bounds — is **locked when the
+team is created**. A run pins that definition. Editing produces a new team
+rather than mutating one that runs may be executing against, so no run ever
+changes shape underneath itself and a transcript can always be read against the
+graph that produced it.
+
+Occupancy is separate and is allowed to change, under two conditions:
+
+1. the team is **paused**, and
+2. the teammate being replaced is **not active**.
+
+Pausing stops new messages from flowing; it does not abort work already in
+flight. A teammate is active while it holds an unanswered turn, and swapping one
+mid-turn would orphan a reply with nowhere to land.
+
+So the graph is immutable and the roster is not. The distinction matters for
+provenance: the claim must record which occupant produced which turn, because
+"the writer said this" stops being a single agent the moment a swap is allowed.
+
+## Decision 8: Every teammate has a session a human can enter
+
+Each node in a run has a session the user can open to interact with that agent
+directly, in the same transcript the team is using.
+
+This is what makes a paused team useful rather than merely stopped: pause, enter
+the reviewer's session, ask it what it actually objects to, then resume or swap.
+
+Two rules keep it from corrupting the record:
+
+- **Human turns are attributed to the human.** They enter the transcript marked
+  as such. An unmarked human turn would let a person's paragraph be published as
+  agent-team output, which is the inverse of the laundering Decision 5 prevents
+  and just as wrong.
+- **A human turn is still bounded work.** It costs the run's budget like any
+  other turn, because the tokens are real.
+
+## Decision 9: Pause and stop are written, and both show the drafts in flight
+
+**Pause** halts new messages and is resumable. **Stop** ends the run and is not.
+They are different controls, not one control with a flag.
+
+Both are **written**. A pause or a stop that lives only in the runtime's memory
+is undone by a restart, and a run that resumes because a process bounced is a
+run that ignored the person who stopped it. The state is in the database, and
+the runtime reads it rather than remembering it.
+
+Both surfaces **show every draft of every artifact in flight**, not the latest
+one. That requires drafts to be retained rather than overwritten: a run that
+kept only the newest draft cannot answer "what did it have before the reviewer
+pushed back", which is exactly the question someone is asking at the moment they
+reach for pause or stop.
+
+So `team_artifact` is append-only. Each draft records its version, its author —
+which occupant, or which human — and the turn that produced it.
 
 ## Consequences
 
