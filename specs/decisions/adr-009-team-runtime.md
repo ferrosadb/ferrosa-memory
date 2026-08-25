@@ -22,7 +22,7 @@ A team is a graph the user draws: agents as nodes, and edges saying when one
 agent involves another. The first team is a writing team — researcher, writer,
 reviewer — producing an agent team knowledge claim for human review.
 
-The shape of the problem forces four decisions before any code, because each one
+The shape of the problem forces five decisions before any code, because each one
 changes the schema or the trust boundary rather than the interface.
 
 ## Decision 1: The runtime lives in Ferrosa Memory
@@ -100,9 +100,34 @@ Rejected: publishing anyway with a disputed marker, which puts a contested claim
 beside agreed ones and relies on a badge to keep them apart. Rejected: discarding
 the run, which throws away the most expensive part.
 
+The draft does **not** wait outside the queue while the tie is unbroken. It
+enters the proposed-knowledge queue immediately, in a `blocked on human` state,
+carrying the objection. A draft held invisibly inside a parked run is work
+nobody can see; in the queue it is work with a state.
+
 Parking also gives the deadlock a shape the rest of the system already has: it
 becomes a message awaiting a person, which is the same surface used for grilling
 the user during a run.
+
+## Decision 5: Only a human awards the green check
+
+Every artifact a team produces goes to the **responsible human** for review. No
+path exists by which agent output becomes approved knowledge without a person
+acting.
+
+This makes the two terminal paths differ in state, not in destination:
+
+| How the run ended | Enters the queue as | Carries |
+|---|---|---|
+| writer and reviewer agreed | proposed | draft, provenance links |
+| bounds exhausted, still disagreeing | blocked on human | draft, provenance links, the objection |
+
+Both wait for the same person and the same action. Agreement between agents buys
+a better starting state, never the outcome.
+
+A claim therefore has an owner, not a pool. "The responsible human" is an
+assignment, and a claim that cannot name one is a claim nobody is going to
+review.
 
 ## Consequences
 
@@ -112,8 +137,9 @@ what makes a published claim auditable — and auditability is the whole point o
 the provenance links.
 
 The team's output is a *candidate*. Writer and reviewer agreeing produces a
-claim ready for review, not a truth. This is the same rule the
-`ontology-from-observations` skill states for induced ontologies: frequency,
-model confidence and repeated agreement are never promoted directly. The human
-is the gate, and the phrase "ready for review" is load-bearing rather than
-decorative.
+claim ready for review, not a truth, and only a human awards the green check.
+
+This is the same rule the `ontology-from-observations` skill states for induced
+ontologies: frequency, model confidence and repeated agreement are never
+promoted directly. The human is the gate, and "ready for review" is load-bearing
+rather than decorative.
