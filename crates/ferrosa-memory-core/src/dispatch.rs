@@ -3,8 +3,8 @@
 //! Maps MCP tool names to handler functions. Validates input schemas before
 //! dispatch. Returns tool definitions for `tools/list`.
 //!
-//! Last revised: 2026-08-12
-//! Last changed: Routed tool discovery through bounded, versioned pagination.
+//! Last revised: 2026-08-24
+//! Last changed: Preserved balanced entity-name recall for workspace-routed searches.
 //!
 //! ## MCP protocol methods handled
 //!
@@ -7184,13 +7184,13 @@ fn select_auto_fusion_profile(
     }
 
     // 6. Default balanced — the fallback. When a workspace cwd is provided,
-    //    use the workspace-aware profile to ensure same-repo affinity. The
-    //    bare "auto" profile zeros workspace_weight, which causes cross-domain
-    //    pollution (e.g. queries from one repo returning unrelated entities from another).
+    //    use the workspace-aware balanced profile to ensure same-repo affinity
+    //    without dropping auto's entity-name phonetic channel. The bare "auto"
+    //    profile zeros workspace_weight, which causes cross-domain pollution.
     if has_workspace {
         return AutoFusionSelection {
             intent: "default_balanced_workspace",
-            profile: "bm25-semantic-workspace",
+            profile: "bm25-semantic-phonetic-workspace",
         };
     }
 
@@ -12299,8 +12299,9 @@ mod tests {
     #[test]
     fn auto_fusion_workspace_cwd_routes_default_to_workspace_profile() {
         // Regression: a default query (not a bug/build, not broad semantic)
-        // with a workspace cwd must route to the workspace-aware profile,
-        // not the bare "auto" profile that zeros workspace_weight.
+        // with a workspace cwd must route to the workspace-aware balanced
+        // profile, preserving auto's entity-name phonetic channel while adding
+        // workspace affinity.
         // Uses a query without any broad_semantic trigger words (no
         // "architecture", "design", "explain", etc.) to hit the default path.
         let filter = crate::hybrid_search::SearchFilter {
@@ -12309,8 +12310,8 @@ mod tests {
         };
         let selected = select_auto_fusion_profile("project-b app roster events RSVP", &filter);
         assert_eq!(
-            selected.profile, "bm25-semantic-workspace",
-            "default query with workspace cwd must use workspace profile, got {}",
+            selected.profile, "bm25-semantic-phonetic-workspace",
+            "default query with workspace cwd must preserve balanced recall, got {}",
             selected.profile
         );
         assert_eq!(selected.intent, "default_balanced_workspace");
