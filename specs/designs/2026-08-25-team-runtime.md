@@ -384,6 +384,26 @@ duration a real decision:
 - **too short**, an ordinary reconnect stops agent work
 - **too long**, a coordinator that has been cut off keeps spending
 
+**The default is 15 minutes**, which states a guarantee rather than a
+preference: *a coordinator that loses contact keeps working for at most fifteen
+minutes.* Long enough that ICE renegotiating or a laptop changing networks does
+not stop agent work; short enough that a runaway is bounded to a quarter hour of
+spend after anyone notices. Doubling it doubles the worst-case spend after a
+cut-off, which is why it is not a free knob.
+
+It is configurable behind a **granted permission**, because the two problems that
+motivate a change push in opposite directions — partitioning wants it longer,
+runaway spend wants it shorter — and each weakens the other guarantee. The
+change records which problem it was for, so a lease lengthened for a partition
+fixed last month is visible as exactly that.
+
+**The ceiling is not part of that permission.** A permission to set lease time
+with no upper bound is a permission to disable break glass. There is a floor and
+a ceiling; raising the ceiling is a separate, higher-scoped decision, the way
+releasing an org halt requires org authority. The floor matters too — a lease
+below normal reconnect time turns every hiccup into an outage, which is easy to
+land on after a spend scare.
+
 Pick it deliberately and **render an expiry as an expiry**. In this system that
 class of failure has previously surfaced as "the display is blank" and "the
 stream stalled", and a coordinator that stopped because it lost its lease should
@@ -517,7 +537,9 @@ Seven tables. Names are indicative; the shapes are the commitment.
                       person halted, and a kill leaves a record of itself
     coordinator       one row per coordinator: parent, scope, declared sandbox
                       backends, declared privilege (container socket / cloud
-                      credentials), and its lease expiry
+                      credentials), lease duration and current expiry
+    lease_policy      the configured duration, its floor and ceiling, who set
+                      it, when, and which problem it was for
     sandbox_backend   per backend: declared capabilities, including whether it
                       can suspend and resume
     halt_hold         one row per active hold: scope (team/user/org), the
@@ -544,6 +566,7 @@ Focused on what this feature introduces, not a full STRIDE pass.
 | T5 | **Spend exhaustion.** A cyclic graph burns budget until something else breaks. | Per-run token and message bounds, enforced by the runtime. Unlike forge's pacing, the default here is **not** unlimited. |
 | T6a | **Human work published as agent-team output.** A person writes a paragraph in a teammate's session; the claim ships it unattributed. | Human turns are marked in the transcript and in draft authorship. Same failure as T6, pointing the other way. |
 | T7 | **Compromised coordinator.** It holds a container socket or cloud credentials; graph authorisation does not constrain it. | Provisioning-scoped credentials, declared and visible privilege, and an action record it cannot edit. Not fully mitigated — a coordinator is trusted with what it can provision. |
+| T8b | **Lease lengthened until break glass is meaningless.** Someone with the permission sets a very long lease; a cut-off coordinator runs unchecked. | The ceiling is not adjustable by the permission that adjusts the lease. Raising it is separately and more highly scoped. |
 | T8 | **Lease starvation as denial of service.** Disrupting the control channel stops all agent work. | Accepted: failing closed is the intended direction. Lease duration is tuned so an ordinary reconnect does not trigger it. |
 | T6c | **Sent-on draft carries borrowed authority.** A stopped draft handed to another team arrives with provenance its new authors did not gather. | Provenance travels but is attributed by origin: inherited evidence renders as inherited, naming the team and run that gathered it. A claim cannot present another team's work as its own. |
 | T6b | **A stopped run resumes.** Pause or stop held in memory is lost to a restart. | Control state is written; the runtime reads it rather than remembering it. |
@@ -561,6 +584,7 @@ Focused on what this feature introduces, not a full STRIDE pass.
 | Pause mistaken for a spend brake | Bill keeps growing while the operator believes it stopped | — | the control names what it does; `halt all` is the global brake, `stop` and interrupt the narrower ones |
 | Halt released by a restart | Everything resumes after someone halted it on purpose | — | halt is written before it acts, and release is explicit |
 | A narrow release undoes a broad hold | A user resumes work an org halted | — | holds stack and release requires authority at the hold's scope |
+| Lease tuned below reconnect time | Every network hiccup becomes an outage | expiries cluster on reconnects | a floor, enforced |
 | Lease expires on a transient reconnect | Agent work stops during ordinary network noise | expiry is rendered as expiry | lease duration tuned above reconnect time |
 | Coordinator far from its runtime | Coordinates nothing despite a healthy database link | — | adjacency is to the runtime, and is a placement requirement not a preference |
 | Coordinator keeps running after a halt it never saw | Break glass has a hole where nobody can look | lease not renewed | the coordinator stops itself; enforcement is by absence, not delivery |
@@ -656,7 +680,8 @@ a runtime restart — the property that justified Decision 1, so it must be
 tested, not assumed. A run **stopped** before a restart and still stopped after
 it, which is the property Decision 9 exists for. A coordinator whose lease
 cannot renew stops on its own, which is the property that makes break glass
-survive a partition. Drafts retained across a pause,
+survive a partition. A lease set beyond its ceiling is refused, and the refusal
+names the ceiling rather than silently clamping. Drafts retained across a pause,
 so the active team page can show every one.
 
 **Live, few and deliberate.** The writing team end to end, with a real model,

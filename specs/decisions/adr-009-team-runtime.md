@@ -6,7 +6,9 @@ executive_summary: >
   coordinate in turn. Coordinators reach the database over the same
   WebRTC control channel the streamer uses, so they sit next to the runtime they
   drive rather than next to a database node, and they execute on renewable
-  leases so a halt is enforced by absence rather than by delivery. Agents delegate through a single send_to(agent, request) endpoint
+  leases so a halt is enforced by absence rather than by delivery -- fifteen
+  minutes by default, bounded, and changeable only with a granted permission
+  that cannot raise its own ceiling. Agents delegate through a single send_to(agent, request) endpoint
   whose target the engine authorises against the graph's edges; because a node
   may act purely as a forwarder the graph has cycles by design, so termination
   is never structural and every run carries explicit bounds. Node capabilities
@@ -26,7 +28,7 @@ A team is a graph the user draws: agents as nodes, and edges saying when one
 agent involves another. The first team is a writing team — researcher, writer,
 reviewer — producing an agent team knowledge claim for human review.
 
-The shape of the problem forces fourteen decisions before any code, because each one
+The shape of the problem forces fifteen decisions before any code, because each one
 changes the schema or the trust boundary rather than the interface.
 
 ## Decision 1: The runtime lives in Ferrosa Memory
@@ -498,6 +500,60 @@ Three controls follow:
    plainly.
 3. **Its actions are recorded where it cannot edit them** — in Memory, on the
    run, like every other control.
+
+## Decision 15: The lease is fifteen minutes, and changing it is a permission
+
+**Default: 15 minutes.** Configurable, and the configuration is gated behind a
+permission that is granted rather than assumed.
+
+### What the number means
+
+The lease is the worst-case gap between cutting a coordinator off and that
+coordinator stopping. So the default states a guarantee in plain terms:
+
+> A coordinator that loses contact — partitioned, halted, or compromised —
+> keeps working for at most fifteen minutes.
+
+Fifteen is chosen against both failure directions. It is comfortably longer than
+an ordinary reconnect, so ICE renegotiating or a laptop changing networks does
+not stop agent work. It is short enough that a runaway coordinator is bounded to
+a quarter hour of spend after anyone notices.
+
+The trade is linear and worth saying out loud, because it is the whole reason
+this is not a free knob: **doubling the lease doubles the worst-case spend after
+a cut-off.**
+
+### Why it is a permission
+
+Two different problems push the number in opposite directions:
+
+| Problem | Direction | What it costs |
+|---|---|---|
+| network partitioning | longer | a longer window of uncontrolled execution |
+| out-of-control spend | shorter | ordinary reconnects start stopping work |
+
+Neither adjustment is routine, and both weaken something. So the permission
+exists to make the change deliberate and attributable rather than convenient.
+It should be granted narrowly and used rarely.
+
+The change records **which problem it was for**, alongside who and when. A lease
+lengthened for a partition that was fixed last month should be visible as
+exactly that.
+
+### The ceiling is not part of the permission
+
+This is the part that keeps the control honest.
+
+A permission to set lease time with no upper bound is a permission to **disable
+break glass** — set it to a day and a cut-off coordinator runs for a day. So the
+lease has a floor and a ceiling, and **the ceiling is not adjustable by the
+permission that adjusts the lease.** Raising the ceiling is a separate,
+higher-scoped decision, in the same way releasing an org halt requires org
+authority.
+
+A floor matters too, in the other direction: a lease shorter than a normal
+reconnect makes every network hiccup an outage, and someone tuning down after a
+spend scare can easily land there.
 
 ## Consequences
 
