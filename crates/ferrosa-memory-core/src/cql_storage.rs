@@ -8355,56 +8355,83 @@ impl Storage for CqlStorage {
             .transpose()
     }
 
-    async fn consolidation_request_list_pending(
+    async fn consolidation_request_stream_pending(
         &self,
-        ctx: &TenantContext,
-        limit: usize,
-    ) -> anyhow::Result<Vec<Uuid>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
+        ctx: TenantContext,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Uuid>>,
+    ) {
+        // Rows go from the driver page straight to the consumer. Nothing is
+        // accumulated: no Vec of candidates, no sort, no limit.
+        //
+        // The two queries match DISJOINT states, and the table is
+        // `PRIMARY KEY ((tenant_id, session_id))` so a session has exactly one
+        // row — there is no duplicate to dedup. The one narrow exception is a
+        // row transitioning between the two queries, and the claim LWT is the
+        // authority there: a second claim on the same session simply returns
+        // `applied = false` and the worker moves on.
+        //
+        // This does NOT make the scan cheap. Both columns are in the partition
+        // key, so "outstanding for this tenant" can only be a ring scan and
+        // ALLOW FILTERING is the only way to express it. Streaming stops the
+        // CLIENT holding the result and lets a slow consumer throttle the
+        // producer; making the server-side lookup cheap needs the schema
+        // change (t_a553df97) or the CDC work (t_25c736b8).
         let pending_query = format!(
-            "SELECT session_id, requested_at FROM {}.consolidation_requests \
+            "SELECT session_id FROM {}.consolidation_requests \
              WHERE tenant_id = ? AND state = 'pending' ALLOW FILTERING",
             self.keyspace
         );
         let stale_query = format!(
-            "SELECT session_id, requested_at FROM {}.consolidation_requests \
+            "SELECT session_id FROM {}.consolidation_requests \
              WHERE tenant_id = ? AND state = 'leased' AND lease_expires_at <= ? ALLOW FILTERING",
             self.keyspace
         );
         let now = chrono::Utc::now();
-        let pending = self
-            .session
-            .query_unpaged(pending_query, (ctx.tenant_id,))
-            .await?;
-        let stale = self
-            .session
-            .query_unpaged(stale_query, (ctx.tenant_id, now))
-            .await?;
 
-        let mut items: Vec<(chrono::DateTime<chrono::Utc>, Uuid)> = Vec::new();
-        let pending_col_map = build_col_map(pending.col_specs());
-        for row in pending.rows_or_empty() {
-            items.push((
-                cql_get(&row, &pending_col_map, "requested_at")?,
-                cql_get(&row, &pending_col_map, "session_id")?,
-            ));
+        let mut pending_iter = match self
+            .session
+            .query_iter(pending_query, (ctx.tenant_id,))
+            .await
+        {
+            Ok(iter) => iter,
+            Err(e) => {
+                let _ = tx.send(Err(anyhow::Error::new(e))).await;
+                return;
+            }
+        };
+        let pending_cols = build_col_map(pending_iter.get_column_specs());
+        while let Some(row) = pending_iter.next().await {
+            let item = row
+                .map_err(anyhow::Error::new)
+                .and_then(|row| cql_get::<Uuid>(&row, &pending_cols, "session_id"));
+            let failed = item.is_err();
+            if tx.send(item).await.is_err() || failed {
+                return;
+            }
         }
-        let stale_col_map = build_col_map(stale.col_specs());
-        for row in stale.rows_or_empty() {
-            items.push((
-                cql_get(&row, &stale_col_map, "requested_at")?,
-                cql_get(&row, &stale_col_map, "session_id")?,
-            ));
+        drop(pending_iter);
+
+        let mut stale_iter = match self
+            .session
+            .query_iter(stale_query, (ctx.tenant_id, now))
+            .await
+        {
+            Ok(iter) => iter,
+            Err(e) => {
+                let _ = tx.send(Err(anyhow::Error::new(e))).await;
+                return;
+            }
+        };
+        let stale_cols = build_col_map(stale_iter.get_column_specs());
+        while let Some(row) = stale_iter.next().await {
+            let item = row
+                .map_err(anyhow::Error::new)
+                .and_then(|row| cql_get::<Uuid>(&row, &stale_cols, "session_id"));
+            let failed = item.is_err();
+            if tx.send(item).await.is_err() || failed {
+                return;
+            }
         }
-        items.sort_by_key(|(requested_at, _)| *requested_at);
-        items.dedup_by_key(|(_, session_id)| *session_id);
-        items.truncate(limit);
-        Ok(items
-            .into_iter()
-            .map(|(_, session_id)| session_id)
-            .collect())
     }
 
     async fn consolidation_run_insert(

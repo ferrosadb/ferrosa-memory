@@ -551,16 +551,104 @@ def patch_codex(hooks_path: Path, wrappers: dict[str, str], dry_run: bool) -> st
         wrappers["ingest_turn"],
         codex_hook_entry(wrappers["ingest_turn"], "Saving Ferrosa Memory context before compaction"),
     )
-    if not changed:
+
+    # Install the Forge-first PreToolUse hook for Bash commands. This nudges
+    # agents toward Forge MCP tools (project_summary, test_summary, cargo, etc.)
+    # instead of raw shell output that wastes tokens.
+    forge_first_changed = install_forge_first_hook(hooks_path, dry_run)
+
+    # Install the AGENTS.md template with the Forge-first decision table.
+    agents_md_changed = install_agents_template(hooks_path.parent / "AGENTS.md", dry_run)
+
+    if not changed and not forge_first_changed and not agents_md_changed:
         return f"Codex hooks already include Ferrosa Memory hooks: {hooks_path}"
     if dry_run:
         return f"Dry run: would patch Codex hooks at {hooks_path}"
     hooks_path.parent.mkdir(parents=True, exist_ok=True)
     backup_path = backup(hooks_path) if hooks_path.exists() else None
     hooks_path.write_text(json.dumps(settings, indent=2) + "\n")
+    parts = []
+    if changed:
+        parts.append("Patched Codex hooks")
+    if forge_first_changed:
+        parts.append("installed forge-first PreToolUse hook")
+    if agents_md_changed:
+        parts.append("installed AGENTS.md template")
+    detail = ", ".join(parts)
     if backup_path:
-        return f"Patched Codex hooks at {hooks_path} (backup: {backup_path})"
-    return f"Created Codex hooks at {hooks_path}"
+        return f"{detail} at {hooks_path} (backup: {backup_path})"
+    return f"{detail} at {hooks_path}"
+
+
+def install_forge_first_hook(hooks_path: Path, dry_run: bool) -> bool:
+    """Install forge-first.sh into ~/.codex/hooks/ and register it in hooks.json.
+
+    Returns True if the hook script or the hooks.json PreToolUse entry changed.
+    The caller is responsible for writing hooks.json after this returns — this
+    function only installs the script file and reports whether a PreToolUse
+    entry is needed.
+    """
+    codex_hooks_dir = hooks_path.parent / "hooks"
+    script_src = Path(__file__).resolve().parent / "hooks" / "forge-first.sh"
+    if not script_src.exists():
+        return False
+    script_dst = codex_hooks_dir / "forge-first.sh"
+    codex_hooks_dir.mkdir(parents=True, exist_ok=True)
+    script_changed = False
+    if not script_dst.exists() or script_dst.read_text() != script_src.read_text():
+        if not dry_run:
+            write_executable(script_dst, script_src.read_text())
+        script_changed = True
+
+    # Register PreToolUse matcher for Bash in hooks.json.
+    # The caller (patch_codex) writes hooks.json after we return, so we
+    # only need to report whether the entry should be added. The actual
+    # ensure_hook call is done by the caller via the return signal.
+    # However, since patch_codex already handles the hooks.json write,
+    # we add the PreToolUse entry here directly.
+    settings: dict[str, object]
+    if hooks_path.exists():
+        settings = json.loads(hooks_path.read_text())
+        if not isinstance(settings, dict):
+            return script_changed
+    else:
+        return script_changed
+
+    entry_changed = ensure_hook_with_entry(
+        settings,
+        "PreToolUse",
+        str(script_dst),
+        codex_hook_entry(str(script_dst), "Checking Forge-first policy"),
+        matcher="Bash",
+    )
+    if entry_changed and not dry_run:
+        # Write immediately so the caller's read-modify-write doesn't lose this.
+        hooks_path.write_text(json.dumps(settings, indent=2) + "\n")
+    return script_changed or entry_changed
+
+
+def install_agents_template(agents_path: Path, dry_run: bool) -> bool:
+    """Install the AGENTS.md template with the Forge-first decision table.
+
+    Does not overwrite an existing AGENTS.md if it already contains the
+    Forge-first marker, so re-runs are safe.
+    """
+    template_src = Path(__file__).resolve().parent / "hooks" / "agents-template.md"
+    if not template_src.exists():
+        return False
+    marker = "Forge-first: prefer MCP tools over raw shell output"
+    if agents_path.exists():
+        existing = agents_path.read_text()
+        if marker in existing:
+            return False
+        # Append to existing AGENTS.md rather than overwriting.
+        if not dry_run:
+            agents_path.write_text(existing.rstrip() + "\n\n---\n\n" + template_src.read_text())
+        return True
+    if not dry_run:
+        agents_path.parent.mkdir(parents=True, exist_ok=True)
+        agents_path.write_text(template_src.read_text())
+    return True
 
 
 def hermes_block(wrappers: dict[str, str]) -> str:

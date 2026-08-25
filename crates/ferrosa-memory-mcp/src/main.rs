@@ -6,6 +6,9 @@
 //! connection fails, starts serving immediately with a "reconnecting" backend
 //! that returns errors, while a background task retries with exponential backoff.
 //! Never falls back to mock storage — mock silently loses data.
+//!
+//! Last revised: 2026-08-24
+//! Last changed: Streams pending consolidation work with bounded backpressure.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1075,12 +1078,30 @@ impl Storage for ReconnectingStorage {
         delegate!(self, consolidation_request_get, ctx, session_id)
     }
 
-    async fn consolidation_request_list_pending(
+    async fn consolidation_request_stream_pending(
         &self,
-        ctx: &TenantContext,
-        limit: usize,
-    ) -> anyhow::Result<Vec<uuid::Uuid>> {
-        delegate!(self, consolidation_request_list_pending, ctx, limit)
+        ctx: TenantContext,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<uuid::Uuid>>,
+    ) {
+        // Hand-written rather than `delegate!` because this yields `()` — the
+        // macro inspects a `Result` return to detect connection loss.
+        //
+        // A missing connection is reported THROUGH the channel. Returning
+        // quietly would make "cannot reach the database" indistinguishable
+        // from "no work outstanding", which is exactly how the invented-tenant
+        // bug stayed invisible for two months.
+        let conn_gen = self.current_generation();
+        match self.current_cql().await {
+            Some(cql) => cql.consolidation_request_stream_pending(ctx, tx).await,
+            None => {
+                self.mark_disconnected(conn_gen).await;
+                let _ = tx
+                    .send(Err(anyhow::anyhow!(
+                        "consolidation stream unavailable: no CQL connection"
+                    )))
+                    .await;
+            }
+        }
     }
 
     async fn consolidation_run_insert(
@@ -3010,7 +3031,7 @@ async fn cql_readiness_probe_loop(storage: Arc<ReconnectingStorage>) {
 /// Background worker that polls the durable consolidation queue and runs
 /// consolidation under a database-backed lease.
 ///
-/// The loop is tenant-scoped: it polls `consolidation_request_list_pending`
+/// The loop is tenant-scoped: it polls `consolidation_request_stream_pending`
 /// for the default tenant context. The dispatcher writes a request row on
 /// every successful write tool, so any replica can pick it up.
 async fn consolidation_worker_loop<S: Storage + Send + Sync + 'static>(
@@ -3031,15 +3052,36 @@ async fn consolidation_worker_loop<S: Storage + Send + Sync + 'static>(
     loop {
         ticker.tick().await;
 
-        let pending = match storage.consolidation_request_list_pending(&ctx, 64).await {
-            Ok(sids) => sids,
-            Err(e) => {
-                tracing::warn!("consolidation list_pending failed: {e}");
-                continue;
-            }
+        // Stream the outstanding sessions rather than fetching a batch.
+        //
+        // This used to take 64 at a time, which meant the storage layer had to
+        // decide WHICH 64 — an ordering, and a buffer to sort candidates in.
+        // Consuming the whole stream removes the selection, so nothing needs
+        // ordering and nothing accumulates: each session is claimed and
+        // processed as it arrives.
+        //
+        // The channel is small on purpose. Claiming and consolidating is far
+        // slower than scanning, so the consumer is the throttle: the producer
+        // blocks on `send` instead of racing ahead. That bounds the WORK in
+        // flight without bounding the RESULT.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<anyhow::Result<uuid::Uuid>>(8);
+        let producer = {
+            let storage = Arc::clone(&storage);
+            let ctx = (*ctx).clone();
+            tokio::spawn(async move {
+                storage.consolidation_request_stream_pending(ctx, tx).await;
+            })
         };
 
-        for sid in pending {
+        while let Some(item) = rx.recv().await {
+            let sid = match item {
+                Ok(sid) => sid,
+                Err(e) => {
+                    // Fail loud and abandon this pass; the next tick retries.
+                    tracing::warn!("consolidation pending stream failed: {e}");
+                    break;
+                }
+            };
             let lease_expires = chrono::Utc::now() + chrono::Duration::seconds(lease_secs as i64);
             let claimed = match storage
                 .consolidation_request_claim(&ctx, sid, &lease_owner, lease_expires)
@@ -3141,6 +3183,13 @@ async fn consolidation_worker_loop<S: Storage + Send + Sync + 'static>(
                 }
             }
         }
+
+        // This pass is done. Drop the receiver first so a producer still
+        // scanning stops on its next `send` — otherwise a `break` above
+        // would leave it blocked — then join it so one pass cannot overlap
+        // the next tick.
+        drop(rx);
+        let _ = producer.await;
     }
 }
 
