@@ -28,6 +28,11 @@
 //! rewrites the same rows; the run still reports what it would have created so
 //! a second pass visibly does nothing.
 
+// This binary reads rows through scylla 0.15's LegacySession API, the same
+// choice cql_storage.rs made and for the same reason: the legacy API is
+// deprecated upstream but has stable semantics, and migrating to the generic
+// deserialization API is a separate piece of work across every call site.
+#![allow(deprecated)]
 use std::collections::BTreeMap;
 
 use anyhow::{Context as _, Result};
@@ -49,7 +54,9 @@ const CLUSTER_LIMIT: usize = 15;
 struct Task {
     id: String,
     title: String,
-    status: String,
+    // No `status` field: rows are filtered to OPEN_STATUSES before one is
+    // built, so every task here is open by definition. Carrying the string
+    // implies a distinction that no longer exists at this point.
     block_reason: String,
     updated_at: i64,
 }
@@ -187,7 +194,6 @@ async fn read_open_tasks(session: &LegacySession) -> Result<Vec<Task>> {
         tasks.push(Task {
             id,
             title: text("title").unwrap_or_default(),
-            status,
             block_reason: text("block_reason").unwrap_or_default(),
             updated_at,
         });

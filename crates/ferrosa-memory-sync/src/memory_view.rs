@@ -12,6 +12,13 @@
 //! `TierRules` exists to avoid. The rows are read and counted in process,
 //! bounded by [`SCAN_LIMIT`], and every answer says whether the bound bit.
 
+// This module reads rows through scylla 0.15's LegacySession API, the same
+// choice cql_storage.rs made and for the same reason: the legacy API is
+// deprecated upstream but has stable semantics, and migrating to the generic
+// deserialization API is a separate piece of work across every call site.
+// Scoped to the module rather than sprinkled per call, so the decision is
+// stated once and a NEW deprecation still surfaces.
+#![allow(deprecated)]
 use anyhow::{Context, Result};
 use std::sync::Arc;
 

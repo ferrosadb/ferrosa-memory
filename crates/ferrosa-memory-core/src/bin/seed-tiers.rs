@@ -35,6 +35,13 @@
 //! guessed source produces a confident tier for something nobody placed,
 //! which is worse than the honest blank the dashboard is built to show.
 
+// This module reads rows through scylla 0.15's LegacySession API, the same
+// choice cql_storage.rs made and for the same reason: the legacy API is
+// deprecated upstream but has stable semantics, and migrating to the generic
+// deserialization API is a separate piece of work across every call site.
+// Scoped to the module rather than sprinkled per call, so the decision is
+// stated once and a NEW deprecation still surfaces.
+#![allow(deprecated)]
 use std::collections::BTreeMap;
 
 use anyhow::{Context as _, Result};
@@ -206,7 +213,7 @@ async fn backfill_sources(
                 "{}\n{}\n{}",
                 entry.context_snippet,
                 entry.description.clone().unwrap_or_default(),
-                entry.properties.to_string(),
+                entry.properties,
             );
             if probe.contains("\"benchmark\"") {
                 *by_type.entry("(benchmark data)".to_owned()).or_default() += 1;

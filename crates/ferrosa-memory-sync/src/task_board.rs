@@ -22,6 +22,13 @@
 //! live board today. Reading only one silently loses half the work, so this
 //! reads both and says so out loud rather than picking a winner.
 
+// This module reads rows through scylla 0.15's LegacySession API, the same
+// choice cql_storage.rs made and for the same reason: the legacy API is
+// deprecated upstream but has stable semantics, and migrating to the generic
+// deserialization API is a separate piece of work across every call site.
+// Scoped to the module rather than sprinkled per call, so the decision is
+// stated once and a NEW deprecation still surfaces.
+#![allow(deprecated)]
 use std::collections::BTreeMap;
 
 use anyhow::{Context as _, Result};
