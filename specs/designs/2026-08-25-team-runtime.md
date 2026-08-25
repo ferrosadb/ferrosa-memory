@@ -82,6 +82,22 @@ No-progress deserves its own bound because the others can all be satisfied while
 nothing happens: two agents can exchange messages politely and indefinitely
 without the draft changing. Detect it on the artifact, not the traffic.
 
+### Termination is a validity rule, not a runtime hope
+
+A team with no terminal state **cannot be saved**. There are exactly three ways
+to have one:
+
+- exhausted attempts — a bound on cycles or messages,
+- elapsed time — a wall-clock deadline,
+- completion — an exit the graph can actually reach.
+
+Because cycles are legal, a reachable exit is not implied by the shape of the
+graph and must be checked. The editor runs the check and refuses, rather than
+saving a team that will be discovered at run time to have no ending.
+
+The check is a pure function of graph plus bounds: cheap, and testable without
+running anything.
+
 **Parking is not failure.** A parked run holds its state and posts a message
 carrying the draft, the objection, and the provenance links. A human answers and
 the run resumes. This is the same surface used to grill the user mid-run, which
@@ -91,7 +107,7 @@ The draft does not wait inside the parked run. It enters the queue immediately,
 `blocked on human`, so that work in dispute is visible rather than buried in a
 run nobody has opened.
 
-## Terminal states
+## How a run ends
 
 Both endings reach the same place. They differ in the state they arrive in and
 what they carry:
@@ -107,6 +123,61 @@ acting** — agent agreement buys a better starting state, never the outcome.
 Every claim names a **responsible human**. This is an assignment, not a pool: a
 claim nobody owns is a claim nobody reviews, and it would sit in the queue
 looking like progress.
+
+## Running a team
+
+The **active team page** is where a run is watched and steered. It shows the
+graph, who is active, the message traffic, and every draft in flight.
+
+### Pause and stop
+
+Two controls, not one with a flag:
+
+| Control | Effect | Resumable |
+|---|---|---|
+| pause | no new messages flow; work already in flight finishes | yes |
+| stop | the run ends | no |
+
+**Both are written.** A pause or stop held only in the runtime's memory is
+undone by a restart, and a run that resumes because a process bounced has
+ignored the person who stopped it. The state lives in the database and the
+runtime reads it rather than remembering it.
+
+**Both show every draft in flight**, on the active team page — every draft, not
+the newest. Someone reaching for pause is usually asking what the thing looked
+like before the last exchange, and a run that overwrites drafts cannot answer.
+`team_artifact` is therefore append-only, each draft recording its version, its
+author, and the turn that produced it.
+
+### Swapping a teammate
+
+The definition is locked at creation (ADR-009 Decision 7). The roster is not.
+
+A teammate may be replaced when both hold:
+
+1. the team is **paused**, and
+2. that teammate is **not active** — it holds no unanswered turn.
+
+Swapping mid-turn would orphan a reply with nowhere to land, which is why the
+idle precondition is a refusal rather than a warning.
+
+Because occupancy can change, provenance records **which occupant** produced
+each turn. "The writer said this" stops being a single agent the moment a swap
+is permitted.
+
+### Sessions
+
+Every teammate has a session a human can enter, writing into the same transcript
+the team is using. This is what makes pause useful rather than merely stopped:
+pause, enter the reviewer's session, find out what it actually objects to, then
+resume or swap.
+
+Two rules keep the record honest:
+
+- **Human turns are attributed to the human.** An unmarked human turn lets a
+  person's paragraph ship as agent-team output — the inverse of the laundering
+  Decision 5 prevents, and just as wrong.
+- **A human turn spends budget.** The tokens are real.
 
 ## Capability model
 
@@ -161,13 +232,20 @@ the same rule `ontology-from-observations` states for induced ontologies.
 
 Seven tables. Names are indicative; the shapes are the commitment.
 
-    team              definition, versioned
+    team              definition, locked at creation
     team_node         role, model, system prompt, declared capabilities
     team_edge         from, to, condition prompt, message template
-    team_run          team version, starting prompt, bounds, state
-    team_message      the transcript: from, to, body, timestamp, refused flag
-    team_artifact     drafts and the final claim, with provenance links,
-                      queue state, and the responsible human
+    team_run          pinned team version, starting prompt, bounds, state
+    team_message      the transcript: from, to, body, timestamp, refused flag,
+                      and whether the author was an agent occupant or a human
+    team_artifact     APPEND-ONLY drafts and the final claim, each with version,
+                      author, originating turn, provenance links, queue state
+                      and responsible human
+    team_occupancy    which agent occupies which role, over time, so a turn can
+                      be attributed after a swap
+    team_control      pause, resume, stop: who, when, why -- written, so a
+                      restart cannot resume what a person stopped
+    team_session      the per-teammate session a human can enter
     team_budget       spend and counters, per run
 
 `team_message` records refusals as well as sends. An authorisation refusal that
@@ -185,6 +263,8 @@ Focused on what this feature introduces, not a full STRIDE pass.
 | T3 | **Prompt injection from researched content.** The researcher fetches open-web text; it lands in the writer's context. | Researcher output is stored and passed as *data*, clearly delimited, never as instructions. This is the highest-likelihood threat here and the least mitigated by capability isolation. |
 | T4 | **Forged provenance.** A claim links to items it did not use, or omits ones it did. | Links are recorded by the runtime from actual message traffic, not asserted by the writer. |
 | T5 | **Spend exhaustion.** A cyclic graph burns budget until something else breaks. | Per-run token and message bounds, enforced by the runtime. Unlike forge's pacing, the default here is **not** unlimited. |
+| T6a | **Human work published as agent-team output.** A person writes a paragraph in a teammate's session; the claim ships it unattributed. | Human turns are marked in the transcript and in draft authorship. Same failure as T6, pointing the other way. |
+| T6b | **A stopped run resumes.** Pause or stop held in memory is lost to a restart. | Control state is written; the runtime reads it rather than remembering it. |
 | T6 | **Claim laundering.** Agent agreement is read as human approval. | Structural, not procedural: there is no transition from any agent-produced state to approved. Both terminal states await a named responsible human, and the green check is only ever awarded by one. |
 
 ## Failure modes
@@ -196,6 +276,10 @@ Focused on what this feature introduces, not a full STRIDE pass.
 | Runtime restarts mid-run | Run lost, if state was in memory | — | state is in the database; a run is resumable by construction |
 | Deadlock undetected | Run parks, nobody notices | message surface on Team tab and home | the surface is the mitigation, which is why it is in scope |
 | Claim without provenance | Unauditable knowledge | schema requires links | refuse to publish a claim with none |
+| Swap attempted mid-turn | Orphaned reply, corrupted transcript | occupant is active | refuse the swap; it is a precondition, not a warning |
+| Draft overwritten | "What did it look like before?" is unanswerable at the moment it is asked | — | artifacts are append-only |
+| Team edited under a running run | Transcript no longer readable against its graph | — | definition locked at creation; editing makes a new team |
+| Graph with no ending saved | Discovered only at run time, after spending | editor validity check | refuse to save |
 | Claim with no responsible human | Sits in the queue unreviewed, indistinguishable from work in progress | assignment is required on entry | refuse to enqueue a claim that cannot name an owner |
 | Capability shown as enforced when it is not | Unfounded trust in isolation | — | unenforced state rendered on every run without a sandbox |
 
@@ -227,10 +311,15 @@ and Information, with provenance recorded from message traffic.
 assignment, and submission to the existing proposed-knowledge queue in the right
 state — `proposed` when the team agreed, `blocked on human` when it did not.
 
-**Slice 7 — the surfaces.** Team tab, graph editor, run view, and the message
-section on the tab and the home page.
+**Slice 7 — run control.** Pause, resume, stop, written; occupancy swap with
+its idle precondition; append-only drafts. All pure state-machine work with one
+storage dependency, and all testable without a model.
 
-**Slice 8 — the writing team.** The three roles as a shipped default team,
+**Slice 8 — the surfaces.** Team tab, graph editor including the terminal-state
+check, the active team page showing drafts in flight with pause and stop, the
+per-teammate sessions, and the message section on the tab and the home page.
+
+**Slice 9 — the writing team.** The three roles as a shipped default team,
 assembled from everything above.
 
 ## Test specification
@@ -238,16 +327,25 @@ assembled from everything above.
 The layers that matter here, and what belongs in each.
 
 **Pure, no I/O.** Authorisation given a graph. Reachability. Bound arithmetic.
-State transitions. Progress detection. Provenance assembly from a message list.
+Run state transitions, including pause, resume and stop. Progress detection.
+Provenance assembly from a message list. The terminal-state validity check, in
+all three of its forms and in the negative case that must be refused. The swap
+preconditions -- paused, and the occupant idle. Attribution of a turn to the
+occupant that held the role at the time.
+
 These are the majority of the correctness surface and none of them needs a
-model.
+model, a cluster or a browser.
 
 **Contract.** `send_to` refuses an unauthorised target and records the refusal.
-A claim without provenance is refused. A run cannot start without bounds.
+A claim without provenance is refused. A team with no terminal state cannot be
+saved. A claim with no responsible human cannot be enqueued. A swap against an
+active occupant is refused.
 
 **Integration.** A two-node delegation against a real store. A run resumed after
 a runtime restart — the property that justified Decision 1, so it must be
-tested, not assumed.
+tested, not assumed. A run **stopped** before a restart and still stopped after
+it, which is the property Decision 9 exists for. Drafts retained across a pause,
+so the active team page can show every one.
 
 **Live, few and deliberate.** The writing team end to end, with a real model,
 producing a claim. Expensive, so bounded and rare.
@@ -260,8 +358,9 @@ needs them:
 - **Slice 5:** who authors a stored summary — the researcher's own words, or the
   runtime recording what it returned? Provenance integrity (T4) argues for the
   runtime.
-- **Slice 7:** does the graph editor allow a graph with no terminal state, given
-  cycles are legal? Refusing needs a definition of "terminal"; permitting needs
-  the bounds to be visible in the editor.
-- **Slice 8:** how does a team version interact with a run already in flight
-  against the previous version?
+- **Slice 7:** when a run is **stopped**, do its drafts go to the queue for
+  salvage, or stay attached to the stopped run? Pause is settled -- the draft
+  enters as `blocked on human` -- but stop is a different intent, and a stopped
+  run's work should probably not arrive looking like something awaiting review.
+- **Slice 7:** does entering a teammate's session pause the team automatically,
+  or may a human talk to one agent while the others keep working?
