@@ -33,6 +33,7 @@ pub mod device_request;
 /// The control-listener runtime, so every binary hosting one shares it.
 #[cfg(feature = "webrtc-transport")]
 pub mod harness_state;
+pub mod knowledge_view;
 pub mod learner_ingest;
 pub mod listener;
 pub mod memory_view;

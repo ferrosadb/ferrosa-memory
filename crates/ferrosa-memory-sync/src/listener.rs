@@ -829,7 +829,11 @@ enum FramePriority {
 /// one file -- is the one to enumerate.
 fn frame_priority(kind: &str) -> FramePriority {
     match kind {
-        "shell_memory_tiers"
+        "shell_knowledge"
+        | "shell_knowledge_claims"
+        | "shell_knowledge_detail"
+        | "shell_knowledge_decide"
+        | "shell_memory_tiers"
         | "shell_memory_items"
         | "shell_tasks"
         | "shell_task"

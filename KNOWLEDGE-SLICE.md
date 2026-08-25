@@ -22,12 +22,12 @@ Decisions: `specs/knowledge-tiers/decisions.md` D16–D49.
 - [x] expiry sweep reads today's bucket
 
 ## Frames — ferrosa-memory-sync
-- [ ] `shell_knowledge` (approved only, D44)
-- [ ] `shell_knowledge_claims` (expiry-sorted, D45)
-- [ ] `shell_knowledge_detail` (version chain, feedback)
-- [ ] commands: approve / reject / send-back
-- [ ] register in EMITTED with sizing; keep inside the datagram
-- [ ] classify the new kinds as Durable in `frame_priority`
+- [x] `shell_knowledge` (approved only, D44)
+- [x] `shell_knowledge_claims` (expiry-sorted, D45)
+- [x] `shell_knowledge_detail` + `shell_knowledge_versions`
+- [x] commands: approve / reject / send-back (send-back requires feedback)
+- [x] EMITTED + size proof — caught a 1,287-byte frame, rows/frame now 2
+- [x] classified Durable in `frame_priority`
 
 ## App — .wt-knowledge-ui (off ferrosa-mobile main)
 - [ ] Knowledge tab: approved only, green check

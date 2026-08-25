@@ -67,6 +67,9 @@ pub struct ShellExtension {
     /// use, and a cluster that is down costs one screen rather than the
     /// session.
     memory: tokio::sync::OnceCell<Option<Arc<crate::memory_view::MemoryView>>>,
+    /// Knowledge and claims, on the same terms again: connected on first use,
+    /// and a cluster that is down costs one screen rather than the session.
+    knowledge: tokio::sync::OnceCell<Option<Arc<crate::knowledge_view::KnowledgeView>>>,
 }
 
 #[derive(Default)]
@@ -97,6 +100,7 @@ impl ShellExtension {
             memory_tenant,
             board: tokio::sync::OnceCell::new(),
             memory: tokio::sync::OnceCell::new(),
+            knowledge: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -150,6 +154,314 @@ impl ShellExtension {
             })
             .await
             .clone()
+    }
+
+    /// Knowledge and claims, connected once. `None` if unreachable.
+    async fn knowledge(&self) -> Option<Arc<crate::knowledge_view::KnowledgeView>> {
+        self.knowledge
+            .get_or_init(|| async {
+                let Some(tenant) = self.memory_tenant else {
+                    tracing::warn!(
+                        "knowledge unavailable: no tenant configured. Pass \
+                         --memory-tenant, or set server.tenant_id in the memory \
+                         config, to the tenant this machine's memory is stored under."
+                    );
+                    return None;
+                };
+                match crate::knowledge_view::KnowledgeView::connect(
+                    &self.board_contact_points,
+                    tenant,
+                )
+                .await
+                {
+                    Ok(view) => {
+                        tracing::info!(%tenant, "knowledge connected");
+                        Some(Arc::new(view))
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, %tenant, "knowledge unavailable");
+                        None
+                    }
+                }
+            })
+            .await
+            .clone()
+    }
+
+    /// The Knowledge tier: approved deliverables only, each with its check.
+    ///
+    /// Approved only, deliberately (D44). A claim on this list would put a
+    /// model's assertion beside a person's judgement.
+    async fn knowledge_frames(&self, cursor: Option<&str>, limit: usize) -> Vec<serde_json::Value> {
+        let Some(view) = self.knowledge().await else {
+            let reason = if self.memory_tenant.is_none() {
+                "no memory tenant is configured on this machine"
+            } else {
+                "the knowledge store could not be reached"
+            };
+            return vec![serde_json::json!({
+                "type": "shell_knowledge",
+                "reachable": false,
+                "reason": reason,
+                "items": [],
+            })];
+        };
+        let limit = limit.clamp(1, KNOWLEDGE_PAGE_MAX);
+        match view.knowledge(cursor, limit).await {
+            Ok(page) => {
+                let rows: Vec<serde_json::Value> = page
+                    .items
+                    .iter()
+                    .map(|item| {
+                        serde_json::json!({
+                            "id": item.knowledge_id,
+                            "title": item.title,
+                            "kind": item.kind,
+                            "repo": item.repo,
+                            "expires": item.expires_at,
+                        })
+                    })
+                    .collect();
+                Self::page_frames("shell_knowledge", rows, cursor.is_none(), page.next_cursor)
+            }
+            Err(error) => vec![serde_json::json!({
+                "type": "shell_knowledge",
+                "reachable": false,
+                "reason": bounded_reason(format_args!("{error:#}")),
+                "items": [],
+            })],
+        }
+    }
+
+    /// The Claims queue: what still needs a person, soonest to lapse first.
+    async fn knowledge_claims_frames(&self, limit: usize) -> Vec<serde_json::Value> {
+        let Some(view) = self.knowledge().await else {
+            return vec![serde_json::json!({
+                "type": "shell_knowledge_claims",
+                "reachable": false,
+                "reason": "the knowledge store could not be reached",
+                "items": [],
+            })];
+        };
+        let limit = limit.clamp(1, KNOWLEDGE_PAGE_MAX);
+        match view.claims(limit).await {
+            Ok(rows) => {
+                let rows: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|row| {
+                        serde_json::json!({
+                            "id": row.knowledge_id,
+                            "title": row.title,
+                            "kind": row.kind,
+                            // The device draws a greyed robot for a claim and a
+                            // green check for approved work, so it needs the
+                            // state rather than inferring it from the tab.
+                            "state": row.state.as_str(),
+                            "priority": row.priority,
+                            "expires": row.expires_at,
+                            "agent": row.author_agent,
+                        })
+                    })
+                    .collect();
+                let mut frames = Self::page_frames("shell_knowledge_claims", rows, true, None);
+                // The sorts the machine can actually perform, so a device does
+                // not offer one that would become a scan.
+                if let Some(first) = frames.first_mut()
+                    && let Some(obj) = first.as_object_mut()
+                {
+                    obj.insert(
+                        "sorts".to_owned(),
+                        serde_json::json!(crate::knowledge_view::CLAIM_SORTS),
+                    );
+                }
+                frames
+            }
+            Err(error) => vec![serde_json::json!({
+                "type": "shell_knowledge_claims",
+                "reachable": false,
+                "reason": bounded_reason(format_args!("{error:#}")),
+                "items": [],
+            })],
+        }
+    }
+
+    /// One item, its chain, and what a reviewer needs to decide.
+    async fn knowledge_detail_frames(&self, id: &str) -> Vec<serde_json::Value> {
+        let Ok(knowledge_id) = uuid::Uuid::parse_str(id) else {
+            return vec![serde_json::json!({
+                "type": "shell_knowledge_detail",
+                "id": id,
+                "reachable": false,
+                "reason": "that is not a knowledge id",
+            })];
+        };
+        let Some(view) = self.knowledge().await else {
+            return vec![serde_json::json!({
+                "type": "shell_knowledge_detail",
+                "id": id,
+                "reachable": false,
+                "reason": "the knowledge store could not be reached",
+            })];
+        };
+        match view.detail(knowledge_id).await {
+            Ok(Some((item, versions))) => {
+                let head = serde_json::json!({
+                    "type": "shell_knowledge_detail",
+                    "id": id,
+                    "reachable": true,
+                    "title": item.title,
+                    "kind": item.kind,
+                    "state": item.state.as_str(),
+                    "priority": item.priority,
+                    "repo": item.repo,
+                    "expires": item.expires_at,
+                    "agent": item.author_agent,
+                    // The session, because the agent may be gone by review time
+                    // and its session is what a replacement picks up (D24).
+                    "session": item.author_session,
+                    "task": item.task_id,
+                    "reviewed_by": item.reviewed_by,
+                    "versions": versions.len(),
+                });
+                let mut frames = vec![head];
+                // The chain is paged like everything else: a deliverable
+                // revised twenty times must not arrive as one oversized frame.
+                let rows: Vec<serde_json::Value> = versions
+                    .iter()
+                    .map(|version| {
+                        serde_json::json!({
+                            "version": version.version,
+                            "state": version.version_state,
+                            "url": version.body_url,
+                            "feedback": version.feedback,
+                        })
+                    })
+                    .collect();
+                frames.extend(Self::page_frames(
+                    "shell_knowledge_versions",
+                    rows,
+                    true,
+                    None,
+                ));
+                frames
+            }
+            Ok(None) => vec![serde_json::json!({
+                "type": "shell_knowledge_detail",
+                "id": id,
+                "reachable": false,
+                "reason": "no knowledge item with that id",
+            })],
+            Err(error) => vec![serde_json::json!({
+                "type": "shell_knowledge_detail",
+                "id": id,
+                "reachable": false,
+                "reason": bounded_reason(format_args!("{error:#}")),
+            })],
+        }
+    }
+
+    /// Approve, reject, or send a claim back.
+    ///
+    /// Three decisions and not two. Reject is "throw this away" — a scenario
+    /// that was explored, a brainstorm that went nowhere — and it demotes to
+    /// Data. Send back is "directionally correct, you need this additional
+    /// context", and it returns to revisit with the feedback attached. One
+    /// button for both would force a person to choose between discarding good
+    /// work and accepting bad work (D36).
+    async fn knowledge_decide_frames(
+        &self,
+        id: &str,
+        decision: &str,
+        body: &serde_json::Value,
+    ) -> Vec<serde_json::Value> {
+        use ferrosa_memory_core::knowledge::KnowledgeState;
+
+        let refuse = |reason: String| {
+            vec![serde_json::json!({
+                "type": "shell_knowledge_detail",
+                "id": id,
+                "reachable": false,
+                "reason": bounded_reason(reason),
+            })]
+        };
+
+        let Ok(knowledge_id) = uuid::Uuid::parse_str(id) else {
+            return refuse("that is not a knowledge id".to_owned());
+        };
+        let to = match decision {
+            "approve" => KnowledgeState::Approved,
+            "reject" => KnowledgeState::Rejected,
+            "send_back" => KnowledgeState::Revisit,
+            other => {
+                return refuse(format!(
+                    "{other} is not a decision; use approve, reject or send_back"
+                ));
+            }
+        };
+        // Sending something back without saying why is the one case that
+        // wastes an agent's next turn, so it is refused rather than accepted.
+        let feedback = body
+            .get("feedback")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if to == KnowledgeState::Revisit && feedback.is_none() {
+            return refuse("sending back needs feedback saying what is missing".to_owned());
+        }
+        let reviewer = body.get("reviewer").and_then(serde_json::Value::as_str);
+
+        let Some(view) = self.knowledge().await else {
+            return refuse("the knowledge store could not be reached".to_owned());
+        };
+        match view.decide(knowledge_id, to, reviewer, feedback).await {
+            // The whole detail comes back, so the screen redraws from what was
+            // actually stored rather than from what it hoped happened.
+            Ok(_) => self.knowledge_detail_frames(id).await,
+            Err(error) => refuse(format!("{error:#}")),
+        }
+    }
+
+    /// Chunk rows into datagram-safe frames.
+    ///
+    /// Shared by every knowledge list so one of them cannot quietly grow past
+    /// the bound while the others stay inside it.
+    fn page_frames(
+        kind: &str,
+        rows: Vec<serde_json::Value>,
+        first_page: bool,
+        next_cursor: Option<String>,
+    ) -> Vec<serde_json::Value> {
+        // An empty page still sends one frame. Without it, a list that matched
+        // nothing looks identical to one that never answered, and the screen
+        // keeps its previous contents.
+        if rows.is_empty() {
+            return vec![serde_json::json!({
+                "type": kind,
+                "reachable": true,
+                "first": first_page,
+                "next_cursor": next_cursor,
+                "items": [],
+            })];
+        }
+        let frame_count = rows.len().div_ceil(KNOWLEDGE_ROWS_PER_FRAME);
+        rows.chunks(KNOWLEDGE_ROWS_PER_FRAME)
+            .enumerate()
+            .map(|(index, chunk)| {
+                serde_json::json!({
+                    "type": kind,
+                    "reachable": true,
+                    // Only the first frame of a first page replaces the list;
+                    // the rest append.
+                    "first": first_page && index == 0,
+                    // Only the LAST frame carries the cursor, or a device would
+                    // ask for the next page while this one is still arriving.
+                    "next_cursor": (index + 1 == frame_count)
+                        .then(|| next_cursor.clone())
+                        .flatten(),
+                    "items": chunk,
+                })
+            })
+            .collect()
     }
 
     /// The DIKW map: four rows, always, plus what the plane does not know.
@@ -1011,6 +1323,26 @@ fn bounded_reason(value: impl std::fmt::Display) -> String {
 /// per-item tier, no absolute path — which is what makes four fit.
 const MEMORY_ITEMS_PER_FRAME: usize = 4;
 
+/// How many knowledge rows travel in ONE frame.
+///
+/// Two. Three was written first and MEASURED at 1,287 bytes against the
+/// 1,100-byte datagram — the fourth time this project has shipped a frame
+/// whose content is bounded in the common case and not in the worst one, and
+/// the first time a test caught it before a device did.
+///
+/// A knowledge row is heavier than a memory item: it carries a kind, a state,
+/// a priority, an expiry and the author agent on top of an id and a title,
+/// because those are what a person needs to decide WITHOUT opening it. The
+/// fields earn their place, so the row count gives way instead.
+const KNOWLEDGE_ROWS_PER_FRAME: usize = 2;
+
+/// How many knowledge rows one REQUEST returns.
+const KNOWLEDGE_PAGE_DEFAULT: usize = 20;
+const KNOWLEDGE_PAGE_MAX: usize = 50;
+
+const _: () = assert!(KNOWLEDGE_ROWS_PER_FRAME <= KNOWLEDGE_PAGE_MAX);
+const _: () = assert!(KNOWLEDGE_PAGE_DEFAULT <= KNOWLEDGE_PAGE_MAX);
+
 // Checked by the compiler rather than by a test: both sides are constants, so
 // the comparison has an answer before anything runs, and a test that asserts it
 // can only ever pass. These are the invariants the size proof below depends on
@@ -1654,6 +1986,57 @@ impl SessionExtension for ShellExtension {
                 }
                 Ok(())
             }
+            "shell_knowledge" => {
+                let cursor = body
+                    .get("cursor")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let limit = body
+                    .get("limit")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|value| value as usize)
+                    .unwrap_or(KNOWLEDGE_PAGE_DEFAULT);
+                for frame in self.knowledge_frames(cursor, limit).await {
+                    session.send(&envelope(frame)).await?;
+                }
+                Ok(())
+            }
+            "shell_knowledge_claims" => {
+                let limit = body
+                    .get("limit")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|value| value as usize)
+                    .unwrap_or(KNOWLEDGE_PAGE_DEFAULT);
+                for frame in self.knowledge_claims_frames(limit).await {
+                    session.send(&envelope(frame)).await?;
+                }
+                Ok(())
+            }
+            "shell_knowledge_detail" => {
+                let id = body
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "a knowledge detail needs an id".to_owned())?;
+                for frame in self.knowledge_detail_frames(id).await {
+                    session.send(&envelope(frame)).await?;
+                }
+                Ok(())
+            }
+            "shell_knowledge_decide" => {
+                let id = body
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "a decision needs an id".to_owned())?;
+                let decision = body
+                    .get("decision")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "a decision needs a decision".to_owned())?;
+                for frame in self.knowledge_decide_frames(id, decision, body).await {
+                    session.send(&envelope(frame)).await?;
+                }
+                Ok(())
+            }
             "shell_memory_tiers" => {
                 session
                     .send(&envelope(self.memory_tiers_frame().await))
@@ -1997,6 +2380,10 @@ mod output_framing_tests {
     /// without being added here, so the next one is not discovered by someone
     /// staring at a blank screen.
     const EMITTED: &[(&str, Sizing)] = &[
+        ("shell_knowledge", Sizing::Paged),
+        ("shell_knowledge_claims", Sizing::Paged),
+        ("shell_knowledge_detail", Sizing::Bounded),
+        ("shell_knowledge_versions", Sizing::Paged),
         ("shell_configs", Sizing::Bounded),
         ("shell_status", Sizing::Bounded),
         ("shell_notice", Sizing::Bounded),
@@ -2119,6 +2506,86 @@ mod output_framing_tests {
                 SAFE_DATAGRAM_BYTES
             );
         }
+    }
+
+    /// A full page of knowledge rows fits a datagram.
+    ///
+    /// Paged means the PAGE size is asserted; the number of pages is not
+    /// bounded and need not be. Without this the kind is merely DECLARED Paged
+    /// and nothing checks it, which is how a 50-item page measured 14,830
+    /// bytes against an 1,100-byte datagram — three times, in three different
+    /// lists, each written after learning it in the last one.
+    #[test]
+    fn a_page_of_knowledge_rows_fits_a_datagram() {
+        let long = "a".repeat(MAX_REASON_BYTES);
+        let rows: Vec<serde_json::Value> = (0..KNOWLEDGE_ROWS_PER_FRAME)
+            .map(|_| {
+                serde_json::json!({
+                    "id": uuid::Uuid::now_v7(),
+                    "title": long,
+                    "kind": "presentation",
+                    "state": "proposed",
+                    "priority": 100,
+                    "repo": "/Users/bkearns/src/ferrosa-suite/ferrosa-memory",
+                    "expires": chrono::Utc::now(),
+                    "agent": "ferrosa-suite claude",
+                })
+            })
+            .collect();
+
+        for kind in [
+            "shell_knowledge",
+            "shell_knowledge_claims",
+            "shell_knowledge_versions",
+        ] {
+            let frames = ShellExtension::page_frames(
+                kind,
+                rows.clone(),
+                true,
+                Some(format!(
+                    "{:013}-{}",
+                    1_767_225_600_000u64,
+                    uuid::Uuid::now_v7()
+                )),
+            );
+            assert_eq!(frames.len(), 1, "{kind} should be one frame at page size");
+            let frame = envelope(frames.into_iter().next().expect("a frame"));
+            assert!(
+                frame.len() <= SAFE_DATAGRAM_BYTES,
+                "a {kind} page is {} bytes, over the {} safe datagram — carry \
+                 fewer rows per frame",
+                frame.len(),
+                SAFE_DATAGRAM_BYTES
+            );
+        }
+    }
+
+    /// An empty page still sends one frame, or a list that matched nothing
+    /// looks identical to one that never answered.
+    #[test]
+    fn an_empty_knowledge_page_still_answers() {
+        let frames = ShellExtension::page_frames("shell_knowledge", Vec::new(), true, None);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["items"].as_array().expect("items").len(), 0);
+        assert_eq!(frames[0]["reachable"], true);
+    }
+
+    /// Only the LAST frame carries the cursor. On an earlier one it would
+    /// invite a device to ask for the next page while this one is still
+    /// arriving, and skip the rest of it.
+    #[test]
+    fn only_the_last_knowledge_frame_carries_the_cursor() {
+        let rows: Vec<serde_json::Value> = (0..KNOWLEDGE_ROWS_PER_FRAME * 3)
+            .map(|i| serde_json::json!({"id": i}))
+            .collect();
+        let frames =
+            ShellExtension::page_frames("shell_knowledge", rows, true, Some("cursor".to_owned()));
+        assert_eq!(frames.len(), 3);
+        assert!(frames[0]["next_cursor"].is_null());
+        assert!(frames[1]["next_cursor"].is_null());
+        assert_eq!(frames[2]["next_cursor"], "cursor");
+        assert_eq!(frames[0]["first"], true);
+        assert_eq!(frames[1]["first"], false);
     }
 
     /// A page of task text fits, using the same bound as output.
