@@ -411,7 +411,7 @@ pub async fn run_control_listener(
                     identity.as_ref(),
                     config.as_ref(),
                     dispatcher.as_ref(),
-                    control_store.as_ref(),
+                    &control_store,
                     &fingerprint,
                     offer,
                     rtc,
@@ -436,7 +436,9 @@ async fn serve_control_session<S, R, T>(
     identity: &ferrosa_memory_core::remote_identity::InstanceSigningIdentity,
     config: &crate::control_session::ControlSessionConfig,
     dispatcher: &crate::control_session::ControlRuntimeDispatcher<T, R>,
-    control_store: &T,
+    // The Arc rather than a reference: the audit heartbeat is spawned, so it
+    // needs a handle that can outlive this call.
+    control_store: &std::sync::Arc<T>,
     fingerprint: &str,
     offer: crate::signaling_client::ControlBrokerSessionView,
     rtc: Option<std::sync::Arc<webrtc::api::API>>,
@@ -509,7 +511,7 @@ async fn serve_control_session<S, R, T>(
 async fn session_work<R, T>(
     channel: &mut crate::control_session::BoundControlChannel,
     dispatcher: &crate::control_session::ControlRuntimeDispatcher<T, R>,
-    control_store: &T,
+    control_store: &std::sync::Arc<T>,
     fingerprint: &str,
     offer: &crate::signaling_client::ControlBrokerSessionView,
     handle: &SessionHandle,
@@ -527,61 +529,79 @@ async fn session_work<R, T>(
         tenant_id: offer.account_id,
         session_origin: format!("mobile-control:{}", offer.session_id),
     };
-    // An AUDIT record that a session began. Nothing below reads the cursor and
-    // nothing about serving the operator depends on this row existing.
+    // An AUDIT record that a session began, written OFF the hot path.
     //
-    // It used to `return` on failure, which ended a perfectly good session
-    // because a bookkeeping write did not land. Observed 2026-08-23: two
-    // sessions in quick succession collided on the same cursor
-    // ("event cursor 4289 is already occupied") and the second was destroyed
-    // moments after connecting — the operator saw a machine that connected and
-    // then had no agents, because the session was gone before the list could
-    // reach them.
+    // Nothing below reads the cursor and nothing about serving the operator
+    // depends on this row existing. It already did not `return` on failure --
+    // that was fixed on 2026-08-23, after a cursor collision destroyed a
+    // healthy session. What it still did was `await`, and that turned out to
+    // be the same bug wearing a different shape.
     //
-    // Losing the record is a real loss and is logged at ERROR so it cannot pass
-    // unnoticed. Losing the SESSION over it is a worse one, and is the operator's
-    // problem rather than the log's.
-    match control_store
-        .reserve_cursor_block(&tenant, fingerprint, 64)
-        .await
-    {
-        Err(error) => {
-            tracing::error!(
-                session_id = %offer.session_id,
-                error = %error,
-                "reserving a control cursor block failed; this session is NOT \
-                 recorded in the durable event log, but continues to serve"
-            );
-        }
-        Ok(block) => {
-            if let Err(error) = control_store
-                .append_event(
-                    &tenant,
-                    fingerprint,
-                    ControlEventDraft {
-                        cursor: block.start,
-                        event_id: Uuid::now_v7(),
-                        command_id: None,
-                        kind: "heartbeat".to_owned(),
-                        payload: serde_json::json!({
-                            "session_id": offer.session_id,
-                            "controller_device_id": offer.controller_device_id,
-                        }),
-                        created_at: chrono::Utc::now(),
-                    },
-                )
-                .await
-            {
-                tracing::error!(
-                    session_id = %offer.session_id,
-                    cursor = block.start,
-                    error = %error,
-                    "persisting the control-session heartbeat failed; this session \
-                     is NOT in the durable event log, but continues to serve"
-                );
+    // With the cluster hot, `reserve_cursor_block` takes its full 30 s to time
+    // out, and for those 30 s this function has not reached `recv_text` yet.
+    // The session is bound, the peer is connected, and every frame the phone
+    // sends -- shell_open, the tmux list, keystrokes -- sits unread in the
+    // queue. Observed 2026-08-24: `visual available` at T+0, the cursor error
+    // at T+30.0, `shell granted` in the same millisecond, closed at T+60.
+    // From the operator's side the terminal simply was not there.
+    //
+    // So it is spawned. An audit heartbeat is best effort by definition, and
+    // best effort means the effort does not hold anything up. Bounded without
+    // extra machinery: one task per session, and sessions are already capped
+    // by MAX_CONCURRENT_CONTROL_SESSIONS.
+    // Detached deliberately. The handle is dropped, which in tokio leaves the
+    // task running: the record is still worth writing after the operator has
+    // gone, and aborting it at session end would throw away the write this
+    // whole block exists to make. It cannot run away -- the store's own
+    // timeout bounds it.
+    drop({
+        let store = std::sync::Arc::clone(control_store);
+        let tenant = tenant.clone();
+        let fingerprint = fingerprint.to_owned();
+        let session_id = offer.session_id;
+        let controller_device_id = offer.controller_device_id;
+        tokio::spawn(async move {
+            match store.reserve_cursor_block(&tenant, &fingerprint, 64).await {
+                Err(error) => {
+                    tracing::error!(
+                        %session_id,
+                        error = %error,
+                        "reserving a control cursor block failed; this session is NOT \
+                         recorded in the durable event log, but continues to serve"
+                    );
+                }
+                Ok(block) => {
+                    if let Err(error) = store
+                        .append_event(
+                            &tenant,
+                            &fingerprint,
+                            ControlEventDraft {
+                                cursor: block.start,
+                                event_id: Uuid::now_v7(),
+                                command_id: None,
+                                kind: "heartbeat".to_owned(),
+                                payload: serde_json::json!({
+                                    "session_id": session_id,
+                                    "controller_device_id": controller_device_id,
+                                }),
+                                created_at: chrono::Utc::now(),
+                            },
+                        )
+                        .await
+                    {
+                        tracing::error!(
+                            %session_id,
+                            cursor = block.start,
+                            error = %error,
+                            "persisting the control-session heartbeat failed; this \
+                             session is NOT in the durable event log, but continues to serve"
+                        );
+                    }
+                }
             }
-        }
-    }
+        })
+    });
+
     // Read a frame, OR notice the peer has gone. Reading alone was not enough:
     // a peer that stops answering without closing leaves this await pending
     // forever, and the session — with everything attached to it — never ends.
@@ -644,6 +664,39 @@ async fn session_work<R, T>(
                 }
             }
             Ok(None) => {}
+            // A capability is down; the session is not. WebRTC,
+            // authentication and the tmux surface need no database, so a
+            // durable-store failure must cost the operator that ONE feature
+            // and nothing else.
+            //
+            // This arm exists because there was no such arm: every store
+            // failure arrived as a protocol violation and fell into the close
+            // below. When the cluster was hot the control channel was torn
+            // down and the terminal the operator was watching disappeared,
+            // which reads as a network fault and is not one.
+            Err(crate::control_session::ControlSessionError::CapabilityUnavailable(reason)) => {
+                tracing::warn!(
+                    session_id = %offer.session_id,
+                    %reason,
+                    "a durable capability is unavailable; the session continues"
+                );
+                // Answered rather than ignored. A request that gets no reply
+                // leaves the device waiting on a capability that is not
+                // coming, which looks the same as a hung session.
+                let reply = frame_id_of(&frame).and_then(|frame_id| {
+                    crate::control_session::capability_unavailable_reply(&frame_id, &reason)
+                });
+                if let Some(reply) = reply
+                    && let Err(error) = channel.send_text(&reply).await
+                {
+                    tracing::info!(
+                        session_id = %offer.session_id,
+                        error = %error,
+                        "sending a capability-unavailable reply failed"
+                    );
+                    break;
+                }
+            }
             Err(error) => {
                 tracing::warn!(
                     session_id = %offer.session_id,
@@ -655,6 +708,21 @@ async fn session_work<R, T>(
             }
         }
     }
+}
+
+/// The frame id a reply must carry back, if the frame has one.
+///
+/// Best effort by design: this is used to answer a request whose handler
+/// already failed, and a frame with no usable id is one the device cannot
+/// correlate a reply to anyway. Returning `None` costs that one answer; it
+/// does not cost the session.
+fn frame_id_of(frame: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(frame)
+        .ok()?
+        .get("frame_id")?
+        .as_str()
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .map(str::to_owned)
 }
 
 /// Which extension, if any, claims this frame.

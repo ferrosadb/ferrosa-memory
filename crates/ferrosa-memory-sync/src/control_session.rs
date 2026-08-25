@@ -143,8 +143,23 @@ pub enum ControlSessionError {
     #[error("timed out waiting for {0}")]
     Timeout(&'static str),
     /// Peer violated the first-frame or text-only protocol.
+    ///
+    /// This one ENDS the session, so it means exactly what it says: the peer
+    /// sent something this protocol cannot interpret. A local dependency
+    /// failing is not a protocol violation -- see [`Self::CapabilityUnavailable`].
     #[error("control protocol violation: {0}")]
     Protocol(String),
+    /// A database-backed capability could not be served right now.
+    ///
+    /// The peer did nothing wrong and the channel is healthy, so this must not
+    /// end the session. Separated from [`Self::Protocol`] because every
+    /// durable-store failure used to be reported as one, and the frame loop
+    /// closes the channel on a protocol error: a hot database therefore
+    /// disconnected the operator's terminal. WebRTC, authentication and tmux
+    /// do not need the database, and a session that can still serve them must
+    /// stay up and say which capability is missing.
+    #[error("control capability unavailable: {0}")]
+    CapabilityUnavailable(String),
     /// Local consumer did not keep up with the bounded inbound queue.
     #[error("control inbound queue is full")]
     Backpressure,
@@ -1355,8 +1370,32 @@ fn bounded_text(value: &str) -> String {
     format!("{}…", &value[..end])
 }
 
+/// A durable-store failure, reported as a missing capability rather than as a
+/// protocol violation.
+///
+/// It was the latter, and the frame loop closes the channel on a protocol
+/// error. So an overloaded database did not merely fail the command feed --
+/// it tore down the control channel, and the terminal the operator was
+/// watching went away with it. Nothing about the peer was wrong.
 fn control_store_error(error: anyhow::Error) -> ControlSessionError {
-    ControlSessionError::Protocol(format!("durable control operation failed: {error}"))
+    ControlSessionError::CapabilityUnavailable(format!("durable control store: {error}"))
+}
+
+/// Tell the caller a capability is down, on the frame they asked about.
+///
+/// Sent instead of closing. A reply the device can correlate is what lets it
+/// mark one control unavailable and keep the rest of the session, which
+/// silence -- or a dropped channel -- does not.
+pub fn capability_unavailable_reply(frame_id: &str, reason: &str) -> Option<String> {
+    serde_json::to_string(&serde_json::json!({
+        "version": CONTROL_PROTOCOL_VERSION,
+        "frame_id": frame_id,
+        "body": {
+            "type": "capability_unavailable",
+            "reason": bounded_text(reason),
+        },
+    }))
+    .ok()
 }
 
 #[cfg(test)]
@@ -1639,5 +1678,151 @@ mod tests {
                 && event.kind == "agent_completed"
                 && event.payload["message"] == "ferrosa-mobile proof of life"
         }));
+    }
+
+    /// A store that behaves like an overloaded cluster: every call fails.
+    ///
+    /// Not a timeout, because the classification is what is under test and it
+    /// is the same for a timeout as for any other store error. A test that
+    /// actually waited 30 s would be measuring tokio.
+    struct OverloadedControlStore;
+
+    impl ControlStore for OverloadedControlStore {
+        async fn reserve_cursor_block(
+            &self,
+            _ctx: &TenantContext,
+            _server_fingerprint: &str,
+            _size: u64,
+        ) -> anyhow::Result<ferrosa_memory_core::control_store::CursorBlock> {
+            anyhow::bail!("Request timeout: Request took longer than 30000ms")
+        }
+
+        async fn append_event(
+            &self,
+            _ctx: &TenantContext,
+            _server_fingerprint: &str,
+            _draft: ControlEventDraft,
+        ) -> anyhow::Result<ferrosa_memory_core::control_store::ControlEvent> {
+            anyhow::bail!("Request timeout: Request took longer than 30000ms")
+        }
+
+        async fn events_after(
+            &self,
+            _ctx: &TenantContext,
+            _server_fingerprint: &str,
+            _after_cursor: Option<u64>,
+            _limit: usize,
+        ) -> anyhow::Result<ferrosa_memory_core::control_store::ControlReplayPage> {
+            anyhow::bail!("Request timeout: Request took longer than 30000ms")
+        }
+
+        async fn put_command_if_absent(
+            &self,
+            _ctx: &TenantContext,
+            _server_fingerprint: &str,
+            _command: &ControlCommand,
+        ) -> anyhow::Result<ferrosa_memory_core::control_store::CommandInsert> {
+            anyhow::bail!("Request timeout: Request took longer than 30000ms")
+        }
+
+        async fn get_command(
+            &self,
+            _ctx: &TenantContext,
+            _server_fingerprint: &str,
+            _command_id: Uuid,
+        ) -> anyhow::Result<Option<ControlCommand>> {
+            anyhow::bail!("Request timeout: Request took longer than 30000ms")
+        }
+
+        async fn update_command(
+            &self,
+            _ctx: &TenantContext,
+            _server_fingerprint: &str,
+            _command_id: Uuid,
+            _update: ferrosa_memory_core::control_store::ControlCommandUpdate,
+        ) -> anyhow::Result<ControlCommand> {
+            anyhow::bail!("Request timeout: Request took longer than 30000ms")
+        }
+    }
+
+    /// The regression. A hot database must not read as a protocol violation,
+    /// because the frame loop CLOSES the channel on one -- which is how an
+    /// overloaded cluster made the operator's terminal disappear.
+    #[tokio::test]
+    async fn a_failing_store_is_a_missing_capability_not_a_protocol_violation() {
+        let dispatcher = ControlRuntimeDispatcher::new(
+            Arc::new(OverloadedControlStore),
+            FakeAgentRuntime {
+                launches: Arc::new(AtomicUsize::new(0)),
+            },
+        );
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "control-runtime-test".to_owned(),
+        };
+        let request = serde_json::json!({
+            "version": CONTROL_PROTOCOL_VERSION,
+            "frame_id": "command-1",
+            "body": {
+                "type": "command",
+                "command_id": Uuid::now_v7(),
+                "command_type": "agent_launch",
+                "payload": {"instruction": "report proof of life"},
+            },
+        })
+        .to_string();
+
+        let error = dispatcher
+            .reply(&ctx, "server-fingerprint", &request)
+            .await
+            .expect_err("an overloaded store cannot serve the command feed");
+        assert!(
+            matches!(error, ControlSessionError::CapabilityUnavailable(_)),
+            "a store failure must not be reported as a protocol violation, \
+             because that tears down the channel; got {error:?}"
+        );
+    }
+
+    /// The other half of the boundary: a peer that really does speak wrongly
+    /// still ends the session. Without this the first test could be satisfied
+    /// by reclassifying everything, which would leave a malformed peer able to
+    /// hold a session open forever.
+    #[tokio::test]
+    async fn a_malformed_frame_is_still_a_protocol_violation() {
+        let dispatcher = ControlRuntimeDispatcher::new(
+            Arc::new(InMemoryControlStore::default()),
+            FakeAgentRuntime {
+                launches: Arc::new(AtomicUsize::new(0)),
+            },
+        );
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "control-runtime-test".to_owned(),
+        };
+        let error = dispatcher
+            .reply(&ctx, "server-fingerprint", "{not json")
+            .await
+            .expect_err("a malformed frame is refused");
+        assert!(
+            matches!(error, ControlSessionError::Protocol(_)),
+            "got {error:?}"
+        );
+    }
+
+    /// The degraded reply has to be correlatable, or the device cannot tell
+    /// which request went unserved and shows a control that never resolves.
+    #[test]
+    fn a_capability_reply_carries_the_frame_it_answers() {
+        let reply = capability_unavailable_reply("command-1", "durable control store: hot")
+            .expect("encodes");
+        let value: serde_json::Value = serde_json::from_str(&reply).expect("json");
+        assert_eq!(value["frame_id"], "command-1");
+        assert_eq!(value["body"]["type"], "capability_unavailable");
+        assert!(
+            value["body"]["reason"]
+                .as_str()
+                .expect("reason")
+                .contains("durable control store")
+        );
     }
 }
