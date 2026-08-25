@@ -546,6 +546,9 @@ async fn session_work<R, T>(
     //
     // `recv_text` is cancel-safe (it awaits `mpsc::Receiver::recv`), so losing
     // the race drops no frame.
+    // Cloned before the loop's own peer-lost future takes ownership, so each
+    // request can build one of its own to race against.
+    let request_peer_state = peer_state.clone();
     let mut lost = std::pin::pin!(peer_lost(peer_state, PEER_DISCONNECT_GRACE));
     loop {
         let frame = tokio::select! {
@@ -574,19 +577,43 @@ async fn session_work<R, T>(
         // frame would not merely go unanswered — it would drop the channel it
         // arrived on.
         if let Some((extension, kind)) = claim(attach, &frame) {
-            if let Err(error) = extension
-                .on_request(handle, &kind, &frame_json(&frame))
-                .await
-            {
+            // Raced against the peer going away. Awaiting this inline meant a
+            // long request kept running after the operator disconnected -- the
+            // loop was not watching for the loss while it waited, so the
+            // disconnect was neither noticed nor acted on until the request
+            // finished on its own.
+            let outcome = serve_request(
+                extension.on_request(handle, &kind, &frame_json(&frame)),
+                async {
+                    peer_lost(request_peer_state.clone(), PEER_DISCONNECT_GRACE).await;
+                },
+                REQUEST_DEADLINE,
+            )
+            .await;
+            match outcome {
+                RequestOutcome::Served => {}
                 // The request failed; the session did not. A screen that could
                 // not be captured is a screen that could not be captured, not a
                 // reason to disconnect a working control channel.
-                tracing::warn!(
+                RequestOutcome::Refused(error) => tracing::warn!(
                     session_id = %offer.session_id,
                     %kind,
                     %error,
                     "session extension refused a request"
-                );
+                ),
+                RequestOutcome::Cancelled(why) => {
+                    tracing::info!(
+                        session_id = %offer.session_id,
+                        %kind,
+                        %why,
+                        "abandoned a request in flight"
+                    );
+                    // The peer is gone; the next loop turn will see it and end
+                    // the session. Nothing more to serve it.
+                    if why == "the peer went away" {
+                        break;
+                    }
+                }
             }
             continue;
         }
@@ -711,6 +738,68 @@ where
             }
         }
     })
+}
+
+/// How one extension request ended.
+#[derive(Debug)]
+enum RequestOutcome {
+    /// The extension answered.
+    Served,
+    /// The extension declined. Its answer, not a failure of the session.
+    Refused(String),
+    /// Nobody is waiting for this any more, so it was dropped.
+    Cancelled(&'static str),
+}
+
+/// How long one extension request may run before it is abandoned.
+///
+/// A bound on WORK. Cancelling a Rust future does not stop a query the server
+/// has already begun, so a request nobody is waiting for still needs an end --
+/// otherwise the only thing that stops it is the query finishing, which is the
+/// behaviour being fixed.
+///
+/// Sixty seconds is far above any request this serves once the tier map counts
+/// instead of scanning (measured 402 ms) and a page is a seek (375 ms), and
+/// far below "forever".
+const REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Serve one extension request, giving up if the peer goes or time runs out.
+///
+/// The frame loop used to `await` the request inline. While it did, the loop
+/// was not in the select that watches for peer loss, so a disconnect was not
+/// noticed until the request finished -- and nothing cancelled it. A long
+/// memory query therefore ran to completion for a phone that had already gone,
+/// which is what an operator sees as "I disconnected and it kept going".
+///
+/// `select!` DROPS the losing branch, and dropping the request future is what
+/// actually stops the work. Abandoning it -- spawning it and walking away --
+/// would leave the query running and look identical from here.
+///
+/// The database session itself is deliberately NOT touched. It is a process-
+/// wide OnceCell shared by every control session, and tearing it down because
+/// one phone went away would take the other phones' board and memory with it.
+async fn serve_request<F, P>(
+    request: F,
+    peer_lost: P,
+    deadline: std::time::Duration,
+) -> RequestOutcome
+where
+    F: std::future::Future<Output = Result<(), String>>,
+    P: std::future::Future<Output = ()>,
+{
+    let request = std::pin::pin!(request);
+    let peer_lost = std::pin::pin!(peer_lost);
+    tokio::select! {
+        // Biased so a peer that is already gone wins deterministically rather
+        // than by whichever branch the runtime polls first.
+        biased;
+        () = peer_lost => RequestOutcome::Cancelled("the peer went away"),
+        outcome = tokio::time::timeout(deadline, request) => match outcome {
+            Ok(Ok(())) => RequestOutcome::Served,
+            Ok(Err(why)) => RequestOutcome::Refused(why),
+            Err(_elapsed) => RequestOutcome::Cancelled("the deadline passed"),
+        },
+    }
 }
 
 /// What the frame loop should do about one dispatcher result.
@@ -1257,5 +1346,95 @@ mod tests {
              reached this line anyway"
         );
         handle.abort();
+    }
+
+    /// A request must stop when the operator goes.
+    ///
+    /// Observed 2026-08-25: a long memory query kept running after the phone
+    /// disconnected. The frame loop awaits `on_request` inline, so while a
+    /// query runs the loop is not in the select that watches for peer loss --
+    /// the disconnect is not noticed, let alone acted on, until the query
+    /// finishes. The DB session is deliberately process-wide and shared, so
+    /// the fix is not to drop the connection; it is to stop the work.
+    ///
+    /// The assertion that matters is `dropped`: a request that is merely
+    /// ABANDONED still holds its future, and the query keeps running.
+    #[tokio::test]
+    async fn losing_the_peer_cancels_the_request_in_flight() {
+        struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = DropFlag(std::sync::Arc::clone(&dropped));
+        let never_finishes = async move {
+            let _held = flag;
+            std::future::pending::<Result<(), String>>().await
+        };
+
+        let outcome = serve_request(
+            never_finishes,
+            async {}, // the peer is already gone
+            std::time::Duration::from_secs(3600),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, RequestOutcome::Cancelled("the peer went away")),
+            "got {outcome:?}"
+        );
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "the request future must be DROPPED, not merely abandoned -- an \
+             abandoned future keeps its query alive"
+        );
+    }
+
+    /// The work is bounded too. Cancelling a Rust future does not stop a query
+    /// the server has already begun, so a request that nobody is waiting for
+    /// must still have an end.
+    #[tokio::test]
+    async fn a_request_that_never_returns_hits_its_deadline() {
+        let outcome = serve_request(
+            std::future::pending::<Result<(), String>>(),
+            std::future::pending::<()>(), // the peer is still there
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+        assert!(
+            matches!(outcome, RequestOutcome::Cancelled("the deadline passed")),
+            "got {outcome:?}"
+        );
+    }
+
+    /// The ordinary case is untouched: a request that answers, answers.
+    #[tokio::test]
+    async fn a_request_that_completes_is_served() {
+        let outcome = serve_request(
+            async { Ok(()) },
+            std::future::pending::<()>(),
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(outcome, RequestOutcome::Served), "got {outcome:?}");
+    }
+
+    /// A refusal is the extension's answer, not a cancellation -- the session
+    /// carries on either way, but they read differently in a log.
+    #[tokio::test]
+    async fn a_refused_request_is_reported_as_refused() {
+        let outcome = serve_request(
+            async { Err("no screen to capture".to_owned()) },
+            std::future::pending::<()>(),
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        match outcome {
+            RequestOutcome::Refused(why) => assert_eq!(why, "no screen to capture"),
+            other => panic!("got {other:?}"),
+        }
     }
 }
