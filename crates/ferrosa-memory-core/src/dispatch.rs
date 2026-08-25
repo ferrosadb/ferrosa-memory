@@ -3,8 +3,8 @@
 //! Maps MCP tool names to handler functions. Validates input schemas before
 //! dispatch. Returns tool definitions for `tools/list`.
 //!
-//! Last revised: 2026-08-12
-//! Last changed: Routed tool discovery through bounded, versioned pagination.
+//! Last revised: 2026-08-24
+//! Last changed: Preserved balanced entity-name recall for workspace-routed searches.
 //!
 //! ## MCP protocol methods handled
 //!
@@ -7258,9 +7258,29 @@ fn select_auto_fusion_profile(
     .iter()
     .any(|needle| lower.contains(needle));
     if broad_semantic {
+        // When a workspace cwd is provided, use the workspace-aware variant
+        // so same-repo entities get the affinity boost. Without this, a broad
+        // semantic search from a different repo returns unrelated entities.
+        if has_workspace {
+            return AutoFusionSelection {
+                intent: "broad_semantic_workspace",
+                profile: "bm25-semantic-workspace",
+            };
+        }
         return AutoFusionSelection {
             intent: "broad_semantic",
             profile: "bm25-semantic",
+        };
+    }
+
+    // 6. Default balanced — the fallback. When a workspace cwd is provided,
+    //    use the workspace-aware balanced profile to ensure same-repo affinity
+    //    without dropping auto's entity-name phonetic channel. The bare "auto"
+    //    profile zeros workspace_weight, which causes cross-domain pollution.
+    if has_workspace {
+        return AutoFusionSelection {
+            intent: "default_balanced_workspace",
+            profile: "bm25-semantic-phonetic-workspace",
         };
     }
 
@@ -8212,6 +8232,11 @@ async fn handle_hybrid_search<S: crate::storage::Storage>(
                 format!("unknown fusion_profile: {requested_fusion_profile}"),
             )
         })?;
+    // Apply `[search.fusion]` config overrides after profile selection.
+    // This lets operators set e.g. workspace_weight = 2.0 in the config file
+    // and have it apply to every search without recompiling or per-call args.
+    let search_config = session.search.lock().await.clone();
+    search_config.fusion.apply_overrides(&mut fusion_config);
     if let Some(weights) = args.get("fusion_weights") {
         let Some(object) = weights.as_object() else {
             return Err((INVALID_PARAMS, "fusion_weights must be an object".into()));
@@ -12288,7 +12313,7 @@ mod tests {
     #[test]
     fn auto_fusion_routes_project_bug_queries_to_workspace_profile() {
         let filter = crate::hybrid_search::SearchFilter {
-            workspace_cwd: Some("/Users/bkearns/src/ferrosa-suite/ferrosa-memory".into()),
+            workspace_cwd: Some("/repo/project-a".into()),
             ..Default::default()
         };
         let selected =
@@ -12359,6 +12384,81 @@ mod tests {
         let without_ws =
             select_auto_fusion_profile(bug_query, &crate::hybrid_search::SearchFilter::default());
         assert_ne!(without_ws.intent, "project_bug_or_build");
+    }
+
+    #[test]
+    fn auto_fusion_workspace_cwd_routes_default_to_workspace_profile() {
+        // Regression: a default query (not a bug/build, not broad semantic)
+        // with a workspace cwd must route to the workspace-aware balanced
+        // profile, preserving auto's entity-name phonetic channel while adding
+        // workspace affinity.
+        // Uses a query without any broad_semantic trigger words (no
+        // "architecture", "design", "explain", etc.) to hit the default path.
+        let filter = crate::hybrid_search::SearchFilter {
+            workspace_cwd: Some("/repo/project-b".into()),
+            ..Default::default()
+        };
+        let selected = select_auto_fusion_profile("project-b app roster events RSVP", &filter);
+        assert_eq!(
+            selected.profile, "bm25-semantic-phonetic-workspace",
+            "default query with workspace cwd must preserve balanced recall, got {}",
+            selected.profile
+        );
+        assert_eq!(selected.intent, "default_balanced_workspace");
+
+        // Without workspace cwd, the same query must fall through to the
+        // bare auto profile (backward compat).
+        let no_ws = select_auto_fusion_profile(
+            "project-b app roster events RSVP",
+            &crate::hybrid_search::SearchFilter::default(),
+        );
+        assert_eq!(no_ws.intent, "default_balanced");
+        assert_eq!(no_ws.profile, "auto");
+    }
+
+    #[test]
+    fn auto_fusion_workspace_cwd_routes_broad_semantic_to_workspace_profile() {
+        // Regression: a broad_semantic query (contains "architecture") with a
+        // workspace cwd must route to the workspace-aware variant.
+        let filter = crate::hybrid_search::SearchFilter {
+            workspace_cwd: Some("/repo/project-c".into()),
+            ..Default::default()
+        };
+        let selected =
+            select_auto_fusion_profile("explain the architecture of the storage engine", &filter);
+        assert_eq!(
+            selected.profile, "bm25-semantic-workspace",
+            "broad semantic with workspace must use workspace profile"
+        );
+        assert_eq!(selected.intent, "broad_semantic_workspace");
+
+        // Without workspace, broad_semantic still uses the non-workspace profile.
+        let no_ws = select_auto_fusion_profile(
+            "explain the architecture of the storage engine",
+            &crate::hybrid_search::SearchFilter::default(),
+        );
+        assert_eq!(no_ws.profile, "bm25-semantic");
+    }
+
+    #[test]
+    fn fusion_tuning_config_overrides_apply_to_workspace_weight() {
+        // Verify that FusionTuningConfig.apply_overrides can set workspace_weight
+        // even when the selected profile zeros it (like "auto" does).
+        let mut config = crate::hybrid_search::FusionConfig::profile("auto").unwrap();
+        assert_eq!(
+            config.workspace_weight, 0.0,
+            "auto profile must zero workspace_weight"
+        );
+
+        let tuning = crate::config::FusionTuningConfig {
+            workspace_weight: Some(2.0),
+            ..Default::default()
+        };
+        tuning.apply_overrides(&mut config);
+        assert_eq!(
+            config.workspace_weight, 2.0,
+            "override must set workspace_weight to 2.0"
+        );
     }
 
     /// Extract the inner tool result from MCP CallToolResult wrapper.
@@ -17570,8 +17670,8 @@ mod tests {
                 "arguments": {
                     "session_start": {
                         "agent": "codex",
-                        "agent_session_id": "codex-ferrosa-suite-leak-check",
-                        "workspace": "/Users/bkearns/src/ferrosa-suite"
+                        "agent_session_id": "codex-test-leak-check",
+                        "workspace": "/repo/test-suite"
                     }
                 }
             }),
@@ -17585,7 +17685,7 @@ mod tests {
         let sid = Uuid::parse_str(configured["session_id"].as_str().unwrap()).unwrap();
         let expected = Uuid::new_v5(
             &Uuid::NAMESPACE_URL,
-            b"ferrosa-memory:agent-session:v1:codex:/Users/bkearns/src/ferrosa-suite:codex-ferrosa-suite-leak-check",
+            b"ferrosa-memory:agent-session:v1:codex:/repo/test-suite:codex-test-leak-check",
         );
 
         assert_eq!(sid, expected);

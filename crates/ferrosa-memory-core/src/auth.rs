@@ -1,5 +1,8 @@
 //! Tenant authentication and context extraction.
 //!
+//! Last revised: 2026-08-24
+//! Last changed: Added tenant-set-preserving reloads for HTTP background-worker safety.
+//!
 //! The auth module is the security boundary that ensures every tool handler
 //! receives a validated [`TenantContext`]. The `tenant_id` is NEVER client-supplied —
 //! it is derived from the authenticated session.
@@ -37,6 +40,8 @@ pub enum AuthError {
     UnrecognizedOrigin(String),
     #[error("failed to load auth file: {0}")]
     AuthFileLoad(String),
+    #[error("auth tenant set changed; restart required to reconcile tenant background workers")]
+    TenantSetChanged,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,6 +70,20 @@ struct PrincipalRecord {
 }
 
 impl FileAuthValidator {
+    /// Every distinct tenant this server is configured to serve, sorted.
+    ///
+    /// In HTTP mode the tenants ARE the auth principals' tenants — there is no
+    /// other source of truth, because `server.tenant_id` is rejected for HTTP
+    /// (`validate_shared_http_config`). Background work that needs a tenant has
+    /// to ask here rather than invent one.
+    pub fn tenants(&self) -> Vec<Uuid> {
+        let guard = self
+            .principals
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::tenant_ids(&guard)
+    }
+
     pub fn from_path(path: &str) -> Result<Self, AuthError> {
         let principals = Self::load_principals(path)?;
         if principals.is_empty() {
@@ -94,6 +113,34 @@ impl FileAuthValidator {
         Ok(count)
     }
 
+    /// Reload credentials while preserving the tenant set observed at startup.
+    ///
+    /// HTTP consolidation workers are created once per tenant. Accepting a new
+    /// tenant set without reconciling those workers would authenticate tenants
+    /// that have no worker, or leave a removed tenant's worker running. Callers
+    /// must restart the server to apply a tenant-set change.
+    pub fn reload_preserving_tenants(&self) -> Result<usize, AuthError> {
+        let new_principals = Self::load_principals(&self.path)?;
+        let count = new_principals.len();
+        if count == 0 {
+            tracing::warn!(
+                path = %self.path,
+                "auth file loaded but contains no principals — all requests will be rejected with 401"
+            );
+        }
+        let new_tenants = Self::tenant_ids(&new_principals);
+        let mut guard = self
+            .principals
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if Self::tenant_ids(&guard) != new_tenants {
+            return Err(AuthError::TenantSetChanged);
+        }
+        guard.clear();
+        guard.extend(new_principals);
+        Ok(count)
+    }
+
     pub fn path(&self) -> &str {
         &self.path
     }
@@ -116,6 +163,13 @@ impl FileAuthValidator {
             );
         }
         Ok(principals)
+    }
+
+    fn tenant_ids(principals: &HashMap<String, PrincipalRecord>) -> Vec<Uuid> {
+        let mut tenants: Vec<Uuid> = principals.values().map(|p| p.tenant_id).collect();
+        tenants.sort();
+        tenants.dedup();
+        tenants
     }
 
     pub fn validate(&self, username: &str, password: &str) -> Option<Uuid> {
@@ -200,6 +254,60 @@ pub fn validate_origin(origin: &str) -> Result<(), AuthError> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The tenant list must come from the principals, and never be invented.
+    ///
+    /// This is what the HTTP consolidation worker polls with. It used to call
+    /// `stdio_tenant_id(&config)`, whose fallback is `Uuid::new_v4()` -- and
+    /// `validate_shared_http_config` refuses to start an HTTP server that sets
+    /// `server.tenant_id`, so the fallback was guaranteed to fire. The worker
+    /// therefore polled a brand-new tenant that owned nothing, on every boot.
+    ///
+    /// Live evidence, 2026-08-22: 275 consolidation requests going back to
+    /// 2026-06-28, 270 with `attempt_count = 0`, `consolidation_runs` empty,
+    /// and 63 orphan tenants in `entity_store` -- one per boot.
+    #[test]
+    fn tenants_come_from_the_principals_and_are_deduped() {
+        let shared = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let path = std::env::temp_dir().join(format!("fmem-auth-{}.toml", Uuid::new_v4()));
+        let body = format!(
+            "[[principal]]\nusername = \"a\"\npassword_sha256 = \"x\"\ntenant_id = \"{shared}\"\n\n\
+[[principal]]\nusername = \"b\"\npassword_sha256 = \"y\"\ntenant_id = \"{shared}\"\n\n\
+[[principal]]\nusername = \"c\"\npassword_sha256 = \"z\"\ntenant_id = \"{other}\"\n"
+        );
+        std::fs::write(&path, body).unwrap();
+
+        let v = FileAuthValidator::from_path(path.to_str().unwrap()).unwrap();
+        let mut expected = vec![shared, other];
+        expected.sort();
+
+        assert_eq!(
+            v.tenants(),
+            expected,
+            "two principals sharing a tenant must yield it once, and a distinct \
+             tenant must not be dropped"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// No principals means no tenant -- not a fabricated one.
+    ///
+    /// The caller must be able to tell "nothing to serve" from "serving
+    /// something", because a worker polling an invented tenant looks exactly
+    /// like a worker that is healthy and idle. That resemblance is why this
+    /// went unnoticed for two months.
+    #[test]
+    fn no_principals_yields_no_tenants() {
+        let path = std::env::temp_dir().join(format!("fmem-auth-{}.toml", Uuid::new_v4()));
+        std::fs::write(&path, "").unwrap();
+        let v = FileAuthValidator::from_path(path.to_str().unwrap()).unwrap();
+        assert!(
+            v.tenants().is_empty(),
+            "an empty auth file must yield no tenants rather than a random one"
+        );
+        std::fs::remove_file(&path).ok();
+    }
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
@@ -316,6 +424,66 @@ mod tests {
             validator.validate("alice", "new_password"),
             Some(new_tenant)
         );
+    }
+
+    #[test]
+    fn reload_preserving_tenants_rejects_tenant_set_changes() {
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[[principal]]\nusername = \"alice\"\npassword_sha256 = \"{}\"\ntenant_id = \"{}\"",
+            sha256_hex("old_password"),
+            tenant_a
+        )
+        .unwrap();
+
+        let path = file.path().to_str().unwrap().to_string();
+        let validator = FileAuthValidator::from_path(&path).unwrap();
+
+        let replacement = format!(
+            "[[principal]]\nusername = \"alice\"\npassword_sha256 = \"{}\"\ntenant_id = \"{}\"",
+            sha256_hex("new_password"),
+            tenant_b
+        );
+        std::fs::write(&path, replacement).unwrap();
+
+        let error = validator.reload_preserving_tenants().unwrap_err();
+        assert!(
+            error.to_string().contains("restart required"),
+            "tenant-set reload rejection must tell the operator how to apply it: {error}"
+        );
+        assert_eq!(validator.tenants(), vec![tenant_a]);
+        assert_eq!(validator.validate("alice", "old_password"), Some(tenant_a));
+        assert_eq!(validator.validate("alice", "new_password"), None);
+    }
+
+    #[test]
+    fn reload_preserving_tenants_accepts_credential_changes() {
+        let tenant = Uuid::new_v4();
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[[principal]]\nusername = \"alice\"\npassword_sha256 = \"{}\"\ntenant_id = \"{}\"",
+            sha256_hex("old_password"),
+            tenant
+        )
+        .unwrap();
+
+        let path = file.path().to_str().unwrap().to_string();
+        let validator = FileAuthValidator::from_path(&path).unwrap();
+        let replacement = format!(
+            "[[principal]]\nusername = \"alice\"\npassword_sha256 = \"{}\"\ntenant_id = \"{}\"",
+            sha256_hex("new_password"),
+            tenant
+        );
+        std::fs::write(&path, replacement).unwrap();
+
+        assert_eq!(validator.reload_preserving_tenants().unwrap(), 1);
+        assert_eq!(validator.tenants(), vec![tenant]);
+        assert_eq!(validator.validate("alice", "old_password"), None);
+        assert_eq!(validator.validate("alice", "new_password"), Some(tenant));
     }
 
     #[test]

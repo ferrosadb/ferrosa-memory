@@ -1,11 +1,17 @@
 //! # ferrosa-memory-mcp
 //!
+//! Last revised: 2026-08-24
+//! Last changed: Kept HTTP consolidation workers aligned with auth reload tenant sets.
+//!
 //! MCP server binary that exposes Ferrosa's memory tools via stdio or HTTP+SSE.
 //!
 //! Connects to a real Ferrosa cluster via CQL (cdrs-tokio). If the initial
 //! connection fails, starts serving immediately with a "reconnecting" backend
 //! that returns errors, while a background task retries with exponential backoff.
 //! Never falls back to mock storage — mock silently loses data.
+//!
+//! Last revised: 2026-08-24
+//! Last changed: Streams pending consolidation work with bounded backpressure.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1075,12 +1081,30 @@ impl Storage for ReconnectingStorage {
         delegate!(self, consolidation_request_get, ctx, session_id)
     }
 
-    async fn consolidation_request_list_pending(
+    async fn consolidation_request_stream_pending(
         &self,
-        ctx: &TenantContext,
-        limit: usize,
-    ) -> anyhow::Result<Vec<uuid::Uuid>> {
-        delegate!(self, consolidation_request_list_pending, ctx, limit)
+        ctx: TenantContext,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<uuid::Uuid>>,
+    ) {
+        // Hand-written rather than `delegate!` because this yields `()` — the
+        // macro inspects a `Result` return to detect connection loss.
+        //
+        // A missing connection is reported THROUGH the channel. Returning
+        // quietly would make "cannot reach the database" indistinguishable
+        // from "no work outstanding", which is exactly how the invented-tenant
+        // bug stayed invisible for two months.
+        let conn_gen = self.current_generation();
+        match self.current_cql().await {
+            Some(cql) => cql.consolidation_request_stream_pending(ctx, tx).await,
+            None => {
+                self.mark_disconnected(conn_gen).await;
+                let _ = tx
+                    .send(Err(anyhow::anyhow!(
+                        "consolidation stream unavailable: no CQL connection"
+                    )))
+                    .await;
+            }
+        }
     }
 
     async fn consolidation_run_insert(
@@ -3018,7 +3042,7 @@ async fn cql_readiness_probe_loop(storage: Arc<ReconnectingStorage>) {
 /// Background worker that polls the durable consolidation queue and runs
 /// consolidation under a database-backed lease.
 ///
-/// The loop is tenant-scoped: it polls `consolidation_request_list_pending`
+/// The loop is tenant-scoped: it polls `consolidation_request_stream_pending`
 /// for the default tenant context. The dispatcher writes a request row on
 /// every successful write tool, so any replica can pick it up.
 async fn consolidation_worker_loop<S: Storage + Send + Sync + 'static>(
@@ -3039,15 +3063,36 @@ async fn consolidation_worker_loop<S: Storage + Send + Sync + 'static>(
     loop {
         ticker.tick().await;
 
-        let pending = match storage.consolidation_request_list_pending(&ctx, 64).await {
-            Ok(sids) => sids,
-            Err(e) => {
-                tracing::warn!("consolidation list_pending failed: {e}");
-                continue;
-            }
+        // Stream the outstanding sessions rather than fetching a batch.
+        //
+        // This used to take 64 at a time, which meant the storage layer had to
+        // decide WHICH 64 — an ordering, and a buffer to sort candidates in.
+        // Consuming the whole stream removes the selection, so nothing needs
+        // ordering and nothing accumulates: each session is claimed and
+        // processed as it arrives.
+        //
+        // The channel is small on purpose. Claiming and consolidating is far
+        // slower than scanning, so the consumer is the throttle: the producer
+        // blocks on `send` instead of racing ahead. That bounds the WORK in
+        // flight without bounding the RESULT.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<anyhow::Result<uuid::Uuid>>(8);
+        let producer = {
+            let storage = Arc::clone(&storage);
+            let ctx = (*ctx).clone();
+            tokio::spawn(async move {
+                storage.consolidation_request_stream_pending(ctx, tx).await;
+            })
         };
 
-        for sid in pending {
+        while let Some(item) = rx.recv().await {
+            let sid = match item {
+                Ok(sid) => sid,
+                Err(e) => {
+                    // Fail loud and abandon this pass; the next tick retries.
+                    tracing::warn!("consolidation pending stream failed: {e}");
+                    break;
+                }
+            };
             let lease_expires = chrono::Utc::now() + chrono::Duration::seconds(lease_secs as i64);
             let claimed = match storage
                 .consolidation_request_claim(&ctx, sid, &lease_owner, lease_expires)
@@ -3149,6 +3194,13 @@ async fn consolidation_worker_loop<S: Storage + Send + Sync + 'static>(
                 }
             }
         }
+
+        // This pass is done. Drop the receiver first so a producer still
+        // scanning stops on its next `send` — otherwise a `break` above
+        // would leave it blocked — then join it so one pass cannot overlap
+        // the next tick.
+        drop(rx);
+        let _ = producer.await;
     }
 }
 
@@ -3804,7 +3856,7 @@ async fn main() -> anyhow::Result<()> {
                 loop {
                     stream.recv().await;
                     tracing::info!(path = %sighup_validator.path(), "SIGHUP received, reloading auth file");
-                    match sighup_validator.reload() {
+                    match sighup_validator.reload_preserving_tenants() {
                         Ok(count) => tracing::info!(principals = count, "auth file reloaded"),
                         Err(e) => {
                             tracing::error!(error = %e, "failed to reload auth file, keeping old principals")
@@ -3847,29 +3899,61 @@ async fn main() -> anyhow::Result<()> {
             spawn_debug_stop_monitor(&config, &session);
 
             // Spawn the cross-replica consolidation worker for HTTP too.
+            //
+            // One worker PER CONFIGURED TENANT, taken from the auth file.
+            //
+            // This used to pass `authenticate_stdio(stdio_tenant_id(&config))`,
+            // and that could never work in HTTP mode. `stdio_tenant_id` falls
+            // back to `Uuid::new_v4()` when `server.tenant_id` is unset, and
+            // `validate_shared_http_config` REFUSES to start an HTTP server
+            // that sets it ("HTTP transport must not use server.tenant_id
+            // fallback"). So the key is guaranteed absent, the fallback always
+            // fires, and the worker polled a freshly-invented tenant that owned
+            // nothing — every tick, forever.
+            //
+            // Observed 2026-08-22 on the live cluster: 275 consolidation
+            // requests spanning 2026-06-28 to that day, 270 with
+            // attempt_count = 0, zero rows in consolidation_runs, and five
+            // leases stranded since 2026-06-30. Consolidation had never run.
+            // The same fallback also left 63 orphan tenants in entity_store,
+            // one per server boot.
+            //
+            // In HTTP mode the auth principals ARE the tenant list; there is no
+            // other source of truth. If it is empty the worker is not started
+            // and says so, rather than inventing an identity to poll with.
             if config.consolidation.enabled {
-                let lease_owner = format!("{}@{}", Uuid::new_v4(), std::process::id());
-                let consolidation_session = Arc::clone(&session);
-                let consolidation_storage = Arc::clone(&storage);
-                let consolidation_ctx = Arc::new(auth::authenticate_stdio(tenant_id));
-                spawn_critical(
-                    "consolidation_worker_loop",
-                    consolidation_worker_loop(
-                        consolidation_session,
-                        consolidation_storage,
-                        consolidation_ctx,
-                        lease_owner,
-                        config.consolidation.clone(),
-                        Arc::clone(&metrics),
-                    ),
-                );
-                tracing::info!(
-                    poll_seconds = config.consolidation.poll_seconds,
-                    lease_seconds = config.consolidation.lease_seconds,
-                    decay_factor = config.consolidation.edge_decay_factor,
-                    prune_days = config.consolidation.stale_edge_max_days,
-                    "consolidation worker enabled (http transport)"
-                );
+                let tenants = auth_validator.tenants();
+                if tenants.is_empty() {
+                    tracing::error!(
+                        auth_file = ?config.server.auth_file,
+                        "consolidation is enabled but no tenant could be resolved from the \
+                         auth file; NOT starting the worker. Pending consolidation requests \
+                         will accumulate unprocessed until a principal is configured."
+                    );
+                } else {
+                    for tenant in &tenants {
+                        let lease_owner = format!("{}@{}", Uuid::new_v4(), std::process::id());
+                        spawn_critical(
+                            "consolidation_worker_loop",
+                            consolidation_worker_loop(
+                                Arc::clone(&session),
+                                Arc::clone(&storage),
+                                Arc::new(auth::authenticate_stdio(*tenant)),
+                                lease_owner,
+                                config.consolidation.clone(),
+                                Arc::clone(&metrics),
+                            ),
+                        );
+                    }
+                    tracing::info!(
+                        tenants = tenants.len(),
+                        poll_seconds = config.consolidation.poll_seconds,
+                        lease_seconds = config.consolidation.lease_seconds,
+                        decay_factor = config.consolidation.edge_decay_factor,
+                        prune_days = config.consolidation.stale_edge_max_days,
+                        "consolidation worker enabled (http transport)"
+                    );
+                }
             }
 
             http::serve_http(

@@ -5,7 +5,7 @@
 # launchd plist / systemd unit).
 #
 # Assumes a Ferrosa instance is running at localhost:9042 — the default
-# from `curl -fsSL https://ferrosadb.com/install.sh | bash`. If your
+# from `curl -fsSL https://www.ferrosa.ai/install.sh | bash`. If your
 # Ferrosa is elsewhere, adjust contact_points + bolt_uri + http_url.
 #
 # Auth: run local first-use installs as ferrosa_admin so writes keep working
@@ -75,6 +75,46 @@ admin_password = "ferrosa_admin"
 # Keep live agent defaults compact to control context size. Use the eval profile
 # below when measuring BRIGHT-Pro/MemoryBench recall before context packing.
 default_limit = 10
+
+[search]
+# Rerank tunables — see SearchConfig in config.rs for details.
+# rerank_min_candidates = 2
+# rerank_max_candidates = 50
+# rerank_min_score_coverage = 5
+# rerank_batch_size = 5
+
+[search.fusion]
+# Fusion weight overrides applied AFTER the auto profile selector picks a
+# profile (e.g. bm25-semantic, bm25-semantic-workspace) and BEFORE per-call
+# fusion_weights from the MCP args are merged. Each key is optional; when
+# unset, the selected profile's default weight is used.
+#
+# Setting workspace_weight = 2.0 here ensures workspace affinity is ALWAYS
+# active, even for profiles that would otherwise zero it (like the bare
+# "auto" and "bm25-semantic" profiles). This fixes cross-domain pollution
+# where e.g. a search from one repo returns entities from a different repo.
+#
+# Setting datalog_frontier_weight enables graph traversal recall using the
+# typed edges in the knowledge graph. Start at 2.0 for a moderate boost.
+#
+# All weights must be in [0.0, 10.0]. Set to 0.0 to disable a signal.
+# workspace_weight = 2.0
+# datalog_frontier_weight = 2.0
+# ann_weight = 1.0
+# fold_weight = 1.0
+# context_bm25_weight = 1.5
+# context_ann_weight = 1.0
+# document_bm25_weight = 2.5
+# document_ann_weight = 1.5
+# phonetic_weight = 1.0
+# document_phonetic_weight = 1.0
+# entity_content_fts_weight = 1.5
+# scene_weight = 1.8
+# profile_weight = 1.0
+# foresight_weight = 1.6
+# warmth_weight = 1.0
+# pagerank_weight = 1.0
+# reputation_weight = 0.5
 
 [embeddings]
 # provider selects the WIRE PROTOCOL, not a vendor:
