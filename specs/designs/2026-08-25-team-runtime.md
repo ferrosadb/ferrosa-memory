@@ -116,8 +116,23 @@ what they carry:
 |---|---|---|---|
 | writer and reviewer agreed | proposed | draft, provenance | responsible human reviews |
 | bounds exhausted, disagreeing | blocked on human | draft, provenance, objection | responsible human breaks the tie |
+| stopped by a person | stopped | every draft, provenance | archive, trash, or send on |
 
-There is no third path. **No artifact receives a green check without a person
+A stopped run's drafts go to the queue too. Stopping ends the run; it does not
+throw the work away, and the drafts are usually the most expensive thing the run
+produced.
+
+What the queue offers a stopped draft is different from what it offers a
+proposed one — it is not awaiting approval, it is awaiting a decision:
+
+- **archive** — keep it, out of the way,
+- **trash** — discard it,
+- **send on** — hand it to another agent or another team for fine tuning.
+
+Send-on is the interesting one: it makes an artifact something teams pass
+between them, so a draft one team could not finish becomes another team's input.
+
+There is no path from any of these to approved except through a person. **No artifact receives a green check without a person
 acting** — agent agreement buys a better starting state, never the outcome.
 
 Every claim names a **responsible human**. This is an assignment, not a pool: a
@@ -131,12 +146,31 @@ graph, who is active, the message traffic, and every draft in flight.
 
 ### Pause and stop
 
-Two controls, not one with a flag:
+Two controls, at two different levels, and a third that is not on this page at
+all.
 
-| Control | Effect | Resumable |
-|---|---|---|
-| pause | no new messages flow; work already in flight finishes | yes |
-| stop | the run ends | no |
+| Control | Level | Effect | Resumable |
+|---|---|---|---|
+| pause | the run | inter-agent delivery is deferred; agents keep working | yes |
+| stop | the run | the run ends | no |
+| interrupt | one agent | halts that agent, via the harness, from inside its session | yes |
+
+**Pause stops the conversation, not the participants.** A message an agent sends
+while paused is persisted and held, and goes out when the run starts again.
+Nothing is refused and nothing is lost.
+
+Two consequences follow, and the interface has to carry both:
+
+- **Pause does not stop spend.** An agent mid-turn keeps thinking and keeps
+  costing. Someone pausing to halt a runaway bill has reached for the wrong
+  control — that is `stop`, or an interrupt per agent.
+- **Resuming delivers a backlog.** Held messages go out together, so a run can
+  get busier the instant it resumes than it was when it was paused.
+
+Messages are addressed to a **role**, not to an agent, which settles what
+happens when a teammate is swapped while messages are queued for it: the new
+occupant receives them. That is the intended behaviour and the reason swapping
+is useful — replace a struggling reviewer and it inherits the queue.
 
 **Both are written.** A pause or stop held only in the runtime's memory is
 undone by a restart, and a run that resumes because a process bounced has
@@ -148,6 +182,22 @@ the newest. Someone reaching for pause is usually asking what the thing looked
 like before the last exchange, and a run that overwrites drafts cannot answer.
 `team_artifact` is therefore append-only, each draft recording its version, its
 author, and the turn that produced it.
+
+### What each node is doing
+
+The graph shows a state per active node:
+
+| Colour | Meaning | What it asks of a person |
+|---|---|---|
+| green | working | nothing |
+| orange | waiting for input | answer it |
+| grey | dead | restart or swap it |
+
+Three states rather than two, because "not working" is not one condition.
+Waiting and dead both look like silence from outside, and only one of them wants
+a human. `dead` must be something the runtime establishes — a crashed harness, a
+lost session, an unreachable node — never inferred from a gap in traffic, or a
+slow agent becomes a dead one on a busy day.
 
 ### Swapping a teammate
 
@@ -236,13 +286,16 @@ Seven tables. Names are indicative; the shapes are the commitment.
     team_node         role, model, system prompt, declared capabilities
     team_edge         from, to, condition prompt, message template
     team_run          pinned team version, starting prompt, bounds, state
-    team_message      the transcript: from, to, body, timestamp, refused flag,
-                      and whether the author was an agent occupant or a human
+    team_message      the transcript: from, to (a ROLE, not an agent), body,
+                      timestamp, refused flag, held-during-pause flag, and
+                      whether the author was an agent occupant or a human
     team_artifact     APPEND-ONLY drafts and the final claim, each with version,
                       author, originating turn, provenance links, queue state
                       and responsible human
     team_occupancy    which agent occupies which role, over time, so a turn can
                       be attributed after a swap
+    team_node_state   working / waiting / dead, per node, established by the
+                      runtime rather than inferred from silence
     team_control      pause, resume, stop: who, when, why -- written, so a
                       restart cannot resume what a person stopped
     team_session      the per-teammate session a human can enter
@@ -264,6 +317,7 @@ Focused on what this feature introduces, not a full STRIDE pass.
 | T4 | **Forged provenance.** A claim links to items it did not use, or omits ones it did. | Links are recorded by the runtime from actual message traffic, not asserted by the writer. |
 | T5 | **Spend exhaustion.** A cyclic graph burns budget until something else breaks. | Per-run token and message bounds, enforced by the runtime. Unlike forge's pacing, the default here is **not** unlimited. |
 | T6a | **Human work published as agent-team output.** A person writes a paragraph in a teammate's session; the claim ships it unattributed. | Human turns are marked in the transcript and in draft authorship. Same failure as T6, pointing the other way. |
+| T6c | **Sent-on draft carries borrowed authority.** A stopped draft handed to another team arrives with provenance its new authors did not gather. | Provenance records who gathered what; a receiving team's claim cannot present inherited links as its own work. Open question on slice 6. |
 | T6b | **A stopped run resumes.** Pause or stop held in memory is lost to a restart. | Control state is written; the runtime reads it rather than remembering it. |
 | T6 | **Claim laundering.** Agent agreement is read as human approval. | Structural, not procedural: there is no transition from any agent-produced state to approved. Both terminal states await a named responsible human, and the green check is only ever awarded by one. |
 
@@ -276,6 +330,9 @@ Focused on what this feature introduces, not a full STRIDE pass.
 | Runtime restarts mid-run | Run lost, if state was in memory | — | state is in the database; a run is resumable by construction |
 | Deadlock undetected | Run parks, nobody notices | message surface on Team tab and home | the surface is the mitigation, which is why it is in scope |
 | Claim without provenance | Unauditable knowledge | schema requires links | refuse to publish a claim with none |
+| Pause mistaken for a spend brake | Bill keeps growing while the operator believes it stopped | — | the control names what it does; stop and per-agent interrupt are the spend controls |
+| A slow node reported dead | Person restarts healthy work | — | dead is established by the runtime, never inferred from a gap in traffic |
+| Resume delivers a backlog at once | Sudden load spike on resume | — | expected; bounds still apply, and held messages are visible while paused |
 | Swap attempted mid-turn | Orphaned reply, corrupted transcript | occupant is active | refuse the swap; it is a precondition, not a warning |
 | Draft overwritten | "What did it look like before?" is unanswerable at the moment it is asked | — | artifacts are append-only |
 | Team edited under a running run | Transcript no longer readable against its graph | — | definition locked at creation; editing makes a new team |
@@ -327,7 +384,10 @@ assembled from everything above.
 The layers that matter here, and what belongs in each.
 
 **Pure, no I/O.** Authorisation given a graph. Reachability. Bound arithmetic.
-Run state transitions, including pause, resume and stop. Progress detection.
+Run state transitions, including pause, resume and stop. Message hold and
+release: a message sent while paused is persisted, not delivered, and goes out
+on resume — in order. Role addressing across a swap: a message queued for a role
+reaches whoever occupies it at delivery. Progress detection.
 Provenance assembly from a message list. The terminal-state validity check, in
 all three of its forms and in the negative case that must be refused. The swap
 preconditions -- paused, and the occupant idle. Attribution of a turn to the
@@ -339,7 +399,8 @@ model, a cluster or a browser.
 **Contract.** `send_to` refuses an unauthorised target and records the refusal.
 A claim without provenance is refused. A team with no terminal state cannot be
 saved. A claim with no responsible human cannot be enqueued. A swap against an
-active occupant is refused.
+active occupant is refused. A stopped run's drafts reach the queue. Node state
+is written by the runtime and never derived from silence.
 
 **Integration.** A two-node delegation against a real store. A run resumed after
 a runtime restart — the property that justified Decision 1, so it must be
@@ -358,9 +419,10 @@ needs them:
 - **Slice 5:** who authors a stored summary — the researcher's own words, or the
   runtime recording what it returned? Provenance integrity (T4) argues for the
   runtime.
-- **Slice 7:** when a run is **stopped**, do its drafts go to the queue for
-  salvage, or stay attached to the stopped run? Pause is settled -- the draft
-  enters as `blocked on human` -- but stop is a different intent, and a stopped
-  run's work should probably not arrive looking like something awaiting review.
-- **Slice 7:** does entering a teammate's session pause the team automatically,
-  or may a human talk to one agent while the others keep working?
+- **Slice 7:** entering a session does not pause the run — pause is a run-level
+  control and interrupt is the per-agent one — but should entering one *offer*
+  the interrupt prominently? A person opening a session usually wants the agent
+  to stop talking first.
+- **Slice 6:** does a draft sent on to another team carry its provenance, or
+  start clean? Carrying it preserves the audit trail and risks a claim citing
+  work its final author never saw.

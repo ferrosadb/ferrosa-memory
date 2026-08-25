@@ -22,7 +22,7 @@ A team is a graph the user draws: agents as nodes, and edges saying when one
 agent involves another. The first team is a writing team — researcher, writer,
 reviewer — producing an agent team knowledge claim for human review.
 
-The shape of the problem forces nine decisions before any code, because each one
+The shape of the problem forces ten decisions before any code, because each one
 changes the schema or the trust boundary rather than the interface.
 
 ## Decision 1: The runtime lives in Ferrosa Memory
@@ -187,8 +187,22 @@ Two rules keep it from corrupting the record:
 
 ## Decision 9: Pause and stop are written, and both show the drafts in flight
 
-**Pause** halts new messages and is resumable. **Stop** ends the run and is not.
-They are different controls, not one control with a flag.
+**Pause stops inter-agent communication. It does not pause the agents.**
+
+A paused run still has agents working. What stops is delivery: a message an
+agent sends is persisted and held, and goes out when the run starts again.
+Nothing is lost and nothing is refused — the traffic is deferred, not blocked.
+
+This has a consequence worth stating loudly, because the word "pause" implies
+otherwise: **pause does not stop spend.** An agent mid-turn keeps thinking and
+keeps costing. Someone reaching for pause to halt a runaway bill has reached for
+the wrong control, and the interface should not let them believe otherwise.
+
+To pause *an agent*, enter its session and use the harness's interrupt. That is
+a different mechanism at a different level, and conflating the two would give
+one control two meanings.
+
+**Stop** ends the run and is not resumable.
 
 Both are **written**. A pause or a stop that lives only in the runtime's memory
 is undone by a restart, and a run that resumes because a process bounced is a
@@ -203,6 +217,26 @@ reach for pause or stop.
 
 So `team_artifact` is append-only. Each draft records its version, its author —
 which occupant, or which human — and the turn that produced it.
+
+## Decision 10: The graph shows what each node is doing
+
+The active nodes carry a state indicator:
+
+| Colour | Meaning |
+|---|---|
+| green | working |
+| orange | waiting for input |
+| grey | dead |
+
+Three states rather than two, because "not working" is not one condition. An
+agent waiting for input is healthy and blocked; a dead one is neither, and the
+difference decides whether a person should answer something or restart
+something. Rendering both as idle would hide the only one that needs a human.
+
+`dead` must be a state the runtime can actually establish — a crashed harness, a
+lost session, a node that cannot be reached — and not merely the absence of
+recent traffic. A quiet node and a dead node look identical from the outside,
+which is exactly why the runtime has to distinguish them rather than the viewer.
 
 ## Consequences
 
