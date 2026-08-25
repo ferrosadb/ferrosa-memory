@@ -154,6 +154,11 @@ all.
 | pause | the run | inter-agent delivery is deferred; agents keep working | yes |
 | stop | the run | the run ends | no |
 | interrupt | one agent | halts that agent, via the harness, from inside its session | yes |
+| halt all | everything | stops EXECUTION in every run of every team | yes, by explicit release |
+| kill | one run | terminates it and discards its work | no |
+
+`halt all` and `kill` are break glass and behave unlike the rest — see "Break
+glass" below.
 
 **Pause stops the conversation, not the participants.** A message an agent sends
 while paused is persisted and held, and goes out when the run starts again.
@@ -229,6 +234,44 @@ Two rules keep the record honest:
   Decision 5 prevents, and just as wrong.
 - **A human turn spends budget.** The tokens are real.
 
+### Break glass
+
+Two global controls for when something is wrong rather than merely unwanted.
+
+**Halt all** stops execution everywhere. Not delivery — execution. This is the
+control `pause` is repeatedly mistaken for, and the one that actually stops the
+bill.
+
+**Kill** ends a run and discards its work.
+
+| | Halt all | Kill | Stop |
+|---|---|---|---|
+| running agents | stopped, resumable | terminated | finish, then end |
+| held and in-flight messages | preserved | discarded | preserved |
+| drafts | preserved | discarded | **go to the queue** |
+| run record and audit trail | preserved | preserved | preserved |
+
+Three rules apply to both and to nothing else:
+
+**Written first, acted on second.** State reaches the database before anything
+is torn down. A break-glass control that lives in a process is worthless exactly
+when it is needed, because whatever made someone reach for it may be what
+restarts the process. On restart the runtime reads a halt and stays halted.
+
+**Release is explicit.** Nothing resumes on a timer or because a process came
+back. Someone halted everything deliberately; the system does not decide when
+that intent has expired.
+
+**The record outlives what they destroy.** Kill discards drafts; it does not
+discard the fact that a run existed and was killed, or who did it and why.
+Otherwise a killed run and a run that never happened look identical, and the
+most consequential action in the system leaves the least evidence.
+
+Kill confirms before acting, and names what will be lost — the run, and how many
+drafts — rather than warning generically. It exists for work that must not be
+kept: bad data, a prompt injection that took, output nobody should act on. If it
+merely stopped, that work would be waiting in the queue.
+
 ## Capability model
 
 Each node declares what it holds — internet, browser, filesystem, shell.
@@ -278,6 +321,16 @@ Agreement between writer and reviewer produces a **candidate**, never a truth �
 the same rule `ontology-from-observations` states for induced ontologies.
 "Ready for review" is the operative phrase.
 
+### Provenance survives a handoff
+
+A draft sent on to another team carries where it came from. The chain is
+attributed by origin rather than flattened: inherited evidence stays marked as
+gathered by the earlier team, in that run, at that time.
+
+This is what makes send-on safe. Absorbed provenance would let the receiving
+team's claim cite sources indistinguishable from its own work, and would end the
+audit trail at exactly the handoff where it most needs to continue.
+
 ## Data model
 
 Seven tables. Names are indicative; the shapes are the commitment.
@@ -296,8 +349,9 @@ Seven tables. Names are indicative; the shapes are the commitment.
                       be attributed after a swap
     team_node_state   working / waiting / dead, per node, established by the
                       runtime rather than inferred from silence
-    team_control      pause, resume, stop: who, when, why -- written, so a
-                      restart cannot resume what a person stopped
+    team_control      pause, resume, stop, halt-all, kill: who, when, why --
+                      written BEFORE the effect, so a restart cannot resume what
+                      a person halted, and a kill leaves a record of itself
     team_session      the per-teammate session a human can enter
     team_budget       spend and counters, per run
 
@@ -317,7 +371,7 @@ Focused on what this feature introduces, not a full STRIDE pass.
 | T4 | **Forged provenance.** A claim links to items it did not use, or omits ones it did. | Links are recorded by the runtime from actual message traffic, not asserted by the writer. |
 | T5 | **Spend exhaustion.** A cyclic graph burns budget until something else breaks. | Per-run token and message bounds, enforced by the runtime. Unlike forge's pacing, the default here is **not** unlimited. |
 | T6a | **Human work published as agent-team output.** A person writes a paragraph in a teammate's session; the claim ships it unattributed. | Human turns are marked in the transcript and in draft authorship. Same failure as T6, pointing the other way. |
-| T6c | **Sent-on draft carries borrowed authority.** A stopped draft handed to another team arrives with provenance its new authors did not gather. | Provenance records who gathered what; a receiving team's claim cannot present inherited links as its own work. Open question on slice 6. |
+| T6c | **Sent-on draft carries borrowed authority.** A stopped draft handed to another team arrives with provenance its new authors did not gather. | Provenance travels but is attributed by origin: inherited evidence renders as inherited, naming the team and run that gathered it. A claim cannot present another team's work as its own. |
 | T6b | **A stopped run resumes.** Pause or stop held in memory is lost to a restart. | Control state is written; the runtime reads it rather than remembering it. |
 | T6 | **Claim laundering.** Agent agreement is read as human approval. | Structural, not procedural: there is no transition from any agent-produced state to approved. Both terminal states await a named responsible human, and the green check is only ever awarded by one. |
 
@@ -330,7 +384,9 @@ Focused on what this feature introduces, not a full STRIDE pass.
 | Runtime restarts mid-run | Run lost, if state was in memory | — | state is in the database; a run is resumable by construction |
 | Deadlock undetected | Run parks, nobody notices | message surface on Team tab and home | the surface is the mitigation, which is why it is in scope |
 | Claim without provenance | Unauditable knowledge | schema requires links | refuse to publish a claim with none |
-| Pause mistaken for a spend brake | Bill keeps growing while the operator believes it stopped | — | the control names what it does; stop and per-agent interrupt are the spend controls |
+| Pause mistaken for a spend brake | Bill keeps growing while the operator believes it stopped | — | the control names what it does; `halt all` is the global brake, `stop` and interrupt the narrower ones |
+| Halt released by a restart | Everything resumes after someone halted it on purpose | — | halt is written before it acts, and release is explicit |
+| Kill leaves no trace | A killed run is indistinguishable from one that never ran | — | the record survives what kill destroys |
 | A slow node reported dead | Person restarts healthy work | — | dead is established by the runtime, never inferred from a gap in traffic |
 | Resume delivers a backlog at once | Sudden load spike on resume | — | expected; bounds still apply, and held messages are visible while paused |
 | Swap attempted mid-turn | Orphaned reply, corrupted transcript | occupant is active | refuse the swap; it is a precondition, not a warning |
@@ -399,7 +455,8 @@ model, a cluster or a browser.
 **Contract.** `send_to` refuses an unauthorised target and records the refusal.
 A claim without provenance is refused. A team with no terminal state cannot be
 saved. A claim with no responsible human cannot be enqueued. A swap against an
-active occupant is refused. A stopped run's drafts reach the queue. Node state
+active occupant is refused. A stopped run's drafts reach the queue; a killed run's do not, and its record
+still does. Halt-all survives a runtime restart and releases only explicitly. Node state
 is written by the runtime and never derived from silence.
 
 **Integration.** A two-node delegation against a real store. A run resumed after
@@ -423,6 +480,5 @@ needs them:
   control and interrupt is the per-agent one — but should entering one *offer*
   the interrupt prominently? A person opening a session usually wants the agent
   to stop talking first.
-- **Slice 6:** does a draft sent on to another team carry its provenance, or
-  start clean? Carrying it preserves the audit trail and risks a claim citing
-  work its final author never saw.
+- **Slice 1:** does `halt all` need a scope narrower than everything — per
+  tenant, per team — or is one global switch the point of a break-glass control?

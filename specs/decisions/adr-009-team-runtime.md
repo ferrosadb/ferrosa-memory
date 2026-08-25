@@ -22,7 +22,7 @@ A team is a graph the user draws: agents as nodes, and edges saying when one
 agent involves another. The first team is a writing team — researcher, writer,
 reviewer — producing an agent team knowledge claim for human review.
 
-The shape of the problem forces ten decisions before any code, because each one
+The shape of the problem forces eleven decisions before any code, because each one
 changes the schema or the trust boundary rather than the interface.
 
 ## Decision 1: The runtime lives in Ferrosa Memory
@@ -238,12 +238,73 @@ lost session, a node that cannot be reached — and not merely the absence of
 recent traffic. A quiet node and a dead node look identical from the outside,
 which is exactly why the runtime has to distinguish them rather than the viewer.
 
+## Decision 11: Break glass — halt everything, and kill
+
+Two emergency controls, global rather than per-run, and deliberately unlike the
+ordinary ones.
+
+**HALT ALL** stops execution everywhere. Not delivery — *execution*. Every agent
+in every run of every team stops working. This is the control `pause` is
+repeatedly mistaken for: it is the one that stops the bill.
+
+**KILL** is destructive. It ends a run and does not preserve its work.
+
+Both are break glass, so three rules apply that do not apply elsewhere:
+
+**They are written first, and acted on second.** The state goes to the database
+before anything is torn down. A break-glass control that lives in a process is
+worthless precisely when it is needed, because the failure that made someone
+reach for it may be the failure that restarts the process. On restart the
+runtime reads a halt and stays halted.
+
+**Release is explicit and separate.** Nothing resumes on its own, on a timer, or
+because a process came back. Someone halted everything on purpose; the system
+does not decide when that purpose has passed.
+
+**Both record who, when and why**, and the record survives what they destroy.
+Kill may discard a run's drafts, but the fact that a run existed and was killed
+is not discardable — otherwise a killed run and a run that never happened look
+identical, and the most consequential action in the system leaves the least
+evidence.
+
+### What kill destroys, precisely
+
+| | Halt all | Kill |
+|---|---|---|
+| running agents | stopped, resumable | terminated |
+| held and in-flight messages | preserved | discarded |
+| drafts | preserved | discarded |
+| the run record and its audit trail | preserved | **preserved** |
+
+The difference from `stop` matters and should be visible in the interface: a
+stopped run sends its drafts to the queue for archive, trash or send-on. A
+killed run does not. Kill is the control for work that should not be kept —
+wrong data, a prompt injection that took, output nobody should act on — and if
+it merely stopped, that work would be sitting in the queue.
+
+Because kill removes something no other control removes, it confirms first and
+names what is about to be lost. Not a generic warning: the count of drafts and
+the run it belongs to.
+
 ## Consequences
 
 Ferrosa Memory gains a scheduler, a run state machine, and an authorisation
 check it did not have. Runs become durable objects with transcripts, which is
 what makes a published claim auditable — and auditability is the whole point of
 the provenance links.
+
+A draft sent on to another team **carries where it came from**. Provenance
+travels with the artifact rather than being reset at the handoff.
+
+The distinction that keeps this honest: carried provenance is *attributed by
+origin*, not absorbed. The receiving team's claim shows inherited evidence as
+inherited — gathered by that team, in that run, at that time — so a claim can
+never present work its authors never saw as their own. The chain is a chain, not
+a flat list.
+
+Without this a handoff would launder evidence: team B's claim would cite sources
+indistinguishable from ones it gathered, and the audit trail would end at the
+handoff, which is the one place it most needs to continue.
 
 The team's output is a *candidate*. Writer and reviewer agreeing produces a
 claim ready for review, not a truth, and only a human awards the green check.
