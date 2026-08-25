@@ -2,8 +2,8 @@
 //! Correctness: Correct when running it twice changes nothing the second time,
 //! when a token nobody would follow is not linked, and when it says what it did
 //! rather than reporting a number.
-//! Last revised: 2026-08-23
-//! Last changed: New.
+//! Last revised: 2026-08-24
+//! Last changed: Scoped the legacy Scylla row API to this board-maintenance boundary.
 //!
 //! # Why this exists
 //!
@@ -28,16 +28,14 @@
 //! rewrites the same rows; the run still reports what it would have created so
 //! a second pass visibly does nothing.
 
-// This binary reads rows through scylla 0.15's LegacySession API, the same
-// choice cql_storage.rs made and for the same reason: the legacy API is
-// deprecated upstream but has stable semantics, and migrating to the generic
-// deserialization API is a separate piece of work across every call site.
-#![allow(deprecated)]
 use std::collections::BTreeMap;
 
 use anyhow::{Context as _, Result};
 use ferrosa_memory_sync::task_board::identifiers_in;
 use scylla::frame::response::result::CqlValue;
+// Match the task-board reader and ferrosa-memory-core's `CqlSession` until the
+// shared dynamic row decoder is migrated as one unit.
+#[allow(deprecated)]
 use scylla::{LegacySession, SessionBuilder};
 
 const TENANT_ID: &str = "00000000-0000-0000-0000-000000000001";
@@ -54,14 +52,12 @@ const CLUSTER_LIMIT: usize = 15;
 struct Task {
     id: String,
     title: String,
-    // No `status` field: rows are filtered to OPEN_STATUSES before one is
-    // built, so every task here is open by definition. Carrying the string
-    // implies a distinction that no longer exists at this point.
     block_reason: String,
     updated_at: i64,
 }
 
 #[tokio::main]
+#[allow(deprecated)]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let dry_run = args.iter().any(|arg| arg == "--dry-run");
@@ -149,6 +145,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+#[allow(deprecated)]
 async fn read_open_tasks(session: &LegacySession) -> Result<Vec<Task>> {
     #[allow(deprecated)]
     let result = session
@@ -201,6 +198,7 @@ async fn read_open_tasks(session: &LegacySession) -> Result<Vec<Task>> {
     Ok(tasks)
 }
 
+#[allow(deprecated)]
 async fn link(session: &LegacySession, src: &str, kind: &str, dst: &str) -> Result<()> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -2,9 +2,8 @@
 //! Correctness: Correct when a device cannot run anything without a grant,
 //! when a config survives a restart of the machine, and when output reaches
 //! the device as it is produced rather than when the command finishes.
-//! Last revised: 2026-08-23
-//! Last changed: shell_scroll moves through tmux's scrollback, which keys sent
-//! into the pane cannot reach.
+//! Last revised: 2026-08-25
+//! Last changed: Adds bounded tenant-aware knowledge-tier frames.
 //!
 //! # Three capabilities wearing one grant, for now
 //!

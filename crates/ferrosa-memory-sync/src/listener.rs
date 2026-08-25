@@ -2,8 +2,8 @@
 //! Correctness: Correct when a binary can run a listener without restating any
 //! of it, and when swapping the visual plugins is the only difference between
 //! one binary and another.
-//! Last revised: 2026-08-22
-//! Last changed: Lifted out of main.rs so a second binary can reuse it.
+//! Last revised: 2026-08-25
+//! Last changed: Routes controller memory views through the configured tenant.
 //!
 //! This lived in `main.rs` and was therefore reachable only by that one binary.
 //! A second binary — one linking real capture plugins where this one links the

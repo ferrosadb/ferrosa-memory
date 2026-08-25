@@ -3,6 +3,8 @@
 //! Reads all memory data for a tenant from the source cluster and upserts it
 //! into the destination cluster. Idempotent: safe to re-run; CQL INSERT is
 //! upsert-by-primary-key for all synced tables.
+//! Last revised: 2026-08-25
+//! Last changed: Preserves knowledge-tier session wiring on the current mainline.
 //!
 //! # Usage
 //!
