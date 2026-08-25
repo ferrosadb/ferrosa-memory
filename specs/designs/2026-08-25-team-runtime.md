@@ -316,6 +316,71 @@ drafts — rather than warning generically. It exists for work that must not be
 kept: bad data, a prompt injection that took, output nobody should act on. If it
 merely stopped, that work would be waiting in the queue.
 
+## Topology
+
+Execution does not run inside the memory server. It runs in **coordinator
+processes**, in the shape of the streamer: installed, supervised, signed, and
+responsible for the machines they can reach.
+
+    Ferrosa Memory        state, authorisation, transcripts, artifacts, holds
+        |
+        +-- host coordinator          sandboxes and VMs on that host
+        |
+        +-- delegate coordinator      in the cloud; itself a coordinator
+                |
+                +-- cloud VMs
+
+Coordinators **nest**. A delegate takes direction from above and coordinates the
+machines below it, so "the coordinator" is a role rather than a singleton.
+
+The split follows the line this project already draws: decisions that say who
+may do what stay in the audited half, platform mechanics do not.
+
+| Concern | Where |
+|---|---|
+| team state, transcripts, artifacts, holds | Ferrosa Memory |
+| `send_to` authorisation | Ferrosa Memory |
+| running sandboxes and VMs | the coordinator |
+
+### Leases, and why break glass still works
+
+A halt is written before it acts. In one process that is enough. Across a tree
+it is not: a delegate that cannot reach the database cannot see the halt, and a
+coordinator that cannot see a halt is one still running agents.
+
+So **every coordinator executes on a lease** — a short, renewable right to run,
+renewed against the database. If renewal fails, for any reason, the coordinator
+stops by itself.
+
+A halt is therefore enforced by **absence rather than delivery**. Cutting a
+coordinator off is as effective as telling it to stop, which inverts the usual
+failure mode where losing contact means losing control.
+
+The cost, stated rather than discovered: a database outage stops agent work.
+For a system that spends money and touches the internet, that is the correct
+direction to fail.
+
+### What survives what
+
+| Event | Run state | Execution |
+|---|---|---|
+| the client closes | survives | continues |
+| the laptop closes | survives | stops for host sandboxes, continues in the cloud |
+| a coordinator dies | survives | resumes when it returns, or another takes the lease |
+| the database is unreachable | survives | **stops everywhere**, by lease expiry |
+
+### Operational requirements
+
+A signed, supervised process on a user's machine inherits problems this project
+has already solved once, in the streamer:
+
+- sign with a stable identity, or every update loses its permissions
+- launch so the operating system attributes it correctly, rather than executing
+  the binary inside the bundle
+- re-sign when replacing it in place, or it is killed on next start
+- allowlist inbound traffic where needed, and say plainly when it is not —
+  otherwise it fails only on the network where it should work best
+
 ## Capability model
 
 Each node declares what it holds — internet, browser, filesystem, shell.
@@ -396,6 +461,8 @@ Seven tables. Names are indicative; the shapes are the commitment.
     team_control      pause, resume, stop, kill: who, when, why -- written
                       BEFORE the effect, so a restart cannot resume what a
                       person halted, and a kill leaves a record of itself
+    coordinator       one row per coordinator: parent, scope, declared sandbox
+                      backends, and its lease expiry
     sandbox_backend   per backend: declared capabilities, including whether it
                       can suspend and resume
     halt_hold         one row per active hold: scope (team/user/org), the
@@ -437,6 +504,9 @@ Focused on what this feature introduces, not a full STRIDE pass.
 | Pause mistaken for a spend brake | Bill keeps growing while the operator believes it stopped | — | the control names what it does; `halt all` is the global brake, `stop` and interrupt the narrower ones |
 | Halt released by a restart | Everything resumes after someone halted it on purpose | — | halt is written before it acts, and release is explicit |
 | A narrow release undoes a broad hold | A user resumes work an org halted | — | holds stack and release requires authority at the hold's scope |
+| Coordinator keeps running after a halt it never saw | Break glass has a hole where nobody can look | lease not renewed | the coordinator stops itself; enforcement is by absence, not delivery |
+| Database outage stops all agent work | Teams idle during an incident | lease expiry | intended, and documented rather than discovered |
+| Delegate outlives its parent | Orphaned cloud VMs spending money | lease not renewed | same lease rule applies at every level of the tree |
 | Halt assumed to freeze on a backend that cannot | Turn discarded when the operator expected it preserved | — | the run states which behaviour it will get before the control is used |
 | Resume continues against a stale handle | Silent failure against a connection that died while frozen | — | resume re-establishes dependencies and fails loudly |
 | Halted team shows no reason | Person retries a release that will refuse them | — | the hold, its scope and who set it are shown |
@@ -464,8 +534,10 @@ this target permitted? Includes reachability, for T2.
 five bounds. Pure. Every bound gets a test that it fires, and a test that an
 unbounded run cannot be started.
 
-**Slice 3 — one agent, executed.** A single node runs against a prompt and
-returns. No delegation. This is where the scheduler lands.
+**Slice 3 — the coordinator, and one agent executed.** A coordinator process
+that takes a lease, renews it, and stops when it cannot. A single node runs
+against a prompt and returns. No delegation, no nesting. The lease behaviour is
+pure and testable ahead of the process existing.
 
 **Slice 4 — `send_to`, end to end.** Two nodes, one edge, a real delegation and
 a real refusal. The first slice where a cycle is possible, so the bounds from
@@ -486,7 +558,12 @@ storage dependency, and all testable without a model.
 check, the active team page showing drafts in flight with pause and stop, the
 per-teammate sessions, and the message section on the tab and the home page.
 
-**Slice 9 — the writing team.** The three roles as a shipped default team,
+**Slice 9 — nesting.** A delegate coordinator that is itself a coordinator, and
+cloud VMs beneath it. Deferred until a single coordinator works, because the
+lease rule is what makes nesting safe and it should be proven at one level
+first.
+
+**Slice 10 — the writing team.** The three roles as a shipped default team,
 assembled from everything above.
 
 ## Test specification
@@ -518,7 +595,9 @@ is written by the runtime and never derived from silence.
 **Integration.** A two-node delegation against a real store. A run resumed after
 a runtime restart — the property that justified Decision 1, so it must be
 tested, not assumed. A run **stopped** before a restart and still stopped after
-it, which is the property Decision 9 exists for. Drafts retained across a pause,
+it, which is the property Decision 9 exists for. A coordinator whose lease
+cannot renew stops on its own, which is the property that makes break glass
+survive a partition. Drafts retained across a pause,
 so the active team page can show every one.
 
 **Live, few and deliberate.** The writing team end to end, with a real model,

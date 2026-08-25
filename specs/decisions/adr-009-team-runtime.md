@@ -1,8 +1,10 @@
 ---
 executive_summary: >
-  Agent teams are user-defined graphs executed by a first-class runtime inside
-  Ferrosa Memory, with state in the database so a run survives the client that
-  started it. Agents delegate through a single send_to(agent, request) endpoint
+  Agent teams are user-defined graphs whose state, authorisation and record live
+  in Ferrosa Memory while execution runs in installed coordinator processes that
+  nest -- a host coordinator, and delegate coordinators in the cloud that
+  coordinate in turn. Coordinators execute on renewable leases, so a halt is
+  enforced by absence rather than by delivery. Agents delegate through a single send_to(agent, request) endpoint
   whose target the engine authorises against the graph's edges; because a node
   may act purely as a forwarder the graph has cycles by design, so termination
   is never structural and every run carries explicit bounds. Node capabilities
@@ -22,7 +24,7 @@ A team is a graph the user draws: agents as nodes, and edges saying when one
 agent involves another. The first team is a writing team — researcher, writer,
 reviewer — producing an agent team knowledge claim for human review.
 
-The shape of the problem forces twelve decisions before any code, because each one
+The shape of the problem forces thirteen decisions before any code, because each one
 changes the schema or the trust boundary rather than the interface.
 
 ## Decision 1: The runtime lives in Ferrosa Memory
@@ -42,6 +44,11 @@ its transcript durable evidence rather than terminal scrollback.
 
 The cost is real and should be stated: this is the largest of the options, and
 it means Ferrosa Memory acquires a scheduler.
+
+**Amended by Decision 13.** Memory owns the state, the authorisation and the
+record. It does not own the *execution*: coordinating sandboxes and VMs happens
+in a separate installed process. The durability argument above is unchanged —
+that was always about state, not about where a process runs.
 
 ## Decision 2: One delegation endpoint, authorised against the graph
 
@@ -349,6 +356,77 @@ and a memory server that may have restarted. Resume is not "continue as though
 no time passed" — it re-establishes what it depends on and fails loudly if it
 cannot, rather than continuing against a stale handle. This is the same class of
 fault as the streamer holding peer addresses frozen at startup.
+
+## Decision 13: The coordinator is an installed process, and coordinators nest
+
+The orchestrator is not a thread inside the memory server. It is a **separate
+installed process, in the shape of the streamer**: supervised on a host, signed,
+and responsible for the machines it can reach.
+
+That splits the system along a line this project has drawn before:
+
+| Concern | Where | Why |
+|---|---|---|
+| team state, transcripts, artifacts, holds | Ferrosa Memory | durable, queryable, survives any process |
+| `send_to` authorisation | Ferrosa Memory | it is an authorisation decision, and those are public and auditable |
+| running sandboxes and VMs | the coordinator process | platform work behind a declared capability |
+
+This mirrors the streamer exactly: the public side owns the channel, the
+identity and the decisions; the private side owns the platform mechanics and is
+handed what it needs without the public side inspecting it. A coordinator may
+therefore be private without any authorisation moving out of the audited half.
+
+### Coordinators nest
+
+One coordinator per host, coordinating what that host can reach. For cloud VMs,
+a **delegate coordinator runs in the cloud and is itself a coordinator** — it
+takes direction from above and coordinates the machines below it.
+
+So the topology is a tree, not a star, and "the coordinator" is a role rather
+than a singleton.
+
+### Break glass through a tree
+
+This is the part that changes an earlier decision's guarantees.
+
+Decision 11 says a halt is written before it acts. In one process that is
+sufficient. Across a tree it is not: a delegate coordinator that cannot reach
+the database cannot see the halt, and a coordinator that cannot see a halt is a
+coordinator still running agents. Break glass would have a hole exactly where
+nobody can look.
+
+**Every coordinator runs on a lease.** It holds a short, renewable right to
+execute, renewed against the database. Renewal fails — partition, database down,
+credentials expired — and it **stops on its own**. Nothing has to reach it.
+
+The property this buys is worth stating precisely: a halt is enforced by
+*absence*, not by delivery. Cutting a coordinator off is as effective as telling
+it to stop, which is the opposite of the usual failure mode where losing contact
+means losing control.
+
+The cost is that a database outage stops agent work. That is the correct
+direction to fail for a system that spends money and touches the internet, and
+it should be documented rather than discovered.
+
+### What this changes about "survives the laptop closing"
+
+Decision 1 claimed a run survives the client that started it. With a host
+coordinator, that needs precision: run *state* always survives, and a cloud
+delegate keeps executing. A run whose sandboxes live on a laptop stops when the
+laptop does — and resumes when its coordinator returns, because the state is
+elsewhere.
+
+### Operational requirements, learned from the streamer
+
+The coordinator is a signed, supervised process on a user's machine, so it
+inherits a set of problems already solved once:
+
+- signed with a stable identity, or every update loses its permissions,
+- launched so the operating system attributes it correctly, not by executing the
+  binary inside the bundle,
+- re-signed when replaced in place, or it is killed on the next start,
+- allowlisted for inbound traffic where it needs it, and told plainly when it is
+  not, rather than failing in a way that only shows up on one network.
 
 ## Consequences
 
