@@ -1,5 +1,8 @@
 //! # ferrosa-memory-mcp
 //!
+//! Last revised: 2026-08-24
+//! Last changed: Kept HTTP consolidation workers aligned with auth reload tenant sets.
+//!
 //! MCP server binary that exposes Ferrosa's memory tools via stdio or HTTP+SSE.
 //!
 //! Connects to a real Ferrosa cluster via CQL (cdrs-tokio). If the initial
@@ -728,29 +731,6 @@ fn startup_default_session_id(config: &Config, repo: &str) -> anyhow::Result<uui
     }
 
     Ok(uuid::Uuid::new_v4())
-}
-
-/// Tenants the HTTP consolidation worker should poll.
-///
-/// Reads them from the auth file, because in HTTP mode that is the only place
-/// a tenant is declared — `server.tenant_id` is rejected outright. Returns an
-/// empty vec rather than a fallback: a background worker with an invented
-/// tenant is indistinguishable from one that is working and finds nothing to
-/// do, which is exactly how this went unnoticed for two months.
-fn http_consolidation_tenants(config: &Config) -> Vec<uuid::Uuid> {
-    let Some(auth_file) = config.server.auth_file.as_deref() else {
-        return Vec::new();
-    };
-    match auth::FileAuthValidator::from_path(auth_file) {
-        Ok(v) => v.tenants(),
-        Err(e) => {
-            tracing::error!(
-                auth_file,
-                "cannot read auth file for consolidation tenants: {e}"
-            );
-            Vec::new()
-        }
-    }
 }
 
 #[cfg(test)]
@@ -3868,7 +3848,7 @@ async fn main() -> anyhow::Result<()> {
                 loop {
                     stream.recv().await;
                     tracing::info!(path = %sighup_validator.path(), "SIGHUP received, reloading auth file");
-                    match sighup_validator.reload() {
+                    match sighup_validator.reload_preserving_tenants() {
                         Ok(count) => tracing::info!(principals = count, "auth file reloaded"),
                         Err(e) => {
                             tracing::error!(error = %e, "failed to reload auth file, keeping old principals")
@@ -3934,7 +3914,7 @@ async fn main() -> anyhow::Result<()> {
             // other source of truth. If it is empty the worker is not started
             // and says so, rather than inventing an identity to poll with.
             if config.consolidation.enabled {
-                let tenants = http_consolidation_tenants(&config);
+                let tenants = auth_validator.tenants();
                 if tenants.is_empty() {
                     tracing::error!(
                         auth_file = ?config.server.auth_file,

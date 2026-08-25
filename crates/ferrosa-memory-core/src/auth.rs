@@ -1,5 +1,8 @@
 //! Tenant authentication and context extraction.
 //!
+//! Last revised: 2026-08-24
+//! Last changed: Added tenant-set-preserving reloads for HTTP background-worker safety.
+//!
 //! The auth module is the security boundary that ensures every tool handler
 //! receives a validated [`TenantContext`]. The `tenant_id` is NEVER client-supplied —
 //! it is derived from the authenticated session.
@@ -37,6 +40,8 @@ pub enum AuthError {
     UnrecognizedOrigin(String),
     #[error("failed to load auth file: {0}")]
     AuthFileLoad(String),
+    #[error("auth tenant set changed; restart required to reconcile tenant background workers")]
+    TenantSetChanged,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,10 +81,7 @@ impl FileAuthValidator {
             .principals
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut out: Vec<Uuid> = guard.values().map(|p| p.tenant_id).collect();
-        out.sort();
-        out.dedup();
-        out
+        Self::tenant_ids(&guard)
     }
 
     pub fn from_path(path: &str) -> Result<Self, AuthError> {
@@ -111,6 +113,34 @@ impl FileAuthValidator {
         Ok(count)
     }
 
+    /// Reload credentials while preserving the tenant set observed at startup.
+    ///
+    /// HTTP consolidation workers are created once per tenant. Accepting a new
+    /// tenant set without reconciling those workers would authenticate tenants
+    /// that have no worker, or leave a removed tenant's worker running. Callers
+    /// must restart the server to apply a tenant-set change.
+    pub fn reload_preserving_tenants(&self) -> Result<usize, AuthError> {
+        let new_principals = Self::load_principals(&self.path)?;
+        let count = new_principals.len();
+        if count == 0 {
+            tracing::warn!(
+                path = %self.path,
+                "auth file loaded but contains no principals — all requests will be rejected with 401"
+            );
+        }
+        let new_tenants = Self::tenant_ids(&new_principals);
+        let mut guard = self
+            .principals
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if Self::tenant_ids(&guard) != new_tenants {
+            return Err(AuthError::TenantSetChanged);
+        }
+        guard.clear();
+        guard.extend(new_principals);
+        Ok(count)
+    }
+
     pub fn path(&self) -> &str {
         &self.path
     }
@@ -133,6 +163,13 @@ impl FileAuthValidator {
             );
         }
         Ok(principals)
+    }
+
+    fn tenant_ids(principals: &HashMap<String, PrincipalRecord>) -> Vec<Uuid> {
+        let mut tenants: Vec<Uuid> = principals.values().map(|p| p.tenant_id).collect();
+        tenants.sort();
+        tenants.dedup();
+        tenants
     }
 
     pub fn validate(&self, username: &str, password: &str) -> Option<Uuid> {
@@ -387,6 +424,66 @@ mod tests {
             validator.validate("alice", "new_password"),
             Some(new_tenant)
         );
+    }
+
+    #[test]
+    fn reload_preserving_tenants_rejects_tenant_set_changes() {
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[[principal]]\nusername = \"alice\"\npassword_sha256 = \"{}\"\ntenant_id = \"{}\"",
+            sha256_hex("old_password"),
+            tenant_a
+        )
+        .unwrap();
+
+        let path = file.path().to_str().unwrap().to_string();
+        let validator = FileAuthValidator::from_path(&path).unwrap();
+
+        let replacement = format!(
+            "[[principal]]\nusername = \"alice\"\npassword_sha256 = \"{}\"\ntenant_id = \"{}\"",
+            sha256_hex("new_password"),
+            tenant_b
+        );
+        std::fs::write(&path, replacement).unwrap();
+
+        let error = validator.reload_preserving_tenants().unwrap_err();
+        assert!(
+            error.to_string().contains("restart required"),
+            "tenant-set reload rejection must tell the operator how to apply it: {error}"
+        );
+        assert_eq!(validator.tenants(), vec![tenant_a]);
+        assert_eq!(validator.validate("alice", "old_password"), Some(tenant_a));
+        assert_eq!(validator.validate("alice", "new_password"), None);
+    }
+
+    #[test]
+    fn reload_preserving_tenants_accepts_credential_changes() {
+        let tenant = Uuid::new_v4();
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[[principal]]\nusername = \"alice\"\npassword_sha256 = \"{}\"\ntenant_id = \"{}\"",
+            sha256_hex("old_password"),
+            tenant
+        )
+        .unwrap();
+
+        let path = file.path().to_str().unwrap().to_string();
+        let validator = FileAuthValidator::from_path(&path).unwrap();
+        let replacement = format!(
+            "[[principal]]\nusername = \"alice\"\npassword_sha256 = \"{}\"\ntenant_id = \"{}\"",
+            sha256_hex("new_password"),
+            tenant
+        );
+        std::fs::write(&path, replacement).unwrap();
+
+        assert_eq!(validator.reload_preserving_tenants().unwrap(), 1);
+        assert_eq!(validator.tenants(), vec![tenant]);
+        assert_eq!(validator.validate("alice", "old_password"), None);
+        assert_eq!(validator.validate("alice", "new_password"), Some(tenant));
     }
 
     #[test]
