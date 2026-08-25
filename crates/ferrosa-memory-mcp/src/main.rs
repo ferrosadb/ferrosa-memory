@@ -6,6 +6,9 @@
 //! connection fails, starts serving immediately with a "reconnecting" backend
 //! that returns errors, while a background task retries with exponential backoff.
 //! Never falls back to mock storage — mock silently loses data.
+//!
+//! Last revised: 2026-08-24
+//! Last changed: Streams pending consolidation work with bounded backpressure.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -3028,7 +3031,7 @@ async fn cql_readiness_probe_loop(storage: Arc<ReconnectingStorage>) {
 /// Background worker that polls the durable consolidation queue and runs
 /// consolidation under a database-backed lease.
 ///
-/// The loop is tenant-scoped: it polls `consolidation_request_list_pending`
+/// The loop is tenant-scoped: it polls `consolidation_request_stream_pending`
 /// for the default tenant context. The dispatcher writes a request row on
 /// every successful write tool, so any replica can pick it up.
 async fn consolidation_worker_loop<S: Storage + Send + Sync + 'static>(
