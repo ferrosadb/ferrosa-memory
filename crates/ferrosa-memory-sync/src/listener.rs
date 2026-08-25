@@ -550,7 +550,8 @@ async fn session_work<R, T>(
     // request can build one of its own to race against.
     let request_peer_state = peer_state.clone();
     // Bounds how much database work one device can have running at once.
-    let durable_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_DURABLE_IN_FLIGHT));
+    let durable_slots =
+        std::sync::Arc::new(tokio::sync::Semaphore::new(max_durable_in_flight()));
     let mut lost = std::pin::pin!(peer_lost(peer_state, PEER_DISCONNECT_GRACE));
     loop {
         let frame = tokio::select! {
@@ -601,9 +602,23 @@ async fn session_work<R, T>(
                 let states = request_peer_state.clone();
                 let session_id = offer.session_id;
                 tokio::spawn(async move {
-                    let _permit = slots.acquire_owned().await;
+                    // The WAIT for a slot is inside `serve_request`, not before
+                    // it. Acquiring first left the queue unbounded: the deadline
+                    // and the peer-loss watch both started only once a permit
+                    // was in hand, so a request that never got one waited
+                    // forever and never noticed the operator leaving. Tasks
+                    // stacked up behind a slot that was not coming back.
+                    //
+                    // Inside, both bounds cover it. Dropping the future removes
+                    // this waiter from the semaphore queue -- tokio's
+                    // `acquire_owned` is cancel-safe -- so a timed-out or
+                    // abandoned request stops competing for slots instead of
+                    // leaking one.
                     let outcome = serve_request(
-                        extension.on_request(&handle, &kind, &body),
+                        async {
+                            let _permit = slots.acquire_owned().await;
+                            extension.on_request(&handle, &kind, &body).await
+                        },
                         async {
                             peer_lost(states, PEER_DISCONNECT_GRACE).await;
                         },
@@ -828,22 +843,74 @@ fn frame_priority(kind: &str) -> FramePriority {
 
 /// How many durable requests one session may have in flight.
 ///
-/// Four, and requests WAIT for a slot rather than being refused.
+/// Four by default, and requests WAIT for a slot rather than being refused.
 ///
 /// Two-and-refuse was the first attempt and it was wrong twice over. Opening a
-/// task detail legitimately issues several reads at once, so the cap was hit
-/// in normal use; and the refusal goes back as `capability_unavailable`, which
-/// no shell renders, so the device simply spun.
+/// task detail legitimately issues several reads at once, so the cap was hit in
+/// normal use; and the refusal goes back as `capability_unavailable`, which no
+/// shell renders, so the device simply spun.
 ///
 /// Waiting is safe here in a way it would not have been on the loop. The
 /// request is already spawned, so blocking on a permit blocks only that task --
-/// the interactive path never sees it. The original "refuse, do not queue"
-/// reasoning confused queueing ON the loop, which rebuilds head-of-line
+/// the interactive path never sees it, and an `.await` on a permit parks the
+/// task rather than holding a worker thread. The original "refuse, do not
+/// queue" reasoning confused queueing ON the loop, which rebuilds head-of-line
 /// blocking, with queueing inside a task, which does not.
 ///
-/// The deadline still bounds it: a request that cannot get a slot dies with
-/// everything else at REQUEST_DEADLINE rather than waiting forever.
-const MAX_DURABLE_IN_FLIGHT: usize = 4;
+/// The wait is bounded: it happens inside `serve_request`, so it ends at
+/// `REQUEST_DEADLINE` or when the peer goes away, whichever comes first.
+///
+/// Overridable with `FERROSA_MEMORY_MAX_DURABLE_IN_FLIGHT` so this can be tuned
+/// against a slow cluster without a rebuild. The effective value is logged once
+/// at startup, and a value that cannot be used is reported rather than quietly
+/// ignored -- a cap of zero would park every durable request until its deadline.
+const MAX_DURABLE_IN_FLIGHT_DEFAULT: usize = 4;
+
+/// Environment override for [`MAX_DURABLE_IN_FLIGHT_DEFAULT`].
+const MAX_DURABLE_IN_FLIGHT_ENV: &str = "FERROSA_MEMORY_MAX_DURABLE_IN_FLIGHT";
+
+/// Resolve the cap from a raw environment value.
+///
+/// Separated from the lookup so the parsing rules are testable without setting
+/// process-wide state. `None` is "unset", which is not a problem; anything set
+/// but unusable IS a problem and is reported by the caller.
+fn parse_max_durable_in_flight(raw: Option<&str>) -> Result<usize, String> {
+    let Some(raw) = raw else {
+        return Ok(MAX_DURABLE_IN_FLIGHT_DEFAULT);
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(0) => Err("a cap of zero would park every durable request".to_owned()),
+        Ok(value) => Ok(value),
+        Err(error) => Err(format!("{error}")),
+    }
+}
+
+/// The cap in force for this process, read once.
+fn max_durable_in_flight() -> usize {
+    static RESOLVED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        let raw = std::env::var(MAX_DURABLE_IN_FLIGHT_ENV).ok();
+        let value = match parse_max_durable_in_flight(raw.as_deref()) {
+            Ok(value) => value,
+            Err(why) => {
+                tracing::error!(
+                    env = MAX_DURABLE_IN_FLIGHT_ENV,
+                    value = raw.as_deref().unwrap_or(""),
+                    %why,
+                    default = MAX_DURABLE_IN_FLIGHT_DEFAULT,
+                    "unusable durable-request cap; falling back to the default"
+                );
+                MAX_DURABLE_IN_FLIGHT_DEFAULT
+            }
+        };
+        tracing::info!(
+            env = MAX_DURABLE_IN_FLIGHT_ENV,
+            max_durable_in_flight = value,
+            "durable request concurrency"
+        );
+        value
+    })
+}
 
 /// How one extension request ended.
 #[derive(Debug)]
@@ -1615,6 +1682,102 @@ mod tests {
                 "{kind} carries no database work and must not be throttled"
             );
         }
+    }
+
+    /// Unset means the default, which is the common case and not a problem.
+    #[test]
+    fn an_absent_cap_is_the_default() {
+        assert_eq!(
+            parse_max_durable_in_flight(None),
+            Ok(MAX_DURABLE_IN_FLIGHT_DEFAULT)
+        );
+        assert_eq!(MAX_DURABLE_IN_FLIGHT_DEFAULT, 4);
+    }
+
+    /// An operator can tune it without a rebuild.
+    #[test]
+    fn a_set_cap_overrides_the_default() {
+        assert_eq!(parse_max_durable_in_flight(Some("12")), Ok(12));
+        assert_eq!(parse_max_durable_in_flight(Some("  7 ")), Ok(7));
+    }
+
+    /// Set-but-unusable is reported, never silently treated as the default by
+    /// the parser. A zero cap parks every durable request until its deadline,
+    /// which would look exactly like the hang this whole path exists to remove.
+    #[test]
+    fn an_unusable_cap_is_an_error_not_a_shrug() {
+        assert!(parse_max_durable_in_flight(Some("0")).is_err());
+        assert!(parse_max_durable_in_flight(Some("")).is_err());
+        assert!(parse_max_durable_in_flight(Some("lots")).is_err());
+        assert!(parse_max_durable_in_flight(Some("-1")).is_err());
+    }
+
+    /// Waiting for a slot must not outlive the request's deadline.
+    ///
+    /// The regression this guards: acquiring the permit BEFORE `serve_request`
+    /// started neither the deadline nor the peer-loss watch until a permit was
+    /// in hand, so a request that never got one waited forever and the tasks
+    /// stacked up. Here every permit is taken and never released, so the only
+    /// way this returns is the deadline firing on the wait itself.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_waiting_for_a_slot_still_times_out() {
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let held = std::sync::Arc::clone(&slots).acquire_owned().await.unwrap();
+
+        let outcome = serve_request(
+            async {
+                let _permit = std::sync::Arc::clone(&slots).acquire_owned().await;
+                Ok(())
+            },
+            std::future::pending::<()>(),
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, RequestOutcome::Cancelled(_)),
+            "a request that never gets a slot must end at its deadline, got {outcome:?}"
+        );
+        drop(held);
+    }
+
+    /// A cancelled waiter must stop competing for slots.
+    ///
+    /// If dropping the future left it queued, every timed-out request would
+    /// still be ahead of the next real one and the cap would drain to nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_waiter_releases_its_place_in_the_queue() {
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let held = std::sync::Arc::clone(&slots).acquire_owned().await.unwrap();
+
+        // A waiter that gives up.
+        let abandoned = serve_request(
+            async {
+                let _permit = std::sync::Arc::clone(&slots).acquire_owned().await;
+                Ok(())
+            },
+            std::future::pending::<()>(),
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(abandoned, RequestOutcome::Cancelled(_)));
+
+        // The slot frees; the next request gets it immediately rather than
+        // queueing behind the one that walked away.
+        drop(held);
+        let served = serve_request(
+            async {
+                let _permit = std::sync::Arc::clone(&slots).acquire_owned().await;
+                Ok(())
+            },
+            std::future::pending::<()>(),
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(
+            matches!(served, RequestOutcome::Served),
+            "the freed slot should go to a live request, got {served:?}"
+        );
     }
 
     /// An unknown kind is Interactive, deliberately the opposite of how this
