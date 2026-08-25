@@ -243,11 +243,41 @@ which is exactly why the runtime has to distinguish them rather than the viewer.
 Two emergency controls, global rather than per-run, and deliberately unlike the
 ordinary ones.
 
-**HALT ALL** stops execution everywhere. Not delivery — *execution*. Every agent
-in every run of every team stops working. This is the control `pause` is
-repeatedly mistaken for: it is the one that stops the bill.
+**HALT** stops execution. Not delivery — *execution*. This is the control
+`pause` is repeatedly mistaken for: it is the one that stops the bill.
 
-**KILL** is destructive. It ends a run and does not preserve its work.
+Halt is **scoped**, at three levels:
+
+| Scope | Covers | Set by |
+|---|---|---|
+| team | one team's runs | whoever manages that team |
+| user | every team that person manages | that person |
+| org | everything in the organisation | an org authority |
+
+Org scope arrives with human teams collaborating with agent teams. It is not
+built first, but the **scope is in the model from the start** — retrofitting a
+scope onto a boolean means revisiting every read of it, and this is a field
+whose correctness matters more than most.
+
+Three properties make scoping work rather than merely exist:
+
+**Halts stack; they do not replace.** A team can be held by a team halt, a user
+halt and an org halt at once. Execution requires **zero** holds covering it, so
+releasing one does not resume anything while another still applies. A single
+flag would let the narrowest release undo the broadest.
+
+**Release authority must match or exceed the halt's scope.** A user cannot
+release an org halt. Without this the org control is advisory, and an advisory
+break-glass control is not one.
+
+**A halted team says which hold stops it, and who set it.** "Halted" alone sends
+someone to a release button that will refuse them. "Halted by your organisation"
+sends them to a person. The distinction costs nothing and is the difference
+between a control that explains itself and one that appears broken.
+
+**KILL** is destructive. It ends a run and does not preserve its work. Unlike
+halt it is not scoped — it names one run, because a control that destroys work
+should never take a wildcard.
 
 Both are break glass, so three rules apply that do not apply elsewhere:
 
@@ -269,7 +299,7 @@ evidence.
 
 ### What kill destroys, precisely
 
-| | Halt all | Kill |
+| | Halt | Kill |
 |---|---|---|
 | running agents | stopped, resumable | terminated |
 | held and in-flight messages | preserved | discarded |
