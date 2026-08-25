@@ -2,8 +2,8 @@
 //! Correctness: Correct when a device cannot run anything without a grant,
 //! when a config survives a restart of the machine, and when output reaches
 //! the device as it is produced rather than when the command finishes.
-//! Last revised: 2026-08-24
-//! Last changed: Made task-cap invariants compile-time checks.
+//! Last revised: 2026-08-25
+//! Last changed: Adds bounded tenant-aware knowledge-tier frames.
 //!
 //! # Three capabilities wearing one grant, for now
 //!
@@ -58,7 +58,15 @@ pub struct ShellExtension {
     /// reaching their agents. The failure then lands on the one screen that
     /// asked for it, with a reason.
     board_contact_points: Vec<String>,
+    /// Which tenant's memory to read. `None` means nobody said, and the
+    /// memory frames say so rather than reading someone else's tenant and
+    /// reporting its emptiness as this one's.
+    memory_tenant: Option<uuid::Uuid>,
     board: tokio::sync::OnceCell<Option<Arc<crate::task_board::TaskBoard>>>,
+    /// The memory tiers, on the same terms as the board: connected on first
+    /// use, and a cluster that is down costs one screen rather than the
+    /// session.
+    memory: tokio::sync::OnceCell<Option<Arc<crate::memory_view::MemoryView>>>,
 }
 
 #[derive(Default)]
@@ -76,6 +84,7 @@ impl ShellExtension {
         workspace: impl Into<PathBuf>,
         store_path: impl Into<PathBuf>,
         board_contact_points: Vec<String>,
+        memory_tenant: Option<uuid::Uuid>,
     ) -> Self {
         let store_path = store_path.into();
         let workspace = workspace.into();
@@ -85,7 +94,9 @@ impl ShellExtension {
             runtime: Arc::new(SessionRuntime::new(workspace)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             board_contact_points,
+            memory_tenant,
             board: tokio::sync::OnceCell::new(),
+            memory: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -97,13 +108,212 @@ impl ShellExtension {
                     Ok(board) => Some(Arc::new(board)),
                     Err(error) => {
                         // Loud, and not fatal. Agents keep working without it.
-                        eprintln!("task board unavailable: {error:#}");
+                        tracing::warn!(%error, "task board unavailable");
                         None
                     }
                 }
             })
             .await
             .clone()
+    }
+
+    /// The memory tiers, connected once. `None` if they could not be reached.
+    async fn memory(&self) -> Option<Arc<crate::memory_view::MemoryView>> {
+        self.memory
+            .get_or_init(|| async {
+                let Some(tenant) = self.memory_tenant else {
+                    tracing::warn!(
+                        "memory tiers unavailable: no tenant configured. Pass \
+                         --memory-tenant, or set server.tenant_id in the memory \
+                         config, or FERROSA_MEMORY_TENANT_ID, to the tenant this \
+                         machine's memory is stored under."
+                    );
+                    return None;
+                };
+                match crate::memory_view::MemoryView::connect(&self.board_contact_points, tenant)
+                    .await
+                {
+                    Ok(view) => {
+                        // Says which tenant, on the way in. An empty tier map
+                        // has two explanations -- nothing seeded, or the wrong
+                        // tenant -- and they are indistinguishable from the
+                        // counts alone. This is the line that tells them apart
+                        // without anyone having to query the cluster.
+                        tracing::info!(%tenant, "memory tiers connected");
+                        Some(Arc::new(view))
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, %tenant, "memory tiers unavailable");
+                        None
+                    }
+                }
+            })
+            .await
+            .clone()
+    }
+
+    /// The DIKW map: four rows, always, plus what the plane does not know.
+    ///
+    /// Bounded — four counts and a handful of root names — so it is one frame.
+    async fn memory_tiers_frame(&self) -> serde_json::Value {
+        let Some(view) = self.memory().await else {
+            // Two different failures. "Unreachable" sends an operator to the
+            // cluster; an unset tenant is a configuration answer nobody gave,
+            // and saying the wrong one costs a round of looking at a database
+            // that was fine all along.
+            let reason = if self.memory_tenant.is_none() {
+                "no memory tenant is configured on this machine"
+            } else {
+                "the memory store could not be reached"
+            };
+            return serde_json::json!({
+                "type": "shell_memory_tiers",
+                "reachable": false,
+                "reason": reason,
+                "tiers": [],
+            });
+        };
+        match view.map().await {
+            Ok(map) => serde_json::json!({
+                "type": "shell_memory_tiers",
+                "reachable": true,
+                "tiers": map.tiers.iter().map(|row| serde_json::json!({
+                    "tier": row.tier.as_str(),
+                    "count": row.count,
+                    "roots": row.roots,
+                })).collect::<Vec<_>>(),
+                // Both numbers are the map's honesty. `sourced == 0` means
+                // nothing records a source yet, which is a build step and not
+                // an empty library; `unclassified` is the hole in the rules.
+                "sourced": map.sourced,
+                "unclassified": map.unclassified,
+                "truncated": map.truncated,
+                "sorts": crate::memory_view::AVAILABLE_SORTS,
+            }),
+            Err(error) => serde_json::json!({
+                "type": "shell_memory_tiers",
+                "reachable": false,
+                "reason": bounded_reason(format_args!("{error:#}")),
+                "tiers": [],
+            }),
+        }
+    }
+
+    /// One page of a tier's contents.
+    ///
+    /// Paged, and the page is small: this frame carries titles, and a tier can
+    /// hold tens of thousands of them. The task list taught this the expensive
+    /// way at 194 KiB.
+    async fn memory_items_frames(
+        &self,
+        tier: &str,
+        query: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Vec<serde_json::Value> {
+        let Some(parsed) = ferrosa_memory_core::tiers::Tier::parse(tier) else {
+            return vec![serde_json::json!({
+                "type": "shell_memory_items",
+                "tier": tier,
+                "reachable": false,
+                "reason": bounded_reason(format_args!("{} is not a tier this machine knows", bounded_reason(tier))),
+                "items": [],
+            })];
+        };
+        let Some(view) = self.memory().await else {
+            return vec![serde_json::json!({
+                "type": "shell_memory_items",
+                "tier": tier,
+                "reachable": false,
+                "reason": "the memory store could not be reached",
+                "items": [],
+            })];
+        };
+        let limit = limit.clamp(1, MEMORY_PAGE_MAX);
+        // A cursor the device sent back. Refused rather than ignored: falling
+        // back to the first page would silently restart a list the operator
+        // was halfway down, which reads as the list looping.
+        let decoded = match cursor
+            .map(crate::memory_view::TierCursor::decode)
+            .transpose()
+        {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                return vec![serde_json::json!({
+                    "type": "shell_memory_items",
+                    "tier": tier,
+                    "reachable": false,
+                    "reason": bounded_reason(format_args!("{error:#}")),
+                    "items": [],
+                })];
+            }
+        };
+        let first_page = decoded.is_none();
+        match view.items(parsed, query, decoded.as_ref(), limit).await {
+            Ok(page) => {
+                let rows: Vec<serde_json::Value> = page
+                    .items
+                    .iter()
+                    .map(|item| {
+                        // No per-item `tier`: every row in this frame is the
+                        // tier named in the header. No `path`: the absolute
+                        // path is the longest field by far and belongs on the
+                        // detail, where one of them is being read rather than
+                        // fifty being scrolled past.
+                        serde_json::json!({
+                            "id": item.entity_id,
+                            "session": item.session_id,
+                            "title": item.title,
+                            "root": item.source_root,
+                        })
+                    })
+                    .collect();
+                // An empty page still sends one frame. Without it a search
+                // that matches nothing looks identical to a search that never
+                // answered, and the screen keeps its previous results.
+                if rows.is_empty() {
+                    return vec![serde_json::json!({
+                        "type": "shell_memory_items",
+                        "tier": tier, "reachable": true, "first": first_page,
+                        "query": query,
+                        "next_cursor": page.next_cursor.as_ref().map(|c| c.encode()),
+                        "items": [],
+                    })];
+                }
+                let frame_count = rows.len().div_ceil(MEMORY_ITEMS_PER_FRAME);
+                rows.chunks(MEMORY_ITEMS_PER_FRAME)
+                    .enumerate()
+                    .map(|(index, chunk)| {
+                        serde_json::json!({
+                            "type": "shell_memory_items",
+                            "tier": tier,
+                            "reachable": true,
+                            // Only the first frame of a first page replaces the
+                            // list; the rest append. Without this every frame
+                            // wipes the one before it and the tier shows its
+                            // last three items.
+                            "first": first_page && index == 0,
+                            "query": query,
+                            // Only the LAST frame of a page carries the
+                            // cursor. On any earlier frame it would invite a
+                            // device to request the next page while this one
+                            // is still arriving, and skip the rest of it.
+                            "next_cursor": (index + 1 == frame_count)
+                                .then(|| page.next_cursor.as_ref().map(|c| c.encode()))
+                                .flatten(),
+                            "items": chunk,
+                        })
+                    })
+                    .collect()
+            }
+            Err(error) => vec![serde_json::json!({
+                "type": "shell_memory_items",
+                "tier": tier,
+                "reachable": false,
+                "reason": bounded_reason(format_args!("{error:#}")),
+                "items": [],
+            })],
+        }
     }
 
     /// One task in full, for the screen that shows a single one.
@@ -192,7 +402,7 @@ impl ShellExtension {
             Err(error) => vec![serde_json::json!({
                 "type": "shell_task_detail",
                 "task_id": task_id,
-                "unavailable": format!("The task board refused the read: {error}"),
+                "unavailable": bounded_reason(format_args!("The task board refused the read: {error}")),
             })],
         }
     }
@@ -386,7 +596,7 @@ impl ShellExtension {
                     "repo_total": 0,
                     "offset": 0,
                     "tasks": [],
-                    "unavailable": format!("The task board refused the read: {error}"),
+                    "unavailable": bounded_reason(format_args!("The task board refused the read: {error}")),
                 })];
             }
         };
@@ -744,6 +954,78 @@ const TASKS_PER_FRAME: usize = 3;
 /// absent.
 const DEFAULT_TASK_PAGE: usize = 10;
 
+/// How many memory items one REQUEST returns, and the hard cap on a request.
+///
+/// Twenty by default. This is a page, not a frame: it arrives across several
+/// frames, exactly as a page of tasks does.
+const MEMORY_PAGE_DEFAULT: usize = 20;
+const MEMORY_PAGE_MAX: usize = 50;
+
+/// How long a failure reason may be on the wire.
+///
+/// Every `reason` and `unavailable` field is built from an error, and an
+/// anyhow chain is unbounded: it carries every context layer, and the CQL
+/// driver's errors can carry a whole statement. The size proof modelled a
+/// 120-byte reason while production could write megabytes, so the proof
+/// passed and the frame did not arrive -- a frame over
+/// MAX_CONTROL_FRAME_BYTES is dropped, which tells the device nothing at
+/// exactly the moment something has gone wrong.
+///
+/// 120 bytes, which is not an invention: it is exactly what
+/// `every_bounded_frame_fits_a_datagram` already assumes every string field
+/// is worth. Setting the bound to the proof's own figure is what makes the
+/// proof cover production -- raising it to 240 was tried and immediately
+/// showed `shell_task_detail` at 1355 bytes against an 1100 datagram, because
+/// that frame carries two such fields and was already close to the line.
+///
+/// Long enough to name a failure and its immediate cause. An error that needs
+/// more than a sentence belongs in the machine's log, which is not size-bound,
+/// and the log line is emitted next to every one of these.
+const MAX_REASON_BYTES: usize = 120;
+
+/// Clamp a failure reason to something a frame can carry.
+///
+/// Truncates on a character boundary. A cut through a multi-byte character
+/// would produce a string that does not serialise, turning a reportable
+/// failure into an unreportable one.
+fn bounded_reason(value: impl std::fmt::Display) -> String {
+    let value = value.to_string();
+    if value.len() <= MAX_REASON_BYTES {
+        return value;
+    }
+    let mut end = MAX_REASON_BYTES.saturating_sub(3);
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &value[..end])
+}
+
+/// How many memory items travel in ONE frame.
+///
+/// Four. The first attempt sent a 50-item page as a single frame and the size
+/// proof measured it at 14,830 bytes against a 1,100-byte safe datagram — the
+/// same mistake as the task list, in a frame written after learning it. A tier
+/// item is not lighter than a task row: an entity id, a session id, a sentence
+/// of title and an absolute path came to about 295 bytes, and three of those
+/// still measured 1,106 against 1,100. The row was trimmed instead — no
+/// per-item tier, no absolute path — which is what makes four fit.
+const MEMORY_ITEMS_PER_FRAME: usize = 4;
+
+// Checked by the compiler rather than by a test: both sides are constants, so
+// the comparison has an answer before anything runs, and a test that asserts it
+// can only ever pass. These are the invariants the size proof below depends on
+// — a default above the cap, or a frame claiming more than a whole page, would
+// make that proof about a frame nobody sends.
+const _: () = assert!(MEMORY_PAGE_DEFAULT > 0);
+const _: () = assert!(
+    MEMORY_PAGE_DEFAULT <= MEMORY_PAGE_MAX,
+    "the default memory page is above its own cap"
+);
+const _: () = assert!(
+    MEMORY_ITEMS_PER_FRAME <= MEMORY_PAGE_MAX,
+    "one frame claims to carry more than a whole page"
+);
+
 /// How many agents a task detail offers to dispatch.
 ///
 /// Four. The frame that carries them is Bounded, and this is the number the
@@ -762,6 +1044,15 @@ const MAX_RELATED: usize = 12;
 /// A cap on WORK, not on truth: the real total travels with every page, so a
 /// device showing 10 of 906 can say so.
 const MAX_TASKS_SENT: usize = 200;
+
+// Compile-time for the same reason. The upper bound is a judgement, not a
+// protocol limit: 200 tasks is 67 frames, and a cap that costs more frames than
+// an operator will ever scroll has stopped bounding anything.
+const _: () = assert!(MAX_TASKS_SENT > 0);
+const _: () = assert!(
+    MAX_TASKS_SENT <= 500,
+    "a cap this high stops being a cap: it is over 160 frames"
+);
 
 /// How often the roster's status is refreshed.
 ///
@@ -1053,6 +1344,8 @@ impl SessionExtension for ShellExtension {
             "shell_task_search",
             "shell_dispatch",
             "shell_task_complete",
+            "shell_memory_tiers",
+            "shell_memory_items",
         ]
     }
 
@@ -1357,6 +1650,42 @@ impl SessionExtension for ShellExtension {
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| "task needs a task_id".to_owned())?;
                 for frame in self.task_detail_frames(id).await {
+                    session.send(&envelope(frame)).await?;
+                }
+                Ok(())
+            }
+            "shell_memory_tiers" => {
+                session
+                    .send(&envelope(self.memory_tiers_frame().await))
+                    .await
+            }
+            "shell_memory_items" => {
+                let tier = body
+                    .get("tier")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "memory items need a tier".to_owned())?;
+                // An empty search is not a search. Without this, clearing the
+                // field would filter to titles containing "" — every row —
+                // which is the same answer by accident and not by rule.
+                let query = body
+                    .get("query")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                // A cursor from the previous page's last frame. Absent means
+                // the first page; `offset` is gone, because an offset into a
+                // list this size is a scan and a cursor is a seek.
+                let cursor = body
+                    .get("cursor")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let limit = body
+                    .get("limit")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|value| value as usize)
+                    .unwrap_or(MEMORY_PAGE_DEFAULT);
+                for frame in self.memory_items_frames(tier, query, cursor, limit).await {
                     session.send(&envelope(frame)).await?;
                 }
                 Ok(())
@@ -1681,6 +2010,8 @@ mod output_framing_tests {
         ("shell_task_search", Sizing::Paged),
         ("shell_task_related", Sizing::Paged),
         ("shell_scrolled", Sizing::Bounded),
+        ("shell_memory_tiers", Sizing::Bounded),
+        ("shell_memory_items", Sizing::Paged),
     ];
 
     /// A new frame kind cannot be emitted without a decision about its size.
@@ -1723,7 +2054,8 @@ mod output_framing_tests {
     /// Every BOUNDED frame kind, at its worst case, fits a datagram.
     #[test]
     fn every_bounded_frame_fits_a_datagram() {
-        let long = "a".repeat(120);
+        // The real bound, so the proof covers what production can write.
+        let long = "a".repeat(MAX_REASON_BYTES);
         let path = "/Users/bkearns/src/ferrosa-suite/ferrosa-memory/crates/ferrosa-memory-sync";
         for (kind, sizing) in EMITTED {
             if *sizing != Sizing::Bounded {
@@ -1864,14 +2196,38 @@ mod output_framing_tests {
         );
     }
 
-    /// The cap bounds work, not truth. A device must be able to say what it is
-    /// not showing, which needs the real total even when the list is cut.
+    /// The size proof for the memory list, which is the frame most likely to
+    /// repeat the task list's mistake: bounded on a fixture, unbounded on a
+    /// real store where every title is a sentence and every path absolute.
     #[test]
-    fn the_task_cap_is_bounded() {
-        const {
-            assert!(MAX_TASKS_SENT > 0);
-            assert!(MAX_TASKS_SENT <= 500);
-        }
+    fn a_page_of_memory_items_fits_a_datagram() {
+        let item = serde_json::json!({
+            "id": "6f1d2c3b-4a59-4e7f-8b21-9c0d1e2f3a4b",
+            "session": "0f9e8d7c-6b5a-4938-8271-6a5b4c3d2e1f",
+            "title": "Ferrosa write ceiling is CQL-path CPU overhead, not storage",
+            "root": "research/consolidation",
+        });
+        let page: Vec<serde_json::Value> =
+            (0..MEMORY_ITEMS_PER_FRAME).map(|_| item.clone()).collect();
+        let frame = envelope(serde_json::json!({
+            "type": "shell_memory_items",
+            "tier": "knowledge",
+            "reachable": true,
+            "query": "write ceiling",
+            "sort": "recent",
+            "offset": 0,
+            "matched": 1284,
+            "truncated": false,
+            "items": page,
+        }));
+        assert!(
+            frame.len() <= SAFE_DATAGRAM_BYTES,
+            "a {}-item frame serializes to {} bytes, over the {} safe datagram. \
+             Lower MEMORY_ITEMS_PER_FRAME rather than hoping real titles are shorter.",
+            MEMORY_ITEMS_PER_FRAME,
+            frame.len(),
+            SAFE_DATAGRAM_BYTES
+        );
     }
 
     /// A conservative floor for path MTU.
@@ -1934,5 +2290,66 @@ mod output_framing_tests {
             assert!(piece.len() <= MAX_OUTPUT_BYTES_PER_FRAME);
             assert!(frame_len(piece) <= SAFE_DATAGRAM_BYTES);
         }
+    }
+
+    /// An error that goes on the wire must be bounded at the point it is
+    /// written, not assumed short.
+    ///
+    /// The size proof above models `reason` with 120 bytes. Production writes
+    /// `format!("{error:#}")` there -- an anyhow chain, which carries every
+    /// context layer and, from the CQL driver, can carry a whole statement. A
+    /// frame over MAX_CONTROL_FRAME_BYTES (64 KiB) does not arrive, so the
+    /// device is told nothing at exactly the moment something went wrong.
+    #[test]
+    fn a_huge_error_still_fits_a_datagram() {
+        // What a driver error with a large statement embedded looks like.
+        let enormous = format!("cql: {}", "SELECT * FROM x WHERE y = 1 AND ".repeat(4_000));
+        assert!(
+            enormous.len() > crate::control_session::MAX_CONTROL_FRAME_BYTES,
+            "the fixture must be oversized"
+        );
+
+        let reason = bounded_reason(&enormous);
+        assert!(
+            reason.len() <= MAX_REASON_BYTES,
+            "a reason is {} bytes, over the {MAX_REASON_BYTES} bound",
+            reason.len()
+        );
+
+        let frame = envelope(serde_json::json!({
+            "type": "shell_memory_tiers",
+            "reachable": false,
+            "reason": reason,
+            "tiers": [],
+        }));
+        assert!(
+            frame.len() <= SAFE_DATAGRAM_BYTES,
+            "an error frame is {} bytes, over the {} safe datagram",
+            frame.len(),
+            SAFE_DATAGRAM_BYTES
+        );
+    }
+
+    /// Truncation must not split a character, or the frame stops being JSON.
+    #[test]
+    fn bounding_a_reason_respects_character_boundaries() {
+        // Three bytes each, so the cut lands mid-character unless handled.
+        let multibyte = "\u{542b}".repeat(MAX_REASON_BYTES);
+        let reason = bounded_reason(&multibyte);
+        assert!(reason.len() <= MAX_REASON_BYTES);
+        assert!(
+            serde_json::to_string(&reason).is_ok(),
+            "a bounded reason must still serialise"
+        );
+    }
+
+    /// A short reason passes through untouched -- the bound must not mangle
+    /// the ordinary case.
+    #[test]
+    fn a_short_reason_is_left_alone() {
+        assert_eq!(
+            bounded_reason("the memory store could not be reached"),
+            "the memory store could not be reached"
+        );
     }
 }
