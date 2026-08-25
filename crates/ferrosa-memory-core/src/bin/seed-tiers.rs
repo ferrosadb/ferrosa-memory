@@ -62,10 +62,37 @@ fn tenant_help() -> &'static str {
      (see the [viz] tenant_id in its config, or the auth file's principals)."
 }
 
+/// Where to connect, without a loopback default.
+///
+/// `--host` first, then `FERROSA_CQL_PROXY_ADDR`, then nothing. There is
+/// deliberately no fallback to 127.0.0.1: this tool WRITES tier rules and
+/// backfills sources, and a default that silently points at whatever happens
+/// to be listening locally is how the first run seeded the wrong tenant. The
+/// same argument that made `--tenant` required applies to the host.
+///
+/// FERROSA_CQL_PROXY_ADDR is a comma-separated list; this takes the first
+/// entry, which is the same thing a single-address deployment sets.
+fn cql_host(args: &[String]) -> Option<String> {
+    if let Some(host) = arg(args, "--host") {
+        return Some(host);
+    }
+    let from_env = std::env::var("FERROSA_CQL_PROXY_ADDR").ok()?;
+    let first = from_env.split(',').map(str::trim).find(|a| !a.is_empty())?;
+    Some(first.to_owned())
+}
+
+fn host_help() -> &'static str {
+    "no CQL address. Pass --host host:port, or set FERROSA_CQL_PROXY_ADDR \
+     to the address your memory server uses."
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let host = arg(&args, "--host").unwrap_or_else(|| "127.0.0.1:19042".to_owned());
+    let Some(host) = cql_host(&args) else {
+        eprintln!("{}", host_help());
+        std::process::exit(2);
+    };
     let keyspace = arg(&args, "--keyspace").unwrap_or_else(|| "agent_memory".to_owned());
     let research = arg(&args, "--research-root");
     let tenant = arg(&args, "--tenant");

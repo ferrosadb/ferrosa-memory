@@ -342,7 +342,7 @@ impl ShellExtension {
                         &comment.body,
                     ));
                 }
-                return frames;
+                frames
             }
             Err(error) => vec![serde_json::json!({
                 "type": "shell_task_detail",
@@ -908,7 +908,7 @@ const MEMORY_PAGE_MAX: usize = 50;
 
 /// How many memory items travel in ONE frame.
 ///
-/// Three. The first attempt sent a 50-item page as a single frame and the size
+/// Four. The first attempt sent a 50-item page as a single frame and the size
 /// proof measured it at 14,830 bytes against a 1,100-byte safe datagram — the
 /// same mistake as the task list, in a frame written after learning it. A tier
 /// item is not lighter than a task row: an entity id, a session id, a sentence
@@ -916,6 +916,21 @@ const MEMORY_PAGE_MAX: usize = 50;
 /// still measured 1,106 against 1,100. The row was trimmed instead — no
 /// per-item tier, no absolute path — which is what makes four fit.
 const MEMORY_ITEMS_PER_FRAME: usize = 4;
+
+// Checked by the compiler rather than by a test: both sides are constants, so
+// the comparison has an answer before anything runs, and a test that asserts it
+// can only ever pass. These are the invariants the size proof below depends on
+// — a default above the cap, or a frame claiming more than a whole page, would
+// make that proof about a frame nobody sends.
+const _: () = assert!(MEMORY_PAGE_DEFAULT > 0);
+const _: () = assert!(
+    MEMORY_PAGE_DEFAULT <= MEMORY_PAGE_MAX,
+    "the default memory page is above its own cap"
+);
+const _: () = assert!(
+    MEMORY_ITEMS_PER_FRAME <= MEMORY_PAGE_MAX,
+    "one frame claims to carry more than a whole page"
+);
 
 /// How many agents a task detail offers to dispatch.
 ///
@@ -935,6 +950,15 @@ const MAX_RELATED: usize = 12;
 /// A cap on WORK, not on truth: the real total travels with every page, so a
 /// device showing 10 of 906 can say so.
 const MAX_TASKS_SENT: usize = 200;
+
+// Compile-time for the same reason. The upper bound is a judgement, not a
+// protocol limit: 200 tasks is 67 frames, and a cap that costs more frames than
+// an operator will ever scroll has stopped bounding anything.
+const _: () = assert!(MAX_TASKS_SENT > 0);
+const _: () = assert!(
+    MAX_TASKS_SENT <= 500,
+    "a cap this high stops being a cap: it is over 160 frames"
+);
 
 /// How often the roster's status is refreshed.
 ///
@@ -2111,33 +2135,6 @@ mod output_framing_tests {
             MEMORY_ITEMS_PER_FRAME,
             frame.len(),
             SAFE_DATAGRAM_BYTES
-        );
-    }
-
-    /// The default page must not exceed the cap, and a frame must not claim to
-    /// carry more than a page, or the size proof is about a frame nobody sends.
-    #[test]
-    fn the_memory_page_default_is_within_its_cap() {
-        assert!(MEMORY_PAGE_DEFAULT > 0);
-        assert!(
-            MEMORY_PAGE_DEFAULT <= MEMORY_PAGE_MAX,
-            "default {MEMORY_PAGE_DEFAULT} is above the cap {MEMORY_PAGE_MAX}"
-        );
-        assert!(
-            MEMORY_ITEMS_PER_FRAME <= MEMORY_PAGE_MAX,
-            "a frame cannot carry more than a whole page"
-        );
-    }
-
-    /// The cap bounds work, not truth. A device must be able to say what it is
-    /// not showing, which needs the real total even when the list is cut.
-    #[test]
-    fn the_task_cap_is_bounded() {
-        assert!(MAX_TASKS_SENT > 0);
-        assert!(
-            MAX_TASKS_SENT <= 500,
-            "a cap this high stops being a cap: it is {} frames",
-            MAX_TASKS_SENT.div_ceil(TASKS_PER_FRAME)
         );
     }
 
