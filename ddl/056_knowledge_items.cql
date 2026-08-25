@@ -118,7 +118,7 @@ CREATE TABLE IF NOT EXISTS agent_memory.knowledge_by_state (
     PRIMARY KEY ((tenant_id, state, priority_band), page_key)
 );
 
--- Which items lapse on which day.
+-- Which items lapse on which day, per state.
 --
 -- Expiry demotes rather than deletes (D34), so a TTL is the wrong primitive --
 -- it would destroy the record the design keeps on purpose. The sweep is app
@@ -127,11 +127,26 @@ CREATE TABLE IF NOT EXISTS agent_memory.knowledge_by_state (
 --
 -- Bucketed by day as `YYYY-MM-DD`, so a sweeper that missed a day can catch up
 -- by reading the days it missed, and a late start does not mean a scan.
+--
+-- `state` is in the partition key because this serves two different readers.
+-- The sweep wants approved items whose expiry has passed. The Knowledge Claims
+-- tab wants PROPOSED items, soonest-to-expire first (D45), and claims expire
+-- too -- an unreviewed proposal against a codebase that has moved is worth
+-- less for never having been read. Without state here the two would read each
+-- other's rows and filter.
+--
+-- page_key is built from `expires_at`, NOT from creation time, so a walk
+-- forward through day buckets is already in expiry order and the tab's default
+-- sort is a seek rather than a sort.
 CREATE TABLE IF NOT EXISTS agent_memory.knowledge_by_expiry (
     tenant_id    uuid,
+    state        text,
     expiry_day   text,
     page_key     text,
     knowledge_id uuid,
+    title        text,
+    kind         text,
+    priority     int,
     expires_at   timestamp,
-    PRIMARY KEY ((tenant_id, expiry_day), page_key)
+    PRIMARY KEY ((tenant_id, state, expiry_day), page_key)
 );
