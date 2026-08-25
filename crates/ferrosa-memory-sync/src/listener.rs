@@ -549,6 +549,8 @@ async fn session_work<R, T>(
     // Cloned before the loop's own peer-lost future takes ownership, so each
     // request can build one of its own to race against.
     let request_peer_state = peer_state.clone();
+    // Bounds how much database work one device can have running at once.
+    let durable_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_DURABLE_IN_FLIGHT));
     let mut lost = std::pin::pin!(peer_lost(peer_state, PEER_DISCONNECT_GRACE));
     loop {
         let frame = tokio::select! {
@@ -582,6 +584,62 @@ async fn session_work<R, T>(
             // loop was not watching for the loss while it waited, so the
             // disconnect was neither noticed nor acted on until the request
             // finished on its own.
+            // Durable work yields the loop. A keystroke arriving behind a
+            // memory read would otherwise wait for the query -- 15 s before
+            // the tier map stopped scanning, ~400 ms now, and in both cases
+            // for no reason: the tmux surface touches no database.
+            if frame_priority(&kind) == FramePriority::Durable {
+                let Ok(permit) = std::sync::Arc::clone(&durable_slots).try_acquire_owned() else {
+                    // Refused, not queued. Queuing here would rebuild the head
+                    // -of-line blocking this removes, one layer down, and a
+                    // device that has already asked twice is better told so
+                    // than left waiting.
+                    tracing::warn!(
+                        session_id = %offer.session_id,
+                        %kind,
+                        "too many durable requests in flight; refusing this one"
+                    );
+                    if let Some(reply) = frame_id_of(&frame).and_then(|id| {
+                        crate::control_session::capability_unavailable_reply(
+                            &id,
+                            "too many database requests in flight",
+                        )
+                    }) && channel.send_text(&reply).await.is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                };
+                let extension = extension.clone();
+                let handle = handle.clone();
+                let body = frame_json(&frame);
+                let states = request_peer_state.clone();
+                let session_id = offer.session_id;
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let outcome = serve_request(
+                        extension.on_request(&handle, &kind, &body),
+                        async {
+                            peer_lost(states, PEER_DISCONNECT_GRACE).await;
+                        },
+                        REQUEST_DEADLINE,
+                    )
+                    .await;
+                    match outcome {
+                        RequestOutcome::Served => {}
+                        RequestOutcome::Refused(error) => tracing::warn!(
+                            %session_id, %kind, %error,
+                            "session extension refused a request"
+                        ),
+                        RequestOutcome::Cancelled(why) => tracing::info!(
+                            %session_id, %kind, %why,
+                            "abandoned a request in flight"
+                        ),
+                    }
+                });
+                continue;
+            }
+
             let outcome = serve_request(
                 extension.on_request(handle, &kind, &frame_json(&frame)),
                 async {
@@ -739,6 +797,52 @@ where
         }
     })
 }
+
+/// Which queue a frame belongs in.
+///
+/// The frame loop serves one request at a time, so a slow request delays every
+/// frame behind it -- including keystrokes. Splitting the two is the whole
+/// point: using a terminal must not wait on a database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FramePriority {
+    /// Using the terminal. Database-free and measured in microseconds, so it
+    /// is served on the loop itself.
+    Interactive,
+    /// Reaches the database. Yields, so it cannot hold the loop.
+    Durable,
+}
+
+/// Classify one frame kind.
+///
+/// The tmux surface is enumerated rather than pattern-matched on a prefix,
+/// because a prefix rule silently promotes whatever is added next. Everything
+/// not named here is Durable, which is the safe direction: guessing
+/// Interactive would put an unclassified command -- possibly a query someone
+/// adds later without reading this -- back on the path this exists to keep
+/// clear. Guessing Durable costs one yield.
+fn frame_priority(kind: &str) -> FramePriority {
+    match kind {
+        "shell_open"
+        | "shell_input"
+        | "shell_resize"
+        | "shell_scroll"
+        | "shell_close"
+        | "shell_list"
+        | "shell_delete_session"
+        | "shell_add_config"
+        | "shell_update_config"
+        | "shell_delete_config" => FramePriority::Interactive,
+        _ => FramePriority::Durable,
+    }
+}
+
+/// How many durable requests one session may have in flight.
+///
+/// Two. Enough that a board read and a memory read overlap rather than
+/// queueing, few enough that a device cannot aim a stack of queries at the
+/// cluster -- which is how the Memory tab starved the control cursor's writes
+/// and took sessions down with it.
+const MAX_DURABLE_IN_FLIGHT: usize = 2;
 
 /// How one extension request ended.
 #[derive(Debug)]
@@ -1436,5 +1540,65 @@ mod tests {
             RequestOutcome::Refused(why) => assert_eq!(why, "no screen to capture"),
             other => panic!("got {other:?}"),
         }
+    }
+
+    /// Keystrokes must not queue behind a database read.
+    ///
+    /// The frame loop serves one request at a time. Every tmux command is
+    /// database-free and returns in microseconds; every board and memory
+    /// command is a query. Serving them from one queue means a keystroke waits
+    /// on whatever query is in flight -- which was 15 s before the tier map
+    /// stopped scanning, and is still ~400 ms.
+    #[test]
+    fn tmux_traffic_is_interactive_and_never_waits_on_a_query() {
+        for kind in [
+            "shell_open",
+            "shell_input",
+            "shell_resize",
+            "shell_scroll",
+            "shell_close",
+            "shell_list",
+            "shell_delete_session",
+        ] {
+            assert_eq!(
+                frame_priority(kind),
+                FramePriority::Interactive,
+                "{kind} is part of using a terminal"
+            );
+        }
+    }
+
+    /// Everything database-backed yields, so the interactive path stays clear.
+    #[test]
+    fn database_backed_frames_are_durable() {
+        for kind in [
+            "shell_memory_tiers",
+            "shell_memory_items",
+            "shell_tasks",
+            "shell_task",
+            "shell_task_search",
+            "shell_task_complete",
+            "shell_dispatch",
+        ] {
+            assert_eq!(
+                frame_priority(kind),
+                FramePriority::Durable,
+                "{kind} reaches the database"
+            );
+        }
+    }
+
+    /// An unknown kind is treated as Durable, not Interactive.
+    ///
+    /// Deliberate: guessing Interactive would put an unclassified command --
+    /// possibly a query added later by someone who did not read this -- back
+    /// onto the path this exists to keep clear. Guessing Durable costs it a
+    /// yield and nothing else.
+    #[test]
+    fn an_unknown_frame_yields_rather_than_taking_the_fast_path() {
+        assert_eq!(
+            frame_priority("shell_something_new"),
+            FramePriority::Durable
+        );
     }
 }
