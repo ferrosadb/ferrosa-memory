@@ -51,6 +51,7 @@ pub mod http;
 pub mod hybrid_search;
 pub mod importance;
 pub mod intention;
+pub mod knowledge;
 pub mod memo;
 pub mod metrics;
 pub mod migration;
