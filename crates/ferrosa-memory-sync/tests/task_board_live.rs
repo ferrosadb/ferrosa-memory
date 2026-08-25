@@ -138,7 +138,10 @@ async fn report_work_for_the_machines_configured_agents() {
         .await
         .expect("connects to the board");
     for dir in &dirs {
-        let found = board.open_work(&[dir.clone()]).await.expect("reads");
+        let found = board
+            .open_work(std::slice::from_ref(dir))
+            .await
+            .expect("reads");
         println!("REPORT {dir}: {} open", found.len());
         for task in found.iter().take(3) {
             println!("    [{}] {} {}", task.status, task.id, task.title);
