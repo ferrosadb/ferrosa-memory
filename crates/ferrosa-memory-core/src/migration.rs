@@ -240,6 +240,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "recency-ordered provenance by root, so a browse page is a seek",
         ddl: include_str!("../../../ddl/055_entity_source_by_root.cql"),
     },
+    Migration {
+        version: 56,
+        description: "knowledge items, their version chain, and the queues that read them",
+        ddl: include_str!("../../../ddl/056_knowledge_items.cql"),
+    },
 ];
 
 /// `ddl/011_warmth_field.cql` — the `entity_warmth` table + session index.
