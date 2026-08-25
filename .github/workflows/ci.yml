@@ -823,13 +823,17 @@ jobs:
         # recompile here. The dedicated fresh-keyspace migration release gate
         # above has already run; excluding it avoids duplicate expensive DDL.
         # `--workspace-remap .` points archived binaries at this checkout for
-        # path-relative fixtures.
+        # path-relative fixtures. `task_board_live` is deliberately absent:
+        # it validates Forge's real task board (schema and data owned by a
+        # different repository), not the disposable CI cluster. It remains
+        # available for an explicit local `--test task_board_live -- --ignored`
+        # run against that external board.
         run: |
           cargo nextest run \
             --archive-file nextest-archive.tar.zst \
             --workspace-remap . \
             --run-ignored ignored-only \
-            --filterset 'not (package(ferrosa-memory-core) and binary(migration_drift) and test(t10_fresh_keyspace_applies_every_registered_migration))' \
+            --filterset 'not (package(ferrosa-memory-core) and binary(migration_drift) and test(t10_fresh_keyspace_applies_every_registered_migration)) and not (package(ferrosa-memory-sync) and binary(task_board_live))' \
             --no-fail-fast
       - name: Run system pytest suite against live cluster
         env:
