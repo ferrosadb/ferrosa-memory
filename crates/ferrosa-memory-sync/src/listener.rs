@@ -589,34 +589,19 @@ async fn session_work<R, T>(
             // the tier map stopped scanning, ~400 ms now, and in both cases
             // for no reason: the tmux surface touches no database.
             if frame_priority(&kind) == FramePriority::Durable {
-                let Ok(permit) = std::sync::Arc::clone(&durable_slots).try_acquire_owned() else {
-                    // Refused, not queued. Queuing here would rebuild the head
-                    // -of-line blocking this removes, one layer down, and a
-                    // device that has already asked twice is better told so
-                    // than left waiting.
-                    tracing::warn!(
-                        session_id = %offer.session_id,
-                        %kind,
-                        "too many durable requests in flight; refusing this one"
-                    );
-                    if let Some(reply) = frame_id_of(&frame).and_then(|id| {
-                        crate::control_session::capability_unavailable_reply(
-                            &id,
-                            "too many database requests in flight",
-                        )
-                    }) && channel.send_text(&reply).await.is_err()
-                    {
-                        break;
-                    }
-                    continue;
-                };
+                // Acquired INSIDE the task, and awaited rather than tried.
+                // The work is already off the loop, so waiting for a slot
+                // costs this request and nothing else -- and refusing instead
+                // sent back a capability_unavailable that no shell renders,
+                // which the operator saw as a spinner that never resolved.
+                let slots = std::sync::Arc::clone(&durable_slots);
                 let extension = extension.clone();
                 let handle = handle.clone();
                 let body = frame_json(&frame);
                 let states = request_peer_state.clone();
                 let session_id = offer.session_id;
                 tokio::spawn(async move {
-                    let _permit = permit;
+                    let _permit = slots.acquire_owned().await;
                     let outcome = serve_request(
                         extension.on_request(&handle, &kind, &body),
                         async {
@@ -814,35 +799,51 @@ enum FramePriority {
 
 /// Classify one frame kind.
 ///
-/// The tmux surface is enumerated rather than pattern-matched on a prefix,
-/// because a prefix rule silently promotes whatever is added next. Everything
-/// not named here is Durable, which is the safe direction: guessing
-/// Interactive would put an unclassified command -- possibly a query someone
-/// adds later without reading this -- back on the path this exists to keep
-/// clear. Guessing Durable costs one yield.
+/// The DURABLE set is enumerated and everything else is Interactive. That is
+/// the opposite of the first attempt, which listed the interactive kinds and
+/// defaulted the rest to Durable -- and which broke the app, because the
+/// unlisted kinds were not queries at all. `input_event` carries remote
+/// keyboard and pointer, and the `visual_*` family carries WebRTC negotiation;
+/// none of them touch a database, and all of them went down the throttled path
+/// and were refused.
+///
+/// The two mistakes do not cost the same. Calling an interactive frame Durable
+/// throttles input and refuses it, which the device cannot even render.
+/// Calling a durable frame Interactive puts one slow request back on the loop,
+/// which is what the code did before any of this existed. So the default must
+/// be Interactive, and the database-backed set -- closed, small, and all in
+/// one file -- is the one to enumerate.
 fn frame_priority(kind: &str) -> FramePriority {
     match kind {
-        "shell_open"
-        | "shell_input"
-        | "shell_resize"
-        | "shell_scroll"
-        | "shell_close"
-        | "shell_list"
-        | "shell_delete_session"
-        | "shell_add_config"
-        | "shell_update_config"
-        | "shell_delete_config" => FramePriority::Interactive,
-        _ => FramePriority::Durable,
+        "shell_memory_tiers"
+        | "shell_memory_items"
+        | "shell_tasks"
+        | "shell_task"
+        | "shell_task_search"
+        | "shell_task_complete"
+        | "shell_dispatch" => FramePriority::Durable,
+        _ => FramePriority::Interactive,
     }
 }
 
 /// How many durable requests one session may have in flight.
 ///
-/// Two. Enough that a board read and a memory read overlap rather than
-/// queueing, few enough that a device cannot aim a stack of queries at the
-/// cluster -- which is how the Memory tab starved the control cursor's writes
-/// and took sessions down with it.
-const MAX_DURABLE_IN_FLIGHT: usize = 2;
+/// Four, and requests WAIT for a slot rather than being refused.
+///
+/// Two-and-refuse was the first attempt and it was wrong twice over. Opening a
+/// task detail legitimately issues several reads at once, so the cap was hit
+/// in normal use; and the refusal goes back as `capability_unavailable`, which
+/// no shell renders, so the device simply spun.
+///
+/// Waiting is safe here in a way it would not have been on the loop. The
+/// request is already spawned, so blocking on a permit blocks only that task --
+/// the interactive path never sees it. The original "refuse, do not queue"
+/// reasoning confused queueing ON the loop, which rebuilds head-of-line
+/// blocking, with queueing inside a task, which does not.
+///
+/// The deadline still bounds it: a request that cannot get a slot dies with
+/// everything else at REQUEST_DEADLINE rather than waiting forever.
+const MAX_DURABLE_IN_FLIGHT: usize = 4;
 
 /// How one extension request ended.
 #[derive(Debug)]
@@ -1588,17 +1589,52 @@ mod tests {
         }
     }
 
-    /// An unknown kind is treated as Durable, not Interactive.
+    /// Remote input and video signalling are interactive.
     ///
-    /// Deliberate: guessing Interactive would put an unclassified command --
-    /// possibly a query added later by someone who did not read this -- back
-    /// onto the path this exists to keep clear. Guessing Durable costs it a
-    /// yield and nothing else.
+    /// This is the regression. They are not `shell_*` frames, so a rule that
+    /// listed the interactive kinds and defaulted the rest to Durable sent
+    /// every keystroke, pointer move and video negotiation frame down the
+    /// throttled path. Observed on the desktop app: 21 `input_event` frames
+    /// refused with "too many durable requests in flight", and a task detail
+    /// that spun forever, because the device cannot render the refusal.
     #[test]
-    fn an_unknown_frame_yields_rather_than_taking_the_fast_path() {
+    fn remote_input_and_video_signalling_are_interactive() {
+        for kind in [
+            "input_event",
+            "visual_offer",
+            "visual_answer",
+            "visual_start",
+            "visual_stop",
+            "visual_pause",
+            "visual_resume",
+            "visual_layout",
+        ] {
+            assert_eq!(
+                frame_priority(kind),
+                FramePriority::Interactive,
+                "{kind} carries no database work and must not be throttled"
+            );
+        }
+    }
+
+    /// An unknown kind is Interactive, deliberately the opposite of how this
+    /// started.
+    ///
+    /// The first version defaulted to Durable, reasoning that an unclassified
+    /// command might be a query. The actual population of unclassified kinds
+    /// turned out to be input and video signalling, and throttling those to
+    /// two in flight broke the app outright. The costs are not symmetric:
+    /// mistaking interactive for durable REFUSES input, while mistaking
+    /// durable for interactive puts one slow request back on the loop, which
+    /// is merely what the code did before any of this existed.
+    ///
+    /// The database-backed set is closed, small, and lives in one file. The
+    /// interactive set is open and grows. Enumerate the closed one.
+    #[test]
+    fn an_unknown_frame_is_interactive() {
         assert_eq!(
-            frame_priority("shell_something_new"),
-            FramePriority::Durable
+            frame_priority("something_added_later"),
+            FramePriority::Interactive
         );
     }
 }
