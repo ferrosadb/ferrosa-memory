@@ -194,7 +194,7 @@ impl ShellExtension {
             Err(error) => serde_json::json!({
                 "type": "shell_memory_tiers",
                 "reachable": false,
-                "reason": format!("{error:#}"),
+                "reason": bounded_reason(format_args!("{error:#}")),
                 "tiers": [],
             }),
         }
@@ -217,7 +217,7 @@ impl ShellExtension {
                 "type": "shell_memory_items",
                 "tier": tier,
                 "reachable": false,
-                "reason": format!("{tier} is not a tier this machine knows"),
+                "reason": bounded_reason(format_args!("{} is not a tier this machine knows", bounded_reason(tier))),
                 "items": [],
             })];
         };
@@ -244,7 +244,7 @@ impl ShellExtension {
                     "type": "shell_memory_items",
                     "tier": tier,
                     "reachable": false,
-                    "reason": format!("{error:#}"),
+                    "reason": bounded_reason(format_args!("{error:#}")),
                     "items": [],
                 })];
             }
@@ -311,7 +311,7 @@ impl ShellExtension {
                 "type": "shell_memory_items",
                 "tier": tier,
                 "reachable": false,
-                "reason": format!("{error:#}"),
+                "reason": bounded_reason(format_args!("{error:#}")),
                 "items": [],
             })],
         }
@@ -403,7 +403,7 @@ impl ShellExtension {
             Err(error) => vec![serde_json::json!({
                 "type": "shell_task_detail",
                 "task_id": task_id,
-                "unavailable": format!("The task board refused the read: {error}"),
+                "unavailable": bounded_reason(format_args!("The task board refused the read: {error}")),
             })],
         }
     }
@@ -597,7 +597,7 @@ impl ShellExtension {
                     "repo_total": 0,
                     "offset": 0,
                     "tasks": [],
-                    "unavailable": format!("The task board refused the read: {error}"),
+                    "unavailable": bounded_reason(format_args!("The task board refused the read: {error}")),
                 })];
             }
         };
@@ -961,6 +961,45 @@ const DEFAULT_TASK_PAGE: usize = 10;
 /// frames, exactly as a page of tasks does.
 const MEMORY_PAGE_DEFAULT: usize = 20;
 const MEMORY_PAGE_MAX: usize = 50;
+
+/// How long a failure reason may be on the wire.
+///
+/// Every `reason` and `unavailable` field is built from an error, and an
+/// anyhow chain is unbounded: it carries every context layer, and the CQL
+/// driver's errors can carry a whole statement. The size proof modelled a
+/// 120-byte reason while production could write megabytes, so the proof
+/// passed and the frame did not arrive -- a frame over
+/// MAX_CONTROL_FRAME_BYTES is dropped, which tells the device nothing at
+/// exactly the moment something has gone wrong.
+///
+/// 120 bytes, which is not an invention: it is exactly what
+/// `every_bounded_frame_fits_a_datagram` already assumes every string field
+/// is worth. Setting the bound to the proof's own figure is what makes the
+/// proof cover production -- raising it to 240 was tried and immediately
+/// showed `shell_task_detail` at 1355 bytes against an 1100 datagram, because
+/// that frame carries two such fields and was already close to the line.
+///
+/// Long enough to name a failure and its immediate cause. An error that needs
+/// more than a sentence belongs in the machine's log, which is not size-bound,
+/// and the log line is emitted next to every one of these.
+const MAX_REASON_BYTES: usize = 120;
+
+/// Clamp a failure reason to something a frame can carry.
+///
+/// Truncates on a character boundary. A cut through a multi-byte character
+/// would produce a string that does not serialise, turning a reportable
+/// failure into an unreportable one.
+fn bounded_reason(value: impl std::fmt::Display) -> String {
+    let value = value.to_string();
+    if value.len() <= MAX_REASON_BYTES {
+        return value;
+    }
+    let mut end = MAX_REASON_BYTES.saturating_sub(3);
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &value[..end])
+}
 
 /// How many memory items travel in ONE frame.
 ///
@@ -2016,7 +2055,8 @@ mod output_framing_tests {
     /// Every BOUNDED frame kind, at its worst case, fits a datagram.
     #[test]
     fn every_bounded_frame_fits_a_datagram() {
-        let long = "a".repeat(120);
+        // The real bound, so the proof covers what production can write.
+        let long = "a".repeat(MAX_REASON_BYTES);
         let path = "/Users/bkearns/src/ferrosa-suite/ferrosa-memory/crates/ferrosa-memory-sync";
         for (kind, sizing) in EMITTED {
             if *sizing != Sizing::Bounded {
@@ -2251,5 +2291,66 @@ mod output_framing_tests {
             assert!(piece.len() <= MAX_OUTPUT_BYTES_PER_FRAME);
             assert!(frame_len(piece) <= SAFE_DATAGRAM_BYTES);
         }
+    }
+
+    /// An error that goes on the wire must be bounded at the point it is
+    /// written, not assumed short.
+    ///
+    /// The size proof above models `reason` with 120 bytes. Production writes
+    /// `format!("{error:#}")` there -- an anyhow chain, which carries every
+    /// context layer and, from the CQL driver, can carry a whole statement. A
+    /// frame over MAX_CONTROL_FRAME_BYTES (64 KiB) does not arrive, so the
+    /// device is told nothing at exactly the moment something went wrong.
+    #[test]
+    fn a_huge_error_still_fits_a_datagram() {
+        // What a driver error with a large statement embedded looks like.
+        let enormous = format!("cql: {}", "SELECT * FROM x WHERE y = 1 AND ".repeat(4_000));
+        assert!(
+            enormous.len() > crate::control_session::MAX_CONTROL_FRAME_BYTES,
+            "the fixture must be oversized"
+        );
+
+        let reason = bounded_reason(&enormous);
+        assert!(
+            reason.len() <= MAX_REASON_BYTES,
+            "a reason is {} bytes, over the {MAX_REASON_BYTES} bound",
+            reason.len()
+        );
+
+        let frame = envelope(serde_json::json!({
+            "type": "shell_memory_tiers",
+            "reachable": false,
+            "reason": reason,
+            "tiers": [],
+        }));
+        assert!(
+            frame.len() <= SAFE_DATAGRAM_BYTES,
+            "an error frame is {} bytes, over the {} safe datagram",
+            frame.len(),
+            SAFE_DATAGRAM_BYTES
+        );
+    }
+
+    /// Truncation must not split a character, or the frame stops being JSON.
+    #[test]
+    fn bounding_a_reason_respects_character_boundaries() {
+        // Three bytes each, so the cut lands mid-character unless handled.
+        let multibyte = "\u{542b}".repeat(MAX_REASON_BYTES);
+        let reason = bounded_reason(&multibyte);
+        assert!(reason.len() <= MAX_REASON_BYTES);
+        assert!(
+            serde_json::to_string(&reason).is_ok(),
+            "a bounded reason must still serialise"
+        );
+    }
+
+    /// A short reason passes through untouched -- the bound must not mangle
+    /// the ordinary case.
+    #[test]
+    fn a_short_reason_is_left_alone() {
+        assert_eq!(
+            bounded_reason("the memory store could not be reached"),
+            "the memory store could not be reached"
+        );
     }
 }
