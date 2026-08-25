@@ -139,6 +139,14 @@ enum Command {
         /// Use an already-current schema without issuing startup DDL.
         #[arg(long)]
         existing_schema: bool,
+        /// Which tenant's memory to serve to a controller.
+        ///
+        /// Falls back to server.tenant_id and then FERROSA_MEMORY_TENANT_ID.
+        /// There is no default: the task board's tenant is on the same
+        /// cluster and reading it reports an empty memory rather than an
+        /// error.
+        #[arg(long = "memory-tenant")]
+        memory_tenant: Option<uuid::Uuid>,
     },
 }
 
@@ -202,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
             workspace,
             contact_points,
             existing_schema,
+            memory_tenant,
         } => {
             ferrosa_memory_sync::listener::run_control_listener(
                 &ferrosa_memory_sync::listener::ListenerConfig {
@@ -210,6 +219,7 @@ async fn main() -> anyhow::Result<()> {
                     workspace,
                     contact_points,
                     existing_schema,
+                    memory_tenant,
                 },
                 // A plain control session. Another binary attaches extensions
                 // here and changes nothing else.

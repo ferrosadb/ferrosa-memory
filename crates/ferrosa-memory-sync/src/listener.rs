@@ -232,6 +232,16 @@ pub struct ListenerConfig {
     pub workspace: std::path::PathBuf,
     pub contact_points: Vec<String>,
     pub existing_schema: bool,
+    /// Which tenant's memory to serve. `None` falls back to
+    /// `server.tenant_id`, then `FERROSA_MEMORY_TENANT_ID`, then nothing.
+    ///
+    /// A field rather than an environment variable alone because the binary
+    /// that hosts this listener is launched through LaunchServices on macOS,
+    /// so that it can hold Screen Recording permission. A GUI launch does not
+    /// inherit the shell's environment — `launchctl setenv` was tried and the
+    /// variable was simply absent from the process — which makes an env-only
+    /// tenant unsettable on the platform this runs on.
+    pub memory_tenant: Option<Uuid>,
 }
 
 /// Run a control listener until the process ends.
@@ -249,6 +259,7 @@ pub async fn run_control_listener(
         workspace,
         contact_points,
         existing_schema,
+        memory_tenant: configured_tenant,
     } = config;
     let existing_schema = *existing_schema;
     use std::{sync::Arc, time::Duration};
@@ -320,7 +331,7 @@ pub async fn run_control_listener(
             // outstanding for the repository this agent works in" without the
             // phone needing a route to the database or a credential for it.
             memory_config.ferrosa.contact_points.clone(),
-            memory_tenant(memory_config.server.tenant_id.as_deref()),
+            configured_tenant.or_else(|| memory_tenant(memory_config.server.tenant_id.as_deref())),
         ),
     ));
 
