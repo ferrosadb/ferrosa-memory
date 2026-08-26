@@ -525,20 +525,48 @@ a cut-off.**
 
 ### Why it is a permission
 
-Two different problems push the number in opposite directions:
+An operator can move it **either direction**, for three reasons that are not
+alike:
 
-| Problem | Direction | What it costs |
-|---|---|---|
-| network partitioning | longer | a longer window of uncontrolled execution |
-| out-of-control spend | shorter | ordinary reconnects start stopping work |
+| Reason | Direction | Planned? | What it costs |
+|---|---|---|---|
+| network partitioning | longer | no | a longer window of uncontrolled execution |
+| out-of-control spend | shorter | no | ordinary reconnects start stopping work |
+| **maintenance** | longer | **yes** | break glass is weaker for the window |
 
-Neither adjustment is routine, and both weaken something. So the permission
-exists to make the change deliberate and attributable rather than convenient.
-It should be granted narrowly and used rarely.
+The first two are reactions to something going wrong. The third is not, and it
+is the common one: restarting database nodes, rolling a cluster, replacing a
+coordinator. During that work the control channel is *expected* to drop, and
+without a raised lease every coordinator expires and stops — turning routine
+maintenance into a full stop of agent work.
 
-The change records **which problem it was for**, alongside who and when. A lease
-lengthened for a partition that was fixed last month should be visible as
-exactly that.
+This is not hypothetical. Rolling the memory cluster is normal operating
+practice here, and with a fifteen-minute lease every coordinator would go quiet
+partway through it.
+
+Each adjustment weakens something, so the permission exists to make the change
+deliberate and attributable rather than convenient. It records **which reason it
+was for**, alongside who and when.
+
+### An override carries its own expiry
+
+Because maintenance is planned and temporary, a maintenance override is
+**time-boxed**: it states how long it applies and reverts to the default on its
+own.
+
+This is the mechanism behind "I do not want this happening often". A permanent
+bump quietly becomes the new normal — a lease raised for a partition fixed last
+month, or a maintenance window that ended in August, is indistinguishable from a
+deliberate policy until someone audits it. An override that expires cannot rot
+that way.
+
+Two rules follow:
+
+- **The override window should match the work**, not the day. A four-hour lease
+  for twenty minutes of maintenance leaves three and a half hours of weakened
+  break glass for no reason.
+- **The default is what it reverts to**, always. Reverting is not another
+  decision someone has to remember to make.
 
 ### The ceiling is not part of the permission
 
