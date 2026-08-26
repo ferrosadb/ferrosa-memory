@@ -613,6 +613,7 @@ async fn session_work<R, T>(
                     // `acquire_owned` is cancel-safe -- so a timed-out or
                     // abandoned request stops competing for slots instead of
                     // leaking one.
+                    let started = std::time::Instant::now();
                     let outcome = serve_request(
                         async {
                             let _permit = slots.acquire_owned().await;
@@ -625,7 +626,15 @@ async fn session_work<R, T>(
                     )
                     .await;
                     match outcome {
-                        RequestOutcome::Served => {}
+                        RequestOutcome::Served => {
+                            let took = started.elapsed();
+                            if took >= SLOW_REQUEST {
+                                tracing::warn!(
+                                    %session_id, %kind, took_ms = took.as_millis() as u64,
+                                    "a request was served slowly; a device was waiting on it"
+                                );
+                            }
+                        }
                         RequestOutcome::Refused(error) => tracing::warn!(
                             %session_id, %kind, %error,
                             "session extension refused a request"
@@ -639,6 +648,7 @@ async fn session_work<R, T>(
                 continue;
             }
 
+            let started = std::time::Instant::now();
             let outcome = serve_request(
                 extension.on_request(handle, &kind, &frame_json(&frame)),
                 async {
@@ -648,7 +658,17 @@ async fn session_work<R, T>(
             )
             .await;
             match outcome {
-                RequestOutcome::Served => {}
+                RequestOutcome::Served => {
+                    let took = started.elapsed();
+                    if took >= SLOW_REQUEST {
+                        tracing::warn!(
+                            session_id = %offer.session_id,
+                            %kind,
+                            took_ms = took.as_millis() as u64,
+                            "a request was served slowly; a device was waiting on it"
+                        );
+                    }
+                }
                 // The request failed; the session did not. A screen that could
                 // not be captured is a screen that could not be captured, not a
                 // reason to disconnect a working control channel.
@@ -925,6 +945,15 @@ enum RequestOutcome {
     /// Nobody is waiting for this any more, so it was dropped.
     Cancelled(&'static str),
 }
+/// How long a request may take before it is worth a log line.
+///
+/// A served request logs nothing: at a few hundred a session that would bury
+/// everything else. But a SLOW one is the thing that leaves a spinner on a
+/// screen, and until this existed a hung request left no trace at all — a
+/// search that never came back could not be told apart from one that was never
+/// sent. Well under the deadline, so a request that is merely slow is visible
+/// long before it is abandoned.
+const SLOW_REQUEST: Duration = Duration::from_secs(3);
 
 /// How long one extension request may run before it is abandoned.
 ///
