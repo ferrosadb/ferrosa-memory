@@ -320,6 +320,26 @@ impl ClosablePeer for Arc<RTCPeerConnection> {
     }
 }
 
+/// Why a gather produced nothing, phrased for whoever reads the log next.
+///
+/// `None` when the count is healthy — a warning on every session is a warning
+/// nobody reads.
+///
+/// Zero candidates earns its own message because the consequence is so
+/// misleading: the answer is still sent, the session still negotiates, and it
+/// fails thirty seconds later as a generic ICE timeout. Nothing downstream says
+/// the local host could not open a socket, so the failure gets attributed to
+/// the network, the phone, or the broker. It was attributed to the broker.
+fn gathering_verdict(candidate_count: usize) -> Option<String> {
+    (candidate_count == 0).then(|| {
+        "gathered 0 ICE candidates: this host could not bind a local socket. \
+         The usual cause is file descriptor exhaustion - check the process's \
+         open descriptor count against its RLIMIT_NOFILE soft limit. The answer \
+         will negotiate and then time out."
+            .to_owned()
+    })
+}
+
 /// Verify the peer's signed hello and return its ephemeral X25519 public key.
 pub fn verify_control_hello(
     identity: &InstancePublicIdentity,
@@ -640,14 +660,15 @@ pub async fn run_control_server_session<S: ControlSignalingApi>(
             .local_description()
             .await
             .ok_or_else(|| ControlSessionError::Rtc("missing local answer".to_owned()))?;
-        tracing::info!(
-            candidate_count = local
-                .sdp
-                .lines()
-                .filter(|line| line.starts_with("a=candidate:"))
-                .count(),
-            "sending gathered control answer"
-        );
+        let candidate_count = local
+            .sdp
+            .lines()
+            .filter(|line| line.starts_with("a=candidate:"))
+            .count();
+        if let Some(fault) = gathering_verdict(candidate_count) {
+            tracing::error!(session_id = %session_id, "{fault}");
+        }
+        tracing::info!(candidate_count, "sending gathered control answer");
         api.control_post_signal(
             session_id,
             &own_fingerprint,
@@ -1992,5 +2013,29 @@ mod tests {
         let peer = RecordingPeer::new();
         let _: Result<u8, String> = close_peer_on_error(&peer, Err("x".to_owned())).await;
         assert_eq!(peer.closes(), 1);
+    }
+
+    /// Zero gathered candidates must be reported, not sent.
+    ///
+    /// An answer with no candidates negotiates, looks fine, and dies half a
+    /// minute later as a generic timeout — while the real cause (no descriptors
+    /// left to bind a socket) is never mentioned anywhere.
+    #[test]
+    fn no_gathered_candidates_is_reported_as_a_fault() {
+        let verdict = gathering_verdict(0);
+        assert!(verdict.is_some(), "zero candidates must not pass silently");
+        let message = verdict.unwrap_or_default();
+        assert!(
+            message.contains("descriptor"),
+            "the message must name the likely cause: {message}"
+        );
+    }
+
+    /// A healthy gather says nothing. A warning on every session is a warning
+    /// nobody reads.
+    #[test]
+    fn a_healthy_gather_is_not_flagged() {
+        assert_eq!(gathering_verdict(8), None);
+        assert_eq!(gathering_verdict(1), None);
     }
 }
