@@ -179,32 +179,55 @@ where
     found
 }
 
-/// The value of `--title` in a shell command, honouring either quote.
+/// The value of the `--title` FLAG in a shell command.
 ///
 /// Written by hand rather than with a shell parser because the input is one
-/// known flag in commands this tool wrote itself, and a real parser would
-/// still have to cope with the heredocs the `--body` beside it uses.
+/// known flag in commands this tool wrote itself, and a real parser would still
+/// have to cope with the heredocs the `--body` beside it uses.
+///
+/// Two rules, both learned the hard way. The occurrence must sit at a token
+/// boundary and be followed by a QUOTE: the body of a pull request travels in
+/// the same command, and this project writes bodies that describe how this
+/// scanner works. One of them contained the phrase "the `gh pr create --title`
+/// that opened each pull request", and taking the first occurrence with a bare
+/// word after it filed a claim whose entire title was a backtick.
+///
+/// An unquoted title is therefore not accepted at all. A real one has spaces
+/// and is always quoted; a bare word after `--title` is punctuation from
+/// surrounding prose far more often than it is a title.
 fn title_argument(command: &str) -> Option<String> {
-    let rest = command.split("--title").nth(1)?.trim_start();
-    let mut chars = rest.chars();
-    let quote = chars.next()?;
-    if quote != '"' && quote != '\'' {
-        // Unquoted: a bare word, ending at whitespace.
-        let word = rest.split_whitespace().next()?;
-        return (!word.is_empty()).then(|| word.to_owned());
-    }
-    let mut title = String::new();
-    let mut escaped = false;
-    for ch in chars {
-        if escaped {
-            title.push(ch);
-            escaped = false;
-        } else if ch == '\\' && quote == '"' {
-            escaped = true;
-        } else if ch == quote {
-            return (!title.is_empty()).then_some(title);
-        } else {
-            title.push(ch);
+    let bytes = command.as_bytes();
+    for (offset, _) in command.match_indices("--title") {
+        // A token boundary before, so `--retitle` is not a match.
+        if offset > 0 && !bytes[offset - 1].is_ascii_whitespace() {
+            continue;
+        }
+        let rest = &command[offset + "--title".len()..];
+        // Whitespace must separate the flag from its value.
+        let trimmed = rest.trim_start();
+        if trimmed.len() == rest.len() {
+            continue;
+        }
+        let mut chars = trimmed.chars();
+        let Some(quote) = chars.next().filter(|c| *c == '"' || *c == '\'') else {
+            continue;
+        };
+        let mut title = String::new();
+        let mut escaped = false;
+        for ch in chars {
+            if escaped {
+                title.push(ch);
+                escaped = false;
+            } else if ch == '\\' && quote == '"' {
+                escaped = true;
+            } else if ch == quote {
+                if !title.is_empty() {
+                    return Some(title);
+                }
+                break;
+            } else {
+                title.push(ch);
+            }
         }
     }
     None
@@ -403,6 +426,46 @@ mod tests {
             ),
         ]);
         assert_eq!(found.len(), 1);
+    }
+
+    /// A `--title` mentioned in PROSE must not be mistaken for the flag.
+    ///
+    /// The body of a pull request is passed in the same command, and this
+    /// project writes bodies that describe how the scanner works. One such
+    /// body contained the phrase "the `gh pr create --title` that opened each
+    /// pull request", and taking the first occurrence produced a claim whose
+    /// entire title was a backtick.
+    #[test]
+    fn a_title_named_in_the_body_is_not_the_title() {
+        let command = concat!(
+            "gh pr create --base main ",
+            "--title \"The knowledge tier: a lifecycle\" ",
+            "--body \"Titles come from the `gh pr create --title` that opened it.\""
+        );
+        assert_eq!(
+            title_argument(command).as_deref(),
+            Some("The knowledge tier: a lifecycle")
+        );
+    }
+
+    /// And the other order: prose FIRST, flag second, which is what a body
+    /// written before the flag produces.
+    #[test]
+    fn a_title_named_before_the_flag_is_not_the_title() {
+        let command = concat!(
+            "gh pr create --body \"see `gh pr create --title` above\" ",
+            "--title \"the real one\""
+        );
+        assert_eq!(title_argument(command).as_deref(), Some("the real one"));
+    }
+
+    /// A stray backtick is punctuation from surrounding prose, not a title.
+    #[test]
+    fn punctuation_is_not_a_title() {
+        assert_eq!(
+            title_argument("gh pr create --title` that opened it").as_deref(),
+            None
+        );
     }
 
     #[test]
