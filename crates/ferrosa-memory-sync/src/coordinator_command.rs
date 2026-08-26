@@ -53,13 +53,31 @@ pub const COORDINATOR_CAPABILITY: &str = "coordinator_control";
 
 /// The plan entitlement that includes agent teams.
 ///
-/// Team features are a paid tier, so a peer needs BOTH: an account whose plan
-/// includes teams, and the capability granted to this particular device. They
-/// answer different questions -- what was bought, and what this device may do
-/// with it -- and neither implies the other. A shared account on an untrusted
-/// device should not reach the coordinator because the plan allows it, and a
-/// fully trusted device should not reach it on a plan that never included it.
+/// An entitlement TURNS FUNCTIONALITY OFF; it does not deny access to
+/// functionality that is present. That distinction decides where it belongs:
+/// not in the authorization path.
+///
+/// The two are different in kind. A capability check is a trust boundary, and
+/// getting it wrong is a privilege escalation. An entitlement is commercial,
+/// and getting it wrong means somebody used a feature they had not paid for --
+/// a billing problem. Running them through one decision makes the toggle look
+/// like a security control and buries the control that actually is one.
+///
+/// So an unentitled account does not get "permission denied" for teams. It gets
+/// a host with no team functionality on it, which is the same answer as a host
+/// that has no coordinator, because from the caller's side it is the same fact.
+/// The upgrade prompt belongs in the plan surface, driven by the entitlements
+/// the client already holds -- not by a refused command.
 pub const TEAMS_ENTITLEMENT: &str = "teams";
+
+/// Whether team functionality exists for this caller at all.
+///
+/// Both inputs mean the same thing to a caller: there is nothing here. A host
+/// without a coordinator has no team functionality installed; an account
+/// without the entitlement has none enabled. Neither is a refusal.
+pub fn teams_available(coordinator_installed: bool, entitlements: &[String]) -> bool {
+    coordinator_installed && entitlements.iter().any(|held| held == TEAMS_ENTITLEMENT)
+}
 
 impl CoordinatorCommand {
     /// Recognise a wire `command_type`, or `None` if it is not a coordinator
@@ -124,55 +142,42 @@ impl CoordinatorCommand {
 /// at this host. One shared "denied" would send someone to fix the wrong thing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefusedReason {
-    /// The account's plan does not include teams.
+    /// This device was not granted the capability.
     ///
-    /// An upgrade prompt, not an error. Rendering this as a permission failure
-    /// tells a paying customer they did something wrong when the honest answer
-    /// is that the feature is on a tier they have not bought.
-    NotInPlan {
-        /// The entitlement that would allow it.
-        required: &'static str,
-    },
-    /// The plan allows it but this device was not granted the capability.
+    /// The only true refusal here, and the only one that is a trust boundary.
     MissingCapability {
         /// What it needed.
         required: &'static str,
     },
-    /// This host has no coordinator configured.
+    /// There is no team functionality here.
     ///
-    /// Distinct from both refusals: nothing was denied, the machine simply does
-    /// not offer it. Collapsing them would tell an operator they lack
-    /// permission, or need to upgrade, on a host that has no coordinator at all.
+    /// Either the host runs no coordinator or the account has no teams
+    /// entitlement. Deliberately ONE answer: both mean "nothing here" from the
+    /// caller's side, and an unentitled caller learning which hosts run a
+    /// coordinator is information it has no use for.
     NotAvailable,
 }
 
 /// Decide whether `command` may proceed.
 ///
-/// `entitlements` come from the account's plan grant and `granted` from what
-/// this device was allowed. Both are the SERVER's view. Neither may ever be the
-/// capability list the client sent in its own subscribe frame: that is what the
-/// client ASKED for, and checking against it authorizes anything a caller cares
-/// to claim.
+/// `available` says whether team functionality exists here at all -- see
+/// [`teams_available`], which folds the entitlement in. `granted` is what this
+/// DEVICE was allowed, and is the actual security decision.
 ///
-/// Order matters. Availability is answered first so a host without a
-/// coordinator replies identically whether or not the caller was entitled --
-/// otherwise the difference between the two answers tells an unauthorized
-/// caller which hosts run one. Plan comes before capability so a customer on
-/// the wrong tier is told to upgrade rather than told their device is
-/// untrusted, which would be true but useless.
+/// `granted` must never be the capability list the client sent in its own
+/// subscribe frame: that is what the client ASKED for, and checking against it
+/// authorizes anything a caller cares to claim.
+///
+/// Availability is answered before the grant so that a host with nothing to
+/// offer replies the same way to everyone. Otherwise the difference between the
+/// two refusals tells an ungranted caller which hosts are worth attacking.
 pub fn authorize(
     command: CoordinatorCommand,
-    entitlements: &[String],
     granted: &[String],
-    coordinator_available: bool,
+    available: bool,
 ) -> Result<(), RefusedReason> {
-    if !coordinator_available {
+    if !available {
         return Err(RefusedReason::NotAvailable);
-    }
-    if !entitlements.iter().any(|held| held == TEAMS_ENTITLEMENT) {
-        return Err(RefusedReason::NotInPlan {
-            required: TEAMS_ENTITLEMENT,
-        });
     }
     let required = command.required_capability();
     if granted.iter().any(|held| held == required) {
@@ -186,12 +191,12 @@ pub fn authorize(
 mod tests {
     use super::*;
 
-    fn plan() -> Vec<String> {
-        vec![TEAMS_ENTITLEMENT.to_owned()]
-    }
-
     fn device() -> Vec<String> {
         vec![COORDINATOR_CAPABILITY.to_owned()]
+    }
+
+    fn plan() -> Vec<String> {
+        vec![TEAMS_ENTITLEMENT.to_owned()]
     }
 
     #[test]
@@ -244,48 +249,59 @@ mod tests {
         assert!(CoordinatorCommand::SecretFulfil.carries_secret());
     }
 
+    // --- availability: the entitlement toggle, not a refusal ---------------
+
     #[test]
-    fn a_peer_on_the_teams_plan_with_the_capability_is_authorized() {
+    fn teams_need_both_a_coordinator_and_the_entitlement() {
+        assert!(teams_available(true, &plan()));
+        assert!(!teams_available(false, &plan()), "no coordinator installed");
+        assert!(!teams_available(true, &[]), "entitlement not held");
+        assert!(!teams_available(false, &[]));
+    }
+
+    #[test]
+    fn an_unentitled_account_sees_absence_not_denial() {
+        // The correction that matters: an entitlement turns functionality OFF,
+        // it does not deny access to functionality that is present. Answering
+        // "permission denied" would make a billing state look like a trust
+        // decision.
+        let available = teams_available(true, &["memory".to_owned()]);
         assert_eq!(
-            authorize(CoordinatorCommand::TeammateList, &plan(), &device(), true),
+            authorize(CoordinatorCommand::TeammateList, &device(), available),
+            Err(RefusedReason::NotAvailable)
+        );
+    }
+
+    #[test]
+    fn an_unentitled_account_and_a_coordinatorless_host_are_indistinguishable() {
+        // One answer on purpose. Both mean "nothing here" from the caller's
+        // side, and the difference is of no use to anyone but an attacker
+        // mapping which hosts run a coordinator.
+        let unentitled = teams_available(true, &[]);
+        let no_coordinator = teams_available(false, &plan());
+        assert_eq!(
+            authorize(CoordinatorCommand::VmList, &device(), unentitled),
+            authorize(CoordinatorCommand::VmList, &device(), no_coordinator)
+        );
+    }
+
+    // --- authorization: the actual trust boundary --------------------------
+
+    #[test]
+    fn a_granted_device_on_an_available_host_is_authorized() {
+        assert_eq!(
+            authorize(CoordinatorCommand::TeammateList, &device(), true),
             Ok(())
         );
     }
 
     #[test]
-    fn a_plan_without_teams_is_an_upgrade_prompt_not_a_permission_error() {
-        // The distinction the tiering exists for. Telling a customer on a lower
-        // plan that permission was denied sends them to check device trust when
-        // the honest answer is that they have not bought the feature.
-        let lower = vec!["memory".to_owned()];
-        assert_eq!(
-            authorize(CoordinatorCommand::TeammateList, &lower, &device(), true),
-            Err(RefusedReason::NotInPlan {
-                required: TEAMS_ENTITLEMENT
-            })
-        );
-    }
-
-    #[test]
-    fn the_teams_plan_alone_does_not_authorize_an_ungranted_device() {
-        // Buying the tier is not the same as trusting the phone. A shared
-        // account on a device that was never granted coordinator control must
-        // not reach it because the plan allows it.
-        assert_eq!(
-            authorize(CoordinatorCommand::SecretFulfil, &plan(), &[], true),
-            Err(RefusedReason::MissingCapability {
-                required: COORDINATOR_CAPABILITY
-            })
-        );
-    }
-
-    #[test]
     fn agent_control_alone_does_not_authorize_coordinator_commands() {
-        // The reason this is its own capability. A peer allowed to launch an
-        // agent must not thereby be able to answer a credential prompt.
+        // Why this is its own capability. A peer allowed to launch an agent
+        // must not thereby be able to answer a credential prompt.
         let granted = vec!["agent_control".to_owned(), "memory_read".to_owned()];
         assert_eq!(
-            authorize(CoordinatorCommand::SecretFulfil, &plan(), &granted, true),
+            authorize(CoordinatorCommand::SecretFulfil, &granted, true),
             Err(RefusedReason::MissingCapability {
                 required: COORDINATOR_CAPABILITY
             })
@@ -293,62 +309,45 @@ mod tests {
     }
 
     #[test]
-    fn nothing_is_authorized_with_neither_plan_nor_grant() {
+    fn an_ungranted_device_is_refused_even_on_an_entitled_account() {
+        // Buying the tier is not the same as trusting the phone.
+        assert!(authorize(CoordinatorCommand::SecretFulfil, &[], true).is_err());
+    }
+
+    #[test]
+    fn nothing_is_authorized_without_a_grant() {
         for command in [
             CoordinatorCommand::TeammateList,
             CoordinatorCommand::SecretFulfil,
             CoordinatorCommand::VmList,
         ] {
             assert!(
-                authorize(command, &[], &[], true).is_err(),
-                "{command:?} was allowed with no plan and no grant"
+                authorize(command, &[], true).is_err(),
+                "{command:?} was allowed with no grant"
             );
         }
     }
 
     #[test]
-    fn a_host_without_a_coordinator_says_so_rather_than_refusing() {
-        // Not a permission problem and not a billing one. Telling an operator
-        // to upgrade, on a machine that has no coordinator at all, sends them
-        // to spend money that would change nothing.
+    fn availability_is_answered_before_the_grant() {
+        // A host with nothing to offer replies the same way to everyone, so the
+        // difference between refusals cannot be used to find hosts worth
+        // attacking.
         assert_eq!(
-            authorize(CoordinatorCommand::TeammateList, &plan(), &device(), false),
-            Err(RefusedReason::NotAvailable)
-        );
-    }
-
-    #[test]
-    fn availability_is_answered_before_plan_or_grant() {
-        // A host with no coordinator answers identically however entitled the
-        // caller is, so the difference between answers cannot be used to
-        // discover which hosts run one.
-        assert_eq!(
-            authorize(CoordinatorCommand::TeammateList, &[], &[], false),
+            authorize(CoordinatorCommand::TeammateList, &[], false),
             Err(RefusedReason::NotAvailable)
         );
         assert_eq!(
-            authorize(CoordinatorCommand::TeammateList, &plan(), &device(), false),
+            authorize(CoordinatorCommand::TeammateList, &device(), false),
             Err(RefusedReason::NotAvailable)
-        );
-    }
-
-    #[test]
-    fn plan_is_answered_before_device_grant() {
-        // Both are missing here. The customer needs to know about the tier
-        // first; "your device is untrusted" would be true and useless.
-        assert_eq!(
-            authorize(CoordinatorCommand::TeammateList, &[], &[], true),
-            Err(RefusedReason::NotInPlan {
-                required: TEAMS_ENTITLEMENT
-            })
         );
     }
 
     #[test]
     fn the_capability_name_matches_the_wire_string_the_app_sends() {
         // ferrosa-mobile serialises ControlCapability::CoordinatorControl as
-        // "coordinator_control". A mismatch here refuses every request from a
-        // correctly granted peer.
+        // "coordinator_control". A mismatch refuses every correctly granted
+        // peer.
         assert_eq!(COORDINATOR_CAPABILITY, "coordinator_control");
     }
 }
