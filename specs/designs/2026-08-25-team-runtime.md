@@ -391,11 +391,29 @@ not stop agent work; short enough that a runaway is bounded to a quarter hour of
 spend after anyone notices. Doubling it doubles the worst-case spend after a
 cut-off, which is why it is not a free knob.
 
-It is configurable behind a **granted permission**, because the two problems that
-motivate a change push in opposite directions — partitioning wants it longer,
-runaway spend wants it shorter — and each weakens the other guarantee. The
-change records which problem it was for, so a lease lengthened for a partition
-fixed last month is visible as exactly that.
+An operator can move it either direction, behind a **granted permission**, for
+three reasons that are not alike:
+
+| Reason | Direction | Planned? |
+|---|---|---|
+| network partitioning | longer | no |
+| out-of-control spend | shorter | no |
+| maintenance | longer | **yes** |
+
+Maintenance is the routine one and the one most easily missed. Rolling the
+memory cluster, restarting database nodes, replacing a coordinator — the control
+channel is *expected* to drop, and without a raised lease every coordinator
+expires and stops. Routine maintenance would become a full stop of agent work.
+
+**An override carries its own expiry.** A maintenance bump states how long it
+applies and reverts to the default by itself. This is what stops a temporary
+change becoming permanent: a lease raised for a window that closed in August is
+indistinguishable from policy until someone audits it, and an override that
+expires cannot rot that way. Match the window to the work — four hours of
+weakened break glass for twenty minutes of maintenance is three and a half hours
+of nothing gained.
+
+The change records which reason it was for, alongside who and when.
 
 **The ceiling is not part of that permission.** A permission to set lease time
 with no upper bound is a permission to disable break glass. There is a floor and
@@ -539,7 +557,8 @@ Seven tables. Names are indicative; the shapes are the commitment.
                       backends, declared privilege (container socket / cloud
                       credentials), lease duration and current expiry
     lease_policy      the configured duration, its floor and ceiling, who set
-                      it, when, and which problem it was for
+                      it, when, which reason it was for, and -- for a temporary
+                      override -- when it reverts
     sandbox_backend   per backend: declared capabilities, including whether it
                       can suspend and resume
     halt_hold         one row per active hold: scope (team/user/org), the
@@ -584,6 +603,8 @@ Focused on what this feature introduces, not a full STRIDE pass.
 | Pause mistaken for a spend brake | Bill keeps growing while the operator believes it stopped | — | the control names what it does; `halt all` is the global brake, `stop` and interrupt the narrower ones |
 | Halt released by a restart | Everything resumes after someone halted it on purpose | — | halt is written before it acts, and release is explicit |
 | A narrow release undoes a broad hold | A user resumes work an org halted | — | holds stack and release requires authority at the hold's scope |
+| Maintenance override never reverted | Break glass permanently weaker, looking like policy | override expiry | overrides are time-boxed and revert to the default themselves |
+| Maintenance run without raising the lease | Every coordinator stops partway through a routine cluster roll | leases expire together | raise it for the window; this is the expected operating procedure |
 | Lease tuned below reconnect time | Every network hiccup becomes an outage | expiries cluster on reconnects | a floor, enforced |
 | Lease expires on a transient reconnect | Agent work stops during ordinary network noise | expiry is rendered as expiry | lease duration tuned above reconnect time |
 | Coordinator far from its runtime | Coordinates nothing despite a healthy database link | — | adjacency is to the runtime, and is a placement requirement not a preference |
@@ -681,7 +702,8 @@ tested, not assumed. A run **stopped** before a restart and still stopped after
 it, which is the property Decision 9 exists for. A coordinator whose lease
 cannot renew stops on its own, which is the property that makes break glass
 survive a partition. A lease set beyond its ceiling is refused, and the refusal
-names the ceiling rather than silently clamping. Drafts retained across a pause,
+names the ceiling rather than silently clamping. A time-boxed override reverts
+to the default without anyone acting. Drafts retained across a pause,
 so the active team page can show every one.
 
 **Live, few and deliberate.** The writing team end to end, with a real model,
