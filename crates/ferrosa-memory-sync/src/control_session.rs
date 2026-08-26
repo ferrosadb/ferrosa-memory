@@ -293,6 +293,47 @@ impl BoundControlChannel {
     }
 }
 
+/// Anything that owns an ICE agent and therefore must be closed on every exit.
+///
+/// A trait rather than the concrete `RTCPeerConnection` for one reason: the
+/// guarantee is only observable, without it, by counting file descriptors on a
+/// machine that has been up for hours. Behind a trait it is a millisecond
+/// assertion against a fake.
+#[async_trait::async_trait]
+pub(crate) trait ClosablePeer: Send + Sync {
+    async fn close_peer(&self) -> Result<(), String>;
+}
+
+/// Close `peer` when `result` is an error, and return `result` either way.
+///
+/// Dropping an `RTCPeerConnection` does NOT release its ICE agent's UDP
+/// sockets — only `close()` does. Every `?` on a path that has already built a
+/// peer connection therefore leaks one socket per gathered candidate, and the
+/// failure paths are the common ones: a controller that goes away mid-handshake
+/// hits them on every attempt.
+async fn close_peer_on_error<T, E>(peer: &impl ClosablePeer, result: Result<T, E>) -> Result<T, E> {
+    if result.is_err() {
+        // The close error is deliberately swallowed. The caller is already
+        // holding a real failure, and replacing it with "close: ..." would
+        // report the cleanup instead of the cause.
+        if let Err(close_error) = peer.close_peer().await {
+            tracing::debug!(%close_error, "closing a failed peer connection also failed");
+        }
+    }
+    result
+}
+
+/// The real peer connection. `close()` is what releases the ICE agent's
+/// sockets; `drop` is not.
+#[async_trait::async_trait]
+impl ClosablePeer for Arc<RTCPeerConnection> {
+    async fn close_peer(&self) -> Result<(), String> {
+        RTCPeerConnection::close(self)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// Verify the peer's signed hello and return its ephemeral X25519 public key.
 pub fn verify_control_hello(
     identity: &InstancePublicIdentity,
@@ -414,89 +455,97 @@ pub async fn run_control_controller_session<S: ControlSignalingApi>(
             .await
             .map_err(|error| ControlSessionError::Rtc(format!("peer connection: {error}")))?,
     );
-    let data_channel = peer_connection
-        .create_data_channel(CONTROL_CHANNEL_LABEL, None)
-        .await
-        .map_err(|error| ControlSessionError::Rtc(format!("create data channel: {error}")))?;
-    let opened = install_open_notification(&data_channel);
-    let mut inbound = install_bounded_inbound(
-        &data_channel,
-        config.inbound_capacity,
-        config.max_frame_bytes,
-    );
 
-    let mut gather = peer_connection.gathering_complete_promise().await;
-    let offer = peer_connection
-        .create_offer(None)
-        .await
-        .map_err(|error| ControlSessionError::Rtc(format!("create offer: {error}")))?;
-    peer_connection
-        .set_local_description(offer)
-        .await
-        .map_err(|error| ControlSessionError::Rtc(format!("set local offer: {error}")))?;
-    let _ = gather.recv().await;
-    let local = peer_connection
-        .local_description()
-        .await
-        .ok_or_else(|| ControlSessionError::Rtc("missing local offer".to_owned()))?;
-    api.control_post_signal(
-        session_id,
-        &own_fingerprint,
-        &BrokerSignal::SdpOffer(local.sdp.clone()),
-    )
-    .await?;
+    // Same guarantee as the server half, and the same reason: everything below
+    // can fail with the peer connection already built and gathering candidates.
+    let bind = async {
+        let data_channel = peer_connection
+            .create_data_channel(CONTROL_CHANNEL_LABEL, None)
+            .await
+            .map_err(|error| ControlSessionError::Rtc(format!("create data channel: {error}")))?;
+        let opened = install_open_notification(&data_channel);
+        let mut inbound = install_bounded_inbound(
+            &data_channel,
+            config.inbound_capacity,
+            config.max_frame_bytes,
+        );
 
-    let answer_sdp = poll_control_signal(
-        api,
-        session_id,
-        &own_fingerprint,
-        config,
-        "SDP answer",
-        |signal| match signal {
-            BrokerSignal::SdpAnswer(value) => Some(value),
-            _ => None,
-        },
-    )
-    .await?;
-    let answer = RTCSessionDescription::answer(answer_sdp.clone())
-        .map_err(|error| ControlSessionError::Rtc(format!("answer SDP: {error}")))?;
-    peer_connection
-        .set_remote_description(answer)
-        .await
-        .map_err(|error| ControlSessionError::Rtc(format!("set remote answer: {error}")))?;
-    wait_channel_open(&data_channel, &opened, config.connect_timeout).await?;
+        let mut gather = peer_connection.gathering_complete_promise().await;
+        let offer = peer_connection
+            .create_offer(None)
+            .await
+            .map_err(|error| ControlSessionError::Rtc(format!("create offer: {error}")))?;
+        peer_connection
+            .set_local_description(offer)
+            .await
+            .map_err(|error| ControlSessionError::Rtc(format!("set local offer: {error}")))?;
+        let _ = gather.recv().await;
+        let local = peer_connection
+            .local_description()
+            .await
+            .ok_or_else(|| ControlSessionError::Rtc("missing local offer".to_owned()))?;
+        api.control_post_signal(
+            session_id,
+            &own_fingerprint,
+            &BrokerSignal::SdpOffer(local.sdp.clone()),
+        )
+        .await?;
 
-    let offer_hash = sha256_hex(local.sdp.as_bytes());
-    let answer_hash = sha256_hex(answer_sdp.as_bytes());
-    let (ephemeral_secret, ephemeral_public) = fresh_ephemeral();
-    let hello = signed_hello(
-        identity,
-        session_id,
-        ControlPeerRole::Controller,
-        &ephemeral_public,
-        &offer_hash,
-        &answer_hash,
-    )?;
-    send_binding_hello(&data_channel, &hello, config.max_frame_bytes).await?;
-    let peer_hello = recv_binding_hello(&mut inbound, config.bind_timeout).await?;
-    let peer_public = verify_control_hello(
-        &peer_hello.identity,
-        &peer_hello.envelope,
-        &server_fingerprint,
-        session_id,
-        ControlPeerRole::Server,
-        &offer_hash,
-        &answer_hash,
-    )?;
-    let session_key = derive_session_key(ephemeral_secret, &peer_public);
+        let answer_sdp = poll_control_signal(
+            api,
+            session_id,
+            &own_fingerprint,
+            config,
+            "SDP answer",
+            |signal| match signal {
+                BrokerSignal::SdpAnswer(value) => Some(value),
+                _ => None,
+            },
+        )
+        .await?;
+        let answer = RTCSessionDescription::answer(answer_sdp.clone())
+            .map_err(|error| ControlSessionError::Rtc(format!("answer SDP: {error}")))?;
+        peer_connection
+            .set_remote_description(answer)
+            .await
+            .map_err(|error| ControlSessionError::Rtc(format!("set remote answer: {error}")))?;
+        wait_channel_open(&data_channel, &opened, config.connect_timeout).await?;
 
-    Ok(BoundControlChannel {
-        peer_connection,
-        data_channel,
-        inbound,
-        session_key,
-        max_frame_bytes: config.max_frame_bytes,
-    })
+        let offer_hash = sha256_hex(local.sdp.as_bytes());
+        let answer_hash = sha256_hex(answer_sdp.as_bytes());
+        let (ephemeral_secret, ephemeral_public) = fresh_ephemeral();
+        let hello = signed_hello(
+            identity,
+            session_id,
+            ControlPeerRole::Controller,
+            &ephemeral_public,
+            &offer_hash,
+            &answer_hash,
+        )?;
+        send_binding_hello(&data_channel, &hello, config.max_frame_bytes).await?;
+        let peer_hello = recv_binding_hello(&mut inbound, config.bind_timeout).await?;
+        let peer_public = verify_control_hello(
+            &peer_hello.identity,
+            &peer_hello.envelope,
+            &server_fingerprint,
+            session_id,
+            ControlPeerRole::Server,
+            &offer_hash,
+            &answer_hash,
+        )?;
+        let session_key = derive_session_key(ephemeral_secret, &peer_public);
+
+        Ok(BoundControlChannel {
+            peer_connection: Arc::clone(&peer_connection),
+            data_channel,
+            inbound,
+            session_key,
+            max_frame_bytes: config.max_frame_bytes,
+        })
+    }
+    .await;
+
+    close_peer_on_error(&peer_connection, bind).await
 }
 
 /// Accept and establish the exact-target Ferrosa Memory server half, returning
@@ -555,98 +604,115 @@ pub async fn run_control_server_session<S: ControlSignalingApi>(
         })
     }));
 
-    let offer_sdp = poll_control_signal(
-        api,
-        session_id,
-        &own_fingerprint,
-        config,
-        "SDP offer",
-        |signal| match signal {
-            BrokerSignal::SdpOffer(value) => Some(value),
-            _ => None,
-        },
-    )
-    .await?;
-    tracing::info!(
-        candidate_count = offer_sdp
-            .lines()
-            .filter(|line| line.starts_with("a=candidate:"))
-            .count(),
-        "received gathered control offer"
-    );
-    let offer = RTCSessionDescription::offer(offer_sdp.clone())
-        .map_err(|error| ControlSessionError::Rtc(format!("offer SDP: {error}")))?;
-    peer_connection
-        .set_remote_description(offer)
-        .await
-        .map_err(|error| ControlSessionError::Rtc(format!("set remote offer: {error}")))?;
-    let mut gather = peer_connection.gathering_complete_promise().await;
-    let answer = peer_connection
-        .create_answer(None)
-        .await
-        .map_err(|error| ControlSessionError::Rtc(format!("create answer: {error}")))?;
-    peer_connection
-        .set_local_description(answer)
-        .await
-        .map_err(|error| ControlSessionError::Rtc(format!("set local answer: {error}")))?;
-    let _ = gather.recv().await;
-    let local = peer_connection
-        .local_description()
-        .await
-        .ok_or_else(|| ControlSessionError::Rtc("missing local answer".to_owned()))?;
-    tracing::info!(
-        candidate_count = local
-            .sdp
-            .lines()
-            .filter(|line| line.starts_with("a=candidate:"))
-            .count(),
-        "sending gathered control answer"
-    );
-    api.control_post_signal(
-        session_id,
-        &own_fingerprint,
-        &BrokerSignal::SdpAnswer(local.sdp.clone()),
-    )
-    .await?;
-
-    let (data_channel, opened, mut inbound) =
-        tokio::time::timeout(config.connect_timeout, channel_receiver.recv())
+    // Everything below can fail, and by this point the peer connection exists
+    // and is about to gather candidates — a UDP socket per candidate. A bare
+    // `?` here drops it WITHOUT closing it, and dropping an RTCPeerConnection
+    // does not release its ICE agent's sockets.
+    //
+    // So the rest of the bind runs in an inner future whose result goes through
+    // `close_peer_on_error`. That is deliberately not a `?` chain: the failure
+    // paths are the COMMON ones — a controller that goes away mid-handshake
+    // hits them on every attempt — and each one used to cost sockets
+    // permanently.
+    let bind = async {
+        let offer_sdp = poll_control_signal(
+            api,
+            session_id,
+            &own_fingerprint,
+            config,
+            "SDP offer",
+            |signal| match signal {
+                BrokerSignal::SdpOffer(value) => Some(value),
+                _ => None,
+            },
+        )
+        .await?;
+        tracing::info!(
+            candidate_count = offer_sdp
+                .lines()
+                .filter(|line| line.starts_with("a=candidate:"))
+                .count(),
+            "received gathered control offer"
+        );
+        let offer = RTCSessionDescription::offer(offer_sdp.clone())
+            .map_err(|error| ControlSessionError::Rtc(format!("offer SDP: {error}")))?;
+        peer_connection
+            .set_remote_description(offer)
             .await
-            .map_err(|_| ControlSessionError::Timeout("control data channel"))?
-            .ok_or(ControlSessionError::ChannelClosed)?;
-    wait_channel_open(&data_channel, &opened, config.connect_timeout).await?;
+            .map_err(|error| ControlSessionError::Rtc(format!("set remote offer: {error}")))?;
+        let mut gather = peer_connection.gathering_complete_promise().await;
+        let answer = peer_connection
+            .create_answer(None)
+            .await
+            .map_err(|error| ControlSessionError::Rtc(format!("create answer: {error}")))?;
+        peer_connection
+            .set_local_description(answer)
+            .await
+            .map_err(|error| ControlSessionError::Rtc(format!("set local answer: {error}")))?;
+        let _ = gather.recv().await;
+        let local = peer_connection
+            .local_description()
+            .await
+            .ok_or_else(|| ControlSessionError::Rtc("missing local answer".to_owned()))?;
+        tracing::info!(
+            candidate_count = local
+                .sdp
+                .lines()
+                .filter(|line| line.starts_with("a=candidate:"))
+                .count(),
+            "sending gathered control answer"
+        );
+        api.control_post_signal(
+            session_id,
+            &own_fingerprint,
+            &BrokerSignal::SdpAnswer(local.sdp.clone()),
+        )
+        .await?;
 
-    let offer_hash = sha256_hex(offer_sdp.as_bytes());
-    let answer_hash = sha256_hex(local.sdp.as_bytes());
-    let peer_hello = recv_binding_hello(&mut inbound, config.bind_timeout).await?;
-    let peer_public = verify_control_hello(
-        &peer_hello.identity,
-        &peer_hello.envelope,
-        &controller_fingerprint,
-        session_id,
-        ControlPeerRole::Controller,
-        &offer_hash,
-        &answer_hash,
-    )?;
-    let (ephemeral_secret, ephemeral_public) = fresh_ephemeral();
-    let hello = signed_hello(
-        identity,
-        session_id,
-        ControlPeerRole::Server,
-        &ephemeral_public,
-        &offer_hash,
-        &answer_hash,
-    )?;
-    send_binding_hello(&data_channel, &hello, config.max_frame_bytes).await?;
-    let session_key = derive_session_key(ephemeral_secret, &peer_public);
+        let (data_channel, opened, mut inbound) =
+            tokio::time::timeout(config.connect_timeout, channel_receiver.recv())
+                .await
+                .map_err(|_| ControlSessionError::Timeout("control data channel"))?
+                .ok_or(ControlSessionError::ChannelClosed)?;
+        wait_channel_open(&data_channel, &opened, config.connect_timeout).await?;
 
-    Ok(BoundControlChannel {
-        peer_connection,
-        data_channel,
-        inbound,
-        session_key,
-        max_frame_bytes: config.max_frame_bytes,
-    })
+        let offer_hash = sha256_hex(offer_sdp.as_bytes());
+        let answer_hash = sha256_hex(local.sdp.as_bytes());
+        let peer_hello = recv_binding_hello(&mut inbound, config.bind_timeout).await?;
+        let peer_public = verify_control_hello(
+            &peer_hello.identity,
+            &peer_hello.envelope,
+            &controller_fingerprint,
+            session_id,
+            ControlPeerRole::Controller,
+            &offer_hash,
+            &answer_hash,
+        )?;
+        let (ephemeral_secret, ephemeral_public) = fresh_ephemeral();
+        let hello = signed_hello(
+            identity,
+            session_id,
+            ControlPeerRole::Server,
+            &ephemeral_public,
+            &offer_hash,
+            &answer_hash,
+        )?;
+        send_binding_hello(&data_channel, &hello, config.max_frame_bytes).await?;
+        let session_key = derive_session_key(ephemeral_secret, &peer_public);
+
+        Ok(BoundControlChannel {
+            peer_connection: Arc::clone(&peer_connection),
+            data_channel,
+            inbound,
+            session_key,
+            max_frame_bytes: config.max_frame_bytes,
+        })
+    }
+    .await;
+
+    // The single exit. Every `?` inside `bind` now lands here with the peer
+    // connection still alive, so it can be closed before the error leaves.
+    close_peer_on_error(&peer_connection, bind).await
 }
 
 fn validate_config(config: &ControlSessionConfig) -> Result<(), ControlSessionError> {
@@ -2022,5 +2088,107 @@ mod tests {
                 .expect("reason")
                 .contains("durable control store")
         );
+    }
+
+    /// A recording stand-in for the peer connection.
+    ///
+    /// The leak this guards against went unnoticed precisely because the only
+    /// way to observe it was to count file descriptors on a machine that had
+    /// been up for hours. Counting calls on a fake makes it a millisecond
+    /// assertion instead.
+    struct RecordingPeer {
+        closes: AtomicUsize,
+        close_result: Result<(), String>,
+    }
+
+    impl RecordingPeer {
+        fn new() -> Self {
+            Self {
+                closes: AtomicUsize::new(0),
+                close_result: Ok(()),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                closes: AtomicUsize::new(0),
+                close_result: Err("ICE agent already gone".to_owned()),
+            }
+        }
+
+        fn closes(&self) -> usize {
+            self.closes.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ClosablePeer for RecordingPeer {
+        async fn close_peer(&self) -> Result<(), String> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            self.close_result.clone()
+        }
+    }
+
+    /// A success is passed straight through, and nothing is closed.
+    ///
+    /// The starter case, and a real requirement: closing a peer connection that
+    /// is about to serve a session would end the session it just established.
+    #[tokio::test]
+    async fn a_successful_result_is_not_closed() {
+        let peer = RecordingPeer::new();
+        let result: Result<u8, String> = close_peer_on_error(&peer, Ok(7)).await;
+        assert_eq!(result, Ok(7));
+        assert_eq!(peer.closes(), 0, "a healthy session must not be torn down");
+    }
+
+    /// THE BUG. A failed bind must close the peer connection it already built.
+    ///
+    /// `run_control_server_session` creates the peer connection, lets it gather
+    /// candidates — binding a UDP socket per candidate — and then has a bare `?`
+    /// after it. Every failure there dropped the connection without closing it.
+    /// Dropping does not release the sockets; only `close()` does.
+    ///
+    /// Measured on a real machine: 226 leaked UDP sockets against a 256
+    /// descriptor limit after ~11 hours, after which the process could gather no
+    /// candidates at all and reported the gateway as unreachable.
+    #[tokio::test]
+    async fn a_failed_bind_closes_the_peer_connection_it_built() {
+        let peer = RecordingPeer::new();
+        let result: Result<u8, String> = close_peer_on_error(
+            &peer,
+            Err("timed out waiting for control data channel".to_owned()),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(peer.closes(), 1, "the failed session leaked its ICE agent");
+    }
+
+    /// Closing must not swallow or replace the real failure. The cleanup is
+    /// never what the operator needs to read; the cause is.
+    #[tokio::test]
+    async fn the_original_error_survives_the_close() {
+        let peer = RecordingPeer::new();
+        let result: Result<u8, String> =
+            close_peer_on_error(&peer, Err("broker transport error".to_owned())).await;
+        assert_eq!(result, Err("broker transport error".to_owned()));
+    }
+
+    /// A close that itself fails still leaves the original error intact.
+    #[tokio::test]
+    async fn a_failing_close_does_not_mask_the_cause() {
+        let peer = RecordingPeer::failing();
+        let result: Result<u8, String> =
+            close_peer_on_error(&peer, Err("attestation rejected".to_owned())).await;
+        assert_eq!(result, Err("attestation rejected".to_owned()));
+        assert_eq!(peer.closes(), 1, "close must still be attempted");
+    }
+
+    /// Exactly once. A double close races the first teardown and logs an error
+    /// that reads like a new fault.
+    #[tokio::test]
+    async fn a_failed_session_is_closed_exactly_once() {
+        let peer = RecordingPeer::new();
+        let _: Result<u8, String> = close_peer_on_error(&peer, Err("x".to_owned())).await;
+        assert_eq!(peer.closes(), 1);
     }
 }
