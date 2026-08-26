@@ -83,6 +83,9 @@ pub struct KnowledgeRow {
     /// The agent that made it, so a claim can be sent back rather than
     /// silently rejected.
     pub author_agent: Option<String>,
+    /// The session that made it. What a replacement agent picks up, and what
+    /// the memory list shows beside every other row.
+    pub author_session: Option<Uuid>,
 }
 
 impl From<KnowledgeItem> for KnowledgeRow {
@@ -96,6 +99,7 @@ impl From<KnowledgeItem> for KnowledgeRow {
             repo: item.repo,
             expires_at: item.expires_at,
             author_agent: item.author_agent,
+            author_session: item.author_session,
         }
     }
 }

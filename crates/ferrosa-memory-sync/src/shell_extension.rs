@@ -514,7 +514,7 @@ impl ShellExtension {
             Ok(map) => serde_json::json!({
                 "type": "shell_memory_tiers",
                 "reachable": true,
-                "tiers": map.tiers.iter().map(|row| serde_json::json!({
+                "tiers": Self::with_claims_row(map.tiers.iter().map(|row| serde_json::json!({
                     "tier": row.tier.as_str(),
                     // A count the store could not give is left as the derived
                     // one rather than replaced by a zero: a wrong number is
@@ -525,11 +525,7 @@ impl ShellExtension {
                         row.count
                     },
                     "roots": row.roots,
-                })).chain(claims.map(|count| serde_json::json!({
-                    "tier": "claims",
-                    "count": count,
-                    "roots": Vec::<String>::new(),
-                }))).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(), claims),
                 // Both numbers are the map's honesty. `sourced == 0` means
                 // nothing records a source yet, which is a build step and not
                 // an empty library; `unclassified` is the hole in the rules.
@@ -552,6 +548,147 @@ impl ShellExtension {
     /// Paged, and the page is small: this frame carries titles, and a tier can
     /// hold tens of thousands of them. The task list taught this the expensive
     /// way at 194 KiB.
+    /// Put the claims row between Information and Knowledge.
+    ///
+    /// The device renders the tiers reversed, so this array is in DIKW order
+    /// and the screen reads Wisdom, Knowledge, Claims, Information, Data. The
+    /// queue belongs directly below the tier it feeds: a claim becomes
+    /// knowledge when a person approves it, and falls to Information when it
+    /// lapses unread. Appended at the end it rendered above Wisdom, at the top
+    /// of the map, which puts unjudged work above everything ratified.
+    fn with_claims_row(
+        mut tiers: Vec<serde_json::Value>,
+        claims: Option<usize>,
+    ) -> Vec<serde_json::Value> {
+        let Some(count) = claims else { return tiers };
+        let row = serde_json::json!({
+            "tier": "claims",
+            "count": count,
+            "roots": Vec::<String>::new(),
+        });
+        // Before Knowledge, wherever the map put it. Positional insertion by a
+        // hardcoded index would silently move if a tier were ever added.
+        match tiers
+            .iter()
+            .position(|tier| tier.get("tier").and_then(|t| t.as_str()) == Some("knowledge"))
+        {
+            Some(index) => tiers.insert(index, row),
+            // No Knowledge row at all is not a map this understands; appending
+            // beats dropping the count on the floor.
+            None => tiers.push(row),
+        }
+        tiers
+    }
+
+    /// One page of a tier the knowledge store holds rather than the entity
+    /// plane.
+    ///
+    /// Projected into the same row shape as the derived tiers, so the device
+    /// renders one kind of list: an id, the session that made it, a title, and
+    /// the repository standing in for a source root.
+    async fn stored_tier_frames(
+        &self,
+        tier: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Vec<serde_json::Value> {
+        let Some(view) = self.knowledge().await else {
+            let reason = if self.memory_tenant.is_none() {
+                "no memory tenant is configured on this machine"
+            } else {
+                "the knowledge store could not be reached"
+            };
+            return vec![serde_json::json!({
+                "type": "shell_memory_items",
+                "tier": tier,
+                "reachable": false,
+                "reason": reason,
+                "items": [],
+            })];
+        };
+        let limit = limit.clamp(1, MEMORY_PAGE_MAX);
+        let first_page = cursor.is_none();
+
+        // Claims are read by expiry, which is a seek across day buckets and
+        // has no cursor of its own; knowledge pages by `page_key`.
+        let (items, next_cursor) = if tier == "claims" {
+            match view.claims(limit).await {
+                Ok(rows) => (
+                    rows.into_iter()
+                        .map(|row| (row.knowledge_id, row.author_session, row.title, row.repo))
+                        .collect::<Vec<_>>(),
+                    None,
+                ),
+                Err(error) => return vec![Self::stored_tier_failure(tier, &error)],
+            }
+        } else {
+            match view.knowledge(cursor, limit).await {
+                Ok(page) => (
+                    page.items
+                        .into_iter()
+                        .map(|item| {
+                            (
+                                item.knowledge_id,
+                                item.author_session,
+                                item.title,
+                                item.repo,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    page.next_cursor,
+                ),
+                Err(error) => return vec![Self::stored_tier_failure(tier, &error)],
+            }
+        };
+
+        let rows: Vec<serde_json::Value> = items
+            .iter()
+            .map(|(id, session, title, repo)| {
+                serde_json::json!({
+                    "id": id,
+                    "session": session,
+                    "title": bounded_title(title),
+                    "root": repo,
+                })
+            })
+            .collect();
+
+        if rows.is_empty() {
+            return vec![serde_json::json!({
+                "type": "shell_memory_items",
+                "tier": tier, "reachable": true, "first": first_page,
+                "next_cursor": next_cursor,
+                "items": [],
+            })];
+        }
+        let frame_count = rows.len().div_ceil(MEMORY_ITEMS_PER_FRAME);
+        rows.chunks(MEMORY_ITEMS_PER_FRAME)
+            .enumerate()
+            .map(|(index, chunk)| {
+                serde_json::json!({
+                    "type": "shell_memory_items",
+                    "tier": tier,
+                    "reachable": true,
+                    "first": first_page && index == 0,
+                    "items": chunk,
+                    // Only the LAST frame carries the cursor, or a device asks
+                    // for the next page while this one is still arriving.
+                    "next_cursor": if index + 1 == frame_count { next_cursor.clone() } else { None },
+                })
+            })
+            .collect()
+    }
+
+    fn stored_tier_failure(tier: &str, error: &anyhow::Error) -> serde_json::Value {
+        serde_json::json!({
+            "type": "shell_memory_items",
+            "tier": tier,
+            "reachable": false,
+            "reason": bounded_reason(format_args!("{error:#}")),
+            "items": [],
+        })
+    }
+
     async fn memory_items_frames(
         &self,
         tier: &str,
@@ -559,6 +696,13 @@ impl ShellExtension {
         cursor: Option<&str>,
         limit: usize,
     ) -> Vec<serde_json::Value> {
+        // Knowledge and claims are STORED, not derived from a source path, so
+        // they are not in the entity plane this pages. Counting them from the
+        // store and then listing them from the entity plane gave a tier that
+        // said 184 and opened empty, which is worse than either number alone.
+        if tier == "knowledge" || tier == "claims" {
+            return self.stored_tier_frames(tier, cursor, limit).await;
+        }
         let Some(parsed) = ferrosa_memory_core::tiers::Tier::parse(tier) else {
             return vec![serde_json::json!({
                 "type": "shell_memory_items",
@@ -2716,6 +2860,56 @@ mod output_framing_tests {
             "these kinds have handlers but are not claimed, so every one of them \
              would reach the built-in dispatcher and close the channel: {missing:?}"
         );
+    }
+
+    /// Claims read directly below Knowledge on the device.
+    ///
+    /// The device renders the array reversed, so DIKW order here becomes
+    /// Wisdom, Knowledge, Claims, Information, Data on screen. Appended at the
+    /// end, the row rendered at the very TOP of the map — unjudged work above
+    /// everything a person had ratified.
+    #[test]
+    fn the_claims_row_sits_between_information_and_knowledge() {
+        let tiers: Vec<serde_json::Value> = ["data", "information", "knowledge", "wisdom"]
+            .iter()
+            .map(|tier| serde_json::json!({ "tier": tier, "count": 1, "roots": [] }))
+            .collect();
+
+        let placed = ShellExtension::with_claims_row(tiers, Some(14));
+        let order: Vec<&str> = placed
+            .iter()
+            .filter_map(|row| row.get("tier").and_then(|t| t.as_str()))
+            .collect();
+        assert_eq!(
+            order,
+            ["data", "information", "claims", "knowledge", "wisdom"]
+        );
+
+        // What the operator actually sees.
+        let shown: Vec<&str> = order.into_iter().rev().collect();
+        assert_eq!(
+            shown,
+            ["wisdom", "knowledge", "claims", "information", "data"]
+        );
+    }
+
+    /// A store that could not be asked adds no row, rather than a zero that
+    /// reads as "no claims".
+    #[test]
+    fn an_unavailable_claim_count_adds_no_row() {
+        let tiers = vec![serde_json::json!({ "tier": "knowledge", "count": 3, "roots": [] })];
+        let placed = ShellExtension::with_claims_row(tiers, None);
+        assert_eq!(placed.len(), 1);
+    }
+
+    /// A map with no Knowledge row at all is not one this understands, but the
+    /// count must not be dropped on the floor.
+    #[test]
+    fn a_map_without_knowledge_still_carries_the_claims() {
+        let tiers = vec![serde_json::json!({ "tier": "data", "count": 1, "roots": [] })];
+        let placed = ShellExtension::with_claims_row(tiers, Some(2));
+        assert_eq!(placed.len(), 2);
+        assert_eq!(placed[1]["tier"], "claims");
     }
 
     /// A title as long as the STORE permits must still fit a datagram.
