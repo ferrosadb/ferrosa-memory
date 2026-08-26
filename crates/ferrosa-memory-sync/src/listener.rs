@@ -499,6 +499,21 @@ async fn serve_control_session<S, R, T>(
     for extension in &attach {
         extension.on_closed(offer.session_id).await;
     }
+
+    // The peer connection, not just the extensions. This comment used to claim
+    // an "unconditional close" that was never here: `channel` was dropped at
+    // the end of scope, and dropping an RTCPeerConnection does NOT release its
+    // ICE agent's UDP sockets. Every completed session leaked one per gathered
+    // candidate, which on a real machine reached 226 sockets against a 256
+    // descriptor limit in about eleven hours — after which the process could
+    // gather no candidates at all and reported the gateway as unreachable.
+    //
+    // Ignoring the result is deliberate: the session is over either way, and a
+    // close error here is not something the operator can act on. It is logged
+    // at debug inside the channel.
+    if let Err(error) = channel.close().await {
+        tracing::debug!(session_id = %offer.session_id, %error, "closing the peer connection failed");
+    }
     tracing::info!(session_id = %offer.session_id, "control session closed");
 }
 
