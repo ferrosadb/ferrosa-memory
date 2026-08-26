@@ -28,7 +28,7 @@ A team is a graph the user draws: agents as nodes, and edges saying when one
 agent involves another. The first team is a writing team — researcher, writer,
 reviewer — producing an agent team knowledge claim for human review.
 
-The shape of the problem forces seventeen decisions before any code, because each one
+The shape of the problem forces eighteen decisions before any code, because each one
 changes the schema or the trust boundary rather than the interface.
 
 ## Decision 1: The runtime lives in Ferrosa Memory
@@ -697,6 +697,65 @@ Three controls, none of which is sufficient alone:
 3. **The asking agent's provenance is one click away**: what it read, and from
    where. A request from an agent that just fetched an unfamiliar page is a
    different proposition from one that has been working from your own corpus.
+
+## Decision 18: The coordinator ships from a private repository, and the seam is public
+
+The coordinator lives in a private repository for now. Decision 13 already
+allowed it; this makes it the plan and states what it costs.
+
+### What may not go with it
+
+The governing rule is that **no private component makes an authorisation
+decision**. A private component that authorises can be swapped for one that
+authorises differently, and the swap is invisible to anyone auditing the public
+half. So these stay in Ferrosa Memory, public and audited, whatever repository
+the coordinator ships from:
+
+| Decision | Stays public because |
+|---|---|
+| `send_to` target check (D2) | it decides what a peer may do |
+| lease granting (D13) | it decides whether a coordinator may execute at all |
+| halt holds and release authority (D11) | it decides who may lift a stop |
+| whether a secret `name` is permitted (D17) | it decides what an agent may ask a human for |
+| node capability declarations (D3) | it decides what an agent is allowed to hold |
+
+The coordinator *enforces* every one of those and *decides* none of them. It
+reads a lease and stops when it lapses; it does not grant itself one.
+
+### The seam has to be real
+
+A private implementation attaches through a public trait, and the trait is not
+enough on its own. Three things must hold, and the third is the one that decays
+quietly:
+
+- the trait is defined in the public repository,
+- a **working** reference implementation ships publicly and is exercised by
+  public CI — not a stub that panics,
+- the public repository builds, tests and ships with no access to the private
+  one.
+
+A trait with no in-tree implementation is a contract nobody compiles against. It
+drifts until the day someone tries to swap it, and then the drift is discovered
+all at once. The reference implementation is what keeps the seam honest, so it
+has to do something real: run a fake sandbox, take a lease, expire it.
+
+### Which private repository
+
+Not settled. `ferrosa-streamer` is the nearest analogue and already carries the
+private platform half, but its subject is capture and this one's is machines — a
+shared repository would put two unrelated products behind one release cadence. A
+dedicated `ferrosa-coordinator` is the cleaner shape and the more work.
+
+Worth deciding before the first commit lands, because moving a repository later
+is cheap and moving its history is not.
+
+### Public is one-way
+
+Recorded because it is the failure that cannot be undone: a branch pushed to a
+public repository stays fetchable by SHA after the branch is deleted. When
+placement is uncertain, the private repository is the reversible choice —
+private to public costs nothing, public to private costs a support request and
+still leaves copies.
 
 ## Consequences
 
