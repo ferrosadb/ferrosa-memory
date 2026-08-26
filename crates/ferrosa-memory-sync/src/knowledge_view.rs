@@ -3,7 +3,7 @@
 //! a claim's expiry drives its order, and when a decision that cannot legally
 //! be made is refused rather than written.
 //! Last revised: 2026-08-25
-//! Last changed: new — the approved tier, the claims queue, and the decisions.
+//! Last changed: the claims horizon missed every default-expiry claim by a day.
 //!
 //! # Why two lists and not one
 //!
@@ -42,10 +42,19 @@ use uuid::Uuid;
 /// How many days ahead the claims list looks for things about to lapse.
 ///
 /// The list walks day buckets forward from today, so this is a bound on WORK —
-/// how many partitions one page may touch — not on the answer. Fourteen covers
-/// the default thirty-day window's urgent half without reading a month of
-/// mostly-empty days.
-const CLAIM_HORIZON_DAYS: i64 = 14;
+/// how many partitions one page may touch — not on the answer.
+///
+/// It must cover the whole window a claim can be filed with, or claims are
+/// silently invisible. It did not: the horizon was fourteen days and the
+/// default claim expiry is fourteen days, so every claim filed with the default
+/// landed one day PAST the last bucket read and the queue showed nothing while
+/// holding fourteen items. An off-by-one in a bound is indistinguishable from
+/// an empty queue.
+///
+/// Tied to the expiry a decision gets, which is the longest window anything in
+/// this system is filed with, and walked inclusively so a claim expiring
+/// exactly at the far edge is still found.
+const CLAIM_HORIZON_DAYS: i64 = ferrosa_memory_core::knowledge::DEFAULT_EXPIRY_DAYS;
 
 /// The orders the claims list can actually be served in.
 ///
@@ -137,7 +146,10 @@ impl KnowledgeView {
         anyhow::ensure!(limit > 0, "a list of no claims is not a list");
         let today = chrono::Utc::now();
         let mut rows: Vec<KnowledgeRow> = Vec::new();
-        for offset in 0..CLAIM_HORIZON_DAYS {
+        // Inclusive: a claim expiring exactly at the horizon is still a claim,
+        // and an exclusive range put every default-expiry claim one day out of
+        // reach.
+        for offset in 0..=CLAIM_HORIZON_DAYS {
             if rows.len() >= limit {
                 break;
             }
@@ -217,5 +229,57 @@ impl KnowledgeView {
             items,
             next_cursor: next,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrosa_memory_core::knowledge::DEFAULT_EXPIRY_DAYS;
+
+    /// The horizon must reach the far edge of the window claims are filed with.
+    ///
+    /// It did not, and the failure was invisible: the horizon was 14 days, the
+    /// default claim expiry was 14 days, and an exclusive range read buckets
+    /// for today..today+13. Every claim filed with the default landed in the
+    /// day-14 bucket, one past the last one read, so a queue holding fourteen
+    /// items showed nothing — identical to having no claims at all.
+    #[test]
+    fn a_claim_at_the_default_expiry_falls_inside_the_horizon() {
+        let today = chrono::Utc::now();
+        let walked: Vec<String> = (0..=CLAIM_HORIZON_DAYS)
+            .map(|offset| expiry_day(today + chrono::Duration::days(offset)))
+            .collect();
+
+        for filed_with in [1, 7, 14, DEFAULT_EXPIRY_DAYS] {
+            let lands_on = expiry_day(today + chrono::Duration::days(filed_with));
+            assert!(
+                walked.contains(&lands_on),
+                "a claim filed with {filed_with} days expires on {lands_on}, which the \
+                 horizon never reads — it would be invisible in the queue"
+            );
+        }
+    }
+
+    /// The horizon is a bound on WORK, so it stays a countable number of reads.
+    #[test]
+    fn the_horizon_stays_a_bounded_number_of_partition_reads() {
+        assert!(
+            (1..=62).contains(&CLAIM_HORIZON_DAYS),
+            "one page of claims must not walk {CLAIM_HORIZON_DAYS} day partitions"
+        );
+    }
+
+    /// Every sort the device is offered must be one this can perform. Offering
+    /// one it cannot is a control that silently does nothing.
+    #[test]
+    fn the_offered_sorts_are_the_ones_that_exist() {
+        assert!(
+            CLAIM_SORTS.contains(&"expiry"),
+            "the default must be offered"
+        );
+        for sort in CLAIM_SORTS {
+            assert!(!sort.is_empty());
+        }
     }
 }
