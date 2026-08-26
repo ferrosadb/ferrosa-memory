@@ -28,7 +28,7 @@ A team is a graph the user draws: agents as nodes, and edges saying when one
 agent involves another. The first team is a writing team — researcher, writer,
 reviewer — producing an agent team knowledge claim for human review.
 
-The shape of the problem forces fifteen decisions before any code, because each one
+The shape of the problem forces sixteen decisions before any code, because each one
 changes the schema or the trust boundary rather than the interface.
 
 ## Decision 1: The runtime lives in Ferrosa Memory
@@ -582,6 +582,51 @@ authority.
 A floor matters too, in the other direction: a lease shorter than a normal
 reconnect makes every network hiccup an outage, and someone tuning down after a
 spend scare can easily land there.
+
+## Decision 16: Privilege is acquired through an attended tmux PTY, not an expect script
+
+A coordinator needs root to finish provisioning a host — container runtimes,
+`jailer` at runtime, device group membership, service units. Root needs a
+password, and the password belongs to a person.
+
+Two mechanisms can drive an interactive `sudo`. They differ on the question that
+decides it: **who holds the password.**
+
+| | expect | tmux PTY |
+|---|---|---|
+| who types it | the script | the person |
+| where it exists | in the script's memory, and whatever fed it | only in the terminal |
+| survives a dropped connection | no | yes, the session persists |
+| can a person watch it | no | yes, by attaching |
+
+**tmux, for anything a person types.** The operator answers the prompt in a live
+PTY the coordinator spawned. Nothing between the keyboard and `sudo` ever holds
+the secret, so there is no store to protect, no argument list to leak it, and no
+question about how long it is retained.
+
+An expect script driving the same prompt must *have* the password in order to
+send it — which means it was transported, held in memory, and possibly logged.
+That is a materially worse position for the same outcome.
+
+This extends what the app's bootstrap probe already established: *"Sudo uses the
+remote PTY for its prompt; the app never pipes or records it."* tmux makes that
+PTY persistent and attendable, which is also what the per-teammate sessions of
+Decision 8 already are — the elevated shell is the same shape as every other
+session, not a special case.
+
+### Two things this constrains
+
+**The transcript must not record input during a prompt.** `sudo` does not echo,
+so a password never reaches the output stream — but a session that transcribes
+*keystrokes* would capture it anyway, and the transcript is durable. Input
+capture must be suppressed while a password prompt is active, and that is a
+property to test rather than assume.
+
+**expect keeps a narrower job.** It is fine for deterministic automation where
+nothing secret is typed. It is not the mechanism for acquiring privilege.
+
+Note also that probing does not need either: `sudo -n true` already answers
+"does sudo want a password here" without a pty, and the bootstrap probe uses it.
 
 ## Consequences
 
