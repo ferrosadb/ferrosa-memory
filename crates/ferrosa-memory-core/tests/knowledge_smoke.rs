@@ -6,19 +6,23 @@
 //!
 //! The shapes that break servers are repetition, concurrency, and reads of
 //! things that are not there. All three are here.
+//! Last revised: 2026-08-26
+//! Last changed: Reused the shared test-cluster contract for CI address and keyspace selection.
 use ferrosa_memory_core::knowledge::*;
+use ferrosa_memory_core::test_cluster::TestClusterConfig;
 use ferrosa_memory_core::types::TenantContext;
 use std::sync::Arc;
 use uuid::Uuid;
 
 async fn store() -> Arc<CqlKnowledgeStore> {
-    let addr = std::env::var("FERROSA_CQL_PROXY_ADDR")
-        .expect("set FERROSA_CQL_PROXY_ADDR to the cluster this should run against");
+    let cluster = TestClusterConfig::from_env()
+        .expect("set FERROSA_TEST_CQL_PORT to the cluster this should run against");
+    let keyspace = cluster.keyspace.clone();
     let cfg = ferrosa_memory_core::config::FerrosaCqlConfig {
         tls_ca_path: None,
         tls_skip_hostname_verify: false,
-        contact_points: vec![addr],
-        keyspace: "agent_memory".to_owned(),
+        contact_points: vec![cluster.contact_point()],
+        keyspace: keyspace.clone(),
         replication_factor: 1,
         consistency: "ONE".into(),
         username: "ferrosa_user".into(),
@@ -30,7 +34,7 @@ async fn store() -> Arc<CqlKnowledgeStore> {
         ferrosa_memory_core::cql_storage::connect_session(&cfg, &cfg.username, &cfg.password)
             .await
             .expect("connect");
-    Arc::new(CqlKnowledgeStore::new(session, "agent_memory"))
+    Arc::new(CqlKnowledgeStore::new(session, keyspace))
 }
 
 fn ctx() -> TenantContext {

@@ -5,21 +5,22 @@
 //! were expensive to get right — chiefly that a state change MOVES rows between
 //! queue partitions rather than copying them, which is a fault this project has
 //! now shipped once and caught twice.
+//! Last revised: 2026-08-26
+//! Last changed: Reused the shared test-cluster contract for CI address and keyspace selection.
 use ferrosa_memory_core::knowledge::*;
+use ferrosa_memory_core::test_cluster::TestClusterConfig;
 use ferrosa_memory_core::types::TenantContext;
 use uuid::Uuid;
 
 async fn store() -> CqlKnowledgeStore {
-    // No loopback default: the p0-11 gate refuses one in source, and a test
-    // that silently points at whatever is listening locally is how the tier
-    // rules were once seeded into the wrong tenant.
-    let addr = std::env::var("FERROSA_CQL_PROXY_ADDR")
-        .expect("set FERROSA_CQL_PROXY_ADDR to the cluster this should run against");
+    let cluster = TestClusterConfig::from_env()
+        .expect("set FERROSA_TEST_CQL_PORT to the cluster this should run against");
+    let keyspace = cluster.keyspace.clone();
     let cfg = ferrosa_memory_core::config::FerrosaCqlConfig {
         tls_ca_path: None,
         tls_skip_hostname_verify: false,
-        contact_points: vec![addr],
-        keyspace: "agent_memory".to_owned(),
+        contact_points: vec![cluster.contact_point()],
+        keyspace: keyspace.clone(),
         replication_factor: 1,
         consistency: "ONE".into(),
         username: "ferrosa_user".into(),
@@ -31,7 +32,7 @@ async fn store() -> CqlKnowledgeStore {
         ferrosa_memory_core::cql_storage::connect_session(&cfg, &cfg.username, &cfg.password)
             .await
             .expect("connect to the cluster");
-    CqlKnowledgeStore::new(session, "agent_memory")
+    CqlKnowledgeStore::new(session, keyspace)
 }
 
 /// A fresh tenant per test, so live runs cannot see each other's rows.
