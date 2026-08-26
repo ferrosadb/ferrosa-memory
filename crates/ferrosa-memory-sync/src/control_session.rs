@@ -990,10 +990,15 @@ pub async fn control_application_reply<S: ControlStore>(
         .get("body")
         .and_then(serde_json::Value::as_object)
         .ok_or_else(|| ControlSessionError::Protocol("missing body".to_owned()))?;
-    let body_type = body
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("a frame with no type");
+    // `liveness_reply` above already refuses a body carrying no type, so a
+    // frame reaching here HAS one. Stated as a guard rather than a default
+    // string: a placeholder would have read like a real kind in the refusal,
+    // and would go quietly wrong if that earlier check ever moved.
+    let Some(body_type) = body.get("type").and_then(serde_json::Value::as_str) else {
+        return Err(ControlSessionError::Protocol(
+            "missing body type".to_owned(),
+        ));
+    };
     if body_type != "subscribe" {
         // Refused, not fatal: an unclaimed kind means no extension serves it,
         // which is a missing capability rather than a peer sending nonsense.
@@ -1640,6 +1645,58 @@ mod tests {
         let future =
             r#"{"version":2,"frame_id":"frame-2","body":{"type":"ping","nonce":"proof-2"}}"#;
         assert!(liveness_reply(future).is_err());
+    }
+
+    /// An unrecognised body type is a MISSING CAPABILITY, not a violation.
+    ///
+    /// The distinction is the whole outage: four shell_knowledge kinds reached
+    /// this parser because the extension never claimed them, and calling them
+    /// protocol violations closed the channel — every session, within a second.
+    #[tokio::test]
+    async fn an_unrecognised_body_type_is_a_missing_capability() {
+        let store = InMemoryControlStore::default();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "control-test".to_owned(),
+        };
+        let request = r#"{"version":1,"frame_id":"k-1","body":{"type":"shell_knowledge_claims"}}"#;
+        let error = control_application_reply(&store, &ctx, "server-fingerprint", request)
+            .await
+            .expect_err("nothing serves that kind");
+        assert!(
+            matches!(error, ControlSessionError::UnknownKind(ref kind)
+                     if kind == "shell_knowledge_claims"),
+            "an unserved kind must name itself and stay non-fatal; got {error:?}"
+        );
+    }
+
+    /// The other side of it. A body with no type at all is not a newer client
+    /// asking for something — it is a peer speaking wrongly, and reclassifying
+    /// that too would let it hold a session open forever.
+    ///
+    /// Enforced in `liveness_reply`, which runs first; the guard in
+    /// `control_application_reply` is the belt to its braces. Pinned here
+    /// because the two are easy to move apart, and it is the ONLY thing
+    /// separating "your build is old" from "you are speaking nonsense".
+    #[tokio::test]
+    async fn a_body_with_no_type_is_still_a_protocol_violation() {
+        let store = InMemoryControlStore::default();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "control-test".to_owned(),
+        };
+        for request in [
+            r#"{"version":1,"frame_id":"bad-1","body":{}}"#,
+            r#"{"version":1,"frame_id":"bad-2","body":{"type":42}}"#,
+        ] {
+            let error = control_application_reply(&store, &ctx, "server-fingerprint", request)
+                .await
+                .expect_err("a body with no type is malformed");
+            assert!(
+                matches!(error, ControlSessionError::Protocol(_)),
+                "{request} must stay fatal; got {error:?}"
+            );
+        }
     }
 
     #[tokio::test]

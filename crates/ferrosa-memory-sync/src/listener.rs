@@ -1404,6 +1404,40 @@ mod tests {
         }
     }
 
+    /// A frame kind nothing serves must be REFUSED, not fatal.
+    ///
+    /// This is the whole outage. The four shell_knowledge kinds had handlers
+    /// and were not claimed, so they reached the built-in dispatcher, which
+    /// called an unrecognised body type a protocol violation and closed the
+    /// channel. Every session died within a second of opening.
+    ///
+    /// A newer app asking an older build for something it does not have is the
+    /// ordinary state of a fleet mid-upgrade. It gets the same answer a hot
+    /// database gets: say what is missing, keep the channel.
+    #[test]
+    fn a_frame_kind_nothing_serves_is_refused_rather_than_fatal() {
+        let outcome = frame_outcome(
+            Err(ControlSessionError::UnknownKind(
+                "shell_knowledge_claims".to_owned(),
+            )),
+            &command_frame("knowledge-1"),
+        );
+        match outcome {
+            FrameOutcome::Degrade { reply, reason } => {
+                assert!(
+                    reason.contains("shell_knowledge_claims"),
+                    "the refusal must name the kind so a device can say what is \
+                     missing; got {reason}"
+                );
+                let reply: serde_json::Value =
+                    serde_json::from_str(&reply.expect("a correlated reply")).expect("json");
+                assert_eq!(reply["frame_id"], "knowledge-1");
+                assert_eq!(reply["body"]["type"], "capability_unavailable");
+            }
+            other => panic!("an unknown kind must not end the session; got {other:?}"),
+        }
+    }
+
     /// The other half. Reclassifying everything would satisfy the test above
     /// and leave a peer that genuinely speaks wrongly able to hold a session
     /// open forever.
