@@ -71,6 +71,7 @@ pub mod scope;
 #[cfg(test)]
 mod security_tests;
 pub mod session;
+pub mod session_scan;
 pub mod session_task;
 pub mod sharing;
 pub mod skill;
