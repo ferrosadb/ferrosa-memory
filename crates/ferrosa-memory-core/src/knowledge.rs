@@ -340,6 +340,16 @@ pub trait KnowledgeStore: Send + Sync {
         limit: usize,
     ) -> impl std::future::Future<Output = anyhow::Result<KnowledgePage>> + Send;
 
+    /// How many items are in one state, across both priority bands.
+    ///
+    /// Counted rather than paged. The memory tab wants a number, and walking
+    /// pages to get one reads every row of a queue that can hold hundreds.
+    fn count(
+        &self,
+        ctx: &crate::types::TenantContext,
+        state: KnowledgeState,
+    ) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send;
+
     /// What lapses on one day, for the sweep.
     fn expiring_on(
         &self,
@@ -570,6 +580,21 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
                 .filter_map(|id| tenant.items.get(id).cloned())
                 .collect();
             KnowledgePage { items, next_cursor }
+        }))
+    }
+
+    async fn count(
+        &self,
+        ctx: &crate::types::TenantContext,
+        state: KnowledgeState,
+    ) -> anyhow::Result<usize> {
+        let tenants = self.tenants.lock().expect("knowledge store poisoned");
+        Ok(tenants.get(&ctx.tenant_id).map_or(0, |tenant| {
+            tenant
+                .items
+                .values()
+                .filter(|item| item.state == state)
+                .count()
         }))
     }
 
@@ -1016,6 +1041,41 @@ impl KnowledgeStore for CqlKnowledgeStore {
             items,
             next_cursor: has_more.then(|| keys.last().cloned()).flatten(),
         })
+    }
+
+    async fn count(
+        &self,
+        ctx: &crate::types::TenantContext,
+        state: KnowledgeState,
+    ) -> anyhow::Result<usize> {
+        // One COUNT per band, which is two seeks rather than a scan. The bands
+        // exist so the overview can read urgent work in one seek; a total wants
+        // both, and adding them is cheaper than an unbanded partition.
+        let mut total = 0usize;
+        for band in ["high", "low"] {
+            #[allow(deprecated)]
+            let result = self
+                .session
+                .query_unpaged(
+                    format!(
+                        "SELECT COUNT(*) FROM {}.knowledge_by_state \
+                         WHERE tenant_id = ? AND state = ? AND priority_band = ?",
+                        self.keyspace
+                    ),
+                    (ctx.tenant_id, state.as_str(), band),
+                )
+                .await
+                .context("counting knowledge in a state")?;
+            let counted = result
+                .rows_or_empty()
+                .into_iter()
+                .next()
+                .and_then(|row| row.columns.first().cloned().flatten())
+                .and_then(|value| value.as_bigint())
+                .unwrap_or(0);
+            total += usize::try_from(counted).unwrap_or(0);
+        }
+        Ok(total)
     }
 
     async fn expiring_on(

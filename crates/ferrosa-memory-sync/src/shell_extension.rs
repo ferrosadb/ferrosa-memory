@@ -485,15 +485,51 @@ impl ShellExtension {
                 "tiers": [],
             });
         };
+        // Knowledge is the one tier that is STORED rather than derived.
+        //
+        // Every other tier is a fact about where a thing came from, and
+        // `summarise` counts them per source root. A ratified deliverable has
+        // no source root — it is not an entity — so the map counted it as zero
+        // while 184 approved items sat in the store, and the tier that the
+        // whole lifecycle exists to fill read empty.
+        //
+        // Claims ride alongside as their own row. They are not a DIKW tier:
+        // they are what is waiting to become one, and a reviewer looking at
+        // the map should see the queue feeding it.
+        let (approved, claims) = match self.knowledge().await {
+            Some(knowledge) => (
+                knowledge
+                    .count(ferrosa_memory_core::knowledge::KnowledgeState::Approved)
+                    .await
+                    .ok(),
+                knowledge
+                    .count(ferrosa_memory_core::knowledge::KnowledgeState::Proposed)
+                    .await
+                    .ok(),
+            ),
+            None => (None, None),
+        };
+
         match view.map().await {
             Ok(map) => serde_json::json!({
                 "type": "shell_memory_tiers",
                 "reachable": true,
                 "tiers": map.tiers.iter().map(|row| serde_json::json!({
                     "tier": row.tier.as_str(),
-                    "count": row.count,
+                    // A count the store could not give is left as the derived
+                    // one rather than replaced by a zero: a wrong number is
+                    // worse than an old one.
+                    "count": if row.tier == ferrosa_memory_core::tiers::Tier::Knowledge {
+                        approved.unwrap_or(row.count)
+                    } else {
+                        row.count
+                    },
                     "roots": row.roots,
-                })).collect::<Vec<_>>(),
+                })).chain(claims.map(|count| serde_json::json!({
+                    "tier": "claims",
+                    "count": count,
+                    "roots": Vec::<String>::new(),
+                }))).collect::<Vec<_>>(),
                 // Both numbers are the map's honesty. `sourced == 0` means
                 // nothing records a source yet, which is a build step and not
                 // an empty library; `unclassified` is the hole in the rules.

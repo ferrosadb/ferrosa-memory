@@ -169,6 +169,15 @@ impl KnowledgeView {
         Ok(rows)
     }
 
+    /// How many deliverables are in one state.
+    ///
+    /// For the memory map, which wants a number rather than a page: knowledge
+    /// is the one tier that is stored rather than derived from a path, so the
+    /// map has to ask the store that holds it.
+    pub async fn count(&self, state: KnowledgeState) -> Result<usize> {
+        self.store.count(&self.ctx, state).await
+    }
+
     /// One item and its chain.
     pub async fn detail(
         &self,
