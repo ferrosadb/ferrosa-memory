@@ -1047,6 +1047,16 @@ fn frame_outcome(
             });
             FrameOutcome::Degrade { reply, reason }
         }
+        // Same treatment, same reasoning: a frame nothing serves is a missing
+        // capability, and a session carrying a working terminal must survive
+        // being asked for something this build does not have.
+        Err(error @ crate::control_session::ControlSessionError::UnknownKind(_)) => {
+            let reason = error.to_string();
+            let reply = frame_id_of(frame).and_then(|frame_id| {
+                crate::control_session::capability_unavailable_reply(&frame_id, &reason)
+            });
+            FrameOutcome::Degrade { reply, reason }
+        }
         Err(error) => FrameOutcome::Close {
             reason: error.to_string(),
         },

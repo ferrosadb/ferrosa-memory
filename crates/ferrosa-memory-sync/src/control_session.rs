@@ -160,6 +160,20 @@ pub enum ControlSessionError {
     /// stay up and say which capability is missing.
     #[error("control capability unavailable: {0}")]
     CapabilityUnavailable(String),
+    /// The peer sent a frame kind nothing on this machine serves.
+    ///
+    /// Not a protocol violation. A newer app asking for something this build
+    /// does not have is the ordinary state of a fleet mid-upgrade, and the
+    /// answer is to say so — not to drop a channel that is carrying a working
+    /// terminal.
+    ///
+    /// This was fatal, and it took down every session: the phone gained a
+    /// Knowledge tab whose four frame kinds the extension had handlers for but
+    /// never listed in `kinds()`, so they reached this dispatcher instead. Once
+    /// the app began loading claims on connect rather than on opening the tab,
+    /// the first frame of every session closed it.
+    #[error("no capability serves {0} on this machine")]
+    UnknownKind(String),
     /// Local consumer did not keep up with the bounded inbound queue.
     #[error("control inbound queue is full")]
     Backpressure,
@@ -976,10 +990,14 @@ pub async fn control_application_reply<S: ControlStore>(
         .get("body")
         .and_then(serde_json::Value::as_object)
         .ok_or_else(|| ControlSessionError::Protocol("missing body".to_owned()))?;
-    if body.get("type").and_then(serde_json::Value::as_str) != Some("subscribe") {
-        return Err(ControlSessionError::Protocol(
-            "unsupported control body type".to_owned(),
-        ));
+    let body_type = body
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("a frame with no type");
+    if body_type != "subscribe" {
+        // Refused, not fatal: an unclaimed kind means no extension serves it,
+        // which is a missing capability rather than a peer sending nonsense.
+        return Err(ControlSessionError::UnknownKind(body_type.to_owned()));
     }
     let after_cursor = match body.get("after_cursor") {
         None | Some(serde_json::Value::Null) => None,

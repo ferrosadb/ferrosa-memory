@@ -1687,30 +1687,46 @@ async fn pump_output(running: Arc<RunningSession>, session: SessionHandle, confi
     let _ = session.send(&frame.to_string()).await;
 }
 
+/// Every frame kind this extension answers.
+///
+/// A const rather than a literal inside `kinds()` so the invariant that every
+/// handled kind is also a claimed one can be checked by a test. A kind with a
+/// handler and no claim never reaches this extension at all: the built-in
+/// dispatcher gets it, does not know it, and closes the channel.
+pub const SHELL_KINDS: &[&str] = &[
+    "shell_start",
+    "shell_stop",
+    "shell_list",
+    "shell_add_config",
+    "shell_update_config",
+    "shell_delete_config",
+    "shell_open",
+    "shell_close",
+    "shell_delete_session",
+    "shell_resize",
+    "shell_input",
+    "shell_scroll",
+    "shell_tasks",
+    "shell_task",
+    "shell_task_search",
+    "shell_dispatch",
+    "shell_task_complete",
+    "shell_memory_tiers",
+    "shell_memory_items",
+    // These four had handlers and were never CLAIMED, so every one of
+    // them fell through to the built-in dispatcher, which does not
+    // know them and closes the channel. Adding a handler is half the
+    // work; a kind the extension does not claim never reaches it.
+    "shell_knowledge",
+    "shell_knowledge_claims",
+    "shell_knowledge_detail",
+    "shell_knowledge_decide",
+];
+
 #[async_trait::async_trait]
 impl SessionExtension for ShellExtension {
     fn kinds(&self) -> &'static [&'static str] {
-        &[
-            "shell_start",
-            "shell_stop",
-            "shell_list",
-            "shell_add_config",
-            "shell_update_config",
-            "shell_delete_config",
-            "shell_open",
-            "shell_close",
-            "shell_delete_session",
-            "shell_resize",
-            "shell_input",
-            "shell_scroll",
-            "shell_tasks",
-            "shell_task",
-            "shell_task_search",
-            "shell_dispatch",
-            "shell_task_complete",
-            "shell_memory_tiers",
-            "shell_memory_items",
-        ]
+        SHELL_KINDS
     }
 
     async fn on_bound(&self, session: &SessionHandle) -> Result<(), String> {
@@ -2593,6 +2609,77 @@ mod output_framing_tests {
                 SAFE_DATAGRAM_BYTES
             );
         }
+    }
+
+    /// Every kind this extension SERVES must also be one it CLAIMS.
+    ///
+    /// The two lists are written in different places — `kinds()` near the top,
+    /// the match arms 1,800 lines below — and they drifted. The four knowledge
+    /// frames had working handlers and were never claimed, so `claim()` never
+    /// routed them here: they reached the built-in dispatcher, which does not
+    /// know them, and it CLOSED the channel. Nothing connected.
+    ///
+    /// Reading the arms out of this file is ugly and it is the only thing that
+    /// actually checks the invariant. A handler with no claim is dead code that
+    /// takes the session down with it.
+    #[test]
+    fn every_kind_with_a_handler_is_also_claimed() {
+        let source = include_str!("shell_extension.rs");
+        let after = source
+            .split("async fn on_request")
+            .nth(1)
+            .expect("on_request exists");
+        // Bounded to the function by counting braces. Reading to end of file
+        // instead swept up the match arms in the sizing tests below, which name
+        // RESPONSE types — three kinds the device never sends, reported as
+        // missing claims. A guard that cries wolf gets deleted.
+        let start = after.find('{').expect("a body");
+        let mut depth = 0usize;
+        let mut end = after.len();
+        for (index, ch) in after.char_indices().skip(start) {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = index;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &after[start..end];
+
+        let mut served: Vec<&str> = Vec::new();
+        for line in body.lines() {
+            let line = line.trim();
+            // Match arms of the dispatcher: `"shell_x" => {` and friends.
+            if let Some(rest) = line.strip_prefix('"')
+                && let Some((kind, tail)) = rest.split_once('"')
+                && tail.trim_start().starts_with("=>")
+                && kind.starts_with("shell_")
+            {
+                served.push(kind);
+            }
+        }
+        assert!(
+            served.len() > 10,
+            "found only {} handled kinds; the reader is broken, not the code",
+            served.len()
+        );
+
+        let claimed = SHELL_KINDS;
+        let missing: Vec<&str> = served
+            .iter()
+            .filter(|kind| !claimed.contains(kind))
+            .copied()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these kinds have handlers but are not claimed, so every one of them \
+             would reach the built-in dispatcher and close the channel: {missing:?}"
+        );
     }
 
     /// A title as long as the STORE permits must still fit a datagram.
