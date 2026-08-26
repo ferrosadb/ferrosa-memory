@@ -51,6 +51,7 @@ pub mod http;
 pub mod hybrid_search;
 pub mod importance;
 pub mod intention;
+pub mod knowledge;
 pub mod memo;
 pub mod metrics;
 pub mod migration;
@@ -70,6 +71,7 @@ pub mod scope;
 #[cfg(test)]
 mod security_tests;
 pub mod session;
+pub mod session_scan;
 pub mod session_task;
 pub mod sharing;
 pub mod skill;

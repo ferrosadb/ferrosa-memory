@@ -613,6 +613,7 @@ async fn session_work<R, T>(
                     // `acquire_owned` is cancel-safe -- so a timed-out or
                     // abandoned request stops competing for slots instead of
                     // leaking one.
+                    let started = std::time::Instant::now();
                     let outcome = serve_request(
                         async {
                             let _permit = slots.acquire_owned().await;
@@ -625,7 +626,15 @@ async fn session_work<R, T>(
                     )
                     .await;
                     match outcome {
-                        RequestOutcome::Served => {}
+                        RequestOutcome::Served => {
+                            let took = started.elapsed();
+                            if took >= SLOW_REQUEST {
+                                tracing::warn!(
+                                    %session_id, %kind, took_ms = took.as_millis() as u64,
+                                    "a request was served slowly; a device was waiting on it"
+                                );
+                            }
+                        }
                         RequestOutcome::Refused(error) => tracing::warn!(
                             %session_id, %kind, %error,
                             "session extension refused a request"
@@ -639,6 +648,7 @@ async fn session_work<R, T>(
                 continue;
             }
 
+            let started = std::time::Instant::now();
             let outcome = serve_request(
                 extension.on_request(handle, &kind, &frame_json(&frame)),
                 async {
@@ -648,7 +658,17 @@ async fn session_work<R, T>(
             )
             .await;
             match outcome {
-                RequestOutcome::Served => {}
+                RequestOutcome::Served => {
+                    let took = started.elapsed();
+                    if took >= SLOW_REQUEST {
+                        tracing::warn!(
+                            session_id = %offer.session_id,
+                            %kind,
+                            took_ms = took.as_millis() as u64,
+                            "a request was served slowly; a device was waiting on it"
+                        );
+                    }
+                }
                 // The request failed; the session did not. A screen that could
                 // not be captured is a screen that could not be captured, not a
                 // reason to disconnect a working control channel.
@@ -829,7 +849,11 @@ enum FramePriority {
 /// one file -- is the one to enumerate.
 fn frame_priority(kind: &str) -> FramePriority {
     match kind {
-        "shell_memory_tiers"
+        "shell_knowledge"
+        | "shell_knowledge_claims"
+        | "shell_knowledge_detail"
+        | "shell_knowledge_decide"
+        | "shell_memory_tiers"
         | "shell_memory_items"
         | "shell_tasks"
         | "shell_task"
@@ -921,6 +945,15 @@ enum RequestOutcome {
     /// Nobody is waiting for this any more, so it was dropped.
     Cancelled(&'static str),
 }
+/// How long a request may take before it is worth a log line.
+///
+/// A served request logs nothing: at a few hundred a session that would bury
+/// everything else. But a SLOW one is the thing that leaves a spinner on a
+/// screen, and until this existed a hung request left no trace at all — a
+/// search that never came back could not be told apart from one that was never
+/// sent. Well under the deadline, so a request that is merely slow is visible
+/// long before it is abandoned.
+const SLOW_REQUEST: Duration = Duration::from_secs(3);
 
 /// How long one extension request may run before it is abandoned.
 ///
@@ -1009,6 +1042,16 @@ fn frame_outcome(
         Ok(Some(reply)) => FrameOutcome::Reply(reply),
         Ok(None) => FrameOutcome::Nothing,
         Err(crate::control_session::ControlSessionError::CapabilityUnavailable(reason)) => {
+            let reply = frame_id_of(frame).and_then(|frame_id| {
+                crate::control_session::capability_unavailable_reply(&frame_id, &reason)
+            });
+            FrameOutcome::Degrade { reply, reason }
+        }
+        // Same treatment, same reasoning: a frame nothing serves is a missing
+        // capability, and a session carrying a working terminal must survive
+        // being asked for something this build does not have.
+        Err(error @ crate::control_session::ControlSessionError::UnknownKind(_)) => {
+            let reason = error.to_string();
             let reply = frame_id_of(frame).and_then(|frame_id| {
                 crate::control_session::capability_unavailable_reply(&frame_id, &reason)
             });
@@ -1358,6 +1401,40 @@ mod tests {
                 assert_eq!(reply["body"]["type"], "capability_unavailable");
             }
             other => panic!("a store failure must not end the session; got {other:?}"),
+        }
+    }
+
+    /// A frame kind nothing serves must be REFUSED, not fatal.
+    ///
+    /// This is the whole outage. The four shell_knowledge kinds had handlers
+    /// and were not claimed, so they reached the built-in dispatcher, which
+    /// called an unrecognised body type a protocol violation and closed the
+    /// channel. Every session died within a second of opening.
+    ///
+    /// A newer app asking an older build for something it does not have is the
+    /// ordinary state of a fleet mid-upgrade. It gets the same answer a hot
+    /// database gets: say what is missing, keep the channel.
+    #[test]
+    fn a_frame_kind_nothing_serves_is_refused_rather_than_fatal() {
+        let outcome = frame_outcome(
+            Err(ControlSessionError::UnknownKind(
+                "shell_knowledge_claims".to_owned(),
+            )),
+            &command_frame("knowledge-1"),
+        );
+        match outcome {
+            FrameOutcome::Degrade { reply, reason } => {
+                assert!(
+                    reason.contains("shell_knowledge_claims"),
+                    "the refusal must name the kind so a device can say what is \
+                     missing; got {reason}"
+                );
+                let reply: serde_json::Value =
+                    serde_json::from_str(&reply.expect("a correlated reply")).expect("json");
+                assert_eq!(reply["frame_id"], "knowledge-1");
+                assert_eq!(reply["body"]["type"], "capability_unavailable");
+            }
+            other => panic!("an unknown kind must not end the session; got {other:?}"),
         }
     }
 
