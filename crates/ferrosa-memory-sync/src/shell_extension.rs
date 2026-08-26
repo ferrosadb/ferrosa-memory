@@ -215,7 +215,7 @@ impl ShellExtension {
                     .map(|item| {
                         serde_json::json!({
                             "id": item.knowledge_id,
-                            "title": item.title,
+                            "title": bounded_title(&item.title),
                             "kind": item.kind,
                             "repo": item.repo,
                             "expires": item.expires_at,
@@ -251,7 +251,7 @@ impl ShellExtension {
                     .map(|row| {
                         serde_json::json!({
                             "id": row.knowledge_id,
-                            "title": row.title,
+                            "title": bounded_title(&row.title),
                             "kind": row.kind,
                             // The device draws a greyed robot for a claim and a
                             // green check for approved work, so it needs the
@@ -309,7 +309,7 @@ impl ShellExtension {
                     "type": "shell_knowledge_detail",
                     "id": id,
                     "reachable": true,
-                    "title": item.title,
+                    "title": bounded_title(&item.title),
                     "kind": item.kind,
                     "state": item.state.as_str(),
                     "priority": item.priority,
@@ -575,7 +575,7 @@ impl ShellExtension {
                         serde_json::json!({
                             "id": item.entity_id,
                             "session": item.session_id,
-                            "title": item.title,
+                            "title": bounded_title(&item.title),
                             "root": item.source_root,
                         })
                     })
@@ -656,7 +656,7 @@ impl ShellExtension {
                 let mut frames = vec![serde_json::json!({
                     "type": "shell_task_detail",
                     "task_id": task_id,
-                    "title": detail.task.title,
+                    "title": bounded_title(&detail.task.title),
                     "status": detail.task.status,
                     "priority": detail.task.priority,
                     "block_reason": detail.task.block_reason,
@@ -689,7 +689,7 @@ impl ShellExtension {
                                 .map(|item| serde_json::json!({
                                     "reason": item.reason,
                                     "id": item.task.id,
-                                    "title": item.task.title,
+                                    "title": bounded_title(&item.task.title),
                                     "status": item.task.status,
                                     "needs_a_person": item.task.waits_on_a_person(),
                                 }))
@@ -948,7 +948,7 @@ impl ShellExtension {
                 .map(|task| {
                     serde_json::json!({
                         "id": task.id,
-                        "title": task.title,
+                        "title": bounded_title(&task.title),
                         "status": task.status,
                         "priority": task.priority,
                         "block_reason": task.block_reason,
@@ -1023,7 +1023,7 @@ impl ShellExtension {
                 .map(|task| {
                     serde_json::json!({
                         "id": task.id,
-                        "title": task.title,
+                        "title": bounded_title(&task.title),
                         "status": task.status,
                         "priority": task.priority,
                         "block_reason": task.block_reason,
@@ -1306,6 +1306,38 @@ fn bounded_reason(value: impl std::fmt::Display) -> String {
         return value;
     }
     let mut end = MAX_REASON_BYTES.saturating_sub(3);
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &value[..end])
+}
+
+/// The widest a title may travel in a list frame.
+///
+/// A row's other fields are fixed-width — an id, a kind, a state, a priority,
+/// an expiry — so the title is the only part that can push a frame past the
+/// datagram. Nothing bounds it upstream: `propose` accepts whatever an agent
+/// sends, and a title assembled from a path runs long routinely.
+///
+/// 120 is the width the sizing proofs measure against at two rows per frame,
+/// so this is the number those proofs were already assuming. It was an
+/// assumption about production rather than a rule production enforced, which
+/// is the fifth showing of this bug class here and the first caught before
+/// anything reached a device.
+const MAX_TITLE_BYTES: usize = 120;
+
+/// Trim a title to something a list frame can carry, on a character boundary.
+///
+/// The full title stays in the store and comes back on the detail frame; this
+/// bounds the LIST, where one long title would cost every other row its place
+/// on the page.
+fn bounded_title(value: &str) -> String {
+    if value.len() <= MAX_TITLE_BYTES {
+        return value.to_owned();
+    }
+    let mut end = MAX_TITLE_BYTES.saturating_sub(3);
+    // Splitting mid-character would make the frame invalid UTF-8, which is a
+    // worse failure than a long title.
     while end > 0 && !value.is_char_boundary(end) {
         end -= 1;
     }
@@ -2441,8 +2473,11 @@ mod output_framing_tests {
     /// Every BOUNDED frame kind, at its worst case, fits a datagram.
     #[test]
     fn every_bounded_frame_fits_a_datagram() {
-        // The real bound, so the proof covers what production can write.
-        let long = "a".repeat(MAX_REASON_BYTES);
+        // Through the real bound rather than AT it. Writing the limit in by
+        // hand asserts what production is assumed to do; passing an overlong
+        // value through the same helper the projections use asserts what it
+        // actually does.
+        let long = bounded_title(&"a".repeat(MAX_REASON_BYTES * 20));
         let path = "/Users/bkearns/src/ferrosa-suite/ferrosa-memory/crates/ferrosa-memory-sync";
         for (kind, sizing) in EMITTED {
             if *sizing != Sizing::Bounded {
@@ -2517,7 +2552,7 @@ mod output_framing_tests {
     /// lists, each written after learning it in the last one.
     #[test]
     fn a_page_of_knowledge_rows_fits_a_datagram() {
-        let long = "a".repeat(MAX_REASON_BYTES);
+        let long = bounded_title(&"a".repeat(MAX_REASON_BYTES * 20));
         let rows: Vec<serde_json::Value> = (0..KNOWLEDGE_ROWS_PER_FRAME)
             .map(|_| {
                 serde_json::json!({
@@ -2558,6 +2593,68 @@ mod output_framing_tests {
                 SAFE_DATAGRAM_BYTES
             );
         }
+    }
+
+    /// A title as long as the STORE permits must still fit a datagram.
+    ///
+    /// The sizing proof above uses a 120-byte title, but nothing bounds a real
+    /// one: `propose` accepts whatever an agent sends, and a deck or report
+    /// title assembled from a path is routinely longer than that. Measuring
+    /// the frame against a width production does not enforce proves nothing —
+    /// it is the same bug this file has now shipped four times, one layer up.
+    #[test]
+    fn a_title_longer_than_the_store_bounds_still_fits_a_datagram() {
+        // Far past anything plausible, deliberately: the point is that the
+        // frame builder bounds it, not that this particular length is safe.
+        let title = "a deck about ".repeat(300);
+        let rows: Vec<serde_json::Value> = (0..KNOWLEDGE_ROWS_PER_FRAME)
+            .map(|_| {
+                serde_json::json!({
+                    "id": uuid::Uuid::now_v7(),
+                    "title": bounded_title(&title),
+                    "kind": "presentation",
+                    "state": "proposed",
+                    "priority": 100,
+                    "repo": "/Users/bkearns/src/ferrosa-suite/ferrosa-memory",
+                    "expires": chrono::Utc::now(),
+                    "agent": "ferrosa-suite claude",
+                })
+            })
+            .collect();
+        let frame = envelope(
+            ShellExtension::page_frames("shell_knowledge_claims", rows, true, None)
+                .into_iter()
+                .next()
+                .expect("a frame"),
+        );
+        assert!(
+            frame.len() <= SAFE_DATAGRAM_BYTES,
+            "a claims page with a long title is {} bytes, over the {} safe \
+             datagram — bound the title in the projection",
+            frame.len(),
+            SAFE_DATAGRAM_BYTES
+        );
+    }
+
+    /// Bounding must not split a multi-byte character, which would make the
+    /// frame invalid UTF-8 rather than merely long.
+    #[test]
+    fn bounding_a_title_lands_on_a_character_boundary() {
+        let title = "\u{1f9ed}".repeat(200);
+        let bounded = bounded_title(&title);
+        assert!(bounded.len() <= MAX_TITLE_BYTES);
+        assert!(
+            bounded.ends_with("..."),
+            "a trimmed title says it was trimmed"
+        );
+    }
+
+    /// A title that already fits is passed through untouched — a reviewer
+    /// should not see an ellipsis on a title that had room.
+    #[test]
+    fn a_short_title_is_left_alone() {
+        let title = "Decide QA-0009";
+        assert_eq!(bounded_title(title), title);
     }
 
     /// An empty page still sends one frame, or a list that matched nothing
