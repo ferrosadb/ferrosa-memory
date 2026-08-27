@@ -49,7 +49,7 @@ DatalogRule.body: Vec<Atom>                                       // pure conjun
       parse error naming it, and a wrong arity is too. Wrong type is Undefined,
       matching the rest of the evaluator.
 
-- [ ] **3. Bind a computed value in the body.** A head can compute now; a body
+- [x] **3. Bind a computed value in the body.** A head can compute now; a body
       still cannot, so there is no way to name an intermediate. `X = W + 1`
       does *not* bind — it parses to `CmpOp::Eq` and, with `X` unbound, passes
       as "cannot decide yet". Needs a distinct operator (`:=`) because

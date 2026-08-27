@@ -968,6 +968,24 @@ pub struct DatalogRule {
     /// against, not something to evaluate.
     #[serde(default)]
     pub head_exprs: Vec<HeadExpr>,
+    /// Computed values the body names, written `D := expr`.
+    ///
+    /// A distinct operator rather than `=`, which already parses to
+    /// `CmpOp::Eq`. Redefining `=` would silently change the meaning of rules
+    /// already stored, and a silent change of meaning is worse than a new
+    /// symbol to learn.
+    ///
+    /// Evaluated in order after the positive atoms, so a binding may use
+    /// anything the body bound and anything an earlier binding named.
+    #[serde(default)]
+    pub bindings: Vec<Binding>,
+}
+
+/// A named value computed from what the body already bound.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Binding {
+    pub var: String,
+    pub expr: FilterExpr,
 }
 
 /// A computed head argument: which position it fills, and how to compute it.
