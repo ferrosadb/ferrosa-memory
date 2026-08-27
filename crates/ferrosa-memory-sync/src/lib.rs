@@ -29,6 +29,8 @@
 pub mod codex_runtime;
 #[cfg(feature = "webrtc-transport")]
 pub mod control_session;
+pub mod coordinator_client;
+pub mod coordinator_command;
 pub mod device_request;
 /// The control-listener runtime, so every binary hosting one shares it.
 #[cfg(feature = "webrtc-transport")]

@@ -711,12 +711,60 @@ pub enum BuiltinFilter {
     LessThan(String, f64),
     /// Legacy. See `GreaterThan` doc.
     NotEqual(String, String),
-    /// Full comparison filter — the only variant the parser emits.
+    /// Full comparison filter.
     Compare {
         op: CmpOp,
         lhs: FilterExpr,
         rhs: FilterExpr,
     },
+    /// A boolean-valued question about the shape of a string, written
+    /// `str_starts_with(S, P)`.
+    StrPred {
+        op: StrOp,
+        subject: FilterExpr,
+        arg: FilterExpr,
+    },
+    /// Disjunction, written `||`. True when any branch is true.
+    Any(Vec<BuiltinFilter>),
+    /// Conjunction, written `&&`. Comma-separated body filters are already an
+    /// implicit `All`; this is the explicit, groupable form.
+    All(Vec<BuiltinFilter>),
+    /// Negation, written `!`. The single mechanism for negating a filter —
+    /// `StrPred` deliberately does not carry its own negated flag.
+    Not(Box<BuiltinFilter>),
+}
+
+/// The string-shape predicates.
+///
+/// These carry a reserved `str_` prefix rather than the bare names, because
+/// `contains` is already an edge type in this system — `contains(X, Y)` is a
+/// legitimate stored relation, and taking the name would have silently changed
+/// the meaning of rules already written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum StrOp {
+    StartsWith,
+    EndsWith,
+    Contains,
+}
+
+impl StrOp {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::StartsWith => "str_starts_with",
+            Self::EndsWith => "str_ends_with",
+            Self::Contains => "str_contains",
+        }
+    }
+
+    pub const ALL: [StrOp; 3] = [StrOp::StartsWith, StrOp::EndsWith, StrOp::Contains];
+
+    pub fn apply(self, subject: &str, arg: &str) -> bool {
+        match self {
+            Self::StartsWith => subject.starts_with(arg),
+            Self::EndsWith => subject.ends_with(arg),
+            Self::Contains => subject.contains(arg),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -748,11 +796,52 @@ pub enum ArithOp {
     Sub,
     Mul,
     Div,
+    /// Remainder, written `%`. Binds as tightly as `*` and `/`.
+    Rem,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AggregateKind {
+    /// Folds *rows*: how many complete unifications the inner conjunction has.
     Count,
+    /// Folds *values* of the aggregate's `value_var`.
+    Sum,
+    Min,
+    Max,
+    Avg,
+}
+
+impl AggregateKind {
+    /// The keyword this kind is written with.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::Sum => "sum",
+            Self::Min => "min",
+            Self::Max => "max",
+            Self::Avg => "avg",
+        }
+    }
+
+    /// Every kind but `Count` folds the values of a named variable, so every
+    /// kind but `Count` requires one.
+    pub fn needs_value_var(self) -> bool {
+        !matches!(self, Self::Count)
+    }
+
+    /// Whether an empty group still produces a value.
+    ///
+    /// `Count` and `Sum` have a well-defined identity over no rows — nothing
+    /// happened zero times and cost zero. `Min`, `Max` and `Avg` do not: there
+    /// is no minimum of nothing, and emitting a sentinel would be a fabricated
+    /// value the caller cannot distinguish from a real one. Those rules simply
+    /// do not fire.
+    pub fn identity_over_empty(self) -> Option<f64> {
+        match self {
+            Self::Count | Self::Sum => Some(0.0),
+            Self::Min | Self::Max | Self::Avg => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -763,20 +852,68 @@ pub struct Aggregate {
     pub inner_conjunction: Vec<Atom>,
     pub group_vars: Vec<String>,
     pub output_var: String,
+    /// The variable whose values are folded, for every kind but `Count`.
+    ///
+    /// Additive: rows written when `count` was the only aggregate carry no
+    /// such field and deserialize to `None`, which is what `Count` wants.
+    #[serde(default)]
+    pub value_var: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum StratifyError {
-    RecursionThroughAggregate { cycle: Vec<String> },
+    RecursionThroughAggregate {
+        cycle: Vec<String>,
+    },
+    /// A predicate's derivation transitively requires its own negation.
+    /// Such a rule set has no stratified model, so it is rejected rather
+    /// than evaluated to an arbitrary fixpoint.
+    RecursionThroughNegation {
+        cycle: Vec<String>,
+    },
+    /// A rule computes a head argument and that head can reach its own body,
+    /// so each round produces a new value and the fixpoint never closes.
+    ///
+    /// The `max_facts` budget would stop it, but by truncation — the caller
+    /// would get an arbitrary prefix with no signal it was cut short.
+    /// Rejecting is the only answer that cannot be mistaken for an answer.
+    RecursionThroughHeadExpression {
+        cycle: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DatalogRule {
     pub head: Atom,
+    /// Positive body atoms. A binding must match every one of them.
     pub body: Vec<Atom>,
     pub filters: Vec<BuiltinFilter>,
     #[serde(default)]
     pub aggregates: Vec<Aggregate>,
+    /// Negated body atoms (`not p(X)`). A binding survives only if it
+    /// matches *none* of them.
+    ///
+    /// Additive on purpose: `RuleEntry` rows written before negation
+    /// existed carry no such field and deserialize to an empty set, which
+    /// means exactly what those rules meant before. Retyping `body` to
+    /// carry polarity would have been a breaking stored-format change.
+    #[serde(default)]
+    pub negated: Vec<Atom>,
+    /// Head arguments that are computed rather than repeated.
+    ///
+    /// Kept beside the head instead of retyping `Atom.args`, because `Atom` is
+    /// shared by the head, body atoms, negated atoms and aggregate inner atoms,
+    /// and only the head may compute — a body atom is a pattern to unify
+    /// against, not something to evaluate.
+    #[serde(default)]
+    pub head_exprs: Vec<HeadExpr>,
+}
+
+/// A computed head argument: which position it fills, and how to compute it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HeadExpr {
+    pub index: usize,
+    pub expr: FilterExpr,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1004,7 +1141,35 @@ impl DerivedFact {
     pub fn has_uuid_endpoints(&self) -> bool {
         Uuid::parse_str(&self.src_id).is_ok() && Uuid::parse_str(&self.dst_id).is_ok()
     }
+
+    /// True iff any step in this fact's derivation was an *absence* — a
+    /// negated literal that held because no row matched it.
+    pub fn rests_on_absence(&self) -> bool {
+        self.provenance
+            .iter()
+            .any(|step| step.parent_kind == PROVENANCE_KIND_ABSENCE)
+    }
+
+    /// True iff this fact may be written to the persisted derived-fact store.
+    ///
+    /// Two independent reasons a derivation must not be cached:
+    ///
+    /// - its endpoints are not both UUIDs, so the UUID-keyed cache table
+    ///   cannot hold it (issue #129); or
+    /// - it rests on an absence. The engine is monotonic only for positive
+    ///   rules: a later base fact can make a negated derivation **false**,
+    ///   and an append-only cache would go on serving the stale derivation
+    ///   forever. For a permission rule that is access which should have
+    ///   been revoked. Negated derivations are therefore evaluated live and
+    ///   never persisted.
+    pub fn is_cacheable(&self) -> bool {
+        self.has_uuid_endpoints() && !self.rests_on_absence()
+    }
 }
+
+/// `ProvenanceStep::parent_kind` for a step that records an *absence*
+/// rather than a matched row — the reason a negated literal held.
+pub const PROVENANCE_KIND_ABSENCE: &str = "absence";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvenanceStep {
@@ -1393,6 +1558,7 @@ mod tests {
             },
             inner_conjunction: vec![],
             group_vars: vec!["X".into()],
+            value_var: None,
             output_var: "N".into(),
         };
         let json = serde_json::to_string(&a).unwrap();
@@ -1419,6 +1585,7 @@ mod tests {
                 },
             ],
             group_vars: vec!["Ctx".into(), "Tool".into()],
+            value_var: None,
             output_var: "N".into(),
         };
         let json = serde_json::to_string(&a).unwrap();
@@ -1443,6 +1610,7 @@ mod tests {
             },
             inner_conjunction: vec![],
             group_vars: vec!["X".into()],
+            value_var: None,
             output_var: "N".into(),
         };
         let mut json: serde_json::Value = serde_json::to_value(&v1_shape).unwrap();
