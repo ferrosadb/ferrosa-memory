@@ -33,10 +33,13 @@ Every gap below is a rule a tenant cannot write today.
 
 ## Checklist
 
-- [ ] **1. Modulo.** `ArithOp` is Add/Sub/Mul/Div. `%` is missing, so no rule can
+- [x] **1. Modulo.** `ArithOp` is Add/Sub/Mul/Div. `%` is missing, so no rule can
       bucket, sample every Nth, or test parity. Division by zero already fails
       loud (`eval_expr` warns and yields no value); modulo by zero must match it
-      rather than produce NaN.
+      rather than produce NaN. *Correction found while implementing: division by
+      zero did NOT fail loud at the filter — `eval_expr` returned `None` for both
+      an unbound variable and a zero divisor, and `check_one_filter` passed on
+      `None`, so `V / 0 == 0` derived a fact. Fixed as part of this item.*
 
 - [ ] **2. String predicates.** Nothing can ask about the shape of a string.
       "Everything except items whose name starts with `tmp_`" is unwritable,
