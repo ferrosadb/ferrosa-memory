@@ -881,3 +881,55 @@ async fn manage_rules_put_refuses_each_new_grammar_mistake_by_name() {
         );
     }
 }
+
+/// A stored disjunctive rule expands at load and every alternative runs.
+#[tokio::test]
+async fn a_stored_disjunctive_rule_expands_and_all_alternatives_evaluate() {
+    let store = MockStorage::new();
+    let ctx = test_ctx();
+    let session_id = Uuid::new_v4();
+    let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+
+    put_edge(&store, &ctx, session_id, a, "co_occurs", b).await;
+    put_edge(&store, &ctx, session_id, b, "supersedes", c).await;
+
+    let params = json!({
+        "name": "manage_rules",
+        "arguments": {
+            "action": "put",
+            "rule_id": "custom-touched",
+            "rule_body": "touched(X, X) :- co_occurs(X, _) ; supersedes(X, _)."
+        }
+    });
+    let ok = dispatch("tools/call", params, &store, &ctx, &SessionState::default())
+        .await
+        .expect("a disjunctive rule is valid syntax");
+    assert_eq!(unwrap_tool_result(ok)["action"], "put");
+    approve_rule(&store, &ctx, "custom-touched").await;
+
+    // The loader expands it: one stored row, two rules.
+    let rules = datalog::load_effective_rules(&store, &ctx, Some("touched"))
+        .await
+        .unwrap();
+    assert_eq!(
+        rules
+            .iter()
+            .filter(|r| r.head.predicate == "touched")
+            .count(),
+        2,
+        "one row, one rule per alternative"
+    );
+
+    let results = datalog::query_predicate(
+        &store,
+        &ctx,
+        session_id,
+        "touched",
+        &DatalogConfig::default(),
+    )
+    .await
+    .unwrap();
+    let touched: Vec<String> = results.iter().map(|r| r.src_id.clone()).collect();
+    assert!(touched.contains(&a.to_string()), "a via co_occurs");
+    assert!(touched.contains(&b.to_string()), "b via supersedes");
+}
