@@ -61,7 +61,7 @@ Every gap below is a rule a tenant cannot write today.
       order. Taking the earliest timestamp or the first name alphabetically is
       unwritable. `Term` already orders strings, floats and uuids. (t_b906d58c)
 
-- [ ] **5. An expression in a head argument.** `Atom.args` is `Vec<Term>`, so a
+- [x] **5. An expression in a head argument.** `Atom.args` is `Vec<Term>`, so a
       head can only repeat a bound variable or a constant. `next(X, N + 1) :-
       rank(X, N).` is unwritable and every derived arithmetic value must be
       precomputed by whatever wrote the base facts. The design question is

@@ -871,6 +871,15 @@ pub enum StratifyError {
     RecursionThroughNegation {
         cycle: Vec<String>,
     },
+    /// A rule computes a head argument and that head can reach its own body,
+    /// so each round produces a new value and the fixpoint never closes.
+    ///
+    /// The `max_facts` budget would stop it, but by truncation — the caller
+    /// would get an arbitrary prefix with no signal it was cut short.
+    /// Rejecting is the only answer that cannot be mistaken for an answer.
+    RecursionThroughHeadExpression {
+        cycle: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -890,6 +899,21 @@ pub struct DatalogRule {
     /// carry polarity would have been a breaking stored-format change.
     #[serde(default)]
     pub negated: Vec<Atom>,
+    /// Head arguments that are computed rather than repeated.
+    ///
+    /// Kept beside the head instead of retyping `Atom.args`, because `Atom` is
+    /// shared by the head, body atoms, negated atoms and aggregate inner atoms,
+    /// and only the head may compute — a body atom is a pattern to unify
+    /// against, not something to evaluate.
+    #[serde(default)]
+    pub head_exprs: Vec<HeadExpr>,
+}
+
+/// A computed head argument: which position it fills, and how to compute it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HeadExpr {
+    pub index: usize,
+    pub expr: FilterExpr,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

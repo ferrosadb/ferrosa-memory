@@ -62,7 +62,7 @@ pub fn parse_rule(text: &str) -> anyhow::Result<DatalogRule> {
     let head_str = text[..sep_pos].trim();
     let body_str = text[sep_pos + 2..].trim();
 
-    let head = parse_atom(head_str, &mut 0)?;
+    let (head, head_exprs) = parse_head(head_str)?;
 
     let body_parts = split_top_level(body_str, ',')?;
     anyhow::ensure!(!body_parts.is_empty(), "rule body must not be empty");
@@ -178,13 +178,48 @@ pub fn parse_rule(text: &str) -> anyhow::Result<DatalogRule> {
     // The stratify analyzer (Task M3) supersedes it and also catches
     // cross-rule recursion through aggregates.
 
+    // A computed head argument may only use variables the body binds; there is
+    // nothing else to compute from.
+    let mut agg_outputs: std::collections::HashSet<String> =
+        aggregates.iter().map(|a| a.output_var.clone()).collect();
+    agg_outputs.extend(positive_vars.iter().cloned());
+    for he in &head_exprs {
+        let mut unbound: Vec<String> = Vec::new();
+        collect_expr_vars(&he.expr, &mut unbound);
+        let unbound: Vec<String> = unbound
+            .into_iter()
+            .filter(|v| !agg_outputs.contains(v))
+            .collect();
+        anyhow::ensure!(
+            unbound.is_empty(),
+            "head expression at argument {} uses variable(s) {} that no body atom binds",
+            he.index,
+            unbound.join(", ")
+        );
+    }
+
     Ok(DatalogRule {
         head,
         body,
         filters,
         aggregates,
         negated,
+        head_exprs,
     })
+}
+
+/// Collect every variable referenced by a filter expression.
+fn collect_expr_vars(e: &crate::types::FilterExpr, out: &mut Vec<String>) {
+    use crate::types::FilterExpr;
+    match e {
+        FilterExpr::Var(name) => out.push(name.clone()),
+        FilterExpr::LitNum(_) | FilterExpr::LitStr(_) => {}
+        FilterExpr::Neg(inner) => collect_expr_vars(inner, out),
+        FilterExpr::BinOp { lhs, rhs, .. } => {
+            collect_expr_vars(lhs, out);
+            collect_expr_vars(rhs, out);
+        }
+    }
 }
 
 /// Strip a leading `not` keyword from a body part.
@@ -198,6 +233,86 @@ fn strip_not_prefix(part: &str) -> Option<&str> {
     }
     let rest = rest.trim_start();
     if rest.is_empty() { None } else { Some(rest) }
+}
+
+/// Parse a rule head, splitting computed arguments out of the atom.
+///
+/// A head argument holding a top-level arithmetic operator is an expression;
+/// anything else is an ordinary term. The atom keeps a placeholder variable at
+/// each computed position so arities and downstream code are unchanged, and
+/// the expression is carried alongside.
+fn parse_head(head_str: &str) -> anyhow::Result<(Atom, Vec<crate::types::HeadExpr>)> {
+    let Some(open) = head_str.find('(') else {
+        return Ok((parse_atom(head_str, &mut 0)?, Vec::new()));
+    };
+    let Some(close) = head_str.rfind(')') else {
+        return Ok((parse_atom(head_str, &mut 0)?, Vec::new()));
+    };
+    let predicate = head_str[..open].trim();
+    let arg_parts = split_top_level(&head_str[open + 1..close], ',')?;
+
+    let mut rewritten: Vec<String> = Vec::with_capacity(arg_parts.len());
+    let mut head_exprs = Vec::new();
+    for (index, part) in arg_parts.iter().enumerate() {
+        if has_top_level_arith(part) {
+            head_exprs.push(crate::types::HeadExpr {
+                index,
+                expr: crate::datalog_filter_expr::parse_head_expr(part)?,
+            });
+            rewritten.push(format!("_headexpr_{index}"));
+        } else {
+            rewritten.push(part.trim().to_string());
+        }
+    }
+
+    let atom = parse_atom(&format!("{predicate}({})", rewritten.join(", ")), &mut 0)?;
+    Ok((atom, head_exprs))
+}
+
+/// True when a head argument carries an arithmetic operator at the top level.
+///
+/// A leading `-` is a negative literal, not an operator, so it does not count.
+fn has_top_level_arith(part: &str) -> bool {
+    let part = part.trim();
+    let bytes = part.as_bytes();
+    let (mut depth, mut in_str, mut i) = (0i32, false, 0usize);
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            if c == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' => in_str = true,
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            // `*`, `/` and `%` never appear inside a uuid, a date or an
+            // identifier, so they are unambiguous on sight.
+            b'*' | b'/' | b'%' if depth == 0 => return true,
+            // `+` and `-` do appear inside uuids (550e8400-e29b-…) and dates
+            // (2026-01-15), so they only count as operators when written with
+            // space around them, which is how arithmetic is actually written.
+            b'+' | b'-'
+                if depth == 0
+                    && i > 0
+                    && bytes[i - 1].is_ascii_whitespace()
+                    && i + 1 < bytes.len()
+                    && bytes[i + 1].is_ascii_whitespace() =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Split a string on a delimiter, but only at top level (not inside parentheses).
@@ -248,6 +363,17 @@ fn parse_atom(text: &str, anon_counter: &mut usize) -> anyhow::Result<Atom> {
 
     let mut args = Vec::with_capacity(arg_parts.len());
     for part in &arg_parts {
+        // Only a head computes. Left alone, `warmth(X, W + 1)` would become a
+        // *variable named* "W + 1" — unbound, therefore matching every row, so
+        // the rule would fire on everything and look like it worked.
+        anyhow::ensure!(
+            !has_top_level_arith(part),
+            "'{}' in atom '{}' looks like arithmetic, but a body atom is a \
+             pattern to match, not an expression to compute. Only a rule head \
+             may compute an argument.",
+            part.trim(),
+            text
+        );
         args.push(parse_term(part.trim(), anon_counter));
     }
 
@@ -649,8 +775,37 @@ fn evaluate_rule(rule: &DatalogRule, all_facts: &FactSet) -> Vec<(Vec<Term>, Vec
     }
     collect_bindings(rule, all_facts)
         .into_iter()
-        .map(|(binding, prov)| (instantiate(&rule.head.args, &binding), prov))
+        .filter_map(|(binding, prov)| {
+            let args = instantiate_head(rule, &binding)?;
+            Some((args, prov))
+        })
         .collect()
+}
+
+/// Instantiate a head, computing any expression arguments.
+///
+/// `None` when an expression has no value — a non-number, or a zero divisor.
+/// Deriving the fact anyway would leave an argument the caller cannot tell
+/// from a real one, so the rule does not fire for that binding.
+fn instantiate_head(rule: &DatalogRule, binding: &Binding) -> Option<Vec<Term>> {
+    let mut args = instantiate(&rule.head.args, binding);
+    for he in &rule.head_exprs {
+        let value = match eval_expr(&he.expr, binding) {
+            Eval::Value(EvalValue::Num(f)) => Term::ConstFloat(OrderedFloat(f)),
+            Eval::Value(EvalValue::Str(s)) => Term::ConstStr(s),
+            Eval::Value(EvalValue::Uuid(u)) => Term::Const(u),
+            Eval::Undefined | Eval::Unbound => {
+                tracing::warn!(
+                    predicate = %rule.head.predicate,
+                    index = he.index,
+                    "datalog: head expression has no value; the rule does not fire"
+                );
+                return None;
+            }
+        };
+        *args.get_mut(he.index)? = value;
+    }
+    Some(args)
 }
 
 /// Run the body-unification + filter-check loop and return raw variable
@@ -775,6 +930,9 @@ fn evaluate_rule_with_aggregates(
         // to phase 1. A negated rule always has a positive body atom, so the
         // body-empty seeding path below can never carry negation.
         negated: rule.negated.clone(),
+        // Phase 1 collects bindings only; the head is instantiated by the
+        // caller, which is where head expressions are applied.
+        head_exprs: Vec::new(),
     };
 
     // Phase 1: collect candidate bindings from non-aggregate body atoms.
@@ -1858,6 +2016,9 @@ pub fn stratify(
         Plain,
         Aggregate,
         Negated,
+        /// A plain dependency, but from a head that computes an argument.
+        /// Harmless across strata; inside one it never reaches a fixpoint.
+        HeadExpr,
     }
 
     // Build predicate dep graph: head -> Vec<(dependency, edge_kind)>.
@@ -1868,8 +2029,13 @@ pub fn stratify(
         let head = rule.head.predicate.clone();
         all_preds.insert(head.clone());
         let entry = graph.entry(head.clone()).or_default();
+        let body_edge = if rule.head_exprs.is_empty() {
+            Edge::Plain
+        } else {
+            Edge::HeadExpr
+        };
         for atom in &rule.body {
-            entry.push((atom.predicate.clone(), Edge::Plain));
+            entry.push((atom.predicate.clone(), body_edge));
             all_preds.insert(atom.predicate.clone());
         }
         for atom in &rule.negated {
@@ -2001,6 +2167,18 @@ pub fn stratify(
                             return Err(crate::types::StratifyError::RecursionThroughNegation {
                                 cycle: scc.clone(),
                             });
+                        }
+                        // `rank(X, N + 1) :- rank(X, N).` produces a new
+                        // value every round. The fact budget would stop it by
+                        // truncation, handing back an arbitrary prefix with no
+                        // signal; rejecting is the only answer that cannot be
+                        // mistaken for an answer.
+                        Edge::HeadExpr => {
+                            return Err(
+                                crate::types::StratifyError::RecursionThroughHeadExpression {
+                                    cycle: scc.clone(),
+                                },
+                            );
                         }
                         Edge::Plain => {}
                     }
@@ -4161,6 +4339,139 @@ mod grammar_tests {
             .unwrap_or_default();
         out.sort();
         out
+    }
+
+    // ── Item 5: an expression in a head argument ──────────────────
+
+    #[test]
+    fn a_head_argument_may_be_an_arithmetic_expression() {
+        let rule = parse_rule("scaled(X, W * 100) :- warmth(X, W).").unwrap();
+        assert_eq!(rule.head_exprs.len(), 1);
+        let corpus = facts(&[("warmth", vec![s("a"), n(0.25)])]);
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(one_term(&all, "scaled", &s("a")), Some(n(25.0)));
+    }
+
+    #[test]
+    fn several_head_arguments_may_be_expressions() {
+        let rule = parse_rule("box(X, W - 1, W + 1) :- warmth(X, W).").unwrap();
+        assert_eq!(rule.head_exprs.len(), 2);
+        let corpus = facts(&[("warmth", vec![s("a"), n(5.0)])]);
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        let row = all
+            .get("box")
+            .unwrap()
+            .iter()
+            .find(|a| a.first() == Some(&s("a")))
+            .unwrap();
+        assert_eq!(row[1], n(4.0));
+        assert_eq!(row[2], n(6.0));
+    }
+
+    #[test]
+    fn a_head_with_only_plain_terms_carries_no_expressions() {
+        let rule = parse_rule("copy(X, W) :- warmth(X, W).").unwrap();
+        assert!(rule.head_exprs.is_empty(), "negation must stay additive");
+    }
+
+    #[test]
+    fn an_arithmetic_head_that_feeds_its_own_body_is_rejected_at_load() {
+        // `rank(X, N + 1) :- rank(X, N).` never reaches a fixpoint. Today the
+        // max_facts budget would stop it BY TRUNCATION, which is the
+        // silently-wrong shape — the caller gets an arbitrary prefix and no
+        // signal. Reject it the way recursion through negation is rejected.
+        let rules = vec![parse_rule("rank(X, N + 1) :- rank(X, N).").unwrap()];
+        let err = stratify(&rules).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::types::StratifyError::RecursionThroughHeadExpression { .. }
+            ),
+            "expected RecursionThroughHeadExpression, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn an_indirect_arithmetic_recursion_is_also_rejected() {
+        let rules = vec![
+            parse_rule("a(X, N + 1) :- b(X, N).").unwrap(),
+            parse_rule("b(X, N) :- a(X, N).").unwrap(),
+        ];
+        assert!(matches!(
+            stratify(&rules).unwrap_err(),
+            crate::types::StratifyError::RecursionThroughHeadExpression { .. }
+        ));
+    }
+
+    #[test]
+    fn a_non_recursive_arithmetic_head_is_allowed() {
+        let rules = vec![parse_rule("scaled(X, W * 100) :- warmth(X, W).").unwrap()];
+        assert!(stratify(&rules).is_ok());
+    }
+
+    #[test]
+    fn plain_recursion_without_an_arithmetic_head_is_still_allowed() {
+        let rules = vec![
+            parse_rule("reach(X, Y) :- edge(X, Y).").unwrap(),
+            parse_rule("reach(X, Z) :- reach(X, Y), edge(Y, Z).").unwrap(),
+        ];
+        assert!(stratify(&rules).is_ok());
+    }
+
+    #[test]
+    fn a_head_expression_variable_the_body_does_not_bind_is_rejected() {
+        let err = parse_rule("scaled(X, Q * 100) :- warmth(X, W).")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains('Q'),
+            "must name the unbound variable, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_head_expression_over_a_non_number_does_not_fire() {
+        // No value means no fact. Deriving one with a missing argument would
+        // be a row the caller cannot tell from a real one.
+        let rule = parse_rule("scaled(X, W * 100) :- warmth(X, W).").unwrap();
+        let corpus = facts(&[("warmth", vec![s("a"), s("warm")])]);
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert!(all.get("scaled").map(|r| r.is_empty()).unwrap_or(true));
+    }
+
+    #[test]
+    fn a_head_expression_that_divides_by_zero_does_not_fire() {
+        let rule = parse_rule("ratio(X, W / 0) :- warmth(X, W).").unwrap();
+        let corpus = facts(&[("warmth", vec![s("a"), n(5.0)])]);
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert!(all.get("ratio").map(|r| r.is_empty()).unwrap_or(true));
+    }
+
+    #[test]
+    fn an_expression_is_only_computed_in_the_head_not_in_a_body_atom() {
+        // A body atom is a pattern to unify against, not something to compute,
+        // so `W + 1` there stays an opaque term and the rule carries no head
+        // expression. It simply will not match a numeric row, which is the
+        // correct reading of a pattern that no fact has.
+        // Left alone it would have become a VARIABLE NAMED "W + 1" — unbound,
+        // therefore matching every row, so the rule fires on everything and
+        // looks like it worked. That is the silent-wrongness shape, so it is
+        // rejected instead.
+        let err = parse_rule("q(X) :- warmth(X, W + 1).")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("compute"), "got: {err}");
+    }
+
+    #[test]
+    fn a_uuid_or_date_in_a_head_argument_is_not_mistaken_for_arithmetic() {
+        // Both are full of hyphens. Reading one as a subtraction would turn a
+        // constant into an expression over variables that do not exist.
+        let id = uuid::Uuid::from_u128(0x550e8400_e29b_41d4_a716_446655440000);
+        let rule = parse_rule(&format!("q(X, {id}) :- p(X).")).unwrap();
+        assert!(rule.head_exprs.is_empty());
+        let rule2 = parse_rule(r#"q(X, "2026-01-15") :- p(X)."#).unwrap();
+        assert!(rule2.head_exprs.is_empty());
     }
 
     // ── Item 4: min/max over any ordered term ─────────────────────
