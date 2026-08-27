@@ -277,9 +277,9 @@ pub fn execution_mode(
 /// # Why this destructures exhaustively
 ///
 /// So that a new field cannot silently change the answer. The body names every
-/// field of [`DatalogRule`]; adding one stops this compiling, and whoever adds
-/// it has to decide here. A compile error is the cheapest possible place to
-/// have that conversation.
+/// field of [`crate::types::DatalogRule`]; adding one stops this compiling, and
+/// whoever adds it has to decide here. A compile error is the cheapest
+/// possible place to have that conversation.
 ///
 /// That guard has now fired once, exactly as intended. Negation landed
 /// (`t_64ea07e9`), and this function had been trivially `true` — which would
