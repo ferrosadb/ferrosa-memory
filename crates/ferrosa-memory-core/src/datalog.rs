@@ -1734,6 +1734,22 @@ fn eval_expr(
                     // A zero modulus is as undefined as a zero divisor, and
                     // f64 would answer NaN — a value the caller cannot tell
                     // from a real one. Refuse it the same way.
+                    // f64::powf answers NaN for a negative base with a
+                    // fractional exponent, and infinity on overflow. Both are
+                    // values the caller cannot tell from a real one.
+                    ArithOp::Pow => {
+                        let r = a.powf(b);
+                        if r.is_finite() {
+                            Eval::Value(EvalValue::Num(r))
+                        } else {
+                            tracing::warn!(
+                                base = a,
+                                exponent = b,
+                                "datalog: exponentiation has no finite real answer"
+                            );
+                            Eval::Undefined
+                        }
+                    }
                     ArithOp::Rem => {
                         if b == 0.0 {
                             tracing::warn!("datalog: modulo by zero in filter");
@@ -5437,6 +5453,55 @@ mod grammar_tests {
         assert!(rule.body.iter().any(|a| a.predicate == "len"));
         let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
         assert_eq!(derived_keys(&all, "q"), vec!["a"]);
+    }
+
+    // ── Final, item 1: exponentiation ─────────────────────────────
+
+    #[test]
+    fn arithmetic_supports_exponentiation() {
+        let corpus = facts(&[("p", vec![s("a"), n(3.0)])]);
+        let rule = parse_rule("q(X) :- p(X, V), V ** 2 == 9.").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a"]);
+    }
+
+    #[test]
+    fn exponentiation_binds_tighter_than_multiplication() {
+        // 2 * 3 ** 2  is  2 * (3 ** 2) = 18, not (2 * 3) ** 2 = 36.
+        let corpus = facts(&[("p", vec![s("a"), n(3.0)])]);
+        let rule = parse_rule("q(X) :- p(X, V), 2 * V ** 2 == 18.").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a"]);
+    }
+
+    #[test]
+    fn exponentiation_is_right_associative() {
+        // 2 ** 3 ** 2 is 2 ** (3 ** 2) = 512, not (2 ** 3) ** 2 = 64.
+        let corpus = facts(&[("p", vec![s("a"), n(2.0)])]);
+        let rule = parse_rule("q(X) :- p(X, V), V ** 3 ** 2 == 512.").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a"]);
+    }
+
+    #[test]
+    fn exponentiation_works_in_a_head_and_a_binding() {
+        let corpus = facts(&[("p", vec![s("a"), n(4.0)])]);
+        let head = parse_rule("sq(X, V ** 2) :- p(X, V).").unwrap();
+        let bind = parse_rule("b(X, S) :- p(X, V), S := V ** 2.").unwrap();
+        let (all_h, _) = evaluate(&[head], &corpus, 100, 10_000);
+        let (all_b, _) = evaluate(&[bind], &corpus, 100, 10_000);
+        assert_eq!(one_term(&all_h, "sq", &s("a")), Some(n(16.0)));
+        assert_eq!(one_term(&all_b, "b", &s("a")), Some(n(16.0)));
+    }
+
+    #[test]
+    fn an_exponentiation_with_no_real_answer_derives_nothing() {
+        // (-8) ** 0.5 is not a real number. f64 answers NaN, which is a value
+        // the caller cannot tell from a real one.
+        let corpus = facts(&[("p", vec![s("a"), n(-8.0)])]);
+        let rule = parse_rule("q(X) :- p(X, V), V ** 0.5 > 0.").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert!(all.get("q").map(|r| r.is_empty()).unwrap_or(true));
     }
 
     // ── Round 2, item 1: set membership ───────────────────────────

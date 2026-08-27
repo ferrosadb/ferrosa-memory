@@ -859,6 +859,9 @@ pub enum ArithOp {
     Div,
     /// Remainder, written `%`. Binds as tightly as `*` and `/`.
     Rem,
+    /// Exponentiation, written `**`. Binds tighter than `*`, and associates to
+    /// the right, so `2 ** 3 ** 2` is `2 ** (3 ** 2)`.
+    Pow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

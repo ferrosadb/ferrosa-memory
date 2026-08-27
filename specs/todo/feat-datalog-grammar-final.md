@@ -23,7 +23,7 @@ Round 2's completeness pass named what was left. This closes it.
 
 ## Checklist
 
-- [ ] **1. Exponentiation.** `ArithOp` is Add/Sub/Mul/Div/Rem. `V ** 2` is
+- [x] **1. Exponentiation.** `ArithOp` is Add/Sub/Mul/Div/Rem. `V ** 2` is
       unwritable, so a rule cannot square, cube, or apply any power law.
       Trivial, streaming, and the only arithmetic operator still missing.
 

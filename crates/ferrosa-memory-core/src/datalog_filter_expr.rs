@@ -11,7 +11,8 @@
 //!   str_pred ::= ("str_starts_with"|"str_ends_with"|"str_contains") "(" expr "," expr ")"
 //!   cmp_op ::= "==" | "!=" | "<=" | ">=" | "=" | "<" | ">"
 //!   expr   ::= term (("+" | "-") term)*
-//!   term   ::= factor (("*" | "/" | "%") factor)*
+//!   term   ::= power (("*" | "/" | "%") power)*
+//!   power  ::= factor ("**" power)?
 //!   factor ::= number | string_lit | call | identifier | "(" expr ")" | "-" factor
 //!   call   ::= func_name "(" expr ("," expr)* ")"
 //! ```
@@ -104,10 +105,32 @@ fn factor(input: &str) -> IResult<&str, FilterExpr> {
     ws(alt((parens, number, string_lit, call, identifier, neg))).parse(input)
 }
 
+/// Exponentiation, tighter than `*` and right-associative.
+///
+/// Right associativity is why this is written by recursion rather than by
+/// folding: `a ** b ** c` must group as `a ** (b ** c)`, so the tail is
+/// parsed as a whole power rather than accumulated left to right.
+fn power(input: &str) -> IResult<&str, FilterExpr> {
+    let (i, base) = factor(input)?;
+    match preceded(ws(tag("**")), power).parse(i) {
+        Ok((rest, exp)) => Ok((
+            rest,
+            FilterExpr::BinOp {
+                op: ArithOp::Pow,
+                lhs: Box::new(base),
+                rhs: Box::new(exp),
+            },
+        )),
+        Err(_) => Ok((i, base)),
+    }
+}
+
 fn term(input: &str) -> IResult<&str, FilterExpr> {
-    let (i, init) = factor(input)?;
+    let (i, init) = power(input)?;
     fold_many0(
-        pair(ws(alt((ch('*'), ch('/'), ch('%')))), factor),
+        // `**` is consumed by `power` below, so a bare `*` here is always
+        // multiplication.
+        pair(ws(alt((ch('*'), ch('/'), ch('%')))), power),
         move || init.clone(),
         |acc, (op, rhs)| FilterExpr::BinOp {
             op: match op {
