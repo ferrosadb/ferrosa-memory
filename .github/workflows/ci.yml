@@ -55,11 +55,10 @@ jobs:
       # The workspace version must agree with the latest released tag, and the
       # commits since it must imply a bump somebody can see.
       #
-      # promote-release syncs main to the tag it just cut, but only via a PR it
-      # opens with continue-on-error and calls "cosmetic". On 2026-08-17 that
-      # PR was never created -- the branch was pushed, `gh pr create` did not
-      # produce one, the failure was swallowed, and main sat at 0.23.0 behind
-      # tag v0.27.0 for five days and twenty-one commits with nothing noticing.
+      # promote-release syncs main to the tag it just cut via a required PR.
+      # This gate remains defense in depth: on 2026-08-17 an older best-effort
+      # workflow swallowed `gh pr create` failure and main sat at 0.23.0 behind
+      # tag v0.27.0 for five days and twenty-one commits.
       #
       # Binaries self-report the Cargo version, so that drift ships binaries
       # announcing one version under a tag that says another, and every
