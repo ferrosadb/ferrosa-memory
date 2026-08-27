@@ -90,7 +90,7 @@ pub fn parse_rule(text: &str) -> anyhow::Result<DatalogRule> {
         let part = part.trim();
         if let Some(rest) = strip_not_prefix(part) {
             deferred_negated.push(rest.to_string());
-        } else if is_reserved_str_part(part) {
+        } else if is_boolean_filter_part(part) || is_reserved_str_part(part) {
             filters.push(crate::datalog_filter_expr::parse_filter(part)?);
         } else if aggregate_keyword(part).is_some() {
             deferred_aggregates.push(part.to_string());
@@ -421,6 +421,43 @@ fn parse_aggregate(
         output_var: output,
         value_var,
     }))
+}
+
+/// True for a body part that opens with `!` or joins with `||` / `&&` at the
+/// top level, which makes it a filter even when its comparison is nested
+/// inside parentheses and so invisible to `has_top_level_cmp`.
+fn is_boolean_filter_part(part: &str) -> bool {
+    let part = part.trim();
+    if part.starts_with('!') {
+        return true;
+    }
+    let bytes = part.as_bytes();
+    let (mut depth, mut in_str, mut i) = (0i32, false, 0usize);
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            if c == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' => in_str = true,
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'|' | b'&' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == c => {
+                return true;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 /// True for a body part that claims the reserved `str_` prefix.
@@ -800,6 +837,10 @@ fn filter_references_any(f: &BuiltinFilter, vars: &std::collections::HashSet<&st
         BuiltinFilter::StrPred { subject, arg, .. } => {
             expr_refs(subject, vars) || expr_refs(arg, vars)
         }
+        BuiltinFilter::Any(branches) | BuiltinFilter::All(branches) => {
+            branches.iter().any(|b| filter_references_any(b, vars))
+        }
+        BuiltinFilter::Not(inner) => filter_references_any(inner, vars),
     }
 }
 
@@ -1253,65 +1294,107 @@ fn check_filters(filters: &[BuiltinFilter], binding: &HashMap<String, Term>) -> 
     filters.iter().all(|f| check_one_filter(f, binding))
 }
 
+/// A filter's verdict.
+///
+/// Three states, not two, for the same reason `Eval` has three: an error and
+/// an undecidable comparison are not the same thing, and `!` must not be able
+/// to flip an error into a pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    True,
+    False,
+    /// Fully bound, but there is no answer — an arithmetic error, or a string
+    /// question asked of a number. Refuses, and negating it still refuses.
+    Undefined,
+    /// Not decidable yet because something is unbound. Passes, which is the
+    /// legacy semantics partial bindings rely on.
+    Unbound,
+}
+
+impl Verdict {
+    fn of(b: bool) -> Self {
+        if b { Verdict::True } else { Verdict::False }
+    }
+
+    /// Whether the binding survives this filter.
+    fn passes(self) -> bool {
+        matches!(self, Verdict::True | Verdict::Unbound)
+    }
+}
+
 /// Check a single builtin filter.
 fn check_one_filter(filter: &BuiltinFilter, binding: &HashMap<String, Term>) -> bool {
+    eval_filter(filter, binding).passes()
+}
+
+fn eval_filter(filter: &BuiltinFilter, binding: &HashMap<String, Term>) -> Verdict {
     match filter {
-        BuiltinFilter::NotEqual(lhs, rhs) => {
-            let lhs_val = binding.get(lhs);
-            let rhs_val = binding.get(rhs);
-            match (lhs_val, rhs_val) {
-                (Some(l), Some(r)) => l != r,
-                _ => true, // unbound variables pass the filter
-            }
-        }
+        BuiltinFilter::NotEqual(lhs, rhs) => match (binding.get(lhs), binding.get(rhs)) {
+            (Some(a), Some(b)) => Verdict::of(a != b),
+            _ => Verdict::Unbound,
+        },
         BuiltinFilter::GreaterThan(var, threshold) => {
-            if let Some(Term::ConstFloat(OrderedFloat(v))) = binding.get(var) {
-                *v > *threshold
-            } else {
-                true // unbound or non-float passes
+            match binding.get(var) {
+                Some(Term::ConstFloat(OrderedFloat(v))) => Verdict::of(*v > *threshold),
+                // Legacy: unbound or non-float passes.
+                _ => Verdict::Unbound,
             }
         }
-        BuiltinFilter::LessThan(var, threshold) => {
-            if let Some(Term::ConstFloat(OrderedFloat(v))) = binding.get(var) {
-                *v < *threshold
-            } else {
-                true
+        BuiltinFilter::LessThan(var, threshold) => match binding.get(var) {
+            Some(Term::ConstFloat(OrderedFloat(v))) => Verdict::of(*v < *threshold),
+            _ => Verdict::Unbound,
+        },
+        BuiltinFilter::Compare { op, lhs, rhs } => {
+            match (eval_expr(lhs, binding), eval_expr(rhs, binding)) {
+                (Eval::Value(l), Eval::Value(r)) => Verdict::of(apply_cmp(*op, &l, &r)),
+                (Eval::Undefined, _) | (_, Eval::Undefined) => Verdict::Undefined,
+                _ => Verdict::Unbound,
             }
         }
-        BuiltinFilter::StrPred {
-            op,
-            negated,
-            subject,
-            arg,
-        } => {
+        BuiltinFilter::StrPred { op, subject, arg } => {
             match (eval_expr(subject, binding), eval_expr(arg, binding)) {
                 (Eval::Value(EvalValue::Str(s)), Eval::Value(EvalValue::Str(a))) => {
-                    op.apply(&s, &a) != *negated
+                    Verdict::of(op.apply(&s, &a))
                 }
                 // Asking whether a number starts with a string has no answer.
-                // Undefined, so the rule must not fire — not false, which
-                // `!` would then flip into a spurious pass.
                 (Eval::Value(_), _) | (_, Eval::Value(_)) => {
                     tracing::warn!(
                         predicate = op.keyword(),
                         "datalog: string predicate applied to a non-string; deriving nothing"
                     );
-                    false
+                    Verdict::Undefined
                 }
-                // Legacy semantics: a partial binding passes the filter.
-                _ => true,
+                _ => Verdict::Unbound,
             }
         }
-        BuiltinFilter::Compare { op, lhs, rhs } => {
-            match (eval_expr(lhs, binding), eval_expr(rhs, binding)) {
-                (Eval::Value(l), Eval::Value(r)) => apply_cmp(*op, &l, &r),
-                // Already warned. A comparison with no answer must not let the
-                // rule fire — that would derive a fact off an arithmetic error.
-                (Eval::Undefined, _) | (_, Eval::Undefined) => false,
-                // Legacy semantics: a partial binding passes the filter.
-                _ => true,
+        // An error anywhere refuses the whole filter, even under a branch that
+        // is true on its own. A rule containing a mistake should say so rather
+        // than fire because another branch happened to hold.
+        BuiltinFilter::All(branches) => {
+            let verdicts: Vec<Verdict> = branches.iter().map(|b| eval_filter(b, binding)).collect();
+            if verdicts.contains(&Verdict::Undefined) {
+                Verdict::Undefined
+            } else if verdicts.contains(&Verdict::False) {
+                Verdict::False
+            } else {
+                Verdict::True
             }
         }
+        BuiltinFilter::Any(branches) => {
+            let verdicts: Vec<Verdict> = branches.iter().map(|b| eval_filter(b, binding)).collect();
+            if verdicts.contains(&Verdict::Undefined) {
+                Verdict::Undefined
+            } else if verdicts.contains(&Verdict::True) || verdicts.contains(&Verdict::Unbound) {
+                Verdict::True
+            } else {
+                Verdict::False
+            }
+        }
+        BuiltinFilter::Not(inner) => match eval_filter(inner, binding) {
+            Verdict::True => Verdict::False,
+            Verdict::False => Verdict::True,
+            other => other,
+        },
     }
 }
 
@@ -4038,6 +4121,97 @@ mod grammar_tests {
             .unwrap_or_default();
         out.sort();
         out
+    }
+
+    // ── Item 3: boolean connectives in a filter ───────────────────
+
+    fn v_corpus() -> FactSet {
+        facts(&[
+            ("p", vec![s("a"), n(1.0)]),
+            ("p", vec![s("b"), n(5.0)]),
+            ("p", vec![s("c"), n(20.0)]),
+        ])
+    }
+
+    #[test]
+    fn a_filter_can_say_or() {
+        let rule = parse_rule("q(X) :- p(X, V), V > 10 || V < 2.").unwrap();
+        let (all, _) = evaluate(&[rule], &v_corpus(), 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn a_filter_can_say_and_explicitly() {
+        let rule = parse_rule("q(X) :- p(X, V), V > 1 && V < 10.").unwrap();
+        let (all, _) = evaluate(&[rule], &v_corpus(), 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["b"]);
+    }
+
+    #[test]
+    fn a_filter_can_say_not() {
+        let rule = parse_rule("q(X) :- p(X, V), !(V > 4).").unwrap();
+        let (all, _) = evaluate(&[rule], &v_corpus(), 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a"]);
+    }
+
+    #[test]
+    fn and_binds_tighter_than_or() {
+        // V > 100 || V > 1 && V < 10  is  V > 100 || (V > 1 && V < 10)
+        // so only b. If `||` bound tighter it would be (…||…) && V < 10,
+        // which would also be only b — so use a case that separates them:
+        // V < 2 || V > 4 && V < 10  ==  V < 2 || (V > 4 && V < 10)  -> a, b
+        let rule = parse_rule("q(X) :- p(X, V), V < 2 || V > 4 && V < 10.").unwrap();
+        let (all, _) = evaluate(&[rule], &v_corpus(), 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn parentheses_override_boolean_precedence() {
+        // (V < 2 || V > 4) && V < 10  -> a and b, but NOT c (20 fails V < 10)
+        let rule = parse_rule("q(X) :- p(X, V), (V < 2 || V > 4) && V < 10.").unwrap();
+        let (all, _) = evaluate(&[rule], &v_corpus(), 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn boolean_connectives_compose_with_string_predicates() {
+        let corpus = facts(&[
+            ("item", vec![s("a"), s("tmp_x")]),
+            ("item", vec![s("b"), s("keep.pdf")]),
+            ("item", vec![s("c"), s("other.txt")]),
+        ]);
+        let rule = parse_rule(
+            r#"pick(X) :- item(X, N), str_starts_with(N, "tmp_") || str_ends_with(N, ".pdf")."#,
+        )
+        .unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "pick"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn arithmetic_still_parses_inside_a_boolean_filter() {
+        // `(V + 1) > 3` must not be mistaken for a parenthesised sub-filter.
+        let rule = parse_rule("q(X) :- p(X, V), (V + 1) > 3 && V < 10.").unwrap();
+        let (all, _) = evaluate(&[rule], &v_corpus(), 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["b"]);
+    }
+
+    #[test]
+    fn an_undefined_branch_refuses_the_whole_filter() {
+        // Conservative on purpose: an arithmetic error anywhere in the tree
+        // refuses, rather than letting a true branch carry a rule that also
+        // contains a mistake. Loud beats lucky.
+        let rule = parse_rule("q(X) :- p(X, V), V / 0 == 0 || V > 0.").unwrap();
+        let (all, _) = evaluate(&[rule], &v_corpus(), 100, 10_000);
+        assert!(all.get("q").map(|r| r.is_empty()).unwrap_or(true));
+    }
+
+    #[test]
+    fn a_multi_part_body_still_ands_its_filters() {
+        // The implicit AND between comma-separated filters is unchanged.
+        let rule = parse_rule("q(X) :- p(X, V), V > 1, V < 10.").unwrap();
+        let (all, _) = evaluate(&[rule], &v_corpus(), 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["b"]);
     }
 
     // ── Item 2: string predicates ─────────────────────────────────

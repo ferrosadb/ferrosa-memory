@@ -718,13 +718,20 @@ pub enum BuiltinFilter {
         rhs: FilterExpr,
     },
     /// A boolean-valued question about the shape of a string, written
-    /// `str_starts_with(S, P)` and optionally negated with a leading `!`.
+    /// `str_starts_with(S, P)`.
     StrPred {
         op: StrOp,
-        negated: bool,
         subject: FilterExpr,
         arg: FilterExpr,
     },
+    /// Disjunction, written `||`. True when any branch is true.
+    Any(Vec<BuiltinFilter>),
+    /// Conjunction, written `&&`. Comma-separated body filters are already an
+    /// implicit `All`; this is the explicit, groupable form.
+    All(Vec<BuiltinFilter>),
+    /// Negation, written `!`. The single mechanism for negating a filter —
+    /// `StrPred` deliberately does not carry its own negated flag.
+    Not(Box<BuiltinFilter>),
 }
 
 /// The string-shape predicates.
