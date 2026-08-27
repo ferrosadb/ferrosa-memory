@@ -50,9 +50,24 @@ Round 2's completeness pass named what was left. This closes it.
       stored-format questions a list term would open. Bounded, like the order
       statistics.
 
-- [ ] **5. Final answers for the term kinds round 2 skipped.** Boolean and
+- [x] **5. Final answers for the term kinds round 2 skipped.** Boolean and
       null were listed as "no requirement" — which is a reason to wait, not a
-      decision. Decide them, so the list stops reappearing.
+      decision. **Both are now declined for reasons stronger than absence of
+      demand, each pinned by a test:**
+
+      - **Boolean.** It would give truth a SECOND spelling. `flag(X, true)`
+        and `flag(X, "true")` would be different terms that do not unify, and
+        every flag already stored is a string — so a rule written with the
+        literal would silently stop matching its own data. The idiomatic form
+        needs no value at all: presence is truth.
+      - **Null.** Datalog's answer to "no value" is the absence of a fact, and
+        negation now says it directly. A null *value* would need three-valued
+        comparison semantics the engine deliberately does not have, and would
+        be a third kind of no-value beside `Unbound` and `Undefined`, which
+        the filter evaluator distinguishes on purpose.
+      - **List.** Closed by item 4 rather than declined. `group_concat`
+        delivers the capability; a list term would be flattened to a string at
+        the `DerivedFact` boundary anyway.
 
 ## Not in scope, with reasons rather than deferrals
 
