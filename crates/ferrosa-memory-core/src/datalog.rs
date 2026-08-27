@@ -949,13 +949,10 @@ fn apply_aggregate(
         };
 
         for (mut binding, mut prov) in members {
-            binding.insert(
-                agg.output_var.clone(),
-                Term::ConstFloat(OrderedFloat(value)),
-            );
+            binding.insert(agg.output_var.clone(), value.clone());
             prov.push(make_provenance_step(
                 &format!("{}({})", agg.kind.keyword(), agg.inner.predicate),
-                &[Term::ConstFloat(OrderedFloat(value))],
+                std::slice::from_ref(&value),
             ));
             out.push((binding, prov));
         }
@@ -1013,16 +1010,34 @@ fn visit_conjunction(
     true
 }
 
+/// Compare two ground terms of the same kind.
+///
+/// `None` for two different kinds: a string against a number has no meaningful
+/// order, and picking one arbitrarily would answer a question nobody asked.
+fn compare_terms(a: &Term, b: &Term) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (Term::ConstFloat(x), Term::ConstFloat(y)) => Some(x.cmp(y)),
+        (Term::ConstStr(x), Term::ConstStr(y)) => Some(x.cmp(y)),
+        (Term::Const(x), Term::Const(y)) => Some(x.cmp(y)),
+        _ => None,
+    }
+}
+
 /// The running state of a streaming aggregate fold.
 enum Fold {
     Count(u64),
     Sum(f64),
-    Min(Option<f64>),
-    Max(Option<f64>),
+    /// `min`/`max` need only a total order, so they carry the term itself
+    /// rather than a number — that is what lets a rule take the earliest
+    /// timestamp or the first name alphabetically.
+    Extreme {
+        want: std::cmp::Ordering,
+        best: Option<Term>,
+    },
     Avg(f64, u64),
-    /// A value that was not a number. The group is refused rather than
-    /// silently totalled without it — a total missing a row is quietly wrong,
-    /// which is worse than no total at all.
+    /// A value the fold cannot use — not a number where one is required, or a
+    /// group whose values are not all the same kind. The group is refused
+    /// rather than silently folded over the subset that happened to fit.
     TypeError,
 }
 
@@ -1032,52 +1047,79 @@ impl Fold {
         match kind {
             K::Count => Fold::Count(0),
             K::Sum => Fold::Sum(0.0),
-            K::Min => Fold::Min(None),
-            K::Max => Fold::Max(None),
+            K::Min => Fold::Extreme {
+                want: std::cmp::Ordering::Less,
+                best: None,
+            },
+            K::Max => Fold::Extreme {
+                want: std::cmp::Ordering::Greater,
+                best: None,
+            },
             K::Avg => Fold::Avg(0.0, 0),
         }
     }
 
     /// Absorb one solved binding. Returns false when the fold can stop early.
-    fn step(&mut self, value: Option<f64>) -> bool {
+    fn step(&mut self, value: Option<&Term>) -> bool {
+        if let Fold::Count(n) = self {
+            *n += 1;
+            return true;
+        }
+        if matches!(self, Fold::TypeError) {
+            return false;
+        }
+        let Some(value) = value else {
+            *self = Fold::TypeError;
+            return false;
+        };
         match self {
-            Fold::Count(n) => {
-                *n += 1;
-                true
-            }
-            Fold::TypeError => false,
-            _ => {
-                let Some(v) = value else {
+            Fold::Extreme { want, best } => match best {
+                None => *best = Some(value.clone()),
+                Some(current) => match compare_terms(value, current) {
+                    Some(ord) if ord == *want => *best = Some(value.clone()),
+                    Some(_) => {}
+                    // Mixed kinds within one group.
+                    None => {
+                        *self = Fold::TypeError;
+                        return false;
+                    }
+                },
+            },
+            Fold::Sum(_) | Fold::Avg(_, _) => {
+                let Term::ConstFloat(OrderedFloat(v)) = value else {
                     *self = Fold::TypeError;
                     return false;
                 };
+                let v = *v;
                 match self {
                     Fold::Sum(acc) => *acc += v,
-                    Fold::Min(acc) => *acc = Some(acc.map_or(v, |a| a.min(v))),
-                    Fold::Max(acc) => *acc = Some(acc.map_or(v, |a| a.max(v))),
                     Fold::Avg(sum, n) => {
                         *sum += v;
                         *n += 1;
                     }
-                    Fold::Count(_) | Fold::TypeError => unreachable!("handled above"),
+                    _ => unreachable!("matched above"),
                 }
-                true
             }
+            Fold::Count(_) | Fold::TypeError => unreachable!("handled above"),
         }
+        true
     }
 
     /// The folded value, or `None` when the group produces nothing.
-    fn finish(self, kind: crate::types::AggregateKind) -> Option<f64> {
+    fn finish(self, kind: crate::types::AggregateKind) -> Option<Term> {
+        let num = |f: f64| Term::ConstFloat(OrderedFloat(f));
         match self {
             Fold::TypeError => None,
-            Fold::Count(n) => Some(n as f64),
-            Fold::Sum(acc) => Some(acc),
-            Fold::Min(acc) | Fold::Max(acc) => acc.or_else(|| kind.identity_over_empty()),
+            Fold::Count(n) => Some(num(n as f64)),
+            Fold::Sum(acc) => Some(num(acc)),
+            // An extreme of nothing does not exist, and neither min nor max has
+            // an identity to fall back on.
+            Fold::Extreme { best, .. } => best.or_else(|| kind.identity_over_empty().map(num)),
             Fold::Avg(sum, n) => {
                 if n == 0 {
-                    kind.identity_over_empty()
+                    kind.identity_over_empty().map(num)
                 } else {
-                    Some(sum / n as f64)
+                    Some(num(sum / n as f64))
                 }
             }
         }
@@ -1087,19 +1129,17 @@ impl Fold {
 /// Fold an aggregate over its inner conjunction, streaming.
 ///
 /// `None` means the group derives nothing: an empty group for a kind with no
-/// identity (`min`, `max`, `avg`), or a value that was not a number.
+/// identity (`min`, `max`, `avg`), a value of the wrong kind, or a group whose
+/// values are not all the same kind.
 fn fold_inner_matches(
     agg: &crate::types::Aggregate,
     binding: &std::collections::HashMap<String, Term>,
     all_facts: &FactSet,
-) -> Option<f64> {
+) -> Option<Term> {
     let mut fold = Fold::start(agg.kind);
     let value_var = agg.value_var.clone();
     visit_inner_matches(agg, binding, all_facts, &mut |solved| {
-        let value = value_var.as_ref().and_then(|name| match solved.get(name) {
-            Some(Term::ConstFloat(OrderedFloat(f))) => Some(*f),
-            _ => None,
-        });
+        let value = value_var.as_ref().and_then(|name| solved.get(name));
         fold.step(value)
     });
     if matches!(fold, Fold::TypeError) {
@@ -1107,8 +1147,8 @@ fn fold_inner_matches(
             aggregate = agg.kind.keyword(),
             predicate = %agg.inner.predicate,
             value_var = ?agg.value_var,
-            "datalog: aggregate value is not a number; the group derives nothing \
-             rather than a total missing that row"
+            "datalog: aggregate value is unusable (wrong kind, or a group mixing \
+             kinds); the group derives nothing rather than a partial answer"
         );
     }
     fold.finish(agg.kind)
@@ -4121,6 +4161,105 @@ mod grammar_tests {
             .unwrap_or_default();
         out.sort();
         out
+    }
+
+    // ── Item 4: min/max over any ordered term ─────────────────────
+
+    /// The term bound to `pred`'s second argument for a given key.
+    fn one_term(all: &FactSet, pred: &str, key: &Term) -> Option<Term> {
+        all.get(pred)?
+            .iter()
+            .find(|args| args.first() == Some(key))
+            .and_then(|args| args.get(1).cloned())
+    }
+
+    #[test]
+    fn min_and_max_order_strings() {
+        // Timestamps are stored as strings in several places here, which is
+        // the case that actually bites.
+        let corpus = facts(&[
+            ("doc", vec![s("d")]),
+            ("created", vec![s("d"), s("2026-03-01")]),
+            ("created", vec![s("d"), s("2026-01-15")]),
+            ("created", vec![s("d"), s("2026-07-09")]),
+        ]);
+        let lo = parse_rule("earliest(X, T) :- doc(X), min(created(X, C), C, T).").unwrap();
+        let hi = parse_rule("latest(X, T) :- doc(X), max(created(X, C), C, T).").unwrap();
+        let (all_lo, _) = evaluate(&[lo], &corpus, 100, 10_000);
+        let (all_hi, _) = evaluate(&[hi], &corpus, 100, 10_000);
+        assert_eq!(
+            one_term(&all_lo, "earliest", &s("d")),
+            Some(s("2026-01-15"))
+        );
+        assert_eq!(one_term(&all_hi, "latest", &s("d")), Some(s("2026-07-09")));
+    }
+
+    #[test]
+    fn min_and_max_order_uuids() {
+        let (a, b) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
+        let corpus = facts(&[
+            ("grp", vec![s("g")]),
+            ("member", vec![s("g"), Term::Const(b)]),
+            ("member", vec![s("g"), Term::Const(a)]),
+        ]);
+        let rule = parse_rule("first(X, M) :- grp(X), min(member(X, U), U, M).").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(one_term(&all, "first", &s("g")), Some(Term::Const(a)));
+    }
+
+    #[test]
+    fn min_and_max_still_order_numbers_and_stay_numeric() {
+        let corpus = facts(&[
+            ("acct", vec![s("a")]),
+            ("spend", vec![s("a"), n(10.0)]),
+            ("spend", vec![s("a"), n(60.0)]),
+        ]);
+        let rule = parse_rule("lo(X, T) :- acct(X), min(spend(X, A), A, T).").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(one_term(&all, "lo", &s("a")), Some(n(10.0)));
+    }
+
+    #[test]
+    fn a_group_mixing_value_types_derives_nothing() {
+        // Comparing a string against a number has no meaningful answer, so
+        // the group is refused rather than ordered by an arbitrary rule.
+        let corpus = facts(&[
+            ("acct", vec![s("a")]),
+            ("spend", vec![s("a"), n(10.0)]),
+            ("spend", vec![s("a"), s("ten")]),
+        ]);
+        let rule = parse_rule("lo(X, T) :- acct(X), min(spend(X, A), A, T).").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert!(all.get("lo").map(|r| r.is_empty()).unwrap_or(true));
+    }
+
+    #[test]
+    fn sum_and_avg_still_refuse_a_non_numeric_value() {
+        // Only min/max were generalised; totalling strings has no meaning.
+        for text in [
+            "t(X, T) :- acct(X), sum(spend(X, A), A, T).",
+            "t(X, T) :- acct(X), avg(spend(X, A), A, T).",
+        ] {
+            let corpus = facts(&[("acct", vec![s("a")]), ("spend", vec![s("a"), s("ten")])]);
+            let rule = parse_rule(text).unwrap();
+            let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+            assert!(
+                all.get("t").map(|r| r.is_empty()).unwrap_or(true),
+                "{text} should refuse a non-numeric value"
+            );
+        }
+    }
+
+    #[test]
+    fn min_over_strings_streams_a_large_group() {
+        let mut corpus = FactSet::new();
+        corpus.insert("doc", vec![s("d")]);
+        for i in 0..20_000u32 {
+            corpus.insert("created", vec![s("d"), s(&format!("2026-{i:06}"))]);
+        }
+        let rule = parse_rule("earliest(X, T) :- doc(X), min(created(X, C), C, T).").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 200_000);
+        assert_eq!(one_term(&all, "earliest", &s("d")), Some(s("2026-000000")));
     }
 
     // ── Item 3: boolean connectives in a filter ───────────────────

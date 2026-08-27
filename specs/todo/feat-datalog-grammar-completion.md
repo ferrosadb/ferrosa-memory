@@ -56,7 +56,7 @@ Every gap below is a rule a tenant cannot write today.
       costs a second rule per alternative, which multiplies with each additional
       disjunct. Needs `||`, `&&` and `!` with parentheses and real precedence.
 
-- [ ] **4. min/max over any ordered term.** The streaming `Fold` holds `f64`.
+- [x] **4. min/max over any ordered term.** The streaming `Fold` holds `f64`.
       `sum` and `avg` genuinely require that; `min` and `max` need only a total
       order. Taking the earliest timestamp or the first name alphabetically is
       unwritable. `Term` already orders strings, floats and uuids. (t_b906d58c)
