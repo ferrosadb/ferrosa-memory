@@ -64,10 +64,6 @@ fn memory_tenant(configured: Option<&str>) -> Option<Uuid> {
 /// slots free rather than being refused.
 const MAX_CONCURRENT_CONTROL_SESSIONS: usize = 8;
 
-/// The live sessions a new one is checked against, and the device claiming it.
-///
-/// Optional at the call site so every existing caller and test keeps working
-/// without one — a listener that does not supply it simply does not supersede,
 /// The live control sessions a listener may supersede.
 ///
 /// A named type because the shape is repeated and clippy is right that the
@@ -84,6 +80,10 @@ pub(crate) type LiveSessions = std::sync::Arc<
     >,
 >;
 
+/// The live sessions a new one is checked against, and the device claiming it.
+///
+/// Optional at the call site so every existing caller and test keeps working
+/// without one — a listener that does not supply it simply does not supersede,
 /// which is the behaviour before this existed.
 pub(crate) struct SupersedeRegistry {
     pub sessions: LiveSessions,
