@@ -67,6 +67,11 @@ pub struct ShellExtension {
     /// use, and a cluster that is down costs one screen rather than the
     /// session.
     memory: tokio::sync::OnceCell<Option<Arc<crate::memory_view::MemoryView>>>,
+    /// Knowledge and claims, on the same terms again: connected on first use,
+    /// and a cluster that is down costs one screen rather than the session.
+    knowledge: tokio::sync::OnceCell<Option<Arc<crate::knowledge_view::KnowledgeView>>>,
+    /// The classification rules, on the same terms again.
+    rules: tokio::sync::OnceCell<Option<Arc<crate::rules_view::RulesView>>>,
 }
 
 #[derive(Default)]
@@ -97,6 +102,8 @@ impl ShellExtension {
             memory_tenant,
             board: tokio::sync::OnceCell::new(),
             memory: tokio::sync::OnceCell::new(),
+            knowledge: tokio::sync::OnceCell::new(),
+            rules: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -152,6 +159,642 @@ impl ShellExtension {
             .clone()
     }
 
+    /// Knowledge and claims, connected once. `None` if unreachable.
+    async fn rules(&self) -> Option<Arc<crate::rules_view::RulesView>> {
+        self.rules
+            .get_or_init(|| async {
+                let tenant = self.memory_tenant?;
+                match crate::rules_view::RulesView::connect(&self.board_contact_points, tenant)
+                    .await
+                {
+                    Ok(view) => Some(Arc::new(view)),
+                    Err(error) => {
+                        tracing::warn!(%error, "rules unavailable");
+                        None
+                    }
+                }
+            })
+            .await
+            .clone()
+    }
+
+    /// The rules that classify this machine's corpus, and the pile they have
+    /// not reached.
+    ///
+    /// PAGED, not bounded. A rule list is per-root rather than per-item so it
+    /// is usually small, and "usually small" is exactly the assumption that
+    /// sends a frame nobody receives. Rules and dangling aliases share one
+    /// paged stream, tagged by `row`, so the tab cannot draw a pile and a set
+    /// of rules that disagree about which read they came from.
+    ///
+    /// The unclassified count comes from the SAME summary the Memory tab
+    /// draws, rather than a second count of the same thing — two counts of one
+    /// pile eventually disagree, and nothing would say which was right. It
+    /// rides on the first frame because it is two integers.
+    ///
+    /// A count the machine could not take is OMITTED, never sent as zero. A
+    /// pile rendered as zero because nobody counted reads as "all done", which
+    /// is the one wrong thing this screen can say.
+    async fn rules_frames(&self) -> Vec<serde_json::Value> {
+        let Some(view) = self.rules().await else {
+            let reason = if self.memory_tenant.is_none() {
+                "no memory tenant is configured on this machine"
+            } else {
+                "the rules store could not be reached"
+            };
+            return vec![serde_json::json!({
+                "type": "shell_rules",
+                "reachable": false,
+                "reason": reason,
+                "items": [],
+            })];
+        };
+
+        let snapshot = match view.snapshot().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return vec![serde_json::json!({
+                    "type": "shell_rules",
+                    "reachable": false,
+                    "reason": bounded_reason(format_args!("{error:#}")),
+                    "items": [],
+                })];
+            }
+        };
+
+        let mut rows: Vec<serde_json::Value> = snapshot
+            .rules
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "row": "rule",
+                    "id": bounded_title(&row.root),
+                    "root": bounded_title(&row.root),
+                    "bucket": {
+                        // Until buckets are user-defined (t_9b1f9166) a bucket
+                        // IS its rung, named for it. Sent in the bucket shape
+                        // now so the app does not change when they diverge.
+                        "id": row.tier.as_str(),
+                        "name": row.tier.as_str(),
+                        "rung": row.tier.as_str(),
+                        "is_default": true,
+                    },
+                    "aliases": row.aliases.iter().map(|a| bounded_title(a)).collect::<Vec<_>>(),
+                    "reachability": if row.reachable() { "reachable" } else { "noAlias" },
+                    "datalog": bounded_title(&row.datalog),
+                    "note": bounded_title(&row.note),
+                    // Counts arrive in the trailing frame, not here. Absent
+                    // means "not counted yet", which the app renders as such.
+                    "is_live": false,
+                    "live_reasons": [],
+                })
+            })
+            .collect();
+
+        rows.extend(snapshot.dangling.iter().map(|alias| {
+            serde_json::json!({
+                "row": "dangling",
+                "alias_prefix": bounded_title(&alias.alias_prefix),
+                "canonical_root": bounded_title(&alias.canonical_root),
+            })
+        }));
+
+        let mut frames = Self::page_frames("shell_rules", rows, true, None);
+        if let Some(first) = frames.first_mut() {
+            // Tells the app a count is on its way, so it can show that it is
+            // counting rather than concluding it was not counted.
+            first["tallying"] = serde_json::json!(true);
+            // Not every tier comes from a path rule, and a screen that listed
+            // only path rules would imply they were the whole story. Someone
+            // asking "which rule made this Knowledge?" would find nothing and
+            // conclude the tab was broken, when the honest answer is that no
+            // rule did.
+            first["other_classifiers"] = serde_json::json!([
+                {
+                    "name": "Knowledge",
+                    "governed_by": "approval",
+                    "explain": "A deliverable is Knowledge because a person \
+                                approved it, and stays Knowledge while it is \
+                                still true. No path rule can put something \
+                                here or take it away.",
+                },
+                {
+                    "name": "Claims",
+                    "governed_by": "approval",
+                    "explain": "What an agent proposed and nobody has judged. \
+                                It becomes Knowledge when approved and lapses \
+                                if left, so its tier follows its state rather \
+                                than its location.",
+                },
+                {
+                    "name": "Promotions",
+                    "governed_by": "person",
+                    "explain": "One item placed by hand. A promotion outranks \
+                                every rule below, which is why an item can sit \
+                                in a bucket no rule would give it.",
+                },
+            ]);
+        }
+        frames
+    }
+
+    /// The counts, sent after the list is already on screen.
+    ///
+    /// Split from `rules_frames` because counting is one round trip per root
+    /// and measured 3.3 s on this store — time a device spent on a spinner
+    /// with the answer to "what rules exist" already in hand. The list is the
+    /// question; the counts are the footnote, and a footnote must not hold up
+    /// the page.
+    ///
+    /// A root whose count failed is absent from the map, never zero.
+    async fn rules_tally_frame(&self) -> serde_json::Value {
+        let Some(view) = self.rules().await else {
+            return serde_json::json!({
+                "type": "shell_rules_tally",
+                "reachable": false,
+                "reason": "the rules store could not be reached",
+            });
+        };
+
+        let counts = view.counts().await;
+        let unclassified = match self.memory().await {
+            Some(memory) => memory.map().await.ok().map(|map| map.unclassified),
+            None => None,
+        };
+
+        let mut frame = serde_json::json!({
+            "type": "shell_rules_tally",
+            "reachable": true,
+            "counts": counts,
+        });
+        if let Some(unclassified) = unclassified {
+            frame["unclassified"] = serde_json::json!(unclassified);
+        }
+        frame
+    }
+
+    /// What a rule can be built out of, on THIS machine.
+    ///
+    /// Derived from the engine's own parser rather than listed, so a block is
+    /// offered only where the operator behind it really exists. A machine
+    /// without negation simply does not advertise the negating blocks, and the
+    /// app shows what that machine can do rather than offering something it
+    /// will refuse.
+    ///
+    /// BOUNDED: the palette is a handful of rows describing a language, not a
+    /// list of anybody's data.
+    fn rule_palette_frame() -> serde_json::Value {
+        let blocks: Vec<serde_json::Value> = ferrosa_memory_core::rule_palette::palette()
+            .into_iter()
+            .map(|block| {
+                serde_json::json!({
+                    "id": block.id,
+                    "label": block.label,
+                    "slot": block.slot,
+                    "fill": block.fill,
+                    "negates": block.negates,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "type": "shell_rule_palette",
+            "reachable": true,
+            "blocks": blocks,
+        })
+    }
+
+    /// Turn a composition into a rule, and say whether the engine accepts it.
+    ///
+    /// Two steps kept apart on purpose. Compiling knows how to WRITE the
+    /// language; only the parser knows whether the result is in it. A compile
+    /// that skipped the parse would be the client owning the grammar again,
+    /// one layer down.
+    ///
+    /// Nothing is stored here. This answers "what would this be, and is it
+    /// valid" so the composer can show both before anyone commits.
+    fn rule_compile_frame(
+        placed: &[ferrosa_memory_core::rule_palette::Placed],
+    ) -> serde_json::Value {
+        use ferrosa_memory_core::rule_palette::compile;
+
+        match compile(placed) {
+            Err(error) => serde_json::json!({
+                "type": "shell_rule_compiled",
+                "reachable": true,
+                "ok": false,
+                // The compiler's words, which are about the composition, not
+                // the parser's, which are about syntax the person never saw.
+                "problem": bounded_reason(format_args!("{error}")),
+            }),
+            Ok(text) => match ferrosa_memory_core::datalog::parse_rule(&text) {
+                Ok(_) => serde_json::json!({
+                    "type": "shell_rule_compiled",
+                    "reachable": true,
+                    "ok": true,
+                    "datalog": bounded_title(&text),
+                }),
+                // Compiled but refused. The person did nothing wrong: this is
+                // the palette and the parser disagreeing, and it is worth
+                // showing rather than swallowing.
+                Err(error) => serde_json::json!({
+                    "type": "shell_rule_compiled",
+                    "reachable": true,
+                    "ok": false,
+                    "datalog": bounded_title(&text),
+                    "problem": bounded_reason(format_args!(
+                        "this machine refused the rule that makes: {error:#}"
+                    )),
+                }),
+            },
+        }
+    }
+
+    /// What one rule has classified.
+    ///
+    /// PAGED: unlike the rule list, a yield is per-item and is the one part of
+    /// this screen that can be large.
+    ///
+    /// A root the store does not have answers as UNREACHABLE with a reason,
+    /// not as an empty page. "This rule classified nothing" and "this rule no
+    /// longer exists" are different sentences, and the second is the one that
+    /// tells a stale screen it is stale.
+    async fn rule_detail_frames(
+        &self,
+        root: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Vec<serde_json::Value> {
+        let Some(view) = self.rules().await else {
+            return vec![serde_json::json!({
+                "type": "shell_rule_detail",
+                "reachable": false,
+                "reason": "the rules store could not be reached",
+                "items": [],
+            })];
+        };
+
+        let limit = limit.clamp(1, KNOWLEDGE_PAGE_MAX);
+        match view.rule_yield(root, cursor, limit).await {
+            Ok(Some(found)) => {
+                let rows: Vec<serde_json::Value> = found
+                    .items
+                    .iter()
+                    .map(|item| {
+                        serde_json::json!({
+                            "id": item.entity_id,
+                            "title": bounded_title(&item.title),
+                            "path": bounded_title(&item.source_path),
+                            // Which alias put it here. Two aliases can reach
+                            // one root, and "why is this here" is answered by
+                            // the alias, never by the root alone.
+                            "matched_alias": item.matched_alias.as_deref().map(bounded_title),
+                        })
+                    })
+                    .collect();
+                let mut frames = Self::page_frames(
+                    "shell_rule_detail",
+                    rows,
+                    cursor.is_none(),
+                    found.next_cursor,
+                );
+                if let Some(first) = frames.first_mut() {
+                    first["root"] = serde_json::json!(bounded_title(&found.rule.root));
+                    first["rung"] = serde_json::json!(found.rule.tier.as_str());
+                    first["datalog"] = serde_json::json!(bounded_title(&found.rule.datalog));
+                    first["aliases"] = serde_json::json!(
+                        found
+                            .rule
+                            .aliases
+                            .iter()
+                            .map(|a| bounded_title(a))
+                            .collect::<Vec<_>>()
+                    );
+                    first["reachable_rule"] = serde_json::json!(found.rule.reachable());
+                }
+                frames
+            }
+            Ok(None) => vec![serde_json::json!({
+                "type": "shell_rule_detail",
+                "reachable": false,
+                "reason": format!("no rule for {} on this machine any more", bounded_title(root)),
+                "items": [],
+            })],
+            Err(error) => vec![serde_json::json!({
+                "type": "shell_rule_detail",
+                "reachable": false,
+                "reason": bounded_reason(format_args!("{error:#}")),
+                "items": [],
+            })],
+        }
+    }
+
+    async fn knowledge(&self) -> Option<Arc<crate::knowledge_view::KnowledgeView>> {
+        self.knowledge
+            .get_or_init(|| async {
+                let Some(tenant) = self.memory_tenant else {
+                    tracing::warn!(
+                        "knowledge unavailable: no tenant configured. Pass \
+                         --memory-tenant, or set server.tenant_id in the memory \
+                         config, to the tenant this machine's memory is stored under."
+                    );
+                    return None;
+                };
+                match crate::knowledge_view::KnowledgeView::connect(
+                    &self.board_contact_points,
+                    tenant,
+                )
+                .await
+                {
+                    Ok(view) => {
+                        tracing::info!(%tenant, "knowledge connected");
+                        Some(Arc::new(view))
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, %tenant, "knowledge unavailable");
+                        None
+                    }
+                }
+            })
+            .await
+            .clone()
+    }
+
+    /// The Knowledge tier: approved deliverables only, each with its check.
+    ///
+    /// Approved only, deliberately (D44). A claim on this list would put a
+    /// model's assertion beside a person's judgement.
+    async fn knowledge_frames(&self, cursor: Option<&str>, limit: usize) -> Vec<serde_json::Value> {
+        let Some(view) = self.knowledge().await else {
+            let reason = if self.memory_tenant.is_none() {
+                "no memory tenant is configured on this machine"
+            } else {
+                "the knowledge store could not be reached"
+            };
+            return vec![serde_json::json!({
+                "type": "shell_knowledge",
+                "reachable": false,
+                "reason": reason,
+                "items": [],
+            })];
+        };
+        let limit = limit.clamp(1, KNOWLEDGE_PAGE_MAX);
+        match view.knowledge(cursor, limit).await {
+            Ok(page) => {
+                let rows: Vec<serde_json::Value> = page
+                    .items
+                    .iter()
+                    .map(|item| {
+                        serde_json::json!({
+                            "id": item.knowledge_id,
+                            "title": bounded_title(&item.title),
+                            "kind": item.kind,
+                            "repo": item.repo,
+                            "expires": item.expires_at,
+                        })
+                    })
+                    .collect();
+                Self::page_frames("shell_knowledge", rows, cursor.is_none(), page.next_cursor)
+            }
+            Err(error) => vec![serde_json::json!({
+                "type": "shell_knowledge",
+                "reachable": false,
+                "reason": bounded_reason(format_args!("{error:#}")),
+                "items": [],
+            })],
+        }
+    }
+
+    /// The Claims queue: what still needs a person, soonest to lapse first.
+    async fn knowledge_claims_frames(&self, limit: usize) -> Vec<serde_json::Value> {
+        let Some(view) = self.knowledge().await else {
+            return vec![serde_json::json!({
+                "type": "shell_knowledge_claims",
+                "reachable": false,
+                "reason": "the knowledge store could not be reached",
+                "items": [],
+            })];
+        };
+        let limit = limit.clamp(1, KNOWLEDGE_PAGE_MAX);
+        match view.claims(limit).await {
+            Ok(rows) => {
+                let rows: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|row| {
+                        serde_json::json!({
+                            "id": row.knowledge_id,
+                            "title": bounded_title(&row.title),
+                            "kind": row.kind,
+                            // The device draws a greyed robot for a claim and a
+                            // green check for approved work, so it needs the
+                            // state rather than inferring it from the tab.
+                            "state": row.state.as_str(),
+                            "priority": row.priority,
+                            "expires": row.expires_at,
+                            "agent": row.author_agent,
+                        })
+                    })
+                    .collect();
+                let mut frames = Self::page_frames("shell_knowledge_claims", rows, true, None);
+                // The sorts the machine can actually perform, so a device does
+                // not offer one that would become a scan.
+                if let Some(first) = frames.first_mut()
+                    && let Some(obj) = first.as_object_mut()
+                {
+                    obj.insert(
+                        "sorts".to_owned(),
+                        serde_json::json!(crate::knowledge_view::CLAIM_SORTS),
+                    );
+                }
+                frames
+            }
+            Err(error) => vec![serde_json::json!({
+                "type": "shell_knowledge_claims",
+                "reachable": false,
+                "reason": bounded_reason(format_args!("{error:#}")),
+                "items": [],
+            })],
+        }
+    }
+
+    /// One item, its chain, and what a reviewer needs to decide.
+    async fn knowledge_detail_frames(&self, id: &str) -> Vec<serde_json::Value> {
+        let Ok(knowledge_id) = uuid::Uuid::parse_str(id) else {
+            return vec![serde_json::json!({
+                "type": "shell_knowledge_detail",
+                "id": id,
+                "reachable": false,
+                "reason": "that is not a knowledge id",
+            })];
+        };
+        let Some(view) = self.knowledge().await else {
+            return vec![serde_json::json!({
+                "type": "shell_knowledge_detail",
+                "id": id,
+                "reachable": false,
+                "reason": "the knowledge store could not be reached",
+            })];
+        };
+        match view.detail(knowledge_id).await {
+            Ok(Some((item, versions))) => {
+                let head = serde_json::json!({
+                    "type": "shell_knowledge_detail",
+                    "id": id,
+                    "reachable": true,
+                    "title": bounded_title(&item.title),
+                    "kind": item.kind,
+                    "state": item.state.as_str(),
+                    "priority": item.priority,
+                    "repo": item.repo,
+                    "expires": item.expires_at,
+                    "agent": item.author_agent,
+                    // The session, because the agent may be gone by review time
+                    // and its session is what a replacement picks up (D24).
+                    "session": item.author_session,
+                    "task": item.task_id,
+                    "reviewed_by": item.reviewed_by,
+                    "versions": versions.len(),
+                });
+                let mut frames = vec![head];
+                // The chain is paged like everything else: a deliverable
+                // revised twenty times must not arrive as one oversized frame.
+                let rows: Vec<serde_json::Value> = versions
+                    .iter()
+                    .map(|version| {
+                        serde_json::json!({
+                            "version": version.version,
+                            "state": version.version_state,
+                            "url": version.body_url,
+                            "feedback": version.feedback,
+                        })
+                    })
+                    .collect();
+                frames.extend(Self::page_frames(
+                    "shell_knowledge_versions",
+                    rows,
+                    true,
+                    None,
+                ));
+                frames
+            }
+            Ok(None) => vec![serde_json::json!({
+                "type": "shell_knowledge_detail",
+                "id": id,
+                "reachable": false,
+                "reason": "no knowledge item with that id",
+            })],
+            Err(error) => vec![serde_json::json!({
+                "type": "shell_knowledge_detail",
+                "id": id,
+                "reachable": false,
+                "reason": bounded_reason(format_args!("{error:#}")),
+            })],
+        }
+    }
+
+    /// Approve, reject, or send a claim back.
+    ///
+    /// Three decisions and not two. Reject is "throw this away" — a scenario
+    /// that was explored, a brainstorm that went nowhere — and it demotes to
+    /// Data. Send back is "directionally correct, you need this additional
+    /// context", and it returns to revisit with the feedback attached. One
+    /// button for both would force a person to choose between discarding good
+    /// work and accepting bad work (D36).
+    async fn knowledge_decide_frames(
+        &self,
+        id: &str,
+        decision: &str,
+        body: &serde_json::Value,
+    ) -> Vec<serde_json::Value> {
+        use ferrosa_memory_core::knowledge::KnowledgeState;
+
+        let refuse = |reason: String| {
+            vec![serde_json::json!({
+                "type": "shell_knowledge_detail",
+                "id": id,
+                "reachable": false,
+                "reason": bounded_reason(reason),
+            })]
+        };
+
+        let Ok(knowledge_id) = uuid::Uuid::parse_str(id) else {
+            return refuse("that is not a knowledge id".to_owned());
+        };
+        let to = match decision {
+            "approve" => KnowledgeState::Approved,
+            "reject" => KnowledgeState::Rejected,
+            "send_back" => KnowledgeState::Revisit,
+            other => {
+                return refuse(format!(
+                    "{other} is not a decision; use approve, reject or send_back"
+                ));
+            }
+        };
+        // Sending something back without saying why is the one case that
+        // wastes an agent's next turn, so it is refused rather than accepted.
+        let feedback = body
+            .get("feedback")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if to == KnowledgeState::Revisit && feedback.is_none() {
+            return refuse("sending back needs feedback saying what is missing".to_owned());
+        }
+        let reviewer = body.get("reviewer").and_then(serde_json::Value::as_str);
+
+        let Some(view) = self.knowledge().await else {
+            return refuse("the knowledge store could not be reached".to_owned());
+        };
+        match view.decide(knowledge_id, to, reviewer, feedback).await {
+            // The whole detail comes back, so the screen redraws from what was
+            // actually stored rather than from what it hoped happened.
+            Ok(_) => self.knowledge_detail_frames(id).await,
+            Err(error) => refuse(format!("{error:#}")),
+        }
+    }
+
+    /// Chunk rows into datagram-safe frames.
+    ///
+    /// Shared by every knowledge list so one of them cannot quietly grow past
+    /// the bound while the others stay inside it.
+    fn page_frames(
+        kind: &str,
+        rows: Vec<serde_json::Value>,
+        first_page: bool,
+        next_cursor: Option<String>,
+    ) -> Vec<serde_json::Value> {
+        // An empty page still sends one frame. Without it, a list that matched
+        // nothing looks identical to one that never answered, and the screen
+        // keeps its previous contents.
+        if rows.is_empty() {
+            return vec![serde_json::json!({
+                "type": kind,
+                "reachable": true,
+                "first": first_page,
+                "next_cursor": next_cursor,
+                "items": [],
+            })];
+        }
+        let frame_count = rows.len().div_ceil(KNOWLEDGE_ROWS_PER_FRAME);
+        rows.chunks(KNOWLEDGE_ROWS_PER_FRAME)
+            .enumerate()
+            .map(|(index, chunk)| {
+                serde_json::json!({
+                    "type": kind,
+                    "reachable": true,
+                    // Only the first frame of a first page replaces the list;
+                    // the rest append.
+                    "first": first_page && index == 0,
+                    // Only the LAST frame carries the cursor, or a device would
+                    // ask for the next page while this one is still arriving.
+                    "next_cursor": (index + 1 == frame_count)
+                        .then(|| next_cursor.clone())
+                        .flatten(),
+                    "items": chunk,
+                })
+            })
+            .collect()
+    }
+
     /// The DIKW map: four rows, always, plus what the plane does not know.
     ///
     /// Bounded — four counts and a handful of root names — so it is one frame.
@@ -173,15 +816,47 @@ impl ShellExtension {
                 "tiers": [],
             });
         };
+        // Knowledge is the one tier that is STORED rather than derived.
+        //
+        // Every other tier is a fact about where a thing came from, and
+        // `summarise` counts them per source root. A ratified deliverable has
+        // no source root — it is not an entity — so the map counted it as zero
+        // while 184 approved items sat in the store, and the tier that the
+        // whole lifecycle exists to fill read empty.
+        //
+        // Claims ride alongside as their own row. They are not a DIKW tier:
+        // they are what is waiting to become one, and a reviewer looking at
+        // the map should see the queue feeding it.
+        let (approved, claims) = match self.knowledge().await {
+            Some(knowledge) => (
+                knowledge
+                    .count(ferrosa_memory_core::knowledge::KnowledgeState::Approved)
+                    .await
+                    .ok(),
+                knowledge
+                    .count(ferrosa_memory_core::knowledge::KnowledgeState::Proposed)
+                    .await
+                    .ok(),
+            ),
+            None => (None, None),
+        };
+
         match view.map().await {
             Ok(map) => serde_json::json!({
                 "type": "shell_memory_tiers",
                 "reachable": true,
-                "tiers": map.tiers.iter().map(|row| serde_json::json!({
+                "tiers": Self::with_claims_row(map.tiers.iter().map(|row| serde_json::json!({
                     "tier": row.tier.as_str(),
-                    "count": row.count,
+                    // A count the store could not give is left as the derived
+                    // one rather than replaced by a zero: a wrong number is
+                    // worse than an old one.
+                    "count": if row.tier == ferrosa_memory_core::tiers::Tier::Knowledge {
+                        approved.unwrap_or(row.count)
+                    } else {
+                        row.count
+                    },
                     "roots": row.roots,
-                })).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(), claims),
                 // Both numbers are the map's honesty. `sourced == 0` means
                 // nothing records a source yet, which is a build step and not
                 // an empty library; `unclassified` is the hole in the rules.
@@ -204,6 +879,147 @@ impl ShellExtension {
     /// Paged, and the page is small: this frame carries titles, and a tier can
     /// hold tens of thousands of them. The task list taught this the expensive
     /// way at 194 KiB.
+    /// Put the claims row between Information and Knowledge.
+    ///
+    /// The device renders the tiers reversed, so this array is in DIKW order
+    /// and the screen reads Wisdom, Knowledge, Claims, Information, Data. The
+    /// queue belongs directly below the tier it feeds: a claim becomes
+    /// knowledge when a person approves it, and falls to Information when it
+    /// lapses unread. Appended at the end it rendered above Wisdom, at the top
+    /// of the map, which puts unjudged work above everything ratified.
+    fn with_claims_row(
+        mut tiers: Vec<serde_json::Value>,
+        claims: Option<usize>,
+    ) -> Vec<serde_json::Value> {
+        let Some(count) = claims else { return tiers };
+        let row = serde_json::json!({
+            "tier": "claims",
+            "count": count,
+            "roots": Vec::<String>::new(),
+        });
+        // Before Knowledge, wherever the map put it. Positional insertion by a
+        // hardcoded index would silently move if a tier were ever added.
+        match tiers
+            .iter()
+            .position(|tier| tier.get("tier").and_then(|t| t.as_str()) == Some("knowledge"))
+        {
+            Some(index) => tiers.insert(index, row),
+            // No Knowledge row at all is not a map this understands; appending
+            // beats dropping the count on the floor.
+            None => tiers.push(row),
+        }
+        tiers
+    }
+
+    /// One page of a tier the knowledge store holds rather than the entity
+    /// plane.
+    ///
+    /// Projected into the same row shape as the derived tiers, so the device
+    /// renders one kind of list: an id, the session that made it, a title, and
+    /// the repository standing in for a source root.
+    async fn stored_tier_frames(
+        &self,
+        tier: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Vec<serde_json::Value> {
+        let Some(view) = self.knowledge().await else {
+            let reason = if self.memory_tenant.is_none() {
+                "no memory tenant is configured on this machine"
+            } else {
+                "the knowledge store could not be reached"
+            };
+            return vec![serde_json::json!({
+                "type": "shell_memory_items",
+                "tier": tier,
+                "reachable": false,
+                "reason": reason,
+                "items": [],
+            })];
+        };
+        let limit = limit.clamp(1, MEMORY_PAGE_MAX);
+        let first_page = cursor.is_none();
+
+        // Claims are read by expiry, which is a seek across day buckets and
+        // has no cursor of its own; knowledge pages by `page_key`.
+        let (items, next_cursor) = if tier == "claims" {
+            match view.claims(limit).await {
+                Ok(rows) => (
+                    rows.into_iter()
+                        .map(|row| (row.knowledge_id, row.author_session, row.title, row.repo))
+                        .collect::<Vec<_>>(),
+                    None,
+                ),
+                Err(error) => return vec![Self::stored_tier_failure(tier, &error)],
+            }
+        } else {
+            match view.knowledge(cursor, limit).await {
+                Ok(page) => (
+                    page.items
+                        .into_iter()
+                        .map(|item| {
+                            (
+                                item.knowledge_id,
+                                item.author_session,
+                                item.title,
+                                item.repo,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    page.next_cursor,
+                ),
+                Err(error) => return vec![Self::stored_tier_failure(tier, &error)],
+            }
+        };
+
+        let rows: Vec<serde_json::Value> = items
+            .iter()
+            .map(|(id, session, title, repo)| {
+                serde_json::json!({
+                    "id": id,
+                    "session": session,
+                    "title": bounded_title(title),
+                    "root": repo,
+                })
+            })
+            .collect();
+
+        if rows.is_empty() {
+            return vec![serde_json::json!({
+                "type": "shell_memory_items",
+                "tier": tier, "reachable": true, "first": first_page,
+                "next_cursor": next_cursor,
+                "items": [],
+            })];
+        }
+        let frame_count = rows.len().div_ceil(MEMORY_ITEMS_PER_FRAME);
+        rows.chunks(MEMORY_ITEMS_PER_FRAME)
+            .enumerate()
+            .map(|(index, chunk)| {
+                serde_json::json!({
+                    "type": "shell_memory_items",
+                    "tier": tier,
+                    "reachable": true,
+                    "first": first_page && index == 0,
+                    "items": chunk,
+                    // Only the LAST frame carries the cursor, or a device asks
+                    // for the next page while this one is still arriving.
+                    "next_cursor": if index + 1 == frame_count { next_cursor.clone() } else { None },
+                })
+            })
+            .collect()
+    }
+
+    fn stored_tier_failure(tier: &str, error: &anyhow::Error) -> serde_json::Value {
+        serde_json::json!({
+            "type": "shell_memory_items",
+            "tier": tier,
+            "reachable": false,
+            "reason": bounded_reason(format_args!("{error:#}")),
+            "items": [],
+        })
+    }
+
     async fn memory_items_frames(
         &self,
         tier: &str,
@@ -211,6 +1027,13 @@ impl ShellExtension {
         cursor: Option<&str>,
         limit: usize,
     ) -> Vec<serde_json::Value> {
+        // Knowledge and claims are STORED, not derived from a source path, so
+        // they are not in the entity plane this pages. Counting them from the
+        // store and then listing them from the entity plane gave a tier that
+        // said 184 and opened empty, which is worse than either number alone.
+        if tier == "knowledge" || tier == "claims" {
+            return self.stored_tier_frames(tier, cursor, limit).await;
+        }
         let Some(parsed) = ferrosa_memory_core::tiers::Tier::parse(tier) else {
             return vec![serde_json::json!({
                 "type": "shell_memory_items",
@@ -263,7 +1086,7 @@ impl ShellExtension {
                         serde_json::json!({
                             "id": item.entity_id,
                             "session": item.session_id,
-                            "title": item.title,
+                            "title": bounded_title(&item.title),
                             "root": item.source_root,
                         })
                     })
@@ -344,7 +1167,7 @@ impl ShellExtension {
                 let mut frames = vec![serde_json::json!({
                     "type": "shell_task_detail",
                     "task_id": task_id,
-                    "title": detail.task.title,
+                    "title": bounded_title(&detail.task.title),
                     "status": detail.task.status,
                     "priority": detail.task.priority,
                     "block_reason": detail.task.block_reason,
@@ -377,7 +1200,7 @@ impl ShellExtension {
                                 .map(|item| serde_json::json!({
                                     "reason": item.reason,
                                     "id": item.task.id,
-                                    "title": item.task.title,
+                                    "title": bounded_title(&item.task.title),
                                     "status": item.task.status,
                                     "needs_a_person": item.task.waits_on_a_person(),
                                 }))
@@ -636,7 +1459,7 @@ impl ShellExtension {
                 .map(|task| {
                     serde_json::json!({
                         "id": task.id,
-                        "title": task.title,
+                        "title": bounded_title(&task.title),
                         "status": task.status,
                         "priority": task.priority,
                         "block_reason": task.block_reason,
@@ -711,7 +1534,7 @@ impl ShellExtension {
                 .map(|task| {
                     serde_json::json!({
                         "id": task.id,
-                        "title": task.title,
+                        "title": bounded_title(&task.title),
                         "status": task.status,
                         "priority": task.priority,
                         "block_reason": task.block_reason,
@@ -1000,6 +1823,38 @@ fn bounded_reason(value: impl std::fmt::Display) -> String {
     format!("{}...", &value[..end])
 }
 
+/// The widest a title may travel in a list frame.
+///
+/// A row's other fields are fixed-width — an id, a kind, a state, a priority,
+/// an expiry — so the title is the only part that can push a frame past the
+/// datagram. Nothing bounds it upstream: `propose` accepts whatever an agent
+/// sends, and a title assembled from a path runs long routinely.
+///
+/// 120 is the width the sizing proofs measure against at two rows per frame,
+/// so this is the number those proofs were already assuming. It was an
+/// assumption about production rather than a rule production enforced, which
+/// is the fifth showing of this bug class here and the first caught before
+/// anything reached a device.
+const MAX_TITLE_BYTES: usize = 120;
+
+/// Trim a title to something a list frame can carry, on a character boundary.
+///
+/// The full title stays in the store and comes back on the detail frame; this
+/// bounds the LIST, where one long title would cost every other row its place
+/// on the page.
+fn bounded_title(value: &str) -> String {
+    if value.len() <= MAX_TITLE_BYTES {
+        return value.to_owned();
+    }
+    let mut end = MAX_TITLE_BYTES.saturating_sub(3);
+    // Splitting mid-character would make the frame invalid UTF-8, which is a
+    // worse failure than a long title.
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &value[..end])
+}
+
 /// How many memory items travel in ONE frame.
 ///
 /// Four. The first attempt sent a 50-item page as a single frame and the size
@@ -1010,6 +1865,26 @@ fn bounded_reason(value: impl std::fmt::Display) -> String {
 /// still measured 1,106 against 1,100. The row was trimmed instead — no
 /// per-item tier, no absolute path — which is what makes four fit.
 const MEMORY_ITEMS_PER_FRAME: usize = 4;
+
+/// How many knowledge rows travel in ONE frame.
+///
+/// Two. Three was written first and MEASURED at 1,287 bytes against the
+/// 1,100-byte datagram — the fourth time this project has shipped a frame
+/// whose content is bounded in the common case and not in the worst one, and
+/// the first time a test caught it before a device did.
+///
+/// A knowledge row is heavier than a memory item: it carries a kind, a state,
+/// a priority, an expiry and the author agent on top of an id and a title,
+/// because those are what a person needs to decide WITHOUT opening it. The
+/// fields earn their place, so the row count gives way instead.
+const KNOWLEDGE_ROWS_PER_FRAME: usize = 2;
+
+/// How many knowledge rows one REQUEST returns.
+const KNOWLEDGE_PAGE_DEFAULT: usize = 20;
+const KNOWLEDGE_PAGE_MAX: usize = 50;
+
+const _: () = assert!(KNOWLEDGE_ROWS_PER_FRAME <= KNOWLEDGE_PAGE_MAX);
+const _: () = assert!(KNOWLEDGE_PAGE_DEFAULT <= KNOWLEDGE_PAGE_MAX);
 
 // Checked by the compiler rather than by a test: both sides are constants, so
 // the comparison has an answer before anything runs, and a test that asserts it
@@ -1323,30 +2198,50 @@ async fn pump_output(running: Arc<RunningSession>, session: SessionHandle, confi
     let _ = session.send(&frame.to_string()).await;
 }
 
+/// Every frame kind this extension answers.
+///
+/// A const rather than a literal inside `kinds()` so the invariant that every
+/// handled kind is also a claimed one can be checked by a test. A kind with a
+/// handler and no claim never reaches this extension at all: the built-in
+/// dispatcher gets it, does not know it, and closes the channel.
+pub const SHELL_KINDS: &[&str] = &[
+    "shell_start",
+    "shell_stop",
+    "shell_list",
+    "shell_add_config",
+    "shell_update_config",
+    "shell_delete_config",
+    "shell_open",
+    "shell_close",
+    "shell_delete_session",
+    "shell_resize",
+    "shell_input",
+    "shell_scroll",
+    "shell_tasks",
+    "shell_task",
+    "shell_task_search",
+    "shell_dispatch",
+    "shell_task_complete",
+    "shell_memory_tiers",
+    "shell_memory_items",
+    // These four had handlers and were never CLAIMED, so every one of
+    // them fell through to the built-in dispatcher, which does not
+    // know them and closes the channel. Adding a handler is half the
+    // work; a kind the extension does not claim never reaches it.
+    "shell_knowledge",
+    "shell_knowledge_claims",
+    "shell_knowledge_detail",
+    "shell_knowledge_decide",
+    "shell_rules",
+    "shell_rule_detail",
+    "shell_rule_palette",
+    "shell_rule_compile",
+];
+
 #[async_trait::async_trait]
 impl SessionExtension for ShellExtension {
     fn kinds(&self) -> &'static [&'static str] {
-        &[
-            "shell_start",
-            "shell_stop",
-            "shell_list",
-            "shell_add_config",
-            "shell_update_config",
-            "shell_delete_config",
-            "shell_open",
-            "shell_close",
-            "shell_delete_session",
-            "shell_resize",
-            "shell_input",
-            "shell_scroll",
-            "shell_tasks",
-            "shell_task",
-            "shell_task_search",
-            "shell_dispatch",
-            "shell_task_complete",
-            "shell_memory_tiers",
-            "shell_memory_items",
-        ]
+        SHELL_KINDS
     }
 
     async fn on_bound(&self, session: &SessionHandle) -> Result<(), String> {
@@ -1650,6 +2545,122 @@ impl SessionExtension for ShellExtension {
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| "task needs a task_id".to_owned())?;
                 for frame in self.task_detail_frames(id).await {
+                    session.send(&envelope(frame)).await?;
+                }
+                Ok(())
+            }
+            "shell_rule_palette" => {
+                let frame = Self::rule_palette_frame();
+                // Logged because the composer showed an empty palette with no
+                // way to tell whether the request arrived, the answer was
+                // empty, or the answer never got back.
+                tracing::info!(
+                    blocks = frame["blocks"].as_array().map(Vec::len).unwrap_or(0),
+                    "rule palette asked for"
+                );
+                session.send(&envelope(frame)).await?;
+                Ok(())
+            }
+            "shell_rule_compile" => {
+                let placed: Vec<ferrosa_memory_core::rule_palette::Placed> = body
+                    .get("blocks")
+                    .and_then(|value| serde_json::from_value(value.clone()).ok())
+                    .unwrap_or_default();
+                session
+                    .send(&envelope(Self::rule_compile_frame(&placed)))
+                    .await?;
+                Ok(())
+            }
+            "shell_rules" => {
+                // The list first, so it is on screen in milliseconds, then
+                // the arithmetic behind it.
+                for frame in self.rules_frames().await {
+                    session.send(&envelope(frame)).await?;
+                }
+                session
+                    .send(&envelope(self.rules_tally_frame().await))
+                    .await?;
+                Ok(())
+            }
+            "shell_rule_detail" => {
+                let Some(root) = body
+                    .get("root")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                else {
+                    session
+                        .send(&envelope(serde_json::json!({
+                            "type": "shell_rule_detail",
+                            "reachable": false,
+                            "reason": "no rule was named",
+                            "items": [],
+                        })))
+                        .await?;
+                    return Ok(());
+                };
+                let cursor = body
+                    .get("cursor")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let limit = body
+                    .get("limit")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|value| value as usize)
+                    .unwrap_or(KNOWLEDGE_PAGE_DEFAULT);
+                for frame in self.rule_detail_frames(root, cursor, limit).await {
+                    session.send(&envelope(frame)).await?;
+                }
+                Ok(())
+            }
+            "shell_knowledge" => {
+                let cursor = body
+                    .get("cursor")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let limit = body
+                    .get("limit")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|value| value as usize)
+                    .unwrap_or(KNOWLEDGE_PAGE_DEFAULT);
+                for frame in self.knowledge_frames(cursor, limit).await {
+                    session.send(&envelope(frame)).await?;
+                }
+                Ok(())
+            }
+            "shell_knowledge_claims" => {
+                let limit = body
+                    .get("limit")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|value| value as usize)
+                    .unwrap_or(KNOWLEDGE_PAGE_DEFAULT);
+                for frame in self.knowledge_claims_frames(limit).await {
+                    session.send(&envelope(frame)).await?;
+                }
+                Ok(())
+            }
+            "shell_knowledge_detail" => {
+                let id = body
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "a knowledge detail needs an id".to_owned())?;
+                for frame in self.knowledge_detail_frames(id).await {
+                    session.send(&envelope(frame)).await?;
+                }
+                Ok(())
+            }
+            "shell_knowledge_decide" => {
+                let id = body
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "a decision needs an id".to_owned())?;
+                let decision = body
+                    .get("decision")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "a decision needs a decision".to_owned())?;
+                for frame in self.knowledge_decide_frames(id, decision, body).await {
                     session.send(&envelope(frame)).await?;
                 }
                 Ok(())
@@ -1997,6 +3008,10 @@ mod output_framing_tests {
     /// without being added here, so the next one is not discovered by someone
     /// staring at a blank screen.
     const EMITTED: &[(&str, Sizing)] = &[
+        ("shell_knowledge", Sizing::Paged),
+        ("shell_knowledge_claims", Sizing::Paged),
+        ("shell_knowledge_detail", Sizing::Bounded),
+        ("shell_knowledge_versions", Sizing::Paged),
         ("shell_configs", Sizing::Bounded),
         ("shell_status", Sizing::Bounded),
         ("shell_notice", Sizing::Bounded),
@@ -2012,6 +3027,11 @@ mod output_framing_tests {
         ("shell_scrolled", Sizing::Bounded),
         ("shell_memory_tiers", Sizing::Bounded),
         ("shell_memory_items", Sizing::Paged),
+        ("shell_rules", Sizing::Paged),
+        ("shell_rule_detail", Sizing::Paged),
+        ("shell_rules_tally", Sizing::Bounded),
+        ("shell_rule_palette", Sizing::Bounded),
+        ("shell_rule_compiled", Sizing::Bounded),
     ];
 
     /// A new frame kind cannot be emitted without a decision about its size.
@@ -2054,8 +3074,11 @@ mod output_framing_tests {
     /// Every BOUNDED frame kind, at its worst case, fits a datagram.
     #[test]
     fn every_bounded_frame_fits_a_datagram() {
-        // The real bound, so the proof covers what production can write.
-        let long = "a".repeat(MAX_REASON_BYTES);
+        // Through the real bound rather than AT it. Writing the limit in by
+        // hand asserts what production is assumed to do; passing an overlong
+        // value through the same helper the projections use asserts what it
+        // actually does.
+        let long = bounded_title(&"a".repeat(MAX_REASON_BYTES * 20));
         let path = "/Users/bkearns/src/ferrosa-suite/ferrosa-memory/crates/ferrosa-memory-sync";
         for (kind, sizing) in EMITTED {
             if *sizing != Sizing::Bounded {
@@ -2119,6 +3142,269 @@ mod output_framing_tests {
                 SAFE_DATAGRAM_BYTES
             );
         }
+    }
+
+    /// A full page of knowledge rows fits a datagram.
+    ///
+    /// Paged means the PAGE size is asserted; the number of pages is not
+    /// bounded and need not be. Without this the kind is merely DECLARED Paged
+    /// and nothing checks it, which is how a 50-item page measured 14,830
+    /// bytes against an 1,100-byte datagram — three times, in three different
+    /// lists, each written after learning it in the last one.
+    #[test]
+    fn a_page_of_knowledge_rows_fits_a_datagram() {
+        let long = bounded_title(&"a".repeat(MAX_REASON_BYTES * 20));
+        let rows: Vec<serde_json::Value> = (0..KNOWLEDGE_ROWS_PER_FRAME)
+            .map(|_| {
+                serde_json::json!({
+                    "id": uuid::Uuid::now_v7(),
+                    "title": long,
+                    "kind": "presentation",
+                    "state": "proposed",
+                    "priority": 100,
+                    "repo": "/Users/bkearns/src/ferrosa-suite/ferrosa-memory",
+                    "expires": chrono::Utc::now(),
+                    "agent": "ferrosa-suite claude",
+                })
+            })
+            .collect();
+
+        for kind in [
+            "shell_knowledge",
+            "shell_knowledge_claims",
+            "shell_knowledge_versions",
+        ] {
+            let frames = ShellExtension::page_frames(
+                kind,
+                rows.clone(),
+                true,
+                Some(format!(
+                    "{:013}-{}",
+                    1_767_225_600_000u64,
+                    uuid::Uuid::now_v7()
+                )),
+            );
+            assert_eq!(frames.len(), 1, "{kind} should be one frame at page size");
+            let frame = envelope(frames.into_iter().next().expect("a frame"));
+            assert!(
+                frame.len() <= SAFE_DATAGRAM_BYTES,
+                "a {kind} page is {} bytes, over the {} safe datagram — carry \
+                 fewer rows per frame",
+                frame.len(),
+                SAFE_DATAGRAM_BYTES
+            );
+        }
+    }
+
+    /// Every kind this extension SERVES must also be one it CLAIMS.
+    ///
+    /// The two lists are written in different places — `kinds()` near the top,
+    /// the match arms 1,800 lines below — and they drifted. The four knowledge
+    /// frames had working handlers and were never claimed, so `claim()` never
+    /// routed them here: they reached the built-in dispatcher, which does not
+    /// know them, and it CLOSED the channel. Nothing connected.
+    ///
+    /// Reading the arms out of this file is ugly and it is the only thing that
+    /// actually checks the invariant. A handler with no claim is dead code that
+    /// takes the session down with it.
+    #[test]
+    fn every_kind_with_a_handler_is_also_claimed() {
+        let source = include_str!("shell_extension.rs");
+        let after = source
+            .split("async fn on_request")
+            .nth(1)
+            .expect("on_request exists");
+        // Bounded to the function by counting braces. Reading to end of file
+        // instead swept up the match arms in the sizing tests below, which name
+        // RESPONSE types — three kinds the device never sends, reported as
+        // missing claims. A guard that cries wolf gets deleted.
+        let start = after.find('{').expect("a body");
+        let mut depth = 0usize;
+        let mut end = after.len();
+        for (index, ch) in after.char_indices().skip(start) {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = index;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &after[start..end];
+
+        let mut served: Vec<&str> = Vec::new();
+        for line in body.lines() {
+            let line = line.trim();
+            // Match arms of the dispatcher: `"shell_x" => {` and friends.
+            if let Some(rest) = line.strip_prefix('"')
+                && let Some((kind, tail)) = rest.split_once('"')
+                && tail.trim_start().starts_with("=>")
+                && kind.starts_with("shell_")
+            {
+                served.push(kind);
+            }
+        }
+        assert!(
+            served.len() > 10,
+            "found only {} handled kinds; the reader is broken, not the code",
+            served.len()
+        );
+
+        let claimed = SHELL_KINDS;
+        let missing: Vec<&str> = served
+            .iter()
+            .filter(|kind| !claimed.contains(kind))
+            .copied()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these kinds have handlers but are not claimed, so every one of them \
+             would reach the built-in dispatcher and close the channel: {missing:?}"
+        );
+    }
+
+    /// Claims read directly below Knowledge on the device.
+    ///
+    /// The device renders the array reversed, so DIKW order here becomes
+    /// Wisdom, Knowledge, Claims, Information, Data on screen. Appended at the
+    /// end, the row rendered at the very TOP of the map — unjudged work above
+    /// everything a person had ratified.
+    #[test]
+    fn the_claims_row_sits_between_information_and_knowledge() {
+        let tiers: Vec<serde_json::Value> = ["data", "information", "knowledge", "wisdom"]
+            .iter()
+            .map(|tier| serde_json::json!({ "tier": tier, "count": 1, "roots": [] }))
+            .collect();
+
+        let placed = ShellExtension::with_claims_row(tiers, Some(14));
+        let order: Vec<&str> = placed
+            .iter()
+            .filter_map(|row| row.get("tier").and_then(|t| t.as_str()))
+            .collect();
+        assert_eq!(
+            order,
+            ["data", "information", "claims", "knowledge", "wisdom"]
+        );
+
+        // What the operator actually sees.
+        let shown: Vec<&str> = order.into_iter().rev().collect();
+        assert_eq!(
+            shown,
+            ["wisdom", "knowledge", "claims", "information", "data"]
+        );
+    }
+
+    /// A store that could not be asked adds no row, rather than a zero that
+    /// reads as "no claims".
+    #[test]
+    fn an_unavailable_claim_count_adds_no_row() {
+        let tiers = vec![serde_json::json!({ "tier": "knowledge", "count": 3, "roots": [] })];
+        let placed = ShellExtension::with_claims_row(tiers, None);
+        assert_eq!(placed.len(), 1);
+    }
+
+    /// A map with no Knowledge row at all is not one this understands, but the
+    /// count must not be dropped on the floor.
+    #[test]
+    fn a_map_without_knowledge_still_carries_the_claims() {
+        let tiers = vec![serde_json::json!({ "tier": "data", "count": 1, "roots": [] })];
+        let placed = ShellExtension::with_claims_row(tiers, Some(2));
+        assert_eq!(placed.len(), 2);
+        assert_eq!(placed[1]["tier"], "claims");
+    }
+
+    /// A title as long as the STORE permits must still fit a datagram.
+    ///
+    /// The sizing proof above uses a 120-byte title, but nothing bounds a real
+    /// one: `propose` accepts whatever an agent sends, and a deck or report
+    /// title assembled from a path is routinely longer than that. Measuring
+    /// the frame against a width production does not enforce proves nothing —
+    /// it is the same bug this file has now shipped four times, one layer up.
+    #[test]
+    fn a_title_longer_than_the_store_bounds_still_fits_a_datagram() {
+        // Far past anything plausible, deliberately: the point is that the
+        // frame builder bounds it, not that this particular length is safe.
+        let title = "a deck about ".repeat(300);
+        let rows: Vec<serde_json::Value> = (0..KNOWLEDGE_ROWS_PER_FRAME)
+            .map(|_| {
+                serde_json::json!({
+                    "id": uuid::Uuid::now_v7(),
+                    "title": bounded_title(&title),
+                    "kind": "presentation",
+                    "state": "proposed",
+                    "priority": 100,
+                    "repo": "/Users/bkearns/src/ferrosa-suite/ferrosa-memory",
+                    "expires": chrono::Utc::now(),
+                    "agent": "ferrosa-suite claude",
+                })
+            })
+            .collect();
+        let frame = envelope(
+            ShellExtension::page_frames("shell_knowledge_claims", rows, true, None)
+                .into_iter()
+                .next()
+                .expect("a frame"),
+        );
+        assert!(
+            frame.len() <= SAFE_DATAGRAM_BYTES,
+            "a claims page with a long title is {} bytes, over the {} safe \
+             datagram — bound the title in the projection",
+            frame.len(),
+            SAFE_DATAGRAM_BYTES
+        );
+    }
+
+    /// Bounding must not split a multi-byte character, which would make the
+    /// frame invalid UTF-8 rather than merely long.
+    #[test]
+    fn bounding_a_title_lands_on_a_character_boundary() {
+        let title = "\u{1f9ed}".repeat(200);
+        let bounded = bounded_title(&title);
+        assert!(bounded.len() <= MAX_TITLE_BYTES);
+        assert!(
+            bounded.ends_with("..."),
+            "a trimmed title says it was trimmed"
+        );
+    }
+
+    /// A title that already fits is passed through untouched — a reviewer
+    /// should not see an ellipsis on a title that had room.
+    #[test]
+    fn a_short_title_is_left_alone() {
+        let title = "Decide QA-0009";
+        assert_eq!(bounded_title(title), title);
+    }
+
+    /// An empty page still sends one frame, or a list that matched nothing
+    /// looks identical to one that never answered.
+    #[test]
+    fn an_empty_knowledge_page_still_answers() {
+        let frames = ShellExtension::page_frames("shell_knowledge", Vec::new(), true, None);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["items"].as_array().expect("items").len(), 0);
+        assert_eq!(frames[0]["reachable"], true);
+    }
+
+    /// Only the LAST frame carries the cursor. On an earlier one it would
+    /// invite a device to ask for the next page while this one is still
+    /// arriving, and skip the rest of it.
+    #[test]
+    fn only_the_last_knowledge_frame_carries_the_cursor() {
+        let rows: Vec<serde_json::Value> = (0..KNOWLEDGE_ROWS_PER_FRAME * 3)
+            .map(|i| serde_json::json!({"id": i}))
+            .collect();
+        let frames =
+            ShellExtension::page_frames("shell_knowledge", rows, true, Some("cursor".to_owned()));
+        assert_eq!(frames.len(), 3);
+        assert!(frames[0]["next_cursor"].is_null());
+        assert!(frames[1]["next_cursor"].is_null());
+        assert_eq!(frames[2]["next_cursor"], "cursor");
+        assert_eq!(frames[0]["first"], true);
+        assert_eq!(frames[1]["first"], false);
     }
 
     /// A page of task text fits, using the same bound as output.

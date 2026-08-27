@@ -1,0 +1,1145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rules Plane</title>
+<link rel="stylesheet" href="tokens.generated.css">
+<style>
+/* ============================================================
+   Rules plane — design iteration, in the blue steel blueprint
+   language. Every colour is a token; the token block is
+   generated (tokens.generated.css) from the app's own generated
+   Swift tokens. No colour literal appears below.
+
+   Three rules, applied:
+     1. Value before hue — hierarchy is lightness. The DIKW rungs
+        are a four-segment meter, not four hues.
+     2. Accent is rationed — the accent carries the claim's <em>,
+        the one primary action, and the app's own panel labels
+        (which is the shipped app's established pattern). Nothing
+        else wears it.
+     3. Hairlines are never load-bearing — --divider is texture,
+        --border is anything a reader must perceive (3:1).
+
+   Type follows the app: SF via -apple-system / ui-monospace, so
+   on an Apple device this renders in the app's actual typeface.
+   Mono uppercase wide-tracked for labels and data; sans for prose.
+   ============================================================ */
+
+:root {
+  --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+
+  /* The app's metric scale, verbatim (FerrosaMetric). */
+  --space1: 4px;  --space2: 8px;  --space3: 12px;
+  --space4: 16px; --space5: 24px; --space6: 32px;
+  --radius-sm: 8px; --radius-md: 12px;
+
+  --measure: 56ch;
+}
+
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+.wrap { max-width: 1080px; margin: 0 auto; padding: 0 var(--space5); }
+
+:where(a, button, select, [tabindex]):focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* ---------- one nav, identical everywhere ---------- */
+
+nav.top {
+  position: sticky; top: 0; z-index: 40;
+  background: var(--bg);
+  border-bottom: 1px solid var(--divider);
+}
+nav.top .wrap {
+  height: 52px;
+  display: flex; align-items: center; justify-content: space-between; gap: var(--space4);
+}
+.brand {
+  font-family: var(--mono);
+  font-size: 11px; font-weight: 600;
+  letter-spacing: 1.4px; text-transform: uppercase;
+  color: var(--text);
+}
+.brand span { color: var(--text-subtle); }
+.themer {
+  font-family: var(--mono);
+  font-size: 10px; letter-spacing: 1px; text-transform: uppercase;
+  background: transparent; color: var(--text-muted);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 6px 10px; min-height: 32px; cursor: pointer;
+}
+.themer:hover { color: var(--text); }
+
+/* ---------- hero: top-aligned, owns its height ---------- */
+
+.hero { padding: var(--space6) 0 var(--space6); border-bottom: 1px solid var(--divider); }
+.hero .wrap {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 400px);
+  gap: var(--space6); align-items: start;
+}
+.eyebrow {
+  font-family: var(--mono);
+  font-size: 10px; font-weight: 600;
+  letter-spacing: 1.6px; text-transform: uppercase;
+  color: var(--text-subtle);
+  margin: 0 0 var(--space3);
+}
+.wordmark {
+  font-family: var(--mono);
+  font-size: 11px; letter-spacing: 1.2px; text-transform: uppercase;
+  color: var(--text-muted);
+  margin: 0 0 var(--space2);
+}
+h1 {
+  font-size: clamp(30px, 4.6vw, 46px);
+  font-weight: 600; line-height: 1.08; letter-spacing: -.02em;
+  margin: 0 0 var(--space4);
+  text-wrap: balance;
+  /* Rule 1: the emphasis must be the LIGHTER half, so the lead-in
+     dims rather than the emphasis brightening. */
+  color: var(--text-muted);
+}
+h1 em { font-style: normal; color: var(--accent); }
+.lede {
+  font-size: 17px; line-height: 1.5; color: var(--text-muted);
+  max-width: var(--measure); margin: 0 0 var(--space5);
+}
+.lede strong { color: var(--text); font-weight: 600; }
+
+.btn-primary {
+  display: inline-block;
+  font-family: var(--sans); font-size: 14px; font-weight: 600;
+  background: var(--primary); color: var(--text-on-primary);
+  border: none; border-radius: var(--radius-sm);
+  padding: 11px 18px; min-height: 44px; cursor: pointer;
+  text-decoration: none;
+}
+.btn-primary:hover { background: var(--primary-hover); }
+
+/* ---------- specimen: real data, shown not described ---------- */
+
+.specimen {
+  background: var(--surface-inset);
+  border: 1px solid var(--border); border-radius: var(--radius-md);
+  padding: var(--space4);
+  font-family: var(--mono); font-size: 11px; line-height: 1.7;
+  overflow-x: auto;
+}
+.specimen .sp-label {
+  font-size: 10px; font-weight: 600; letter-spacing: 1.4px; text-transform: uppercase;
+  color: var(--text-subtle);
+  display: block; margin-bottom: var(--space3);
+}
+.specimen dl { margin: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px var(--space3); }
+.specimen dt { color: var(--text-subtle); white-space: nowrap; }
+.specimen dd { margin: 0; color: var(--text); overflow-wrap: anywhere; }
+.specimen .sp-rule {
+  margin-top: var(--space3); padding-top: var(--space3);
+  border-top: 1px solid var(--divider);
+  color: var(--text-muted); white-space: pre-wrap;
+}
+.specimen .sp-note { color: var(--text-subtle); margin-top: var(--space2); display: block; font-size: 10px; }
+
+/* ---------- sections ---------- */
+
+section.band { padding: var(--space6) 0; border-bottom: 1px solid var(--divider); }
+.sec-head { max-width: var(--measure); margin-bottom: var(--space5); }
+h2 {
+  font-size: clamp(21px, 2.7vw, 27px); font-weight: 600;
+  letter-spacing: -.015em; line-height: 1.2; margin: 0 0 var(--space3);
+  text-wrap: balance;
+}
+h3 { font-size: 16px; font-weight: 600; line-height: 1.35; margin: 0 0 var(--space2); }
+p { margin: 0 0 var(--space3); max-width: var(--measure); color: var(--text-muted); }
+p:last-child { margin-bottom: 0; }
+p strong { color: var(--text); font-weight: 600; }
+.sec-label {
+  font-family: var(--mono);
+  font-size: 10px; font-weight: 600; letter-spacing: 1.6px; text-transform: uppercase;
+  color: var(--text-subtle); margin: 0 0 var(--space3);
+}
+
+code, .m { font-family: var(--mono); font-size: .92em; color: var(--text); }
+
+/* ---------- the rung meter: quantity, not hue (rule 2) ---------- */
+
+.meter { display: inline-flex; gap: 2px; vertical-align: middle; flex-shrink: 0; }
+.meter i { display: block; width: 5px; height: 12px; border: 1px solid var(--border); }
+.meter i.on { background: var(--text-muted); border-color: var(--text-muted); }
+.rung-word { font-family: var(--mono); font-size: 11px; letter-spacing: .4px; color: var(--text-muted); }
+
+.ladder { border: 1px solid var(--border); border-radius: var(--radius-md); overflow: hidden; }
+.ladder-row {
+  display: flex; align-items: center; gap: var(--space3);
+  padding: var(--space3) var(--space4);
+  border-bottom: 1px solid var(--divider);
+  background: var(--surface);
+}
+.ladder-row:last-child { border-bottom: none; }
+.ladder-name { font-family: var(--mono); font-size: 11px; letter-spacing: 1px; text-transform: uppercase; color: var(--text); width: 96px; flex-shrink: 0; }
+.ladder-note { font-size: 13px; color: var(--text-muted); flex: 1; min-width: 0; }
+.ladder-n { font-family: var(--mono); font-size: 11px; color: var(--text-subtle); font-variant-numeric: tabular-nums; }
+
+/* ---------- app screens: matched to the shipped components ---------- */
+
+.screens { display: flex; flex-direction: column; }
+.screen-step {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 352px);
+  gap: var(--space6); align-items: start;
+  padding: var(--space5) 0; border-top: 1px solid var(--divider);
+}
+.screen-step:first-child { border-top: none; padding-top: 0; }
+.screen-step p { font-size: 14px; }
+.ref {
+  display: inline-block; font-family: var(--mono); font-size: 10px;
+  letter-spacing: .6px; color: var(--text-subtle);
+  border: 1px solid var(--divider); border-radius: 4px;
+  padding: 2px 6px; margin: var(--space3) var(--space1) 0 0;
+}
+
+/* The device: the app's own ground, not a chrome mockup. */
+.device {
+  background: var(--bg);
+  border: 1px solid var(--border); border-radius: 20px;
+  overflow: hidden;
+}
+.status-bar {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: var(--space2) var(--space4);
+  font-family: var(--mono); font-size: 10px; letter-spacing: .6px;
+  color: var(--text-subtle);
+  border-bottom: 1px solid var(--divider);
+}
+.status-bar b { color: var(--text-muted); font-weight: 500; }
+.device-body { padding: var(--space4); display: flex; flex-direction: column; gap: var(--space3); }
+
+/* Panel — matches PanelChrome.swift exactly. */
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space4);
+  display: flex; flex-direction: column; gap: var(--space3);
+}
+.panel-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space2); }
+.panel-label {
+  font-family: var(--mono); font-size: 11px; font-weight: 500;
+  letter-spacing: 1.4px; text-transform: uppercase;
+  color: var(--accent);
+}
+.panel-action {
+  font-family: var(--mono); font-size: 11px; font-weight: 600;
+  background: none; border: none; color: var(--primary); cursor: pointer;
+  padding: 4px; min-height: 32px;
+}
+
+/* Caption — the app's muted one-liner. */
+.caption { font-family: var(--mono); font-size: 11px; color: var(--text-muted); margin: 0; }
+
+/* Row — matches KnowledgeRowView: 14 semibold sans title, 11 mono subtle meta. */
+.row { display: flex; align-items: flex-start; gap: 10px; padding: 5px 0; }
+.row-body { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3px; }
+.row-title { font-size: 14px; font-weight: 600; color: var(--text); line-height: 1.3; }
+.row-meta {
+  display: flex; flex-wrap: wrap; gap: var(--space2);
+  font-family: var(--mono); font-size: 11px; color: var(--text-subtle);
+  font-variant-numeric: tabular-nums;
+}
+.row-meta .warn { color: var(--warning); }
+.row-n { font-family: var(--mono); font-size: 12px; color: var(--text-muted); font-variant-numeric: tabular-nums; flex-shrink: 0; }
+
+/* Tag — 9px semibold mono, tracking .6, capsule, tint at 14%. */
+.tag {
+  font-family: var(--mono); font-size: 9px; font-weight: 600;
+  letter-spacing: .6px; text-transform: uppercase;
+  padding: 2px 5px; border-radius: 999px; white-space: nowrap;
+}
+.tag-neutral { color: var(--text-muted); background: var(--surface-raised); }
+.tag-danger  { color: var(--danger);  background: var(--danger-soft); }
+.tag-warning { color: var(--warning); background: var(--warning-soft); }
+.tag-success { color: var(--success); background: var(--success-soft); }
+
+/* The one chip, never tinted. Stroke marks on currentColor. */
+.chip {
+  width: 20px; height: 20px; flex-shrink: 0;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--surface-inset); color: var(--text-muted);
+  display: grid; place-items: center;
+}
+.chip svg { width: 11px; height: 11px; display: block; }
+
+.hairline { height: 1px; background: var(--divider); border: 0; margin: 0; }
+
+.stat { display: flex; align-items: baseline; gap: var(--space2); }
+.stat-n {
+  font-family: var(--mono); font-size: 26px; font-weight: 600;
+  color: var(--text); font-variant-numeric: tabular-nums; letter-spacing: -.02em;
+}
+.stat-l { font-size: 12px; color: var(--text-muted); }
+
+.btn-row { display: flex; gap: var(--space2); }
+.btn-sm {
+  flex: 1; font-family: var(--sans); font-size: 13px; font-weight: 600;
+  min-height: 44px; padding: 10px; cursor: pointer;
+  border-radius: var(--radius-sm);
+  background: var(--primary); color: var(--text-on-primary); border: none;
+}
+.btn-sm.secondary { background: transparent; color: var(--text-muted); border: 1px solid var(--border); }
+.btn-sm.danger { background: transparent; color: var(--danger); border: 1px solid var(--danger); flex: 0 0 auto; padding: 8px 12px; min-height: 36px; font-size: 12px; }
+
+/* blocks in the composer sheet */
+.blk {
+  display: flex; align-items: center; gap: var(--space2); flex-wrap: wrap;
+  border: 1px solid var(--border); background: var(--surface-inset);
+  padding: 9px 11px; min-height: 44px;
+  font-size: 13px; color: var(--text);
+}
+.blk-when { border-radius: var(--radius-sm) var(--radius-sm) var(--radius-sm) 16px; }
+.blk-then { border-radius: 16px var(--radius-sm) var(--radius-sm) var(--radius-sm); }
+.blk-not  { border-style: dashed; border-color: var(--danger); color: var(--danger); border-radius: var(--radius-sm); }
+.slot {
+  font-family: var(--mono); font-size: 11px;
+  background: var(--surface-raised); border: 1px solid var(--border);
+  border-radius: 4px; padding: 3px 7px;
+  color: var(--text);
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.blk-lbl { font-family: var(--mono); font-size: 11px; letter-spacing: 1px; text-transform: uppercase; color: var(--text-subtle); }
+
+/* ---------- composer ---------- */
+
+.composer {
+  display: grid; grid-template-columns: minmax(0, 200px) minmax(0, 1fr);
+  border: 1px solid var(--border); border-radius: var(--radius-md);
+  overflow: hidden; background: var(--surface);
+}
+.palette { background: var(--surface-inset); border-right: 1px solid var(--divider); padding: var(--space4); }
+.palette h4, .canvas h4 {
+  font-family: var(--mono); font-size: 10px; font-weight: 600;
+  letter-spacing: 1.4px; text-transform: uppercase; color: var(--text-subtle);
+  margin: 0 0 var(--space3);
+}
+.palette h4 + .pal-group { margin-bottom: var(--space4); }
+.pal-group { display: flex; flex-direction: column; gap: var(--space2); }
+.pal-btn {
+  font-family: var(--sans); font-size: 13px; text-align: left;
+  min-height: 40px; padding: 9px 11px; cursor: pointer;
+  background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
+.pal-btn:hover { border-color: var(--primary); }
+.pal-btn.neg { border-style: dashed; border-color: var(--danger); color: var(--danger); }
+
+.canvas { padding: var(--space4); min-width: 0; }
+.canvas-stack { display: flex; flex-direction: column; gap: var(--space2); min-height: 88px; }
+.empty-hint {
+  font-family: var(--mono); font-size: 11px; color: var(--text-muted);
+  border: 1px dashed var(--border); border-radius: var(--radius-sm);
+  padding: var(--space5) var(--space4); text-align: center;
+}
+.built select {
+  font-family: var(--mono); font-size: 11px;
+  background: var(--surface-raised); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px;
+  padding: 4px 6px; min-height: 30px; cursor: pointer; max-width: 180px;
+}
+.x {
+  margin-left: auto; background: none; border: none; color: var(--text-subtle);
+  font-size: 18px; line-height: 1; cursor: pointer;
+  min-width: 32px; min-height: 32px; font-family: var(--sans);
+}
+.x:hover { color: var(--danger); }
+
+.readout {
+  margin-top: var(--space4); border-top: 1px solid var(--divider);
+  padding-top: var(--space3); display: flex; flex-direction: column; gap: var(--space3);
+}
+.ro-line { display: flex; gap: var(--space3); align-items: baseline; flex-wrap: wrap; }
+.ro-lbl {
+  font-family: var(--mono); font-size: 10px; font-weight: 600;
+  letter-spacing: 1.2px; text-transform: uppercase; color: var(--text-subtle);
+  width: 96px; flex-shrink: 0;
+}
+.ro-val { font-size: 14px; color: var(--text); min-width: 0; }
+.compiled {
+  font-family: var(--mono); font-size: 11px; color: var(--text-muted);
+  background: var(--surface-inset); border: 1px solid var(--divider);
+  border-radius: var(--radius-sm);
+  padding: 9px 11px; overflow-x: auto; white-space: pre; flex: 1 1 240px;
+}
+.mode {
+  font-family: var(--mono); font-size: 10px; font-weight: 600;
+  letter-spacing: .6px; text-transform: uppercase;
+  padding: 3px 7px; border-radius: 999px;
+  color: var(--text-muted); background: var(--surface-raised);
+}
+.mode.live { color: var(--warning); background: var(--warning-soft); }
+
+/* ---------- questions ---------- */
+
+.q {
+  border-top: 1px solid var(--divider); padding: var(--space5) 0;
+  display: grid; grid-template-columns: 26px minmax(0, 1fr); gap: var(--space4);
+}
+.q:last-child { border-bottom: 1px solid var(--divider); }
+.q-n { font-family: var(--mono); font-size: 11px; color: var(--text-subtle); font-variant-numeric: tabular-nums; padding-top: 3px; }
+.q p { font-size: 14px; }
+.rec {
+  margin-top: var(--space3); padding-left: var(--space3);
+  border-left: 1px solid var(--border);
+  font-size: 14px; color: var(--text);
+}
+
+footer { padding: var(--space5) 0 var(--space6); }
+footer p { font-family: var(--mono); font-size: 11px; color: var(--text-subtle); max-width: none; line-height: 1.7; }
+
+/* ---------- buckets: a name the person chose, over a rung ---------- */
+.bucket { display: inline-flex; align-items: center; gap: 6px; }
+.bucket-name {
+  font-family: var(--mono); font-size: 11px; letter-spacing: .4px;
+  text-transform: uppercase; color: var(--text-muted); white-space: nowrap;
+}
+.bucket-name.custom { color: var(--text); }
+.bucket-row {
+  display: flex; align-items: center; gap: var(--space3);
+  padding: var(--space3) var(--space4);
+  border-bottom: 1px solid var(--divider); background: var(--surface);
+}
+.bucket-row:last-child { border-bottom: none; }
+.bucket-row .who {
+  font-family: var(--mono); font-size: 10px; letter-spacing: .6px;
+  text-transform: uppercase; color: var(--text-subtle);
+  margin-left: auto; white-space: nowrap;
+}
+.bucket-row .ladder-note { flex: 1; }
+.rung-under {
+  font-family: var(--mono); font-size: 10px; color: var(--text-subtle);
+  white-space: nowrap;
+}
+
+/* Destructive weight must be visible BEFORE the tap (D13). Three
+   distinct levels, never interchangeable. */
+.act { display: flex; flex-direction: column; gap: var(--space2); }
+.act-btn {
+  display: flex; align-items: baseline; gap: var(--space2); flex-wrap: wrap;
+  width: 100%; text-align: left; cursor: pointer;
+  font-family: var(--sans); font-size: 13px; font-weight: 600;
+  min-height: 44px; padding: 10px 12px; border-radius: var(--radius-sm);
+}
+.act-btn small {
+  font-family: var(--mono); font-size: 10px; font-weight: 400;
+  letter-spacing: .3px; opacity: .85;
+}
+.act-safe   { background: transparent; color: var(--text-muted); border: 1px solid var(--border); }
+.act-share  { background: var(--primary); color: var(--text-on-primary); border: 1px solid var(--primary); }
+.act-danger { background: transparent; color: var(--danger); border: 1px solid var(--danger); }
+.act-grave  { background: var(--danger-soft); color: var(--danger); border: 1px solid var(--danger); }
+.act-grave small { opacity: 1; }
+
+@media (max-width: 900px) {
+  .hero .wrap, .screen-step { grid-template-columns: 1fr; gap: var(--space5); }
+  .composer { grid-template-columns: 1fr; }
+  .palette { border-right: none; border-bottom: 1px solid var(--divider); }
+  .ro-lbl { width: auto; }
+}
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <div class="wrap">
+    <span class="brand">Ferrosa <span>/ Rules Plane</span></span>
+    <button class="themer" id="themer" type="button">Theme: auto</button>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <div>
+      <p class="eyebrow">Design iteration 01 · 26 Aug</p>
+      <p class="wordmark">Ferrosa Memory · Rules</p>
+      <h1>Classify a whole pile <em>without reading a rule</em>.</h1>
+      <p class="lede">
+        The tab opens on what is unclassified and its job is to empty that pile. You
+        never start from a blank editor — you start <strong>from a stack of files and say
+        what it is</strong>. That swaps the hard question, what rule should exist, for one
+        an executive can answer on sight.
+      </p>
+      <a class="btn-primary" href="#screens">See the four screens</a>
+    </div>
+
+    <div class="specimen">
+      <span class="sp-label">Specimen · one live tier rule</span>
+      <dl>
+        <dt>root</dt><dd>research/skills</dd>
+        <dt>tier</dt><dd>wisdom</dd>
+        <dt>alias</dt><dd>~/src/research/skills</dd>
+        <dt>note</dt><dd>builtin: ships with the build</dd>
+        <dt>fired</dt><dd>~1,204 items</dd>
+      </dl>
+      <div class="sp-rule">tier(E, "wisdom") :-
+  source_root(E, "research/skills").</div>
+      <span class="sp-note">Two rows in two tables. Either one alone is inert.</span>
+    </div>
+  </div>
+</header>
+
+<section class="band">
+  <div class="wrap">
+    <p class="sec-label">The model · buckets over rungs</p>
+    <div class="sec-head">
+      <h2>DIKW is the default, not the vocabulary</h2>
+      <p>
+        A person names their own buckets — <strong>financial knowledge</strong>,
+        <strong>engineering information</strong>, <strong>trash</strong>. Underneath, each
+        one sits on a DIKW rung, because several things already depend on the tiers being
+        <em>ordered</em>: the sharing floor is written as a floor, and Data is the floor
+        that "unclassified" falls to. A flat set of arbitrary labels has neither.
+      </p>
+      <p>
+        So the bucket is the person's word and the rung is the machinery's. The meter
+        shows the rung, which means two buckets can share one meter — and the
+        <strong>name</strong> is what tells them apart.
+      </p>
+    </div>
+
+    <div class="ladder">
+      <div class="bucket-row">
+        <span class="meter"><i class="on"></i><i></i><i></i><i></i></span>
+        <span class="bucket-name">Data</span>
+        <span class="ladder-note">Arrived somehow. Nobody placed it.</span>
+        <span class="who">default</span>
+      </div>
+      <div class="bucket-row">
+        <span class="meter"><i class="on"></i><i></i><i></i><i></i></span>
+        <span class="bucket-name custom">Trash</span>
+        <span class="ladder-note">Kept, never surfaced. Suppression, not a rung.</span>
+        <span class="who">yours</span>
+      </div>
+      <div class="bucket-row">
+        <span class="meter"><i class="on"></i><i class="on"></i><i></i><i></i></span>
+        <span class="bucket-name">Information</span>
+        <span class="ladder-note">Curated, but someone else's.</span>
+        <span class="who">default</span>
+      </div>
+      <div class="bucket-row">
+        <span class="meter"><i class="on"></i><i class="on"></i><i></i><i></i></span>
+        <span class="bucket-name custom">Engineering information</span>
+        <span class="ladder-note">Specs, drivers, vendor docs.</span>
+        <span class="who">yours</span>
+      </div>
+      <div class="bucket-row">
+        <span class="meter"><i class="on"></i><i class="on"></i><i class="on"></i><i></i></span>
+        <span class="bucket-name">Knowledge</span>
+        <span class="ladder-note">Worked out here. Rules sit at this rung too.</span>
+        <span class="who">default</span>
+      </div>
+      <div class="bucket-row">
+        <span class="meter"><i class="on"></i><i class="on"></i><i class="on"></i><i></i></span>
+        <span class="bucket-name custom">Financial knowledge</span>
+        <span class="ladder-note">Board packs, models, the numbers behind them.</span>
+        <span class="who">yours</span>
+      </div>
+      <div class="bucket-row">
+        <span class="meter"><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i></span>
+        <span class="bucket-name">Wisdom</span>
+        <span class="ladder-note">How we decide. Smallest and most valuable.</span>
+        <span class="who">default</span>
+      </div>
+    </div>
+    <p style="margin-top: var(--space4)">
+      Creating a bucket has blast radius of its own: one placed at the wrong rung
+      quietly changes what is shareable. "Trash" is the case the rule language cannot
+      state yet — <em>everything except trash</em> is an exclusion, which is what
+      negation is for.
+    </p>
+  </div>
+</section>
+
+<section class="band" id="screens">
+  <div class="wrap">
+    <p class="sec-label">Four screens · one errand</p>
+    <div class="sec-head">
+      <h2>Built from the shipped components</h2>
+      <p>
+        Panel, SectionLabel, Tag, Caption and the knowledge row are matched to
+        <code>PanelChrome.swift</code> and <code>KnowledgeView.swift</code> — same sizes,
+        same tracking, same tokens. On an Apple device this renders in SF, so it is the
+        app's actual typeface rather than an approximation of it.
+      </p>
+    </div>
+
+    <div class="screens">
+
+      <div class="screen-step">
+        <div>
+          <h3>1 · Opens on the pile, not the rules</h3>
+          <p>
+            Unclassified material grouped by where it came from. The rules themselves are one
+            tap away and mostly get opened when something looks wrong.
+          </p>
+          <p>
+            A tab that opened on a list of rules would ask its user to already know what a
+            rule is.
+          </p>
+          <span class="ref">D7 plain language</span><span class="ref">R7 worklist</span>
+        </div>
+        <div class="device">
+          <div class="status-bar"><span>9:41</span><b>MEMORY</b></div>
+          <div class="device-body">
+            <div class="panel">
+              <div class="panel-head">
+                <span class="panel-label">Unclassified</span>
+                <button class="panel-action" type="button">Classify ›</button>
+              </div>
+              <div class="stat">
+                <span class="stat-n">3,107</span>
+                <span class="stat-l">of 12,749 · down 312 today</span>
+              </div>
+              <p class="caption">grouped by origin · newest first</p>
+              <hr class="hairline">
+              <div class="row">
+                <span class="chip" aria-hidden="true"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M1 3.2h3.6l1 1.4H11V10H1z"/></svg></span>
+                <span class="row-body">
+                  <span class="row-title">~/Downloads/board</span>
+                  <span class="row-meta"><span>pdf · deck</span><span>2 days ago</span></span>
+                </span>
+                <span class="row-n">312</span>
+              </div>
+              <div class="row">
+                <span class="chip" aria-hidden="true"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M1 3.2h3.6l1 1.4H11V10H1z"/></svg></span>
+                <span class="row-body">
+                  <span class="row-title">old-crm-export</span>
+                  <span class="row-meta"><span>csv</span><span>nothing since March</span></span>
+                </span>
+                <span class="row-n">891</span>
+              </div>
+              <div class="row">
+                <span class="chip" aria-hidden="true"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M1 3.2h3.6l1 1.4H11V10H1z"/></svg></span>
+                <span class="row-body">
+                  <span class="row-title">~/src/ferrosa/specs</span>
+                  <span class="row-meta"><span>markdown</span><span>active</span></span>
+                </span>
+                <span class="row-n">700</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="screen-step">
+        <div>
+          <h3>2 · Blocks that only fit one way</h3>
+          <p>
+            Tapping a group opens the composer <strong>already filled in</strong>. The folder
+            is known, so the only decision left is the rung — confirm a sentence, pick one
+            of four.
+          </p>
+          <p>
+            The two buttons add another block. Neither opens a text field.
+          </p>
+          <span class="ref">D8 Scratch shapes</span><span class="ref">D1 server parses</span>
+        </div>
+        <div class="device">
+          <div class="status-bar"><span>‹ Unclassified</span><b>NEW RULE</b></div>
+          <div class="device-body">
+            <div class="panel">
+              <div class="panel-head"><span class="panel-label">Board papers</span></div>
+              <p class="caption">312 items would be affected</p>
+              <span class="blk-lbl">Anything…</span>
+              <div class="blk blk-when">in folder <span class="slot">~/Downloads/board</span></div>
+              <span class="blk-lbl">…is</span>
+              <div class="blk blk-then">
+                <span class="meter"><i class="on"></i><i class="on"></i><i class="on"></i><i></i></span>
+                <span class="bucket-name custom">Financial knowledge</span>
+              </div>
+              <div class="btn-row">
+                <button class="btn-sm secondary" type="button">+ and also</button>
+                <button class="btn-sm secondary" type="button">+ but not</button>
+              </div>
+              <button class="btn-sm" type="button">See what this does</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="screen-step">
+        <div>
+          <h3>3 · The count, then the consent</h3>
+          <p>
+            No rule applies blind. The preview is a dry run of the same resolution the write
+            performs — <strong>not a separate estimate</strong>, because two code paths
+            eventually disagree and the one people trust is the one that never runs.
+          </p>
+          <p>
+            "Nothing else changes" does real work. The fear is not whether this is right,
+            it is what else it quietly touches.
+          </p>
+          <span class="ref">D6 preview by count</span>
+        </div>
+        <div class="device">
+          <div class="status-bar"><span>‹ Back</span><b>PREVIEW</b></div>
+          <div class="device-body">
+            <div class="panel">
+              <div class="panel-head"><span class="panel-label">Would classify 312</span></div>
+              <p class="caption">checked a moment ago</p>
+              <hr class="hairline">
+              <div class="row">
+                <span class="row-body">
+                  <span class="row-meta" style="font-size:11px">
+                    unclassified →
+                    <span class="meter"><i class="on"></i><i class="on"></i><i class="on"></i><i></i></span>
+                    <span class="bucket-name custom">Financial knowledge</span>
+                  </span>
+                </span>
+                <span class="row-n">312</span>
+              </div>
+              <div class="row">
+                <span class="row-body"><span class="row-meta">already classified, moving</span></span>
+                <span class="row-n">0</span>
+              </div>
+              <hr class="hairline">
+              <p class="caption">Q3 Board Deck.pdf<br>FY26 Operating Plan v4.pdf<br>Comp Committee — notes.md<br>…and 309 more</p>
+              <p class="caption">Nothing else changes. Items you placed by hand keep the bucket you gave them.</p>
+              <div class="btn-row">
+                <button class="btn-sm secondary" type="button">Not yet</button>
+                <button class="btn-sm" type="button">Classify them</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="screen-step">
+        <div>
+          <h3>4 · Receipts, and one broken rule</h3>
+          <p>
+            Every rule leads with <strong>what it has actually done</strong>. The fire count
+            is the receipt that makes an abstract rule real to someone who cannot read it.
+          </p>
+          <p>
+            The first rule is why this screen exists. It is not merely unmatched — nothing
+            can ever match it, because no alias points at that root. In a plain list it
+            would look identical to a working rule.
+          </p>
+          <span class="ref">R3 unreachable</span><span class="ref">D5 fire counts</span><span class="ref">D3 expiry</span>
+        </div>
+        <div class="device">
+          <div class="status-bar"><span>‹ Memory</span><b>RULES</b></div>
+          <div class="device-body">
+            <div class="panel">
+              <div class="panel-head">
+                <span class="panel-label">Rules</span>
+                <button class="panel-action" type="button">+ New</button>
+              </div>
+              <p class="caption">4 rules · 1 needs attention</p>
+              <hr class="hairline">
+              <div class="row">
+                <span class="row-body">
+                  <span class="row-title">Old CRM exports are Data</span>
+                  <span class="row-meta">
+                    <span class="tag tag-danger">unreachable</span>
+                    <span>never classified anything, and never can</span>
+                  </span>
+                  <span class="row-meta">no alias points at “old-crm”</span>
+                  <button class="btn-sm danger" type="button">Point it at a folder</button>
+                </span>
+              </div>
+              <hr class="hairline">
+              <div class="row">
+                <span class="row-body">
+                  <span class="row-title">Board papers are Knowledge</span>
+                  <span class="row-meta"><span class="tag tag-success">live</span><span>classified 312 · added today</span></span>
+                </span>
+              </div>
+              <div class="row">
+                <span class="row-body">
+                  <span class="row-title">Research skills are Wisdom</span>
+                  <span class="row-meta">
+                    <span class="tag tag-warning">ends in 6d</span>
+                    <span>~1,204 classified · shared with 2</span>
+                  </span>
+                </span>
+              </div>
+              <div class="row">
+                <span class="row-body">
+                  <span class="row-title">Session capture is Data</span>
+                  <span class="row-meta"><span class="tag tag-neutral">stored</span><span>~8,902 classified · 12 Aug</span></span>
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+
+      <div class="screen-step">
+        <div>
+          <h3>5 · A rule is a handle on its yield</h3>
+          <p>
+            Opening a rule shows <strong>what it classified</strong>, and offers three acts
+            over exactly that set. Once a rule names a body of material, every bulk thing
+            someone wants to do is a thing done to that set.
+          </p>
+          <p>
+            The three differ enormously in reversibility, so they must not look alike.
+            Deleting the rule returns items to the pile and is undone by re-creating it.
+            Deleting the data is not undone by anything.
+          </p>
+          <p>
+            Sharing by rule shares a <strong>live set</strong>: the rule keeps firing, so
+            what it classifies tomorrow joins a share consented to today. That is the
+            point — "share my financial knowledge" should stay true — but no preview can
+            show a blast radius that grows after the fact, so the screen says it in words.
+          </p>
+          <span class="ref">D13 rule yield</span><span class="ref">D12 preview + apply</span>
+        </div>
+        <div class="device">
+          <div class="status-bar"><span>‹ Rules</span><b>RULE</b></div>
+          <div class="device-body">
+            <div class="panel">
+              <div class="panel-head"><span class="panel-label">Board papers</span></div>
+              <div class="blk blk-when" style="min-height:0;padding:7px 9px">
+                in folder <span class="slot">~/Downloads/board</span>
+              </div>
+              <div class="blk blk-then" style="min-height:0;padding:7px 9px">
+                <span class="meter"><i class="on"></i><i class="on"></i><i class="on"></i><i></i></span>
+                <span class="bucket-name custom">Financial knowledge</span>
+              </div>
+              <hr class="hairline">
+              <div class="stat">
+                <span class="stat-n">312</span>
+                <span class="stat-l">classified · still firing</span>
+              </div>
+              <p class="caption">Q3 Board Deck.pdf<br>FY26 Operating Plan v4.pdf<br>…and 310 more</p>
+            </div>
+
+            <div class="panel">
+              <div class="panel-head"><span class="panel-label">Act on these 312</span></div>
+              <div class="act">
+                <button class="act-btn act-safe" type="button">
+                  Delete the rule <small>312 return to the pile · undoable</small>
+                </button>
+                <button class="act-btn act-share" type="button">
+                  Share all 312 <small>live · later matches join automatically</small>
+                </button>
+                <button class="act-btn act-grave" type="button">
+                  Delete the data <small>removes the 312 items · 30 days to recover</small>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="band">
+  <div class="wrap">
+    <p class="sec-label">Prototype · try it</p>
+    <div class="sec-head">
+      <h2>The composer, working</h2>
+      <p>
+        Click blocks to build a rule. Nothing is typed and nothing malformed can be
+        assembled. The readout shows the plain reading the executive sees, the datalog the
+        server compiles it to, and how the rule will run. The two dashed blocks need
+        negation, which does not exist yet.
+      </p>
+    </div>
+
+    <div class="composer">
+      <div class="palette">
+        <h4>Anything that is…</h4>
+        <div class="pal-group">
+          <button class="pal-btn" type="button" data-add="folder">in a folder</button>
+          <button class="pal-btn" type="button" data-add="tag">tagged</button>
+          <button class="pal-btn" type="button" data-add="author">written by</button>
+          <button class="pal-btn neg" type="button" data-add="not-tag">not tagged</button>
+          <button class="pal-btn neg" type="button" data-add="not-approved">without</button>
+        </div>
+        <h4>…goes in</h4>
+        <div class="pal-group">
+          <button class="pal-btn" type="button" data-add="tier">a bucket</button>
+          <button class="pal-btn" type="button" data-add="share">shareable or not</button>
+        </div>
+      </div>
+
+      <div class="canvas">
+        <h4>Your rule</h4>
+        <div class="canvas-stack" id="stack">
+          <div class="empty-hint" id="hint">Pick a block to start.</div>
+        </div>
+        <div class="readout">
+          <div class="ro-line">
+            <span class="ro-lbl">In English</span>
+            <span class="ro-val" id="plain">—</span>
+          </div>
+          <div class="ro-line">
+            <span class="ro-lbl">Compiled</span>
+            <code class="compiled" id="compiled">—</code>
+          </div>
+          <div class="ro-line">
+            <span class="ro-lbl">How it runs</span>
+            <span class="ro-val"><span class="mode" id="mode">—</span></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="band">
+  <div class="wrap">
+    <p class="sec-label">Settled · 26 Aug</p>
+    <div class="sec-head">
+      <h2>Four answers, and what they opened</h2>
+      <p>
+        All four calls came back. Two were confirmed, one was overturned, and one grew
+        into a bigger feature than it started as.
+      </p>
+    </div>
+
+    <div class="q">
+      <span class="q-n">01</span>
+      <div>
+        <h3>Opens on the pile · confirmed</h3>
+        <p>
+          And with a sharper goal than I had: the point is not to browse a pile, it is to
+          <strong>empty</strong> it. So the count wants a direction — "3,107, down 312
+          today" is a job in progress; a bare number is just a fact.
+        </p>
+      </div>
+    </div>
+
+    <div class="q">
+      <span class="q-n">02</span>
+      <div>
+        <h3>Plainer words · overturned, and it changed the model</h3>
+        <p>
+          Not a rename. DIKW becomes the <strong>default</strong> bucket set rather than
+          the vocabulary, and a person names their own — financial knowledge, engineering
+          information, trash.
+        </p>
+        <p>
+          Each bucket keeps a DIKW rung underneath, because the sharing floor is literally
+          a floor and Data is what unclassified falls to; a flat set of labels has neither.
+          The bucket is the person's word, the rung is the machinery's.
+        </p>
+      </div>
+    </div>
+
+    <div class="q">
+      <span class="q-n">03</span>
+      <div>
+        <h3>“Classify” · confirmed against my recommendation</h3>
+        <p>
+          It is what the system does, and precision won over familiarity. Copy can change
+          later if it proves confusing in use.
+        </p>
+      </div>
+    </div>
+
+    <div class="q">
+      <span class="q-n">04</span>
+      <div>
+        <h3>Always preview · confirmed, and then some</h3>
+        <p>
+          Preview and apply are one flow. Beyond that, a rule now has to show its yield and
+          act on it — delete the rule, delete the data, or share everything it classified.
+          That is screen 5, and it is the largest thing to come out of this round.
+        </p>
+      </div>
+    </div>
+
+    <div class="q">
+      <span class="q-n">→</span>
+      <div>
+        <h3>Three things these answers opened</h3>
+        <p>
+          <strong>Trash cannot be stated yet.</strong> "Everything except trash" is an
+          exclusion, and the rule language has no <em>not</em>. Until negation lands it is
+          a bucket at the Data rung plus a suppression flag the read path honours.
+        </p>
+        <p>
+          <strong>A share can now be a rule, not a list.</strong> That is a real change to
+          the sharing design, where the share unit was a set of items. It needs to be
+          revocable as one thing.
+        </p>
+        <p>
+          <strong>Creating a bucket has blast radius.</strong> A bucket placed at the wrong
+          rung silently changes what is shareable, which argues it deserves the same
+          preview treatment as editing a rule.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p>
+      Decisions D1–D8 and findings R1–R8 · specs/rules-plane/decisions.md<br>
+      Negation, needed by two composer blocks · t_64ea07e9<br>
+      Palette generated from the app's FerrosaTokens.generated.swift · no colour literal in this file<br>
+      check-contrast.mjs · 36 combinations, 0 below AA, all three themes
+    </p>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var DEFS = {
+    folder:         { kind: 'when', label: 'in folder',   slot: ['~/Downloads/board', '~/src/research/skills', 'shared-with-me/legal'], pred: function (v) { return 'source_root(E, "' + v + '")'; }, say: function (v) { return 'in ' + v; } },
+    tag:            { kind: 'when', label: 'tagged',      slot: ['board', 'legal', 'secret'], pred: function (v) { return 'tag(E, "' + v + '")'; }, say: function (v) { return 'tagged ' + v; } },
+    author:         { kind: 'when', label: 'written by',  slot: ['ben', 'the strategy team'], pred: function (v) { return 'author(E, "' + v + '")'; }, say: function (v) { return 'written by ' + v; } },
+    'not-tag':      { kind: 'when', neg: true, label: 'not tagged', slot: ['secret', 'draft'], pred: function (v) { return 'not tag(E, "' + v + '")'; }, say: function (v) { return 'not tagged ' + v; } },
+    'not-approved': { kind: 'when', neg: true, label: 'without',    slot: ['an approval', 'a reviewer'], pred: function () { return 'not approved(E)'; }, say: function (v) { return 'without ' + v; } },
+    // Buckets are user-defined (D10). The compiled form uses the bucket's
+    // underlying RUNG, which is what the ordered machinery reads.
+    tier:           { kind: 'then', label: 'the bucket',
+                      slot: ['Data', 'Trash', 'Information', 'Engineering information', 'Knowledge', 'Financial knowledge', 'Wisdom'],
+                      rung: { 'Data': 'data', 'Trash': 'data', 'Information': 'information',
+                              'Engineering information': 'information', 'Knowledge': 'knowledge',
+                              'Financial knowledge': 'knowledge', 'Wisdom': 'wisdom' },
+                      pred: function (v) {
+                        var r = this.rung[v];
+                        return v.toLowerCase() === r
+                          ? 'tier(E, "' + r + '")'
+                          : 'bucket(E, "' + v.toLowerCase().replace(/ /g, '_') + '"), tier(E, "' + r + '")';
+                      },
+                      say: function (v) { return v; } },
+    share:          { kind: 'then', label: 'and is',      slot: ['shareable', 'never shareable'], pred: function (v) { return v === 'shareable' ? 'shareable(E)' : 'blocked(E)'; }, say: function (v) { return v; } }
+  };
+
+  var stack = document.getElementById('stack');
+  var hint = document.getElementById('hint');
+  var built = [];
+  var seq = 0;
+
+  function add(type) {
+    if (!DEFS[type]) { return; }
+    var id = ++seq;
+    built.push({ id: id, type: type, value: DEFS[type].slot[0] });
+    render();
+    var el = stack.querySelector('[data-id="' + id + '"] select');
+    if (el) { el.focus(); }
+  }
+
+  function label(text) {
+    var d = document.createElement('span');
+    d.className = 'blk-lbl';
+    d.textContent = text;
+    return d;
+  }
+
+  function blockEl(b) {
+    var def = DEFS[b.type];
+    var wrap = document.createElement('div');
+    wrap.className = 'blk built ' + (def.kind === 'when' ? 'blk-when' : 'blk-then') + (def.neg ? ' blk-not' : '');
+    wrap.setAttribute('data-id', b.id);
+
+    var lbl = document.createElement('span');
+    lbl.textContent = def.label;
+    wrap.appendChild(lbl);
+
+    var sel = document.createElement('select');
+    sel.setAttribute('aria-label', def.label);
+    def.slot.forEach(function (opt) {
+      var o = document.createElement('option');
+      o.value = opt; o.textContent = opt;
+      if (opt === b.value) { o.selected = true; }
+      sel.appendChild(o);
+    });
+    sel.addEventListener('change', function () { b.value = sel.value; update(); });
+    wrap.appendChild(sel);
+
+    var x = document.createElement('button');
+    x.type = 'button'; x.className = 'x'; x.textContent = '×';
+    x.setAttribute('aria-label', 'Remove the ' + def.label + ' block');
+    x.addEventListener('click', function () {
+      built = built.filter(function (o) { return o.id !== b.id; });
+      render();
+    });
+    wrap.appendChild(x);
+    return wrap;
+  }
+
+  function render() {
+    stack.innerHTML = '';
+    if (!built.length) { stack.appendChild(hint); update(); return; }
+    var whens = built.filter(function (b) { return DEFS[b.type].kind === 'when'; });
+    var thens = built.filter(function (b) { return DEFS[b.type].kind === 'then'; });
+    if (whens.length) { stack.appendChild(label('Anything…')); }
+    whens.forEach(function (b) { stack.appendChild(blockEl(b)); });
+    if (thens.length) { stack.appendChild(label('…is')); }
+    thens.forEach(function (b) { stack.appendChild(blockEl(b)); });
+    update();
+  }
+
+  function update() {
+    var plain = document.getElementById('plain');
+    var compiled = document.getElementById('compiled');
+    var mode = document.getElementById('mode');
+    var whens = built.filter(function (b) { return DEFS[b.type].kind === 'when'; });
+    var thens = built.filter(function (b) { return DEFS[b.type].kind === 'then'; });
+
+    if (!whens.length || !thens.length) {
+      plain.textContent = '—';
+      compiled.textContent = whens.length ? 'Add what it should be.' : (thens.length ? 'Add what to look for.' : '—');
+      mode.textContent = '—';
+      mode.className = 'mode';
+      return;
+    }
+
+    plain.textContent = 'Anything '
+      + whens.map(function (b) { return DEFS[b.type].say(b.value); }).join(' and ')
+      + ' is '
+      + thens.map(function (b) { return DEFS[b.type].say(b.value); }).join(' and ') + '.';
+
+    var body = whens.map(function (b) { return DEFS[b.type].pred(b.value); }).join(', ');
+    compiled.textContent = thens.map(function (b) { return DEFS[b.type].pred(b.value) + ' :- ' + body + '.'; }).join('\n');
+
+    var negated = whens.some(function (b) { return DEFS[b.type].neg; });
+    mode.textContent = negated ? 'live · uses not' : 'stored edges';
+    mode.className = negated ? 'mode live' : 'mode';
+  }
+
+  Array.prototype.forEach.call(document.querySelectorAll('[data-add]'), function (btn) {
+    btn.addEventListener('click', function () { add(btn.getAttribute('data-add')); });
+  });
+
+  var themer = document.getElementById('themer');
+  var modes = ['auto', 'dark', 'light'];
+  var mi = 0;
+  themer.addEventListener('click', function () {
+    mi = (mi + 1) % modes.length;
+    var m = modes[mi];
+    if (m === 'auto') { document.documentElement.removeAttribute('data-theme'); }
+    else { document.documentElement.setAttribute('data-theme', m); }
+    themer.textContent = 'Theme: ' + m;
+  });
+
+  add('folder');
+  add('tier');
+})();
+</script>
+</body>
+</html>
