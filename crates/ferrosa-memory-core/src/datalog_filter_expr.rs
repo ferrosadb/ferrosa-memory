@@ -222,6 +222,17 @@ fn filter(input: &str) -> IResult<&str, BuiltinFilter> {
 /// junk, missing comparison operator, malformed expression). Callers in
 /// `datalog.rs` pre-screen for the presence of a comparison operator
 /// before dispatching to this function.
+/// Parse a bare arithmetic expression, with no comparison around it.
+///
+/// Used for a computed head argument, which is an expression rather than a
+/// filter — there is nothing to compare it against.
+pub fn parse_head_expr(input: &str) -> anyhow::Result<FilterExpr> {
+    match all_consuming(expr).parse(input) {
+        Ok((_, e)) => Ok(e),
+        Err(e) => anyhow::bail!("invalid head expression '{}': {}", input.trim(), e),
+    }
+}
+
 pub fn parse_filter(input: &str) -> anyhow::Result<BuiltinFilter> {
     match all_consuming(filter).parse(input) {
         Ok((_, f)) => Ok(f),
