@@ -1159,6 +1159,24 @@ impl AgentRuntime for CodexTmuxRuntime {
 pub struct ControlRuntimeDispatcher<S, R> {
     store: Arc<S>,
     runtime: Arc<R>,
+    /// The coordinator beside this listener, when one is installed.
+    ///
+    /// `None` is a normal state, not a degraded one: a machine that only serves
+    /// memory has no coordinator, and team commands answer "not available"
+    /// rather than failing.
+    #[cfg(feature = "webrtc-transport")]
+    coordinator: Option<Arc<crate::coordinator_client::CoordinatorClient>>,
+    /// What the ACCOUNT has paid for.
+    ///
+    /// An entitlement turns functionality off; it is not a permission check.
+    /// An account without `teams` sees a machine with no team functionality,
+    /// which is the same answer as a machine that has none installed.
+    entitlements: Vec<String>,
+    /// What THIS DEVICE was granted.
+    ///
+    /// The actual security decision, and the server's view of it. It must never
+    /// be the capability list the client asked for in its own subscribe frame.
+    granted_capabilities: Vec<String>,
 }
 
 impl<S, R> ControlRuntimeDispatcher<S, R>
@@ -1170,7 +1188,33 @@ where
         Self {
             store,
             runtime: Arc::new(runtime),
+            #[cfg(feature = "webrtc-transport")]
+            coordinator: None,
+            // Empty by default, which denies every coordinator command. A
+            // dispatcher that has not been told what the peer may do must not
+            // assume it may do anything.
+            entitlements: Vec::new(),
+            granted_capabilities: Vec::new(),
         }
+    }
+
+    /// Attach the coordinator and the server's view of what this peer may do.
+    ///
+    /// Both grants are supplied by the CALLER, which reads them from the
+    /// account and the device record. They are deliberately not derived from
+    /// anything the client sent.
+    #[cfg(feature = "webrtc-transport")]
+    #[must_use]
+    pub fn with_coordinator(
+        mut self,
+        coordinator: Option<Arc<crate::coordinator_client::CoordinatorClient>>,
+        entitlements: Vec<String>,
+        granted_capabilities: Vec<String>,
+    ) -> Self {
+        self.coordinator = coordinator;
+        self.entitlements = entitlements;
+        self.granted_capabilities = granted_capabilities;
+        self
     }
 
     /// Reply to liveness, replay, or the first typed agent command. A duplicate
@@ -1197,6 +1241,132 @@ where
         self.dispatch_command(ctx, server_fingerprint, &value).await
     }
 
+    /// Answer a coordinator command, or say plainly why it cannot be answered.
+    ///
+    /// Three refusals, kept apart because they need different things from the
+    /// reader. `NotAvailable` covers both "this host runs no coordinator" and
+    /// "the account has no teams entitlement" -- ONE answer on purpose, since
+    /// both mean "nothing here" from the caller's side and the difference is of
+    /// use only to somebody mapping which hosts run one.
+    ///
+    /// Reads answer straight from the coordinator and record NOTHING durable: a
+    /// list is safe to repeat, and writing an event per poll would bury the
+    /// events that describe real changes. Writes are the opposite -- they are
+    /// what the log exists for.
+    async fn dispatch_coordinator_command(
+        &self,
+        ctx: &TenantContext,
+        server_fingerprint: &str,
+        frame: &serde_json::Value,
+        frame_id: &str,
+        command: crate::coordinator_command::CoordinatorCommand,
+    ) -> Result<Option<String>, ControlSessionError> {
+        use crate::coordinator_command::{Effect, RefusedReason, authorize, teams_available};
+
+        let available = teams_available(self.coordinator.is_some(), &self.entitlements);
+        if let Err(reason) = authorize(command, &self.granted_capabilities, available) {
+            let message = match reason {
+                RefusedReason::NotAvailable => "teams are not available on this machine",
+                RefusedReason::MissingCapability { .. } => {
+                    "this device is not permitted to drive the coordinator"
+                }
+            };
+            // A refusal is not a protocol violation: the frame was well formed
+            // and the answer is no. Killing the session over it would take down
+            // everything else the peer is doing.
+            return Err(ControlSessionError::CapabilityUnavailable(
+                message.to_owned(),
+            ));
+        }
+
+        let Some(coordinator) = self.coordinator.as_ref() else {
+            return Err(ControlSessionError::CapabilityUnavailable(
+                "teams are not available on this machine".to_owned(),
+            ));
+        };
+
+        // NOTE: the frame is never logged from here on. For SecretFulfil it
+        // carries a credential, and the redaction that protects it on the app
+        // side does not travel with the JSON.
+        let payload = frame.pointer("/body/payload").cloned().unwrap_or_default();
+
+        let outcome = match command {
+            crate::coordinator_command::CoordinatorCommand::TeammateList => {
+                coordinator.teammates().await
+            }
+            crate::coordinator_command::CoordinatorCommand::SecretPendingList => {
+                coordinator.pending_secrets().await
+            }
+            crate::coordinator_command::CoordinatorCommand::VmList => coordinator.vms().await,
+            crate::coordinator_command::CoordinatorCommand::SecretFulfil => {
+                let request_id = payload
+                    .get("request_id")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| {
+                        ControlSessionError::Protocol("secret_fulfil needs a request_id".to_owned())
+                    })?;
+                // Taken as an owned String and moved straight into the call, so
+                // it is not retained here after the request.
+                let value = payload
+                    .get("value")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        ControlSessionError::Protocol("secret_fulfil needs a value".to_owned())
+                    })?
+                    .to_owned();
+                coordinator.fulfil_secret(request_id, value).await
+            }
+            crate::coordinator_command::CoordinatorCommand::SecretDeny => {
+                let request_id = payload
+                    .get("request_id")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| {
+                        ControlSessionError::Protocol("secret_deny needs a request_id".to_owned())
+                    })?;
+                coordinator
+                    .deny_secret(request_id)
+                    .await
+                    .map(|()| serde_json::json!({"denied": request_id}))
+            }
+        };
+
+        let result = outcome.map_err(|e| {
+            // The coordinator being unreachable costs this capability, not the
+            // session: the peer keeps its memory and agent access.
+            ControlSessionError::CapabilityUnavailable(format!("coordinator: {e}"))
+        })?;
+
+        if command.effect() == Effect::Write {
+            // Writes belong in the durable record, so the log says who answered
+            // a credential prompt and when. The RESULT is recorded, which for a
+            // fulfilment is a state and a path -- never the value.
+            let _ = append_control_event(
+                self.store.as_ref(),
+                ctx,
+                server_fingerprint,
+                Uuid::now_v7(),
+                "coordinator_command",
+                serde_json::json!({
+                    "command_type": command.as_wire(),
+                    "result": result.clone(),
+                }),
+            )
+            .await?;
+        }
+
+        let reply = serde_json::json!({
+            "version": CONTROL_PROTOCOL_VERSION,
+            "frame_id": frame_id,
+            "body": {
+                "type": "command_result",
+                "command_id": frame.pointer("/body/command_id").cloned().unwrap_or_default(),
+                "state": "succeeded",
+                "result": result,
+            }
+        });
+        Ok(Some(reply.to_string()))
+    }
+
     async fn dispatch_command(
         &self,
         ctx: &TenantContext,
@@ -1220,6 +1390,19 @@ where
             .pointer("/body/command_type")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| ControlSessionError::Protocol("missing command_type".to_owned()))?;
+        // Coordinator commands take a different path: they are answered by the
+        // coordinator beside this listener rather than by the agent runtime,
+        // and reads among them produce no durable command at all.
+        //
+        // Recognised BEFORE the agent_launch check so an unknown command still
+        // reports "unsupported" rather than being mistaken for one.
+        if let Some(command) =
+            crate::coordinator_command::CoordinatorCommand::from_wire(command_type)
+        {
+            return self
+                .dispatch_coordinator_command(ctx, server_fingerprint, frame, frame_id, command)
+                .await;
+        }
         if command_type != "agent_launch" {
             return Err(ControlSessionError::Protocol(
                 "unsupported command_type".to_owned(),

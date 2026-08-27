@@ -351,3 +351,75 @@ mod tests {
         assert_eq!(COORDINATOR_CAPABILITY, "coordinator_control");
     }
 }
+
+#[cfg(test)]
+mod dispatch_contract_tests {
+    use super::*;
+
+    /// The wire names here must match what the app sends. Asserted as literals
+    /// rather than derived, because a rename on either side is a break no type
+    /// system catches: the app would send a string this build no longer
+    /// recognises and the command would read as unsupported.
+    #[test]
+    fn the_wire_names_match_the_apps_command_types() {
+        assert_eq!(CoordinatorCommand::TeammateList.as_wire(), "teammate_list");
+        assert_eq!(
+            CoordinatorCommand::SecretPendingList.as_wire(),
+            "secret_pending_list"
+        );
+        assert_eq!(CoordinatorCommand::SecretFulfil.as_wire(), "secret_fulfil");
+        assert_eq!(CoordinatorCommand::SecretDeny.as_wire(), "secret_deny");
+        assert_eq!(CoordinatorCommand::VmList.as_wire(), "vm_list");
+    }
+
+    /// Reads must not write to the durable log. The app polls these; recording
+    /// an event per poll would bury the events describing real changes under a
+    /// stream of listings.
+    #[test]
+    fn reads_are_not_recorded_and_writes_are() {
+        for command in [
+            CoordinatorCommand::TeammateList,
+            CoordinatorCommand::SecretPendingList,
+            CoordinatorCommand::VmList,
+        ] {
+            assert_eq!(
+                command.effect(),
+                Effect::Read,
+                "{command:?} must not write to the log"
+            );
+        }
+        for command in [
+            CoordinatorCommand::SecretFulfil,
+            CoordinatorCommand::SecretDeny,
+        ] {
+            assert_eq!(
+                command.effect(),
+                Effect::Write,
+                "{command:?} answers a credential prompt and belongs in the log"
+            );
+        }
+    }
+
+    /// An unentitled account and a host with no coordinator must be
+    /// indistinguishable to the caller, so the difference cannot be used to
+    /// find hosts worth attacking.
+    #[test]
+    fn absence_looks_the_same_whatever_causes_it() {
+        let device = vec![COORDINATOR_CAPABILITY.to_owned()];
+        let no_coordinator = teams_available(false, &[TEAMS_ENTITLEMENT.to_owned()]);
+        let no_entitlement = teams_available(true, &[]);
+        assert_eq!(
+            authorize(CoordinatorCommand::TeammateList, &device, no_coordinator),
+            authorize(CoordinatorCommand::TeammateList, &device, no_entitlement)
+        );
+    }
+
+    /// The one frame carrying a credential is marked, so the dispatcher can
+    /// avoid logging it. The app-side redaction does not travel with the JSON.
+    #[test]
+    fn the_dispatcher_can_tell_which_frame_holds_a_secret() {
+        assert!(CoordinatorCommand::SecretFulfil.carries_secret());
+        assert!(!CoordinatorCommand::SecretDeny.carries_secret());
+        assert!(!CoordinatorCommand::TeammateList.carries_secret());
+    }
+}
