@@ -788,6 +788,67 @@ pub enum FilterExpr {
         rhs: Box<FilterExpr>,
     },
     Neg(Box<FilterExpr>),
+    /// A call to one of a closed set of pure functions.
+    ///
+    /// Closed on purpose: an open extension point would mean an unknown name
+    /// had to be read as something, and the only other reading — a variable —
+    /// is unbound and therefore matches every row.
+    Call {
+        func: Func,
+        args: Vec<FilterExpr>,
+    },
+}
+
+/// The functions callable from an expression. Pure, total on their declared
+/// types, and cheap — nothing here allocates unboundedly or can loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Func {
+    Abs,
+    Floor,
+    Ceil,
+    Round,
+    Len,
+    Lower,
+    Upper,
+    Concat,
+}
+
+impl Func {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Abs => "abs",
+            Self::Floor => "floor",
+            Self::Ceil => "ceil",
+            Self::Round => "round",
+            Self::Len => "len",
+            Self::Lower => "lower",
+            Self::Upper => "upper",
+            Self::Concat => "concat",
+        }
+    }
+
+    /// How many arguments the function takes.
+    pub fn arity(self) -> usize {
+        match self {
+            Self::Concat => 2,
+            _ => 1,
+        }
+    }
+
+    pub const ALL: [Func; 8] = [
+        Func::Abs,
+        Func::Floor,
+        Func::Ceil,
+        Func::Round,
+        Func::Len,
+        Func::Lower,
+        Func::Upper,
+        Func::Concat,
+    ];
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.keyword() == name)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -798,6 +859,9 @@ pub enum ArithOp {
     Div,
     /// Remainder, written `%`. Binds as tightly as `*` and `/`.
     Rem,
+    /// Exponentiation, written `**`. Binds tighter than `*`, and associates to
+    /// the right, so `2 ** 3 ** 2` is `2 ** (3 ** 2)`.
+    Pow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -809,6 +873,29 @@ pub enum AggregateKind {
     Min,
     Max,
     Avg,
+    /// Folds distinct *values* of `value_var`.
+    ///
+    /// The one fold that cannot stream: distinctness needs a set, and the set
+    /// grows with the answer. It is therefore bounded — see
+    /// `datalog::DISTINCT_VALUE_CAP`.
+    CountDistinct,
+    /// Population standard deviation. Streams: Welford's method computes
+    /// variance in one pass with constant memory, so this is a fold like
+    /// `sum` and `avg`, not a member of the bounded family below.
+    StdDev,
+    /// The middle value. Needs the whole group ordered before an answer
+    /// exists, so it is bounded — see `datalog::RETAINED_VALUE_CAP`.
+    Median,
+    /// The value at a fraction of the way through the ordered group. `Median`
+    /// is this with `P = 0.5` rather than a separate mechanism.
+    Percentile,
+    /// The values themselves, joined by a separator.
+    ///
+    /// Every other aggregate reduces a group to one number; this is the only
+    /// one that answers "which ones". It returns a string rather than a list
+    /// because `DerivedFact` carries its endpoints as strings — a list-valued
+    /// argument would be flattened at that boundary anyway.
+    GroupConcat,
 }
 
 impl AggregateKind {
@@ -820,6 +907,11 @@ impl AggregateKind {
             Self::Min => "min",
             Self::Max => "max",
             Self::Avg => "avg",
+            Self::CountDistinct => "count_distinct",
+            Self::StdDev => "stddev",
+            Self::Median => "median",
+            Self::Percentile => "percentile",
+            Self::GroupConcat => "group_concat",
         }
     }
 
@@ -829,6 +921,19 @@ impl AggregateKind {
         !matches!(self, Self::Count)
     }
 
+    /// Whether the aggregate takes a literal parameter between its value
+    /// variable and its output — the fraction for `percentile`, the separator
+    /// for `group_concat`.
+    pub fn needs_param(self) -> bool {
+        matches!(self, Self::Percentile | Self::GroupConcat)
+    }
+
+    /// Whether the fold must retain the whole group rather than an
+    /// accumulator. These are the aggregates that cannot stream.
+    pub fn retains_group(self) -> bool {
+        matches!(self, Self::Median | Self::Percentile | Self::GroupConcat)
+    }
+
     /// Whether an empty group still produces a value.
     ///
     /// `Count` and `Sum` have a well-defined identity over no rows — nothing
@@ -836,10 +941,19 @@ impl AggregateKind {
     /// is no minimum of nothing, and emitting a sentinel would be a fabricated
     /// value the caller cannot distinguish from a real one. Those rules simply
     /// do not fire.
-    pub fn identity_over_empty(self) -> Option<f64> {
+    pub fn identity_over_empty(self) -> Option<Term> {
         match self {
-            Self::Count | Self::Sum => Some(0.0),
-            Self::Min | Self::Max | Self::Avg => None,
+            Self::Count | Self::Sum | Self::CountDistinct => {
+                Some(Term::ConstFloat(OrderedFloat(0.0)))
+            }
+            // Joining no values is the empty string, which is a real answer
+            // rather than a stand-in for one.
+            Self::GroupConcat => Some(Term::ConstStr(String::new())),
+            // There is no middle, extreme, mean or spread of nothing, and a
+            // sentinel would be a fabricated value.
+            Self::Min | Self::Max | Self::Avg | Self::StdDev | Self::Median | Self::Percentile => {
+                None
+            }
         }
     }
 }
@@ -847,6 +961,13 @@ impl AggregateKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Aggregate {
     pub kind: AggregateKind,
+    /// The literal parameter, for the kinds that take one.
+    ///
+    /// Additive: rows written before `percentile` and `group_concat` existed
+    /// carry no such field and deserialize to `None`, which is what every
+    /// other kind wants.
+    #[serde(default)]
+    pub param: Option<Term>,
     pub inner: Atom,
     #[serde(default)]
     pub inner_conjunction: Vec<Atom>,
@@ -907,6 +1028,24 @@ pub struct DatalogRule {
     /// against, not something to evaluate.
     #[serde(default)]
     pub head_exprs: Vec<HeadExpr>,
+    /// Computed values the body names, written `D := expr`.
+    ///
+    /// A distinct operator rather than `=`, which already parses to
+    /// `CmpOp::Eq`. Redefining `=` would silently change the meaning of rules
+    /// already stored, and a silent change of meaning is worse than a new
+    /// symbol to learn.
+    ///
+    /// Evaluated in order after the positive atoms, so a binding may use
+    /// anything the body bound and anything an earlier binding named.
+    #[serde(default)]
+    pub bindings: Vec<Binding>,
+}
+
+/// A named value computed from what the body already bound.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Binding {
+    pub var: String,
+    pub expr: FilterExpr,
 }
 
 /// A computed head argument: which position it fills, and how to compute it.
@@ -1558,6 +1697,7 @@ mod tests {
             },
             inner_conjunction: vec![],
             group_vars: vec!["X".into()],
+            param: None,
             value_var: None,
             output_var: "N".into(),
         };
@@ -1585,6 +1725,7 @@ mod tests {
                 },
             ],
             group_vars: vec!["Ctx".into(), "Tool".into()],
+            param: None,
             value_var: None,
             output_var: "N".into(),
         };
@@ -1610,6 +1751,7 @@ mod tests {
             },
             inner_conjunction: vec![],
             group_vars: vec!["X".into()],
+            param: None,
             value_var: None,
             output_var: "N".into(),
         };

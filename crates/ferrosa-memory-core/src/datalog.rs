@@ -41,6 +41,124 @@ pub struct EffectiveRuleEntry {
 
 // ─── Rule Parser ──────────────────────────────────────────────────
 
+/// The most distinct values one `count_distinct` group may hold.
+///
+/// Every other fold streams: it keeps one accumulator no matter how large the
+/// group. Distinctness cannot — it has to remember what it has already seen,
+/// and that set grows with the answer.
+///
+/// So it is bounded, and the bound is loud. Past it the group derives nothing
+/// rather than a truncated count, because a count that silently omits values
+/// is a number the caller cannot tell from a real one. Deliberately
+/// conservative; raise it if a real group needs more.
+pub const DISTINCT_VALUE_CAP: usize = 10_000;
+
+/// The most values one whole-group fold may retain.
+///
+/// `median`, `percentile` and `group_concat` cannot stream: an answer does not
+/// exist until the group is ordered, so the values have to be kept. Lower than
+/// `DISTINCT_VALUE_CAP` because these retain every value, not only the
+/// distinct ones. Past it the group derives nothing rather than a statistic
+/// computed from a truncated sample.
+pub const RETAINED_VALUE_CAP: usize = 10_000;
+
+/// The most rules one disjunctive rule may expand to.
+///
+/// Alternatives multiply: N binary groups is 2^N rules. The cap turns a
+/// runaway into an error naming it, rather than one rule quietly becoming
+/// hundreds that all have to be evaluated.
+const MAX_RULE_ALTERNATIVES: usize = 64;
+
+/// Parse a rule, expanding `;` alternatives into one rule each.
+///
+/// Disjunction is handled here rather than in the evaluator: expanding to
+/// disjunctive normal form at load costs nothing at evaluation time and means
+/// the evaluator never learns a new body shape.
+pub fn parse_rules(text: &str) -> anyhow::Result<Vec<DatalogRule>> {
+    let text = text.trim().trim_end_matches('.').trim();
+    let sep = text
+        .find(":-")
+        .ok_or_else(|| anyhow::anyhow!("rule must contain ':-' separator"))?;
+    let head_str = &text[..sep];
+    let bodies = expand_disjunction(text[sep + 2..].trim())?;
+    anyhow::ensure!(
+        bodies.len() <= MAX_RULE_ALTERNATIVES,
+        "rule expands to {} alternatives, more than the {MAX_RULE_ALTERNATIVES} allowed; \
+         split it into separate rules so the cost is visible",
+        bodies.len()
+    );
+    bodies
+        .iter()
+        .map(|body| parse_rule(&format!("{head_str} :- {body}.")))
+        .collect()
+}
+
+/// Expand a body into one conjunction per alternative.
+///
+/// `,` binds tighter than `;`, as in Prolog, so `a, b ; c` is `(a, b) ; c`.
+/// A parenthesised group holding alternatives distributes over the rest of the
+/// conjunction, which is what makes `a, (b ; c)` two rules rather than one.
+fn expand_disjunction(body: &str) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    for alternative in split_top_level(body, ';')? {
+        let parts = split_top_level(&alternative, ',')?;
+        // Each part expands to one or more conjunct strings; the alternatives
+        // of the whole are the cartesian product of the parts' expansions.
+        let mut combos: Vec<Vec<String>> = vec![Vec::new()];
+        for part in &parts {
+            let trimmed = part.trim();
+            let expansions = match strip_group(trimmed) {
+                Some(inner) => expand_disjunction(inner)?,
+                None => vec![trimmed.to_string()],
+            };
+            anyhow::ensure!(
+                combos.len() * expansions.len() <= MAX_RULE_ALTERNATIVES,
+                "rule expands past the {MAX_RULE_ALTERNATIVES}-alternative cap; \
+                 split it into separate rules so the cost is visible"
+            );
+            combos = combos
+                .into_iter()
+                .flat_map(|prefix| {
+                    expansions.iter().map(move |e| {
+                        let mut next = prefix.clone();
+                        next.push(e.clone());
+                        next
+                    })
+                })
+                .collect();
+        }
+        out.extend(combos.into_iter().map(|c| c.join(", ")));
+    }
+    Ok(out)
+}
+
+/// The inside of a parenthesised group that holds alternatives, if this part
+/// is one. A group without a `;` is left alone — it may be a filter.
+fn strip_group(part: &str) -> Option<&str> {
+    let inner = part.strip_prefix('(')?.strip_suffix(')')?;
+    // Only a *balanced* outer pair counts: `(a) ; (b)` is not one group.
+    let mut depth = 0i32;
+    for c in inner.chars() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    split_top_level(inner, ';')
+        .ok()
+        .filter(|alts| alts.len() > 1)
+        .map(|_| inner)
+}
+
 /// Parse a Datalog rule from text.
 ///
 /// Syntax: `head(args) :- body1(args), body2(args), X != Y.`
@@ -62,6 +180,19 @@ pub fn parse_rule(text: &str) -> anyhow::Result<DatalogRule> {
     let head_str = text[..sep_pos].trim();
     let body_str = text[sep_pos + 2..].trim();
 
+    // `parse_rule` is used where exactly one rule is expected. Returning the
+    // first alternative and dropping the rest would be silently wrong, so a
+    // disjunctive body is refused here and callers that want it use
+    // `parse_rules`.
+    if let Ok(alternatives) = expand_disjunction(body_str)
+        && alternatives.len() > 1
+    {
+        anyhow::bail!(
+            "rule body has {} alternatives; use parse_rules to expand them",
+            alternatives.len()
+        );
+    }
+
     let (head, head_exprs) = parse_head(head_str)?;
 
     let body_parts = split_top_level(body_str, ',')?;
@@ -81,6 +212,7 @@ pub fn parse_rule(text: &str) -> anyhow::Result<DatalogRule> {
     let mut aggregates: Vec<crate::types::Aggregate> = Vec::new();
     let mut deferred_aggregates: Vec<String> = Vec::new();
     let mut deferred_negated: Vec<String> = Vec::new();
+    let mut deferred_bindings: Vec<String> = Vec::new();
     let mut anon_counter = 0usize;
 
     // Pass 1: classify each body part; defer aggregate and negated parts for
@@ -90,6 +222,8 @@ pub fn parse_rule(text: &str) -> anyhow::Result<DatalogRule> {
         let part = part.trim();
         if let Some(rest) = strip_not_prefix(part) {
             deferred_negated.push(rest.to_string());
+        } else if split_assignment(part).is_some() {
+            deferred_bindings.push(part.to_string());
         } else if is_boolean_filter_part(part) || is_reserved_str_part(part) {
             filters.push(crate::datalog_filter_expr::parse_filter(part)?);
         } else if aggregate_keyword(part).is_some() {
@@ -178,11 +312,43 @@ pub fn parse_rule(text: &str) -> anyhow::Result<DatalogRule> {
     // The stratify analyzer (Task M3) supersedes it and also catches
     // cross-rule recursion through aggregates.
 
+    // Bindings run in order after the positive atoms, so each may use what the
+    // body bound and what an earlier binding named — but nothing later.
+    let mut bindings: Vec<crate::types::Binding> = Vec::new();
+    let mut bound_so_far: std::collections::HashSet<String> = positive_vars.clone();
+    bound_so_far.extend(aggregates.iter().map(|a| a.output_var.clone()));
+    for part in &deferred_bindings {
+        let (var, rhs) = split_assignment(part).expect("classified as an assignment");
+        let var = var.trim().to_string();
+        anyhow::ensure!(
+            var.starts_with(|c: char| c.is_ascii_uppercase() || c == '_'),
+            "'{var}' is not a variable, so ':=' has nothing to bind"
+        );
+        anyhow::ensure!(
+            !bound_so_far.contains(&var),
+            "'{var}' is already bound; ':=' names a NEW value, and rebinding \
+             would make the rule read two ways depending on evaluation order"
+        );
+        let expr = crate::datalog_filter_expr::parse_head_expr(rhs)?;
+        let mut used = Vec::new();
+        collect_expr_vars(&expr, &mut used);
+        let unbound: Vec<String> = used
+            .into_iter()
+            .filter(|v| !bound_so_far.contains(v))
+            .collect();
+        anyhow::ensure!(
+            unbound.is_empty(),
+            "binding '{var} := {}' uses variable(s) {} that nothing has bound yet",
+            rhs.trim(),
+            unbound.join(", ")
+        );
+        bound_so_far.insert(var.clone());
+        bindings.push(crate::types::Binding { var, expr });
+    }
+
     // A computed head argument may only use variables the body binds; there is
     // nothing else to compute from.
-    let mut agg_outputs: std::collections::HashSet<String> =
-        aggregates.iter().map(|a| a.output_var.clone()).collect();
-    agg_outputs.extend(positive_vars.iter().cloned());
+    let agg_outputs: std::collections::HashSet<String> = bound_so_far.clone();
     for he in &head_exprs {
         let mut unbound: Vec<String> = Vec::new();
         collect_expr_vars(&he.expr, &mut unbound);
@@ -205,7 +371,42 @@ pub fn parse_rule(text: &str) -> anyhow::Result<DatalogRule> {
         aggregates,
         negated,
         head_exprs,
+        bindings,
     })
+}
+
+/// Split `NAME := expr` at a top-level `:=`.
+///
+/// `=` is deliberately not accepted: it already parses to `CmpOp::Eq`, and
+/// redefining it would silently change the meaning of rules already stored.
+fn split_assignment(part: &str) -> Option<(&str, &str)> {
+    let bytes = part.as_bytes();
+    let (mut depth, mut in_str, mut i) = (0i32, false, 0usize);
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            if c == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' => in_str = true,
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            b':' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'=' => {
+                return Some((&part[..i], &part[i + 2..]));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Collect every variable referenced by a filter expression.
@@ -218,6 +419,11 @@ fn collect_expr_vars(e: &crate::types::FilterExpr, out: &mut Vec<String>) {
         FilterExpr::BinOp { lhs, rhs, .. } => {
             collect_expr_vars(lhs, out);
             collect_expr_vars(rhs, out);
+        }
+        FilterExpr::Call { args, .. } => {
+            for a in args {
+                collect_expr_vars(a, out);
+            }
         }
     }
 }
@@ -254,7 +460,7 @@ fn parse_head(head_str: &str) -> anyhow::Result<(Atom, Vec<crate::types::HeadExp
     let mut rewritten: Vec<String> = Vec::with_capacity(arg_parts.len());
     let mut head_exprs = Vec::new();
     for (index, part) in arg_parts.iter().enumerate() {
-        if has_top_level_arith(part) {
+        if has_top_level_arith(part) || looks_like_call(part) {
             head_exprs.push(crate::types::HeadExpr {
                 index,
                 expr: crate::datalog_filter_expr::parse_head_expr(part)?,
@@ -267,6 +473,25 @@ fn parse_head(head_str: &str) -> anyhow::Result<(Atom, Vec<crate::types::HeadExp
 
     let atom = parse_atom(&format!("{predicate}({})", rewritten.join(", ")), &mut 0)?;
     Ok((atom, head_exprs))
+}
+
+/// True when a head argument is shaped like a function call.
+///
+/// The name is not checked here. Routing it to the expression parser is what
+/// makes an unknown name an error naming it, rather than a term that quietly
+/// becomes the string "frobnicate(V)".
+fn looks_like_call(part: &str) -> bool {
+    let part = part.trim();
+    let Some(open) = part.find('(') else {
+        return false;
+    };
+    if !part.ends_with(')') {
+        return false;
+    }
+    let name = &part[..open];
+    !name.is_empty()
+        && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// True when a head argument carries an arithmetic operator at the top level.
@@ -321,12 +546,35 @@ fn split_top_level(s: &str, delim: char) -> anyhow::Result<Vec<String>> {
     let mut current = String::new();
     let mut depth = 0u32;
 
+    let mut in_str = false;
+    let mut escaped = false;
+
     for ch in s.chars() {
-        if ch == '(' {
+        // A comma inside a string literal is text, not a separator. Without
+        // this, `p(X, "a,b")` splits in the middle of its own argument.
+        if in_str {
+            current.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_str = true;
+            current.push(ch);
+            continue;
+        }
+        // Brackets nest exactly like parentheses here: a set literal's commas
+        // separate its elements, not the rule's body parts.
+        if ch == '(' || ch == '[' {
             depth += 1;
             current.push(ch);
-        } else if ch == ')' {
-            anyhow::ensure!(depth > 0, "unmatched closing parenthesis");
+        } else if ch == ')' || ch == ']' {
+            anyhow::ensure!(depth > 0, "unmatched closing parenthesis or bracket");
             depth -= 1;
             current.push(ch);
         } else if ch == delim && depth == 0 {
@@ -466,18 +714,60 @@ fn parse_aggregate(
         );
     }
 
+    if kind.needs_param() && parts.len() < 4 {
+        anyhow::bail!(
+            "aggregate '{s}' needs a literal between its value var and its output: \
+             {}(atom.., Value, {}, Out)",
+            kind.keyword(),
+            if kind == crate::types::AggregateKind::Percentile {
+                "Fraction"
+            } else {
+                "Separator"
+            }
+        );
+    }
+
+    // The literal parameter, when the kind takes one, sits just before the
+    // output var.
+    let param = if kind.needs_param() {
+        let raw = parts[parts.len() - 2].trim();
+        let term = parse_term(raw, &mut 0);
+        match kind {
+            crate::types::AggregateKind::Percentile => {
+                let Term::ConstFloat(OrderedFloat(p)) = term else {
+                    anyhow::bail!("percentile fraction '{raw}' must be a number");
+                };
+                anyhow::ensure!(
+                    (0.0..=1.0).contains(&p),
+                    "percentile fraction {p} is outside 0..=1, so it names no \
+                     position in the group"
+                );
+                Some(Term::ConstFloat(OrderedFloat(p)))
+            }
+            _ => {
+                let Term::ConstStr(sep) = term else {
+                    anyhow::bail!("group_concat separator '{raw}' must be a quoted string");
+                };
+                Some(Term::ConstStr(sep))
+            }
+        }
+    } else {
+        None
+    };
+
     // For a value aggregate the second-to-last part is the value variable.
     // Atoms always carry parentheses, so a bare identifier here is
     // unambiguous.
+    let tail = if kind.needs_param() { 3 } else { 2 };
     let (value_var, atom_parts) = if kind.needs_value_var() {
-        let raw = parts[parts.len() - 2].trim().to_string();
+        let raw = parts[parts.len() - tail].trim().to_string();
         if raw.contains('(') {
             anyhow::bail!(
                 "aggregate '{s}' needs a value variable before its output var, \
                  got the atom '{raw}'"
             );
         }
-        (Some(raw), &parts[..parts.len() - 2])
+        (Some(raw), &parts[..parts.len() - tail])
     } else {
         (None, &parts[..parts.len() - 1])
     };
@@ -541,6 +831,7 @@ fn parse_aggregate(
 
     Ok(Some(crate::types::Aggregate {
         kind,
+        param,
         inner,
         inner_conjunction,
         group_vars,
@@ -549,9 +840,9 @@ fn parse_aggregate(
     }))
 }
 
-/// True for a body part that opens with `!` or joins with `||` / `&&` at the
-/// top level, which makes it a filter even when its comparison is nested
-/// inside parentheses and so invisible to `has_top_level_cmp`.
+/// True for a body part that opens with `!`, joins with `||` / `&&`, or holds
+/// a set literal at the top level — each of which makes it a filter even when
+/// it carries no comparison `has_top_level_cmp` can see.
 fn is_boolean_filter_part(part: &str) -> bool {
     let part = part.trim();
     if part.starts_with('!') {
@@ -579,6 +870,9 @@ fn is_boolean_filter_part(part: &str) -> bool {
             b'|' | b'&' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == c => {
                 return true;
             }
+            // A set literal. Atoms never use brackets, so a top-level `[`
+            // means `expr in [...]` and nothing else.
+            b'[' if depth == 0 => return true,
             _ => {}
         }
         i += 1;
@@ -607,10 +901,26 @@ fn is_reserved_str_part(part: &str) -> bool {
 /// legacy escape `count` already had: `sum(X, Y)` fails to parse as an
 /// aggregate and falls through to plain body-atom parsing.
 fn aggregate_keyword(part: &str) -> Option<crate::types::AggregateKind> {
-    use crate::types::AggregateKind::{Avg, Count, Max, Min, Sum};
-    [Count, Sum, Min, Max, Avg]
-        .into_iter()
-        .find(|kind| part.starts_with(&format!("{}(", kind.keyword())))
+    use crate::types::AggregateKind::{
+        Avg, Count, CountDistinct, GroupConcat, Max, Median, Min, Percentile, StdDev, Sum,
+    };
+    // `count_distinct` before `count`: prefix matching includes the `(`, so
+    // they cannot actually collide, but keeping the longer name first makes
+    // that independent of how the match is written.
+    [
+        CountDistinct,
+        Count,
+        Sum,
+        Min,
+        Max,
+        Avg,
+        StdDev,
+        Median,
+        Percentile,
+        GroupConcat,
+    ]
+    .into_iter()
+    .find(|kind| part.starts_with(&format!("{}(", kind.keyword())))
 }
 
 /// True iff `s` contains a comparison operator at the top level — i.e.
@@ -848,6 +1158,28 @@ fn collect_bindings(rule: &DatalogRule, all_facts: &FactSet) -> Vec<Candidate> {
     // check below is a decision, not a race with this stratum's fixpoint.
     final_bindings
         .into_iter()
+        // Bindings come before filters, because a filter may test what a
+        // binding named. A binding with no value drops the candidate: firing
+        // with a missing value would derive a row the caller cannot tell from
+        // a real one.
+        .filter_map(|(mut binding, prov)| {
+            for b in &rule.bindings {
+                let value = match eval_expr(&b.expr, &binding) {
+                    Eval::Value(EvalValue::Num(f)) => Term::ConstFloat(OrderedFloat(f)),
+                    Eval::Value(EvalValue::Str(s)) => Term::ConstStr(s),
+                    Eval::Value(EvalValue::Uuid(u)) => Term::Const(u),
+                    Eval::Undefined | Eval::Unbound => {
+                        tracing::warn!(
+                            var = %b.var,
+                            "datalog: binding has no value; the rule does not fire"
+                        );
+                        return None;
+                    }
+                };
+                binding.insert(b.var.clone(), value);
+            }
+            Some((binding, prov))
+        })
         .filter(|(binding, _)| check_filters(&rule.filters, binding))
         .filter_map(|(binding, mut provenance)| {
             for neg in &rule.negated {
@@ -933,6 +1265,7 @@ fn evaluate_rule_with_aggregates(
         // Phase 1 collects bindings only; the head is instantiated by the
         // caller, which is where head expressions are applied.
         head_exprs: Vec::new(),
+        bindings: rule.bindings.clone(),
     };
 
     // Phase 1: collect candidate bindings from non-aggregate body atoms.
@@ -984,6 +1317,7 @@ fn filter_references_any(f: &BuiltinFilter, vars: &std::collections::HashSet<&st
             FilterExpr::LitNum(_) | FilterExpr::LitStr(_) => false,
             FilterExpr::Neg(inner) => expr_refs(inner, vars),
             FilterExpr::BinOp { lhs, rhs, .. } => expr_refs(lhs, vars) || expr_refs(rhs, vars),
+            FilterExpr::Call { args, .. } => args.iter().any(|a| expr_refs(a, vars)),
         }
     }
     match f {
@@ -1168,6 +1502,110 @@ fn visit_conjunction(
     true
 }
 
+/// Evaluate a whitelisted function call.
+///
+/// A wrong-typed argument is Undefined rather than false, matching the rest of
+/// the evaluator: false is a value `!` would flip into a spurious pass.
+fn eval_call(
+    func: crate::types::Func,
+    args: &[crate::types::FilterExpr],
+    binding: &std::collections::HashMap<String, Term>,
+) -> Eval {
+    use crate::types::Func;
+
+    let mut values = Vec::with_capacity(args.len());
+    for a in args {
+        match eval_expr(a, binding) {
+            Eval::Value(v) => values.push(v),
+            other => return other,
+        }
+    }
+
+    let wrong_type = || {
+        tracing::warn!(
+            function = func.keyword(),
+            "datalog: function applied to the wrong type; deriving nothing"
+        );
+        Eval::Undefined
+    };
+
+    match (func, values.as_slice()) {
+        (Func::Abs, [EvalValue::Num(x)]) => Eval::Value(EvalValue::Num(x.abs())),
+        (Func::Floor, [EvalValue::Num(x)]) => Eval::Value(EvalValue::Num(x.floor())),
+        (Func::Ceil, [EvalValue::Num(x)]) => Eval::Value(EvalValue::Num(x.ceil())),
+        (Func::Round, [EvalValue::Num(x)]) => Eval::Value(EvalValue::Num(x.round())),
+        // Characters, not bytes: a length in bytes would differ for the same
+        // text depending on the alphabet it is written in.
+        (Func::Len, [EvalValue::Str(s)]) => Eval::Value(EvalValue::Num(s.chars().count() as f64)),
+        (Func::Lower, [EvalValue::Str(s)]) => Eval::Value(EvalValue::Str(s.to_lowercase())),
+        (Func::Upper, [EvalValue::Str(s)]) => Eval::Value(EvalValue::Str(s.to_uppercase())),
+        (Func::Concat, [EvalValue::Str(a), EvalValue::Str(b)]) => {
+            Eval::Value(EvalValue::Str(format!("{a}{b}")))
+        }
+        _ => wrong_type(),
+    }
+}
+
+/// Reduce a retained group to its answer.
+///
+/// `median` is `percentile` at 0.5 rather than a separate calculation, so the
+/// two can never disagree about an even-sized group.
+fn finish_retained(
+    kind: crate::types::AggregateKind,
+    param: Option<&Term>,
+    values: Vec<Term>,
+) -> Option<Term> {
+    use crate::types::AggregateKind as K;
+
+    if values.is_empty() {
+        return kind.identity_over_empty();
+    }
+
+    if kind == K::GroupConcat {
+        let Some(Term::ConstStr(sep)) = param else {
+            return None;
+        };
+        // Sorted so the answer does not depend on fact-set iteration order,
+        // which is a HashSet's and therefore arbitrary.
+        let mut rendered: Vec<String> = values.iter().map(term_to_string).collect();
+        rendered.sort();
+        return Some(Term::ConstStr(rendered.join(sep)));
+    }
+
+    // Order statistics are numeric: ordering a string against a number has no
+    // meaningful answer, the same reason min/max refuses a mixed group.
+    let mut nums: Vec<f64> = Vec::with_capacity(values.len());
+    for v in &values {
+        let Term::ConstFloat(OrderedFloat(f)) = v else {
+            tracing::warn!(
+                aggregate = kind.keyword(),
+                "datalog: order statistic over a non-numeric value; deriving nothing"
+            );
+            return None;
+        };
+        nums.push(*f);
+    }
+    nums.sort_by(|a, b| a.partial_cmp(b).expect("no NaN: eval rejects it"));
+
+    let fraction = match kind {
+        K::Median => 0.5,
+        _ => match param {
+            Some(Term::ConstFloat(OrderedFloat(p))) => *p,
+            _ => return None,
+        },
+    };
+
+    // Linear interpolation between the two neighbouring ranks. This is what
+    // makes percentile(0.5) equal median on an even-sized group.
+    let idx = fraction * (nums.len() - 1) as f64;
+    let lo = idx.floor() as usize;
+    let hi = idx.ceil() as usize;
+    let frac = idx - lo as f64;
+    Some(Term::ConstFloat(OrderedFloat(
+        nums[lo] + frac * (nums[hi] - nums[lo]),
+    )))
+}
+
 /// Compare two ground terms of the same kind.
 ///
 /// `None` for two different kinds: a string against a number has no meaningful
@@ -1193,6 +1631,19 @@ enum Fold {
         best: Option<Term>,
     },
     Avg(f64, u64),
+    /// The non-streaming fold. Holds every distinct value seen so far, capped
+    /// at `DISTINCT_VALUE_CAP`.
+    Distinct(std::collections::HashSet<Term>),
+    /// Welford's online variance: count, running mean, running sum of squared
+    /// deviations. Constant memory, one pass — `stddev` streams.
+    Spread {
+        n: u64,
+        mean: f64,
+        m2: f64,
+    },
+    /// The whole group, retained because an answer does not exist until it is
+    /// ordered. Capped at `RETAINED_VALUE_CAP`.
+    Retained(Vec<Term>),
     /// A value the fold cannot use — not a number where one is required, or a
     /// group whose values are not all the same kind. The group is refused
     /// rather than silently folded over the subset that happened to fit.
@@ -1214,6 +1665,13 @@ impl Fold {
                 best: None,
             },
             K::Avg => Fold::Avg(0.0, 0),
+            K::CountDistinct => Fold::Distinct(std::collections::HashSet::new()),
+            K::StdDev => Fold::Spread {
+                n: 0,
+                mean: 0.0,
+                m2: 0.0,
+            },
+            K::Median | K::Percentile | K::GroupConcat => Fold::Retained(Vec::new()),
         }
     }
 
@@ -1231,6 +1689,43 @@ impl Fold {
             return false;
         };
         match self {
+            Fold::Distinct(seen) => {
+                seen.insert(value.clone());
+                if seen.len() > DISTINCT_VALUE_CAP {
+                    tracing::warn!(
+                        cap = DISTINCT_VALUE_CAP,
+                        "datalog: count_distinct group exceeded its cap; deriving \
+                         nothing rather than a truncated count"
+                    );
+                    *self = Fold::TypeError;
+                    return false;
+                }
+            }
+            Fold::Retained(values) => {
+                values.push(value.clone());
+                if values.len() > RETAINED_VALUE_CAP {
+                    tracing::warn!(
+                        cap = RETAINED_VALUE_CAP,
+                        "datalog: whole-group aggregate exceeded its cap; deriving \
+                         nothing rather than a statistic over a truncated sample"
+                    );
+                    *self = Fold::TypeError;
+                    return false;
+                }
+            }
+            Fold::Spread { n, mean, m2 } => {
+                let Term::ConstFloat(OrderedFloat(v)) = value else {
+                    *self = Fold::TypeError;
+                    return false;
+                };
+                // Welford: update the mean, then accumulate the squared
+                // deviation against both the old and new mean. Numerically
+                // stabler than summing squares and subtracting.
+                *n += 1;
+                let delta = *v - *mean;
+                *mean += delta / *n as f64;
+                *m2 += delta * (*v - *mean);
+            }
             Fold::Extreme { want, best } => match best {
                 None => *best = Some(value.clone()),
                 Some(current) => match compare_terms(value, current) {
@@ -1264,18 +1759,29 @@ impl Fold {
     }
 
     /// The folded value, or `None` when the group produces nothing.
-    fn finish(self, kind: crate::types::AggregateKind) -> Option<Term> {
+    fn finish(self, kind: crate::types::AggregateKind, param: Option<&Term>) -> Option<Term> {
         let num = |f: f64| Term::ConstFloat(OrderedFloat(f));
         match self {
             Fold::TypeError => None,
             Fold::Count(n) => Some(num(n as f64)),
+            Fold::Distinct(seen) => Some(num(seen.len() as f64)),
+            Fold::Spread { n, m2, .. } => {
+                if n == 0 {
+                    kind.identity_over_empty()
+                } else {
+                    // Population, not sample: the group IS the population the
+                    // rule asked about, not a draw from a larger one.
+                    Some(num((m2 / n as f64).sqrt()))
+                }
+            }
+            Fold::Retained(values) => finish_retained(kind, param, values),
             Fold::Sum(acc) => Some(num(acc)),
             // An extreme of nothing does not exist, and neither min nor max has
             // an identity to fall back on.
-            Fold::Extreme { best, .. } => best.or_else(|| kind.identity_over_empty().map(num)),
+            Fold::Extreme { best, .. } => best.or_else(|| kind.identity_over_empty()),
             Fold::Avg(sum, n) => {
                 if n == 0 {
-                    kind.identity_over_empty().map(num)
+                    kind.identity_over_empty()
                 } else {
                     Some(num(sum / n as f64))
                 }
@@ -1309,7 +1815,7 @@ fn fold_inner_matches(
              kinds); the group derives nothing rather than a partial answer"
         );
     }
-    fold.finish(agg.kind)
+    fold.finish(agg.kind, agg.param.as_ref())
 }
 
 /// Try to unify atom arguments with fact arguments under an existing binding.
@@ -1389,6 +1895,7 @@ fn eval_expr(
         },
         FilterExpr::LitNum(OrderedFloat(f)) => Eval::Value(EvalValue::Num(*f)),
         FilterExpr::LitStr(s) => Eval::Value(EvalValue::Str(s.clone())),
+        FilterExpr::Call { func, args } => eval_call(*func, args, binding),
         FilterExpr::Neg(inner) => match eval_expr(inner, binding) {
             Eval::Value(EvalValue::Num(x)) => Eval::Value(EvalValue::Num(-x)),
             Eval::Value(_) => {
@@ -1424,6 +1931,22 @@ fn eval_expr(
                     // A zero modulus is as undefined as a zero divisor, and
                     // f64 would answer NaN — a value the caller cannot tell
                     // from a real one. Refuse it the same way.
+                    // f64::powf answers NaN for a negative base with a
+                    // fractional exponent, and infinity on overflow. Both are
+                    // values the caller cannot tell from a real one.
+                    ArithOp::Pow => {
+                        let r = a.powf(b);
+                        if r.is_finite() {
+                            Eval::Value(EvalValue::Num(r))
+                        } else {
+                            tracing::warn!(
+                                base = a,
+                                exponent = b,
+                                "datalog: exponentiation has no finite real answer"
+                            );
+                            Eval::Undefined
+                        }
+                    }
                     ArithOp::Rem => {
                         if b == 0.0 {
                             tracing::warn!("datalog: modulo by zero in filter");
@@ -1790,11 +2313,14 @@ pub async fn load_effective_rules(
     ctx: &TenantContext,
     family: Option<&str>,
 ) -> anyhow::Result<Vec<DatalogRule>> {
-    load_effective_rule_entries(storage, ctx, family)
-        .await?
-        .into_iter()
-        .map(|rule| parse_rule(&rule.entry.rule_body))
-        .collect()
+    // `parse_rules`, not `parse_rule`: a stored rule may use `;`, and each
+    // alternative becomes a rule the evaluator runs.
+    let entries = load_effective_rule_entries(storage, ctx, family).await?;
+    let mut rules = Vec::with_capacity(entries.len());
+    for entry in entries {
+        rules.extend(parse_rules(&entry.entry.rule_body)?);
+    }
+    Ok(rules)
 }
 
 // ─── Fact Loading ─────────────────────────────────────────────────
@@ -4225,7 +4751,14 @@ mod aggregate_grammar_tests {
     fn avg_divides_the_sum_by_the_row_count() {
         let rules = vec![parse_rule("mean(X, T) :- account(X), avg(spend(X, A), A, T).").unwrap()];
         let (all, _) = evaluate(&rules, &spend_corpus(), 100, 10_000);
-        assert_eq!(one_value(&all, "mean", &s("alice")), Some(100.0 / 3.0));
+        // Tolerance, not equality: this went through a division, and
+        // instruction selection differs between arm64 and x86_64.
+        let got = one_value(&all, "mean", &s("alice")).expect("derived mean");
+        assert!(
+            (got - 100.0 / 3.0).abs() < 1e-9,
+            "expected about {}, got {got}",
+            100.0 / 3.0
+        );
         assert_eq!(one_value(&all, "mean", &s("bob")), Some(5.0));
     }
 
@@ -4475,6 +5008,22 @@ mod grammar_tests {
     }
 
     // ── Item 4: min/max over any ordered term ─────────────────────
+
+    /// Assert a computed numeric answer to within float tolerance.
+    ///
+    /// Exact bit equality is the wrong assertion for anything that has been
+    /// through a square root or a division: instruction selection differs by
+    /// architecture, and this suite runs on arm64 locally and x86_64 in CI.
+    /// `stddev` over the textbook group is 2.0 on one and 1.9999999999999998
+    /// on the other, and both are right.
+    fn assert_near(got: Option<Term>, want: f64) {
+        match got {
+            Some(Term::ConstFloat(OrderedFloat(v))) => {
+                assert!((v - want).abs() < 1e-9, "expected about {want}, got {v}")
+            }
+            other => panic!("expected a number near {want}, got {other:?}"),
+        }
+    }
 
     /// The term bound to `pred`'s second argument for a given key.
     fn one_term(all: &FactSet, pred: &str, key: &Term) -> Option<Term> {
@@ -4765,6 +5314,799 @@ mod grammar_tests {
         assert!(err.contains("str_startswith"), "got: {err}");
     }
 
+    // ── Round 2, item 5: count over distinct values ───────────────
+
+    #[test]
+    fn identical_rows_are_already_deduped_so_both_counts_agree() {
+        let corpus = facts(&[
+            ("acct", vec![s("a")]),
+            ("tag", vec![s("a"), s("red")]),
+            ("tag", vec![s("a"), s("red")]),
+            ("tag", vec![s("a"), s("blue")]),
+        ]);
+        let distinct = parse_rule("d(X, N) :- acct(X), count_distinct(tag(X, T), T, N).").unwrap();
+        let plain = parse_rule("c(X, N) :- acct(X), count(tag(X, T), N).").unwrap();
+        let (all_d, _) = evaluate(&[distinct], &corpus, 100, 10_000);
+        let (all_c, _) = evaluate(&[plain], &corpus, 100, 10_000);
+        // A FactSet is a set, so identical rows collapse before either fold
+        // sees them and the two agree here. Distinctness only becomes visible
+        // on rows that DIFFER but repeat in the counted column — which is what
+        // the next test does. Kept because it is the boundary between them.
+        assert_eq!(one_term(&all_d, "d", &s("a")), Some(n(2.0)));
+        assert_eq!(one_term(&all_c, "c", &s("a")), Some(n(2.0)));
+    }
+
+    #[test]
+    fn count_distinct_collapses_repeats_that_count_does_not() {
+        // Two owners, one shared colour: three rows, two distinct colours.
+        let corpus = facts(&[
+            ("acct", vec![s("a")]),
+            ("owns", vec![s("a"), s("x"), s("red")]),
+            ("owns", vec![s("a"), s("y"), s("red")]),
+            ("owns", vec![s("a"), s("z"), s("blue")]),
+        ]);
+        let distinct =
+            parse_rule("d(X, N) :- acct(X), count_distinct(owns(X, _, C), C, N).").unwrap();
+        let plain = parse_rule("c(X, N) :- acct(X), count(owns(X, _, C), N).").unwrap();
+        let (all_d, _) = evaluate(&[distinct], &corpus, 100, 10_000);
+        let (all_c, _) = evaluate(&[plain], &corpus, 100, 10_000);
+        assert_eq!(one_term(&all_d, "d", &s("a")), Some(n(2.0)), "two colours");
+        assert_eq!(one_term(&all_c, "c", &s("a")), Some(n(3.0)), "three rows");
+    }
+
+    #[test]
+    fn count_distinct_over_no_rows_is_zero_and_fires() {
+        let corpus = facts(&[("acct", vec![s("carol")])]);
+        let rule = parse_rule("d(X, N) :- acct(X), count_distinct(tag(X, T), T, N).").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(one_term(&all, "d", &s("carol")), Some(n(0.0)));
+    }
+
+    #[test]
+    fn count_distinct_needs_a_value_variable_like_the_other_folds() {
+        let err = parse_rule("d(X, N) :- acct(X), count_distinct(tag(X, T), N).")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("count_distinct"), "got: {err}");
+    }
+
+    #[test]
+    fn count_distinct_orders_mixed_kinds_without_confusing_them() {
+        // Distinctness is equality, not ordering, so mixed kinds are fine
+        // here even though min/max refuses them.
+        let corpus = facts(&[
+            ("acct", vec![s("a")]),
+            ("v", vec![s("a"), s("k1"), s("1")]),
+            ("v", vec![s("a"), s("k2"), n(1.0)]),
+        ]);
+        let rule = parse_rule("d(X, N) :- acct(X), count_distinct(v(X, _, V), V, N).").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(
+            one_term(&all, "d", &s("a")),
+            Some(n(2.0)),
+            "the string \"1\" and the number 1 are different values"
+        );
+    }
+
+    #[test]
+    fn count_distinct_refuses_a_group_past_its_cap_rather_than_growing_without_bound() {
+        // This is the one fold that cannot stream: distinctness needs a set,
+        // and the set grows with the answer. Bounded and loud beats unbounded.
+        let mut corpus = FactSet::new();
+        corpus.insert("acct", vec![s("a")]);
+        for i in 0..=(DISTINCT_VALUE_CAP as u32) {
+            corpus.insert("tag", vec![s("a"), s(&format!("t{i}"))]);
+        }
+        let rule = parse_rule("d(X, N) :- acct(X), count_distinct(tag(X, T), T, N).").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 5_000_000);
+        assert!(
+            all.get("d").map(|r| r.is_empty()).unwrap_or(true),
+            "past the cap the group derives nothing rather than a truncated count"
+        );
+    }
+
+    // ── Round 2, item 4: atom-level disjunction ───────────────────
+
+    #[test]
+    fn a_body_can_offer_alternatives() {
+        let rules = parse_rules("q(X) :- p(X) ; r(X).").unwrap();
+        assert_eq!(rules.len(), 2, "one rule per alternative");
+        assert!(rules.iter().all(|r| r.head.predicate == "q"));
+        let corpus = facts(&[("p", vec![s("a")]), ("r", vec![s("b")])]);
+        let (all, _) = evaluate(&rules, &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn a_comma_binds_tighter_than_a_semicolon() {
+        // `a, b ; c` is `(a, b) ; c`, as in Prolog.
+        let rules = parse_rules("q(X) :- p(X), t(X) ; r(X).").unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(
+            rules[0].body.len(),
+            2,
+            "first alternative is the conjunction"
+        );
+        assert_eq!(rules[1].body.len(), 1);
+    }
+
+    #[test]
+    fn a_parenthesised_alternative_distributes_over_the_conjunction() {
+        let rules = parse_rules("q(X) :- base(X), (p(X) ; r(X)).").unwrap();
+        assert_eq!(rules.len(), 2);
+        for rule in &rules {
+            assert!(rule.body.iter().any(|a| a.predicate == "base"));
+        }
+        let corpus = facts(&[
+            ("base", vec![s("a")]),
+            ("base", vec![s("b")]),
+            ("base", vec![s("c")]),
+            ("p", vec![s("a")]),
+            ("r", vec![s("b")]),
+        ]);
+        let (all, _) = evaluate(&rules, &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a", "b"], "c matches neither");
+    }
+
+    #[test]
+    fn two_groups_produce_the_cartesian_product_of_alternatives() {
+        let rules = parse_rules("q(X) :- (a(X) ; b(X)), (c(X) ; d(X)).").unwrap();
+        assert_eq!(rules.len(), 4);
+    }
+
+    #[test]
+    fn a_rule_with_no_disjunction_expands_to_exactly_itself() {
+        let rules = parse_rules("q(X) :- p(X), r(X).").unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0], parse_rule("q(X) :- p(X), r(X).").unwrap());
+    }
+
+    #[test]
+    fn the_singular_parser_refuses_a_rule_that_expands_to_several() {
+        // parse_rule is used where exactly one rule is expected; silently
+        // returning the first alternative would drop the others.
+        let err = parse_rule("q(X) :- p(X) ; r(X).").unwrap_err().to_string();
+        assert!(
+            err.contains("parse_rules") || err.contains("alternative"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn disjunction_composes_with_negation_and_filters() {
+        let corpus = facts(&[
+            ("p", vec![s("a")]),
+            ("r", vec![s("b")]),
+            ("r", vec![s("c")]),
+            ("banned", vec![s("c")]),
+        ]);
+        let rules = parse_rules("q(X) :- (p(X) ; r(X)), not banned(X).").unwrap();
+        let (all, _) = evaluate(&rules, &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn a_semicolon_inside_a_string_is_not_an_alternative() {
+        let rules = parse_rules(r#"q(X) :- p(X, "a;b")."#).unwrap();
+        assert_eq!(rules.len(), 1);
+    }
+
+    #[test]
+    fn a_runaway_expansion_is_refused_rather_than_silently_enormous() {
+        // Six binary groups is 64 rules; seven is 128. The cap fails loud
+        // rather than quietly compiling one rule into hundreds.
+        let body: String = (0..7)
+            .map(|i| format!("(a{i}(X) ; b{i}(X))"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let err = parse_rules(&format!("q(X) :- {body}."))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("alternative") || err.contains("expand"),
+            "got: {err}"
+        );
+    }
+
+    // ── Round 2, item 3: bind a computed value in the body ────────
+
+    #[test]
+    fn a_body_can_bind_a_computed_value() {
+        let corpus = facts(&[("p", vec![s("a"), n(4.0)])]);
+        let rule = parse_rule("q(X, D) :- p(X, V), D := V * 2.").unwrap();
+        assert_eq!(rule.bindings.len(), 1);
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(one_term(&all, "q", &s("a")), Some(n(8.0)));
+    }
+
+    #[test]
+    fn a_bound_value_is_usable_by_a_later_filter() {
+        let corpus = facts(&[("p", vec![s("a"), n(4.0)]), ("p", vec![s("b"), n(1.0)])]);
+        let rule = parse_rule("q(X) :- p(X, V), D := V * 2, D > 5.").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a"]);
+    }
+
+    #[test]
+    fn a_binding_may_build_on_an_earlier_binding() {
+        let corpus = facts(&[("p", vec![s("a"), n(2.0)])]);
+        let rule = parse_rule("q(X, F) :- p(X, V), D := V * 2, F := D + 1.").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(one_term(&all, "q", &s("a")), Some(n(5.0)));
+    }
+
+    #[test]
+    fn equals_still_compares_and_does_not_bind() {
+        // Redefining `=` would silently change the meaning of stored rules.
+        // `X = W + 1` remains a comparison, and with X unbound it is
+        // undecidable, so it passes — exactly as before.
+        let rule = parse_rule("q(X) :- p(X, V), Y = V + 1.").unwrap();
+        assert!(rule.bindings.is_empty(), "`=` binds nothing");
+        assert_eq!(rule.filters.len(), 1, "`=` is still a comparison");
+    }
+
+    #[test]
+    fn a_binding_whose_right_side_is_unbound_is_rejected() {
+        let err = parse_rule("q(X, D) :- p(X, V), D := Missing * 2.")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Missing"), "must name it, got: {err}");
+    }
+
+    #[test]
+    fn a_binding_that_shadows_a_body_variable_is_rejected() {
+        // Rebinding a variable the body already bound would make the rule read
+        // two ways, and which one wins would depend on evaluation order.
+        let err = parse_rule("q(X, V) :- p(X, V), V := 1.")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains('V'), "must name it, got: {err}");
+    }
+
+    #[test]
+    fn two_bindings_cannot_use_the_same_name() {
+        let err = parse_rule("q(X, D) :- p(X, V), D := V + 1, D := V + 2.")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains('D'), "must name it, got: {err}");
+    }
+
+    #[test]
+    fn a_binding_that_has_no_value_does_not_fire_the_rule() {
+        let corpus = facts(&[("p", vec![s("a"), s("text")])]);
+        let rule = parse_rule("q(X, D) :- p(X, V), D := V * 2.").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert!(all.get("q").map(|r| r.is_empty()).unwrap_or(true));
+    }
+
+    #[test]
+    fn a_binding_can_call_a_function() {
+        let corpus = facts(&[("item", vec![s("a"), s("Report")])]);
+        let rule = parse_rule("q(X, L) :- item(X, N), L := lower(N).").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(one_term(&all, "q", &s("a")), Some(s("report")));
+    }
+
+    // ── Round 2, item 2: function calls in an expression ──────────
+
+    #[test]
+    fn numeric_functions_are_available_in_an_expression() {
+        let corpus = facts(&[("p", vec![s("a"), n(-3.7)]), ("p", vec![s("b"), n(2.2)])]);
+        for (text, expect) in [
+            ("q(X) :- p(X, V), abs(V) > 3.", vec!["a"]),
+            ("q(X) :- p(X, V), floor(V) == -4.", vec!["a"]),
+            ("q(X) :- p(X, V), ceil(V) == 3.", vec!["b"]),
+            ("q(X) :- p(X, V), round(V) == 2.", vec!["b"]),
+        ] {
+            let rule = parse_rule(text).unwrap();
+            let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+            assert_eq!(derived_keys(&all, "q"), expect, "{text}");
+        }
+    }
+
+    #[test]
+    fn string_functions_are_available_in_an_expression() {
+        let corpus = facts(&[("item", vec![s("a"), s("Report.PDF")])]);
+        for text in [
+            r#"q(X) :- item(X, N), len(N) == 10."#,
+            r#"q(X) :- item(X, N), lower(N) == "report.pdf"."#,
+            r#"q(X) :- item(X, N), upper(N) == "REPORT.PDF"."#,
+            r#"q(X) :- item(X, N), concat(N, "!") == "Report.PDF!"."#,
+        ] {
+            let rule = parse_rule(text).unwrap();
+            let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+            assert_eq!(derived_keys(&all, "q"), vec!["a"], "{text}");
+        }
+    }
+
+    #[test]
+    fn a_function_call_nests_and_composes_with_arithmetic() {
+        let corpus = facts(&[("p", vec![s("a"), n(-2.0)])]);
+        let rule = parse_rule("q(X) :- p(X, V), abs(V) * 3 == 6.").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a"]);
+    }
+
+    #[test]
+    fn a_function_call_works_in_a_head_expression() {
+        let corpus = facts(&[("p", vec![s("a"), n(-2.5)])]);
+        let rule = parse_rule("r(X, abs(V)) :- p(X, V).").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(one_term(&all, "r", &s("a")), Some(n(2.5)));
+    }
+
+    #[test]
+    fn an_unknown_function_is_rejected_by_name() {
+        // A closed whitelist. Silently reading `frobnicate(V)` as a variable
+        // would make it match everything, which is the failure this keeps
+        // refusing.
+        let err = parse_rule("q(X) :- p(X, V), frobnicate(V) > 1.")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("frobnicate"), "got: {err}");
+    }
+
+    #[test]
+    fn a_function_called_with_the_wrong_arity_is_rejected_by_name() {
+        let err = parse_rule("q(X) :- p(X, V), abs(V, 2) > 1.")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("abs"), "got: {err}");
+    }
+
+    #[test]
+    fn a_function_applied_to_the_wrong_type_derives_nothing() {
+        // Undefined, matching the rest of the evaluator — not false, which
+        // `!` would flip into a spurious pass.
+        let corpus = facts(&[("item", vec![s("a"), s("text")])]);
+        let rule = parse_rule("q(X) :- item(X, N), abs(N) > 1.").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert!(all.get("q").map(|r| r.is_empty()).unwrap_or(true));
+    }
+
+    #[test]
+    fn a_user_predicate_may_still_be_named_like_a_function() {
+        // Functions live in expressions; atoms are matched. `len(X, Y)` in a
+        // body atom position is a relation, and stays one.
+        let corpus = facts(&[("len", vec![s("a"), n(3.0)])]);
+        let rule = parse_rule("q(X) :- len(X, Y).").unwrap();
+        assert!(rule.body.iter().any(|a| a.predicate == "len"));
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a"]);
+    }
+
+    #[test]
+    fn a_comma_inside_a_string_literal_is_not_an_argument_separator() {
+        // Regression, and pre-existing: `split_top_level` tracked parentheses
+        // and brackets but not strings, so this split in the middle of its
+        // own argument. Nothing had used a comma inside a literal before
+        // group_concat's separator made it unavoidable.
+        let rule = parse_rule(r#"q(X) :- p(X, "a,b")."#).unwrap();
+        assert_eq!(rule.body.len(), 1);
+        assert_eq!(rule.body[0].args.len(), 2);
+        assert_eq!(rule.body[0].args[1], s("a,b"));
+
+        let corpus = facts(&[("p", vec![s("x"), s("a,b")])]);
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["x"]);
+    }
+
+    #[test]
+    fn an_escaped_quote_inside_a_literal_does_not_end_it() {
+        let rule = parse_rule(r#"q(X) :- p(X, "a\",b")."#).unwrap();
+        assert_eq!(rule.body[0].args.len(), 2);
+    }
+
+    // ── The completeness guard ────────────────────────────────────
+
+    /// Three specs in a row have claimed the grammar was complete by reading
+    /// the types and writing prose. Twice that was wrong.
+    ///
+    /// This test is the claim in a form that breaks. It pins the surface each
+    /// spec enumerated, so ADDING a variant fails here and forces the next
+    /// author to re-run the completeness pass and record the answer, rather
+    /// than inheriting a stale "complete".
+    #[test]
+    fn the_grammar_surface_is_the_one_the_spec_signed_off() {
+        use crate::types::{AggregateKind as A, ArithOp, CmpOp, Func, StrOp};
+
+        // Aggregates: 5 streaming folds, 1 bounded-distinct, 3 whole-group.
+        let aggregates = [
+            A::Count,
+            A::Sum,
+            A::Min,
+            A::Max,
+            A::Avg,
+            A::StdDev,
+            A::CountDistinct,
+            A::Median,
+            A::Percentile,
+            A::GroupConcat,
+        ];
+        assert_eq!(aggregates.len(), 10, "an aggregate was added or removed");
+        assert_eq!(
+            aggregates.iter().filter(|k| k.retains_group()).count(),
+            3,
+            "the set of folds that cannot stream changed; that is a design \
+             decision, not an implementation detail"
+        );
+
+        // Arithmetic, comparison, string shape, functions.
+        let _exhaustive_arith = |op: ArithOp| match op {
+            ArithOp::Add
+            | ArithOp::Sub
+            | ArithOp::Mul
+            | ArithOp::Div
+            | ArithOp::Rem
+            | ArithOp::Pow => (),
+        };
+        let _exhaustive_cmp = |op: CmpOp| match op {
+            CmpOp::Eq | CmpOp::Ne | CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => (),
+        };
+        assert_eq!(StrOp::ALL.len(), 3, "a string predicate changed");
+        assert_eq!(Func::ALL.len(), 8, "a function was added or removed");
+
+        // Terms: Var, Const(Uuid), ConstStr, ConstFloat. Boolean, null and
+        // list are declined — see the three tests above for why.
+        let _exhaustive_term = |t: Term| match t {
+            Term::Var(_) | Term::Const(_) | Term::ConstStr(_) | Term::ConstFloat(_) => (),
+        };
+    }
+
+    // ── Final, item 5: the term kinds, decided ────────────────────
+
+    #[test]
+    fn truth_has_exactly_one_spelling_which_is_why_a_boolean_term_is_declined() {
+        // A boolean term would give truth a SECOND spelling. `flag(X, true)`
+        // and `flag(X, "true")` would be different terms that do not unify,
+        // and every flag already stored is a string — so a rule written with
+        // the literal would silently stop matching its own data.
+        let corpus = facts(&[("flag", vec![s("a"), s("true")])]);
+        let rule = parse_rule(r#"on(X) :- flag(X, "true")."#).unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "on"), vec!["a"]);
+
+        // And the idiomatic form needs no value at all: presence is truth.
+        let corpus2 = facts(&[("active", vec![s("b")])]);
+        let rule2 = parse_rule("on(X) :- active(X).").unwrap();
+        let (all2, _) = evaluate(&[rule2], &corpus2, 100, 10_000);
+        assert_eq!(derived_keys(&all2, "on"), vec!["b"]);
+    }
+
+    #[test]
+    fn absence_is_already_expressible_which_is_why_a_null_term_is_declined() {
+        // Datalog's answer to "no value" is the absence of a fact, and
+        // negation says it directly. A null VALUE would need three-valued
+        // comparison semantics the engine deliberately does not have, and
+        // would be a THIRD kind of no-value beside Unbound and Undefined,
+        // which the filter evaluator already distinguishes on purpose.
+        let corpus = facts(&[
+            ("item", vec![s("a")]),
+            ("item", vec![s("b")]),
+            ("owner", vec![s("b"), s("someone")]),
+        ]);
+        let rule = parse_rule("unowned(X) :- item(X), not owner(X, _).").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "unowned"), vec!["a"]);
+    }
+
+    #[test]
+    fn a_group_of_values_comes_back_as_a_string_which_is_why_a_list_term_is_declined() {
+        // The capability a list term was wanted for. `DerivedFact` carries
+        // its endpoints as strings, so a list-valued argument would be
+        // flattened at that boundary regardless — the list would buy nothing
+        // and cost unification, ordering and a stored-format change.
+        let corpus = facts(&[
+            ("acct", vec![s("a")]),
+            ("tag", vec![s("a"), s("k1"), s("x")]),
+            ("tag", vec![s("a"), s("k2"), s("y")]),
+        ]);
+        let rule =
+            parse_rule(r#"g(X, S) :- acct(X), group_concat(tag(X, _, T), T, "|", S)."#).unwrap();
+        let (_, derived) = evaluate(&[rule], &corpus, 100, 10_000);
+        let fact = derived.iter().find(|d| d.pred == "g").unwrap();
+        assert_eq!(
+            fact.dst_id, "x|y",
+            "the values survive as a string endpoint"
+        );
+    }
+
+    // ── Final, items 2-4: the last aggregates ─────────────────────
+
+    fn spread_corpus() -> FactSet {
+        // 2, 4, 4, 4, 5, 5, 7, 9 — the textbook population with mean 5 and
+        // population stddev exactly 2.
+        let mut f = FactSet::new();
+        f.insert("acct", vec![s("a")]);
+        for (k, v) in [
+            ("k1", 2.0),
+            ("k2", 4.0),
+            ("k3", 4.0),
+            ("k4", 4.0),
+            ("k5", 5.0),
+            ("k6", 5.0),
+            ("k7", 7.0),
+            ("k8", 9.0),
+        ] {
+            f.insert("v", vec![s("a"), s(k), n(v)]);
+        }
+        f
+    }
+
+    #[test]
+    fn stddev_folds_the_spread_of_a_group() {
+        let rule = parse_rule("d(X, S) :- acct(X), stddev(v(X, _, V), V, S).").unwrap();
+        let (all, _) = evaluate(&[rule], &spread_corpus(), 100, 10_000);
+        assert_near(one_term(&all, "d", &s("a")), 2.0);
+    }
+
+    #[test]
+    fn stddev_of_a_single_value_is_zero() {
+        let corpus = facts(&[("acct", vec![s("a")]), ("v", vec![s("a"), s("k"), n(7.0)])]);
+        let rule = parse_rule("d(X, S) :- acct(X), stddev(v(X, _, V), V, S).").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_near(one_term(&all, "d", &s("a")), 0.0);
+    }
+
+    #[test]
+    fn stddev_over_no_rows_does_not_fire() {
+        let corpus = facts(&[("acct", vec![s("carol")])]);
+        let rule = parse_rule("d(X, S) :- acct(X), stddev(v(X, _, V), V, S).").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert!(all.get("d").map(|r| r.is_empty()).unwrap_or(true));
+    }
+
+    #[test]
+    fn stddev_streams_a_large_group() {
+        // Welford: one pass, constant memory. This would be a 20k-element
+        // vector if it were retained like the order statistics.
+        let mut corpus = FactSet::new();
+        corpus.insert("acct", vec![s("a")]);
+        for i in 0..20_000u32 {
+            corpus.insert("v", vec![s("a"), s(&format!("k{i}")), n(5.0)]);
+        }
+        let rule = parse_rule("d(X, S) :- acct(X), stddev(v(X, _, V), V, S).").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 200_000);
+        assert_near(one_term(&all, "d", &s("a")), 0.0);
+    }
+
+    #[test]
+    fn median_takes_the_middle_of_a_group() {
+        // 2,4,4,4,5,5,7,9 -> even count, so the mean of the middle pair.
+        let rule = parse_rule("m(X, M) :- acct(X), median(v(X, _, V), V, M).").unwrap();
+        let (all, _) = evaluate(&[rule], &spread_corpus(), 100, 10_000);
+        assert_near(one_term(&all, "m", &s("a")), 4.5);
+    }
+
+    #[test]
+    fn median_of_an_odd_group_is_an_actual_member() {
+        let corpus = facts(&[
+            ("acct", vec![s("a")]),
+            ("v", vec![s("a"), s("k1"), n(1.0)]),
+            ("v", vec![s("a"), s("k2"), n(100.0)]),
+            ("v", vec![s("a"), s("k3"), n(3.0)]),
+        ]);
+        let rule = parse_rule("m(X, M) :- acct(X), median(v(X, _, V), V, M).").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(one_term(&all, "m", &s("a")), Some(n(3.0)));
+    }
+
+    #[test]
+    fn percentile_takes_a_fraction_and_median_is_the_half_of_it() {
+        let corpus = spread_corpus();
+        let p50 = parse_rule("p(X, R) :- acct(X), percentile(v(X, _, V), V, 0.5, R).").unwrap();
+        let med = parse_rule("p(X, R) :- acct(X), median(v(X, _, V), V, R).").unwrap();
+        let (all_p, _) = evaluate(&[p50], &corpus, 100, 10_000);
+        let (all_m, _) = evaluate(&[med], &corpus, 100, 10_000);
+        assert_eq!(
+            one_term(&all_p, "p", &s("a")),
+            one_term(&all_m, "p", &s("a"))
+        );
+
+        let hi = parse_rule("t(X, R) :- acct(X), percentile(v(X, _, V), V, 1.0, R).").unwrap();
+        let (all_hi, _) = evaluate(&[hi], &corpus, 100, 10_000);
+        assert_eq!(
+            one_term(&all_hi, "t", &s("a")),
+            Some(n(9.0)),
+            "p100 is the max"
+        );
+    }
+
+    #[test]
+    fn a_percentile_outside_zero_to_one_is_rejected_at_parse() {
+        let err = parse_rule("t(X, R) :- acct(X), percentile(v(X, _, V), V, 1.5, R).")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("1.5") || err.contains("percentile"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_concat_returns_the_values_not_a_statistic() {
+        let corpus = facts(&[
+            ("acct", vec![s("a")]),
+            ("tag", vec![s("a"), s("k1"), s("red")]),
+            ("tag", vec![s("a"), s("k2"), s("blue")]),
+        ]);
+        let rule =
+            parse_rule(r#"g(X, S) :- acct(X), group_concat(tag(X, _, T), T, ", ", S)."#).unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        // Sorted, so the answer does not depend on fact-set iteration order.
+        assert_eq!(one_term(&all, "g", &s("a")), Some(s("blue, red")));
+    }
+
+    #[test]
+    fn group_concat_over_no_rows_is_the_empty_string_and_fires() {
+        let corpus = facts(&[("acct", vec![s("carol")])]);
+        let rule =
+            parse_rule(r#"g(X, S) :- acct(X), group_concat(tag(X, _, T), T, ",", S)."#).unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(one_term(&all, "g", &s("carol")), Some(s("")));
+    }
+
+    #[test]
+    fn the_whole_group_folds_refuse_a_group_past_the_cap() {
+        // median, percentile and group_concat all retain the group, so all
+        // three are bounded the way count_distinct is.
+        let mut corpus = FactSet::new();
+        corpus.insert("acct", vec![s("a")]);
+        for i in 0..=(RETAINED_VALUE_CAP as u32) {
+            corpus.insert("v", vec![s("a"), s(&format!("k{i}")), n(f64::from(i))]);
+        }
+        for (text, pred) in [
+            ("m(X, R) :- acct(X), median(v(X, _, V), V, R).", "m"),
+            (
+                "p(X, R) :- acct(X), percentile(v(X, _, V), V, 0.9, R).",
+                "p",
+            ),
+            (
+                r#"g(X, R) :- acct(X), group_concat(v(X, _, V), V, ",", R)."#,
+                "g",
+            ),
+        ] {
+            let rule = parse_rule(text).unwrap();
+            let (all, _) = evaluate(&[rule], &corpus, 100, 5_000_000);
+            assert!(
+                all.get(pred).map(|r| r.is_empty()).unwrap_or(true),
+                "{text} must derive nothing past the cap"
+            );
+        }
+    }
+
+    // ── Final, item 1: exponentiation ─────────────────────────────
+
+    #[test]
+    fn arithmetic_supports_exponentiation() {
+        let corpus = facts(&[("p", vec![s("a"), n(3.0)])]);
+        let rule = parse_rule("q(X) :- p(X, V), V ** 2 == 9.").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a"]);
+    }
+
+    #[test]
+    fn exponentiation_binds_tighter_than_multiplication() {
+        // 2 * 3 ** 2  is  2 * (3 ** 2) = 18, not (2 * 3) ** 2 = 36.
+        let corpus = facts(&[("p", vec![s("a"), n(3.0)])]);
+        let rule = parse_rule("q(X) :- p(X, V), 2 * V ** 2 == 18.").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a"]);
+    }
+
+    #[test]
+    fn exponentiation_is_right_associative() {
+        // 2 ** 3 ** 2 is 2 ** (3 ** 2) = 512, not (2 ** 3) ** 2 = 64.
+        let corpus = facts(&[("p", vec![s("a"), n(2.0)])]);
+        let rule = parse_rule("q(X) :- p(X, V), V ** 3 ** 2 == 512.").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a"]);
+    }
+
+    #[test]
+    fn exponentiation_works_in_a_head_and_a_binding() {
+        let corpus = facts(&[("p", vec![s("a"), n(4.0)])]);
+        let head = parse_rule("sq(X, V ** 2) :- p(X, V).").unwrap();
+        let bind = parse_rule("b(X, S) :- p(X, V), S := V ** 2.").unwrap();
+        let (all_h, _) = evaluate(&[head], &corpus, 100, 10_000);
+        let (all_b, _) = evaluate(&[bind], &corpus, 100, 10_000);
+        assert_eq!(one_term(&all_h, "sq", &s("a")), Some(n(16.0)));
+        assert_eq!(one_term(&all_b, "b", &s("a")), Some(n(16.0)));
+    }
+
+    #[test]
+    fn an_exponentiation_with_no_real_answer_derives_nothing() {
+        // (-8) ** 0.5 is not a real number. f64 answers NaN, which is a value
+        // the caller cannot tell from a real one.
+        let corpus = facts(&[("p", vec![s("a"), n(-8.0)])]);
+        let rule = parse_rule("q(X) :- p(X, V), V ** 0.5 > 0.").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert!(all.get("q").map(|r| r.is_empty()).unwrap_or(true));
+    }
+
+    // ── Round 2, item 1: set membership ───────────────────────────
+
+    #[test]
+    fn a_filter_can_test_set_membership() {
+        let corpus = facts(&[
+            ("item", vec![s("a"), s("red")]),
+            ("item", vec![s("b"), s("blue")]),
+            ("item", vec![s("c"), s("green")]),
+        ]);
+        let rule = parse_rule(r#"warm(X) :- item(X, C), C in ["red", "orange"]."#).unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "warm"), vec!["a"]);
+    }
+
+    #[test]
+    fn set_membership_works_over_numbers() {
+        let corpus = facts(&[("p", vec![s("a"), n(1.0)]), ("p", vec![s("b"), n(7.0)])]);
+        let rule = parse_rule("q(X) :- p(X, V), V in [1, 2, 3].").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a"]);
+    }
+
+    #[test]
+    fn set_membership_desugars_to_a_disjunction_of_equalities() {
+        // Not a new evaluator path — it is the `Any(Eq..)` the author would
+        // otherwise have typed by hand.
+        let rule = parse_rule(r#"q(X) :- p(X, C), C in ["a", "b"]."#).unwrap();
+        match &rule.filters[0] {
+            crate::types::BuiltinFilter::Any(branches) => {
+                assert_eq!(branches.len(), 2);
+                assert!(branches.iter().all(|b| matches!(
+                    b,
+                    crate::types::BuiltinFilter::Compare {
+                        op: crate::types::CmpOp::Eq,
+                        ..
+                    }
+                )));
+            }
+            other => panic!("expected Any of Eq, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_single_element_set_is_a_plain_equality() {
+        let rule = parse_rule(r#"q(X) :- p(X, C), C in ["a"]."#).unwrap();
+        assert!(matches!(
+            &rule.filters[0],
+            crate::types::BuiltinFilter::Compare {
+                op: crate::types::CmpOp::Eq,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn set_membership_negates_and_composes() {
+        let corpus = facts(&[
+            ("item", vec![s("a"), s("red")]),
+            ("item", vec![s("b"), s("blue")]),
+        ]);
+        let rule = parse_rule(r#"cool(X) :- item(X, C), !(C in ["red"])."#).unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "cool"), vec!["b"]);
+    }
+
+    #[test]
+    fn an_empty_set_is_rejected_rather_than_matching_nothing() {
+        // `C in []` can never hold. It is always a mistake, and a filter that
+        // silently matches nothing looks exactly like "no rows".
+        let err = parse_rule("q(X) :- p(X, C), C in [].")
+            .unwrap_err()
+            .to_string();
+        assert!(!err.is_empty(), "an empty set literal is rejected");
+    }
+
+    #[test]
+    fn the_left_side_of_in_may_be_an_expression() {
+        let corpus = facts(&[("p", vec![s("a"), n(2.0)])]);
+        let rule = parse_rule("q(X) :- p(X, V), V * 2 in [4, 8].").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a"]);
+    }
+
     // ── Item 1: modulo ────────────────────────────────────────────
 
     #[test]
@@ -4829,5 +6171,29 @@ mod grammar_tests {
         let corpus = facts(&[("num", vec![s("a"), s("not-a-number")])]);
         let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
         assert!(all.get("bad").map(|r| r.is_empty()).unwrap_or(true));
+    }
+}
+
+#[cfg(test)]
+mod numeric_harm_measurement {
+    use super::*;
+
+    /// Measurement for round-2 item 6, kept as a test so the conclusion stays
+    /// checkable rather than becoming a claim in a commit message.
+    #[test]
+    fn a_whole_number_already_renders_without_a_decimal_point() {
+        assert_eq!(term_to_string(&Term::ConstFloat(OrderedFloat(3.0))), "3");
+        assert_eq!(term_to_string(&Term::ConstFloat(OrderedFloat(0.0))), "0");
+        assert_eq!(term_to_string(&Term::ConstFloat(OrderedFloat(2.5))), "2.5");
+    }
+
+    #[test]
+    fn f64_is_exact_for_integers_far_beyond_anything_this_engine_counts() {
+        // Every numeric fact the loader produces is a score in [0,1]
+        // (`confidence`, `warmth`); the rest are folds over those. f64 holds
+        // integers exactly to 2^53, which is nine quadrillion.
+        let limit = (2f64).powi(53);
+        assert_eq!(limit + 1.0, limit, "2^53 is where exactness ends");
+        assert!(limit > 9.0e15, "and that is far past any count here");
     }
 }
