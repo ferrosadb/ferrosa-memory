@@ -41,10 +41,15 @@ Every gap below is a rule a tenant cannot write today.
       an unbound variable and a zero divisor, and `check_one_filter` passed on
       `None`, so `V / 0 == 0` derived a fact. Fixed as part of this item.*
 
-- [ ] **2. String predicates.** Nothing can ask about the shape of a string.
+- [x] **2. String predicates.** Nothing can ask about the shape of a string.
       "Everything except items whose name starts with `tmp_`" is unwritable,
       which is the same class of requirement that motivated negation.
-      `starts_with`, `ends_with`, `contains`.
+      `starts_with`, `ends_with`, `contains`. *Named `str_starts_with`,
+      `str_ends_with`, `str_contains` in the end: `contains` is already an edge
+      type here, so `contains(X, Y)` is a legitimate stored relation and taking
+      the bare name would have silently changed rules already written. The
+      `str_` prefix is reserved so a typo is rejected rather than read as a
+      relation.*
 
 - [ ] **3. Disjunction in a filter.** `check_filters` is `.all()`, so the body's
       filters are implicitly AND-ed and there is no way to say "or". Today that
