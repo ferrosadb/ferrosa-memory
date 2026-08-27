@@ -322,11 +322,13 @@ fn split_top_level(s: &str, delim: char) -> anyhow::Result<Vec<String>> {
     let mut depth = 0u32;
 
     for ch in s.chars() {
-        if ch == '(' {
+        // Brackets nest exactly like parentheses here: a set literal's commas
+        // separate its elements, not the rule's body parts.
+        if ch == '(' || ch == '[' {
             depth += 1;
             current.push(ch);
-        } else if ch == ')' {
-            anyhow::ensure!(depth > 0, "unmatched closing parenthesis");
+        } else if ch == ')' || ch == ']' {
+            anyhow::ensure!(depth > 0, "unmatched closing parenthesis or bracket");
             depth -= 1;
             current.push(ch);
         } else if ch == delim && depth == 0 {
@@ -549,9 +551,9 @@ fn parse_aggregate(
     }))
 }
 
-/// True for a body part that opens with `!` or joins with `||` / `&&` at the
-/// top level, which makes it a filter even when its comparison is nested
-/// inside parentheses and so invisible to `has_top_level_cmp`.
+/// True for a body part that opens with `!`, joins with `||` / `&&`, or holds
+/// a set literal at the top level — each of which makes it a filter even when
+/// it carries no comparison `has_top_level_cmp` can see.
 fn is_boolean_filter_part(part: &str) -> bool {
     let part = part.trim();
     if part.starts_with('!') {
@@ -579,6 +581,9 @@ fn is_boolean_filter_part(part: &str) -> bool {
             b'|' | b'&' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == c => {
                 return true;
             }
+            // A set literal. Atoms never use brackets, so a top-level `[`
+            // means `expr in [...]` and nothing else.
+            b'[' if depth == 0 => return true,
             _ => {}
         }
         i += 1;
@@ -4763,6 +4768,89 @@ mod grammar_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("str_startswith"), "got: {err}");
+    }
+
+    // ── Round 2, item 1: set membership ───────────────────────────
+
+    #[test]
+    fn a_filter_can_test_set_membership() {
+        let corpus = facts(&[
+            ("item", vec![s("a"), s("red")]),
+            ("item", vec![s("b"), s("blue")]),
+            ("item", vec![s("c"), s("green")]),
+        ]);
+        let rule = parse_rule(r#"warm(X) :- item(X, C), C in ["red", "orange"]."#).unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "warm"), vec!["a"]);
+    }
+
+    #[test]
+    fn set_membership_works_over_numbers() {
+        let corpus = facts(&[("p", vec![s("a"), n(1.0)]), ("p", vec![s("b"), n(7.0)])]);
+        let rule = parse_rule("q(X) :- p(X, V), V in [1, 2, 3].").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a"]);
+    }
+
+    #[test]
+    fn set_membership_desugars_to_a_disjunction_of_equalities() {
+        // Not a new evaluator path — it is the `Any(Eq..)` the author would
+        // otherwise have typed by hand.
+        let rule = parse_rule(r#"q(X) :- p(X, C), C in ["a", "b"]."#).unwrap();
+        match &rule.filters[0] {
+            crate::types::BuiltinFilter::Any(branches) => {
+                assert_eq!(branches.len(), 2);
+                assert!(branches.iter().all(|b| matches!(
+                    b,
+                    crate::types::BuiltinFilter::Compare {
+                        op: crate::types::CmpOp::Eq,
+                        ..
+                    }
+                )));
+            }
+            other => panic!("expected Any of Eq, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_single_element_set_is_a_plain_equality() {
+        let rule = parse_rule(r#"q(X) :- p(X, C), C in ["a"]."#).unwrap();
+        assert!(matches!(
+            &rule.filters[0],
+            crate::types::BuiltinFilter::Compare {
+                op: crate::types::CmpOp::Eq,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn set_membership_negates_and_composes() {
+        let corpus = facts(&[
+            ("item", vec![s("a"), s("red")]),
+            ("item", vec![s("b"), s("blue")]),
+        ]);
+        let rule = parse_rule(r#"cool(X) :- item(X, C), !(C in ["red"])."#).unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "cool"), vec!["b"]);
+    }
+
+    #[test]
+    fn an_empty_set_is_rejected_rather_than_matching_nothing() {
+        // `C in []` can never hold. It is always a mistake, and a filter that
+        // silently matches nothing looks exactly like "no rows".
+        let err = parse_rule("q(X) :- p(X, C), C in [].")
+            .unwrap_err()
+            .to_string();
+        assert!(!err.is_empty(), "an empty set literal is rejected");
+    }
+
+    #[test]
+    fn the_left_side_of_in_may_be_an_expression() {
+        let corpus = facts(&[("p", vec![s("a"), n(2.0)])]);
+        let rule = parse_rule("q(X) :- p(X, V), V * 2 in [4, 8].").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a"]);
     }
 
     // ── Item 1: modulo ────────────────────────────────────────────
