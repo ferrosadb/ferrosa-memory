@@ -752,7 +752,46 @@ pub enum ArithOp {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AggregateKind {
+    /// Folds *rows*: how many complete unifications the inner conjunction has.
     Count,
+    /// Folds *values* of the aggregate's `value_var`.
+    Sum,
+    Min,
+    Max,
+    Avg,
+}
+
+impl AggregateKind {
+    /// The keyword this kind is written with.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::Sum => "sum",
+            Self::Min => "min",
+            Self::Max => "max",
+            Self::Avg => "avg",
+        }
+    }
+
+    /// Every kind but `Count` folds the values of a named variable, so every
+    /// kind but `Count` requires one.
+    pub fn needs_value_var(self) -> bool {
+        !matches!(self, Self::Count)
+    }
+
+    /// Whether an empty group still produces a value.
+    ///
+    /// `Count` and `Sum` have a well-defined identity over no rows — nothing
+    /// happened zero times and cost zero. `Min`, `Max` and `Avg` do not: there
+    /// is no minimum of nothing, and emitting a sentinel would be a fabricated
+    /// value the caller cannot distinguish from a real one. Those rules simply
+    /// do not fire.
+    pub fn identity_over_empty(self) -> Option<f64> {
+        match self {
+            Self::Count | Self::Sum => Some(0.0),
+            Self::Min | Self::Max | Self::Avg => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -763,6 +802,12 @@ pub struct Aggregate {
     pub inner_conjunction: Vec<Atom>,
     pub group_vars: Vec<String>,
     pub output_var: String,
+    /// The variable whose values are folded, for every kind but `Count`.
+    ///
+    /// Additive: rows written when `count` was the only aggregate carry no
+    /// such field and deserialize to `None`, which is what `Count` wants.
+    #[serde(default)]
+    pub value_var: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1439,6 +1484,7 @@ mod tests {
             },
             inner_conjunction: vec![],
             group_vars: vec!["X".into()],
+            value_var: None,
             output_var: "N".into(),
         };
         let json = serde_json::to_string(&a).unwrap();
@@ -1465,6 +1511,7 @@ mod tests {
                 },
             ],
             group_vars: vec!["Ctx".into(), "Tool".into()],
+            value_var: None,
             output_var: "N".into(),
         };
         let json = serde_json::to_string(&a).unwrap();
@@ -1489,6 +1536,7 @@ mod tests {
             },
             inner_conjunction: vec![],
             group_vars: vec!["X".into()],
+            value_var: None,
             output_var: "N".into(),
         };
         let mut json: serde_json::Value = serde_json::to_value(&v1_shape).unwrap();

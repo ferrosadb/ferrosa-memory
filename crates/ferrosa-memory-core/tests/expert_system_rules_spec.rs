@@ -682,3 +682,110 @@ async fn manage_rules_put_accepts_a_negated_rule_and_refuses_an_unsafe_one() {
         "a refused rule must not be stored"
     );
 }
+
+/// A value aggregate stored through the tenant-facing tool path, same as
+/// negation: accepted on write, refused on write when unsafe, and it parses
+/// back into a rule the engine will run.
+#[tokio::test]
+async fn manage_rules_put_accepts_a_value_aggregate_and_refuses_an_unsafe_one() {
+    let store = MockStorage::new();
+    let ctx = test_ctx();
+    let session = SessionState::default();
+
+    let put = |rule_id: &'static str, body: &'static str| {
+        json!({
+            "name": "manage_rules",
+            "arguments": {"action": "put", "rule_id": rule_id, "rule_body": body}
+        })
+    };
+
+    let ok = dispatch(
+        "tools/call",
+        put(
+            "custom-warmth-total",
+            "hot(X, X) :- node(X), sum(warmth(X, W), W, T), T > 1.0.",
+        ),
+        &store,
+        &ctx,
+        &session,
+    )
+    .await
+    .expect("a sum aggregate is valid syntax");
+    assert_eq!(unwrap_tool_result(ok)["action"], "put");
+
+    let stored = store
+        .rule_get(&ctx, "custom-warmth-total")
+        .await
+        .unwrap()
+        .expect("rule was stored");
+    let reparsed = ferrosa_memory_core::datalog::parse_rule(&stored.rule_body).unwrap();
+    assert_eq!(reparsed.aggregates.len(), 1);
+    assert_eq!(
+        reparsed.aggregates[0].kind,
+        ferrosa_memory_core::types::AggregateKind::Sum
+    );
+    assert_eq!(reparsed.aggregates[0].value_var.as_deref(), Some("W"));
+
+    // A value var no inner atom binds is refused at write time.
+    let err = dispatch(
+        "tools/call",
+        put(
+            "custom-warmth-unsafe",
+            "hot(X, X) :- node(X), sum(warmth(X, W), Missing, T).",
+        ),
+        &store,
+        &ctx,
+        &session,
+    )
+    .await
+    .expect_err("an unbound value var must be refused on write");
+    assert!(err.1.contains("Missing"), "got: {}", err.1);
+    assert!(
+        store
+            .rule_get(&ctx, "custom-warmth-unsafe")
+            .await
+            .unwrap()
+            .is_none(),
+        "a refused rule must not be stored"
+    );
+}
+
+/// The engine actually folds a stored value aggregate over real session facts.
+#[tokio::test]
+async fn a_stored_value_aggregate_folds_over_session_facts() {
+    let store = MockStorage::new();
+    let ctx = test_ctx();
+    let session_id = Uuid::new_v4();
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+
+    put_edge(&store, &ctx, session_id, a, "co_occurs", b).await;
+    put_edge(&store, &ctx, session_id, b, "co_occurs", a).await;
+
+    store
+        .rule_put(
+            &ctx,
+            &active_rule(
+                &ctx,
+                "custom-degree",
+                "degree",
+                "degree(X, N) :- co_occurs(X, _), count(co_occurs(X, Y), N).",
+            ),
+        )
+        .await
+        .unwrap();
+    approve_rule(&store, &ctx, "custom-degree").await;
+
+    let results = datalog::query_predicate(
+        &store,
+        &ctx,
+        session_id,
+        "degree",
+        &DatalogConfig::default(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !results.is_empty(),
+        "a stored aggregate rule should derive something"
+    );
+}
