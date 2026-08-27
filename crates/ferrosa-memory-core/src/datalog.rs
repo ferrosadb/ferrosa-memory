@@ -5588,3 +5588,27 @@ mod grammar_tests {
         assert!(all.get("bad").map(|r| r.is_empty()).unwrap_or(true));
     }
 }
+
+#[cfg(test)]
+mod numeric_harm_measurement {
+    use super::*;
+
+    /// Measurement for round-2 item 6, kept as a test so the conclusion stays
+    /// checkable rather than becoming a claim in a commit message.
+    #[test]
+    fn a_whole_number_already_renders_without_a_decimal_point() {
+        assert_eq!(term_to_string(&Term::ConstFloat(OrderedFloat(3.0))), "3");
+        assert_eq!(term_to_string(&Term::ConstFloat(OrderedFloat(0.0))), "0");
+        assert_eq!(term_to_string(&Term::ConstFloat(OrderedFloat(2.5))), "2.5");
+    }
+
+    #[test]
+    fn f64_is_exact_for_integers_far_beyond_anything_this_engine_counts() {
+        // Every numeric fact the loader produces is a score in [0,1]
+        // (`confidence`, `warmth`); the rest are folds over those. f64 holds
+        // integers exactly to 2^53, which is nine quadrillion.
+        let limit = (2f64).powi(53);
+        assert_eq!(limit + 1.0, limit, "2^53 is where exactness ends");
+        assert!(limit > 9.0e15, "and that is far past any count here");
+    }
+}

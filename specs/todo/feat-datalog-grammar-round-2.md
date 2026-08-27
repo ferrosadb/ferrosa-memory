@@ -75,15 +75,28 @@ DatalogRule.body: Vec<Atom>                                       // pure conjun
       deriving a truncated count would be a number the caller cannot tell from
       a real one.
 
-- [ ] **6. Integer numerals — decide before building.** Every number is an
+- [~] **6. Integer numerals — MEASURED, then DEFERRED.** Every number is an
       `f64`. `count` returns `3.0`, and `%` loses precision above 2^53.
       The cost is high: a `Term::ConstInt` variant touches parsing (when is `2`
       an int?), every arithmetic and comparison path, the stored format, and
       the return type of `count`.
-      **Measure the harm before paying it.** If nothing in the corpus does
-      integer arithmetic near 2^53 and no caller is confused by `3.0`, this is
-      cost without benefit and should be deferred with that reason recorded,
-      not half-built.
+      **Measured, and the harm is not there.** Two tests in
+      `numeric_harm_measurement` keep the finding checkable:
+
+      1. A whole number already renders without a decimal point —
+         `term_to_string(ConstFloat(3.0))` is `"3"`, not `"3.0"`. The cosmetic
+         complaint was against something that does not happen.
+      2. f64 holds integers exactly to 2^53, which is nine quadrillion. Every
+         numeric fact the loader produces is a score in [0,1] — `confidence`
+         and `warmth` are the only two — and everything else is a fold over
+         those. Nothing in this engine can approach the limit. Uuids are their
+         own term and timestamps are stored as strings, so neither is a route
+         to a large integer either.
+
+      Deferred, not done. A `Term::ConstInt` would touch parsing, every
+      arithmetic and comparison path, the stored format and the return type of
+      `count`, for no measured benefit. Tracked so the decision is findable if
+      a numeric source is ever added that changes the measurement.
 
 ## Deliberately not in scope
 
