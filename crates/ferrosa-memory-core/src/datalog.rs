@@ -53,6 +53,15 @@ pub struct EffectiveRuleEntry {
 /// conservative; raise it if a real group needs more.
 pub const DISTINCT_VALUE_CAP: usize = 10_000;
 
+/// The most values one whole-group fold may retain.
+///
+/// `median`, `percentile` and `group_concat` cannot stream: an answer does not
+/// exist until the group is ordered, so the values have to be kept. Lower than
+/// `DISTINCT_VALUE_CAP` because these retain every value, not only the
+/// distinct ones. Past it the group derives nothing rather than a statistic
+/// computed from a truncated sample.
+pub const RETAINED_VALUE_CAP: usize = 10_000;
+
 /// The most rules one disjunctive rule may expand to.
 ///
 /// Alternatives multiply: N binary groups is 2^N rules. The cap turns a
@@ -537,7 +546,28 @@ fn split_top_level(s: &str, delim: char) -> anyhow::Result<Vec<String>> {
     let mut current = String::new();
     let mut depth = 0u32;
 
+    let mut in_str = false;
+    let mut escaped = false;
+
     for ch in s.chars() {
+        // A comma inside a string literal is text, not a separator. Without
+        // this, `p(X, "a,b")` splits in the middle of its own argument.
+        if in_str {
+            current.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_str = true;
+            current.push(ch);
+            continue;
+        }
         // Brackets nest exactly like parentheses here: a set literal's commas
         // separate its elements, not the rule's body parts.
         if ch == '(' || ch == '[' {
@@ -684,18 +714,60 @@ fn parse_aggregate(
         );
     }
 
+    if kind.needs_param() && parts.len() < 4 {
+        anyhow::bail!(
+            "aggregate '{s}' needs a literal between its value var and its output: \
+             {}(atom.., Value, {}, Out)",
+            kind.keyword(),
+            if kind == crate::types::AggregateKind::Percentile {
+                "Fraction"
+            } else {
+                "Separator"
+            }
+        );
+    }
+
+    // The literal parameter, when the kind takes one, sits just before the
+    // output var.
+    let param = if kind.needs_param() {
+        let raw = parts[parts.len() - 2].trim();
+        let term = parse_term(raw, &mut 0);
+        match kind {
+            crate::types::AggregateKind::Percentile => {
+                let Term::ConstFloat(OrderedFloat(p)) = term else {
+                    anyhow::bail!("percentile fraction '{raw}' must be a number");
+                };
+                anyhow::ensure!(
+                    (0.0..=1.0).contains(&p),
+                    "percentile fraction {p} is outside 0..=1, so it names no \
+                     position in the group"
+                );
+                Some(Term::ConstFloat(OrderedFloat(p)))
+            }
+            _ => {
+                let Term::ConstStr(sep) = term else {
+                    anyhow::bail!("group_concat separator '{raw}' must be a quoted string");
+                };
+                Some(Term::ConstStr(sep))
+            }
+        }
+    } else {
+        None
+    };
+
     // For a value aggregate the second-to-last part is the value variable.
     // Atoms always carry parentheses, so a bare identifier here is
     // unambiguous.
+    let tail = if kind.needs_param() { 3 } else { 2 };
     let (value_var, atom_parts) = if kind.needs_value_var() {
-        let raw = parts[parts.len() - 2].trim().to_string();
+        let raw = parts[parts.len() - tail].trim().to_string();
         if raw.contains('(') {
             anyhow::bail!(
                 "aggregate '{s}' needs a value variable before its output var, \
                  got the atom '{raw}'"
             );
         }
-        (Some(raw), &parts[..parts.len() - 2])
+        (Some(raw), &parts[..parts.len() - tail])
     } else {
         (None, &parts[..parts.len() - 1])
     };
@@ -759,6 +831,7 @@ fn parse_aggregate(
 
     Ok(Some(crate::types::Aggregate {
         kind,
+        param,
         inner,
         inner_conjunction,
         group_vars,
@@ -828,13 +901,26 @@ fn is_reserved_str_part(part: &str) -> bool {
 /// legacy escape `count` already had: `sum(X, Y)` fails to parse as an
 /// aggregate and falls through to plain body-atom parsing.
 fn aggregate_keyword(part: &str) -> Option<crate::types::AggregateKind> {
-    use crate::types::AggregateKind::{Avg, Count, CountDistinct, Max, Min, Sum};
+    use crate::types::AggregateKind::{
+        Avg, Count, CountDistinct, GroupConcat, Max, Median, Min, Percentile, StdDev, Sum,
+    };
     // `count_distinct` before `count`: prefix matching includes the `(`, so
     // they cannot actually collide, but keeping the longer name first makes
     // that independent of how the match is written.
-    [CountDistinct, Count, Sum, Min, Max, Avg]
-        .into_iter()
-        .find(|kind| part.starts_with(&format!("{}(", kind.keyword())))
+    [
+        CountDistinct,
+        Count,
+        Sum,
+        Min,
+        Max,
+        Avg,
+        StdDev,
+        Median,
+        Percentile,
+        GroupConcat,
+    ]
+    .into_iter()
+    .find(|kind| part.starts_with(&format!("{}(", kind.keyword())))
 }
 
 /// True iff `s` contains a comparison operator at the top level — i.e.
@@ -1460,6 +1546,66 @@ fn eval_call(
     }
 }
 
+/// Reduce a retained group to its answer.
+///
+/// `median` is `percentile` at 0.5 rather than a separate calculation, so the
+/// two can never disagree about an even-sized group.
+fn finish_retained(
+    kind: crate::types::AggregateKind,
+    param: Option<&Term>,
+    values: Vec<Term>,
+) -> Option<Term> {
+    use crate::types::AggregateKind as K;
+
+    if values.is_empty() {
+        return kind.identity_over_empty();
+    }
+
+    if kind == K::GroupConcat {
+        let Some(Term::ConstStr(sep)) = param else {
+            return None;
+        };
+        // Sorted so the answer does not depend on fact-set iteration order,
+        // which is a HashSet's and therefore arbitrary.
+        let mut rendered: Vec<String> = values.iter().map(term_to_string).collect();
+        rendered.sort();
+        return Some(Term::ConstStr(rendered.join(sep)));
+    }
+
+    // Order statistics are numeric: ordering a string against a number has no
+    // meaningful answer, the same reason min/max refuses a mixed group.
+    let mut nums: Vec<f64> = Vec::with_capacity(values.len());
+    for v in &values {
+        let Term::ConstFloat(OrderedFloat(f)) = v else {
+            tracing::warn!(
+                aggregate = kind.keyword(),
+                "datalog: order statistic over a non-numeric value; deriving nothing"
+            );
+            return None;
+        };
+        nums.push(*f);
+    }
+    nums.sort_by(|a, b| a.partial_cmp(b).expect("no NaN: eval rejects it"));
+
+    let fraction = match kind {
+        K::Median => 0.5,
+        _ => match param {
+            Some(Term::ConstFloat(OrderedFloat(p))) => *p,
+            _ => return None,
+        },
+    };
+
+    // Linear interpolation between the two neighbouring ranks. This is what
+    // makes percentile(0.5) equal median on an even-sized group.
+    let idx = fraction * (nums.len() - 1) as f64;
+    let lo = idx.floor() as usize;
+    let hi = idx.ceil() as usize;
+    let frac = idx - lo as f64;
+    Some(Term::ConstFloat(OrderedFloat(
+        nums[lo] + frac * (nums[hi] - nums[lo]),
+    )))
+}
+
 /// Compare two ground terms of the same kind.
 ///
 /// `None` for two different kinds: a string against a number has no meaningful
@@ -1488,6 +1634,16 @@ enum Fold {
     /// The non-streaming fold. Holds every distinct value seen so far, capped
     /// at `DISTINCT_VALUE_CAP`.
     Distinct(std::collections::HashSet<Term>),
+    /// Welford's online variance: count, running mean, running sum of squared
+    /// deviations. Constant memory, one pass — `stddev` streams.
+    Spread {
+        n: u64,
+        mean: f64,
+        m2: f64,
+    },
+    /// The whole group, retained because an answer does not exist until it is
+    /// ordered. Capped at `RETAINED_VALUE_CAP`.
+    Retained(Vec<Term>),
     /// A value the fold cannot use — not a number where one is required, or a
     /// group whose values are not all the same kind. The group is refused
     /// rather than silently folded over the subset that happened to fit.
@@ -1510,6 +1666,12 @@ impl Fold {
             },
             K::Avg => Fold::Avg(0.0, 0),
             K::CountDistinct => Fold::Distinct(std::collections::HashSet::new()),
+            K::StdDev => Fold::Spread {
+                n: 0,
+                mean: 0.0,
+                m2: 0.0,
+            },
+            K::Median | K::Percentile | K::GroupConcat => Fold::Retained(Vec::new()),
         }
     }
 
@@ -1538,6 +1700,31 @@ impl Fold {
                     *self = Fold::TypeError;
                     return false;
                 }
+            }
+            Fold::Retained(values) => {
+                values.push(value.clone());
+                if values.len() > RETAINED_VALUE_CAP {
+                    tracing::warn!(
+                        cap = RETAINED_VALUE_CAP,
+                        "datalog: whole-group aggregate exceeded its cap; deriving \
+                         nothing rather than a statistic over a truncated sample"
+                    );
+                    *self = Fold::TypeError;
+                    return false;
+                }
+            }
+            Fold::Spread { n, mean, m2 } => {
+                let Term::ConstFloat(OrderedFloat(v)) = value else {
+                    *self = Fold::TypeError;
+                    return false;
+                };
+                // Welford: update the mean, then accumulate the squared
+                // deviation against both the old and new mean. Numerically
+                // stabler than summing squares and subtracting.
+                *n += 1;
+                let delta = *v - *mean;
+                *mean += delta / *n as f64;
+                *m2 += delta * (*v - *mean);
             }
             Fold::Extreme { want, best } => match best {
                 None => *best = Some(value.clone()),
@@ -1572,19 +1759,29 @@ impl Fold {
     }
 
     /// The folded value, or `None` when the group produces nothing.
-    fn finish(self, kind: crate::types::AggregateKind) -> Option<Term> {
+    fn finish(self, kind: crate::types::AggregateKind, param: Option<&Term>) -> Option<Term> {
         let num = |f: f64| Term::ConstFloat(OrderedFloat(f));
         match self {
             Fold::TypeError => None,
             Fold::Count(n) => Some(num(n as f64)),
             Fold::Distinct(seen) => Some(num(seen.len() as f64)),
+            Fold::Spread { n, m2, .. } => {
+                if n == 0 {
+                    kind.identity_over_empty()
+                } else {
+                    // Population, not sample: the group IS the population the
+                    // rule asked about, not a draw from a larger one.
+                    Some(num((m2 / n as f64).sqrt()))
+                }
+            }
+            Fold::Retained(values) => finish_retained(kind, param, values),
             Fold::Sum(acc) => Some(num(acc)),
             // An extreme of nothing does not exist, and neither min nor max has
             // an identity to fall back on.
-            Fold::Extreme { best, .. } => best.or_else(|| kind.identity_over_empty().map(num)),
+            Fold::Extreme { best, .. } => best.or_else(|| kind.identity_over_empty()),
             Fold::Avg(sum, n) => {
                 if n == 0 {
-                    kind.identity_over_empty().map(num)
+                    kind.identity_over_empty()
                 } else {
                     Some(num(sum / n as f64))
                 }
@@ -1618,7 +1815,7 @@ fn fold_inner_matches(
              kinds); the group derives nothing rather than a partial answer"
         );
     }
-    fold.finish(agg.kind)
+    fold.finish(agg.kind, agg.param.as_ref())
 }
 
 /// Try to unify atom arguments with fact arguments under an existing binding.
@@ -5453,6 +5650,192 @@ mod grammar_tests {
         assert!(rule.body.iter().any(|a| a.predicate == "len"));
         let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
         assert_eq!(derived_keys(&all, "q"), vec!["a"]);
+    }
+
+    #[test]
+    fn a_comma_inside_a_string_literal_is_not_an_argument_separator() {
+        // Regression, and pre-existing: `split_top_level` tracked parentheses
+        // and brackets but not strings, so this split in the middle of its
+        // own argument. Nothing had used a comma inside a literal before
+        // group_concat's separator made it unavoidable.
+        let rule = parse_rule(r#"q(X) :- p(X, "a,b")."#).unwrap();
+        assert_eq!(rule.body.len(), 1);
+        assert_eq!(rule.body[0].args.len(), 2);
+        assert_eq!(rule.body[0].args[1], s("a,b"));
+
+        let corpus = facts(&[("p", vec![s("x"), s("a,b")])]);
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["x"]);
+    }
+
+    #[test]
+    fn an_escaped_quote_inside_a_literal_does_not_end_it() {
+        let rule = parse_rule(r#"q(X) :- p(X, "a\",b")."#).unwrap();
+        assert_eq!(rule.body[0].args.len(), 2);
+    }
+
+    // ── Final, items 2-4: the last aggregates ─────────────────────
+
+    fn spread_corpus() -> FactSet {
+        // 2, 4, 4, 4, 5, 5, 7, 9 — the textbook population with mean 5 and
+        // population stddev exactly 2.
+        let mut f = FactSet::new();
+        f.insert("acct", vec![s("a")]);
+        for (k, v) in [
+            ("k1", 2.0),
+            ("k2", 4.0),
+            ("k3", 4.0),
+            ("k4", 4.0),
+            ("k5", 5.0),
+            ("k6", 5.0),
+            ("k7", 7.0),
+            ("k8", 9.0),
+        ] {
+            f.insert("v", vec![s("a"), s(k), n(v)]);
+        }
+        f
+    }
+
+    #[test]
+    fn stddev_folds_the_spread_of_a_group() {
+        let rule = parse_rule("d(X, S) :- acct(X), stddev(v(X, _, V), V, S).").unwrap();
+        let (all, _) = evaluate(&[rule], &spread_corpus(), 100, 10_000);
+        assert_eq!(one_term(&all, "d", &s("a")), Some(n(2.0)));
+    }
+
+    #[test]
+    fn stddev_of_a_single_value_is_zero() {
+        let corpus = facts(&[("acct", vec![s("a")]), ("v", vec![s("a"), s("k"), n(7.0)])]);
+        let rule = parse_rule("d(X, S) :- acct(X), stddev(v(X, _, V), V, S).").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(one_term(&all, "d", &s("a")), Some(n(0.0)));
+    }
+
+    #[test]
+    fn stddev_over_no_rows_does_not_fire() {
+        let corpus = facts(&[("acct", vec![s("carol")])]);
+        let rule = parse_rule("d(X, S) :- acct(X), stddev(v(X, _, V), V, S).").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert!(all.get("d").map(|r| r.is_empty()).unwrap_or(true));
+    }
+
+    #[test]
+    fn stddev_streams_a_large_group() {
+        // Welford: one pass, constant memory. This would be a 20k-element
+        // vector if it were retained like the order statistics.
+        let mut corpus = FactSet::new();
+        corpus.insert("acct", vec![s("a")]);
+        for i in 0..20_000u32 {
+            corpus.insert("v", vec![s("a"), s(&format!("k{i}")), n(5.0)]);
+        }
+        let rule = parse_rule("d(X, S) :- acct(X), stddev(v(X, _, V), V, S).").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 200_000);
+        assert_eq!(one_term(&all, "d", &s("a")), Some(n(0.0)), "all identical");
+    }
+
+    #[test]
+    fn median_takes_the_middle_of_a_group() {
+        // 2,4,4,4,5,5,7,9 -> even count, so the mean of the middle pair.
+        let rule = parse_rule("m(X, M) :- acct(X), median(v(X, _, V), V, M).").unwrap();
+        let (all, _) = evaluate(&[rule], &spread_corpus(), 100, 10_000);
+        assert_eq!(one_term(&all, "m", &s("a")), Some(n(4.5)));
+    }
+
+    #[test]
+    fn median_of_an_odd_group_is_an_actual_member() {
+        let corpus = facts(&[
+            ("acct", vec![s("a")]),
+            ("v", vec![s("a"), s("k1"), n(1.0)]),
+            ("v", vec![s("a"), s("k2"), n(100.0)]),
+            ("v", vec![s("a"), s("k3"), n(3.0)]),
+        ]);
+        let rule = parse_rule("m(X, M) :- acct(X), median(v(X, _, V), V, M).").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(one_term(&all, "m", &s("a")), Some(n(3.0)));
+    }
+
+    #[test]
+    fn percentile_takes_a_fraction_and_median_is_the_half_of_it() {
+        let corpus = spread_corpus();
+        let p50 = parse_rule("p(X, R) :- acct(X), percentile(v(X, _, V), V, 0.5, R).").unwrap();
+        let med = parse_rule("p(X, R) :- acct(X), median(v(X, _, V), V, R).").unwrap();
+        let (all_p, _) = evaluate(&[p50], &corpus, 100, 10_000);
+        let (all_m, _) = evaluate(&[med], &corpus, 100, 10_000);
+        assert_eq!(
+            one_term(&all_p, "p", &s("a")),
+            one_term(&all_m, "p", &s("a"))
+        );
+
+        let hi = parse_rule("t(X, R) :- acct(X), percentile(v(X, _, V), V, 1.0, R).").unwrap();
+        let (all_hi, _) = evaluate(&[hi], &corpus, 100, 10_000);
+        assert_eq!(
+            one_term(&all_hi, "t", &s("a")),
+            Some(n(9.0)),
+            "p100 is the max"
+        );
+    }
+
+    #[test]
+    fn a_percentile_outside_zero_to_one_is_rejected_at_parse() {
+        let err = parse_rule("t(X, R) :- acct(X), percentile(v(X, _, V), V, 1.5, R).")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("1.5") || err.contains("percentile"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_concat_returns_the_values_not_a_statistic() {
+        let corpus = facts(&[
+            ("acct", vec![s("a")]),
+            ("tag", vec![s("a"), s("k1"), s("red")]),
+            ("tag", vec![s("a"), s("k2"), s("blue")]),
+        ]);
+        let rule =
+            parse_rule(r#"g(X, S) :- acct(X), group_concat(tag(X, _, T), T, ", ", S)."#).unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        // Sorted, so the answer does not depend on fact-set iteration order.
+        assert_eq!(one_term(&all, "g", &s("a")), Some(s("blue, red")));
+    }
+
+    #[test]
+    fn group_concat_over_no_rows_is_the_empty_string_and_fires() {
+        let corpus = facts(&[("acct", vec![s("carol")])]);
+        let rule =
+            parse_rule(r#"g(X, S) :- acct(X), group_concat(tag(X, _, T), T, ",", S)."#).unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(one_term(&all, "g", &s("carol")), Some(s("")));
+    }
+
+    #[test]
+    fn the_whole_group_folds_refuse_a_group_past_the_cap() {
+        // median, percentile and group_concat all retain the group, so all
+        // three are bounded the way count_distinct is.
+        let mut corpus = FactSet::new();
+        corpus.insert("acct", vec![s("a")]);
+        for i in 0..=(RETAINED_VALUE_CAP as u32) {
+            corpus.insert("v", vec![s("a"), s(&format!("k{i}")), n(f64::from(i))]);
+        }
+        for (text, pred) in [
+            ("m(X, R) :- acct(X), median(v(X, _, V), V, R).", "m"),
+            (
+                "p(X, R) :- acct(X), percentile(v(X, _, V), V, 0.9, R).",
+                "p",
+            ),
+            (
+                r#"g(X, R) :- acct(X), group_concat(v(X, _, V), V, ",", R)."#,
+                "g",
+            ),
+        ] {
+            let rule = parse_rule(text).unwrap();
+            let (all, _) = evaluate(&[rule], &corpus, 100, 5_000_000);
+            assert!(
+                all.get(pred).map(|r| r.is_empty()).unwrap_or(true),
+                "{text} must derive nothing past the cap"
+            );
+        }
     }
 
     // ── Final, item 1: exponentiation ─────────────────────────────

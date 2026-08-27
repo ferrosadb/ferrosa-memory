@@ -27,12 +27,12 @@ Round 2's completeness pass named what was left. This closes it.
       unwritable, so a rule cannot square, cube, or apply any power law.
       Trivial, streaming, and the only arithmetic operator still missing.
 
-- [ ] **2. Standard deviation.** A real fold, and worth separating from median
+- [x] **2. Standard deviation.** A real fold, and worth separating from median
       for exactly that reason: Welford's method computes variance in ONE pass
       with constant memory, so `stddev` streams like `sum` and `avg` and does
       not belong in the bounded family below.
 
-- [ ] **3. Order statistics — `median` and `percentile`.** No rule can ask for
+- [x] **3. Order statistics — `median` and `percentile`.** No rule can ask for
       a middle or a tail. Unlike every streaming fold, these need the whole
       group ordered before an answer exists, so they join `count_distinct` in
       the bounded family: retain up to a cap, and past it derive nothing
@@ -40,7 +40,7 @@ Round 2's completeness pass named what was left. This closes it.
       `percentile(atoms.., Value, P, Out)` takes the fraction as a literal;
       `median` is the `P = 0.5` shorthand rather than a separate mechanism.
 
-- [ ] **4. Getting the values out of a group.** Every aggregate reduces a group
+- [x] **4. Getting the values out of a group.** Every aggregate reduces a group
       to one number. Nothing can answer "which ones", only "how many".
       Round 2 recorded this as needing a list term, and that was wrong:
       `DerivedFact` carries `src_id`/`dst_id` as **strings**, so a list-valued
