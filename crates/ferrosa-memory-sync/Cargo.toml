@@ -66,6 +66,7 @@ path = "src/main.rs"
 
 [dev-dependencies]
 proptest = "1"
+tempfile = { workspace = true }
 # `test-util` gives the paused clock. The peer-loss tests turn on a ten-second
 # grace period; without it they would take ten real seconds each and would be
 # timing-dependent, which is the wrong way to test a timeout.
