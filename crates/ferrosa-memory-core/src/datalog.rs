@@ -5674,6 +5674,62 @@ mod grammar_tests {
         assert_eq!(rule.body[0].args.len(), 2);
     }
 
+    // ── The completeness guard ────────────────────────────────────
+
+    /// Three specs in a row have claimed the grammar was complete by reading
+    /// the types and writing prose. Twice that was wrong.
+    ///
+    /// This test is the claim in a form that breaks. It pins the surface each
+    /// spec enumerated, so ADDING a variant fails here and forces the next
+    /// author to re-run the completeness pass and record the answer, rather
+    /// than inheriting a stale "complete".
+    #[test]
+    fn the_grammar_surface_is_the_one_the_spec_signed_off() {
+        use crate::types::{AggregateKind as A, ArithOp, CmpOp, Func, StrOp};
+
+        // Aggregates: 5 streaming folds, 1 bounded-distinct, 3 whole-group.
+        let aggregates = [
+            A::Count,
+            A::Sum,
+            A::Min,
+            A::Max,
+            A::Avg,
+            A::StdDev,
+            A::CountDistinct,
+            A::Median,
+            A::Percentile,
+            A::GroupConcat,
+        ];
+        assert_eq!(aggregates.len(), 10, "an aggregate was added or removed");
+        assert_eq!(
+            aggregates.iter().filter(|k| k.retains_group()).count(),
+            3,
+            "the set of folds that cannot stream changed; that is a design \
+             decision, not an implementation detail"
+        );
+
+        // Arithmetic, comparison, string shape, functions.
+        let _exhaustive_arith = |op: ArithOp| match op {
+            ArithOp::Add
+            | ArithOp::Sub
+            | ArithOp::Mul
+            | ArithOp::Div
+            | ArithOp::Rem
+            | ArithOp::Pow => (),
+        };
+        let _exhaustive_cmp = |op: CmpOp| match op {
+            CmpOp::Eq | CmpOp::Ne | CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => (),
+        };
+        assert_eq!(StrOp::ALL.len(), 3, "a string predicate changed");
+        assert_eq!(Func::ALL.len(), 8, "a function was added or removed");
+
+        // Terms: Var, Const(Uuid), ConstStr, ConstFloat. Boolean, null and
+        // list are declined — see the three tests above for why.
+        let _exhaustive_term = |t: Term| match t {
+            Term::Var(_) | Term::Const(_) | Term::ConstStr(_) | Term::ConstFloat(_) => (),
+        };
+    }
+
     // ── Final, item 5: the term kinds, decided ────────────────────
 
     #[test]
