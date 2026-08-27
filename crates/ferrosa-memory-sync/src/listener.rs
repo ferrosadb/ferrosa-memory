@@ -92,24 +92,39 @@ pub(crate) struct SupersedeRegistry {
 
 /// Which live sessions a new one displaces.
 ///
-/// One session per controller device. A device that reconnects — because it
+/// Only UNHEALTHY ones from the same device. Health is what separates a stale
+/// reconnect from a SECOND WINDOW, and the first version of this rule did not
+/// ask: keyed on the device alone it closed every other session that device
+/// had, so opening a second window on the desktop killed the first. One was
+/// observed alive and healthy for 20 seconds before the next window arrived
+/// and shot it. Neither the device id nor the instance id can tell the two
+/// apart — several windows of one app are one install on one machine, and
+/// legitimately want several sessions.
+///
+/// A device that reconnects — because it
 /// backgrounded, changed network, or lost ICE — offers a NEW session, and
 /// without this the old one is served alongside it until its ICE eventually
 /// times out. Six accumulated from a single phone before this was found, each
 /// dying about a minute later, which is what the operator experienced as the
 /// connection dropping.
 ///
-/// It also protects the concurrency cap. `MAX_CONCURRENT_CONTROL_SESSIONS` is
-/// eight because that "covers a person's own devices" — an assumption that only
-/// holds at one session each. One phone holding six slots starves the tablet
-/// and the laptop queued behind it.
+/// It still protects the concurrency cap for the case that motivated it.
+/// `MAX_CONCURRENT_CONTROL_SESSIONS` is eight because that "covers a person's
+/// own devices" — true at a few sessions each, not at six dead ones from one
+/// phone.
 ///
 /// Pure, and given the live set rather than reading it, so the decision can be
 /// tested without a runtime, a broker or a peer connection.
-fn sessions_superseded_by(new_session: Uuid, new_device: Uuid, live: &[(Uuid, Uuid)]) -> Vec<Uuid> {
+fn sessions_superseded_by(
+    new_session: Uuid,
+    new_device: Uuid,
+    live: &[(Uuid, Uuid, bool)],
+) -> Vec<Uuid> {
     live.iter()
-        .filter(|(session, device)| *device == new_device && *session != new_session)
-        .map(|(session, _)| *session)
+        .filter(|(session, device, healthy)| {
+            *device == new_device && *session != new_session && !*healthy
+        })
+        .map(|(session, _, _)| *session)
         .collect()
 }
 
@@ -549,7 +564,22 @@ async fn serve_control_session<S, R, T>(
                 registry.controller_device_id,
                 channel.peer_connection(),
             ));
-            let pairs: Vec<(Uuid, Uuid)> = live.iter().map(|(s, d, _)| (*s, *d)).collect();
+            // Health read from the peer itself. Connected or still
+            // negotiating is a session someone is using — very likely another
+            // window — and must not be closed because a new one arrived.
+            let pairs: Vec<(Uuid, Uuid, bool)> = live
+                .iter()
+                .map(|(s, d, peer)| {
+                    let state = peer.connection_state();
+                    let healthy = matches!(
+                        state,
+                        webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::New
+                            | webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Connecting
+                            | webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Connected
+                    );
+                    (*s, *d, healthy)
+                })
+                .collect();
             let ids =
                 sessions_superseded_by(offer.session_id, registry.controller_device_id, &pairs);
             live.iter()
@@ -1294,51 +1324,49 @@ mod supersede_tests {
     fn sess(n: u8) -> Uuid {
         Uuid::from_bytes([0xF0 | n; 16])
     }
+    const HEALTHY: bool = true;
+    const DEAD: bool = false;
 
-    /// The ordinary first connection. Nothing to displace.
     #[test]
     fn a_first_session_from_a_device_supersedes_nothing() {
         assert!(sessions_superseded_by(sess(1), dev(1), &[]).is_empty());
     }
 
-    /// The bug, stated. A phone that reconnects had BOTH sessions served, and
-    /// the older one was left to die on an ICE timeout — which is what the
-    /// operator saw as the connection dropping.
+    /// The reconnect this rule exists for. The old session is registered but
+    /// no longer carrying traffic, and without this it is served alongside the
+    /// new one until its ICE times out about a minute later — which the
+    /// operator sees as the connection dropping.
     #[test]
-    fn a_reconnecting_device_supersedes_its_own_previous_session() {
-        let live = [(sess(1), dev(1))];
+    fn a_reconnecting_device_supersedes_its_own_dead_session() {
+        let live = [(sess(1), dev(1), DEAD)];
         assert_eq!(
             sessions_superseded_by(sess(2), dev(1), &live),
             vec![sess(1)]
         );
     }
 
-    /// Six had piled up on one phone before this was found, so one is not the
-    /// only case that matters.
+    /// The regression this rule CAUSED, now pinned.
+    ///
+    /// Several windows of one app are one install on one machine, so neither
+    /// the device id nor the instance id distinguishes them. Keyed on the
+    /// device alone, opening a second window killed the first — one was
+    /// observed alive and healthy for 20 seconds before the next arrived.
     #[test]
-    fn every_stale_session_from_that_device_is_superseded() {
-        let live = [(sess(1), dev(1)), (sess(2), dev(1)), (sess(3), dev(1))];
-        assert_eq!(
-            sessions_superseded_by(sess(4), dev(1), &live),
-            vec![sess(1), sess(2), sess(3)]
+    fn a_second_window_does_not_kill_a_healthy_first_one() {
+        let live = [(sess(1), dev(1), HEALTHY)];
+        assert!(
+            sessions_superseded_by(sess(2), dev(1), &live).is_empty(),
+            "a healthy session from the same device is a second window, not a stale reconnect"
         );
     }
 
-    /// The tablet must not be hung up on because the phone reconnected. This
-    /// is the whole reason the rule is per DEVICE and not "one session".
+    /// Mixed: reap what is dead, leave what is working.
     #[test]
-    fn another_devices_session_is_never_superseded() {
-        let live = [(sess(1), dev(2))];
-        assert!(sessions_superseded_by(sess(2), dev(1), &live).is_empty());
-    }
-
-    #[test]
-    fn only_the_matching_device_is_superseded_among_several() {
+    fn only_the_dead_sessions_are_reaped() {
         let live = [
-            (sess(1), dev(1)),
-            (sess(2), dev(2)),
-            (sess(3), dev(1)),
-            (sess(4), dev(3)),
+            (sess(1), dev(1), DEAD),
+            (sess(2), dev(1), HEALTHY),
+            (sess(3), dev(1), DEAD),
         ];
         assert_eq!(
             sessions_superseded_by(sess(9), dev(1), &live),
@@ -1346,12 +1374,19 @@ mod supersede_tests {
         );
     }
 
-    /// A session must never end itself. The registry may already contain the
-    /// new session by the time this runs, and superseding it would hang up on
-    /// the connection being established.
+    /// The tablet must not be hung up on because the phone reconnected — the
+    /// reason the rule is per device at all.
+    #[test]
+    fn another_devices_session_is_never_superseded() {
+        let live = [(sess(1), dev(2), DEAD)];
+        assert!(sessions_superseded_by(sess(2), dev(1), &live).is_empty());
+    }
+
+    /// A session must never end itself. The registry already contains the new
+    /// session when this runs.
     #[test]
     fn a_session_never_supersedes_itself() {
-        let live = [(sess(1), dev(1))];
+        let live = [(sess(1), dev(1), DEAD)];
         assert!(sessions_superseded_by(sess(1), dev(1), &live).is_empty());
     }
 }
