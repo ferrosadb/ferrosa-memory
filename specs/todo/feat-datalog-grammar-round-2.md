@@ -67,7 +67,7 @@ DatalogRule.body: Vec<Atom>                                       // pure conjun
       a new `parse_rules` returns the expansion, so no caller changes meaning
       by accident.
 
-- [ ] **5. `count_distinct`.** `count(p(X, Y), N)` counts *unifications*, not
+- [x] **5. `count_distinct`.** `count(p(X, Y), N)` counts *unifications*, not
       distinct values. **This is the one item that cannot be fully streaming**,
       and the spec should say so rather than imply otherwise: distinctness
       needs a set, and the set is proportional to the number of distinct

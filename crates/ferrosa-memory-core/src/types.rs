@@ -870,6 +870,12 @@ pub enum AggregateKind {
     Min,
     Max,
     Avg,
+    /// Folds distinct *values* of `value_var`.
+    ///
+    /// The one fold that cannot stream: distinctness needs a set, and the set
+    /// grows with the answer. It is therefore bounded — see
+    /// `datalog::DISTINCT_VALUE_CAP`.
+    CountDistinct,
 }
 
 impl AggregateKind {
@@ -881,6 +887,7 @@ impl AggregateKind {
             Self::Min => "min",
             Self::Max => "max",
             Self::Avg => "avg",
+            Self::CountDistinct => "count_distinct",
         }
     }
 
@@ -899,7 +906,7 @@ impl AggregateKind {
     /// do not fire.
     pub fn identity_over_empty(self) -> Option<f64> {
         match self {
-            Self::Count | Self::Sum => Some(0.0),
+            Self::Count | Self::Sum | Self::CountDistinct => Some(0.0),
             Self::Min | Self::Max | Self::Avg => None,
         }
     }

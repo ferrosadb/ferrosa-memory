@@ -41,6 +41,18 @@ pub struct EffectiveRuleEntry {
 
 // ─── Rule Parser ──────────────────────────────────────────────────
 
+/// The most distinct values one `count_distinct` group may hold.
+///
+/// Every other fold streams: it keeps one accumulator no matter how large the
+/// group. Distinctness cannot — it has to remember what it has already seen,
+/// and that set grows with the answer.
+///
+/// So it is bounded, and the bound is loud. Past it the group derives nothing
+/// rather than a truncated count, because a count that silently omits values
+/// is a number the caller cannot tell from a real one. Deliberately
+/// conservative; raise it if a real group needs more.
+pub const DISTINCT_VALUE_CAP: usize = 10_000;
+
 /// The most rules one disjunctive rule may expand to.
 ///
 /// Alternatives multiply: N binary groups is 2^N rules. The cap turns a
@@ -816,8 +828,11 @@ fn is_reserved_str_part(part: &str) -> bool {
 /// legacy escape `count` already had: `sum(X, Y)` fails to parse as an
 /// aggregate and falls through to plain body-atom parsing.
 fn aggregate_keyword(part: &str) -> Option<crate::types::AggregateKind> {
-    use crate::types::AggregateKind::{Avg, Count, Max, Min, Sum};
-    [Count, Sum, Min, Max, Avg]
+    use crate::types::AggregateKind::{Avg, Count, CountDistinct, Max, Min, Sum};
+    // `count_distinct` before `count`: prefix matching includes the `(`, so
+    // they cannot actually collide, but keeping the longer name first makes
+    // that independent of how the match is written.
+    [CountDistinct, Count, Sum, Min, Max, Avg]
         .into_iter()
         .find(|kind| part.starts_with(&format!("{}(", kind.keyword())))
 }
@@ -1470,6 +1485,9 @@ enum Fold {
         best: Option<Term>,
     },
     Avg(f64, u64),
+    /// The non-streaming fold. Holds every distinct value seen so far, capped
+    /// at `DISTINCT_VALUE_CAP`.
+    Distinct(std::collections::HashSet<Term>),
     /// A value the fold cannot use — not a number where one is required, or a
     /// group whose values are not all the same kind. The group is refused
     /// rather than silently folded over the subset that happened to fit.
@@ -1491,6 +1509,7 @@ impl Fold {
                 best: None,
             },
             K::Avg => Fold::Avg(0.0, 0),
+            K::CountDistinct => Fold::Distinct(std::collections::HashSet::new()),
         }
     }
 
@@ -1508,6 +1527,18 @@ impl Fold {
             return false;
         };
         match self {
+            Fold::Distinct(seen) => {
+                seen.insert(value.clone());
+                if seen.len() > DISTINCT_VALUE_CAP {
+                    tracing::warn!(
+                        cap = DISTINCT_VALUE_CAP,
+                        "datalog: count_distinct group exceeded its cap; deriving \
+                         nothing rather than a truncated count"
+                    );
+                    *self = Fold::TypeError;
+                    return false;
+                }
+            }
             Fold::Extreme { want, best } => match best {
                 None => *best = Some(value.clone()),
                 Some(current) => match compare_terms(value, current) {
@@ -1546,6 +1577,7 @@ impl Fold {
         match self {
             Fold::TypeError => None,
             Fold::Count(n) => Some(num(n as f64)),
+            Fold::Distinct(seen) => Some(num(seen.len() as f64)),
             Fold::Sum(acc) => Some(num(acc)),
             // An extreme of nothing does not exist, and neither min nor max has
             // an identity to fall back on.
@@ -5044,6 +5076,97 @@ mod grammar_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("str_startswith"), "got: {err}");
+    }
+
+    // ── Round 2, item 5: count over distinct values ───────────────
+
+    #[test]
+    fn identical_rows_are_already_deduped_so_both_counts_agree() {
+        let corpus = facts(&[
+            ("acct", vec![s("a")]),
+            ("tag", vec![s("a"), s("red")]),
+            ("tag", vec![s("a"), s("red")]),
+            ("tag", vec![s("a"), s("blue")]),
+        ]);
+        let distinct = parse_rule("d(X, N) :- acct(X), count_distinct(tag(X, T), T, N).").unwrap();
+        let plain = parse_rule("c(X, N) :- acct(X), count(tag(X, T), N).").unwrap();
+        let (all_d, _) = evaluate(&[distinct], &corpus, 100, 10_000);
+        let (all_c, _) = evaluate(&[plain], &corpus, 100, 10_000);
+        // A FactSet is a set, so identical rows collapse before either fold
+        // sees them and the two agree here. Distinctness only becomes visible
+        // on rows that DIFFER but repeat in the counted column — which is what
+        // the next test does. Kept because it is the boundary between them.
+        assert_eq!(one_term(&all_d, "d", &s("a")), Some(n(2.0)));
+        assert_eq!(one_term(&all_c, "c", &s("a")), Some(n(2.0)));
+    }
+
+    #[test]
+    fn count_distinct_collapses_repeats_that_count_does_not() {
+        // Two owners, one shared colour: three rows, two distinct colours.
+        let corpus = facts(&[
+            ("acct", vec![s("a")]),
+            ("owns", vec![s("a"), s("x"), s("red")]),
+            ("owns", vec![s("a"), s("y"), s("red")]),
+            ("owns", vec![s("a"), s("z"), s("blue")]),
+        ]);
+        let distinct =
+            parse_rule("d(X, N) :- acct(X), count_distinct(owns(X, _, C), C, N).").unwrap();
+        let plain = parse_rule("c(X, N) :- acct(X), count(owns(X, _, C), N).").unwrap();
+        let (all_d, _) = evaluate(&[distinct], &corpus, 100, 10_000);
+        let (all_c, _) = evaluate(&[plain], &corpus, 100, 10_000);
+        assert_eq!(one_term(&all_d, "d", &s("a")), Some(n(2.0)), "two colours");
+        assert_eq!(one_term(&all_c, "c", &s("a")), Some(n(3.0)), "three rows");
+    }
+
+    #[test]
+    fn count_distinct_over_no_rows_is_zero_and_fires() {
+        let corpus = facts(&[("acct", vec![s("carol")])]);
+        let rule = parse_rule("d(X, N) :- acct(X), count_distinct(tag(X, T), T, N).").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(one_term(&all, "d", &s("carol")), Some(n(0.0)));
+    }
+
+    #[test]
+    fn count_distinct_needs_a_value_variable_like_the_other_folds() {
+        let err = parse_rule("d(X, N) :- acct(X), count_distinct(tag(X, T), N).")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("count_distinct"), "got: {err}");
+    }
+
+    #[test]
+    fn count_distinct_orders_mixed_kinds_without_confusing_them() {
+        // Distinctness is equality, not ordering, so mixed kinds are fine
+        // here even though min/max refuses them.
+        let corpus = facts(&[
+            ("acct", vec![s("a")]),
+            ("v", vec![s("a"), s("k1"), s("1")]),
+            ("v", vec![s("a"), s("k2"), n(1.0)]),
+        ]);
+        let rule = parse_rule("d(X, N) :- acct(X), count_distinct(v(X, _, V), V, N).").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(
+            one_term(&all, "d", &s("a")),
+            Some(n(2.0)),
+            "the string \"1\" and the number 1 are different values"
+        );
+    }
+
+    #[test]
+    fn count_distinct_refuses_a_group_past_its_cap_rather_than_growing_without_bound() {
+        // This is the one fold that cannot stream: distinctness needs a set,
+        // and the set grows with the answer. Bounded and loud beats unbounded.
+        let mut corpus = FactSet::new();
+        corpus.insert("acct", vec![s("a")]);
+        for i in 0..=(DISTINCT_VALUE_CAP as u32) {
+            corpus.insert("tag", vec![s("a"), s(&format!("t{i}"))]);
+        }
+        let rule = parse_rule("d(X, N) :- acct(X), count_distinct(tag(X, T), T, N).").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 5_000_000);
+        assert!(
+            all.get("d").map(|r| r.is_empty()).unwrap_or(true),
+            "past the cap the group derives nothing rather than a truncated count"
+        );
     }
 
     // ── Round 2, item 4: atom-level disjunction ───────────────────
