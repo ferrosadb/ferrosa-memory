@@ -81,6 +81,7 @@ pub fn parse_rule(text: &str) -> anyhow::Result<DatalogRule> {
     let mut aggregates: Vec<crate::types::Aggregate> = Vec::new();
     let mut deferred_aggregates: Vec<String> = Vec::new();
     let mut deferred_negated: Vec<String> = Vec::new();
+    let mut deferred_bindings: Vec<String> = Vec::new();
     let mut anon_counter = 0usize;
 
     // Pass 1: classify each body part; defer aggregate and negated parts for
@@ -90,6 +91,8 @@ pub fn parse_rule(text: &str) -> anyhow::Result<DatalogRule> {
         let part = part.trim();
         if let Some(rest) = strip_not_prefix(part) {
             deferred_negated.push(rest.to_string());
+        } else if split_assignment(part).is_some() {
+            deferred_bindings.push(part.to_string());
         } else if is_boolean_filter_part(part) || is_reserved_str_part(part) {
             filters.push(crate::datalog_filter_expr::parse_filter(part)?);
         } else if aggregate_keyword(part).is_some() {
@@ -178,11 +181,43 @@ pub fn parse_rule(text: &str) -> anyhow::Result<DatalogRule> {
     // The stratify analyzer (Task M3) supersedes it and also catches
     // cross-rule recursion through aggregates.
 
+    // Bindings run in order after the positive atoms, so each may use what the
+    // body bound and what an earlier binding named — but nothing later.
+    let mut bindings: Vec<crate::types::Binding> = Vec::new();
+    let mut bound_so_far: std::collections::HashSet<String> = positive_vars.clone();
+    bound_so_far.extend(aggregates.iter().map(|a| a.output_var.clone()));
+    for part in &deferred_bindings {
+        let (var, rhs) = split_assignment(part).expect("classified as an assignment");
+        let var = var.trim().to_string();
+        anyhow::ensure!(
+            var.starts_with(|c: char| c.is_ascii_uppercase() || c == '_'),
+            "'{var}' is not a variable, so ':=' has nothing to bind"
+        );
+        anyhow::ensure!(
+            !bound_so_far.contains(&var),
+            "'{var}' is already bound; ':=' names a NEW value, and rebinding \
+             would make the rule read two ways depending on evaluation order"
+        );
+        let expr = crate::datalog_filter_expr::parse_head_expr(rhs)?;
+        let mut used = Vec::new();
+        collect_expr_vars(&expr, &mut used);
+        let unbound: Vec<String> = used
+            .into_iter()
+            .filter(|v| !bound_so_far.contains(v))
+            .collect();
+        anyhow::ensure!(
+            unbound.is_empty(),
+            "binding '{var} := {}' uses variable(s) {} that nothing has bound yet",
+            rhs.trim(),
+            unbound.join(", ")
+        );
+        bound_so_far.insert(var.clone());
+        bindings.push(crate::types::Binding { var, expr });
+    }
+
     // A computed head argument may only use variables the body binds; there is
     // nothing else to compute from.
-    let mut agg_outputs: std::collections::HashSet<String> =
-        aggregates.iter().map(|a| a.output_var.clone()).collect();
-    agg_outputs.extend(positive_vars.iter().cloned());
+    let agg_outputs: std::collections::HashSet<String> = bound_so_far.clone();
     for he in &head_exprs {
         let mut unbound: Vec<String> = Vec::new();
         collect_expr_vars(&he.expr, &mut unbound);
@@ -205,7 +240,42 @@ pub fn parse_rule(text: &str) -> anyhow::Result<DatalogRule> {
         aggregates,
         negated,
         head_exprs,
+        bindings,
     })
+}
+
+/// Split `NAME := expr` at a top-level `:=`.
+///
+/// `=` is deliberately not accepted: it already parses to `CmpOp::Eq`, and
+/// redefining it would silently change the meaning of rules already stored.
+fn split_assignment(part: &str) -> Option<(&str, &str)> {
+    let bytes = part.as_bytes();
+    let (mut depth, mut in_str, mut i) = (0i32, false, 0usize);
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            if c == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' => in_str = true,
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            b':' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'=' => {
+                return Some((&part[..i], &part[i + 2..]));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Collect every variable referenced by a filter expression.
@@ -877,6 +947,28 @@ fn collect_bindings(rule: &DatalogRule, all_facts: &FactSet) -> Vec<Candidate> {
     // check below is a decision, not a race with this stratum's fixpoint.
     final_bindings
         .into_iter()
+        // Bindings come before filters, because a filter may test what a
+        // binding named. A binding with no value drops the candidate: firing
+        // with a missing value would derive a row the caller cannot tell from
+        // a real one.
+        .filter_map(|(mut binding, prov)| {
+            for b in &rule.bindings {
+                let value = match eval_expr(&b.expr, &binding) {
+                    Eval::Value(EvalValue::Num(f)) => Term::ConstFloat(OrderedFloat(f)),
+                    Eval::Value(EvalValue::Str(s)) => Term::ConstStr(s),
+                    Eval::Value(EvalValue::Uuid(u)) => Term::Const(u),
+                    Eval::Undefined | Eval::Unbound => {
+                        tracing::warn!(
+                            var = %b.var,
+                            "datalog: binding has no value; the rule does not fire"
+                        );
+                        return None;
+                    }
+                };
+                binding.insert(b.var.clone(), value);
+            }
+            Some((binding, prov))
+        })
         .filter(|(binding, _)| check_filters(&rule.filters, binding))
         .filter_map(|(binding, mut provenance)| {
             for neg in &rule.negated {
@@ -962,6 +1054,7 @@ fn evaluate_rule_with_aggregates(
         // Phase 1 collects bindings only; the head is instantiated by the
         // caller, which is where head expressions are applied.
         head_exprs: Vec::new(),
+        bindings: rule.bindings.clone(),
     };
 
     // Phase 1: collect candidate bindings from non-aggregate body atoms.
@@ -4838,6 +4931,85 @@ mod grammar_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("str_startswith"), "got: {err}");
+    }
+
+    // ── Round 2, item 3: bind a computed value in the body ────────
+
+    #[test]
+    fn a_body_can_bind_a_computed_value() {
+        let corpus = facts(&[("p", vec![s("a"), n(4.0)])]);
+        let rule = parse_rule("q(X, D) :- p(X, V), D := V * 2.").unwrap();
+        assert_eq!(rule.bindings.len(), 1);
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(one_term(&all, "q", &s("a")), Some(n(8.0)));
+    }
+
+    #[test]
+    fn a_bound_value_is_usable_by_a_later_filter() {
+        let corpus = facts(&[("p", vec![s("a"), n(4.0)]), ("p", vec![s("b"), n(1.0)])]);
+        let rule = parse_rule("q(X) :- p(X, V), D := V * 2, D > 5.").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a"]);
+    }
+
+    #[test]
+    fn a_binding_may_build_on_an_earlier_binding() {
+        let corpus = facts(&[("p", vec![s("a"), n(2.0)])]);
+        let rule = parse_rule("q(X, F) :- p(X, V), D := V * 2, F := D + 1.").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(one_term(&all, "q", &s("a")), Some(n(5.0)));
+    }
+
+    #[test]
+    fn equals_still_compares_and_does_not_bind() {
+        // Redefining `=` would silently change the meaning of stored rules.
+        // `X = W + 1` remains a comparison, and with X unbound it is
+        // undecidable, so it passes — exactly as before.
+        let rule = parse_rule("q(X) :- p(X, V), Y = V + 1.").unwrap();
+        assert!(rule.bindings.is_empty(), "`=` binds nothing");
+        assert_eq!(rule.filters.len(), 1, "`=` is still a comparison");
+    }
+
+    #[test]
+    fn a_binding_whose_right_side_is_unbound_is_rejected() {
+        let err = parse_rule("q(X, D) :- p(X, V), D := Missing * 2.")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Missing"), "must name it, got: {err}");
+    }
+
+    #[test]
+    fn a_binding_that_shadows_a_body_variable_is_rejected() {
+        // Rebinding a variable the body already bound would make the rule read
+        // two ways, and which one wins would depend on evaluation order.
+        let err = parse_rule("q(X, V) :- p(X, V), V := 1.")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains('V'), "must name it, got: {err}");
+    }
+
+    #[test]
+    fn two_bindings_cannot_use_the_same_name() {
+        let err = parse_rule("q(X, D) :- p(X, V), D := V + 1, D := V + 2.")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains('D'), "must name it, got: {err}");
+    }
+
+    #[test]
+    fn a_binding_that_has_no_value_does_not_fire_the_rule() {
+        let corpus = facts(&[("p", vec![s("a"), s("text")])]);
+        let rule = parse_rule("q(X, D) :- p(X, V), D := V * 2.").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert!(all.get("q").map(|r| r.is_empty()).unwrap_or(true));
+    }
+
+    #[test]
+    fn a_binding_can_call_a_function() {
+        let corpus = facts(&[("item", vec![s("a"), s("Report")])]);
+        let rule = parse_rule("q(X, L) :- item(X, N), L := lower(N).").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(one_term(&all, "q", &s("a")), Some(s("report")));
     }
 
     // ── Round 2, item 2: function calls in an expression ──────────
