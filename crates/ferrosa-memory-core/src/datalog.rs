@@ -219,6 +219,11 @@ fn collect_expr_vars(e: &crate::types::FilterExpr, out: &mut Vec<String>) {
             collect_expr_vars(lhs, out);
             collect_expr_vars(rhs, out);
         }
+        FilterExpr::Call { args, .. } => {
+            for a in args {
+                collect_expr_vars(a, out);
+            }
+        }
     }
 }
 
@@ -254,7 +259,7 @@ fn parse_head(head_str: &str) -> anyhow::Result<(Atom, Vec<crate::types::HeadExp
     let mut rewritten: Vec<String> = Vec::with_capacity(arg_parts.len());
     let mut head_exprs = Vec::new();
     for (index, part) in arg_parts.iter().enumerate() {
-        if has_top_level_arith(part) {
+        if has_top_level_arith(part) || looks_like_call(part) {
             head_exprs.push(crate::types::HeadExpr {
                 index,
                 expr: crate::datalog_filter_expr::parse_head_expr(part)?,
@@ -267,6 +272,25 @@ fn parse_head(head_str: &str) -> anyhow::Result<(Atom, Vec<crate::types::HeadExp
 
     let atom = parse_atom(&format!("{predicate}({})", rewritten.join(", ")), &mut 0)?;
     Ok((atom, head_exprs))
+}
+
+/// True when a head argument is shaped like a function call.
+///
+/// The name is not checked here. Routing it to the expression parser is what
+/// makes an unknown name an error naming it, rather than a term that quietly
+/// becomes the string "frobnicate(V)".
+fn looks_like_call(part: &str) -> bool {
+    let part = part.trim();
+    let Some(open) = part.find('(') else {
+        return false;
+    };
+    if !part.ends_with(')') {
+        return false;
+    }
+    let name = &part[..open];
+    !name.is_empty()
+        && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// True when a head argument carries an arithmetic operator at the top level.
@@ -989,6 +1013,7 @@ fn filter_references_any(f: &BuiltinFilter, vars: &std::collections::HashSet<&st
             FilterExpr::LitNum(_) | FilterExpr::LitStr(_) => false,
             FilterExpr::Neg(inner) => expr_refs(inner, vars),
             FilterExpr::BinOp { lhs, rhs, .. } => expr_refs(lhs, vars) || expr_refs(rhs, vars),
+            FilterExpr::Call { args, .. } => args.iter().any(|a| expr_refs(a, vars)),
         }
     }
     match f {
@@ -1171,6 +1196,50 @@ fn visit_conjunction(
         }
     }
     true
+}
+
+/// Evaluate a whitelisted function call.
+///
+/// A wrong-typed argument is Undefined rather than false, matching the rest of
+/// the evaluator: false is a value `!` would flip into a spurious pass.
+fn eval_call(
+    func: crate::types::Func,
+    args: &[crate::types::FilterExpr],
+    binding: &std::collections::HashMap<String, Term>,
+) -> Eval {
+    use crate::types::Func;
+
+    let mut values = Vec::with_capacity(args.len());
+    for a in args {
+        match eval_expr(a, binding) {
+            Eval::Value(v) => values.push(v),
+            other => return other,
+        }
+    }
+
+    let wrong_type = || {
+        tracing::warn!(
+            function = func.keyword(),
+            "datalog: function applied to the wrong type; deriving nothing"
+        );
+        Eval::Undefined
+    };
+
+    match (func, values.as_slice()) {
+        (Func::Abs, [EvalValue::Num(x)]) => Eval::Value(EvalValue::Num(x.abs())),
+        (Func::Floor, [EvalValue::Num(x)]) => Eval::Value(EvalValue::Num(x.floor())),
+        (Func::Ceil, [EvalValue::Num(x)]) => Eval::Value(EvalValue::Num(x.ceil())),
+        (Func::Round, [EvalValue::Num(x)]) => Eval::Value(EvalValue::Num(x.round())),
+        // Characters, not bytes: a length in bytes would differ for the same
+        // text depending on the alphabet it is written in.
+        (Func::Len, [EvalValue::Str(s)]) => Eval::Value(EvalValue::Num(s.chars().count() as f64)),
+        (Func::Lower, [EvalValue::Str(s)]) => Eval::Value(EvalValue::Str(s.to_lowercase())),
+        (Func::Upper, [EvalValue::Str(s)]) => Eval::Value(EvalValue::Str(s.to_uppercase())),
+        (Func::Concat, [EvalValue::Str(a), EvalValue::Str(b)]) => {
+            Eval::Value(EvalValue::Str(format!("{a}{b}")))
+        }
+        _ => wrong_type(),
+    }
 }
 
 /// Compare two ground terms of the same kind.
@@ -1394,6 +1463,7 @@ fn eval_expr(
         },
         FilterExpr::LitNum(OrderedFloat(f)) => Eval::Value(EvalValue::Num(*f)),
         FilterExpr::LitStr(s) => Eval::Value(EvalValue::Str(s.clone())),
+        FilterExpr::Call { func, args } => eval_call(*func, args, binding),
         FilterExpr::Neg(inner) => match eval_expr(inner, binding) {
             Eval::Value(EvalValue::Num(x)) => Eval::Value(EvalValue::Num(-x)),
             Eval::Value(_) => {
@@ -4768,6 +4838,94 @@ mod grammar_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("str_startswith"), "got: {err}");
+    }
+
+    // ── Round 2, item 2: function calls in an expression ──────────
+
+    #[test]
+    fn numeric_functions_are_available_in_an_expression() {
+        let corpus = facts(&[("p", vec![s("a"), n(-3.7)]), ("p", vec![s("b"), n(2.2)])]);
+        for (text, expect) in [
+            ("q(X) :- p(X, V), abs(V) > 3.", vec!["a"]),
+            ("q(X) :- p(X, V), floor(V) == -4.", vec!["a"]),
+            ("q(X) :- p(X, V), ceil(V) == 3.", vec!["b"]),
+            ("q(X) :- p(X, V), round(V) == 2.", vec!["b"]),
+        ] {
+            let rule = parse_rule(text).unwrap();
+            let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+            assert_eq!(derived_keys(&all, "q"), expect, "{text}");
+        }
+    }
+
+    #[test]
+    fn string_functions_are_available_in_an_expression() {
+        let corpus = facts(&[("item", vec![s("a"), s("Report.PDF")])]);
+        for text in [
+            r#"q(X) :- item(X, N), len(N) == 10."#,
+            r#"q(X) :- item(X, N), lower(N) == "report.pdf"."#,
+            r#"q(X) :- item(X, N), upper(N) == "REPORT.PDF"."#,
+            r#"q(X) :- item(X, N), concat(N, "!") == "Report.PDF!"."#,
+        ] {
+            let rule = parse_rule(text).unwrap();
+            let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+            assert_eq!(derived_keys(&all, "q"), vec!["a"], "{text}");
+        }
+    }
+
+    #[test]
+    fn a_function_call_nests_and_composes_with_arithmetic() {
+        let corpus = facts(&[("p", vec![s("a"), n(-2.0)])]);
+        let rule = parse_rule("q(X) :- p(X, V), abs(V) * 3 == 6.").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a"]);
+    }
+
+    #[test]
+    fn a_function_call_works_in_a_head_expression() {
+        let corpus = facts(&[("p", vec![s("a"), n(-2.5)])]);
+        let rule = parse_rule("r(X, abs(V)) :- p(X, V).").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(one_term(&all, "r", &s("a")), Some(n(2.5)));
+    }
+
+    #[test]
+    fn an_unknown_function_is_rejected_by_name() {
+        // A closed whitelist. Silently reading `frobnicate(V)` as a variable
+        // would make it match everything, which is the failure this keeps
+        // refusing.
+        let err = parse_rule("q(X) :- p(X, V), frobnicate(V) > 1.")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("frobnicate"), "got: {err}");
+    }
+
+    #[test]
+    fn a_function_called_with_the_wrong_arity_is_rejected_by_name() {
+        let err = parse_rule("q(X) :- p(X, V), abs(V, 2) > 1.")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("abs"), "got: {err}");
+    }
+
+    #[test]
+    fn a_function_applied_to_the_wrong_type_derives_nothing() {
+        // Undefined, matching the rest of the evaluator — not false, which
+        // `!` would flip into a spurious pass.
+        let corpus = facts(&[("item", vec![s("a"), s("text")])]);
+        let rule = parse_rule("q(X) :- item(X, N), abs(N) > 1.").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert!(all.get("q").map(|r| r.is_empty()).unwrap_or(true));
+    }
+
+    #[test]
+    fn a_user_predicate_may_still_be_named_like_a_function() {
+        // Functions live in expressions; atoms are matched. `len(X, Y)` in a
+        // body atom position is a relation, and stays one.
+        let corpus = facts(&[("len", vec![s("a"), n(3.0)])]);
+        let rule = parse_rule("q(X) :- len(X, Y).").unwrap();
+        assert!(rule.body.iter().any(|a| a.predicate == "len"));
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a"]);
     }
 
     // ── Round 2, item 1: set membership ───────────────────────────
