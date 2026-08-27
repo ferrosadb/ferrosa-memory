@@ -748,6 +748,8 @@ pub enum ArithOp {
     Sub,
     Mul,
     Div,
+    /// Remainder, written `%`. Binds as tightly as `*` and `/`.
+    Rem,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

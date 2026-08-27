@@ -5,7 +5,7 @@
 //!   filter ::= expr cmp_op expr
 //!   cmp_op ::= "==" | "!=" | "<=" | ">=" | "=" | "<" | ">"
 //!   expr   ::= term (("+" | "-") term)*
-//!   term   ::= factor (("*" | "/") factor)*
+//!   term   ::= factor (("*" | "/" | "%") factor)*
 //!   factor ::= number | string_lit | identifier | "(" expr ")" | "-" factor
 //! ```
 //!
@@ -77,13 +77,13 @@ fn factor(input: &str) -> IResult<&str, FilterExpr> {
 fn term(input: &str) -> IResult<&str, FilterExpr> {
     let (i, init) = factor(input)?;
     fold_many0(
-        pair(ws(alt((ch('*'), ch('/')))), factor),
+        pair(ws(alt((ch('*'), ch('/'), ch('%')))), factor),
         move || init.clone(),
         |acc, (op, rhs)| FilterExpr::BinOp {
-            op: if op == '*' {
-                ArithOp::Mul
-            } else {
-                ArithOp::Div
+            op: match op {
+                '*' => ArithOp::Mul,
+                '/' => ArithOp::Div,
+                _ => ArithOp::Rem,
             },
             lhs: Box::new(acc),
             rhs: Box::new(rhs),

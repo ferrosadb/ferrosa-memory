@@ -1098,48 +1098,85 @@ enum EvalValue {
     Uuid(uuid::Uuid),
 }
 
+/// The outcome of evaluating a filter expression.
+///
+/// `None` used to mean both "no value yet" and "no value ever", and the filter
+/// passed either way. Those are not the same thing: an unbound variable means
+/// the comparison cannot be decided *yet*, while a zero divisor means it has
+/// no answer *at all*. Collapsing them let `V / 0 == 0` derive a fact.
+enum Eval {
+    Value(EvalValue),
+    /// A variable the binding does not bind. The filter passes, which is the
+    /// legacy semantics partial bindings have always relied on.
+    Unbound,
+    /// The expression is fully bound but has no value — a zero divisor or
+    /// modulus, or arithmetic on something that is not a number. The filter
+    /// must not pass: firing anyway would derive a fact off an error.
+    Undefined,
+}
+
 fn eval_expr(
     e: &crate::types::FilterExpr,
     binding: &std::collections::HashMap<String, Term>,
-) -> Option<EvalValue> {
+) -> Eval {
     use crate::types::{ArithOp, FilterExpr};
     use ordered_float::OrderedFloat;
     match e {
-        FilterExpr::Var(name) => match binding.get(name)? {
-            Term::ConstFloat(OrderedFloat(f)) => Some(EvalValue::Num(*f)),
-            Term::ConstStr(s) => Some(EvalValue::Str(s.clone())),
-            Term::Const(u) => Some(EvalValue::Uuid(*u)),
-            Term::Var(_) => None,
+        FilterExpr::Var(name) => match binding.get(name) {
+            Some(Term::ConstFloat(OrderedFloat(f))) => Eval::Value(EvalValue::Num(*f)),
+            Some(Term::ConstStr(s)) => Eval::Value(EvalValue::Str(s.clone())),
+            Some(Term::Const(u)) => Eval::Value(EvalValue::Uuid(*u)),
+            Some(Term::Var(_)) | None => Eval::Unbound,
         },
-        FilterExpr::LitNum(OrderedFloat(f)) => Some(EvalValue::Num(*f)),
-        FilterExpr::LitStr(s) => Some(EvalValue::Str(s.clone())),
-        FilterExpr::Neg(inner) => match eval_expr(inner, binding)? {
-            EvalValue::Num(x) => Some(EvalValue::Num(-x)),
-            _ => {
+        FilterExpr::LitNum(OrderedFloat(f)) => Eval::Value(EvalValue::Num(*f)),
+        FilterExpr::LitStr(s) => Eval::Value(EvalValue::Str(s.clone())),
+        FilterExpr::Neg(inner) => match eval_expr(inner, binding) {
+            Eval::Value(EvalValue::Num(x)) => Eval::Value(EvalValue::Num(-x)),
+            Eval::Value(_) => {
                 tracing::warn!("datalog: unary minus on non-numeric value");
-                None
+                Eval::Undefined
             }
+            other => other,
         },
         FilterExpr::BinOp { op, lhs, rhs } => {
-            let l = eval_expr(lhs, binding)?;
-            let r = eval_expr(rhs, binding)?;
+            let l = eval_expr(lhs, binding);
+            let r = eval_expr(rhs, binding);
+            // An error anywhere in the tree poisons the whole tree; only when
+            // nothing is undefined does an unbound operand mean "not yet".
+            if matches!(l, Eval::Undefined) || matches!(r, Eval::Undefined) {
+                return Eval::Undefined;
+            }
+            let (Eval::Value(l), Eval::Value(r)) = (l, r) else {
+                return Eval::Unbound;
+            };
             match (l, r) {
                 (EvalValue::Num(a), EvalValue::Num(b)) => match op {
-                    ArithOp::Add => Some(EvalValue::Num(a + b)),
-                    ArithOp::Sub => Some(EvalValue::Num(a - b)),
-                    ArithOp::Mul => Some(EvalValue::Num(a * b)),
+                    ArithOp::Add => Eval::Value(EvalValue::Num(a + b)),
+                    ArithOp::Sub => Eval::Value(EvalValue::Num(a - b)),
+                    ArithOp::Mul => Eval::Value(EvalValue::Num(a * b)),
                     ArithOp::Div => {
                         if b == 0.0 {
                             tracing::warn!("datalog: division by zero in filter");
-                            None
+                            Eval::Undefined
                         } else {
-                            Some(EvalValue::Num(a / b))
+                            Eval::Value(EvalValue::Num(a / b))
+                        }
+                    }
+                    // A zero modulus is as undefined as a zero divisor, and
+                    // f64 would answer NaN — a value the caller cannot tell
+                    // from a real one. Refuse it the same way.
+                    ArithOp::Rem => {
+                        if b == 0.0 {
+                            tracing::warn!("datalog: modulo by zero in filter");
+                            Eval::Undefined
+                        } else {
+                            Eval::Value(EvalValue::Num(a % b))
                         }
                     }
                 },
                 _ => {
                     tracing::warn!("datalog: arithmetic on non-numeric values");
-                    None
+                    Eval::Undefined
                 }
             }
         }
@@ -1222,12 +1259,14 @@ fn check_one_filter(filter: &BuiltinFilter, binding: &HashMap<String, Term>) -> 
             }
         }
         BuiltinFilter::Compare { op, lhs, rhs } => {
-            let (Some(l), Some(r)) = (eval_expr(lhs, binding), eval_expr(rhs, binding)) else {
-                // Unbound or type-mismatch (already warned). Match legacy
-                // semantics: partial bindings pass the filter.
-                return true;
-            };
-            apply_cmp(*op, &l, &r)
+            match (eval_expr(lhs, binding), eval_expr(rhs, binding)) {
+                (Eval::Value(l), Eval::Value(r)) => apply_cmp(*op, &l, &r),
+                // Already warned. A comparison with no answer must not let the
+                // rule fire — that would derive a fact off an arithmetic error.
+                (Eval::Undefined, _) | (_, Eval::Undefined) => false,
+                // Legacy semantics: a partial binding passes the filter.
+                _ => true,
+            }
         }
     }
 }
@@ -3918,5 +3957,108 @@ mod aggregate_grammar_tests {
         let (all, _) = evaluate(&rules, &corpus, 100, 200_000);
         // 1 + 2 + ... + 20000
         assert_eq!(one_value(&all, "total", &s("alice")), Some(200_010_000.0));
+    }
+}
+
+// ─── Grammar Completion Tests ─────────────────────────────────────
+
+#[cfg(test)]
+mod grammar_tests {
+    use super::*;
+
+    fn facts(rows: &[(&str, Vec<Term>)]) -> FactSet {
+        let mut fs = FactSet::new();
+        for (pred, args) in rows {
+            fs.insert(pred, args.clone());
+        }
+        fs
+    }
+
+    fn s(v: &str) -> Term {
+        Term::ConstStr(v.to_string())
+    }
+
+    fn n(v: f64) -> Term {
+        Term::ConstFloat(OrderedFloat(v))
+    }
+
+    fn derived_keys(all: &FactSet, pred: &str) -> Vec<String> {
+        let mut out: Vec<String> = all
+            .get(pred)
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|args| args.first())
+                    .map(term_to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort();
+        out
+    }
+
+    // ── Item 1: modulo ────────────────────────────────────────────
+
+    #[test]
+    fn arithmetic_supports_modulo() {
+        let rule = parse_rule("even(X) :- num(X, V), V % 2 == 0.").unwrap();
+        assert_eq!(rule.filters.len(), 1);
+        let corpus = facts(&[
+            ("num", vec![s("a"), n(4.0)]),
+            ("num", vec![s("b"), n(7.0)]),
+            ("num", vec![s("c"), n(0.0)]),
+        ]);
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "even"), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn modulo_binds_as_tightly_as_multiplication() {
+        // 1 + 7 % 4  parses as  1 + (7 % 4)  = 4, not (1 + 7) % 4 = 0.
+        let rule = parse_rule("ok(X) :- num(X, V), 1 + V % 4 == 4.").unwrap();
+        let corpus = facts(&[("num", vec![s("a"), n(7.0)])]);
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "ok"), vec!["a"]);
+    }
+
+    #[test]
+    fn modulo_by_zero_derives_nothing_rather_than_a_nan() {
+        // Matches division by zero, which already refuses rather than
+        // producing a value the caller cannot tell from a real one.
+        let rule = parse_rule("bad(X) :- num(X, V), V % 0 == 0.").unwrap();
+        let corpus = facts(&[("num", vec![s("a"), n(4.0)])]);
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert!(
+            all.get("bad").map(|r| r.is_empty()).unwrap_or(true),
+            "modulo by zero must not derive anything"
+        );
+    }
+
+    #[test]
+    fn division_by_zero_no_longer_passes_the_filter() {
+        // Regression: `eval_expr` returned None both for an unbound variable
+        // and for a zero divisor, and `check_one_filter` passed on None, so
+        // this derived a fact off an arithmetic error.
+        let rule = parse_rule("bad(X) :- num(X, V), V / 0 == 0.").unwrap();
+        let corpus = facts(&[("num", vec![s("a"), n(4.0)])]);
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert!(all.get("bad").map(|r| r.is_empty()).unwrap_or(true));
+    }
+
+    #[test]
+    fn an_unbound_variable_still_passes_the_filter() {
+        // The other half of the split: "cannot be decided yet" keeps the
+        // legacy semantics that partial bindings rely on.
+        let rule = parse_rule("ok(X) :- num(X, _), Unbound > 5.").unwrap();
+        let corpus = facts(&[("num", vec![s("a"), n(4.0)])]);
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "ok"), vec!["a"]);
+    }
+
+    #[test]
+    fn modulo_of_a_non_number_derives_nothing() {
+        let rule = parse_rule("bad(X) :- num(X, V), V % 2 == 0.").unwrap();
+        let corpus = facts(&[("num", vec![s("a"), s("not-a-number")])]);
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert!(all.get("bad").map(|r| r.is_empty()).unwrap_or(true));
     }
 }
