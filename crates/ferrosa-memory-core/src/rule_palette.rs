@@ -214,7 +214,7 @@ fn definitions() -> Vec<Definition> {
 pub fn palette() -> Vec<Block> {
     definitions()
         .into_iter()
-        .filter(|definition| supported(definition))
+        .filter(supported)
         .map(|definition| definition.block)
         .collect()
 }
@@ -286,10 +286,10 @@ pub fn compile(placed: &[Placed]) -> Result<String, CompileError> {
         if value.contains('"') {
             return Err(CompileError::QuoteInValue);
         }
-        if let Some(needs) = definition.requires {
-            if !required.contains(&needs) {
-                required.push(needs);
-            }
+        if let Some(needs) = definition.requires
+            && !required.contains(&needs)
+        {
+            required.push(needs);
         }
         let rendered = (definition.render)(value);
         match definition.block.slot {

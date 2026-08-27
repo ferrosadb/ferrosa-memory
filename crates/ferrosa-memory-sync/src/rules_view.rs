@@ -60,6 +60,12 @@ impl RulesView {
         // Bounded on the same terms as the knowledge and board views: a
         // control session is being set up, and an unreachable cluster must
         // fail in seconds with a reason rather than hold a phone open.
+        // build_legacy is deprecated upstream and still what every other store
+        // in this crate uses. Annotated rather than migrated: switching one
+        // call site to the new deserialization API would leave this store
+        // reading rows differently from the ones beside it, and that is a
+        // change to make deliberately across the crate, not incidentally here.
+        #[allow(deprecated)]
         let session = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             SessionBuilder::new()

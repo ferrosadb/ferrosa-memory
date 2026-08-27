@@ -294,6 +294,10 @@ pub fn execution_mode(
 /// - `head_exprs` — computes head arguments rather than repeating them.
 ///   Computing a value cannot withdraw a conclusion: the same bindings still
 ///   derive, they merely carry a computed term. Monotonicity is unaffected.
+/// - `bindings` — body-named computed values (`D := expr`), evaluated after the
+///   positive atoms from what those atoms already bound. Naming a value derived
+///   from existing bindings adds a term; it cannot un-derive a conclusion. Also
+///   unaffected.
 pub fn is_monotonic(rule: &crate::types::DatalogRule) -> bool {
     let crate::types::DatalogRule {
         head: _,
@@ -302,6 +306,7 @@ pub fn is_monotonic(rule: &crate::types::DatalogRule) -> bool {
         aggregates: _,
         negated,
         head_exprs: _,
+        bindings: _,
     } = rule;
     negated.is_empty()
 }

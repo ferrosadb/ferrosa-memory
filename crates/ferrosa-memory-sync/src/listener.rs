@@ -68,17 +68,25 @@ const MAX_CONCURRENT_CONTROL_SESSIONS: usize = 8;
 ///
 /// Optional at the call site so every existing caller and test keeps working
 /// without one — a listener that does not supply it simply does not supersede,
+/// The live control sessions a listener may supersede.
+///
+/// A named type because the shape is repeated and clippy is right that the
+/// inline form is unreadable: the tuple is (session id, controller device id,
+/// the peer connection to close). Naming it also makes the ORDER of the two
+/// uuids explicit at every use, which an anonymous `(Uuid, Uuid, _)` does not.
+pub(crate) type LiveSessions = std::sync::Arc<
+    tokio::sync::Mutex<
+        Vec<(
+            Uuid,
+            Uuid,
+            std::sync::Arc<webrtc::peer_connection::RTCPeerConnection>,
+        )>,
+    >,
+>;
+
 /// which is the behaviour before this existed.
 pub(crate) struct SupersedeRegistry {
-    pub sessions: std::sync::Arc<
-        tokio::sync::Mutex<
-            Vec<(
-                Uuid,
-                Uuid,
-                std::sync::Arc<webrtc::peer_connection::RTCPeerConnection>,
-            )>,
-        >,
-    >,
+    pub sessions: LiveSessions,
     pub controller_device_id: Uuid,
 }
 
@@ -356,9 +364,7 @@ pub async fn run_control_listener(
     // its own previous session instead of being served twice. `in_flight`
     // cannot answer this: it is keyed by SESSION, and a reconnect is a new
     // session id by definition.
-    let live_sessions: Arc<
-        tokio::sync::Mutex<Vec<(Uuid, Uuid, Arc<webrtc::peer_connection::RTCPeerConnection>)>>,
-    > = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let live_sessions: LiveSessions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     // Bounded so a flood of offers cannot exhaust the host. Sessions beyond the
     // cap stay pending on the broker and are picked up as slots free.
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONTROL_SESSIONS));
