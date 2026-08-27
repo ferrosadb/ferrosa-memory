@@ -41,6 +41,103 @@ pub struct EffectiveRuleEntry {
 
 // ─── Rule Parser ──────────────────────────────────────────────────
 
+/// The most rules one disjunctive rule may expand to.
+///
+/// Alternatives multiply: N binary groups is 2^N rules. The cap turns a
+/// runaway into an error naming it, rather than one rule quietly becoming
+/// hundreds that all have to be evaluated.
+const MAX_RULE_ALTERNATIVES: usize = 64;
+
+/// Parse a rule, expanding `;` alternatives into one rule each.
+///
+/// Disjunction is handled here rather than in the evaluator: expanding to
+/// disjunctive normal form at load costs nothing at evaluation time and means
+/// the evaluator never learns a new body shape.
+pub fn parse_rules(text: &str) -> anyhow::Result<Vec<DatalogRule>> {
+    let text = text.trim().trim_end_matches('.').trim();
+    let sep = text
+        .find(":-")
+        .ok_or_else(|| anyhow::anyhow!("rule must contain ':-' separator"))?;
+    let head_str = &text[..sep];
+    let bodies = expand_disjunction(text[sep + 2..].trim())?;
+    anyhow::ensure!(
+        bodies.len() <= MAX_RULE_ALTERNATIVES,
+        "rule expands to {} alternatives, more than the {MAX_RULE_ALTERNATIVES} allowed; \
+         split it into separate rules so the cost is visible",
+        bodies.len()
+    );
+    bodies
+        .iter()
+        .map(|body| parse_rule(&format!("{head_str} :- {body}.")))
+        .collect()
+}
+
+/// Expand a body into one conjunction per alternative.
+///
+/// `,` binds tighter than `;`, as in Prolog, so `a, b ; c` is `(a, b) ; c`.
+/// A parenthesised group holding alternatives distributes over the rest of the
+/// conjunction, which is what makes `a, (b ; c)` two rules rather than one.
+fn expand_disjunction(body: &str) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    for alternative in split_top_level(body, ';')? {
+        let parts = split_top_level(&alternative, ',')?;
+        // Each part expands to one or more conjunct strings; the alternatives
+        // of the whole are the cartesian product of the parts' expansions.
+        let mut combos: Vec<Vec<String>> = vec![Vec::new()];
+        for part in &parts {
+            let trimmed = part.trim();
+            let expansions = match strip_group(trimmed) {
+                Some(inner) => expand_disjunction(inner)?,
+                None => vec![trimmed.to_string()],
+            };
+            anyhow::ensure!(
+                combos.len() * expansions.len() <= MAX_RULE_ALTERNATIVES,
+                "rule expands past the {MAX_RULE_ALTERNATIVES}-alternative cap; \
+                 split it into separate rules so the cost is visible"
+            );
+            combos = combos
+                .into_iter()
+                .flat_map(|prefix| {
+                    expansions.iter().map(move |e| {
+                        let mut next = prefix.clone();
+                        next.push(e.clone());
+                        next
+                    })
+                })
+                .collect();
+        }
+        out.extend(combos.into_iter().map(|c| c.join(", ")));
+    }
+    Ok(out)
+}
+
+/// The inside of a parenthesised group that holds alternatives, if this part
+/// is one. A group without a `;` is left alone — it may be a filter.
+fn strip_group(part: &str) -> Option<&str> {
+    let inner = part.strip_prefix('(')?.strip_suffix(')')?;
+    // Only a *balanced* outer pair counts: `(a) ; (b)` is not one group.
+    let mut depth = 0i32;
+    for c in inner.chars() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    split_top_level(inner, ';')
+        .ok()
+        .filter(|alts| alts.len() > 1)
+        .map(|_| inner)
+}
+
 /// Parse a Datalog rule from text.
 ///
 /// Syntax: `head(args) :- body1(args), body2(args), X != Y.`
@@ -61,6 +158,19 @@ pub fn parse_rule(text: &str) -> anyhow::Result<DatalogRule> {
 
     let head_str = text[..sep_pos].trim();
     let body_str = text[sep_pos + 2..].trim();
+
+    // `parse_rule` is used where exactly one rule is expected. Returning the
+    // first alternative and dropping the rest would be silently wrong, so a
+    // disjunctive body is refused here and callers that want it use
+    // `parse_rules`.
+    if let Ok(alternatives) = expand_disjunction(body_str)
+        && alternatives.len() > 1
+    {
+        anyhow::bail!(
+            "rule body has {} alternatives; use parse_rules to expand them",
+            alternatives.len()
+        );
+    }
 
     let (head, head_exprs) = parse_head(head_str)?;
 
@@ -1958,11 +2068,14 @@ pub async fn load_effective_rules(
     ctx: &TenantContext,
     family: Option<&str>,
 ) -> anyhow::Result<Vec<DatalogRule>> {
-    load_effective_rule_entries(storage, ctx, family)
-        .await?
-        .into_iter()
-        .map(|rule| parse_rule(&rule.entry.rule_body))
-        .collect()
+    // `parse_rules`, not `parse_rule`: a stored rule may use `;`, and each
+    // alternative becomes a rule the evaluator runs.
+    let entries = load_effective_rule_entries(storage, ctx, family).await?;
+    let mut rules = Vec::with_capacity(entries.len());
+    for entry in entries {
+        rules.extend(parse_rules(&entry.entry.rule_body)?);
+    }
+    Ok(rules)
 }
 
 // ─── Fact Loading ─────────────────────────────────────────────────
@@ -4931,6 +5044,109 @@ mod grammar_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("str_startswith"), "got: {err}");
+    }
+
+    // ── Round 2, item 4: atom-level disjunction ───────────────────
+
+    #[test]
+    fn a_body_can_offer_alternatives() {
+        let rules = parse_rules("q(X) :- p(X) ; r(X).").unwrap();
+        assert_eq!(rules.len(), 2, "one rule per alternative");
+        assert!(rules.iter().all(|r| r.head.predicate == "q"));
+        let corpus = facts(&[("p", vec![s("a")]), ("r", vec![s("b")])]);
+        let (all, _) = evaluate(&rules, &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn a_comma_binds_tighter_than_a_semicolon() {
+        // `a, b ; c` is `(a, b) ; c`, as in Prolog.
+        let rules = parse_rules("q(X) :- p(X), t(X) ; r(X).").unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(
+            rules[0].body.len(),
+            2,
+            "first alternative is the conjunction"
+        );
+        assert_eq!(rules[1].body.len(), 1);
+    }
+
+    #[test]
+    fn a_parenthesised_alternative_distributes_over_the_conjunction() {
+        let rules = parse_rules("q(X) :- base(X), (p(X) ; r(X)).").unwrap();
+        assert_eq!(rules.len(), 2);
+        for rule in &rules {
+            assert!(rule.body.iter().any(|a| a.predicate == "base"));
+        }
+        let corpus = facts(&[
+            ("base", vec![s("a")]),
+            ("base", vec![s("b")]),
+            ("base", vec![s("c")]),
+            ("p", vec![s("a")]),
+            ("r", vec![s("b")]),
+        ]);
+        let (all, _) = evaluate(&rules, &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a", "b"], "c matches neither");
+    }
+
+    #[test]
+    fn two_groups_produce_the_cartesian_product_of_alternatives() {
+        let rules = parse_rules("q(X) :- (a(X) ; b(X)), (c(X) ; d(X)).").unwrap();
+        assert_eq!(rules.len(), 4);
+    }
+
+    #[test]
+    fn a_rule_with_no_disjunction_expands_to_exactly_itself() {
+        let rules = parse_rules("q(X) :- p(X), r(X).").unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0], parse_rule("q(X) :- p(X), r(X).").unwrap());
+    }
+
+    #[test]
+    fn the_singular_parser_refuses_a_rule_that_expands_to_several() {
+        // parse_rule is used where exactly one rule is expected; silently
+        // returning the first alternative would drop the others.
+        let err = parse_rule("q(X) :- p(X) ; r(X).").unwrap_err().to_string();
+        assert!(
+            err.contains("parse_rules") || err.contains("alternative"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn disjunction_composes_with_negation_and_filters() {
+        let corpus = facts(&[
+            ("p", vec![s("a")]),
+            ("r", vec![s("b")]),
+            ("r", vec![s("c")]),
+            ("banned", vec![s("c")]),
+        ]);
+        let rules = parse_rules("q(X) :- (p(X) ; r(X)), not banned(X).").unwrap();
+        let (all, _) = evaluate(&rules, &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn a_semicolon_inside_a_string_is_not_an_alternative() {
+        let rules = parse_rules(r#"q(X) :- p(X, "a;b")."#).unwrap();
+        assert_eq!(rules.len(), 1);
+    }
+
+    #[test]
+    fn a_runaway_expansion_is_refused_rather_than_silently_enormous() {
+        // Six binary groups is 64 rules; seven is 128. The cap fails loud
+        // rather than quietly compiling one rule into hundreds.
+        let body: String = (0..7)
+            .map(|i| format!("(a{i}(X) ; b{i}(X))"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let err = parse_rules(&format!("q(X) :- {body}."))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("alternative") || err.contains("expand"),
+            "got: {err}"
+        );
     }
 
     // ── Round 2, item 3: bind a computed value in the body ────────

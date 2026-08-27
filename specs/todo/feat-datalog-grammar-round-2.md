@@ -56,7 +56,7 @@ DatalogRule.body: Vec<Atom>                                       // pure conjun
       redefining `=` would silently change the meaning of stored rules. RHS
       variables must already be bound; LHS must be fresh.
 
-- [ ] **4. Atom-level disjunction.** `body` is a pure conjunction and the
+- [x] **4. Atom-level disjunction.** `body` is a pure conjunction and the
       splitter does not know `;`, so `q(X) :- p(X) ; r(X).` still needs two
       rules. The previous spec closed disjunction *for filters* and read as if
       it had closed disjunction. The justification used there — each

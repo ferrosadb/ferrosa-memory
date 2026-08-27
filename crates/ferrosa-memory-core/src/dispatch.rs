@@ -9761,8 +9761,14 @@ async fn handle_manage_rules<S: crate::storage::Storage>(
             let rule_id = require_str(&args, "rule_id")?;
             let rule_body = require_str(&args, "rule_body")?;
 
-            let parsed = crate::datalog::parse_rule(rule_body)
+            // `parse_rules` so a disjunctive body validates here rather than
+            // failing later in the loader. Every alternative shares the head,
+            // so the first one names the family.
+            let parsed = crate::datalog::parse_rules(rule_body)
                 .map_err(|e| (INVALID_PARAMS, format!("Invalid rule syntax: {e}")))?;
+            let parsed = parsed
+                .first()
+                .ok_or((INVALID_PARAMS, "rule expanded to nothing".to_string()))?;
             let family = args
                 .get("family")
                 .and_then(|v| v.as_str())
