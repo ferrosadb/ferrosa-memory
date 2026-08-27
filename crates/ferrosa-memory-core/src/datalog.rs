@@ -90,7 +90,7 @@ pub fn parse_rule(text: &str) -> anyhow::Result<DatalogRule> {
         let part = part.trim();
         if let Some(rest) = strip_not_prefix(part) {
             deferred_negated.push(rest.to_string());
-        } else if part.starts_with("count(") {
+        } else if aggregate_keyword(part).is_some() {
             deferred_aggregates.push(part.to_string());
         } else if has_top_level_cmp(part) {
             let f = crate::datalog_filter_expr::parse_filter(part)?;
@@ -285,16 +285,45 @@ fn parse_aggregate(
     body_vars: &std::collections::HashSet<String>,
 ) -> anyhow::Result<Option<crate::types::Aggregate>> {
     let s = s.trim();
-    let Some(rest) = s.strip_prefix("count(") else {
+    let Some(kind) = aggregate_keyword(s) else {
         return Ok(None);
     };
+    let rest = s
+        .strip_prefix(kind.keyword())
+        .and_then(|r| r.strip_prefix('('))
+        .expect("aggregate_keyword matched this prefix");
     let Some(inner_text) = rest.strip_suffix(')') else {
         anyhow::bail!("aggregate '{s}' is missing closing ')'");
     };
     let parts = split_top_level(inner_text, ',')?;
+
+    // Below the floor every kind shares — one inner atom and an output var —
+    // nothing could have been meant but a malformed aggregate.
     if parts.len() < 2 {
         anyhow::bail!(
-            "aggregate '{s}' must have at least one inner atom and an output var separated by ','"
+            "aggregate '{s}' must have at least one inner atom and an output var \
+             separated by ','"
+        );
+    }
+
+    // Above that floor, a first part that is not a compound atom means a plain
+    // predicate that happens to share the keyword's name — the legacy escape
+    // `count(X, N)` has always had. This has to be decided before the
+    // kind-specific arity check, or `sum(X, Y)` would be an error rather than
+    // an atom.
+    if !parts
+        .first()
+        .is_some_and(|first| parse_atom(first, &mut 0).is_ok())
+    {
+        return Ok(None);
+    }
+
+    // `count(atom.., Out)`; every other kind is `kind(atom.., Value, Out)`.
+    if kind.needs_value_var() && parts.len() < 3 {
+        anyhow::bail!(
+            "aggregate '{s}' folds values, so it needs a value var between its \
+             inner atoms and its output var: {}(atom.., Value, Out)",
+            kind.keyword()
         );
     }
     let output = parts.last().unwrap().trim().to_string();
@@ -309,7 +338,21 @@ fn parse_aggregate(
         );
     }
 
-    let atom_parts = &parts[..parts.len() - 1];
+    // For a value aggregate the second-to-last part is the value variable.
+    // Atoms always carry parentheses, so a bare identifier here is
+    // unambiguous.
+    let (value_var, atom_parts) = if kind.needs_value_var() {
+        let raw = parts[parts.len() - 2].trim().to_string();
+        if raw.contains('(') {
+            anyhow::bail!(
+                "aggregate '{s}' needs a value variable before its output var, \
+                 got the atom '{raw}'"
+            );
+        }
+        (Some(raw), &parts[..parts.len() - 2])
+    } else {
+        (None, &parts[..parts.len() - 1])
+    };
     let mut atoms: Vec<Atom> = Vec::with_capacity(atom_parts.len());
     let mut anon = 0;
     for (i, part) in atom_parts.iter().enumerate() {
@@ -340,19 +383,54 @@ fn parse_aggregate(
             if let crate::types::Term::Var(name) = arg
                 && (head_vars.contains(name) || body_vars.contains(name))
                 && !group_vars.contains(name)
+                // The value var is what the fold consumes, never what it
+                // groups by — grouping on it would put every distinct value
+                // in its own group and make the fold a no-op.
+                && value_var.as_deref() != Some(name.as_str())
             {
                 group_vars.push(name.clone());
             }
         }
     }
 
+    if let Some(value) = &value_var {
+        anyhow::ensure!(
+            value != &output,
+            "aggregate '{s}' folds '{value}' into itself; the value variable and \
+             the output variable must differ"
+        );
+        let bound_by_inner = atoms.iter().any(|atom| {
+            atom.args
+                .iter()
+                .any(|arg| matches!(arg, crate::types::Term::Var(n) if n == value))
+        });
+        anyhow::ensure!(
+            bound_by_inner,
+            "aggregate '{s}' folds '{value}', which no inner atom binds; there \
+             would be nothing to fold"
+        );
+    }
+
     Ok(Some(crate::types::Aggregate {
-        kind: crate::types::AggregateKind::Count,
+        kind,
         inner,
         inner_conjunction,
         group_vars,
         output_var: output,
+        value_var,
     }))
+}
+
+/// The aggregate kind a body part is written with, if any.
+///
+/// Matches only `kind(`, so a predicate literally named `sum` keeps the same
+/// legacy escape `count` already had: `sum(X, Y)` fails to parse as an
+/// aggregate and falls through to plain body-atom parsing.
+fn aggregate_keyword(part: &str) -> Option<crate::types::AggregateKind> {
+    use crate::types::AggregateKind::{Avg, Count, Max, Min, Sum};
+    [Count, Sum, Min, Max, Avg]
+        .into_iter()
+        .find(|kind| part.starts_with(&format!("{}(", kind.keyword())))
 }
 
 /// True iff `s` contains a comparison operator at the top level — i.e.
@@ -802,16 +880,21 @@ fn apply_aggregate(
             Some((b, _)) => b.clone(),
             None => continue,
         };
-        let count = count_inner_matches(agg, &representative, all_facts);
+        // `None` means this group produces no value at all — an empty group
+        // for a kind with no identity, or a value that was not a number. The
+        // members are dropped rather than bound to a fabricated number.
+        let Some(value) = fold_inner_matches(agg, &representative, all_facts) else {
+            continue;
+        };
 
         for (mut binding, mut prov) in members {
             binding.insert(
                 agg.output_var.clone(),
-                Term::ConstFloat(OrderedFloat(count as f64)),
+                Term::ConstFloat(OrderedFloat(value)),
             );
             prov.push(make_provenance_step(
-                &format!("count({})", agg.inner.predicate),
-                &[Term::ConstFloat(OrderedFloat(count as f64))],
+                &format!("{}({})", agg.kind.keyword(), agg.inner.predicate),
+                &[Term::ConstFloat(OrderedFloat(value))],
             ));
             out.push((binding, prov));
         }
@@ -819,46 +902,155 @@ fn apply_aggregate(
     out
 }
 
-/// Count how many complete unifications exist for the aggregate's inner conjunction
-/// under the given binding. For single-atom aggregates this degenerates to counting
-/// matching rows; for multi-atom conjunctions it backtracks over all combinations.
-fn count_inner_matches(
+/// Visit every complete unification of an aggregate's inner conjunction.
+///
+/// Streaming by construction: the backtracker hands each solved binding to
+/// `visit` and drops it, so nothing proportional to the size of the group is
+/// ever collected. A group of twenty thousand rows costs one binding at a
+/// time, not a twenty-thousand-element vector.
+///
+/// `visit` returns false to stop early — which is how a fold abandons a group
+/// it has already decided cannot produce a value.
+fn visit_inner_matches(
     agg: &crate::types::Aggregate,
     binding: &std::collections::HashMap<String, Term>,
     all_facts: &FactSet,
-) -> usize {
+    visit: &mut impl FnMut(&Binding) -> bool,
+) {
     let atoms: Vec<&Atom> = if agg.inner_conjunction.is_empty() {
         vec![&agg.inner]
     } else {
         agg.inner_conjunction.iter().collect()
     };
-    let mut count = 0;
-    count_conjunction(&atoms, 0, binding.clone(), all_facts, &mut count);
-    count
+    visit_conjunction(&atoms, 0, binding.clone(), all_facts, visit);
 }
 
 /// Recursive conjunction backtracker: extends `binding` one atom at a time and
-/// increments `count` whenever all atoms are unified.
-fn count_conjunction(
+/// calls `visit` whenever all atoms are unified. Returns false once `visit`
+/// has asked to stop, which unwinds the whole search.
+fn visit_conjunction(
     atoms: &[&Atom],
     i: usize,
     binding: std::collections::HashMap<String, Term>,
     all_facts: &FactSet,
-    count: &mut usize,
-) {
+    visit: &mut impl FnMut(&Binding) -> bool,
+) -> bool {
     if i == atoms.len() {
-        *count += 1;
-        return;
+        return visit(&binding);
     }
     let atom = atoms[i];
     let Some(rows) = all_facts.get(&atom.predicate) else {
-        return;
+        return true;
     };
     for row in rows {
-        if let Some(extended) = try_unify(&atom.args, row, &binding) {
-            count_conjunction(atoms, i + 1, extended, all_facts, count);
+        if let Some(extended) = try_unify(&atom.args, row, &binding)
+            && !visit_conjunction(atoms, i + 1, extended, all_facts, visit)
+        {
+            return false;
         }
     }
+    true
+}
+
+/// The running state of a streaming aggregate fold.
+enum Fold {
+    Count(u64),
+    Sum(f64),
+    Min(Option<f64>),
+    Max(Option<f64>),
+    Avg(f64, u64),
+    /// A value that was not a number. The group is refused rather than
+    /// silently totalled without it — a total missing a row is quietly wrong,
+    /// which is worse than no total at all.
+    TypeError,
+}
+
+impl Fold {
+    fn start(kind: crate::types::AggregateKind) -> Self {
+        use crate::types::AggregateKind as K;
+        match kind {
+            K::Count => Fold::Count(0),
+            K::Sum => Fold::Sum(0.0),
+            K::Min => Fold::Min(None),
+            K::Max => Fold::Max(None),
+            K::Avg => Fold::Avg(0.0, 0),
+        }
+    }
+
+    /// Absorb one solved binding. Returns false when the fold can stop early.
+    fn step(&mut self, value: Option<f64>) -> bool {
+        match self {
+            Fold::Count(n) => {
+                *n += 1;
+                true
+            }
+            Fold::TypeError => false,
+            _ => {
+                let Some(v) = value else {
+                    *self = Fold::TypeError;
+                    return false;
+                };
+                match self {
+                    Fold::Sum(acc) => *acc += v,
+                    Fold::Min(acc) => *acc = Some(acc.map_or(v, |a| a.min(v))),
+                    Fold::Max(acc) => *acc = Some(acc.map_or(v, |a| a.max(v))),
+                    Fold::Avg(sum, n) => {
+                        *sum += v;
+                        *n += 1;
+                    }
+                    Fold::Count(_) | Fold::TypeError => unreachable!("handled above"),
+                }
+                true
+            }
+        }
+    }
+
+    /// The folded value, or `None` when the group produces nothing.
+    fn finish(self, kind: crate::types::AggregateKind) -> Option<f64> {
+        match self {
+            Fold::TypeError => None,
+            Fold::Count(n) => Some(n as f64),
+            Fold::Sum(acc) => Some(acc),
+            Fold::Min(acc) | Fold::Max(acc) => acc.or_else(|| kind.identity_over_empty()),
+            Fold::Avg(sum, n) => {
+                if n == 0 {
+                    kind.identity_over_empty()
+                } else {
+                    Some(sum / n as f64)
+                }
+            }
+        }
+    }
+}
+
+/// Fold an aggregate over its inner conjunction, streaming.
+///
+/// `None` means the group derives nothing: an empty group for a kind with no
+/// identity (`min`, `max`, `avg`), or a value that was not a number.
+fn fold_inner_matches(
+    agg: &crate::types::Aggregate,
+    binding: &std::collections::HashMap<String, Term>,
+    all_facts: &FactSet,
+) -> Option<f64> {
+    let mut fold = Fold::start(agg.kind);
+    let value_var = agg.value_var.clone();
+    visit_inner_matches(agg, binding, all_facts, &mut |solved| {
+        let value = value_var.as_ref().and_then(|name| match solved.get(name) {
+            Some(Term::ConstFloat(OrderedFloat(f))) => Some(*f),
+            _ => None,
+        });
+        fold.step(value)
+    });
+    if matches!(fold, Fold::TypeError) {
+        tracing::warn!(
+            aggregate = agg.kind.keyword(),
+            predicate = %agg.inner.predicate,
+            value_var = ?agg.value_var,
+            "datalog: aggregate value is not a number; the group derives nothing \
+             rather than a total missing that row"
+        );
+    }
+    fold.finish(agg.kind)
 }
 
 /// Try to unify atom arguments with fact arguments under an existing binding.
@@ -3488,5 +3680,243 @@ mod negation_tests {
         let fact = derived.iter().find(|d| d.pred == "q").unwrap();
         assert!(!fact.rests_on_absence());
         assert!(fact.is_cacheable());
+    }
+}
+
+// ─── Aggregate Grammar Tests (min/max/sum/avg) ────────────────────
+
+#[cfg(test)]
+mod aggregate_grammar_tests {
+    use super::*;
+    use crate::types::AggregateKind;
+
+    fn facts(rows: &[(&str, Vec<Term>)]) -> FactSet {
+        let mut fs = FactSet::new();
+        for (pred, args) in rows {
+            fs.insert(pred, args.clone());
+        }
+        fs
+    }
+
+    fn s(v: &str) -> Term {
+        Term::ConstStr(v.to_string())
+    }
+
+    fn n(v: f64) -> Term {
+        Term::ConstFloat(OrderedFloat(v))
+    }
+
+    /// Read the single value bound to `pred`'s second argument.
+    fn one_value(all: &FactSet, pred: &str, key: &Term) -> Option<f64> {
+        all.get(pred)?.iter().find_map(|args| {
+            (args.first() == Some(key)).then(|| match args.get(1) {
+                Some(Term::ConstFloat(OrderedFloat(f))) => *f,
+                other => panic!("expected a number, got {other:?}"),
+            })
+        })
+    }
+
+    // ── Parsing ───────────────────────────────────────────────────
+
+    #[test]
+    fn parse_rule_supports_sum_min_max_avg_with_a_value_variable() {
+        for (text, kind) in [
+            (
+                "total(X, T) :- account(X), sum(spend(X, A), A, T).",
+                AggregateKind::Sum,
+            ),
+            (
+                "lowest(X, T) :- account(X), min(spend(X, A), A, T).",
+                AggregateKind::Min,
+            ),
+            (
+                "highest(X, T) :- account(X), max(spend(X, A), A, T).",
+                AggregateKind::Max,
+            ),
+            (
+                "mean(X, T) :- account(X), avg(spend(X, A), A, T).",
+                AggregateKind::Avg,
+            ),
+        ] {
+            let rule = parse_rule(text).unwrap();
+            assert_eq!(rule.aggregates.len(), 1, "{text}");
+            let agg = &rule.aggregates[0];
+            assert_eq!(agg.kind, kind, "{text}");
+            assert_eq!(agg.value_var.as_deref(), Some("A"), "{text}");
+            assert_eq!(agg.output_var, "T", "{text}");
+            assert_eq!(agg.inner.predicate, "spend", "{text}");
+        }
+    }
+
+    #[test]
+    fn count_still_parses_and_carries_no_value_variable() {
+        let rule = parse_rule("n(X, N) :- account(X), count(spend(X, A), N).").unwrap();
+        let agg = &rule.aggregates[0];
+        assert_eq!(agg.kind, AggregateKind::Count);
+        assert_eq!(agg.value_var, None, "count folds rows, not values");
+        assert_eq!(agg.output_var, "N");
+    }
+
+    #[test]
+    fn a_value_aggregate_over_a_conjunction_keeps_every_inner_atom() {
+        let rule =
+            parse_rule("total(X, T) :- account(X), sum(spend(X, A), approved(A), A, T).").unwrap();
+        let agg = &rule.aggregates[0];
+        assert_eq!(agg.inner_conjunction.len(), 2);
+        assert_eq!(agg.value_var.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn a_value_aggregate_without_a_value_variable_is_rejected() {
+        let err = parse_rule("total(X, T) :- account(X), sum(spend(X, A), T).")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("value") || err.contains("sum"),
+            "should explain the missing value variable, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_value_variable_not_bound_by_the_inner_atoms_is_rejected() {
+        let err = parse_rule("total(X, T) :- account(X), sum(spend(X, A), Z, T).")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains('Z'),
+            "rejection must name the unbound value variable, got: {err}"
+        );
+    }
+
+    #[test]
+    fn the_value_variable_and_the_output_variable_must_differ() {
+        let err = parse_rule("total(X, A) :- account(X), sum(spend(X, A), A, A).")
+            .unwrap_err()
+            .to_string();
+        assert!(!err.is_empty(), "aggregating into its own input is a bug");
+    }
+
+    #[test]
+    fn a_predicate_literally_named_sum_is_still_a_plain_atom() {
+        // Same legacy escape `count(X, N)` already has.
+        let rule = parse_rule("q(X, Y) :- sum(X, Y).").unwrap();
+        assert!(rule.aggregates.is_empty());
+        assert_eq!(rule.body.len(), 1);
+        assert_eq!(rule.body[0].predicate, "sum");
+    }
+
+    // ── Evaluation ────────────────────────────────────────────────
+
+    fn spend_corpus() -> FactSet {
+        facts(&[
+            ("account", vec![s("alice")]),
+            ("account", vec![s("bob")]),
+            ("spend", vec![s("alice"), n(10.0)]),
+            ("spend", vec![s("alice"), n(30.0)]),
+            ("spend", vec![s("alice"), n(60.0)]),
+            ("spend", vec![s("bob"), n(5.0)]),
+        ])
+    }
+
+    #[test]
+    fn sum_folds_the_value_across_a_group() {
+        let rules = vec![parse_rule("total(X, T) :- account(X), sum(spend(X, A), A, T).").unwrap()];
+        let (all, _) = evaluate(&rules, &spend_corpus(), 100, 10_000);
+        assert_eq!(one_value(&all, "total", &s("alice")), Some(100.0));
+        assert_eq!(one_value(&all, "total", &s("bob")), Some(5.0));
+    }
+
+    #[test]
+    fn min_and_max_pick_the_extremes_of_a_group() {
+        let lo = vec![parse_rule("lo(X, T) :- account(X), min(spend(X, A), A, T).").unwrap()];
+        let hi = vec![parse_rule("hi(X, T) :- account(X), max(spend(X, A), A, T).").unwrap()];
+        let (all_lo, _) = evaluate(&lo, &spend_corpus(), 100, 10_000);
+        let (all_hi, _) = evaluate(&hi, &spend_corpus(), 100, 10_000);
+        assert_eq!(one_value(&all_lo, "lo", &s("alice")), Some(10.0));
+        assert_eq!(one_value(&all_hi, "hi", &s("alice")), Some(60.0));
+        assert_eq!(one_value(&all_lo, "lo", &s("bob")), Some(5.0));
+    }
+
+    #[test]
+    fn avg_divides_the_sum_by_the_row_count() {
+        let rules = vec![parse_rule("mean(X, T) :- account(X), avg(spend(X, A), A, T).").unwrap()];
+        let (all, _) = evaluate(&rules, &spend_corpus(), 100, 10_000);
+        assert_eq!(one_value(&all, "mean", &s("alice")), Some(100.0 / 3.0));
+        assert_eq!(one_value(&all, "mean", &s("bob")), Some(5.0));
+    }
+
+    #[test]
+    fn sum_over_no_rows_is_zero_and_the_rule_still_fires() {
+        // A total of nothing is zero, and staying monotone matches `count`.
+        let corpus = facts(&[("account", vec![s("carol")])]);
+        let rules = vec![parse_rule("total(X, T) :- account(X), sum(spend(X, A), A, T).").unwrap()];
+        let (all, _) = evaluate(&rules, &corpus, 100, 10_000);
+        assert_eq!(one_value(&all, "total", &s("carol")), Some(0.0));
+    }
+
+    #[test]
+    fn min_max_and_avg_over_no_rows_do_not_fire_at_all() {
+        // There is no minimum of nothing. Emitting one would be a fabricated
+        // value, so the rule must not fire rather than invent a sentinel.
+        let corpus = facts(&[("account", vec![s("carol")])]);
+        for (text, pred) in [
+            ("lo(X, T) :- account(X), min(spend(X, A), A, T).", "lo"),
+            ("hi(X, T) :- account(X), max(spend(X, A), A, T).", "hi"),
+            ("mean(X, T) :- account(X), avg(spend(X, A), A, T).", "mean"),
+        ] {
+            let rules = vec![parse_rule(text).unwrap()];
+            let (all, _) = evaluate(&rules, &corpus, 100, 10_000);
+            assert!(
+                all.get(pred).map(|r| r.is_empty()).unwrap_or(true),
+                "{pred} must derive nothing over an empty group"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_numeric_value_makes_the_group_derive_nothing_rather_than_a_wrong_total() {
+        // Skipping the offending row would report a total that is quietly
+        // wrong. The group is refused instead.
+        let corpus = facts(&[
+            ("account", vec![s("alice")]),
+            ("spend", vec![s("alice"), n(10.0)]),
+            ("spend", vec![s("alice"), s("not-a-number")]),
+        ]);
+        let rules = vec![parse_rule("total(X, T) :- account(X), sum(spend(X, A), A, T).").unwrap()];
+        let (all, _) = evaluate(&rules, &corpus, 100, 10_000);
+        assert!(
+            all.get("total").map(|r| r.is_empty()).unwrap_or(true),
+            "a group with a non-numeric value must not produce a total"
+        );
+    }
+
+    #[test]
+    fn a_post_aggregate_filter_applies_to_the_folded_value() {
+        let rules =
+            vec![parse_rule("big(X, T) :- account(X), sum(spend(X, A), A, T), T > 50.").unwrap()];
+        let (all, _) = evaluate(&rules, &spend_corpus(), 100, 10_000);
+        assert_eq!(one_value(&all, "big", &s("alice")), Some(100.0));
+        assert_eq!(
+            one_value(&all, "big", &s("bob")),
+            None,
+            "bob's 5 is below 50"
+        );
+    }
+
+    #[test]
+    fn folding_visits_a_large_inner_relation_without_materialising_it() {
+        // 20k rows in one group. The fold is a streaming visitor over the
+        // conjunction backtracker, so nothing proportional to the group is
+        // ever collected; this would allocate a 20k-element Vec per group if
+        // it were materialised.
+        let mut corpus = FactSet::new();
+        corpus.insert("account", vec![s("alice")]);
+        for i in 1..=20_000u32 {
+            corpus.insert("spend", vec![s("alice"), n(f64::from(i))]);
+        }
+        let rules = vec![parse_rule("total(X, T) :- account(X), sum(spend(X, A), A, T).").unwrap()];
+        let (all, _) = evaluate(&rules, &corpus, 100, 200_000);
+        // 1 + 2 + ... + 20000
+        assert_eq!(one_value(&all, "total", &s("alice")), Some(200_010_000.0));
     }
 }
