@@ -789,3 +789,95 @@ async fn a_stored_value_aggregate_folds_over_session_facts() {
         "a stored aggregate rule should derive something"
     );
 }
+
+/// The completed grammar through the tenant-facing tool path: every new form
+/// is accepted on write, stored as text, and parses back into a rule the
+/// engine will run.
+#[tokio::test]
+async fn manage_rules_put_accepts_every_new_grammar_form() {
+    let store = MockStorage::new();
+    let ctx = test_ctx();
+    let session = SessionState::default();
+
+    let cases: [(&str, &str); 5] = [
+        (
+            "g-mod",
+            "bucket(X, X) :- node(X), warmth(X, W), W % 2 == 0.",
+        ),
+        (
+            "g-str",
+            r#"scratch(X, X) :- node(X), node_name(X, N), str_starts_with(N, "tmp_")."#,
+        ),
+        (
+            "g-bool",
+            "edge_case(X, X) :- node(X), warmth(X, W), W < 0.1 || W > 0.9.",
+        ),
+        (
+            "g-minmax",
+            "earliest(X, T) :- node(X), min(node_name(X, C), C, T).",
+        ),
+        ("g-head", "scaled(X, W * 100) :- warmth(X, W)."),
+    ];
+
+    for (rule_id, body) in cases {
+        let params = json!({
+            "name": "manage_rules",
+            "arguments": {"action": "put", "rule_id": rule_id, "rule_body": body}
+        });
+        let ok = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .unwrap_or_else(|e| panic!("{rule_id} rejected: {}", e.1));
+        assert_eq!(unwrap_tool_result(ok)["action"], "put");
+
+        let stored = store
+            .rule_get(&ctx, rule_id)
+            .await
+            .unwrap()
+            .expect("stored");
+        ferrosa_memory_core::datalog::parse_rule(&stored.rule_body)
+            .unwrap_or_else(|e| panic!("{rule_id} did not survive the round trip: {e}"));
+    }
+}
+
+/// Every new rejection lands at write time, naming what is wrong, where the
+/// tenant can still fix it — not at load time in someone else's session.
+#[tokio::test]
+async fn manage_rules_put_refuses_each_new_grammar_mistake_by_name() {
+    let store = MockStorage::new();
+    let ctx = test_ctx();
+    let session = SessionState::default();
+
+    let cases: [(&str, &str, &str); 4] = [
+        (
+            "bad-str",
+            r#"q(X, X) :- node(X), str_startswith(X, "a")."#,
+            "str_startswith",
+        ),
+        ("bad-head-var", "q(X, Q * 2) :- warmth(X, W).", "Q"),
+        ("bad-body-arith", "q(X, X) :- warmth(X, W + 1).", "compute"),
+        (
+            "bad-value-var",
+            "q(X, T) :- node(X), sum(warmth(X, W), Missing, T).",
+            "Missing",
+        ),
+    ];
+
+    for (rule_id, body, expect) in cases {
+        let params = json!({
+            "name": "manage_rules",
+            "arguments": {"action": "put", "rule_id": rule_id, "rule_body": body}
+        });
+        let err = dispatch("tools/call", params, &store, &ctx, &session)
+            .await
+            .expect_err(&format!("{rule_id} should have been refused"));
+        assert!(
+            err.1.contains(expect),
+            "{rule_id}: expected the message to name {expect:?}, got: {}",
+            err.1
+        );
+        assert!(
+            store.rule_get(&ctx, rule_id).await.unwrap().is_none(),
+            "{rule_id}: a refused rule must not be stored"
+        );
+    }
+}
