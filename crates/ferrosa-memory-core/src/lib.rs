@@ -59,6 +59,8 @@ pub mod migration_backfill;
 pub mod migration_backfill_cql;
 pub mod ner;
 pub mod pagerank;
+pub mod rule_palette;
+pub mod rules_view;
 pub mod plan;
 pub mod promotion;
 pub mod quota;

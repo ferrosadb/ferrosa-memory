@@ -37,6 +37,7 @@ pub mod knowledge_view;
 pub mod learner_ingest;
 pub mod listener;
 pub mod memory_view;
+pub mod rules_view;
 pub mod pack;
 pub mod pack_crypto;
 pub mod peer_cli;
