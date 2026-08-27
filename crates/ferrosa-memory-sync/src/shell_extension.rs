@@ -372,7 +372,9 @@ impl ShellExtension {
     ///
     /// Nothing is stored here. This answers "what would this be, and is it
     /// valid" so the composer can show both before anyone commits.
-    fn rule_compile_frame(placed: &[ferrosa_memory_core::rule_palette::Placed]) -> serde_json::Value {
+    fn rule_compile_frame(
+        placed: &[ferrosa_memory_core::rule_palette::Placed],
+    ) -> serde_json::Value {
         use ferrosa_memory_core::rule_palette::compile;
 
         match compile(placed) {
@@ -460,7 +462,12 @@ impl ShellExtension {
                     first["rung"] = serde_json::json!(found.rule.tier.as_str());
                     first["datalog"] = serde_json::json!(bounded_title(&found.rule.datalog));
                     first["aliases"] = serde_json::json!(
-                        found.rule.aliases.iter().map(|a| bounded_title(a)).collect::<Vec<_>>()
+                        found
+                            .rule
+                            .aliases
+                            .iter()
+                            .map(|a| bounded_title(a))
+                            .collect::<Vec<_>>()
                     );
                     first["reachable_rule"] = serde_json::json!(found.rule.reachable());
                 }
@@ -2570,7 +2577,9 @@ impl SessionExtension for ShellExtension {
                 for frame in self.rules_frames().await {
                     session.send(&envelope(frame)).await?;
                 }
-                session.send(&envelope(self.rules_tally_frame().await)).await?;
+                session
+                    .send(&envelope(self.rules_tally_frame().await))
+                    .await?;
                 Ok(())
             }
             "shell_rule_detail" => {

@@ -70,12 +70,15 @@ const MAX_CONCURRENT_CONTROL_SESSIONS: usize = 8;
 /// without one — a listener that does not supply it simply does not supersede,
 /// which is the behaviour before this existed.
 pub(crate) struct SupersedeRegistry {
-    pub sessions:
-        std::sync::Arc<
-            tokio::sync::Mutex<
-                Vec<(Uuid, Uuid, std::sync::Arc<webrtc::peer_connection::RTCPeerConnection>)>,
-            >,
+    pub sessions: std::sync::Arc<
+        tokio::sync::Mutex<
+            Vec<(
+                Uuid,
+                Uuid,
+                std::sync::Arc<webrtc::peer_connection::RTCPeerConnection>,
+            )>,
         >,
+    >,
     pub controller_device_id: Uuid,
 }
 
@@ -95,11 +98,7 @@ pub(crate) struct SupersedeRegistry {
 ///
 /// Pure, and given the live set rather than reading it, so the decision can be
 /// tested without a runtime, a broker or a peer connection.
-fn sessions_superseded_by(
-    new_session: Uuid,
-    new_device: Uuid,
-    live: &[(Uuid, Uuid)],
-) -> Vec<Uuid> {
+fn sessions_superseded_by(new_session: Uuid, new_device: Uuid, live: &[(Uuid, Uuid)]) -> Vec<Uuid> {
     live.iter()
         .filter(|(session, device)| *device == new_device && *session != new_session)
         .map(|(session, _)| *session)
@@ -474,7 +473,10 @@ pub async fn run_control_listener(
                 )
                 .await;
                 in_flight.lock().await.remove(&session_id);
-                live_sessions.lock().await.retain(|(id, _, _)| *id != session_id);
+                live_sessions
+                    .lock()
+                    .await
+                    .retain(|(id, _, _)| *id != session_id);
             });
         }
     }
@@ -541,13 +543,9 @@ async fn serve_control_session<S, R, T>(
                 registry.controller_device_id,
                 channel.peer_connection(),
             ));
-            let pairs: Vec<(Uuid, Uuid)> =
-                live.iter().map(|(s, d, _)| (*s, *d)).collect();
-            let ids = sessions_superseded_by(
-                offer.session_id,
-                registry.controller_device_id,
-                &pairs,
-            );
+            let pairs: Vec<(Uuid, Uuid)> = live.iter().map(|(s, d, _)| (*s, *d)).collect();
+            let ids =
+                sessions_superseded_by(offer.session_id, registry.controller_device_id, &pairs);
             live.iter()
                 .filter(|(id, _, _)| ids.contains(id))
                 .map(|(id, _, peer)| (*id, std::sync::Arc::clone(peer)))

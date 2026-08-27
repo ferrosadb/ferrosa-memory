@@ -241,9 +241,7 @@ impl LiveReason {
     /// Wording for the screen: a person needs to know why, not only that.
     pub fn explain(self) -> &'static str {
         match self {
-            Self::Expires => {
-                "this rule expires, and stored edges would outlive it"
-            }
+            Self::Expires => "this rule expires, and stored edges would outlive it",
             Self::NonMonotonic => {
                 "this rule uses negation, so a later fact could make a stored edge false"
             }
@@ -278,29 +276,83 @@ pub fn execution_mode(
 ///
 /// # Why this destructures exhaustively
 ///
-/// Today the grammar has no negation, so every rule is monotonic and this
-/// function is trivially `true`. That is exactly what makes it dangerous: when
-/// negation lands (`t_64ea07e9`) a function that silently kept answering `true`
-/// would hand every negated rule to the materialising path, which is the one
-/// place a negated rule must never go.
+/// So that a new field cannot silently change the answer. The body names every
+/// field of [`DatalogRule`]; adding one stops this compiling, and whoever adds
+/// it has to decide here. A compile error is the cheapest possible place to
+/// have that conversation.
 ///
-/// So the body names every field of [`DatalogRule`]. Adding one — `negated`,
-/// or any later operator that can retract a conclusion — stops this compiling,
-/// and whoever adds it has to decide here. A compile error is the cheapest
-/// possible place to have that conversation.
+/// That guard has now fired once, exactly as intended. Negation landed
+/// (`t_64ea07e9`), and this function had been trivially `true` — which would
+/// have handed every negated rule to the materialising path, the one place a
+/// negated rule must never go.
+///
+/// The two fields it caught, and why they answer differently:
+///
+/// - `negated` — a binding survives only if it matches NONE of these atoms, so
+///   adding a fact can RETRACT a conclusion that previously held. That is the
+///   definition of non-monotonic, and it is why this function now has a body.
+/// - `head_exprs` — computes head arguments rather than repeating them.
+///   Computing a value cannot withdraw a conclusion: the same bindings still
+///   derive, they merely carry a computed term. Monotonicity is unaffected.
 pub fn is_monotonic(rule: &crate::types::DatalogRule) -> bool {
     let crate::types::DatalogRule {
         head: _,
         body: _,
         filters: _,
         aggregates: _,
+        negated,
+        head_exprs: _,
     } = rule;
-    true
+    negated.is_empty()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rule with no negation only ever adds conclusions.
+    #[test]
+    fn a_rule_without_negation_is_monotonic() {
+        let rule = crate::datalog::parse_rule("p(X) :- q(X).").expect("parse");
+        assert!(is_monotonic(&rule));
+    }
+
+    /// The property the exhaustive destructure exists to protect.
+    ///
+    /// A negated body atom means a binding survives only if it matches none of
+    /// them, so adding a fact can RETRACT a conclusion that previously held.
+    /// While is_monotonic answered a hard-coded `true`, every such rule was
+    /// routed to the materialising path -- the one place its own documentation
+    /// says a negated rule must never go.
+    #[test]
+    fn a_rule_with_negation_is_not_monotonic() {
+        let rule = crate::datalog::parse_rule("p(X) :- q(X), not r(X).").expect("parse");
+        assert!(
+            !rule.negated.is_empty(),
+            "the parser did not record negation"
+        );
+        assert!(!is_monotonic(&rule));
+    }
+
+    /// A computed head argument does not withdraw anything.
+    ///
+    /// The same bindings still derive; they merely carry a computed term. This
+    /// is the other field the guard caught, and it answers the opposite way to
+    /// negation -- which is the whole reason the destructure names fields
+    /// individually rather than ending in `..`.
+    #[test]
+    fn a_computed_head_argument_does_not_make_a_rule_non_monotonic() {
+        let rule = crate::datalog::parse_rule("p(X) :- q(X), not r(X).").expect("parse");
+        let with_expr = crate::types::DatalogRule {
+            negated: Vec::new(),
+            ..rule
+        };
+        assert!(
+            is_monotonic(&with_expr),
+            "only negation should make a rule non-monotonic"
+        );
+    }
+
     use chrono::{DateTime, Utc};
 
     fn now() -> DateTime<Utc> {
@@ -377,10 +429,7 @@ mod tests {
     fn the_longest_matching_alias_is_the_one_reported() {
         let resolver = RootResolver::new([
             ("research".to_owned(), "research/corpus".to_owned()),
-            (
-                "research/skills".to_owned(),
-                "research/skills".to_owned(),
-            ),
+            ("research/skills".to_owned(), "research/skills".to_owned()),
         ]);
         let rules = [
             rule("research/corpus", Tier::Information),
@@ -533,11 +582,8 @@ mod tests {
     /// The screen must not invent a syntax the engine would reject.
     #[test]
     fn the_rendered_rule_matches_what_the_engine_emits() {
-        let engine = crate::tiers::TierRules::new([(
-            "research/skills".to_owned(),
-            Tier::Wisdom,
-        )])
-        .as_datalog();
+        let engine = crate::tiers::TierRules::new([("research/skills".to_owned(), Tier::Wisdom)])
+            .as_datalog();
         assert_eq!(
             engine,
             vec![datalog_for("research/skills", Tier::Wisdom)],

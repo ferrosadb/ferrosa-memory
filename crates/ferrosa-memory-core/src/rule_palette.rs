@@ -132,7 +132,20 @@ fn definitions() -> Vec<Definition> {
             },
             probe: r#"tier(E, "data") :- source_root(E, "x"), not source_root(E, "y")."#,
             absent_from_atoms: Some("not "),
-            requires: None,
+            // A negated atom cannot stand alone. Datalog safety requires every
+            // variable to be bound by a POSITIVE body atom, so
+            // `tier(E, ...) :- not source_root(E, "x").` leaves E unbound and
+            // would derive over everything that does not exist. The parser
+            // refuses it, and it is right to.
+            //
+            // This block was written before the parser enforced that, so it
+            // compiled a rule nothing would accept. The block's own probe had
+            // the answer all along -- it pairs the negation with
+            // `source_root(E, "x")` -- it simply never declared the dependency.
+            //
+            // `source_root(E, R)` is also the honest reading of "not in folder":
+            // entities that HAVE a source root, and whose root is not this one.
+            requires: Some("source_root(E, R)"),
             render: |v| format!("not source_root(E, \"{}\")", quote(v)),
         },
         // The string predicates from the grammar-completion work. Each is
@@ -219,10 +232,7 @@ fn supported(definition: &Definition) -> bool {
     let Some(token) = definition.absent_from_atoms else {
         return true;
     };
-    !rule
-        .body
-        .iter()
-        .any(|atom| atom.predicate.contains(token))
+    !rule.body.iter().any(|atom| atom.predicate.contains(token))
 }
 
 /// One placed block: which block, and what fills it.
@@ -304,13 +314,15 @@ pub fn compile(placed: &[Placed]) -> Result<String, CompileError> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn placed(id: &str, value: &str) -> Placed {
-        Placed { block_id: id.to_owned(), value: value.to_owned() }
+        Placed {
+            block_id: id.to_owned(),
+            value: value.to_owned(),
+        }
     }
 
     /// The ordinary case, and the shape the composer produces most often.
@@ -430,10 +442,7 @@ mod tests {
     #[test]
     fn a_quote_in_a_value_is_refused_not_stripped() {
         assert_eq!(
-            compile(&[
-                placed("in_folder", "a\"b"),
-                placed("goes_in", "wisdom"),
-            ]),
+            compile(&[placed("in_folder", "a\"b"), placed("goes_in", "wisdom"),]),
             Err(CompileError::QuoteInValue)
         );
     }
@@ -471,13 +480,13 @@ mod tests {
     fn parsing_alone_is_not_evidence_of_support() {
         let probe = r#"tier(E, "data") :- source_root(E, "x"), not source_root(E, "y")."#;
         let parsed = crate::datalog::parse_rule(probe);
-        assert!(parsed.is_ok(), "the probe must parse either way — that is the trap");
+        assert!(
+            parsed.is_ok(),
+            "the probe must parse either way — that is the trap"
+        );
 
         let rule = parsed.expect("parsed");
-        let degraded = rule
-            .body
-            .iter()
-            .any(|atom| atom.predicate.contains("not "));
+        let degraded = rule.body.iter().any(|atom| atom.predicate.contains("not "));
 
         // Whichever build this is, the palette must AGREE with the structure.
         let offers_negation = palette().iter().any(|b| b.id == "not_in_folder");
@@ -493,7 +502,9 @@ mod tests {
     #[test]
     fn no_offered_block_degraded_into_a_relation() {
         for definition in definitions() {
-            let Some(token) = definition.absent_from_atoms else { continue };
+            let Some(token) = definition.absent_from_atoms else {
+                continue;
+            };
             let offered = palette().iter().any(|b| b.id == definition.block.id);
             if !offered {
                 continue;
