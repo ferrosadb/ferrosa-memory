@@ -6,7 +6,7 @@ executive_summary: >
   statistic — plus two term kinds it skipped. This closes the capability gaps
   and gives the term kinds a final answer, so the question does not need
   asking again.
-status: todo
+status: implemented
 priority: P45
 component: ferrosa-memory-core/src/datalog.rs
 last_updated: 2026-08-27
@@ -83,3 +83,93 @@ Round 2's completeness pass named what was left. This closes it.
 Unchanged. Streaming, with the bounded family the stated and now-enumerated
 exception; additive against the pre-negation digest; no migration; fail loud;
 write-time validation.
+
+
+## Implementation Notes
+
+Five items, one commit each. Two capability gaps found nothing left behind them
+after; the term kinds are decided rather than deferred.
+
+### The grammar, complete
+
+```text
+rule      ::= head ":-" body "."
+body      ::= alternative (";" alternative)*
+alternative ::= element ("," element)*
+element   ::= atom | "not" atom | filter | aggregate | binding | "(" body ")"
+binding   ::= Var ":=" expr
+filter    ::= bool_or
+bool_or   ::= bool_and ("||" bool_and)*
+bool_and  ::= bool_not ("&&" bool_not)*
+bool_not  ::= "!"* bool_primary
+bool_primary ::= "(" filter ")" | str_pred | membership | expr cmp_op expr
+str_pred  ::= ("str_starts_with"|"str_ends_with"|"str_contains") "(" expr "," expr ")"
+membership::= expr "in" "[" expr ("," expr)* "]"
+expr      ::= term (("+" | "-") term)*
+term      ::= power (("*" | "/" | "%") power)*
+power     ::= factor ("**" power)?
+factor    ::= number | string | call | identifier | "(" expr ")" | "-" factor
+call      ::= ("abs"|"floor"|"ceil"|"round"|"len"|"lower"|"upper"|"concat") "(" expr,.. ")"
+aggregate ::= "count" "(" atom+ "," Out ")"
+            | ("sum"|"min"|"max"|"avg"|"stddev"|"count_distinct"|"median")
+              "(" atom+ "," Value "," Out ")"
+            | ("percentile"|"group_concat") "(" atom+ "," Value "," Literal "," Out ")"
+head      ::= predicate "(" (term | expr)* ")"
+```
+
+### The completeness claim, in a form that breaks
+
+Three specs in a row claimed completeness by reading the types and writing
+prose. Twice that was wrong — round 1 missed five gaps, round 2 missed one of
+its own (atom disjunction, closed for filters and written up as closed
+generally).
+
+So the claim is now a test. `the_grammar_surface_is_the_one_the_spec_signed_off`
+pins the enumerated surface: adding a variant to `AggregateKind`, `StrOp`,
+`Func`, `ArithOp`, `CmpOp` or `Term` **fails it**, forcing the next author to
+re-run the pass and record the answer rather than inheriting a stale
+"complete". Verified by adding a variant and watching it fail.
+
+It also pins that exactly three folds retain their group, because *which folds
+cannot stream* is a design decision and not an implementation detail.
+
+### Streaming, finally enumerated
+
+| Fold | Memory |
+|---|---|
+| count, sum, min, max, avg, **stddev** | one accumulator |
+| count_distinct | the distinct set, capped at 10,000 |
+| median, percentile, group_concat | the whole group, capped at 10,000 |
+
+`stddev` is in the first row because Welford computes variance in one pass. It
+was worth separating from median for that reason alone — grouping them by name
+would have hidden that one streams and the other cannot.
+
+### A pre-existing bug
+
+`split_top_level` tracked parentheses and brackets but not string literals, so
+`p(X, "a,b")` split in the middle of its own argument. Nothing had put a comma
+inside a literal until `group_concat`'s separator made it unavoidable. Fixed,
+with a regression test for the plain case and one for an escaped quote.
+
+### Declined, with reasons rather than deferrals
+
+- **Boolean term** — would give truth a second spelling that does not unify
+  with the string form already stored.
+- **Null term** — needs three-valued comparison semantics the engine
+  deliberately lacks, and would be a third no-value beside `Unbound` and
+  `Undefined`.
+- **List term** — not declined but closed: `group_concat` delivers the
+  capability, and a list would flatten to a string at the `DerivedFact`
+  boundary anyway.
+- **Integer numerals** — measured in round 2; nothing can reach the precision
+  limit. `t_cb1b3744`.
+- **Regular expressions** — ReDoS surface in a tenant-editable rule.
+
+### Verification
+
+1454 workspace lib tests, 16 in the rule contract suite, plus governance,
+tool-catalog and additivity. `clippy --workspace --all-targets -D warnings` and
+`fmt --check` clean. The pre-negation fixture digest — recorded before any of
+this work began, three PRs ago — still matches byte-for-byte. **Live-cluster
+tests were not run.**
