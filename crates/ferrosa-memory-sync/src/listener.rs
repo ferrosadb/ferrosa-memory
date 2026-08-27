@@ -64,6 +64,55 @@ fn memory_tenant(configured: Option<&str>) -> Option<Uuid> {
 /// slots free rather than being refused.
 const MAX_CONCURRENT_CONTROL_SESSIONS: usize = 8;
 
+/// The live sessions a new one is checked against, and the device claiming it.
+///
+/// Optional at the call site so every existing caller and test keeps working
+/// without one — a listener that does not supply it simply does not supersede,
+/// The live control sessions a listener may supersede.
+///
+/// A named type because the shape is repeated and clippy is right that the
+/// inline form is unreadable: the tuple is (session id, controller device id,
+/// the peer connection to close). Naming it also makes the ORDER of the two
+/// uuids explicit at every use, which an anonymous `(Uuid, Uuid, _)` does not.
+pub(crate) type LiveSessions = std::sync::Arc<
+    tokio::sync::Mutex<
+        Vec<(
+            Uuid,
+            Uuid,
+            std::sync::Arc<webrtc::peer_connection::RTCPeerConnection>,
+        )>,
+    >,
+>;
+
+/// which is the behaviour before this existed.
+pub(crate) struct SupersedeRegistry {
+    pub sessions: LiveSessions,
+    pub controller_device_id: Uuid,
+}
+
+/// Which live sessions a new one displaces.
+///
+/// One session per controller device. A device that reconnects — because it
+/// backgrounded, changed network, or lost ICE — offers a NEW session, and
+/// without this the old one is served alongside it until its ICE eventually
+/// times out. Six accumulated from a single phone before this was found, each
+/// dying about a minute later, which is what the operator experienced as the
+/// connection dropping.
+///
+/// It also protects the concurrency cap. `MAX_CONCURRENT_CONTROL_SESSIONS` is
+/// eight because that "covers a person's own devices" — an assumption that only
+/// holds at one session each. One phone holding six slots starves the tablet
+/// and the laptop queued behind it.
+///
+/// Pure, and given the live set rather than reading it, so the decision can be
+/// tested without a runtime, a broker or a peer connection.
+fn sessions_superseded_by(new_session: Uuid, new_device: Uuid, live: &[(Uuid, Uuid)]) -> Vec<Uuid> {
+    live.iter()
+        .filter(|(session, device)| *device == new_device && *session != new_session)
+        .map(|(session, _)| *session)
+        .collect()
+}
+
 /// Wait added per consecutive failed poll.
 const POLL_BACKOFF_BASE: Duration = Duration::from_millis(500);
 
@@ -311,6 +360,11 @@ pub async fn run_control_listener(
     // tablet and an iPad on one account that is the normal case, not an edge.
     let in_flight: Arc<tokio::sync::Mutex<std::collections::HashSet<Uuid>>> =
         Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+    // Live sessions and who owns them, so a device that reconnects displaces
+    // its own previous session instead of being served twice. `in_flight`
+    // cannot answer this: it is keyed by SESSION, and a reconnect is a new
+    // session id by definition.
+    let live_sessions: LiveSessions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     // Bounded so a flood of offers cannot exhaust the host. Sessions beyond the
     // cap stay pending on the broker and are picked up as slots free.
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONTROL_SESSIONS));
@@ -400,6 +454,8 @@ pub async fn run_control_listener(
             let fingerprint = fingerprint.clone();
             let rtc = rtc_api.clone();
             let attach = hooks.clone();
+            let live_sessions = Arc::clone(&live_sessions);
+            let controller_device_id = offer.controller_device_id;
             // Kept because `offer` moves into the call below, and the id is
             // needed afterwards to release the in-flight slot.
             let session_id = offer.session_id;
@@ -416,9 +472,17 @@ pub async fn run_control_listener(
                     offer,
                     rtc,
                     attach,
+                    Some(SupersedeRegistry {
+                        sessions: Arc::clone(&live_sessions),
+                        controller_device_id,
+                    }),
                 )
                 .await;
                 in_flight.lock().await.remove(&session_id);
+                live_sessions
+                    .lock()
+                    .await
+                    .retain(|(id, _, _)| *id != session_id);
             });
         }
     }
@@ -443,6 +507,7 @@ async fn serve_control_session<S, R, T>(
     offer: crate::signaling_client::ControlBrokerSessionView,
     rtc: Option<std::sync::Arc<webrtc::api::API>>,
     attach: Vec<std::sync::Arc<dyn SessionExtension>>,
+    supersede: Option<SupersedeRegistry>,
 ) where
     S: crate::signaling_client::ControlSignalingApi,
     R: crate::control_session::AgentRuntime,
@@ -472,6 +537,39 @@ async fn serve_control_session<S, R, T>(
         peer: channel.peer_connection(),
         sink: channel.frame_sink(),
     };
+
+    // One session per controller device. Registering BEFORE displacing means
+    // the new session is already in the list when the decision runs, which is
+    // why that decision refuses to supersede itself.
+    if let Some(registry) = &supersede {
+        let doomed = {
+            let mut live = registry.sessions.lock().await;
+            live.push((
+                offer.session_id,
+                registry.controller_device_id,
+                channel.peer_connection(),
+            ));
+            let pairs: Vec<(Uuid, Uuid)> = live.iter().map(|(s, d, _)| (*s, *d)).collect();
+            let ids =
+                sessions_superseded_by(offer.session_id, registry.controller_device_id, &pairs);
+            live.iter()
+                .filter(|(id, _, _)| ids.contains(id))
+                .map(|(id, _, peer)| (*id, std::sync::Arc::clone(peer)))
+                .collect::<Vec<_>>()
+        };
+        for (old, peer) in doomed {
+            // Said out loud: an operator whose screen goes blank deserves the
+            // reason in the log, and "superseded" is a different event from
+            // "the peer went away".
+            tracing::info!(
+                superseded = %old,
+                by = %offer.session_id,
+                device = %registry.controller_device_id,
+                "a newer session from this device supersedes an older one"
+            );
+            let _ = peer.close().await;
+        }
+    }
     for extension in &attach {
         // Logged, not fatal, and the next extension still runs. One failing
         // must not cost the operator the others, nor the control channel
@@ -565,7 +663,7 @@ async fn session_work<R, T>(
     // request can build one of its own to race against.
     let request_peer_state = peer_state.clone();
     // Bounds how much database work one device can have running at once.
-    let durable_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_DURABLE_IN_FLIGHT));
+    let durable_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(max_durable_in_flight()));
     let mut lost = std::pin::pin!(peer_lost(peer_state, PEER_DISCONNECT_GRACE));
     loop {
         let frame = tokio::select! {
@@ -604,36 +702,36 @@ async fn session_work<R, T>(
             // the tier map stopped scanning, ~400 ms now, and in both cases
             // for no reason: the tmux surface touches no database.
             if frame_priority(&kind) == FramePriority::Durable {
-                let Ok(permit) = std::sync::Arc::clone(&durable_slots).try_acquire_owned() else {
-                    // Refused, not queued. Queuing here would rebuild the head
-                    // -of-line blocking this removes, one layer down, and a
-                    // device that has already asked twice is better told so
-                    // than left waiting.
-                    tracing::warn!(
-                        session_id = %offer.session_id,
-                        %kind,
-                        "too many durable requests in flight; refusing this one"
-                    );
-                    if let Some(reply) = frame_id_of(&frame).and_then(|id| {
-                        crate::control_session::capability_unavailable_reply(
-                            &id,
-                            "too many database requests in flight",
-                        )
-                    }) && channel.send_text(&reply).await.is_err()
-                    {
-                        break;
-                    }
-                    continue;
-                };
+                // Acquired INSIDE the task, and awaited rather than tried.
+                // The work is already off the loop, so waiting for a slot
+                // costs this request and nothing else -- and refusing instead
+                // sent back a capability_unavailable that no shell renders,
+                // which the operator saw as a spinner that never resolved.
+                let slots = std::sync::Arc::clone(&durable_slots);
                 let extension = extension.clone();
                 let handle = handle.clone();
                 let body = frame_json(&frame);
                 let states = request_peer_state.clone();
                 let session_id = offer.session_id;
                 tokio::spawn(async move {
-                    let _permit = permit;
+                    // The WAIT for a slot is inside `serve_request`, not before
+                    // it. Acquiring first left the queue unbounded: the deadline
+                    // and the peer-loss watch both started only once a permit
+                    // was in hand, so a request that never got one waited
+                    // forever and never noticed the operator leaving. Tasks
+                    // stacked up behind a slot that was not coming back.
+                    //
+                    // Inside, both bounds cover it. Dropping the future removes
+                    // this waiter from the semaphore queue -- tokio's
+                    // `acquire_owned` is cancel-safe -- so a timed-out or
+                    // abandoned request stops competing for slots instead of
+                    // leaking one.
+                    let started = std::time::Instant::now();
                     let outcome = serve_request(
-                        extension.on_request(&handle, &kind, &body),
+                        async {
+                            let _permit = slots.acquire_owned().await;
+                            extension.on_request(&handle, &kind, &body).await
+                        },
                         async {
                             peer_lost(states, PEER_DISCONNECT_GRACE).await;
                         },
@@ -641,7 +739,15 @@ async fn session_work<R, T>(
                     )
                     .await;
                     match outcome {
-                        RequestOutcome::Served => {}
+                        RequestOutcome::Served => {
+                            let took = started.elapsed();
+                            if took >= SLOW_REQUEST {
+                                tracing::warn!(
+                                    %session_id, %kind, took_ms = took.as_millis() as u64,
+                                    "a request was served slowly; a device was waiting on it"
+                                );
+                            }
+                        }
                         RequestOutcome::Refused(error) => tracing::warn!(
                             %session_id, %kind, %error,
                             "session extension refused a request"
@@ -655,6 +761,7 @@ async fn session_work<R, T>(
                 continue;
             }
 
+            let started = std::time::Instant::now();
             let outcome = serve_request(
                 extension.on_request(handle, &kind, &frame_json(&frame)),
                 async {
@@ -664,7 +771,17 @@ async fn session_work<R, T>(
             )
             .await;
             match outcome {
-                RequestOutcome::Served => {}
+                RequestOutcome::Served => {
+                    let took = started.elapsed();
+                    if took >= SLOW_REQUEST {
+                        tracing::warn!(
+                            session_id = %offer.session_id,
+                            %kind,
+                            took_ms = took.as_millis() as u64,
+                            "a request was served slowly; a device was waiting on it"
+                        );
+                    }
+                }
                 // The request failed; the session did not. A screen that could
                 // not be captured is a screen that could not be captured, not a
                 // reason to disconnect a working control channel.
@@ -829,35 +946,107 @@ enum FramePriority {
 
 /// Classify one frame kind.
 ///
-/// The tmux surface is enumerated rather than pattern-matched on a prefix,
-/// because a prefix rule silently promotes whatever is added next. Everything
-/// not named here is Durable, which is the safe direction: guessing
-/// Interactive would put an unclassified command -- possibly a query someone
-/// adds later without reading this -- back on the path this exists to keep
-/// clear. Guessing Durable costs one yield.
+/// The DURABLE set is enumerated and everything else is Interactive. That is
+/// the opposite of the first attempt, which listed the interactive kinds and
+/// defaulted the rest to Durable -- and which broke the app, because the
+/// unlisted kinds were not queries at all. `input_event` carries remote
+/// keyboard and pointer, and the `visual_*` family carries WebRTC negotiation;
+/// none of them touch a database, and all of them went down the throttled path
+/// and were refused.
+///
+/// The two mistakes do not cost the same. Calling an interactive frame Durable
+/// throttles input and refuses it, which the device cannot even render.
+/// Calling a durable frame Interactive puts one slow request back on the loop,
+/// which is what the code did before any of this existed. So the default must
+/// be Interactive, and the database-backed set -- closed, small, and all in
+/// one file -- is the one to enumerate.
 fn frame_priority(kind: &str) -> FramePriority {
     match kind {
-        "shell_open"
-        | "shell_input"
-        | "shell_resize"
-        | "shell_scroll"
-        | "shell_close"
-        | "shell_list"
-        | "shell_delete_session"
-        | "shell_add_config"
-        | "shell_update_config"
-        | "shell_delete_config" => FramePriority::Interactive,
-        _ => FramePriority::Durable,
+        "shell_knowledge"
+        | "shell_knowledge_claims"
+        | "shell_knowledge_detail"
+        | "shell_knowledge_decide"
+        | "shell_memory_tiers"
+        | "shell_memory_items"
+        | "shell_tasks"
+        | "shell_task"
+        | "shell_task_search"
+        | "shell_task_complete"
+        | "shell_dispatch" => FramePriority::Durable,
+        _ => FramePriority::Interactive,
     }
 }
 
 /// How many durable requests one session may have in flight.
 ///
-/// Two. Enough that a board read and a memory read overlap rather than
-/// queueing, few enough that a device cannot aim a stack of queries at the
-/// cluster -- which is how the Memory tab starved the control cursor's writes
-/// and took sessions down with it.
-const MAX_DURABLE_IN_FLIGHT: usize = 2;
+/// Four by default, and requests WAIT for a slot rather than being refused.
+///
+/// Two-and-refuse was the first attempt and it was wrong twice over. Opening a
+/// task detail legitimately issues several reads at once, so the cap was hit in
+/// normal use; and the refusal goes back as `capability_unavailable`, which no
+/// shell renders, so the device simply spun.
+///
+/// Waiting is safe here in a way it would not have been on the loop. The
+/// request is already spawned, so blocking on a permit blocks only that task --
+/// the interactive path never sees it, and an `.await` on a permit parks the
+/// task rather than holding a worker thread. The original "refuse, do not
+/// queue" reasoning confused queueing ON the loop, which rebuilds head-of-line
+/// blocking, with queueing inside a task, which does not.
+///
+/// The wait is bounded: it happens inside `serve_request`, so it ends at
+/// `REQUEST_DEADLINE` or when the peer goes away, whichever comes first.
+///
+/// Overridable with `FERROSA_MEMORY_MAX_DURABLE_IN_FLIGHT` so this can be tuned
+/// against a slow cluster without a rebuild. The effective value is logged once
+/// at startup, and a value that cannot be used is reported rather than quietly
+/// ignored -- a cap of zero would park every durable request until its deadline.
+const MAX_DURABLE_IN_FLIGHT_DEFAULT: usize = 4;
+
+/// Environment override for [`MAX_DURABLE_IN_FLIGHT_DEFAULT`].
+const MAX_DURABLE_IN_FLIGHT_ENV: &str = "FERROSA_MEMORY_MAX_DURABLE_IN_FLIGHT";
+
+/// Resolve the cap from a raw environment value.
+///
+/// Separated from the lookup so the parsing rules are testable without setting
+/// process-wide state. `None` is "unset", which is not a problem; anything set
+/// but unusable IS a problem and is reported by the caller.
+fn parse_max_durable_in_flight(raw: Option<&str>) -> Result<usize, String> {
+    let Some(raw) = raw else {
+        return Ok(MAX_DURABLE_IN_FLIGHT_DEFAULT);
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(0) => Err("a cap of zero would park every durable request".to_owned()),
+        Ok(value) => Ok(value),
+        Err(error) => Err(format!("{error}")),
+    }
+}
+
+/// The cap in force for this process, read once.
+fn max_durable_in_flight() -> usize {
+    static RESOLVED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        let raw = std::env::var(MAX_DURABLE_IN_FLIGHT_ENV).ok();
+        let value = match parse_max_durable_in_flight(raw.as_deref()) {
+            Ok(value) => value,
+            Err(why) => {
+                tracing::error!(
+                    env = MAX_DURABLE_IN_FLIGHT_ENV,
+                    value = raw.as_deref().unwrap_or(""),
+                    %why,
+                    default = MAX_DURABLE_IN_FLIGHT_DEFAULT,
+                    "unusable durable-request cap; falling back to the default"
+                );
+                MAX_DURABLE_IN_FLIGHT_DEFAULT
+            }
+        };
+        tracing::info!(
+            env = MAX_DURABLE_IN_FLIGHT_ENV,
+            max_durable_in_flight = value,
+            "durable request concurrency"
+        );
+        value
+    })
+}
 
 /// How one extension request ended.
 #[derive(Debug)]
@@ -869,6 +1058,15 @@ enum RequestOutcome {
     /// Nobody is waiting for this any more, so it was dropped.
     Cancelled(&'static str),
 }
+/// How long a request may take before it is worth a log line.
+///
+/// A served request logs nothing: at a few hundred a session that would bury
+/// everything else. But a SLOW one is the thing that leaves a spinner on a
+/// screen, and until this existed a hung request left no trace at all — a
+/// search that never came back could not be told apart from one that was never
+/// sent. Well under the deadline, so a request that is merely slow is visible
+/// long before it is abandoned.
+const SLOW_REQUEST: Duration = Duration::from_secs(3);
 
 /// How long one extension request may run before it is abandoned.
 ///
@@ -957,6 +1155,16 @@ fn frame_outcome(
         Ok(Some(reply)) => FrameOutcome::Reply(reply),
         Ok(None) => FrameOutcome::Nothing,
         Err(crate::control_session::ControlSessionError::CapabilityUnavailable(reason)) => {
+            let reply = frame_id_of(frame).and_then(|frame_id| {
+                crate::control_session::capability_unavailable_reply(&frame_id, &reason)
+            });
+            FrameOutcome::Degrade { reply, reason }
+        }
+        // Same treatment, same reasoning: a frame nothing serves is a missing
+        // capability, and a session carrying a working terminal must survive
+        // being asked for something this build does not have.
+        Err(error @ crate::control_session::ControlSessionError::UnknownKind(_)) => {
+            let reason = error.to_string();
             let reply = frame_id_of(frame).and_then(|frame_id| {
                 crate::control_session::capability_unavailable_reply(&frame_id, &reason)
             });
@@ -1073,6 +1281,78 @@ async fn peer_lost(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod supersede_tests {
+    use super::*;
+
+    fn dev(n: u8) -> Uuid {
+        Uuid::from_bytes([n; 16])
+    }
+    fn sess(n: u8) -> Uuid {
+        Uuid::from_bytes([0xF0 | n; 16])
+    }
+
+    /// The ordinary first connection. Nothing to displace.
+    #[test]
+    fn a_first_session_from_a_device_supersedes_nothing() {
+        assert!(sessions_superseded_by(sess(1), dev(1), &[]).is_empty());
+    }
+
+    /// The bug, stated. A phone that reconnects had BOTH sessions served, and
+    /// the older one was left to die on an ICE timeout — which is what the
+    /// operator saw as the connection dropping.
+    #[test]
+    fn a_reconnecting_device_supersedes_its_own_previous_session() {
+        let live = [(sess(1), dev(1))];
+        assert_eq!(
+            sessions_superseded_by(sess(2), dev(1), &live),
+            vec![sess(1)]
+        );
+    }
+
+    /// Six had piled up on one phone before this was found, so one is not the
+    /// only case that matters.
+    #[test]
+    fn every_stale_session_from_that_device_is_superseded() {
+        let live = [(sess(1), dev(1)), (sess(2), dev(1)), (sess(3), dev(1))];
+        assert_eq!(
+            sessions_superseded_by(sess(4), dev(1), &live),
+            vec![sess(1), sess(2), sess(3)]
+        );
+    }
+
+    /// The tablet must not be hung up on because the phone reconnected. This
+    /// is the whole reason the rule is per DEVICE and not "one session".
+    #[test]
+    fn another_devices_session_is_never_superseded() {
+        let live = [(sess(1), dev(2))];
+        assert!(sessions_superseded_by(sess(2), dev(1), &live).is_empty());
+    }
+
+    #[test]
+    fn only_the_matching_device_is_superseded_among_several() {
+        let live = [
+            (sess(1), dev(1)),
+            (sess(2), dev(2)),
+            (sess(3), dev(1)),
+            (sess(4), dev(3)),
+        ];
+        assert_eq!(
+            sessions_superseded_by(sess(9), dev(1), &live),
+            vec![sess(1), sess(3)]
+        );
+    }
+
+    /// A session must never end itself. The registry may already contain the
+    /// new session by the time this runs, and superseding it would hang up on
+    /// the connection being established.
+    #[test]
+    fn a_session_never_supersedes_itself() {
+        let live = [(sess(1), dev(1))];
+        assert!(sessions_superseded_by(sess(1), dev(1), &live).is_empty());
     }
 }
 
@@ -1306,6 +1586,40 @@ mod tests {
                 assert_eq!(reply["body"]["type"], "capability_unavailable");
             }
             other => panic!("a store failure must not end the session; got {other:?}"),
+        }
+    }
+
+    /// A frame kind nothing serves must be REFUSED, not fatal.
+    ///
+    /// This is the whole outage. The four shell_knowledge kinds had handlers
+    /// and were not claimed, so they reached the built-in dispatcher, which
+    /// called an unrecognised body type a protocol violation and closed the
+    /// channel. Every session died within a second of opening.
+    ///
+    /// A newer app asking an older build for something it does not have is the
+    /// ordinary state of a fleet mid-upgrade. It gets the same answer a hot
+    /// database gets: say what is missing, keep the channel.
+    #[test]
+    fn a_frame_kind_nothing_serves_is_refused_rather_than_fatal() {
+        let outcome = frame_outcome(
+            Err(ControlSessionError::UnknownKind(
+                "shell_knowledge_claims".to_owned(),
+            )),
+            &command_frame("knowledge-1"),
+        );
+        match outcome {
+            FrameOutcome::Degrade { reply, reason } => {
+                assert!(
+                    reason.contains("shell_knowledge_claims"),
+                    "the refusal must name the kind so a device can say what is \
+                     missing; got {reason}"
+                );
+                let reply: serde_json::Value =
+                    serde_json::from_str(&reply.expect("a correlated reply")).expect("json");
+                assert_eq!(reply["frame_id"], "knowledge-1");
+                assert_eq!(reply["body"]["type"], "capability_unavailable");
+            }
+            other => panic!("an unknown kind must not end the session; got {other:?}"),
         }
     }
 
@@ -1603,17 +1917,148 @@ mod tests {
         }
     }
 
-    /// An unknown kind is treated as Durable, not Interactive.
+    /// Remote input and video signalling are interactive.
     ///
-    /// Deliberate: guessing Interactive would put an unclassified command --
-    /// possibly a query added later by someone who did not read this -- back
-    /// onto the path this exists to keep clear. Guessing Durable costs it a
-    /// yield and nothing else.
+    /// This is the regression. They are not `shell_*` frames, so a rule that
+    /// listed the interactive kinds and defaulted the rest to Durable sent
+    /// every keystroke, pointer move and video negotiation frame down the
+    /// throttled path. Observed on the desktop app: 21 `input_event` frames
+    /// refused with "too many durable requests in flight", and a task detail
+    /// that spun forever, because the device cannot render the refusal.
     #[test]
-    fn an_unknown_frame_yields_rather_than_taking_the_fast_path() {
+    fn remote_input_and_video_signalling_are_interactive() {
+        for kind in [
+            "input_event",
+            "visual_offer",
+            "visual_answer",
+            "visual_start",
+            "visual_stop",
+            "visual_pause",
+            "visual_resume",
+            "visual_layout",
+        ] {
+            assert_eq!(
+                frame_priority(kind),
+                FramePriority::Interactive,
+                "{kind} carries no database work and must not be throttled"
+            );
+        }
+    }
+
+    /// Unset means the default, which is the common case and not a problem.
+    #[test]
+    fn an_absent_cap_is_the_default() {
         assert_eq!(
-            frame_priority("shell_something_new"),
-            FramePriority::Durable
+            parse_max_durable_in_flight(None),
+            Ok(MAX_DURABLE_IN_FLIGHT_DEFAULT)
+        );
+        assert_eq!(MAX_DURABLE_IN_FLIGHT_DEFAULT, 4);
+    }
+
+    /// An operator can tune it without a rebuild.
+    #[test]
+    fn a_set_cap_overrides_the_default() {
+        assert_eq!(parse_max_durable_in_flight(Some("12")), Ok(12));
+        assert_eq!(parse_max_durable_in_flight(Some("  7 ")), Ok(7));
+    }
+
+    /// Set-but-unusable is reported, never silently treated as the default by
+    /// the parser. A zero cap parks every durable request until its deadline,
+    /// which would look exactly like the hang this whole path exists to remove.
+    #[test]
+    fn an_unusable_cap_is_an_error_not_a_shrug() {
+        assert!(parse_max_durable_in_flight(Some("0")).is_err());
+        assert!(parse_max_durable_in_flight(Some("")).is_err());
+        assert!(parse_max_durable_in_flight(Some("lots")).is_err());
+        assert!(parse_max_durable_in_flight(Some("-1")).is_err());
+    }
+
+    /// Waiting for a slot must not outlive the request's deadline.
+    ///
+    /// The regression this guards: acquiring the permit BEFORE `serve_request`
+    /// started neither the deadline nor the peer-loss watch until a permit was
+    /// in hand, so a request that never got one waited forever and the tasks
+    /// stacked up. Here every permit is taken and never released, so the only
+    /// way this returns is the deadline firing on the wait itself.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_waiting_for_a_slot_still_times_out() {
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let held = std::sync::Arc::clone(&slots).acquire_owned().await.unwrap();
+
+        let outcome = serve_request(
+            async {
+                let _permit = std::sync::Arc::clone(&slots).acquire_owned().await;
+                Ok(())
+            },
+            std::future::pending::<()>(),
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, RequestOutcome::Cancelled(_)),
+            "a request that never gets a slot must end at its deadline, got {outcome:?}"
+        );
+        drop(held);
+    }
+
+    /// A cancelled waiter must stop competing for slots.
+    ///
+    /// If dropping the future left it queued, every timed-out request would
+    /// still be ahead of the next real one and the cap would drain to nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_waiter_releases_its_place_in_the_queue() {
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let held = std::sync::Arc::clone(&slots).acquire_owned().await.unwrap();
+
+        // A waiter that gives up.
+        let abandoned = serve_request(
+            async {
+                let _permit = std::sync::Arc::clone(&slots).acquire_owned().await;
+                Ok(())
+            },
+            std::future::pending::<()>(),
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(abandoned, RequestOutcome::Cancelled(_)));
+
+        // The slot frees; the next request gets it immediately rather than
+        // queueing behind the one that walked away.
+        drop(held);
+        let served = serve_request(
+            async {
+                let _permit = std::sync::Arc::clone(&slots).acquire_owned().await;
+                Ok(())
+            },
+            std::future::pending::<()>(),
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(
+            matches!(served, RequestOutcome::Served),
+            "the freed slot should go to a live request, got {served:?}"
+        );
+    }
+
+    /// An unknown kind is Interactive, deliberately the opposite of how this
+    /// started.
+    ///
+    /// The first version defaulted to Durable, reasoning that an unclassified
+    /// command might be a query. The actual population of unclassified kinds
+    /// turned out to be input and video signalling, and throttling those to
+    /// two in flight broke the app outright. The costs are not symmetric:
+    /// mistaking interactive for durable REFUSES input, while mistaking
+    /// durable for interactive puts one slow request back on the loop, which
+    /// is merely what the code did before any of this existed.
+    ///
+    /// The database-backed set is closed, small, and lives in one file. The
+    /// interactive set is open and grows. Enumerate the closed one.
+    #[test]
+    fn an_unknown_frame_is_interactive() {
+        assert_eq!(
+            frame_priority("something_added_later"),
+            FramePriority::Interactive
         );
     }
 }

@@ -1,0 +1,25 @@
+{
+  "baseUrl": "http://192.168.14.154:8787",
+  "docRoot": ".",
+  "viewports": ["1440x900", "390x844"],
+  "whitespaceThreshold": 200,
+  "tokenSources": [
+    { "label": "generated ferrosa tokens", "path": "tokens.generated.css", "prefix": "" }
+  ],
+  "checks": [
+    ["text", "bg", 4.5, "body text"],
+    ["text", "surface", 4.5, "body text on a surface"],
+    ["text-muted", "surface", 4.5, "muted text"],
+    ["text-subtle", "surface", 4.5, "subtle text"],
+    ["primary", "surface", 4.5, "primary as a link or label"],
+    ["accent", "surface", 4.5, "accent as code or data"],
+    ["success", "surface", 4.5, "status word"],
+    ["warning", "surface", 4.5, "status word"],
+    ["danger", "surface", 4.5, "status word"],
+    ["text-on-primary", "primary", 4.5, "primary button label"],
+    ["border", "surface", 3.0, "component boundary (1.4.11)"],
+    ["border", "bg", 3.0, "component boundary (1.4.11)"]
+  ],
+  "pages": ["index.html"],
+  "uniform": []
+}

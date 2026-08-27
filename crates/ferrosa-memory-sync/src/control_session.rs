@@ -2,16 +2,16 @@
 //!
 //! Correctness: the peer identity is bound to the exact SDP pair, inbound
 //! queues and frames are bounded, and typed commands persist before execution.
-//! Last revised: 2026-08-19
-//! Last changed: Added idempotent agent-launch dispatch and durable completion.
+//! Last revised: 2026-08-25
+//! Last changed: Split durable replay at the frame bound without skipping events.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
 use ferrosa_memory_core::control_store::{
-    CommandInsert, ControlCommand, ControlCommandState, ControlCommandUpdate, ControlEventDraft,
-    ControlStore, MAX_CONTROL_REPLAY_EVENTS,
+    CommandInsert, ControlCommand, ControlCommandState, ControlCommandUpdate, ControlEvent,
+    ControlEventDraft, ControlStore, MAX_CONTROL_REPLAY_EVENTS,
 };
 use ferrosa_memory_core::remote_identity::{
     InstancePublicIdentity, InstanceSigningIdentity, SignedEnvelope,
@@ -160,6 +160,20 @@ pub enum ControlSessionError {
     /// stay up and say which capability is missing.
     #[error("control capability unavailable: {0}")]
     CapabilityUnavailable(String),
+    /// The peer sent a frame kind nothing on this machine serves.
+    ///
+    /// Not a protocol violation. A newer app asking for something this build
+    /// does not have is the ordinary state of a fleet mid-upgrade, and the
+    /// answer is to say so — not to drop a channel that is carrying a working
+    /// terminal.
+    ///
+    /// This was fatal, and it took down every session: the phone gained a
+    /// Knowledge tab whose four frame kinds the extension had handlers for but
+    /// never listed in `kinds()`, so they reached this dispatcher instead. Once
+    /// the app began loading claims on connect rather than on opening the tab,
+    /// the first frame of every session closed it.
+    #[error("no capability serves {0} on this machine")]
+    UnknownKind(String),
     /// Local consumer did not keep up with the bounded inbound queue.
     #[error("control inbound queue is full")]
     Backpressure,
@@ -1063,10 +1077,19 @@ pub async fn control_application_reply<S: ControlStore>(
         .get("body")
         .and_then(serde_json::Value::as_object)
         .ok_or_else(|| ControlSessionError::Protocol("missing body".to_owned()))?;
-    if body.get("type").and_then(serde_json::Value::as_str) != Some("subscribe") {
+    // `liveness_reply` above already refuses a body carrying no type, so a
+    // frame reaching here HAS one. Stated as a guard rather than a default
+    // string: a placeholder would have read like a real kind in the refusal,
+    // and would go quietly wrong if that earlier check ever moved.
+    let Some(body_type) = body.get("type").and_then(serde_json::Value::as_str) else {
         return Err(ControlSessionError::Protocol(
-            "unsupported control body type".to_owned(),
+            "missing body type".to_owned(),
         ));
+    };
+    if body_type != "subscribe" {
+        // Refused, not fatal: an unclaimed kind means no extension serves it,
+        // which is a missing capability rather than a peer sending nonsense.
+        return Err(ControlSessionError::UnknownKind(body_type.to_owned()));
     }
     let after_cursor = match body.get("after_cursor") {
         None | Some(serde_json::Value::Null) => None,
@@ -1101,31 +1124,70 @@ pub async fn control_application_reply<S: ControlStore>(
         .map_err(|error| {
             ControlSessionError::Protocol(format!("durable replay failed: {error}"))
         })?;
-    let events: Vec<_> = page
-        .events
-        .into_iter()
-        .map(|event| {
-            serde_json::json!({
-                "cursor": event.cursor,
-                "event_id": event.event_id.to_string(),
-                "command_id": event.command_id.map(|value| value.to_string()),
-                "kind": event.kind,
-                "payload": event.payload,
-                "created_at": event.created_at,
-            })
-        })
-        .collect();
-    serde_json::to_string(&serde_json::json!({
-        "version": CONTROL_PROTOCOL_VERSION,
-        "frame_id": frame_id,
-        "body": {
-            "type": "event_batch",
-            "high_water_cursor": page.high_water_cursor,
-            "events": events,
-        },
-    }))
-    .map(Some)
-    .map_err(|error| ControlSessionError::Protocol(format!("event batch encode: {error}")))
+    encode_event_batch(frame_id, page.high_water_cursor, page.events).map(Some)
+}
+
+/// Encode the largest ordered event prefix that fits one control frame.
+///
+/// Each durable payload is bounded independently, but their JSON envelope can
+/// still exceed the data-channel limit when a replay page contains several
+/// terminal events. The returned high-water cursor advances only through the
+/// last encoded event, so the next subscription receives every omitted event.
+fn encode_event_batch(
+    frame_id: &str,
+    final_high_water_cursor: u64,
+    events: Vec<ControlEvent>,
+) -> Result<String, ControlSessionError> {
+    let frame_id = serde_json::to_string(frame_id)
+        .map_err(|error| ControlSessionError::Protocol(format!("frame id encode: {error}")))?;
+    let envelope_bytes = event_batch_json(&frame_id, u64::MAX, "").len();
+    let event_count = events.len();
+    let mut encoded_events = Vec::with_capacity(event_count);
+    let mut encoded_bytes = envelope_bytes;
+    let mut last_cursor = None;
+
+    for event in events {
+        let cursor = event.cursor;
+        let encoded = serde_json::to_string(&serde_json::json!({
+            "cursor": cursor,
+            "event_id": event.event_id.to_string(),
+            "command_id": event.command_id.map(|value| value.to_string()),
+            "kind": event.kind,
+            "payload": event.payload,
+            "created_at": event.created_at,
+        }))
+        .map_err(|error| ControlSessionError::Protocol(format!("event encode: {error}")))?;
+        let delimiter_bytes = if encoded_events.is_empty() { 0 } else { 1 };
+        let candidate_bytes = encoded_bytes + delimiter_bytes + encoded.len();
+        if candidate_bytes > MAX_CONTROL_FRAME_BYTES {
+            if encoded_events.is_empty() {
+                return Err(ControlSessionError::FrameTooLarge {
+                    actual: candidate_bytes,
+                    limit: MAX_CONTROL_FRAME_BYTES,
+                });
+            }
+            break;
+        }
+        encoded_bytes = candidate_bytes;
+        last_cursor = Some(cursor);
+        encoded_events.push(encoded);
+    }
+
+    let high_water_cursor = if encoded_events.len() == event_count {
+        final_high_water_cursor
+    } else {
+        last_cursor.expect("a truncated batch contains at least one event")
+    };
+    let events = encoded_events.join(",");
+    let reply = event_batch_json(&frame_id, high_water_cursor, &events);
+    debug_assert!(reply.len() <= MAX_CONTROL_FRAME_BYTES);
+    Ok(reply)
+}
+
+fn event_batch_json(frame_id: &str, high_water_cursor: u64, events: &str) -> String {
+    format!(
+        r#"{{"version":{CONTROL_PROTOCOL_VERSION},"frame_id":{frame_id},"body":{{"type":"event_batch","high_water_cursor":{high_water_cursor},"events":[{events}]}}}}"#
+    )
 }
 
 /// Runtime seam for typed agent commands. The control protocol never exposes
@@ -1708,6 +1770,37 @@ mod tests {
         InstanceSigningIdentity::generate(InstanceId::new())
     }
 
+    async fn append_large_terminal_events(
+        store: &InMemoryControlStore,
+        ctx: &TenantContext,
+        server: &str,
+    ) -> ferrosa_memory_core::control_store::CursorBlock {
+        let block = store
+            .reserve_cursor_block(ctx, server, 8)
+            .await
+            .expect("reserve cursors");
+        for offset in 0..6 {
+            store
+                .append_event(
+                    ctx,
+                    server,
+                    ControlEventDraft {
+                        cursor: block.start + offset,
+                        event_id: Uuid::now_v7(),
+                        command_id: None,
+                        kind: "terminal".to_owned(),
+                        payload: serde_json::json!({
+                            "text": "x".repeat(MAX_AGENT_RESULT_TEXT_BYTES),
+                        }),
+                        created_at: Utc::now(),
+                    },
+                )
+                .await
+                .expect("append bounded terminal event");
+        }
+        block
+    }
+
     /// `parse_hex_32` decodes every byte value, and rejects malformed input.
     ///
     /// Cover for the `as_chunks::<2>()` rewrite: the decoder walks fixed-size
@@ -1824,6 +1917,58 @@ mod tests {
         assert!(liveness_reply(future).is_err());
     }
 
+    /// An unrecognised body type is a MISSING CAPABILITY, not a violation.
+    ///
+    /// The distinction is the whole outage: four shell_knowledge kinds reached
+    /// this parser because the extension never claimed them, and calling them
+    /// protocol violations closed the channel — every session, within a second.
+    #[tokio::test]
+    async fn an_unrecognised_body_type_is_a_missing_capability() {
+        let store = InMemoryControlStore::default();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "control-test".to_owned(),
+        };
+        let request = r#"{"version":1,"frame_id":"k-1","body":{"type":"shell_knowledge_claims"}}"#;
+        let error = control_application_reply(&store, &ctx, "server-fingerprint", request)
+            .await
+            .expect_err("nothing serves that kind");
+        assert!(
+            matches!(error, ControlSessionError::UnknownKind(ref kind)
+                     if kind == "shell_knowledge_claims"),
+            "an unserved kind must name itself and stay non-fatal; got {error:?}"
+        );
+    }
+
+    /// The other side of it. A body with no type at all is not a newer client
+    /// asking for something — it is a peer speaking wrongly, and reclassifying
+    /// that too would let it hold a session open forever.
+    ///
+    /// Enforced in `liveness_reply`, which runs first; the guard in
+    /// `control_application_reply` is the belt to its braces. Pinned here
+    /// because the two are easy to move apart, and it is the ONLY thing
+    /// separating "your build is old" from "you are speaking nonsense".
+    #[tokio::test]
+    async fn a_body_with_no_type_is_still_a_protocol_violation() {
+        let store = InMemoryControlStore::default();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "control-test".to_owned(),
+        };
+        for request in [
+            r#"{"version":1,"frame_id":"bad-1","body":{}}"#,
+            r#"{"version":1,"frame_id":"bad-2","body":{"type":42}}"#,
+        ] {
+            let error = control_application_reply(&store, &ctx, "server-fingerprint", request)
+                .await
+                .expect_err("a body with no type is malformed");
+            assert!(
+                matches!(error, ControlSessionError::Protocol(_)),
+                "{request} must stay fatal; got {error:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn subscribe_replays_durable_events_after_cursor() {
         let store = InMemoryControlStore::default();
@@ -1867,6 +2012,59 @@ mod tests {
         assert_eq!(value["body"]["high_water_cursor"], block.end);
         assert_eq!(value["body"]["events"].as_array().unwrap().len(), 1);
         assert_eq!(value["body"]["events"][0]["cursor"], block.start + 1);
+    }
+
+    #[tokio::test]
+    async fn subscribe_splits_event_batches_at_the_control_frame_limit() {
+        let store = InMemoryControlStore::default();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "bounded-replay-test".to_owned(),
+        };
+        let server = "server-fingerprint";
+        let block = append_large_terminal_events(&store, &ctx, server).await;
+
+        let first_request = r#"{"version":1,"frame_id":"sub-large-1","body":{"type":"subscribe","after_cursor":null,"capabilities":["agent_control"]}}"#;
+        let first_reply = control_application_reply(&store, &ctx, server, first_request)
+            .await
+            .expect("valid first subscribe")
+            .expect("first subscribe reply");
+        assert!(
+            first_reply.len() <= MAX_CONTROL_FRAME_BYTES,
+            "a replay reply must fit the channel frame; got {} bytes",
+            first_reply.len()
+        );
+        let first: serde_json::Value =
+            serde_json::from_str(&first_reply).expect("first reply JSON");
+        let first_events = first["body"]["events"]
+            .as_array()
+            .expect("first event batch");
+        assert!(!first_events.is_empty());
+        assert!(first_events.len() < 6, "the fixture must require two pages");
+        let first_high_water = first["body"]["high_water_cursor"]
+            .as_u64()
+            .expect("first high-water cursor");
+        assert_eq!(
+            first_high_water,
+            first_events.last().unwrap()["cursor"].as_u64().unwrap(),
+            "the cursor must not advance past an event omitted from this frame"
+        );
+
+        let second_request = format!(
+            r#"{{"version":1,"frame_id":"sub-large-2","body":{{"type":"subscribe","after_cursor":{first_high_water},"capabilities":["agent_control"]}}}}"#
+        );
+        let second_reply = control_application_reply(&store, &ctx, server, &second_request)
+            .await
+            .expect("valid second subscribe")
+            .expect("second subscribe reply");
+        assert!(second_reply.len() <= MAX_CONTROL_FRAME_BYTES);
+        let second: serde_json::Value =
+            serde_json::from_str(&second_reply).expect("second reply JSON");
+        let second_events = second["body"]["events"]
+            .as_array()
+            .expect("second event batch");
+        assert_eq!(first_events.len() + second_events.len(), 6);
+        assert_eq!(second["body"]["high_water_cursor"], block.end);
     }
 
     #[tokio::test]
