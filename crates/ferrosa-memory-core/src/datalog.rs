@@ -4751,7 +4751,14 @@ mod aggregate_grammar_tests {
     fn avg_divides_the_sum_by_the_row_count() {
         let rules = vec![parse_rule("mean(X, T) :- account(X), avg(spend(X, A), A, T).").unwrap()];
         let (all, _) = evaluate(&rules, &spend_corpus(), 100, 10_000);
-        assert_eq!(one_value(&all, "mean", &s("alice")), Some(100.0 / 3.0));
+        // Tolerance, not equality: this went through a division, and
+        // instruction selection differs between arm64 and x86_64.
+        let got = one_value(&all, "mean", &s("alice")).expect("derived mean");
+        assert!(
+            (got - 100.0 / 3.0).abs() < 1e-9,
+            "expected about {}, got {got}",
+            100.0 / 3.0
+        );
         assert_eq!(one_value(&all, "mean", &s("bob")), Some(5.0));
     }
 
@@ -5001,6 +5008,22 @@ mod grammar_tests {
     }
 
     // ── Item 4: min/max over any ordered term ─────────────────────
+
+    /// Assert a computed numeric answer to within float tolerance.
+    ///
+    /// Exact bit equality is the wrong assertion for anything that has been
+    /// through a square root or a division: instruction selection differs by
+    /// architecture, and this suite runs on arm64 locally and x86_64 in CI.
+    /// `stddev` over the textbook group is 2.0 on one and 1.9999999999999998
+    /// on the other, and both are right.
+    fn assert_near(got: Option<Term>, want: f64) {
+        match got {
+            Some(Term::ConstFloat(OrderedFloat(v))) => {
+                assert!((v - want).abs() < 1e-9, "expected about {want}, got {v}")
+            }
+            other => panic!("expected a number near {want}, got {other:?}"),
+        }
+    }
 
     /// The term bound to `pred`'s second argument for a given key.
     fn one_term(all: &FactSet, pred: &str, key: &Term) -> Option<Term> {
@@ -5814,7 +5837,7 @@ mod grammar_tests {
     fn stddev_folds_the_spread_of_a_group() {
         let rule = parse_rule("d(X, S) :- acct(X), stddev(v(X, _, V), V, S).").unwrap();
         let (all, _) = evaluate(&[rule], &spread_corpus(), 100, 10_000);
-        assert_eq!(one_term(&all, "d", &s("a")), Some(n(2.0)));
+        assert_near(one_term(&all, "d", &s("a")), 2.0);
     }
 
     #[test]
@@ -5822,7 +5845,7 @@ mod grammar_tests {
         let corpus = facts(&[("acct", vec![s("a")]), ("v", vec![s("a"), s("k"), n(7.0)])]);
         let rule = parse_rule("d(X, S) :- acct(X), stddev(v(X, _, V), V, S).").unwrap();
         let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
-        assert_eq!(one_term(&all, "d", &s("a")), Some(n(0.0)));
+        assert_near(one_term(&all, "d", &s("a")), 0.0);
     }
 
     #[test]
@@ -5844,7 +5867,7 @@ mod grammar_tests {
         }
         let rule = parse_rule("d(X, S) :- acct(X), stddev(v(X, _, V), V, S).").unwrap();
         let (all, _) = evaluate(&[rule], &corpus, 100, 200_000);
-        assert_eq!(one_term(&all, "d", &s("a")), Some(n(0.0)), "all identical");
+        assert_near(one_term(&all, "d", &s("a")), 0.0);
     }
 
     #[test]
@@ -5852,7 +5875,7 @@ mod grammar_tests {
         // 2,4,4,4,5,5,7,9 -> even count, so the mean of the middle pair.
         let rule = parse_rule("m(X, M) :- acct(X), median(v(X, _, V), V, M).").unwrap();
         let (all, _) = evaluate(&[rule], &spread_corpus(), 100, 10_000);
-        assert_eq!(one_term(&all, "m", &s("a")), Some(n(4.5)));
+        assert_near(one_term(&all, "m", &s("a")), 4.5);
     }
 
     #[test]
