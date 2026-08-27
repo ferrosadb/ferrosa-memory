@@ -5674,6 +5674,64 @@ mod grammar_tests {
         assert_eq!(rule.body[0].args.len(), 2);
     }
 
+    // ── Final, item 5: the term kinds, decided ────────────────────
+
+    #[test]
+    fn truth_has_exactly_one_spelling_which_is_why_a_boolean_term_is_declined() {
+        // A boolean term would give truth a SECOND spelling. `flag(X, true)`
+        // and `flag(X, "true")` would be different terms that do not unify,
+        // and every flag already stored is a string — so a rule written with
+        // the literal would silently stop matching its own data.
+        let corpus = facts(&[("flag", vec![s("a"), s("true")])]);
+        let rule = parse_rule(r#"on(X) :- flag(X, "true")."#).unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "on"), vec!["a"]);
+
+        // And the idiomatic form needs no value at all: presence is truth.
+        let corpus2 = facts(&[("active", vec![s("b")])]);
+        let rule2 = parse_rule("on(X) :- active(X).").unwrap();
+        let (all2, _) = evaluate(&[rule2], &corpus2, 100, 10_000);
+        assert_eq!(derived_keys(&all2, "on"), vec!["b"]);
+    }
+
+    #[test]
+    fn absence_is_already_expressible_which_is_why_a_null_term_is_declined() {
+        // Datalog's answer to "no value" is the absence of a fact, and
+        // negation says it directly. A null VALUE would need three-valued
+        // comparison semantics the engine deliberately does not have, and
+        // would be a THIRD kind of no-value beside Unbound and Undefined,
+        // which the filter evaluator already distinguishes on purpose.
+        let corpus = facts(&[
+            ("item", vec![s("a")]),
+            ("item", vec![s("b")]),
+            ("owner", vec![s("b"), s("someone")]),
+        ]);
+        let rule = parse_rule("unowned(X) :- item(X), not owner(X, _).").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "unowned"), vec!["a"]);
+    }
+
+    #[test]
+    fn a_group_of_values_comes_back_as_a_string_which_is_why_a_list_term_is_declined() {
+        // The capability a list term was wanted for. `DerivedFact` carries
+        // its endpoints as strings, so a list-valued argument would be
+        // flattened at that boundary regardless — the list would buy nothing
+        // and cost unification, ordering and a stored-format change.
+        let corpus = facts(&[
+            ("acct", vec![s("a")]),
+            ("tag", vec![s("a"), s("k1"), s("x")]),
+            ("tag", vec![s("a"), s("k2"), s("y")]),
+        ]);
+        let rule =
+            parse_rule(r#"g(X, S) :- acct(X), group_concat(tag(X, _, T), T, "|", S)."#).unwrap();
+        let (_, derived) = evaluate(&[rule], &corpus, 100, 10_000);
+        let fact = derived.iter().find(|d| d.pred == "g").unwrap();
+        assert_eq!(
+            fact.dst_id, "x|y",
+            "the values survive as a string endpoint"
+        );
+    }
+
     // ── Final, items 2-4: the last aggregates ─────────────────────
 
     fn spread_corpus() -> FactSet {
