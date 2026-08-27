@@ -645,7 +645,7 @@ impl ControlStore for CqlControlStore {
             let first_bucket = cursor_bucket(after.saturating_add(1))?;
             let last_bucket = cursor_bucket(high_water)?;
             for bucket in first_bucket..=last_bucket {
-                if events.len() == fetch_limit {
+                if events.len() >= fetch_limit {
                     break;
                 }
                 let lower = if bucket == first_bucket {
@@ -653,12 +653,21 @@ impl ControlStore for CqlControlStore {
                 } else {
                     u64::try_from(bucket)? * CONTROL_CURSOR_BUCKET_SIZE
                 };
-                let remaining = i32::try_from(fetch_limit - events.len())?;
+                let Some(remaining) = replay_remaining(fetch_limit, events.len())? else {
+                    break;
+                };
+                // LITERAL limit, not a bound one.
+                //
+                // A bound `LIMIT ?` is ignored by this engine and the whole
+                // partition comes back, which is what overran the page and
+                // underflowed the arithmetic above. `remaining` is an i32 this
+                // function computed, never caller input, so interpolating it
+                // introduces nothing.
                 let query = format!(
                     "SELECT cursor, event_id, command_id, event_type, payload, created_at \
                      FROM {}.mobile_control_events \
                      WHERE tenant_id = ? AND server_fingerprint = ? AND cursor_bucket = ? \
-                     AND cursor > ? LIMIT ?",
+                     AND cursor > ? LIMIT {remaining}",
                     self.keyspace
                 );
                 #[allow(deprecated)]
@@ -671,7 +680,6 @@ impl ControlStore for CqlControlStore {
                             server_fingerprint,
                             bucket,
                             i64::try_from(lower)?,
-                            remaining,
                         ),
                     )
                     .await?;
@@ -961,6 +969,27 @@ fn validate_command_transition(
     Ok(())
 }
 
+/// How many more events this replay page may take, or `None` when it is full.
+///
+/// Saturating and `None`-terminated rather than a bare subtraction. The loop
+/// guarded only `events.len() == fetch_limit`, so a page that came back LARGER
+/// than asked walked straight past it and underflowed `fetch_limit - len` into
+/// a huge `usize`. The conversion then failed with "out of range integral type
+/// conversion attempted", which the session surfaced as a control protocol
+/// violation and hung up — every session, immediately, on one machine.
+///
+/// A page CAN come back larger: this engine ignores a bound `LIMIT ?` and
+/// returns the whole partition, so the only limit that binds is a literal one.
+/// This function is correct either way, which is the point — it does not rely
+/// on the database having honoured anything.
+fn replay_remaining(fetch_limit: usize, collected: usize) -> anyhow::Result<Option<i32>> {
+    let remaining = fetch_limit.saturating_sub(collected);
+    if remaining == 0 {
+        return Ok(None);
+    }
+    Ok(Some(i32::try_from(remaining)?))
+}
+
 fn cursor_bucket(cursor: u64) -> anyhow::Result<i32> {
     if cursor == 0 {
         anyhow::bail!("cursor zero is not a durable event cursor");
@@ -980,5 +1009,44 @@ fn lwt_applied(result: scylla::LegacyQueryResult) -> anyhow::Result<Option<bool>
     match row.columns.get(*index).cloned().flatten() {
         Some(CqlValue::Boolean(value)) => Ok(Some(value)),
         _ => anyhow::bail!("conditional CQL [applied] value is not boolean"),
+    }
+}
+
+#[cfg(test)]
+mod replay_paging_tests {
+    use super::*;
+
+    /// The failure this exists to stop.
+    ///
+    /// A page that came back LARGER than asked walked past an `==` guard and
+    /// underflowed `fetch_limit - len` into a huge usize. The conversion then
+    /// failed with "out of range integral type conversion attempted", which
+    /// the session reported as a control protocol violation and hung up on —
+    /// every session, immediately, on the machine where it happened.
+    ///
+    /// It is reachable rather than theoretical: this engine ignores a bound
+    /// `LIMIT ?` and returns the whole partition, so the page size the caller
+    /// asked for was never binding.
+    #[test]
+    fn an_overrun_page_reports_full_rather_than_underflowing() {
+        assert_eq!(replay_remaining(10, 25).unwrap(), None);
+        assert_eq!(replay_remaining(1, usize::MAX).unwrap(), None);
+    }
+
+    #[test]
+    fn an_exactly_full_page_is_full() {
+        assert_eq!(replay_remaining(10, 10).unwrap(), None);
+    }
+
+    #[test]
+    fn a_partial_page_asks_for_the_difference() {
+        assert_eq!(replay_remaining(10, 4).unwrap(), Some(6));
+        assert_eq!(replay_remaining(10, 0).unwrap(), Some(10));
+    }
+
+    /// A limit past CQL's int range is an error, not a silent truncation.
+    #[test]
+    fn a_limit_beyond_cql_int_range_is_refused() {
+        assert!(replay_remaining(usize::MAX, 0).is_err());
     }
 }
