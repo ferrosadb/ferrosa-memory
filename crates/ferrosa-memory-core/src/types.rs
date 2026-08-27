@@ -788,6 +788,67 @@ pub enum FilterExpr {
         rhs: Box<FilterExpr>,
     },
     Neg(Box<FilterExpr>),
+    /// A call to one of a closed set of pure functions.
+    ///
+    /// Closed on purpose: an open extension point would mean an unknown name
+    /// had to be read as something, and the only other reading — a variable —
+    /// is unbound and therefore matches every row.
+    Call {
+        func: Func,
+        args: Vec<FilterExpr>,
+    },
+}
+
+/// The functions callable from an expression. Pure, total on their declared
+/// types, and cheap — nothing here allocates unboundedly or can loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Func {
+    Abs,
+    Floor,
+    Ceil,
+    Round,
+    Len,
+    Lower,
+    Upper,
+    Concat,
+}
+
+impl Func {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Abs => "abs",
+            Self::Floor => "floor",
+            Self::Ceil => "ceil",
+            Self::Round => "round",
+            Self::Len => "len",
+            Self::Lower => "lower",
+            Self::Upper => "upper",
+            Self::Concat => "concat",
+        }
+    }
+
+    /// How many arguments the function takes.
+    pub fn arity(self) -> usize {
+        match self {
+            Self::Concat => 2,
+            _ => 1,
+        }
+    }
+
+    pub const ALL: [Func; 8] = [
+        Func::Abs,
+        Func::Floor,
+        Func::Ceil,
+        Func::Round,
+        Func::Len,
+        Func::Lower,
+        Func::Upper,
+        Func::Concat,
+    ];
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.keyword() == name)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

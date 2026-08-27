@@ -42,7 +42,7 @@ DatalogRule.body: Vec<Atom>                                       // pure conjun
       chain of `||`. Pure sugar over `Any(Eq..)`, which is why it is first: it
       is the smallest thing that exercises the whole loop.
 
-- [ ] **2. Function calls in an expression.** `FilterExpr` has no `Call`, so
+- [x] **2. Function calls in an expression.** `FilterExpr` has no `Call`, so
       there is no `abs`, `floor`, `ceil`, `round`, `len`, `lower`, `upper` or
       `concat`. Every one of those is a bespoke enumeration in Rust today.
       A closed whitelist, not an open extension point: an unknown name is a

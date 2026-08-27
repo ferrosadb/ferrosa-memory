@@ -12,12 +12,13 @@
 //!   cmp_op ::= "==" | "!=" | "<=" | ">=" | "=" | "<" | ">"
 //!   expr   ::= term (("+" | "-") term)*
 //!   term   ::= factor (("*" | "/" | "%") factor)*
-//!   factor ::= number | string_lit | identifier | "(" expr ")" | "-" factor
+//!   factor ::= number | string_lit | call | identifier | "(" expr ")" | "-" factor
+//!   call   ::= func_name "(" expr ("," expr)* ")"
 //! ```
 //!
 //! See `docs/superpowers/specs/2026-05-02-datalog-filter-grammar-design.md`.
 
-use crate::types::{ArithOp, BuiltinFilter, CmpOp, FilterExpr, StrOp};
+use crate::types::{ArithOp, BuiltinFilter, CmpOp, FilterExpr, Func, StrOp};
 use nom::{
     IResult, Parser,
     branch::alt,
@@ -56,6 +57,27 @@ fn string_lit(input: &str) -> IResult<&str, FilterExpr> {
     Ok((i, FilterExpr::LitStr(s.to_string())))
 }
 
+/// A call to a whitelisted function: `abs(V)`, `concat(A, B)`.
+///
+/// Tried before `identifier`, and deliberately strict: once a name is followed
+/// by `(` it must be a known function called with the right arity. Falling
+/// back to reading it as a variable would produce an unbound variable, which
+/// matches every row and makes a typo look like a rule that works.
+fn call(input: &str) -> IResult<&str, FilterExpr> {
+    let head = satisfy(|c: char| c.is_ascii_alphabetic() || c == '_');
+    let tail = many0_count(satisfy(|c: char| c.is_ascii_alphanumeric() || c == '_'));
+    let (i, name) = recognize(pair(head, tail)).parse(input)?;
+    let (i, args) =
+        delimited(ws(ch('(')), separated_list1(ws(ch(',')), expr), ws(ch(')'))).parse(i)?;
+
+    let fail = || nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Verify));
+    let func = Func::parse(name).ok_or_else(fail)?;
+    if args.len() != func.arity() {
+        return Err(fail());
+    }
+    Ok((i, FilterExpr::Call { func, args }))
+}
+
 fn identifier(input: &str) -> IResult<&str, FilterExpr> {
     // Accept both uppercase and lowercase identifiers to support variable names
     // like 'name', 'x', 'X', etc. Datalog filters allow variable names starting
@@ -77,7 +99,9 @@ fn neg(input: &str) -> IResult<&str, FilterExpr> {
 
 fn factor(input: &str) -> IResult<&str, FilterExpr> {
     // number is tried before neg so that `-2.5` parses as a single LitNum.
-    ws(alt((parens, number, string_lit, identifier, neg))).parse(input)
+    // `call` before `identifier`: both start with a name, and only the longer
+    // match is right when a `(` follows.
+    ws(alt((parens, number, string_lit, call, identifier, neg))).parse(input)
 }
 
 fn term(input: &str) -> IResult<&str, FilterExpr> {
