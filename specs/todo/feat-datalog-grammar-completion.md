@@ -51,7 +51,7 @@ Every gap below is a rule a tenant cannot write today.
       `str_` prefix is reserved so a typo is rejected rather than read as a
       relation.*
 
-- [ ] **3. Disjunction in a filter.** `check_filters` is `.all()`, so the body's
+- [x] **3. Disjunction in a filter.** `check_filters` is `.all()`, so the body's
       filters are implicitly AND-ed and there is no way to say "or". Today that
       costs a second rule per alternative, which multiplies with each additional
       disjunct. Needs `||`, `&&` and `!` with parentheses and real precedence.

@@ -2,8 +2,12 @@
 //!
 //! Grammar (high-precedence first):
 //! ```text
-//!   filter ::= str_pred | expr cmp_op expr
-//!   str_pred ::= "!"? ("str_starts_with"|"str_ends_with"|"str_contains") "(" expr "," expr ")"
+//!   filter   ::= bool_or
+//!   bool_or  ::= bool_and ("||" bool_and)*
+//!   bool_and ::= bool_not ("&&" bool_not)*
+//!   bool_not ::= "!"* bool_primary
+//!   bool_primary ::= "(" filter ")" | str_pred | expr cmp_op expr
+//!   str_pred ::= ("str_starts_with"|"str_ends_with"|"str_contains") "(" expr "," expr ")"
 //!   cmp_op ::= "==" | "!=" | "<=" | ">=" | "=" | "<" | ">"
 //!   expr   ::= term (("+" | "-") term)*
 //!   term   ::= factor (("*" | "/" | "%") factor)*
@@ -19,7 +23,7 @@ use nom::{
     bytes::complete::{escaped, is_not, tag},
     character::complete::{char as ch, multispace0, one_of, satisfy},
     combinator::{all_consuming, map, recognize, value},
-    multi::{fold_many0, many0_count},
+    multi::{fold_many0, many0, many0_count},
     number::complete::double,
     sequence::{delimited, pair, preceded},
 };
@@ -125,41 +129,91 @@ fn cmp_op(input: &str) -> IResult<&str, CmpOp> {
     .parse(input)
 }
 
-/// A string-shape predicate: `str_starts_with(S, P)`, optionally `!`-negated.
+/// A string-shape predicate: `str_starts_with(S, P)`.
 ///
 /// Tried before the comparison production because its head is a bare
 /// identifier, which `expr` would otherwise happily consume as a variable.
+/// Negation is not parsed here — `!` belongs to `bool_not` so there is exactly
+/// one mechanism for it.
 fn str_pred(input: &str) -> IResult<&str, BuiltinFilter> {
-    let (i, negated) = map(ws(many0_count(ch('!'))), |n| n % 2 == 1).parse(input)?;
     let (i, op) = ws(alt((
         value(StrOp::StartsWith, tag(StrOp::StartsWith.keyword())),
         value(StrOp::EndsWith, tag(StrOp::EndsWith.keyword())),
         value(StrOp::Contains, tag(StrOp::Contains.keyword())),
     )))
-    .parse(i)?;
+    .parse(input)?;
     let (i, (subject, arg)) = delimited(
         ws(ch('(')),
         (expr, preceded(ws(ch(',')), expr)),
         ws(ch(')')),
     )
     .parse(i)?;
+    Ok((i, BuiltinFilter::StrPred { op, subject, arg }))
+}
+
+/// A comparison, the other leaf of the boolean tree.
+fn comparison(input: &str) -> IResult<&str, BuiltinFilter> {
+    let (i, (lhs, op, rhs)) = (expr, cmp_op, expr).parse(input)?;
+    Ok((i, BuiltinFilter::Compare { op, lhs, rhs }))
+}
+
+/// A leaf, or a parenthesised sub-filter.
+///
+/// `( filter )` is tried first and backtracks, which is what keeps arithmetic
+/// working: in `(V + 1) > 3` the parenthesised group is not a filter, so the
+/// attempt fails and `comparison` re-reads it as a parenthesised *expression*.
+fn bool_primary(input: &str) -> IResult<&str, BuiltinFilter> {
+    alt((
+        delimited(ws(ch('(')), bool_or, ws(ch(')'))),
+        str_pred,
+        comparison,
+    ))
+    .parse(input)
+}
+
+fn bool_not(input: &str) -> IResult<&str, BuiltinFilter> {
+    let (i, bangs) = ws(many0_count(ch('!'))).parse(input)?;
+    let (i, inner) = bool_primary(i)?;
     Ok((
         i,
-        BuiltinFilter::StrPred {
-            op,
-            negated,
-            subject,
-            arg,
+        if bangs % 2 == 1 {
+            BuiltinFilter::Not(Box::new(inner))
+        } else {
+            inner
         },
     ))
 }
 
-fn filter(input: &str) -> IResult<&str, BuiltinFilter> {
-    if let Ok(parsed) = str_pred(input) {
-        return Ok(parsed);
+fn bool_and(input: &str) -> IResult<&str, BuiltinFilter> {
+    let (i, first) = bool_not(input)?;
+    let (i, rest) = many0(preceded(ws(tag("&&")), bool_not)).parse(i)?;
+    Ok((i, fold_bool(first, rest, BuiltinFilter::All)))
+}
+
+fn bool_or(input: &str) -> IResult<&str, BuiltinFilter> {
+    let (i, first) = bool_and(input)?;
+    let (i, rest) = many0(preceded(ws(tag("||")), bool_and)).parse(i)?;
+    Ok((i, fold_bool(first, rest, BuiltinFilter::Any)))
+}
+
+/// Keep a lone branch as its bare leaf so a filter that uses no connective
+/// serialises exactly as it did before this existed.
+fn fold_bool(
+    first: BuiltinFilter,
+    rest: Vec<BuiltinFilter>,
+    wrap: fn(Vec<BuiltinFilter>) -> BuiltinFilter,
+) -> BuiltinFilter {
+    if rest.is_empty() {
+        return first;
     }
-    let (i, (lhs, op, rhs)) = (expr, cmp_op, expr).parse(input)?;
-    Ok((i, BuiltinFilter::Compare { op, lhs, rhs }))
+    let mut all = Vec::with_capacity(rest.len() + 1);
+    all.push(first);
+    all.extend(rest);
+    wrap(all)
+}
+
+fn filter(input: &str) -> IResult<&str, BuiltinFilter> {
+    bool_or(input)
 }
 
 /// Parse a single filter expression.
