@@ -360,6 +360,44 @@ pub struct CqlControlStore {
 }
 
 impl CqlControlStore {
+    /// Which event, if any, holds `cursor`.
+    ///
+    /// Used to settle a conditional insert whose outcome the server did not
+    /// report. The event id is the deciding evidence: it is generated per draft,
+    /// so a row carrying ours proves our own write landed rather than merely
+    /// that something is there.
+    async fn event_owner(
+        &self,
+        ctx: &TenantContext,
+        server_fingerprint: &str,
+        cursor: u64,
+    ) -> anyhow::Result<Option<Uuid>> {
+        let bucket = cursor_bucket(cursor)?;
+        let query = format!(
+            "SELECT event_id FROM {}.mobile_control_events \
+             WHERE tenant_id = ? AND server_fingerprint = ? AND cursor_bucket = ? AND cursor = ?",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        let result = self
+            .session
+            .query_unpaged(
+                query,
+                (
+                    ctx.tenant_id,
+                    server_fingerprint,
+                    bucket,
+                    i64::try_from(cursor)?,
+                ),
+            )
+            .await?;
+        let columns = build_col_map(result.col_specs());
+        let Some(row) = result.rows_or_empty().into_iter().next() else {
+            return Ok(None);
+        };
+        Ok(Some(cql_get::<Uuid>(&row, &columns, "event_id")?))
+    }
+
     /// Apply all ordered application migrations, then connect with runtime
     /// credentials. Startup fails loud if schema migration cannot complete.
     pub async fn connect(config: &FerrosaCqlConfig) -> anyhow::Result<Self> {
@@ -615,8 +653,46 @@ impl ControlStore for CqlControlStore {
                 ),
             )
             .await?;
-        if lwt_applied(result)? != Some(true) {
-            anyhow::bail!("event cursor {} is already occupied", draft.cursor);
+        match lwt_applied(result)? {
+            Some(true) => {}
+            Some(false) => {
+                anyhow::bail!("event cursor {} is already occupied", draft.cursor)
+            }
+            None => {
+                // The server did not return an [applied] column, so the driver
+                // cannot say whether the conditional insert took effect. That is
+                // NOT the same as it failing, and treating it as failure is what
+                // made every control-session heartbeat report
+                //
+                //     event cursor N is already occupied
+                //     this session is NOT in the durable event log
+                //
+                // while the row was in fact written. The claim was backwards:
+                // 100% of sessions "failed", each at a FRESH cursor one block
+                // further on, which is what a healthy allocator handing out new
+                // blocks looks like -- not a stale one reissuing old ones.
+                //
+                // reserve_cursor_block already handles None this way, by reading
+                // its own write back. The same server, the same driver, the same
+                // ambiguity; this path simply never learned about it.
+                //
+                // Read back and let the row decide. Ours means the insert
+                // applied. Somebody else's means the cursor really was taken.
+                let row_owner = self
+                    .event_owner(ctx, server_fingerprint, draft.cursor)
+                    .await?;
+                match row_owner {
+                    Some(event_id) if event_id == draft.event_id => {}
+                    Some(_) => {
+                        anyhow::bail!("event cursor {} is already occupied", draft.cursor)
+                    }
+                    None => anyhow::bail!(
+                        "event cursor {} was neither written nor occupied; the conditional \
+                         insert did not apply and left no row",
+                        draft.cursor
+                    ),
+                }
+            }
         }
         Ok(ControlEvent {
             cursor: draft.cursor,
