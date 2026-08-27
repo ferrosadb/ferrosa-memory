@@ -414,7 +414,7 @@ fn collect_expr_vars(e: &crate::types::FilterExpr, out: &mut Vec<String>) {
     use crate::types::FilterExpr;
     match e {
         FilterExpr::Var(name) => out.push(name.clone()),
-        FilterExpr::LitNum(_) | FilterExpr::LitStr(_) => {}
+        FilterExpr::LitNum(_) | FilterExpr::LitStr(_) | FilterExpr::Null => {}
         FilterExpr::Neg(inner) => collect_expr_vars(inner, out),
         FilterExpr::BinOp { lhs, rhs, .. } => {
             collect_expr_vars(lhs, out);
@@ -638,6 +638,11 @@ fn parse_term(s: &str, anon_counter: &mut usize) -> Term {
     }
     if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
         return Term::ConstStr(s[1..s.len() - 1].to_string());
+    }
+    // Exactly `null`, lowercase. A variable is uppercase-initial, so
+    // `Nullable` is untouched, and a quoted "null" is still the string.
+    if s == "null" {
+        return Term::ConstNull;
     }
     if let Ok(uuid) = Uuid::parse_str(s) {
         return Term::Const(uuid);
@@ -890,9 +895,8 @@ fn is_boolean_filter_part(part: &str) -> bool {
 /// The bare names were not taken: `contains` is already an edge type here, so
 /// `contains(X, Y)` is a legitimate stored relation.
 fn is_reserved_str_part(part: &str) -> bool {
-    part.trim_start_matches('!')
-        .trim_start()
-        .starts_with("str_")
+    let bare = part.trim_start_matches('!').trim_start();
+    bare.starts_with("str_") || bare.starts_with("is_null(")
 }
 
 /// The aggregate kind a body part is written with, if any.
@@ -1104,6 +1108,9 @@ fn instantiate_head(rule: &DatalogRule, binding: &Binding) -> Option<Vec<Term>> 
             Eval::Value(EvalValue::Num(f)) => Term::ConstFloat(OrderedFloat(f)),
             Eval::Value(EvalValue::Str(s)) => Term::ConstStr(s),
             Eval::Value(EvalValue::Uuid(u)) => Term::Const(u),
+            // Null is a value, so the rule fires carrying it. Only an error or
+            // an undecidable expression stops the head being built.
+            Eval::Null => Term::ConstNull,
             Eval::Undefined | Eval::Unbound => {
                 tracing::warn!(
                     predicate = %rule.head.predicate,
@@ -1168,6 +1175,7 @@ fn collect_bindings(rule: &DatalogRule, all_facts: &FactSet) -> Vec<Candidate> {
                     Eval::Value(EvalValue::Num(f)) => Term::ConstFloat(OrderedFloat(f)),
                     Eval::Value(EvalValue::Str(s)) => Term::ConstStr(s),
                     Eval::Value(EvalValue::Uuid(u)) => Term::Const(u),
+                    Eval::Null => Term::ConstNull,
                     Eval::Undefined | Eval::Unbound => {
                         tracing::warn!(
                             var = %b.var,
@@ -1314,7 +1322,7 @@ fn filter_references_any(f: &BuiltinFilter, vars: &std::collections::HashSet<&st
     fn expr_refs(e: &FilterExpr, vars: &std::collections::HashSet<&str>) -> bool {
         match e {
             FilterExpr::Var(name) => vars.contains(name.as_str()),
-            FilterExpr::LitNum(_) | FilterExpr::LitStr(_) => false,
+            FilterExpr::LitNum(_) | FilterExpr::LitStr(_) | FilterExpr::Null => false,
             FilterExpr::Neg(inner) => expr_refs(inner, vars),
             FilterExpr::BinOp { lhs, rhs, .. } => expr_refs(lhs, vars) || expr_refs(rhs, vars),
             FilterExpr::Call { args, .. } => args.iter().any(|a| expr_refs(a, vars)),
@@ -1329,6 +1337,7 @@ fn filter_references_any(f: &BuiltinFilter, vars: &std::collections::HashSet<&st
         BuiltinFilter::StrPred { subject, arg, .. } => {
             expr_refs(subject, vars) || expr_refs(arg, vars)
         }
+        BuiltinFilter::IsNull(e) => expr_refs(e, vars),
         BuiltinFilter::Any(branches) | BuiltinFilter::All(branches) => {
             branches.iter().any(|b| filter_references_any(b, vars))
         }
@@ -1517,6 +1526,7 @@ fn eval_call(
     for a in args {
         match eval_expr(a, binding) {
             Eval::Value(v) => values.push(v),
+            // A function of null is null, as in SQL.
             other => return other,
         }
     }
@@ -1804,6 +1814,13 @@ fn fold_inner_matches(
     let value_var = agg.value_var.clone();
     visit_inner_matches(agg, binding, all_facts, &mut |solved| {
         let value = value_var.as_ref().and_then(|name| solved.get(name));
+        // SQL's rule: a value fold ignores nulls, so `avg` divides by the
+        // count of non-null values and `min` never returns one. `count` looks
+        // at no value at all, so it still counts the row — it is `count(*)`,
+        // not `count(col)`.
+        if matches!(value, Some(Term::ConstNull)) {
+            return true;
+        }
         fold.step(value)
     });
     if matches!(fold, Fold::TypeError) {
@@ -1871,6 +1888,10 @@ enum EvalValue {
 /// no answer *at all*. Collapsing them let `V / 0 == 0` derive a fact.
 enum Eval {
     Value(EvalValue),
+    /// A known-absent value. Propagates through arithmetic and function calls
+    /// the way SQL's null does, and reaches a comparison as `Unknown` — which
+    /// is Kleene, unlike `Undefined`, which poisons.
+    Null,
     /// A variable the binding does not bind. The filter passes, which is the
     /// legacy semantics partial bindings have always relied on.
     Unbound,
@@ -1891,12 +1912,15 @@ fn eval_expr(
             Some(Term::ConstFloat(OrderedFloat(f))) => Eval::Value(EvalValue::Num(*f)),
             Some(Term::ConstStr(s)) => Eval::Value(EvalValue::Str(s.clone())),
             Some(Term::Const(u)) => Eval::Value(EvalValue::Uuid(*u)),
+            Some(Term::ConstNull) => Eval::Null,
             Some(Term::Var(_)) | None => Eval::Unbound,
         },
         FilterExpr::LitNum(OrderedFloat(f)) => Eval::Value(EvalValue::Num(*f)),
         FilterExpr::LitStr(s) => Eval::Value(EvalValue::Str(s.clone())),
+        FilterExpr::Null => Eval::Null,
         FilterExpr::Call { func, args } => eval_call(*func, args, binding),
         FilterExpr::Neg(inner) => match eval_expr(inner, binding) {
+            Eval::Null => Eval::Null,
             Eval::Value(EvalValue::Num(x)) => Eval::Value(EvalValue::Num(-x)),
             Eval::Value(_) => {
                 tracing::warn!("datalog: unary minus on non-numeric value");
@@ -1911,6 +1935,12 @@ fn eval_expr(
             // nothing is undefined does an unbound operand mean "not yet".
             if matches!(l, Eval::Undefined) || matches!(r, Eval::Undefined) {
                 return Eval::Undefined;
+            }
+            // Null before Unbound: `null + 1` is null, not "not yet decided",
+            // and it must NOT be a type error — if it poisoned, the whole
+            // Kleene design would collapse back to refusing.
+            if matches!(l, Eval::Null) || matches!(r, Eval::Null) {
+                return Eval::Null;
             }
             let (Eval::Value(l), Eval::Value(r)) = (l, r) else {
                 return Eval::Unbound;
@@ -2017,15 +2047,29 @@ fn check_filters(filters: &[BuiltinFilter], binding: &HashMap<String, Term>) -> 
 
 /// A filter's verdict.
 ///
-/// Three states, not two, for the same reason `Eval` has three: an error and
-/// an undecidable comparison are not the same thing, and `!` must not be able
-/// to flip an error into a pass.
+/// Five states, because "no answer" has three different causes that deserve
+/// three different propagations. Collapsing any pair of them has been a bug
+/// each time it was tried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verdict {
     True,
     False,
-    /// Fully bound, but there is no answer — an arithmetic error, or a string
-    /// question asked of a number. Refuses, and negating it still refuses.
+    /// No answer because a value is null.
+    ///
+    /// Propagates by KLEENE — `true || unknown` is true, `false && unknown` is
+    /// false — because a null is ordinary data and should not spread through a
+    /// rule that has already been decided by another branch.
+    ///
+    /// Does not pass, matching SQL: `WHERE x = NULL` returns no rows.
+    Unknown,
+    /// No answer because something went wrong — a zero divisor or modulus,
+    /// arithmetic on a non-number, a non-finite power, a string question asked
+    /// of a number.
+    ///
+    /// POISONS, unlike `Unknown`: it refuses the whole tree even beside a
+    /// branch that is true on its own, because a rule containing a mistake
+    /// should say so rather than fire on a coincidence. Negating it still
+    /// refuses, so `!` cannot turn an error into a pass.
     Undefined,
     /// Not decidable yet because something is unbound. Passes, which is the
     /// legacy semantics partial bindings rely on.
@@ -2068,15 +2112,29 @@ fn eval_filter(filter: &BuiltinFilter, binding: &HashMap<String, Term>) -> Verdi
         BuiltinFilter::Compare { op, lhs, rhs } => {
             match (eval_expr(lhs, binding), eval_expr(rhs, binding)) {
                 (Eval::Value(l), Eval::Value(r)) => Verdict::of(apply_cmp(*op, &l, &r)),
+                // An error outranks a null: a rule that divides by zero AND
+                // touches a null is a rule with a mistake in it.
                 (Eval::Undefined, _) | (_, Eval::Undefined) => Verdict::Undefined,
+                // Comparing to null has no answer, and that is ordinary data
+                // rather than a mistake — so Unknown, which is Kleene.
+                (Eval::Null, _) | (_, Eval::Null) => Verdict::Unknown,
                 _ => Verdict::Unbound,
             }
         }
+        // The only question about a null with a definite answer, which is why
+        // it has to exist: `V == null` is Unknown and so never fires.
+        BuiltinFilter::IsNull(e) => match eval_expr(e, binding) {
+            Eval::Null => Verdict::True,
+            Eval::Value(_) => Verdict::False,
+            Eval::Undefined => Verdict::Undefined,
+            Eval::Unbound => Verdict::Unbound,
+        },
         BuiltinFilter::StrPred { op, subject, arg } => {
             match (eval_expr(subject, binding), eval_expr(arg, binding)) {
                 (Eval::Value(EvalValue::Str(s)), Eval::Value(EvalValue::Str(a))) => {
                     Verdict::of(op.apply(&s, &a))
                 }
+                (Eval::Null, _) | (_, Eval::Null) => Verdict::Unknown,
                 // Asking whether a number starts with a string has no answer.
                 (Eval::Value(_), _) | (_, Eval::Value(_)) => {
                     tracing::warn!(
@@ -2088,15 +2146,19 @@ fn eval_filter(filter: &BuiltinFilter, binding: &HashMap<String, Term>) -> Verdi
                 _ => Verdict::Unbound,
             }
         }
-        // An error anywhere refuses the whole filter, even under a branch that
-        // is true on its own. A rule containing a mistake should say so rather
-        // than fire because another branch happened to hold.
+        // `Undefined` is tested first in both, which is the poisoning rule: an
+        // error refuses the whole tree regardless of what its siblings say.
+        // Below that these are Kleene's tables — a decisive branch settles the
+        // answer, and only an inconclusive set is Unknown.
         BuiltinFilter::All(branches) => {
             let verdicts: Vec<Verdict> = branches.iter().map(|b| eval_filter(b, binding)).collect();
             if verdicts.contains(&Verdict::Undefined) {
                 Verdict::Undefined
             } else if verdicts.contains(&Verdict::False) {
+                // `false && unknown` is false: one false branch settles it.
                 Verdict::False
+            } else if verdicts.contains(&Verdict::Unknown) {
+                Verdict::Unknown
             } else {
                 Verdict::True
             }
@@ -2106,7 +2168,10 @@ fn eval_filter(filter: &BuiltinFilter, binding: &HashMap<String, Term>) -> Verdi
             if verdicts.contains(&Verdict::Undefined) {
                 Verdict::Undefined
             } else if verdicts.contains(&Verdict::True) || verdicts.contains(&Verdict::Unbound) {
+                // `true || unknown` is true: one true branch settles it.
                 Verdict::True
+            } else if verdicts.contains(&Verdict::Unknown) {
+                Verdict::Unknown
             } else {
                 Verdict::False
             }
@@ -2146,6 +2211,7 @@ fn term_to_string(t: &Term) -> String {
         Term::Const(u) => u.to_string(),
         Term::ConstStr(s) => s.clone(),
         Term::ConstFloat(f) => f.to_string(),
+        Term::ConstNull => "null".to_string(),
     }
 }
 
@@ -5697,6 +5763,181 @@ mod grammar_tests {
         assert_eq!(rule.body[0].args.len(), 2);
     }
 
+    // ── Null and three-valued semantics ───────────────────────────
+
+    fn null_corpus() -> FactSet {
+        facts(&[
+            ("p", vec![s("a"), n(10.0)]),
+            ("p", vec![s("b"), Term::ConstNull]),
+            ("p", vec![s("c"), n(1.0)]),
+        ])
+    }
+
+    #[test]
+    fn null_parses_as_a_value_not_an_identifier() {
+        let rule = parse_rule("q(X) :- p(X, V), is_null(V).").unwrap();
+        assert_eq!(rule.filters.len(), 1);
+        let head = parse_rule("q(X, null) :- p(X, _).").unwrap();
+        assert_eq!(head.head.args[1], Term::ConstNull);
+    }
+
+    #[test]
+    fn an_identifier_merely_containing_null_is_still_a_variable() {
+        let rule = parse_rule("q(X) :- p(X, Nullable), Nullable > 1.").unwrap();
+        assert!(
+            rule.body[0]
+                .args
+                .iter()
+                .any(|a| *a == Term::Var("Nullable".into()))
+        );
+    }
+
+    #[test]
+    fn comparing_to_null_is_unknown_so_it_never_fires() {
+        // SQL's rule: `WHERE x = NULL` returns no rows, and neither does
+        // `x != NULL`. Unknown is not false, but it does not pass.
+        for text in [
+            "q(X) :- p(X, V), V == null.",
+            "q(X) :- p(X, V), V != null.",
+            "q(X) :- p(X, V), V > null.",
+        ] {
+            let rule = parse_rule(text).unwrap();
+            let (all, _) = evaluate(&[rule], &null_corpus(), 100, 10_000);
+            assert!(
+                all.get("q").map(|r| r.is_empty()).unwrap_or(true),
+                "{text} must derive nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn is_null_is_how_you_actually_ask() {
+        let rule = parse_rule("q(X) :- p(X, V), is_null(V).").unwrap();
+        let (all, _) = evaluate(&[rule], &null_corpus(), 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["b"]);
+    }
+
+    #[test]
+    fn not_is_null_gives_the_negative_and_is_never_unknown() {
+        let rule = parse_rule("q(X) :- p(X, V), !is_null(V).").unwrap();
+        let (all, _) = evaluate(&[rule], &null_corpus(), 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a", "c"]);
+    }
+
+    // ── Kleene, and the line between Unknown and Undefined ────────
+
+    #[test]
+    fn true_or_unknown_is_true() {
+        // The Kleene rule. Under the old poisoning propagation this derived
+        // nothing, because any no-answer refused the whole tree.
+        let rule = parse_rule("q(X) :- p(X, V), V > 5 || V == null.").unwrap();
+        let (all, _) = evaluate(&[rule], &null_corpus(), 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a"], "a is 10, so true wins");
+    }
+
+    #[test]
+    fn false_and_unknown_is_false_which_negates_to_true() {
+        // The only way to observe False rather than Unknown is through `!`,
+        // since neither passes on its own.
+        let rule = parse_rule("q(X) :- p(X, V), !(V > 100 && V == null).").unwrap();
+        let (all, _) = evaluate(&[rule], &null_corpus(), 100, 10_000);
+        assert_eq!(
+            derived_keys(&all, "q"),
+            vec!["a", "c"],
+            "false && unknown is false, and !false is true"
+        );
+    }
+
+    #[test]
+    fn not_unknown_is_still_unknown() {
+        let rule = parse_rule("q(X) :- p(X, V), !(V == null).").unwrap();
+        let (all, _) = evaluate(&[rule], &null_corpus(), 100, 10_000);
+        assert!(
+            all.get("q").map(|r| r.is_empty()).unwrap_or(true),
+            "negating unknown does not make it true"
+        );
+    }
+
+    #[test]
+    fn an_error_still_poisons_even_beside_a_true_branch() {
+        // The safety decision this design exists to preserve. Kleene applies
+        // to Unknown; an ERROR is not Unknown and must still refuse.
+        let rule = parse_rule("q(X) :- p(X, V), V > 5 || V / 0 == 1.").unwrap();
+        let (all, _) = evaluate(&[rule], &null_corpus(), 100, 10_000);
+        assert!(
+            all.get("q").map(|r| r.is_empty()).unwrap_or(true),
+            "an arithmetic error must not be masked by a true sibling"
+        );
+    }
+
+    #[test]
+    fn arithmetic_on_null_is_null_not_a_type_error() {
+        // If `null + 1` were a type error it would poison, and the whole
+        // design would collapse back to the old behaviour.
+        let rule = parse_rule("q(X) :- p(X, V), V + 1 > 5 || V > 5.").unwrap();
+        let (all, _) = evaluate(&[rule], &null_corpus(), 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a"], "b's null stays unknown");
+    }
+
+    #[test]
+    fn a_function_of_null_is_null() {
+        let rule = parse_rule("q(X) :- p(X, V), abs(V) > 5 || V > 5.").unwrap();
+        let (all, _) = evaluate(&[rule], &null_corpus(), 100, 10_000);
+        assert_eq!(derived_keys(&all, "q"), vec!["a"]);
+    }
+
+    // ── Aggregates ────────────────────────────────────────────────
+
+    #[test]
+    fn value_aggregates_skip_nulls_the_way_sql_does() {
+        let corpus = facts(&[
+            ("acct", vec![s("a")]),
+            ("v", vec![s("a"), s("k1"), n(2.0)]),
+            ("v", vec![s("a"), s("k2"), Term::ConstNull]),
+            ("v", vec![s("a"), s("k3"), n(4.0)]),
+        ]);
+        for (text, pred, want) in [
+            ("t(X, R) :- acct(X), sum(v(X, _, V), V, R).", "t", 6.0),
+            ("t(X, R) :- acct(X), avg(v(X, _, V), V, R).", "t", 3.0),
+            ("t(X, R) :- acct(X), min(v(X, _, V), V, R).", "t", 2.0),
+            ("t(X, R) :- acct(X), max(v(X, _, V), V, R).", "t", 4.0),
+        ] {
+            let rule = parse_rule(text).unwrap();
+            let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+            assert_near(one_term(&all, pred, &s("a")), want);
+        }
+    }
+
+    #[test]
+    fn count_counts_rows_including_the_null_ones() {
+        // `count` counts unifications, so it is `count(*)`, not `count(col)`.
+        let corpus = facts(&[
+            ("acct", vec![s("a")]),
+            ("v", vec![s("a"), s("k1"), n(2.0)]),
+            ("v", vec![s("a"), s("k2"), Term::ConstNull]),
+        ]);
+        let rule = parse_rule("t(X, N) :- acct(X), count(v(X, _, V), N).").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_near(one_term(&all, "t", &s("a")), 2.0);
+    }
+
+    #[test]
+    fn a_group_of_nothing_but_nulls_is_an_empty_group() {
+        let corpus = facts(&[
+            ("acct", vec![s("a")]),
+            ("v", vec![s("a"), s("k1"), Term::ConstNull]),
+        ]);
+        let sum = parse_rule("t(X, R) :- acct(X), sum(v(X, _, V), V, R).").unwrap();
+        let min = parse_rule("m(X, R) :- acct(X), min(v(X, _, V), V, R).").unwrap();
+        let (all_s, _) = evaluate(&[sum], &corpus, 100, 10_000);
+        let (all_m, _) = evaluate(&[min], &corpus, 100, 10_000);
+        assert_near(one_term(&all_s, "t", &s("a")), 0.0);
+        assert!(
+            all_m.get("m").map(|r| r.is_empty()).unwrap_or(true),
+            "there is no minimum of nothing"
+        );
+    }
+
     // ── The completeness guard ────────────────────────────────────
 
     /// Three specs in a row have claimed the grammar was complete by reading
@@ -5746,10 +5987,30 @@ mod grammar_tests {
         assert_eq!(StrOp::ALL.len(), 3, "a string predicate changed");
         assert_eq!(Func::ALL.len(), 8, "a function was added or removed");
 
-        // Terms: Var, Const(Uuid), ConstStr, ConstFloat. Boolean, null and
-        // list are declined — see the three tests above for why.
+        // Terms: Var, Const(Uuid), ConstStr, ConstFloat, ConstNull.
+        //
+        // `ConstNull` is here because this guard did its job. It failed when
+        // the variant was added, which forced the completeness pass to be run
+        // again rather than inherited — and that pass is what found the
+        // earlier reasoning for declining null to be wrong.
+        //
+        // Boolean and list remain declined; see the two tests above.
         let _exhaustive_term = |t: Term| match t {
-            Term::Var(_) | Term::Const(_) | Term::ConstStr(_) | Term::ConstFloat(_) => (),
+            Term::Var(_)
+            | Term::Const(_)
+            | Term::ConstStr(_)
+            | Term::ConstFloat(_)
+            | Term::ConstNull => (),
+        };
+
+        // Five verdicts, because "no answer" has three causes with three
+        // propagations. Collapsing any pair has been a bug each time.
+        let _exhaustive_verdict = |v: Verdict| match v {
+            Verdict::True
+            | Verdict::False
+            | Verdict::Unknown
+            | Verdict::Undefined
+            | Verdict::Unbound => (),
         };
     }
 

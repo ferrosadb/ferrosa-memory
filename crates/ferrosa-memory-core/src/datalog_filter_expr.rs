@@ -6,7 +6,8 @@
 //!   bool_or  ::= bool_and ("||" bool_and)*
 //!   bool_and ::= bool_not ("&&" bool_not)*
 //!   bool_not ::= "!"* bool_primary
-//!   bool_primary ::= "(" filter ")" | str_pred | membership | expr cmp_op expr
+//!   bool_primary ::= "(" filter ")" | str_pred | is_null | membership | expr cmp_op expr
+//!   is_null ::= "is_null" "(" expr ")"
 //!   membership ::= expr "in" "[" expr ("," expr)* "]"
 //!   str_pred ::= ("str_starts_with"|"str_ends_with"|"str_contains") "(" expr "," expr ")"
 //!   cmp_op ::= "==" | "!=" | "<=" | ">=" | "=" | "<" | ">"
@@ -79,6 +80,15 @@ fn call(input: &str) -> IResult<&str, FilterExpr> {
     Ok((i, FilterExpr::Call { func, args }))
 }
 
+/// The `null` literal in an expression position.
+///
+/// Before `identifier`, which would otherwise read it as a variable named
+/// `null` — unbound, and therefore matching everything.
+fn null_lit(input: &str) -> IResult<&str, FilterExpr> {
+    let (i, _) = ws(tag("null")).parse(input)?;
+    Ok((i, FilterExpr::Null))
+}
+
 fn identifier(input: &str) -> IResult<&str, FilterExpr> {
     // Accept both uppercase and lowercase identifiers to support variable names
     // like 'name', 'x', 'X', etc. Datalog filters allow variable names starting
@@ -102,7 +112,10 @@ fn factor(input: &str) -> IResult<&str, FilterExpr> {
     // number is tried before neg so that `-2.5` parses as a single LitNum.
     // `call` before `identifier`: both start with a name, and only the longer
     // match is right when a `(` follows.
-    ws(alt((parens, number, string_lit, call, identifier, neg))).parse(input)
+    ws(alt((
+        parens, number, string_lit, null_lit, call, identifier, neg,
+    )))
+    .parse(input)
 }
 
 /// Exponentiation, tighter than `*` and right-associative.
@@ -232,6 +245,17 @@ fn membership(input: &str) -> IResult<&str, BuiltinFilter> {
     ))
 }
 
+/// `is_null(expr)`.
+///
+/// Needed because `V == null` is Unknown and therefore never fires — without
+/// this there would be no way to ask the question at all. `!is_null(V)` covers
+/// the negative, and neither is ever Unknown.
+fn is_null_pred(input: &str) -> IResult<&str, BuiltinFilter> {
+    let (i, _) = ws(tag("is_null")).parse(input)?;
+    let (i, e) = delimited(ws(ch('(')), expr, ws(ch(')'))).parse(i)?;
+    Ok((i, BuiltinFilter::IsNull(e)))
+}
+
 /// A comparison, the other leaf of the boolean tree.
 fn comparison(input: &str) -> IResult<&str, BuiltinFilter> {
     let (i, (lhs, op, rhs)) = (expr, cmp_op, expr).parse(input)?;
@@ -247,6 +271,7 @@ fn bool_primary(input: &str) -> IResult<&str, BuiltinFilter> {
     alt((
         delimited(ws(ch('(')), bool_or, ws(ch(')'))),
         str_pred,
+        is_null_pred,
         membership,
         comparison,
     ))
