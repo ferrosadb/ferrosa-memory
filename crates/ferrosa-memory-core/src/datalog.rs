@@ -90,6 +90,8 @@ pub fn parse_rule(text: &str) -> anyhow::Result<DatalogRule> {
         let part = part.trim();
         if let Some(rest) = strip_not_prefix(part) {
             deferred_negated.push(rest.to_string());
+        } else if is_reserved_str_part(part) {
+            filters.push(crate::datalog_filter_expr::parse_filter(part)?);
         } else if aggregate_keyword(part).is_some() {
             deferred_aggregates.push(part.to_string());
         } else if has_top_level_cmp(part) {
@@ -419,6 +421,21 @@ fn parse_aggregate(
         output_var: output,
         value_var,
     }))
+}
+
+/// True for a body part that claims the reserved `str_` prefix.
+///
+/// The prefix is reserved so a typo cannot quietly become a relation over
+/// stored facts — `str_startswith(N, "a")` would then derive nothing and look
+/// exactly like "no rows matched". Claiming the prefix means the filter parser
+/// gets the part and rejects it by name if it is not a real builtin.
+///
+/// The bare names were not taken: `contains` is already an edge type here, so
+/// `contains(X, Y)` is a legitimate stored relation.
+fn is_reserved_str_part(part: &str) -> bool {
+    part.trim_start_matches('!')
+        .trim_start()
+        .starts_with("str_")
 }
 
 /// The aggregate kind a body part is written with, if any.
@@ -780,6 +797,9 @@ fn filter_references_any(f: &BuiltinFilter, vars: &std::collections::HashSet<&st
             vars.contains(a.as_str())
         }
         BuiltinFilter::Compare { lhs, rhs, .. } => expr_refs(lhs, vars) || expr_refs(rhs, vars),
+        BuiltinFilter::StrPred { subject, arg, .. } => {
+            expr_refs(subject, vars) || expr_refs(arg, vars)
+        }
     }
 }
 
@@ -1256,6 +1276,30 @@ fn check_one_filter(filter: &BuiltinFilter, binding: &HashMap<String, Term>) -> 
                 *v < *threshold
             } else {
                 true
+            }
+        }
+        BuiltinFilter::StrPred {
+            op,
+            negated,
+            subject,
+            arg,
+        } => {
+            match (eval_expr(subject, binding), eval_expr(arg, binding)) {
+                (Eval::Value(EvalValue::Str(s)), Eval::Value(EvalValue::Str(a))) => {
+                    op.apply(&s, &a) != *negated
+                }
+                // Asking whether a number starts with a string has no answer.
+                // Undefined, so the rule must not fire — not false, which
+                // `!` would then flip into a spurious pass.
+                (Eval::Value(_), _) | (_, Eval::Value(_)) => {
+                    tracing::warn!(
+                        predicate = op.keyword(),
+                        "datalog: string predicate applied to a non-string; deriving nothing"
+                    );
+                    false
+                }
+                // Legacy semantics: a partial binding passes the filter.
+                _ => true,
             }
         }
         BuiltinFilter::Compare { op, lhs, rhs } => {
@@ -3994,6 +4038,107 @@ mod grammar_tests {
             .unwrap_or_default();
         out.sort();
         out
+    }
+
+    // ── Item 2: string predicates ─────────────────────────────────
+
+    fn name_corpus() -> FactSet {
+        facts(&[
+            ("item", vec![s("a"), s("tmp_scratch")]),
+            ("item", vec![s("b"), s("report.pdf")]),
+            ("item", vec![s("c"), s("tmp_other")]),
+            ("item", vec![s("d"), s("summary.pdf")]),
+        ])
+    }
+
+    #[test]
+    fn starts_with_selects_by_prefix() {
+        let rule = parse_rule(r#"temp(X) :- item(X, N), str_starts_with(N, "tmp_")."#).unwrap();
+        let (all, _) = evaluate(&[rule], &name_corpus(), 100, 10_000);
+        assert_eq!(derived_keys(&all, "temp"), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn ends_with_selects_by_suffix() {
+        let rule = parse_rule(r#"doc(X) :- item(X, N), str_ends_with(N, ".pdf")."#).unwrap();
+        let (all, _) = evaluate(&[rule], &name_corpus(), 100, 10_000);
+        assert_eq!(derived_keys(&all, "doc"), vec!["b", "d"]);
+    }
+
+    #[test]
+    fn contains_selects_by_substring() {
+        let rule = parse_rule(r#"has(X) :- item(X, N), str_contains(N, "mm")."#).unwrap();
+        let (all, _) = evaluate(&[rule], &name_corpus(), 100, 10_000);
+        assert_eq!(derived_keys(&all, "has"), vec!["d"]);
+    }
+
+    #[test]
+    fn a_string_predicate_composes_with_negation() {
+        // The requirement that motivated this: "everything except the
+        // scratch files", which has no positive encoding.
+        let rule =
+            parse_rule(r#"keep(X) :- item(X, N), not tombstoned(X), !str_starts_with(N, "tmp_")."#)
+                .unwrap();
+        let (all, _) = evaluate(&[rule], &name_corpus(), 100, 10_000);
+        assert_eq!(derived_keys(&all, "keep"), vec!["b", "d"]);
+    }
+
+    #[test]
+    fn a_string_predicate_over_both_variables_compares_two_bindings() {
+        let corpus = facts(&[
+            ("pair", vec![s("a"), s("foobar"), s("foo")]),
+            ("pair", vec![s("b"), s("foobar"), s("bar")]),
+        ]);
+        let rule =
+            parse_rule("pre(X) :- pair(X, Whole, Part), str_starts_with(Whole, Part).").unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "pre"), vec!["a"]);
+    }
+
+    #[test]
+    fn a_string_predicate_on_a_non_string_derives_nothing() {
+        // Undefined, not false and not a pass: asking whether a number
+        // starts with a string has no answer.
+        let corpus = facts(&[("item", vec![s("a"), n(42.0)])]);
+        let rule = parse_rule(r#"bad(X) :- item(X, N), str_starts_with(N, "4")."#).unwrap();
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert!(all.get("bad").map(|r| r.is_empty()).unwrap_or(true));
+    }
+
+    #[test]
+    fn a_string_predicate_with_the_wrong_arity_is_rejected_at_parse() {
+        let err = parse_rule(r#"bad(X) :- item(X, N), str_starts_with(N)."#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("str_starts_with"),
+            "rejection should name the predicate, got: {err}"
+        );
+    }
+
+    #[test]
+    fn the_builtins_do_not_collide_with_the_contains_edge_type() {
+        // `contains` is a real edge type in this system (enrich.rs matches on
+        // it), so `contains(X, Y)` is a legitimate stored relation. That is why
+        // the builtins carry a reserved `str_` prefix instead of taking the
+        // bare names — taking them would have broken rules already written.
+        let corpus = facts(&[("contains", vec![s("box"), s("ball")])]);
+        let rule = parse_rule("inside(Y) :- contains(X, Y).").unwrap();
+        assert!(rule.body.iter().any(|a| a.predicate == "contains"));
+        assert!(rule.filters.is_empty(), "not read as a builtin");
+        let (all, _) = evaluate(&[rule], &corpus, 100, 10_000);
+        assert_eq!(derived_keys(&all, "inside"), vec!["ball"]);
+    }
+
+    #[test]
+    fn an_unknown_str_prefixed_predicate_is_rejected_rather_than_read_as_a_relation() {
+        // The `str_` prefix is reserved. Silently treating a typo'd builtin as
+        // a relation over stored facts would derive nothing and look like "no
+        // match", which is the silent-wrongness shape.
+        let err = parse_rule(r#"bad(X) :- item(X, N), str_startswith(N, "a")."#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("str_startswith"), "got: {err}");
     }
 
     // ── Item 1: modulo ────────────────────────────────────────────

@@ -711,12 +711,53 @@ pub enum BuiltinFilter {
     LessThan(String, f64),
     /// Legacy. See `GreaterThan` doc.
     NotEqual(String, String),
-    /// Full comparison filter — the only variant the parser emits.
+    /// Full comparison filter.
     Compare {
         op: CmpOp,
         lhs: FilterExpr,
         rhs: FilterExpr,
     },
+    /// A boolean-valued question about the shape of a string, written
+    /// `str_starts_with(S, P)` and optionally negated with a leading `!`.
+    StrPred {
+        op: StrOp,
+        negated: bool,
+        subject: FilterExpr,
+        arg: FilterExpr,
+    },
+}
+
+/// The string-shape predicates.
+///
+/// These carry a reserved `str_` prefix rather than the bare names, because
+/// `contains` is already an edge type in this system — `contains(X, Y)` is a
+/// legitimate stored relation, and taking the name would have silently changed
+/// the meaning of rules already written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum StrOp {
+    StartsWith,
+    EndsWith,
+    Contains,
+}
+
+impl StrOp {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::StartsWith => "str_starts_with",
+            Self::EndsWith => "str_ends_with",
+            Self::Contains => "str_contains",
+        }
+    }
+
+    pub const ALL: [StrOp; 3] = [StrOp::StartsWith, StrOp::EndsWith, StrOp::Contains];
+
+    pub fn apply(self, subject: &str, arg: &str) -> bool {
+        match self {
+            Self::StartsWith => subject.starts_with(arg),
+            Self::EndsWith => subject.ends_with(arg),
+            Self::Contains => subject.contains(arg),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

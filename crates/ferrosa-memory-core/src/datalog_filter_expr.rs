@@ -2,7 +2,8 @@
 //!
 //! Grammar (high-precedence first):
 //! ```text
-//!   filter ::= expr cmp_op expr
+//!   filter ::= str_pred | expr cmp_op expr
+//!   str_pred ::= "!"? ("str_starts_with"|"str_ends_with"|"str_contains") "(" expr "," expr ")"
 //!   cmp_op ::= "==" | "!=" | "<=" | ">=" | "=" | "<" | ">"
 //!   expr   ::= term (("+" | "-") term)*
 //!   term   ::= factor (("*" | "/" | "%") factor)*
@@ -11,7 +12,7 @@
 //!
 //! See `docs/superpowers/specs/2026-05-02-datalog-filter-grammar-design.md`.
 
-use crate::types::{ArithOp, BuiltinFilter, CmpOp, FilterExpr};
+use crate::types::{ArithOp, BuiltinFilter, CmpOp, FilterExpr, StrOp};
 use nom::{
     IResult, Parser,
     branch::alt,
@@ -124,7 +125,39 @@ fn cmp_op(input: &str) -> IResult<&str, CmpOp> {
     .parse(input)
 }
 
+/// A string-shape predicate: `str_starts_with(S, P)`, optionally `!`-negated.
+///
+/// Tried before the comparison production because its head is a bare
+/// identifier, which `expr` would otherwise happily consume as a variable.
+fn str_pred(input: &str) -> IResult<&str, BuiltinFilter> {
+    let (i, negated) = map(ws(many0_count(ch('!'))), |n| n % 2 == 1).parse(input)?;
+    let (i, op) = ws(alt((
+        value(StrOp::StartsWith, tag(StrOp::StartsWith.keyword())),
+        value(StrOp::EndsWith, tag(StrOp::EndsWith.keyword())),
+        value(StrOp::Contains, tag(StrOp::Contains.keyword())),
+    )))
+    .parse(i)?;
+    let (i, (subject, arg)) = delimited(
+        ws(ch('(')),
+        (expr, preceded(ws(ch(',')), expr)),
+        ws(ch(')')),
+    )
+    .parse(i)?;
+    Ok((
+        i,
+        BuiltinFilter::StrPred {
+            op,
+            negated,
+            subject,
+            arg,
+        },
+    ))
+}
+
 fn filter(input: &str) -> IResult<&str, BuiltinFilter> {
+    if let Ok(parsed) = str_pred(input) {
+        return Ok(parsed);
+    }
     let (i, (lhs, op, rhs)) = (expr, cmp_op, expr).parse(input)?;
     Ok((i, BuiltinFilter::Compare { op, lhs, rhs }))
 }
