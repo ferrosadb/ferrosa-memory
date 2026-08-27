@@ -38,7 +38,7 @@ DatalogRule.body: Vec<Atom>                                       // pure conjun
 
 ## Checklist
 
-- [ ] **1. Set membership.** `X in ["a", "b", "c"]` — today it is a hand-written
+- [x] **1. Set membership.** `X in ["a", "b", "c"]` — today it is a hand-written
       chain of `||`. Pure sugar over `Any(Eq..)`, which is why it is first: it
       is the smallest thing that exercises the whole loop.
 

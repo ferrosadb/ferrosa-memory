@@ -6,7 +6,8 @@
 //!   bool_or  ::= bool_and ("||" bool_and)*
 //!   bool_and ::= bool_not ("&&" bool_not)*
 //!   bool_not ::= "!"* bool_primary
-//!   bool_primary ::= "(" filter ")" | str_pred | expr cmp_op expr
+//!   bool_primary ::= "(" filter ")" | str_pred | membership | expr cmp_op expr
+//!   membership ::= expr "in" "[" expr ("," expr)* "]"
 //!   str_pred ::= ("str_starts_with"|"str_ends_with"|"str_contains") "(" expr "," expr ")"
 //!   cmp_op ::= "==" | "!=" | "<=" | ">=" | "=" | "<" | ">"
 //!   expr   ::= term (("+" | "-") term)*
@@ -23,7 +24,7 @@ use nom::{
     bytes::complete::{escaped, is_not, tag},
     character::complete::{char as ch, multispace0, one_of, satisfy},
     combinator::{all_consuming, map, recognize, value},
-    multi::{fold_many0, many0, many0_count},
+    multi::{fold_many0, many0, many0_count, separated_list1},
     number::complete::double,
     sequence::{delimited, pair, preceded},
 };
@@ -151,6 +152,39 @@ fn str_pred(input: &str) -> IResult<&str, BuiltinFilter> {
     Ok((i, BuiltinFilter::StrPred { op, subject, arg }))
 }
 
+/// Set membership: `expr in [expr, expr, ...]`.
+///
+/// Desugars to the disjunction of equalities the author would otherwise have
+/// typed by hand, so it introduces no new evaluator path — one element is a
+/// plain `Eq`, more than one is an `Any` of them.
+///
+/// An empty set is not accepted: `separated_list1` requires at least one
+/// element, so `C in []` fails to parse. It could never hold, and a filter
+/// that silently matches nothing looks exactly like "no rows".
+fn membership(input: &str) -> IResult<&str, BuiltinFilter> {
+    let (i, subject) = expr(input)?;
+    let (i, _) = ws(tag("in")).parse(i)?;
+    let (i, items) =
+        delimited(ws(ch('[')), separated_list1(ws(ch(',')), expr), ws(ch(']'))).parse(i)?;
+
+    let mut branches: Vec<BuiltinFilter> = items
+        .into_iter()
+        .map(|item| BuiltinFilter::Compare {
+            op: CmpOp::Eq,
+            lhs: subject.clone(),
+            rhs: item,
+        })
+        .collect();
+    Ok((
+        i,
+        if branches.len() == 1 {
+            branches.pop().expect("just checked")
+        } else {
+            BuiltinFilter::Any(branches)
+        },
+    ))
+}
+
 /// A comparison, the other leaf of the boolean tree.
 fn comparison(input: &str) -> IResult<&str, BuiltinFilter> {
     let (i, (lhs, op, rhs)) = (expr, cmp_op, expr).parse(input)?;
@@ -166,6 +200,7 @@ fn bool_primary(input: &str) -> IResult<&str, BuiltinFilter> {
     alt((
         delimited(ws(ch('(')), bool_or, ws(ch(')'))),
         str_pred,
+        membership,
         comparison,
     ))
     .parse(input)
