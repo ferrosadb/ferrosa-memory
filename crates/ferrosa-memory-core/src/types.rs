@@ -767,16 +767,34 @@ pub struct Aggregate {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum StratifyError {
-    RecursionThroughAggregate { cycle: Vec<String> },
+    RecursionThroughAggregate {
+        cycle: Vec<String>,
+    },
+    /// A predicate's derivation transitively requires its own negation.
+    /// Such a rule set has no stratified model, so it is rejected rather
+    /// than evaluated to an arbitrary fixpoint.
+    RecursionThroughNegation {
+        cycle: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DatalogRule {
     pub head: Atom,
+    /// Positive body atoms. A binding must match every one of them.
     pub body: Vec<Atom>,
     pub filters: Vec<BuiltinFilter>,
     #[serde(default)]
     pub aggregates: Vec<Aggregate>,
+    /// Negated body atoms (`not p(X)`). A binding survives only if it
+    /// matches *none* of them.
+    ///
+    /// Additive on purpose: `RuleEntry` rows written before negation
+    /// existed carry no such field and deserialize to an empty set, which
+    /// means exactly what those rules meant before. Retyping `body` to
+    /// carry polarity would have been a breaking stored-format change.
+    #[serde(default)]
+    pub negated: Vec<Atom>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1004,7 +1022,35 @@ impl DerivedFact {
     pub fn has_uuid_endpoints(&self) -> bool {
         Uuid::parse_str(&self.src_id).is_ok() && Uuid::parse_str(&self.dst_id).is_ok()
     }
+
+    /// True iff any step in this fact's derivation was an *absence* — a
+    /// negated literal that held because no row matched it.
+    pub fn rests_on_absence(&self) -> bool {
+        self.provenance
+            .iter()
+            .any(|step| step.parent_kind == PROVENANCE_KIND_ABSENCE)
+    }
+
+    /// True iff this fact may be written to the persisted derived-fact store.
+    ///
+    /// Two independent reasons a derivation must not be cached:
+    ///
+    /// - its endpoints are not both UUIDs, so the UUID-keyed cache table
+    ///   cannot hold it (issue #129); or
+    /// - it rests on an absence. The engine is monotonic only for positive
+    ///   rules: a later base fact can make a negated derivation **false**,
+    ///   and an append-only cache would go on serving the stale derivation
+    ///   forever. For a permission rule that is access which should have
+    ///   been revoked. Negated derivations are therefore evaluated live and
+    ///   never persisted.
+    pub fn is_cacheable(&self) -> bool {
+        self.has_uuid_endpoints() && !self.rests_on_absence()
+    }
 }
+
+/// `ProvenanceStep::parent_kind` for a step that records an *absence*
+/// rather than a matched row — the reason a negated literal held.
+pub const PROVENANCE_KIND_ABSENCE: &str = "absence";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvenanceStep {

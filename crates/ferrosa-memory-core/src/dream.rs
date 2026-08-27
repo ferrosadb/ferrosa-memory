@@ -288,9 +288,12 @@ pub async fn run_consolidation(
                 // mid-batch, leaving a partial, non-atomic write and a fail-loud
                 // warning every pass. Cache only UUID↔UUID facts; the taxonomy
                 // facts are re-derived at query time via the Datalog frontier.
+                // `is_cacheable` also excludes any derivation resting on an
+                // absence: negation is non-monotonic, so a later base fact can
+                // falsify it and this cache has no way to take it back.
                 let cacheable: Vec<crate::types::DerivedFact> = derived
                     .iter()
-                    .filter(|f| f.has_uuid_endpoints())
+                    .filter(|f| f.is_cacheable())
                     .cloned()
                     .collect();
                 let skipped = derived.len() - cacheable.len();

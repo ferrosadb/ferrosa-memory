@@ -80,13 +80,17 @@ pub fn parse_rule(text: &str) -> anyhow::Result<DatalogRule> {
     let mut filters = Vec::new();
     let mut aggregates: Vec<crate::types::Aggregate> = Vec::new();
     let mut deferred_aggregates: Vec<String> = Vec::new();
+    let mut deferred_negated: Vec<String> = Vec::new();
     let mut anon_counter = 0usize;
 
-    // Pass 1: classify each body part; defer aggregate parts for Pass 2
-    // (aggregates need body_vars which aren't known until atoms are parsed).
+    // Pass 1: classify each body part; defer aggregate and negated parts for
+    // Pass 2 (both need the positive body atoms parsed first — aggregates for
+    // body_vars, negated atoms for the range-restriction check).
     for part in &body_parts {
         let part = part.trim();
-        if part.starts_with("count(") {
+        if let Some(rest) = strip_not_prefix(part) {
+            deferred_negated.push(rest.to_string());
+        } else if part.starts_with("count(") {
             deferred_aggregates.push(part.to_string());
         } else if has_top_level_cmp(part) {
             let f = crate::datalog_filter_expr::parse_filter(part)?;
@@ -117,10 +121,56 @@ pub fn parse_rule(text: &str) -> anyhow::Result<DatalogRule> {
         }
     }
 
+    // A negated atom filters candidate bindings; it cannot generate them.
+    // Without a positive atom there is nothing to range-restrict against and
+    // nothing to filter, so reject before the generic emptiness check below.
+    anyhow::ensure!(
+        deferred_negated.is_empty() || !body.is_empty(),
+        "a rule with a negated atom must have at least one positive body atom"
+    );
+
     anyhow::ensure!(
         !body.is_empty() || !aggregates.is_empty(),
         "rule must have at least one body atom"
     );
+
+    // Pass 3: parse negated atoms and enforce range restriction against the
+    // final set of positive body atoms.
+    let positive_vars: std::collections::HashSet<String> = body
+        .iter()
+        .flat_map(|a| a.args.iter())
+        .filter_map(|t| match t {
+            Term::Var(name) => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+
+    let mut negated = Vec::new();
+    for part in &deferred_negated {
+        let atom = parse_atom(part, &mut anon_counter)?;
+        let unbound: Vec<&str> = atom
+            .args
+            .iter()
+            .filter_map(|t| match t {
+                // An anonymous variable is existential by construction: the
+                // parser renames each `_` uniquely, so it can never be named
+                // by the head or a filter, and checking it only asks whether
+                // *some* row matches — never enumerating the universe.
+                Term::Var(name) if !name.starts_with("_anon_") => Some(name.as_str()),
+                _ => None,
+            })
+            .filter(|name| !positive_vars.contains(*name))
+            .collect();
+        anyhow::ensure!(
+            unbound.is_empty(),
+            "unsafe negation in `not {}`: variable(s) {} are not bound by any \
+             positive body atom, so the rule would range over every value in \
+             the store",
+            part,
+            unbound.join(", ")
+        );
+        negated.push(atom);
+    }
 
     // Note: the v1 intra-rule recursion guard was removed here.
     // The stratify analyzer (Task M3) supersedes it and also catches
@@ -131,7 +181,21 @@ pub fn parse_rule(text: &str) -> anyhow::Result<DatalogRule> {
         body,
         filters,
         aggregates,
+        negated,
     })
+}
+
+/// Strip a leading `not` keyword from a body part.
+///
+/// Requires whitespace after the keyword so a predicate whose name merely
+/// begins with those letters — `nothing(X)` — stays a positive atom.
+fn strip_not_prefix(part: &str) -> Option<&str> {
+    let rest = part.strip_prefix("not")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim_start();
+    if rest.is_empty() { None } else { Some(rest) }
 }
 
 /// Split a string on a delimiter, but only at top level (not inside parentheses).
@@ -489,11 +553,64 @@ fn collect_bindings(rule: &DatalogRule, all_facts: &FactSet) -> Vec<Candidate> {
             next_bindings
         });
 
-    // Apply filters and return bindings (head instantiation is the caller's job)
+    // Apply filters, then negation. Filters first because they are cheap and
+    // prune candidates a negation check would otherwise scan facts for.
+    //
+    // Stratification guarantees every negated predicate settled in a strictly
+    // lower stratum, so `all_facts` holds its final extension here and the
+    // check below is a decision, not a race with this stratum's fixpoint.
     final_bindings
         .into_iter()
         .filter(|(binding, _)| check_filters(&rule.filters, binding))
+        .filter_map(|(binding, mut provenance)| {
+            for neg in &rule.negated {
+                if negated_atom_matches(neg, &binding, all_facts) {
+                    return None;
+                }
+                provenance.push(make_absence_step(neg, &binding));
+            }
+            Some((binding, provenance))
+        })
         .collect()
+}
+
+/// True iff some fact matches the negated atom under the current binding.
+///
+/// This is negation as failure over the settled lower strata, so it never
+/// binds: a variable already bound must match that value, and an unbound
+/// (anonymous) variable is a wildcard asking only whether *some* row matches.
+fn negated_atom_matches(atom: &Atom, binding: &Binding, all_facts: &FactSet) -> bool {
+    let Some(fact_set) = all_facts.get(&atom.predicate) else {
+        return false;
+    };
+    fact_set.iter().any(|fact_args| {
+        fact_args.len() == atom.args.len()
+            && atom
+                .args
+                .iter()
+                .zip(fact_args.iter())
+                .all(|(pattern, actual)| match pattern {
+                    Term::Var(name) => match binding.get(name) {
+                        Some(bound) => bound == actual,
+                        None => true,
+                    },
+                    constant => constant == actual,
+                })
+    })
+}
+
+/// Build a provenance step recording that a negated atom held — that is,
+/// that nothing matched it. There is no row to cite, so the step names the
+/// absent predicate and the bindings the absence was checked under.
+fn make_absence_step(atom: &Atom, binding: &Binding) -> ProvenanceStep {
+    let args = instantiate(&atom.args, binding);
+    let (src, dst) = extract_src_dst(&args);
+    ProvenanceStep {
+        parent_src: src,
+        parent_pred: atom.predicate.clone(),
+        parent_dst: dst,
+        parent_kind: crate::types::PROVENANCE_KIND_ABSENCE.to_string(),
+    }
 }
 
 /// Two-phase aggregate evaluator.
@@ -522,6 +639,10 @@ fn evaluate_rule_with_aggregates(
         body: rule.body.clone(),
         filters: phase1_filters.clone(),
         aggregates: Vec::new(),
+        // Negated atoms prune candidates before aggregation, so they belong
+        // to phase 1. A negated rule always has a positive body atom, so the
+        // body-empty seeding path below can never carry negation.
+        negated: rule.negated.clone(),
     };
 
     // Phase 1: collect candidate bindings from non-aggregate body atoms.
@@ -973,13 +1094,33 @@ fn compute_confidence(provenance: &[ProvenanceStep], _all_facts: &FactSet) -> f6
     // Rule weight defaults to 0.9 for builtins.
     let min_parent = 1.0_f64;
     let weight = 0.9_f64;
-    (min_parent * weight).clamp(0.0, 1.0)
+    // An absence is weaker evidence than a present row. The store is
+    // open-world: "no row says otherwise" can equally mean the row has not
+    // arrived yet. A derivation resting on one is discounted once, however
+    // many absences it rests on — the weakness is in the kind of evidence,
+    // not its count. Purely positive derivations are unaffected, which is
+    // what keeps negation additive for every rule that does not use it.
+    let absence_factor = if provenance
+        .iter()
+        .any(|step| step.parent_kind == crate::types::PROVENANCE_KIND_ABSENCE)
+    {
+        ABSENCE_CONFIDENCE_WEIGHT
+    } else {
+        1.0
+    };
+    (min_parent * weight * absence_factor).clamp(0.0, 1.0)
 }
+
+/// Confidence discount applied once to any derivation resting on an absence.
+const ABSENCE_CONFIDENCE_WEIGHT: f64 = 0.8;
 
 /// Format a rule identifier from its head predicate and body predicates.
 fn format_rule_id(rule: &DatalogRule) -> String {
-    let body_preds: Vec<&str> = rule.body.iter().map(|a| a.predicate.as_str()).collect();
-    format!("{}:-{}", rule.head.predicate, body_preds.join(","))
+    // Negated predicates are appended rather than interleaved so that a rule
+    // without negation keeps byte-identical its previous id.
+    let mut preds: Vec<String> = rule.body.iter().map(|a| a.predicate.clone()).collect();
+    preds.extend(rule.negated.iter().map(|a| format!("not {}", a.predicate)));
+    format!("{}:-{}", rule.head.predicate, preds.join(","))
 }
 
 // ─── Built-in Rules ───────────────────────────────────────────────
@@ -1267,10 +1408,29 @@ pub async fn query_predicate(
         .filter(|d| d.pred == predicate)
         .collect();
 
-    // 4. Cache results and record telemetry
+    // 4. Cache results and record telemetry.
+    //
+    // A derivation resting on an absence is non-monotonic: a later base fact
+    // can falsify it, and this cache is append-only, so it would go on serving
+    // the stale derivation. Those are re-derived live on every query instead.
     let elapsed_ms = start.elapsed().as_millis() as i64;
-    if !results.is_empty() {
-        storage.derived_cache_put(ctx, &cache_key, &results).await?;
+    let cacheable: Vec<DerivedFact> = results
+        .iter()
+        .filter(|f| !f.rests_on_absence())
+        .cloned()
+        .collect();
+    let uncacheable = results.len() - cacheable.len();
+    if uncacheable > 0 {
+        tracing::debug!(
+            predicate,
+            uncacheable,
+            "datalog: not caching derivations that rest on an absence; re-derived per query"
+        );
+    }
+    if !cacheable.is_empty() {
+        storage
+            .derived_cache_put(ctx, &cache_key, &cacheable)
+            .await?;
     }
     storage
         .heat_record(ctx, predicate, false, Some(elapsed_ms))
@@ -1299,6 +1459,7 @@ pub fn stratify(
     enum Edge {
         Plain,
         Aggregate,
+        Negated,
     }
 
     // Build predicate dep graph: head -> Vec<(dependency, edge_kind)>.
@@ -1311,6 +1472,10 @@ pub fn stratify(
         let entry = graph.entry(head.clone()).or_default();
         for atom in &rule.body {
             entry.push((atom.predicate.clone(), Edge::Plain));
+            all_preds.insert(atom.predicate.clone());
+        }
+        for atom in &rule.negated {
+            entry.push((atom.predicate.clone(), Edge::Negated));
             all_preds.insert(atom.predicate.clone());
         }
         for agg in &rule.aggregates {
@@ -1422,10 +1587,24 @@ pub fn stratify(
         for node in scc {
             if let Some(succs) = graph.get(node) {
                 for (succ, edge) in succs {
-                    if scc_set.contains(succ.as_str()) && *edge == Edge::Aggregate {
-                        return Err(crate::types::StratifyError::RecursionThroughAggregate {
-                            cycle: scc.clone(),
-                        });
+                    if !scc_set.contains(succ.as_str()) {
+                        continue;
+                    }
+                    match edge {
+                        Edge::Aggregate => {
+                            return Err(crate::types::StratifyError::RecursionThroughAggregate {
+                                cycle: scc.clone(),
+                            });
+                        }
+                        // A predicate that transitively depends on its own
+                        // negation has no stratified model. Reject rather
+                        // than settle on an arbitrary fixpoint.
+                        Edge::Negated => {
+                            return Err(crate::types::StratifyError::RecursionThroughNegation {
+                                cycle: scc.clone(),
+                            });
+                        }
+                        Edge::Plain => {}
                     }
                 }
             }
@@ -1437,7 +1616,7 @@ pub fn stratify(
     let mut scc_stratum: HashMap<usize, usize> = HashMap::new();
     for (i, scc) in sccs.iter().enumerate() {
         let mut max_dep_stratum: i64 = -1;
-        let mut had_aggregate_edge = false;
+        let mut had_settling_edge = false;
         for node in scc {
             if let Some(succs) = graph.get(node) {
                 for (succ, edge) in succs {
@@ -1447,17 +1626,19 @@ pub fn stratify(
                         if s > max_dep_stratum {
                             max_dep_stratum = s;
                         }
-                        if *edge == Edge::Aggregate {
-                            had_aggregate_edge = true;
+                        if matches!(edge, Edge::Aggregate | Edge::Negated) {
+                            had_settling_edge = true;
                         }
                     }
                 }
             }
         }
         // Plain edges: stratum = max_dep + 1 (derived predicates always lift one level).
-        // Aggregate edges: stratum = max_dep + 2 (extra lift ensures the aggregated relation
-        // is fully computed before aggregation runs).
-        let lift = if had_aggregate_edge { 2 } else { 1 };
+        // Aggregate and negated edges: stratum = max_dep + 2. Both read a relation
+        // rather than extend it, so the extra lift guarantees that relation is fully
+        // computed first — for negation this is exactly what makes the negated atom
+        // constant during this stratum's semi-naive fixpoint, and so sound.
+        let lift = if had_settling_edge { 2 } else { 1 };
         let stratum = if max_dep_stratum < 0 {
             0
         } else {
@@ -2609,6 +2790,7 @@ mod tests {
             crate::types::StratifyError::RecursionThroughAggregate { cycle } => {
                 assert!(cycle.contains(&"loop".to_string()));
             }
+            other => panic!("expected RecursionThroughAggregate, got {other:?}"),
         }
     }
 
@@ -2622,6 +2804,7 @@ mod tests {
                 assert!(cycle.iter().any(|c| c == "a"));
                 assert!(cycle.iter().any(|c| c == "b"));
             }
+            other => panic!("expected RecursionThroughAggregate, got {other:?}"),
         }
     }
 
@@ -2908,5 +3091,402 @@ mod tests {
                 prop_assert_eq!(forward, reversed);
             }
         }
+    }
+}
+
+// ─── Negation Tests ───────────────────────────────────────────────
+
+#[cfg(test)]
+mod negation_tests {
+    use super::*;
+    use crate::types::{DatalogRule, Term};
+
+    // ── Slice 1: syntax and representation ────────────────────────
+
+    #[test]
+    fn parse_rule_accepts_a_negated_body_atom() {
+        let rule = parse_rule("shareable(X) :- item(X), not secret(X).").unwrap();
+        assert_eq!(rule.body.len(), 1, "positive atoms stay in body");
+        assert_eq!(rule.body[0].predicate, "item");
+        assert_eq!(rule.negated.len(), 1, "negated atom lands in `negated`");
+        assert_eq!(rule.negated[0].predicate, "secret");
+        assert_eq!(rule.negated[0].args, vec![Term::Var("X".into())]);
+    }
+
+    #[test]
+    fn parse_rule_accepts_a_multi_arg_negated_atom() {
+        let rule = parse_rule("q(X, Y) :- p(X, Y), not r(X, Y).").unwrap();
+        assert_eq!(rule.negated.len(), 1);
+        assert_eq!(rule.negated[0].args.len(), 2);
+    }
+
+    #[test]
+    fn parse_rule_treats_a_predicate_named_not_something_as_positive() {
+        // `nothing(X)` must not be read as `not hing(X)`.
+        let rule = parse_rule("q(X) :- nothing(X).").unwrap();
+        assert_eq!(rule.body.len(), 1);
+        assert_eq!(rule.body[0].predicate, "nothing");
+        assert!(rule.negated.is_empty());
+    }
+
+    #[test]
+    fn parse_rule_rejects_a_body_that_is_only_negated() {
+        // With no positive atom there is nothing to range-restrict against.
+        let err = parse_rule("q(X) :- not p(X).").unwrap_err().to_string();
+        assert!(
+            err.contains("positive"),
+            "error should explain the missing positive atom, got: {err}"
+        );
+    }
+
+    #[test]
+    fn datalog_rule_without_negated_field_still_deserializes() {
+        // Stored-format guard: RuleEntry rows written before negation existed.
+        let json = r#"{"head":{"predicate":"q","args":[{"type":"Var","value":"X"}]},
+                       "body":[{"predicate":"p","args":[{"type":"Var","value":"X"}]}],
+                       "filters":[]}"#;
+        let rule: DatalogRule = serde_json::from_str(json).unwrap();
+        assert!(rule.negated.is_empty(), "absent field means no negation");
+        assert_eq!(rule.body.len(), 1);
+    }
+
+    #[test]
+    fn negated_rule_round_trips_through_serde() {
+        let rule = parse_rule("q(X) :- p(X), not r(X).").unwrap();
+        let json = serde_json::to_string(&rule).unwrap();
+        let back: DatalogRule = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.negated.len(), 1);
+        assert_eq!(back.negated[0].predicate, "r");
+        assert_eq!(back, rule);
+    }
+
+    // ── Slice 2: range-restriction safety ─────────────────────────
+
+    #[test]
+    fn parse_rule_rejects_a_negated_variable_no_positive_atom_binds() {
+        let err = parse_rule("q(X) :- p(X), not r(Y).")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains('Y'),
+            "rejection must name the unbound variable, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_rule_accepts_a_negated_variable_bound_by_a_positive_atom() {
+        let rule = parse_rule("q(X) :- p(X), not r(X).").unwrap();
+        assert_eq!(rule.negated.len(), 1);
+    }
+
+    #[test]
+    fn parse_rule_allows_an_anonymous_variable_in_a_negated_atom() {
+        // `_` is existential by construction — the parser renames each one
+        // uniquely, so it can never be referenced by the head or a filter,
+        // and checking it never enumerates the universe.
+        let rule = parse_rule("q(X) :- p(X), not r(X, _).").unwrap();
+        assert_eq!(rule.negated.len(), 1);
+        assert_eq!(rule.negated[0].args.len(), 2);
+    }
+
+    // ── Slice 3: stratification ───────────────────────────────────
+
+    #[test]
+    fn stratify_lifts_a_negated_dependency_above_its_source() {
+        let rules = vec![
+            parse_rule("p(X) :- base(X).").unwrap(),
+            parse_rule("q(X) :- base(X), not p(X).").unwrap(),
+        ];
+        let strata = stratify(&rules).unwrap();
+        let stratum_of = |pred: &str| {
+            strata
+                .iter()
+                .position(|group| group.iter().any(|i| rules[*i].head.predicate == pred))
+                .unwrap()
+        };
+        assert!(
+            stratum_of("q") > stratum_of("p"),
+            "the negated relation must settle in a strictly lower stratum"
+        );
+    }
+
+    #[test]
+    fn stratify_rejects_recursion_through_negation() {
+        let rules = vec![parse_rule("p(X) :- base(X), not p(X).").unwrap()];
+        let err = stratify(&rules).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::types::StratifyError::RecursionThroughNegation { .. }
+            ),
+            "expected RecursionThroughNegation, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn stratify_rejects_cross_rule_recursion_through_negation() {
+        let rules = vec![
+            parse_rule("p(X) :- base(X), not q(X).").unwrap(),
+            parse_rule("q(X) :- base(X), p(X).").unwrap(),
+        ];
+        let err = stratify(&rules).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::types::StratifyError::RecursionThroughNegation { .. }
+        ));
+    }
+
+    #[test]
+    fn stratify_still_allows_plain_recursion_alongside_negation() {
+        let rules = vec![
+            parse_rule("reach(X, Y) :- edge(X, Y).").unwrap(),
+            parse_rule("reach(X, Z) :- reach(X, Y), edge(Y, Z).").unwrap(),
+            parse_rule("unreached(X) :- node(X), not reach(X, X).").unwrap(),
+        ];
+        assert!(stratify(&rules).is_ok());
+    }
+
+    // ── Slice 4: evaluation ───────────────────────────────────────
+
+    fn facts(rows: &[(&str, Vec<Term>)]) -> FactSet {
+        let mut fs = FactSet::new();
+        for (pred, args) in rows {
+            fs.insert(pred, args.clone());
+        }
+        fs
+    }
+
+    fn s(v: &str) -> Term {
+        Term::ConstStr(v.to_string())
+    }
+
+    #[test]
+    fn evaluate_excludes_bindings_the_negated_atom_matches() {
+        let rules = vec![parse_rule("shareable(X) :- item(X), not secret(X).").unwrap()];
+        let initial = facts(&[
+            ("item", vec![s("a")]),
+            ("item", vec![s("b")]),
+            ("secret", vec![s("b")]),
+        ]);
+        let (all, _derived) = evaluate(&rules, &initial, 100, 1000);
+        assert!(all.contains("shareable", &[s("a")]), "a is not secret");
+        assert!(
+            !all.contains("shareable", &[s("b")]),
+            "b is secret and must be excluded"
+        );
+    }
+
+    #[test]
+    fn evaluate_keeps_every_binding_when_the_negated_relation_is_empty() {
+        let rules = vec![parse_rule("shareable(X) :- item(X), not secret(X).").unwrap()];
+        let initial = facts(&[("item", vec![s("a")]), ("item", vec![s("b")])]);
+        let (all, _) = evaluate(&rules, &initial, 100, 1000);
+        assert!(all.contains("shareable", &[s("a")]));
+        assert!(all.contains("shareable", &[s("b")]));
+    }
+
+    #[test]
+    fn evaluate_matches_a_negated_atom_on_all_its_bound_arguments() {
+        // `not r(X, "red")` must only exclude X bound to a *red* r row.
+        let rules = vec![parse_rule("q(X) :- p(X), not r(X, \"red\").").unwrap()];
+        let initial = facts(&[
+            ("p", vec![s("a")]),
+            ("p", vec![s("b")]),
+            ("r", vec![s("a"), s("red")]),
+            ("r", vec![s("b"), s("blue")]),
+        ]);
+        let (all, _) = evaluate(&rules, &initial, 100, 1000);
+        assert!(!all.contains("q", &[s("a")]), "a has a red r row");
+        assert!(all.contains("q", &[s("b")]), "b's r row is blue, not red");
+    }
+
+    #[test]
+    fn evaluate_treats_an_anonymous_negated_argument_as_existential() {
+        let rules = vec![parse_rule("q(X) :- p(X), not r(X, _).").unwrap()];
+        let initial = facts(&[
+            ("p", vec![s("a")]),
+            ("p", vec![s("b")]),
+            ("r", vec![s("a"), s("anything")]),
+        ]);
+        let (all, _) = evaluate(&rules, &initial, 100, 1000);
+        assert!(!all.contains("q", &[s("a")]), "some r row mentions a");
+        assert!(all.contains("q", &[s("b")]), "no r row mentions b");
+    }
+
+    #[test]
+    fn a_new_base_fact_falsifies_a_previously_derived_fact_on_re_evaluation() {
+        let rules = vec![parse_rule("shareable(X) :- item(X), not secret(X).").unwrap()];
+        let before = facts(&[("item", vec![s("a")])]);
+        let (all_before, _) = evaluate(&rules, &before, 100, 1000);
+        assert!(all_before.contains("shareable", &[s("a")]));
+
+        // The non-monotonic case: adding a base fact removes a derived fact.
+        let after = facts(&[("item", vec![s("a")]), ("secret", vec![s("a")])]);
+        let (all_after, _) = evaluate(&rules, &after, 100, 1000);
+        assert!(
+            !all_after.contains("shareable", &[s("a")]),
+            "re-evaluation must not re-derive the falsified fact"
+        );
+    }
+
+    // ── Slice 5: provenance and confidence ────────────────────────
+
+    #[test]
+    fn provenance_names_the_absent_predicate() {
+        let rules = vec![parse_rule("q(X) :- p(X), not r(X).").unwrap()];
+        let initial = facts(&[("p", vec![s("a")])]);
+        let (_, derived) = evaluate(&rules, &initial, 100, 1000);
+        let fact = derived.iter().find(|d| d.pred == "q").expect("derived q");
+        let absence = fact
+            .provenance
+            .iter()
+            .find(|step| step.parent_kind == "absence")
+            .expect("an absence provenance step");
+        assert_eq!(absence.parent_pred, "r");
+        assert_eq!(absence.parent_src, "a", "the absence records its binding");
+    }
+
+    #[test]
+    fn an_absence_counts_toward_support_count() {
+        let rules = vec![parse_rule("q(X) :- p(X), not r(X).").unwrap()];
+        let initial = facts(&[("p", vec![s("a")])]);
+        let (_, derived) = evaluate(&rules, &initial, 100, 1000);
+        let fact = derived.iter().find(|d| d.pred == "q").unwrap();
+        assert_eq!(
+            fact.support_count, 2,
+            "one positive atom + one absence = 2 support"
+        );
+    }
+
+    #[test]
+    fn an_absence_is_weaker_evidence_than_a_present_fact() {
+        let positive = vec![parse_rule("q(X) :- p(X), r(X).").unwrap()];
+        let negative = vec![parse_rule("q(X) :- p(X), not s(X).").unwrap()];
+        let pos_facts = facts(&[("p", vec![s("a")]), ("r", vec![s("a")])]);
+        let neg_facts = facts(&[("p", vec![s("a")])]);
+
+        let (_, pos_derived) = evaluate(&positive, &pos_facts, 100, 1000);
+        let (_, neg_derived) = evaluate(&negative, &neg_facts, 100, 1000);
+
+        let pos_conf = pos_derived
+            .iter()
+            .find(|d| d.pred == "q")
+            .unwrap()
+            .confidence;
+        let neg_conf = neg_derived
+            .iter()
+            .find(|d| d.pred == "q")
+            .unwrap()
+            .confidence;
+        assert!(
+            neg_conf < pos_conf,
+            "absence ({neg_conf}) must weigh less than presence ({pos_conf})"
+        );
+    }
+
+    // ── Slice 6: never cache a derivation that rests on an absence ─
+
+    #[test]
+    fn a_fact_derived_through_negation_is_not_cacheable() {
+        let rules = vec![parse_rule("q(X) :- p(X), not r(X).").unwrap()];
+        let initial = facts(&[("p", vec![Term::Const(uuid::Uuid::nil())])]);
+        let (_, derived) = evaluate(&rules, &initial, 100, 1000);
+        let fact = derived.iter().find(|d| d.pred == "q").unwrap();
+        assert!(
+            fact.rests_on_absence(),
+            "the derivation rests on an absence"
+        );
+        assert!(
+            !fact.is_cacheable(),
+            "a non-monotonic derivation must never be persisted"
+        );
+    }
+
+    // ── Slice 7: D4 — the tier floor as an exclusion ──────────────
+
+    /// The current DIKW corpus: one tier per entity, four tiers.
+    fn dikw_corpus() -> FactSet {
+        facts(&[
+            ("tier", vec![s("raw-log"), s("data")]),
+            ("tier", vec![s("parsed-doc"), s("information")]),
+            ("tier", vec![s("linked-fact"), s("knowledge")]),
+            ("tier", vec![s("rust-skill"), s("wisdom")]),
+        ])
+    }
+
+    fn shareable_set(rule_texts: &[&str], corpus: &FactSet) -> Vec<String> {
+        let rules: Vec<_> = rule_texts.iter().map(|t| parse_rule(t).unwrap()).collect();
+        let (all, _) = evaluate(&rules, corpus, 100, 10_000);
+        let mut out: Vec<String> = all
+            .get("shareable")
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|args| args.first())
+                    .map(term_to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn the_d4_tier_floor_and_its_exclusion_form_derive_the_same_set() {
+        let corpus = dikw_corpus();
+
+        // D4 as it is written today: the floor, enumerated upward. This is a
+        // positive encoding of a negative intent, equivalent only while the
+        // tier lattice stays totally ordered, closed, and one-tier-per-entity.
+        let floor = shareable_set(
+            &[
+                "shareable(E) :- tier(E, \"knowledge\").",
+                "shareable(E) :- tier(E, \"wisdom\").",
+            ],
+            &corpus,
+        );
+
+        // The same grant said as what it actually means: everything tiered,
+        // except the two tiers below the floor.
+        let exclusion = shareable_set(
+            &["shareable(E) :- tier(E, _), not tier(E, \"data\"), \
+               not tier(E, \"information\")."],
+            &corpus,
+        );
+
+        assert_eq!(floor, vec!["linked-fact", "rust-skill"]);
+        assert_eq!(
+            exclusion, floor,
+            "the exclusion form must derive exactly the floor's set"
+        );
+    }
+
+    #[test]
+    fn an_exclusion_off_the_tier_axis_is_now_expressible_at_all() {
+        // "share everything except items tagged secret" has no positive
+        // encoding as a tier floor — it does not lie along the tier axis.
+        // This is the requirement that cost a bespoke enumeration in Rust.
+        let corpus = facts(&[
+            ("tier", vec![s("linked-fact"), s("knowledge")]),
+            ("tier", vec![s("rust-skill"), s("wisdom")]),
+            ("tier", vec![s("payroll"), s("wisdom")]),
+            ("tagged", vec![s("payroll"), s("secret")]),
+        ]);
+        let got = shareable_set(
+            &["shareable(E) :- tier(E, _), not tagged(E, \"secret\")."],
+            &corpus,
+        );
+        assert_eq!(got, vec!["linked-fact", "rust-skill"]);
+    }
+
+    #[test]
+    fn a_purely_positive_derivation_stays_cacheable() {
+        let rules = vec![parse_rule("q(X, Y) :- p(X, Y).").unwrap()];
+        let id_a = uuid::Uuid::new_v4();
+        let id_b = uuid::Uuid::new_v4();
+        let initial = facts(&[("p", vec![Term::Const(id_a), Term::Const(id_b)])]);
+        let (_, derived) = evaluate(&rules, &initial, 100, 1000);
+        let fact = derived.iter().find(|d| d.pred == "q").unwrap();
+        assert!(!fact.rests_on_absence());
+        assert!(fact.is_cacheable());
     }
 }
