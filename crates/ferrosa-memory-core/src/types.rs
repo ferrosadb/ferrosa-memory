@@ -693,6 +693,13 @@ pub enum Term {
     Const(Uuid),
     ConstStr(String),
     ConstFloat(OrderedFloat<f64>),
+    /// A known-absent value, written `null`.
+    ///
+    /// Distinct from a variable that is unbound, which means "not decided
+    /// yet", and from an evaluation error, which means "no answer at all".
+    /// Comparing anything to it is `Unknown`, which propagates by Kleene —
+    /// unlike an error, which poisons.
+    ConstNull,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -717,6 +724,10 @@ pub enum BuiltinFilter {
         lhs: FilterExpr,
         rhs: FilterExpr,
     },
+    /// `is_null(expr)`. Answers true or false and never `Unknown`, which is
+    /// what makes it the only way to actually ask: `V == null` is `Unknown`
+    /// and therefore never fires.
+    IsNull(FilterExpr),
     /// A boolean-valued question about the shape of a string, written
     /// `str_starts_with(S, P)`.
     StrPred {
@@ -788,6 +799,8 @@ pub enum FilterExpr {
         rhs: Box<FilterExpr>,
     },
     Neg(Box<FilterExpr>),
+    /// The `null` literal.
+    Null,
     /// A call to one of a closed set of pure functions.
     ///
     /// Closed on purpose: an open extension point would mean an unknown name
