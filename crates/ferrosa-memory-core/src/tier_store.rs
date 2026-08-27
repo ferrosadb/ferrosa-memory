@@ -516,7 +516,7 @@ pub struct TierSummary {
 /// 512 is far above the eight roots this tenant has and far below a number
 /// that would make a map slow. Crossing it is a configuration problem worth
 /// hearing about, not a size to absorb silently.
-const MAX_ROOTS_COUNTED: usize = 512;
+pub const MAX_ROOTS_COUNTED: usize = 512;
 
 /// How many promotions one summary will read.
 ///

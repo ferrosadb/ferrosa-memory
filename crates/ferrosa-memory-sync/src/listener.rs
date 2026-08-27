@@ -64,6 +64,48 @@ fn memory_tenant(configured: Option<&str>) -> Option<Uuid> {
 /// slots free rather than being refused.
 const MAX_CONCURRENT_CONTROL_SESSIONS: usize = 8;
 
+/// The live sessions a new one is checked against, and the device claiming it.
+///
+/// Optional at the call site so every existing caller and test keeps working
+/// without one — a listener that does not supply it simply does not supersede,
+/// which is the behaviour before this existed.
+pub(crate) struct SupersedeRegistry {
+    pub sessions:
+        std::sync::Arc<
+            tokio::sync::Mutex<
+                Vec<(Uuid, Uuid, std::sync::Arc<webrtc::peer_connection::RTCPeerConnection>)>,
+            >,
+        >,
+    pub controller_device_id: Uuid,
+}
+
+/// Which live sessions a new one displaces.
+///
+/// One session per controller device. A device that reconnects — because it
+/// backgrounded, changed network, or lost ICE — offers a NEW session, and
+/// without this the old one is served alongside it until its ICE eventually
+/// times out. Six accumulated from a single phone before this was found, each
+/// dying about a minute later, which is what the operator experienced as the
+/// connection dropping.
+///
+/// It also protects the concurrency cap. `MAX_CONCURRENT_CONTROL_SESSIONS` is
+/// eight because that "covers a person's own devices" — an assumption that only
+/// holds at one session each. One phone holding six slots starves the tablet
+/// and the laptop queued behind it.
+///
+/// Pure, and given the live set rather than reading it, so the decision can be
+/// tested without a runtime, a broker or a peer connection.
+fn sessions_superseded_by(
+    new_session: Uuid,
+    new_device: Uuid,
+    live: &[(Uuid, Uuid)],
+) -> Vec<Uuid> {
+    live.iter()
+        .filter(|(session, device)| *device == new_device && *session != new_session)
+        .map(|(session, _)| *session)
+        .collect()
+}
+
 /// Wait added per consecutive failed poll.
 const POLL_BACKOFF_BASE: Duration = Duration::from_millis(500);
 
@@ -311,6 +353,13 @@ pub async fn run_control_listener(
     // tablet and an iPad on one account that is the normal case, not an edge.
     let in_flight: Arc<tokio::sync::Mutex<std::collections::HashSet<Uuid>>> =
         Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+    // Live sessions and who owns them, so a device that reconnects displaces
+    // its own previous session instead of being served twice. `in_flight`
+    // cannot answer this: it is keyed by SESSION, and a reconnect is a new
+    // session id by definition.
+    let live_sessions: Arc<
+        tokio::sync::Mutex<Vec<(Uuid, Uuid, Arc<webrtc::peer_connection::RTCPeerConnection>)>>,
+    > = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     // Bounded so a flood of offers cannot exhaust the host. Sessions beyond the
     // cap stay pending on the broker and are picked up as slots free.
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONTROL_SESSIONS));
@@ -400,6 +449,8 @@ pub async fn run_control_listener(
             let fingerprint = fingerprint.clone();
             let rtc = rtc_api.clone();
             let attach = hooks.clone();
+            let live_sessions = Arc::clone(&live_sessions);
+            let controller_device_id = offer.controller_device_id;
             // Kept because `offer` moves into the call below, and the id is
             // needed afterwards to release the in-flight slot.
             let session_id = offer.session_id;
@@ -416,9 +467,14 @@ pub async fn run_control_listener(
                     offer,
                     rtc,
                     attach,
+                    Some(SupersedeRegistry {
+                        sessions: Arc::clone(&live_sessions),
+                        controller_device_id,
+                    }),
                 )
                 .await;
                 in_flight.lock().await.remove(&session_id);
+                live_sessions.lock().await.retain(|(id, _, _)| *id != session_id);
             });
         }
     }
@@ -443,6 +499,7 @@ async fn serve_control_session<S, R, T>(
     offer: crate::signaling_client::ControlBrokerSessionView,
     rtc: Option<std::sync::Arc<webrtc::api::API>>,
     attach: Vec<std::sync::Arc<dyn SessionExtension>>,
+    supersede: Option<SupersedeRegistry>,
 ) where
     S: crate::signaling_client::ControlSignalingApi,
     R: crate::control_session::AgentRuntime,
@@ -472,6 +529,43 @@ async fn serve_control_session<S, R, T>(
         peer: channel.peer_connection(),
         sink: channel.frame_sink(),
     };
+
+    // One session per controller device. Registering BEFORE displacing means
+    // the new session is already in the list when the decision runs, which is
+    // why that decision refuses to supersede itself.
+    if let Some(registry) = &supersede {
+        let doomed = {
+            let mut live = registry.sessions.lock().await;
+            live.push((
+                offer.session_id,
+                registry.controller_device_id,
+                channel.peer_connection(),
+            ));
+            let pairs: Vec<(Uuid, Uuid)> =
+                live.iter().map(|(s, d, _)| (*s, *d)).collect();
+            let ids = sessions_superseded_by(
+                offer.session_id,
+                registry.controller_device_id,
+                &pairs,
+            );
+            live.iter()
+                .filter(|(id, _, _)| ids.contains(id))
+                .map(|(id, _, peer)| (*id, std::sync::Arc::clone(peer)))
+                .collect::<Vec<_>>()
+        };
+        for (old, peer) in doomed {
+            // Said out loud: an operator whose screen goes blank deserves the
+            // reason in the log, and "superseded" is a different event from
+            // "the peer went away".
+            tracing::info!(
+                superseded = %old,
+                by = %offer.session_id,
+                device = %registry.controller_device_id,
+                "a newer session from this device supersedes an older one"
+            );
+            let _ = peer.close().await;
+        }
+    }
     for extension in &attach {
         // Logged, not fatal, and the next extension still runs. One failing
         // must not cost the operator the others, nor the control channel
@@ -1183,6 +1277,78 @@ async fn peer_lost(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod supersede_tests {
+    use super::*;
+
+    fn dev(n: u8) -> Uuid {
+        Uuid::from_bytes([n; 16])
+    }
+    fn sess(n: u8) -> Uuid {
+        Uuid::from_bytes([0xF0 | n; 16])
+    }
+
+    /// The ordinary first connection. Nothing to displace.
+    #[test]
+    fn a_first_session_from_a_device_supersedes_nothing() {
+        assert!(sessions_superseded_by(sess(1), dev(1), &[]).is_empty());
+    }
+
+    /// The bug, stated. A phone that reconnects had BOTH sessions served, and
+    /// the older one was left to die on an ICE timeout — which is what the
+    /// operator saw as the connection dropping.
+    #[test]
+    fn a_reconnecting_device_supersedes_its_own_previous_session() {
+        let live = [(sess(1), dev(1))];
+        assert_eq!(
+            sessions_superseded_by(sess(2), dev(1), &live),
+            vec![sess(1)]
+        );
+    }
+
+    /// Six had piled up on one phone before this was found, so one is not the
+    /// only case that matters.
+    #[test]
+    fn every_stale_session_from_that_device_is_superseded() {
+        let live = [(sess(1), dev(1)), (sess(2), dev(1)), (sess(3), dev(1))];
+        assert_eq!(
+            sessions_superseded_by(sess(4), dev(1), &live),
+            vec![sess(1), sess(2), sess(3)]
+        );
+    }
+
+    /// The tablet must not be hung up on because the phone reconnected. This
+    /// is the whole reason the rule is per DEVICE and not "one session".
+    #[test]
+    fn another_devices_session_is_never_superseded() {
+        let live = [(sess(1), dev(2))];
+        assert!(sessions_superseded_by(sess(2), dev(1), &live).is_empty());
+    }
+
+    #[test]
+    fn only_the_matching_device_is_superseded_among_several() {
+        let live = [
+            (sess(1), dev(1)),
+            (sess(2), dev(2)),
+            (sess(3), dev(1)),
+            (sess(4), dev(3)),
+        ];
+        assert_eq!(
+            sessions_superseded_by(sess(9), dev(1), &live),
+            vec![sess(1), sess(3)]
+        );
+    }
+
+    /// A session must never end itself. The registry may already contain the
+    /// new session by the time this runs, and superseding it would hang up on
+    /// the connection being established.
+    #[test]
+    fn a_session_never_supersedes_itself() {
+        let live = [(sess(1), dev(1))];
+        assert!(sessions_superseded_by(sess(1), dev(1), &live).is_empty());
     }
 }
 

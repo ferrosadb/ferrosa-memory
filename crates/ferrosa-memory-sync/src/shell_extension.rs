@@ -70,6 +70,8 @@ pub struct ShellExtension {
     /// Knowledge and claims, on the same terms again: connected on first use,
     /// and a cluster that is down costs one screen rather than the session.
     knowledge: tokio::sync::OnceCell<Option<Arc<crate::knowledge_view::KnowledgeView>>>,
+    /// The classification rules, on the same terms again.
+    rules: tokio::sync::OnceCell<Option<Arc<crate::rules_view::RulesView>>>,
 }
 
 #[derive(Default)]
@@ -101,6 +103,7 @@ impl ShellExtension {
             board: tokio::sync::OnceCell::new(),
             memory: tokio::sync::OnceCell::new(),
             knowledge: tokio::sync::OnceCell::new(),
+            rules: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -157,6 +160,327 @@ impl ShellExtension {
     }
 
     /// Knowledge and claims, connected once. `None` if unreachable.
+    async fn rules(&self) -> Option<Arc<crate::rules_view::RulesView>> {
+        self.rules
+            .get_or_init(|| async {
+                let tenant = self.memory_tenant?;
+                match crate::rules_view::RulesView::connect(&self.board_contact_points, tenant)
+                    .await
+                {
+                    Ok(view) => Some(Arc::new(view)),
+                    Err(error) => {
+                        tracing::warn!(%error, "rules unavailable");
+                        None
+                    }
+                }
+            })
+            .await
+            .clone()
+    }
+
+    /// The rules that classify this machine's corpus, and the pile they have
+    /// not reached.
+    ///
+    /// PAGED, not bounded. A rule list is per-root rather than per-item so it
+    /// is usually small, and "usually small" is exactly the assumption that
+    /// sends a frame nobody receives. Rules and dangling aliases share one
+    /// paged stream, tagged by `row`, so the tab cannot draw a pile and a set
+    /// of rules that disagree about which read they came from.
+    ///
+    /// The unclassified count comes from the SAME summary the Memory tab
+    /// draws, rather than a second count of the same thing — two counts of one
+    /// pile eventually disagree, and nothing would say which was right. It
+    /// rides on the first frame because it is two integers.
+    ///
+    /// A count the machine could not take is OMITTED, never sent as zero. A
+    /// pile rendered as zero because nobody counted reads as "all done", which
+    /// is the one wrong thing this screen can say.
+    async fn rules_frames(&self) -> Vec<serde_json::Value> {
+        let Some(view) = self.rules().await else {
+            let reason = if self.memory_tenant.is_none() {
+                "no memory tenant is configured on this machine"
+            } else {
+                "the rules store could not be reached"
+            };
+            return vec![serde_json::json!({
+                "type": "shell_rules",
+                "reachable": false,
+                "reason": reason,
+                "items": [],
+            })];
+        };
+
+        let snapshot = match view.snapshot().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return vec![serde_json::json!({
+                    "type": "shell_rules",
+                    "reachable": false,
+                    "reason": bounded_reason(format_args!("{error:#}")),
+                    "items": [],
+                })];
+            }
+        };
+
+        let mut rows: Vec<serde_json::Value> = snapshot
+            .rules
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "row": "rule",
+                    "id": bounded_title(&row.root),
+                    "root": bounded_title(&row.root),
+                    "bucket": {
+                        // Until buckets are user-defined (t_9b1f9166) a bucket
+                        // IS its rung, named for it. Sent in the bucket shape
+                        // now so the app does not change when they diverge.
+                        "id": row.tier.as_str(),
+                        "name": row.tier.as_str(),
+                        "rung": row.tier.as_str(),
+                        "is_default": true,
+                    },
+                    "aliases": row.aliases.iter().map(|a| bounded_title(a)).collect::<Vec<_>>(),
+                    "reachability": if row.reachable() { "reachable" } else { "noAlias" },
+                    "datalog": bounded_title(&row.datalog),
+                    "note": bounded_title(&row.note),
+                    // Counts arrive in the trailing frame, not here. Absent
+                    // means "not counted yet", which the app renders as such.
+                    "is_live": false,
+                    "live_reasons": [],
+                })
+            })
+            .collect();
+
+        rows.extend(snapshot.dangling.iter().map(|alias| {
+            serde_json::json!({
+                "row": "dangling",
+                "alias_prefix": bounded_title(&alias.alias_prefix),
+                "canonical_root": bounded_title(&alias.canonical_root),
+            })
+        }));
+
+        let mut frames = Self::page_frames("shell_rules", rows, true, None);
+        if let Some(first) = frames.first_mut() {
+            // Tells the app a count is on its way, so it can show that it is
+            // counting rather than concluding it was not counted.
+            first["tallying"] = serde_json::json!(true);
+            // Not every tier comes from a path rule, and a screen that listed
+            // only path rules would imply they were the whole story. Someone
+            // asking "which rule made this Knowledge?" would find nothing and
+            // conclude the tab was broken, when the honest answer is that no
+            // rule did.
+            first["other_classifiers"] = serde_json::json!([
+                {
+                    "name": "Knowledge",
+                    "governed_by": "approval",
+                    "explain": "A deliverable is Knowledge because a person \
+                                approved it, and stays Knowledge while it is \
+                                still true. No path rule can put something \
+                                here or take it away.",
+                },
+                {
+                    "name": "Claims",
+                    "governed_by": "approval",
+                    "explain": "What an agent proposed and nobody has judged. \
+                                It becomes Knowledge when approved and lapses \
+                                if left, so its tier follows its state rather \
+                                than its location.",
+                },
+                {
+                    "name": "Promotions",
+                    "governed_by": "person",
+                    "explain": "One item placed by hand. A promotion outranks \
+                                every rule below, which is why an item can sit \
+                                in a bucket no rule would give it.",
+                },
+            ]);
+        }
+        frames
+    }
+
+    /// The counts, sent after the list is already on screen.
+    ///
+    /// Split from `rules_frames` because counting is one round trip per root
+    /// and measured 3.3 s on this store — time a device spent on a spinner
+    /// with the answer to "what rules exist" already in hand. The list is the
+    /// question; the counts are the footnote, and a footnote must not hold up
+    /// the page.
+    ///
+    /// A root whose count failed is absent from the map, never zero.
+    async fn rules_tally_frame(&self) -> serde_json::Value {
+        let Some(view) = self.rules().await else {
+            return serde_json::json!({
+                "type": "shell_rules_tally",
+                "reachable": false,
+                "reason": "the rules store could not be reached",
+            });
+        };
+
+        let counts = view.counts().await;
+        let unclassified = match self.memory().await {
+            Some(memory) => memory.map().await.ok().map(|map| map.unclassified),
+            None => None,
+        };
+
+        let mut frame = serde_json::json!({
+            "type": "shell_rules_tally",
+            "reachable": true,
+            "counts": counts,
+        });
+        if let Some(unclassified) = unclassified {
+            frame["unclassified"] = serde_json::json!(unclassified);
+        }
+        frame
+    }
+
+    /// What a rule can be built out of, on THIS machine.
+    ///
+    /// Derived from the engine's own parser rather than listed, so a block is
+    /// offered only where the operator behind it really exists. A machine
+    /// without negation simply does not advertise the negating blocks, and the
+    /// app shows what that machine can do rather than offering something it
+    /// will refuse.
+    ///
+    /// BOUNDED: the palette is a handful of rows describing a language, not a
+    /// list of anybody's data.
+    fn rule_palette_frame() -> serde_json::Value {
+        let blocks: Vec<serde_json::Value> = ferrosa_memory_core::rule_palette::palette()
+            .into_iter()
+            .map(|block| {
+                serde_json::json!({
+                    "id": block.id,
+                    "label": block.label,
+                    "slot": block.slot,
+                    "fill": block.fill,
+                    "negates": block.negates,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "type": "shell_rule_palette",
+            "reachable": true,
+            "blocks": blocks,
+        })
+    }
+
+    /// Turn a composition into a rule, and say whether the engine accepts it.
+    ///
+    /// Two steps kept apart on purpose. Compiling knows how to WRITE the
+    /// language; only the parser knows whether the result is in it. A compile
+    /// that skipped the parse would be the client owning the grammar again,
+    /// one layer down.
+    ///
+    /// Nothing is stored here. This answers "what would this be, and is it
+    /// valid" so the composer can show both before anyone commits.
+    fn rule_compile_frame(placed: &[ferrosa_memory_core::rule_palette::Placed]) -> serde_json::Value {
+        use ferrosa_memory_core::rule_palette::compile;
+
+        match compile(placed) {
+            Err(error) => serde_json::json!({
+                "type": "shell_rule_compiled",
+                "reachable": true,
+                "ok": false,
+                // The compiler's words, which are about the composition, not
+                // the parser's, which are about syntax the person never saw.
+                "problem": bounded_reason(format_args!("{error}")),
+            }),
+            Ok(text) => match ferrosa_memory_core::datalog::parse_rule(&text) {
+                Ok(_) => serde_json::json!({
+                    "type": "shell_rule_compiled",
+                    "reachable": true,
+                    "ok": true,
+                    "datalog": bounded_title(&text),
+                }),
+                // Compiled but refused. The person did nothing wrong: this is
+                // the palette and the parser disagreeing, and it is worth
+                // showing rather than swallowing.
+                Err(error) => serde_json::json!({
+                    "type": "shell_rule_compiled",
+                    "reachable": true,
+                    "ok": false,
+                    "datalog": bounded_title(&text),
+                    "problem": bounded_reason(format_args!(
+                        "this machine refused the rule that makes: {error:#}"
+                    )),
+                }),
+            },
+        }
+    }
+
+    /// What one rule has classified.
+    ///
+    /// PAGED: unlike the rule list, a yield is per-item and is the one part of
+    /// this screen that can be large.
+    ///
+    /// A root the store does not have answers as UNREACHABLE with a reason,
+    /// not as an empty page. "This rule classified nothing" and "this rule no
+    /// longer exists" are different sentences, and the second is the one that
+    /// tells a stale screen it is stale.
+    async fn rule_detail_frames(
+        &self,
+        root: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Vec<serde_json::Value> {
+        let Some(view) = self.rules().await else {
+            return vec![serde_json::json!({
+                "type": "shell_rule_detail",
+                "reachable": false,
+                "reason": "the rules store could not be reached",
+                "items": [],
+            })];
+        };
+
+        let limit = limit.clamp(1, KNOWLEDGE_PAGE_MAX);
+        match view.rule_yield(root, cursor, limit).await {
+            Ok(Some(found)) => {
+                let rows: Vec<serde_json::Value> = found
+                    .items
+                    .iter()
+                    .map(|item| {
+                        serde_json::json!({
+                            "id": item.entity_id,
+                            "title": bounded_title(&item.title),
+                            "path": bounded_title(&item.source_path),
+                            // Which alias put it here. Two aliases can reach
+                            // one root, and "why is this here" is answered by
+                            // the alias, never by the root alone.
+                            "matched_alias": item.matched_alias.as_deref().map(bounded_title),
+                        })
+                    })
+                    .collect();
+                let mut frames = Self::page_frames(
+                    "shell_rule_detail",
+                    rows,
+                    cursor.is_none(),
+                    found.next_cursor,
+                );
+                if let Some(first) = frames.first_mut() {
+                    first["root"] = serde_json::json!(bounded_title(&found.rule.root));
+                    first["rung"] = serde_json::json!(found.rule.tier.as_str());
+                    first["datalog"] = serde_json::json!(bounded_title(&found.rule.datalog));
+                    first["aliases"] = serde_json::json!(
+                        found.rule.aliases.iter().map(|a| bounded_title(a)).collect::<Vec<_>>()
+                    );
+                    first["reachable_rule"] = serde_json::json!(found.rule.reachable());
+                }
+                frames
+            }
+            Ok(None) => vec![serde_json::json!({
+                "type": "shell_rule_detail",
+                "reachable": false,
+                "reason": format!("no rule for {} on this machine any more", bounded_title(root)),
+                "items": [],
+            })],
+            Err(error) => vec![serde_json::json!({
+                "type": "shell_rule_detail",
+                "reachable": false,
+                "reason": bounded_reason(format_args!("{error:#}")),
+                "items": [],
+            })],
+        }
+    }
+
     async fn knowledge(&self) -> Option<Arc<crate::knowledge_view::KnowledgeView>> {
         self.knowledge
             .get_or_init(|| async {
@@ -1901,6 +2225,10 @@ pub const SHELL_KINDS: &[&str] = &[
     "shell_knowledge_claims",
     "shell_knowledge_detail",
     "shell_knowledge_decide",
+    "shell_rules",
+    "shell_rule_detail",
+    "shell_rule_palette",
+    "shell_rule_compile",
 ];
 
 #[async_trait::async_trait]
@@ -2210,6 +2538,69 @@ impl SessionExtension for ShellExtension {
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| "task needs a task_id".to_owned())?;
                 for frame in self.task_detail_frames(id).await {
+                    session.send(&envelope(frame)).await?;
+                }
+                Ok(())
+            }
+            "shell_rule_palette" => {
+                let frame = Self::rule_palette_frame();
+                // Logged because the composer showed an empty palette with no
+                // way to tell whether the request arrived, the answer was
+                // empty, or the answer never got back.
+                tracing::info!(
+                    blocks = frame["blocks"].as_array().map(Vec::len).unwrap_or(0),
+                    "rule palette asked for"
+                );
+                session.send(&envelope(frame)).await?;
+                Ok(())
+            }
+            "shell_rule_compile" => {
+                let placed: Vec<ferrosa_memory_core::rule_palette::Placed> = body
+                    .get("blocks")
+                    .and_then(|value| serde_json::from_value(value.clone()).ok())
+                    .unwrap_or_default();
+                session
+                    .send(&envelope(Self::rule_compile_frame(&placed)))
+                    .await?;
+                Ok(())
+            }
+            "shell_rules" => {
+                // The list first, so it is on screen in milliseconds, then
+                // the arithmetic behind it.
+                for frame in self.rules_frames().await {
+                    session.send(&envelope(frame)).await?;
+                }
+                session.send(&envelope(self.rules_tally_frame().await)).await?;
+                Ok(())
+            }
+            "shell_rule_detail" => {
+                let Some(root) = body
+                    .get("root")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                else {
+                    session
+                        .send(&envelope(serde_json::json!({
+                            "type": "shell_rule_detail",
+                            "reachable": false,
+                            "reason": "no rule was named",
+                            "items": [],
+                        })))
+                        .await?;
+                    return Ok(());
+                };
+                let cursor = body
+                    .get("cursor")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let limit = body
+                    .get("limit")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|value| value as usize)
+                    .unwrap_or(KNOWLEDGE_PAGE_DEFAULT);
+                for frame in self.rule_detail_frames(root, cursor, limit).await {
                     session.send(&envelope(frame)).await?;
                 }
                 Ok(())
@@ -2627,6 +3018,11 @@ mod output_framing_tests {
         ("shell_scrolled", Sizing::Bounded),
         ("shell_memory_tiers", Sizing::Bounded),
         ("shell_memory_items", Sizing::Paged),
+        ("shell_rules", Sizing::Paged),
+        ("shell_rule_detail", Sizing::Paged),
+        ("shell_rules_tally", Sizing::Bounded),
+        ("shell_rule_palette", Sizing::Bounded),
+        ("shell_rule_compiled", Sizing::Bounded),
     ];
 
     /// A new frame kind cannot be emitted without a decision about its size.
