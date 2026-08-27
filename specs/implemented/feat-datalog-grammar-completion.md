@@ -7,7 +7,7 @@ executive_summary: >
   a string, min/max refuse anything that is not a number, and a head argument
   cannot hold an expression. Each is a thing a tenant currently cannot write,
   and each currently costs a bespoke enumeration in Rust.
-status: todo
+status: implemented
 priority: P45
 component: ferrosa-memory-core/src/datalog.rs
 last_updated: 2026-08-26
@@ -95,3 +95,77 @@ Every gap below is a rule a tenant cannot write today.
 - Regular expressions in string predicates. `starts_with`/`ends_with`/`contains`
   are bounded and cheap; a regex engine in a tenant-editable rule is an ReDoS
   surface and needs its own decision.
+
+
+## Implementation Notes
+
+All five items done, one commit each, TDD throughout. The grammar now reads:
+
+```text
+rule     ::= head ":-" body "."
+body     ::= (atom | "not" atom | filter | aggregate) ("," ...)*
+filter   ::= bool_or
+bool_or  ::= bool_and ("||" bool_and)*
+bool_and ::= bool_not ("&&" bool_not)*
+bool_not ::= "!"* bool_primary
+bool_primary ::= "(" filter ")" | str_pred | expr cmp_op expr
+str_pred ::= ("str_starts_with"|"str_ends_with"|"str_contains") "(" expr "," expr ")"
+expr     ::= term (("+" | "-") term)*
+term     ::= factor (("*" | "/" | "%") factor)*
+agg      ::= ("count" "(" atom+ "," Out ")")
+           | (("sum"|"min"|"max"|"avg") "(" atom+ "," Value "," Out ")")
+head     ::= predicate "(" (term | expr)* ")"
+```
+
+### What the checklist got wrong
+
+**Division by zero did not fail loud.** `eval_expr` returned `None` for both an
+unbound variable and a zero divisor, and `check_one_filter` passed the filter on
+`None`, so `V / 0 == 0` derived a fact. Found while implementing item 1 and
+fixed there. The evaluator now answers with three states, and the distinction
+earns its keep again in item 3, where `!` over an undefined comparison must not
+become a pass.
+
+**Arithmetic in a body atom was silently accepted** as a variable whose name
+happened to be `"W + 1"` — unbound, so it matched every row and the rule fired
+on everything. Found by an item-5 test that asserted the wrong thing. Now a
+parse error.
+
+### Decisions worth keeping
+
+- **Reserved `str_` prefix, not the bare names.** `contains` is already an edge
+  type here, so `contains(X, Y)` is a legitimate stored relation; taking the
+  name would have quietly changed rules already written. The prefix is reserved
+  so a typo is rejected rather than read as a relation matching nothing.
+- **An undefined branch refuses the whole filter**, even under a true sibling.
+  A rule containing a mistake should say so rather than fire because another
+  branch happened to hold.
+- **A computed head that can reach its own body is rejected at load**
+  (`RecursionThroughHeadExpression`), on the same SCC machinery negation and
+  aggregates use. The fact budget would have bounded it by truncation, which is
+  the silently-wrong shape.
+- **A group mixing value kinds derives nothing.** `Term`'s derived ordering
+  would happily order a string against a number by variant position, answering
+  a question nobody asked.
+- **`+`/`-` need whitespace to count as operators.** Uuids and dates are full of
+  hyphens; `*`, `/` and `%` are unambiguous on sight.
+
+### Streaming
+
+Unchanged and still true: the aggregate fold is a visitor over the conjunction
+backtracker, holding one accumulator. Generalising `min`/`max` from `f64` to
+`Term` did not change that. Two 20,000-row tests, one numeric and one over
+strings.
+
+### Verification
+
+1391 workspace lib tests, 15 in the rule contract suite, plus the governance,
+tool-catalog and additivity suites. `clippy --workspace --all-targets -D
+warnings` and `fmt --check` clean. The pre-negation fixture digest — recorded
+from the commit before any of this work — still matches byte-for-byte after
+every item. **Live-cluster tests were not run.**
+
+### Not done
+
+Regular expressions in string predicates, as scoped out above: a regex engine in
+a tenant-editable rule is a ReDoS surface and needs its own decision.
