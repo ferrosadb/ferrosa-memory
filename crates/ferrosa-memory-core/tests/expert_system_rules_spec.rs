@@ -430,3 +430,255 @@ async fn tp001_effective_loader_is_permutation_invariant() {
 
     assert_eq!(ids_a, ids_b);
 }
+
+// ─── Negated rules through the registry ───────────────────────────
+
+async fn put_edge(
+    store: &MockStorage,
+    ctx: &TenantContext,
+    session_id: Uuid,
+    src: Uuid,
+    edge_type: &str,
+    dst: Uuid,
+) {
+    store
+        .typed_edge_put(
+            ctx,
+            &TypedEdge {
+                tenant_id: ctx.tenant_id,
+                session_id,
+                src_id: src,
+                edge_type: edge_type.into(),
+                dst_id: dst,
+                weight: 1.0,
+                metadata: None,
+                created_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// The whole point of negation living in the rule *language* rather than in
+/// Rust: a tenant can store an exclusion and the engine runs it.
+#[tokio::test]
+async fn a_negated_rule_stored_in_the_registry_is_loaded_parsed_and_evaluated() {
+    let store = MockStorage::new();
+    let ctx = test_ctx();
+    let session_id = Uuid::new_v4();
+    let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+
+    put_edge(&store, &ctx, session_id, a, "co_occurs", b).await;
+    put_edge(&store, &ctx, session_id, b, "co_occurs", c).await;
+    // b has been superseded by a.
+    put_edge(&store, &ctx, session_id, a, "supersedes", b).await;
+
+    store
+        .rule_put(
+            &ctx,
+            &active_rule(
+                &ctx,
+                "custom-live",
+                "live",
+                "live(X, X) :- co_occurs(X, _), not supersedes(_, X).",
+            ),
+        )
+        .await
+        .unwrap();
+    approve_rule(&store, &ctx, "custom-live").await;
+
+    let results =
+        datalog::query_predicate(&store, &ctx, session_id, "live", &DatalogConfig::default())
+            .await
+            .unwrap();
+
+    let live: Vec<String> = results.iter().map(|r| r.src_id.clone()).collect();
+    assert!(
+        live.contains(&a.to_string()),
+        "a co-occurs and nothing supersedes it"
+    );
+    assert!(
+        !live.contains(&b.to_string()),
+        "b is superseded, so the negated atom must exclude it"
+    );
+
+    // The absence is recorded, not silently dropped.
+    let fact = results.iter().find(|r| r.src_id == a.to_string()).unwrap();
+    assert!(
+        fact.provenance
+            .iter()
+            .any(|s| s.parent_kind == "absence" && s.parent_pred == "supersedes"),
+        "provenance should name the absent predicate"
+    );
+
+    // And it is never persisted: a later `supersedes` edge would falsify it,
+    // and this cache is append-only.
+    assert!(!fact.is_cacheable());
+    let cached = store
+        .derived_cache_get(&ctx, &format!("live:{session_id}"))
+        .await
+        .unwrap();
+    assert!(
+        cached.is_empty(),
+        "a derivation resting on an absence must not reach the cache"
+    );
+}
+
+/// A stored rule whose negation is unsafe must fail the load loudly rather
+/// than silently contributing nothing to the rule set.
+#[tokio::test]
+async fn a_stored_rule_with_unsafe_negation_fails_the_load_and_names_the_variable() {
+    let store = MockStorage::new();
+    let ctx = test_ctx();
+
+    store
+        .rule_put(
+            &ctx,
+            &active_rule(
+                &ctx,
+                "custom-unsafe",
+                "unsafe_neg",
+                "unsafe_neg(X, X) :- co_occurs(X, _), not supersedes(Q, Z).",
+            ),
+        )
+        .await
+        .unwrap();
+    approve_rule(&store, &ctx, "custom-unsafe").await;
+
+    let err = datalog::load_effective_rules(&store, &ctx, Some("unsafe_neg"))
+        .await
+        .expect_err("unsafe negation must not load");
+    let msg = err.to_string();
+    assert!(msg.contains('Q') && msg.contains('Z'), "got: {msg}");
+}
+
+/// Documents today's behaviour, which negation makes easier to reach: a
+/// stored rule set that cannot be stratified derives NOTHING and says so only
+/// in a log line. The caller cannot tell this from "no rules matched".
+///
+/// This test changes when `evaluate` learns to return a typed error.
+#[tokio::test]
+async fn a_stored_rule_recursive_through_negation_currently_derives_nothing_silently() {
+    let store = MockStorage::new();
+    let ctx = test_ctx();
+    let session_id = Uuid::new_v4();
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    put_edge(&store, &ctx, session_id, a, "co_occurs", b).await;
+
+    store
+        .rule_put(
+            &ctx,
+            &active_rule(
+                &ctx,
+                "custom-paradox",
+                "paradox",
+                "paradox(X, X) :- co_occurs(X, _), not paradox(X, X).",
+            ),
+        )
+        .await
+        .unwrap();
+    approve_rule(&store, &ctx, "custom-paradox").await;
+
+    // It parses and loads — the rejection is the stratifier's job.
+    let rules = datalog::load_effective_rules(&store, &ctx, Some("paradox"))
+        .await
+        .expect("an unstratifiable rule still parses");
+    assert!(matches!(
+        datalog::stratify(&rules),
+        Err(ferrosa_memory_core::types::StratifyError::RecursionThroughNegation { .. })
+    ));
+
+    let results = datalog::query_predicate(
+        &store,
+        &ctx,
+        session_id,
+        "paradox",
+        &DatalogConfig::default(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        results.is_empty(),
+        "known gap: rejection is indistinguishable from no match (see t_82f2fde7)"
+    );
+}
+
+/// The tenant-facing path: `manage_rules put` validates with the same
+/// `parse_rule` the loader uses, so a negated rule is accepted on write and an
+/// unsafe one is refused there — at the point the tenant can still fix it,
+/// rather than at load time in someone else's session.
+#[tokio::test]
+async fn manage_rules_put_accepts_a_negated_rule_and_refuses_an_unsafe_one() {
+    let store = MockStorage::new();
+    let ctx = test_ctx();
+    let session = SessionState::default();
+
+    let put = |rule_id: &'static str, body: &'static str| {
+        json!({
+            "name": "manage_rules",
+            "arguments": {
+                "action": "put",
+                "rule_id": rule_id,
+                "rule_body": body
+            }
+        })
+    };
+
+    // Accepted, and stored verbatim as text.
+    let ok = dispatch(
+        "tools/call",
+        put(
+            "custom-shareable",
+            r#"shareable(E, E) :- tier(E, _), not tagged(E, "secret")."#,
+        ),
+        &store,
+        &ctx,
+        &session,
+    )
+    .await
+    .expect("a negated rule is valid syntax");
+    let body = unwrap_tool_result(ok);
+    assert_eq!(body["action"], "put");
+
+    let stored = store
+        .rule_get(&ctx, "custom-shareable")
+        .await
+        .unwrap()
+        .expect("rule was stored");
+    assert!(
+        stored.rule_body.contains("not tagged"),
+        "the negation survives the round trip as text: {}",
+        stored.rule_body
+    );
+    // And it parses back into a rule the engine will run.
+    let reparsed = ferrosa_memory_core::datalog::parse_rule(&stored.rule_body).unwrap();
+    assert_eq!(reparsed.negated.len(), 1);
+    assert_eq!(reparsed.negated[0].predicate, "tagged");
+
+    // Refused at write time, naming the unbound variable.
+    let err = dispatch(
+        "tools/call",
+        put(
+            "custom-unsafe-write",
+            "bad(E, E) :- tier(E, _), not tagged(Other, \"secret\").",
+        ),
+        &store,
+        &ctx,
+        &session,
+    )
+    .await
+    .expect_err("unsafe negation must be refused on write");
+    assert!(
+        err.1.contains("Other"),
+        "the tenant should be told which variable is unbound, got: {}",
+        err.1
+    );
+    assert!(
+        store
+            .rule_get(&ctx, "custom-unsafe-write")
+            .await
+            .unwrap()
+            .is_none(),
+        "a refused rule must not be stored"
+    );
+}
