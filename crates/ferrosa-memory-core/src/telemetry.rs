@@ -173,16 +173,14 @@ pub fn init(service: &str, plan: &TelemetryPlan, default_filter: &str) -> Teleme
     use tracing_subscriber::util::SubscriberInitExt;
 
     let sentry_guard = plan.sentry_dsn.as_ref().map(|dsn| {
-        sentry::init((
-            dsn.as_str(),
-            sentry::ClientOptions {
-                release: Some(release_id(service, env!("CARGO_PKG_VERSION"), BUILD_SHA).into()),
-                // Never. This process holds other people's memory, and the
-                // default attaches the machine's IP and username.
-                send_default_pii: false,
-                ..Default::default()
-            },
-        ))
+        // Built field by field: ClientOptions is #[non_exhaustive], so a
+        // struct expression does not compile from outside the SDK.
+        let mut options = sentry::ClientOptions::default();
+        options.release = Some(release_id(service, env!("CARGO_PKG_VERSION"), BUILD_SHA).into());
+        // Never. This process holds other people's memory, and the default
+        // attaches the machine's IP and username.
+        options.send_default_pii = false;
+        sentry::init((dsn.as_str(), options))
     });
 
     let (debug_writer, debug_guard) = match plan.debug_log_dir.as_ref() {
