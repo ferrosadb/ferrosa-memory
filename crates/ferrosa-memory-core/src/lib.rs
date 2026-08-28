@@ -83,6 +83,7 @@ pub mod speculative;
 pub mod spreading;
 pub mod storage;
 pub mod system_describe;
+pub mod telemetry;
 pub mod temporal;
 pub mod tenant_provision;
 pub mod test_cluster;
