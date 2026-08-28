@@ -93,6 +93,32 @@ impl TelemetryPlan {
     }
 }
 
+/// The commit this binary was built from, or `unknown`.
+///
+/// Set by build.rs, from `FERROSA_BUILD_SHA` if CI supplied it and otherwise
+/// from git. `unknown` is honest: a stale SHA would be believed.
+pub const BUILD_SHA: &str = env!("FERROSA_BUILD_SHA");
+
+/// How one build identifies itself to Sentry.
+///
+/// `service@version+sha`, e.g. `memory-mcp@0.29.0+a1b2c3d4e5f6`.
+///
+/// The SERVICE, not the crate: `sentry::release_name!()` expands to
+/// CARGO_PKG_NAME at its call site, which is this crate — so all three
+/// binaries would have reported `ferrosa-memory-core@0.29.0` and nothing would
+/// have distinguished the MCP server from the sync CLI.
+///
+/// The SHA, not just the version: nightly cuts several builds per version, and
+/// the first question about any report is whether it is the build that already
+/// has the fix.
+pub fn release_id(service: &str, version: &str, build_sha: &str) -> String {
+    if build_sha.is_empty() || build_sha == "unknown" {
+        format!("{service}@{version}")
+    } else {
+        format!("{service}@{version}+{build_sha}")
+    }
+}
+
 /// Everything the process must hold onto for diagnostics to keep working.
 ///
 /// Dropping this flushes and stops both sinks, so `main` must keep it alive for
@@ -138,7 +164,7 @@ pub fn init(service: &str, plan: &TelemetryPlan, default_filter: &str) -> Teleme
         sentry::init((
             dsn.as_str(),
             sentry::ClientOptions {
-                release: sentry::release_name!(),
+                release: Some(release_id(service, env!("CARGO_PKG_VERSION"), BUILD_SHA).into()),
                 // Never. This process holds other people's memory, and the
                 // default attaches the machine's IP and username.
                 send_default_pii: false,
@@ -218,6 +244,54 @@ pub fn init(service: &str, plan: &TelemetryPlan, default_filter: &str) -> Teleme
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The identifier a report is traced back to.
+    #[test]
+    fn a_release_id_names_the_service_the_version_and_the_commit() {
+        assert_eq!(
+            release_id("memory-mcp", "0.29.0", "a1b2c3d4e5f6"),
+            "memory-mcp@0.29.0+a1b2c3d4e5f6"
+        );
+    }
+
+    /// The SERVICE, not the crate. `sentry::release_name!()` expands to
+    /// CARGO_PKG_NAME at its call site — this crate — so all three binaries
+    /// would have reported the same thing and nothing would have told the MCP
+    /// server apart from the sync CLI.
+    #[test]
+    fn the_three_binaries_are_distinguishable() {
+        let mcp = release_id("memory-mcp", "0.29.0", "abc123");
+        let sync = release_id("memory-sync", "0.29.0", "abc123");
+        assert_ne!(mcp, sync);
+    }
+
+    /// An unknown commit degrades to the version rather than shipping the word
+    /// "unknown" into a release name, which would group every unstamped build
+    /// of every version together.
+    #[test]
+    fn an_unknown_commit_falls_back_to_the_version() {
+        assert_eq!(
+            release_id("memory-mcp", "0.29.0", "unknown"),
+            "memory-mcp@0.29.0"
+        );
+        assert_eq!(release_id("memory-mcp", "0.29.0", ""), "memory-mcp@0.29.0");
+    }
+
+    /// A dirty tree is a build nobody else can reproduce, and the SHA says so.
+    #[test]
+    fn a_dirty_build_is_marked_as_such() {
+        assert!(release_id("memory-mcp", "0.29.0", "abc123-dirty").ends_with("+abc123-dirty"));
+    }
+
+    /// The stamp is present in this very build, so a build.rs that silently
+    /// stopped running would fail here rather than in a report months later.
+    #[test]
+    fn this_build_carries_a_stamp() {
+        assert!(
+            !BUILD_SHA.is_empty(),
+            "build.rs did not set FERROSA_BUILD_SHA"
+        );
+    }
 
     /// A release build with no Sentry still writes a local log.
     ///
