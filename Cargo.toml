@@ -22,6 +22,14 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Diagnostics. rustls rather than native-tls so a musl build needs no OpenSSL,
+# and default-features off so the SDK does not install its own panic handler
+# behind our backs -- `panic` is opted into explicitly below.
+sentry = { version = "0.34", default-features = false, features = [
+    "backtrace", "contexts", "panic", "reqwest", "rustls",
+] }
+sentry-tracing = "0.34"
+tracing-appender = "0.2"
 
 # Metrics
 prometheus = "0.14"

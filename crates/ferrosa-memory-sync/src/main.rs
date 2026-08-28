@@ -23,7 +23,6 @@ use ferrosa_memory_core::graph::{GraphClient, GraphConfig};
 use ferrosa_memory_core::storage::Storage;
 use ferrosa_memory_core::types::{FoldStatus, TenantContext};
 use futures_util::StreamExt;
-use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -168,9 +167,11 @@ struct SyncStats {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    // One init for all three binaries. Each used to build its own subscriber,
+    // which is three chances to drift and none of them reported a failure
+    // anywhere but a console nobody watches.
+    let plan = ferrosa_memory_core::telemetry::plan_from_env();
+    let _telemetry = ferrosa_memory_core::telemetry::init("memory-sync", &plan, "info");
 
     let args = Args::parse();
 

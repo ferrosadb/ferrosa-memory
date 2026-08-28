@@ -36,7 +36,6 @@ use futures_util::StreamExt;
 use scylla::frame::response::result::{CqlValue, Row};
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use tokio::sync::RwLock;
-use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 const SPARQL_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
@@ -3415,12 +3414,11 @@ async fn main() -> anyhow::Result<()> {
         "ferrosa_memory_core=warn,ferrosa_memory_mcp=warn"
     };
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    // Shared with the other two binaries. The stderr writer is not optional
+    // here and telemetry::init enforces it: this process speaks MCP on stdout,
+    // and a log line written there corrupts the JSON-RPC stream.
+    let plan = ferrosa_memory_core::telemetry::plan_from_env();
+    let _telemetry = ferrosa_memory_core::telemetry::init("memory-mcp", &plan, default_filter);
 
     // Fail loud: make every panic (including in spawned tasks tokio would
     // otherwise swallow) a visible ERROR log line. Installed before any task
