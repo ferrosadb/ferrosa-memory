@@ -138,9 +138,21 @@ pub struct TelemetryGuard {
 /// public, and a DSN committed here could be used by anyone and could not be
 /// rotated without a release.
 pub fn plan_from_env() -> TelemetryPlan {
+    plan_from_env_prefixed("FERROSA_MEMORY")
+}
+
+/// The same, for a component with its own variables.
+///
+/// `FERROSA_STREAMER_SENTRY_DSN`, `FERROSA_STREAMER_DEBUG_LOG_DIR`, and so on.
+/// One Sentry project per component means one variable per component: a single
+/// shared name would send every component's errors to whichever project the
+/// installer happened to configure last.
+pub fn plan_from_env_prefixed(prefix: &str) -> TelemetryPlan {
     TelemetryPlan::resolve(
-        std::env::var("FERROSA_MEMORY_SENTRY_DSN").ok().as_deref(),
-        std::env::var("FERROSA_MEMORY_DEBUG_LOG_DIR")
+        std::env::var(format!("{prefix}_SENTRY_DSN"))
+            .ok()
+            .as_deref(),
+        std::env::var(format!("{prefix}_DEBUG_LOG_DIR"))
             .ok()
             .as_deref(),
         cfg!(debug_assertions),
