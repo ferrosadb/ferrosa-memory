@@ -25,10 +25,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Diagnostics. rustls rather than native-tls so a musl build needs no OpenSSL,
 # and default-features off so the SDK does not install its own panic handler
 # behind our backs -- `panic` is opted into explicitly below.
-sentry = { version = "0.34", default-features = false, features = [
+sentry = { version = "0.49", default-features = false, features = [
     "backtrace", "contexts", "panic", "reqwest", "rustls",
 ] }
-sentry-tracing = "0.34"
+sentry-tracing = "0.49"
 tracing-appender = "0.2"
 
 # Metrics
