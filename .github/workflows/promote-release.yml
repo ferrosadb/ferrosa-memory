@@ -19,6 +19,7 @@ on:
 permissions:
   contents: write
   actions: write
+  pull-requests: write
 
 concurrency:
   group: promote-release-${{ github.repository }}
@@ -95,9 +96,8 @@ jobs:
           NEXT_VERSION: ${{ steps.calc.outputs.next_version }}
           NEXT_TAG: ${{ steps.calc.outputs.next_tag }}
         # Keep main's [workspace.package] version in step with the released tag.
-        # main is protected -> open a PR. Append-only + best-effort: the release is
-        # already cut above, so a failure here never blocks it.
-        continue-on-error: true
+        # main is protected -> open a PR. Keep this fail-loud: a stable release
+        # whose source version is left drifting is incomplete operator state.
         run: |
           set -euo pipefail
           git fetch origin main
