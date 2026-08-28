@@ -693,6 +693,12 @@ pub enum Term {
     Const(Uuid),
     ConstStr(String),
     ConstFloat(OrderedFloat<f64>),
+    /// An instant, in UTC.
+    ///
+    /// Reached from the ISO-8601 strings timestamps are stored as via
+    /// `date(S)`, which is what makes this usable against real data rather
+    /// than only against literals.
+    ConstTime(chrono::DateTime<chrono::Utc>),
     /// A known-absent value, written `null`.
     ///
     /// Distinct from a variable that is unbound, which means "not decided
@@ -801,6 +807,9 @@ pub enum FilterExpr {
     Neg(Box<FilterExpr>),
     /// The `null` literal.
     Null,
+    /// A stamped instant. Not written by hand — it is what `now()` becomes
+    /// once the clock has been read for an evaluation.
+    LitTime(chrono::DateTime<chrono::Utc>),
     /// A call to one of a closed set of pure functions.
     ///
     /// Closed on purpose: an open extension point would mean an unknown name
@@ -824,6 +833,15 @@ pub enum Func {
     Lower,
     Upper,
     Concat,
+    /// The clock. Stamped once per evaluation rather than read per row — see
+    /// `datalog::stamp_clock`.
+    Now,
+    /// Parse an ISO-8601 string into a time. The bridge to stored timestamps.
+    Date,
+    Weeks,
+    Days,
+    Hours,
+    Minutes,
 }
 
 impl Func {
@@ -837,6 +855,12 @@ impl Func {
             Self::Lower => "lower",
             Self::Upper => "upper",
             Self::Concat => "concat",
+            Self::Now => "now",
+            Self::Date => "date",
+            Self::Weeks => "weeks",
+            Self::Days => "days",
+            Self::Hours => "hours",
+            Self::Minutes => "minutes",
         }
     }
 
@@ -844,11 +868,20 @@ impl Func {
     pub fn arity(self) -> usize {
         match self {
             Self::Concat => 2,
+            Self::Now => 0,
             _ => 1,
         }
     }
 
-    pub const ALL: [Func; 8] = [
+    /// True for the one function whose answer depends on when it is asked.
+    ///
+    /// A rule containing it is non-monotonic in the same way a negated rule
+    /// is: its conclusions stop being true without any base fact changing.
+    pub fn reads_the_clock(self) -> bool {
+        matches!(self, Self::Now)
+    }
+
+    pub const ALL: [Func; 14] = [
         Func::Abs,
         Func::Floor,
         Func::Ceil,
@@ -857,6 +890,12 @@ impl Func {
         Func::Lower,
         Func::Upper,
         Func::Concat,
+        Func::Now,
+        Func::Date,
+        Func::Weeks,
+        Func::Days,
+        Func::Hours,
+        Func::Minutes,
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -1302,6 +1341,16 @@ impl DerivedFact {
             .any(|step| step.parent_kind == PROVENANCE_KIND_ABSENCE)
     }
 
+    /// True iff this fact was derived by a rule that read the clock.
+    ///
+    /// Such a fact stops being true with no base fact changing at all, which
+    /// is exactly why it cannot be cached.
+    pub fn reads_the_clock(&self) -> bool {
+        self.provenance
+            .iter()
+            .any(|step| step.parent_kind == PROVENANCE_KIND_CLOCK)
+    }
+
     /// True iff this fact may be written to the persisted derived-fact store.
     ///
     /// Two independent reasons a derivation must not be cached:
@@ -1315,13 +1364,19 @@ impl DerivedFact {
     ///   been revoked. Negated derivations are therefore evaluated live and
     ///   never persisted.
     pub fn is_cacheable(&self) -> bool {
-        self.has_uuid_endpoints() && !self.rests_on_absence()
+        self.has_uuid_endpoints() && !self.rests_on_absence() && !self.reads_the_clock()
     }
 }
 
 /// `ProvenanceStep::parent_kind` for a step that records an *absence*
 /// rather than a matched row — the reason a negated literal held.
 pub const PROVENANCE_KIND_ABSENCE: &str = "absence";
+
+/// `ProvenanceStep::parent_kind` for a derivation that read the clock.
+///
+/// Beside absence for the same reason: both make a derivation non-monotonic,
+/// so neither may be persisted.
+pub const PROVENANCE_KIND_CLOCK: &str = "clock";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvenanceStep {

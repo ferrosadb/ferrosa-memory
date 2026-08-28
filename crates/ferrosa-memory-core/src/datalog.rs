@@ -414,7 +414,10 @@ fn collect_expr_vars(e: &crate::types::FilterExpr, out: &mut Vec<String>) {
     use crate::types::FilterExpr;
     match e {
         FilterExpr::Var(name) => out.push(name.clone()),
-        FilterExpr::LitNum(_) | FilterExpr::LitStr(_) | FilterExpr::Null => {}
+        FilterExpr::LitNum(_)
+        | FilterExpr::LitStr(_)
+        | FilterExpr::Null
+        | FilterExpr::LitTime(_) => {}
         FilterExpr::Neg(inner) => collect_expr_vars(inner, out),
         FilterExpr::BinOp { lhs, rhs, .. } => {
             collect_expr_vars(lhs, out);
@@ -981,6 +984,32 @@ pub fn evaluate(
     max_iterations: usize,
     max_facts: usize,
 ) -> (FactSet, Vec<DerivedFact>) {
+    evaluate_at(
+        rules,
+        initial_facts,
+        max_iterations,
+        max_facts,
+        chrono::Utc::now(),
+    )
+}
+
+/// Evaluate against a given instant.
+///
+/// The clock is read ONCE, here, and stamped into the rules before the
+/// fixpoint runs. Reading it per row would let two rows in one evaluation
+/// disagree about what "now" is, and a rule near a boundary would then include
+/// one and exclude the other for no reason a person could see.
+///
+/// Taking the instant as an argument is also what makes any of it testable.
+pub fn evaluate_at(
+    rules: &[DatalogRule],
+    initial_facts: &FactSet,
+    max_iterations: usize,
+    max_facts: usize,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (FactSet, Vec<DerivedFact>) {
+    let stamped: Vec<DatalogRule> = rules.iter().map(|r| stamp_clock(r, now)).collect();
+    let rules = &stamped[..];
     let strata = match stratify(rules) {
         Ok(s) => s,
         Err(e) => {
@@ -1037,6 +1066,20 @@ fn evaluate_stratum(
                     new_delta.insert(pred, head_args.clone());
 
                     let (src_id, dst_id) = extract_src_dst(&head_args);
+                    // A clock-dependent derivation is non-monotonic in the same
+                    // way a negated one is: it stops being true with no base
+                    // fact changing. Recording that in provenance is what makes
+                    // `is_cacheable` refuse it, by the mechanism absence
+                    // already uses.
+                    let mut provenance_steps = provenance_steps;
+                    if rule_reads_the_clock(rule) {
+                        provenance_steps.push(ProvenanceStep {
+                            parent_src: String::new(),
+                            parent_pred: "now".to_string(),
+                            parent_dst: String::new(),
+                            parent_kind: crate::types::PROVENANCE_KIND_CLOCK.to_string(),
+                        });
+                    }
                     let confidence = compute_confidence(&provenance_steps, &all_facts);
 
                     derived.push(DerivedFact {
@@ -1108,6 +1151,7 @@ fn instantiate_head(rule: &DatalogRule, binding: &Binding) -> Option<Vec<Term>> 
             Eval::Value(EvalValue::Num(f)) => Term::ConstFloat(OrderedFloat(f)),
             Eval::Value(EvalValue::Str(s)) => Term::ConstStr(s),
             Eval::Value(EvalValue::Uuid(u)) => Term::Const(u),
+            Eval::Value(EvalValue::Time(t)) => Term::ConstTime(t),
             // Null is a value, so the rule fires carrying it. Only an error or
             // an undecidable expression stops the head being built.
             Eval::Null => Term::ConstNull,
@@ -1175,6 +1219,7 @@ fn collect_bindings(rule: &DatalogRule, all_facts: &FactSet) -> Vec<Candidate> {
                     Eval::Value(EvalValue::Num(f)) => Term::ConstFloat(OrderedFloat(f)),
                     Eval::Value(EvalValue::Str(s)) => Term::ConstStr(s),
                     Eval::Value(EvalValue::Uuid(u)) => Term::Const(u),
+                    Eval::Value(EvalValue::Time(t)) => Term::ConstTime(t),
                     Eval::Null => Term::ConstNull,
                     Eval::Undefined | Eval::Unbound => {
                         tracing::warn!(
@@ -1322,7 +1367,10 @@ fn filter_references_any(f: &BuiltinFilter, vars: &std::collections::HashSet<&st
     fn expr_refs(e: &FilterExpr, vars: &std::collections::HashSet<&str>) -> bool {
         match e {
             FilterExpr::Var(name) => vars.contains(name.as_str()),
-            FilterExpr::LitNum(_) | FilterExpr::LitStr(_) | FilterExpr::Null => false,
+            FilterExpr::LitNum(_)
+            | FilterExpr::LitStr(_)
+            | FilterExpr::Null
+            | FilterExpr::LitTime(_) => false,
             FilterExpr::Neg(inner) => expr_refs(inner, vars),
             FilterExpr::BinOp { lhs, rhs, .. } => expr_refs(lhs, vars) || expr_refs(rhs, vars),
             FilterExpr::Call { args, .. } => args.iter().any(|a| expr_refs(a, vars)),
@@ -1540,6 +1588,29 @@ fn eval_call(
     };
 
     match (func, values.as_slice()) {
+        // `now()` never reaches here: `stamp_clock` replaces it with a literal
+        // before evaluation, so every row in one run sees one instant.
+        (Func::Now, []) => {
+            tracing::warn!("datalog: now() was not stamped before evaluation");
+            Eval::Undefined
+        }
+        (Func::Date, [EvalValue::Str(text)]) => match parse_iso8601(text) {
+            Some(t) => Eval::Value(EvalValue::Time(t)),
+            None => {
+                tracing::warn!(
+                    value = %text,
+                    "datalog: date() could not read this as a timestamp"
+                );
+                Eval::Undefined
+            }
+        },
+        // Already a time — accepted so a rule need not know how a column is
+        // stored.
+        (Func::Date, [EvalValue::Time(t)]) => Eval::Value(EvalValue::Time(*t)),
+        (Func::Weeks, [EvalValue::Num(n)]) => Eval::Value(EvalValue::Num(n * 604_800_000.0)),
+        (Func::Days, [EvalValue::Num(n)]) => Eval::Value(EvalValue::Num(n * 86_400_000.0)),
+        (Func::Hours, [EvalValue::Num(n)]) => Eval::Value(EvalValue::Num(n * 3_600_000.0)),
+        (Func::Minutes, [EvalValue::Num(n)]) => Eval::Value(EvalValue::Num(n * 60_000.0)),
         (Func::Abs, [EvalValue::Num(x)]) => Eval::Value(EvalValue::Num(x.abs())),
         (Func::Floor, [EvalValue::Num(x)]) => Eval::Value(EvalValue::Num(x.floor())),
         (Func::Ceil, [EvalValue::Num(x)]) => Eval::Value(EvalValue::Num(x.ceil())),
@@ -1616,6 +1687,143 @@ fn finish_retained(
     )))
 }
 
+/// Replace every `now()` in a rule with the instant this evaluation is for.
+///
+/// Done once up front rather than per row, so the whole run agrees about when
+/// it is. A rule with no `now()` is returned unchanged, which is what keeps
+/// this free for every rule that does not ask.
+fn stamp_clock(rule: &DatalogRule, now: chrono::DateTime<chrono::Utc>) -> DatalogRule {
+    if !rule_reads_the_clock(rule) {
+        return rule.clone();
+    }
+    let mut out = rule.clone();
+    for f in &mut out.filters {
+        stamp_filter(f, now);
+    }
+    for he in &mut out.head_exprs {
+        stamp_expr(&mut he.expr, now);
+    }
+    for b in &mut out.bindings {
+        stamp_expr(&mut b.expr, now);
+    }
+    out
+}
+
+fn stamp_filter(f: &mut BuiltinFilter, now: chrono::DateTime<chrono::Utc>) {
+    match f {
+        BuiltinFilter::Compare { lhs, rhs, .. } => {
+            stamp_expr(lhs, now);
+            stamp_expr(rhs, now);
+        }
+        BuiltinFilter::StrPred { subject, arg, .. } => {
+            stamp_expr(subject, now);
+            stamp_expr(arg, now);
+        }
+        BuiltinFilter::IsNull(e) => stamp_expr(e, now),
+        BuiltinFilter::Any(bs) | BuiltinFilter::All(bs) => {
+            for b in bs {
+                stamp_filter(b, now);
+            }
+        }
+        BuiltinFilter::Not(inner) => stamp_filter(inner, now),
+        BuiltinFilter::NotEqual(_, _)
+        | BuiltinFilter::GreaterThan(_, _)
+        | BuiltinFilter::LessThan(_, _) => {}
+    }
+}
+
+fn stamp_expr(e: &mut crate::types::FilterExpr, now: chrono::DateTime<chrono::Utc>) {
+    use crate::types::FilterExpr;
+    match e {
+        FilterExpr::Call { func, args } => {
+            if func.reads_the_clock() {
+                *e = FilterExpr::LitTime(now);
+                return;
+            }
+            for a in args {
+                stamp_expr(a, now);
+            }
+        }
+        FilterExpr::Neg(inner) => stamp_expr(inner, now),
+        FilterExpr::BinOp { lhs, rhs, .. } => {
+            stamp_expr(lhs, now);
+            stamp_expr(rhs, now);
+        }
+        FilterExpr::Var(_)
+        | FilterExpr::LitNum(_)
+        | FilterExpr::LitStr(_)
+        | FilterExpr::Null
+        | FilterExpr::LitTime(_) => {}
+    }
+}
+
+/// True if the rule's answer depends on when it is asked.
+///
+/// Matches both forms deliberately: `now()` before stamping, and the
+/// `LitTime` it becomes after. A `LitTime` cannot be written by hand — it only
+/// arises from stamping — so its presence is proof the clock was read, which
+/// is what lets one function serve both the stamper and the cache guard.
+fn rule_reads_the_clock(rule: &DatalogRule) -> bool {
+    fn expr_reads(e: &crate::types::FilterExpr) -> bool {
+        use crate::types::FilterExpr;
+        match e {
+            FilterExpr::LitTime(_) => true,
+            FilterExpr::Call { func, args } => {
+                func.reads_the_clock() || args.iter().any(expr_reads)
+            }
+            FilterExpr::Neg(inner) => expr_reads(inner),
+            FilterExpr::BinOp { lhs, rhs, .. } => expr_reads(lhs) || expr_reads(rhs),
+            _ => false,
+        }
+    }
+    fn filter_reads(f: &BuiltinFilter) -> bool {
+        match f {
+            BuiltinFilter::Compare { lhs, rhs, .. } => expr_reads(lhs) || expr_reads(rhs),
+            BuiltinFilter::StrPred { subject, arg, .. } => expr_reads(subject) || expr_reads(arg),
+            BuiltinFilter::IsNull(e) => expr_reads(e),
+            BuiltinFilter::Any(bs) | BuiltinFilter::All(bs) => bs.iter().any(filter_reads),
+            BuiltinFilter::Not(inner) => filter_reads(inner),
+            _ => false,
+        }
+    }
+    rule.filters.iter().any(filter_reads)
+        || rule.head_exprs.iter().any(|h| expr_reads(&h.expr))
+        || rule.bindings.iter().any(|b| expr_reads(&b.expr))
+}
+
+/// Shift a time by a duration in milliseconds.
+fn shift_time(t: chrono::DateTime<chrono::Utc>, ms: f64) -> Eval {
+    if !ms.is_finite() {
+        return Eval::Undefined;
+    }
+    match chrono::Duration::try_milliseconds(ms as i64) {
+        Some(d) => match t.checked_add_signed(d) {
+            Some(shifted) => Eval::Value(EvalValue::Time(shifted)),
+            // Beyond what a timestamp can represent. A wrapped or clamped
+            // instant would be a value the caller cannot tell from a real one.
+            None => {
+                tracing::warn!("datalog: shifting this time overflows the calendar");
+                Eval::Undefined
+            }
+        },
+        None => Eval::Undefined,
+    }
+}
+
+/// Read an ISO-8601 timestamp, or a bare `YYYY-MM-DD` as midnight UTC.
+///
+/// Both because a corpus holds both: a full RFC-3339 stamp from a machine, and
+/// a plain day from a person.
+fn parse_iso8601(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::TimeZone;
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(text) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    let day = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()?;
+    let midnight = day.and_hms_opt(0, 0, 0)?;
+    chrono::Utc.from_local_datetime(&midnight).single()
+}
+
 /// Compare two ground terms of the same kind.
 ///
 /// `None` for two different kinds: a string against a number has no meaningful
@@ -1625,6 +1833,7 @@ fn compare_terms(a: &Term, b: &Term) -> Option<std::cmp::Ordering> {
         (Term::ConstFloat(x), Term::ConstFloat(y)) => Some(x.cmp(y)),
         (Term::ConstStr(x), Term::ConstStr(y)) => Some(x.cmp(y)),
         (Term::Const(x), Term::Const(y)) => Some(x.cmp(y)),
+        (Term::ConstTime(x), Term::ConstTime(y)) => Some(x.cmp(y)),
         _ => None,
     }
 }
@@ -1878,6 +2087,7 @@ enum EvalValue {
     Num(f64),
     Str(String),
     Uuid(uuid::Uuid),
+    Time(chrono::DateTime<chrono::Utc>),
 }
 
 /// The outcome of evaluating a filter expression.
@@ -1912,12 +2122,14 @@ fn eval_expr(
             Some(Term::ConstFloat(OrderedFloat(f))) => Eval::Value(EvalValue::Num(*f)),
             Some(Term::ConstStr(s)) => Eval::Value(EvalValue::Str(s.clone())),
             Some(Term::Const(u)) => Eval::Value(EvalValue::Uuid(*u)),
+            Some(Term::ConstTime(t)) => Eval::Value(EvalValue::Time(*t)),
             Some(Term::ConstNull) => Eval::Null,
             Some(Term::Var(_)) | None => Eval::Unbound,
         },
         FilterExpr::LitNum(OrderedFloat(f)) => Eval::Value(EvalValue::Num(*f)),
         FilterExpr::LitStr(s) => Eval::Value(EvalValue::Str(s.clone())),
         FilterExpr::Null => Eval::Null,
+        FilterExpr::LitTime(t) => Eval::Value(EvalValue::Time(*t)),
         FilterExpr::Call { func, args } => eval_call(*func, args, binding),
         FilterExpr::Neg(inner) => match eval_expr(inner, binding) {
             Eval::Null => Eval::Null,
@@ -1946,6 +2158,28 @@ fn eval_expr(
                 return Eval::Unbound;
             };
             match (l, r) {
+                // A time plus or minus a duration is a time; the duration is
+                // milliseconds, which is why `days(7)` is just a number.
+                (EvalValue::Time(t), EvalValue::Num(ms)) => match op {
+                    ArithOp::Add => shift_time(t, ms),
+                    ArithOp::Sub => shift_time(t, -ms),
+                    _ => {
+                        tracing::warn!("datalog: a time may only be shifted by a duration");
+                        Eval::Undefined
+                    }
+                },
+                // A duration before a time reads oddly but is the same thing.
+                (EvalValue::Num(ms), EvalValue::Time(t)) if matches!(op, ArithOp::Add) => {
+                    shift_time(t, ms)
+                }
+                // Two times subtract to the duration between them.
+                (EvalValue::Time(a), EvalValue::Time(b)) => match op {
+                    ArithOp::Sub => Eval::Value(EvalValue::Num((a - b).num_milliseconds() as f64)),
+                    _ => {
+                        tracing::warn!("datalog: two times may only be subtracted");
+                        Eval::Undefined
+                    }
+                },
                 (EvalValue::Num(a), EvalValue::Num(b)) => match op {
                     ArithOp::Add => Eval::Value(EvalValue::Num(a + b)),
                     ArithOp::Sub => Eval::Value(EvalValue::Num(a - b)),
@@ -1995,36 +2229,37 @@ fn eval_expr(
     }
 }
 
-fn apply_cmp(op: crate::types::CmpOp, l: &EvalValue, r: &EvalValue) -> bool {
+/// Apply a comparison operator to an ordering.
+///
+/// Extracted because three kinds order the same way and only differ in how
+/// they produce the ordering; keeping one copy is what stops a fourth kind
+/// getting a subtly different `Le`.
+fn ordered(op: crate::types::CmpOp, ord: std::cmp::Ordering) -> bool {
     use crate::types::CmpOp;
     use std::cmp::Ordering;
+    match (op, ord) {
+        (CmpOp::Eq, Ordering::Equal) => true,
+        (CmpOp::Ne, ord) => ord != Ordering::Equal,
+        (CmpOp::Lt, Ordering::Less) => true,
+        (CmpOp::Le, ord) => ord != Ordering::Greater,
+        (CmpOp::Gt, Ordering::Greater) => true,
+        (CmpOp::Ge, ord) => ord != Ordering::Less,
+        _ => false,
+    }
+}
+
+fn apply_cmp(op: crate::types::CmpOp, l: &EvalValue, r: &EvalValue) -> bool {
+    use crate::types::CmpOp;
     match (l, r) {
-        (EvalValue::Num(a), EvalValue::Num(b)) => {
-            let Some(ord) = a.partial_cmp(b) else {
-                return false;
-            }; // NaN
-            match (op, ord) {
-                (CmpOp::Eq, Ordering::Equal) => true,
-                (CmpOp::Ne, ord) => ord != Ordering::Equal,
-                (CmpOp::Lt, Ordering::Less) => true,
-                (CmpOp::Le, ord) => ord != Ordering::Greater,
-                (CmpOp::Gt, Ordering::Greater) => true,
-                (CmpOp::Ge, ord) => ord != Ordering::Less,
-                _ => false,
-            }
-        }
-        (EvalValue::Str(a), EvalValue::Str(b)) => {
-            let ord = a.cmp(b);
-            match (op, ord) {
-                (CmpOp::Eq, Ordering::Equal) => true,
-                (CmpOp::Ne, ord) => ord != Ordering::Equal,
-                (CmpOp::Lt, Ordering::Less) => true,
-                (CmpOp::Le, ord) => ord != Ordering::Greater,
-                (CmpOp::Gt, Ordering::Greater) => true,
-                (CmpOp::Ge, ord) => ord != Ordering::Less,
-                _ => false,
-            }
-        }
+        (EvalValue::Num(a), EvalValue::Num(b)) => match a.partial_cmp(b) {
+            Some(ord) => ordered(op, ord),
+            None => false, // NaN
+        },
+        (EvalValue::Str(a), EvalValue::Str(b)) => ordered(op, a.cmp(b)),
+        // Instants are totally ordered, which is the whole point of having a
+        // time value rather than comparing timestamp strings and hoping the
+        // format sorts.
+        (EvalValue::Time(a), EvalValue::Time(b)) => ordered(op, a.cmp(b)),
         (EvalValue::Uuid(a), EvalValue::Uuid(b)) => match op {
             CmpOp::Eq => a == b,
             CmpOp::Ne => a != b,
@@ -2211,6 +2446,8 @@ fn term_to_string(t: &Term) -> String {
         Term::Const(u) => u.to_string(),
         Term::ConstStr(s) => s.clone(),
         Term::ConstFloat(f) => f.to_string(),
+        // RFC-3339, so a rendered time reads back through `date()`.
+        Term::ConstTime(t) => t.to_rfc3339(),
         Term::ConstNull => "null".to_string(),
     }
 }
@@ -5938,6 +6175,171 @@ mod grammar_tests {
         );
     }
 
+    // ── Time ──────────────────────────────────────────────────────
+
+    fn at(iso: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(iso)
+            .expect("test timestamp")
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// Documents dated across three weeks, as ISO-8601 STRINGS — which is how
+    /// timestamps are actually stored in this corpus.
+    fn dated_corpus() -> FactSet {
+        facts(&[
+            ("doc", vec![s("fresh"), s("2026-08-27T09:00:00Z")]),
+            ("doc", vec![s("lastweek"), s("2026-08-24T09:00:00Z")]),
+            ("doc", vec![s("old"), s("2026-07-01T09:00:00Z")]),
+        ])
+    }
+
+    const NOW: &str = "2026-08-28T12:00:00Z";
+
+    #[test]
+    fn date_parses_the_strings_timestamps_are_stored_as() {
+        let rule = parse_rule(r#"q(X) :- doc(X, C), date(C) > date("2026-08-25")."#).unwrap();
+        let (all, _) = evaluate_at(&[rule], &dated_corpus(), 100, 10_000, at(NOW));
+        assert_eq!(derived_keys(&all, "q"), vec!["fresh"]);
+    }
+
+    #[test]
+    fn date_accepts_a_bare_day_as_well_as_a_full_timestamp() {
+        let rule =
+            parse_rule(r#"q(X) :- p(X), date("2026-08-25") < date("2026-08-26T00:00:00Z")."#)
+                .unwrap();
+        let corpus = facts(&[("p", vec![s("a")])]);
+        let (all, _) = evaluate_at(&[rule], &corpus, 100, 10_000, at(NOW));
+        assert_eq!(derived_keys(&all, "q"), vec!["a"]);
+    }
+
+    #[test]
+    fn an_unparseable_date_is_an_error_not_a_null() {
+        // The data is not what the rule thought it was, which is a mistake
+        // rather than an absence — so Undefined, which poisons.
+        let corpus = facts(&[("doc", vec![s("a"), s("not-a-date")])]);
+        let rule = parse_rule("q(X) :- doc(X, C), date(C) < now() || 1 == 1.").unwrap();
+        let (all, _) = evaluate_at(&[rule], &corpus, 100, 10_000, at(NOW));
+        assert!(
+            all.get("q").map(|r| r.is_empty()).unwrap_or(true),
+            "a bad timestamp must not be masked by a true sibling"
+        );
+    }
+
+    #[test]
+    fn date_of_null_is_null() {
+        let corpus = facts(&[("doc", vec![s("a"), Term::ConstNull])]);
+        let rule = parse_rule("q(X) :- doc(X, C), date(C) < now() || 1 == 1.").unwrap();
+        let (all, _) = evaluate_at(&[rule], &corpus, 100, 10_000, at(NOW));
+        assert_eq!(
+            derived_keys(&all, "q"),
+            vec!["a"],
+            "true || unknown is true"
+        );
+    }
+
+    #[test]
+    fn last_week_is_expressible() {
+        // The sentence that started this.
+        let rule = parse_rule("recent(X) :- doc(X, C), date(C) > now() - days(7).").unwrap();
+        let (all, _) = evaluate_at(&[rule], &dated_corpus(), 100, 10_000, at(NOW));
+        assert_eq!(derived_keys(&all, "recent"), vec!["fresh", "lastweek"]);
+    }
+
+    #[test]
+    fn older_than_is_expressible_as_the_other_direction() {
+        let rule = parse_rule("stale(X) :- doc(X, C), now() - date(C) > days(30).").unwrap();
+        let (all, _) = evaluate_at(&[rule], &dated_corpus(), 100, 10_000, at(NOW));
+        assert_eq!(derived_keys(&all, "stale"), vec!["old"]);
+    }
+
+    #[test]
+    fn every_duration_helper_works() {
+        let corpus = facts(&[("p", vec![s("a")])]);
+        for text in [
+            "q(X) :- p(X), weeks(1) == days(7).",
+            "q(X) :- p(X), days(1) == hours(24).",
+            "q(X) :- p(X), hours(1) == minutes(60).",
+        ] {
+            let rule = parse_rule(text).unwrap();
+            let (all, _) = evaluate_at(&[rule], &corpus, 100, 10_000, at(NOW));
+            assert_eq!(derived_keys(&all, "q"), vec!["a"], "{text}");
+        }
+    }
+
+    #[test]
+    fn a_time_minus_a_time_is_a_duration() {
+        let corpus = facts(&[("p", vec![s("a")])]);
+        let rule =
+            parse_rule(r#"q(X) :- p(X), date("2026-08-28") - date("2026-08-21") == days(7)."#)
+                .unwrap();
+        let (all, _) = evaluate_at(&[rule], &corpus, 100, 10_000, at(NOW));
+        assert_eq!(derived_keys(&all, "q"), vec!["a"]);
+    }
+
+    #[test]
+    fn a_time_survives_into_a_head_and_orders_like_any_term() {
+        let rule = parse_rule("when(X, date(C)) :- doc(X, C).").unwrap();
+        let (all, _) = evaluate_at(&[rule], &dated_corpus(), 100, 10_000, at(NOW));
+        assert_eq!(
+            one_term(&all, "when", &s("old")),
+            Some(Term::ConstTime(at("2026-07-01T09:00:00Z")))
+        );
+
+        // min/max order times through the same machinery that orders any term.
+        let mx = parse_rule("latest(T) :- anchor(A), max(doc(_, C), C, T).").unwrap();
+        let corpus = {
+            let mut f = dated_corpus();
+            f.insert("anchor", vec![s("a")]);
+            f
+        };
+        let (all2, _) = evaluate_at(&[mx], &corpus, 100, 10_000, at(NOW));
+        assert!(all2.get("latest").is_some());
+    }
+
+    // ── The two correctness properties ────────────────────────────
+
+    #[test]
+    fn the_clock_is_read_once_so_every_row_sees_the_same_instant() {
+        // Read per row, two rows in one run could disagree about "now", and a
+        // rule near a boundary would include one and exclude the other for no
+        // reason a person could see.
+        let corpus = facts(&[("p", vec![s("a")]), ("p", vec![s("b")])]);
+        let rule = parse_rule("stamp(X, now()) :- p(X).").unwrap();
+        let (all, _) = evaluate_at(&[rule], &corpus, 100, 10_000, at(NOW));
+        let a = one_term(&all, "stamp", &s("a"));
+        let b = one_term(&all, "stamp", &s("b"));
+        assert_eq!(a, b, "both rows must see one instant");
+        assert_eq!(a, Some(Term::ConstTime(at(NOW))));
+    }
+
+    #[test]
+    fn a_rule_that_reads_the_clock_is_never_cached() {
+        // The same non-monotonicity negation has, by a different door: this
+        // fact stops being true with no base fact changing at all.
+        let id = uuid::Uuid::new_v4();
+        let corpus = facts(&[("doc", vec![Term::Const(id), s("2026-08-27T09:00:00Z")])]);
+        let rule = parse_rule("recent(X, X) :- doc(X, C), date(C) > now() - days(7).").unwrap();
+        let (_, derived) = evaluate_at(&[rule], &corpus, 100, 10_000, at(NOW));
+        let fact = derived
+            .iter()
+            .find(|d| d.pred == "recent")
+            .expect("derived");
+        assert!(
+            !fact.is_cacheable(),
+            "a clock-dependent derivation must never be persisted"
+        );
+    }
+
+    #[test]
+    fn a_rule_that_does_not_read_the_clock_stays_cacheable() {
+        let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let corpus = facts(&[("p", vec![Term::Const(a), Term::Const(b)])]);
+        let rule = parse_rule("q(X, Y) :- p(X, Y).").unwrap();
+        let (_, derived) = evaluate_at(&[rule], &corpus, 100, 10_000, at(NOW));
+        let fact = derived.iter().find(|d| d.pred == "q").unwrap();
+        assert!(fact.is_cacheable());
+    }
+
     // ── The completeness guard ────────────────────────────────────
 
     /// Three specs in a row have claimed the grammar was complete by reading
@@ -5985,7 +6387,13 @@ mod grammar_tests {
             CmpOp::Eq | CmpOp::Ne | CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => (),
         };
         assert_eq!(StrOp::ALL.len(), 3, "a string predicate changed");
-        assert_eq!(Func::ALL.len(), 8, "a function was added or removed");
+        assert_eq!(Func::ALL.len(), 14, "a function was added or removed");
+        assert_eq!(
+            Func::ALL.iter().filter(|f| f.reads_the_clock()).count(),
+            1,
+            "exactly one function is non-deterministic; that is a design \
+             decision, since every such rule becomes uncacheable"
+        );
 
         // Terms: Var, Const(Uuid), ConstStr, ConstFloat, ConstNull.
         //
@@ -6000,7 +6408,12 @@ mod grammar_tests {
             | Term::Const(_)
             | Term::ConstStr(_)
             | Term::ConstFloat(_)
-            | Term::ConstNull => (),
+            | Term::ConstNull
+            // Added when the NL-editor grill turned up a sentence with no
+            // representation at all — "from last week". The guard failed on
+            // it, which is the second time it has forced a real re-read
+            // rather than an inherited claim.
+            | Term::ConstTime(_) => (),
         };
 
         // Five verdicts, because "no answer" has three causes with three
