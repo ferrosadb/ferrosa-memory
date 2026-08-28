@@ -27,7 +27,7 @@ use nom::{
     bytes::complete::{escaped, is_not, tag},
     character::complete::{char as ch, multispace0, one_of, satisfy},
     combinator::{all_consuming, map, recognize, value},
-    multi::{fold_many0, many0, many0_count, separated_list1},
+    multi::{fold_many0, many0, many0_count, separated_list0, separated_list1},
     number::complete::double,
     sequence::{delimited, pair, preceded},
 };
@@ -69,8 +69,10 @@ fn call(input: &str) -> IResult<&str, FilterExpr> {
     let head = satisfy(|c: char| c.is_ascii_alphabetic() || c == '_');
     let tail = many0_count(satisfy(|c: char| c.is_ascii_alphanumeric() || c == '_'));
     let (i, name) = recognize(pair(head, tail)).parse(input)?;
+    // `separated_list0`, not 1: `now()` takes no arguments. A wrong count is
+    // still refused below, by the arity check rather than by the parser.
     let (i, args) =
-        delimited(ws(ch('(')), separated_list1(ws(ch(',')), expr), ws(ch(')'))).parse(i)?;
+        delimited(ws(ch('(')), separated_list0(ws(ch(',')), expr), ws(ch(')'))).parse(i)?;
 
     let fail = || nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Verify));
     let func = Func::parse(name).ok_or_else(fail)?;
