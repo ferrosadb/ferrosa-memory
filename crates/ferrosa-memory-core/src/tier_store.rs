@@ -877,6 +877,21 @@ impl CqlTierStore {
         }
     }
 
+    /// The tier reader and a leaf-detail reader must use the same authenticated
+    /// CQL session. Exposing a clone, rather than a second connector, avoids a
+    /// cold-detail tap selecting a different coordinator or credentials.
+    pub fn query_session(&self) -> Arc<CqlSession> {
+        self.session.clone()
+    }
+
+    /// The validated keyspace selected when this store was constructed.
+    ///
+    /// It is configuration, never request data, so callers may use it only to
+    /// interpolate an identifier into CQL while keeping every value bound.
+    pub fn keyspace(&self) -> &str {
+        &self.keyspace
+    }
+
     async fn load_resolver(&self, ctx: &TenantContext) -> anyhow::Result<RootResolver> {
         let aliases = self.aliases(ctx).await?;
         Ok(RootResolver::new(

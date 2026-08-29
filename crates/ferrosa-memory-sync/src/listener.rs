@@ -998,6 +998,7 @@ fn frame_priority(kind: &str) -> FramePriority {
         | "shell_knowledge_decide"
         | "shell_memory_tiers"
         | "shell_memory_items"
+        | "shell_memory_item"
         | "shell_tasks"
         | "shell_task"
         | "shell_task_search"
@@ -1938,6 +1939,7 @@ mod tests {
         for kind in [
             "shell_memory_tiers",
             "shell_memory_items",
+            "shell_memory_item",
             "shell_tasks",
             "shell_task",
             "shell_task_search",

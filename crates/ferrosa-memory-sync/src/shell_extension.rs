@@ -1139,6 +1139,28 @@ impl ShellExtension {
         }
     }
 
+    /// Full information for one node, fetched only after the person opens it.
+    /// One hop is returned by `MemoryView`; traversing an edge is a new request.
+    async fn memory_item_frame(&self, id: &str, session: &str) -> serde_json::Value {
+        let Ok(entity_id) = uuid::Uuid::parse_str(id) else {
+            return serde_json::json!({"type":"shell_memory_item","reachable":false,"reason":"memory item id is not a UUID"});
+        };
+        let Ok(session_id) = uuid::Uuid::parse_str(session) else {
+            return serde_json::json!({"type":"shell_memory_item","reachable":false,"reason":"memory item session is not a UUID"});
+        };
+        let Some(view) = self.memory().await else {
+            return serde_json::json!({"type":"shell_memory_item","reachable":false,"reason":"the memory store could not be reached"});
+        };
+        match view.node_detail(session_id, entity_id).await {
+            Ok(node) => {
+                serde_json::json!({"type":"shell_memory_item","reachable":true,"node":node})
+            }
+            Err(error) => {
+                serde_json::json!({"type":"shell_memory_item","reachable":false,"reason":bounded_reason(format_args!("{error:#}"))})
+            }
+        }
+    }
+
     /// One task in full, for the screen that shows a single one.
     ///
     /// Fetched on demand rather than carried with the list: the list is over a
@@ -2224,6 +2246,7 @@ pub const SHELL_KINDS: &[&str] = &[
     "shell_task_complete",
     "shell_memory_tiers",
     "shell_memory_items",
+    "shell_memory_item",
     // These four had handlers and were never CLAIMED, so every one of
     // them fell through to the built-in dispatcher, which does not
     // know them and closes the channel. Adding a handler is half the
@@ -2701,6 +2724,19 @@ impl SessionExtension for ShellExtension {
                 }
                 Ok(())
             }
+            "shell_memory_item" => {
+                let id = body
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "memory item needs an id".to_owned())?;
+                let item_session = body
+                    .get("session")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "memory item needs a session".to_owned())?;
+                session
+                    .send(&envelope(self.memory_item_frame(id, item_session).await))
+                    .await
+            }
             other => Err(format!("claimed {other} and cannot serve it")),
         }
     }
@@ -3027,6 +3063,7 @@ mod output_framing_tests {
         ("shell_scrolled", Sizing::Bounded),
         ("shell_memory_tiers", Sizing::Bounded),
         ("shell_memory_items", Sizing::Paged),
+        ("shell_memory_item", Sizing::Bounded),
         ("shell_rules", Sizing::Paged),
         ("shell_rule_detail", Sizing::Paged),
         ("shell_rules_tally", Sizing::Bounded),
