@@ -855,7 +855,8 @@ impl ShellExtension {
                     } else {
                         row.count
                     },
-                    "roots": row.roots,
+                    "roots": bounded_tier_roots(&row.roots),
+                    "root_count": row.roots.len(),
                 })).collect::<Vec<_>>(), claims),
                 // Both numbers are the map's honesty. `sourced == 0` means
                 // nothing records a source yet, which is a build step and not
@@ -1805,6 +1806,18 @@ const DEFAULT_TASK_PAGE: usize = 10;
 /// frames, exactly as a page of tasks does.
 const MEMORY_PAGE_DEFAULT: usize = 20;
 const MEMORY_PAGE_MAX: usize = 50;
+
+/// A map is orientation, not a dump of every source root. Keeping this small
+/// ensures the first response after reconnect fits a cellular data channel.
+const MEMORY_TIER_ROOT_PREVIEW: usize = 2;
+
+fn bounded_tier_roots(roots: &[String]) -> Vec<String> {
+    roots
+        .iter()
+        .take(MEMORY_TIER_ROOT_PREVIEW)
+        .map(|root| bounded_title(root))
+        .collect()
+}
 
 /// How long a failure reason may be on the wire.
 ///
@@ -3551,6 +3564,21 @@ mod output_framing_tests {
             frame.len(),
             SAFE_DATAGRAM_BYTES
         );
+    }
+
+    /// The very first memory response must be reliable on cellular. A machine
+    /// with many source roots used to put every path into this one frame,
+    /// exceed SCTP's practical MTU, and leave the app showing an empty map.
+    #[test]
+    fn memory_tier_root_preview_is_bounded_for_reconnect() {
+        let roots = (0..100)
+            .map(|index| format!("/very/long/source/root/{index:03}"))
+            .collect::<Vec<_>>();
+
+        let preview = bounded_tier_roots(&roots);
+
+        assert_eq!(preview.len(), MEMORY_TIER_ROOT_PREVIEW);
+        assert_eq!(preview, roots[..MEMORY_TIER_ROOT_PREVIEW]);
     }
 
     /// A conservative floor for path MTU.
