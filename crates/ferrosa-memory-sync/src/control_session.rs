@@ -1101,18 +1101,28 @@ pub async fn control_application_reply<S: ControlStore>(
         .get("capabilities")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| ControlSessionError::Protocol("capabilities must be an array".to_owned()))?;
-    if capabilities.len() > MAX_CONTROL_CAPABILITIES
-        || capabilities.iter().any(|value| {
-            !matches!(
-                value.as_str(),
-                Some("agent_control" | "memory_read" | "approval_decide")
-            )
-        })
-    {
+    if capabilities.len() > MAX_CONTROL_CAPABILITIES {
         return Err(ControlSessionError::Protocol(
-            "unsupported or oversized capability set".to_owned(),
+            "oversized capability set".to_owned(),
         ));
     }
+    // An unrecognized capability is DECLINED, not fatal.
+    //
+    // Rejecting the frame killed the whole session over one right the
+    // controller merely asked about, so adding any value to the vocabulary
+    // broke every listener already deployed. Declining costs the controller
+    // that one capability and nothing else, which is what the grant event
+    // below then tells it.
+    let requested: Vec<&str> = capabilities
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    if requested.len() != capabilities.len() {
+        return Err(ControlSessionError::Protocol(
+            "capabilities must be strings".to_owned(),
+        ));
+    }
+
     let page = store
         .events_after(
             ctx,
@@ -1239,6 +1249,13 @@ pub struct ControlRuntimeDispatcher<S, R> {
     /// The actual security decision, and the server's view of it. It must never
     /// be the capability list the client asked for in its own subscribe frame.
     granted_capabilities: Vec<String>,
+    /// The last sequence accepted for each open note.
+    ///
+    /// Enforcing this is what stops a replayed or reordered append merging into
+    /// a transcript, which would corrupt it in a way nobody could later detect.
+    /// Bounded by `MAX_TRACKED_NOTES`: the map is fed by whatever the
+    /// controller opens.
+    note_sequences: Arc<tokio::sync::Mutex<std::collections::HashMap<String, u64>>>,
 }
 
 impl<S, R> ControlRuntimeDispatcher<S, R>
@@ -1257,6 +1274,7 @@ where
             // assume it may do anything.
             entitlements: Vec::new(),
             granted_capabilities: Vec::new(),
+            note_sequences: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -1297,6 +1315,26 @@ where
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| ControlSessionError::Protocol("missing body type".to_owned()))?;
         if body_type != "command" {
+            if body_type == "subscribe" {
+                // State what this DEVICE was granted, before replaying
+                // anything. Taken from the dispatcher's own record, never from
+                // the set the client asked for in its subscribe — that field is
+                // a request, and treating it as the answer would let a
+                // controller grant itself whatever it named.
+                //
+                // Appended rather than synthesised into the reply: the
+                // controller commits cursors from this batch, and an event with
+                // an invented cursor would corrupt its resume position. One
+                // event per subscribe is the cost, and a subscribe happens on
+                // connect and reconnect, not per frame.
+                append_grant_event(
+                    self.store.as_ref(),
+                    ctx,
+                    server_fingerprint,
+                    &self.granted_capabilities,
+                )
+                .await?;
+            }
             return control_application_reply(self.store.as_ref(), ctx, server_fingerprint, input)
                 .await;
         }
@@ -1465,6 +1503,18 @@ where
                 .dispatch_coordinator_command(ctx, server_fingerprint, frame, frame_id, command)
                 .await;
         }
+        if matches!(command_type, "note_open" | "note_append" | "note_commit") {
+            return self
+                .handle_note_command(
+                    ctx,
+                    server_fingerprint,
+                    frame_id,
+                    command_id,
+                    command_type,
+                    frame,
+                )
+                .await;
+        }
         if command_type != "agent_launch" {
             return Err(ControlSessionError::Protocol(
                 "unsupported command_type".to_owned(),
@@ -1597,6 +1647,238 @@ where
 
         command_result_reply_with_cursor(frame_id, &running, Some(accepted_cursor)).map(Some)
     }
+
+    /// Store a captured note.
+    ///
+    /// The note lives in the durable event log rather than a table of its own.
+    /// That is deliberate for this first cut: the log is already tenant-scoped,
+    /// cursor-ordered, and replayed to the controller, so a note is durable and
+    /// resumable without a schema migration. It is NOT the final home — a note
+    /// should become a first-class memory entity so it is searchable — and
+    /// nothing here depends on it staying where it is, because the note is
+    /// reconstructed by folding its events.
+    async fn handle_note_command(
+        &self,
+        ctx: &TenantContext,
+        server_fingerprint: &str,
+        frame_id: &str,
+        command_id: Uuid,
+        command_type: &str,
+        frame: &serde_json::Value,
+    ) -> Result<Option<String>, ControlSessionError> {
+        let payload = frame
+            .pointer("/body/payload")
+            .cloned()
+            .ok_or_else(|| ControlSessionError::Protocol("missing command payload".to_owned()))?;
+
+        // Idempotent by command id, like every other command. A controller that
+        // retried an append after a lost answer must not append twice.
+        let now = Utc::now();
+        let command = ControlCommand {
+            command_id,
+            command_type: command_type.to_owned(),
+            request: payload.clone(),
+            state: ControlCommandState::Queued,
+            result: None,
+            result_cursor: None,
+            created_at: now,
+            updated_at: now,
+        };
+        if let CommandInsert::Duplicate(existing) = self
+            .store
+            .put_command_if_absent(ctx, server_fingerprint, &command)
+            .await
+            .map_err(control_store_error)?
+        {
+            return command_result_reply(frame_id, &existing).map(Some);
+        }
+
+        // Queued -> Running -> terminal. The store enforces that order, and it
+        // is right to: a command that jumped straight to a terminal state would
+        // have no observable moment of being in flight, which is the state a
+        // reconnecting controller needs to see to know its work was accepted.
+        self.store
+            .update_command(
+                ctx,
+                server_fingerprint,
+                command_id,
+                ControlCommandUpdate {
+                    state: ControlCommandState::Running,
+                    result: None,
+                    result_cursor: None,
+                    updated_at: Utc::now(),
+                },
+            )
+            .await
+            .map_err(control_store_error)?;
+
+        let outcome = match command_type {
+            "note_open" => {
+                self.open_note(ctx, server_fingerprint, command_id, &payload)
+                    .await
+            }
+            "note_append" => {
+                self.append_note(ctx, server_fingerprint, command_id, &payload)
+                    .await
+            }
+            _ => {
+                self.commit_note(ctx, server_fingerprint, command_id, &payload)
+                    .await
+            }
+        };
+
+        match outcome {
+            Ok(result) => {
+                let succeeded = persist_terminal_command(
+                    self.store.as_ref(),
+                    ctx,
+                    server_fingerprint,
+                    command_id,
+                    ControlCommandState::Succeeded,
+                    note_event_kind(command_type),
+                    result.clone(),
+                )
+                .await?;
+                command_result_reply(frame_id, &succeeded).map(Some)
+            }
+            Err(reason) => {
+                // Recorded as a failed command, not as a protocol error. A bad
+                // note must not take the session down — the controller needs to
+                // hear that this note was refused and why, and keep the channel
+                // it would use to fix it.
+                let failed = persist_terminal_command(
+                    self.store.as_ref(),
+                    ctx,
+                    server_fingerprint,
+                    command_id,
+                    ControlCommandState::Failed,
+                    "note_refused",
+                    serde_json::json!({ "reason": bounded_text(&reason) }),
+                )
+                .await?;
+                command_result_reply(frame_id, &failed).map(Some)
+            }
+        }
+    }
+
+    /// Allocate the note's id. The controller never picks it: two devices of
+    /// one account capturing at the same moment would otherwise have to agree
+    /// on one without talking to each other.
+    async fn open_note(
+        &self,
+        _ctx: &TenantContext,
+        _server_fingerprint: &str,
+        _command_id: Uuid,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let source = payload
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "a note must say which control captured it".to_owned())?;
+        if !matches!(source, "voice" | "typed") {
+            return Err(format!("unknown note source {source:?}"));
+        }
+        let context = payload
+            .get("context")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        // Time-ordered so the notes list sorts without a secondary key.
+        let note_id = Uuid::now_v7().to_string();
+        Ok(serde_json::json!({
+            "note_id": note_id,
+            "source": source,
+            "context": context,
+        }))
+    }
+
+    /// Add one finalised utterance, or a typed note's whole body.
+    async fn append_note(
+        &self,
+        _ctx: &TenantContext,
+        _server_fingerprint: &str,
+        _command_id: Uuid,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let note_id = note_id_of(payload)?;
+        let seq = payload
+            .get("seq")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| "an append must carry a sequence number".to_owned())?;
+        let text = payload
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "an append must carry text".to_owned())?;
+        if text.len() > MAX_NOTE_TEXT_BYTES {
+            return Err(format!(
+                "an append may be at most {MAX_NOTE_TEXT_BYTES} bytes"
+            ));
+        }
+
+        // Sequence enforcement. A replayed or reordered append that merged
+        // would corrupt a transcript in a way nobody could later detect, so a
+        // non-increasing sequence is refused rather than interleaved.
+        let mut seen = self.note_sequences.lock().await;
+        let last = seen.get(&note_id).copied();
+        if let Some(last) = last
+            && seq <= last
+        {
+            return Err(format!(
+                "append {seq} is not after {last} for this note; refusing to interleave"
+            ));
+        }
+        if seen.len() >= MAX_TRACKED_NOTES && last.is_none() {
+            // Bounded: the map is fed by whatever the controller opens.
+            return Err("too many notes are open on this session".to_owned());
+        }
+        seen.insert(note_id.clone(), seq);
+        drop(seen);
+
+        Ok(serde_json::json!({
+            "note_id": note_id,
+            "seq": seq,
+            "text": text,
+        }))
+    }
+
+    /// Close a note. Everything appended before this is already durable.
+    async fn commit_note(
+        &self,
+        _ctx: &TenantContext,
+        _server_fingerprint: &str,
+        _command_id: Uuid,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let note_id = note_id_of(payload)?;
+        self.note_sequences.lock().await.remove(&note_id);
+        Ok(serde_json::json!({ "note_id": note_id }))
+    }
+}
+
+/// Longest single append the listener will store.
+///
+/// Matches the controller's bound so the two cannot disagree about what fits.
+const MAX_NOTE_TEXT_BYTES: usize = 8 * 1024;
+
+/// How many notes one session may have open at once.
+const MAX_TRACKED_NOTES: usize = 64;
+
+fn note_id_of(payload: &serde_json::Value) -> Result<String, String> {
+    payload
+        .get("note_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 64)
+        .map(str::to_owned)
+        .ok_or_else(|| "a note command must name its note".to_owned())
+}
+
+fn note_event_kind(command_type: &str) -> &'static str {
+    match command_type {
+        "note_open" => "note_opened",
+        "note_append" => "note_appended",
+        _ => "note_committed",
+    }
 }
 
 async fn persist_terminal_command<S: ControlStore>(
@@ -1631,6 +1913,39 @@ async fn persist_terminal_command<S: ControlStore>(
         )
         .await
         .map_err(control_store_error)
+}
+
+/// Tell the controller what it may do.
+///
+/// Carries no command_id: this is not the consequence of a command, it is the
+/// listener stating a fact about the session.
+async fn append_grant_event<S: ControlStore>(
+    store: &S,
+    ctx: &TenantContext,
+    server_fingerprint: &str,
+    granted: &[String],
+) -> Result<u64, ControlSessionError> {
+    let cursor = store
+        .reserve_cursor_block(ctx, server_fingerprint, 1)
+        .await
+        .map_err(control_store_error)?
+        .start;
+    store
+        .append_event(
+            ctx,
+            server_fingerprint,
+            ControlEventDraft {
+                cursor,
+                event_id: Uuid::now_v7(),
+                command_id: None,
+                kind: "capabilities_granted".to_owned(),
+                payload: serde_json::json!({ "capabilities": granted }),
+                created_at: Utc::now(),
+            },
+        )
+        .await
+        .map_err(control_store_error)?;
+    Ok(cursor)
 }
 
 async fn append_control_event<S: ControlStore>(
@@ -2065,6 +2380,264 @@ mod tests {
             .expect("second event batch");
         assert_eq!(first_events.len() + second_events.len(), 6);
         assert_eq!(second["body"]["high_water_cursor"], block.end);
+    }
+
+    fn note_dispatcher(
+        store: &Arc<InMemoryControlStore>,
+    ) -> ControlRuntimeDispatcher<InMemoryControlStore, FakeAgentRuntime> {
+        ControlRuntimeDispatcher::new(
+            Arc::clone(store),
+            FakeAgentRuntime {
+                launches: Arc::new(AtomicUsize::new(0)),
+            },
+        )
+    }
+
+    fn note_ctx() -> TenantContext {
+        TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "note-test".to_owned(),
+        }
+    }
+
+    fn note_frame(command_type: &str, payload: serde_json::Value) -> String {
+        serde_json::json!({
+            "version": CONTROL_PROTOCOL_VERSION,
+            "frame_id": "note-frame",
+            "body": {
+                "type": "command",
+                "command_id": Uuid::now_v7(),
+                "command_type": command_type,
+                "payload": payload,
+            },
+        })
+        .to_string()
+    }
+
+    async fn reply_json(
+        dispatcher: &ControlRuntimeDispatcher<InMemoryControlStore, FakeAgentRuntime>,
+        ctx: &TenantContext,
+        server: &str,
+        frame: &str,
+    ) -> serde_json::Value {
+        let raw = dispatcher
+            .reply(ctx, server, frame)
+            .await
+            .expect("dispatch")
+            .expect("a reply");
+        serde_json::from_str(&raw).expect("reply json")
+    }
+
+    /// The whole flow: open allocates an id, appends carry it, commit closes.
+    #[tokio::test]
+    async fn a_note_can_be_opened_appended_to_and_committed() {
+        let store = Arc::new(InMemoryControlStore::default());
+        let dispatcher = note_dispatcher(&store);
+        let ctx = note_ctx();
+        let server = "server-fingerprint";
+
+        let opened = reply_json(
+            &dispatcher,
+            &ctx,
+            server,
+            &note_frame(
+                "note_open",
+                serde_json::json!({"source": "typed", "context": {"section": "work"}}),
+            ),
+        )
+        .await;
+        assert_eq!(opened["body"]["state"], "succeeded");
+        let note_id = opened["body"]["result"]["note_id"]
+            .as_str()
+            .expect("the listener must allocate an id")
+            .to_owned();
+        assert!(!note_id.is_empty());
+
+        let appended = reply_json(
+            &dispatcher,
+            &ctx,
+            server,
+            &note_frame(
+                "note_append",
+                serde_json::json!({"note_id": note_id, "seq": 1, "text": "the index is stale"}),
+            ),
+        )
+        .await;
+        assert_eq!(appended["body"]["state"], "succeeded");
+
+        let committed = reply_json(
+            &dispatcher,
+            &ctx,
+            server,
+            &note_frame("note_commit", serde_json::json!({"note_id": note_id})),
+        )
+        .await;
+        assert_eq!(committed["body"]["state"], "succeeded");
+    }
+
+    /// The controller must not pick the id: two devices of one account
+    /// capturing at the same moment would have to agree on one without talking.
+    #[tokio::test]
+    async fn two_notes_opened_together_get_different_ids() {
+        let store = Arc::new(InMemoryControlStore::default());
+        let dispatcher = note_dispatcher(&store);
+        let ctx = note_ctx();
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let opened = reply_json(
+                &dispatcher,
+                &ctx,
+                "server-fingerprint",
+                &note_frame("note_open", serde_json::json!({"source": "voice"})),
+            )
+            .await;
+            ids.push(
+                opened["body"]["result"]["note_id"]
+                    .as_str()
+                    .expect("id")
+                    .to_owned(),
+            );
+        }
+        assert_ne!(ids[0], ids[1]);
+    }
+
+    /// A replayed or reordered append that merged would corrupt a transcript in
+    /// a way nobody could later detect. It is refused, and the refusal is a
+    /// failed command rather than a dead session.
+    #[tokio::test]
+    async fn a_non_increasing_append_is_refused_without_killing_the_session() {
+        let store = Arc::new(InMemoryControlStore::default());
+        let dispatcher = note_dispatcher(&store);
+        let ctx = note_ctx();
+        let server = "server-fingerprint";
+
+        let opened = reply_json(
+            &dispatcher,
+            &ctx,
+            server,
+            &note_frame("note_open", serde_json::json!({"source": "voice"})),
+        )
+        .await;
+        let note_id = opened["body"]["result"]["note_id"]
+            .as_str()
+            .expect("id")
+            .to_owned();
+
+        for seq in [1u64, 2] {
+            let ok = reply_json(
+                &dispatcher,
+                &ctx,
+                server,
+                &note_frame(
+                    "note_append",
+                    serde_json::json!({"note_id": note_id, "seq": seq, "text": "in order"}),
+                ),
+            )
+            .await;
+            assert_eq!(ok["body"]["state"], "succeeded");
+        }
+
+        let refused = reply_json(
+            &dispatcher,
+            &ctx,
+            server,
+            &note_frame(
+                "note_append",
+                serde_json::json!({"note_id": note_id, "seq": 2, "text": "out of order"}),
+            ),
+        )
+        .await;
+        assert_eq!(refused["body"]["state"], "failed");
+        assert!(
+            refused["body"]["result"]["reason"]
+                .as_str()
+                .expect("reason")
+                .contains("interleave"),
+            "the refusal must say why: {refused}"
+        );
+
+        // The session survives: the next well-formed append still works.
+        let next = reply_json(
+            &dispatcher,
+            &ctx,
+            server,
+            &note_frame(
+                "note_append",
+                serde_json::json!({"note_id": note_id, "seq": 3, "text": "still working"}),
+            ),
+        )
+        .await;
+        assert_eq!(next["body"]["state"], "succeeded");
+    }
+
+    /// An empty append is a capture bug. Storing it would put blank lines
+    /// through a transcript that nobody could tell from silence in the room.
+    #[tokio::test]
+    async fn an_empty_append_is_refused() {
+        let store = Arc::new(InMemoryControlStore::default());
+        let dispatcher = note_dispatcher(&store);
+        let ctx = note_ctx();
+        let refused = reply_json(
+            &dispatcher,
+            &ctx,
+            "server-fingerprint",
+            &note_frame(
+                "note_append",
+                serde_json::json!({"note_id": "n-1", "seq": 1, "text": "   "}),
+            ),
+        )
+        .await;
+        assert_eq!(refused["body"]["state"], "failed");
+    }
+
+    /// A subscribe is answered with what THIS DEVICE was granted, so a
+    /// controller can finally learn whether it may write.
+    #[tokio::test]
+    async fn a_subscribe_states_what_the_device_was_granted() {
+        let store = Arc::new(InMemoryControlStore::default());
+        let dispatcher = note_dispatcher(&store);
+        let ctx = note_ctx();
+        let subscribe = serde_json::json!({
+            "version": CONTROL_PROTOCOL_VERSION,
+            "frame_id": "sub-1",
+            "body": {
+                "type": "subscribe",
+                "after_cursor": serde_json::Value::Null,
+                "capabilities": ["agent_control", "memory_read", "approval_decide"],
+            },
+        })
+        .to_string();
+        let batch = reply_json(&dispatcher, &ctx, "server-fingerprint", &subscribe).await;
+        assert_eq!(batch["body"]["type"], "event_batch");
+        let grant = batch["body"]["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .find(|event| event["kind"] == "capabilities_granted")
+            .expect("the listener must state what it granted");
+        assert!(grant["payload"]["capabilities"].is_array());
+    }
+
+    /// A capability this listener does not know is DECLINED, not fatal.
+    /// Rejecting the frame killed the session over one right the controller
+    /// merely asked about, which made the vocabulary impossible to extend.
+    #[tokio::test]
+    async fn an_unknown_requested_capability_does_not_kill_the_session() {
+        let store = Arc::new(InMemoryControlStore::default());
+        let dispatcher = note_dispatcher(&store);
+        let ctx = note_ctx();
+        let subscribe = serde_json::json!({
+            "version": CONTROL_PROTOCOL_VERSION,
+            "frame_id": "sub-2",
+            "body": {
+                "type": "subscribe",
+                "after_cursor": serde_json::Value::Null,
+                "capabilities": ["memory_read", "invented_next_year"],
+            },
+        })
+        .to_string();
+        let batch = reply_json(&dispatcher, &ctx, "server-fingerprint", &subscribe).await;
+        assert_eq!(batch["body"]["type"], "event_batch");
     }
 
     #[tokio::test]
