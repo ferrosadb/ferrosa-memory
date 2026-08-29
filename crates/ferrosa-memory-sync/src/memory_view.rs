@@ -3,7 +3,7 @@
 //! when a tier with nothing in it still appears, and when a sort the machine
 //! cannot actually perform is never offered.
 //! Last revised: 2026-08-24
-//! Last changed: new — the DIKW map and a tier's contents.
+//! Last changed: added bounded, on-demand graph-node detail reads.
 //!
 //! # Why the counting happens here and not in CQL
 //!
@@ -22,6 +22,7 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
+use ferrosa_memory_core::cql_storage::{build_col_map, cql_get};
 use ferrosa_memory_core::tier_store::page_key;
 use ferrosa_memory_core::tier_store::{
     CqlTierStore, EntitySource, TierStore, TierSummary, load_rules, summarise,
@@ -68,6 +69,20 @@ pub const AVAILABLE_SORTS: &[&str] = &["recent"];
 pub struct MemoryView {
     store: CqlTierStore,
     ctx: TenantContext,
+}
+
+/// The complete, bounded leaf returned when a person opens one graph node.
+/// It is deliberately one hop: following edges is an explicit next request,
+/// never graph materialization disguised as a detail pane.
+pub const NODE_DETAIL_EDGE_LIMIT: usize = 48;
+
+/// Keep a leaf response within one datagram-scale budget without ever
+/// materialising a graph traversal. One more row than the visible window is
+/// read so the client can offer an explicit "more" action.
+fn bounded_edge_window<T>(edges: Vec<T>) -> (Vec<T>, bool) {
+    let per_direction = NODE_DETAIL_EDGE_LIMIT / 2;
+    let has_more = edges.len() > per_direction;
+    (edges.into_iter().take(per_direction).collect(), has_more)
 }
 
 /// One row of a tier's contents.
@@ -179,6 +194,88 @@ impl MemoryView {
                 session_origin: "mobile-control".to_owned(),
             },
         })
+    }
+
+    /// Read one node and up to 24 edges in each direction for a detail pane.
+    ///
+    /// The tenant and session predicates make this a leaf lookup under the
+    /// caller's established memory context. It deliberately does not traverse
+    /// further: a connected node becomes the root of a subsequent request.
+    pub async fn node_detail(
+        &self,
+        session_id: Uuid,
+        entity_id: Uuid,
+    ) -> Result<serde_json::Value> {
+        let session = self.store.query_session();
+        let keyspace = self.store.keyspace();
+        #[allow(deprecated)]
+        let entity = session.query_unpaged(
+            format!("SELECT entity_name, entity_type, context_snippet, description, tags, properties, confidence, created_at FROM {keyspace}.entity_store WHERE tenant_id = ? AND session_id = ? AND entity_id = ?"),
+            (self.ctx.tenant_id, session_id, entity_id),
+        ).await?;
+        let columns = build_col_map(entity.col_specs());
+        let entity_rows = entity.rows_or_empty();
+        let row = entity_rows
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("the requested node does not exist in this session"))?;
+        let text = |name| cql_get::<String>(row, &columns, name).unwrap_or_default();
+        let tags: Vec<String> = serde_json::from_str(&text("tags")).unwrap_or_default();
+        let properties: serde_json::Value =
+            serde_json::from_str(&text("properties")).unwrap_or(serde_json::Value::Null);
+
+        let edge_query = |predicate: &str| {
+            format!(
+                "SELECT src_id, edge_type, dst_id, weight, metadata FROM {keyspace}.typed_edges WHERE tenant_id = ? AND session_id = ? AND {predicate} = ? LIMIT {}{}",
+                NODE_DETAIL_EDGE_LIMIT / 2 + 1,
+                if predicate == "dst_id" {
+                    " ALLOW FILTERING"
+                } else {
+                    ""
+                },
+            )
+        };
+        #[allow(deprecated)]
+        let outgoing = session
+            .query_unpaged(
+                edge_query("src_id"),
+                (self.ctx.tenant_id, session_id, entity_id),
+            )
+            .await?;
+        #[allow(deprecated)]
+        let incoming = session
+            .query_unpaged(
+                edge_query("dst_id"),
+                (self.ctx.tenant_id, session_id, entity_id),
+            )
+            .await?;
+        let encode_edges = |result: scylla::transport::legacy_query_result::LegacyQueryResult,
+                            direction: &str| {
+            let cols = build_col_map(result.col_specs());
+            result.rows_or_empty().iter().filter_map(|edge| {
+                let other = if direction == "out" { cql_get::<Uuid>(edge, &cols, "dst_id").ok()? } else { cql_get::<Uuid>(edge, &cols, "src_id").ok()? };
+                Some(serde_json::json!({
+                    "direction": direction,
+                    "type": cql_get::<String>(edge, &cols, "edge_type").unwrap_or_default(),
+                    "node": { "id": other, "session": session_id },
+                    "weight": cql_get::<f64>(edge, &cols, "weight").unwrap_or(1.0),
+                    "metadata": cql_get::<String>(edge, &cols, "metadata").ok().filter(|v| !v.is_empty()),
+                }))
+            }).collect::<Vec<_>>()
+        };
+        let (outgoing, more_outgoing) = bounded_edge_window(encode_edges(outgoing, "out"));
+        let (incoming, more_incoming) = bounded_edge_window(encode_edges(incoming, "in"));
+        let edges = outgoing.into_iter().chain(incoming).collect::<Vec<_>>();
+        Ok(serde_json::json!({
+            "id": entity_id, "session": session_id,
+            "title": text("entity_name"), "type": text("entity_type"),
+            "content": text("context_snippet"),
+            "description": cql_get::<String>(row, &columns, "description").ok().filter(|v| !v.is_empty()),
+            "tags": tags, "properties": properties,
+            "confidence": cql_get::<f32>(row, &columns, "confidence").unwrap_or(1.0),
+            "created_at": cql_get::<chrono::DateTime<chrono::Utc>>(row, &columns, "created_at").ok().map(|v| v.to_rfc3339()),
+            "edges": edges,
+            "more_edges": { "outgoing": more_outgoing, "incoming": more_incoming },
+        }))
     }
 
     /// The DIKW map.
@@ -382,5 +479,16 @@ mod tests {
     #[test]
     fn only_the_orders_a_seek_can_serve_are_advertised() {
         assert_eq!(AVAILABLE_SORTS, &["recent"]);
+    }
+
+    /// A detail pane must not accidentally grow with a high-degree node. The
+    /// extra row only reports truncation; it is never sent to the device.
+    #[test]
+    fn node_edges_are_limited_and_report_more() {
+        let input = (0..=NODE_DETAIL_EDGE_LIMIT / 2).collect::<Vec<_>>();
+        let (visible, has_more) = bounded_edge_window(input);
+
+        assert_eq!(visible.len(), NODE_DETAIL_EDGE_LIMIT / 2);
+        assert!(has_more);
     }
 }
