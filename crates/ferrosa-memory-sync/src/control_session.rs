@@ -1273,7 +1273,11 @@ where
             // dispatcher that has not been told what the peer may do must not
             // assume it may do anything.
             entitlements: Vec::new(),
-            granted_capabilities: Vec::new(),
+            // Not empty. `with_coordinator` is the only other setter and the
+            // listener path never calls it, so an empty default meant the
+            // listener told every controller it had been granted nothing —
+            // disabling capabilities it does in fact serve.
+            granted_capabilities: default_granted_capabilities(),
             note_sequences: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
@@ -1913,6 +1917,35 @@ async fn persist_terminal_command<S: ControlStore>(
         )
         .await
         .map_err(control_store_error)
+}
+
+/// What a listener grants a device of its own account, absent narrower rules.
+///
+/// Every capability this listener actually implements. That is defensible only
+/// because of what is already true by the time a session exists: the device is
+/// attested by signed hello and belongs to the SAME account, and trust D15 says
+/// every same-account device is privileged — so a grant here buys no authority
+/// the device could not already reach.
+///
+/// It is deliberately not least-privilege yet, and that is a gap rather than a
+/// decision. Per-device, per-capability grants are the unbuilt piece; when they
+/// land, this becomes the ceiling a device's own record is narrowed against
+/// rather than the answer.
+///
+/// `memory_write` is here and cannot be asked for: shipped controllers are
+/// refused by shipped listeners if their subscribe names it, so it is offered
+/// rather than requested.
+#[must_use]
+pub fn default_granted_capabilities() -> Vec<String> {
+    [
+        "agent_control",
+        "approval_decide",
+        "memory_read",
+        "memory_write",
+    ]
+    .iter()
+    .map(|value| (*value).to_owned())
+    .collect()
 }
 
 /// Tell the controller what it may do.
@@ -2615,7 +2648,24 @@ mod tests {
             .iter()
             .find(|event| event["kind"] == "capabilities_granted")
             .expect("the listener must state what it granted");
-        assert!(grant["payload"]["capabilities"].is_array());
+        let granted: Vec<&str> = grant["payload"]["capabilities"]
+            .as_array()
+            .expect("capabilities")
+            .iter()
+            .map(|v| v.as_str().expect("string"))
+            .collect();
+        // The grant must not be EMPTY. An empty list is a statement that this
+        // listener grants nothing, which disables every control against a
+        // machine that in fact serves them — and it is what a default-empty
+        // dispatcher field produced, because the listener path never sets it.
+        assert!(
+            !granted.is_empty(),
+            "an empty grant disables working features"
+        );
+        assert!(
+            granted.contains(&"memory_write"),
+            "a listener that stores notes must say so: {granted:?}"
+        );
     }
 
     /// A capability this listener does not know is DECLINED, not fatal.
