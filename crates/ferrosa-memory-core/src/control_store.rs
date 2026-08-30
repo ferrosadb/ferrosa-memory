@@ -984,18 +984,6 @@ fn validate_block_size(size: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Rows still needed to fill a replay page, or `None` when it is already full.
-///
-/// Saturating rather than exact: a server that does not honour the `LIMIT` on a
-/// bucket query hands back more rows than were requested, so `collected` can
-/// overshoot `fetch_limit`. An `==` check misses that overshoot and the next
-/// `fetch_limit - collected` underflows `usize` into a value `i32::try_from`
-/// rejects — surfacing as "out of range integral type conversion attempted" and
-/// killing the control session instead of degrading.
-fn remaining_fetch(fetch_limit: usize, collected: usize) -> Option<usize> {
-    fetch_limit.checked_sub(collected).filter(|n| *n > 0)
-}
-
 fn validate_replay_limit(limit: usize) -> anyhow::Result<()> {
     if limit == 0 || limit > MAX_CONTROL_REPLAY_EVENTS {
         anyhow::bail!("replay limit must be 1..={MAX_CONTROL_REPLAY_EVENTS}");
