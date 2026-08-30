@@ -360,12 +360,18 @@ async fn t03_old_schema_auto_upgrades_to_v31() {
         .expect("initial bootstrap must succeed");
 
     // Step 2: Roll back `co_occurs_with` to pre-v31 state by removing
-    // the `first_seen` column if it exists. Scylla supports DROP COLUMN.
+    // the `first_seen` column. The bootstrap above guarantees it exists;
+    // fail loudly if the test fixture cannot establish the required state.
+    // Ferrosa's ALTER TABLE grammar accepts `DROP <column>`, not Cassandra's
+    // optional `IF EXISTS` suffix.
     let rollback_stmt = format!(
-        "ALTER TABLE {}.co_occurs_with DROP first_seen IF EXISTS",
+        "ALTER TABLE {}.co_occurs_with DROP first_seen",
         cfg.keyspace
     );
-    let _ = session.query_unpaged(rollback_stmt, ()).await; // may fail if column absent; that's fine
+    session
+        .query_unpaged(rollback_stmt, ())
+        .await
+        .expect("rollback must remove first_seen before replaying migration 31");
 
     // Step 3: Rewind schema_version to 30 to simulate an old deploy.
     let rewind_stmt = format!(
