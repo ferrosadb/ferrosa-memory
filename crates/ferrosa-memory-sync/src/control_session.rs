@@ -1063,6 +1063,17 @@ pub async fn control_application_reply<S: ControlStore>(
     server_fingerprint: &str,
     input: &str,
 ) -> Result<Option<String>, ControlSessionError> {
+    control_application_reply_granting(store, ctx, server_fingerprint, input, None).await
+}
+
+/// As above, additionally stating what the controller was granted.
+pub async fn control_application_reply_granting<S: ControlStore>(
+    store: &S,
+    ctx: &TenantContext,
+    server_fingerprint: &str,
+    input: &str,
+    granted: Option<&[String]>,
+) -> Result<Option<String>, ControlSessionError> {
     if let Some(reply) = liveness_reply(input)? {
         return Ok(Some(reply));
     }
@@ -1134,7 +1145,7 @@ pub async fn control_application_reply<S: ControlStore>(
         .map_err(|error| {
             ControlSessionError::Protocol(format!("durable replay failed: {error}"))
         })?;
-    encode_event_batch(frame_id, page.high_water_cursor, page.events).map(Some)
+    encode_event_batch(frame_id, page.high_water_cursor, page.events, granted).map(Some)
 }
 
 /// Encode the largest ordered event prefix that fits one control frame.
@@ -1147,10 +1158,14 @@ fn encode_event_batch(
     frame_id: &str,
     final_high_water_cursor: u64,
     events: Vec<ControlEvent>,
+    granted: Option<&[String]>,
 ) -> Result<String, ControlSessionError> {
     let frame_id = serde_json::to_string(frame_id)
         .map_err(|error| ControlSessionError::Protocol(format!("frame id encode: {error}")))?;
-    let envelope_bytes = event_batch_json(&frame_id, u64::MAX, "").len();
+    // Measured WITH the grant, so the field cannot push a batch that just fit
+    // over the frame limit — which would make the reply unsendable exactly when
+    // a controller had the most to catch up on.
+    let envelope_bytes = event_batch_json(&frame_id, u64::MAX, "", granted).len();
     let event_count = events.len();
     let mut encoded_events = Vec::with_capacity(event_count);
     let mut encoded_bytes = envelope_bytes;
@@ -1189,14 +1204,33 @@ fn encode_event_batch(
         last_cursor.expect("a truncated batch contains at least one event")
     };
     let events = encoded_events.join(",");
-    let reply = event_batch_json(&frame_id, high_water_cursor, &events);
+    let reply = event_batch_json(&frame_id, high_water_cursor, &events, granted);
     debug_assert!(reply.len() <= MAX_CONTROL_FRAME_BYTES);
     Ok(reply)
 }
 
-fn event_batch_json(frame_id: &str, high_water_cursor: u64, events: &str) -> String {
+/// Encode a batch, optionally stating what the controller was granted.
+///
+/// The grant rides on the BATCH rather than as an event inside it. An event
+/// carries the newest cursor and therefore sits at the tail of the ordered
+/// list, and the encoder keeps only the largest prefix that fits one frame — so
+/// any replay backlog pushed the grant out of the batch and a controller
+/// learned what it could do only after draining everything that had ever
+/// happened. A session-level fact must not queue behind content.
+///
+/// Additive: a controller that predates the field ignores it.
+fn event_batch_json(
+    frame_id: &str,
+    high_water_cursor: u64,
+    events: &str,
+    granted: Option<&[String]>,
+) -> String {
+    let grant = granted
+        .and_then(|list| serde_json::to_string(list).ok())
+        .map(|list| format!(r#","granted_capabilities":{list}"#))
+        .unwrap_or_default();
     format!(
-        r#"{{"version":{CONTROL_PROTOCOL_VERSION},"frame_id":{frame_id},"body":{{"type":"event_batch","high_water_cursor":{high_water_cursor},"events":[{events}]}}}}"#
+        r#"{{"version":{CONTROL_PROTOCOL_VERSION},"frame_id":{frame_id},"body":{{"type":"event_batch","high_water_cursor":{high_water_cursor},"events":[{events}]{grant}}}}}"#
     )
 }
 
@@ -1320,24 +1354,28 @@ where
             .ok_or_else(|| ControlSessionError::Protocol("missing body type".to_owned()))?;
         if body_type != "command" {
             if body_type == "subscribe" {
-                // State what this DEVICE was granted, before replaying
-                // anything. Taken from the dispatcher's own record, never from
-                // the set the client asked for in its subscribe — that field is
-                // a request, and treating it as the answer would let a
-                // controller grant itself whatever it named.
+                // State what this DEVICE was granted, on the batch itself.
                 //
-                // Appended rather than synthesised into the reply: the
-                // controller commits cursors from this batch, and an event with
-                // an invented cursor would corrupt its resume position. One
-                // event per subscribe is the cost, and a subscribe happens on
-                // connect and reconnect, not per frame.
-                append_grant_event(
+                // Taken from the dispatcher's own record, never from the set
+                // the client asked for in its subscribe — that field is a
+                // request, and treating it as the answer would let a controller
+                // grant itself whatever it named.
+                //
+                // On the batch rather than as an event in the log: an event
+                // carries the newest cursor, so it sits at the tail of the
+                // ordered list, and the encoder keeps only the largest prefix
+                // that fits one frame. Any replay backlog pushed the grant out
+                // of the batch, and the controller reported the listener too
+                // old to store notes against a listener that had just been
+                // updated. A session-level fact must not queue behind content.
+                return control_application_reply_granting(
                     self.store.as_ref(),
                     ctx,
                     server_fingerprint,
-                    &self.granted_capabilities,
+                    input,
+                    Some(&self.granted_capabilities),
                 )
-                .await?;
+                .await;
             }
             return control_application_reply(self.store.as_ref(), ctx, server_fingerprint, input)
                 .await;
@@ -1946,39 +1984,6 @@ pub fn default_granted_capabilities() -> Vec<String> {
     .iter()
     .map(|value| (*value).to_owned())
     .collect()
-}
-
-/// Tell the controller what it may do.
-///
-/// Carries no command_id: this is not the consequence of a command, it is the
-/// listener stating a fact about the session.
-async fn append_grant_event<S: ControlStore>(
-    store: &S,
-    ctx: &TenantContext,
-    server_fingerprint: &str,
-    granted: &[String],
-) -> Result<u64, ControlSessionError> {
-    let cursor = store
-        .reserve_cursor_block(ctx, server_fingerprint, 1)
-        .await
-        .map_err(control_store_error)?
-        .start;
-    store
-        .append_event(
-            ctx,
-            server_fingerprint,
-            ControlEventDraft {
-                cursor,
-                event_id: Uuid::now_v7(),
-                command_id: None,
-                kind: "capabilities_granted".to_owned(),
-                payload: serde_json::json!({ "capabilities": granted }),
-                created_at: Utc::now(),
-            },
-        )
-        .await
-        .map_err(control_store_error)?;
-    Ok(cursor)
 }
 
 async fn append_control_event<S: ControlStore>(
@@ -2642,13 +2647,11 @@ mod tests {
         .to_string();
         let batch = reply_json(&dispatcher, &ctx, "server-fingerprint", &subscribe).await;
         assert_eq!(batch["body"]["type"], "event_batch");
-        let grant = batch["body"]["events"]
-            .as_array()
-            .expect("events")
-            .iter()
-            .find(|event| event["kind"] == "capabilities_granted")
-            .expect("the listener must state what it granted");
-        let granted: Vec<&str> = grant["payload"]["capabilities"]
+        // Read from the BATCH, not from an event inside it. An event carries
+        // the newest cursor and is the first thing dropped when the encoder
+        // truncates to one frame, so a controller with a backlog never saw it —
+        // which is how a freshly updated listener reported itself too old.
+        let granted: Vec<&str> = batch["body"]["granted_capabilities"]
             .as_array()
             .expect("capabilities")
             .iter()
