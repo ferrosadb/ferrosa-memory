@@ -6,7 +6,7 @@
 //! compiles to. D14 then makes the **text** authoritative and the tree a
 //! projection, valid only while it still compiles to exactly that text.
 //!
-//! [`project`] enforces that itself: it guesses a tree, recompiles it, and
+//! [`Palette::project`] enforces that itself: it guesses a tree, recompiles it, and
 //! returns it only if the result is the text it started from. A guess that
 //! cannot be verified is `None` — "beyond blocks" — never half a tree.
 
