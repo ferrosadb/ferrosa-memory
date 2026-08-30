@@ -452,23 +452,44 @@ async fn verify_existing_control_schema(
         );
     }
 
-    let probes = [
-        format!(
-            "SELECT next_cursor, reservation_token FROM {keyspace}.mobile_control_cursor_state LIMIT 1"
-        ),
-        format!("SELECT cursor, event_type, payload FROM {keyspace}.mobile_control_events LIMIT 1"),
-        format!(
-            "SELECT command_id, command_type, state, payload FROM {keyspace}.mobile_control_commands LIMIT 1"
-        ),
-    ];
-    for query in probes {
-        #[allow(deprecated)]
-        session
-            .query_unpaged(query, ())
-            .await
-            .context("probing existing mobile-control schema")?;
-    }
+    let [cursor_query, event_query, command_query] =
+        existing_control_schema_probe_queries(keyspace);
+    let tenant = Uuid::nil();
+    let fingerprint = "__ferrosa_mobile_schema_probe__";
+    #[allow(deprecated)]
+    session
+        .query_unpaged(cursor_query, (tenant, fingerprint))
+        .await
+        .context("probing existing mobile-control cursor schema")?;
+    #[allow(deprecated)]
+    session
+        .query_unpaged(event_query, (tenant, fingerprint, -1_i32))
+        .await
+        .context("probing existing mobile-control event schema")?;
+    #[allow(deprecated)]
+    session
+        .query_unpaged(command_query, (tenant, fingerprint))
+        .await
+        .context("probing existing mobile-control command schema")?;
     Ok(())
+}
+
+fn existing_control_schema_probe_queries(keyspace: &str) -> [String; 3] {
+    [
+        format!(
+            "SELECT next_cursor, reservation_token FROM {keyspace}.mobile_control_cursor_state \
+             WHERE tenant_id = ? AND server_fingerprint = ?"
+        ),
+        format!(
+            "SELECT cursor, event_type, payload FROM {keyspace}.mobile_control_events \
+             WHERE tenant_id = ? AND server_fingerprint = ? AND cursor_bucket = ?"
+        ),
+        format!(
+            "SELECT command_id, command_type, state, request_payload \
+             FROM {keyspace}.mobile_control_commands \
+             WHERE tenant_id = ? AND server_fingerprint = ?"
+        ),
+    ]
 }
 
 impl ControlStore for CqlControlStore {
@@ -622,15 +643,15 @@ impl ControlStore for CqlControlStore {
             let first_bucket = cursor_bucket(after.saturating_add(1))?;
             let last_bucket = cursor_bucket(high_water)?;
             for bucket in first_bucket..=last_bucket {
-                if events.len() == fetch_limit {
+                let Some(want) = remaining_fetch(fetch_limit, events.len()) else {
                     break;
-                }
+                };
                 let lower = if bucket == first_bucket {
                     after
                 } else {
                     u64::try_from(bucket)? * CONTROL_CURSOR_BUCKET_SIZE
                 };
-                let remaining = i32::try_from(fetch_limit - events.len())?;
+                let remaining = i32::try_from(want)?;
                 let query = format!(
                     "SELECT cursor, event_id, command_id, event_type, payload, created_at \
                      FROM {}.mobile_control_events \
@@ -856,6 +877,18 @@ fn validate_block_size(size: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Rows still needed to fill a replay page, or `None` when it is already full.
+///
+/// Saturating rather than exact: a server that does not honour the `LIMIT` on a
+/// bucket query hands back more rows than were requested, so `collected` can
+/// overshoot `fetch_limit`. An `==` check misses that overshoot and the next
+/// `fetch_limit - collected` underflows `usize` into a value `i32::try_from`
+/// rejects — surfacing as "out of range integral type conversion attempted" and
+/// killing the control session instead of degrading.
+fn remaining_fetch(fetch_limit: usize, collected: usize) -> Option<usize> {
+    fetch_limit.checked_sub(collected).filter(|n| *n > 0)
+}
+
 fn validate_replay_limit(limit: usize) -> anyhow::Result<()> {
     if limit == 0 || limit > MAX_CONTROL_REPLAY_EVENTS {
         anyhow::bail!("replay limit must be 1..={MAX_CONTROL_REPLAY_EVENTS}");
@@ -957,5 +990,60 @@ fn lwt_applied(result: scylla::LegacyQueryResult) -> anyhow::Result<Option<bool>
     match row.columns.get(*index).cloned().flatten() {
         Some(CqlValue::Boolean(value)) => Ok(Some(value)),
         _ => anyhow::bail!("conditional CQL [applied] value is not boolean"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{existing_control_schema_probe_queries, remaining_fetch};
+
+    #[test]
+    fn remaining_fetch_asks_for_the_shortfall() {
+        assert_eq!(remaining_fetch(257, 0), Some(257));
+        assert_eq!(remaining_fetch(257, 100), Some(157));
+        assert_eq!(remaining_fetch(257, 256), Some(1));
+    }
+
+    #[test]
+    fn remaining_fetch_stops_when_the_page_is_exactly_full() {
+        assert_eq!(remaining_fetch(257, 257), None);
+    }
+
+    #[test]
+    fn remaining_fetch_stops_when_the_server_over_returned() {
+        // A server that ignores LIMIT hands back more rows than were asked for,
+        // so the collected count overshoots the page size. The old `==` guard
+        // missed the overshoot and then evaluated `fetch_limit - collected`,
+        // underflowing usize into a value `i32::try_from` rejects with "out of
+        // range integral type conversion attempted" — which killed the control
+        // session instead of degrading.
+        assert_eq!(remaining_fetch(257, 258), None);
+        assert_eq!(remaining_fetch(257, 100_000), None);
+        assert_eq!(remaining_fetch(1, usize::MAX), None);
+    }
+
+    #[test]
+    fn existing_schema_probe_is_partition_bounded() {
+        let queries = existing_control_schema_probe_queries("agent_memory");
+
+        assert_eq!(queries.len(), 3);
+        for query in queries {
+            assert!(query.contains("WHERE tenant_id = ? AND server_fingerprint = ?"));
+            assert!(!query.contains("system_schema"));
+            assert!(!query.contains("LIMIT"));
+        }
+    }
+
+    #[test]
+    fn existing_schema_probe_covers_every_control_table() {
+        let queries = existing_control_schema_probe_queries("agent_memory");
+
+        assert!(queries[0].contains("mobile_control_cursor_state"));
+        assert!(queries[0].contains("reservation_token"));
+        assert!(queries[1].contains("mobile_control_events"));
+        assert!(queries[1].contains("cursor_bucket = ?"));
+        assert!(queries[1].contains("payload"));
+        assert!(queries[2].contains("mobile_control_commands"));
+        assert!(queries[2].contains("request_payload"));
     }
 }

@@ -2,16 +2,16 @@
 //!
 //! Correctness: the peer identity is bound to the exact SDP pair, inbound
 //! queues and frames are bounded, and typed commands persist before execution.
-//! Last revised: 2026-08-19
-//! Last changed: Added idempotent agent-launch dispatch and durable completion.
+//! Last revised: 2026-08-25
+//! Last changed: Split durable replay at the frame bound without skipping events.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
 use ferrosa_memory_core::control_store::{
-    CommandInsert, ControlCommand, ControlCommandState, ControlCommandUpdate, ControlEventDraft,
-    ControlStore, MAX_CONTROL_REPLAY_EVENTS,
+    CommandInsert, ControlCommand, ControlCommandState, ControlCommandUpdate, ControlEvent,
+    ControlEventDraft, ControlStore, MAX_CONTROL_REPLAY_EVENTS,
 };
 use ferrosa_memory_core::remote_identity::{
     InstancePublicIdentity, InstanceSigningIdentity, SignedEnvelope,
@@ -19,7 +19,7 @@ use ferrosa_memory_core::remote_identity::{
 use ferrosa_memory_core::types::TenantContext;
 use serde::{Deserialize, Serialize};
 use sha2_kdf::{Digest, Sha256};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 use uuid::Uuid;
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
@@ -31,6 +31,7 @@ use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
 use crate::codex_runtime::{CodexRunResult, CodexTmuxRuntime, MAX_CODEX_INSTRUCTION_BYTES};
@@ -166,7 +167,7 @@ enum BindingFrame {
 pub struct BoundControlChannel {
     peer_connection: Arc<RTCPeerConnection>,
     data_channel: Arc<RTCDataChannel>,
-    inbound: mpsc::Receiver<Vec<u8>>,
+    inbound: ControlInbound,
     session_key: Secret,
     max_frame_bytes: usize,
 }
@@ -189,11 +190,7 @@ impl BoundControlChannel {
 
     /// Receive one complete post-binding UTF-8 application frame.
     pub async fn recv_text(&mut self) -> Result<String, ControlSessionError> {
-        let bytes = self
-            .inbound
-            .recv()
-            .await
-            .ok_or(ControlSessionError::ChannelClosed)?;
+        let bytes = self.inbound.recv().await?;
         String::from_utf8(bytes)
             .map_err(|_| ControlSessionError::Protocol("frame is not UTF-8".to_owned()))
     }
@@ -209,6 +206,27 @@ impl BoundControlChannel {
             .close()
             .await
             .map_err(|error| ControlSessionError::Rtc(format!("close: {error}")))
+    }
+}
+
+struct ControlInbound {
+    frames: mpsc::Receiver<Vec<u8>>,
+    closed: watch::Receiver<bool>,
+    close_signal: watch::Sender<bool>,
+}
+
+impl ControlInbound {
+    async fn recv(&mut self) -> Result<Vec<u8>, ControlSessionError> {
+        if *self.closed.borrow() {
+            return Err(ControlSessionError::ChannelClosed);
+        }
+        tokio::select! {
+            frame = self.frames.recv() => frame.ok_or(ControlSessionError::ChannelClosed),
+            changed = self.closed.changed() => {
+                let _ = changed;
+                Err(ControlSessionError::ChannelClosed)
+            }
+        }
     }
 }
 
@@ -340,6 +358,7 @@ pub async fn run_control_controller_session<S: ControlSignalingApi>(
         config.inbound_capacity,
         config.max_frame_bytes,
     );
+    install_peer_close_notification(&peer_connection, inbound.close_signal.clone());
 
     let mut gather = peer_connection.gathering_complete_promise().await;
     let offer = peer_connection
@@ -443,8 +462,10 @@ pub async fn run_control_server_session<S: ControlSignalingApi>(
     let (channel_sender, mut channel_receiver) = mpsc::channel(1);
     let inbound_capacity = config.inbound_capacity;
     let max_frame_bytes = config.max_frame_bytes;
+    let peer_connection_for_channel = Arc::clone(&peer_connection);
     peer_connection.on_data_channel(Box::new(move |data_channel: Arc<RTCDataChannel>| {
         let channel_sender = channel_sender.clone();
+        let peer_connection = Arc::clone(&peer_connection_for_channel);
         Box::pin(async move {
             if data_channel.label() != CONTROL_CHANNEL_LABEL {
                 let _ = data_channel.close().await;
@@ -452,6 +473,7 @@ pub async fn run_control_server_session<S: ControlSignalingApi>(
             }
             let opened = install_open_notification(&data_channel);
             let inbound = install_bounded_inbound(&data_channel, inbound_capacity, max_frame_bytes);
+            install_peer_close_notification(&peer_connection, inbound.close_signal.clone());
             let _ = channel_sender.try_send((data_channel, opened, inbound));
         })
     }));
@@ -666,8 +688,9 @@ fn install_bounded_inbound(
     data_channel: &Arc<RTCDataChannel>,
     capacity: usize,
     max_frame_bytes: usize,
-) -> mpsc::Receiver<Vec<u8>> {
+) -> ControlInbound {
     let (sender, receiver) = mpsc::channel(capacity);
+    let (close_signal, closed) = watch::channel(false);
     let channel = data_channel.clone();
     data_channel.on_message(Box::new(move |message: DataChannelMessage| {
         let sender = sender.clone();
@@ -682,7 +705,35 @@ fn install_bounded_inbound(
             }
         })
     }));
-    receiver
+    let channel_close_signal = close_signal.clone();
+    data_channel.on_close(Box::new(move || {
+        let channel_close_signal = channel_close_signal.clone();
+        Box::pin(async move {
+            channel_close_signal.send_replace(true);
+        })
+    }));
+    ControlInbound {
+        frames: receiver,
+        closed,
+        close_signal,
+    }
+}
+
+fn install_peer_close_notification(
+    peer_connection: &Arc<RTCPeerConnection>,
+    close_signal: watch::Sender<bool>,
+) {
+    peer_connection.on_peer_connection_state_change(Box::new(move |state| {
+        let close_signal = close_signal.clone();
+        Box::pin(async move {
+            if matches!(
+                state,
+                RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
+            ) {
+                close_signal.send_replace(true);
+            }
+        })
+    }));
 }
 
 async fn wait_channel_open(
@@ -767,13 +818,12 @@ async fn send_binding_hello(
 }
 
 async fn recv_binding_hello(
-    inbound: &mut mpsc::Receiver<Vec<u8>>,
+    inbound: &mut ControlInbound,
     deadline: Duration,
 ) -> Result<ControlHelloFrame, ControlSessionError> {
     let bytes = tokio::time::timeout(deadline, inbound.recv())
         .await
-        .map_err(|_| ControlSessionError::Timeout("signed peer hello"))?
-        .ok_or(ControlSessionError::ChannelClosed)?;
+        .map_err(|_| ControlSessionError::Timeout("signed peer hello"))??;
     let frame: BindingFrame = serde_json::from_slice(&bytes)
         .map_err(|error| ControlSessionError::Protocol(format!("first frame: {error}")))?;
     match frame {
@@ -929,31 +979,70 @@ pub async fn control_application_reply<S: ControlStore>(
         .map_err(|error| {
             ControlSessionError::Protocol(format!("durable replay failed: {error}"))
         })?;
-    let events: Vec<_> = page
-        .events
-        .into_iter()
-        .map(|event| {
-            serde_json::json!({
-                "cursor": event.cursor,
-                "event_id": event.event_id.to_string(),
-                "command_id": event.command_id.map(|value| value.to_string()),
-                "kind": event.kind,
-                "payload": event.payload,
-                "created_at": event.created_at,
-            })
-        })
-        .collect();
-    serde_json::to_string(&serde_json::json!({
-        "version": CONTROL_PROTOCOL_VERSION,
-        "frame_id": frame_id,
-        "body": {
-            "type": "event_batch",
-            "high_water_cursor": page.high_water_cursor,
-            "events": events,
-        },
-    }))
-    .map(Some)
-    .map_err(|error| ControlSessionError::Protocol(format!("event batch encode: {error}")))
+    encode_event_batch(frame_id, page.high_water_cursor, page.events).map(Some)
+}
+
+/// Encode the largest ordered event prefix that fits one control frame.
+///
+/// Each durable payload is bounded independently, but their JSON envelope can
+/// still exceed the data-channel limit when a replay page contains several
+/// terminal events. The returned high-water cursor advances only through the
+/// last encoded event, so the next subscription receives every omitted event.
+fn encode_event_batch(
+    frame_id: &str,
+    final_high_water_cursor: u64,
+    events: Vec<ControlEvent>,
+) -> Result<String, ControlSessionError> {
+    let frame_id = serde_json::to_string(frame_id)
+        .map_err(|error| ControlSessionError::Protocol(format!("frame id encode: {error}")))?;
+    let envelope_bytes = event_batch_json(&frame_id, u64::MAX, "").len();
+    let event_count = events.len();
+    let mut encoded_events = Vec::with_capacity(event_count);
+    let mut encoded_bytes = envelope_bytes;
+    let mut last_cursor = None;
+
+    for event in events {
+        let cursor = event.cursor;
+        let encoded = serde_json::to_string(&serde_json::json!({
+            "cursor": cursor,
+            "event_id": event.event_id.to_string(),
+            "command_id": event.command_id.map(|value| value.to_string()),
+            "kind": event.kind,
+            "payload": event.payload,
+            "created_at": event.created_at,
+        }))
+        .map_err(|error| ControlSessionError::Protocol(format!("event encode: {error}")))?;
+        let delimiter_bytes = if encoded_events.is_empty() { 0 } else { 1 };
+        let candidate_bytes = encoded_bytes + delimiter_bytes + encoded.len();
+        if candidate_bytes > MAX_CONTROL_FRAME_BYTES {
+            if encoded_events.is_empty() {
+                return Err(ControlSessionError::FrameTooLarge {
+                    actual: candidate_bytes,
+                    limit: MAX_CONTROL_FRAME_BYTES,
+                });
+            }
+            break;
+        }
+        encoded_bytes = candidate_bytes;
+        last_cursor = Some(cursor);
+        encoded_events.push(encoded);
+    }
+
+    let high_water_cursor = if encoded_events.len() == event_count {
+        final_high_water_cursor
+    } else {
+        last_cursor.expect("a truncated batch contains at least one event")
+    };
+    let events = encoded_events.join(",");
+    let reply = event_batch_json(&frame_id, high_water_cursor, &events);
+    debug_assert!(reply.len() <= MAX_CONTROL_FRAME_BYTES);
+    Ok(reply)
+}
+
+fn event_batch_json(frame_id: &str, high_water_cursor: u64, events: &str) -> String {
+    format!(
+        r#"{{"version":{CONTROL_PROTOCOL_VERSION},"frame_id":{frame_id},"body":{{"type":"event_batch","high_water_cursor":{high_water_cursor},"events":[{events}]}}}}"#
+    )
 }
 
 /// Runtime seam for typed agent commands. The control protocol never exposes
@@ -1329,6 +1418,37 @@ mod tests {
         InstanceSigningIdentity::generate(InstanceId::new())
     }
 
+    async fn append_large_terminal_events(
+        store: &InMemoryControlStore,
+        ctx: &TenantContext,
+        server: &str,
+    ) -> ferrosa_memory_core::control_store::CursorBlock {
+        let block = store
+            .reserve_cursor_block(ctx, server, 8)
+            .await
+            .expect("reserve cursors");
+        for offset in 0..6 {
+            store
+                .append_event(
+                    ctx,
+                    server,
+                    ControlEventDraft {
+                        cursor: block.start + offset,
+                        event_id: Uuid::now_v7(),
+                        command_id: None,
+                        kind: "terminal".to_owned(),
+                        payload: serde_json::json!({
+                            "text": "x".repeat(MAX_AGENT_RESULT_TEXT_BYTES),
+                        }),
+                        created_at: Utc::now(),
+                    },
+                )
+                .await
+                .expect("append bounded terminal event");
+        }
+        block
+    }
+
     #[test]
     fn control_hello_rejects_version_label_and_role_mismatch() {
         let signer = identity();
@@ -1466,6 +1586,59 @@ mod tests {
         assert_eq!(value["body"]["high_water_cursor"], block.end);
         assert_eq!(value["body"]["events"].as_array().unwrap().len(), 1);
         assert_eq!(value["body"]["events"][0]["cursor"], block.start + 1);
+    }
+
+    #[tokio::test]
+    async fn subscribe_splits_event_batches_at_the_control_frame_limit() {
+        let store = InMemoryControlStore::default();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "bounded-replay-test".to_owned(),
+        };
+        let server = "server-fingerprint";
+        let block = append_large_terminal_events(&store, &ctx, server).await;
+
+        let first_request = r#"{"version":1,"frame_id":"sub-large-1","body":{"type":"subscribe","after_cursor":null,"capabilities":["agent_control"]}}"#;
+        let first_reply = control_application_reply(&store, &ctx, server, first_request)
+            .await
+            .expect("valid first subscribe")
+            .expect("first subscribe reply");
+        assert!(
+            first_reply.len() <= MAX_CONTROL_FRAME_BYTES,
+            "a replay reply must fit the channel frame; got {} bytes",
+            first_reply.len()
+        );
+        let first: serde_json::Value =
+            serde_json::from_str(&first_reply).expect("first reply JSON");
+        let first_events = first["body"]["events"]
+            .as_array()
+            .expect("first event batch");
+        assert!(!first_events.is_empty());
+        assert!(first_events.len() < 6, "the fixture must require two pages");
+        let first_high_water = first["body"]["high_water_cursor"]
+            .as_u64()
+            .expect("first high-water cursor");
+        assert_eq!(
+            first_high_water,
+            first_events.last().unwrap()["cursor"].as_u64().unwrap(),
+            "the cursor must not advance past an event omitted from this frame"
+        );
+
+        let second_request = format!(
+            r#"{{"version":1,"frame_id":"sub-large-2","body":{{"type":"subscribe","after_cursor":{first_high_water},"capabilities":["agent_control"]}}}}"#
+        );
+        let second_reply = control_application_reply(&store, &ctx, server, &second_request)
+            .await
+            .expect("valid second subscribe")
+            .expect("second subscribe reply");
+        assert!(second_reply.len() <= MAX_CONTROL_FRAME_BYTES);
+        let second: serde_json::Value =
+            serde_json::from_str(&second_reply).expect("second reply JSON");
+        let second_events = second["body"]["events"]
+            .as_array()
+            .expect("second event batch");
+        assert_eq!(first_events.len() + second_events.len(), 6);
+        assert_eq!(second["body"]["high_water_cursor"], block.end);
     }
 
     #[tokio::test]

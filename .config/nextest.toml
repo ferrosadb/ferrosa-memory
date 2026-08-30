@@ -7,12 +7,25 @@
 # to simulate partial-migration recovery. Run concurrently, one test's schema
 # changes break another's migration-count assertions (e.g. dropping
 # `entity_warmth`/`typed_edges` makes a sibling's gap-detector re-apply extra
-# migrations). Serialize the whole migration_drift binary so these tests can't
-# race. (Under `make test-live` / libtest the same serialization is enforced by
-# an in-process async mutex shared by those tests.)
+# migrations). Serialize these binaries so these tests can't race. (Under
+# `make test-live` / libtest the same serialization is enforced by an
+# in-process async mutex shared by those tests.)
+#
+# The group must cover EVERY binary that calls `run_migrations` against the
+# shared keyspace, not just `migration_drift`. `launch_gates_g3_g4` and
+# `skill_e2e_live` both migrate `test.keyspace` too, and while they sat
+# outside the group nextest ran them CONCURRENTLY with migration_drift:
+# t03 deletes the v31 `schema_version` row and asserts its own
+# `run_migrations` re-applies exactly one migration, but a concurrent
+# `run_migrations` from another binary re-applied v31 first, so t03 found
+# nothing pending and got 0 (CI run 32606574972).
+#
+# `every_migration_running_binary_is_serialized_by_the_nextest_group` in
+# tests/migration_drift.rs fails if a new migration-running binary is added
+# without being listed here.
 [test-groups]
 migration-drift = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'package(ferrosa-memory-core) and binary(migration_drift)'
+filter = 'package(ferrosa-memory-core) and (binary(migration_drift) or binary(launch_gates_g3_g4) or binary(skill_e2e_live))'
 test-group = 'migration-drift'

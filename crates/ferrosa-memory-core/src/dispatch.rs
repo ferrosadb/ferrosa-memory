@@ -7187,10 +7187,22 @@ fn select_auto_fusion_profile(
     //    use the workspace-aware profile to ensure same-repo affinity. The
     //    bare "auto" profile zeros workspace_weight, which causes cross-domain
     //    pollution (e.g. queries from one repo returning unrelated entities from another).
+    //
+    //    The workspace variant must be the PHONETIC one. `auto` sets
+    //    `phonetic_weight = 1.0`, and `bm25-semantic-workspace` zeroes it — so
+    //    routing here on the strength of a `cwd` would have quietly removed
+    //    phonetic recall from every default query that supplies one. For an
+    //    entity with no embedding, phonetic on `entity_name` is what surfaces
+    //    it at all, so the result is not a reordering but an empty answer.
+    //
+    //    `bm25-semantic-phonetic-workspace` is exactly `auto` plus workspace
+    //    affinity, which is the change this branch is for. The
+    //    `broad_semantic` pair above is consistent already: neither the bare
+    //    nor the workspace profile carries phonetic.
     if has_workspace {
         return AutoFusionSelection {
             intent: "default_balanced_workspace",
-            profile: "bm25-semantic-workspace",
+            profile: "bm25-semantic-phonetic-workspace",
         };
     }
 
@@ -12308,12 +12320,38 @@ mod tests {
             ..Default::default()
         };
         let selected = select_auto_fusion_profile("project-b app roster events RSVP", &filter);
-        assert_eq!(
-            selected.profile, "bm25-semantic-workspace",
-            "default query with workspace cwd must use workspace profile, got {}",
+        assert_eq!(selected.intent, "default_balanced_workspace");
+
+        // Assert the PROPERTIES the routing exists for, not the profile's
+        // name. This originally pinned "bm25-semantic-workspace", which
+        // passed while silently dropping phonetic recall: that profile zeroes
+        // `phonetic_weight`, and the bare `auto` it replaces sets it to 1.0.
+        // For an entity with no embedding, phonetic on `entity_name` is the
+        // only thing that surfaces it, so the effect was an empty result set
+        // rather than a reordering -- caught by two feedback tests, not by
+        // this one.
+        let ws = crate::hybrid_search::FusionConfig::profile(selected.profile)
+            .expect("the selected profile must exist");
+        let bare = crate::hybrid_search::FusionConfig::profile("auto").expect("auto must exist");
+
+        assert!(
+            ws.workspace_weight > 0.0,
+            "the point of this branch is workspace affinity: {}",
             selected.profile
         );
-        assert_eq!(selected.intent, "default_balanced_workspace");
+        assert!(
+            ws.phonetic_weight >= bare.phonetic_weight,
+            "adding workspace affinity must not remove phonetic recall that \
+             `auto` had: {} has phonetic_weight {} vs auto's {}",
+            selected.profile,
+            ws.phonetic_weight,
+            bare.phonetic_weight
+        );
+        assert!(
+            ws.context_bm25_weight >= bare.context_bm25_weight && ws.ann_weight >= bare.ann_weight,
+            "nor may it weaken the lexical or semantic sources: {}",
+            selected.profile
+        );
 
         // Without workspace cwd, the same query must fall through to the
         // bare auto profile (backward compat).
