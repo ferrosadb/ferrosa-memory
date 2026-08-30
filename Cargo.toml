@@ -1,9 +1,9 @@
 [workspace]
-members = ["crates/ferrosa-memory-core", "crates/ferrosa-memory-mcp", "crates/ferrosa-memory-batch", "crates/ferrosa-memory-sync", "crates/ferrosa-memory-eval"]
+members = ["crates/fmem-cli", "crates/ferrosa-memory-core", "crates/ferrosa-memory-mcp", "crates/ferrosa-memory-batch", "crates/ferrosa-memory-sync", "crates/ferrosa-memory-eval"]
 resolver = "2"
 
 [workspace.package]
-version = "0.23.0"
+version = "0.29.0"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -22,6 +22,14 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Diagnostics. rustls rather than native-tls so a musl build needs no OpenSSL,
+# and default-features off so the SDK does not install its own panic handler
+# behind our backs -- `panic` is opted into explicitly below.
+sentry = { version = "0.49", default-features = false, features = [
+    "backtrace", "contexts", "panic", "reqwest", "rustls",
+] }
+sentry-tracing = "0.49"
+tracing-appender = "0.2"
 
 # Metrics
 prometheus = "0.14"
@@ -53,6 +61,11 @@ rand = "0.8"
 # MaaS P2P WebRTC transport (ferrosa-memory-sync, behind the `webrtc-transport`
 # feature so non-P2P builds don't pull the ICE/DTLS/SCTP/SRTP tree). Provides
 # the concrete RTCDataChannel that backs peer_transport::DataChannel (MAAS-T-25b).
+# Held at 0.17 deliberately. 0.20 restructured the crate into a thin async
+# layer over a Sans-I/O `rtc` core: webrtc::api, webrtc::interceptor and
+# webrtc::ice_transport are gone, APIBuilder became PeerConnectionBuilder, and
+# every on_*() callback became a PeerConnectionEventHandler method. That is a
+# port of the P2P event model, not an upgrade. See .github/dependabot.yml.
 webrtc = "0.17"
 bytes = "1"
 # digest 0.11 changed finalize() output to hybrid_array::Array, which doesn't

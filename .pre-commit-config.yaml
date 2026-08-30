@@ -65,3 +65,17 @@ repos:
         language: system
         pass_filenames: false
         stages: [pre-push]
+
+  # The same check CI runs, run locally: a version that has drifted from its
+  # tag is cheapest to notice before it is pushed. One script, two callers --
+  # a second implementation is how the local rule and the gate come to
+  # disagree about what "in step" means.
+  - repo: local
+    hooks:
+      - id: version-sync
+        name: workspace version matches the latest release tag
+        entry: .github/scripts/check-version-sync.sh
+        language: system
+        pass_filenames: false
+        # Only when the thing it reads actually changes.
+        files: '^Cargo\.toml$'

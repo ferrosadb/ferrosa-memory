@@ -1,11 +1,17 @@
 //! # ferrosa-memory-mcp
 //!
+//! Last revised: 2026-08-24
+//! Last changed: Kept HTTP consolidation workers aligned with auth reload tenant sets.
+//!
 //! MCP server binary that exposes Ferrosa's memory tools via stdio or HTTP+SSE.
 //!
 //! Connects to a real Ferrosa cluster via CQL (cdrs-tokio). If the initial
 //! connection fails, starts serving immediately with a "reconnecting" backend
 //! that returns errors, while a background task retries with exponential backoff.
 //! Never falls back to mock storage — mock silently loses data.
+//!
+//! Last revised: 2026-08-24
+//! Last changed: Streams pending consolidation work with bounded backpressure.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -30,7 +36,6 @@ use futures_util::StreamExt;
 use scylla::frame::response::result::{CqlValue, Row};
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use tokio::sync::RwLock;
-use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 const SPARQL_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
@@ -1098,12 +1103,30 @@ impl Storage for ReconnectingStorage {
         delegate!(self, consolidation_request_get, ctx, session_id)
     }
 
-    async fn consolidation_request_list_pending(
+    async fn consolidation_request_stream_pending(
         &self,
-        ctx: &TenantContext,
-        limit: usize,
-    ) -> anyhow::Result<Vec<uuid::Uuid>> {
-        delegate!(self, consolidation_request_list_pending, ctx, limit)
+        ctx: TenantContext,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<uuid::Uuid>>,
+    ) {
+        // Hand-written rather than `delegate!` because this yields `()` — the
+        // macro inspects a `Result` return to detect connection loss.
+        //
+        // A missing connection is reported THROUGH the channel. Returning
+        // quietly would make "cannot reach the database" indistinguishable
+        // from "no work outstanding", which is exactly how the invented-tenant
+        // bug stayed invisible for two months.
+        let conn_gen = self.current_generation();
+        match self.current_cql().await {
+            Some(cql) => cql.consolidation_request_stream_pending(ctx, tx).await,
+            None => {
+                self.mark_disconnected(conn_gen).await;
+                let _ = tx
+                    .send(Err(anyhow::anyhow!(
+                        "consolidation stream unavailable: no CQL connection"
+                    )))
+                    .await;
+            }
+        }
     }
 
     async fn consolidation_run_insert(
@@ -1673,6 +1696,14 @@ impl Storage for ReconnectingStorage {
         query: EntityListQuery,
     ) -> anyhow::Result<Vec<EntityTypeStateCount>> {
         delegate!(self, entity_counts_by_type_and_state, ctx, query)
+    }
+
+    async fn entity_source_record(
+        &self,
+        ctx: &TenantContext,
+        draft: ferrosa_memory_core::tier_store::SourceDraft,
+    ) -> anyhow::Result<ferrosa_memory_core::tier_store::EntitySource> {
+        delegate!(self, entity_source_record, ctx, draft)
     }
 
     async fn document_chunk_put(
@@ -3033,7 +3064,7 @@ async fn cql_readiness_probe_loop(storage: Arc<ReconnectingStorage>) {
 /// Background worker that polls the durable consolidation queue and runs
 /// consolidation under a database-backed lease.
 ///
-/// The loop is tenant-scoped: it polls `consolidation_request_list_pending`
+/// The loop is tenant-scoped: it polls `consolidation_request_stream_pending`
 /// for the default tenant context. The dispatcher writes a request row on
 /// every successful write tool, so any replica can pick it up.
 async fn consolidation_worker_loop<S: Storage + Send + Sync + 'static>(
@@ -3054,15 +3085,36 @@ async fn consolidation_worker_loop<S: Storage + Send + Sync + 'static>(
     loop {
         ticker.tick().await;
 
-        let pending = match storage.consolidation_request_list_pending(&ctx, 64).await {
-            Ok(sids) => sids,
-            Err(e) => {
-                tracing::warn!("consolidation list_pending failed: {e}");
-                continue;
-            }
+        // Stream the outstanding sessions rather than fetching a batch.
+        //
+        // This used to take 64 at a time, which meant the storage layer had to
+        // decide WHICH 64 — an ordering, and a buffer to sort candidates in.
+        // Consuming the whole stream removes the selection, so nothing needs
+        // ordering and nothing accumulates: each session is claimed and
+        // processed as it arrives.
+        //
+        // The channel is small on purpose. Claiming and consolidating is far
+        // slower than scanning, so the consumer is the throttle: the producer
+        // blocks on `send` instead of racing ahead. That bounds the WORK in
+        // flight without bounding the RESULT.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<anyhow::Result<uuid::Uuid>>(8);
+        let producer = {
+            let storage = Arc::clone(&storage);
+            let ctx = (*ctx).clone();
+            tokio::spawn(async move {
+                storage.consolidation_request_stream_pending(ctx, tx).await;
+            })
         };
 
-        for sid in pending {
+        while let Some(item) = rx.recv().await {
+            let sid = match item {
+                Ok(sid) => sid,
+                Err(e) => {
+                    // Fail loud and abandon this pass; the next tick retries.
+                    tracing::warn!("consolidation pending stream failed: {e}");
+                    break;
+                }
+            };
             let lease_expires = chrono::Utc::now() + chrono::Duration::seconds(lease_secs as i64);
             let claimed = match storage
                 .consolidation_request_claim(&ctx, sid, &lease_owner, lease_expires)
@@ -3164,6 +3216,13 @@ async fn consolidation_worker_loop<S: Storage + Send + Sync + 'static>(
                 }
             }
         }
+
+        // This pass is done. Drop the receiver first so a producer still
+        // scanning stops on its next `send` — otherwise a `break` above
+        // would leave it blocked — then join it so one pass cannot overlap
+        // the next tick.
+        drop(rx);
+        let _ = producer.await;
     }
 }
 
@@ -3378,12 +3437,11 @@ async fn main() -> anyhow::Result<()> {
         "ferrosa_memory_core=warn,ferrosa_memory_mcp=warn"
     };
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    // Shared with the other two binaries. The stderr writer is not optional
+    // here and telemetry::init enforces it: this process speaks MCP on stdout,
+    // and a log line written there corrupts the JSON-RPC stream.
+    let plan = ferrosa_memory_core::telemetry::plan_from_env();
+    let _telemetry = ferrosa_memory_core::telemetry::init("memory-mcp", &plan, default_filter);
 
     // Fail loud: make every panic (including in spawned tasks tokio would
     // otherwise swallow) a visible ERROR log line. Installed before any task
@@ -3819,7 +3877,7 @@ async fn main() -> anyhow::Result<()> {
                 loop {
                     stream.recv().await;
                     tracing::info!(path = %sighup_validator.path(), "SIGHUP received, reloading auth file");
-                    match sighup_validator.reload() {
+                    match sighup_validator.reload_preserving_tenants() {
                         Ok(count) => tracing::info!(principals = count, "auth file reloaded"),
                         Err(e) => {
                             tracing::error!(error = %e, "failed to reload auth file, keeping old principals")
@@ -3885,7 +3943,7 @@ async fn main() -> anyhow::Result<()> {
             // other source of truth. If it is empty the worker is not started
             // and says so, rather than inventing an identity to poll with.
             if config.consolidation.enabled {
-                let tenants = http_consolidation_tenants(&config);
+                let tenants = auth_validator.tenants();
                 if tenants.is_empty() {
                     tracing::error!(
                         auth_file = ?config.server.auth_file,

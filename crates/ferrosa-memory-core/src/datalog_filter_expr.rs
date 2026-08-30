@@ -2,23 +2,32 @@
 //!
 //! Grammar (high-precedence first):
 //! ```text
-//!   filter ::= expr cmp_op expr
+//!   filter   ::= bool_or
+//!   bool_or  ::= bool_and ("||" bool_and)*
+//!   bool_and ::= bool_not ("&&" bool_not)*
+//!   bool_not ::= "!"* bool_primary
+//!   bool_primary ::= "(" filter ")" | str_pred | is_null | membership | expr cmp_op expr
+//!   is_null ::= "is_null" "(" expr ")"
+//!   membership ::= expr "in" "[" expr ("," expr)* "]"
+//!   str_pred ::= ("str_starts_with"|"str_ends_with"|"str_contains") "(" expr "," expr ")"
 //!   cmp_op ::= "==" | "!=" | "<=" | ">=" | "=" | "<" | ">"
 //!   expr   ::= term (("+" | "-") term)*
-//!   term   ::= factor (("*" | "/") factor)*
-//!   factor ::= number | string_lit | identifier | "(" expr ")" | "-" factor
+//!   term   ::= power (("*" | "/" | "%") power)*
+//!   power  ::= factor ("**" power)?
+//!   factor ::= number | string_lit | call | identifier | "(" expr ")" | "-" factor
+//!   call   ::= func_name "(" expr ("," expr)* ")"
 //! ```
 //!
 //! See `docs/superpowers/specs/2026-05-02-datalog-filter-grammar-design.md`.
 
-use crate::types::{ArithOp, BuiltinFilter, CmpOp, FilterExpr};
+use crate::types::{ArithOp, BuiltinFilter, CmpOp, FilterExpr, Func, StrOp};
 use nom::{
     IResult, Parser,
     branch::alt,
     bytes::complete::{escaped, is_not, tag},
     character::complete::{char as ch, multispace0, one_of, satisfy},
     combinator::{all_consuming, map, recognize, value},
-    multi::{fold_many0, many0_count},
+    multi::{fold_many0, many0, many0_count, separated_list0, separated_list1},
     number::complete::double,
     sequence::{delimited, pair, preceded},
 };
@@ -50,6 +59,38 @@ fn string_lit(input: &str) -> IResult<&str, FilterExpr> {
     Ok((i, FilterExpr::LitStr(s.to_string())))
 }
 
+/// A call to a whitelisted function: `abs(V)`, `concat(A, B)`.
+///
+/// Tried before `identifier`, and deliberately strict: once a name is followed
+/// by `(` it must be a known function called with the right arity. Falling
+/// back to reading it as a variable would produce an unbound variable, which
+/// matches every row and makes a typo look like a rule that works.
+fn call(input: &str) -> IResult<&str, FilterExpr> {
+    let head = satisfy(|c: char| c.is_ascii_alphabetic() || c == '_');
+    let tail = many0_count(satisfy(|c: char| c.is_ascii_alphanumeric() || c == '_'));
+    let (i, name) = recognize(pair(head, tail)).parse(input)?;
+    // `separated_list0`, not 1: `now()` takes no arguments. A wrong count is
+    // still refused below, by the arity check rather than by the parser.
+    let (i, args) =
+        delimited(ws(ch('(')), separated_list0(ws(ch(',')), expr), ws(ch(')'))).parse(i)?;
+
+    let fail = || nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Verify));
+    let func = Func::parse(name).ok_or_else(fail)?;
+    if args.len() != func.arity() {
+        return Err(fail());
+    }
+    Ok((i, FilterExpr::Call { func, args }))
+}
+
+/// The `null` literal in an expression position.
+///
+/// Before `identifier`, which would otherwise read it as a variable named
+/// `null` — unbound, and therefore matching everything.
+fn null_lit(input: &str) -> IResult<&str, FilterExpr> {
+    let (i, _) = ws(tag("null")).parse(input)?;
+    Ok((i, FilterExpr::Null))
+}
+
 fn identifier(input: &str) -> IResult<&str, FilterExpr> {
     // Accept both uppercase and lowercase identifiers to support variable names
     // like 'name', 'x', 'X', etc. Datalog filters allow variable names starting
@@ -71,19 +112,46 @@ fn neg(input: &str) -> IResult<&str, FilterExpr> {
 
 fn factor(input: &str) -> IResult<&str, FilterExpr> {
     // number is tried before neg so that `-2.5` parses as a single LitNum.
-    ws(alt((parens, number, string_lit, identifier, neg))).parse(input)
+    // `call` before `identifier`: both start with a name, and only the longer
+    // match is right when a `(` follows.
+    ws(alt((
+        parens, number, string_lit, null_lit, call, identifier, neg,
+    )))
+    .parse(input)
+}
+
+/// Exponentiation, tighter than `*` and right-associative.
+///
+/// Right associativity is why this is written by recursion rather than by
+/// folding: `a ** b ** c` must group as `a ** (b ** c)`, so the tail is
+/// parsed as a whole power rather than accumulated left to right.
+fn power(input: &str) -> IResult<&str, FilterExpr> {
+    let (i, base) = factor(input)?;
+    match preceded(ws(tag("**")), power).parse(i) {
+        Ok((rest, exp)) => Ok((
+            rest,
+            FilterExpr::BinOp {
+                op: ArithOp::Pow,
+                lhs: Box::new(base),
+                rhs: Box::new(exp),
+            },
+        )),
+        Err(_) => Ok((i, base)),
+    }
 }
 
 fn term(input: &str) -> IResult<&str, FilterExpr> {
-    let (i, init) = factor(input)?;
+    let (i, init) = power(input)?;
     fold_many0(
-        pair(ws(alt((ch('*'), ch('/')))), factor),
+        // `**` is consumed by `power` below, so a bare `*` here is always
+        // multiplication.
+        pair(ws(alt((ch('*'), ch('/'), ch('%')))), power),
         move || init.clone(),
         |acc, (op, rhs)| FilterExpr::BinOp {
-            op: if op == '*' {
-                ArithOp::Mul
-            } else {
-                ArithOp::Div
+            op: match op {
+                '*' => ArithOp::Mul,
+                '/' => ArithOp::Div,
+                _ => ArithOp::Rem,
             },
             lhs: Box::new(acc),
             rhs: Box::new(rhs),
@@ -124,9 +192,137 @@ fn cmp_op(input: &str) -> IResult<&str, CmpOp> {
     .parse(input)
 }
 
-fn filter(input: &str) -> IResult<&str, BuiltinFilter> {
+/// A string-shape predicate: `str_starts_with(S, P)`.
+///
+/// Tried before the comparison production because its head is a bare
+/// identifier, which `expr` would otherwise happily consume as a variable.
+/// Negation is not parsed here — `!` belongs to `bool_not` so there is exactly
+/// one mechanism for it.
+fn str_pred(input: &str) -> IResult<&str, BuiltinFilter> {
+    let (i, op) = ws(alt((
+        value(StrOp::StartsWith, tag(StrOp::StartsWith.keyword())),
+        value(StrOp::EndsWith, tag(StrOp::EndsWith.keyword())),
+        value(StrOp::Contains, tag(StrOp::Contains.keyword())),
+    )))
+    .parse(input)?;
+    let (i, (subject, arg)) = delimited(
+        ws(ch('(')),
+        (expr, preceded(ws(ch(',')), expr)),
+        ws(ch(')')),
+    )
+    .parse(i)?;
+    Ok((i, BuiltinFilter::StrPred { op, subject, arg }))
+}
+
+/// Set membership: `expr in [expr, expr, ...]`.
+///
+/// Desugars to the disjunction of equalities the author would otherwise have
+/// typed by hand, so it introduces no new evaluator path — one element is a
+/// plain `Eq`, more than one is an `Any` of them.
+///
+/// An empty set is not accepted: `separated_list1` requires at least one
+/// element, so `C in []` fails to parse. It could never hold, and a filter
+/// that silently matches nothing looks exactly like "no rows".
+fn membership(input: &str) -> IResult<&str, BuiltinFilter> {
+    let (i, subject) = expr(input)?;
+    let (i, _) = ws(tag("in")).parse(i)?;
+    let (i, items) =
+        delimited(ws(ch('[')), separated_list1(ws(ch(',')), expr), ws(ch(']'))).parse(i)?;
+
+    let mut branches: Vec<BuiltinFilter> = items
+        .into_iter()
+        .map(|item| BuiltinFilter::Compare {
+            op: CmpOp::Eq,
+            lhs: subject.clone(),
+            rhs: item,
+        })
+        .collect();
+    Ok((
+        i,
+        if branches.len() == 1 {
+            branches.pop().expect("just checked")
+        } else {
+            BuiltinFilter::Any(branches)
+        },
+    ))
+}
+
+/// `is_null(expr)`.
+///
+/// Needed because `V == null` is Unknown and therefore never fires — without
+/// this there would be no way to ask the question at all. `!is_null(V)` covers
+/// the negative, and neither is ever Unknown.
+fn is_null_pred(input: &str) -> IResult<&str, BuiltinFilter> {
+    let (i, _) = ws(tag("is_null")).parse(input)?;
+    let (i, e) = delimited(ws(ch('(')), expr, ws(ch(')'))).parse(i)?;
+    Ok((i, BuiltinFilter::IsNull(e)))
+}
+
+/// A comparison, the other leaf of the boolean tree.
+fn comparison(input: &str) -> IResult<&str, BuiltinFilter> {
     let (i, (lhs, op, rhs)) = (expr, cmp_op, expr).parse(input)?;
     Ok((i, BuiltinFilter::Compare { op, lhs, rhs }))
+}
+
+/// A leaf, or a parenthesised sub-filter.
+///
+/// `( filter )` is tried first and backtracks, which is what keeps arithmetic
+/// working: in `(V + 1) > 3` the parenthesised group is not a filter, so the
+/// attempt fails and `comparison` re-reads it as a parenthesised *expression*.
+fn bool_primary(input: &str) -> IResult<&str, BuiltinFilter> {
+    alt((
+        delimited(ws(ch('(')), bool_or, ws(ch(')'))),
+        str_pred,
+        is_null_pred,
+        membership,
+        comparison,
+    ))
+    .parse(input)
+}
+
+fn bool_not(input: &str) -> IResult<&str, BuiltinFilter> {
+    let (i, bangs) = ws(many0_count(ch('!'))).parse(input)?;
+    let (i, inner) = bool_primary(i)?;
+    Ok((
+        i,
+        if bangs % 2 == 1 {
+            BuiltinFilter::Not(Box::new(inner))
+        } else {
+            inner
+        },
+    ))
+}
+
+fn bool_and(input: &str) -> IResult<&str, BuiltinFilter> {
+    let (i, first) = bool_not(input)?;
+    let (i, rest) = many0(preceded(ws(tag("&&")), bool_not)).parse(i)?;
+    Ok((i, fold_bool(first, rest, BuiltinFilter::All)))
+}
+
+fn bool_or(input: &str) -> IResult<&str, BuiltinFilter> {
+    let (i, first) = bool_and(input)?;
+    let (i, rest) = many0(preceded(ws(tag("||")), bool_and)).parse(i)?;
+    Ok((i, fold_bool(first, rest, BuiltinFilter::Any)))
+}
+
+/// Keep a lone branch as its bare leaf so a filter that uses no connective
+/// serialises exactly as it did before this existed.
+fn fold_bool(
+    first: BuiltinFilter,
+    rest: Vec<BuiltinFilter>,
+    wrap: fn(Vec<BuiltinFilter>) -> BuiltinFilter,
+) -> BuiltinFilter {
+    if rest.is_empty() {
+        return first;
+    }
+    let mut all = Vec::with_capacity(rest.len() + 1);
+    all.push(first);
+    all.extend(rest);
+    wrap(all)
+}
+
+fn filter(input: &str) -> IResult<&str, BuiltinFilter> {
+    bool_or(input)
 }
 
 /// Parse a single filter expression.
@@ -135,6 +331,17 @@ fn filter(input: &str) -> IResult<&str, BuiltinFilter> {
 /// junk, missing comparison operator, malformed expression). Callers in
 /// `datalog.rs` pre-screen for the presence of a comparison operator
 /// before dispatching to this function.
+/// Parse a bare arithmetic expression, with no comparison around it.
+///
+/// Used for a computed head argument, which is an expression rather than a
+/// filter — there is nothing to compare it against.
+pub fn parse_head_expr(input: &str) -> anyhow::Result<FilterExpr> {
+    match all_consuming(expr).parse(input) {
+        Ok((_, e)) => Ok(e),
+        Err(e) => anyhow::bail!("invalid head expression '{}': {}", input.trim(), e),
+    }
+}
+
 pub fn parse_filter(input: &str) -> anyhow::Result<BuiltinFilter> {
     match all_consuming(filter).parse(input) {
         Ok((_, f)) => Ok(f),

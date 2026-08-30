@@ -225,6 +225,26 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "verifiable ownership token for mobile control cursor reservations",
         ddl: include_str!("../../../ddl/052_mobile_control_cursor_reservation_token.cql"),
     },
+    Migration {
+        version: 53,
+        description: "archived agent sessions with their raw tmux buffers",
+        ddl: include_str!("../../../ddl/053_session_archives.cql"),
+    },
+    Migration {
+        version: 54,
+        description: "knowledge tiers: source provenance, root aliases, tier rules, promotions",
+        ddl: include_str!("../../../ddl/054_knowledge_tiers.cql"),
+    },
+    Migration {
+        version: 55,
+        description: "recency-ordered provenance by root, so a browse page is a seek",
+        ddl: include_str!("../../../ddl/055_entity_source_by_root.cql"),
+    },
+    Migration {
+        version: 56,
+        description: "knowledge items, their version chain, and the queues that read them",
+        ddl: include_str!("../../../ddl/056_knowledge_items.cql"),
+    },
 ];
 
 /// `ddl/011_warmth_field.cql` — the `entity_warmth` table + session index.

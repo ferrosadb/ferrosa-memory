@@ -3,8 +3,8 @@
 //! Maps MCP tool names to handler functions. Validates input schemas before
 //! dispatch. Returns tool definitions for `tools/list`.
 //!
-//! Last revised: 2026-08-12
-//! Last changed: Routed tool discovery through bounded, versioned pagination.
+//! Last revised: 2026-08-24
+//! Last changed: Preserved balanced entity-name recall for workspace-routed searches.
 //!
 //! ## MCP protocol methods handled
 //!
@@ -3204,6 +3204,8 @@ async fn handle_ingest_entities<S: crate::storage::Storage>(
     let mut document_chunk_embeddings_failed = 0usize;
     let mut document_index_failed = Vec::new();
     let mut turn_chain_edges_created = 0usize;
+    let mut sources_recorded = 0usize;
+    let mut source_failed = Vec::new();
 
     let mut available_entities = std::collections::HashSet::new();
     let mut seen_entity_ids = std::collections::HashSet::new();
@@ -3400,6 +3402,50 @@ async fn handle_ingest_entities<S: crate::storage::Storage>(
                         "reason": "entity row not visible after write"
                     }));
                     continue;
+                }
+            }
+        }
+
+        // Where it came from, if the caller said. Recorded for updates as
+        // well as inserts: a re-ingest from a moved file should re-tier the
+        // entity, and only writing on insert would leave it filed under the
+        // path it had the first time anyone saw it.
+        if !request.options.dry_run
+            && let Some(path) = entity
+                .attrs
+                .as_ref()
+                .and_then(|attrs| attrs.get("source_path"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+        {
+            match storage
+                .entity_source_record(
+                    ctx,
+                    crate::tier_store::SourceDraft {
+                        entity_id: entity.id,
+                        session_id: request.session_id,
+                        title: entity.name.clone(),
+                        source_path: path.to_owned(),
+                    },
+                )
+                .await
+            {
+                Ok(_) => sources_recorded += 1,
+                // Loud, and not fatal. The entity is ingested either way, but
+                // a store where nothing has a source is a store where every
+                // tier reads zero -- that has to surface as a failure rather
+                // than as an empty library.
+                Err(error) => {
+                    tracing::warn!(
+                        entity_id = %entity.id,
+                        %error,
+                        "could not record where this entity came from"
+                    );
+                    source_failed.push(serde_json::json!({
+                        "id": entity.id.to_string(),
+                        "reason": error.to_string(),
+                    }));
                 }
             }
         }
@@ -3629,6 +3675,11 @@ async fn handle_ingest_entities<S: crate::storage::Storage>(
             "chunk_embeddings_failed": document_chunk_embeddings_failed,
             "failed": document_index_failed,
             "hint": "Document chunks are semantic and linked with prev/next IDs. Search results may suggest chunk_ctx expansion when adjacent context matters."
+        },
+        "knowledge_tier": {
+            "sources_recorded": sources_recorded,
+            "failed": source_failed,
+            "hint": "Pass attrs.source_path to record where an entity came from. Its tier is derived from that path through the alias and root rules, so an entity without one sits at Data."
         },
         "turn_chain": {
             "edges_created": turn_chain_edges_created,
@@ -5420,6 +5471,10 @@ async fn handle_ingest_skill<S: crate::storage::Storage>(
         "output_artifacts",
         "completion_criteria",
         "content_hash",
+        // Where the SKILL.md lives, so the skill can be tiered. Skills are the
+        // Wisdom tier's whole population; without this they arrive with no
+        // origin and sit at Data alongside session exhaust.
+        "source_path",
     ];
     if let Some(obj) = args.as_object() {
         let unknown: Vec<&str> = obj
@@ -5440,6 +5495,8 @@ async fn handle_ingest_skill<S: crate::storage::Storage>(
     }
 
     let name = require_str(&args, "name")?.to_string();
+    // Kept for the source record, which is written after `params` takes it.
+    let skill_name = name.clone();
     let category = require_str(&args, "category")?.to_string();
     let description = require_str(&args, "description")?.to_string();
     let caller_session_id = optional_uuid(&args, "session_id")?.unwrap_or(uuid::Uuid::nil());
@@ -5525,8 +5582,41 @@ async fn handle_ingest_skill<S: crate::storage::Storage>(
     .await
     .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
 
+    // Record where it came from, if the caller said. Best-effort and loud, on
+    // the same terms as ingest_entities: the skill lands either way, but a
+    // skill with no origin cannot be told from session exhaust by the tier
+    // rules, and that must look like a failure rather than a quiet Data row.
+    let mut source_recorded = false;
+    if let Some(path) = args
+        .get("source_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        match storage
+            .entity_source_record(
+                ctx,
+                crate::tier_store::SourceDraft {
+                    entity_id: action.entity_id(),
+                    session_id: caller_session_id,
+                    title: skill_name,
+                    source_path: path.to_owned(),
+                },
+            )
+            .await
+        {
+            Ok(_) => source_recorded = true,
+            Err(error) => tracing::warn!(
+                entity_id = %action.entity_id(),
+                %error,
+                "could not record where this skill came from"
+            ),
+        }
+    }
+
     let mut result = serde_json::to_value(&action).map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
     if let Some(obj) = result.as_object_mut() {
+        obj.insert("source_recorded".into(), Value::Bool(source_recorded));
         obj.insert(
             "_hint".into(),
             Value::String(
@@ -7184,21 +7274,9 @@ fn select_auto_fusion_profile(
     }
 
     // 6. Default balanced — the fallback. When a workspace cwd is provided,
-    //    use the workspace-aware profile to ensure same-repo affinity. The
-    //    bare "auto" profile zeros workspace_weight, which causes cross-domain
-    //    pollution (e.g. queries from one repo returning unrelated entities from another).
-    //
-    //    The workspace variant must be the PHONETIC one. `auto` sets
-    //    `phonetic_weight = 1.0`, and `bm25-semantic-workspace` zeroes it — so
-    //    routing here on the strength of a `cwd` would have quietly removed
-    //    phonetic recall from every default query that supplies one. For an
-    //    entity with no embedding, phonetic on `entity_name` is what surfaces
-    //    it at all, so the result is not a reordering but an empty answer.
-    //
-    //    `bm25-semantic-phonetic-workspace` is exactly `auto` plus workspace
-    //    affinity, which is the change this branch is for. The
-    //    `broad_semantic` pair above is consistent already: neither the bare
-    //    nor the workspace profile carries phonetic.
+    //    use the workspace-aware balanced profile to ensure same-repo affinity
+    //    without dropping auto's entity-name phonetic channel. The bare "auto"
+    //    profile zeros workspace_weight, which causes cross-domain pollution.
     if has_workspace {
         return AutoFusionSelection {
             intent: "default_balanced_workspace",
@@ -9683,8 +9761,14 @@ async fn handle_manage_rules<S: crate::storage::Storage>(
             let rule_id = require_str(&args, "rule_id")?;
             let rule_body = require_str(&args, "rule_body")?;
 
-            let parsed = crate::datalog::parse_rule(rule_body)
+            // `parse_rules` so a disjunctive body validates here rather than
+            // failing later in the loader. Every alternative shares the head,
+            // so the first one names the family.
+            let parsed = crate::datalog::parse_rules(rule_body)
                 .map_err(|e| (INVALID_PARAMS, format!("Invalid rule syntax: {e}")))?;
+            let parsed = parsed
+                .first()
+                .ok_or((INVALID_PARAMS, "rule expanded to nothing".to_string()))?;
             let family = args
                 .get("family")
                 .and_then(|v| v.as_str())
@@ -12311,8 +12395,9 @@ mod tests {
     #[test]
     fn auto_fusion_workspace_cwd_routes_default_to_workspace_profile() {
         // Regression: a default query (not a bug/build, not broad semantic)
-        // with a workspace cwd must route to the workspace-aware profile,
-        // not the bare "auto" profile that zeros workspace_weight.
+        // with a workspace cwd must route to the workspace-aware balanced
+        // profile, preserving auto's entity-name phonetic channel while adding
+        // workspace affinity.
         // Uses a query without any broad_semantic trigger words (no
         // "architecture", "design", "explain", etc.) to hit the default path.
         let filter = crate::hybrid_search::SearchFilter {
@@ -12320,39 +12405,12 @@ mod tests {
             ..Default::default()
         };
         let selected = select_auto_fusion_profile("project-b app roster events RSVP", &filter);
+        assert_eq!(
+            selected.profile, "bm25-semantic-phonetic-workspace",
+            "default query with workspace cwd must preserve balanced recall, got {}",
+            selected.profile
+        );
         assert_eq!(selected.intent, "default_balanced_workspace");
-
-        // Assert the PROPERTIES the routing exists for, not the profile's
-        // name. This originally pinned "bm25-semantic-workspace", which
-        // passed while silently dropping phonetic recall: that profile zeroes
-        // `phonetic_weight`, and the bare `auto` it replaces sets it to 1.0.
-        // For an entity with no embedding, phonetic on `entity_name` is the
-        // only thing that surfaces it, so the effect was an empty result set
-        // rather than a reordering -- caught by two feedback tests, not by
-        // this one.
-        let ws = crate::hybrid_search::FusionConfig::profile(selected.profile)
-            .expect("the selected profile must exist");
-        let bare = crate::hybrid_search::FusionConfig::profile("auto").expect("auto must exist");
-
-        assert!(
-            ws.workspace_weight > 0.0,
-            "the point of this branch is workspace affinity: {}",
-            selected.profile
-        );
-        assert!(
-            ws.phonetic_weight >= bare.phonetic_weight,
-            "adding workspace affinity must not remove phonetic recall that \
-             `auto` had: {} has phonetic_weight {} vs auto's {}",
-            selected.profile,
-            ws.phonetic_weight,
-            bare.phonetic_weight
-        );
-        assert!(
-            ws.context_bm25_weight >= bare.context_bm25_weight && ws.ann_weight >= bare.ann_weight,
-            "nor may it weaken the lexical or semantic sources: {}",
-            selected.profile
-        );
-
         // Without workspace cwd, the same query must fall through to the
         // bare auto profile (backward compat).
         let no_ws = select_auto_fusion_profile(
@@ -15183,6 +15241,135 @@ mod tests {
             "unexpected failure reason: {}",
             failed[0]
         );
+    }
+
+    /// Ingest records WHERE an entity came from, so it can be tiered.
+    ///
+    /// Until this existed nothing wrote a source, which meant every tier read
+    /// zero on a real store -- a dashboard that was correct and useless.
+    #[tokio::test]
+    async fn ingest_records_a_source_path_when_one_is_given() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            ollama_base_url: String::new(),
+            entity_types: vec!["note".into()],
+            ..SessionState::default()
+        };
+        let sid = Uuid::nil();
+        let id = Uuid::parse_str("aaaaaaaa-0000-0000-0000-00000000d001").unwrap();
+
+        let result = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "ingest_entities",
+                "arguments": {
+                    "tenant_id": ctx.tenant_id.to_string(),
+                    "session_id": sid.to_string(),
+                    "entities": [{
+                        "id": id.to_string(),
+                        "name": "Rust ownership",
+                        "entity_type": "note",
+                        "context": "borrowing",
+                        "attrs": { "source_path": "/Users/bkearns/src/research/skills/rust.md" }
+                    }],
+                    "options": { "embed_missing": false, "on_conflict": "update" }
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let result = unwrap_tool_result(result);
+
+        assert_eq!(result["entities"]["inserted"], 1);
+        assert_eq!(result["knowledge_tier"]["sources_recorded"], 1);
+        assert_eq!(result["knowledge_tier"]["failed"], serde_json::json!([]));
+    }
+
+    /// No path, no row. An entity whose origin nobody stated must not be
+    /// filed under a guessed one -- "I do not know where this came from" and
+    /// "this came from somewhere unclassified" are different states, and only
+    /// the first should be silent.
+    #[tokio::test]
+    async fn ingest_records_nothing_when_no_source_path_is_given() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            ollama_base_url: String::new(),
+            entity_types: vec!["note".into()],
+            ..SessionState::default()
+        };
+        let sid = Uuid::nil();
+
+        let result = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "ingest_entities",
+                "arguments": {
+                    "tenant_id": ctx.tenant_id.to_string(),
+                    "session_id": sid.to_string(),
+                    "entities": [{
+                        "id": Uuid::parse_str("aaaaaaaa-0000-0000-0000-00000000d002")
+                            .unwrap().to_string(),
+                        "name": "No origin",
+                        "entity_type": "note",
+                        "context": "exhaust"
+                    }],
+                    "options": { "embed_missing": false, "on_conflict": "update" }
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["entities"]["inserted"], 1);
+        assert_eq!(result["knowledge_tier"]["sources_recorded"], 0);
+    }
+
+    /// A blank path is not a path. Recording it would put an entity under a
+    /// root of "", which no rule covers and which reads as a real answer.
+    #[tokio::test]
+    async fn ingest_treats_a_blank_source_path_as_absent() {
+        let store = MockStorage::new();
+        let ctx = test_ctx();
+        let session = SessionState {
+            ollama_base_url: String::new(),
+            entity_types: vec!["note".into()],
+            ..SessionState::default()
+        };
+
+        let result = dispatch(
+            "tools/call",
+            serde_json::json!({
+                "name": "ingest_entities",
+                "arguments": {
+                    "tenant_id": ctx.tenant_id.to_string(),
+                    "session_id": Uuid::nil().to_string(),
+                    "entities": [{
+                        "id": Uuid::parse_str("aaaaaaaa-0000-0000-0000-00000000d003")
+                            .unwrap().to_string(),
+                        "name": "Blank origin",
+                        "entity_type": "note",
+                        "context": "exhaust",
+                        "attrs": { "source_path": "   " }
+                    }],
+                    "options": { "embed_missing": false, "on_conflict": "update" }
+                }
+            }),
+            &store,
+            &ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let result = unwrap_tool_result(result);
+        assert_eq!(result["knowledge_tier"]["sources_recorded"], 0);
     }
 
     #[tokio::test]

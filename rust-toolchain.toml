@@ -7,11 +7,11 @@
 # compile on 1.94.1 but builds clean on 1.95.0+. A contributor one release
 # behind hit exactly that "fails locally, green in CI" trap.
 #
-# 1.96.0 is the current stable and is >= the 1.95.0 inference fix. rustup will
+# 1.98.0 is the current stable and is >= the 1.95.0 inference fix. rustup will
 # auto-install this exact version on first `cargo` invocation, so an older
 # default stable can't silently diverge. Bump this in lockstep with the CI
 # toolchain (.github/workflows/ci.yml, dtolnay/rust-toolchain).
 [toolchain]
-channel = "1.96.0"
+channel = "1.98.0"
 components = ["rustfmt", "clippy", "llvm-tools-preview"]
 profile = "minimal"

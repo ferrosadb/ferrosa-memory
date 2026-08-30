@@ -3,6 +3,8 @@
 //! Reads all memory data for a tenant from the source cluster and upserts it
 //! into the destination cluster. Idempotent: safe to re-run; CQL INSERT is
 //! upsert-by-primary-key for all synced tables.
+//! Last revised: 2026-08-25
+//! Last changed: Preserves knowledge-tier session wiring on the current mainline.
 //!
 //! # Usage
 //!
@@ -21,7 +23,6 @@ use ferrosa_memory_core::graph::{GraphClient, GraphConfig};
 use ferrosa_memory_core::storage::Storage;
 use ferrosa_memory_core::types::{FoldStatus, TenantContext};
 use futures_util::StreamExt;
-use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -68,9 +69,6 @@ enum Command {
         /// Gateway base URL.
         #[arg(long)]
         gateway: String,
-        /// API key; falls back to $FERROSA_MAAS_API_KEY.
-        #[arg(long, env = "FERROSA_MAAS_API_KEY")]
-        api_key: String,
         /// Already-approved device key file (from p2p-keygen).
         #[arg(long)]
         identity: std::path::PathBuf,
@@ -85,10 +83,8 @@ enum Command {
         /// Gateway base URL (e.g. https://gw.example).
         #[arg(long)]
         gateway: String,
-        /// API key; falls back to $FERROSA_MAAS_API_KEY.
-        #[arg(long, env = "FERROSA_MAAS_API_KEY")]
-        api_key: String,
-        /// Device key file (from p2p-keygen; its key must be registered).
+        /// Enrolled device key file. The ONLY credential — it signs every
+        /// request, so no bearer key sits on this machine.
         #[arg(long)]
         identity: std::path::PathBuf,
         /// The learner's account id (must be a mutual contact).
@@ -108,10 +104,8 @@ enum Command {
         /// Gateway base URL.
         #[arg(long)]
         gateway: String,
-        /// API key; falls back to $FERROSA_MAAS_API_KEY.
-        #[arg(long, env = "FERROSA_MAAS_API_KEY")]
-        api_key: String,
-        /// Device key file (from p2p-keygen; its key must be registered).
+        /// Enrolled device key file. The ONLY credential — it signs every
+        /// request, so no bearer key sits on this machine.
         #[arg(long)]
         identity: std::path::PathBuf,
         /// Landing directory for applied packs (durable JSON; the
@@ -130,10 +124,11 @@ enum Command {
         /// Gateway base URL.
         #[arg(long)]
         gateway: String,
-        /// API key; falls back to $FERROSA_MAAS_API_KEY.
-        #[arg(long, env = "FERROSA_MAAS_API_KEY")]
-        api_key: String,
-        /// Registered device key file (from p2p-keygen).
+        /// Enrolled device key file (from `fmem login` or `p2p-keygen`).
+        ///
+        /// The ONLY credential. This path no longer takes an API key: the
+        /// identity signs every request, so there is no bearer secret sitting
+        /// on the machine for an attacker to lift.
         #[arg(long)]
         identity: std::path::PathBuf,
         /// One absolute project directory available to the managed Codex CLI.
@@ -145,6 +140,14 @@ enum Command {
         /// Use an already-current schema without issuing startup DDL.
         #[arg(long)]
         existing_schema: bool,
+        /// Which tenant's memory to serve to a controller.
+        ///
+        /// Falls back to server.tenant_id and then FERROSA_MEMORY_TENANT_ID.
+        /// There is no default: the task board's tenant is on the same
+        /// cluster and reading it reports an empty memory rather than an
+        /// error.
+        #[arg(long = "memory-tenant")]
+        memory_tenant: Option<uuid::Uuid>,
     },
 }
 
@@ -164,9 +167,11 @@ struct SyncStats {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    // One init for all three binaries. Each used to build its own subscriber,
+    // which is three chances to drift and none of them reported a failure
+    // anywhere but a console nobody watches.
+    let plan = ferrosa_memory_core::telemetry::plan_from_env();
+    let _telemetry = ferrosa_memory_core::telemetry::init("memory-sync", &plan, "info");
 
     let args = Args::parse();
 
@@ -183,53 +188,45 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "webrtc-transport")]
         Command::DeviceApprove {
             gateway,
-            api_key,
             identity,
             device_id,
-        } => cmd_device_approve(&gateway, &api_key, &identity, device_id).await,
+        } => cmd_device_approve(&gateway, &identity, device_id).await,
         #[cfg(feature = "webrtc-transport")]
         Command::P2pShare {
             gateway,
-            api_key,
             identity,
             learner_account,
             selection,
             namespace,
-        } => {
-            cmd_p2p_share(
-                &gateway,
-                &api_key,
-                &identity,
-                learner_account,
-                &selection,
-                &namespace,
-            )
-            .await
-        }
+        } => cmd_p2p_share(&gateway, &identity, learner_account, &selection, &namespace).await,
         #[cfg(feature = "webrtc-transport")]
         Command::P2pReceive {
             gateway,
-            api_key,
             identity,
             out_dir,
             session,
-        } => cmd_p2p_receive(&gateway, &api_key, &identity, &out_dir, session).await,
+        } => cmd_p2p_receive(&gateway, &identity, &out_dir, session).await,
         #[cfg(feature = "webrtc-transport")]
         Command::ControlListen {
             gateway,
-            api_key,
             identity,
             workspace,
             contact_points,
             existing_schema,
+            memory_tenant,
         } => {
-            cmd_control_listen(
-                &gateway,
-                &api_key,
-                &identity,
-                &workspace,
-                &contact_points,
-                existing_schema,
+            ferrosa_memory_sync::listener::run_control_listener(
+                &ferrosa_memory_sync::listener::ListenerConfig {
+                    gateway,
+                    identity,
+                    workspace,
+                    contact_points,
+                    existing_schema,
+                    memory_tenant,
+                },
+                // A plain control session. Another binary attaches extensions
+                // here and changes nothing else.
+                ferrosa_memory_sync::listener::SessionExtensions::none(),
             )
             .await
         }
@@ -256,16 +253,21 @@ fn cmd_p2p_keygen(out: &std::path::Path) -> anyhow::Result<()> {
 #[cfg(feature = "webrtc-transport")]
 async fn cmd_device_approve(
     gateway: &str,
-    api_key: &str,
     identity_path: &std::path::Path,
     target_device_id: Uuid,
 ) -> anyhow::Result<()> {
     use ferrosa_memory_sync::peer_cli;
     use ferrosa_memory_sync::signaling_client::HttpSignalingClient;
 
-    let identity = peer_cli::load_identity(identity_path)?;
+    let identity = std::sync::Arc::new(peer_cli::load_identity(identity_path)?);
     let fingerprint = identity.public_identity().public_key_fingerprint.0;
-    let api = HttpSignalingClient::new(gateway, api_key);
+    // The approving device signs for itself. It already had to prove possession
+    // of an enrolled key to be allowed to vouch at all, so an API key here was
+    // a second, weaker credential doing no additional work.
+    let api = HttpSignalingClient::with_credential(
+        gateway,
+        ferrosa_memory_sync::signaling_client::Credential::device(std::sync::Arc::clone(&identity)),
+    );
     let account = api.whoami().await?;
     let devices = api.devices().await?;
     let approver = devices
@@ -299,7 +301,6 @@ async fn cmd_device_approve(
 #[cfg(feature = "webrtc-transport")]
 async fn cmd_p2p_share(
     gateway: &str,
-    api_key: &str,
     identity_path: &std::path::Path,
     learner_account: Uuid,
     selection_path: &std::path::Path,
@@ -310,11 +311,14 @@ async fn cmd_p2p_share(
     use ferrosa_memory_sync::peer_cli;
     use ferrosa_memory_sync::peer_session::{PeerSessionConfig, run_teacher_session};
     use ferrosa_memory_sync::replication::{PackBuildParams, TeacherSelection};
-    use ferrosa_memory_sync::signaling_client::{HttpSignalingClient, SignalingApi};
+    use ferrosa_memory_sync::signaling_client::{Credential, HttpSignalingClient, SignalingApi};
 
-    let identity = peer_cli::load_identity(identity_path)?;
+    let identity = std::sync::Arc::new(peer_cli::load_identity(identity_path)?);
     let selection: TeacherSelection = serde_json::from_slice(&std::fs::read(selection_path)?)?;
-    let api = HttpSignalingClient::new(gateway, api_key);
+    let api = HttpSignalingClient::with_credential(
+        gateway,
+        Credential::device(std::sync::Arc::clone(&identity)),
+    );
     let public = identity.public_identity();
 
     let pack_id = Uuid::new_v4();
@@ -363,17 +367,19 @@ async fn cmd_p2p_share(
 #[cfg(feature = "webrtc-transport")]
 async fn cmd_p2p_receive(
     gateway: &str,
-    api_key: &str,
     identity_path: &std::path::Path,
     out_dir: &std::path::Path,
     session: Option<Uuid>,
 ) -> anyhow::Result<()> {
     use ferrosa_memory_sync::peer_cli::{self, DirPackApplyStore};
     use ferrosa_memory_sync::peer_session::{PeerSessionConfig, run_learner_session};
-    use ferrosa_memory_sync::signaling_client::{HttpSignalingClient, SignalingApi};
+    use ferrosa_memory_sync::signaling_client::{Credential, HttpSignalingClient, SignalingApi};
 
-    let identity = peer_cli::load_identity(identity_path)?;
-    let api = HttpSignalingClient::new(gateway, api_key);
+    let identity = std::sync::Arc::new(peer_cli::load_identity(identity_path)?);
+    let api = HttpSignalingClient::with_credential(
+        gateway,
+        Credential::device(std::sync::Arc::clone(&identity)),
+    );
 
     let session_id = match session {
         Some(s) => s,
@@ -414,147 +420,6 @@ async fn cmd_p2p_receive(
         health.packs_applied
     );
     Ok(())
-}
-
-#[cfg(feature = "webrtc-transport")]
-async fn cmd_control_listen(
-    gateway: &str,
-    api_key: &str,
-    identity_path: &std::path::Path,
-    workspace: &std::path::Path,
-    contact_points: &[String],
-    existing_schema: bool,
-) -> anyhow::Result<()> {
-    use std::{sync::Arc, time::Duration};
-
-    use ferrosa_memory_core::config::load_config_with_dbaas;
-    use ferrosa_memory_core::control_store::{ControlEventDraft, ControlStore, CqlControlStore};
-    use ferrosa_memory_core::types::TenantContext;
-    use ferrosa_memory_sync::codex_runtime::{CodexTmuxConfig, CodexTmuxRuntime};
-    use ferrosa_memory_sync::control_session::{
-        ControlRuntimeDispatcher, ControlSessionConfig, run_control_server_session,
-    };
-    use ferrosa_memory_sync::peer_cli;
-    use ferrosa_memory_sync::signaling_client::{ControlSignalingApi, HttpSignalingClient};
-
-    let identity = peer_cli::load_identity(identity_path)?;
-    let public = identity.public_identity();
-    let fingerprint = public.public_key_fingerprint.0;
-    let api = HttpSignalingClient::new(gateway, api_key);
-    let config = ControlSessionConfig::default();
-    let mut memory_config = load_config_with_dbaas()
-        .context("loading Ferrosa Memory config for durable mobile control")?;
-    if !contact_points.is_empty() {
-        memory_config.ferrosa.contact_points = contact_points.to_vec();
-    }
-    let store = if existing_schema {
-        CqlControlStore::connect_existing(&memory_config.ferrosa).await
-    } else {
-        CqlControlStore::connect(&memory_config.ferrosa).await
-    }
-    .context("connecting durable mobile control store")?;
-    let control_store = Arc::new(store);
-    let runtime = CodexTmuxRuntime::new(CodexTmuxConfig::new(workspace, fingerprint.clone()))
-        .context("configuring Codex tmux-light runtime")?;
-    let dispatcher = ControlRuntimeDispatcher::new(Arc::clone(&control_store), runtime);
-    println!("control listener device fingerprint: {fingerprint}");
-    println!("managed Codex workspace: {}", workspace.display());
-    println!("polling {gateway} for device-targeted control offers");
-
-    loop {
-        let pending = api.control_pending_offers(&fingerprint).await?;
-        if pending.is_empty() {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            continue;
-        }
-        for offer in pending {
-            println!(
-                "accepting control session {} from controller device {}",
-                offer.session_id, offer.controller_device_id
-            );
-            let mut channel = match run_control_server_session(
-                &api,
-                &identity,
-                offer.session_id,
-                &config,
-            )
-            .await
-            {
-                Ok(channel) => channel,
-                Err(error) => {
-                    tracing::warn!(
-                        session_id = %offer.session_id,
-                        error = %error,
-                        "control session bind failed"
-                    );
-                    continue;
-                }
-            };
-            println!("control session {} bound directly", offer.session_id);
-            let tenant = TenantContext {
-                tenant_id: offer.account_id,
-                session_origin: format!("mobile-control:{}", offer.session_id),
-            };
-            let cursor = control_store
-                .reserve_cursor_block(&tenant, &fingerprint, 64)
-                .await
-                .context("reserving durable mobile control cursor block")?
-                .start;
-            control_store
-                .append_event(
-                    &tenant,
-                    &fingerprint,
-                    ControlEventDraft {
-                        cursor,
-                        event_id: Uuid::now_v7(),
-                        command_id: None,
-                        kind: "heartbeat".to_owned(),
-                        payload: serde_json::json!({
-                            "session_id": offer.session_id,
-                            "controller_device_id": offer.controller_device_id,
-                        }),
-                        created_at: chrono::Utc::now(),
-                    },
-                )
-                .await
-                .context("persisting control-session heartbeat")?;
-            loop {
-                let frame = match channel.recv_text().await {
-                    Ok(frame) => frame,
-                    Err(error) => {
-                        tracing::info!(
-                            session_id = %offer.session_id,
-                            error = %error,
-                            "control session disconnected"
-                        );
-                        break;
-                    }
-                };
-                match dispatcher.reply(&tenant, &fingerprint, &frame).await {
-                    Ok(Some(reply)) => {
-                        if let Err(error) = channel.send_text(&reply).await {
-                            tracing::info!(
-                                session_id = %offer.session_id,
-                                error = %error,
-                                "control pong send failed"
-                            );
-                            break;
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        tracing::warn!(
-                            session_id = %offer.session_id,
-                            error = %error,
-                            "invalid control application frame"
-                        );
-                        let _ = channel.close().await;
-                        break;
-                    }
-                }
-            }
-        }
-    }
 }
 
 async fn cmd_sync(
@@ -633,8 +498,6 @@ mod cli_tests {
             "control-listen",
             "--gateway",
             "https://gateway.example",
-            "--api-key",
-            "secret",
             "--identity",
             "/tmp/device.json",
             "--workspace",
@@ -652,6 +515,36 @@ mod cli_tests {
                     && contact_points == vec!["127.0.0.1:19044"]
                     && existing_schema
         ));
+    }
+
+    /// `--api-key` is GONE from every command that carries an identity.
+    ///
+    /// Asserted rather than assumed: a re-added flag would fail no other test.
+    /// It would simply reintroduce a bearer secret on machines that no longer
+    /// need one, and nothing would notice until someone read the help text.
+    #[test]
+    fn identity_commands_refuse_an_api_key() {
+        for command in [
+            "control-listen",
+            "device-approve",
+            "p2p-share",
+            "p2p-receive",
+        ] {
+            let parsed = Args::try_parse_from([
+                "memory-sync",
+                command,
+                "--gateway",
+                "https://gateway.example",
+                "--identity",
+                "/tmp/device.json",
+                "--api-key",
+                "secret",
+            ]);
+            assert!(
+                parsed.is_err(),
+                "{command} still accepts --api-key; device identities do not use one"
+            );
+        }
     }
 }
 

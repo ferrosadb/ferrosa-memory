@@ -16,6 +16,7 @@
     deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
 )]
 
+use ferrosa_memory_core::remote_identity::InstanceSigningIdentity;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -209,25 +210,99 @@ pub trait ControlSignalingApi: Send + Sync {
     ) -> impl std::future::Future<Output = Result<Vec<BrokerSignal>, SignalingClientError>> + Send;
 }
 
-/// HTTPS client for a live gateway broker, authenticated by API key.
+/// How a client proves who it is.
+///
+/// Device identities do NOT use API keys. A key is a bearer secret that sits on
+/// the machine and authorises everything until it is revoked; a device signs
+/// each request, so a captured one cannot be lifted onto another call and there
+/// is nothing on disk worth stealing. The API-key arm remains only for callers
+/// that predate enrolment and have no identity yet.
+pub enum Credential {
+    /// Legacy account-scoped bearer key.
+    ApiKey(String),
+    /// A device identity, signing every request (`X-Device-*`).
+    ///
+    /// `Arc` rather than an owned value so a caller that also needs the
+    /// identity — the control session signs its hello with the same key —
+    /// shares ONE copy. Cloning it would put a second copy of the secret in
+    /// memory to satisfy a borrow checker, and re-reading the file would put it
+    /// through the filesystem twice.
+    Device(std::sync::Arc<InstanceSigningIdentity>),
+}
+
+impl Credential {
+    /// Build a device credential from an enrolled identity.
+    pub fn device(identity: std::sync::Arc<InstanceSigningIdentity>) -> Self {
+        Self::Device(identity)
+    }
+
+    /// Authenticate one request.
+    ///
+    /// `body` must be the exact bytes being sent: the signature covers their
+    /// hash, so hashing one serialization and sending another would sign
+    /// something the server never receives.
+    fn apply(
+        &self,
+        req: reqwest::RequestBuilder,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> reqwest::RequestBuilder {
+        match self {
+            Self::ApiKey(key) => req.header("Api-Key", key),
+            Self::Device(identity) => {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs() as i64);
+                let nonce = Uuid::new_v4().to_string();
+                let signed = crate::device_request::sign_request(
+                    identity, method, path, body, timestamp, &nonce,
+                );
+                signed
+                    .pairs()
+                    .into_iter()
+                    .fold(req, |r, (name, value)| r.header(name, value))
+            }
+        }
+    }
+}
+
+/// HTTPS client for a live gateway broker.
 pub struct HttpSignalingClient {
     base: String,
-    api_key: String,
+    credential: Credential,
     http: reqwest::Client,
 }
 
 impl HttpSignalingClient {
     /// Build a client for `base` (e.g. `https://gw.example`) with `api_key`.
     pub fn new(base: impl Into<String>, api_key: impl Into<String>) -> Self {
+        Self::with_credential(base, Credential::ApiKey(api_key.into()))
+    }
+
+    /// Build a client that signs every request with a device identity.
+    pub fn with_credential(base: impl Into<String>, credential: Credential) -> Self {
         Self {
             base: base.into().trim_end_matches('/').to_string(),
-            api_key: api_key.into(),
+            credential,
             http: reqwest::Client::new(),
         }
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base)
+    }
+
+    /// The path the signature covers: everything before any query string.
+    ///
+    /// The gateway verifies against `uri().path()`, so signing the query too
+    /// would 401 every request that carries one — and it would look like a
+    /// credential fault rather than a formatting one.
+    fn signed_path(path: &str) -> &str {
+        match path.split_once('?') {
+            Some((before, _)) => before,
+            None => path,
+        }
     }
 
     async fn check(resp: reqwest::Response) -> Result<reqwest::Response, SignalingClientError> {
@@ -247,9 +322,13 @@ impl HttpSignalingClient {
         path: &str,
     ) -> Result<T, SignalingClientError> {
         let resp = self
-            .http
-            .get(self.url(path))
-            .header("Api-Key", &self.api_key)
+            .credential
+            .apply(
+                self.http.get(self.url(path)),
+                "GET",
+                Self::signed_path(path),
+                b"",
+            )
             .send()
             .await
             .map_err(|e| SignalingClientError::Transport(e.to_string()))?;
@@ -265,11 +344,22 @@ impl HttpSignalingClient {
         path: &str,
         body: &B,
     ) -> Result<T, SignalingClientError> {
+        // Serialized ONCE. The signature covers the hash of these bytes, so
+        // letting reqwest re-serialize the value would sign something other
+        // than what is transmitted.
+        let bytes =
+            serde_json::to_vec(body).map_err(|e| SignalingClientError::Decode(e.to_string()))?;
         let resp = self
-            .http
-            .post(self.url(path))
-            .header("Api-Key", &self.api_key)
-            .json(body)
+            .credential
+            .apply(
+                self.http
+                    .post(self.url(path))
+                    .header("content-type", "application/json"),
+                "POST",
+                Self::signed_path(path),
+                &bytes,
+            )
+            .body(bytes.clone())
             .send()
             .await
             .map_err(|e| SignalingClientError::Transport(e.to_string()))?;
@@ -285,11 +375,19 @@ impl HttpSignalingClient {
         path: &str,
         body: &B,
     ) -> Result<(), SignalingClientError> {
+        let bytes =
+            serde_json::to_vec(body).map_err(|e| SignalingClientError::Decode(e.to_string()))?;
         let resp = self
-            .http
-            .post(self.url(path))
-            .header("Api-Key", &self.api_key)
-            .json(body)
+            .credential
+            .apply(
+                self.http
+                    .post(self.url(path))
+                    .header("content-type", "application/json"),
+                "POST",
+                Self::signed_path(path),
+                &bytes,
+            )
+            .body(bytes.clone())
             .send()
             .await
             .map_err(|e| SignalingClientError::Transport(e.to_string()))?;

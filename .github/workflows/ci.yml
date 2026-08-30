@@ -28,7 +28,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
         with:
-          toolchain: "1.96.0"   # keep in sync with rust-toolchain.toml
+          toolchain: "1.98.0"   # keep in sync with rust-toolchain.toml
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -52,6 +52,25 @@ jobs:
       # "localhost:19042" as a fixture) don't trip the rule.
       - name: No loopback CQL addresses in production source (p0-11)
         run: ./.github/scripts/check-no-prod-loopback.sh
+      # The workspace version must agree with the latest released tag, and the
+      # commits since it must imply a bump somebody can see.
+      #
+      # promote-release syncs main to the tag it just cut via a required PR.
+      # This gate remains defense in depth: on 2026-08-17 an older best-effort
+      # workflow swallowed `gh pr create` failure and main sat at 0.23.0 behind
+      # tag v0.27.0 for five days and twenty-one commits.
+      #
+      # Binaries self-report the Cargo version, so that drift ships binaries
+      # announcing one version under a tag that says another, and every
+      # downstream update check compares the two.
+      #
+      # fetch-depth 0 on this step's own fetch: the default checkout has no
+      # tags, and a tag-less checkout would make this check pass by finding
+      # nothing to disagree with.
+      - name: Fetch tags for the version check
+        run: git fetch --tags --quiet
+      - name: Workspace version is in step with the latest release tag
+        run: ./.github/scripts/check-version-sync.sh
 
   # Stage 1b: Dependency advisories
   advisories:
@@ -61,7 +80,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
         with:
-          toolchain: "1.96.0"   # keep in sync with rust-toolchain.toml
+          toolchain: "1.98.0"   # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install cargo-deny
         run: cargo install --locked cargo-deny
@@ -77,7 +96,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
         with:
-          toolchain: "1.96.0"   # keep in sync with rust-toolchain.toml
+          toolchain: "1.98.0"   # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: ws-noinstrument
@@ -89,7 +108,7 @@ jobs:
       # The `--all-targets` build above already compiled these test binaries, so
       # `nextest archive` is cache-warm and just packages them.
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2.85.10
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
         with:
           tool: nextest
       - name: Archive test binaries (built once, run in integration)
@@ -118,11 +137,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
         with:
-          toolchain: "1.96.0"   # keep in sync with rust-toolchain.toml
+          toolchain: "1.98.0"   # keep in sync with rust-toolchain.toml
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2.85.10
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
         with:
           tool: cargo-llvm-cov
       - name: Run tests with coverage
@@ -173,7 +192,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
         with:
-          toolchain: "1.96.0"   # keep in sync with rust-toolchain.toml
+          toolchain: "1.98.0"   # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: ws-noinstrument
@@ -243,7 +262,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
         with:
-          toolchain: "1.96.0"   # keep in sync with rust-toolchain.toml
+          toolchain: "1.98.0"   # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: ws-noinstrument
@@ -303,13 +322,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
         with:
-          toolchain: "1.96.0"   # keep in sync with rust-toolchain.toml
+          toolchain: "1.98.0"   # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: ws-noinstrument
           cache-on-failure: false
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2.85.10
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
         with:
           tool: nextest
       - name: Download prebuilt test-binary archive (from the build job)
@@ -803,13 +822,17 @@ jobs:
         # recompile here. The dedicated fresh-keyspace migration release gate
         # above has already run; excluding it avoids duplicate expensive DDL.
         # `--workspace-remap .` points archived binaries at this checkout for
-        # path-relative fixtures.
+        # path-relative fixtures. `task_board_live` is deliberately absent:
+        # it validates Forge's real task board (schema and data owned by a
+        # different repository), not the disposable CI cluster. It remains
+        # available for an explicit local `--test task_board_live -- --ignored`
+        # run against that external board.
         run: |
           cargo nextest run \
             --archive-file nextest-archive.tar.zst \
             --workspace-remap . \
             --run-ignored ignored-only \
-            --filterset 'not (package(ferrosa-memory-core) and binary(migration_drift) and test(t10_fresh_keyspace_applies_every_registered_migration))' \
+            --filterset 'not (package(ferrosa-memory-core) and binary(migration_drift) and test(t10_fresh_keyspace_applies_every_registered_migration)) and not (package(ferrosa-memory-sync) and binary(task_board_live))' \
             --no-fail-fast
       - name: Run system pytest suite against live cluster
         env:

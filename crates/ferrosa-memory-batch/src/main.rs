@@ -22,7 +22,6 @@ use ferrosa_memory_core::storage::Storage;
 use ferrosa_memory_core::types::TenantContext;
 use ferrosa_memory_core::warmth;
 use futures_util::future::join_all;
-use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 fn batch_cql_config(
@@ -40,9 +39,11 @@ fn batch_cql_config(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    // One init for all three binaries. Each used to build its own subscriber,
+    // which is three chances to drift and none of them reported a failure
+    // anywhere but a console nobody watches.
+    let plan = ferrosa_memory_core::telemetry::plan_from_env();
+    let _telemetry = ferrosa_memory_core::telemetry::init("memory-batch", &plan, "info");
 
     let config = match ferrosa_memory_core::config::load_config() {
         Ok(c) => c,

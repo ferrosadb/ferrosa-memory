@@ -121,4 +121,18 @@ GRANT MODIFY ON agent_memory.mobile_control_cursor_state TO ferrosa_user;
 GRANT MODIFY ON agent_memory.mobile_control_events       TO ferrosa_user;
 GRANT MODIFY ON agent_memory.mobile_control_commands     TO ferrosa_user;
 
+-- Session archives (migration 053): a swiped-away session's raw tmux buffer is
+-- written on the serving path, so the runtime role must be able to write it.
+-- Without this an auth-enabled deployment fails on the first archive rather
+-- than at migration time.
+GRANT MODIFY ON agent_memory.session_archives TO ferrosa_user;
+
+-- Knowledge tiers (migration 054): source provenance, alias and tier rules,
+-- and human promotions. All four are written on the serving path -- ingest
+-- records a source, and the permissions UI edits rules and promotions.
+GRANT MODIFY ON agent_memory.entity_source   TO ferrosa_user;
+GRANT MODIFY ON agent_memory.tier_root_alias TO ferrosa_user;
+GRANT MODIFY ON agent_memory.tier_root_rule  TO ferrosa_user;
+GRANT MODIFY ON agent_memory.tier_promotion  TO ferrosa_user;
+
 -- graph-owned tables: NOT GRANTED to ferrosa_user on purpose.

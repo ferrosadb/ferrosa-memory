@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ferrosa-memory installer — fetches a release tarball, installs to ~/.ferrosa/,
 # offers system-service registration. Assumes Ferrosa is already running at
-# localhost:9042 (install via https://ferrosadb.com/install.sh first).
+# localhost:9042 (install via https://www.ferrosa.ai/install.sh first).
 #
 # SOURCE OF TRUTH: this file (ferrosadb/ferrosa-memory : docs/install-memory.sh).
 # It is mirrored into ferrosadb/ferrosa docs/install-memory.sh, which is what
-# GitHub Pages serves at https://ferrosadb.com/install-memory.sh. Edit it HERE;
+# GitHub Pages serves at https://www.ferrosa.ai/install-memory.sh. Edit it HERE;
 # the ferrosa copy is a published mirror.
 #
 # It is idempotent: re-running upgrades an existing install in place. When the
@@ -19,9 +19,9 @@
 #                       cut automatically each night. Resolves via /releases.
 #
 # Usage:
-#   curl -fsSL https://ferrosadb.com/install-memory.sh | bash
-#   curl -fsSL https://ferrosadb.com/install-memory.sh | bash -s -- --channel nightly
-#   curl -fsSL https://ferrosadb.com/install-memory.sh | bash -s -- --version v0.16.0 --no-service
+#   curl -fsSL https://www.ferrosa.ai/install-memory.sh | bash
+#   curl -fsSL https://www.ferrosa.ai/install-memory.sh | bash -s -- --channel nightly
+#   curl -fsSL https://www.ferrosa.ai/install-memory.sh | bash -s -- --version v0.16.0 --no-service
 set -euo pipefail
 
 REPO="ferrosadb/ferrosa-memory"
@@ -259,7 +259,12 @@ register_macos() {
   sed -e "s|__BINARY_PATH__|$BIN_DIR/ferrosa-memory-mcp|g" \
       -e "s|__REPO_ROOT__|$INSTALL_ROOT|g" \
       -e "s|__CONFIG_PATH__|$CONFIG_DIR/ferrosa-memory.toml|g" \
-      "$TMP/launchd/com.ferrosa-memory.mcp.plist" > "$plist"
+      "$TMP/launchd/com.ferrosa-memory.mcp.plist.in" > "$plist"
+  # A plist that still carries a placeholder is not installable: launchd would
+  # try to exec a literal __BINARY_PATH__ and the job would silently never run.
+  if grep -q "__[A-Z_]*__" "$plist"; then
+    die "generated $plist still contains a placeholder; the shipped template and this installer disagree"
+  fi
   launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null || true
   launchctl bootstrap "gui/$(id -u)" "$plist"
   say "launchd: com.ferrosa-memory.mcp loaded; will start on every login"
@@ -364,9 +369,9 @@ fi
 cat <<EOF >&2
 
 This MCP server connects to a running Ferrosa instance at localhost:9042
-(default from https://ferrosadb.com/install.sh). Ensure Ferrosa is up:
+(default from https://www.ferrosa.ai/install.sh). Ensure Ferrosa is up:
 
-  curl -fsSL https://ferrosadb.com/install.sh | bash
+  curl -fsSL https://www.ferrosa.ai/install.sh | bash
 
 To register with Claude Code, add to your MCP config:
 
@@ -380,7 +385,7 @@ To register with Claude Code, add to your MCP config:
   }
 
 Upgrade later by re-running this installer (idempotent):
-  curl -fsSL https://ferrosadb.com/install-memory.sh | bash -s -- --channel ${CHANNEL}
+  curl -fsSL https://www.ferrosa.ai/install-memory.sh | bash -s -- --channel ${CHANNEL}
 
 Docs: https://github.com/ferrosadb/ferrosa-memory
 EOF

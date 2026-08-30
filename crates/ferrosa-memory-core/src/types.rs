@@ -693,6 +693,19 @@ pub enum Term {
     Const(Uuid),
     ConstStr(String),
     ConstFloat(OrderedFloat<f64>),
+    /// An instant, in UTC.
+    ///
+    /// Reached from the ISO-8601 strings timestamps are stored as via
+    /// `date(S)`, which is what makes this usable against real data rather
+    /// than only against literals.
+    ConstTime(chrono::DateTime<chrono::Utc>),
+    /// A known-absent value, written `null`.
+    ///
+    /// Distinct from a variable that is unbound, which means "not decided
+    /// yet", and from an evaluation error, which means "no answer at all".
+    /// Comparing anything to it is `Unknown`, which propagates by Kleene —
+    /// unlike an error, which poisons.
+    ConstNull,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -711,12 +724,64 @@ pub enum BuiltinFilter {
     LessThan(String, f64),
     /// Legacy. See `GreaterThan` doc.
     NotEqual(String, String),
-    /// Full comparison filter — the only variant the parser emits.
+    /// Full comparison filter.
     Compare {
         op: CmpOp,
         lhs: FilterExpr,
         rhs: FilterExpr,
     },
+    /// `is_null(expr)`. Answers true or false and never `Unknown`, which is
+    /// what makes it the only way to actually ask: `V == null` is `Unknown`
+    /// and therefore never fires.
+    IsNull(FilterExpr),
+    /// A boolean-valued question about the shape of a string, written
+    /// `str_starts_with(S, P)`.
+    StrPred {
+        op: StrOp,
+        subject: FilterExpr,
+        arg: FilterExpr,
+    },
+    /// Disjunction, written `||`. True when any branch is true.
+    Any(Vec<BuiltinFilter>),
+    /// Conjunction, written `&&`. Comma-separated body filters are already an
+    /// implicit `All`; this is the explicit, groupable form.
+    All(Vec<BuiltinFilter>),
+    /// Negation, written `!`. The single mechanism for negating a filter —
+    /// `StrPred` deliberately does not carry its own negated flag.
+    Not(Box<BuiltinFilter>),
+}
+
+/// The string-shape predicates.
+///
+/// These carry a reserved `str_` prefix rather than the bare names, because
+/// `contains` is already an edge type in this system — `contains(X, Y)` is a
+/// legitimate stored relation, and taking the name would have silently changed
+/// the meaning of rules already written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum StrOp {
+    StartsWith,
+    EndsWith,
+    Contains,
+}
+
+impl StrOp {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::StartsWith => "str_starts_with",
+            Self::EndsWith => "str_ends_with",
+            Self::Contains => "str_contains",
+        }
+    }
+
+    pub const ALL: [StrOp; 3] = [StrOp::StartsWith, StrOp::EndsWith, StrOp::Contains];
+
+    pub fn apply(self, subject: &str, arg: &str) -> bool {
+        match self {
+            Self::StartsWith => subject.starts_with(arg),
+            Self::EndsWith => subject.ends_with(arg),
+            Self::Contains => subject.contains(arg),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -740,6 +805,102 @@ pub enum FilterExpr {
         rhs: Box<FilterExpr>,
     },
     Neg(Box<FilterExpr>),
+    /// The `null` literal.
+    Null,
+    /// A stamped instant. Not written by hand — it is what `now()` becomes
+    /// once the clock has been read for an evaluation.
+    LitTime(chrono::DateTime<chrono::Utc>),
+    /// A call to one of a closed set of pure functions.
+    ///
+    /// Closed on purpose: an open extension point would mean an unknown name
+    /// had to be read as something, and the only other reading — a variable —
+    /// is unbound and therefore matches every row.
+    Call {
+        func: Func,
+        args: Vec<FilterExpr>,
+    },
+}
+
+/// The functions callable from an expression. Pure, total on their declared
+/// types, and cheap — nothing here allocates unboundedly or can loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Func {
+    Abs,
+    Floor,
+    Ceil,
+    Round,
+    Len,
+    Lower,
+    Upper,
+    Concat,
+    /// The clock. Stamped once per evaluation rather than read per row — see
+    /// `datalog::stamp_clock`.
+    Now,
+    /// Parse an ISO-8601 string into a time. The bridge to stored timestamps.
+    Date,
+    Weeks,
+    Days,
+    Hours,
+    Minutes,
+}
+
+impl Func {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Abs => "abs",
+            Self::Floor => "floor",
+            Self::Ceil => "ceil",
+            Self::Round => "round",
+            Self::Len => "len",
+            Self::Lower => "lower",
+            Self::Upper => "upper",
+            Self::Concat => "concat",
+            Self::Now => "now",
+            Self::Date => "date",
+            Self::Weeks => "weeks",
+            Self::Days => "days",
+            Self::Hours => "hours",
+            Self::Minutes => "minutes",
+        }
+    }
+
+    /// How many arguments the function takes.
+    pub fn arity(self) -> usize {
+        match self {
+            Self::Concat => 2,
+            Self::Now => 0,
+            _ => 1,
+        }
+    }
+
+    /// True for the one function whose answer depends on when it is asked.
+    ///
+    /// A rule containing it is non-monotonic in the same way a negated rule
+    /// is: its conclusions stop being true without any base fact changing.
+    pub fn reads_the_clock(self) -> bool {
+        matches!(self, Self::Now)
+    }
+
+    pub const ALL: [Func; 14] = [
+        Func::Abs,
+        Func::Floor,
+        Func::Ceil,
+        Func::Round,
+        Func::Len,
+        Func::Lower,
+        Func::Upper,
+        Func::Concat,
+        Func::Now,
+        Func::Date,
+        Func::Weeks,
+        Func::Days,
+        Func::Hours,
+        Func::Minutes,
+    ];
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.keyword() == name)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -748,35 +909,202 @@ pub enum ArithOp {
     Sub,
     Mul,
     Div,
+    /// Remainder, written `%`. Binds as tightly as `*` and `/`.
+    Rem,
+    /// Exponentiation, written `**`. Binds tighter than `*`, and associates to
+    /// the right, so `2 ** 3 ** 2` is `2 ** (3 ** 2)`.
+    Pow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AggregateKind {
+    /// Folds *rows*: how many complete unifications the inner conjunction has.
     Count,
+    /// Folds *values* of the aggregate's `value_var`.
+    Sum,
+    Min,
+    Max,
+    Avg,
+    /// Folds distinct *values* of `value_var`.
+    ///
+    /// The one fold that cannot stream: distinctness needs a set, and the set
+    /// grows with the answer. It is therefore bounded — see
+    /// `datalog::DISTINCT_VALUE_CAP`.
+    CountDistinct,
+    /// Population standard deviation. Streams: Welford's method computes
+    /// variance in one pass with constant memory, so this is a fold like
+    /// `sum` and `avg`, not a member of the bounded family below.
+    StdDev,
+    /// The middle value. Needs the whole group ordered before an answer
+    /// exists, so it is bounded — see `datalog::RETAINED_VALUE_CAP`.
+    Median,
+    /// The value at a fraction of the way through the ordered group. `Median`
+    /// is this with `P = 0.5` rather than a separate mechanism.
+    Percentile,
+    /// The values themselves, joined by a separator.
+    ///
+    /// Every other aggregate reduces a group to one number; this is the only
+    /// one that answers "which ones". It returns a string rather than a list
+    /// because `DerivedFact` carries its endpoints as strings — a list-valued
+    /// argument would be flattened at that boundary anyway.
+    GroupConcat,
+}
+
+impl AggregateKind {
+    /// The keyword this kind is written with.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::Sum => "sum",
+            Self::Min => "min",
+            Self::Max => "max",
+            Self::Avg => "avg",
+            Self::CountDistinct => "count_distinct",
+            Self::StdDev => "stddev",
+            Self::Median => "median",
+            Self::Percentile => "percentile",
+            Self::GroupConcat => "group_concat",
+        }
+    }
+
+    /// Every kind but `Count` folds the values of a named variable, so every
+    /// kind but `Count` requires one.
+    pub fn needs_value_var(self) -> bool {
+        !matches!(self, Self::Count)
+    }
+
+    /// Whether the aggregate takes a literal parameter between its value
+    /// variable and its output — the fraction for `percentile`, the separator
+    /// for `group_concat`.
+    pub fn needs_param(self) -> bool {
+        matches!(self, Self::Percentile | Self::GroupConcat)
+    }
+
+    /// Whether the fold must retain the whole group rather than an
+    /// accumulator. These are the aggregates that cannot stream.
+    pub fn retains_group(self) -> bool {
+        matches!(self, Self::Median | Self::Percentile | Self::GroupConcat)
+    }
+
+    /// Whether an empty group still produces a value.
+    ///
+    /// `Count` and `Sum` have a well-defined identity over no rows — nothing
+    /// happened zero times and cost zero. `Min`, `Max` and `Avg` do not: there
+    /// is no minimum of nothing, and emitting a sentinel would be a fabricated
+    /// value the caller cannot distinguish from a real one. Those rules simply
+    /// do not fire.
+    pub fn identity_over_empty(self) -> Option<Term> {
+        match self {
+            Self::Count | Self::Sum | Self::CountDistinct => {
+                Some(Term::ConstFloat(OrderedFloat(0.0)))
+            }
+            // Joining no values is the empty string, which is a real answer
+            // rather than a stand-in for one.
+            Self::GroupConcat => Some(Term::ConstStr(String::new())),
+            // There is no middle, extreme, mean or spread of nothing, and a
+            // sentinel would be a fabricated value.
+            Self::Min | Self::Max | Self::Avg | Self::StdDev | Self::Median | Self::Percentile => {
+                None
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Aggregate {
     pub kind: AggregateKind,
+    /// The literal parameter, for the kinds that take one.
+    ///
+    /// Additive: rows written before `percentile` and `group_concat` existed
+    /// carry no such field and deserialize to `None`, which is what every
+    /// other kind wants.
+    #[serde(default)]
+    pub param: Option<Term>,
     pub inner: Atom,
     #[serde(default)]
     pub inner_conjunction: Vec<Atom>,
     pub group_vars: Vec<String>,
     pub output_var: String,
+    /// The variable whose values are folded, for every kind but `Count`.
+    ///
+    /// Additive: rows written when `count` was the only aggregate carry no
+    /// such field and deserialize to `None`, which is what `Count` wants.
+    #[serde(default)]
+    pub value_var: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum StratifyError {
-    RecursionThroughAggregate { cycle: Vec<String> },
+    RecursionThroughAggregate {
+        cycle: Vec<String>,
+    },
+    /// A predicate's derivation transitively requires its own negation.
+    /// Such a rule set has no stratified model, so it is rejected rather
+    /// than evaluated to an arbitrary fixpoint.
+    RecursionThroughNegation {
+        cycle: Vec<String>,
+    },
+    /// A rule computes a head argument and that head can reach its own body,
+    /// so each round produces a new value and the fixpoint never closes.
+    ///
+    /// The `max_facts` budget would stop it, but by truncation — the caller
+    /// would get an arbitrary prefix with no signal it was cut short.
+    /// Rejecting is the only answer that cannot be mistaken for an answer.
+    RecursionThroughHeadExpression {
+        cycle: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DatalogRule {
     pub head: Atom,
+    /// Positive body atoms. A binding must match every one of them.
     pub body: Vec<Atom>,
     pub filters: Vec<BuiltinFilter>,
     #[serde(default)]
     pub aggregates: Vec<Aggregate>,
+    /// Negated body atoms (`not p(X)`). A binding survives only if it
+    /// matches *none* of them.
+    ///
+    /// Additive on purpose: `RuleEntry` rows written before negation
+    /// existed carry no such field and deserialize to an empty set, which
+    /// means exactly what those rules meant before. Retyping `body` to
+    /// carry polarity would have been a breaking stored-format change.
+    #[serde(default)]
+    pub negated: Vec<Atom>,
+    /// Head arguments that are computed rather than repeated.
+    ///
+    /// Kept beside the head instead of retyping `Atom.args`, because `Atom` is
+    /// shared by the head, body atoms, negated atoms and aggregate inner atoms,
+    /// and only the head may compute — a body atom is a pattern to unify
+    /// against, not something to evaluate.
+    #[serde(default)]
+    pub head_exprs: Vec<HeadExpr>,
+    /// Computed values the body names, written `D := expr`.
+    ///
+    /// A distinct operator rather than `=`, which already parses to
+    /// `CmpOp::Eq`. Redefining `=` would silently change the meaning of rules
+    /// already stored, and a silent change of meaning is worse than a new
+    /// symbol to learn.
+    ///
+    /// Evaluated in order after the positive atoms, so a binding may use
+    /// anything the body bound and anything an earlier binding named.
+    #[serde(default)]
+    pub bindings: Vec<Binding>,
+}
+
+/// A named value computed from what the body already bound.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Binding {
+    pub var: String,
+    pub expr: FilterExpr,
+}
+
+/// A computed head argument: which position it fills, and how to compute it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HeadExpr {
+    pub index: usize,
+    pub expr: FilterExpr,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1004,7 +1332,51 @@ impl DerivedFact {
     pub fn has_uuid_endpoints(&self) -> bool {
         Uuid::parse_str(&self.src_id).is_ok() && Uuid::parse_str(&self.dst_id).is_ok()
     }
+
+    /// True iff any step in this fact's derivation was an *absence* — a
+    /// negated literal that held because no row matched it.
+    pub fn rests_on_absence(&self) -> bool {
+        self.provenance
+            .iter()
+            .any(|step| step.parent_kind == PROVENANCE_KIND_ABSENCE)
+    }
+
+    /// True iff this fact was derived by a rule that read the clock.
+    ///
+    /// Such a fact stops being true with no base fact changing at all, which
+    /// is exactly why it cannot be cached.
+    pub fn reads_the_clock(&self) -> bool {
+        self.provenance
+            .iter()
+            .any(|step| step.parent_kind == PROVENANCE_KIND_CLOCK)
+    }
+
+    /// True iff this fact may be written to the persisted derived-fact store.
+    ///
+    /// Two independent reasons a derivation must not be cached:
+    ///
+    /// - its endpoints are not both UUIDs, so the UUID-keyed cache table
+    ///   cannot hold it (issue #129); or
+    /// - it rests on an absence. The engine is monotonic only for positive
+    ///   rules: a later base fact can make a negated derivation **false**,
+    ///   and an append-only cache would go on serving the stale derivation
+    ///   forever. For a permission rule that is access which should have
+    ///   been revoked. Negated derivations are therefore evaluated live and
+    ///   never persisted.
+    pub fn is_cacheable(&self) -> bool {
+        self.has_uuid_endpoints() && !self.rests_on_absence() && !self.reads_the_clock()
+    }
 }
+
+/// `ProvenanceStep::parent_kind` for a step that records an *absence*
+/// rather than a matched row — the reason a negated literal held.
+pub const PROVENANCE_KIND_ABSENCE: &str = "absence";
+
+/// `ProvenanceStep::parent_kind` for a derivation that read the clock.
+///
+/// Beside absence for the same reason: both make a derivation non-monotonic,
+/// so neither may be persisted.
+pub const PROVENANCE_KIND_CLOCK: &str = "clock";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvenanceStep {
@@ -1393,6 +1765,8 @@ mod tests {
             },
             inner_conjunction: vec![],
             group_vars: vec!["X".into()],
+            param: None,
+            value_var: None,
             output_var: "N".into(),
         };
         let json = serde_json::to_string(&a).unwrap();
@@ -1419,6 +1793,8 @@ mod tests {
                 },
             ],
             group_vars: vec!["Ctx".into(), "Tool".into()],
+            param: None,
+            value_var: None,
             output_var: "N".into(),
         };
         let json = serde_json::to_string(&a).unwrap();
@@ -1443,6 +1819,8 @@ mod tests {
             },
             inner_conjunction: vec![],
             group_vars: vec!["X".into()],
+            param: None,
+            value_var: None,
             output_var: "N".into(),
         };
         let mut json: serde_json::Value = serde_json::to_value(&v1_shape).unwrap();

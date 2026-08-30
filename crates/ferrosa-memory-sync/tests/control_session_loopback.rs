@@ -223,7 +223,14 @@ async fn direct_control_bind_and_ping_pong() {
     });
     let server_config = config();
     let server_task = tokio::spawn(async move {
-        run_control_server_session(&server_api, &server_identity, session_id, &server_config).await
+        run_control_server_session(
+            &server_api,
+            &server_identity,
+            session_id,
+            &server_config,
+            None,
+        )
+        .await
     });
 
     let mut controller = controller_task

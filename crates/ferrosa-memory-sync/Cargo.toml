@@ -5,7 +5,18 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# Terminal output is raw bytes — escape sequences, and whatever encoding the
+# program chose. JSON strings cannot carry that, and lossy UTF-8 conversion
+# would corrupt exactly the control sequences the emulator needs.
+base64 = "0.23"
 ferrosa-memory-core = { path = "../ferrosa-memory-core" }
+# For the SessionExtension seam: a dyn-compatible async trait. Already in the
+# tree via webrtc; this makes the dependency an explicit one.
+async-trait = "0.1"
+# A PTY, not piped stdio. Programs line-buffer and emit progress only when they
+# believe they are on a terminal; piped output arrives in 8 KiB lumps minutes
+# apart, which in an interactive session is indistinguishable from a hang.
+portable-pty = "0.9"
 scylla = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -55,3 +66,8 @@ path = "src/main.rs"
 
 [dev-dependencies]
 proptest = "1"
+tempfile = { workspace = true }
+# `test-util` gives the paused clock. The peer-loss tests turn on a ten-second
+# grace period; without it they would take ten real seconds each and would be
+# timing-dependent, which is the wrong way to test a timeout.
+tokio = { workspace = true, features = ["test-util"] }

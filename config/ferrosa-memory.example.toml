@@ -5,7 +5,7 @@
 # launchd plist / systemd unit).
 #
 # Assumes a Ferrosa instance is running at localhost:9042 — the default
-# from `curl -fsSL https://ferrosadb.com/install.sh | bash`. If your
+# from `curl -fsSL https://www.ferrosa.ai/install.sh | bash`. If your
 # Ferrosa is elsewhere, adjust contact_points + bolt_uri + http_url.
 #
 # Auth: run local first-use installs as ferrosa_admin so writes keep working

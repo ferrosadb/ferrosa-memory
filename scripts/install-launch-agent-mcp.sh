@@ -5,7 +5,7 @@ export PATH="/opt/homebrew/bin:$PATH"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-TEMPLATE="${REPO_ROOT}/launchd/com.ferrosa-memory.mcp.plist"
+TEMPLATE="${REPO_ROOT}/launchd/com.ferrosa-memory.mcp.plist.in"
 TARGET_DIR="${HOME}/Library/LaunchAgents"
 TARGET="${TARGET_DIR}/com.ferrosa-memory.mcp.plist"
 DEBUG_BINARY="${REPO_ROOT}/target/debug/ferrosa-memory-mcp"
@@ -41,6 +41,14 @@ sed -e "s|__BINARY_PATH__|${BINARY_PATH}|g" \
     -e "s|__REPO_ROOT__|${REPO_ROOT}|g" \
     -e "s|__CONFIG_PATH__|${CONFIG_PATH}|g" \
     "${TEMPLATE}" > "${TARGET}"
+
+# A plist that still carries a placeholder is not installable: launchd would try
+# to exec a literal __BINARY_PATH__ and the job would silently never run.
+if grep -q "__[A-Z_]*__" "${TARGET}"; then
+  echo "error: ${TARGET} still contains a placeholder after substitution" >&2
+  grep -o "__[A-Z_]*__" "${TARGET}" | sort -u | sed 's/^/  /' >&2
+  exit 1
+fi
 
 if launchctl print "${DOMAIN}/${LABEL}" >/dev/null 2>&1; then
     launchctl bootout "${DOMAIN}" "${TARGET}" || true

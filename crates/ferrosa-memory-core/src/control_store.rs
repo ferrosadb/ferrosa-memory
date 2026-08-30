@@ -360,6 +360,44 @@ pub struct CqlControlStore {
 }
 
 impl CqlControlStore {
+    /// Which event, if any, holds `cursor`.
+    ///
+    /// Used to settle a conditional insert whose outcome the server did not
+    /// report. The event id is the deciding evidence: it is generated per draft,
+    /// so a row carrying ours proves our own write landed rather than merely
+    /// that something is there.
+    async fn event_owner(
+        &self,
+        ctx: &TenantContext,
+        server_fingerprint: &str,
+        cursor: u64,
+    ) -> anyhow::Result<Option<Uuid>> {
+        let bucket = cursor_bucket(cursor)?;
+        let query = format!(
+            "SELECT event_id FROM {}.mobile_control_events \
+             WHERE tenant_id = ? AND server_fingerprint = ? AND cursor_bucket = ? AND cursor = ?",
+            self.keyspace
+        );
+        #[allow(deprecated)]
+        let result = self
+            .session
+            .query_unpaged(
+                query,
+                (
+                    ctx.tenant_id,
+                    server_fingerprint,
+                    bucket,
+                    i64::try_from(cursor)?,
+                ),
+            )
+            .await?;
+        let columns = build_col_map(result.col_specs());
+        let Some(row) = result.rows_or_empty().into_iter().next() else {
+            return Ok(None);
+        };
+        Ok(Some(cql_get::<Uuid>(&row, &columns, "event_id")?))
+    }
+
     /// Apply all ordered application migrations, then connect with runtime
     /// credentials. Startup fails loud if schema migration cannot complete.
     pub async fn connect(config: &FerrosaCqlConfig) -> anyhow::Result<Self> {
@@ -401,7 +439,7 @@ impl CqlControlStore {
         &self,
         ctx: &TenantContext,
         server_fingerprint: &str,
-    ) -> anyhow::Result<(u64, Option<Uuid>)> {
+    ) -> anyhow::Result<Option<(u64, Option<Uuid>)>> {
         let query = format!(
             "SELECT next_cursor, reservation_token FROM {}.mobile_control_cursor_state \
              WHERE tenant_id = ? AND server_fingerprint = ?",
@@ -413,12 +451,20 @@ impl CqlControlStore {
             .query_unpaged(query, (ctx.tenant_id, server_fingerprint))
             .await?;
         let columns = build_col_map(result.col_specs());
+        // `None` means NO ROW, which is not the same as a row holding a low
+        // cursor. Collapsing the two is what wedged this allocator: the caller
+        // used `high_water == 0` to decide between INSERT and UPDATE, so an
+        // existing row whose `next_cursor` was 0 or 1 sent it down the
+        // `INSERT ... IF NOT EXISTS` path against a row that already existed.
+        // That never applies, and the loop reported 32 rounds of it as
+        // contention — a permanent, deterministic failure wearing the costume
+        // of a transient one.
         let Some(row) = result.rows_or_empty().into_iter().next() else {
-            return Ok((0, None));
+            return Ok(None);
         };
         let next: i64 = cql_get(&row, &columns, "next_cursor")?;
         let token = cql_get::<Uuid>(&row, &columns, "reservation_token").ok();
-        Ok((u64::try_from(next)?.saturating_sub(1), token))
+        Ok(Some((u64::try_from(next)?.saturating_sub(1), token)))
     }
 
     async fn high_water(
@@ -428,7 +474,7 @@ impl CqlControlStore {
     ) -> anyhow::Result<u64> {
         self.cursor_state(ctx, server_fingerprint)
             .await
-            .map(|(high_water, _)| high_water)
+            .map(|state| state.map_or(0, |(high_water, _)| high_water))
     }
 }
 
@@ -502,7 +548,8 @@ impl ControlStore for CqlControlStore {
         validate_stream(server_fingerprint)?;
         validate_block_size(size)?;
         for _ in 0..32 {
-            let high_water = self.high_water(ctx, server_fingerprint).await?;
+            let existing = self.cursor_state(ctx, server_fingerprint).await?;
+            let high_water = existing.map_or(0, |(high_water, _)| high_water);
             let start = high_water.saturating_add(1).max(1);
             let end = start
                 .checked_add(size - 1)
@@ -511,7 +558,7 @@ impl ControlStore for CqlControlStore {
             let next = i64::try_from(end + 1)?;
             let now = Utc::now();
             let reservation_token = Uuid::now_v7();
-            let query = if high_water == 0 {
+            let query = if existing.is_none() {
                 format!(
                     "INSERT INTO {}.mobile_control_cursor_state \
                      (tenant_id, server_fingerprint, next_cursor, updated_at, reservation_token) \
@@ -527,7 +574,7 @@ impl ControlStore for CqlControlStore {
                 )
             };
             #[allow(deprecated)]
-            let result = if high_water == 0 {
+            let result = if existing.is_none() {
                 self.session
                     .query_unpaged(
                         query,
@@ -560,8 +607,10 @@ impl ControlStore for CqlControlStore {
                 Some(true) => return Ok(CursorBlock { start, end }),
                 Some(false) => continue,
                 None => {
-                    let (observed_high_water, observed_token) =
-                        self.cursor_state(ctx, server_fingerprint).await?;
+                    let (observed_high_water, observed_token) = self
+                        .cursor_state(ctx, server_fingerprint)
+                        .await?
+                        .unwrap_or((0, None));
                     if observed_high_water == end && observed_token == Some(reservation_token) {
                         return Ok(CursorBlock { start, end });
                     }
@@ -571,7 +620,19 @@ impl ControlStore for CqlControlStore {
                 }
             }
         }
-        anyhow::bail!("mobile control cursor allocation remained contended after 32 attempts")
+        // Report the state, not just the count. "Contended after 32 attempts"
+        // described a race; when the cause was actually a stuck row, it sent
+        // the reader looking for a competing writer that did not exist.
+        let observed = self.cursor_state(ctx, server_fingerprint).await?;
+        anyhow::bail!(
+            "mobile control cursor allocation failed after 32 attempts for {server_fingerprint}; \
+             row {}",
+            match observed {
+                Some((high_water, token)) =>
+                    format!("high_water={high_water} reservation_token={token:?}"),
+                None => "absent".to_owned(),
+            }
+        )
     }
 
     async fn append_event(
@@ -613,8 +674,46 @@ impl ControlStore for CqlControlStore {
                 ),
             )
             .await?;
-        if lwt_applied(result)? != Some(true) {
-            anyhow::bail!("event cursor {} is already occupied", draft.cursor);
+        match lwt_applied(result)? {
+            Some(true) => {}
+            Some(false) => {
+                anyhow::bail!("event cursor {} is already occupied", draft.cursor)
+            }
+            None => {
+                // The server did not return an [applied] column, so the driver
+                // cannot say whether the conditional insert took effect. That is
+                // NOT the same as it failing, and treating it as failure is what
+                // made every control-session heartbeat report
+                //
+                //     event cursor N is already occupied
+                //     this session is NOT in the durable event log
+                //
+                // while the row was in fact written. The claim was backwards:
+                // 100% of sessions "failed", each at a FRESH cursor one block
+                // further on, which is what a healthy allocator handing out new
+                // blocks looks like -- not a stale one reissuing old ones.
+                //
+                // reserve_cursor_block already handles None this way, by reading
+                // its own write back. The same server, the same driver, the same
+                // ambiguity; this path simply never learned about it.
+                //
+                // Read back and let the row decide. Ours means the insert
+                // applied. Somebody else's means the cursor really was taken.
+                let row_owner = self
+                    .event_owner(ctx, server_fingerprint, draft.cursor)
+                    .await?;
+                match row_owner {
+                    Some(event_id) if event_id == draft.event_id => {}
+                    Some(_) => {
+                        anyhow::bail!("event cursor {} is already occupied", draft.cursor)
+                    }
+                    None => anyhow::bail!(
+                        "event cursor {} was neither written nor occupied; the conditional \
+                         insert did not apply and left no row",
+                        draft.cursor
+                    ),
+                }
+            }
         }
         Ok(ControlEvent {
             cursor: draft.cursor,
@@ -643,7 +742,7 @@ impl ControlStore for CqlControlStore {
             let first_bucket = cursor_bucket(after.saturating_add(1))?;
             let last_bucket = cursor_bucket(high_water)?;
             for bucket in first_bucket..=last_bucket {
-                let Some(want) = remaining_fetch(fetch_limit, events.len()) else {
+                if events.len() >= fetch_limit {
                     break;
                 };
                 let lower = if bucket == first_bucket {
@@ -651,12 +750,21 @@ impl ControlStore for CqlControlStore {
                 } else {
                     u64::try_from(bucket)? * CONTROL_CURSOR_BUCKET_SIZE
                 };
-                let remaining = i32::try_from(want)?;
+                let Some(remaining) = replay_remaining(fetch_limit, events.len())? else {
+                    break;
+                };
+                // LITERAL limit, not a bound one.
+                //
+                // A bound `LIMIT ?` is ignored by this engine and the whole
+                // partition comes back, which is what overran the page and
+                // underflowed the arithmetic above. `remaining` is an i32 this
+                // function computed, never caller input, so interpolating it
+                // introduces nothing.
                 let query = format!(
                     "SELECT cursor, event_id, command_id, event_type, payload, created_at \
                      FROM {}.mobile_control_events \
                      WHERE tenant_id = ? AND server_fingerprint = ? AND cursor_bucket = ? \
-                     AND cursor > ? LIMIT ?",
+                     AND cursor > ? LIMIT {remaining}",
                     self.keyspace
                 );
                 #[allow(deprecated)]
@@ -669,7 +777,6 @@ impl ControlStore for CqlControlStore {
                             server_fingerprint,
                             bucket,
                             i64::try_from(lower)?,
-                            remaining,
                         ),
                     )
                     .await?;
@@ -971,6 +1078,27 @@ fn validate_command_transition(
     Ok(())
 }
 
+/// How many more events this replay page may take, or `None` when it is full.
+///
+/// Saturating and `None`-terminated rather than a bare subtraction. The loop
+/// guarded only `events.len() == fetch_limit`, so a page that came back LARGER
+/// than asked walked straight past it and underflowed `fetch_limit - len` into
+/// a huge `usize`. The conversion then failed with "out of range integral type
+/// conversion attempted", which the session surfaced as a control protocol
+/// violation and hung up — every session, immediately, on one machine.
+///
+/// A page CAN come back larger: this engine ignores a bound `LIMIT ?` and
+/// returns the whole partition, so the only limit that binds is a literal one.
+/// This function is correct either way, which is the point — it does not rely
+/// on the database having honoured anything.
+fn replay_remaining(fetch_limit: usize, collected: usize) -> anyhow::Result<Option<i32>> {
+    let remaining = fetch_limit.saturating_sub(collected);
+    if remaining == 0 {
+        return Ok(None);
+    }
+    Ok(Some(i32::try_from(remaining)?))
+}
+
 fn cursor_bucket(cursor: u64) -> anyhow::Result<i32> {
     if cursor == 0 {
         anyhow::bail!("cursor zero is not a durable event cursor");
@@ -995,37 +1123,11 @@ fn lwt_applied(result: scylla::LegacyQueryResult) -> anyhow::Result<Option<bool>
 
 #[cfg(test)]
 mod tests {
-    use super::{existing_control_schema_probe_queries, remaining_fetch};
-
-    #[test]
-    fn remaining_fetch_asks_for_the_shortfall() {
-        assert_eq!(remaining_fetch(257, 0), Some(257));
-        assert_eq!(remaining_fetch(257, 100), Some(157));
-        assert_eq!(remaining_fetch(257, 256), Some(1));
-    }
-
-    #[test]
-    fn remaining_fetch_stops_when_the_page_is_exactly_full() {
-        assert_eq!(remaining_fetch(257, 257), None);
-    }
-
-    #[test]
-    fn remaining_fetch_stops_when_the_server_over_returned() {
-        // A server that ignores LIMIT hands back more rows than were asked for,
-        // so the collected count overshoots the page size. The old `==` guard
-        // missed the overshoot and then evaluated `fetch_limit - collected`,
-        // underflowing usize into a value `i32::try_from` rejects with "out of
-        // range integral type conversion attempted" — which killed the control
-        // session instead of degrading.
-        assert_eq!(remaining_fetch(257, 258), None);
-        assert_eq!(remaining_fetch(257, 100_000), None);
-        assert_eq!(remaining_fetch(1, usize::MAX), None);
-    }
+    use super::*;
 
     #[test]
     fn existing_schema_probe_is_partition_bounded() {
         let queries = existing_control_schema_probe_queries("agent_memory");
-
         assert_eq!(queries.len(), 3);
         for query in queries {
             assert!(query.contains("WHERE tenant_id = ? AND server_fingerprint = ?"));
@@ -1037,7 +1139,6 @@ mod tests {
     #[test]
     fn existing_schema_probe_covers_every_control_table() {
         let queries = existing_control_schema_probe_queries("agent_memory");
-
         assert!(queries[0].contains("mobile_control_cursor_state"));
         assert!(queries[0].contains("reservation_token"));
         assert!(queries[1].contains("mobile_control_events"));
@@ -1045,5 +1146,27 @@ mod tests {
         assert!(queries[1].contains("payload"));
         assert!(queries[2].contains("mobile_control_commands"));
         assert!(queries[2].contains("request_payload"));
+    }
+
+    #[test]
+    fn an_overrun_page_reports_full_rather_than_underflowing() {
+        assert_eq!(replay_remaining(10, 25).unwrap(), None);
+        assert_eq!(replay_remaining(1, usize::MAX).unwrap(), None);
+    }
+
+    #[test]
+    fn an_exactly_full_page_is_full() {
+        assert_eq!(replay_remaining(10, 10).unwrap(), None);
+    }
+
+    #[test]
+    fn a_partial_page_asks_for_the_difference() {
+        assert_eq!(replay_remaining(10, 4).unwrap(), Some(6));
+        assert_eq!(replay_remaining(10, 0).unwrap(), Some(10));
+    }
+
+    #[test]
+    fn a_limit_beyond_cql_int_range_is_refused() {
+        assert!(replay_remaining(usize::MAX, 0).is_err());
     }
 }

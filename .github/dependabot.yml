@@ -58,3 +58,22 @@ updates:
         update-types: ["version-update:semver-major"]
       - dependency-name: "rand"
         update-types: ["version-update:semver-major"]
+      # webrtc 0.20 is not a version bump, it is a different library: a thin
+      # async layer over a Sans-I/O `rtc` core, with PeerConnectionBuilder in
+      # place of APIBuilder and a PeerConnectionEventHandler trait in place of
+      # every on_*() callback. webrtc::api, webrtc::interceptor and
+      # webrtc::ice_transport no longer exist at all.
+      #
+      # Porting is real work across ~3200 lines of control_session.rs,
+      # peer_session.rs and peer_transport_webrtc.rs, and it rewrites the event
+      # model of the P2P transport rather than adjusting call sites. Left to
+      # dependabot it reappears weekly as a PR that can never go green (#209),
+      # which teaches everyone to ignore a red badge on dependency PRs — the
+      # one place a red badge matters most.
+      #
+      # Same treatment as the RustCrypto jump above: closed as unmergeable,
+      # tracked as deliberate work, ignore removed when that lands.
+      - dependency-name: "webrtc"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
