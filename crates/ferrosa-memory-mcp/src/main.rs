@@ -732,29 +732,6 @@ fn startup_default_session_id(config: &Config, repo: &str) -> anyhow::Result<uui
     Ok(uuid::Uuid::new_v4())
 }
 
-/// Tenants the HTTP consolidation worker should poll.
-///
-/// Reads them from the auth file, because in HTTP mode that is the only place
-/// a tenant is declared — `server.tenant_id` is rejected outright. Returns an
-/// empty vec rather than a fallback: a background worker with an invented
-/// tenant is indistinguishable from one that is working and finds nothing to
-/// do, which is exactly how this went unnoticed for two months.
-fn http_consolidation_tenants(config: &Config) -> Vec<uuid::Uuid> {
-    let Some(auth_file) = config.server.auth_file.as_deref() else {
-        return Vec::new();
-    };
-    match auth::FileAuthValidator::from_path(auth_file) {
-        Ok(v) => v.tenants(),
-        Err(e) => {
-            tracing::error!(
-                auth_file,
-                "cannot read auth file for consolidation tenants: {e}"
-            );
-            Vec::new()
-        }
-    }
-}
-
 #[cfg(test)]
 fn build_http_validator(config: &Config) -> anyhow::Result<Arc<http::CredentialValidator>> {
     validate_shared_http_config(config)?;
