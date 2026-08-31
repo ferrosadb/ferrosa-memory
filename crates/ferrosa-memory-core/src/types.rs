@@ -730,6 +730,13 @@ pub enum BuiltinFilter {
         lhs: FilterExpr,
         rhs: FilterExpr,
     },
+    /// A spatial relation between two geometries, written
+    /// `geo_within(a, b)` and its seven siblings.
+    GeoPred {
+        relation: crate::geojson::SpatialRelation,
+        left: FilterExpr,
+        right: FilterExpr,
+    },
     /// `is_null(expr)`. Answers true or false and never `Unknown`, which is
     /// what makes it the only way to actually ask: `V == null` is `Unknown`
     /// and therefore never fires.
@@ -838,6 +845,12 @@ pub enum Func {
     Now,
     /// Parse an ISO-8601 string into a time. The bridge to stored timestamps.
     Date,
+    /// Parse GeoJSON text into a geometry. The same bridge as `Date`, for the
+    /// same reason: geometry arrives as JSON exactly as timestamps arrive as
+    /// strings, and without it a geometry value has nothing to compare against.
+    Geo,
+    /// Great-circle distance in metres, centre to centre.
+    GeoDistance,
     Weeks,
     Days,
     Hours,
@@ -857,6 +870,8 @@ impl Func {
             Self::Concat => "concat",
             Self::Now => "now",
             Self::Date => "date",
+            Self::Geo => "geo",
+            Self::GeoDistance => "geo_distance",
             Self::Weeks => "weeks",
             Self::Days => "days",
             Self::Hours => "hours",
@@ -867,7 +882,7 @@ impl Func {
     /// How many arguments the function takes.
     pub fn arity(self) -> usize {
         match self {
-            Self::Concat => 2,
+            Self::Concat | Self::GeoDistance => 2,
             Self::Now => 0,
             _ => 1,
         }
@@ -881,7 +896,7 @@ impl Func {
         matches!(self, Self::Now)
     }
 
-    pub const ALL: [Func; 14] = [
+    pub const ALL: [Func; 16] = [
         Func::Abs,
         Func::Floor,
         Func::Ceil,
@@ -896,6 +911,8 @@ impl Func {
         Func::Days,
         Func::Hours,
         Func::Minutes,
+        Func::Geo,
+        Func::GeoDistance,
     ];
 
     pub fn parse(name: &str) -> Option<Self> {

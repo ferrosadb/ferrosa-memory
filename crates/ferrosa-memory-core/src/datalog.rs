@@ -899,7 +899,7 @@ fn is_boolean_filter_part(part: &str) -> bool {
 /// `contains(X, Y)` is a legitimate stored relation.
 fn is_reserved_str_part(part: &str) -> bool {
     let bare = part.trim_start_matches('!').trim_start();
-    bare.starts_with("str_") || bare.starts_with("is_null(")
+    bare.starts_with("str_") || bare.starts_with("is_null(") || bare.starts_with("geo_")
 }
 
 /// The aggregate kind a body part is written with, if any.
@@ -1152,6 +1152,16 @@ fn instantiate_head(rule: &DatalogRule, binding: &Binding) -> Option<Vec<Term>> 
             Eval::Value(EvalValue::Str(s)) => Term::ConstStr(s),
             Eval::Value(EvalValue::Uuid(u)) => Term::Const(u),
             Eval::Value(EvalValue::Time(t)) => Term::ConstTime(t),
+            // A geometry is a computed intermediate, not something a fact can
+            // hold — there is no geometry term, on purpose. Keep the GeoJSON
+            // text and call `geo()` where the question is asked.
+            Eval::Value(EvalValue::Geo(_)) => {
+                tracing::warn!(
+                    predicate = %rule.head.predicate,
+                    "datalog: a geometry cannot be a head argument; store its GeoJSON text"
+                );
+                return None;
+            }
             // Null is a value, so the rule fires carrying it. Only an error or
             // an undecidable expression stops the head being built.
             Eval::Null => Term::ConstNull,
@@ -1220,6 +1230,13 @@ fn collect_bindings(rule: &DatalogRule, all_facts: &FactSet) -> Vec<Candidate> {
                     Eval::Value(EvalValue::Str(s)) => Term::ConstStr(s),
                     Eval::Value(EvalValue::Uuid(u)) => Term::Const(u),
                     Eval::Value(EvalValue::Time(t)) => Term::ConstTime(t),
+                    Eval::Value(EvalValue::Geo(_)) => {
+                        tracing::warn!(
+                            var = %b.var,
+                            "datalog: a geometry cannot be bound; keep its GeoJSON text"
+                        );
+                        return None;
+                    }
                     Eval::Null => Term::ConstNull,
                     Eval::Undefined | Eval::Unbound => {
                         tracing::warn!(
@@ -1386,6 +1403,9 @@ fn filter_references_any(f: &BuiltinFilter, vars: &std::collections::HashSet<&st
             expr_refs(subject, vars) || expr_refs(arg, vars)
         }
         BuiltinFilter::IsNull(e) => expr_refs(e, vars),
+        BuiltinFilter::GeoPred { left, right, .. } => {
+            expr_refs(left, vars) || expr_refs(right, vars)
+        }
         BuiltinFilter::Any(branches) | BuiltinFilter::All(branches) => {
             branches.iter().any(|b| filter_references_any(b, vars))
         }
@@ -1594,6 +1614,20 @@ fn eval_call(
             tracing::warn!("datalog: now() was not stamped before evaluation");
             Eval::Undefined
         }
+        (Func::Geo, [EvalValue::Str(text)]) => match crate::geojson::Geometry::parse(text) {
+            Some(g) => Eval::Value(EvalValue::Geo(g)),
+            None => {
+                tracing::warn!("datalog: geo() could not read this as GeoJSON");
+                Eval::Undefined
+            }
+        },
+        // Already a geometry — accepted so a rule need not know how a column
+        // is stored.
+        (Func::Geo, [EvalValue::Geo(g)]) => Eval::Value(EvalValue::Geo(g.clone())),
+        (Func::GeoDistance, [EvalValue::Geo(a), EvalValue::Geo(b)]) => match a.distance_to(b) {
+            Some(m) => Eval::Value(EvalValue::Num(m)),
+            None => Eval::Undefined,
+        },
         (Func::Date, [EvalValue::Str(text)]) => match parse_iso8601(text) {
             Some(t) => Eval::Value(EvalValue::Time(t)),
             None => {
@@ -1720,6 +1754,10 @@ fn stamp_filter(f: &mut BuiltinFilter, now: chrono::DateTime<chrono::Utc>) {
             stamp_expr(arg, now);
         }
         BuiltinFilter::IsNull(e) => stamp_expr(e, now),
+        BuiltinFilter::GeoPred { left, right, .. } => {
+            stamp_expr(left, now);
+            stamp_expr(right, now);
+        }
         BuiltinFilter::Any(bs) | BuiltinFilter::All(bs) => {
             for b in bs {
                 stamp_filter(b, now);
@@ -1781,6 +1819,7 @@ fn rule_reads_the_clock(rule: &DatalogRule) -> bool {
             BuiltinFilter::Compare { lhs, rhs, .. } => expr_reads(lhs) || expr_reads(rhs),
             BuiltinFilter::StrPred { subject, arg, .. } => expr_reads(subject) || expr_reads(arg),
             BuiltinFilter::IsNull(e) => expr_reads(e),
+            BuiltinFilter::GeoPred { left, right, .. } => expr_reads(left) || expr_reads(right),
             BuiltinFilter::Any(bs) | BuiltinFilter::All(bs) => bs.iter().any(filter_reads),
             BuiltinFilter::Not(inner) => filter_reads(inner),
             _ => false,
@@ -2088,6 +2127,7 @@ enum EvalValue {
     Str(String),
     Uuid(uuid::Uuid),
     Time(chrono::DateTime<chrono::Utc>),
+    Geo(crate::geojson::Geometry),
 }
 
 /// The outcome of evaluating a filter expression.
@@ -2356,6 +2396,39 @@ fn eval_filter(filter: &BuiltinFilter, binding: &HashMap<String, Term>) -> Verdi
                 _ => Verdict::Unbound,
             }
         }
+        BuiltinFilter::GeoPred {
+            relation,
+            left,
+            right,
+        } => match (eval_expr(left, binding), eval_expr(right, binding)) {
+            (Eval::Value(EvalValue::Geo(a)), Eval::Value(EvalValue::Geo(b))) => {
+                match a.relates(*relation, &b) {
+                    Some(answer) => Verdict::of(answer),
+                    // The relate engine could not answer for this pair. "No"
+                    // and "cannot say" are different, and a rule must not fire
+                    // on the second thinking it got the first.
+                    None => {
+                        tracing::warn!(
+                            relation = relation.keyword(),
+                            "datalog: this pair of shapes has no answer for that relation"
+                        );
+                        Verdict::Undefined
+                    }
+                }
+            }
+            (Eval::Null, _) | (_, Eval::Null) => Verdict::Unknown,
+            // A geometry question asked of something that is not a geometry —
+            // usually text that failed to parse, which is a mistake in the
+            // data rather than an absence.
+            (Eval::Value(_), _) | (_, Eval::Value(_)) => {
+                tracing::warn!(
+                    relation = relation.keyword(),
+                    "datalog: spatial relation applied to a non-geometry; deriving nothing"
+                );
+                Verdict::Undefined
+            }
+            _ => Verdict::Unbound,
+        },
         // The only question about a null with a definite answer, which is why
         // it has to exist: `V == null` is Unknown and so never fires.
         BuiltinFilter::IsNull(e) => match eval_expr(e, binding) {
@@ -6387,7 +6460,15 @@ mod grammar_tests {
             CmpOp::Eq | CmpOp::Ne | CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => (),
         };
         assert_eq!(StrOp::ALL.len(), 3, "a string predicate changed");
-        assert_eq!(Func::ALL.len(), 14, "a function was added or removed");
+        // 16: eight general, four temporal, two spatial, and the clock.
+        // Grew when GeoJSON arrived, which is the third time this guard has
+        // forced a re-read rather than let a stale claim ride.
+        assert_eq!(Func::ALL.len(), 16, "a function was added or removed");
+        assert_eq!(
+            crate::geojson::SpatialRelation::ALL.len(),
+            8,
+            "the DE-9IM set is fixed by the standard, not by us"
+        );
         assert_eq!(
             Func::ALL.iter().filter(|f| f.reads_the_clock()).count(),
             1,

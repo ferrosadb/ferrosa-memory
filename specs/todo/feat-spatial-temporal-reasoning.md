@@ -14,7 +14,7 @@ last_updated: 2026-08-30
 
 ## Checklist
 
-- [ ] **1. GeoJSON, the whole RFC.** All seven geometry types plus Feature and
+- [x] **1. GeoJSON, the whole RFC.** All seven geometry types plus Feature and
       FeatureCollection, parsed by the `geojson` crate rather than by hand, and
       the DE-9IM predicate set over them from `geo`. `geo(S)` is the bridge and
       it is deliberately the same bridge `date(S)` is — geometry arrives as

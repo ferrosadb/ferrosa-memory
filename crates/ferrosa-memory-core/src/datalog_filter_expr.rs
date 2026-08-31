@@ -20,6 +20,7 @@
 //!
 //! See `docs/superpowers/specs/2026-05-02-datalog-filter-grammar-design.md`.
 
+use crate::geojson::SpatialRelation;
 use crate::types::{ArithOp, BuiltinFilter, CmpOp, FilterExpr, Func, StrOp};
 use nom::{
     IResult, Parser,
@@ -247,6 +248,36 @@ fn membership(input: &str) -> IResult<&str, BuiltinFilter> {
     ))
 }
 
+/// A spatial relation: `geo_within(a, b)` and its siblings.
+fn geo_pred(input: &str) -> IResult<&str, BuiltinFilter> {
+    let (i, relation) = ws(alt((
+        // Longest first: `geo_contains` must not be read as `geo_cont…`.
+        value(SpatialRelation::Intersects, tag("geo_intersects")),
+        value(SpatialRelation::Contains, tag("geo_contains")),
+        value(SpatialRelation::Disjoint, tag("geo_disjoint")),
+        value(SpatialRelation::Overlaps, tag("geo_overlaps")),
+        value(SpatialRelation::Touches, tag("geo_touches")),
+        value(SpatialRelation::Crosses, tag("geo_crosses")),
+        value(SpatialRelation::Equals, tag("geo_equals")),
+        value(SpatialRelation::Within, tag("geo_within")),
+    )))
+    .parse(input)?;
+    let (i, (left, right)) = delimited(
+        ws(ch('(')),
+        (expr, preceded(ws(ch(',')), expr)),
+        ws(ch(')')),
+    )
+    .parse(i)?;
+    Ok((
+        i,
+        BuiltinFilter::GeoPred {
+            relation,
+            left,
+            right,
+        },
+    ))
+}
+
 /// `is_null(expr)`.
 ///
 /// Needed because `V == null` is Unknown and therefore never fires — without
@@ -273,6 +304,7 @@ fn bool_primary(input: &str) -> IResult<&str, BuiltinFilter> {
     alt((
         delimited(ws(ch('(')), bool_or, ws(ch(')'))),
         str_pred,
+        geo_pred,
         is_null_pred,
         membership,
         comparison,
