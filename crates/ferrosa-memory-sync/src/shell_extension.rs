@@ -62,16 +62,16 @@ pub struct ShellExtension {
     /// memory frames say so rather than reading someone else's tenant and
     /// reporting its emptiness as this one's.
     memory_tenant: Option<uuid::Uuid>,
-    board: tokio::sync::OnceCell<Option<Arc<crate::task_board::TaskBoard>>>,
+    board: crate::retry_gate::ClusterView<crate::task_board::TaskBoard>,
     /// The memory tiers, on the same terms as the board: connected on first
     /// use, and a cluster that is down costs one screen rather than the
     /// session.
-    memory: tokio::sync::OnceCell<Option<Arc<crate::memory_view::MemoryView>>>,
+    memory: crate::retry_gate::ClusterView<crate::memory_view::MemoryView>,
     /// Knowledge and claims, on the same terms again: connected on first use,
     /// and a cluster that is down costs one screen rather than the session.
-    knowledge: tokio::sync::OnceCell<Option<Arc<crate::knowledge_view::KnowledgeView>>>,
+    knowledge: crate::retry_gate::ClusterView<crate::knowledge_view::KnowledgeView>,
     /// The classification rules, on the same terms again.
-    rules: tokio::sync::OnceCell<Option<Arc<crate::rules_view::RulesView>>>,
+    rules: crate::retry_gate::ClusterView<crate::rules_view::RulesView>,
 }
 
 #[derive(Default)]
@@ -100,82 +100,48 @@ impl ShellExtension {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             board_contact_points,
             memory_tenant,
-            board: tokio::sync::OnceCell::new(),
-            memory: tokio::sync::OnceCell::new(),
-            knowledge: tokio::sync::OnceCell::new(),
-            rules: tokio::sync::OnceCell::new(),
+            board: crate::retry_gate::ClusterView::new("task board"),
+            memory: crate::retry_gate::ClusterView::new("memory tiers"),
+            knowledge: crate::retry_gate::ClusterView::new("knowledge"),
+            rules: crate::retry_gate::ClusterView::new("rules"),
         }
     }
 
     /// The board, connected once. `None` if it could not be reached.
     async fn board(&self) -> Option<Arc<crate::task_board::TaskBoard>> {
         self.board
-            .get_or_init(|| async {
-                match crate::task_board::TaskBoard::connect(&self.board_contact_points).await {
-                    Ok(board) => Some(Arc::new(board)),
-                    Err(error) => {
-                        // Loud, and not fatal. Agents keep working without it.
-                        tracing::warn!(%error, "task board unavailable");
-                        None
-                    }
-                }
-            })
+            .get(|| crate::task_board::TaskBoard::connect(&self.board_contact_points))
             .await
-            .clone()
     }
 
     /// The memory tiers, connected once. `None` if they could not be reached.
     async fn memory(&self) -> Option<Arc<crate::memory_view::MemoryView>> {
+        let Some(tenant) = self.memory_tenant else {
+            // Not a connection failure, so not the retry path: no amount of
+            // retrying supplies a tenant nobody configured.
+            tracing::warn!(
+                "memory tiers unavailable: no tenant configured. Pass \
+                 --memory-tenant, or set server.tenant_id in the memory \
+                 config, or FERROSA_MEMORY_TENANT_ID, to the tenant this \
+                 machine's memory is stored under."
+            );
+            return None;
+        };
+        // Says which tenant. An empty tier map has two explanations -- nothing
+        // seeded, or the wrong tenant -- and they are indistinguishable from
+        // the counts alone.
+        tracing::debug!(%tenant, "reading memory tiers");
         self.memory
-            .get_or_init(|| async {
-                let Some(tenant) = self.memory_tenant else {
-                    tracing::warn!(
-                        "memory tiers unavailable: no tenant configured. Pass \
-                         --memory-tenant, or set server.tenant_id in the memory \
-                         config, or FERROSA_MEMORY_TENANT_ID, to the tenant this \
-                         machine's memory is stored under."
-                    );
-                    return None;
-                };
-                match crate::memory_view::MemoryView::connect(&self.board_contact_points, tenant)
-                    .await
-                {
-                    Ok(view) => {
-                        // Says which tenant, on the way in. An empty tier map
-                        // has two explanations -- nothing seeded, or the wrong
-                        // tenant -- and they are indistinguishable from the
-                        // counts alone. This is the line that tells them apart
-                        // without anyone having to query the cluster.
-                        tracing::info!(%tenant, "memory tiers connected");
-                        Some(Arc::new(view))
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, %tenant, "memory tiers unavailable");
-                        None
-                    }
-                }
-            })
+            .get(|| crate::memory_view::MemoryView::connect(&self.board_contact_points, tenant))
             .await
-            .clone()
     }
 
     /// Knowledge and claims, connected once. `None` if unreachable.
     async fn rules(&self) -> Option<Arc<crate::rules_view::RulesView>> {
+        let tenant = self.memory_tenant?;
         self.rules
-            .get_or_init(|| async {
-                let tenant = self.memory_tenant?;
-                match crate::rules_view::RulesView::connect(&self.board_contact_points, tenant)
-                    .await
-                {
-                    Ok(view) => Some(Arc::new(view)),
-                    Err(error) => {
-                        tracing::warn!(%error, "rules unavailable");
-                        None
-                    }
-                }
-            })
+            .get(|| crate::rules_view::RulesView::connect(&self.board_contact_points, tenant))
             .await
-            .clone()
     }
 
     /// The rules that classify this machine's corpus, and the pile they have
@@ -489,34 +455,19 @@ impl ShellExtension {
     }
 
     async fn knowledge(&self) -> Option<Arc<crate::knowledge_view::KnowledgeView>> {
+        let Some(tenant) = self.memory_tenant else {
+            tracing::warn!(
+                "knowledge unavailable: no tenant configured. Pass \
+                 --memory-tenant, or set server.tenant_id in the memory \
+                 config, to the tenant this machine's memory is stored under."
+            );
+            return None;
+        };
         self.knowledge
-            .get_or_init(|| async {
-                let Some(tenant) = self.memory_tenant else {
-                    tracing::warn!(
-                        "knowledge unavailable: no tenant configured. Pass \
-                         --memory-tenant, or set server.tenant_id in the memory \
-                         config, to the tenant this machine's memory is stored under."
-                    );
-                    return None;
-                };
-                match crate::knowledge_view::KnowledgeView::connect(
-                    &self.board_contact_points,
-                    tenant,
-                )
-                .await
-                {
-                    Ok(view) => {
-                        tracing::info!(%tenant, "knowledge connected");
-                        Some(Arc::new(view))
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, %tenant, "knowledge unavailable");
-                        None
-                    }
-                }
+            .get(|| {
+                crate::knowledge_view::KnowledgeView::connect(&self.board_contact_points, tenant)
             })
             .await
-            .clone()
     }
 
     /// The Knowledge tier: approved deliverables only, each with its check.
