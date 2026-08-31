@@ -24,7 +24,7 @@ last_updated: 2026-08-30
       people say it. Getting it backwards puts San Francisco in China and
       nothing about the result looks wrong, so it gets its own test.
 
-- [ ] **2. Composition, of which transitivity is a special case.**
+- [x] **2. Composition, of which transitivity is a special case.**
       `Characteristic::Transitive` generates `p(X,Z) :- p(X,Y), p(Y,Z).` That
       is the diagonal of a composition table. The general form —
 
