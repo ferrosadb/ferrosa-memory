@@ -46,6 +46,8 @@ pub mod peer_cli;
 pub mod peer_session;
 pub mod peer_transport;
 pub mod replication;
+/// When to try a refused dependency again, instead of caching the refusal.
+mod retry_gate;
 pub mod rules_view;
 pub mod session_config;
 /// Runs a configured session and carries its text both ways.
