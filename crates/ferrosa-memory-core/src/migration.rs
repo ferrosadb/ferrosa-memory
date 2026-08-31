@@ -245,6 +245,21 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "knowledge items, their version chain, and the queues that read them",
         ddl: include_str!("../../../ddl/056_knowledge_items.cql"),
     },
+    Migration {
+        version: 57,
+        description: "policy-governed artifact links, tags, approval records, and opaque content blobs",
+        ddl: include_str!("../../../ddl/057_memory_artifacts.cql"),
+    },
+    Migration {
+        version: 58,
+        description: "durable bytes for globally content-addressed artifact blobs",
+        ddl: include_str!("../../../ddl/058_memory_artifact_blob_content.cql"),
+    },
+    Migration {
+        version: 59,
+        description: "durable display names for artifact links",
+        ddl: include_str!("../../../ddl/059_memory_artifact_display_name.cql"),
+    },
 ];
 
 /// `ddl/011_warmth_field.cql` — the `entity_warmth` table + session index.
