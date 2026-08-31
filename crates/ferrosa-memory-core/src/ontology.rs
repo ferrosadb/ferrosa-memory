@@ -77,16 +77,27 @@ pub struct PredicateDef {
     pub kind: PredicateKind,
     /// One line, in the words of the person choosing it from a palette.
     pub meaning: String,
+    /// The kind of thing this relates FROM, as an `fo:` class id.
+    ///
+    /// Required by the published package contract, and worth having anyway:
+    /// without it nothing can check that a rule relates the kinds of thing
+    /// the relation was meant for.
+    pub domain_of: String,
+    /// The kind of thing this relates TO.
+    pub range_of: String,
     pub characteristics: Vec<Characteristic>,
 }
 
 impl PredicateDef {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         name: &str,
         arity: usize,
         domain: Domain,
         kind: PredicateKind,
         meaning: &str,
+        domain_of: &str,
+        range_of: &str,
         characteristics: Vec<Characteristic>,
     ) -> Self {
         Self {
@@ -95,6 +106,8 @@ impl PredicateDef {
             domain,
             kind,
             meaning: meaning.to_string(),
+            domain_of: domain_of.to_string(),
+            range_of: range_of.to_string(),
             characteristics,
         }
     }
@@ -181,6 +194,8 @@ impl Vocabulary {
                     Structural,
                     Base,
                     "the first kind is a kind of the second",
+                    "fo:Class",
+                    "fo:Class",
                     vec![Transitive, Irreflexive],
                 ),
                 p(
@@ -189,6 +204,8 @@ impl Vocabulary {
                     Structural,
                     Base,
                     "this particular thing is one of that kind",
+                    "fo:Instance",
+                    "fo:Class",
                     vec![],
                 ),
                 p(
@@ -197,6 +214,8 @@ impl Vocabulary {
                     Structural,
                     Base,
                     "the first thing is a part of the second",
+                    "fo:Instance",
+                    "fo:Instance",
                     vec![Transitive, Irreflexive, InverseOf("contains".into())],
                 ),
                 p(
@@ -205,6 +224,8 @@ impl Vocabulary {
                     Structural,
                     Base,
                     "the first thing has the second inside it",
+                    "fo:Instance",
+                    "fo:Instance",
                     vec![InverseOf("part_of".into())],
                 ),
                 p(
@@ -213,6 +234,8 @@ impl Vocabulary {
                     Structural,
                     Base,
                     "nothing can be both of these kinds at once",
+                    "fo:Class",
+                    "fo:Class",
                     vec![Symmetric, DisjointClasses],
                 ),
                 p(
@@ -221,6 +244,8 @@ impl Vocabulary {
                     Structural,
                     Base,
                     "these two are connected, without saying how",
+                    "fo:Instance",
+                    "fo:Instance",
                     vec![Symmetric],
                 ),
                 // ── Business: who answers for what ────────────────────
@@ -230,6 +255,8 @@ impl Vocabulary {
                     Business,
                     Base,
                     "this person or team owns that thing",
+                    "fo:Instance",
+                    "fo:Instance",
                     vec![InverseOf("owned_by".into())],
                 ),
                 p(
@@ -238,6 +265,8 @@ impl Vocabulary {
                     Business,
                     Base,
                     "this thing is owned by that person or team",
+                    "fo:Instance",
+                    "fo:Instance",
                     vec![InverseOf("owns".into())],
                 ),
                 p(
@@ -246,6 +275,8 @@ impl Vocabulary {
                     Business,
                     Base,
                     "this person reports to that one",
+                    "fo:Instance",
+                    "fo:Instance",
                     vec![Transitive, Irreflexive, InverseOf("manages".into())],
                 ),
                 p(
@@ -254,6 +285,8 @@ impl Vocabulary {
                     Business,
                     Base,
                     "this person manages that one",
+                    "fo:Instance",
+                    "fo:Instance",
                     vec![InverseOf("reports_to".into())],
                 ),
                 p(
@@ -262,6 +295,8 @@ impl Vocabulary {
                     Business,
                     Base,
                     "this person or team belongs to that group",
+                    "fo:Instance",
+                    "fo:Instance",
                     vec![Transitive],
                 ),
                 p(
@@ -270,6 +305,8 @@ impl Vocabulary {
                     Business,
                     Base,
                     "this person answers for that thing",
+                    "fo:Instance",
+                    "fo:Instance",
                     vec![],
                 ),
                 p(
@@ -278,6 +315,8 @@ impl Vocabulary {
                     Business,
                     Base,
                     "this person approved that thing",
+                    "fo:Instance",
+                    "fo:Instance",
                     vec![],
                 ),
                 p(
@@ -286,6 +325,8 @@ impl Vocabulary {
                     Business,
                     Base,
                     "this replaces that",
+                    "fo:Instance",
+                    "fo:Instance",
                     vec![Transitive, Irreflexive],
                 ),
                 p(
@@ -294,6 +335,8 @@ impl Vocabulary {
                     Business,
                     Base,
                     "this is one version of that work",
+                    "fo:Instance",
+                    "fo:Instance",
                     vec![],
                 ),
                 p(
@@ -302,6 +345,8 @@ impl Vocabulary {
                     Business,
                     Base,
                     "this is in that place",
+                    "fo:Instance",
+                    "fo:Instance",
                     vec![Transitive, Irreflexive],
                 ),
                 // ── Technical: what rests on what ─────────────────────
@@ -311,6 +356,8 @@ impl Vocabulary {
                     Technical,
                     Base,
                     "this needs that to work",
+                    "fo:Instance",
+                    "fo:Instance",
                     vec![Transitive, Irreflexive],
                 ),
                 p(
@@ -319,6 +366,8 @@ impl Vocabulary {
                     Technical,
                     Base,
                     "this calls that",
+                    "fo:Instance",
+                    "fo:Instance",
                     vec![SubPropertyOf("depends_on".into())],
                 ),
                 p(
@@ -327,6 +376,8 @@ impl Vocabulary {
                     Technical,
                     Base,
                     "this uses that",
+                    "fo:Instance",
+                    "fo:Instance",
                     vec![SubPropertyOf("depends_on".into())],
                 ),
                 p(
@@ -335,6 +386,8 @@ impl Vocabulary {
                     Technical,
                     Base,
                     "this is an implementation of that",
+                    "fo:Instance",
+                    "fo:Instance",
                     vec![],
                 ),
                 p(
@@ -343,6 +396,8 @@ impl Vocabulary {
                     Technical,
                     Base,
                     "this mentions that",
+                    "fo:Instance",
+                    "fo:Instance",
                     vec![],
                 ),
                 p(
@@ -351,6 +406,8 @@ impl Vocabulary {
                     Technical,
                     Base,
                     "this runs on that",
+                    "fo:Instance",
+                    "fo:Instance",
                     vec![],
                 ),
                 // ── Temporal: facts only ──────────────────────────────
@@ -366,6 +423,8 @@ impl Vocabulary {
                     Temporal,
                     Computed,
                     "when this was made",
+                    "fo:Instance",
+                    "fo:Property",
                     vec![],
                 ),
                 p(
@@ -374,6 +433,8 @@ impl Vocabulary {
                     Temporal,
                     Computed,
                     "when this last changed",
+                    "fo:Instance",
+                    "fo:Property",
                     vec![],
                 ),
                 p(
@@ -382,9 +443,150 @@ impl Vocabulary {
                     Temporal,
                     Computed,
                     "when this stops applying",
+                    "fo:Instance",
+                    "fo:Property",
                     vec![],
                 ),
             ],
+        }
+    }
+}
+
+/// A portable ontology package, in the shape `ferrosa-experts` publishes and
+/// validates.
+///
+/// The point of exporting is that there is then only ONE vocabulary. A Rust
+/// copy and a published copy that are merely similar is the same hazard D1
+/// names for the grammar: two sides holding independent copies of one
+/// vocabulary, and one of them stale.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Package {
+    pub manifest: Manifest,
+    pub document: Document,
+    /// Reasoning this vocabulary has that the package format cannot carry.
+    ///
+    /// Reported rather than dropped. A published package that silently
+    /// reasons LESS than the vocabulary it claims to be is worse than one
+    /// that says what it left behind.
+    pub unrepresentable: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Manifest {
+    pub format: String,
+    pub id: String,
+    pub version: String,
+    pub title: String,
+    pub entrypoint: String,
+    pub license: String,
+    pub mutable: bool,
+    pub dependencies: Vec<String>,
+    pub exports: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Document {
+    #[serde(rename = "@context")]
+    pub context: serde_json::Value,
+    #[serde(rename = "@graph")]
+    pub graph: Vec<serde_json::Value>,
+}
+
+impl Vocabulary {
+    /// Export as a portable package.
+    pub fn to_package(&self) -> Package {
+        use serde_json::json;
+
+        let mut graph: Vec<serde_json::Value> = Vec::new();
+
+        // The meta-types every term points at. Present because the contract
+        // requires `fo:Ontology`, and because a reference that does not
+        // resolve inside the document is a dangling pointer for an importer.
+        for (id, label, definition) in [
+            ("fo:Ontology", "Ontology", "A versioned set of terms."),
+            (
+                "fo:Class",
+                "Class",
+                "A concept whose instances may be classified.",
+            ),
+            ("fo:Instance", "Instance", "A particular thing."),
+            (
+                "fo:Relationship",
+                "Relationship",
+                "A way two things may be related.",
+            ),
+            ("fo:Property", "Property", "A value a thing carries."),
+        ] {
+            graph.push(json!({
+                "id": id, "type": "fo:Class",
+                "label": label, "definition": definition
+            }));
+        }
+
+        let mut unrepresentable = Vec::new();
+
+        for p in &self.predicates {
+            let mut carried: Vec<&str> = Vec::new();
+            for c in &p.characteristics {
+                match c {
+                    Characteristic::Transitive => carried.push("transitive"),
+                    Characteristic::Symmetric => carried.push("symmetric"),
+                    Characteristic::Irreflexive => carried.push("irreflexive"),
+                    Characteristic::DisjointClasses => carried.push("disjoint_classes"),
+                    // The v1 schema has nowhere to put these two, and they
+                    // generate most of the reasoning here. Say so.
+                    Characteristic::InverseOf(other) => {
+                        unrepresentable.push(format!("{}: inverse_of({other})", p.name))
+                    }
+                    Characteristic::SubPropertyOf(parent) => {
+                        unrepresentable.push(format!("{}: sub_property_of({parent})", p.name))
+                    }
+                }
+            }
+            graph.push(json!({
+                "id": format!("fo:{}", p.name),
+                "type": "fo:Relationship",
+                "label": p.name.replace('_', " "),
+                "definition": p.meaning,
+                "domain": p.domain_of,
+                "range": p.range_of,
+                "predicate_kind": match p.kind {
+                    PredicateKind::Base => "base",
+                    PredicateKind::Derived => "derived",
+                    PredicateKind::Computed => "computed",
+                },
+                "characteristic": carried,
+            }));
+        }
+
+        Package {
+            manifest: Manifest {
+                format: "ferrosa-ontology-package/v1".into(),
+                id: "urn:ferrosa:ontology:reasoning".into(),
+                version: format!("{}.0.0", self.version),
+                title: "Ferrosa Reasoning Vocabulary".into(),
+                entrypoint: "ontology.jsonld".into(),
+                license: "Apache-2.0".into(),
+                mutable: false,
+                dependencies: vec!["urn:ferrosa:ontology:base".into()],
+                exports: self.predicates.iter().map(|p| p.name.clone()).collect(),
+            },
+            document: Document {
+                context: json!({
+                    "fo": "https://ferrosa.ai/ontology/v1#",
+                    "id": "@id",
+                    "type": "@type",
+                    "label": "http://www.w3.org/2004/02/skos/core#prefLabel",
+                    "definition": "http://www.w3.org/2004/02/skos/core#definition",
+                    "subclass_of": {"@id": "fo:subclass_of", "@type": "@id"},
+                    "domain": {"@id": "fo:domain", "@type": "@id"},
+                    "range": {"@id": "fo:range", "@type": "@id"},
+                    "characteristic": "fo:characteristic",
+                    "predicate_kind": "fo:predicate_kind"
+                }),
+                graph,
+            },
+            unrepresentable,
         }
     }
 }
@@ -405,6 +607,124 @@ mod tests {
             .into_iter()
             .find(|p| p.name == name)
             .unwrap_or_else(|| panic!("no predicate '{name}' in the vocabulary"))
+    }
+
+    // ── Exporting to the portable package format ──────────────────
+
+    #[test]
+    fn every_relation_declares_what_it_relates() {
+        // `ferrosa-experts`' package contract requires domain and range on
+        // every relationship. Without them a vocabulary cannot be published,
+        // and more importantly nothing can check that a rule relates the kinds
+        // of thing the relation was meant for.
+        for p in v().predicates {
+            assert!(
+                !p.domain_of.is_empty(),
+                "{} does not say what it relates FROM",
+                p.name
+            );
+            assert!(
+                !p.range_of.is_empty(),
+                "{} does not say what it relates TO",
+                p.name
+            );
+        }
+    }
+
+    #[test]
+    fn the_export_is_a_package_the_published_contract_accepts() {
+        let pkg = v().to_package();
+        assert_eq!(pkg.manifest.format, "ferrosa-ontology-package/v1");
+        assert!(pkg.manifest.id.starts_with("urn:ferrosa:ontology:"));
+        assert!(
+            !pkg.manifest.mutable,
+            "a published package must be immutable"
+        );
+        assert!(
+            !pkg.manifest.entrypoint.contains('/'),
+            "entrypoint is package-local"
+        );
+
+        let doc: serde_json::Value = serde_json::to_value(&pkg.document).unwrap();
+        assert_eq!(doc["@context"]["fo"], "https://ferrosa.ai/ontology/v1#");
+        let graph = doc["@graph"].as_array().expect("a graph");
+        assert!(!graph.is_empty());
+        assert!(
+            graph.iter().any(|t| t["id"] == "fo:Ontology"),
+            "the base meta-type must be present"
+        );
+    }
+
+    #[test]
+    fn every_exported_term_carries_what_the_validator_requires() {
+        let doc = serde_json::to_value(v().to_package().document).unwrap();
+        let graph = doc["@graph"].as_array().unwrap().clone();
+        let ids: Vec<String> = graph
+            .iter()
+            .map(|t| t["id"].as_str().unwrap().to_string())
+            .collect();
+
+        for term in &graph {
+            let id = term["id"].as_str().unwrap();
+            assert!(term["type"].is_string(), "{id} has no type");
+            assert!(
+                term["label"].as_str().is_some_and(|l| !l.is_empty()),
+                "{id} has no label"
+            );
+            if term["type"] == "fo:Relationship" {
+                assert!(term.get("domain").is_some(), "{id} needs a domain");
+                assert!(term.get("range").is_some(), "{id} needs a range");
+            }
+            // Every reference must resolve inside the document, or an
+            // importer receives a dangling pointer.
+            for field in ["domain", "range", "subclass_of"] {
+                if let Some(val) = term.get(field) {
+                    let targets: Vec<String> = match val {
+                        serde_json::Value::String(s) => vec![s.clone()],
+                        serde_json::Value::Array(a) => {
+                            a.iter().map(|x| x.as_str().unwrap().to_string()).collect()
+                        }
+                        other => panic!("{id}.{field} is {other:?}"),
+                    };
+                    for t in targets {
+                        assert!(ids.contains(&t), "{id}.{field} points at unknown {t}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_characteristics_the_published_schema_knows_are_exported() {
+        // The schema's set is {transitive, symmetric, irreflexive,
+        // disjoint_classes}. Exporting anything else would produce a package
+        // its own validator rejects.
+        const KNOWN: [&str; 4] = ["transitive", "symmetric", "irreflexive", "disjoint_classes"];
+        let doc = serde_json::to_value(v().to_package().document).unwrap();
+        for term in doc["@graph"].as_array().unwrap() {
+            if let Some(cs) = term.get("characteristic").and_then(|c| c.as_array()) {
+                for c in cs {
+                    let c = c.as_str().unwrap();
+                    assert!(KNOWN.contains(&c), "{c} is not in the published schema");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_characteristic_the_package_cannot_carry_is_reported_not_dropped() {
+        // `inverse_of` and `sub_property_of` generate most of the reasoning
+        // here and the v1 package schema has nowhere to put them. Silently
+        // dropping them would publish a vocabulary that reasons LESS than the
+        // one it claims to be, so the export says what it could not carry.
+        let pkg = v().to_package();
+        assert!(
+            !pkg.unrepresentable.is_empty(),
+            "the gap is real; the export must name it"
+        );
+        let joined = pkg.unrepresentable.join(" ");
+        assert!(joined.contains("inverse_of"), "got: {joined}");
+        assert!(joined.contains("sub_property_of"), "got: {joined}");
     }
 
     // ── The vocabulary is a contract ──────────────────────────────
