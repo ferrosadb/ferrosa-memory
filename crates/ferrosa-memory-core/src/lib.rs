@@ -70,6 +70,7 @@ pub mod remotes;
 pub mod router;
 pub mod rule_palette;
 
+pub mod geojson;
 pub mod ontology;
 pub mod rule_blocks;
 pub mod rules_view;

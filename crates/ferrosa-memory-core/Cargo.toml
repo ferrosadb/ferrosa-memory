@@ -15,6 +15,8 @@ scylla-driver = []
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+geojson = { workspace = true }
+geo = { workspace = true }
 toml = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
