@@ -71,6 +71,7 @@ pub mod remote_identity;
 pub mod remotes;
 pub mod router;
 pub mod rule_palette;
+pub mod poll_backoff;
 pub mod rules_view;
 pub mod scope;
 #[cfg(test)]

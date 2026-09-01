@@ -3108,11 +3108,27 @@ async fn consolidation_worker_loop<S: Storage + Send + Sync + 'static>(
     let lease_secs = cfg.lease_seconds.max(poll_secs * 2);
     let renew_threshold = Duration::from_secs(lease_secs / 2);
     let tenant_label = ctx.tenant_id.to_string();
-    let mut ticker = tokio::time::interval(Duration::from_secs(poll_secs));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // Back off while the queue is empty.
+    //
+    // Each pass is a full ring scan by construction — `consolidation_requests`
+    // is keyed by `(tenant_id, session_id)`, so "outstanding for this tenant"
+    // cannot address a partition (t_a553df97). It costs the same whether there
+    // is work or not, so a fixed interval makes an idle deployment pay that
+    // scan forever; measured, that was most of ~95% CPU on two nodes.
+    //
+    // Event-driven CDC (t_25c736b8) is the real answer, and this is not
+    // scaffolding it removes: that design keeps "a bounded low-frequency sweep
+    // as the correctness backstop" because the CDC bus is lossy with no
+    // replay. A sweep that slows down when idle is that backstop.
+    let mut backoff = ferrosa_memory_core::poll_backoff::IdleBackoff::new(
+        Duration::from_secs(poll_secs),
+        Duration::from_secs(cfg.poll_idle_max_seconds.max(poll_secs)),
+    );
 
     loop {
-        ticker.tick().await;
+        tokio::time::sleep(backoff.delay()).await;
+        let mut found_work = false;
 
         // Stream the outstanding sessions rather than fetching a batch.
         //
@@ -3165,6 +3181,11 @@ async fn consolidation_worker_loop<S: Storage + Send + Sync + 'static>(
             if !claimed {
                 continue;
             }
+            // A claim is the honest signal that this pass was worth its scan.
+            // Seeing a row is not: another replica may already hold the lease,
+            // and counting that as work would keep every replica at the base
+            // interval whenever any one of them is busy.
+            found_work = true;
 
             // Insert run audit record under this lease.
             let run_id = Uuid::now_v7();
@@ -3252,6 +3273,28 @@ async fn consolidation_worker_loop<S: Storage + Send + Sync + 'static>(
         // the next tick.
         drop(rx);
         let _ = producer.await;
+
+        // Report the EDGES, not the ticks. A line per idle pass is what let
+        // the original scan hide for two months: it ran the whole time,
+        // found nothing, cost full price, and looked exactly like work.
+        match backoff.record(found_work) {
+            ferrosa_memory_core::poll_backoff::Transition::BeganBackingOff => {
+                tracing::info!(
+                    tenant = %tenant_label,
+                    base_seconds = poll_secs,
+                    max_seconds = cfg.poll_idle_max_seconds,
+                    "consolidation queue is empty; slowing the sweep until there is work"
+                );
+            }
+            ferrosa_memory_core::poll_backoff::Transition::Resumed => {
+                tracing::info!(
+                    tenant = %tenant_label,
+                    idle_passes = backoff.idle_passes(),
+                    "consolidation work returned; sweeping at the base interval again"
+                );
+            }
+            ferrosa_memory_core::poll_backoff::Transition::Steady => {}
+        }
     }
 }
 
