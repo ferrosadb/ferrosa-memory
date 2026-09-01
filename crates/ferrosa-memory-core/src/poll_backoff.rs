@@ -47,6 +47,14 @@ pub struct IdleBackoff {
     max: Duration,
     current: Duration,
     idle_passes: u32,
+    /// Whether any pass has run yet.
+    ///
+    /// The first delay is ZERO. This replaced a `tokio::time::interval`, whose
+    /// first `tick()` completes immediately, so sleeping the base interval
+    /// before the first scan silently added that interval to every cold start
+    /// — including a replica trying to claim a consolidation lease whose
+    /// holder just died.
+    started: bool,
 }
 
 impl IdleBackoff {
@@ -65,12 +73,17 @@ impl IdleBackoff {
             max: max.max(base),
             current: base,
             idle_passes: 0,
+            started: false,
         }
     }
 
     /// How long to wait before the next poll.
     pub fn delay(&self) -> Duration {
-        self.current
+        if self.started {
+            self.current
+        } else {
+            Duration::ZERO
+        }
     }
 
     /// How many consecutive passes have found nothing.
@@ -80,6 +93,7 @@ impl IdleBackoff {
 
     /// Record what a pass found, and get back whether that is worth saying.
     pub fn record(&mut self, found_work: bool) -> Transition {
+        self.started = true;
         if found_work {
             let was_backing_off = self.idle_passes > 0;
             self.idle_passes = 0;
@@ -118,9 +132,27 @@ mod tests {
         IdleBackoff::new(BASE, MAX)
     }
 
+    /// The FIRST pass must not wait.
+    ///
+    /// This replaced a `tokio::time::interval`, whose first `tick()` completes
+    /// immediately. Sleeping the base interval before the first scan delays
+    /// every cold start by that interval — and a replica taking over a
+    /// consolidation lease after the holder dies cannot claim it until it has
+    /// scanned once. That is a takeover outage, not merely a slower poll.
     #[test]
-    fn a_fresh_poll_runs_at_its_base_interval() {
-        assert_eq!(backoff().delay(), BASE);
+    fn the_first_poll_does_not_wait() {
+        assert_eq!(
+            backoff().delay(),
+            Duration::ZERO,
+            "a cold start must scan before it sleeps"
+        );
+    }
+
+    #[test]
+    fn it_settles_to_the_base_interval_after_the_first_pass() {
+        let mut b = backoff();
+        assert_eq!(b.record(true), Transition::Steady);
+        assert_eq!(b.delay(), BASE);
     }
 
     #[test]
@@ -233,7 +265,11 @@ mod tests {
         // Config comes from a file a person edits. A base of zero would spin
         // the loop as fast as the runtime allows, which is worse than the bug
         // being fixed.
-        let b = IdleBackoff::new(Duration::ZERO, Duration::ZERO);
+        // Checked AFTER the first pass: the first delay is deliberately zero
+        // so a cold start scans immediately, and one immediate scan is not a
+        // busy loop. What must never be zero is the steady-state interval.
+        let mut b = IdleBackoff::new(Duration::ZERO, Duration::ZERO);
+        b.record(true);
         assert!(b.delay() >= Duration::from_secs(1), "never a busy loop");
 
         let mut inverted = IdleBackoff::new(Duration::from_secs(60), Duration::from_secs(5));
